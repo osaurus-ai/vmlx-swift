@@ -1,6 +1,3 @@
-// Stream.runWith: run callback with a dedicated default stream.
-// Uses only public mlx C API.
-
 #include "mlx/c/stream.h"
 #include "mlx/c/device.h"
 
@@ -9,8 +6,9 @@ extern "C" int mlx_stream_run_with(
     void (*callback)(void* context),
     void* context) {
 
-    // Save current default
-    mlx_device dev = mlx_default_device_new();
+    mlx_device dev = mlx_device_new();
+    mlx_get_default_device(&dev);
+
     mlx_stream old_stream = mlx_stream_new();
     int rc = mlx_get_default_stream(&old_stream, dev);
     if (rc != 0) {
@@ -19,7 +17,6 @@ extern "C" int mlx_stream_run_with(
         return rc;
     }
 
-    // Set new default
     rc = mlx_set_default_stream(stream);
     if (rc != 0) {
         mlx_stream_free(old_stream);
@@ -27,10 +24,8 @@ extern "C" int mlx_stream_run_with(
         return rc;
     }
 
-    // Run callback
     callback(context);
 
-    // Restore original default
     mlx_set_default_stream(old_stream);
     mlx_stream_free(old_stream);
     mlx_device_free(dev);
