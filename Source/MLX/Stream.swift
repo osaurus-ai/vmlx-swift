@@ -141,7 +141,7 @@ public final class Stream: @unchecked Sendable, Equatable {
     /// stream switching overhead. Matches Python's `with mx.stream(s): ...`
     ///
     /// - Parameter body: Closure to run with this stream as default.
-    public func runWith(_ body: () -> Void) {
+    public func runWith(_ body: @escaping () -> Void) {
         // Use Unmanaged to pass the closure as a void* context to C
         let box = ClosureBox(body)
         let unmanaged = Unmanaged.passRetained(box)
