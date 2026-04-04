@@ -104,6 +104,30 @@ public final class Stream: @unchecked Sendable, Equatable {
         return try await $defaultStream.withValue(Stream(device), operation: body)
     }
 
+    /// Set the C++ process-wide default stream (zero overhead, no @TaskLocal).
+    ///
+    /// This calls `mlx_set_default_stream()` directly — the C++ scheduler's
+    /// `default_streams_` map is updated immediately. All subsequent MLX ops
+    /// that use the default stream will dispatch to this stream's thread/queue.
+    ///
+    /// Use with `restoreDefault()` to bracket generation loops:
+    /// ```swift
+    /// let genStream = Stream(Device.defaultDevice())
+    /// Stream.setDefault(genStream)  // model ops → generation stream
+    /// asyncEval(token)              // submitted to generation stream
+    /// Stream.restoreDefault()       // item() → default stream (no contention)
+    /// let value = token.item(Int.self)
+    /// ```
+    public static func setDefault(_ stream: Stream) {
+        mlx_set_default_stream(stream.ctx)
+    }
+
+    /// Restore the original default stream for the device.
+    public static func restoreDefault(device: Device = Device.defaultDevice()) {
+        let defaultStream = Stream.defaultStream(device)
+        mlx_set_default_stream(defaultStream.ctx)
+    }
+
     init(_ ctx: mlx_stream) {
         self.ctx = ctx
     }
