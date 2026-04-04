@@ -128,6 +128,25 @@ public final class Stream: @unchecked Sendable, Equatable {
         mlx_set_default_stream(defaultStream.ctx)
     }
 
+    /// Run a closure with this stream as the C++ default. Zero per-call overhead.
+    ///
+    /// Sets the C++ scheduler's default stream, runs the closure, restores the
+    /// original — all in one C++ call. No Swift `@TaskLocal`, no per-iteration
+    /// stream switching overhead. Matches Python's `with mx.stream(s): ...`
+    ///
+    /// - Parameter body: Closure to run with this stream as default.
+    public func runWith(_ body: @convention(block) () -> Void) {
+        // Bridge Swift closure to C function pointer via context
+        var closure = body
+        withUnsafeMutablePointer(to: &closure) { ptr in
+            mlx_stream_run_with(ctx, { context in
+                let closurePtr = context!.assumingMemoryBound(
+                    to: (@convention(block) () -> Void).self)
+                closurePtr.pointee()
+            }, ptr)
+        }
+    }
+
     init(_ ctx: mlx_stream) {
         self.ctx = ctx
     }

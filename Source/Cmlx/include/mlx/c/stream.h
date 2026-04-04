@@ -70,6 +70,16 @@ int mlx_get_default_stream(mlx_stream* stream, mlx_device dev);
  */
 int mlx_set_default_stream(mlx_stream stream);
 /**
+ * Run a callback with a dedicated stream as the default.
+ * Sets the given stream as default, calls callback(context),
+ * then restores the original default stream.
+ * All MLX ops inside the callback use the given stream.
+ */
+int mlx_stream_run_with(
+    mlx_stream stream,
+    void (*callback)(void* context),
+    void* context);
+/**
  * Returns the current default CPU stream.
  */
 mlx_stream mlx_default_cpu_stream_new(void);
