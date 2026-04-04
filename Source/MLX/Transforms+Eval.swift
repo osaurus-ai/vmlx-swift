@@ -3,9 +3,10 @@
 import Cmlx
 import Foundation
 
-/// lock to be held while doing any eval or asyncEval.  This is
-/// a recursive lock to handle any cases where a closure might
-/// call back into eval.
+/// Lock for operations that modify MLX global state (compile, stream creation).
+/// NOT used for eval/asyncEval — the C++ scheduler has its own std::mutex.
+/// Removing evalLock from the eval hot path allows asyncEval and item() to
+/// overlap, enabling Metal command pipeline parallelism.
 let evalLock = NSRecursiveLock()
 
 /// Evaluate one or more `MLXArray`
@@ -14,9 +15,7 @@ let evalLock = NSRecursiveLock()
 /// - <doc:lazy-evaluation>
 public func eval(_ arrays: MLXArray...) {
     let vector_array = new_mlx_vector_array(arrays)
-    _ = evalLock.withLock {
-        mlx_eval(vector_array)
-    }
+    mlx_eval(vector_array)
     mlx_vector_array_free(vector_array)
 }
 
@@ -26,9 +25,7 @@ public func eval(_ arrays: MLXArray...) {
 /// - <doc:lazy-evaluation>
 public func eval(_ arrays: some Collection<MLXArray>) {
     let vector_array = new_mlx_vector_array(arrays)
-    _ = evalLock.withLock {
-        mlx_eval(vector_array)
-    }
+    mlx_eval(vector_array)
     mlx_vector_array_free(vector_array)
 }
 
@@ -39,9 +36,7 @@ public func eval(_ arrays: some Collection<MLXArray>) {
 /// - ``asyncEval(_:)-(Collection<MLXArray>)``
 public func asyncEval(_ arrays: some Collection<MLXArray>) {
     let vector_array = new_mlx_vector_array(arrays)
-    _ = evalLock.withLock {
-        mlx_async_eval(vector_array)
-    }
+    mlx_async_eval(vector_array)
     mlx_vector_array_free(vector_array)
 }
 

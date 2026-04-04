@@ -554,9 +554,8 @@ public final class MLXArray {
     /// MLX is lazy and arrays are not fully realized until they are evaluated.  This method is typically
     /// not needed as all reads ensure the contents are evaluated.
     public func eval() {
-        _ = evalLock.withLock {
-            mlx_array_eval(ctx)
-        }
+        // No evalLock — C++ scheduler is thread-safe internally
+        mlx_array_eval(ctx)
     }
 
     /// Replace the contents with a reference to a new array (INTERNAL).
