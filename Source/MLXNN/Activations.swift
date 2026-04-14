@@ -136,6 +136,10 @@ public func softPlus(_ x: MLXArray) -> MLXArray {
 /// - <doc:activations>
 /// - ``Softplus``
 public func softplus(_ x: MLXArray) -> MLXArray {
+    // The fast path is now at the scalar-wrap layer (see `_cachedZero` in
+    // DType.swift). `logAddExp(x, 0)` still goes through `toArrays(x, 0)`,
+    // but `Int.asMLXArray(dtype:)` now returns a cached singleton for 0,
+    // avoiding the per-call heap-allocated MLXArray construction.
     logAddExp(x, 0)
 }
 

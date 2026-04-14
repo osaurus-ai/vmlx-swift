@@ -247,13 +247,58 @@ extension Bool: HasDType {
     static public var dtype: DType { .bool }
 }
 
+// MARK: - Shared zero singletons
+//
+// Callers that pass an `Int` literal 0 to an op accepting `ScalarOrArray`
+// (e.g. `maximum(x, 0)`, `logAddExp(x, 0)`, `x - 0`, `where(c, x, 0)`)
+// previously paid a full heap-allocated `MLXArray(Int, dtype:)` construction
+// on every call. At ~4 us/call on M4 Max that's measurable in decode hot
+// paths — softplus (which is `logAddExp(x, 0)`) was 2.2x slower than
+// Python's `nn.softplus` for exactly this reason (measured 2026-04-13).
+//
+// These file-level `let`s build one shared MLXArray zero per common dtype
+// at first use and keep them alive for the process lifetime. `mlx_*` ops
+// read their inputs without mutation, so sharing the same `ctx` across
+// concurrent callers is safe.
+nonisolated(unsafe) internal let _zeroScalarInt32: MLXArray = MLXArray(Int32(0))
+nonisolated(unsafe) internal let _zeroScalarFloat32: MLXArray = MLXArray(Float(0))
+nonisolated(unsafe) internal let _zeroScalarFloat16: MLXArray = {
+    #if !arch(x86_64)
+        return MLXArray(Float16(0))
+    #else
+        return MLXArray(Float(0)).asType(.float16)
+    #endif
+}()
+nonisolated(unsafe) internal let _zeroScalarBFloat16: MLXArray =
+    MLXArray(Float(0)).asType(.bfloat16)
+nonisolated(unsafe) internal let _zeroScalarInt64: MLXArray = MLXArray(Int64(0))
+
+@inline(__always)
+internal func _cachedZero(dtype: DType) -> MLXArray? {
+    switch dtype {
+    case .float32: return _zeroScalarFloat32
+    case .float16: return _zeroScalarFloat16
+    case .bfloat16: return _zeroScalarBFloat16
+    case .int32: return _zeroScalarInt32
+    case .int64: return _zeroScalarInt64
+    default: return nil
+    }
+}
+
 extension Int: HasDType {
     static public var dtype: DType { .int64 }
 
     public func asMLXArray(dtype: DType?) -> MLXArray {
         // callers can use Int64() to get explicit .int64 behavior
         let dtype = dtype ?? .int32
-        return MLXArray(self, dtype: dtype == .bool ? .int32 : dtype)
+        let finalDtype: DType = dtype == .bool ? .int32 : dtype
+        // Fast path for the scalar-zero case — skip the per-call heap
+        // allocation of a fresh `MLXArray(0, dtype:)` in favor of a shared
+        // cached singleton. Measured ~4 us/call savings on M4 Max.
+        if self == 0, let z = _cachedZero(dtype: finalDtype) {
+            return z
+        }
+        return MLXArray(self, dtype: finalDtype)
     }
 }
 
