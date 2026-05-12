@@ -201,10 +201,8 @@ buildable and the runtime matrix has a dedicated validation row for that path.
 
 ## Maintainers
 
-vmlx-swift is an Osaurus project. Eric Jang is the primary maintainer for the
-Swift MLX runtime work, with technical direction, product stewardship, and
-review from Osaurus leadership. The package is built for Osaurus first, but the
-public API and validation standards are intended to be usable by other Swift MLX
+vmlx-swift is an Osaurus project. The package is built for Osaurus first, with
+public APIs and validation standards intended to be usable by other Swift MLX
 applications over time.
 
 ## License
