@@ -16,6 +16,20 @@ private extension Template {
     }
 }
 
+private func repositoryFile(_ relativePath: String) throws -> String {
+    var search = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+    for _ in 0..<8 {
+        let package = search.appendingPathComponent("Package.swift")
+        let candidate = search.appendingPathComponent(relativePath)
+        if FileManager.default.fileExists(atPath: package.path),
+           FileManager.default.fileExists(atPath: candidate.path) {
+            return try String(contentsOf: candidate, encoding: .utf8)
+        }
+        search = search.deletingLastPathComponent()
+    }
+    throw CocoaError(.fileNoSuchFile)
+}
+
 @Suite("DeepseekV4 chat-template fallback")
 struct DeepseekV4ChatTemplateFallbackFocusedTests {
     @Test("reasoning effort max reaches DSV4 fallback preface")
@@ -74,6 +88,44 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("<\u{FF5C}DSML\u{FF5C}tool_calls>"))
         #expect(rendered.hasSuffix(
             "<\u{FF5C}User\u{FF5C}>Use the available tool if helpful.<\u{FF5C}Assistant\u{FF5C}><think>"))
+    }
+
+    @Test("standalone DSV4 template renders tools without a system message")
+    func standaloneDSV4TemplateRendersToolsWithoutSystemMessage() throws {
+        let source = try repositoryFile("Libraries/MLXLMCommon/ChatTemplates/DSV4Minimal.jinja")
+        let template = try Template(source)
+        let rendered = try template.renderDSV4([
+            "messages": [
+                ["role": "user", "content": "Use a tool if needed."],
+            ],
+            "tools": [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "osaurus_no_system_probe",
+                        "description": "Probe no-system DSV4 tool rendering.",
+                        "parameters": [
+                            "type": "object",
+                            "properties": [
+                                "query": ["type": "string"] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ],
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+        ])
+
+        #expect(rendered.contains("## Tools"))
+        #expect(rendered.contains("osaurus_no_system_probe"))
+        #expect(rendered.contains("<\u{FF5C}DSML\u{FF5C}tool_calls>"))
+        #expect(rendered.contains("<\u{FF5C}User\u{FF5C}>Use a tool if needed.\n\n## Tools"))
+        let toolsIndex = try #require(rendered.range(of: "## Tools")?.lowerBound)
+        let userIndex = try #require(rendered.range(of: "<\u{FF5C}User\u{FF5C}>")?.lowerBound)
+        let assistantIndex = try #require(rendered.range(of: "<\u{FF5C}Assistant\u{FF5C}>")?.lowerBound)
+        #expect(userIndex < toolsIndex)
+        #expect(toolsIndex < assistantIndex)
     }
 
     @Test("Swift Jinja tojson accepts Python separators kwarg used by Kimi tools")

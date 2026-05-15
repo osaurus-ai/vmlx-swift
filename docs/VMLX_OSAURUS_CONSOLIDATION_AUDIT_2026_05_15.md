@@ -33,6 +33,11 @@ The PR touches the DSV4 parser/live-smoke path, tokenizer loader tests,
 runtime readiness docs, and the runtime pin checker. It still depends on the
 existing multi-package pin graph below.
 
+Local `../osaurus-staging` is dirty during this audit, with changes in DSV4 live
+smoke and sandbox lock tests plus untracked investigation material. Do not edit
+or re-pin Osaurus from this package pass until that worktree is intentionally
+settled or the exact Osaurus write scope is re-confirmed.
+
 Previously referenced PR:
 
 - PR: `osaurus-ai/osaurus#1073`
@@ -66,6 +71,41 @@ OsaurusCore currently imports products from those packages separately:
 That pin graph is exactly what this repo should replace after `vmlx-swift`
 passes the runtime gates. Osaurus should not be moved to a single dependency
 until the equivalent product surface exists here and the live matrix is proven.
+
+## Moving Sibling Audit
+
+`../vmlx-swift-lm` is currently not a clean upstream:
+
+- It is behind `origin/main` by 5 commits.
+- It has many dirty runtime/cache/template/model edits from parallel local work.
+- It has untracked DSV4 reasoning-policy files whose behavior conflicts with
+  the no-hidden-downgrade rule and must not be copied.
+- It has in-flight batch/cache-salt test edits that should be treated as a
+  signal to verify the same cache-key behavior here, not as an automatic patch.
+
+Already reconciled in `vmlx-swift`:
+
+- ZAYA/ZAYA1-VL nested JANGTQ_K metadata and `mxtq_seed` plumbing.
+- VMLX umbrella product exposing the current Osaurus stable import surface.
+- MTP status detection and preserved/disabled/error bundle metadata plumbing.
+- DSV4 standalone `DSV4Minimal.jinja` no-system tool-schema rendering, aligned
+  with the compiled Swift fallback and covered by a focused test.
+
+Still open before the Osaurus single-package PR:
+
+- DSV4 long-context CSA/HSA/SWA + prefix/paged/disk behavior, including vector
+  drift status.
+- BatchEngine continuous batching, cancellation, cache-key salting, and
+  simultaneous session isolation with the current dirty sibling deltas compared
+  one by one.
+- JANGTQ active routed expert path: low physical footprint, usable token/s,
+  coherent multi-turn, and no permanent prestack dependency unless explicitly
+  diagnostic.
+- VL/video/audio multi-turn media-salt behavior, including nil media salt on
+  text-only turns and grounded output after media changes.
+- SSM/hybrid async re-derive with companion-cache proof.
+- Full Osaurus API/app gates after repin: HTTP routes, tray/process events,
+  model picker, deep sleep/wake, packaged-app launch, and UI error surfaces.
 
 ## Package-Side Consolidation Added Here
 

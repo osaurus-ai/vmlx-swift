@@ -90,6 +90,10 @@ These rows are now covered in this checkout with artifacts under
 
 - DSV4 fallback tools: pre-fix failure plus post-fix JANGTQ-K and JANGTQ2
   template-smoke passes for top-level OpenAI tools and Osaurus-sized schemas.
+- DSV4 standalone template parity: `DSV4Minimal.jinja` now renders OpenAI
+  tool schemas before the first user turn when no system message exists, and a
+  focused test reads the standalone file directly so it cannot silently lag
+  behind `ChatTemplateFallbacks.dsv4Minimal`.
 - DSV4 reasoning policy: `reasoning_effort=max` and low/medium/high pass
   through without hidden aliasing; the legacy raw-max env no longer gates max.
 - DSV4 fallback max preface: focused template test proves max reaches rendered
@@ -134,6 +138,19 @@ These rows are now covered in this checkout with artifacts under
 - RunBench executable caveat: after editing executable sources, use
   `swift build --product RunBench`, not target-only builds, before trusting a
   live binary artifact.
+
+## Current Focused Proof Added 2026-05-15
+
+- MTP bundle status plumbing: loader and model configuration now expose
+  preserved/disabled/error MTP status without claiming speculative accept/reject
+  decode is implemented. The local Qwen3.6 JANG_4M MTP/VL bundle probe passed
+  strict status checks and the focused MTP suite.
+- Osaurus single-package surface: `VMLX` remains the intended umbrella product
+  for the next Osaurus repin, but this is a package-graph prerequisite only. It
+  does not replace live multi-turn model/cache/API proof.
+- Moving sibling boundary: `../vmlx-swift-lm` is behind `origin/main` and dirty
+  with parallel local edits. Treat it as evidence to compare, not a source to
+  copy wholesale.
 
 ## Fix Gates
 

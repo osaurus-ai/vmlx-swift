@@ -5,13 +5,19 @@ live sibling checkout at `../vmlx-swift-lm`.
 
 ## Snapshot
 
-- Current repo: `vmlx-swift`, branch `vmlx-0.31.3`, HEAD `df44b86` before this
-  working-tree patch set.
+- Current repo: `vmlx-swift`, branch `vmlx-0.31.3`, HEAD `da8830b` before this
+  DSV4 template/audit patch set.
 - Reference repo: `../vmlx-swift-lm`, branch `main`, HEAD `81c8ef7`, behind
   `origin/main` by 5 commits and dirty.
 - Treat `../vmlx-swift-lm` as reference evidence, not clean upstream. It has
   useful fixes, but it also carries local experimental deltas and stale policy
   that must not be copied blindly.
+
+The live sibling worktree also has in-flight cache-salt test edits and many
+parallel local runtime file edits. Those edits are a moving signal, not a
+merge source. Each behavior-affecting delta must either be ported with a focused
+test and live model/cache proof, or explicitly rejected with the reason recorded
+here.
 
 ## Package Shape
 
@@ -82,6 +88,39 @@ swift test --filter 'ZayaConfigDecodeFocusedTests|VLShapeGuardFocusedTests|Deeps
 ```
 
 Result: 16 tests in 3 suites passed.
+
+### DSV4 Standalone Jinja Tool Rendering
+
+The sibling `origin/main` had a real DSV4 fallback-template fix for tool schemas
+when no system message is present. `vmlx-swift` already had the corrected Swift
+fallback string in `ChatTemplateFallbacks.dsv4Minimal`, but the repo-visible
+standalone file `Libraries/MLXLMCommon/ChatTemplates/DSV4Minimal.jinja` was
+behind it. That is a bad release surface because downstream maintainers and bundle
+writers can inspect or copy the standalone file.
+
+Ported into `vmlx-swift`:
+
+- `Libraries/MLXLMCommon/ChatTemplates/DSV4Minimal.jinja`
+  - Uses the same tool-rendering macro shape as the Swift fallback.
+  - Renders top-level tools before the first user turn when no system message is
+    present.
+  - Keeps no-hidden-downgrade reasoning behavior: `enable_thinking=true` opens
+    `<think>`, direct chat mode emits `</think>`, and `reasoning_effort=max`
+    remains visible to the template.
+- `Tests/MLXLMCommonFocusedTests/DeepseekV4ChatTemplateFallbackFocusedTests.swift`
+  - Reads the standalone `.jinja` file and proves no-system OpenAI tools render
+    into a DSML schema block before the user turn.
+
+Verification:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+swift test --filter DeepseekV4ChatTemplateFallbackFocusedTests --jobs 2
+```
+
+Result: 6 tests in 1 suite passed. A plain `swift test` invocation without
+`DEVELOPER_DIR` still fails on this machine because the default toolchain cannot
+import Swift Testing.
 
 ## Already Aligned
 
@@ -160,7 +199,7 @@ runtime behavior and cannot be safely copied by stat/diff alone.
 | --- | --- | --- |
 | `JANGTQStreamingExperts.swift` | Huge source delta; this repo has the larger implementation. | Sidecar missing-array behavior, active-streaming low-RAM path, resident vs ephemeral overlays, no full-footprint hidden load, token/s and multi-turn coherence. |
 | `Evaluate.swift` | Large delta; this repo carries current MLXPress profiling, KV-policy salting, and DSV4 reasoning pass-through work. | HTTP/BatchEngine/TokenIterator parity, sampling defaults, reasoning on/off, tool stream splitting, no hidden clamps. |
-| `DeepseekV4ChatEncoder.swift` and `DSV4Minimal.jinja` | Small but policy-sensitive deltas. | `enable_thinking`, `reasoning_effort=max`, CSA/HSA/SWA long context, prefix/paged/disk cache proof, vector drift check. |
+| `DeepseekV4ChatEncoder.swift` and `DSV4Minimal.jinja` | Standalone no-system tool rendering is fixed here; encoder and long-context behavior remain policy-sensitive. | `enable_thinking`, `reasoning_effort=max`, CSA/HSA/SWA long context, prefix/paged/disk cache proof, vector drift check. |
 | `BatchEngine.swift` / `BatchScheduler.swift` | No current no-index source diff against the sibling snapshot. | Still requires live B>1 continuous batching, cancel, mid-stream failure, cache isolation by policy salt, and hybrid cache behavior. |
 | `MediaSalt.swift` and VL path | `MediaSalt.swift` is source-aligned; VLM model/factory files still differ. | Image+text -> text-only -> new image multi-turn, nil media salt on text-only turn, prefix resume correctness, grounded output. |
 | `Hy3.swift` | Sibling dirty delta exists. | Real Hy3 local smoke with reasoning on/off, correct chat template, no repeated empty think blocks, cache stack behavior. |
