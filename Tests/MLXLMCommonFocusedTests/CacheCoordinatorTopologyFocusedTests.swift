@@ -221,6 +221,53 @@ struct CacheCoordinatorTopologyFocusedTests {
         }
     }
 
+    @Test("hybrid disk media-salt prompt boundary returns exact hit")
+    func hybridDiskMediaSaltPromptBoundaryReturnsExactHit() {
+        FocusedMLXTestSupport.withLock {
+        let tmp = makeTempDir("zaya-cca-salted-exact")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let coordinator = makeCoordinator(
+            usePagedCache: true,
+            enableDiskCache: true,
+            diskCacheDir: tmp,
+            modelKey: "zaya-cca-salted-exact-focused")
+        coordinator.setHybrid(true)
+        coordinator.setPagedIncompatible(true)
+
+        let tokens = [61, 62, 63, 64]
+        let cache = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
+        _ = cache.update(
+            keys: MLXArray.ones([1, 1, tokens.count, 8], dtype: .bfloat16),
+            values: MLXArray.ones([1, 1, tokens.count, 8], dtype: .bfloat16) * Float(2))
+        cache.writeCCA(
+            conv: MLXArray.ones([1, 4, 2], dtype: .float32) * Float(3),
+            prev: MLXArray.ones([1, 8], dtype: .float32) * Float(4))
+
+        coordinator.storeAfterGeneration(
+            promptTokens: tokens,
+            perLayerData: extractLayerData(from: [cache]),
+            ssmStates: nil,
+            cache: [cache],
+            mediaSalt: "image-a")
+
+        switch coordinator.fetch(tokens: tokens, mediaSalt: "image-a") {
+        case .hit(let matchedTokens, let remainingTokens, let detail, let blocks, _, let diskArrays):
+            #expect(matchedTokens == tokens.count)
+            #expect(remainingTokens.isEmpty)
+            #expect(detail == .disk)
+            #expect(blocks.isEmpty)
+            #expect(diskArrays?["zaya_0_conv_state"] != nil)
+            #expect(diskArrays?["zaya_0_prev_hs"] != nil)
+        case .miss:
+            Issue.record("hybrid disk-backed media-salt prompt boundary must hit exactly")
+        }
+
+        if case .hit = coordinator.fetch(tokens: tokens, mediaSalt: "image-b") {
+            Issue.record("different media salt must not hit exact hybrid disk boundary")
+        }
+        }
+    }
+
     @Test("path-dependent and sliding caches require disk-backed coordinator restore")
     func pathDependentAndSlidingCachesRequireDiskBackedRestore() {
         FocusedMLXTestSupport.withLock {

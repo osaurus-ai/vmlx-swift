@@ -83,8 +83,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("let lastToken = MLXArray([Int32(last)])"))
     }
 
-    @Test("MiniMax open-thinking prompts get close-token bias without forced close")
-    func minimaxOpenThinkingGetsReasoningCloseBiasWithoutForcedClose() throws {
+    @Test("reasoning close-token forcing is not a decode feature")
+    func reasoningCloseTokenForcingIsAbsent() throws {
         let evaluate = try String(
             contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
             encoding: .utf8)
@@ -92,20 +92,18 @@ struct BatchEngineGrowingChatCacheSourceTests {
             contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
             encoding: .utf8)
 
-        #expect(evaluate.contains("public struct ReasoningCloseBiasConfig"))
-        #expect(evaluate.contains("public struct ReasoningCloseBiasProcessor"))
-        #expect(evaluate.contains("forceAfterTokens"))
-        #expect(evaluate.contains("token.item(Int.self) == config.tokenID"))
-        #expect(engine.contains("parametersWithAutomaticReasoningCloseBias"))
-        #expect(evaluate.contains("name.contains(\"minimax\") || modelTypeName.contains(\"minimax\")"))
-        #expect(evaluate.contains("promptTail.range(of: \"<think>\", options: .backwards)"))
-        #expect(evaluate.contains("promptTail.range(of: \"</think>\", options: .backwards)"))
-        #expect(evaluate.contains("_specialTokenID(\"</think>\", tokenizer: tokenizer)"))
-        #expect(evaluate.contains("tokenizer.encode(text: token, addSpecialTokens: false)"))
-        #expect(evaluate.contains("forceAfterTokens: nil"))
-        #expect(!evaluate.contains("forceAfterTokens: forceAfter"))
-        #expect(!evaluate.contains("let forceAfter: Int?"))
-        #expect(evaluate.contains("reasoningCloseBias active"))
+        #expect(!evaluate.contains("ReasoningCloseBiasConfig"))
+        #expect(!evaluate.contains("ReasoningCloseBiasProcessor"))
+        #expect(!evaluate.contains("reasoningCloseBias"))
+        #expect(!evaluate.contains("forceAfterTokens"))
+        #expect(!evaluate.contains("token.item(Int.self) == config.tokenID"))
+        #expect(!engine.contains("parametersWithAutomaticReasoningCloseBias"))
+        #expect(!evaluate.contains("parametersWithAutomaticReasoningCloseBias"))
+        #expect(!engine.contains("_parametersWithAutomaticReasoningCloseBias"))
+        #expect(!evaluate.contains("_parametersWithAutomaticReasoningCloseBias"))
+        #expect(!evaluate.contains("_specialTokenID(\"</think>\", tokenizer: tokenizer)"))
+        #expect(!evaluate.contains("name.contains(\"minimax\") || modelTypeName.contains(\"minimax\")"))
+        #expect(!evaluate.contains("reasoningCloseBias active"))
     }
 
     @Test("batch engine has env-gated reasoning prompt-tail diagnostics")

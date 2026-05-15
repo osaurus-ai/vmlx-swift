@@ -5,8 +5,6 @@ import MLX
 import MLXNN
 import os
 
-private let reasoningCloseBiasLog = Logger(subsystem: "vmlx", category: "Generation")
-
 /// A `LogitSampler` is responsible for sampling `logits` produced by
 /// a ``LanguageModel`` to produce a token.
 ///
@@ -222,15 +220,6 @@ public struct GenerateParameters: Sendable {
     /// See `Libraries/MLXLMCommon/BatchEngine/STOP-SEQUENCES-CONTRACT.md`.
     public var extraStopStrings: [String] = []
 
-    /// Optional decode-time control for models whose chat template opens a
-    /// reasoning block with a real special token but whose quantized logits can
-    /// under-rank the matching close token. The processor applies an additive
-    /// bias after `activateAfterTokens`. `forceAfterTokens` is available only
-    /// for explicit experiments; the automatic MiniMax path must not use it,
-    /// because a forced close token can move downstream parsing out of the
-    /// reasoning rail before the model has naturally transitioned.
-    public var reasoningCloseBias: ReasoningCloseBiasConfig? = nil
-
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -254,8 +243,7 @@ public struct GenerateParameters: Sendable {
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
         prefillStepSize: Int = 512,
-        extraStopStrings: [String] = [],
-        reasoningCloseBias: ReasoningCloseBiasConfig? = nil
+        extraStopStrings: [String] = []
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -281,7 +269,6 @@ public struct GenerateParameters: Sendable {
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
         self.extraStopStrings = extraStopStrings
-        self.reasoningCloseBias = reasoningCloseBias
     }
 
     public init(
@@ -372,38 +359,15 @@ public struct GenerateParameters: Sendable {
             frequencyContext = nil
         }
 
-        let closeBias = reasoningCloseBias.map { ReasoningCloseBiasProcessor(config: $0) }
-
-        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil && closeBias == nil {
+        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil {
             return nil
         }
 
         return PenaltyProcessor(
             repetitionContext: repetitionContext,
             presenceContext: presenceContext,
-            frequencyContext: frequencyContext,
-            reasoningCloseBias: closeBias
+            frequencyContext: frequencyContext
         )
-    }
-}
-
-/// Decode-time close-token correction for open reasoning blocks.
-public struct ReasoningCloseBiasConfig: Sendable, Equatable {
-    public var tokenID: Int
-    public var activateAfterTokens: Int
-    public var bias: Float
-    public var forceAfterTokens: Int?
-
-    public init(
-        tokenID: Int,
-        activateAfterTokens: Int,
-        bias: Float,
-        forceAfterTokens: Int? = nil
-    ) {
-        self.tokenID = tokenID
-        self.activateAfterTokens = max(0, activateAfterTokens)
-        self.bias = bias
-        self.forceAfterTokens = forceAfterTokens
     }
 }
 
@@ -665,72 +629,26 @@ public struct FrequencyPenaltyContext: LogitProcessor {
     }
 }
 
-/// Biases, then optionally forces, a reasoning close token once.
-///
-/// Forcing is intentionally not enabled by automatic MiniMax handling. It is
-/// only here for explicit diagnostic experiments where the caller accepts that
-/// the model state may not match a naturally sampled reasoning boundary.
-public struct ReasoningCloseBiasProcessor: LogitProcessor {
-    let config: ReasoningCloseBiasConfig
-    private var generatedCount = 0
-    private var didClose = false
-
-    public init(config: ReasoningCloseBiasConfig) {
-        self.config = config
-    }
-
-    public mutating func prompt(_ prompt: MLXArray) {}
-
-    public func process(logits: MLXArray) -> MLXArray {
-        guard !didClose, generatedCount >= config.activateAfterTokens else {
-            return logits
-        }
-
-        let tokenIndex = MLXArray([Int32(config.tokenID)]).asType(.uint32)
-        if let forceAfter = config.forceAfterTokens, generatedCount >= forceAfter {
-            let vocabSize = logits.dim(-1)
-            let mask = (MLXArray.arange(vocabSize).asType(.int32) .== Int32(config.tokenID))
-                .reshaped(1, vocabSize)
-            return MLX.where(mask, MLXArray(0.0), MLXArray(-Float.infinity))
-        }
-
-        let adjusted = logits
-        adjusted[0..., tokenIndex] = adjusted[0..., tokenIndex] + config.bias
-        return adjusted
-    }
-
-    public mutating func didSample(token: MLXArray) {
-        generatedCount += 1
-        if token.item(Int.self) == config.tokenID {
-            didClose = true
-        }
-    }
-}
-
 /// Processor that composes penalty processors in Python mlx-lm order.
 public struct PenaltyProcessor: LogitProcessor {
     var repetitionContext: RepetitionContext?
     var presenceContext: PresencePenaltyContext?
     var frequencyContext: FrequencyPenaltyContext?
-    var reasoningCloseBias: ReasoningCloseBiasProcessor?
 
     public init(
         repetitionContext: RepetitionContext?,
         presenceContext: PresencePenaltyContext?,
-        frequencyContext: FrequencyPenaltyContext?,
-        reasoningCloseBias: ReasoningCloseBiasProcessor? = nil
+        frequencyContext: FrequencyPenaltyContext?
     ) {
         self.repetitionContext = repetitionContext
         self.presenceContext = presenceContext
         self.frequencyContext = frequencyContext
-        self.reasoningCloseBias = reasoningCloseBias
     }
 
     mutating public func prompt(_ prompt: MLXArray) {
         repetitionContext?.prompt(prompt)
         presenceContext?.prompt(prompt)
         frequencyContext?.prompt(prompt)
-        reasoningCloseBias?.prompt(prompt)
     }
 
     public func process(logits: MLXArray) -> MLXArray {
@@ -738,7 +656,6 @@ public struct PenaltyProcessor: LogitProcessor {
         logits = repetitionContext?.process(logits: logits) ?? logits
         logits = presenceContext?.process(logits: logits) ?? logits
         logits = frequencyContext?.process(logits: logits) ?? logits
-        logits = reasoningCloseBias?.process(logits: logits) ?? logits
         return logits
     }
 
@@ -746,7 +663,6 @@ public struct PenaltyProcessor: LogitProcessor {
         repetitionContext?.didSample(token: token)
         presenceContext?.didSample(token: token)
         frequencyContext?.didSample(token: token)
-        reasoningCloseBias?.didSample(token: token)
     }
 }
 
@@ -2282,33 +2198,26 @@ public func generate(
 
     let promptTail = _decodePromptTail(
         input: input, tokenizer: context.tokenizer, tokens: 64)
-    let effectiveParameters = _parametersWithAutomaticReasoningCloseBias(
-        parameters,
-        promptTail: promptTail,
-        modelConfiguration: context.configuration,
-        model: context.model,
-        tokenizer: context.tokenizer)
-
     // Block-diffusion speculative decoding dispatch. When
     // parameters.draftStrategy is .dflash or .ddtree AND the target
     // model conforms to HiddenStateCaptureModel + TokenEmbedderModel,
     // route through SpecDecStream. Zero API churn for callers using
     // .none / nil / .autoregressive — those fall through to the
     // existing TokenIterator path below.
-    if let strategy = effectiveParameters.draftStrategy,
+    if let strategy = parameters.draftStrategy,
         strategy.usesBlockDiffusion,
         let stream = SpecDecStream.streamViaStrategy(
             strategy: strategy,
             inputIds: input.text.tokens,
             context: context,
-            maxNewTokens: effectiveParameters.maxTokens ?? 256,
+            maxNewTokens: parameters.maxTokens ?? 256,
             stopTokenIDs: [],
-            temperature: effectiveParameters.temperature)
+            temperature: parameters.temperature)
     {
         return stream
     }
     let iterator = try TokenIterator(
-        input: input, model: context.model, cache: cache, parameters: effectiveParameters,
+        input: input, model: context.model, cache: cache, parameters: parameters,
         cacheCoordinator: cacheCoordinator)
     let (stream, _) = generateTask(
         promptTokenCount: input.text.tokens.size,
@@ -2316,7 +2225,7 @@ public func generate(
         tokenizer: context.tokenizer,
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
-        extraStopStrings: effectiveParameters.extraStopStrings,
+        extraStopStrings: parameters.extraStopStrings,
         promptTail: promptTail)
     return stream
 }
@@ -3317,56 +3226,4 @@ internal func _decodePromptTail(
     guard !tokenIds.isEmpty else { return nil }
     let tail = Array(tokenIds.suffix(max(1, tokens)))
     return tokenizer.decode(tokenIds: tail, skipSpecialTokens: false)
-}
-
-internal func _parametersWithAutomaticReasoningCloseBias(
-    _ parameters: GenerateParameters,
-    promptTail: String?,
-    modelConfiguration: ModelConfiguration,
-    model: any LanguageModel,
-    tokenizer: any Tokenizer
-) -> GenerateParameters {
-    guard parameters.reasoningCloseBias == nil else { return parameters }
-
-    guard let promptTail,
-          let openRange = promptTail.range(of: "<think>", options: .backwards)
-    else {
-        return parameters
-    }
-    if let closeRange = promptTail.range(of: "</think>", options: .backwards),
-       closeRange.lowerBound > openRange.lowerBound {
-        return parameters
-    }
-
-    guard let closeTokenID = _specialTokenID("</think>", tokenizer: tokenizer) else {
-        reasoningCloseBiasLog.info(
-            "reasoningCloseBias skipped model=\(modelConfiguration.name, privacy: .public) reason=no_close_token")
-        return parameters
-    }
-
-    var adjusted = parameters
-    let maxTokens = parameters.maxTokens ?? 1024
-    let activateAfter = min(16, max(6, maxTokens / 4))
-    adjusted.reasoningCloseBias = ReasoningCloseBiasConfig(
-        tokenID: closeTokenID,
-        activateAfterTokens: activateAfter,
-        bias: 12.0,
-        forceAfterTokens: nil)
-    reasoningCloseBiasLog.info(
-        "reasoningCloseBias active model=\(modelConfiguration.name, privacy: .public) tokenID=\(closeTokenID, privacy: .public) activateAfter=\(activateAfter, privacy: .public) forceAfter=-1")
-    return adjusted
-}
-
-private func _specialTokenID(_ token: String, tokenizer: any Tokenizer) -> Int? {
-    if let id = tokenizer.convertTokenToId(token) {
-        return id
-    }
-
-    let encoded = tokenizer.encode(text: token, addSpecialTokens: false)
-    guard encoded.count == 1, let id = encoded.first else {
-        return nil
-    }
-
-    let roundTrip = tokenizer.decode(tokenIds: [id], skipSpecialTokens: false)
-    return roundTrip == token ? id : nil
 }

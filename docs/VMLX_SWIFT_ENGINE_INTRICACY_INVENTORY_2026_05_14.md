@@ -75,8 +75,10 @@ this package.
 - `draftStrategy`: optional autoregressive/diffusion speculative path; plain
   autoregressive remains default.
 - `extraStopStrings`: decoded visible-output stop strings.
-- `reasoningCloseBias`: additive close-token bias for known open-thinking
-  quantized cases. Automatic use must not become a hidden forced close.
+- Reasoning parsing is routing only. The engine must not bias or force
+  `</think>` tokens to make a reasoning block close; if a model never emits
+  its family close marker, the row is a runtime/template/cache failure to
+  investigate, not something to hide with decode logits.
 
 Sampling behavior:
 

@@ -298,16 +298,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             }
 
             var tried = Set<Int>()
-            let preferredBoundaries = isHybrid
-                ? [tokens.count - 1]
-                : [tokens.count, tokens.count - 1]
-            if isHybrid {
-                // Exact full-prefix hits are rejected by BatchEngine and
-                // TokenIterator for path-dependent recurrent state because
-                // seeding logits would re-feed the final token. Do not pay
-                // disk IO for a hit the caller must roll back anyway.
-                tried.insert(tokens.count)
-            }
+            let preferredBoundaries = [tokens.count, tokens.count - 1]
             for boundary in preferredBoundaries where boundary > 0 {
                 tried.insert(boundary)
                 if let hit = diskHit(boundary: boundary) {

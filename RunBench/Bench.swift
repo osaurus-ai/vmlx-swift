@@ -4398,16 +4398,6 @@ func runThinkingLoopProbe(modelPath: String, maxNew: Int) async throws {
     if env["BENCH_THINK_COMPILED"] == "1" {
         fallbackParams.enableCompiledBatchDecode = true
     }
-    if ProcessInfo.processInfo.environment["BENCH_THINK_NO_AUTO_BIAS"] == "1" {
-        // Diagnostic-only A/B knob. A far-future zero-bias config prevents
-        // the automatic MiniMax close-bias helper from installing itself
-        // without changing logits during this short probe.
-        fallbackParams.reasoningCloseBias = ReasoningCloseBiasConfig(
-            tokenID: 0,
-            activateAfterTokens: Int.max,
-            bias: 0,
-            forceAfterTokens: nil)
-    }
     let params = GenerateParameters(
         generationConfig: context.configuration.generationDefaults,
         fallback: fallbackParams)

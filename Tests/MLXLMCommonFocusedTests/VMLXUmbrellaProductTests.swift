@@ -16,5 +16,6 @@ struct VMLXUmbrellaProductTests {
         let _: MediaProcessing.Type = MediaProcessing.self
         let _: AutoTokenizer.Type = AutoTokenizer.self
         let _: Template.Type = Template.self
+        let _: VMLXServerRuntimeSettings.Type = VMLXServerRuntimeSettings.self
     }
 }
