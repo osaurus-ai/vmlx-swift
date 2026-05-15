@@ -1003,16 +1003,20 @@ class BatchEngineIntegrationTests: XCTestCase {
 
         let (engine, coordinator) = makeEngineWithCoordinator(maxBatchSize: 1)
         let promptTokens: [Int32] = [3, 7, 11, 13, 17, 19, 23, 29]
+        let params = GenerateParameters(maxTokens: 3, temperature: 0)
+        let promptSalt = computeCacheSalt(
+            for: LMInput(tokens: MLXArray(promptTokens)),
+            parameters: params)
         let stream = await engine.generate(
             input: LMInput(tokens: MLXArray(promptTokens)),
-            parameters: GenerateParameters(maxTokens: 3, temperature: 0)
+            parameters: params
         )
 
         let result = await collectGenerations(from: stream)
         XCTAssertEqual(result.info?.stopReason, .length)
 
         let expectedTokens = promptTokens.map { Int($0) }
-        switch coordinator.fetch(tokens: expectedTokens, mediaSalt: nil) {
+        switch coordinator.fetch(tokens: expectedTokens, mediaSalt: promptSalt) {
         case .hit(let matchedTokens, let remainingTokens, let detail, _, _, _):
             XCTAssertEqual(matchedTokens, expectedTokens.count)
             XCTAssertTrue(remainingTokens.isEmpty)

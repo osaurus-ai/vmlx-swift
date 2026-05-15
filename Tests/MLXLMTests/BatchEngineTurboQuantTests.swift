@@ -689,6 +689,9 @@ class BatchEngineMultiTurnTests: XCTestCase {
         // Turn 1: establish the cache entry.
         let promptTokens: [Int32] = [3, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43]
         let params = GenerateParameters(maxTokens: 6, temperature: 0)
+        let promptSalt = computeCacheSalt(
+            for: LMInput(tokens: MLXArray(promptTokens)),
+            parameters: params)
 
         let (_, s1) = await engine.submit(
             input: LMInput(tokens: MLXArray(promptTokens)),
@@ -701,7 +704,7 @@ class BatchEngineMultiTurnTests: XCTestCase {
         // Direct coordinator inspection — turn 1's finishSlot must have
         // stored an entry for this prompt.
         let lookup = coordinator.fetch(
-            tokens: promptTokens.map(Int.init), mediaSalt: nil)
+            tokens: promptTokens.map(Int.init), mediaSalt: promptSalt)
         if case .miss = lookup {
             XCTFail("Turn 1 should have populated the paged cache")
         }
@@ -737,6 +740,9 @@ class BatchEngineMultiTurnTests: XCTestCase {
             kvMode: .turboQuant(keyBits: 3, valueBits: 3),
             temperature: 0
         )
+        let promptSalt = computeCacheSalt(
+            for: LMInput(tokens: MLXArray(promptTokens)),
+            parameters: params)
 
         let (_, s1) = await engine.submit(
             input: LMInput(tokens: MLXArray(promptTokens)),
@@ -749,7 +755,7 @@ class BatchEngineMultiTurnTests: XCTestCase {
         // Cache entry existence: finishSlot's coordinator.storeAfterGeneration
         // should have populated the paged cache for this prompt.
         let lookup = coordinator.fetch(
-            tokens: promptTokens.map(Int.init), mediaSalt: nil)
+            tokens: promptTokens.map(Int.init), mediaSalt: promptSalt)
         if case .miss = lookup {
             XCTFail("Turn 1 should have populated the paged cache under TQ")
         }
@@ -816,6 +822,12 @@ class BatchEngineMultiTurnTests: XCTestCase {
         let promptA: [Int32] = [101, 103, 107, 109, 113, 127, 131, 137, 139]
         let promptB: [Int32] = [150, 151, 152, 153, 154, 155, 156, 157, 158]
         let params = GenerateParameters(maxTokens: 4, temperature: 0)
+        let saltA = computeCacheSalt(
+            for: LMInput(tokens: MLXArray(promptA)),
+            parameters: params)
+        let saltB = computeCacheSalt(
+            for: LMInput(tokens: MLXArray(promptB)),
+            parameters: params)
 
         // Fill cache with A.
         let (_, sA) = await engine.submit(
@@ -828,7 +840,7 @@ class BatchEngineMultiTurnTests: XCTestCase {
         // After A finishes, the coordinator has A's cache entry. Submitting
         // a fetch with B's tokens should miss — no cross-contamination.
         let bLookupBeforeBRun = coordinator.fetch(
-            tokens: promptB.map(Int.init), mediaSalt: nil)
+            tokens: promptB.map(Int.init), mediaSalt: saltB)
         if case .hit = bLookupBeforeBRun {
             XCTFail("Coordinator must not return cached blocks for an unrelated prompt (contamination)")
         }
@@ -842,8 +854,8 @@ class BatchEngineMultiTurnTests: XCTestCase {
         XCTAssertEqual(rB.tokens.count, 4, "B must complete")
 
         // After B completes, both A and B entries should be retrievable.
-        let aLookup = coordinator.fetch(tokens: promptA.map(Int.init), mediaSalt: nil)
-        let bLookup = coordinator.fetch(tokens: promptB.map(Int.init), mediaSalt: nil)
+        let aLookup = coordinator.fetch(tokens: promptA.map(Int.init), mediaSalt: saltA)
+        let bLookup = coordinator.fetch(tokens: promptB.map(Int.init), mediaSalt: saltB)
         if case .miss = aLookup { XCTFail("A entry should survive B's submission") }
         if case .miss = bLookup { XCTFail("B entry should be stored after completion") }
     }
@@ -864,6 +876,12 @@ class BatchEngineMultiTurnTests: XCTestCase {
         let promptA: [Int32] = [7, 13, 19, 29, 37, 43, 53, 61, 71, 79]
         let promptB: [Int32] = [12, 14, 18, 22, 26, 28, 32, 38, 42, 44]
         let params = GenerateParameters(maxTokens: 4, temperature: 0)
+        let saltA = computeCacheSalt(
+            for: LMInput(tokens: MLXArray(promptA)),
+            parameters: params)
+        let saltB = computeCacheSalt(
+            for: LMInput(tokens: MLXArray(promptB)),
+            parameters: params)
 
         // Turn 1 A and B concurrent
         let (_, s1A) = await engine.submit(
@@ -878,8 +896,8 @@ class BatchEngineMultiTurnTests: XCTestCase {
 
         // Both prompts should have entries in the coordinator after their
         // respective completions.
-        let lookupA = coordinator.fetch(tokens: promptA.map(Int.init), mediaSalt: nil)
-        let lookupB = coordinator.fetch(tokens: promptB.map(Int.init), mediaSalt: nil)
+        let lookupA = coordinator.fetch(tokens: promptA.map(Int.init), mediaSalt: saltA)
+        let lookupB = coordinator.fetch(tokens: promptB.map(Int.init), mediaSalt: saltB)
         if case .miss = lookupA { XCTFail("Turn 1 A should populate cache") }
         if case .miss = lookupB { XCTFail("Turn 1 B should populate cache") }
 

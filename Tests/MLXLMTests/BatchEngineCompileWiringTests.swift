@@ -292,6 +292,9 @@ class BatchEngineCompileWiringTests: XCTestCase {
             temperature: 0
         )
         let promptTokens: [Int32] = [3, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+        let promptSalt = computeCacheSalt(
+            for: LMInput(tokens: MLXArray(promptTokens)),
+            parameters: params)
 
         let (_, s1) = await engine.submit(
             input: LMInput(tokens: MLXArray(promptTokens)),
@@ -303,7 +306,7 @@ class BatchEngineCompileWiringTests: XCTestCase {
         // The coordinator should have stored the prompt's post-generation
         // cache state. Verify via direct fetch.
         let lookup = coordinator.fetch(
-            tokens: promptTokens.map(Int.init), mediaSalt: nil)
+            tokens: promptTokens.map(Int.init), mediaSalt: promptSalt)
         if case .miss = lookup {
             XCTFail("Turn 1 under compile should still populate the coordinator")
         }
@@ -365,6 +368,9 @@ class BatchEngineCompileWiringTests: XCTestCase {
             temperature: 0
         )
         let promptTokens: [Int32] = [41, 43, 47, 53, 59, 61, 67, 71]
+        let promptSalt = computeCacheSalt(
+            for: LMInput(tokens: MLXArray(promptTokens)),
+            parameters: params)
 
         let (_, stream) = await engine.submit(
             input: LMInput(tokens: MLXArray(promptTokens)),
@@ -380,7 +386,7 @@ class BatchEngineCompileWiringTests: XCTestCase {
         // Coordinator must still see the prompt entry after a long decode
         // under compile.
         let lookup = coordinator.fetch(
-            tokens: promptTokens.map(Int.init), mediaSalt: nil)
+            tokens: promptTokens.map(Int.init), mediaSalt: promptSalt)
         if case .miss = lookup {
             XCTFail("Long-decode compile run must still populate the coordinator")
         }
