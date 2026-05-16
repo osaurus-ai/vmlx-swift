@@ -150,6 +150,17 @@ public protocol NativeMTPModel: LanguageModel {
     /// Target/backbone forward that returns logits plus pre-final-norm hidden.
     func nativeBackboneForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult
 
+    /// Target/backbone verifier forward for native MTP.
+    ///
+    /// Implementations with non-trimmable recurrent state can record
+    /// prefix-commit snapshots while still returning logits for the full
+    /// verifier sequence. The iterator decides the accepted prefix after
+    /// sampling and then commits those recorded states.
+    func nativeBackboneMTPVerifyForward(
+        _ inputs: MLXArray,
+        cache: [KVCache]?
+    ) -> NativeMTPForwardResult
+
     /// One recursive MTP draft step. `nextTokenIds` is the sampled token at the
     /// position after `hiddenStates`.
     func nativeMTPForward(
@@ -157,6 +168,15 @@ public protocol NativeMTPModel: LanguageModel {
         nextTokenIds: MLXArray,
         cache: [KVCache]?
     ) -> NativeMTPForwardResult
+}
+
+public extension NativeMTPModel {
+    func nativeBackboneMTPVerifyForward(
+        _ inputs: MLXArray,
+        cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        nativeBackboneForward(inputs, cache: cache)
+    }
 }
 
 public enum NativeMTPActivationError: Error, CustomStringConvertible {

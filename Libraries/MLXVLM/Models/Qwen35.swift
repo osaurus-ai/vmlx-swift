@@ -865,7 +865,8 @@ enum Qwen35Language {
         func callAsFunction(
             _ inputs: MLXArray,
             mask: MLXArray? = nil,
-            cache: MambaCache? = nil
+            cache: MambaCache? = nil,
+            recordPrefixCommitStates: Bool = false
         ) -> MLXArray {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
@@ -901,7 +902,8 @@ enum Qwen35Language {
             let k = split[1].reshaped(B, S, numKHeads, headKDim)
             let v = split[2].reshaped(B, S, numVHeads, headVDim)
 
-            var state = cache?[1]
+            let initialState = cache?[1]
+            var state = initialState
             let invScale = pow(Float(headKDim), -0.5)
             let qNormed =
                 MLXArray(pow(invScale, 2), dtype: q.dtype)
@@ -922,14 +924,85 @@ enum Qwen35Language {
                 state: state,
                 mask: mask
             )
+            let finalState = state!
 
             if let cache {
-                cache[1] = state
+                if recordPrefixCommitStates, S > 1 {
+                    self.recordPrefixCommitStates(
+                        cache: cache,
+                        convInput: convInput,
+                        q: qNormed,
+                        k: kNormed,
+                        v: v,
+                        a: a,
+                        b: b,
+                        initialState: initialState,
+                        finalState: finalState,
+                        mask: mask,
+                        baseOffset: cache.offset)
+                }
+                cache[1] = finalState
                 cache.offset += S
             }
 
             out = norm(out, gate: z)
             return outProj(out.reshaped(B, S, -1))
+        }
+
+        private func recordPrefixCommitStates(
+            cache: MambaCache,
+            convInput: MLXArray,
+            q: MLXArray,
+            k: MLXArray,
+            v: MLXArray,
+            a: MLXArray,
+            b: MLXArray,
+            initialState: MLXArray?,
+            finalState: MLXArray,
+            mask: MLXArray?,
+            baseOffset: Int
+        ) {
+            let sequenceLength = q.dim(1)
+            guard sequenceLength > 0 else { return }
+
+            for prefixLength in 1 ... sequenceLength {
+                let convEnd = convInput.dim(1) - sequenceLength + prefixLength
+                let convStart = max(0, convEnd - max(0, convKernelSize - 1))
+                let convState = convInput[0..., convStart ..< convEnd, 0...]
+
+                let recurrentState: MLXArray
+                if prefixLength == sequenceLength {
+                    recurrentState = finalState
+                } else {
+                    let (_, prefixState) = gatedDeltaUpdate(
+                        q: q[0..., 0 ..< prefixLength, 0..., 0...],
+                        k: k[0..., 0 ..< prefixLength, 0..., 0...],
+                        v: v[0..., 0 ..< prefixLength, 0..., 0...],
+                        a: a[0..., 0 ..< prefixLength, 0...],
+                        b: b[0..., 0 ..< prefixLength, 0...],
+                        aLog: aLog,
+                        dtBias: dtBias,
+                        state: initialState,
+                        mask: prefixMask(mask, length: prefixLength))
+                    recurrentState = prefixState
+                }
+
+                cache.recordPrefixCommitState(
+                    length: prefixLength,
+                    arrays: [convState, recurrentState],
+                    offset: baseOffset + prefixLength)
+            }
+        }
+
+        private func prefixMask(_ mask: MLXArray?, length: Int) -> MLXArray? {
+            guard let mask else { return nil }
+            if mask.ndim == 1 {
+                return mask[0 ..< length]
+            }
+            if mask.ndim == 2 {
+                return mask[0..., 0 ..< length]
+            }
+            return mask[0..., 0 ..< length, 0...]
         }
     }
 
@@ -1025,11 +1098,16 @@ enum Qwen35Language {
             attentionMask: MLXArray?,
             ssmMask: MLXArray?,
             cache: KVCache?,
-            positionIds: MLXArray?
+            positionIds: MLXArray?,
+            recordPrefixCommitStates: Bool = false
         ) -> MLXArray {
             let r: MLXArray
             if isLinear {
-                r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+                r = linearAttn!(
+                    inputLayerNorm(x),
+                    mask: ssmMask,
+                    cache: cache as? MambaCache,
+                    recordPrefixCommitStates: recordPrefixCommitStates)
             } else {
                 r = selfAttn!(
                     inputLayerNorm(x), mask: attentionMask, cache: cache, positionIds: positionIds)
@@ -1195,7 +1273,8 @@ enum Qwen35Language {
             _ inputs: MLXArray,
             inputsEmbeds: MLXArray? = nil,
             cache: [KVCache?]? = nil,
-            positionIds: MLXArray? = nil
+            positionIds: MLXArray? = nil,
+            recordPrefixCommitStates: Bool = false
         ) -> MLXArray {
             var hiddenStates: MLXArray
             if let inputsEmbeds {
@@ -1226,7 +1305,8 @@ enum Qwen35Language {
                     attentionMask: faMask,
                     ssmMask: layerSSMMask,
                     cache: cacheArray?[index],
-                    positionIds: positionIds)
+                    positionIds: positionIds,
+                    recordPrefixCommitStates: recordPrefixCommitStates)
             }
 
             return hiddenStates
@@ -1456,10 +1536,14 @@ enum Qwen35Language {
 
         func textOnlyForwardWithHidden(
             _ inputs: MLXArray,
-            cache: [KVCache]?
+            cache: [KVCache]?,
+            recordPrefixCommitStates: Bool = false
         ) -> NativeMTPForwardResult {
             let cacheOpt: [KVCache?]? = cache?.map { $0 as KVCache? }
-            let hidden = model.callAsFunctionPreNorm(inputs, cache: cacheOpt)
+            let hidden = model.callAsFunctionPreNorm(
+                inputs,
+                cache: cacheOpt,
+                recordPrefixCommitStates: recordPrefixCommitStates)
             let logits: MLXArray
             if let lmHead {
                 logits = lmHead(model.norm(hidden))
@@ -1709,6 +1793,16 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         cache: [KVCache]?
     ) -> NativeMTPForwardResult {
         languageModel.textOnlyForwardWithHidden(inputs, cache: cache)
+    }
+
+    public func nativeBackboneMTPVerifyForward(
+        _ inputs: MLXArray,
+        cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        languageModel.textOnlyForwardWithHidden(
+            inputs,
+            cache: cache,
+            recordPrefixCommitStates: true)
     }
 
     public func nativeMTPForward(

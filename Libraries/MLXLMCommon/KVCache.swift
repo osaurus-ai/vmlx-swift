@@ -1207,8 +1207,34 @@ public class ArraysCache: BaseKVCache {
 
 /// Simple cache for Mamba-style state space models
 public class MambaCache: ArraysCache {
+    private struct PrefixCommitState {
+        var arrays: [MLXArray]
+        var offset: Int
+    }
+
+    private var prefixCommitStates: [Int: PrefixCommitState] = [:]
+
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
+    }
+
+    public func recordPrefixCommitState(length: Int, arrays: [MLXArray], offset: Int) {
+        guard length > 0, !arrays.isEmpty else { return }
+        prefixCommitStates[length] = PrefixCommitState(
+            arrays: arrays.map { $0[.ellipsis] },
+            offset: offset)
+    }
+
+    public func commitRecordedPrefix(length: Int) -> Bool {
+        guard let snapshot = prefixCommitStates[length] else { return false }
+        self.state = snapshot.arrays.map { $0[.ellipsis] }
+        self.offset = snapshot.offset
+        clearRecordedPrefixes()
+        return true
+    }
+
+    public func clearRecordedPrefixes() {
+        prefixCommitStates.removeAll(keepingCapacity: true)
     }
 
     public override func copy() -> any KVCache {

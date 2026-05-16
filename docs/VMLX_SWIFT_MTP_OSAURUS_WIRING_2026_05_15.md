@@ -27,7 +27,18 @@ request passes runtime activation checks.
 
 ## Qwen3.6 MTP Reference Facts
 
-The JANG-side verified Qwen3.6 27B JANG_4M MTP bundle has these properties:
+The JANG-side verified Qwen3.6 27B MTP reference bundles used for Swift
+runtime work are:
+
+- `/Users/eric/models/JANGQ/Qwen3.6-27B-JANG_4M-MTP`
+- `/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP4-MTP`
+
+Use both as examples in probes and docs. JANG_4M proves the JANG affine/mixed
+format path, and MXFP4 proves the native MXFP4 path. Do not substitute CRACK
+artifacts when testing MTP; the CRACK variants intentionally do not carry MTP
+tensors.
+
+The verified JANG_4M MTP bundle has these properties:
 
 - 29 indexed shards.
 - `runtime.total_weight_bytes=17820460160`
@@ -140,20 +151,19 @@ alone. It requires:
 
 Bundles whose config advertises MTP but whose weights do not contain MTP tensors
 fail closed. The local CRACK bundle
-`~/models/dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` currently reports:
+`/Users/eric/models/dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` currently reports:
 
 ```text
 native MTP was requested but this bundle does not have complete MTP tensor evidence:
 mtp: metadata_only_missing_weights, layers=1, tensors=0, speculative=off
 ```
 
-The implementation uses private MTP draft cache, target-model verification, and
-explicit rollback+repair on partial rejection. Rejected draft state is not kept
-in the backbone cache. This is a correctness-first path, not the speed path.
-Depth values greater than one currently exercise recursive draft calls and
-partial-accept repair, but they are not production depth-3 acceleration because
-the verifier cache still has to be repaired by re-forwarding accepted prefixes
-instead of committing an intermediate captured verifier state.
+The implementation uses private MTP draft cache and target-model verification.
+For Qwen3.6 hybrid SSM/KV, the verifier now records accepted-prefix Mamba state
+and trims rejected attention-KV suffixes, so rejected draft state is not kept in
+the backbone cache. This is real D3 prefix-commit semantics, but it is not yet a
+production speed path because the small-M verifier and prefix-state capture are
+still eager Swift/MLX work rather than a tuned compiled verifier kernel.
 
 Live current-code artifacts under `docs/local/native-mtp-qwen36-20260515/`
 record the following local rows:
@@ -168,20 +178,35 @@ record the following local rows:
 | `Qwen3.6-27B-MXFP4-MTP` | native MTP D1 post-cleanup | `mx-mtp-artifact-native-d1-postrevert-96.log` | coherent, `34.0 tok/s` median on a short 51-token stop, `loop=NO` |
 | `Qwen3.6-27B-JANG_4M-CRACK` | native MTP requested | `jang4m-crack-native-mtp-denied-postrevert.log` | fail-closed, `metadata_only_missing_weights`, exit status 133 |
 
+Live 2026-05-16 D3 prefix-commit artifacts under
+`docs/local/native-mtp-qwen36-20260516-d3-prefix-commit/`:
+
+| Bundle | Mode | Artifact | Result |
+| --- | --- | --- | --- |
+| `/Users/eric/models/JANGQ/Qwen3.6-27B-JANG_4M-MTP` | AR baseline | `jang4m-mtp-ar-baseline-256.log` | coherent, `13.9 tok/s`, `stop=length`, `loop=NO` |
+| `/Users/eric/models/JANGQ/Qwen3.6-27B-JANG_4M-MTP` | native MTP D3 prefix commit | `jang4m-mtp-d3-prefix-commit-no-checkpoint-256.log` | coherent, `15.0 tok/s`, `verifyCalls=117`, `prefixCommit=117`, `rollbackRepair=0`, `avgCommittedPerVerify=2.19`, `loop=NO` |
+| `/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP4-MTP` | AR baseline | `mxfp4-mtp-ar-baseline-256.log` | coherent, `14.6 tok/s`, `stop=length`, `loop=NO` |
+| `/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP4-MTP` | native MTP D3 prefix commit | `mxfp4-mtp-d3-prefix-commit-no-checkpoint-256.log` | coherent, `16.4 tok/s`, `verifyCalls=116`, `prefixCommit=116`, `rollbackRepair=0`, `avgCommittedPerVerify=2.21`, `loop=NO` |
+
+Phase-timing reruns (`*-phase-256.*`) show the wall is target verify, not cache
+commit: JANG_4M spent `16.388s` in target verify, `1.903s` in MTP draft,
+`0.140s` in sampling, and `0.088s` in cache commit; MXFP4 spent `15.411s`,
+`1.202s`, `0.118s`, and `0.069s` respectively. This points the next speed pass
+at compiled/tuned small-M verifier execution, not another cache monkeypatch.
+
 The 50 tok/s Qwen3.6 27B target is not achieved by the current Swift path.
-The attempted verifier argmax vectorization was rejected after live rows were
-slower, so it is not part of the implementation. The next real speed work is
-proper depth-3 activation:
+The D3 path is correct enough to keep as an explicit diagnostic, but it must not
+auto-launch as a production acceleration mode. The attempted verifier argmax
+vectorization was rejected after live rows were slower, so it is not part of the
+implementation. The next real speed work is:
 
 1. recursive MTP draft returns logits and hidden state for `d1`, `d2`, and
-   `d3`;
+   `d3` without recomputing state traces;
 2. one target verifier forward over `[primary, d1, d2, d3]`;
-3. capture/commit of intermediate Qwen hybrid SSM/KV states for accepted prefix
-   length `0...3`;
-4. correction-token repair only for the rejected suffix, not a full all-or-
-   nothing rollback;
-5. compiled or tuned small-M verifier shapes;
-6. telemetry for requested/effective depth, verify calls, accepted-by-depth,
+3. compiled/tuned small-M verifier shapes for Qwen3.6 hybrid blocks;
+4. phase timing for target verify time, MTP draft time, cache commit time, and
+   sampling time;
+5. telemetry for requested/effective depth, verify calls, accepted-by-depth,
    bonus tokens, correction count, target verify time, MTP draft time, and output
    tail review.
 
@@ -199,9 +224,11 @@ until at least one family implements all of:
 3. Keep a temporary draft cache/state separate from accepted base KV.
 4. Propose recursive draft tokens up to the requested depth.
 5. Verify `[primary, d1, ... dK]` through the base model in one target forward.
-6. Commit an accepted draft prefix of length `0...K` plus the verifier bonus
-   token into the base cache stack. The backbone cache never receives rejected
-   draft state.
+6. Commit the primary token plus accepted draft prefix of length `0...K` into
+   the base cache stack. A verifier bonus token is emitted as the next primary
+   and committed by the following verifier cycle; it is not silently written
+   into cache without a target forward. The backbone cache never receives
+   rejected draft state.
 7. Discard draft state on rejection, cancellation, stop, or request failure.
 8. Report verify cycles, accepted/rejected draft counts, acceptance rate,
    fallback count, and token/s.
@@ -218,14 +245,13 @@ requires hidden-state draft feedback, private draft cache, accepted-only
 backbone commit, variable `0...depth` accepted-prefix commit, and a compiled or
 tuned small-M verifier hot path before any speed claim is accepted.
 
-Implementation target for the next runtime pass: D3 MLLM native-MTP with correct
-cache boundaries. Prefix, paged KV, and block-L2 disk remain prompt-boundary
-verified caches. Each D3 verify pass advances the live backbone cache only
-through verified target positions. Until the capture/commit path exists, partial
-rejects must use an explicit rollback+repair path so rejected draft state is not
-stored. This is acceptable as a correctness-first stepping stone only if the
-bench reports coherency, token/s, verify calls, accepted-prefix length, and the
-rollback+repair cost.
+Current runtime state: D3 MLLM native-MTP has correct cache boundaries for the
+Qwen3.6 text path. Prefix, paged KV, and block-L2 disk remain prompt-boundary
+verified caches. Each D3 verify pass advances the live backbone cache through
+verified target positions only; rejected draft suffixes are not kept. The
+remaining production blocker is speed: prefix commit now avoids full
+rollback+repair, but the verifier/prefix-state hot path is not tuned enough to
+beat the 50 tok/s target.
 
 Qwen-style bundles use top-level `mtp.fc.*` and `mtp.layers.0.*` tensors. Hy3
 and Bailing-style bundles may store the MTP layer at

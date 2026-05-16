@@ -49,8 +49,8 @@ The package is complete only when all of these are true:
 | Local model inventory. | `docs/VMLX_LIVE_MODEL_MATRIX_2026_05_15.md`; local `find ~/models -maxdepth 4 -name config.json` shows DSV4, Hy3, Kimi, Laguna, MiniMax, ZAYA/ZAYA-VL, Qwen3.5/3.6, Gemma4, Ling, and Nemotron Omni families. | static-proven |
 | Live infer matrix for installed models. | `docs/local/live-model-matrix/20260515Tinfer-under20/REPORT.md` and `status.tsv`. Many under-20GB rows passed; several rows failed or were skipped. | partial |
 | MTP activation must use real tensor evidence, not names. | `9b1b254`; `docs/VMLX_SWIFT_MTP_OSAURUS_WIRING_2026_05_15.md`; local fail-closed artifact `docs/local/native-mtp-qwen36-20260515/jang4m-crack-native-mtp-denied-postrevert.log`. | live-proven |
-| MTP depth-3 production acceleration. | Current D2/D3 rows are coherent correctness probes only. Doc explicitly says proper D3 still requires capture/commit and small-M verify. | open |
-| Qwen3.6 MTP coherency and token/s. | Local artifacts `jang4m-mtp-artifact-native-d1-postrevert-96.log` and `mx-mtp-artifact-native-d1-postrevert-96.log`: coherent, `stop=stop`, `loop=NO`, `30.2` and `34.0 tok/s` short rows. | live-proven for D1 smoke only |
+| MTP depth-3 production acceleration. | Current D3 rows prove recursive draft plus accepted-prefix cache commit, but remain below the 50 tok/s production target. Small-M verifier tuning is still open. | open |
+| Qwen3.6 MTP coherency and token/s. | D1 artifacts `jang4m-mtp-artifact-native-d1-postrevert-96.log` and `mx-mtp-artifact-native-d1-postrevert-96.log`: coherent, `30.2` and `34.0 tok/s` short rows. D3 prefix-commit artifacts under `docs/local/native-mtp-qwen36-20260516-d3-prefix-commit/`: coherent, `prefixCommit>0`, `rollbackRepair=0`, no loops. | live-proven for explicit MTP diagnostic rows |
 | Qwen3.6 50 tok/s target. | Not achieved. Current rows are below target and the rejected verifier argmax experiment was not committed. | open |
 | DSV4 native encoder, CSA/HSA/SWA, long context, vector drift. | Focused docs exist in `docs/VMLX_SWIFT_PRODUCTION_ENGINE_GATE.md`, but current full long-context/vector gate is still listed open in consolidation audit. | open |
 | Prefix cache OFF/ON and cache hit proof. | Existing matrix/harness describes rows; not complete for every topology and model family. | open |
@@ -103,15 +103,24 @@ Live-proven:
 - MTP activation requires `VMLINUX_NATIVE_MTP=1`.
 - Supported Qwen model types must expose real MTP tensor evidence.
 - CRACK config metadata without tensors fails closed.
+- Qwen3.6 MTP proof targets are
+  `/Users/eric/models/JANGQ/Qwen3.6-27B-JANG_4M-MTP` and
+  `/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP4-MTP`.
 - Qwen3.6 JANG_4M-MTP and MXFP4-MTP D1 smokes are coherent with telemetry.
+- Qwen3.6 D3 prefix-commit smokes are coherent on both proof targets:
+  `docs/local/native-mtp-qwen36-20260516-d3-prefix-commit/jang4m-mtp-d3-prefix-commit-no-checkpoint-256.log`
+  and
+  `docs/local/native-mtp-qwen36-20260516-d3-prefix-commit/mxfp4-mtp-d3-prefix-commit-no-checkpoint-256.log`.
+  Both rows report `rollbackRepair=0`.
+- MTP phase telemetry now reports target verify, MTP draft, sampling, and cache
+  commit time. The 2026-05-16 phase rows show target verify dominates, so the
+  next speed pass must focus on compiled/tuned small-M verifier execution.
 
 Not yet complete:
 
-- Proper depth-3 acceleration.
-- Capture/commit for Qwen hybrid SSM/KV accepted prefixes.
+- Production-speed depth-3 acceleration near the 50 tok/s target.
 - Compiled/tuned small-M verifier.
 - MTP with VL multi-turn/media salt/cache proof.
-- MTP speed target near 50 tok/s.
 - Auto-launch eligibility for Osaurus.
 
 ## Immediate Next Gates
@@ -121,9 +130,9 @@ Not yet complete:
    live failures and should not be hidden.
 2. Run a clean-worktree focused test pass once Flux Package.swift edits are
    either committed by the Flux agent or isolated in a separate worktree.
-3. Start native MTP D3 implementation only after recording the current
-   correctness baseline: target verifier capture/commit API, Qwen Mamba/KV
-   checkpoint shape, and small-M verifier instrumentation.
+3. Optimize the native MTP D3 verifier hot path. The correctness baseline now
+   exists; the remaining production blocker is compiled/tuned small-M verifier
+   execution near the 50 tok/s target.
 4. Run DSV4 long-context/vector drift with current pushed engine.
 5. Expand the model matrix beyond the 20GB cutoff for DSV4, MiniMax, Ling, Hy3,
    and Kimi one family at a time, with process checks before and after each run.
