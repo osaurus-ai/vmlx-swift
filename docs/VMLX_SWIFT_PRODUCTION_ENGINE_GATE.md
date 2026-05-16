@@ -217,6 +217,17 @@ These rows are now covered in this checkout with artifacts under
   `Tests/MLXLMTests/NemotronHOmniSmokeTests.swift` file remains present on disk
   but is not part of the active package test targets, so a filtered run of that
   class executes 0 tests and is not counted as proof.
+- ZAYA1-VL JANGTQ_K mixed-bit kernel probe: `BENCH_ZAYA_TQ_KERNEL_PROBE=1`
+  is a diagnostic-only `RunBench` row that loads actual packed tensors and the
+  real `jangtq_runtime.safetensors`, then compares gate/up 2-bit, fused
+  SwiGLU, and down 4-bit Metal kernels against a CPU dequant reference. It does
+  not alter generation and is not a fallback path. Artifact
+  `docs/local/live-model-matrix/20260516Tzaya-vl-jangtqk-debug/ZAYA1-VL-8B-JANGTQ_K_tq_kernel_probe_layers.out`
+  covers layers `0,1,10,20,39` and experts `0,7,15`, with max diffs around
+  `1e-5`. This rules out the Swift mixed-bit JANGTQ kernel implementation as
+  the cause of the remaining ZAYA K math-row incoherence. The row remains
+  blocked until packer-side/reference dequant or a rebuilt K artifact proves
+  the model itself is coherent.
 
 ## Fix Gates
 

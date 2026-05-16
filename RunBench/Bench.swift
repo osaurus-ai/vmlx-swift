@@ -233,6 +233,16 @@ struct Bench {
             return
         }
 
+        // BENCH_ZAYA_TQ_KERNEL_PROBE=1: diagnostic-only check for ZAYA
+        // JANGTQ_K. It loads one real layer's packed JANGTQ tensors and
+        // compares the Metal kernels against a CPU dequant reference. This
+        // never alters model generation; it only distinguishes a kernel/runtime
+        // bug from a legitimately bad packed artifact.
+        if (env["BENCH_ZAYA_TQ_KERNEL_PROBE"] ?? "0") == "1" {
+            try await runZayaTQKernelProbe(modelPath: modelPath)
+            return
+        }
+
         // BENCH_TEMPLATE_SMOKE=1: tokenizer-only chat-template/Jinja
         // smoke for production model bundles. It exercises plain,
         // thinking on/off, reasoning_effort=max, tools, and multi-turn
@@ -3891,6 +3901,275 @@ func runZayaMoEBits(modelPath: String) async throws {
         print("... \(rows.count - 12) additional module(s) omitted")
     }
     print("=== BENCH_ZAYA_MOE_BITS: done ===")
+}
+
+func runZayaTQKernelProbe(modelPath: String) async throws {
+    let modelDir = URL(fileURLWithPath: modelPath)
+    let env = ProcessInfo.processInfo.environment
+    let layer = Int(env["BENCH_ZAYA_TQ_KERNEL_PROBE_LAYER"] ?? "0") ?? 0
+    let expertIDs = (env["BENCH_ZAYA_TQ_KERNEL_PROBE_EXPERTS"] ?? "0,7,15")
+        .split(separator: ",")
+        .compactMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+
+    print("\n=== BENCH_ZAYA_TQ_KERNEL_PROBE: actual tensor kernel parity ===")
+    print("Model: \(modelPath)")
+    print("Layer: \(layer) experts: \(expertIDs)")
+
+    let config = try loadJSONObject(modelDir.appending(path: "config.json"))
+    guard let hiddenSize = config["hidden_size"] as? Int else {
+        throw NSError(
+            domain: "RunBench.ZayaTQKernelProbe", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "config.json missing hidden_size"])
+    }
+
+    let indexURL = modelDir.appending(path: "model.safetensors.index.json")
+    let index = try loadJSONObject(indexURL)
+    guard let weightMap = index["weight_map"] as? [String: String] else {
+        throw NSError(
+            domain: "RunBench.ZayaTQKernelProbe", code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "model.safetensors.index.json missing weight_map"])
+    }
+
+    var shardCache: [String: [String: MLXArray]] = [:]
+    func tensor(_ key: String) throws -> MLXArray {
+        guard let shard = weightMap[key] else {
+            throw NSError(
+                domain: "RunBench.ZayaTQKernelProbe", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "missing tensor in index: \(key)"])
+        }
+        if shardCache[shard] == nil {
+            shardCache[shard] = try MLX.loadArrays(url: modelDir.appending(path: shard))
+        }
+        guard let value = shardCache[shard]?[key] else {
+            throw NSError(
+                domain: "RunBench.ZayaTQKernelProbe", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "tensor \(key) absent from shard \(shard)"])
+        }
+        return value
+    }
+
+    let sidecarURL = modelDir.appending(path: "jangtq_runtime.safetensors")
+    guard FileManager.default.fileExists(atPath: sidecarURL.path) else {
+        throw NSError(
+            domain: "RunBench.ZayaTQKernelProbe", code: 5,
+            userInfo: [NSLocalizedDescriptionKey: "missing jangtq_runtime.safetensors"])
+    }
+    let sidecar = try MLX.loadArrays(url: sidecarURL)
+
+    let prefix = "model.layers.\(layer).zaya_block.experts.switch_mlp"
+    let gatePacked = try tensor("\(prefix).gate_proj.tq_packed")
+    let gateNorms = try tensor("\(prefix).gate_proj.tq_norms")
+    let upPacked = try tensor("\(prefix).up_proj.tq_packed")
+    let upNorms = try tensor("\(prefix).up_proj.tq_norms")
+    let downPacked = try tensor("\(prefix).down_proj.tq_packed")
+    let downNorms = try tensor("\(prefix).down_proj.tq_norms")
+
+    let hiddenDims = gatePacked.dim(1)
+    let numExperts = gatePacked.dim(0)
+    let gateBits = inferTQBits(inFeatures: hiddenSize, packedCols: gatePacked.dim(-1))
+    let upBits = inferTQBits(inFeatures: hiddenSize, packedCols: upPacked.dim(-1))
+    let downBits = inferTQBits(inFeatures: hiddenDims, packedCols: downPacked.dim(-1))
+    guard gateBits == upBits else {
+        throw NSError(
+            domain: "RunBench.ZayaTQKernelProbe", code: 6,
+            userInfo: [NSLocalizedDescriptionKey:
+                "gate/up bits differ: gate=\(gateBits) up=\(upBits)"])
+    }
+
+    guard let gateCodebook = sidecar["codebook.\(hiddenSize).\(gateBits)"],
+          let downCodebook = sidecar["codebook.\(hiddenDims).\(downBits)"]
+    else {
+        throw NSError(
+            domain: "RunBench.ZayaTQKernelProbe", code: 7,
+            userInfo: [NSLocalizedDescriptionKey:
+                "sidecar missing codebook.\(hiddenSize).\(gateBits) or codebook.\(hiddenDims).\(downBits)"])
+    }
+
+    MLX.eval(
+        gatePacked, gateNorms, upPacked, upNorms, downPacked, downNorms,
+        gateCodebook, downCodebook)
+
+    let gatePackedCPU = gatePacked.asArray(UInt32.self)
+    let upPackedCPU = upPacked.asArray(UInt32.self)
+    let downPackedCPU = downPacked.asArray(UInt32.self)
+    let gateNormsCPU = gateNorms.asArray(Float.self)
+    let upNormsCPU = upNorms.asArray(Float.self)
+    let downNormsCPU = downNorms.asArray(Float.self)
+    let gateCodebookCPU = gateCodebook.asArray(Float.self)
+    let downCodebookCPU = downCodebook.asArray(Float.self)
+
+    let x = deterministicProbeVector(count: hiddenSize)
+    let xArray = MLXArray(x).reshaped([1, hiddenSize])
+    print(
+        "Resolved: hidden=\(hiddenSize) intermediate=\(hiddenDims) experts=\(numExperts) " +
+        "gateBits=\(gateBits) upBits=\(upBits) downBits=\(downBits)")
+
+    var failures: [String] = []
+    for expert in expertIDs {
+        guard expert >= 0 && expert < numExperts else {
+            failures.append("expert \(expert) out of range 0..<\(numExperts)")
+            continue
+        }
+
+        let rhs = MLXArray([UInt32(expert)])
+
+        let gateMetal = JANGTQKernels.gatherTQTopK(
+            xRot: xArray,
+            packed: gatePacked,
+            norms: gateNorms,
+            codebook: gateCodebook,
+            rhsIndices: rhs,
+            batchTokens: 1,
+            K: 1,
+            inFeatures: hiddenSize,
+            outFeatures: hiddenDims,
+            bits: gateBits)
+        let gateCPU = tqMatmulReference(
+            x: x,
+            packed: gatePackedCPU,
+            norms: gateNormsCPU,
+            codebook: gateCodebookCPU,
+            expert: expert,
+            numExperts: numExperts,
+            inFeatures: hiddenSize,
+            outFeatures: hiddenDims,
+            bits: gateBits)
+
+        let upMetal = JANGTQKernels.gatherTQTopK(
+            xRot: xArray,
+            packed: upPacked,
+            norms: upNorms,
+            codebook: gateCodebook,
+            rhsIndices: rhs,
+            batchTokens: 1,
+            K: 1,
+            inFeatures: hiddenSize,
+            outFeatures: hiddenDims,
+            bits: upBits)
+        let upCPU = tqMatmulReference(
+            x: x,
+            packed: upPackedCPU,
+            norms: upNormsCPU,
+            codebook: gateCodebookCPU,
+            expert: expert,
+            numExperts: numExperts,
+            inFeatures: hiddenSize,
+            outFeatures: hiddenDims,
+            bits: upBits)
+
+        let fusedMetal = JANGTQKernels.fusedGateUpSwiGLU(
+            xRot: xArray,
+            packedGate: gatePacked,
+            normsGate: gateNorms,
+            packedUp: upPacked,
+            normsUp: upNorms,
+            codebook: gateCodebook,
+            rhsIndices: rhs,
+            batchTokens: 1,
+            K: 1,
+            inFeatures: hiddenSize,
+            outFeatures: hiddenDims,
+            bits: gateBits)
+        let fusedCPU = zip(gateCPU, upCPU).map { gate, up -> Float in
+            let silu = gate / Float(1.0 + Foundation.exp(Double(-gate)))
+            return silu * up
+        }
+
+        let downInput = MLXArray(fusedCPU).reshaped([1, hiddenDims])
+        let downMetal = JANGTQKernels.gatherTQ(
+            xRot: downInput,
+            packed: downPacked,
+            norms: downNorms,
+            codebook: downCodebook,
+            rhsIndices: rhs,
+            nRows: 1,
+            inFeatures: hiddenDims,
+            outFeatures: hiddenSize,
+            bits: downBits)
+        let downCPU = tqMatmulReference(
+            x: fusedCPU,
+            packed: downPackedCPU,
+            norms: downNormsCPU,
+            codebook: downCodebookCPU,
+            expert: expert,
+            numExperts: numExperts,
+            inFeatures: hiddenDims,
+            outFeatures: hiddenSize,
+            bits: downBits)
+
+        MLX.eval(gateMetal, upMetal, fusedMetal, downMetal)
+        let gateDiff = maxAbsDiff(gateMetal.asArray(Float.self), gateCPU)
+        let upDiff = maxAbsDiff(upMetal.asArray(Float.self), upCPU)
+        let fusedDiff = maxAbsDiff(fusedMetal.asArray(Float.self), fusedCPU)
+        let downDiff = maxAbsDiff(downMetal.asArray(Float.self), downCPU)
+
+        print(String(
+            format: "expert=%02d gate_max=%.6f up_max=%.6f fused_max=%.6f down_max=%.6f",
+            expert, gateDiff, upDiff, fusedDiff, downDiff))
+
+        if gateDiff > 0.02 { failures.append("expert \(expert) gate diff \(gateDiff)") }
+        if upDiff > 0.02 { failures.append("expert \(expert) up diff \(upDiff)") }
+        if fusedDiff > 0.05 { failures.append("expert \(expert) fused diff \(fusedDiff)") }
+        if downDiff > 0.02 { failures.append("expert \(expert) down diff \(downDiff)") }
+    }
+
+    if !failures.isEmpty {
+        fputs("BENCH_ZAYA_TQ_KERNEL_PROBE: \(failures.count) failure(s): \(failures)\n", stderr)
+        exit(1)
+    }
+    print("=== BENCH_ZAYA_TQ_KERNEL_PROBE: passed ===")
+}
+
+private func inferTQBits(inFeatures: Int, packedCols: Int) -> Int {
+    guard inFeatures > 0 else { return 0 }
+    return max(1, (packedCols * 32) / inFeatures)
+}
+
+private func deterministicProbeVector(count: Int) -> [Float] {
+    (0 ..< count).map { index in
+        Float(((index * 37 + 17) % 211) - 105) / 64.0
+    }
+}
+
+private func tqMatmulReference(
+    x: [Float],
+    packed: [UInt32],
+    norms: [Float],
+    codebook: [Float],
+    expert: Int,
+    numExperts: Int,
+    inFeatures: Int,
+    outFeatures: Int,
+    bits: Int
+) -> [Float] {
+    precondition(expert >= 0 && expert < numExperts)
+    let valsPerU32 = 32 / bits
+    let mask = UInt32((1 << bits) - 1)
+    let packedCols = (inFeatures + valsPerU32 - 1) / valsPerU32
+    let expertPackedBase = expert * outFeatures * packedCols
+    let expertNormBase = expert * outFeatures
+    var output = [Float](repeating: 0, count: outFeatures)
+    for out in 0 ..< outFeatures {
+        var acc: Float = 0
+        let rowBase = expertPackedBase + out * packedCols
+        for packIndex in 0 ..< packedCols {
+            let word = packed[rowBase + packIndex]
+            let inputBase = packIndex * valsPerU32
+            for slot in 0 ..< valsPerU32 {
+                let inputIndex = inputBase + slot
+                if inputIndex >= inFeatures { break }
+                let codeIndex = Int((word >> UInt32(slot * bits)) & mask)
+                acc += x[inputIndex] * codebook[codeIndex]
+            }
+        }
+        output[out] = acc * norms[expertNormBase + out]
+    }
+    return output
+}
+
+private func maxAbsDiff(_ lhs: [Float], _ rhs: [Float]) -> Float {
+    guard lhs.count == rhs.count else { return .infinity }
+    return zip(lhs, rhs).map { abs($0 - $1) }.max() ?? 0
 }
 
 private func loadJSONObject(_ url: URL) throws -> [String: Any] {

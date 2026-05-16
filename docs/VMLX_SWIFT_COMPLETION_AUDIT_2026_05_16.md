@@ -9,10 +9,10 @@ Current pushed branch state:
 
 - Branch: `vmlx-0.31.3`
 - Latest pushed runtime checkpoint entering the focused-test/doc refresh:
-  `7962647`
-  (`fix(omni): ground no-think media prompts`)
-- Prior non-MTP checkpoints in this pass: `50df533`, `0deb14b`, and
-  `6e435d7`.
+  `9a56de1`
+  (`test(omni): cover focused evs and remap contracts`)
+- Prior non-MTP checkpoints in this pass: `50df533`, `0deb14b`,
+  `6e435d7`, and `7962647`.
 - Previous MTP runtime checkpoint: `0fdb164`
   (`feat(runtime): add exact native mtp sampling`)
 - Current worktree is not clean because another agent is working on Flux-native
@@ -139,6 +139,18 @@ Known failing rows from that snapshot:
   The `BENCH_ZAYA_CONTRACT` gate was corrected to understand ZAYA1-VL's
   40-layer CCA+MoE topology and vision-LoRA `local_experts`; K, JANGTQ4, and
   MXFP4 now pass contract at `.../*_contract_v2.out`.
+- The remaining K blocker is also not explained by the Swift Metal mixed-bit
+  JANGTQ kernels. `BENCH_ZAYA_TQ_KERNEL_PROBE=1` loads actual
+  `ZAYA1-VL-8B-JANGTQ_K` layer tensors plus the real sidecar and compares
+  gate/up 2-bit, fused SwiGLU, and down 4-bit kernels against a CPU dequant
+  reference. Single-layer proof:
+  `docs/local/live-model-matrix/20260516Tzaya-vl-jangtqk-debug/ZAYA1-VL-8B-JANGTQ_K_tq_kernel_probe.out`.
+  Cross-layer proof:
+  `.../ZAYA1-VL-8B-JANGTQ_K_tq_kernel_probe_layers.out` covers layers
+  `0,1,10,20,39` and experts `0,7,15`; all max diffs are about `1e-5`.
+  Treat the math-row failure as a real K artifact/runtime-quality blocker until
+  a packer-side dequant comparison or a rebuilt K bundle proves otherwise. Do
+  not add a sampler/template guard for it.
 
 2026-05-16 non-MTP DSV4 follow-up:
 
@@ -225,8 +237,11 @@ Not yet complete:
 ## Immediate Next Gates
 
 1. Continue diagnosing the remaining `fail:133` rows without MTP scope:
-   `ZAYA1-VL-8B-JANGTQ_K` is still a real coherence failure on one math row.
-   The JANGTQ4/MXFP4 ZAYA1-VL text-template failures are fixed and live-proven.
+   `ZAYA1-VL-8B-JANGTQ_K` is still a real coherence failure on one math row,
+   but the Swift mixed-bit JANGTQ kernel path now has actual-tensor CPU parity
+   proof. The next useful check is packer-side/reference dequant comparison or a
+   rebuilt K artifact, not a runtime sampler workaround. The JANGTQ4/MXFP4
+   ZAYA1-VL text-template failures are fixed and live-proven.
 2. Finish migrating any still-useful lightweight rows from
    `Tests/MLXLMTests/NemotronHOmniSmokeTests.swift` into an active test target.
    The critical EVS/remap/shape rows are now covered by
