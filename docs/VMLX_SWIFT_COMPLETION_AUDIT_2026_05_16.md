@@ -60,7 +60,7 @@ The package is complete only when all of these are true:
 | MTP depth-3 production acceleration. | Current D3 rows prove recursive draft plus accepted-prefix cache commit, but remain below the 50 tok/s production target. Small-M verifier tuning is still open. | open |
 | Qwen3.6 MTP coherency and token/s. | D1 artifacts `jang4m-mtp-artifact-native-d1-postrevert-96.log` and `mx-mtp-artifact-native-d1-postrevert-96.log`: coherent, `30.2` and `34.0 tok/s` short rows. D3 prefix-commit artifacts under `docs/local/native-mtp-qwen36-20260516-d3-prefix-commit/`: coherent, `prefixCommit>0`, `rollbackRepair=0`, no loops. | live-proven for explicit MTP diagnostic rows |
 | Qwen3.6 50 tok/s target. | Not achieved. Current rows are below target and the rejected verifier argmax experiment was not committed. | open |
-| DSV4 native encoder, CSA/HSA/SWA, long context, vector drift. | New non-MTP DSV4 JANGTQ-K rows under `docs/local/live-model-matrix/20260516Tdsv4-nonmtp/` prove config/template, three-turn recall, reasoning off/on/max with rep=1.0, and a 5.5k-token semantic recall row. Full B7 long-context/vector drift and speed matrix are still open. | partial |
+| DSV4 native encoder, CSA/HSA/SWA, long context, vector drift. | New non-MTP DSV4 JANGTQ-K rows under `docs/local/live-model-matrix/20260516Tdsv4-nonmtp/` prove config/template, three-turn recall, reasoning off/on/max with rep=1.0, a 5.5k-token semantic recall row, and DSV4 paged-incompatible salted disk-cache restore. A 16k-token long-context row currently fails with Metal OOM, and the ds4 official vector fixture is not present locally. | partial/failing |
 | Prefix cache OFF/ON and cache hit proof. | Existing matrix/harness describes rows; not complete for every topology and model family. | open |
 | Paged cache OFF/ON. | Existing focused tests and some model rows exist, but no package-wide matrix artifact proves all relevant architectures. | open |
 | Disk L2 OFF/ON and fresh-session restore. | Existing docs and some rows exist; package-wide, per-topology proof remains incomplete. | open |
@@ -170,6 +170,20 @@ Known failing rows from that snapshot:
   slow (`~0.07 tok/s`) and is not a substitute for the full DSV4 B7
   long-context/vector drift gate:
   `.../DeepSeek-V4-Flash-JANGTQ-K_coherence_long.out`.
+- Current DSV4 cache-topology proof:
+  `.../DeepSeek-V4-Flash-JANGTQ-K_growing_chat_cache_current.out` and
+  `.err`. It reports `pagedIncompatible=true`, salted prompt/post-answer disk
+  hits with `diskArrays=yes`, nil-salt misses, and a coherent turn-2 recall.
+  Prompt prefill time drops from `15.423s` to `0.307s`.
+- Current DSV4 long-context blocker:
+  `.../DeepSeek-V4-Flash-JANGTQ-K_coherence_long_16k_current.out` prepares a
+  `16318` token prompt, then `.err` fails with Metal
+  `kIOGPUCommandBufferCallbackErrorOutOfMemory`. Do not claim DSV4 long-context
+  production readiness until the memory path is fixed and rerun.
+- The Python ds4 official vector fixture expected by
+  `tests/cross_matrix/dsv4_vector_probe.py` was not present at
+  `/tmp/ds4-read/tests/test-vectors/official.vec` on this machine, so the
+  vector-drift row remains explicitly blocked rather than inferred.
 
 2026-05-16 non-MTP Nemotron Omni follow-up:
 
@@ -254,8 +268,10 @@ Not yet complete:
    either committed by the Flux agent or isolated in a separate worktree.
 5. MTP is parked for this non-MTP production pass. Do not spend current
    validation time on MTP unless the user re-opens that scope.
-6. Run DSV4 B7 long-context/vector drift with current pushed engine. The new
-   5.5k recall row proves a narrower path only.
+6. Fix DSV4 16k+ long-context memory behavior, then rerun B7-style
+   long-context and vector drift. Current pushed engine passes the DSV4 disk
+   restore/cache topology row but fails the 16k long-context row with Metal OOM;
+   the ds4 official vector fixture is also absent locally.
 7. Expand the model matrix beyond the 20GB cutoff for DSV4, MiniMax, Ling, Hy3,
    and Kimi one family at a time, with process checks before and after each run.
 

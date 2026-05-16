@@ -169,6 +169,20 @@ These rows are now covered in this checkout with artifacts under
   off/on/max, and explicit `repetition_penalty=1.0` without hidden sampler
   floors. The 5.5k semantic recall row returns the requested facts, but the full
   B7 long-context/vector drift gate is still open.
+- DSV4 paged-incompatible cache topology proof:
+  `docs/local/live-model-matrix/20260516Tdsv4-nonmtp/DeepSeek-V4-Flash-JANGTQ-K_growing_chat_cache_current.out`
+  proves salted disk restore on the DSV4 path. The stderr companion records
+  `hybrid=false pagedIncompatible=true`, salted prompt/post-answer hits from
+  disk with `diskArrays=yes`, and nil-salt misses. Turn 2 remains coherent and
+  prompt prefill drops from `15.423s` to `0.307s`.
+- DSV4 16k long-context is currently a hard blocker, not a pass:
+  `docs/local/live-model-matrix/20260516Tdsv4-nonmtp/DeepSeek-V4-Flash-JANGTQ-K_coherence_long_16k_current.out`
+  reaches `prepared prompt=16318`, then `.err` terminates with Metal
+  `kIOGPUCommandBufferCallbackErrorOutOfMemory`. The engine must fix this
+  memory path before claiming B7-style long-context production readiness.
+- The ds4 official vector fixture used by the Python `dsv4_vector_probe.py`
+  was not present at `/tmp/ds4-read/tests/test-vectors/official.vec`; vector
+  drift remains blocked, not inferred from the shorter recall rows.
 - Nemotron Omni video generation now follows the real source contract: the
   processor carries the post-EVS keep count through `LMInput.ProcessedVideo`,
   and the model applies RADIO video embedding, class-token strip, pixel shuffle,
