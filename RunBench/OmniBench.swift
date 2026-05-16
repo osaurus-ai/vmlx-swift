@@ -121,6 +121,31 @@ enum OmniBench {
                 maxNewTokens: maxNewTokens)
         })
 
+        // Row 3b: direct image with reasoning explicitly off. This isolates
+        // model/template behavior from BatchEngine scheduling so the B3 row
+        // cannot be misclassified as a batching bug if the direct no-thinking
+        // vision path is also not grounded.
+        results.append(await runRow("3b. image reasoning OFF direct", maxNew: maxNewTokens) {
+            let img = try synthesiseGradient(side: 224)
+            let cache = context.model.newCache(parameters: .init())
+            return try await runImageTurn(
+                prompt: "Describe this image briefly.",
+                image: img, context: context, cache: cache,
+                maxNewTokens: maxNewTokens,
+                enableThinking: false)
+        })
+
+        if (ProcessInfo.processInfo.environment["BENCH_OMNI_TAIL_PROBE"] ?? "0") == "1" {
+            results.append(await runRow("3c. image no-think tail variants", maxNew: maxNewTokens) {
+                let img = try synthesiseGradient(side: 224)
+                return try await runImageTailVariants(
+                    prompt: "Describe this image briefly.",
+                    image: img,
+                    context: context,
+                    maxNewTokens: maxNewTokens)
+            })
+        }
+
         // Row 4: Image multi-turn (cache reuse + MediaSalt)
         results.append(await runRow("4. image multi-turn x2", maxNew: maxNewTokens) {
             let img = try synthesiseGradient(side: 224)
@@ -676,9 +701,11 @@ enum OmniBench {
         image: CIImage,
         context: ModelContext,
         cache: [KVCache],
-        maxNewTokens: Int
+        maxNewTokens: Int,
+        enableThinking: Bool = true
     ) async throws -> TurnResult {
-        let userInput = UserInput(prompt: prompt, images: [.ciImage(image)])
+        var userInput = UserInput(prompt: prompt, images: [.ciImage(image)])
+        userInput.additionalContext = ["enable_thinking": enableThinking]
         let lmInput = try await context.processor.prepare(input: userInput)
 
         var params = GenerateParameters(maxTokens: maxNewTokens)
@@ -698,6 +725,115 @@ enum OmniBench {
         return TurnResult(
             shortText: text.replacingOccurrences(of: "\n", with: " "),
             tokens: tokens.count, secs: secs)
+    }
+
+    private static func runImageTailVariants(
+        prompt: String,
+        image: CIImage,
+        context: ModelContext,
+        maxNewTokens: Int
+    ) async throws -> TurnResult {
+        var userInput = UserInput(prompt: prompt, images: [.ciImage(image)])
+        userInput.additionalContext = ["enable_thinking": false]
+        let baseInput = try await context.processor.prepare(input: userInput)
+
+        let variants: [(name: String, tail: String, allowReasoningFallback: Bool)] = [
+            ("closed-compact", "<|im_start|>assistant\n<think></think>", false),
+            ("closed-newline", "<|im_start|>assistant\n<think></think>\n", false),
+            ("closed-spaced", "<|im_start|>assistant\n<think>\n</think>\n\n", false),
+            ("assistant-only", "<|im_start|>assistant\n", false),
+            ("thinking-open", "<|im_start|>assistant\n<think>\n", true),
+        ]
+
+        var details: [String] = []
+        var totalTokens = 0
+        var totalSecs = 0.0
+        var groundedPasses = 0
+
+        for variant in variants {
+            let lmInput = try rewriteAssistantTail(
+                baseInput,
+                tokenizer: context.tokenizer,
+                replacementTail: variant.tail)
+            let cache = context.model.newCache(parameters: .init())
+            var params = GenerateParameters(maxTokens: maxNewTokens)
+            params.temperature = 0.0
+            params.prefillStepSize = 512
+
+            let iter = try TokenIterator(
+                input: lmInput, model: context.model, cache: cache,
+                parameters: params)
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let tokens = collectGeneratedTokens(
+                iter, context: context, maxNewTokens: maxNewTokens)
+            let secs = CFAbsoluteTimeGetCurrent() - t0
+            let text = userVisibleText(
+                context: context,
+                lmInput: lmInput,
+                tokenIds: tokens,
+                allowReasoningFallback: variant.allowReasoningFallback)
+            totalTokens += tokens.count
+            totalSecs += secs
+            do {
+                try validateVisibleOmniText(text, row: "image tail \(variant.name)")
+                groundedPasses += 1
+                details.append("\(variant.name)=PASS:\(text.prefix(70))")
+            } catch {
+                details.append("\(variant.name)=FAIL:\(text.prefix(70))")
+            }
+        }
+
+        if groundedPasses == 0 {
+            throw NSError(
+                domain: "OmniBench", code: 105,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "no image tail variant grounded the image; \(details.joined(separator: " || "))"])
+        }
+        return TurnResult(
+            shortText: details.joined(separator: " || "),
+            tokens: totalTokens,
+            secs: totalSecs)
+    }
+
+    private static func rewriteAssistantTail(
+        _ input: LMInput,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        replacementTail: String
+    ) throws -> LMInput {
+        let currentTails = [
+            "<|im_start|>assistant\n<think></think>",
+            "<|im_start|>assistant\n<think>\n</think>\n\n",
+        ]
+        let replacementIds = tokenizer.encode(
+            text: replacementTail,
+            addSpecialTokens: false)
+        let originalIds = input.text.tokens.reshaped([-1]).asArray(Int.self)
+        for currentTail in currentTails {
+            let currentTailIds = tokenizer.encode(
+                text: currentTail,
+                addSpecialTokens: false)
+            if originalIds.count >= currentTailIds.count,
+               Array(originalIds.suffix(currentTailIds.count)) == currentTailIds
+            {
+                let rewrittenIds = Array(originalIds.dropLast(currentTailIds.count)) + replacementIds
+                let tokens = MLXArray(rewrittenIds).expandedDimensions(axis: 0)
+                let mask = ones(like: tokens).asType(.int8)
+                return LMInput(
+                    text: .init(tokens: tokens, mask: mask),
+                    image: input.image,
+                    video: input.video,
+                    audio: input.audio,
+                    mediaTokenIds: input.mediaTokenIds,
+                    cacheScopeSalt: input.cacheScopeSalt)
+            }
+        }
+        let promptTail = tokenizer.decode(
+            tokenIds: Array(originalIds.suffix(128)),
+            skipSpecialTokens: false)
+        throw NSError(
+            domain: "OmniBench", code: 106,
+            userInfo: [NSLocalizedDescriptionKey:
+                "could not rewrite assistant tail; prompt tail=\(promptTail)"])
     }
 
     private static func runVideoTurn(

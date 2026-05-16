@@ -63,14 +63,14 @@ The package is complete only when all of these are true:
 | Disk L2 OFF/ON and fresh-session restore. | Existing docs and some rows exist; package-wide, per-topology proof remains incomplete. | open |
 | SSM companion cache and async rederive. | Qwen/hybrid rows are required by docs; not exhaustively live-proven for all relevant local models. | open |
 | VL media salt, same-image hit, changed-image miss. | `docs/local/live-model-matrix/20260516Tzaya-vl-think-template-fix/ZAYA1-VL-8B-JANGTQ4_vl_chat_cache.out`: same-media replay HIT, different-media MISS, coherent blue/orange follow-up. | live-proven for ZAYA1-VL JANGTQ4 |
-| Nemotron Omni audio/Parakeet/RADIO. | Video generation now carries the processor's post-EVS keep count and applies real EVS before prompt splice. `docs/local/live-model-matrix/20260516Tomni-nonmtp/Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_evs_v2.out` passes 13/13 TokenIterator rows; strict pre-fix artifact `..._omni_strict.out` failed the video row. BatchEngine text/audio scheduler rows pass, but BatchEngine image with explicit `enable_thinking=false` still returns a missing-image denial in `..._omni_batch_forced_evs_v3.out`. | partial |
+| Nemotron Omni audio/Parakeet/RADIO. | Video generation now carries the processor's post-EVS keep count and applies real EVS before prompt splice. `docs/local/live-model-matrix/20260516Tomni-nonmtp/Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_evs_v2.out` passes 13/13 TokenIterator rows; strict pre-fix artifact `..._omni_strict.out` failed the video row. The second fix canonicalizes the closed no-thinking media tail to `<think>\n</think>\n\n`; tail probe `..._omni_tail_probe.out` proves compact tail fails and spaced tail grounds the same image, and `..._omni_batch_nothink_tail_fix.out` passes 18/18 including direct and BatchEngine image with `enable_thinking=false`. | live-proven for Omni JANGTQ4 |
 | Reasoning on/off/effort matrix. | Focused DSV4 pass-through exists; full model-family reasoning matrix is not complete. | open |
 | Tool parser matrix by family. | DSV4 and selected templates have focused proof; full dsml/deepseek/gemma4/kimi/jang/zaya/llama/qwen/mistral matrix remains open. | open |
 | Generation config defaults apply. | Harness supports resolved defaults; package-wide three-bundle proof and per-model override matrix remain incomplete. | open |
-| Single-batch and continuous batching. | Omni BatchEngine harness now forces `maxBatchSize=2` for B=1 rows so it exercises the scheduler path instead of the solo fast path. Text B=1, text B=2, and audio B=1 pass; image B=1 is blocked by grounding with `enable_thinking=false`. Full per-family batching remains incomplete. | partial |
+| Single-batch and continuous batching. | Omni BatchEngine harness now forces `maxBatchSize=2` for B=1 rows so it exercises the scheduler path instead of the solo fast path. Text B=1, text B=2, image B=1, and audio B=1 pass after the no-thinking media-tail fix in `docs/local/live-model-matrix/20260516Tomni-nonmtp/Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_batch_nothink_tail_fix.out`. Full per-family batching remains incomplete. | live-proven for Omni JANGTQ4; package-wide partial |
 | TurboQuant/JANGTQ encode/decode and acceleration toggles. | Focused JANGTQ/Hadamard/matmul proof exists; live low-footprint active routed expert pass for all relevant models remains open. | open |
 | Distributed mode. | Targets exist (`MLXDistributed*`, `TPRankWorker`), but no no-peer distributed clean artifact is recorded for this audit. | open |
-| Full `swift test`. | Current filtered test attempt still fails before focused tests because SwiftPM compiles `MLXPressPolicyTests` first and that target errors with `no such module 'Testing'`. This is a blocker, not a pass. | open |
+| Full `swift test`. | Current filtered test attempt still fails before focused tests because SwiftPM compiles `MLXPressPolicyTests` first and that target errors with `no such module 'Testing'`. Latest artifact: `docs/local/live-model-matrix/20260516Tomni-nonmtp/NemotronHOmniSmokeTests_tail_fix.err`. This is a blocker, not a pass. | open |
 | Release build. | `swift build -c release --product RunBench --jobs 2` passed after the non-MTP ZAYA1-VL template/harness changes. | live-proven |
 | Osaurus single-package repin. | Not done. Osaurus still pins split runtime stack. | open |
 
@@ -177,6 +177,17 @@ Known failing rows from that snapshot:
   fails image B=1 because the model says the image is blank or missing when
   `enable_thinking=false`. This is now correctly caught as a failure instead of
   counted as a false pass. Do not hide it by forcing reasoning on.
+- The direct tail probe
+  `docs/local/live-model-matrix/20260516Tomni-nonmtp/Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_tail_probe.out`
+  proves the actual media no-thinking contract: compact `<think></think>` and
+  `<think></think>\n` both fail with the missing-image denial, while the closed
+  newline-delimited tail `<think>\n</think>\n\n` grounds the same prepared image
+  tensor. This is a prompt-rendering correction, not a hidden reasoning override.
+- Post-tail-fix BatchEngine evidence:
+  `docs/local/live-model-matrix/20260516Tomni-nonmtp/Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_batch_nothink_tail_fix.out`
+  passes 18/18. The direct `3b. image reasoning OFF direct` row returns a
+  grounded gradient description at `96.6 tok/s`; `B3. BatchEngine image B=1`
+  returns the same grounded class of answer at `47.8 tok/s`.
 
 Skipped rows because of the 20GB cutoff include DSV4 Flash, Hy3, Kimi,
 MiniMax, Ling, and other large bundles. They are not production passes.
@@ -213,9 +224,9 @@ Not yet complete:
 1. Continue diagnosing the remaining `fail:133` rows without MTP scope:
    `ZAYA1-VL-8B-JANGTQ_K` is still a real coherence failure on one math row.
    The JANGTQ4/MXFP4 ZAYA1-VL text-template failures are fixed and live-proven.
-2. Fix Nemotron Omni BatchEngine image grounding with explicit
-   `enable_thinking=false`. Current text/audio scheduler rows pass, but the
-   image row still returns a missing-image denial.
+2. Extend the Omni-style no-thinking media-tail gate to any other local
+   multimodal reasoning model that shows the same compact-tail failure. Do not
+   assume it globally; prove it per family with a direct media tensor row.
 3. Run a clean-worktree focused test pass once Flux Package.swift edits are
    either committed by the Flux agent or isolated in a separate worktree.
 4. MTP is parked for this non-MTP production pass. Do not spend current

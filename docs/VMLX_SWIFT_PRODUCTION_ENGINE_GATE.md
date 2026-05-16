@@ -188,11 +188,23 @@ These rows are now covered in this checkout with artifacts under
   explicit `enable_thinking=false` still returns a missing-image denial in
   `.../Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_batch_forced_evs_v3.out`.
   This is a real blocker, not a row to mask by forcing reasoning on.
+- Nemotron Omni no-thinking media-tail fix: the direct tail probe
+  `.../Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_tail_probe.out` shows compact
+  `<think></think>` and `<think></think>\n` fail to ground the same prepared
+  image tensor, while `<think>\n</think>\n\n` passes. The processor now
+  canonicalizes only the already-closed media no-thinking tail to that newline
+  form, leaving reasoning disabled and leaving text-only prompts alone.
+- Nemotron Omni post-tail-fix proof:
+  `.../Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_batch_nothink_tail_fix.out`
+  passes 18/18. Direct image with `enable_thinking=false` is grounded at
+  `96.6 tok/s`, and BatchEngine image B=1 with `enable_thinking=false` is
+  grounded at `47.8 tok/s`; text/audio BatchEngine rows still pass.
 - Build proof after the non-MTP runtime/harness changes:
   `swift build -c release --product RunBench --jobs 2` passes. Focused
   `swift test` is still blocked before the target test by the unrelated
   `Tests/MLXPressPolicyTests/MLXPressLowRamPolicySourceTests.swift:4:8:
-  no such module 'Testing'` compile error.
+  no such module 'Testing'` compile error; latest artifact:
+  `docs/local/live-model-matrix/20260516Tomni-nonmtp/NemotronHOmniSmokeTests_tail_fix.err`.
 
 ## Fix Gates
 

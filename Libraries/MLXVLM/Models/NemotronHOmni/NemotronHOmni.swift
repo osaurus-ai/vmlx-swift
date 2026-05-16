@@ -754,9 +754,18 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             Self.prependMedia(media, toLastUserIn: &messages)
         }
 
-        let promptTokens = try tokenizer.applyChatTemplate(
+        var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
+        if !media.isEmpty {
+            // The shipped template's compact no-thinking tail is text-safe, but
+            // the omni VLM path grounds images only with an explicitly closed,
+            // newline-delimited thought block. Keep reasoning disabled; only
+            // canonicalize the closed media prompt tail.
+            promptTokens = Self.canonicalizeNoThinkingMediaTail(
+                promptTokens,
+                tokenizer: tokenizer)
+        }
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
 
@@ -798,6 +807,26 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         }
         let text = contentText(from: messages[0]["content"])
         messages[0]["content"] = media + text
+    }
+
+    private static func canonicalizeNoThinkingMediaTail(
+        _ promptTokens: [Int],
+        tokenizer: any MLXLMCommon.Tokenizer
+    ) -> [Int] {
+        let compactTail = "<|im_start|>assistant\n<think></think>"
+        let canonicalTail = "<|im_start|>assistant\n<think>\n</think>\n\n"
+        let compactIds = tokenizer.encode(
+            text: compactTail,
+            addSpecialTokens: false)
+        guard promptTokens.count >= compactIds.count,
+              Array(promptTokens.suffix(compactIds.count)) == compactIds
+        else {
+            return promptTokens
+        }
+        let canonicalIds = tokenizer.encode(
+            text: canonicalTail,
+            addSpecialTokens: false)
+        return Array(promptTokens.dropLast(compactIds.count)) + canonicalIds
     }
 
     public static func videoTokenCountAfterEVS(
