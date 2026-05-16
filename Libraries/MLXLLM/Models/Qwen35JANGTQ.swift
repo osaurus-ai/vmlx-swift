@@ -694,23 +694,21 @@ public class Qwen35JANGTQTextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     /// Sanitize for the JANGTQ wire format. Three jobs:
-    ///   1. Strip MTP heads + apply the (1+norm) shift convention from
-    ///      the affine sanitize (matches `Qwen35TextModel.sanitize`).
+    ///   1. Strip MTP heads, then apply the (1+norm) shift convention only
+    ///      when base conv1d tensors still require the affine sanitize
+    ///      (matches `Qwen35TextModel.sanitize`).
     ///   2. Drop `.tq_bits` metadata tensors — these are per-tensor
     ///      bit-width hints, not module parameters.
     ///   3. Stack per-expert `experts.{E}.{w1,w2,w3}.{tq_packed,tq_norms}`
     ///      tensors into the 3D layout `TurboQuantSwitchGLU` expects
     ///      under `mlp.switch_mlp.{gate_proj,up_proj,down_proj}.{tq_packed,tq_norms}`.
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var weights = weights
-
-        let hasMTP = weights.keys.contains { $0.contains("mtp.") }
+        var weights = weights.filter { !Self.isMTPWeightKey($0.key) }
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
         }
-        let shouldShiftNorms = hasMTP || hasUnsanitizedConv1d
+        let shouldShiftNorms = hasUnsanitizedConv1d
 
-        weights = weights.filter { !$0.key.contains("mtp.") }
         if configuration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
         }
@@ -784,6 +782,13 @@ public class Qwen35JANGTQTextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return weights
+    }
+
+    private static func isMTPWeightKey(_ key: String) -> Bool {
+        key.hasPrefix("mtp.")
+            || key.hasPrefix("model.mtp_layers.")
+            || key.contains(".mtp.")
+            || key.contains(".mtp_layers.")
     }
 }
 

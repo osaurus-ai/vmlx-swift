@@ -1227,6 +1227,7 @@ public struct JangLoader: Sendable {
         weights: [String: MLXArray],
         defaultBits: Int? = nil,
         defaultGroupSize: Int? = nil,
+        defaultMode: QuantizationMode = .affine,
         bitWidthsHint: [Int] = []
     ) -> BaseConfiguration.PerLayerQuantization? {
         // Find every base path that has a `.scales` companion.
@@ -1284,12 +1285,12 @@ public struct JangLoader: Sendable {
             {
                 perLayer[path] = .quantize(
                     BaseConfiguration.Quantization(
-                        groupSize: t.groupSize, bits: t.bits))
+                        groupSize: t.groupSize, bits: t.bits, mode: defaultMode))
             }
         }
         return BaseConfiguration.PerLayerQuantization(
             quantization: BaseConfiguration.Quantization(
-                groupSize: chosenDefault.groupSize, bits: chosenDefault.bits),
+                groupSize: chosenDefault.groupSize, bits: chosenDefault.bits, mode: defaultMode),
             perLayerQuantization: perLayer
         )
     }
@@ -1298,7 +1299,8 @@ public struct JangLoader: Sendable {
         weights: [String: MLXArray],
         jangConfig: JangConfig,
         overrideGroupSize: Int? = nil,
-        overrideBits: Int? = nil
+        overrideBits: Int? = nil,
+        overrideMode: QuantizationMode = .affine
     ) -> BaseConfiguration.PerLayerQuantization {
         // Prefer the caller-supplied group_size (typically from
         // config.json's quantization.group_size) over jangConfig's
@@ -1386,7 +1388,8 @@ public struct JangLoader: Sendable {
 
             if bits != defaultBits || inferredGroupSize != groupSize {
                 perLayer[basePath] = .quantize(
-                    BaseConfiguration.Quantization(groupSize: inferredGroupSize, bits: bits))
+                    BaseConfiguration.Quantization(
+                        groupSize: inferredGroupSize, bits: bits, mode: overrideMode))
             }
         }
 
@@ -1394,7 +1397,8 @@ public struct JangLoader: Sendable {
         // The default quantization covers all layers not in perLayer
 
         return BaseConfiguration.PerLayerQuantization(
-            quantization: BaseConfiguration.Quantization(groupSize: groupSize, bits: defaultBits),
+            quantization: BaseConfiguration.Quantization(
+                groupSize: groupSize, bits: defaultBits, mode: overrideMode),
             perLayerQuantization: perLayer
         )
     }

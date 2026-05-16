@@ -17,6 +17,12 @@ public struct BaseConfiguration: Codable, Sendable {
             self.bits = bits
         }
 
+        public init(groupSize: Int, bits: Int, mode: QuantizationMode) {
+            self.groupSize = groupSize
+            self.bits = bits
+            self._mode = mode
+        }
+
         public let groupSize: Int
         public let bits: Int
         private var _mode: QuantizationMode? = nil

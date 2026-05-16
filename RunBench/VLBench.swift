@@ -119,7 +119,8 @@ enum VLBench {
         print("  \(label) [\(parameters.enableCompiledBatchDecode ? "compile" : "uncomp")]:")
         let t0 = CFAbsoluteTimeGetCurrent()
 
-        let userInput = UserInput(prompt: prompt, images: [.ciImage(image)])
+        var userInput = UserInput(prompt: prompt, images: [.ciImage(image)])
+        userInput.additionalContext = ["enable_thinking": false]
         let lmInput = try await context.processor.prepare(input: userInput)
         nonisolated(unsafe) let sendable = lmInput
         let stream = await engine.generate(input: sendable, parameters: parameters)
@@ -143,6 +144,43 @@ enum VLBench {
         print(String(format: "    TTFT %dms, total %.2fs, chunks=%d",
             Int((ttft ?? 0) * 1000), total, chunkCount))
         print("    \"\(preview)\"")
+
+        let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard chunkCount > 0, !visible.isEmpty else {
+            throw NSError(
+                domain: "VLBench",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "\(label) emitted no visible VL output"])
+        }
+        if prompt.localizedCaseInsensitiveContains("describe"),
+            !containsAnyWord(
+                visible,
+                words: ["image", "gradient", "red", "green", "blue", "orange", "yellow", "purple", "color", "colour"])
+        {
+            throw NSError(
+                domain: "VLBench",
+                code: 2,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "\(label) did not emit grounded image/color language: \(preview)"
+                ])
+        }
+        if prompt.localizedCaseInsensitiveContains("top edge"),
+            !containsAnyWord(visible, words: ["red"])
+        {
+            throw NSError(
+                domain: "VLBench",
+                code: 3,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "\(label) did not ground top-edge colour as red: \(preview)"
+                ])
+        }
+    }
+
+    private static func containsAnyWord(_ text: String, words: Set<String>) -> Bool {
+        let tokens = text.lowercased().components(separatedBy: CharacterSet.letters.inverted)
+        return tokens.contains { words.contains($0) }
     }
 
     private static func makeProofCoordinator(

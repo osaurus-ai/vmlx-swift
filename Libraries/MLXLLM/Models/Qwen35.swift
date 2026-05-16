@@ -674,13 +674,11 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
+        var weights = weights.filter { !Self.isMTPWeightKey($0.key) }
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
         }
-        let shouldShiftNormWeights = hasMTPWeights || hasUnsanitizedConv1d
-
-        var weights = weights.filter { !$0.key.contains("mtp.") }
+        let shouldShiftNormWeights = hasUnsanitizedConv1d
 
         if configuration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
@@ -711,6 +709,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
         }
 
         return weights
+    }
+
+    private static func isMTPWeightKey(_ key: String) -> Bool {
+        key.hasPrefix("mtp.")
+            || key.hasPrefix("model.mtp_layers.")
+            || key.contains(".mtp.")
+            || key.contains(".mtp_layers.")
     }
 }
 

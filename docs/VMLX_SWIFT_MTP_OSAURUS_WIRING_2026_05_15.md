@@ -69,6 +69,12 @@ It detects MTP tensors from:
 - layer-N MTP layouts such as `model.layers.<num_hidden_layers>.*`
   and `language_model.model.layers.<num_hidden_layers>.*`
 
+Directory names are not MTP evidence. `jang_config.runtime.bundle_has_mtp`,
+`mtp_layers`, or `mtp_mode` can establish that the bundle expected MTP, but
+`MTPBundleStatus.bundleHasMTP` is true only when tensor names prove that MTP
+weights are present. Metadata without tensor evidence is reported as
+`metadata_only_missing_weights`.
+
 It detects VL tensors separately from:
 
 - `vision_tower.*`
@@ -124,12 +130,38 @@ The future activation path should be family-specific. Do not add a global
 `DraftStrategy.mtp` switch until at least one family implements all of:
 
 1. Load the MTP head/layer without breaking the base autoregressive loader.
-2. Keep a temporary draft cache/state separate from accepted base KV.
-3. Propose one or more draft tokens.
-4. Verify every draft token through the base model.
-5. Commit only accepted tokens into the base cache stack.
-6. Discard draft state on rejection, cancellation, stop, or request failure.
-7. Report accepted/rejected draft counts and token/s.
+2. Return both logits and hidden state from each MTP draft step. D2/D3 recursive
+   draft cannot be built from a logits-only `mtp_forward`.
+3. Keep a temporary draft cache/state separate from accepted base KV.
+4. Propose recursive draft tokens up to the requested depth.
+5. Verify `[primary, d1, ... dK]` through the base model in one target forward.
+6. Commit an accepted draft prefix of length `0...K` plus the verifier bonus
+   token into the base cache stack. The backbone cache never receives rejected
+   draft state.
+7. Discard draft state on rejection, cancellation, stop, or request failure.
+8. Report verify cycles, accepted/rejected draft counts, acceptance rate,
+   fallback count, and token/s.
+
+Depth matters. A D1 loop that drafts one token and verifies two positions is not
+the MTPLX-style target. For a 256-token response, D1 still takes about 128
+verify cycles at full acceptance. A D3 path verifies `[primary, d1, d2, d3]` and
+can commit up to four tokens per cycle, so the full-acceptance lower bound is 64
+verify cycles, with real rows expected around 50-70 depending on bonus handling
+and stop behavior.
+
+The Swift contract type for this is `MTPRecursiveDraftContract`. Its D3 shape
+requires hidden-state draft feedback, private draft cache, accepted-only
+backbone commit, variable `0...depth` accepted-prefix commit, and a compiled or
+tuned small-M verifier hot path before any speed claim is accepted.
+
+Implementation target for the next runtime pass: D3 MLLM native-MTP with correct
+cache boundaries. Prefix, paged KV, and block-L2 disk remain prompt-boundary
+verified caches. Each D3 verify pass advances the live backbone cache only
+through verified target positions. Until the capture/commit path exists, partial
+rejects must use an explicit rollback+repair path so rejected draft state is not
+stored. This is acceptable as a correctness-first stepping stone only if the
+bench reports coherency, token/s, verify calls, accepted-prefix length, and the
+rollback+repair cost.
 
 Qwen-style bundles use top-level `mtp.fc.*` and `mtp.layers.0.*` tensors. Hy3
 and Bailing-style bundles may store the MTP layer at
@@ -164,6 +196,51 @@ Hybrid/SSM rule:
 - MTP draft recurrent state is not an SSM companion cache entry.
 - Async re-derive for hybrid models must re-derive from accepted base tokens and
   accepted companion state only.
+- For D2/D3, rollback/commit must support accepted draft prefix length `0...K`;
+  a single accept/reject bit is not enough for hybrid SSM correctness.
+- Accepted: keep the verifier state after `[primary, accepted drafts...]`.
+- Rejected: restore or repair to the state after the accepted prefix, not
+  blindly to `primary` and not past the rejected draft.
+
+For D2/D3 this partial-acceptance rule is mandatory. If the verifier accepts
+`d1` and `d2` but rejects `d3`, the backbone cache must commit state after
+`[primary, d1, d2]`. It must not roll all the way back to `primary`, and it
+must not keep the rejected `d3`.
+
+There are two correct implementation options:
+
+1. Capture/commit path: record intermediate hybrid SSM/KV states during the
+   verifier forward and commit the selected accepted prefix.
+2. Rollback + repair path: rollback to `primary`, then re-forward the accepted
+   prefix plus correction through the target model.
+
+The capture/commit path is the speed path. The rollback+repair path can be a
+correctness-first stepping stone, but it will reduce speed whenever partial
+rejections occur. It must still be explicit and measured; hidden guards or
+all-or-nothing acceptance are not acceptable production semantics.
+
+## Speed Bench Requirements
+
+Every future native-MTP speed claim must report:
+
+- AR baseline tok/s and MTP tok/s on the same artifact, machine, sampler, and
+  prompt set;
+- MTP depth requested and effective;
+- verify calls;
+- output tokens;
+- accepted/drafted by depth;
+- average committed tokens per verify call;
+- bonus-token count;
+- correction/rejection count;
+- target verify forward time;
+- MTP draft time;
+- accept/residual sampling time;
+- cache mode (`off`, `paged+ssm`, etc.);
+- whether small-M compiled verify or stock MLX verify was used;
+- whether a draft-only LM head or MTP sidecar was used; and
+- output tail review.
+
+Without those fields, a tok/s number is not diagnosable.
 
 ## VL Rules
 

@@ -4,6 +4,37 @@ import Foundation
 import MLX
 import MLXNN
 
+private func isPreservedMTPWeightKey(_ key: String) -> Bool {
+    let lower = key.lowercased()
+    return lower.hasPrefix("mtp.")
+        || lower.hasPrefix("model.mtp_layers.")
+        || lower.contains(".mtp.")
+        || lower.contains(".mtp_layers.")
+}
+
+private func loadSafetensorsHeaderNamesForBaseLoad(_ url: URL) throws -> [String] {
+    let handle = try FileHandle(forReadingFrom: url)
+    defer { try? handle.close() }
+
+    guard let lengthData = try handle.read(upToCount: 8), lengthData.count == 8 else {
+        return []
+    }
+    var headerLength: UInt64 = 0
+    for (index, byte) in lengthData.enumerated() {
+        headerLength |= UInt64(byte) << UInt64(index * 8)
+    }
+    guard headerLength > 0, headerLength <= 64 * 1024 * 1024 else {
+        return []
+    }
+    guard let headerData = try handle.read(upToCount: Int(headerLength)),
+        headerData.count == Int(headerLength),
+        let header = try JSONSerialization.jsonObject(with: headerData) as? [String: Any]
+    else {
+        return []
+    }
+    return header.keys.filter { $0 != "__metadata__" }
+}
+
 /// Load model weights.
 ///
 /// This is typically called via ``ModelFactory/load(from:configuration:progressHandler:)``.
@@ -134,11 +165,25 @@ public func loadWeights(
             .prestackedRoutedReplacementKeys(in: modelDirectory)) ?? []
         var skippedPrestackedSourceTensors = 0
         var skippedStreamingSourceTensors = 0
+        var skippedPreservedMTPTensors = 0
+        var skippedPreservedMTPShards = 0
         let streamingRoutedExperts = JANGTQStreamingExperts.isEnabled
         for url in allShardURLs {
+            if let headerNames = try? loadSafetensorsHeaderNamesForBaseLoad(url),
+                !headerNames.isEmpty,
+                headerNames.allSatisfy(isPreservedMTPWeightKey)
+            {
+                skippedPreservedMTPShards += 1
+                skippedPreservedMTPTensors += headerNames.count
+                continue
+            }
             let (w, m) = try loadArraysAndMetadata(url: url)
             let isPrestackedShard = url.lastPathComponent == "jangpress-prestacked.safetensors"
             for (key, value) in w {
+                if isPreservedMTPWeightKey(key) {
+                    skippedPreservedMTPTensors += 1
+                    continue
+                }
                 if streamingRoutedExperts,
                    JANGTQStreamingExperts.isStreamableRoutedTensorKey(key)
                 {
@@ -166,6 +211,10 @@ public func loadWeights(
         if skippedStreamingSourceTensors > 0 {
             FileHandle.standardError.write(Data(
                 "[loadWeights] using MLXPress active-expert streaming; skipped \(skippedStreamingSourceTensors) per-expert tensor(s) during weight load\n".utf8))
+        }
+        if skippedPreservedMTPTensors > 0 {
+            FileHandle.standardError.write(Data(
+                "[loadWeights] preserved MTP tensors are isolated from base AR load; skipped \(skippedPreservedMTPTensors) tensor(s) across \(skippedPreservedMTPShards) MTP-only shard(s)\n".utf8))
         }
     }
 
@@ -239,10 +288,12 @@ public func loadWeights(
         // bits=4)`) and would re-introduce the wrong values.
         let configGS: Int? = quantization?.groupSize
         let configBits: Int? = quantization?.bits
+        let configMode: QuantizationMode = quantization?.mode ?? .affine
         let inferred = JangLoader.inferPerLayerQuantization(
             weights: weights, jangConfig: jangConfig,
             overrideGroupSize: configGS,
-            overrideBits: configBits)
+            overrideBits: configBits,
+            overrideMode: configMode)
 
         if !inferred.perLayerQuantization.isEmpty {
             let b = inferred.quantization?.bits ?? -1
@@ -277,14 +328,15 @@ public func loadWeights(
         if let shapeInferred = JangLoader.inferPerLayerQuantizationFromShapes(
             weights: weights,
             defaultBits: perLayerQuantization.quantization?.bits,
-            defaultGroupSize: perLayerQuantization.quantization?.groupSize)
+            defaultGroupSize: perLayerQuantization.quantization?.groupSize,
+            defaultMode: perLayerQuantization.quantization?.mode ?? .affine)
         {
             var corrections = 0
             for (path, expected) in shapeInferred.perLayerQuantization {
                 if case .quantize(let q) = expected {
                     if let configured = remappedPerLayer[path],
                         case .quantize(let cq) = configured,
-                        cq.bits == q.bits && cq.groupSize == q.groupSize
+                        cq.bits == q.bits && cq.groupSize == q.groupSize && cq.mode == q.mode
                     { continue }
                     remappedPerLayer[path] = expected
                     corrections += 1
@@ -311,7 +363,8 @@ public func loadWeights(
             JangLoader.inferPerLayerQuantizationFromShapes(
                 weights: weights,
                 defaultBits: quantization.bits,
-                defaultGroupSize: quantization.groupSize)
+                defaultGroupSize: quantization.groupSize,
+                defaultMode: quantization.mode)
         if let inferred, !inferred.perLayerQuantization.isEmpty {
             let b = inferred.quantization?.bits ?? -1
             let g = inferred.quantization?.groupSize ?? -1

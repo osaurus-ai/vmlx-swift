@@ -1502,23 +1502,24 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     }
 
     private func sanitize(weights: [String: MLXArray], isMLXFormat: Bool) -> [String: MLXArray] {
-        // Detect norm shift need BEFORE filtering MTP keys (same logic as LLM path).
+        var weights = weights.filter { !Self.isMTPWeightKey($0.key) }
+
+        // Detect norm shift need after filtering MTP sidecar keys. Preserved MTP
+        // tensors are not part of the base autoregressive path and must not
+        // change base norm conversion.
         // JANG models have format=mlx but still need norm shift (norms aren't pre-baked).
         // MLX-community models (converted with mlx_lm.convert) DO have norms pre-baked.
-        let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
         }
-        let shouldShiftNormWeights = hasMTPWeights || hasUnsanitizedConv1d || !isMLXFormat
-
-        var weights = weights.filter { !$0.key.contains("mtp.") }
+        let shouldShiftNormWeights = hasUnsanitizedConv1d || !isMLXFormat
 
         if config.textConfiguration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
         }
 
-        // MLX-native models (no MTP, no unsanitized conv1d) may still need key remapping
-        if isMLXFormat && !hasMTPWeights && !hasUnsanitizedConv1d {
+        // MLX-native models with no unsanitized conv1d may still need key remapping.
+        if isMLXFormat && !hasUnsanitizedConv1d {
             let needsRemap = weights.keys.contains { $0.contains("model.language_model") || $0.contains("model.visual") }
             if !needsRemap {
                 return weights
@@ -1564,6 +1565,13 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         }
 
         return visionModel.sanitize(weights: sanitized)
+    }
+
+    private static func isMTPWeightKey(_ key: String) -> Bool {
+        key.hasPrefix("mtp.")
+            || key.hasPrefix("model.mtp_layers.")
+            || key.contains(".mtp.")
+            || key.contains(".mtp_layers.")
     }
 }
 

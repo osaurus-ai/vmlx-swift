@@ -386,6 +386,24 @@ Required gates:
 - The runtime must expose `mtp_available`, `mtp_enabled`, draft depth, accepted
   token count, rejected token count, acceptance rate, fallback count, and speed
   delta in metrics/status.
+- D2/D3 MTP requires a draft step that returns hidden state as well as logits.
+  A logits-only `mtp_forward` is acceptable for metadata or D1 diagnostics only;
+  it is not a production MTP activation path.
+- D3 must verify `[primary, d1, d2, d3]` in one target forward and commit an
+  accepted prefix length of `0...3` plus the verifier bonus. A D1 loop that takes
+  roughly 128 verify cycles for 256 output tokens is not the target; a D3 row
+  should move toward the 50-70 verify-cycle range before speed work is credited.
+- Hybrid/SSM MTP must carry the same variable-prefix rollback/commit semantics:
+  only accepted base tokens and accepted companion state may survive rejection.
+- Partial acceptance is not all-or-nothing. If D3 accepts `d1` and `d2` but
+  rejects `d3`, the cache state after `[primary, d1, d2]` is the only valid
+  committed state. The implementation may use capture/commit for speed or
+  rollback+repair as a measured correctness-first stepping stone.
+- Every native-MTP speed row must include AR baseline tok/s, MTP tok/s, requested
+  and effective depth, verify calls, output tokens, accepted/drafted by depth,
+  average committed tokens per verify call, bonus tokens, correction/rejection
+  count, target verify time, draft time, residual sampling time, cache mode,
+  verify kernel mode, draft-head mode, and output tail review.
 - Unsupported models must fall back to normal decode with a clear status reason,
   not a crash and not silent speculative behavior.
 - Run ON/OFF inverse rows per family: MTP off equals baseline output behavior;

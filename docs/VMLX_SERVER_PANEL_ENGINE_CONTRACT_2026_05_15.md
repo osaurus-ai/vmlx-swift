@@ -121,6 +121,9 @@ VL models add cache and shape invariants beyond text:
 `MTPBundleStatus.mode == preserved_enabled` means the bundle preserved MTP
 metadata/tensors. It does not mean speculative decode is live. The engine may
 only auto-launch MTP when status says a verified accept/reject runtime exists.
+The status must be derived from actual weight-map or safetensors-header tensor
+names, not from model or directory names. If metadata claims MTP but tensor names
+do not prove it, the server must surface `metadata_only_missing_weights`.
 
 MTP cache rules:
 
@@ -129,6 +132,12 @@ MTP cache rules:
 - only accepted tokens are appended to base cache;
 - VL bundles with MTP must keep media embeddings, media salt, and draft text
   state separate.
+- D2/D3 acceptance is prefix-length based, not binary. A verifier round that
+  accepts `d1,d2` and rejects `d3` must commit cache state after
+  `[primary,d1,d2]`.
+- Osaurus should surface verify calls, accepted/drafted by depth, average
+  committed tokens per verify, bonus tokens, corrections, phase timing, cache
+  mode, and verifier kernel mode for any future MTP-on row.
 
 ## Live Proof Dependency
 

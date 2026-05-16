@@ -12,7 +12,8 @@ Options:
                           discovered config.json bundles under --models-root.
   --run-dir PATH          Artifact directory. Default:
                           docs/local/live-model-matrix/<timestamp>
-  --profile NAME          inventory|metadata|text|batch|vl|omni|mtp|all. Default: inventory
+  --profile NAME          inventory|metadata|infer|text|batch|vl|omni|mtp|turnmatrix|all.
+                          Default: inventory
   --max-size-gb N         Skip live load above N GB unless --allow-huge. Default: 20
   --allow-huge            Permit live loads above --max-size-gb.
   --no-build              Reuse existing .build/debug/RunBench.
@@ -22,11 +23,16 @@ Options:
 Profiles:
   inventory   Write models.tsv only.
   metadata    Run no/low-load config and template smokes.
+  infer       Run plain inference rows only: metadata, BENCH_PROD without a
+              cache coordinator, plus direct media inference for VL/Omni.
   text        Run BENCH_PROD with an explicit cache coordinator.
   batch       Run B=1, multi-turn, cache-hit, B=2, per-slot sampler, and TQ B=2.
   vl          Run VL BatchEngine chat and media-salt cache probes.
   omni        Run Nemotron Omni probe with BatchEngine stress enabled.
   mtp         Run focused MTP metadata tests for MTP-looking bundles.
+  turnmatrix  Run the production turn matrix for the detected family:
+              metadata, MTP metadata when present, tiered cache OFF/ON,
+              reasoning ON/OFF, batch cache stack, and media rows for VL/Omni.
   all         metadata plus the model-family live profile.
 
 This is a proof harness, not a pass generator. Skipped or failed rows remain
@@ -42,6 +48,7 @@ ALLOW_HUGE=0
 BUILD=1
 DRY_RUN=0
 MODELS=()
+SWIFT_DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -76,7 +83,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$PROFILE" in
-  inventory|metadata|text|batch|vl|omni|mtp|all) ;;
+  inventory|metadata|infer|text|batch|vl|omni|mtp|turnmatrix|all) ;;
   *) echo "unknown profile: $PROFILE" >&2; exit 2 ;;
 esac
 
@@ -110,20 +117,81 @@ has_file_named() {
 
 contains_mtp_evidence() {
   local dir="$1"
-  [[ "$(basename "$dir" | tr '[:upper:]' '[:lower:]')" == *mtp* ]] && return 0
-  if [[ -f "$dir/config.json" ]] &&
-     jq -e '.. | objects | to_entries[]? | select((.key|ascii_downcase|contains("mtp")) and (.value != null))' \
-       "$dir/config.json" >/dev/null 2>&1
-  then
-    return 0
-  fi
-  if [[ -f "$dir/jang_config.json" ]] &&
-     jq -e '.. | objects | to_entries[]? | select((.key|ascii_downcase|contains("mtp")) and (.value != null))' \
-       "$dir/jang_config.json" >/dev/null 2>&1
-  then
-    return 0
-  fi
-  return 1
+  python3 - "$dir" <<'PY'
+import json
+import pathlib
+import struct
+import sys
+
+root = pathlib.Path(sys.argv[1])
+
+def load_json(path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+def int_value(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+def safetensors_header_names(path):
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(8)
+            if len(raw) != 8:
+                return []
+            header_len = struct.unpack("<Q", raw)[0]
+            if header_len <= 0 or header_len > 64 * 1024 * 1024:
+                return []
+            header = json.loads(handle.read(header_len))
+    except Exception:
+        return []
+    return [key for key in header if key != "__metadata__"]
+
+def tensor_names():
+    index = load_json(root / "model.safetensors.index.json")
+    weight_map = index.get("weight_map")
+    if isinstance(weight_map, dict):
+        return list(weight_map)
+    names = []
+    for path in sorted(root.glob("*.safetensors")):
+        names.extend(safetensors_header_names(path))
+    return names
+
+config = load_json(root / "config.json")
+text_config = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
+prefixes = []
+for base_layer in (
+    int_value(config.get("num_hidden_layers")),
+    int_value(text_config.get("num_hidden_layers")),
+):
+    if base_layer is not None and base_layer > 0:
+        prefixes.append(f"model.layers.{base_layer}.")
+        prefixes.append(f"language_model.model.layers.{base_layer}.")
+
+def is_mtp_tensor(name):
+    lower = name.lower()
+    if lower.startswith("mtp.") or lower.startswith("model.mtp_layers."):
+        return True
+    if ".mtp." in lower or ".mtp_layers." in lower:
+        return True
+    if "nextn" in lower or "next_n" in lower:
+        return True
+    return any(name.startswith(prefix) for prefix in prefixes)
+
+sys.exit(0 if any(is_mtp_tensor(name) for name in tensor_names()) else 1)
+PY
 }
 
 classify_profile() {
@@ -206,13 +274,82 @@ run_logged() {
   return "$code"
 }
 
+mark_status() {
+  local name="$1" status="$2"
+  printf "%s\t%s\n" "$name" "$status" >>"${RUN_DIR}/status.tsv"
+}
+
 run_runbench() {
   local name="$1"; shift
   run_logged "$name" env "$@" .build/debug/RunBench
 }
 
 matrix_max_tokens() {
-  printf "%s" "${VMLX_MATRIX_MAX_TOKENS:-${VMLINUX_MATRIX_MAX_TOKENS:-64}}"
+  printf "%s" "${VMLX_MATRIX_MAX_TOKENS:-${VMLINUX_MATRIX_MAX_TOKENS:-192}}"
+}
+
+matrix_prod_max_tokens() {
+  printf "%s" "${VMLX_MATRIX_PROD_MAX_TOKENS:-${VMLINUX_MATRIX_PROD_MAX_TOKENS:-2048}}"
+}
+
+matrix_prod_seed() {
+  printf "%s" "${VMLX_MATRIX_PROD_SEED:-${VMLINUX_MATRIX_PROD_SEED:-0}}"
+}
+
+run_text_turn_matrix() {
+  local name="$1" dir="$2" max_tokens="$3"
+  local cache_dir="${RUN_DIR}/${name}.prod-cache"
+  local prod_max_tokens prod_seed
+  prod_max_tokens="$(matrix_prod_max_tokens)"
+  prod_seed="$(matrix_prod_seed)"
+
+  # Tiered cache OFF: no CacheCoordinator, so no cross-request prefix, paged,
+  # disk-L2, or SSM companion state. Per-request KV remains required for real
+  # autoregressive decode.
+  run_runbench "${name}.prod_defaults_tiered_cache_off" \
+    BENCH_MODEL="$dir" BENCH_PROD=1 BENCH_PROD_SEED="$prod_seed" \
+    BENCH_MAX_TOKENS="$prod_max_tokens" || true
+
+  run_runbench "${name}.prod_defaults_tiered_cache_on" \
+    BENCH_MODEL="$dir" BENCH_PROD=1 BENCH_PROD_SEED="$prod_seed" BENCH_PROD_COORD=1 \
+    BENCH_PROD_CACHE_DIR="$cache_dir" \
+    BENCH_MAX_TOKENS="$prod_max_tokens" || true
+
+  if [[ "${VMLX_MATRIX_INCLUDE_GREEDY:-${VMLINUX_MATRIX_INCLUDE_GREEDY:-0}}" == "1" ]]; then
+    run_runbench "${name}.prod_greedy_tiered_cache_off" \
+      BENCH_MODEL="$dir" BENCH_PROD=1 BENCH_PROD_GREEDY=1 BENCH_PROD_SEED="$prod_seed" \
+      BENCH_MAX_TOKENS="$prod_max_tokens" || true
+    run_runbench "${name}.prod_greedy_tiered_cache_on" \
+      BENCH_MODEL="$dir" BENCH_PROD=1 BENCH_PROD_GREEDY=1 BENCH_PROD_SEED="$prod_seed" BENCH_PROD_COORD=1 \
+      BENCH_PROD_CACHE_DIR="${RUN_DIR}/${name}.prod-greedy-cache" \
+      BENCH_MAX_TOKENS="$prod_max_tokens" || true
+  fi
+
+  run_batch_stack "$name" "$dir" "$max_tokens"
+}
+
+run_plain_infer_matrix() {
+  local name="$1" dir="$2" family_profile="$3" max_tokens="$4"
+  local prod_max_tokens prod_seed
+  prod_max_tokens="$(matrix_prod_max_tokens)"
+  prod_seed="$(matrix_prod_seed)"
+
+  run_runbench "${name}.infer_prod_defaults_cache_off" \
+    BENCH_MODEL="$dir" BENCH_PROD=1 BENCH_PROD_SEED="$prod_seed" \
+    BENCH_MAX_TOKENS="$prod_max_tokens" || true
+
+  case "$family_profile" in
+    vl)
+      run_runbench "${name}.infer_vl_batch_chat" \
+        BENCH_MODEL="$dir" BENCH_VL_BATCH_CHAT=1 \
+        BENCH_MAX_TOKENS="$max_tokens" || true
+      ;;
+    omni)
+      run_runbench "${name}.infer_omni" \
+        BENCH_MODEL="$dir" BENCH_OMNI=1 \
+        BENCH_MAX_TOKENS="$max_tokens" || true
+      ;;
+  esac
 }
 
 run_batch_stack() {
@@ -240,13 +377,50 @@ run_batch_stack() {
     BENCH_MAX_TOKENS="$max_tokens" || true
 }
 
+run_vl_turn_matrix() {
+  local name="$1" dir="$2" max_tokens="$3"
+  local video_path="${VMLX_MATRIX_VIDEO:-${VMLINUX_MATRIX_VIDEO:-Tests/MLXLMTests/Resources/1080p_30.mov}}"
+
+  # Text-only rows on a VL bundle are the "VL payload OFF" proof. Media rows
+  # below are the "VL payload ON" proof.
+  run_text_turn_matrix "$name" "$dir" "$max_tokens"
+
+  run_runbench "${name}.vl_batch_chat" \
+    BENCH_MODEL="$dir" BENCH_VL_BATCH_CHAT=1 \
+    BENCH_MAX_TOKENS="$max_tokens" || true
+  run_runbench "${name}.vl_chat_cache" \
+    BENCH_MODEL="$dir" BENCH_VL_CHAT_CACHE=1 \
+    BENCH_MAX_TOKENS="$max_tokens" || true
+  run_runbench "${name}.vl_media_salt" \
+    BENCH_MODEL="$dir" BENCH_VL_BATCH_MEDIASALT=1 \
+    BENCH_MAX_TOKENS="$max_tokens" || true
+
+  if [[ -f "$video_path" ]]; then
+    run_runbench "${name}.vl_mixed_text_image_video" \
+      BENCH_MODEL="$dir" BENCH_VL_MIXED=1 BENCH_VIDEO="$video_path" \
+      BENCH_MAX_TOKENS="$max_tokens" || true
+  else
+    mark_status "${name}.vl_mixed_text_image_video" "n-a:no-video-fixture"
+  fi
+}
+
+run_omni_turn_matrix() {
+  local name="$1" dir="$2" max_tokens="$3"
+
+  run_text_turn_matrix "$name" "$dir" "$max_tokens"
+  run_runbench "${name}.omni" \
+    BENCH_MODEL="$dir" BENCH_OMNI=1 BENCH_OMNI_BATCH=1 \
+    BENCH_MAX_TOKENS="$max_tokens" || true
+}
+
 safe_name() {
   basename "$1" | tr -c 'A-Za-z0-9._-' '_'
 }
 
 maybe_build() {
   [[ "$BUILD" -eq 0 || "$PROFILE" == "inventory" ]] && return 0
-  run_logged build_runbench swift build --jobs "${VMLINUX_SWIFT_BUILD_JOBS:-2}" --product RunBench
+  run_logged build_runbench env DEVELOPER_DIR="$SWIFT_DEVELOPER_DIR" \
+    swift build --jobs "${VMLINUX_SWIFT_BUILD_JOBS:-2}" --product RunBench
 }
 
 write_inventory
@@ -271,15 +445,18 @@ while IFS=$'\t' read -r status size_gb bytes family_profile mtp arch model_type 
     continue
   fi
 
-  if [[ "$PROFILE" == "metadata" || "$PROFILE" == "all" ]]; then
+  if [[ "$PROFILE" == "metadata" || "$PROFILE" == "infer" || "$PROFILE" == "all" || "$PROFILE" == "turnmatrix" ]]; then
     run_runbench "${name}.config" BENCH_MODEL="$dir" BENCH_CONFIG_SMOKE=1 BENCH_MAX_TOKENS=8 || true
     run_runbench "${name}.template" BENCH_MODEL="$dir" BENCH_TEMPLATE_SMOKE=1 BENCH_MAX_TOKENS=8 || true
   fi
 
-  if [[ "$PROFILE" == "mtp" || ( "$PROFILE" == "all" && "$mtp" == "yes" ) ]]; then
+  if [[ "$PROFILE" == "mtp" && "$mtp" != "yes" ]]; then
+    mark_status "${name}.mtp" "n-a:no-mtp-tensors"
+  elif [[ "$PROFILE" == "mtp" || ( ( "$PROFILE" == "all" || "$PROFILE" == "turnmatrix" ) && "$mtp" == "yes" ) ]]; then
     expects_vl=0
     [[ "$family_profile" == "vl" ]] && expects_vl=1
     run_logged "${name}.mtp" env \
+      DEVELOPER_DIR="$SWIFT_DEVELOPER_DIR" \
       VMLX_MTP_REAL_BUNDLE="$dir" \
       VMLX_MTP_REAL_BUNDLE_EXPECTS_VL="$expects_vl" \
       swift test --filter MTPRuntimeFocusedTests --jobs 2 || true
@@ -289,6 +466,16 @@ while IFS=$'\t' read -r status size_gb bytes family_profile mtp arch model_type 
   [[ "$PROFILE" == "all" ]] && live_profile="$family_profile"
 
   case "$live_profile" in
+    infer)
+      run_plain_infer_matrix "$name" "$dir" "$family_profile" "$(matrix_max_tokens)"
+      ;;
+    turnmatrix)
+      case "$family_profile" in
+        text) run_text_turn_matrix "$name" "$dir" "$(matrix_max_tokens)" ;;
+        vl) run_vl_turn_matrix "$name" "$dir" "$(matrix_max_tokens)" ;;
+        omni) run_omni_turn_matrix "$name" "$dir" "$(matrix_max_tokens)" ;;
+      esac
+      ;;
     text)
       run_runbench "${name}.prod" \
         BENCH_MODEL="$dir" BENCH_PROD=1 BENCH_PROD_COORD=1 \
@@ -320,6 +507,9 @@ done <"${RUN_DIR}/models.tsv"
   printf -- "- run dir: %s\n" "$RUN_DIR"
   printf -- "- profile: %s\n" "$PROFILE"
   printf -- "- max size GB: %s\n" "$MAX_SIZE_GB"
+  printf -- "- prod max tokens: %s\n" "$(matrix_prod_max_tokens)"
+  printf -- "- prod seed: %s\n" "$(matrix_prod_seed)"
+  printf -- "- batch/media max tokens: %s\n" "$(matrix_max_tokens)"
   printf -- "- allow huge: %s\n" "$ALLOW_HUGE"
   printf -- "- dry run: %s\n\n" "$DRY_RUN"
   printf "## Status\n\n"

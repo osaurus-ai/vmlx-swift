@@ -146,6 +146,140 @@ public struct MTPDraftStateContract: Codable, Sendable, Equatable {
     }
 }
 
+/// Cache commit policy for a future MTP verifier round.
+public enum MTPBackboneCacheCommitPolicy: String, Codable, Sendable, Equatable {
+    /// Only tokens verified and accepted by the backbone model may enter base KV,
+    /// paged cache, disk L2, SSM companion state, or media-scoped cache state.
+    case acceptedVerifierTokensOnly = "accepted_verifier_tokens_only"
+}
+
+/// Correct ways to preserve backbone cache state after a partially accepted MTP
+/// verify round. All-or-nothing draft acceptance is not a valid D2/D3 semantic.
+public enum MTPPartialAcceptCommitStrategy: String, Codable, Sendable, Equatable {
+    /// Capture intermediate verifier KV/recurrent states and install the state
+    /// matching the accepted draft prefix. This is the intended speed path.
+    case captureCommit = "capture_commit"
+
+    /// Roll back to the primary verifier state, then re-forward the accepted
+    /// draft prefix through the target model. This is correctness-first and
+    /// measurably slower when partial rejections occur.
+    case rollbackRepair = "rollback_repair"
+}
+
+/// Required telemetry surface for any future native-MTP speed claim.
+public struct MTPSpeedBenchRequirements: Codable, Sendable, Equatable {
+    public let requiresARBaseline: Bool
+    public let requiresMTPDepth: Bool
+    public let requiresVerifyCalls: Bool
+    public let requiresAcceptedDraftedByDepth: Bool
+    public let requiresCommittedTokensPerVerify: Bool
+    public let requiresBonusTokenCount: Bool
+    public let requiresCorrectionCount: Bool
+    public let requiresPhaseTiming: Bool
+    public let requiresCacheMode: Bool
+    public let requiresVerifyKernelMode: Bool
+    public let requiresDraftHeadMode: Bool
+    public let requiresOutputTailReview: Bool
+
+    public init(
+        requiresARBaseline: Bool = true,
+        requiresMTPDepth: Bool = true,
+        requiresVerifyCalls: Bool = true,
+        requiresAcceptedDraftedByDepth: Bool = true,
+        requiresCommittedTokensPerVerify: Bool = true,
+        requiresBonusTokenCount: Bool = true,
+        requiresCorrectionCount: Bool = true,
+        requiresPhaseTiming: Bool = true,
+        requiresCacheMode: Bool = true,
+        requiresVerifyKernelMode: Bool = true,
+        requiresDraftHeadMode: Bool = true,
+        requiresOutputTailReview: Bool = true
+    ) {
+        self.requiresARBaseline = requiresARBaseline
+        self.requiresMTPDepth = requiresMTPDepth
+        self.requiresVerifyCalls = requiresVerifyCalls
+        self.requiresAcceptedDraftedByDepth = requiresAcceptedDraftedByDepth
+        self.requiresCommittedTokensPerVerify = requiresCommittedTokensPerVerify
+        self.requiresBonusTokenCount = requiresBonusTokenCount
+        self.requiresCorrectionCount = requiresCorrectionCount
+        self.requiresPhaseTiming = requiresPhaseTiming
+        self.requiresCacheMode = requiresCacheMode
+        self.requiresVerifyKernelMode = requiresVerifyKernelMode
+        self.requiresDraftHeadMode = requiresDraftHeadMode
+        self.requiresOutputTailReview = requiresOutputTailReview
+    }
+
+    public static let nativeMTP = MTPSpeedBenchRequirements()
+}
+
+/// Depth-aware runtime contract for recursive MTP draft/verify.
+///
+/// This is a correctness contract, not an implementation switch. It exists so
+/// status/UI/server wiring can distinguish a one-token logits-only experiment
+/// from the real D2/D3 path needed for useful MTP speedups.
+public struct MTPRecursiveDraftContract: Codable, Sendable, Equatable {
+    public let depth: Int
+    public let draftStepReturnsHiddenState: Bool
+    public let verifierIncludesPrimaryPosition: Bool
+    public let backboneCacheCommitPolicy: MTPBackboneCacheCommitPolicy
+    public let draftCacheIsPrivate: Bool
+    public let minAcceptedDraftTokensPerVerify: Int
+    public let maxAcceptedDraftTokensPerVerify: Int
+    public let requiresVariablePrefixCommit: Bool
+    public let requiresCompiledVerifyHotPath: Bool
+    public let requiresSmallMVerifyTuning: Bool
+    public let partialAcceptCommitStrategy: MTPPartialAcceptCommitStrategy
+    public let speedBenchRequirements: MTPSpeedBenchRequirements
+
+    public init(
+        depth: Int,
+        draftStepReturnsHiddenState: Bool = true,
+        verifierIncludesPrimaryPosition: Bool = true,
+        backboneCacheCommitPolicy: MTPBackboneCacheCommitPolicy = .acceptedVerifierTokensOnly,
+        draftCacheIsPrivate: Bool = true,
+        minAcceptedDraftTokensPerVerify: Int = 0,
+        maxAcceptedDraftTokensPerVerify: Int? = nil,
+        requiresVariablePrefixCommit: Bool = true,
+        requiresCompiledVerifyHotPath: Bool = true,
+        requiresSmallMVerifyTuning: Bool = true,
+        partialAcceptCommitStrategy: MTPPartialAcceptCommitStrategy = .captureCommit,
+        speedBenchRequirements: MTPSpeedBenchRequirements = .nativeMTP
+    ) {
+        self.depth = max(0, depth)
+        self.draftStepReturnsHiddenState = draftStepReturnsHiddenState
+        self.verifierIncludesPrimaryPosition = verifierIncludesPrimaryPosition
+        self.backboneCacheCommitPolicy = backboneCacheCommitPolicy
+        self.draftCacheIsPrivate = draftCacheIsPrivate
+        self.minAcceptedDraftTokensPerVerify = max(0, minAcceptedDraftTokensPerVerify)
+        self.maxAcceptedDraftTokensPerVerify = max(
+            0, min(maxAcceptedDraftTokensPerVerify ?? max(0, depth), max(0, depth)))
+        self.requiresVariablePrefixCommit = requiresVariablePrefixCommit
+        self.requiresCompiledVerifyHotPath = requiresCompiledVerifyHotPath
+        self.requiresSmallMVerifyTuning = requiresSmallMVerifyTuning
+        self.partialAcceptCommitStrategy = partialAcceptCommitStrategy
+        self.speedBenchRequirements = speedBenchRequirements
+    }
+
+    /// Target verifier positions per round: primary position plus recursive
+    /// draft positions. D3 verifies `[primary, d1, d2, d3]`.
+    public var verifierPositionsPerCycle: Int {
+        (verifierIncludesPrimaryPosition ? 1 : 0) + depth
+    }
+
+    /// Maximum emitted tokens per successful verify cycle: accepted drafts plus
+    /// the target bonus token from the verifier.
+    public var maxCommittedTokensPerVerify: Int {
+        maxAcceptedDraftTokensPerVerify + (verifierIncludesPrimaryPosition ? 1 : 0)
+    }
+
+    public func fullAcceptanceVerifyCycles(forOutputTokens outputTokens: Int) -> Int {
+        guard outputTokens > 0, maxCommittedTokensPerVerify > 0 else { return 0 }
+        return Int(ceil(Double(outputTokens) / Double(maxCommittedTokensPerVerify)))
+    }
+
+    public static let mtplxDepth3 = MTPRecursiveDraftContract(depth: 3)
+}
+
 /// No-load MTP/VL inspector. It reads JSON metadata and safetensors headers only;
 /// it never materializes tensors or changes the active generation path.
 public enum MTPBundleInspector {
@@ -164,13 +298,18 @@ public enum MTPBundleInspector {
 
         let runtimeMode = jangConfig?.runtime.mtpMode ?? .none
         let runtimeBundleHasMTP = jangConfig?.runtime.bundleHasMTP ?? false
-        let bundleHasMTP = runtimeBundleHasMTP || !mtpNames.isEmpty
+        let metadataClaimsMTP = runtimeBundleHasMTP || runtimeMode != .none || configuredLayers > 0
+        let bundleHasMTP = !mtpNames.isEmpty
+        var statusEvidence = evidence
+        if runtimeBundleHasMTP {
+            statusEvidence.append("jang_config.runtime.bundle_has_mtp=true")
+        }
 
         let mode: MTPRuntimeMode
-        if runtimeMode != .none {
-            mode = runtimeMode
-        } else if !bundleHasMTP && configuredLayers > 0 {
+        if !bundleHasMTP && metadataClaimsMTP {
             mode = .metadataOnlyMissingWeights
+        } else if runtimeMode != .none {
+            mode = runtimeMode
         } else if bundleHasMTP && configuredLayers > 0 {
             mode = .preservedEnabled
         } else {
@@ -185,7 +324,7 @@ public enum MTPBundleInspector {
             mode: mode,
             tensorSamples: Array(mtpNames.sorted().prefix(8)),
             visionTensorSamples: Array(visionNames.sorted().prefix(8)),
-            configEvidence: evidence)
+            configEvidence: Array(Set(statusEvidence)).sorted())
     }
 
     private static func configuredMTPLayers(

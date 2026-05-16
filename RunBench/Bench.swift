@@ -2427,11 +2427,12 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
 /// DIFFERENT `GenerateParameters`. Verify both slots' samplers actually
 /// fire with their respective settings:
 ///
-/// - Slot 0: temp=0 (greedy). Re-running the same input must produce
-///   byte-identical tokens.
-/// - Slot 1: temp=0.8 topP=0.9 with a fixed seed. Output must differ
-///   from the greedy path by at least one token (otherwise the sampler
-///   didn't actually kick in, or both slots share a sampler instance).
+/// - Slot 0: temp=0 (greedy). Re-running the same B=2 shape with the same
+///   companion slot must produce byte-identical tokens.
+/// - Slot 1: temp=0.8 topP=0.9 with a fixed seed. Re-running the same B=2
+///   shape must produce byte-identical tokens, and the output must differ from
+///   the greedy path by at least one token (otherwise the sampler didn't
+///   actually kick in, or both slots share a sampler instance).
 func runBatchEnginePerSlotSampler(modelPath: String, maxNew: Int) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     print("\n=== BatchEngine per-slot sampler (iter 36) ===")
@@ -2464,72 +2465,81 @@ func runBatchEnginePerSlotSampler(modelPath: String, maxNew: Int) async throws {
     var stochasticParams = GenerateParameters(
         maxTokens: maxNew, temperature: 0.8, prefillStepSize: 512)
     stochasticParams.topP = 0.9
+    stochasticParams.randomSeed = 36
 
     nonisolated(unsafe) let ctx = context
-    let engine = BatchEngine(context: ctx, maxBatchSize: 2)
+
+    func runPair(label: String) async -> ([Int], [Int]) {
+        let engine = BatchEngine(context: ctx, maxBatchSize: 2)
+        nonisolated(unsafe) let in0 = freshInput()
+        nonisolated(unsafe) let in1 = freshInput()
+        let (_, s0) = await engine.submit(input: in0, parameters: greedyParams)
+        let (_, s1) = await engine.submit(input: in1, parameters: stochasticParams)
+        await requireActiveSlotOverlap(engine, atLeast: 2, label: label)
+
+        let results = await withTaskGroup(of: (Int, [Int]).self) { group in
+            group.addTask {
+                var ids: [Int] = []
+                for await e in s0 {
+                    if case .token(let id) = e { ids.append(id) }
+                    if ids.count >= maxNew { break }
+                }
+                return (0, ids)
+            }
+            group.addTask {
+                var ids: [Int] = []
+                for await e in s1 {
+                    if case .token(let id) = e { ids.append(id) }
+                    if ids.count >= maxNew { break }
+                }
+                return (1, ids)
+            }
+            var collected: [(Int, [Int])] = []
+            for await result in group {
+                collected.append(result)
+            }
+            return collected.sorted { $0.0 < $1.0 }
+        }
+        await engine.shutdown()
+        return (results[0].1, results[1].1)
+    }
 
     // Submit both concurrently — same engine, same model, same prompt,
     // different params.
-    nonisolated(unsafe) let in0 = freshInput()
-    nonisolated(unsafe) let in1 = freshInput()
-    let (_, s0) = await engine.submit(input: in0, parameters: greedyParams)
-    let (_, s1) = await engine.submit(input: in1, parameters: stochasticParams)
-
-    let results = await withTaskGroup(of: (Int, [Int]).self) { group in
-        group.addTask {
-            var ids: [Int] = []
-            for await e in s0 {
-                if case .token(let id) = e { ids.append(id) }
-                if ids.count >= maxNew { break }
-            }
-            return (0, ids)
-        }
-        group.addTask {
-            var ids: [Int] = []
-            for await e in s1 {
-                if case .token(let id) = e { ids.append(id) }
-                if ids.count >= maxNew { break }
-            }
-            return (1, ids)
-        }
-        var collected: [(Int, [Int])] = []
-        for await result in group {
-            collected.append(result)
-        }
-        return collected.sorted { $0.0 < $1.0 }
-    }
-    let greedyTokens = results[0].1
-    let stochasticTokens = results[1].1
+    let (greedyTokens, stochasticTokens) = await runPair(label: "PerSlotSampler B=2")
     print("  slot 0 (temp=0)    first 15: \(Array(greedyTokens.prefix(15)))")
-    print("  slot 1 (temp=0.8)  first 15: \(Array(stochasticTokens.prefix(15)))")
+    print("  slot 1 (temp=0.8, seed=36) first 15: \(Array(stochasticTokens.prefix(15)))")
 
-    // Re-run slot 0 alone to confirm greedy determinism. Use a FRESH
-    // engine — the previous B=2 submission has finished and we want a
-    // clean cache. Same prompt + same params → must produce the same
-    // tokens. If not, either the sampler bled state across slots or
-    // temp=0 isn't truly greedy.
-    nonisolated(unsafe) let greedyRecheckInput = freshInput()
-    let recheckEngine = BatchEngine(context: ctx, maxBatchSize: 1)
-    let (_, sr) = await recheckEngine.submit(
-        input: greedyRecheckInput, parameters: greedyParams)
-    var greedyRecheck: [Int] = []
-    for await e in sr {
-        if case .token(let id) = e { greedyRecheck.append(id) }
-        if greedyRecheck.count >= maxNew { break }
-    }
-    print("  slot 0 re-run      first 15: \(Array(greedyRecheck.prefix(15)))")
+    // Re-run the identical B=2 shape with a fresh engine. This is the
+    // load-bearing determinism check: it avoids conflating true per-slot
+    // sampler/state bugs with legitimate B=1-vs-B=2 low-bit tie-breaking.
+    let (greedyRecheck, stochasticRecheck) = await runPair(
+        label: "PerSlotSampler B=2 recheck")
+    print("  slot 0 B=2 re-run  first 15: \(Array(greedyRecheck.prefix(15)))")
+    print("  slot 1 B=2 re-run  first 15: \(Array(stochasticRecheck.prefix(15)))")
 
     // Assertions.
-    // 1. Greedy path must be deterministic across runs.
+    // 1. Greedy path must be deterministic across identical B=2 runs.
     if greedyTokens != greedyRecheck {
         fputs("[PerSlotSampler] FAIL: greedy slot 0 diverged between runs — " +
               "\(greedyTokens.count) vs \(greedyRecheck.count) tokens, " +
               "first diff at \(firstDiffIndex(greedyTokens, greedyRecheck) ?? -1). " +
-              "Either temp=0 isn't really greedy or slot state bled across submissions.\n",
+              "Either temp=0 isn't really greedy or slot state bled across identical B=2 submissions.\n",
               stderr)
         exit(1)
     }
-    // 2. Stochastic path must differ from greedy on at least one token.
+    // 2. Fixed-seed stochastic path must also be deterministic across
+    //    identical B=2 runs. This proves the sampler's random state is
+    //    request-local rather than shared across slots.
+    if stochasticTokens != stochasticRecheck {
+        fputs("[PerSlotSampler] FAIL: fixed-seed stochastic slot diverged between B=2 runs — " +
+              "\(stochasticTokens.count) vs \(stochasticRecheck.count) tokens, " +
+              "first diff at \(firstDiffIndex(stochasticTokens, stochasticRecheck) ?? -1). " +
+              "Sampler RNG state is not request-local.\n",
+              stderr)
+        exit(1)
+    }
+    // 3. Stochastic path must differ from greedy on at least one token.
     //    (Not guaranteed on every run — sampling MAY happen to match the
     //    greedy choice — but on a real prompt with temp=0.8 and ≥20 tokens
     //    the probability of byte-for-byte match is effectively zero.)
@@ -6612,8 +6622,35 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
     }
     let engine = BatchEngine(
         context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
-    let params = GenerateParameters(
-        maxTokens: budget, temperature: 0, prefillStepSize: 512)
+    let greedy = (env["BENCH_PROD_GREEDY"] ?? "0") == "1"
+    let randomSeed = env["BENCH_PROD_SEED"].flatMap(UInt64.init)
+    var params: GenerateParameters
+    if greedy {
+        params = GenerateParameters(
+            maxTokens: budget, temperature: 0, topP: 1, topK: 0,
+            minP: 0, randomSeed: randomSeed, repetitionPenalty: nil,
+            prefillStepSize: 512)
+    } else {
+        let fallback = GenerateParameters(
+            maxTokens: budget, randomSeed: randomSeed, prefillStepSize: 512)
+        params = GenerateParameters(
+            generationConfig: context.configuration.generationDefaults,
+            fallback: fallback)
+        // The live gate owns decode budget. Bundle generation_config drives
+        // sampling, but a huge max_new_tokens must not make matrix rows unbounded.
+        params.maxTokens = budget
+        params.randomSeed = randomSeed
+    }
+    print(String(format:
+        "Sampling: mode=%@ maxTokens=%d temp=%.3f topP=%.3f topK=%d minP=%.3f rep=%@ seed=%@",
+        greedy ? "explicit-greedy" : "bundle-defaults",
+        params.maxTokens ?? -1,
+        Double(params.temperature),
+        Double(params.topP),
+        params.topK,
+        Double(params.minP),
+        params.repetitionPenalty.map { String(format: "%.3f", Double($0)) } ?? "nil",
+        params.randomSeed.map(String.init) ?? "nil"))
 
     final class Stats: @unchecked Sendable {
         var peakRSS: Double; var pass = 0; var fail = 0
@@ -6682,13 +6719,63 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
             short.replacingOccurrences(of: "\n", with: "\\n")))
     }
 
+    func visibleReasoningMarkerLeak(_ text: String) -> String? {
+        [
+            "<think>", "</think>",
+            "[THINK]", "[/THINK]",
+            "<|channel>", "<channel|>",
+            "<|channel|>analysis", "<|channel|>final",
+            "<|message|>",
+        ].first { text.contains($0) }
+    }
+
+    func requireNoVisibleReasoningMarkers(_ r: TurnResult) -> (Bool, String) {
+        if let marker = visibleReasoningMarkerLeak(r.text) {
+            return (false, "visible chunk leaked reasoning marker \(marker)")
+        }
+        return (true, "")
+    }
+
+    func requireVisibleAnswer(_ r: TurnResult, contains expected: String) -> (Bool, String) {
+        let noLeak = requireNoVisibleReasoningMarkers(r)
+        if !noLeak.0 { return noLeak }
+        if context.configuration.reasoningParserName != nil &&
+            r.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return (false, "reasoning ON produced no .reasoning deltas")
+        }
+        let visible = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if visible.isEmpty {
+            return (false, "answer only appeared in reasoning / no visible chunk")
+        }
+        if !r.text.contains(expected) {
+            if r.reasoning.contains(expected) {
+                return (false, "'\(expected)' only appeared in reasoning")
+            }
+            return (false, "no '\(expected)' in visible output")
+        }
+        return (true, "")
+    }
+
+    func requireReasoningOffVisible(_ r: TurnResult) -> (Bool, String) {
+        let noLeak = requireNoVisibleReasoningMarkers(r)
+        if !noLeak.0 { return noLeak }
+        if !r.reasoning.isEmpty {
+            return (false, "reasoning emitted while enable_thinking=false")
+        }
+        if r.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return (false, "empty visible output")
+        }
+        return (true, "")
+    }
+
     // ──────────────── S1  reasoning=ON math ────────────────
     try await runTurn(
         label: "S1 think=ON math(7+8-11)",
         prompt: "Compute 7 + 8 - 11. Respond with just the number.",
         thinking: true
     ) { r in
-        (r.text + r.reasoning).contains("4") ? (true, "") : (false, "no '4'")
+        requireVisibleAnswer(r, contains: "4")
     }
 
     // ──────────────── S2  same prompt → cache hit ────────────────
@@ -6697,8 +6784,8 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
         prompt: "Compute 7 + 8 - 11. Respond with just the number.",
         thinking: true
     ) { r in
-        let contentOK = (r.text + r.reasoning).contains("4")
-        if !contentOK { return (false, "no '4' on cache hit") }
+        let contentOK = requireVisibleAnswer(r, contains: "4")
+        if !contentOK.0 { return contentOK }
         let ttftS1 = stats.ttftByLabel["S1 think=ON math(7+8-11)"] ?? 99999
         // Soft check: warn on no speedup, don't fail
         if r.ttftMs >= Int(Double(ttftS1) * 0.95) {
@@ -6713,9 +6800,10 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
         prompt: "What color is the sky on a clear day? Answer with one word.",
         thinking: false
     ) { r in
+        let visible = requireReasoningOffVisible(r)
+        if !visible.0 { return visible }
         let t = (r.text + r.reasoning).lowercased()
         if t.contains("blue") { return (true, "") }
-        if (r.text + r.reasoning).isEmpty { return (false, "empty") }
         return (true, "accepted non-blue")
     }
 
@@ -6725,22 +6813,21 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
         prompt: "Compute 12 + 3. Respond with just the number.",
         thinking: true
     ) { r in
-        (r.text + r.reasoning).contains("15") ? (true, "") : (false, "no '15'")
+        requireVisibleAnswer(r, contains: "15")
     }
     try await runTurn(
         label: "S4.2 flip think=OFF name",
         prompt: "Name a planet. One word.",
         thinking: false
     ) { r in
-        if (r.text + r.reasoning).isEmpty { return (false, "empty") }
-        return (true, "")
+        requireReasoningOffVisible(r)
     }
     try await runTurn(
         label: "S4.3 flip-back think=ON math(5*4)",
         prompt: "Compute 5 * 4. Respond with just the number.",
         thinking: true
     ) { r in
-        (r.text + r.reasoning).contains("20") ? (true, "") : (false, "no '20'")
+        requireVisibleAnswer(r, contains: "20")
     }
 
     // ──────────────── S5  UTF-8 verbatim ────────────────
@@ -6749,8 +6836,7 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
         prompt: "Write exactly this line verbatim: 🚀 café naïve résumé 你好 こんにちは 안녕하세요",
         thinking: false
     ) { r in
-        if (r.text + r.reasoning).isEmpty { return (false, "empty") }
-        return (true, "")
+        requireReasoningOffVisible(r)
     }
 
     print(String(format:

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+import MLX
+import MLXLLM
 import MLXLMCommon
 import Testing
 
@@ -81,6 +83,46 @@ struct MTPRuntimeFocusedTests {
         #expect(!status.canAutoLaunchMTP)
     }
 
+    @Test("JANG MTP metadata without tensor evidence is not treated as an MTP bundle")
+    func jangMTPMetadataWithoutTensorEvidenceIsMissingWeights() throws {
+        let root = try makeTemporaryBundle(name: "named-mtp-but-no-mtp-tensors")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try writeJSON([
+            "model_type": "qwen3_5",
+            "text_config": [
+                "num_hidden_layers": 64,
+                "mtp_num_hidden_layers": 1,
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("config.json"))
+        try writeJSON([
+            "format": "jang",
+            "format_version": "2.0",
+            "runtime": [
+                "bundle_has_mtp": true,
+                "mtp_layers": 1,
+                "mtp_mode": "preserved_enabled",
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("jang_config.json"))
+        try writeJSON([
+            "weight_map": [
+                "model.embed_tokens.weight": "model-00001-of-00001.safetensors",
+                "model.layers.0.self_attn.q_proj.weight": "model-00001-of-00001.safetensors",
+                "model.layers.63.mlp.down_proj.weight": "model-00001-of-00001.safetensors",
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("model.safetensors.index.json"))
+
+        let status = try MTPBundleInspector.inspect(modelDirectory: root)
+
+        #expect(!status.bundleHasMTP)
+        #expect(status.configuredLayers == 1)
+        #expect(status.tensorCount == 0)
+        #expect(status.mode == .metadataOnlyMissingWeights)
+        #expect(!status.hasCompleteMTPArtifact)
+        #expect(!status.canAutoLaunchMTP)
+        #expect(status.configEvidence.contains("jang_config.runtime.bundle_has_mtp=true"))
+    }
+
     @Test("JANG runtime parses MTP activation metadata")
     func jangRuntimeParsesMTPActivationMetadata() throws {
         let config = try JangLoader.parseConfig(from: [
@@ -120,6 +162,129 @@ struct MTPRuntimeFocusedTests {
         #expect(configuration.mtpStatus == status)
         #expect(resolved.mtpStatus == status)
         #expect(resolved.mtpStatus?.requiresAcceptRejectBeforeEnable == true)
+    }
+
+    @Test("recursive MTP contract models D3 hidden-state draft verify")
+    func recursiveMTPContractModelsD3HiddenStateDraftVerify() {
+        let contract = MTPRecursiveDraftContract.mtplxDepth3
+
+        #expect(contract.depth == 3)
+        #expect(contract.draftStepReturnsHiddenState)
+        #expect(contract.draftCacheIsPrivate)
+        #expect(contract.backboneCacheCommitPolicy == .acceptedVerifierTokensOnly)
+        #expect(contract.verifierPositionsPerCycle == 4)
+        #expect(contract.minAcceptedDraftTokensPerVerify == 0)
+        #expect(contract.maxAcceptedDraftTokensPerVerify == 3)
+        #expect(contract.requiresVariablePrefixCommit)
+        #expect(contract.partialAcceptCommitStrategy == .captureCommit)
+        #expect(contract.maxCommittedTokensPerVerify == 4)
+        #expect(contract.fullAcceptanceVerifyCycles(forOutputTokens: 256) == 64)
+        #expect(contract.speedBenchRequirements.requiresARBaseline)
+        #expect(contract.speedBenchRequirements.requiresVerifyCalls)
+        #expect(contract.speedBenchRequirements.requiresAcceptedDraftedByDepth)
+        #expect(contract.speedBenchRequirements.requiresPhaseTiming)
+        #expect(contract.speedBenchRequirements.requiresOutputTailReview)
+    }
+
+    @Test("shape-walk quantization preserves MXFP4 mode")
+    func shapeWalkQuantizationPreservesMXFP4Mode() {
+        let weights: [String: MLXArray] = [
+            "model.layers.0.mlp.down_proj.weight": MLXArray.zeros([2, 16], dtype: .uint32),
+            "model.layers.0.mlp.down_proj.scales": MLXArray.zeros([2, 4], dtype: .float32),
+            "model.layers.1.mlp.down_proj.weight": MLXArray.zeros([2, 32], dtype: .uint32),
+            "model.layers.1.mlp.down_proj.scales": MLXArray.zeros([2, 4], dtype: .float32),
+        ]
+
+        let inferred = JangLoader.inferPerLayerQuantizationFromShapes(
+            weights: weights,
+            defaultBits: 4,
+            defaultGroupSize: 32,
+            defaultMode: .mxfp4)
+
+        #expect(inferred?.quantization?.mode == .mxfp4)
+        if case .quantize(let override)? =
+            inferred?.perLayerQuantization["model.layers.1.mlp.down_proj"]
+        {
+            #expect(override.bits == 8)
+            #expect(override.groupSize == 32)
+            #expect(override.mode == .mxfp4)
+        } else {
+            Issue.record("Expected 8-bit MXFP4 per-layer override")
+        }
+    }
+
+    @Test("Qwen3.5 sanitize does not shift base norms just because MTP tensors exist")
+    func qwen35SanitizeDoesNotShiftBaseNormsForPreservedMTP() throws {
+        let configData = """
+        {
+          "hidden_size": 4,
+          "num_hidden_layers": 1,
+          "intermediate_size": 8,
+          "num_attention_heads": 1,
+          "num_key_value_heads": 1,
+          "linear_num_value_heads": 1,
+          "linear_num_key_heads": 1,
+          "linear_key_head_dim": 4,
+          "linear_value_head_dim": 4,
+          "linear_conv_kernel_dim": 4,
+          "head_dim": 4,
+          "vocab_size": 16,
+          "tie_word_embeddings": false
+        }
+        """.data(using: .utf8)!
+        let configuration = try JSONDecoder().decode(Qwen35TextConfiguration.self, from: configData)
+        let model = Qwen35TextModel(configuration)
+        let norm = MLXArray([Float](repeating: 0.5, count: 4))
+
+        let sanitized = model.sanitize(weights: [
+            "mtp.layers.0.linear_attn.conv1d.weight": MLXArray.zeros([4, 4, 4], dtype: .float32),
+            "mtp.fc.weight": MLXArray.zeros([4, 4], dtype: .float32),
+            "model.norm.weight": norm,
+        ])
+
+        #expect(sanitized["mtp.fc.weight"] == nil)
+        #expect(sanitized["mtp.layers.0.linear_attn.conv1d.weight"] == nil)
+        #expect(sanitized["model.norm.weight"]?.asArray(Float.self) == [0.5, 0.5, 0.5, 0.5])
+    }
+
+    @Test("Qwen3.5 JANGTQ sanitize also ignores MTP sidecar conv when deciding norm shifts")
+    func qwen35JANGTQSanitizeDoesNotShiftBaseNormsForPreservedMTP() throws {
+        let configData = """
+        {
+          "hidden_size": 4,
+          "num_hidden_layers": 1,
+          "intermediate_size": 8,
+          "num_attention_heads": 1,
+          "num_key_value_heads": 1,
+          "linear_num_value_heads": 1,
+          "linear_num_key_heads": 1,
+          "linear_key_head_dim": 4,
+          "linear_value_head_dim": 4,
+          "linear_conv_kernel_dim": 4,
+          "head_dim": 4,
+          "vocab_size": 16,
+          "tie_word_embeddings": false,
+          "num_experts": 0,
+          "num_experts_per_tok": 0,
+          "weight_format": "mxtq",
+          "mxtq_bits": 4
+        }
+        """.data(using: .utf8)!
+        let configuration = try JSONDecoder().decode(
+            Qwen35JANGTQTextConfiguration.self, from: configData)
+        let model = Qwen35JANGTQTextModel(configuration)
+        let norm = MLXArray([Float](repeating: 0.5, count: 4))
+
+        let sanitized = model.sanitize(weights: [
+            "model.mtp_layers.0.linear_attn.conv1d.weight": MLXArray.zeros(
+                [4, 4, 4], dtype: .float32),
+            "mtp.fc.weight": MLXArray.zeros([4, 4], dtype: .float32),
+            "model.norm.weight": norm,
+        ])
+
+        #expect(sanitized["model.mtp_layers.0.linear_attn.conv1d.weight"] == nil)
+        #expect(sanitized["mtp.fc.weight"] == nil)
+        #expect(sanitized["model.norm.weight"]?.asArray(Float.self) == [0.5, 0.5, 0.5, 0.5])
     }
 
     @Test("optional real local MTP bundle inspection")
