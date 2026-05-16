@@ -8,8 +8,10 @@ artifact or source reference. Everything else stays `open`.
 Current pushed branch state:
 
 - Branch: `vmlx-0.31.3`
-- Last pushed checkpoint entering this pass: `0deb14b`
-  (`audit(runtime): tighten zaya vl jangtq gates`)
+- Current pushed checkpoint: `7962647`
+  (`fix(omni): ground no-think media prompts`)
+- Prior non-MTP checkpoints in this pass: `50df533`, `0deb14b`, and
+  `6e435d7`.
 - Previous MTP runtime checkpoint: `0fdb164`
   (`feat(runtime): add exact native mtp sampling`)
 - Current worktree is not clean because another agent is working on Flux-native
@@ -70,8 +72,8 @@ The package is complete only when all of these are true:
 | Single-batch and continuous batching. | Omni BatchEngine harness now forces `maxBatchSize=2` for B=1 rows so it exercises the scheduler path instead of the solo fast path. Text B=1, text B=2, image B=1, and audio B=1 pass after the no-thinking media-tail fix in `docs/local/live-model-matrix/20260516Tomni-nonmtp/Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_batch_nothink_tail_fix.out`. Full per-family batching remains incomplete. | live-proven for Omni JANGTQ4; package-wide partial |
 | TurboQuant/JANGTQ encode/decode and acceleration toggles. | Focused JANGTQ/Hadamard/matmul proof exists; live low-footprint active routed expert pass for all relevant models remains open. | open |
 | Distributed mode. | Targets exist (`MLXDistributed*`, `TPRankWorker`), but no no-peer distributed clean artifact is recorded for this audit. | open |
-| Full `swift test`. | Current filtered test attempt still fails before focused tests because SwiftPM compiles `MLXPressPolicyTests` first and that target errors with `no such module 'Testing'`. Latest artifact: `docs/local/live-model-matrix/20260516Tomni-nonmtp/NemotronHOmniSmokeTests_tail_fix.err`. This is a blocker, not a pass. | open |
-| Release build. | `swift build -c release --product RunBench --jobs 2` passed after the non-MTP ZAYA1-VL template/harness changes. | live-proven |
+| Full `swift test`. | Full package test remains open, but the local `Testing`/`XCTest` import blocker was narrowed to the shell toolchain/framework search path, not source. The passing local invocation is `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test ... -Xswiftc -F -Xswiftc /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks`. Focused artifacts: `docs/local/live-model-matrix/20260516Tnonmtp-tests/NemotronHOmniPreEncodedAudioTests_xcode.out` and the MLXPress policy run from the same invocation. `Tests/MLXLMTests/NemotronHOmniSmokeTests.swift` is currently not wired into an active package test target, so the earlier filtered row that ran 0 tests is not counted. | partial |
+| Release build. | `swift build -c release --product RunBench --jobs 2` passed after the non-MTP Omni tail fix; artifact: `docs/local/live-model-matrix/20260516Tnonmtp-tests/RunBench_release_build.out`. | live-proven |
 | Osaurus single-package repin. | Not done. Osaurus still pins split runtime stack. | open |
 
 ## Current Model Matrix Snapshot
@@ -224,16 +226,19 @@ Not yet complete:
 1. Continue diagnosing the remaining `fail:133` rows without MTP scope:
    `ZAYA1-VL-8B-JANGTQ_K` is still a real coherence failure on one math row.
    The JANGTQ4/MXFP4 ZAYA1-VL text-template failures are fixed and live-proven.
-2. Extend the Omni-style no-thinking media-tail gate to any other local
+2. Wire `Tests/MLXLMTests/NemotronHOmniSmokeTests.swift` into an active test
+   target or move the still-relevant rows into `MLXLMCommonFocusedTests`; the
+   file exists but is not discoverable by the current package graph.
+3. Extend the Omni-style no-thinking media-tail gate to any other local
    multimodal reasoning model that shows the same compact-tail failure. Do not
    assume it globally; prove it per family with a direct media tensor row.
-3. Run a clean-worktree focused test pass once Flux Package.swift edits are
+4. Run a clean-worktree focused test pass once Flux Package.swift edits are
    either committed by the Flux agent or isolated in a separate worktree.
-4. MTP is parked for this non-MTP production pass. Do not spend current
+5. MTP is parked for this non-MTP production pass. Do not spend current
    validation time on MTP unless the user re-opens that scope.
-5. Run DSV4 B7 long-context/vector drift with current pushed engine. The new
+6. Run DSV4 B7 long-context/vector drift with current pushed engine. The new
    5.5k recall row proves a narrower path only.
-6. Expand the model matrix beyond the 20GB cutoff for DSV4, MiniMax, Ling, Hy3,
+7. Expand the model matrix beyond the 20GB cutoff for DSV4, MiniMax, Ling, Hy3,
    and Kimi one family at a time, with process checks before and after each run.
 
 ## Mergeability Call

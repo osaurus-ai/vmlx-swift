@@ -199,12 +199,19 @@ These rows are now covered in this checkout with artifacts under
   passes 18/18. Direct image with `enable_thinking=false` is grounded at
   `96.6 tok/s`, and BatchEngine image B=1 with `enable_thinking=false` is
   grounded at `47.8 tok/s`; text/audio BatchEngine rows still pass.
-- Build proof after the non-MTP runtime/harness changes:
-  `swift build -c release --product RunBench --jobs 2` passes. Focused
-  `swift test` is still blocked before the target test by the unrelated
-  `Tests/MLXPressPolicyTests/MLXPressLowRamPolicySourceTests.swift:4:8:
-  no such module 'Testing'` compile error; latest artifact:
-  `docs/local/live-model-matrix/20260516Tomni-nonmtp/NemotronHOmniSmokeTests_tail_fix.err`.
+- Build and focused-test proof after the non-MTP runtime/harness changes:
+  `swift build -c release --product RunBench --jobs 2` passes with artifact
+  `docs/local/live-model-matrix/20260516Tnonmtp-tests/RunBench_release_build.out`.
+  Local Swift Testing/XCTest rows require the Xcode MacOSX test framework search
+  path because `xcode-select` points at CommandLineTools. This invocation passes
+  the previously blocked Swift Testing policy row and the wired Omni focused
+  audio rows:
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test
+  --filter <suite> --jobs 2 -Xswiftc -F -Xswiftc
+  /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks`.
+  `Tests/MLXLMTests/NemotronHOmniSmokeTests.swift` is present on disk but is not
+  part of the active package test targets, so a filtered run of that class
+  executes 0 tests and is not counted as proof.
 
 ## Fix Gates
 
