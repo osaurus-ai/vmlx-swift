@@ -1042,6 +1042,19 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Prompt token IDs captured at init for cache store after generation.
     public let promptTokenIds: [Int]
 
+    /// Canonical prompt-prefix boundaries safe to store in addition to the
+    /// full generation prompt.
+    let cachePrefixTokenCounts: [Int]
+
+    /// Original prepared input, retained for correctness-first re-derive of
+    /// cache-prefix boundaries that cannot be produced by trimming.
+    let originalInput: LMInput
+
+    /// Parameters used to allocate compatible cache layers for boundary
+    /// re-derive. This preserves rotating/sliding cache choices while the
+    /// store path still writes raw prompt-boundary KV to disk.
+    let cacheInitParameters: GenerateParameters?
+
     /// Clean cache state captured immediately after prefill and before any
     /// generated token is fed back into the model.
     var promptCacheSnapshot: [KVCache]?
@@ -1100,6 +1113,9 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.cacheCoordinator = nil
         self.promptTokenIds = []
+        self.cachePrefixTokenCounts = []
+        self.originalInput = LMInput(text: y)
+        self.cacheInitParameters = parameters
         self.promptCacheSnapshot = nil
         self.mediaSalt = nil
 
@@ -1169,6 +1185,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         } else {
             self.promptTokenIds = []
         }
+        self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
+        self.originalInput = input
+        self.cacheInitParameters = effectiveParameters
         self.promptCacheSnapshot = nil
 
         // Compute a stable fingerprint of request-scope/media content plus
@@ -1436,6 +1455,9 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.cacheCoordinator = nil
         self.promptTokenIds = []
+        self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
+        self.originalInput = input
+        self.cacheInitParameters = nil
         self.promptCacheSnapshot = nil
         self.mediaSalt = nil
 
@@ -1703,6 +1725,21 @@ public struct TokenIterator: TokenIteratorProtocol {
                 cache: promptCacheSnapshot,
                 kvBits: nil,
                 kvMode: .none)
+
+            for boundary in Set(cachePrefixTokenCounts).sorted()
+            where boundary > 0 && boundary < promptTokenIds.count {
+                let boundaryTokens = Array(promptTokenIds.prefix(boundary))
+                if let boundarySnapshot = cacheSnapshotForBoundary(
+                    tokens: boundaryTokens,
+                    promptSnapshot: promptCacheSnapshot)
+                {
+                    store(
+                        tokens: boundaryTokens,
+                        cache: boundarySnapshot,
+                        kvBits: nil,
+                        kvMode: .none)
+                }
+            }
         }
 
         guard includeGeneratedBoundary, !generatedTokenIds.isEmpty else { return }
@@ -1711,6 +1748,55 @@ public struct TokenIterator: TokenIteratorProtocol {
         guard (cache.map(\.offset).max() ?? 0) >= generatedBoundaryTokens.count
         else { return }
         store(tokens: generatedBoundaryTokens, cache: cache, kvBits: kvBits, kvMode: kvMode)
+    }
+
+    private func cacheSnapshotForBoundary(
+        tokens: [Int],
+        promptSnapshot: [KVCache]
+    ) -> [KVCache]? {
+        guard !tokens.isEmpty, tokens.count < promptTokenIds.count else {
+            return nil
+        }
+        let trimCount = promptTokenIds.count - tokens.count
+        let trimmed = promptSnapshot.map { $0.copy() }
+        if canTrimPromptCache(trimmed),
+           trimPromptCache(trimmed, numTokens: trimCount) == trimCount
+        {
+            MLX.eval(trimmed)
+            return trimmed
+        }
+
+        do {
+            let boundaryTokens = MLXArray(tokens.map { Int32($0) })
+                .reshaped(1, tokens.count)
+            let boundaryInput = LMInput(
+                text: LMInput.Text(tokens: boundaryTokens),
+                image: originalInput.image,
+                video: originalInput.video,
+                audio: originalInput.audio,
+                mediaTokenIds: originalInput.mediaTokenIds,
+                cacheScopeSalt: originalInput.cacheScopeSalt)
+            let cache = model.newCache(parameters: cacheInitParameters)
+            switch try model.prepare(
+                boundaryInput,
+                cache: cache,
+                windowSize: effectivePrefillWindow(
+                    requested: promptTokenIds.count,
+                    input: boundaryInput))
+            {
+            case .tokens(let remaining):
+                _ = model(remaining, cache: cache, state: nil)
+            case .logits:
+                break
+            }
+            MLX.eval(cache)
+            return cache
+        } catch {
+            Self.logger.debug(
+                "TokenIterator: skipped history-boundary cache rederive: \(String(describing: error), privacy: .public)"
+            )
+            return nil
+        }
     }
 }
 

@@ -8,9 +8,9 @@ artifact or source reference. Everything else stays `open`.
 Current pushed branch state:
 
 - Branch: `vmlx-0.31.3`
-- Latest pushed runtime checkpoint entering the guard-removal/doc refresh:
-  `b516f61`
-  (`docs(runtime): record dsv4 cache and long-context gates`)
+- Latest pushed runtime checkpoint entering the Qwen cache-boundary fix:
+  `ea34c0d`
+  (`fix(runtime): surface unclosed reasoning telemetry`)
 - Prior non-MTP checkpoints in this pass: `50df533`, `0deb14b`,
   `6e435d7`, `7962647`, `9a56de1`, and `ed04161`.
 - Previous MTP runtime checkpoint: `0fdb164`
@@ -64,6 +64,7 @@ The package is complete only when all of these are true:
 | Prefix cache OFF/ON and cache hit proof. | Existing matrix/harness describes rows; not complete for every topology and model family. | open |
 | Paged cache OFF/ON. | Existing focused tests and some model rows exist, but no package-wide matrix artifact proves all relevant architectures. | open |
 | Disk L2 OFF/ON and fresh-session restore. | Existing docs and some rows exist; package-wide, per-topology proof remains incomplete. | open |
+| Qwen-style stateless full-history cache boundary. | `docs/local/live-model-matrix/20260516Tguard-removal/Qwen3.6-27B-JANG_4M-CRACK_growing_chat_cache_history_boundary_final.out` proves a real disk hit at the canonical history boundary after the rendered turn-2 history diverges from the turn-1 generation prompt. | live-proven for Qwen3.6 JANG_4M CRACK non-MTP |
 | SSM companion cache and async rederive. | Qwen/hybrid rows are required by docs; not exhaustively live-proven for all relevant local models. | open |
 | VL media salt, same-image hit, changed-image miss. | `docs/local/live-model-matrix/20260516Tzaya-vl-think-template-fix/ZAYA1-VL-8B-JANGTQ4_vl_chat_cache.out`: same-media replay HIT, different-media MISS, coherent blue/orange follow-up. | live-proven for ZAYA1-VL JANGTQ4 |
 | Nemotron Omni audio/Parakeet/RADIO. | Video generation now carries the processor's post-EVS keep count and applies real EVS before prompt splice. `docs/local/live-model-matrix/20260516Tomni-nonmtp/Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_evs_v2.out` passes 13/13 TokenIterator rows; strict pre-fix artifact `..._omni_strict.out` failed the video row. The second fix canonicalizes the closed no-thinking media tail to `<think>\n</think>\n\n`; tail probe `..._omni_tail_probe.out` proves compact tail fails and spaced tail grounds the same image, and `..._omni_batch_nothink_tail_fix.out` passes 18/18 including direct and BatchEngine image with `enable_thinking=false`. | live-proven for Omni JANGTQ4 |
@@ -236,6 +237,13 @@ Known failing rows from that snapshot:
   stress row fails honestly: at `maxTokens=768`, `temp=0.600 topP=1.000 topK=0
   minP=0.000 rep=1.000`, it emits reasoning only, hits length, and produces no
   visible answer. This is not hidden by a forced close or repetition floor.
+- Gemma 4 thinking-off control evidence:
+  `docs/local/live-model-matrix/20260516Tguard-removal/Gemma-4-26B-A4B-it-JANG_4M-CRACK_story_bundle_defaults_think_off_probe.out`.
+  The same story prompt with `enable_thinking=false` uses the template's closed
+  empty Harmony thought channel, returns a coherent visible two-sentence story,
+  stops normally after `31` tokens, and reports `unclosedReasoning=false`.
+  This isolates the failure to the open thinking-channel path rather than base
+  decode, tokenizer, or generation_config merge.
 - The failure exposed a terminal-info bug in the shared solo generation loop:
   public `BatchEngine.generate`/solo-fast-path info was snapshotting after
   parser flush and could report `unclosedReasoning=NO` even when the parser
@@ -246,6 +254,51 @@ Known failing rows from that snapshot:
 - The diagnostic loop heuristic now also catches long repeated non-whitespace
   scalar runs, so numeric/token-salad tails are not missed merely because they
   are not repeated word spans.
+
+2026-05-16 non-MTP Qwen3.6 cache/template-boundary follow-up:
+
+- Scope: `/Users/eric/models/dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` is a
+  non-MTP row. This evidence does not claim MTP activation; MTP remains gated
+  by real `mtp.*` tensor/config evidence and the explicit native-MTP path.
+- Pre-fix diagnostic:
+  `docs/local/live-model-matrix/20260516Tguard-removal/Qwen3.6-27B-JANG_4M-CRACK_growing_chat_cache_diagnostic.out`
+  and `.err`. Turn 1 stored salted prompt/post-answer disk entries, but the
+  real turn-2 full-history prompt diverged before the raw generation-prompt
+  boundary: `prompt=1863/1867 postAnswer=1863/1873`. The stored turn-1 prompt
+  ended in the active-generation no-thinking rail
+  `<|im_start|>assistant\n<think>\n\n</think>\n\n`; the next request rendered
+  the same assistant message as history with visible content instead. Reusing
+  raw turn-1 KV under the turn-2 token key would have been unsafe.
+- Fix: tokenizers can now expose the same chat template with
+  `addGenerationPrompt=false`. `LLMUserInputProcessor` records a
+  `cachePrefixTokenCounts` boundary only when that no-generation render is a
+  strict prefix of the actual generation prompt. `BatchEngine` and
+  `TokenIterator` store a real cache snapshot for that boundary by trimming
+  compatible prompt snapshots or by correctness-first re-deriving the boundary
+  with the original media fields, cache salt, and cache parameters. Hybrid-pool
+  re-derive uses the existing DSV4 full-window prefill rule.
+- Final live proof:
+  `docs/local/live-model-matrix/20260516Tguard-removal/Qwen3.6-27B-JANG_4M-CRACK_growing_chat_cache_history_boundary_final.out`
+  and `.err`. The row records `Cache history-boundary counts: [1860]`; turn 2
+  probes `HIT tier=disk matched=1860/1897 remaining=37 diskArrays=yes`, answers
+  `qwen36-cache-green` coherently, stops normally, and drops prompt prefill from
+  `2.360s` to `0.157s` (`ratio=0.07`). Nil-salt probes miss, so the hit is not
+  a salt collision.
+- Focused proof:
+  `docs/local/live-model-matrix/20260516Tguard-removal/NoHiddenReasoningCloseBiasFocusedTests_history_boundary_final.out`
+  passes 3/3 source guards for no hidden reasoning close bias, terminal
+  unclosed-reasoning telemetry, and the real history-boundary cache mechanism.
+  Release build proof:
+  `docs/local/live-model-matrix/20260516Tguard-removal/RunBench_release_build_history_boundary_final.out`.
+- Osaurus implication: stateless full-history chat requests need safe
+  history-boundary cache entries for templates that add assistant
+  generation-control rails only on the active turn. This fix stores real KV/SSM
+  state for the prefix the next request actually contains; it is not a forced
+  hit, repetition guard, template monkeypatch, or fake cache reuse.
+- Still open: this row is text-only. VL/media cache rows still need separate
+  image/video/audio proofs for MRoPE, 2D/3D media vectors, Hadamard/JANGTQ
+  matmul, and media-salt cache behavior across same-media and changed-media
+  turns.
 
 2026-05-16 non-MTP Nemotron Omni follow-up:
 

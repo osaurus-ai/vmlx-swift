@@ -2059,10 +2059,69 @@ public actor BatchEngine {
                 )
             }
 
+            func boundarySnapshot(tokens: [Int]) -> [KVCache]? {
+                guard !tokens.isEmpty, tokens.count < promptTokens.count else {
+                    return nil
+                }
+                let trimCount = promptTokens.count - tokens.count
+                let trimmed = promptCacheSnapshot.map { $0.copy() }
+                if canTrimPromptCache(trimmed),
+                   trimPromptCache(trimmed, numTokens: trimCount) == trimCount
+                {
+                    MLX.eval(trimmed)
+                    return trimmed
+                }
+
+                do {
+                    let boundaryTokens = MLXArray(tokens.map { Int32($0) })
+                        .reshaped(1, tokens.count)
+                    let boundaryInput = LMInput(
+                        text: LMInput.Text(tokens: boundaryTokens),
+                        image: slot.originalInput.image,
+                        video: slot.originalInput.video,
+                        audio: slot.originalInput.audio,
+                        mediaTokenIds: slot.originalInput.mediaTokenIds,
+                        cacheScopeSalt: slot.originalInput.cacheScopeSalt)
+                    let cache = context.model.newCache(parameters: slot.parameters)
+                    switch try context.model.prepare(
+                        boundaryInput,
+                        cache: cache,
+                        windowSize: effectivePrefillWindow(
+                            requested: slot.prefillStepSize,
+                            input: boundaryInput,
+                            cache: cache))
+                    {
+                    case .tokens(let remaining):
+                        _ = context.model(remaining, cache: cache, state: nil)
+                    case .logits:
+                        break
+                    }
+                    MLX.eval(cache)
+                    return cache
+                } catch {
+                    Self.logger.debug(
+                        "Skipped history-boundary cache rederive for slot \(slot.id.description, privacy: .public): \(String(describing: error), privacy: .public)"
+                    )
+                    return nil
+                }
+            }
+
             storeCacheEntry(
                 tokens: promptTokens,
                 snapshot: promptCacheSnapshot,
                 label: "prompt-boundary")
+
+            for boundary in Set(slot.originalInput.cachePrefixTokenCounts).sorted()
+            where boundary > 0 && boundary < promptTokens.count {
+                if let snapshot = boundarySnapshot(
+                    tokens: Array(promptTokens.prefix(boundary)))
+                {
+                    storeCacheEntry(
+                        tokens: Array(promptTokens.prefix(boundary)),
+                        snapshot: snapshot,
+                        label: "history-boundary")
+                }
+            }
 
             // A normal EOS stop means the last visible assistant token has
             // already been fed back into the cache before EOS was sampled.

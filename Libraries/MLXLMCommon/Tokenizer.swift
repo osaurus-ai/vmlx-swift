@@ -20,6 +20,22 @@ public protocol Tokenizer: Sendable {
     ) throws -> [Int]
 }
 
+/// Optional tokenizer capability for rendering the same chat template with
+/// `add_generation_prompt` disabled.
+///
+/// Cache stores use this to capture canonical history boundaries before the
+/// assistant generation rail. That lets a later full-history request reuse a
+/// safe prefix instead of falsely keying KV state that includes model-specific
+/// generation-control tokens not present in rendered history.
+public protocol GenerationPromptControllableTokenizer: Tokenizer {
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?,
+        addGenerationPrompt: Bool
+    ) throws -> [Int]
+}
+
 extension Tokenizer {
     public func encode(text: String) -> [Int] {
         encode(text: text, addSpecialTokens: true)

@@ -2273,9 +2273,30 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         messages: messages,
         tools: nil,
         additionalContext: ["enable_thinking": false])
+    let historyBoundaryTokens = try? (
+        context.tokenizer as? GenerationPromptControllableTokenizer
+    )?.applyChatTemplate(
+        messages: messages,
+        tools: nil,
+        additionalContext: ["enable_thinking": false],
+        addGenerationPrompt: false)
+    let cachePrefixTokenCounts: [Int]
+    if let historyBoundaryTokens,
+       !historyBoundaryTokens.isEmpty,
+       historyBoundaryTokens.count < promptTokens.count,
+       promptTokens.prefix(historyBoundaryTokens.count).elementsEqual(historyBoundaryTokens)
+    {
+        cachePrefixTokenCounts = [historyBoundaryTokens.count]
+    } else {
+        cachePrefixTokenCounts = []
+    }
     let promptArray = MLXArray(promptTokens.map { Int32($0) })
         .reshaped(1, promptTokens.count)
-    let turn1 = LMInput(text: LMInput.Text(tokens: promptArray))
+    let turn1 = LMInput(
+        text: LMInput.Text(tokens: promptArray),
+        cacheScopeSalt: cacheScopeSalt(from: ["enable_thinking": false]),
+        cachePrefixTokenCounts: cachePrefixTokenCounts)
+    print("  Cache history-boundary counts: \(cachePrefixTokenCounts)")
 
     func run(label: String, input: sending LMInput) async
         -> (tokens: [Int], info: GenerateCompletionInfo?, wall: Double)
@@ -2372,8 +2393,47 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         text: LMInput.Text(tokens: turn2Array),
         cacheScopeSalt: turn1.cacheScopeSalt)
 
+    func commonPrefixCount(_ lhs: [Int], _ rhs: [Int]) -> Int {
+        let limit = Swift.min(lhs.count, rhs.count)
+        var idx = 0
+        while idx < limit, lhs[idx] == rhs[idx] {
+            idx += 1
+        }
+        return idx
+    }
+
+    func decodedWindow(_ tokens: [Int], around index: Int) -> String {
+        let lower = Swift.max(0, index - 16)
+        let upper = Swift.min(tokens.count, index + 16)
+        guard lower < upper else { return "" }
+        return context.tokenizer.decode(
+            tokenIds: Array(tokens[lower..<upper]),
+            skipSpecialTokens: false
+        )
+        .replacingOccurrences(of: "\n", with: "\\n")
+    }
+
     let turn2Salt = computeCacheSalt(for: turn2, parameters: params)
     let boundaryTokens = promptTokens + r1.tokens
+    let promptCommon = commonPrefixCount(turn2Tokens, promptTokens)
+    let boundaryCommon = commonPrefixCount(turn2Tokens, boundaryTokens)
+    writeDiagnostic(
+        "  Native turn-2 common prefix: prompt=\(promptCommon)/\(promptTokens.count) postAnswer=\(boundaryCommon)/\(boundaryTokens.count)")
+    if promptCommon < promptTokens.count {
+        writeDiagnostic(
+            "  Native turn-2 diverged before prompt boundary at token \(promptCommon)")
+        writeDiagnostic(
+            "    stored prompt window: \"\(decodedWindow(promptTokens, around: promptCommon))\"")
+        writeDiagnostic(
+            "    turn-2 prompt window: \"\(decodedWindow(turn2Tokens, around: promptCommon))\"")
+    } else if boundaryCommon < boundaryTokens.count {
+        writeDiagnostic(
+            "  Native turn-2 diverged before post-answer boundary at token \(boundaryCommon)")
+        writeDiagnostic(
+            "    stored post-answer window: \"\(decodedWindow(boundaryTokens, around: boundaryCommon))\"")
+        writeDiagnostic(
+            "    turn-2 prompt window: \"\(decodedWindow(turn2Tokens, around: boundaryCommon))\"")
+    }
     writeDiagnostic("  Coordinator flags: hybrid=\(coordinator.isHybrid) pagedIncompatible=\(coordinator.isPagedIncompatible)")
     describeProbe("Prompt-boundary salted probe", tokens: promptTokens + [-1], mediaSalt: turn2Salt)
     describeProbe("Post-answer salted probe", tokens: boundaryTokens + [-1], mediaSalt: turn2Salt)
@@ -2389,17 +2449,31 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             turn2Tokens.count,
             remaining.count,
             diskArrays == nil ? "no" : "yes"))
-        let expectedPromptBoundary = promptTokens.count
+        let expectedPromptBoundary = promptCommon < promptTokens.count
+            ? (cachePrefixTokenCounts.max() ?? promptTokens.count)
+            : promptTokens.count
         let expectedPostAnswerBoundary = promptTokens.count + r1.tokens.count
         if matched < expectedPromptBoundary {
             throw NSError(domain: "BENCH_GROWING_CHAT_CACHE", code: 4,
                 userInfo: [NSLocalizedDescriptionKey:
-                    "probe hit did not reach prompt boundary: matched=\(matched), expected at least \(expectedPromptBoundary)"])
+                    "probe hit did not reach the safe prompt/cache boundary: matched=\(matched), expected at least \(expectedPromptBoundary)"])
         }
-        if matched < expectedPostAnswerBoundary {
+        if matched < promptTokens.count {
+            print("  Probe note: native turn-2 chat template diverged from the generation prompt; matched canonical history boundary \(matched) instead of full prompt \(promptTokens.count).")
+        } else if matched < expectedPostAnswerBoundary {
             print("  Probe note: native turn-2 chat template matched the prompt boundary but not the raw post-answer boundary; this is expected when the template re-wraps the assistant turn.")
         }
     case .miss:
+        if promptCommon < promptTokens.count {
+            throw NSError(domain: "BENCH_GROWING_CHAT_CACHE", code: 11,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "native turn-2 chat template diverged from the cached turn-1 generation prompt before the prompt boundary; storing the raw turn-1 KV under turn-2 tokens would be unsafe"])
+        }
+        if boundaryCommon < boundaryTokens.count {
+            throw NSError(domain: "BENCH_GROWING_CHAT_CACHE", code: 12,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "native turn-2 chat template matched the prompt boundary but diverged before the raw post-answer boundary; this family needs a canonical history-boundary cache repair before stateless growing-chat L2 can hit"])
+        }
         throw NSError(domain: "BENCH_GROWING_CHAT_CACHE", code: 5,
             userInfo: [NSLocalizedDescriptionKey:
                 "coordinator missed turn 2 growing prompt; post-answer boundary was not stored under the key turn 2 uses"])

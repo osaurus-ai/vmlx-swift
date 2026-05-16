@@ -80,7 +80,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
             // import Tokenizers
             //
             { (huggingFaceTokenizer: Tokenizers.Tokenizer) -> MLXLMCommon.Tokenizer in
-                struct TokenizerBridge: MLXLMCommon.Tokenizer {
+                struct TokenizerBridge: MLXLMCommon.GenerationPromptControllableTokenizer {
                     private let upstream: any Tokenizers.Tokenizer
 
                     init(_ upstream: any Tokenizers.Tokenizer) {
@@ -397,6 +397,26 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 }
                             }
                             throw error
+                        }
+                    }
+
+                    func applyChatTemplate(
+                        messages: [[String: any Sendable]],
+                        tools: [[String: any Sendable]]?,
+                        additionalContext: [String: any Sendable]?,
+                        addGenerationPrompt: Bool
+                    ) throws -> [Int] {
+                        do {
+                            return try upstream.applyChatTemplate(
+                                messages: messages,
+                                chatTemplate: nil,
+                                addGenerationPrompt: addGenerationPrompt,
+                                truncation: false,
+                                maxLength: nil,
+                                tools: tools,
+                                additionalContext: additionalContext)
+                        } catch Tokenizers.TokenizerError.missingChatTemplate {
+                            throw MLXLMCommon.TokenizerError.missingChatTemplate
                         }
                     }
                 }

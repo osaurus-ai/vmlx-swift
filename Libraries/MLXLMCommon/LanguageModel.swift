@@ -54,6 +54,17 @@ public struct LMInput {
     /// salt that the coordinator mixes into its block hash.
     public let cacheScopeSalt: String?
 
+    /// Additional prompt-prefix lengths that are safe to store in the cache.
+    ///
+    /// Some chat templates append assistant generation-control tokens to the
+    /// active turn, but omit those tokens when the same assistant message is
+    /// rendered as history on the next request. The full prompt KV state is
+    /// then correct for decoding turn 1, but unsafe to key under turn 2's
+    /// shorter historical prefix. Processors can record the canonical history
+    /// boundary here so cache stores persist a real prefix the next request
+    /// actually contains.
+    public let cachePrefixTokenCounts: [Int]
+
     /// Representation of tokenized input text.
     public struct Text {
 
@@ -150,10 +161,16 @@ public struct LMInput {
         }
     }
 
-    public init(tokens: MLXArray, mask: MLXArray? = nil, cacheScopeSalt: String? = nil) {
+    public init(
+        tokens: MLXArray,
+        mask: MLXArray? = nil,
+        cacheScopeSalt: String? = nil,
+        cachePrefixTokenCounts: [Int] = []
+    ) {
         self.init(
             text: .init(tokens: tokens, mask: mask),
-            cacheScopeSalt: cacheScopeSalt)
+            cacheScopeSalt: cacheScopeSalt,
+            cachePrefixTokenCounts: cachePrefixTokenCounts)
     }
 
     public init(
@@ -161,7 +178,8 @@ public struct LMInput {
         video: LMInput.ProcessedVideo? = nil,
         audio: LMInput.ProcessedAudio? = nil,
         mediaTokenIds: [Int]? = nil,
-        cacheScopeSalt: String? = nil
+        cacheScopeSalt: String? = nil,
+        cachePrefixTokenCounts: [Int] = []
     ) {
         self.text = text
         self.image = image
@@ -169,6 +187,7 @@ public struct LMInput {
         self.audio = audio
         self.mediaTokenIds = mediaTokenIds
         self.cacheScopeSalt = cacheScopeSalt
+        self.cachePrefixTokenCounts = cachePrefixTokenCounts
     }
 }
 
