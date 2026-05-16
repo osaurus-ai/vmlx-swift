@@ -496,6 +496,187 @@ public struct CategoricalSampler: LogitSampler {
     }
 }
 
+/// Sampling helper used by exact speculative decoding paths.
+///
+/// The normal ``LogitSampler`` protocol intentionally returns only a sampled
+/// token. Speculative accept/reject also needs the probability assigned to the
+/// draft token by both the verifier and draft distributions. This helper keeps
+/// the same filter order as ``TopPSampler`` and adds probability-ratio
+/// acceptance plus residual correction sampling.
+public struct SpeculativeSamplingController {
+    public struct Sample {
+        public let token: MLXArray
+        public let probabilities: MLXArray
+    }
+
+    public struct AcceptanceDecision {
+        public let accepted: Bool
+        public let acceptanceProbability: Float
+        public let correction: MLXArray?
+    }
+
+    private let temperature: Float
+    private let topP: Float
+    private let topK: Int
+    private let minP: Float
+    private let sampleState: MLXRandom.RandomState
+    private let acceptanceState: MLXRandom.RandomState
+    private let residualState: MLXRandom.RandomState
+    private let negInf = MLXArray(-Float.infinity)
+
+    public init(parameters: GenerateParameters) {
+        self.temperature = parameters.temperature
+        self.topP = parameters.topP
+        self.topK = parameters.topK
+        self.minP = parameters.minP
+
+        if let seed = parameters.randomSeed {
+            self.sampleState = MLXRandom.RandomState(seed: seed)
+            self.acceptanceState = MLXRandom.RandomState(seed: seed &+ 0x9E37_79B9_7F4A_7C15)
+            self.residualState = MLXRandom.RandomState(seed: seed &+ 0xD1B5_4A32_D192_ED03)
+        } else {
+            self.sampleState = MLXRandom.RandomState()
+            self.acceptanceState = MLXRandom.RandomState()
+            self.residualState = MLXRandom.RandomState()
+        }
+    }
+
+    public var isGreedy: Bool {
+        temperature == 0
+    }
+
+    public func probabilities(logits: MLXArray) -> MLXArray {
+        precondition(!isGreedy, "greedy speculative decoding does not need distributions")
+        var logits = normalizedRow(logits)
+        if logits.dtype == .bfloat16 {
+            logits = logits.asType(.float32)
+        }
+
+        var logprobs = logSoftmax(logits)
+        if topP > 0 && topP < 1 {
+            logprobs = applyTopP(logprobs, topP: MLXArray(topP))
+        }
+        if minP > 0 {
+            logprobs = applyMinP(logprobs, minP: MLXArray(minP))
+        }
+        if topK > 0 {
+            logprobs = applyTopK(logprobs, topK: topK)
+        }
+
+        return softmax(logprobs * (1 / MLXArray(temperature)), axis: -1, precise: true)
+    }
+
+    public func sample(logits: MLXArray) -> Sample {
+        let probabilities = probabilities(logits: logits)
+        return Sample(
+            token: sample(probabilities: probabilities, state: sampleState),
+            probabilities: probabilities)
+    }
+
+    public func sampleFromTarget(probabilities: MLXArray) -> MLXArray {
+        sample(probabilities: probabilities, state: sampleState)
+    }
+
+    public func acceptOrCorrect(
+        draftToken: MLXArray,
+        targetProbabilities: MLXArray,
+        draftProbabilities: MLXArray
+    ) -> AcceptanceDecision {
+        let p = probability(targetProbabilities, token: draftToken)
+        let q = probability(draftProbabilities, token: draftToken)
+
+        let acceptanceProbability: Float
+        if q <= 0 {
+            acceptanceProbability = p > 0 ? 1 : 0
+        } else {
+            acceptanceProbability = min(1, p / q)
+        }
+
+        if acceptanceProbability >= 1 {
+            return AcceptanceDecision(
+                accepted: true,
+                acceptanceProbability: acceptanceProbability,
+                correction: nil)
+        }
+
+        let roll = withRandomState(acceptanceState) {
+            MLXRandom.uniform(0.0 ..< 1.0).item(Float.self)
+        }
+        if roll <= acceptanceProbability {
+            return AcceptanceDecision(
+                accepted: true,
+                acceptanceProbability: acceptanceProbability,
+                correction: nil)
+        }
+
+        let correction = sampleResidual(
+            targetProbabilities: targetProbabilities,
+            draftProbabilities: draftProbabilities)
+        return AcceptanceDecision(
+            accepted: false,
+            acceptanceProbability: acceptanceProbability,
+            correction: correction)
+    }
+
+    private func sampleResidual(
+        targetProbabilities: MLXArray,
+        draftProbabilities: MLXArray
+    ) -> MLXArray {
+        let target = normalizedRow(targetProbabilities)
+        let draft = normalizedRow(draftProbabilities)
+        let delta = target - draft
+        let residual = MLX.where(delta .> 0, delta, MLXArray(0.0, dtype: delta.dtype))
+        let mass = residual.sum().item(Float.self)
+        let probabilities = mass > 0 ? residual / MLXArray(mass) : target
+        return sample(probabilities: probabilities, state: residualState)
+    }
+
+    private func sample(
+        probabilities: MLXArray,
+        state: MLXRandom.RandomState
+    ) -> MLXArray {
+        withRandomState(state) {
+            categorical(log(normalizedRow(probabilities)))
+        }
+    }
+
+    private func probability(_ probabilities: MLXArray, token: MLXArray) -> Float {
+        let row = normalizedRow(probabilities)
+        let tokenID = token.item(Int.self)
+        guard tokenID >= 0, tokenID < row.dim(-1) else { return 0 }
+        return row[0..., tokenID ..< (tokenID + 1)].item(Float.self)
+    }
+
+    private func normalizedRow(_ array: MLXArray) -> MLXArray {
+        array.ndim == 1 ? array.reshaped(1, array.dim(0)) : array
+    }
+
+    /// Keep tokens whose cumulative probability exceeds `1 - topP`.
+    private func applyTopP(_ logprobs: MLXArray, topP: MLXArray) -> MLXArray {
+        let sortedIndices = argSort(logprobs, axis: -1)
+        let sortedLogprobs = takeAlong(logprobs, sortedIndices, axis: -1)
+        let sortedProbs = exp(sortedLogprobs)
+        let cumulativeProbs = cumsum(sortedProbs, axis: -1)
+        let filtered = MLX.where(cumulativeProbs .> (1 - topP), sortedLogprobs, negInf)
+        return putAlong(logprobs, sortedIndices, values: filtered, axis: -1)
+    }
+
+    /// Keep tokens with probability >= maxProb * minP.
+    private func applyMinP(_ logprobs: MLXArray, minP: MLXArray) -> MLXArray {
+        let maxLogprob = logprobs.max(axis: -1, keepDims: true)
+        let threshold = maxLogprob + log(minP)
+        return MLX.where(logprobs .>= threshold, logprobs, negInf)
+    }
+
+    /// Keep only the top-k highest-probability tokens.
+    private func applyTopK(_ logprobs: MLXArray, topK: Int) -> MLXArray {
+        let vocabularySize = logprobs.dim(-1)
+        guard topK < vocabularySize else { return logprobs }
+        let maskIndices = argPartition(-logprobs, kth: topK - 1, axis: -1)[0..., topK...]
+        return putAlong(logprobs, maskIndices, values: negInf, axis: -1)
+    }
+}
+
 /// GPU-resident ring buffer of recent token IDs.
 ///
 /// Shared by penalty processors to avoid duplicating ring buffer logic.

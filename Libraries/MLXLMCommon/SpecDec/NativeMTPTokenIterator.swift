@@ -19,7 +19,7 @@ enum NativeMTPRuntimeError: Error, CustomStringConvertible {
         case .emptyPrompt:
             "native MTP requires a non-empty prompt"
         case .unsupportedSampling(let detail):
-            "native MTP currently supports greedy temperature=0 only: \(detail)"
+            "native MTP sampling is unsupported for this request: \(detail)"
         case .maxTokensTooSmall:
             "native MTP requires maxTokens > 1; use the AR iterator for one-token probes"
         case .verifierProducedNoTokens:
@@ -48,6 +48,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     var mtpCache: [KVCache]
     var processor: LogitProcessor?
     let sampler: LogitSampler
+    let speculativeSampler: SpeculativeSamplingController
     let maxTokens: Int?
     let depth: Int
     let promptTokenIds: [Int]
@@ -59,10 +60,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var pendingIndex = 0
     private var nextMain: MLXArray?
     private var drafts: [MLXArray] = []
+    private var draftProbabilities: [MLXArray] = []
 
     private(set) var verifyCalls = 0
     private(set) var acceptedByDepth: [Int: Int] = [:]
     private(set) var rejectedCount = 0
+    private(set) var residualCorrectionCount = 0
     private(set) var bonusCount = 0
     private(set) var prefixCommitCount = 0
     private(set) var rollbackRepairCount = 0
@@ -70,6 +73,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var mtpDraftTime: TimeInterval = 0
     private(set) var samplingTime: TimeInterval = 0
     private(set) var cacheCommitTime: TimeInterval = 0
+    private(set) var acceptanceProbabilitySum = 0.0
+    private(set) var acceptanceProbabilityCount = 0
 
     init(
         input: LMInput,
@@ -80,9 +85,6 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     ) throws {
         guard model.nativeMTPAvailable else {
             throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
-        }
-        guard parameters.temperature == 0 else {
-            throw NativeMTPRuntimeError.unsupportedSampling("temperature=\(parameters.temperature)")
         }
         if let maxTokens = parameters.maxTokens, maxTokens <= 1 {
             throw NativeMTPRuntimeError.maxTokensTooSmall
@@ -96,6 +98,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.mtpCache = model.makeNativeMTPCache()
         self.processor = parameters.processor()
         self.sampler = parameters.sampler()
+        self.speculativeSampler = SpeculativeSamplingController(parameters: parameters)
         self.maxTokens = parameters.maxTokens
         self.depth = Swift.max(1, requestedDepth)
         self.promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
@@ -114,12 +117,16 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             firstToken = Self.sampleLast(
                 logits: backbone.logits,
                 sampler: sampler,
+                speculativeSampler: speculativeSampler,
                 processor: &processor)
+                .token
         case .logits(let output):
             firstToken = Self.sampleLast(
                 logits: output.logits,
                 sampler: sampler,
+                speculativeSampler: speculativeSampler,
                 processor: &processor)
+                .token
         }
         MLX.eval(firstToken)
 
@@ -130,20 +137,25 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let secondToken = Self.sampleLast(
             logits: bridge.logits,
             sampler: sampler,
+            speculativeSampler: speculativeSampler,
             processor: &processor)
+            .token
         MLX.eval(secondToken)
 
         nextMain = secondToken
         pendingTokens.append(secondToken.item(Int.self))
         let draftStart = Date.timeIntervalSinceReferenceDate
-        drafts = Self.makeDrafts(
+        let draftBatch = Self.makeDrafts(
             model: model,
             hidden: Self.lastHidden(bridge.hiddenStates),
             nextToken: secondToken,
             mtpCache: mtpCache,
             depth: self.depth,
             sampler: sampler,
+            speculativeSampler: speculativeSampler,
             processor: processor)
+        drafts = draftBatch.tokens
+        draftProbabilities = draftBatch.probabilities
         self.mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
     }
 
@@ -180,22 +192,28 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let avgCommitted = verifyCalls > 0
             ? Double(generatedTokenIds.count) / Double(verifyCalls)
             : 0
+        let avgAcceptP = acceptanceProbabilityCount > 0
+            ? acceptanceProbabilitySum / Double(acceptanceProbabilityCount)
+            : 0
         let line = String(
             format:
-                "[NativeMTP] depth=%d verifyCalls=%d outputTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d prefixCommit=%d rollbackRepair=%d avgCommittedPerVerify=%.2f targetVerifySec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f cacheMode=private-mtp+verifier-prefix-commit\n",
+                "[NativeMTP] depth=%d verifyCalls=%d outputTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f targetVerifySec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f samplingMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",
             depth,
             verifyCalls,
             generatedTokenIds.count,
             accepted.isEmpty ? "none" : accepted,
             bonusCount,
             rejectedCount,
+            residualCorrectionCount,
             prefixCommitCount,
             rollbackRepairCount,
             avgCommitted,
+            avgAcceptP,
             targetVerifyTime,
             mtpDraftTime,
             samplingTime,
-            cacheCommitTime)
+            cacheCommitTime,
+            speculativeSampler.isGreedy ? "greedy" : "exact-pq")
         FileHandle.standardError.write(Data(line.utf8))
     }
 
@@ -214,28 +232,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         targetVerifyTime += Date.timeIntervalSinceReferenceDate - verifyStart
 
         let sampleStart = Date.timeIntervalSinceReferenceDate
-        var sampled: [MLXArray] = []
-        sampled.reserveCapacity(requested.count)
-        var sampledIDs: [Int] = []
-        sampledIDs.reserveCapacity(requested.count)
-        var verifyProcessor = processor
-        for index in 0 ..< requested.count {
-            let token = Self.sampleRow(
-                logits: verifier.logits[0..., index, 0...],
-                sampler: sampler,
-                processor: &verifyProcessor)
-            MLX.eval(token)
-            sampled.append(token)
-            sampledIDs.append(token.item(Int.self))
-        }
+        let verifyDecision = Self.verifyDrafts(
+            logits: verifier.logits,
+            drafts: drafts,
+            draftProbabilities: draftProbabilities,
+            sampler: sampler,
+            speculativeSampler: speculativeSampler,
+            processor: processor)
         samplingTime += Date.timeIntervalSinceReferenceDate - sampleStart
 
-        var accepted = 0
-        while accepted < drafts.count {
-            let targetID = sampledIDs[accepted]
-            let draftID = drafts[accepted].item(Int.self)
-            guard targetID == draftID else { break }
-            accepted += 1
+        let accepted = verifyDecision.accepted
+        let nextVerifiedToken = verifyDecision.nextToken
+        if !speculativeSampler.isGreedy {
+            acceptanceProbabilitySum += verifyDecision.acceptanceProbabilitySum
+            acceptanceProbabilityCount += verifyDecision.acceptanceProbabilityCount
         }
 
         verifyCalls += 1
@@ -261,15 +271,18 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let hiddenForNextMTP: MLXArray
         if accepted == drafts.count {
             bonusCount += 1
-            let bonus = sampled[drafts.count]
+            let bonus = nextVerifiedToken
             processor?.didSample(token: bonus)
             pendingTokens.append(bonus.item(Int.self))
             nextToken = bonus
             hiddenForNextMTP = verifier.hiddenStates[0..., drafts.count ..< (drafts.count + 1), 0...]
         } else {
             rejectedCount += 1
+            if !speculativeSampler.isGreedy {
+                residualCorrectionCount += 1
+            }
 
-            let correction = sampled[accepted]
+            let correction = nextVerifiedToken
             processor?.didSample(token: correction)
             pendingTokens.append(correction.item(Int.self))
             nextToken = correction
@@ -305,15 +318,121 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         nextMain = nextToken
         let draftStart = Date.timeIntervalSinceReferenceDate
-        drafts = Self.makeDrafts(
+        let draftBatch = Self.makeDrafts(
             model: model,
             hidden: hiddenForNextMTP,
             nextToken: nextToken,
             mtpCache: mtpCache,
             depth: depth,
             sampler: sampler,
+            speculativeSampler: speculativeSampler,
             processor: processor)
+        drafts = draftBatch.tokens
+        draftProbabilities = draftBatch.probabilities
         mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
+    }
+
+    private struct VerifyDecision {
+        let accepted: Int
+        let nextToken: MLXArray
+        let acceptanceProbabilitySum: Double
+        let acceptanceProbabilityCount: Int
+    }
+
+    private struct DraftBatch {
+        let tokens: [MLXArray]
+        let probabilities: [MLXArray]
+    }
+
+    private static func verifyDrafts(
+        logits: MLXArray,
+        drafts: [MLXArray],
+        draftProbabilities: [MLXArray],
+        sampler: LogitSampler,
+        speculativeSampler: SpeculativeSamplingController,
+        processor: LogitProcessor?
+    ) -> VerifyDecision {
+        if speculativeSampler.isGreedy {
+            var sampled: [MLXArray] = []
+            sampled.reserveCapacity(drafts.count + 1)
+            var sampledIDs: [Int] = []
+            sampledIDs.reserveCapacity(drafts.count + 1)
+            var verifyProcessor = processor
+            for index in 0 ... drafts.count {
+                let sample = sampleRow(
+                    logits: logits[0..., index, 0...],
+                    sampler: sampler,
+                    speculativeSampler: speculativeSampler,
+                    processor: &verifyProcessor)
+                MLX.eval(sample.token)
+                sampled.append(sample.token)
+                sampledIDs.append(sample.token.item(Int.self))
+            }
+
+            var accepted = 0
+            while accepted < drafts.count {
+                let targetID = sampledIDs[accepted]
+                let draftID = drafts[accepted].item(Int.self)
+                guard targetID == draftID else { break }
+                accepted += 1
+            }
+
+            return VerifyDecision(
+                accepted: accepted,
+                nextToken: sampled[accepted],
+                acceptanceProbabilitySum: 0,
+                acceptanceProbabilityCount: 0)
+        }
+
+        var targetProbabilities: [MLXArray] = []
+        targetProbabilities.reserveCapacity(drafts.count + 1)
+        var verifyProcessor = processor
+        for index in 0 ... drafts.count {
+            let probabilities = processedProbabilities(
+                logits: logits[0..., index, 0...],
+                speculativeSampler: speculativeSampler,
+                processor: &verifyProcessor)
+            MLX.eval(probabilities)
+            targetProbabilities.append(probabilities)
+            if index < drafts.count {
+                verifyProcessor?.didSample(token: drafts[index])
+            }
+        }
+
+        var accepted = 0
+        var probabilitySum = 0.0
+        var probabilityCount = 0
+        while accepted < drafts.count {
+            let decision = speculativeSampler.acceptOrCorrect(
+                draftToken: drafts[accepted],
+                targetProbabilities: targetProbabilities[accepted],
+                draftProbabilities: draftProbabilities[accepted])
+            probabilitySum += Double(decision.acceptanceProbability)
+            probabilityCount += 1
+
+            if decision.accepted {
+                accepted += 1
+                continue
+            }
+
+            guard let correction = decision.correction else {
+                preconditionFailure("rejected speculative token must return a residual correction")
+            }
+            MLX.eval(correction)
+            return VerifyDecision(
+                accepted: accepted,
+                nextToken: correction,
+                acceptanceProbabilitySum: probabilitySum,
+                acceptanceProbabilityCount: probabilityCount)
+        }
+
+        let bonus = speculativeSampler.sampleFromTarget(probabilities: targetProbabilities[drafts.count])
+        MLX.eval(bonus)
+        return VerifyDecision(
+            accepted: accepted,
+            nextToken: bonus,
+            acceptanceProbabilitySum: probabilitySum,
+            acceptanceProbabilityCount: probabilityCount)
     }
 
     private static func makeDrafts(
@@ -323,10 +442,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpCache: [KVCache],
         depth: Int,
         sampler: LogitSampler,
+        speculativeSampler: SpeculativeSamplingController,
         processor: LogitProcessor?
-    ) -> [MLXArray] {
-        var result: [MLXArray] = []
-        result.reserveCapacity(depth)
+    ) -> DraftBatch {
+        var tokens: [MLXArray] = []
+        tokens.reserveCapacity(depth)
+        var probabilities: [MLXArray] = []
+        probabilities.reserveCapacity(speculativeSampler.isGreedy ? 0 : depth)
 
         var hidden = hidden
         var token = nextToken
@@ -339,14 +461,18 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let draft = sampleLast(
                 logits: out.logits,
                 sampler: sampler,
+                speculativeSampler: speculativeSampler,
                 processor: &draftProcessor)
-            MLX.eval(draft, out.hiddenStates)
-            result.append(draft)
+            MLX.eval(draft.token, out.hiddenStates)
+            tokens.append(draft.token)
+            if !speculativeSampler.isGreedy {
+                probabilities.append(draft.probabilities)
+            }
             hidden = lastHidden(out.hiddenStates)
-            token = draft
+            token = draft.token
         }
 
-        return result
+        return DraftBatch(tokens: tokens, probabilities: probabilities)
     }
 
     private static func canCommitVerifierCache(_ cache: [KVCache]) -> Bool {
@@ -396,25 +522,61 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static func sampleLast(
         logits: MLXArray,
         sampler: LogitSampler,
+        speculativeSampler: SpeculativeSamplingController,
         processor: inout LogitProcessor?
-    ) -> MLXArray {
-        sampleRow(logits: logits[0..., -1, 0...], sampler: sampler, processor: &processor)
+    ) -> SpeculativeSamplingController.Sample {
+        sampleRow(
+            logits: logits[0..., -1, 0...],
+            sampler: sampler,
+            speculativeSampler: speculativeSampler,
+            processor: &processor)
     }
 
     private static func sampleRow(
         logits: MLXArray,
         sampler: LogitSampler,
+        speculativeSampler: SpeculativeSamplingController,
         processor: inout LogitProcessor?
-    ) -> MLXArray {
+    ) -> SpeculativeSamplingController.Sample {
         var logits = logits
         if var local = processor {
             logits = local.process(logits: logits)
-            let token = sampler.sample(logits: logits)
-            local.didSample(token: token)
+            let sample = sampleProcessedRow(
+                logits: logits,
+                sampler: sampler,
+                speculativeSampler: speculativeSampler)
+            local.didSample(token: sample.token)
             processor = local
-            return token
+            return sample
         }
-        return sampler.sample(logits: logits)
+        return sampleProcessedRow(
+            logits: logits,
+            sampler: sampler,
+            speculativeSampler: speculativeSampler)
+    }
+
+    private static func sampleProcessedRow(
+        logits: MLXArray,
+        sampler: LogitSampler,
+        speculativeSampler: SpeculativeSamplingController
+    ) -> SpeculativeSamplingController.Sample {
+        if speculativeSampler.isGreedy {
+            let token = sampler.sample(logits: logits)
+            return SpeculativeSamplingController.Sample(token: token, probabilities: MLXArray.zeros([0]))
+        }
+        return speculativeSampler.sample(logits: logits)
+    }
+
+    private static func processedProbabilities(
+        logits: MLXArray,
+        speculativeSampler: SpeculativeSamplingController,
+        processor: inout LogitProcessor?
+    ) -> MLXArray {
+        var logits = logits
+        if let local = processor {
+            logits = local.process(logits: logits)
+        }
+        return speculativeSampler.probabilities(logits: logits)
     }
 
     private static func tokenInput(_ token: MLXArray) -> MLXArray {

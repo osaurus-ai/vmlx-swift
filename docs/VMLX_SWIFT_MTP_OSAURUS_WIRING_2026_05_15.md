@@ -147,7 +147,8 @@ alone. It requires:
 - complete MTP tensor evidence from the index or safetensors headers;
 - an active Swift model exposing `NativeMTPModel`;
 - explicit runtime selection;
-- greedy `temperature=0` for the current implementation.
+- greedy `temperature=0` or the native exact p/q stochastic verifier path
+  described below.
 
 Bundles whose config advertises MTP but whose weights do not contain MTP tensors
 fail closed. The local CRACK bundle
@@ -164,6 +165,42 @@ and trims rejected attention-KV suffixes, so rejected draft state is not kept in
 the backbone cache. This is real D3 prefix-commit semantics, but it is not yet a
 production speed path because the small-M verifier and prefix-state capture are
 still eager Swift/MLX work rather than a tuned compiled verifier kernel.
+
+## Clean-Room Runtime Comparison - 2026-05-16
+
+The Swift implementation was checked against the public behavior of two Python
+runtime families without copying code:
+
+- `mlx_lm` speculative decode uses separate verifier and draft caches, drafts
+  `K` tokens, verifies `[primary, d1, ... dK]` in one target forward, accepts a
+  draft prefix, emits the verifier token at the first rejected/bonus position,
+  and trims rejected cache suffixes. That matches the Swift greedy structure.
+- MTPLX native MTP uses the model's own MTP heads, recursive draft hidden-state
+  feedback, an MTP-private cache, target verification over
+  `[primary, d1, d2, d3]`, exact probability-ratio acceptance at stochastic
+  temperatures, residual correction sampling on rejection, accepted-prefix cache
+  commit, and a compiled/tuned small-M verifier hot path.
+
+The important deltas for Swift were:
+
+1. Native MTP draft must return hidden state as well as logits. Swift now does
+   this through `NativeMTPForwardResult`.
+2. D2/D3 cannot use all-or-nothing cache acceptance. Swift now commits
+   `primary + acceptedDraftPrefix` and trims/repairs rejected suffixes.
+3. Stochastic MTP cannot compare sampled token IDs. Swift now has
+   `SpeculativeSamplingController`, which applies the same top-p, min-p, top-k,
+   and temperature distribution shape as the existing sampler, then performs
+   `min(1, p/q)` acceptance and residual correction.
+4. The target verifier processor state must advance with draft tokens while
+   computing target distributions for later draft positions. It must not advance
+   with an unrelated target sample before the draft is accepted.
+5. The remaining speed delta is not another sampler or fake guard problem. The
+   measured wall is still target verification, so the next real speed path is a
+   compiled/retuned small-M verifier shape bank plus any required MLX qmv kernel
+   work.
+
+This is intentionally a behavioral contract, not a source port. Python project
+structure, function names, and implementation text were not copied into Swift.
 
 Live current-code artifacts under `docs/local/native-mtp-qwen36-20260515/`
 record the following local rows:
@@ -188,6 +225,14 @@ Live 2026-05-16 D3 prefix-commit artifacts under
 | `/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP4-MTP` | AR baseline | `mxfp4-mtp-ar-baseline-256.log` | coherent, `14.6 tok/s`, `stop=length`, `loop=NO` |
 | `/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP4-MTP` | native MTP D3 prefix commit | `mxfp4-mtp-d3-prefix-commit-no-checkpoint-256.log` | coherent, `16.4 tok/s`, `verifyCalls=116`, `prefixCommit=116`, `rollbackRepair=0`, `avgCommittedPerVerify=2.21`, `loop=NO` |
 
+Live 2026-05-16 exact p/q stochastic native-MTP artifacts under
+`docs/local/native-mtp-qwen36-20260516-cleanroom/`:
+
+| Bundle | Mode | Artifact | Result |
+| --- | --- | --- | --- |
+| `/Users/eric/models/JANGQ/Qwen3.6-27B-JANG_4M-MTP` | native MTP D3, `temp=0.6`, `top_p=0.95`, `top_k=20` | `jang4m-mtp-d3-exactpq-temp06-64.log` / `.err` | coherent, `stop=stop`, `loop=NO`, `tokps=8.2`, `verifyCalls=17`, `acceptedByDepth=0:5,1:8,2:1,3:3`, `residualCorrection=14`, `avgAcceptP=0.591`, `samplingMode=exact-pq` |
+| `/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP4-MTP` | native MTP D3, `temp=0.6`, `top_p=0.95`, `top_k=20` | `mxfp4-mtp-d3-exactpq-temp06-64.log` / `.err` | coherent, `stop=stop`, `loop=NO`, `tokps=27.5`, `verifyCalls=17`, `acceptedByDepth=0:1,1:7,2:4,3:5`, `residualCorrection=12`, `avgAcceptP=0.686`, `samplingMode=exact-pq` |
+
 Phase-timing reruns (`*-phase-256.*`) show the wall is target verify, not cache
 commit: JANG_4M spent `16.388s` in target verify, `1.903s` in MTP draft,
 `0.140s` in sampling, and `0.088s` in cache commit; MXFP4 spent `15.411s`,
@@ -195,15 +240,17 @@ commit: JANG_4M spent `16.388s` in target verify, `1.903s` in MTP draft,
 at compiled/tuned small-M verifier execution, not another cache monkeypatch.
 
 The 50 tok/s Qwen3.6 27B target is not achieved by the current Swift path.
-The D3 path is correct enough to keep as an explicit diagnostic, but it must not
-auto-launch as a production acceleration mode. The attempted verifier argmax
-vectorization was rejected after live rows were slower, so it is not part of the
-implementation. The next real speed work is:
+The D3 path is correct enough to keep as an explicit diagnostic, including
+stochastic exact p/q acceptance, but it must not auto-launch as a production
+acceleration mode. The attempted verifier argmax vectorization was rejected
+after live rows were slower, so it is not part of the implementation. The next
+real speed work is:
 
 1. recursive MTP draft returns logits and hidden state for `d1`, `d2`, and
    `d3` without recomputing state traces;
 2. one target verifier forward over `[primary, d1, d2, d3]`;
-3. compiled/tuned small-M verifier shapes for Qwen3.6 hybrid blocks;
+3. compiled/tuned small-M verifier shapes for Qwen3.6 hybrid blocks, with cache
+   offsets represented in the graph rather than as Python/Swift scalar state;
 4. phase timing for target verify time, MTP draft time, cache commit time, and
    sampling time;
 5. telemetry for requested/effective depth, verify calls, accepted-by-depth,

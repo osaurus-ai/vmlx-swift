@@ -115,6 +115,55 @@ public class SampleTests: XCTestCase {
         XCTAssertTrue(GenerateParameters(temperature: 0).sampler() is ArgMaxSampler)
     }
 
+    func testSpeculativeSamplingDistributionHonorsTopK() {
+        let controller = SpeculativeSamplingController(
+            parameters: GenerateParameters(
+                temperature: 1.0, topP: 1.0, topK: 2, minP: 0.0, randomSeed: 7))
+        let logits =
+            MLXArray([0.0 as Float, 4.0 as Float, 3.0 as Float, 1.0 as Float])[.newAxis, .ellipsis]
+        let probabilities = controller.probabilities(logits: logits)[0].asArray(Float.self)
+
+        XCTAssertEqual(probabilities[0], 0, accuracy: 1e-6)
+        XCTAssertGreaterThan(probabilities[1], 0)
+        XCTAssertGreaterThan(probabilities[2], 0)
+        XCTAssertEqual(probabilities[3], 0, accuracy: 1e-6)
+        XCTAssertEqual(probabilities.reduce(0, +), 1, accuracy: 1e-5)
+    }
+
+    func testSpeculativeSamplingAcceptsWhenTargetDominatesDraft() {
+        let controller = SpeculativeSamplingController(
+            parameters: GenerateParameters(temperature: 1.0, randomSeed: 11))
+        let target = MLXArray([0.9 as Float, 0.1 as Float])[.newAxis, .ellipsis]
+        let draft = MLXArray([0.4 as Float, 0.6 as Float])[.newAxis, .ellipsis]
+        let token = MLXArray([UInt32(0)])
+
+        let decision = controller.acceptOrCorrect(
+            draftToken: token,
+            targetProbabilities: target,
+            draftProbabilities: draft)
+
+        XCTAssertTrue(decision.accepted)
+        XCTAssertEqual(decision.acceptanceProbability, 1, accuracy: 1e-6)
+        XCTAssertNil(decision.correction)
+    }
+
+    func testSpeculativeSamplingRejectsWithResidualCorrection() {
+        let controller = SpeculativeSamplingController(
+            parameters: GenerateParameters(temperature: 1.0, randomSeed: 13))
+        let target = MLXArray([0.0 as Float, 1.0 as Float])[.newAxis, .ellipsis]
+        let draft = MLXArray([1.0 as Float, 0.0 as Float])[.newAxis, .ellipsis]
+        let token = MLXArray([UInt32(0)])
+
+        let decision = controller.acceptOrCorrect(
+            draftToken: token,
+            targetProbabilities: target,
+            draftProbabilities: draft)
+
+        XCTAssertFalse(decision.accepted)
+        XCTAssertEqual(decision.acceptanceProbability, 0, accuracy: 1e-6)
+        XCTAssertEqual(decision.correction?.item(Int.self), 1)
+    }
+
     func testPresencePenaltyContextPenalizesSeenTokens() {
         var processor = PresencePenaltyContext(presencePenalty: 0.5, presenceContextSize: 20)
         processor.prompt(MLXArray([1, 1, 3]))
