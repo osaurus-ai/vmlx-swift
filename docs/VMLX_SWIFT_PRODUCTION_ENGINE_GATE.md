@@ -204,14 +204,19 @@ These rows are now covered in this checkout with artifacts under
   `docs/local/live-model-matrix/20260516Tnonmtp-tests/RunBench_release_build.out`.
   Local Swift Testing/XCTest rows require the Xcode MacOSX test framework search
   path because `xcode-select` points at CommandLineTools. This invocation passes
-  the previously blocked Swift Testing policy row and the wired Omni focused
-  audio rows:
+  the previously blocked Swift Testing policy row and the expanded wired Omni
+  focused suite:
   `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test
   --filter <suite> --jobs 2 -Xswiftc -F -Xswiftc
   /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks`.
-  `Tests/MLXLMTests/NemotronHOmniSmokeTests.swift` is present on disk but is not
-  part of the active package test targets, so a filtered run of that class
-  executes 0 tests and is not counted as proof.
+  The expanded Omni focused artifact is
+  `docs/local/live-model-matrix/20260516Tnonmtp-tests/NemotronHOmniPreEncodedAudioTests_expanded_xcode.out`
+  with 7/7 rows passing: live audio buffer, pre-encoded Parakeet embedding,
+  video EVS token count, RADIO pixel shuffle, Parakeet relative shift,
+  projector remaps, and Parakeet weight transpose. The older
+  `Tests/MLXLMTests/NemotronHOmniSmokeTests.swift` file remains present on disk
+  but is not part of the active package test targets, so a filtered run of that
+  class executes 0 tests and is not counted as proof.
 
 ## Fix Gates
 
