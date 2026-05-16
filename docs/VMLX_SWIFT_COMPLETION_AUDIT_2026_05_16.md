@@ -8,10 +8,13 @@ artifact or source reference. Everything else stays `open`.
 Current pushed branch state:
 
 - Branch: `vmlx-0.31.3`
-- Pushed HEAD: `4e53670` (`docs(runtime): refresh osaurus consolidation audit`)
+- Pushed HEAD: `0fdb164` (`feat(runtime): add exact native mtp sampling`)
 - Previous runtime commit: `9b1b254` (`feat(runtime): add tensor-gated qwen native mtp`)
 - Current worktree is not clean because another agent is working on Flux-native
   Swift files. The dirty Flux files are excluded from this audit's commit scope.
+- Current non-MTP focus: ZAYA1-VL template/tool/vision correctness,
+  live multi-turn text rows, and VL media cache rows. Native MTP is parked for
+  this pass.
 
 ## Objective Restated as Deliverables
 
@@ -57,7 +60,7 @@ The package is complete only when all of these are true:
 | Paged cache OFF/ON. | Existing focused tests and some model rows exist, but no package-wide matrix artifact proves all relevant architectures. | open |
 | Disk L2 OFF/ON and fresh-session restore. | Existing docs and some rows exist; package-wide, per-topology proof remains incomplete. | open |
 | SSM companion cache and async rederive. | Qwen/hybrid rows are required by docs; not exhaustively live-proven for all relevant local models. | open |
-| VL media salt, same-image hit, changed-image miss. | Some VL rows pass; current infer matrix has ZAYA-VL text prod rows failing with status 133 while VL batch chat rows pass. Needs diagnosis, not a pass. | open |
+| VL media salt, same-image hit, changed-image miss. | `docs/local/live-model-matrix/20260516Tzaya-vl-think-template-fix/ZAYA1-VL-8B-JANGTQ4_vl_chat_cache.out`: same-media replay HIT, different-media MISS, coherent blue/orange follow-up. | live-proven for ZAYA1-VL JANGTQ4 |
 | Nemotron Omni audio/Parakeet/RADIO. | `docs/local/live-model-matrix/20260515Tinfer-under20/` has Omni JANGTQ and JANGTQ4 `infer_omni` pass rows. Chunk-concat safety remains documented as not proven. | partial |
 | Reasoning on/off/effort matrix. | Focused DSV4 pass-through exists; full model-family reasoning matrix is not complete. | open |
 | Tool parser matrix by family. | DSV4 and selected templates have focused proof; full dsml/deepseek/gemma4/kimi/jang/zaya/llama/qwen/mistral matrix remains open. | open |
@@ -65,8 +68,8 @@ The package is complete only when all of these are true:
 | Single-batch and continuous batching. | Batch harness exists; full B=1/B>1 overlap and isolation proof per family remains incomplete. | open |
 | TurboQuant/JANGTQ encode/decode and acceleration toggles. | Focused JANGTQ/Hadamard/matmul proof exists; live low-footprint active routed expert pass for all relevant models remains open. | open |
 | Distributed mode. | Targets exist (`MLXDistributed*`, `TPRankWorker`), but no no-peer distributed clean artifact is recorded for this audit. | open |
-| Full `swift test`. | Current dirty worktree test attempt failed before MTP tests because package/test graph compiled `MLXPressPolicyTests` with `no such module 'Testing'` under the active command. This is a blocker, not a pass. | open |
-| Release build. | `swift build -c release --product RunBench --jobs 2` passed after MTP changes. | live-proven |
+| Full `swift test`. | Current filtered test attempt still fails before focused tests because SwiftPM compiles `MLXPressPolicyTests` first and that target errors with `no such module 'Testing'`. This is a blocker, not a pass. | open |
+| Release build. | `swift build -c release --product RunBench --jobs 2` passed after the non-MTP ZAYA1-VL template/harness changes. | live-proven |
 | Osaurus single-package repin. | Not done. Osaurus still pins split runtime stack. | open |
 
 ## Current Model Matrix Snapshot
@@ -92,6 +95,31 @@ Known failing rows from that snapshot:
 - `ZAYA1-VL-8B-MXFP4_.infer_prod_defaults_cache_off` -> `fail:133`
 - `Qwen3.6-27B-MXFP4-MTP_.infer_prod_defaults_cache_off` -> `fail:133`
 - `Qwen3.6-27B-MXFP4-MTP_.infer_vl_batch_chat` -> `fail:133`
+
+2026-05-16 non-MTP ZAYA1-VL follow-up:
+
+- Root cause for JANGTQ4/MXFP4 text failures was not sampling and not a model
+  quality issue: the loader shim manufactured a Qwen-style `<think>` assistant
+  prefill even though ZAYA1-VL bundles stamp `think_in_template=false` and their
+  shipped VL sidecar generation prompt is plain `<|im_start|>assistant\n`.
+- Fix scope: ZAYA1-VL metadata shim still materializes vision placeholders and
+  Zyphra XML tools, but no longer emits `<think>` or `enable_thinking` rails.
+  The production harness now probes the actual rendered prompt before requiring
+  `.reasoning` deltas; non-toggleable templates must still produce visible,
+  coherent output with no marker leak.
+- `ZAYA1-VL-8B-JANGTQ4` now passes `BENCH_TEMPLATE_SMOKE=1`,
+  `BENCH_PROD=1`, and `BENCH_VL_CHAT_CACHE=1`:
+  `docs/local/live-model-matrix/20260516Tzaya-vl-think-template-fix/ZAYA1-VL-8B-JANGTQ4_template_smoke.out`,
+  `.../ZAYA1-VL-8B-JANGTQ4_prod_postharness.out`, and
+  `.../ZAYA1-VL-8B-JANGTQ4_vl_chat_cache.out`.
+- `ZAYA1-VL-8B-MXFP4` now passes `BENCH_PROD=1` at
+  `docs/local/live-model-matrix/20260516Tzaya-vl-think-template-fix/ZAYA1-VL-8B-MXFP4_prod.out`.
+- `ZAYA1-VL-8B-JANGTQ_K` remains blocked: bundle-default sampling and explicit
+  greedy both fail the same `7+8-11` row (`7`/`8` stochastic, `6` greedy) while
+  other short rows pass. Artifacts:
+  `docs/local/live-model-matrix/20260516Tzaya-vl-think-template-fix/ZAYA1-VL-8B-JANGTQ_K_prod.out`
+  and `.../ZAYA1-VL-8B-JANGTQ_K_prod_greedy.out`. Do not call this variant
+  production-ready until the quant/runtime cause is found.
 
 Skipped rows because of the 20GB cutoff include DSV4 Flash, Hy3, Kimi,
 MiniMax, Ling, and other large bundles. They are not production passes.
@@ -125,9 +153,9 @@ Not yet complete:
 
 ## Immediate Next Gates
 
-1. Diagnose the `fail:133` rows in the existing under-20GB matrix, starting with
-   `Qwen3.6-27B-MXFP4-MTP` and ZAYA-VL prod-default text rows. These are current
-   live failures and should not be hidden.
+1. Continue diagnosing the remaining `fail:133` rows without MTP scope:
+   `ZAYA1-VL-8B-JANGTQ_K` is still a real coherence failure on one math row.
+   The JANGTQ4/MXFP4 ZAYA1-VL text-template failures are fixed and live-proven.
 2. Run a clean-worktree focused test pass once Flux Package.swift edits are
    either committed by the Flux agent or isolated in a separate worktree.
 3. Optimize the native MTP D3 verifier hot path. The correctness baseline now

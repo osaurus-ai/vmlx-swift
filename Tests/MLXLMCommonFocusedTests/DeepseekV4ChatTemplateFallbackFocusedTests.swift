@@ -210,7 +210,9 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("Describe the image"))
         #expect(rendered.contains("<name>osaurus_probe_tool_0</name>"))
         #expect(rendered.contains("<zyphra_tool_call>"))
-        #expect(rendered.hasSuffix("<|im_start|>assistant\n<think>\n</think>\n\n"))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
+        #expect(!rendered.contains("<think>"))
+        #expect(!rendered.contains("enable_thinking"))
     }
 
     @Test("ZAYA1-VL sidecar shim rewrites every loader-visible template source")
@@ -233,6 +235,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             "capabilities": [
                 "family": "zaya1_vl",
                 "tool_parser": "zaya_xml",
+                "think_in_template": false,
                 "supports_tools": true,
             ],
         ]
@@ -265,5 +268,46 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             contentsOf: shim.appendingPathComponent("chat_template.jinja"),
             encoding: .utf8)
         #expect(jinjaTemplate == tokenizerTemplate)
+    }
+
+    @Test("ZAYA1-VL metadata shim engages without sidecar template")
+    func zayaVLMetadataShimEngagesWithoutSidecarTemplate() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(
+            "zaya-vl-metadata-shim-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let tokenizerConfig: [String: Any] = [
+            "bos_token": "<bos>",
+            "eos_token": "<|im_end|>",
+            "chat_template": "user: {{ messages[0]['content'] }}\nassistant: ",
+        ]
+        let jangConfig: [String: Any] = [
+            "capabilities": [
+                "family": "zaya1_vl",
+                "tool_parser": "zaya_xml",
+                "think_in_template": false,
+                "supports_tools": true,
+                "supports_thinking": true,
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: tokenizerConfig).write(
+            to: root.appendingPathComponent("tokenizer_config.json"))
+        try JSONSerialization.data(withJSONObject: jangConfig).write(
+            to: root.appendingPathComponent("jang_config.json"))
+
+        let shim = JangLoader.resolveChatTemplateSidecarSubstitution(for: root)
+        #expect(shim != root)
+
+        let rewrittenTokenizerData = try Data(
+            contentsOf: shim.appendingPathComponent("tokenizer_config.json"))
+        let rewrittenTokenizer = try #require(
+            JSONSerialization.jsonObject(with: rewrittenTokenizerData) as? [String: Any])
+        let tokenizerTemplate = try #require(rewrittenTokenizer["chat_template"] as? String)
+        #expect(tokenizerTemplate.contains("zyphra_tool_call"))
+        #expect(tokenizerTemplate.contains("<|vision_start|><image><|vision_end|>"))
+        #expect(!tokenizerTemplate.contains("enable_thinking"))
+        #expect(!tokenizerTemplate.contains("<think>"))
     }
 }

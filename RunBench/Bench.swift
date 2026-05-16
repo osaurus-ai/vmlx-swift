@@ -6655,6 +6655,32 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
         params.repetitionPenalty.map { String(format: "%.3f", Double($0)) } ?? "nil",
         params.randomSeed.map(String.init) ?? "nil"))
 
+    func promptTail(thinking: Bool) async throws -> String {
+        var probe = UserInput(prompt: "Probe reasoning toggle.")
+        probe.additionalContext = ["enable_thinking": thinking]
+        let input = try await ctx.processor.prepare(input: probe)
+        let ids = input.text.tokens.reshaped(-1).asArray(Int32.self).map { Int($0) }
+        return ctx.tokenizer.decode(
+            tokenIds: Array(ids.suffix(96)), skipSpecialTokens: false)
+    }
+
+    func hasReasoningPromptRail(_ text: String) -> Bool {
+        text.contains("<think>")
+            || text.contains("[THINK]")
+            || text.contains("<|channel>")
+            || text.contains("<|channel|>analysis")
+    }
+
+    let thinkingOnPromptTail = try await promptTail(thinking: true)
+    let thinkingOffPromptTail = try await promptTail(thinking: false)
+    let reasoningPromptToggleActive =
+        thinkingOnPromptTail != thinkingOffPromptTail
+        && hasReasoningPromptRail(thinkingOnPromptTail)
+    print(
+        "Reasoning prompt toggle: \(reasoningPromptToggleActive ? "active" : "not-template-active")"
+            + " onTail=\(thinkingOnPromptTail.suffix(80).debugDescription)"
+            + " offTail=\(thinkingOffPromptTail.suffix(80).debugDescription)")
+
     final class Stats: @unchecked Sendable {
         var peakRSS: Double; var pass = 0; var fail = 0
         var ttftByLabel: [String: Int] = [:]
@@ -6742,7 +6768,7 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
     func requireVisibleAnswer(_ r: TurnResult, contains expected: String) -> (Bool, String) {
         let noLeak = requireNoVisibleReasoningMarkers(r)
         if !noLeak.0 { return noLeak }
-        if context.configuration.reasoningParserName != nil &&
+        if reasoningPromptToggleActive &&
             r.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
             return (false, "reasoning ON produced no .reasoning deltas")

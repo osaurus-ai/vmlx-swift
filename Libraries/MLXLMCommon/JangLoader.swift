@@ -698,12 +698,22 @@ public struct JangLoader: Sendable {
     /// placeholders unless we materialize a tokenizer shim whose
     /// `chat_template` field points at the sidecar template.
     ///
+    /// ZAYA1-VL JANG bundles have an additional real metadata contract:
+    /// `jang_config.json` stamps `family = zaya1_vl`,
+    /// `tool_parser = zaya_xml`, `think_in_template = false`, and
+    /// `supports_tools = true`, while older
+    /// tokenizer configs may still carry a plain `user:` / `assistant:`
+    /// template that ignores image placeholders and tools. For those bundles,
+    /// materialize the native ZAYA1-VL vision/tool template even if no sidecar
+    /// file exists, while preserving `think_in_template=false`.
+    ///
     /// This is intentionally data-driven, not family-name driven:
     ///
-    /// - `chat_template.json` must exist and contain a string `chat_template`.
-    /// - The sidecar template must contain a vision placeholder marker.
-    /// - The current tokenizer config must not already contain a vision
-    ///   placeholder marker.
+    /// - If `chat_template.json` exists, it must contain a string
+    ///   `chat_template` with a vision placeholder marker.
+    /// - Or `jang_config.json` must prove the ZAYA1-VL tool-aware contract.
+    /// - The current tokenizer config must not already contain the same
+    ///   production markers.
     ///
     /// If any condition is not met, returns `directory` unchanged.
     public static func resolveChatTemplateSidecarSubstitution(
@@ -711,34 +721,47 @@ public struct JangLoader: Sendable {
         fileManager: FileManager = .default
     ) -> URL {
         let configURL = directory.appendingPathComponent("tokenizer_config.json")
-        let sidecarURL = directory.appendingPathComponent("chat_template.json")
         guard fileManager.fileExists(atPath: configURL.path),
-              fileManager.fileExists(atPath: sidecarURL.path),
               let configData = try? Data(contentsOf: configURL),
               var configJSON = try? JSONSerialization.jsonObject(with: configData)
-                as? [String: Any],
-              let sidecarData = try? Data(contentsOf: sidecarURL),
-              let sidecarJSON = try? JSONSerialization.jsonObject(with: sidecarData)
-                as? [String: Any],
-              let sidecarTemplate = sidecarJSON["chat_template"] as? String
+                as? [String: Any]
         else {
             return directory
         }
 
-        guard isVisionChatTemplate(sidecarTemplate) else {
+        let currentTemplate = configJSON["chat_template"] as? String
+        let zayaToolAware = shouldUseZayaVLToolAwareTemplate(for: directory)
+        if let currentTemplate, templateAlreadyMatchesZayaVLToolAware(currentTemplate) {
             return directory
         }
-        if let currentTemplate = configJSON["chat_template"] as? String,
+
+        let sidecarURL = directory.appendingPathComponent("chat_template.json")
+        let sidecarTemplate: String? = {
+            guard fileManager.fileExists(atPath: sidecarURL.path),
+                  let sidecarData = try? Data(contentsOf: sidecarURL),
+                  let sidecarJSON = try? JSONSerialization.jsonObject(with: sidecarData)
+                    as? [String: Any],
+                  let template = sidecarJSON["chat_template"] as? String,
+                  isVisionChatTemplate(template)
+            else {
+                return nil
+            }
+            return template
+        }()
+
+        guard zayaToolAware || sidecarTemplate != nil else {
+            return directory
+        }
+        if !zayaToolAware,
+           let currentTemplate,
            isVisionChatTemplate(currentTemplate)
         {
             return directory
         }
 
-        let effectiveTemplate =
-            shouldUseZayaVLToolAwareTemplate(
-                for: directory, sidecarTemplate: sidecarTemplate)
+        let effectiveTemplate = zayaToolAware
             ? ChatTemplateFallbacks.zayaVLVisionToolMinimal
-            : sidecarTemplate
+            : sidecarTemplate!
         configJSON["chat_template"] = effectiveTemplate
 
         let shimDir = fileManager.temporaryDirectory.appendingPathComponent(
@@ -788,13 +811,13 @@ public struct JangLoader: Sendable {
             || template.contains("<image>")
     }
 
-    private static func shouldUseZayaVLToolAwareTemplate(
-        for directory: URL,
-        sidecarTemplate: String
-    ) -> Bool {
-        guard isVisionChatTemplate(sidecarTemplate),
-              let config = try? loadConfig(at: directory)
-        else {
+    private static func templateAlreadyMatchesZayaVLToolAware(_ template: String) -> Bool {
+        isVisionChatTemplate(template)
+            && template.contains("zyphra_tool_call")
+    }
+
+    private static func shouldUseZayaVLToolAwareTemplate(for directory: URL) -> Bool {
+        guard let config = try? loadConfig(at: directory) else {
             return false
         }
 
@@ -802,6 +825,7 @@ public struct JangLoader: Sendable {
         let parser = config.capabilities?.toolParser?.lowercased() ?? ""
         return family.contains("zaya1_vl")
             && ["zaya", "zaya_xml", "zyphra", "zyphra_xml"].contains(parser)
+            && config.capabilities?.thinkInTemplate == false
             && config.capabilities?.supportsTools == true
     }
 

@@ -673,14 +673,14 @@ public enum ChatTemplateFallbacks {
 
     /// ZAYA1-VL multimodal template with the same Zyphra XML tool
     /// declaration/call contract as text ZAYA, while preserving the shipped
-    /// vision placeholder markers. The source sidecar template handles image
-    /// turns but ignores top-level `tools`; the text ZAYA template handles
-    /// tools but cannot render image content arrays. This is the combined
-    /// production prompt contract for JANG ZAYA1-VL bundles that stamp
-    /// `capabilities.tool_parser = zaya_xml`.
+    /// vision placeholder markers.
+    ///
+    /// ZAYA1-VL bundles stamp `think_in_template=false`, so this fallback must
+    /// not prefill `<think>` or `<think></think>` rails. The runtime reasoning
+    /// parser still handles real model-emitted `<think>...</think>` blocks, but
+    /// the template does not manufacture them.
     public static let zayaVLVisionToolMinimal: String = #"""
 {{- bos_token -}}
-{%- set _enable_thinking = enable_thinking if enable_thinking is defined else false -%}
 {%- if tools is not defined -%}
     {%- set tools = [] -%}
 {%- endif -%}
@@ -754,8 +754,6 @@ public enum ChatTemplateFallbacks {
         {{- '<|im_start|>assistant\n' -}}
         {%- if message['reasoning_content'] is defined and message['reasoning_content'] is string and message['reasoning_content'] | trim | length > 0 -%}
             {{- '<think>\n' ~ message['reasoning_content'] ~ '\n</think>\n\n' -}}
-        {%- elif _enable_thinking == false -%}
-            {{- '<think>\n</think>\n\n' -}}
         {%- endif -%}
         {{- render_content(message['content']) -}}
         {%- if message['tool_calls'] is defined and message['tool_calls'] is iterable and message['tool_calls'] | length > 0 -%}
@@ -776,11 +774,7 @@ public enum ChatTemplateFallbacks {
 {%- endfor -%}
 
 {%- if add_generation_prompt -%}
-    {%- if _enable_thinking -%}
-        {{- '<|im_start|>assistant\n<think>\n' -}}
-    {%- else -%}
-        {{- '<|im_start|>assistant\n<think>\n</think>\n\n' -}}
-    {%- endif -%}
+    {{- '<|im_start|>assistant\n' -}}
 {%- endif -%}
 """#
 
