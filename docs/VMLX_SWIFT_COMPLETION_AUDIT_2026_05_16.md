@@ -64,9 +64,9 @@ The package is complete only when all of these are true:
 | Prefix cache OFF/ON and cache hit proof. | Existing matrix/harness describes rows; not complete for every topology and model family. | open |
 | Paged cache OFF/ON. | Existing focused tests and some model rows exist, but no package-wide matrix artifact proves all relevant architectures. | open |
 | Disk L2 OFF/ON and fresh-session restore. | Existing docs and some rows exist; package-wide, per-topology proof remains incomplete. | open |
-| Qwen-style stateless full-history cache boundary. | `docs/local/live-model-matrix/20260516Tguard-removal/Qwen3.6-27B-JANG_4M-CRACK_growing_chat_cache_history_boundary_final.out` proves a real disk hit at the canonical history boundary after the rendered turn-2 history diverges from the turn-1 generation prompt. | live-proven for Qwen3.6 JANG_4M CRACK non-MTP |
+| Qwen-style stateless full-history cache boundary. | `docs/local/live-model-matrix/20260516Tguard-removal/Qwen3.6-27B-JANG_4M-CRACK_growing_chat_cache_history_boundary_final.out` and `.../Qwen3.6-27B-MXFP4-CRACK_growing_chat_cache_probe.out` prove real disk hits at canonical history boundaries after rendered turn-2 history diverges from the turn-1 generation prompt. | live-proven for Qwen3.6 JANG_4M and MXFP4 CRACK non-MTP |
 | SSM companion cache and async rederive. | Qwen/hybrid rows are required by docs; not exhaustively live-proven for all relevant local models. | open |
-| VL media salt, same-image hit, changed-image miss. | `docs/local/live-model-matrix/20260516Tzaya-vl-think-template-fix/ZAYA1-VL-8B-JANGTQ4_vl_chat_cache.out`: same-media replay HIT, different-media MISS, coherent blue/orange follow-up. `docs/local/live-model-matrix/20260516Tguard-removal/Qwen3.6-27B-JANG_4M-CRACK_vl_chat_cache_final.out`: Qwen3VLProcessor same-media disk HIT `84/84`, different-media MISS, coherent follow-up. | live-proven for ZAYA1-VL JANGTQ4 and Qwen3.6 JANG_4M CRACK |
+| VL media salt, same-image hit, changed-image miss. | `docs/local/live-model-matrix/20260516Tzaya-vl-think-template-fix/ZAYA1-VL-8B-JANGTQ4_vl_chat_cache.out`: same-media replay HIT, different-media MISS, coherent blue/orange follow-up. `docs/local/live-model-matrix/20260516Tguard-removal/Qwen3.6-27B-JANG_4M-CRACK_vl_chat_cache_final.out` and `.../Qwen3.6-27B-MXFP4-CRACK_vl_chat_cache_probe.out`: Qwen3VLProcessor same-media disk HIT `84/84`, different-media MISS, coherent follow-up. | live-proven for ZAYA1-VL JANGTQ4 plus Qwen3.6 JANG_4M/MXFP4 CRACK |
 | Nemotron Omni audio/Parakeet/RADIO. | Video generation now carries the processor's post-EVS keep count and applies real EVS before prompt splice. `docs/local/live-model-matrix/20260516Tomni-nonmtp/Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_evs_v2.out` passes 13/13 TokenIterator rows; strict pre-fix artifact `..._omni_strict.out` failed the video row. The second fix canonicalizes the closed no-thinking media tail to `<think>\n</think>\n\n`; tail probe `..._omni_tail_probe.out` proves compact tail fails and spaced tail grounds the same image, and `..._omni_batch_nothink_tail_fix.out` passes 18/18 including direct and BatchEngine image with `enable_thinking=false`. | live-proven for Omni JANGTQ4 |
 | Reasoning on/off/effort matrix. | Focused DSV4 pass-through exists. MiniMax Small now has live thinking ON/OFF alternation with `.reasoning` deltas ON and zero reasoning OFF. Ling/Bailing template has no active thinking rail in this bundle and returns visible content with no marker leak. Full model-family reasoning-effort matrix is not complete. | partial |
 | Tool parser matrix by family. | DSV4 and selected templates have focused proof; full dsml/deepseek/gemma4/kimi/jang/zaya/llama/qwen/mistral matrix remains open. | open |
@@ -257,9 +257,10 @@ Known failing rows from that snapshot:
 
 2026-05-16 non-MTP Qwen3.6 cache/template-boundary follow-up:
 
-- Scope: `/Users/eric/models/dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` is a
-  non-MTP row. This evidence does not claim MTP activation; MTP remains gated
-  by real `mtp.*` tensor/config evidence and the explicit native-MTP path.
+- Scope: `/Users/eric/models/dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` and
+  `/Users/eric/models/dealign.ai/Qwen3.6-27B-MXFP4-CRACK` are non-MTP rows.
+  This evidence does not claim MTP activation; MTP remains gated by real
+  `mtp.*` tensor/config evidence and the explicit native-MTP path.
 - Pre-fix diagnostic:
   `docs/local/live-model-matrix/20260516Tguard-removal/Qwen3.6-27B-JANG_4M-CRACK_growing_chat_cache_diagnostic.out`
   and `.err`. Turn 1 stored salted prompt/post-answer disk entries, but the
@@ -284,6 +285,13 @@ Known failing rows from that snapshot:
   `qwen36-cache-green` coherently, stops normally, and drops prompt prefill from
   `2.360s` to `0.157s` (`ratio=0.07`). Nil-salt probes miss, so the hit is not
   a salt collision.
+- Paired MXFP4 proof:
+  `docs/local/live-model-matrix/20260516Tguard-removal/Qwen3.6-27B-MXFP4-CRACK_growing_chat_cache_probe.out`
+  and `.err`. MXFP4 records `Cache history-boundary counts: [1863]`; turn 2
+  probes `HIT tier=disk matched=1863/1903 remaining=40 diskArrays=yes`, answers
+  `qwen36-mxfp-cache-green`, stops normally, and drops prompt prefill from
+  `2.329s` to `0.165s` (`ratio=0.07`). This proves the fix is not a
+  JANG_4M-only artifact.
 - Focused proof:
   `docs/local/live-model-matrix/20260516Tguard-removal/NoHiddenReasoningCloseBiasFocusedTests_history_boundary_final.out`
   passes 3/3 source guards for no hidden reasoning close bias, terminal
@@ -297,12 +305,14 @@ Known failing rows from that snapshot:
   hit, repetition guard, template monkeypatch, or fake cache reuse.
 - Qwen3.6 VL cache proof:
   `docs/local/live-model-matrix/20260516Tguard-removal/Qwen3.6-27B-JANG_4M-CRACK_vl_chat_cache_final.out`
-  and `.err`. The model loads with `Qwen3VLProcessor`; the structured chat row
-  attaches real generated gradient images, gets a grounded cold answer, proves
+  plus
+  `docs/local/live-model-matrix/20260516Tguard-removal/Qwen3.6-27B-MXFP4-CRACK_vl_chat_cache_probe.out`.
+  Both models load with `Qwen3VLProcessor`; the structured chat rows attach
+  real generated gradient images, get grounded cold answers, prove
   same-media disk restore `HIT disk 84/84`, proves a changed image misses, and
   answers the text-only follow-up coherently with `Red and blue.` This covers
-  Qwen VL chat-template/media-salt/MRoPE path at the real engine level for this
-  model.
+  Qwen VL chat-template/media-salt/MRoPE path at the real engine level for both
+  non-MTP 27B artifacts.
 - Still open: broader VL/media cache rows still need separate video/audio
   proofs where supported, plus per-family MRoPE 2D/3D vector and
   Hadamard/JANGTQ matmul coverage beyond this Qwen3.6 JANG_4M row.
