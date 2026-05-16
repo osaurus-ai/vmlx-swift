@@ -83,6 +83,32 @@ struct MTPRuntimeFocusedTests {
         #expect(!status.canAutoLaunchMTP)
     }
 
+    @Test("inactive native MTP scrub does not touch generic nextn metadata")
+    func inactiveNativeMTPScrubDoesNotTouchGenericNextnMetadata() throws {
+        let config = """
+        {
+          "model_type": "deepseek_v4",
+          "mtp_num_hidden_layers": 1,
+          "num_nextn_predict_layers": 7,
+          "text_config": {
+            "model_type": "qwen3_5",
+            "mtp_num_hidden_layers": 1,
+            "num_nextn_predict_layers": 3
+          }
+        }
+        """.data(using: .utf8)!
+
+        let scrubbed = try NativeMTPActivation.scrubInactiveMTPConfig(config)
+        let object = try #require(
+            JSONSerialization.jsonObject(with: scrubbed) as? [String: Any])
+        let textConfig = try #require(object["text_config"] as? [String: Any])
+
+        #expect(object["mtp_num_hidden_layers"] as? Int == 0)
+        #expect(object["num_nextn_predict_layers"] as? Int == 7)
+        #expect(textConfig["mtp_num_hidden_layers"] as? Int == 0)
+        #expect(textConfig["num_nextn_predict_layers"] as? Int == 3)
+    }
+
     @Test("JANG MTP metadata without tensor evidence is not treated as an MTP bundle")
     func jangMTPMetadataWithoutTensorEvidenceIsMissingWeights() throws {
         let root = try makeTemporaryBundle(name: "named-mtp-but-no-mtp-tensors")

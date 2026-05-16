@@ -1360,6 +1360,23 @@ public final class LLMModelFactory: ModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
+        let earlyJangConfig: JangConfig?
+        if JangLoader.isJangModel(at: modelDirectory) {
+            earlyJangConfig = try JangLoader.loadConfig(at: modelDirectory)
+        } else {
+            earlyJangConfig = nil
+        }
+        let earlyMTPStatus = try? MTPBundleInspector.inspect(
+            modelDirectory: modelDirectory,
+            jangConfig: earlyJangConfig)
+        let loadNativeMTP = try NativeMTPActivation.shouldLoadNativeMTPWeights(
+            configData: configData,
+            baseModelType: baseConfig.modelType,
+            status: earlyMTPStatus)
+        if !loadNativeMTP {
+            configData = try NativeMTPActivation.scrubInactiveMTPConfig(configData)
+        }
+
         // Determine effective model type for the LLM factory.
         // VLM configs may wrap a different text decoder (e.g., mistral3 VLM wraps mistral4 text).
         // If text_config.model_type exists and differs from the top-level, prefer it when
@@ -1422,15 +1439,8 @@ public final class LLMModelFactory: ModelFactory {
 
         // Detect JANG model — if jang_config.json exists, load it for per-layer quantization.
         // Standard MLX models skip this entirely (jangConfig stays nil).
-        let jangConfig: JangConfig?
-        if JangLoader.isJangModel(at: modelDirectory) {
-            jangConfig = try JangLoader.loadConfig(at: modelDirectory)
-        } else {
-            jangConfig = nil
-        }
-        let mtpStatus = try? MTPBundleInspector.inspect(
-            modelDirectory: modelDirectory,
-            jangConfig: jangConfig)
+        let jangConfig = earlyJangConfig
+        let mtpStatus = earlyMTPStatus
 
         // Build a ModelConfiguration with loaded EOS token IDs and tool call format.
         //
@@ -1523,7 +1533,8 @@ public final class LLMModelFactory: ModelFactory {
             // that share a packed shape (e.g., (4,64) ≡ (8,32)). Closes
             // Cascade-2 JANG_4M / Nemotron-Omni MXFP4 first-prefill rmsNorm.
             perLayerQuantization: baseConfig.perLayerQuantization,
-            jangConfig: jangConfig)
+            jangConfig: jangConfig,
+            loadPreservedMTP: loadNativeMTP)
 
         let tokenizer = try await tokenizerTask
 

@@ -381,6 +381,7 @@ public struct Qwen35Configuration: Codable, Sendable {
         public var headDim: Int?
         public var ropeParameters: [String: StringOrNumber]?
         public var fullAttentionInterval: Int = 4
+        public var mtpNumHiddenLayers: Int = 0
 
         // MoE fields
         public var numExperts: Int = 0
@@ -412,6 +413,7 @@ public struct Qwen35Configuration: Codable, Sendable {
             case headDim = "head_dim"
             case ropeParameters = "rope_parameters"
             case fullAttentionInterval = "full_attention_interval"
+            case mtpNumHiddenLayers = "mtp_num_hidden_layers"
             case numExperts = "num_experts"
             case numExpertsPerTok = "num_experts_per_tok"
             case decoderSparseStep = "decoder_sparse_step"
@@ -453,6 +455,8 @@ public struct Qwen35Configuration: Codable, Sendable {
             self.headDim = try container.decodeIfPresent(Int.self, forKey: .headDim)
             self.fullAttentionInterval =
                 try container.decodeIfPresent(Int.self, forKey: .fullAttentionInterval) ?? 4
+            self.mtpNumHiddenLayers =
+                try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
 
             self.numExperts = try container.decodeIfPresent(Int.self, forKey: .numExperts) ?? 0
             self.numExpertsPerTok =
@@ -884,8 +888,11 @@ enum Qwen35Language {
             }
 
             let convInput = concatenated([convState, mixedQKV], axis: 1)
+                .reshaped(B, convState.dim(1) + S, convDim)
             if let cache, convKernelSize > 1 {
-                cache[0] = convInput[0..., (-(convKernelSize - 1))...]
+                let end = convInput.dim(1)
+                let start = max(0, end - (convKernelSize - 1))
+                cache[0] = convInput[0..., start ..< end, 0...]
             }
 
             let convOut = silu(conv1d(convInput))
@@ -1033,6 +1040,123 @@ enum Qwen35Language {
         }
     }
 
+    final class MTPDecoderLayer: Module {
+        @ModuleInfo(key: "self_attn") var selfAttn: Attention
+        @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
+        @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
+        @ModuleInfo(key: "mlp") var mlp: MLP
+
+        init(_ args: Qwen35Configuration.TextConfiguration) {
+            _selfAttn.wrappedValue = Attention(args)
+            _inputLayerNorm.wrappedValue = RMSNorm(
+                dimensions: args.hiddenSize, eps: args.rmsNormEps)
+            _postAttentionLayerNorm.wrappedValue = RMSNorm(
+                dimensions: args.hiddenSize, eps: args.rmsNormEps)
+            _mlp.wrappedValue = MLP(
+                dimensions: args.hiddenSize,
+                hiddenDimensions: args.intermediateSize)
+            super.init()
+        }
+
+        func callAsFunction(
+            _ x: MLXArray,
+            attentionMask: MLXArray?,
+            cache: KVCache?,
+            positionIds: MLXArray?
+        ) -> MLXArray {
+            let h = x + selfAttn(
+                inputLayerNorm(x),
+                mask: attentionMask,
+                cache: cache,
+                positionIds: positionIds)
+            return h + mlp(postAttentionLayerNorm(h))
+        }
+    }
+
+    final class MTPModule: Module {
+        @ModuleInfo(key: "pre_fc_norm_hidden") var preFCNormHidden: RMSNorm
+        @ModuleInfo(key: "pre_fc_norm_embedding") var preFCNormEmbedding: RMSNorm
+        @ModuleInfo(key: "fc") var fc: Linear
+        @ModuleInfo(key: "layers") var layers: [MTPDecoderLayer]
+        @ModuleInfo(key: "norm") var norm: RMSNorm
+
+        init(_ args: Qwen35Configuration.TextConfiguration) {
+            _preFCNormHidden.wrappedValue = RMSNorm(
+                dimensions: args.hiddenSize, eps: args.rmsNormEps)
+            _preFCNormEmbedding.wrappedValue = RMSNorm(
+                dimensions: args.hiddenSize, eps: args.rmsNormEps)
+            _fc.wrappedValue = Linear(args.hiddenSize * 2, args.hiddenSize, bias: false)
+            _layers.wrappedValue = (0 ..< max(0, args.mtpNumHiddenLayers)).map { _ in
+                MTPDecoderLayer(args)
+            }
+            _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+            super.init()
+        }
+
+        func preNormHidden(
+            hiddenStates: MLXArray,
+            nextTokenIds: MLXArray,
+            embedTokens: Embedding,
+            cache: [KVCache]?
+        ) -> MLXArray {
+            let embeds = embedTokens(nextTokenIds)
+            let fusedInput = concatenated([
+                preFCNormEmbedding(embeds),
+                preFCNormHidden(hiddenStates),
+            ], axis: -1)
+            var hiddenStates = fc(fusedInput)
+
+            var cacheArray = cache
+            if cacheArray == nil {
+                cacheArray = (0 ..< layers.count).map { _ in KVCacheSimple() as KVCache }
+            }
+            let maskMode = createAttentionMask(
+                h: hiddenStates, cache: cacheArray?.first, returnArray: true)
+            let attentionMask: MLXArray?
+            if case .array(let mask) = maskMode {
+                attentionMask = mask
+            } else {
+                attentionMask = nil
+            }
+            let positionIds = textPositionIds(for: hiddenStates, cache: cacheArray?.first)
+            for (index, layer) in layers.enumerated() {
+                hiddenStates = layer(
+                    hiddenStates,
+                    attentionMask: attentionMask,
+                    cache: cacheArray?[index],
+                    positionIds: positionIds)
+            }
+            return hiddenStates
+        }
+
+        func callAsFunction(
+            hiddenStates: MLXArray,
+            nextTokenIds: MLXArray,
+            embedTokens: Embedding,
+            cache: [KVCache]?
+        ) -> MLXArray {
+            norm(preNormHidden(
+                hiddenStates: hiddenStates,
+                nextTokenIds: nextTokenIds,
+                embedTokens: embedTokens,
+                cache: cache))
+        }
+
+        func makeCache() -> [KVCache] {
+            (0 ..< layers.count).map { _ in KVCacheSimple() as KVCache }
+        }
+
+        private func textPositionIds(for hiddenStates: MLXArray, cache: KVCache?) -> MLXArray {
+            let batchSize = hiddenStates.dim(0)
+            let seqLength = hiddenStates.dim(1)
+            let offset = cache?.offset ?? 0
+            var base = MLXArray(stride(from: offset, to: offset + seqLength, by: 1))
+                .asType(.int32)
+            base = tiled(base[.newAxis, 0...], repetitions: [batchSize, 1])
+            return tiled(base[.newAxis, 0..., 0...], repetitions: [3, 1, 1])
+        }
+    }
+
     final class Model: Module {
         @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
         @ModuleInfo(key: "layers") fileprivate var layers: [DecoderLayer]
@@ -1065,6 +1189,47 @@ enum Qwen35Language {
                 inputs, inputsEmbeds: inputsEmbeds, cache: cache,
                 positionIds: positionIds, captureLayerIDs: [])
             return h
+        }
+
+        func callAsFunctionPreNorm(
+            _ inputs: MLXArray,
+            inputsEmbeds: MLXArray? = nil,
+            cache: [KVCache?]? = nil,
+            positionIds: MLXArray? = nil
+        ) -> MLXArray {
+            var hiddenStates: MLXArray
+            if let inputsEmbeds {
+                hiddenStates = inputsEmbeds
+            } else {
+                hiddenStates = embedTokens(inputs)
+            }
+
+            var cacheArray = cache
+            if cacheArray == nil {
+                cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
+            }
+
+            let faMaskMode = createAttentionMask(
+                h: hiddenStates, cache: cacheArray?[faIdx], returnArray: true)
+            let faMask: MLXArray?
+            if case .array(let arrayMask) = faMaskMode {
+                faMask = arrayMask
+            } else {
+                faMask = nil
+            }
+            let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+
+            for (index, layer) in layers.enumerated() {
+                let layerSSMMask = layer.isLinear ? ssmMask : nil
+                hiddenStates = layer(
+                    hiddenStates,
+                    attentionMask: faMask,
+                    ssmMask: layerSSMMask,
+                    cache: cacheArray?[index],
+                    positionIds: positionIds)
+            }
+
+            return hiddenStates
         }
 
         /// Forward with optional per-block hidden-state capture. Mirrors
@@ -1125,6 +1290,7 @@ enum Qwen35Language {
     final class LanguageModel: Module {
         @ModuleInfo var model: Model
         @ModuleInfo(key: "lm_head") var lmHead: Linear?
+        @ModuleInfo(key: "mtp") var mtp: MTPModule?
 
         let config: Qwen35Configuration
         let textConfig: Qwen35Configuration.TextConfiguration
@@ -1149,6 +1315,9 @@ enum Qwen35Language {
                     config.textConfiguration.hiddenSize,
                     config.textConfiguration.vocabularySize,
                     bias: false)
+            }
+            if config.textConfiguration.mtpNumHiddenLayers > 0 {
+                _mtp.wrappedValue = MTPModule(config.textConfiguration)
             }
             super.init()
         }
@@ -1285,6 +1454,43 @@ enum Qwen35Language {
             return (logits, captured)
         }
 
+        func textOnlyForwardWithHidden(
+            _ inputs: MLXArray,
+            cache: [KVCache]?
+        ) -> NativeMTPForwardResult {
+            let cacheOpt: [KVCache?]? = cache?.map { $0 as KVCache? }
+            let hidden = model.callAsFunctionPreNorm(inputs, cache: cacheOpt)
+            let logits: MLXArray
+            if let lmHead {
+                logits = lmHead(model.norm(hidden))
+            } else {
+                logits = model.embedTokens.asLinear(model.norm(hidden))
+            }
+            return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
+        }
+
+        func nativeMTPForward(
+            hiddenStates: MLXArray,
+            nextTokenIds: MLXArray,
+            cache: [KVCache]?
+        ) -> NativeMTPForwardResult {
+            guard let mtp else {
+                fatalError("Qwen35 VLM nativeMTPForward called without an MTP module")
+            }
+            let hidden = mtp.preNormHidden(
+                hiddenStates: hiddenStates,
+                nextTokenIds: nextTokenIds,
+                embedTokens: model.embedTokens,
+                cache: cache)
+            let logits: MLXArray
+            if let lmHead {
+                logits = lmHead(mtp.norm(hidden))
+            } else {
+                logits = model.embedTokens.asLinear(mtp.norm(hidden))
+            }
+            return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
+        }
+
         func makeCache(maxKVSize: Int?) -> [KVCache] {
             model.layers.map { layer in
                 if layer.isLinear {
@@ -1301,7 +1507,7 @@ enum Qwen35Language {
 
 // MARK: - Model
 
-public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel {
+public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel {
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
@@ -1490,6 +1696,32 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         return languageModel.model.embedTokens.asLinear(hidden)
     }
 
+    // MARK: - NativeMTPModel
+
+    public var nativeMTPAvailable: Bool { languageModel.mtp != nil }
+
+    public func makeNativeMTPCache() -> [KVCache] {
+        languageModel.mtp?.makeCache() ?? []
+    }
+
+    public func nativeBackboneForward(
+        _ inputs: MLXArray,
+        cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        languageModel.textOnlyForwardWithHidden(inputs, cache: cache)
+    }
+
+    public func nativeMTPForward(
+        hiddenStates: MLXArray,
+        nextTokenIds: MLXArray,
+        cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        languageModel.nativeMTPForward(
+            hiddenStates: hiddenStates,
+            nextTokenIds: nextTokenIds,
+            cache: cache)
+    }
+
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
         MLXArray]
     {
@@ -1502,24 +1734,21 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     }
 
     private func sanitize(weights: [String: MLXArray], isMLXFormat: Bool) -> [String: MLXArray] {
-        var weights = weights.filter { !Self.isMTPWeightKey($0.key) }
+        let loadNativeMTP = config.textConfiguration.mtpNumHiddenLayers > 0
+        var weights = loadNativeMTP ? weights : weights.filter { !Self.isMTPWeightKey($0.key) }
 
-        // Detect norm shift need after filtering MTP sidecar keys. Preserved MTP
-        // tensors are not part of the base autoregressive path and must not
-        // change base norm conversion.
-        // JANG models have format=mlx but still need norm shift (norms aren't pre-baked).
-        // MLX-community models (converted with mlx_lm.convert) DO have norms pre-baked.
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
         }
-        let shouldShiftNormWeights = hasUnsanitizedConv1d || !isMLXFormat
+        let shouldShiftNormWeights =
+            hasUnsanitizedConv1d || Self.baseNormWeightsNeedShift(weights)
 
         if config.textConfiguration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
         }
 
         // MLX-native models with no unsanitized conv1d may still need key remapping.
-        if isMLXFormat && !hasUnsanitizedConv1d {
+        if isMLXFormat && !hasUnsanitizedConv1d && !shouldShiftNormWeights {
             let needsRemap = weights.keys.contains { $0.contains("model.language_model") || $0.contains("model.visual") }
             if !needsRemap {
                 return weights
@@ -1551,13 +1780,26 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
             } else if key.contains("lm_head") {
                 key = key.replacingOccurrences(of: "lm_head", with: "language_model.lm_head")
             }
+            if loadNativeMTP {
+                if key.hasPrefix("mtp.") {
+                    key = "language_model." + key
+                } else if key.hasPrefix("model.mtp_layers.") {
+                    key = key.replacingOccurrences(
+                        of: "model.mtp_layers.",
+                        with: "language_model.mtp.layers.")
+                }
+            }
 
             if key.contains("conv1d.weight") && value.dim(-1) != 1 {
                 value = value.movedAxis(source: 2, destination: 1)
             }
-            if shouldShiftNormWeights && normKeys.contains(where: { key.hasSuffix($0) })
-                && value.ndim == 1
-            {
+            let isMTPNorm = loadNativeMTP
+                && Self.isMTPWeightKey(key)
+                && key.hasSuffix(".weight")
+                && (key.contains("norm") || key.contains("q_norm") || key.contains("k_norm"))
+            let shouldShiftBaseNorm = shouldShiftNormWeights
+                && normKeys.contains(where: { key.hasSuffix($0) })
+            if (shouldShiftBaseNorm || isMTPNorm) && value.ndim == 1 {
                 value = value + MLXArray(1, dtype: value.dtype)
             }
 
@@ -1572,6 +1814,28 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
             || key.hasPrefix("model.mtp_layers.")
             || key.contains(".mtp.")
             || key.contains(".mtp_layers.")
+    }
+
+    private static func baseNormWeightsNeedShift(_ weights: [String: MLXArray]) -> Bool {
+        let probeSuffixes = [
+            ".input_layernorm.weight",
+            ".post_attention_layernorm.weight",
+        ]
+        for (key, value) in weights where value.ndim == 1 {
+            guard probeSuffixes.contains(where: { key.hasSuffix($0) }) else {
+                continue
+            }
+            let mean = value.asType(.float32).mean().item(Float.self)
+            if mean < 0.5 { return true }
+            if mean > 0.5 { return false }
+        }
+        return !isMLXFormatLike(weights)
+    }
+
+    private static func isMLXFormatLike(_ weights: [String: MLXArray]) -> Bool {
+        weights.keys.contains { key in
+            key.hasPrefix("language_model.") || key.hasPrefix("vision_tower.")
+        }
     }
 }
 

@@ -1298,65 +1298,26 @@ public struct JangLoader: Sendable {
     public static func inferPerLayerQuantization(
         weights: [String: MLXArray],
         jangConfig: JangConfig,
-        overrideGroupSize: Int? = nil,
-        overrideBits: Int? = nil,
-        overrideMode: QuantizationMode = .affine
+        hiddenSizeHint: Int? = nil,
+        validInDims: Set<Int> = [],
+        declaredDefaultQuantization: BaseConfiguration.Quantization? = nil
     ) -> BaseConfiguration.PerLayerQuantization {
-        // Prefer the caller-supplied group_size (typically from
-        // config.json's quantization.group_size) over jangConfig's
-        // default blockSize. Bundles whose jang_config.json doesn't
-        // carry explicit quant metadata (e.g., DSV4-Flash JANG_2L
-        // ships `weight_format: "bf16"`) need the config.json value
-        // to land at the right group_size during shape inference.
-        //
-        // 2026-04-28 EXCEPTION: when jangConfig has explicit
-        // `bit_widths_used` (signal that this is a real JANG-converted
-        // bundle), the converter's chosen `block_size` is authoritative
-        // and we must IGNORE config.json's `group_size`. Reason:
-        // Cascade-2 JANG_4M / Nemotron-Omni MXFP4 ship `config.json`
-        // with `quantization.group_size = 32` (HF-tooling default)
-        // even though the JANG converter actually packed at gs=64.
-        // The (8, 32) and (4, 64) `(bits, gs)` pairs share the same
-        // packed shape, so the primary path silently picks (8, 32)
-        // and the dequant reconstructs wrong row vectors. Mid-prefill
-        // rmsNorm shape trap follows on the first forward.
-        //
-        // The signal `!bit_widths_used.isEmpty` distinguishes a real
-        // JANG-converted bundle from a non-JANG bundle that just
-        // happens to ship a jang_config.json shell — only the former
-        // carries an authoritative blockSize stamp.
-        let isAuthoritativeJang = !jangConfig.quantization.bitWidthsUsed.isEmpty
-        let groupSize: Int
-        if isAuthoritativeJang {
-            groupSize = jangConfig.quantization.blockSize
-        } else {
-            groupSize = overrideGroupSize ?? jangConfig.quantization.blockSize
-        }
+        // JANGTQ bundles use two independent bit namespaces:
+        //   - `mxtq_bits` / `routed_expert_bits` for tq_packed routed experts.
+        //   - config.json::quantization for ordinary affine dense/router weights.
+        // If config.json already decoded a top-level affine quantization block,
+        // use that as the declared fallback for shape comparison. The actual
+        // per-leaf load entries below remain shape-authoritative.
+        let groupSize = declaredDefaultQuantization?.groupSize
+            ?? jangConfig.quantization.blockSize
         var perLayer = [String: BaseConfiguration.QuantizationOption]()
 
-        // Find the default (most common) bit width.
-        // Priority: jang_config.bitWidthsUsed (authoritative when present)
-        // → overrideBits (config.json's quantization.bits — authoritative for
-        //   bundles like mxfp4 whose jang_config has only `mxfp4` field, no
-        //   `quantization` field, so bitWidthsUsed defaults to [2,4,6])
-        // → fallback 4.
-        //
-        // 2026-05-01: this fixes a (bits, gs) ambiguity bug for embed_tokens
-        // on Mistral-Medium-3.5-128B-mxfp4. Bundle is quantized at (bits=4,
-        // gs=32) producing weight=[131072, 1536] uint32 + scales=[131072, 384].
-        // Default bitWidthsUsed=[2,4,6].min()=2 with overrideGroupSize=64
-        // (jangConfig.blockSize default) makes the shape walk pick (bits=2,
-        // gs=64) which is mathematically valid for the same packed shape but
-        // produces in_dim=24576 (2× hiddenSize=12288). Embed forward then
-        // returns [B, T, 24576], failing the next RMSNorm with weight=12288.
-        // Passing overrideBits=4 from config.json's quantization.bits resolves
-        // the ambiguity correctly.
-        let defaultBits: Int
-        if isAuthoritativeJang {
-            defaultBits = jangConfig.quantization.bitWidthsUsed.min() ?? 4
-        } else {
-            defaultBits = overrideBits ?? jangConfig.quantization.bitWidthsUsed.min() ?? 4
-        }
+        let defaultBits = declaredDefaultQuantization?.bits
+            ?? (jangConfig.quantization.bitWidthsUsed.min() ?? 4)
+        let defaultMode = declaredDefaultQuantization?.mode ?? .affine
+        let bitWidthsUsed = Array(Set(
+            jangConfig.quantization.bitWidthsUsed + [defaultBits]
+        )).sorted()
 
         // Group weight keys by their base path (strip .weight/.scales/.biases suffix)
         var quantizedLayers = Set<String>()
@@ -1367,38 +1328,170 @@ public struct JangLoader: Sendable {
             }
         }
 
-        // For each quantized layer, infer the actual bit width.
-        // First try with the JANG block_size as group_size. If that doesn't produce
-        // a valid integer bit width, fall back to inferring both bits and group_size
-        // from shapes (handles gates with different group_size like 64 vs 128).
-        for basePath in quantizedLayers {
+        var disagreementCount = 0
+        var sampleDeclared: (Int, Int)? = nil
+        var sampleInferred: (Int, Int)? = nil
+
+        // Shape truth wins for every leaf. Emit an override even when the
+        // inferred pair matches the declared default so downstream lookup never
+        // falls through to stale top-level metadata for a path variant.
+        for basePath in quantizedLayers.sorted() {
             guard let weightArray = weights[basePath + ".weight"],
                 let scalesArray = weights[basePath + ".scales"]
             else {
                 continue
             }
 
-            // Try with known group_size first; pass bitWidthsUsed so the
-            // fallback can disambiguate layers whose group_size differs
-            // from the body (e.g., MoE gates).
-            let (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
-                weight: weightArray, scales: scalesArray,
-                knownGroupSize: groupSize,
-                bitWidthsUsed: jangConfig.quantization.bitWidthsUsed)
+            let packedDim = weightArray.shape.last ?? 0
+            let numGroups = scalesArray.shape.last ?? 1
+            let (bits, inferredGroupSize): (Int, Int)
+
+            let isHiddenAnchor =
+                basePath.hasSuffix("embed_tokens")
+                || basePath.hasSuffix("embed")
+                || basePath.hasSuffix("lm_head")
+            let isHiddenInputProjection =
+                basePath.hasSuffix(".linear_attn.in_proj_qkv")
+                || basePath.hasSuffix(".linear_attn.in_proj_z")
+                || basePath.hasSuffix(".linear_attn.in_proj_a")
+                || basePath.hasSuffix(".linear_attn.in_proj_b")
+                || basePath.hasSuffix(".self_attn.q_proj")
+                || basePath.hasSuffix(".self_attn.k_proj")
+                || basePath.hasSuffix(".self_attn.v_proj")
+                || basePath.hasSuffix(".attn.q_proj")
+                || basePath.hasSuffix(".attn.k_proj")
+                || basePath.hasSuffix(".attn.v_proj")
+                || basePath.hasSuffix(".mlp.gate_proj")
+                || basePath.hasSuffix(".mlp.up_proj")
+            let isMTPFusionFC =
+                basePath.hasSuffix(".mtp.fc")
+                || basePath.hasSuffix("mtp.fc")
+            let isSwitchMLPDown =
+                basePath.hasSuffix("switch_mlp.down_proj")
+                || basePath.hasSuffix("switch_glu.down_proj")
+                || basePath.contains("switch_mlp.up_proj")
+                || basePath.contains("switch_mlp.gate_proj")
+                || basePath.contains("switch_glu.up_proj")
+                || basePath.contains("switch_glu.gate_proj")
+
+            func inferFromUniqueValidInDim() -> (bits: Int, groupSize: Int)? {
+                guard !validInDims.isEmpty else { return nil }
+                let preferred: [(Int, Int)] = [
+                    (8, 32), (8, 64), (8, 128),
+                    (4, 32), (4, 64), (4, 128),
+                    (2, 32), (2, 64), (2, 128),
+                    (3, 32), (6, 32),
+                    (5, 32), (5, 64), (3, 64), (6, 64),
+                ]
+                var matches: [(bits: Int, groupSize: Int, inDim: Int)] = []
+                for (candidateBits, candidateGroupSize) in preferred {
+                    guard candidateBits > 0, (packedDim * 32) % candidateBits == 0 else {
+                        continue
+                    }
+                    let inputDim = (packedDim * 32) / candidateBits
+                    guard validInDims.contains(inputDim), inputDim % numGroups == 0 else {
+                        continue
+                    }
+                    let impliedGroupSize = inputDim / numGroups
+                    if impliedGroupSize == candidateGroupSize {
+                        matches.append((candidateBits, candidateGroupSize, inputDim))
+                    }
+                }
+                let uniqueInputDims = Set(matches.map(\.inDim))
+                guard uniqueInputDims.count == 1, let first = matches.first else {
+                    return nil
+                }
+                return (first.bits, first.groupSize)
+            }
+
+            if (isHiddenAnchor || isHiddenInputProjection),
+               let hiddenSize = hiddenSizeHint, hiddenSize > 0
+            {
+                (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
+                    packedDim: packedDim,
+                    numGroups: numGroups,
+                    knownGroupSize: groupSize,
+                    bitWidthsUsed: bitWidthsUsed,
+                    expectedInDim: hiddenSize)
+            } else if isMTPFusionFC,
+                      let hiddenSize = hiddenSizeHint, hiddenSize > 0
+            {
+                (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
+                    packedDim: packedDim,
+                    numGroups: numGroups,
+                    knownGroupSize: groupSize,
+                    bitWidthsUsed: bitWidthsUsed,
+                    expectedInDim: hiddenSize * 2)
+            } else if let picked = inferFromUniqueValidInDim() {
+                (bits, inferredGroupSize) = picked
+            } else if isSwitchMLPDown && !validInDims.isEmpty {
+                let preferred: [(Int, Int)] = [
+                    (8, 32), (8, 64), (8, 128),
+                    (4, 32), (4, 64), (4, 128),
+                    (2, 32), (2, 64), (2, 128),
+                ]
+                var picked: (Int, Int)? = nil
+                for (candidateBits, candidateGroupSize) in preferred {
+                    guard (packedDim * 32) % candidateBits == 0 else { continue }
+                    let inputDim = (packedDim * 32) / candidateBits
+                    guard validInDims.contains(inputDim), inputDim % numGroups == 0 else {
+                        continue
+                    }
+                    let impliedGroupSize = inputDim / numGroups
+                    if impliedGroupSize == candidateGroupSize {
+                        picked = (candidateBits, candidateGroupSize)
+                        break
+                    }
+                }
+                if let picked {
+                    (bits, inferredGroupSize) = picked
+                } else {
+                    (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
+                        weight: weightArray,
+                        scales: scalesArray,
+                        knownGroupSize: groupSize,
+                        bitWidthsUsed: bitWidthsUsed)
+                }
+            } else {
+                (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
+                    weight: weightArray,
+                    scales: scalesArray,
+                    knownGroupSize: groupSize,
+                    bitWidthsUsed: bitWidthsUsed)
+            }
 
             if bits != defaultBits || inferredGroupSize != groupSize {
-                perLayer[basePath] = .quantize(
-                    BaseConfiguration.Quantization(
-                        groupSize: inferredGroupSize, bits: bits, mode: overrideMode))
+                disagreementCount += 1
+                if sampleDeclared == nil {
+                    sampleDeclared = (defaultBits, groupSize)
+                    sampleInferred = (bits, inferredGroupSize)
+                }
             }
+
+            perLayer[basePath] = .quantize(
+                BaseConfiguration.Quantization(
+                    groupSize: inferredGroupSize,
+                    bits: bits,
+                    mode: defaultMode))
         }
 
-        // Layers without .scales are unquantized (norms, biases) — they don't need entries
-        // The default quantization covers all layers not in perLayer
+        if disagreementCount > 0,
+           let declared = sampleDeclared,
+           let inferred = sampleInferred
+        {
+            let plural = disagreementCount == 1 ? "" : "s"
+            let line = (
+                "[JangLoader] config-metadata mismatch patched in-memory: "
+                    + "declared (bits=\(declared.0), gs=\(declared.1)) "
+                    + "-> shape-inferred (bits=\(inferred.0), gs=\(inferred.1)), "
+                    + "\(disagreementCount) per-layer override\(plural) applied.\n"
+            )
+            FileHandle.standardError.write(Data(line.utf8))
+        }
 
         return BaseConfiguration.PerLayerQuantization(
             quantization: BaseConfiguration.Quantization(
-                groupSize: groupSize, bits: defaultBits, mode: overrideMode),
+                groupSize: groupSize, bits: defaultBits, mode: defaultMode),
             perLayerQuantization: perLayer
         )
     }
@@ -1429,91 +1522,87 @@ public struct JangLoader: Sendable {
         weight: MLXArray, scales: MLXArray, knownGroupSize: Int? = nil,
         bitWidthsUsed: [Int] = []
     ) -> (bits: Int, groupSize: Int) {
-        let packedDim = weight.shape.last ?? 0
-        let numGroups = scales.shape.last ?? 1
+        inferBitWidthAndGroupSize(
+            packedDim: weight.shape.last ?? 0,
+            numGroups: scales.shape.last ?? 1,
+            knownGroupSize: knownGroupSize,
+            bitWidthsUsed: bitWidthsUsed)
+    }
 
+    public static func inferBitWidthAndGroupSize(
+        packedDim: Int, numGroups: Int,
+        knownGroupSize: Int? = nil,
+        bitWidthsUsed: [Int] = []
+    ) -> (bits: Int, groupSize: Int) {
         guard packedDim > 0 && numGroups > 0 else { return (4, knownGroupSize ?? 64) }
 
-        let validBits = [2, 3, 4, 5, 6, 8]
-
-        // Primary path: knownGroupSize gives an unambiguous answer.
-        // bits must divide (packedDim * 32) exactly.
-        if let gs = knownGroupSize, gs > 0 {
-            let inDim = numGroups * gs
-            if inDim > 0 && (packedDim * 32) % inDim == 0 {
-                let bits = (packedDim * 32) / inDim
-                if validBits.contains(bits) {
-                    return (bits, gs)
-                }
-            }
-        }
-
-        // Fallback: the provided knownGroupSize is wrong for this tensor
-        // (e.g., MoE gates / attention with a different group_size than
-        // body layers). Search a fixed `(bits, gs)` preference order
-        // and pick the first valid hit:
-        //
-        //     (8,32), (8,64), (8,128),
-        //     (4,32), (4,64), (4,128),
-        //     (2,32), (2,64), (2,128),
-        //     (3,32), (6,32)
-        //
-        // Why this order is empirically correct for JANG/JANGTQ
-        // bundles:
-        //
-        //   - The converter classify rules put attention / embed /
-        //     lm_head / shared at the highest available bit width
-        //     (8 affine, gs=32 or 64) and routed experts at low bits
-        //     (2 / 3 / 4) with the same gs.
-        //   - When two `(bits, gs)` pairs share `bits * gs` (and thus
-        //     the same `packedDim / numGroups` ratio — e.g.
-        //     (8,32) ≡ (4,64) ≡ (2,128)) the converter ALWAYS chose
-        //     the high-bit variant for attention layers, never the
-        //     low-bit variant. Trying (8,32) first picks the right
-        //     answer for those layers; routed experts (which actually
-        //     are 4-bit or 2-bit) fail the (8,*) ratio check and fall
-        //     through to (4,*) or (2,*).
-        //
-        // This also fixes the `bitWidthsUsed=[2,4,6]` regression on
-        // re-stamped MiniMax/Qwen JANGTQ bundles whose attention
-        // layers are actually 8-bit — the old code excluded 8 from
-        // the candidate list and silently returned `(4, 32)`, which
-        // produced wrong dequant constants and a mid-decode rms_norm
-        // shape trap (2026-04-25 reproducer).
-        let mlxValidGroupSizes = [32, 64, 128]
-        let preferOrder: [(bits: Int, gs: Int)] = [
+        let preferred: [(Int, Int)] = [
             (8, 32), (8, 64), (8, 128),
             (4, 32), (4, 64), (4, 128),
             (2, 32), (2, 64), (2, 128),
             (3, 32), (6, 32),
+            (5, 32), (5, 64), (3, 64), (6, 64),
         ]
-        for cand in preferOrder {
-            let bits = cand.bits
-            let gs = cand.gs
-            // Match: bits * gs * numGroups must equal packedDim * 32.
-            if bits * gs * numGroups == packedDim * 32,
-                mlxValidGroupSizes.contains(gs)
-            {
-                return (bits, gs)
+        for (bits, groupSize) in preferred {
+            guard (packedDim * 32) % bits == 0 else { continue }
+            let inputDim = (packedDim * 32) / bits
+            guard inputDim > 0, inputDim % numGroups == 0 else { continue }
+            if inputDim / numGroups == groupSize {
+                return (bits, groupSize)
             }
         }
 
-        // Last-resort: prior search by `bitWidthsUsed` first (preserves
-        // legacy behaviour for bundles whose actual bit width isn't in
-        // the preference order — e.g., a 5-bit layer).
+        let validBits = [2, 3, 4, 5, 6, 8]
         let candidates = bitWidthsUsed.isEmpty
             ? validBits.sorted(by: >)
             : bitWidthsUsed.sorted(by: >)
         for bits in candidates {
             guard bits > 0, (packedDim * 32) % bits == 0 else { continue }
-            let inDim = (packedDim * 32) / bits
-            guard inDim > 0, inDim % numGroups == 0 else { continue }
-            let gs = inDim / numGroups
-            guard mlxValidGroupSizes.contains(gs) else { continue }
-            return (bits, gs)
+            let inputDim = (packedDim * 32) / bits
+            guard inputDim > 0, inputDim % numGroups == 0 else { continue }
+            return (bits, inputDim / numGroups)
         }
 
         return (4, knownGroupSize ?? 64)
+    }
+
+    public static func inferBitWidthAndGroupSize(
+        packedDim: Int, numGroups: Int,
+        knownGroupSize: Int? = nil,
+        bitWidthsUsed: [Int] = [],
+        expectedInDim: Int
+    ) -> (bits: Int, groupSize: Int) {
+        guard packedDim > 0 && numGroups > 0 && expectedInDim > 0 else {
+            return inferBitWidthAndGroupSize(
+                packedDim: packedDim,
+                numGroups: numGroups,
+                knownGroupSize: knownGroupSize,
+                bitWidthsUsed: bitWidthsUsed)
+        }
+
+        let preferred: [(Int, Int)] = [
+            (8, 32), (8, 64), (8, 128),
+            (4, 32), (4, 64), (4, 128),
+            (2, 32), (2, 64), (2, 128),
+            (3, 32), (6, 32),
+            (5, 32), (5, 64), (3, 64), (6, 64),
+        ]
+        for (bits, groupSize) in preferred {
+            guard (packedDim * 32) % bits == 0 else { continue }
+            let inputDim = (packedDim * 32) / bits
+            guard inputDim == expectedInDim, inputDim % numGroups == 0 else {
+                continue
+            }
+            if inputDim / numGroups == groupSize {
+                return (bits, groupSize)
+            }
+        }
+
+        return inferBitWidthAndGroupSize(
+            packedDim: packedDim,
+            numGroups: numGroups,
+            knownGroupSize: knownGroupSize,
+            bitWidthsUsed: bitWidthsUsed)
     }
 
     // MARK: - MoE Gate Dequantization

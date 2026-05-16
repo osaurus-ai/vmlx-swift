@@ -35,6 +35,10 @@ import Foundation
 ///   4-7× over autoregressive on pure-attention models; smaller gains on
 ///   hybrid-SSM models until Phase 3 per-node recurrent forking lands.
 ///
+/// - ``nativeMTP(depth:)`` — uses a native MTP sidecar already present in
+///   the target model artifact. This never loads a separate draft model and
+///   is valid only for model instances conforming to ``NativeMTPModel``.
+///
 /// ## Picking a block size / budget
 ///
 /// - `blockSize` (DFlash, DDTree) — number of future positions the drafter
@@ -80,6 +84,13 @@ public enum DraftStrategy: @unchecked Sendable {
     ///     the drafter's training value.
     case ddtree(drafterPath: URL, branchingBudget: Int, blockSize: Int)
 
+    /// Native model-owned MTP draft/verify.
+    ///
+    /// This path is intentionally explicit. The model must have been loaded
+    /// with real MTP tensors and `NativeMTPActivation` must have allowed them
+    /// through the loader; otherwise the iterator refuses to start.
+    case nativeMTP(depth: Int)
+
     /// Discriminator usable as a stable dictionary key / log label.
     /// Does not expose associated values.
     public var kindName: String {
@@ -88,6 +99,7 @@ public enum DraftStrategy: @unchecked Sendable {
         case .autoregressive: return "autoregressive"
         case .dflash: return "dflash"
         case .ddtree: return "ddtree"
+        case .nativeMTP: return "native_mtp"
         }
     }
 
@@ -97,7 +109,12 @@ public enum DraftStrategy: @unchecked Sendable {
     public var usesBlockDiffusion: Bool {
         switch self {
         case .dflash, .ddtree: return true
-        case .none, .autoregressive: return false
+        case .none, .autoregressive, .nativeMTP: return false
         }
+    }
+
+    public var usesNativeMTP: Bool {
+        if case .nativeMTP = self { return true }
+        return false
     }
 }

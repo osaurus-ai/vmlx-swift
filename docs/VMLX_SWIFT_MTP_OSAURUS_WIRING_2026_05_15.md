@@ -1,8 +1,9 @@
 # vMLX Swift MTP / Osaurus Wiring Plan - 2026-05-15
 
-This document records the Swift-side MTP status contract added for Osaurus.
-It is intentionally a status and wiring contract, not a claim that speculative
-MTP decode is production-ready.
+This document records the Swift-side MTP status and activation contract for
+Osaurus. Native MTP now exists as an explicit, tensor-gated runtime path for
+Qwen3.6, but it is still not an automatic production launch mode. Auto-launch
+requires the cache, VL, multi-turn, and speed gates below.
 
 ## Current Boundary
 
@@ -21,8 +22,8 @@ The inspector reads only metadata and tensor names:
 - safetensors headers when no index file exists
 
 It never materializes tensors and it does not alter generation. Plain
-autoregressive decode remains the default path unless an explicit future MTP
-runtime proves verified accept/reject.
+autoregressive decode remains the default path unless an explicit native MTP
+request passes runtime activation checks.
 
 ## Qwen3.6 MTP Reference Facts
 
@@ -39,14 +40,14 @@ The JANG-side verified Qwen3.6 27B JANG_4M MTP bundle has these properties:
 - Text probe answered `2 + 2` as `4`.
 - Image probe on a generated red square answered `red`.
 
-That proves the artifact preserves MTP and VL. It does not prove Swift
-speculative MTP accept/reject decode, so Swift must report:
+That proves the artifact preserves MTP and VL. Swift must still distinguish
+artifact preservation from runtime readiness:
 
 ```text
 mode=preserved_enabled
 hasCompleteMTPArtifact=true
-speculativeDecodeEnabled=false
-canAutoLaunchMTP=false
+speculativeDecodeEnabled=false unless explicitly requested
+canAutoLaunchMTP=false until the full gate passes
 requiresAcceptRejectBeforeEnable=true
 ```
 
@@ -124,10 +125,73 @@ should return a clear unsupported/error response. It must not silently route
 through a fake guard, force a hidden sampler fallback, cap output length, or
 pretend speculative MTP ran.
 
-## Future Swift Runtime Activation
+## Explicit Swift Runtime Activation
 
-The future activation path should be family-specific. Do not add a global
-`DraftStrategy.mtp` switch until at least one family implements all of:
+The package has an opt-in Qwen3.6 native-MTP path behind
+`VMLINUX_NATIVE_MTP=1` plus `DraftStrategy.nativeMTP(depth:)`. Activation is
+not inferred from model names and is not inferred from `mtp_num_hidden_layers`
+alone. It requires:
+
+- supported Qwen3.5/Qwen3.6 text or VL model type;
+- complete MTP tensor evidence from the index or safetensors headers;
+- an active Swift model exposing `NativeMTPModel`;
+- explicit runtime selection;
+- greedy `temperature=0` for the current implementation.
+
+Bundles whose config advertises MTP but whose weights do not contain MTP tensors
+fail closed. The local CRACK bundle
+`~/models/dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` currently reports:
+
+```text
+native MTP was requested but this bundle does not have complete MTP tensor evidence:
+mtp: metadata_only_missing_weights, layers=1, tensors=0, speculative=off
+```
+
+The implementation uses private MTP draft cache, target-model verification, and
+explicit rollback+repair on partial rejection. Rejected draft state is not kept
+in the backbone cache. This is a correctness-first path, not the speed path.
+Depth values greater than one currently exercise recursive draft calls and
+partial-accept repair, but they are not production depth-3 acceleration because
+the verifier cache still has to be repaired by re-forwarding accepted prefixes
+instead of committing an intermediate captured verifier state.
+
+Live current-code artifacts under `docs/local/native-mtp-qwen36-20260515/`
+record the following local rows:
+
+| Bundle | Mode | Artifact | Result |
+| --- | --- | --- | --- |
+| `Qwen3.6-27B-JANG_4M-MTP` | AR base | `jang4m-mtp-artifact-ar-normdetect-256.log` | coherent, `stop=stop`, `loop=NO`; norm convention detected from weights |
+| `Qwen3.6-27B-JANG_4M-MTP` | native MTP D1 | `jang4m-mtp-artifact-native-d1-mtpfcfix-256.log` | coherent, `23.6 tok/s` median, `verifyCalls=106`, `avgCommittedPerVerify=1.62` |
+| `Qwen3.6-27B-JANG_4M-MTP` | native MTP D2 | `jang4m-mtp-artifact-native-d2-mtpfcfix-256.log` | coherent, `19.7 tok/s` median, `verifyCalls=85`, `avgCommittedPerVerify=2.02` |
+| `Qwen3.6-27B-JANG_4M-MTP` | native MTP D3 | `jang4m-mtp-artifact-native-d3-mtpfcfix-256.log` | coherent, `12.2 tok/s` median, `verifyCalls=85`, `avgCommittedPerVerify=2.11` |
+| `Qwen3.6-27B-JANG_4M-MTP` | native MTP D1 post-cleanup | `jang4m-mtp-artifact-native-d1-postrevert-96.log` | coherent, `30.2 tok/s` median on a short 48-token stop, `loop=NO` |
+| `Qwen3.6-27B-MXFP4-MTP` | native MTP D1 post-cleanup | `mx-mtp-artifact-native-d1-postrevert-96.log` | coherent, `34.0 tok/s` median on a short 51-token stop, `loop=NO` |
+| `Qwen3.6-27B-JANG_4M-CRACK` | native MTP requested | `jang4m-crack-native-mtp-denied-postrevert.log` | fail-closed, `metadata_only_missing_weights`, exit status 133 |
+
+The 50 tok/s Qwen3.6 27B target is not achieved by the current Swift path.
+The attempted verifier argmax vectorization was rejected after live rows were
+slower, so it is not part of the implementation. The next real speed work is
+proper depth-3 activation:
+
+1. recursive MTP draft returns logits and hidden state for `d1`, `d2`, and
+   `d3`;
+2. one target verifier forward over `[primary, d1, d2, d3]`;
+3. capture/commit of intermediate Qwen hybrid SSM/KV states for accepted prefix
+   length `0...3`;
+4. correction-token repair only for the rejected suffix, not a full all-or-
+   nothing rollback;
+5. compiled or tuned small-M verifier shapes;
+6. telemetry for requested/effective depth, verify calls, accepted-by-depth,
+   bonus tokens, correction count, target verify time, MTP draft time, and output
+   tail review.
+
+A hidden sampler floor, forced repetition penalty, forced stop, or all-or-
+nothing accept rule is not an acceptable substitute.
+
+## Runtime Activation Contract
+
+The activation path is family-specific. Do not add a global auto-MTP switch
+until at least one family implements all of:
 
 1. Load the MTP head/layer without breaking the base autoregressive loader.
 2. Return both logits and hidden state from each MTP draft step. D2/D3 recursive

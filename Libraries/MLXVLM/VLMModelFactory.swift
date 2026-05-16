@@ -499,6 +499,23 @@ public final class VLMModelFactory: ModelFactory {
             }
         }
 
+        let earlyJangConfig: JangConfig?
+        if JangLoader.isJangModel(at: modelDirectory) {
+            earlyJangConfig = try JangLoader.loadConfig(at: modelDirectory)
+        } else {
+            earlyJangConfig = nil
+        }
+        let earlyMTPStatus = try? MTPBundleInspector.inspect(
+            modelDirectory: modelDirectory,
+            jangConfig: earlyJangConfig)
+        let loadNativeMTP = try NativeMTPActivation.shouldLoadNativeMTPWeights(
+            configData: mergedConfigData,
+            baseModelType: dispatchModelType,
+            status: earlyMTPStatus)
+        if !loadNativeMTP {
+            mergedConfigData = try NativeMTPActivation.scrubInactiveMTPConfig(mergedConfigData)
+        }
+
         let model: LanguageModel
         do {
             model = try await typeRegistry.createModel(
@@ -530,15 +547,8 @@ public final class VLMModelFactory: ModelFactory {
         // Detect JANG model BEFORE tool-format selection so the `capabilities.tool_parser`
         // stamp is authoritative for JANG bundles. Standard MLX models skip this and
         // jangConfig stays nil, in which case we fall through to the model_type heuristic.
-        let jangConfig: JangConfig?
-        if JangLoader.isJangModel(at: modelDirectory) {
-            jangConfig = try JangLoader.loadConfig(at: modelDirectory)
-        } else {
-            jangConfig = nil
-        }
-        let mtpStatus = try? MTPBundleInspector.inspect(
-            modelDirectory: modelDirectory,
-            jangConfig: jangConfig)
+        let jangConfig = earlyJangConfig
+        let mtpStatus = earlyMTPStatus
 
         // Tool-format resolution priority (same rationale as LLMModelFactory):
         //   1. Caller-supplied `configuration.toolCallFormat` (explicit override).
@@ -603,7 +613,8 @@ public final class VLMModelFactory: ModelFactory {
             // and causing mid-prefill rmsNorm shape traps.
             quantization: jangConfig != nil ? baseConfig.quantization : nil,
             perLayerQuantization: baseConfig.perLayerQuantization,
-            jangConfig: jangConfig)
+            jangConfig: jangConfig,
+            loadPreservedMTP: loadNativeMTP)
 
         let tokenizer = try await tokenizerTask
         let processorConfigData: Data

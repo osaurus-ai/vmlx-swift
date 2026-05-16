@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+import MLX
 
 /// Runtime mode stamped by a model bundle or inferred from its files.
 ///
@@ -118,6 +119,131 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
             return "\(base), speculative=off (metadata only; MTP weights missing)"
         }
         return "\(base), speculative=off"
+    }
+}
+
+/// Output from a native-MTP capable target forward.
+///
+/// `hiddenStates` is the pre-final-norm hidden state at the same positions as
+/// `logits`. Qwen MTP heads fuse this hidden state with the next sampled token,
+/// so final-norm activations are not a valid substitute.
+public struct NativeMTPForwardResult {
+    public let logits: MLXArray
+    public let hiddenStates: MLXArray
+
+    public init(logits: MLXArray, hiddenStates: MLXArray) {
+        self.logits = logits
+        self.hiddenStates = hiddenStates
+    }
+}
+
+/// Capability exposed only by loaded models that have a real native MTP head.
+public protocol NativeMTPModel: LanguageModel {
+    /// True only when the concrete model instance has an instantiated MTP module
+    /// whose weights were allowed through the loader.
+    var nativeMTPAvailable: Bool { get }
+
+    /// Private per-request cache for the MTP head. It is never prefix/paged/L2
+    /// cache state.
+    func makeNativeMTPCache() -> [KVCache]
+
+    /// Target/backbone forward that returns logits plus pre-final-norm hidden.
+    func nativeBackboneForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult
+
+    /// One recursive MTP draft step. `nextTokenIds` is the sampled token at the
+    /// position after `hiddenStates`.
+    func nativeMTPForward(
+        hiddenStates: MLXArray,
+        nextTokenIds: MLXArray,
+        cache: [KVCache]?
+    ) -> NativeMTPForwardResult
+}
+
+public enum NativeMTPActivationError: Error, CustomStringConvertible {
+    case requestedButMissingArtifact(MTPBundleStatus?)
+    case requestedForUnsupportedModel([String])
+    case invalidConfigData
+
+    public var description: String {
+        switch self {
+        case .requestedButMissingArtifact(let status):
+            return "native MTP was requested but this bundle does not have complete MTP tensor evidence: \(status?.statusLine ?? "no status")"
+        case .requestedForUnsupportedModel(let types):
+            return "native MTP was requested for unsupported model type(s): \(types.joined(separator: ", "))"
+        case .invalidConfigData:
+            return "native MTP config rewrite failed"
+        }
+    }
+}
+
+/// Fail-closed native-MTP activation policy.
+///
+/// The runtime never enables native MTP from a path or marketing name. The first
+/// Swift implementation is deliberately Qwen3.6/Qwen3.5 only and requires:
+/// `VMLINUX_NATIVE_MTP=1`, supported config model type, and real MTP tensor keys.
+public enum NativeMTPActivation {
+    public static var isExplicitlyRequested: Bool {
+        let raw = ProcessInfo.processInfo.environment["VMLINUX_NATIVE_MTP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? "0"
+        return ["1", "true", "yes", "on"].contains(raw)
+    }
+
+    public static func shouldLoadNativeMTPWeights(
+        configData: Data,
+        baseModelType: String,
+        status: MTPBundleStatus?
+    ) throws -> Bool {
+        guard isExplicitlyRequested else { return false }
+        let modelTypes = modelTypes(in: configData, fallback: baseModelType)
+        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else {
+            throw NativeMTPActivationError.requestedForUnsupportedModel(modelTypes)
+        }
+        guard status?.hasCompleteMTPArtifact == true else {
+            throw NativeMTPActivationError.requestedButMissingArtifact(status)
+        }
+        return true
+    }
+
+    public static func scrubInactiveMTPConfig(_ configData: Data) throws -> Data {
+        guard var object = try JSONSerialization.jsonObject(with: configData) as? [String: Any]
+        else {
+            throw NativeMTPActivationError.invalidConfigData
+        }
+        scrubMTPKeys(in: &object)
+        if var textConfig = object["text_config"] as? [String: Any] {
+            scrubMTPKeys(in: &textConfig)
+            object["text_config"] = textConfig
+        }
+        return try JSONSerialization.data(withJSONObject: object)
+    }
+
+    private static func scrubMTPKeys(in object: inout [String: Any]) {
+        if object["mtp_num_hidden_layers"] != nil {
+            object["mtp_num_hidden_layers"] = 0
+        }
+    }
+
+    private static func modelTypes(in configData: Data, fallback: String) -> [String] {
+        var result = Set<String>()
+        if !fallback.isEmpty { result.insert(fallback) }
+        if let object = try? JSONSerialization.jsonObject(with: configData) as? [String: Any] {
+            if let top = object["model_type"] as? String { result.insert(top) }
+            if let textConfig = object["text_config"] as? [String: Any],
+                let text = textConfig["model_type"] as? String
+            {
+                result.insert(text)
+            }
+        }
+        return Array(result).sorted()
+    }
+
+    private static func isSupportedQwenMTPModelType(_ value: String) -> Bool {
+        let normalized = value.lowercased().replacingOccurrences(of: "-", with: "_")
+        return normalized == "qwen3_5"
+            || normalized == "qwen3_5_text"
+            || normalized == "qwen3_5_vl"
+            || normalized == "qwen3_vl"
     }
 }
 

@@ -48,7 +48,8 @@ public func loadWeights(
     modelDirectory: URL, model: LanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
-    jangConfig: JangConfig? = nil
+    jangConfig: JangConfig? = nil,
+    loadPreservedMTP: Bool = false
 ) throws {
     // load the weights and collect metadata from the first safetensor file
     var weights = [String: MLXArray]()
@@ -169,7 +170,8 @@ public func loadWeights(
         var skippedPreservedMTPShards = 0
         let streamingRoutedExperts = JANGTQStreamingExperts.isEnabled
         for url in allShardURLs {
-            if let headerNames = try? loadSafetensorsHeaderNamesForBaseLoad(url),
+            if !loadPreservedMTP,
+                let headerNames = try? loadSafetensorsHeaderNamesForBaseLoad(url),
                 !headerNames.isEmpty,
                 headerNames.allSatisfy(isPreservedMTPWeightKey)
             {
@@ -180,7 +182,7 @@ public func loadWeights(
             let (w, m) = try loadArraysAndMetadata(url: url)
             let isPrestackedShard = url.lastPathComponent == "jangpress-prestacked.safetensors"
             for (key, value) in w {
-                if isPreservedMTPWeightKey(key) {
+                if !loadPreservedMTP, isPreservedMTPWeightKey(key) {
                     skippedPreservedMTPTensors += 1
                     continue
                 }
@@ -215,6 +217,10 @@ public func loadWeights(
         if skippedPreservedMTPTensors > 0 {
             FileHandle.standardError.write(Data(
                 "[loadWeights] preserved MTP tensors are isolated from base AR load; skipped \(skippedPreservedMTPTensors) tensor(s) across \(skippedPreservedMTPShards) MTP-only shard(s)\n".utf8))
+        }
+        if loadPreservedMTP {
+            FileHandle.standardError.write(Data(
+                "[loadWeights] native MTP requested; preserved MTP tensors are included in model update\n".utf8))
         }
     }
 
@@ -257,10 +263,17 @@ public func loadWeights(
     // than the body. Dequantizing resolves ambiguous bit/group_size inference.
     // Safe for JANGTQ-native too: the dequant only touches `.*.gate.*` keys,
     // not the `tq_packed`/`tq_norms` expert projections.
+    let declaredAffineQuantization = perLayerQuantization?.quantization
     if let jangConfig {
+        let gateBitWidths = Array(Set(
+            jangConfig.quantization.bitWidthsUsed
+                + [declaredAffineQuantization?.bits].compactMap { $0 }
+        )).sorted()
         JangLoader.dequantizeMoEGates(
-            weights: &weights, groupSize: jangConfig.quantization.blockSize,
-            bitWidthsUsed: jangConfig.quantization.bitWidthsUsed)
+            weights: &weights,
+            groupSize: declaredAffineQuantization?.groupSize
+                ?? jangConfig.quantization.blockSize,
+            bitWidthsUsed: gateBitWidths)
     }
 
     // Determine quantization: JANG models infer per-layer bit widths from tensor shapes.
@@ -286,14 +299,13 @@ public func loadWeights(
         // dict here because that dict can be HF-tooling-stale (claims
         // `(gs=32, bits=8)` for layers actually packed at `(gs=64,
         // bits=4)`) and would re-introduce the wrong values.
-        let configGS: Int? = quantization?.groupSize
-        let configBits: Int? = quantization?.bits
-        let configMode: QuantizationMode = quantization?.mode ?? .affine
+        let hiddenHint = readHiddenSizeHint(at: modelDirectory)
+        let validInDims = readValidInDims(at: modelDirectory)
         let inferred = JangLoader.inferPerLayerQuantization(
             weights: weights, jangConfig: jangConfig,
-            overrideGroupSize: configGS,
-            overrideBits: configBits,
-            overrideMode: configMode)
+            hiddenSizeHint: hiddenHint,
+            validInDims: validInDims,
+            declaredDefaultQuantization: declaredAffineQuantization ?? quantization)
 
         if !inferred.perLayerQuantization.isEmpty {
             let b = inferred.quantization?.bits ?? -1
@@ -301,7 +313,57 @@ public func loadWeights(
             FileHandle.standardError.write(
                 Data("[Load] JANG shape walk produced \(inferred.perLayerQuantization.count) per-layer quant override(s) over default (bits=\(b), gs=\(g))\n".utf8))
         }
-        effectivePerLayerQuantization = inferred
+        func variants(_ key: String) -> [String] {
+            var out = [key]
+            if key.contains(".attn.") || key.hasSuffix(".attn") {
+                out.append(key.replacingOccurrences(of: ".attn.", with: ".self_attn."))
+                if key.hasSuffix(".attn") {
+                    out.append(String(key.dropLast(".attn".count)) + ".self_attn")
+                }
+            }
+            return out
+        }
+
+        var merged = inferred.perLayerQuantization
+        for (key, value) in inferred.perLayerQuantization {
+            for variant in variants(key) where merged[variant] == nil {
+                merged[variant] = value
+            }
+            let modelPrefixed = "model.\(key)"
+            if merged[modelPrefixed] == nil { merged[modelPrefixed] = value }
+            for variant in variants(modelPrefixed) where merged[variant] == nil {
+                merged[variant] = value
+            }
+        }
+        if let perLayerQuantization {
+            for (key, value) in perLayerQuantization.perLayerQuantization {
+                for variant in variants(key) {
+                    if merged[variant] == nil { merged[variant] = value }
+                    let modelPrefixed = "model.\(variant)"
+                    if merged[modelPrefixed] == nil { merged[modelPrefixed] = value }
+                }
+                if key.hasPrefix("language_model.model.") {
+                    let stripped = String(key.dropFirst("language_model.".count))
+                    for variant in variants(stripped) where merged[variant] == nil {
+                        merged[variant] = value
+                    }
+                } else if key.hasPrefix("language_model.") {
+                    let stripped = String(key.dropFirst("language_model.".count))
+                    for variant in variants(stripped) where merged[variant] == nil {
+                        merged[variant] = value
+                    }
+                }
+            }
+        }
+        effectivePerLayerQuantization = BaseConfiguration.PerLayerQuantization(
+            quantization: declaredAffineQuantization ?? inferred.quantization,
+            perLayerQuantization: merged
+        )
+        if ProcessInfo.processInfo.environment["VMLX_LOAD_DIAG"] == "1" {
+            let topQ = declaredAffineQuantization ?? inferred.quantization
+            FileHandle.standardError.write(Data(
+                "[merge-diag] top-level quantization = \(topQ.map { "(b=\($0.bits), gs=\($0.groupSize), mode=\($0.mode.rawValue))" } ?? "NIL"); merged_count=\(merged.count); inferred_count=\(inferred.perLayerQuantization.count); explicit_count=\(perLayerQuantization?.perLayerQuantization.count ?? 0); hidden_hint=\(hiddenHint.map(String.init) ?? "nil"); valid_dims=\(validInDims.sorted())\n".utf8))
+        }
     } else if let perLayerQuantization {
         // Remap perLayerQuantization keys to match sanitized weight paths.
         // Config.json uses VLM-prefixed keys like "language_model.model.layers.0..."
@@ -589,4 +651,95 @@ private func dtypeByteWidth(_ dtype: DType) -> Int {
         return 8
     }
     return 4
+}
+
+private func readHiddenSizeHint(at modelDirectory: URL) -> Int? {
+    let configURL = modelDirectory.appendingPathComponent("config.json")
+    guard let data = try? Data(contentsOf: configURL),
+          let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    if let textConfig = top["text_config"] as? [String: Any],
+       let hiddenSize = textConfig["hidden_size"] as? Int, hiddenSize > 0
+    {
+        return hiddenSize
+    }
+    if let hiddenSize = top["hidden_size"] as? Int, hiddenSize > 0 {
+        return hiddenSize
+    }
+    return nil
+}
+
+/// Build architecture-valid input dimensions for JANG bit/group-size
+/// disambiguation. Shape math alone can make (8, 32), (4, 64), and
+/// (2, 128) look equivalent; these dimensions constrain Qwen hybrid SSM,
+/// MLA, and MoE projections to real model widths.
+private func readValidInDims(at modelDirectory: URL) -> Set<Int> {
+    let configURL = modelDirectory.appendingPathComponent("config.json")
+    guard let data = try? Data(contentsOf: configURL),
+          let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return [] }
+    let config = (top["text_config"] as? [String: Any]) ?? top
+    var dims = Set<Int>()
+    func add(_ value: Any?) {
+        if let int = value as? Int, int > 0 {
+            dims.insert(int)
+        }
+    }
+
+    add(config["hidden_size"])
+    add(config["intermediate_size"])
+    add(config["moe_intermediate_size"])
+    add(config["expert_intermediate_size"])
+    add(config["shared_expert_intermediate_size"])
+    add(config["q_lora_rank"])
+    add(config["kv_lora_rank"])
+    add(config["v_head_dim"])
+    add(config["qk_nope_head_dim"])
+    add(config["qk_rope_head_dim"])
+
+    let headDims = [config["head_dim"], config["global_head_dim"]].compactMap { $0 as? Int }
+    let headCounts = [
+        config["num_attention_heads"],
+        config["num_key_value_heads"],
+        config["num_global_key_value_heads"],
+    ].compactMap { $0 as? Int }
+    for headDim in headDims where headDim > 0 {
+        for count in headCounts where count > 0 {
+            dims.insert(headDim * count)
+        }
+    }
+
+    if let nope = config["qk_nope_head_dim"] as? Int,
+       let rope = config["qk_rope_head_dim"] as? Int,
+       let heads = config["num_attention_heads"] as? Int,
+       nope > 0, rope > 0, heads > 0
+    {
+        dims.insert((nope + rope) * heads)
+    }
+
+    if let groups = config["o_groups"] as? Int,
+       let rank = config["o_lora_rank"] as? Int
+    {
+        let groupedOut = groups * rank
+        if groupedOut > 0 { dims.insert(groupedOut) }
+    }
+
+    if let keyHeads = config["linear_num_key_heads"] as? Int,
+       let keyHeadDim = config["linear_key_head_dim"] as? Int
+    {
+        let keyDim = keyHeads * keyHeadDim
+        if keyDim > 0 { dims.insert(keyDim) }
+
+        if let valueHeads = config["linear_num_value_heads"] as? Int,
+           let valueHeadDim = config["linear_value_head_dim"] as? Int
+        {
+            let valueDim = valueHeads * valueHeadDim
+            if valueDim > 0 { dims.insert(valueDim) }
+
+            let convDim = keyDim * 2 + valueDim
+            if convDim > 0 { dims.insert(convDim) }
+        }
+    }
+
+    return dims
 }

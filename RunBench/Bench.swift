@@ -5577,6 +5577,9 @@ func runPerfBench(
                 params.compiledMaxCacheLength =
                     Int(env["BENCH_PERF_COMPILED_MAX_LEN"] ?? "4096") ?? 4096
             }
+            if let nativeMTPDepth = env["BENCH_PERF_NATIVE_MTP_DEPTH"].flatMap(Int.init) {
+                params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
+            }
             switch (env["BENCH_PERF_KV_MODE"] ?? "none").lowercased() {
             case "tq", "tq44", "turboquant":
                 params.kvMode = .turboQuant(keyBits: 4, valueBits: 4)

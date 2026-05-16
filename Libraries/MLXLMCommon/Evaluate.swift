@@ -680,17 +680,20 @@ public struct PenaltyProcessor: LogitProcessor {
 }
 
 /// Common properties shared by token-generating iterators.
-protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
+public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
     var maxTokens: Int? { get }
     var tokenCount: Int { get }
     var promptPrefillTime: TimeInterval { get }
+    var promptTokenIds: [Int] { get }
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool)
 }
 
 extension TokenIteratorProtocol {
-    mutating func storeCacheAfterGeneration(
+    public var promptTokenIds: [Int] { [] }
+
+    public mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {}
@@ -841,8 +844,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     var processor: LogitProcessor?
     let sampler: LogitSampler
 
-    var tokenCount = 0
-    let maxTokens: Int?
+    public var tokenCount = 0
+    public let maxTokens: Int?
 
     // Cache quantization parameters
     let kvBits: Int?
@@ -856,7 +859,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     let cacheCoordinator: CacheCoordinator?
 
     /// Prompt token IDs captured at init for cache store after generation.
-    let promptTokenIds: [Int]
+    public let promptTokenIds: [Int]
 
     /// Clean cache state captured immediately after prefill and before any
     /// generated token is fed back into the model.
@@ -869,7 +872,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     let mediaSalt: String?
 
     // Internal metrics
-    var promptPrefillTime: TimeInterval = 0.0
+    public var promptPrefillTime: TimeInterval = 0.0
 
     /// DSV4's HybridPoolCache carries compressor/indexer pool state in
     /// addition to the local sliding-window KV. Chunked prefill mutates that
@@ -1462,7 +1465,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
     }
 
-    mutating func storeCacheAfterGeneration(
+    public mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
@@ -1571,8 +1574,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     var processor: LogitProcessor?
     let sampler: LogitSampler
 
-    var tokenCount = 0
-    let maxTokens: Int?
+    public var tokenCount = 0
+    public let maxTokens: Int?
     let numDraftTokens: Int
 
     // Buffer of accepted tokens from the current speculation round
@@ -1580,7 +1583,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     private var pendingIndex = 0
 
     // Internal metrics
-    var promptPrefillTime: TimeInterval = 0.0
+    public var promptPrefillTime: TimeInterval = 0.0
 
     /// Initialize a `SpeculativeTokenIterator` with the given input.
     ///
@@ -2211,6 +2214,28 @@ public func generate(
 
     let promptTail = _decodePromptTail(
         input: input, tokenizer: context.tokenizer, tokens: 64)
+    if let strategy = parameters.draftStrategy,
+        case .nativeMTP(let depth) = strategy
+    {
+        guard let nativeModel = context.model as? any NativeMTPModel else {
+            throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
+        }
+        let iterator = try NativeMTPTokenIterator(
+            input: input,
+            model: nativeModel,
+            cache: cache,
+            parameters: parameters,
+            depth: depth)
+        let (stream, _) = generateTask(
+            promptTokenCount: input.text.tokens.size,
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer,
+            iterator: iterator,
+            wiredMemoryTicket: wiredMemoryTicket,
+            extraStopStrings: parameters.extraStopStrings,
+            promptTail: promptTail)
+        return stream
+    }
     // Block-diffusion speculative decoding dispatch. When
     // parameters.draftStrategy is .dflash or .ddtree AND the target
     // model conforms to HiddenStateCaptureModel + TokenEmbedderModel,
@@ -2366,7 +2391,7 @@ public func generateTask(
     promptTokenCount: Int,
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
-    iterator: consuming TokenIterator,
+    iterator: consuming any TokenIteratorProtocol,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     extraStopStrings: [String] = [],
     promptTail: String? = nil
@@ -2515,6 +2540,27 @@ public func generateTokensTask(
     context.jangPressRuntime.recordPromptTokenActivity(
         input.text.tokens.reshaped(-1).asArray(Int.self))
 
+    if let strategy = parameters.draftStrategy,
+        case .nativeMTP(let depth) = strategy
+    {
+        guard let nativeModel = context.model as? any NativeMTPModel else {
+            throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
+        }
+        let iterator = try NativeMTPTokenIterator(
+            input: input,
+            model: nativeModel,
+            cache: cache,
+            parameters: parameters,
+            depth: depth)
+        return generateTokenTask(
+            promptTokenCount: input.text.tokens.size,
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer,
+            iterator: iterator,
+            includeStopToken: includeStopToken,
+            wiredMemoryTicket: wiredMemoryTicket)
+    }
+
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters,
         cacheCoordinator: cacheCoordinator)
@@ -2548,7 +2594,7 @@ public func generateTokenTask(
     promptTokenCount: Int,
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
-    iterator: consuming TokenIterator,
+    iterator: consuming any TokenIteratorProtocol,
     includeStopToken: Bool = false,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
@@ -2595,7 +2641,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 tokenizer: tokenizer
             )
 
-            for token in iterator {
+            while let token = iterator.next() {
                 // Check for cancellation on every loop iteration.
                 if Task.isCancelled {
                     stopReason = .cancelled
