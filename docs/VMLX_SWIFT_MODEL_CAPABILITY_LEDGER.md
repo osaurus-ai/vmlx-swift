@@ -88,7 +88,7 @@ Focused fix artifacts live under `docs/local/swift-release-gates/dsv4-fixes/`.
 | `dealign.ai/Ling-2.6-flash-MXFP4-CRACK` | `bailing_hybrid` / `BailingHybridModel` | `PASS` | Current release turnmatrix passes config/template/MTP metadata, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Bundle defaults apply with `rep=nil`; disk L2 and SSM companion hits are recorded. | Generic paged prefix hit is `N-A` by topology because Ling/Bailing uses disk-backed restore. |
 | `JANGQ/Hy3-preview-JANGTQ` | `hy_v3` / `Hy3Model` | `PASS` | Current release turnmatrix passes config/template/MTP metadata, production defaults cache OFF/ON, paged cache hit, disk restore, B=2 concurrent, per-slot sampler, and TurboQuant B=2. Bundle defaults apply as `temp=0.900 topP=1.000 topK=-1 minP=0.000 rep=nil`. | Cold first prompt is slow; JANGTQ_K is tracked separately because it needs active expert streaming. |
 | `JANGQ/Hy3-preview-JANGTQ_K` | `hy_v3` / `Hy3Model` | `PARTIAL` | Eager load was killed, but active expert streaming now passes the short production matrix without a process-global model-dir override after `loadWeights` binds the loaded model directory. It skips 91,008 per-expert tensors, indexes 79 layers x 192 experts, and passes 7/7 at about 6.2 GiB RSS. | Speed remains blocked at about 1.4 tok/s. This is correctness/low-footprint proof only; multi-model active streaming still needs a per-loaded-model store before Osaurus exposes simultaneous JANGTQ_K sessions. |
-| `dealign.ai/Gemma-4-26B-A4B-it-JANG_4M-CRACK` | `gemma4` / `Gemma4` | `PARTIAL` | Text release turnmatrix passes config/template, cache OFF/ON `BENCH_PROD` 7/7, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Structured VL chat-cache row now passes: image A cold, same-image replay disk hit `308/308`, different-image miss, and text-only follow-up stays grounded. Live tool-call schema row now passes through `UserInput.tools` with `get_weather({"location":"Tokyo"})`, `toolCalls=1`, and no raw marker leak. | Long-budget Harmony reasoning remains open; GPT-OSS is parser-contract only because no local GPT-OSS bundle is present. |
+| `dealign.ai/Gemma-4-26B-A4B-it-JANG_4M-CRACK` | `gemma4` / `Gemma4` | `PARTIAL` | Text release turnmatrix passes config/template, cache OFF/ON `BENCH_PROD` 7/7, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Structured VL chat-cache row now passes: image A cold, same-image replay disk hit `308/308`, different-image miss, and text-only follow-up stays grounded. Live tool-call schema row now passes through `UserInput.tools` with `get_weather({"location":"Tokyo"})`, `toolCalls=1`, and no raw marker leak. Long-budget single-turn Harmony reasoning on/off now passes with 1420 reasoning chars ON and zero reasoning chars OFF. | Multi-turn reasoning matrix remains open; GPT-OSS is parser-contract only because no local GPT-OSS bundle is present. |
 
 Fresh parser/cache contract refresh:
 `docs/local/production-readiness/20260517T2148_nonexcluded_parser_cache_refresh/`
@@ -299,8 +299,13 @@ weights.
   `docs/local/live-model-matrix/20260517T212204Z_gemma4_batch_toolcall_real_schema/gemma4_batch_toolcall.out`
   passes with `Tool format: gemma4`, `Reasoning stamp: harmony`, one structured
   `get_weather({"location":"Tokyo"})` call, `stop`, `genTokens=14`, zero visible
-  chunks, and no raw marker leak. Remaining open row is long-budget Harmony
-  reasoning.
+  chunks, and no raw marker leak. The long-budget Harmony reasoning row
+  `docs/local/live-model-matrix/20260517T2150_gemma4_harmony_long_reasoning/`
+  passes the explicit thinking-on path with `1420` reasoning chars, `668`
+  visible-content chars, normal EOS, and `77.9 tok/s`; the inverse
+  `enable_thinking=false` row reports `0` reasoning chars, `547` visible-content
+  chars, normal EOS, and `69.7 tok/s`. Remaining open row is a full multi-turn
+  reasoning/API matrix, not single-turn Harmony leakage.
 
 ### Nemotron Omni / Nemotron H
 
