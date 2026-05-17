@@ -113,6 +113,14 @@ Known failing rows from that snapshot:
   The production harness now probes the actual rendered prompt before requiring
   `.reasoning` deltas; non-toggleable templates must still produce visible,
   coherent output with no marker leak.
+- 2026-05-16 shape/template audit found and fixed a second ZAYA1-VL template
+  leak: the sidecar-free metadata shim's fallback did not prefill thinking, but
+  still rendered historical assistant `reasoning_content` as `<think>...</think>`.
+  That is not allowed when `think_in_template=false`. The fallback now omits the
+  reasoning-content block entirely. Pre-fix failing artifact:
+  `docs/local/live-model-matrix/20260516Tshape-template-audit/focused_shape_template_tests.out`.
+  Post-fix proof:
+  `docs/local/live-model-matrix/20260516Tshape-template-audit/focused_shape_template_tests_after_zaya_fix.out`.
 - `ZAYA1-VL-8B-JANGTQ4` now passes `BENCH_TEMPLATE_SMOKE=1`,
   `BENCH_PROD=1`, and `BENCH_VL_CHAT_CACHE=1`:
   `docs/local/live-model-matrix/20260516Tzaya-vl-think-template-fix/ZAYA1-VL-8B-JANGTQ4_template_smoke.out`,
@@ -387,6 +395,20 @@ Live-proven:
   validation, text-only media-cache suffix policy, 2D/3D JANGTQ matmul inputs,
   3D/4D Hadamard shape preservation, and TurboQuant-KV Hadamard rank-four
   shape preservation.
+- The broader active focused target was rerun after the ZAYA template fix:
+  `docs/local/live-model-matrix/20260516Tshape-template-audit/mlxlmcommon_focused_target_after_zaya_fix.out`
+  passes 78/78 tests across 13 suites. Covered surfaces include CacheCoordinator
+  topology, DSV4 paged-incompatible CSA/HSA disk restore, hybrid SSM companion
+  requirements, ZAYA CCA disk payloads, media-salt isolation, DSV4 reasoning
+  policy pass-through/no hidden max downgrade, VMLX server sampling settings,
+  Qwen/VL finite extent guards, Omni Parakeet/RADIO/EVS shape rows, native-MTP
+  fail-closed dispatch, JANGTQ active expert descriptors, and JANGTQ
+  Hadamard/matmul rank handling.
+- `Tests/MLXLMTests` is still not an active package test target in the current
+  `Package.swift`; a direct filter against those names ran zero tests at
+  `docs/local/live-model-matrix/20260516Tshape-template-audit/mlxlmtests_shape_template_tests.out`.
+  Do not count those source files as release evidence until they are wired,
+  migrated into `MLXLMCommonFocusedTests`, or intentionally deleted.
 
 Not yet complete:
 

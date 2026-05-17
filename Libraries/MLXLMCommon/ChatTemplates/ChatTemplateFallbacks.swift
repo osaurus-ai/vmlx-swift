@@ -752,9 +752,6 @@ public enum ChatTemplateFallbacks {
         {{- '<|im_end|>\n' -}}
     {%- elif message['role'] == 'assistant' -%}
         {{- '<|im_start|>assistant\n' -}}
-        {%- if message['reasoning_content'] is defined and message['reasoning_content'] is string and message['reasoning_content'] | trim | length > 0 -%}
-            {{- '<think>\n' ~ message['reasoning_content'] ~ '\n</think>\n\n' -}}
-        {%- endif -%}
         {{- render_content(message['content']) -}}
         {%- if message['tool_calls'] is defined and message['tool_calls'] is iterable and message['tool_calls'] | length > 0 -%}
             {%- for tool_call in message['tool_calls'] -%}

@@ -106,6 +106,21 @@ Already reconciled in `vmlx-swift`:
   and `.err`.
 - DSV4 standalone `DSV4Minimal.jinja` no-system tool-schema rendering, aligned
   with the compiled Swift fallback and covered by a focused test.
+- ZAYA1-VL sidecar-free metadata shim now preserves the
+  `think_in_template=false` contract all the way through the fallback template:
+  no assistant-tail thinking prefill, no `enable_thinking` rail, and no
+  historical `reasoning_content` serialization into `<think>...</think>`.
+  Pre-fix and post-fix artifacts:
+  `docs/local/live-model-matrix/20260516Tshape-template-audit/focused_shape_template_tests.out`
+  and
+  `docs/local/live-model-matrix/20260516Tshape-template-audit/focused_shape_template_tests_after_zaya_fix.out`.
+- Active focused package gate after the template fix:
+  `docs/local/live-model-matrix/20260516Tshape-template-audit/mlxlmcommon_focused_target_after_zaya_fix.out`
+  passes 78/78 tests across 13 suites, including cache topology, DSV4
+  paged-incompatible disk restore, hybrid SSM companion gating, ZAYA CCA disk
+  payloads, media salts, Omni Parakeet/RADIO/EVS shape rows, server sampling
+  settings, native-MTP fail-closed dispatch, and JANGTQ Hadamard/matmul rank
+  behavior.
 
 Still open before the Osaurus single-package PR:
 
@@ -126,6 +141,10 @@ Still open before the Osaurus single-package PR:
 - VL/video/audio multi-turn media-salt behavior, including nil media salt on
   text-only turns and grounded output after media changes.
 - SSM/hybrid async re-derive with companion-cache proof.
+- The historical `Tests/MLXLMTests` directory is not wired into the current
+  package test graph. Rows from those files are useful source/reference material
+  only until they are moved into an active target or `Package.swift` is updated
+  deliberately outside concurrent Flux package edits.
 - Full Osaurus API/app gates after repin: HTTP routes, tray/process events,
   model picker, deep sleep/wake, packaged-app launch, and UI error surfaces.
 
