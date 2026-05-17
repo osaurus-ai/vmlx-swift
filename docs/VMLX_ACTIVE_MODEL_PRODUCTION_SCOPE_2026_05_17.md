@@ -367,6 +367,9 @@ Fresh 2026-05-17 artifacts:
 docs/local/live-model-matrix/20260517T_omni_reverify/
 docs/local/live-model-matrix/20260517T_omni_current_recheck/
 docs/local/live-model-matrix/20260517T155603Z_omni_live_voice_current_verify/
+docs/local/live-model-matrix/20260517T164618Z_omni_live_voice_current_recheck/
+docs/local/live-model-matrix/20260517T164640Z_omni_live_audio_streaming_jangtq4_current/
+docs/local/live-model-matrix/20260517T164702Z_omni_integrated_jangtq4_current/
 ```
 
 Current result on `Nemotron-Omni-Nano-JANGTQ4-CRACK`:
@@ -433,6 +436,28 @@ Current result on `Nemotron-Omni-Nano-JANGTQ4-CRACK`:
     `BENCH_OMNI_BATCH=1` passes 18/18 at `maxTokens=48`. Load is 1.79 s,
     direct decode rows are 88.4-110.3 tok/s, and BatchEngine rows are
     37.6-70.8 tok/s.
+- Fresh 09:46 PDT current recheck after the BatchEngine mixed-codec scheduler
+  patch:
+  - `NemotronHOmniPreEncodedAudioTests.log`: Xcode-backed focused test command
+    passes 8/8 on the current checkout. Covered rows are retained live audio
+    snapshots, caller-supplied Parakeet embeddings, RADIO pixel shuffle,
+    Parakeet relative shift, EVS placeholder count, projector remaps, source
+    weight transposes, and generation-default plumbing.
+  - `omni_audio_latency_jangtq4_both_paths_cache_off_32.jsonl`: release-built
+    JANGTQ4 live-audio bench loads in 1.74 s, uses bundle defaults
+    (`temp=0.600 topP=0.950 topK=0 minP=0.000 rep=1.000`), pre-encodes
+    Parakeet to `63 x 2688` in 46.4 ms, and streams raw PCM plus pre-encoded
+    audio through both BatchEngine and TokenIterator. First deltas are
+    221.2 ms raw BatchEngine, 170.3 ms pre-encoded BatchEngine, 183.3 ms raw
+    TokenIterator, and 152.3 ms pre-encoded TokenIterator. Decode rates are
+    66.0-75.6 tok/s.
+  - `omni_runbench_jangtq4_48.log`: integrated `BENCH_OMNI=1`
+    `BENCH_OMNI_BATCH=1` passes 18/18 at `maxTokens=48` with bundle defaults.
+    Load is 1.74 s, direct decode rows are 93.1-112.5 tok/s, and BatchEngine
+    rows are 45.0-69.5 tok/s. Covered rows include text, image, video encoder,
+    video LMInput, audio encoder, audio LMInput, reasoning on/off, mixed
+    image+audio, media-salt isolation, hybrid SSM warm-pass, and BatchEngine
+    text/image/audio.
 
 ## ZAYA Harness and VL Follow-Up - 2026-05-17
 

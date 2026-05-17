@@ -271,10 +271,13 @@ weights.
 - Template/reasoning/tools: template smoke passes; reasoning parser maps to
   Nemotron H; tool parser maps to Nemotron format.
 - Current status: JANGTQ4 core Omni path is live-proven in
-  `docs/local/live-model-matrix/20260517T163112Z_omni_live_voice_reverify_current/`.
+  `docs/local/live-model-matrix/20260517T164618Z_omni_live_voice_current_recheck/`,
+  `docs/local/live-model-matrix/20260517T164640Z_omni_live_audio_streaming_jangtq4_current/`,
+  and `docs/local/live-model-matrix/20260517T164702Z_omni_integrated_jangtq4_current/`.
   Focused pre-encoded audio tests pass 8/8; release `BENCH_OMNI=1`
   `BENCH_OMNI_BATCH=1` passes 18/18 at 48 tokens; raw PCM and pre-encoded
-  Parakeet stream through BatchEngine and TokenIterator with bundle defaults.
+  Parakeet stream through BatchEngine and TokenIterator with bundle defaults at
+  66.0-75.6 tok/s.
   Chunked Parakeet embeddings are not concat-safe, so live voice must retain
   PCM and submit a full-snapshot pre-encode or raw PCM at endpoint.
 - Open: repeated audio with disk cache ON still has an output-quality edge
