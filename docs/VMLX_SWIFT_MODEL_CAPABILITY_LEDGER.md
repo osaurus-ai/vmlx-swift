@@ -125,8 +125,8 @@ weights.
 | `dealign.ai/Ling-2.6-flash-MXFP4-CRACK` | 63G | `bailing_hybrid` | no | file | `PASS` | `PASS` |
 | `dealign.ai/MiniMax-M2.7-JANGTQ_K-CRACK` | 74G | `minimax_m2` | yes | file | `PASS` | `TODO` |
 | `dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK` | 12G | `nemotron_h` | yes | file | `PASS` | `PASS` |
-| `dealign.ai/Nemotron-Omni-Nano-JANGTQ4-CRACK` | 19G | `nemotron_h` | yes | file | `PASS` | `TODO` |
-| `dealign.ai/Nemotron-Omni-Nano-MXFP4-CRACK` | 21G | `nemotron_h` | no | file | `PASS` | `TODO` |
+| `dealign.ai/Nemotron-Omni-Nano-JANGTQ4-CRACK` | 19G | `nemotron_h` | yes | file | `PASS` | `PASS` |
+| `dealign.ai/Nemotron-Omni-Nano-MXFP4-CRACK` | 21G | `nemotron_h` | no | file | `PASS` | `PASS` |
 | `dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` | 16G | `qwen3_5` | no | file | `PASS` | `TODO` |
 | `dealign.ai/Qwen3.6-27B-MXFP4-CRACK` | 14G | `qwen3_5` | no | file | `PASS` | `PARTIAL` |
 | `dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK` | 11G | `qwen3_5_moe` | yes | file | `PASS` | `PARTIAL` |
@@ -316,7 +316,7 @@ weights.
   video, audio, and pre-encoded audio handling.
 - Template/reasoning/tools: template smoke passes; reasoning parser maps to
   Nemotron H; tool parser maps to Nemotron format.
-- Current status: JANGTQ core and JANGTQ4 core Omni paths are live-proven. The
+- Current status: JANGTQ, JANGTQ4, and MXFP4 core Omni paths are live-proven. The
   fresh JANGTQ artifact
   `docs/local/live-model-matrix/20260517T214045Z_nemotron_jangtq_omni_recheck/omni_jangtq_48.log`
   passes 18/18 at 48 tokens with bundle generation defaults, `NemotronHOmni`
@@ -330,6 +330,13 @@ weights.
   `docs/local/live-model-matrix/20260517T164640Z_omni_live_audio_streaming_jangtq4_current/`,
   `docs/local/live-model-matrix/20260517T164702Z_omni_integrated_jangtq4_current/`,
   and `docs/local/live-model-matrix/20260517T170614Z_omni_live_voice_fresh_recheck/`.
+  MXFP4 core Omni path is live-proven in
+  `docs/local/live-model-matrix/20260517T2215_nemotron_mxfp4_omni_recheck/nemotron_mxfp4_omni.log`,
+  which passes 18/18 at 48 tokens with bundle generation defaults, text-only,
+  three-turn text, image, video/audio encoder, video/audio LMInput, reasoning
+  OFF, ON/OFF/ON reasoning toggle, mixed image+audio, media-salt isolation,
+  hybrid SSM warm-pass parity, and BatchEngine text/image/audio rows. Direct
+  rows report about 127-137 tok/s and BatchEngine rows about 50-82 tok/s.
   The latest recheck fixed the audio wrapper parity bug: Swift now emits the
   bundled processor's `<so_start>`/`<so_end>` tokens around `<so_embedding>`
   slots instead of literal `<sound>` text. Focused pre-encoded audio tests pass
@@ -342,8 +349,7 @@ weights.
   wrapper fix, but some short BatchEngine/pre-encoded rows are still weak.
   Repeated audio with disk cache ON remains a separate output-quality edge from
   the earlier gate. Cache-on live audio stays PARTIAL until a focused root-cause
-  gate is added. The MXFP4 sibling bundle still has only short streaming smoke
-  rows in the latest artifact, not production core coherency proof.
+  gate is added.
 
 ### Kimi K2.6
 
