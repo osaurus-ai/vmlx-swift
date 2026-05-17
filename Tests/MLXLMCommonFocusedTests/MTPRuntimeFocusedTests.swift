@@ -5,6 +5,7 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
+import MLXNN
 import Testing
 
 @Suite("MTP runtime metadata")
@@ -212,6 +213,68 @@ struct MTPRuntimeFocusedTests {
         #expect(contract.speedBenchRequirements.requiresOutputTailReview)
     }
 
+    @Test("BatchEngine.generate rejects native MTP without an active MTP head")
+    func batchEngineGenerateRejectsNativeMTPWithoutActiveHead() async throws {
+        try await FocusedMLXTestSupport.withLock {
+            let model = try Qwen35TextModel(Self.tinyQwen35Config(mtpLayers: 0))
+            let context = Self.nativeMTPDispatchContext(model: model)
+            let engine = BatchEngine(context: context, maxBatchSize: 2)
+            var params = GenerateParameters(maxTokens: 4, temperature: 0)
+            params.draftStrategy = .nativeMTP(depth: 3)
+
+            let stream = await engine.generate(
+                input: LMInput(tokens: MLXArray([3, 5, 7])),
+                parameters: params)
+            let info = await Self.collectInfo(from: stream)
+
+            #expect(info.count == 1)
+            #expect(info.cancelled == 1)
+        }
+    }
+
+    @Test("BatchEngine.generate routes active native MTP through the exclusive lane")
+    func batchEngineGenerateRunsActiveNativeMTP() async throws {
+        try await FocusedMLXTestSupport.withLock {
+            let model = FocusedNativeMTPProbeTarget()
+            #expect(model.nativeMTPAvailable)
+            let context = Self.nativeMTPDispatchContext(model: model)
+            let engine = BatchEngine(context: context, maxBatchSize: 2)
+            var params = GenerateParameters(maxTokens: 4, temperature: 0)
+            params.draftStrategy = .nativeMTP(depth: 3)
+
+            let stream = await engine.generate(
+                input: LMInput(tokens: MLXArray([3, 5, 7])),
+                parameters: params)
+            let info = await Self.collectInfo(from: stream)
+
+            #expect(info.count == 1)
+            #expect(info.cancelled == 0)
+        }
+    }
+
+    @Test("BatchEngine.submit rejects native MTP instead of silently batching AR")
+    func batchEngineSubmitRejectsNativeMTP() async throws {
+        try await FocusedMLXTestSupport.withLock {
+            let model = FocusedNativeMTPProbeTarget()
+            let context = Self.nativeMTPDispatchContext(model: model)
+            let engine = BatchEngine(context: context, maxBatchSize: 2)
+            var params = GenerateParameters(maxTokens: 4, temperature: 0)
+            params.draftStrategy = .nativeMTP(depth: 3)
+
+            let (_, stream) = await engine.submit(
+                input: LMInput(tokens: MLXArray([3, 5, 7])),
+                parameters: params)
+            var cancelled = 0
+            for await event in stream {
+                if case .info(let info) = event, info.stopReason == .cancelled {
+                    cancelled += 1
+                }
+            }
+
+            #expect(cancelled == 1)
+        }
+    }
+
     @Test("shape-walk quantization preserves MXFP4 mode")
     func shapeWalkQuantizationPreservesMXFP4Mode() {
         let weights: [String: MLXArray] = [
@@ -347,5 +410,135 @@ struct MTPRuntimeFocusedTests {
             withJSONObject: object,
             options: [.prettyPrinted, .sortedKeys])
         try data.write(to: url)
+    }
+
+    private static func tinyQwen35Config(mtpLayers: Int) throws -> Qwen35TextConfiguration {
+        let data = """
+        {
+          "hidden_size": 16,
+          "num_hidden_layers": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 2,
+          "linear_num_value_heads": 1,
+          "linear_num_key_heads": 1,
+          "linear_key_head_dim": 8,
+          "linear_value_head_dim": 8,
+          "linear_conv_kernel_dim": 4,
+          "head_dim": 8,
+          "vocab_size": 32,
+          "tie_word_embeddings": false,
+          "mtp_num_hidden_layers": \(mtpLayers)
+        }
+        """.data(using: .utf8)!
+        return try JSONDecoder().decode(Qwen35TextConfiguration.self, from: data)
+    }
+
+    private static func nativeMTPDispatchContext(model: any LanguageModel) -> ModelContext {
+        let tokenizer = FocusedMTPTokenizer()
+        return ModelContext(
+            configuration: ModelConfiguration(id: "focused-native-mtp"),
+            model: model,
+            processor: FocusedMTPProcessor(tokenizer: tokenizer),
+            tokenizer: tokenizer)
+    }
+
+    private static func collectInfo(
+        from stream: AsyncStream<Generation>
+    ) async -> (count: Int, cancelled: Int) {
+        var count = 0
+        var cancelled = 0
+        for await event in stream {
+            if case .info(let info) = event {
+                count += 1
+                if info.stopReason == .cancelled {
+                    cancelled += 1
+                }
+            }
+        }
+        return (count, cancelled)
+    }
+}
+
+private struct FocusedMTPTokenizer: Tokenizer {
+    let vocabularySize = 64
+    let eosTokenId: Int? = 60
+    let unknownTokenId: Int? = 61
+    let bosToken: String? = nil
+    let eosToken: String? = nil
+    let unknownToken: String? = nil
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        [3, 5, 7]
+    }
+
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.map(String.init).joined(separator: " ")
+    }
+
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { String(id) }
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        [3, 5, 7]
+    }
+}
+
+private struct FocusedMTPProcessor: UserInputProcessor {
+    let tokenizer: any Tokenizer
+
+    func prepare(input: UserInput) async throws -> LMInput {
+        LMInput(tokens: MLXArray([3, 5, 7]))
+    }
+}
+
+private final class FocusedNativeMTPProbeTarget: Module, LanguageModel, NativeMTPModel,
+    KVCacheDimensionProvider, @unchecked Sendable
+{
+    var kvHeads: [Int] { [1] }
+    var nativeMTPAvailable: Bool { true }
+
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        preconditionFailure("BatchEngine native MTP dispatch fell through to AR callAsFunction")
+    }
+
+    func makeNativeMTPCache() -> [KVCache] {
+        newCache(parameters: nil)
+    }
+
+    func nativeBackboneForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
+        NativeMTPForwardResult(
+            logits: logits(for: inputs),
+            hiddenStates: hiddenStates(for: inputs))
+    }
+
+    func nativeMTPForward(
+        hiddenStates: MLXArray,
+        nextTokenIds: MLXArray,
+        cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        NativeMTPForwardResult(
+            logits: logits(for: nextTokenIds),
+            hiddenStates: self.hiddenStates(for: nextTokenIds))
+    }
+
+    private func sequenceLength(_ inputs: MLXArray) -> Int {
+        inputs.ndim >= 2 ? inputs.dim(1) : inputs.size
+    }
+
+    private func logits(for inputs: MLXArray) -> MLXArray {
+        MLXArray.zeros([1, sequenceLength(inputs), 16])
+    }
+
+    private func hiddenStates(for inputs: MLXArray) -> MLXArray {
+        MLXArray.zeros([1, sequenceLength(inputs), 4])
     }
 }

@@ -372,11 +372,29 @@ Live-proven:
 - MTP phase telemetry now reports target verify, MTP draft, sampling, and cache
   commit time. The 2026-05-16 phase rows show target verify dominates, so the
   next speed pass must focus on compiled/tuned small-M verifier execution.
+- `BatchEngine.generate` now honors `DraftStrategy.nativeMTP(depth:)` through
+  the exclusive solo native-MTP lane instead of silently falling through to
+  ordinary AR batching. Focused test proof:
+  `MTPRuntimeFocusedTests` passes 14/14, including active native-MTP dispatch,
+  missing-head fail-closed dispatch, and `BatchEngine.submit` rejection for raw
+  batched native-MTP. Real bundle proof:
+  `docs/local/live-model-matrix/20260516Tbatch-mtp-dispatch/Qwen3.6-27B-JANG_4M-MTP_batch_native_mtp_d3.out`
+  and `.err` show path=`batch`, coherent text, `33.3 tok/s`, `loop=NO`,
+  `leaks=none`, and `[NativeMTP] depth=3 ... prefixCommit=13`.
+- VL/media and JANGTQ tensor-shape guard coverage was rerun after this dispatch
+  fix: `VLShapeGuardFocusedTests`, `MediaCachePlaceholderTests`, and
+  `JANGTQHadamardShuffleTests` passed 19/19. This covers finite 2D extent
+  validation, text-only media-cache suffix policy, 2D/3D JANGTQ matmul inputs,
+  3D/4D Hadamard shape preservation, and TurboQuant-KV Hadamard rank-four
+  shape preservation.
 
 Not yet complete:
 
 - Production-speed depth-3 acceleration near the 50 tok/s target.
 - Compiled/tuned small-M verifier.
+- True multi-slot native-MTP scheduling with paged KV/block-L2/SSM companion
+  cache. Current `BatchEngine.generate` native-MTP support is an exclusive solo
+  lane; `BatchEngine.submit` intentionally fails closed.
 - MTP with VL multi-turn/media salt/cache proof.
 - Auto-launch eligibility for Osaurus.
 
@@ -398,8 +416,9 @@ Not yet complete:
    assume it globally; prove it per family with a direct media tensor row.
 4. Run a clean-worktree focused test pass once Flux Package.swift edits are
    either committed by the Flux agent or isolated in a separate worktree.
-5. MTP is parked for this non-MTP production pass. Do not spend current
-   validation time on MTP unless the user re-opens that scope.
+5. Keep native MTP explicit-only until the speed and cache-composition gates
+   close. The current BatchEngine fix prevents false positives; it does not
+   make native MTP auto-launch eligible.
 6. Fix DSV4 16k+ long-context memory behavior, then rerun B7-style
    long-context and vector drift. Current pushed engine passes the DSV4 disk
    restore/cache topology row but fails the 16k long-context row with Metal OOM;

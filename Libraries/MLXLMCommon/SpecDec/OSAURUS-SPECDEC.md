@@ -150,7 +150,18 @@ JANG converters will emit:
 
 ## 11. BatchEngine integration
 
-`BatchEngine.generate(input:parameters:)` supports `draftStrategy` same as `Evaluate.generate`. Per-slot strategies in the batched path are Phase 4 late work.
+`BatchEngine.generate(input:parameters:)` supports `draftStrategy` at the API
+surface:
+
+- `.dflash` / `.ddtree` dispatch through `SpecDecStream.streamViaStrategy`
+  when the target and drafter meet the block-diffusion contracts.
+- `.nativeMTP(depth:)` dispatches through the native MTP iterator as an
+  exclusive solo lane. This prevents a false AR fallback when Osaurus requests
+  MTP, but it is not a multi-slot paged native-MTP scheduler.
+- `BatchEngine.submit(input:parameters:)` rejects native MTP. Raw batched
+  native-MTP scheduling remains future work.
+
+Per-slot strategies in the batched path are Phase 4 late work.
 
 ## 12. Verification
 

@@ -238,7 +238,15 @@ public enum DraftStrategy: Sendable {
 public var GenerateParameters.draftStrategy: DraftStrategy?
 ```
 
-Set `draftStrategy` on `GenerateParameters` and the same `Evaluate.generate` / `BatchEngine.generate` entry points dispatch through `SpecDecStream.streamViaStrategy`. The returned `AsyncStream<Generation>` emits the same `.chunk(String)` + `.toolCall(ToolCall)` + `.info(GenerateCompletionInfo)` events the non-speculative path does.
+Set `draftStrategy` on `GenerateParameters` and the same `Evaluate.generate` / `BatchEngine.generate` entry points honor the request. Block-diffusion strategies dispatch through `SpecDecStream.streamViaStrategy`. Native MTP dispatches through the real `NativeMTPTokenIterator` when the loaded model exposes an active MTP head.
+
+Current native-MTP boundary for Osaurus:
+
+- `Evaluate.generate` supports `.nativeMTP(depth:)`.
+- `BatchEngine.generate` supports `.nativeMTP(depth:)` only as an exclusive solo lane. It does not claim multi-slot paged native-MTP batching yet.
+- `BatchEngine.submit` rejects native MTP instead of silently running ordinary AR batch decode.
+
+The returned `AsyncStream<Generation>` emits the same `.chunk(String)` + `.toolCall(ToolCall)` + `.info(GenerateCompletionInfo)` events the non-speculative path does.
 
 Invariant: **at temperature 0, output is byte-identical to greedy autoregressive decode**. The drafter affects speed (mean acceptance length), not output.
 

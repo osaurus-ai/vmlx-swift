@@ -99,15 +99,22 @@ Already reconciled in `vmlx-swift`:
 - Explicit tensor-gated Qwen3.6 native MTP activation via
   `DraftStrategy.nativeMTP(depth:)` and `VMLINUX_NATIVE_MTP=1`, with fail-closed
   behavior when config metadata exists but MTP tensors are absent.
+- `BatchEngine.generate` now honors explicit native MTP through an exclusive
+  solo lane and `BatchEngine.submit` rejects native MTP so raw batching cannot
+  silently run AR while Osaurus believes MTP is active. Live proof:
+  `docs/local/live-model-matrix/20260516Tbatch-mtp-dispatch/Qwen3.6-27B-JANG_4M-MTP_batch_native_mtp_d3.out`
+  and `.err`.
 - DSV4 standalone `DSV4Minimal.jinja` no-system tool-schema rendering, aligned
   with the compiled Swift fallback and covered by a focused test.
 
 Still open before the Osaurus single-package PR:
 
-- Proper native-MTP depth-3 acceleration: one verifier over
-  `[primary, d1, d2, d3]`, intermediate Qwen hybrid SSM/KV capture/commit for
-  accepted prefix length `0...3`, and compiled/tuned small-M verifier shapes.
-  Current MTP rows are coherent correctness probes, not the 50 tok/s target.
+- Proper native-MTP depth-3 production acceleration and cache composition: one
+  verifier over `[primary, d1, d2, d3]`, intermediate Qwen hybrid SSM/KV
+  capture/commit for accepted prefix length `0...3`, compiled/tuned small-M
+  verifier shapes, plus true multi-slot paged native-MTP scheduling. Current
+  MTP rows are coherent correctness probes and an exclusive BatchEngine lane,
+  not the 50 tok/s target or a paged multi-batch implementation.
 - DSV4 long-context CSA/HSA/SWA + prefix/paged/disk behavior, including vector
   drift status.
 - BatchEngine continuous batching, cancellation, cache-key salting, and

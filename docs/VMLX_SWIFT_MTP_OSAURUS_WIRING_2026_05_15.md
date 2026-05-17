@@ -239,6 +239,24 @@ commit: JANG_4M spent `16.388s` in target verify, `1.903s` in MTP draft,
 `1.202s`, `0.118s`, and `0.069s` respectively. This points the next speed pass
 at compiled/tuned small-M verifier execution, not another cache monkeypatch.
 
+Live 2026-05-16 BatchEngine dispatch artifacts under
+`docs/local/live-model-matrix/20260516Tbatch-mtp-dispatch/`:
+
+| Bundle | Mode | Artifact | Result |
+| --- | --- | --- | --- |
+| `/Users/eric/models/JANGQ/Qwen3.6-27B-JANG_4M-MTP` | `BatchEngine.generate`, native MTP D3 | `Qwen3.6-27B-JANG_4M-MTP_batch_native_mtp_d3.out` / `.err` | coherent short row, path=`batch`, `33.3 tok/s`, `stop=length`, `unclosedReasoning=NO`, `loop=NO`, `leaks=none`, `[NativeMTP] depth=3 verifyCalls=13 prefixCommit=13 rollbackRepair=0 avgCommittedPerVerify=2.46` |
+
+Focused test proof for the same dispatch contract:
+
+- `MTPRuntimeFocusedTests` passes 14/14.
+- `BatchEngine.generate` with active native MTP reaches the real
+  `NativeMTPTokenIterator` and emits native-MTP telemetry.
+- `BatchEngine.generate` with a requested native-MTP strategy but no active MTP
+  head fails closed instead of running plain AR.
+- `BatchEngine.submit` rejects native MTP instead of silently treating it as
+  ordinary batched decode. Raw multi-slot native-MTP scheduling is not
+  implemented yet.
+
 The 50 tok/s Qwen3.6 27B target is not achieved by the current Swift path.
 The D3 path is correct enough to keep as an explicit diagnostic, including
 stochastic exact p/q acceptance, but it must not auto-launch as a production
@@ -293,12 +311,19 @@ backbone commit, variable `0...depth` accepted-prefix commit, and a compiled or
 tuned small-M verifier hot path before any speed claim is accepted.
 
 Current runtime state: D3 MLLM native-MTP has correct cache boundaries for the
-Qwen3.6 text path. Prefix, paged KV, and block-L2 disk remain prompt-boundary
-verified caches. Each D3 verify pass advances the live backbone cache through
-verified target positions only; rejected draft suffixes are not kept. The
-remaining production blocker is speed: prefix commit now avoids full
+Qwen3.6 text path. `Evaluate.generate` and `BatchEngine.generate` both honor an
+explicit `.nativeMTP(depth:)` request. The BatchEngine path is deliberately an
+exclusive solo lane; it is not a multi-slot paged native-MTP scheduler.
+`BatchEngine.submit` rejects native MTP so a raw batched caller cannot get a
+fake AR pass while believing MTP ran.
+
+Prefix, paged KV, and block-L2 disk remain prompt-boundary verified caches.
+Each D3 verify pass advances the live backbone cache through verified target
+positions only; rejected draft suffixes are not kept. The remaining production
+blockers are speed and composition: prefix commit now avoids full
 rollback+repair, but the verifier/prefix-state hot path is not tuned enough to
-beat the 50 tok/s target.
+beat the 50 tok/s target, and native MTP has not been proven with VL media
+salt, paged KV/block-L2, or hybrid SSM companion-cache rederive.
 
 Qwen-style bundles use top-level `mtp.fc.*` and `mtp.layers.0.*` tensors. Hy3
 and Bailing-style bundles may store the MTP layer at

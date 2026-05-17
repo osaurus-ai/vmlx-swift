@@ -434,6 +434,13 @@ public actor BatchEngine {
             return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
         }
 
+        if parameters.draftStrategy?.usesNativeMTP == true {
+            Self.logger.error(
+                "Rejected BatchEngine.submit native MTP request: raw batched native-MTP scheduling is not implemented; use BatchEngine.generate or Evaluate.generate for the exclusive native-MTP path."
+            )
+            return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
+        }
+
         let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
         let promptTail = _decodePromptTail(
             input: input, tokenizer: context.tokenizer, tokens: 64)
@@ -550,6 +557,18 @@ public actor BatchEngine {
             tokenizer: tokenizer,
             modelName: context.configuration.name,
             path: "BatchEngine.generate")
+        if parameters.draftStrategy?.usesNativeMTP == true {
+            guard canStartExclusiveSoloPath else {
+                Self.logger.error(
+                    "Rejected BatchEngine.generate native MTP request: native MTP is an exclusive solo path until batched/paged native-MTP scheduling lands."
+                )
+                return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+            }
+            return startSoloFastPath(
+                input: input,
+                parameters: parameters,
+                promptTail: promptTail)
+        }
         if canStartSoloFastPath {
             return startSoloFastPath(
                 input: input,
@@ -807,6 +826,14 @@ public actor BatchEngine {
             !isShutdown
     }
 
+    private var canStartExclusiveSoloPath: Bool {
+        waitQueue.isEmpty &&
+            activeSlots.isEmpty &&
+            loopTask == nil &&
+            soloFastPathTask == nil &&
+            !isShutdown
+    }
+
     private func startSoloFastPath(
         input: consuming sending LMInput,
         parameters: GenerateParameters,
@@ -833,19 +860,40 @@ public actor BatchEngine {
         let sourceStream: AsyncStream<Generation>
         let generationTask: Task<Void, Never>
         do {
-            let iterator = try TokenIterator(
-                input: input,
-                model: context.model,
-                cache: nil,
-                parameters: soloParameters,
-                cacheCoordinator: cacheCoordinator)
-            (sourceStream, generationTask) = generateTask(
-                promptTokenCount: promptTokenCount,
-                modelConfiguration: context.configuration,
-                tokenizer: context.tokenizer,
-                iterator: iterator,
-                extraStopStrings: soloParameters.extraStopStrings,
-                promptTail: promptTail)
+            if let strategy = soloParameters.draftStrategy,
+                case .nativeMTP(let depth) = strategy
+            {
+                guard let nativeModel = context.model as? any NativeMTPModel else {
+                    throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
+                }
+                let iterator = try NativeMTPTokenIterator(
+                    input: input,
+                    model: nativeModel,
+                    cache: nil,
+                    parameters: soloParameters,
+                    depth: depth)
+                (sourceStream, generationTask) = generateTask(
+                    promptTokenCount: promptTokenCount,
+                    modelConfiguration: context.configuration,
+                    tokenizer: context.tokenizer,
+                    iterator: iterator,
+                    extraStopStrings: soloParameters.extraStopStrings,
+                    promptTail: promptTail)
+            } else {
+                let iterator = try TokenIterator(
+                    input: input,
+                    model: context.model,
+                    cache: nil,
+                    parameters: soloParameters,
+                    cacheCoordinator: cacheCoordinator)
+                (sourceStream, generationTask) = generateTask(
+                    promptTokenCount: promptTokenCount,
+                    modelConfiguration: context.configuration,
+                    tokenizer: context.tokenizer,
+                    iterator: iterator,
+                    extraStopStrings: soloParameters.extraStopStrings,
+                    promptTail: promptTail)
+            }
         } catch {
             Self.logger.error(
                 "Solo fast path setup failed: \(error.localizedDescription, privacy: .public)"
