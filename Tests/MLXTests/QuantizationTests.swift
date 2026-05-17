@@ -35,6 +35,25 @@ class QuantizationTests: XCTestCase {
             quantized3.describeExtra(0), "(embeddingCount=512, dimensions=1024)")
     }
 
+    func testQuantizedEmbeddingCheckpointInitializerRestoresUnpackedDimension() {
+        let dense = MLXRandom.normal([16, 64])
+        let (weight, scales, biases) = MLX.quantized(
+            dense, groupSize: 32, bits: 4, mode: .affine)
+        let embedding = QuantizedEmbedding(
+            weight: weight,
+            scales: scales,
+            biases: biases,
+            groupSize: 32,
+            bits: 4,
+            mode: .affine)
+
+        let lookedUp = embedding(MLXArray([0, 7, 15]))
+        XCTAssertEqual(lookedUp.shape, [3, 64])
+
+        let projected = embedding.asLinear(MLXArray.zeros([2, 64]))
+        XCTAssertEqual(projected.shape, [2, 16])
+    }
+
     func testQuantizedLinearInitializerPreservesMXFP8Mode() {
         let linear = Linear(64, 32, bias: false)
         let quantized = QuantizedLinear(linear, groupSize: 32, bits: 8, mode: .mxfp8)

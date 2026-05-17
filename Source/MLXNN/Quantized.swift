@@ -201,6 +201,31 @@ open class QuantizedEmbedding: Embedding, Quantized {
         self.freeze()
     }
 
+    /// Initializer for already-quantized checkpoint tensors.
+    ///
+    /// Pre-quantized model bundles store embedding weights in packed form
+    /// alongside per-group scales and optional biases. Loading those bundles
+    /// should construct the quantized embedding directly from the file-backed
+    /// arrays instead of quantizing a randomly initialized placeholder and
+    /// relying on a later parameter update.
+    public init(
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode = .affine
+    ) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        self.scales = scales
+        self.biases = biases
+        super.init(weight: weight)
+
+        self.freeze()
+    }
+
     open override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let s = x.shape
         let x = x.flattened()

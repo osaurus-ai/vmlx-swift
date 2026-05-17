@@ -112,6 +112,51 @@ prove all four MXFP variants now run bundle-default D3 exact-pq with
 `verifierMode=sequential_repair`, coherent two-turn output, disk-prefix hits,
 and SSM hits. Greedy rows still use `chunk_commit` where proven.
 
+## Qwen3.5 35B 4-bit Loader Repair - 2026-05-17
+
+Fresh live artifact after cleanup:
+
+```text
+docs/local/live-model-matrix/20260517T_qwen35_after_cleanup_infer/
+```
+
+This fixes the current `Qwen3.5-35B-A3B-4bit` release-gate blocker without
+changing sampling policy. The failing row was a real loader/runtime shape bug:
+the shape-walk quantization inference picked the preferred `(bits=8,
+group_size=32)` candidate for stock MLX affine embedding tensors before
+honoring the declared `group_size=64`. That unpacked the text embedding path to
+1024 hidden units, then the first Qwen3.5 RMSNorm trapped because its weight is
+2048-wide.
+
+Code-level repair:
+
+- `JangLoader.inferBitWidthAndGroupSize(...)` now honors a known
+  `group_size` first when the packed/scales shape makes a valid bit width.
+- Already-quantized embedding checkpoint tensors now load as
+  `QuantizedEmbedding(weight:scales:biases:groupSize:bits:mode:)`, instead of
+  quantizing a placeholder embedding and relying on a later parameter update.
+- The text-only Qwen3.5 model registers nested modules with `@ModuleInfo`, so
+  package-level parameter updates can reach the real text stack.
+
+Current proof:
+
+- focused tests pass for the stock MLX affine embedding shape case and the
+  quantized embedding checkpoint initializer;
+- release `RunBench` builds;
+- `REPORT.md` passes all four rows: config, template, production defaults with
+  cache off, and VL BatchEngine chat;
+- production text uses bundle defaults (`temp=1.000`, `topP=0.950`, `topK=20`,
+  `minP=0.000`, `rep=nil`) and passes 7/7 reasoning on/off rows with visible
+  coherent answers at about 90-101 tok/s;
+- VL BatchEngine chat loads `Qwen35MoE` with `Qwen3VLProcessor`; compile OFF and
+  ON both ground the red/blue gradient image and answer the follow-up color.
+
+Earlier failing diagnostics for this exact root cause are preserved under:
+
+```text
+docs/local/live-model-matrix/20260517T_qwen35_embedding_fix/
+```
+
 ## Active Non-Excluded Family Matrix
 
 | Family | Local bundles | Engine surfaces to prove | Current MTP policy |

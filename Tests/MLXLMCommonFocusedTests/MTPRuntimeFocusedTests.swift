@@ -669,6 +669,33 @@ struct MTPRuntimeFocusedTests {
         #expect(inferred.groupSize == 128)
     }
 
+    @Test("shape-walk quantization honors known group size for stock MLX affine embeddings")
+    func shapeWalkQuantizationHonorsKnownGroupSizeForStockMLXEmbeddings() {
+        let direct = JangLoader.inferBitWidthAndGroupSize(
+            packedDim: 256,
+            numGroups: 32,
+            knownGroupSize: 64)
+
+        #expect(direct.bits == 4)
+        #expect(direct.groupSize == 64)
+
+        let weights: [String: MLXArray] = [
+            "language_model.model.embed_tokens.weight": MLXArray.zeros(
+                [248_320, 256], dtype: .uint32),
+            "language_model.model.embed_tokens.scales": MLXArray.zeros(
+                [248_320, 32], dtype: .float32),
+        ]
+        let inferred = JangLoader.inferPerLayerQuantizationFromShapes(
+            weights: weights,
+            defaultBits: 4,
+            defaultGroupSize: 64,
+            defaultMode: .affine)
+
+        #expect(inferred?.quantization?.bits == 4)
+        #expect(inferred?.quantization?.groupSize == 64)
+        #expect(inferred?.perLayerQuantization["language_model.model.embed_tokens"] == nil)
+    }
+
     @Test("shape-walk quantization uses hidden size for JANG_2K routed expert inputs")
     func shapeWalkQuantizationUsesHiddenSizeForJang2KRoutedExpertInputs() {
         let base = "model.layers.0.mlp.switch_mlp.gate_proj"

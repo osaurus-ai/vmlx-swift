@@ -1596,6 +1596,18 @@ public struct JangLoader: Sendable {
     ) -> (bits: Int, groupSize: Int) {
         guard packedDim > 0 && numGroups > 0 else { return (4, knownGroupSize ?? 64) }
 
+        if let knownGroupSize, knownGroupSize > 0 {
+            let inputDim = numGroups * knownGroupSize
+            let packedBits = packedDim * 32
+            if inputDim > 0, packedBits % inputDim == 0 {
+                let bits = packedBits / inputDim
+                let validBits = bitWidthsUsed.isEmpty ? [2, 3, 4, 5, 6, 8] : bitWidthsUsed
+                if bits > 0, validBits.contains(bits) {
+                    return (bits, knownGroupSize)
+                }
+            }
+        }
+
         let preferred: [(Int, Int)] = [
             (8, 32), (8, 64), (8, 128),
             (4, 32), (4, 64), (4, 128),

@@ -733,9 +733,8 @@ final class Qwen35MTPModule: Module {
 
 public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-
-    fileprivate let layers: [Qwen35DecoderLayer]
-    let norm: RMSNorm
+    @ModuleInfo(key: "layers") fileprivate var layers: [Qwen35DecoderLayer]
+    @ModuleInfo(key: "norm") var norm: RMSNorm
 
     let ssmIdx: Int
     let faIdx: Int
@@ -748,11 +747,11 @@ public class Qwen35TextModelInner: Module {
             dimensions: args.hiddenSize
         )
 
-        self.layers = (0 ..< args.hiddenLayers).map { layerIdx in
+        _layers.wrappedValue = (0 ..< args.hiddenLayers).map { layerIdx in
             Qwen35DecoderLayer(args, layerIdx: layerIdx)
         }
 
-        self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
         self.ssmIdx = 0
         self.faIdx = args.fullAttentionInterval - 1
@@ -838,7 +837,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
-    public let model: Qwen35TextModelInner
+    @ModuleInfo public var model: Qwen35TextModelInner
     let configuration: Qwen35TextConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
@@ -856,6 +855,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
         if args.mtpNumHiddenLayers > 0 {
             _mtp.wrappedValue = Qwen35MTPModule(args)
         }
+        super.init()
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {

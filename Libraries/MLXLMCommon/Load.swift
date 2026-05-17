@@ -535,6 +535,16 @@ public func loadWeights(
                     groupSize: gs, bits: b, mode: mode))
             }
 
+            if m is Embedding {
+                return (path, QuantizedEmbedding(
+                    weight: loadedWeight,
+                    scales: loadedScales,
+                    biases: quantBiases,
+                    groupSize: gs,
+                    bits: b,
+                    mode: mode))
+            }
+
             if let q = quantizeSingle(layer: m, groupSize: gs, bits: b, mode: mode) {
                 return (path, q)
             }
