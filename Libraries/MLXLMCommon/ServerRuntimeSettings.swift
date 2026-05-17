@@ -45,6 +45,53 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     ) -> [VMLXServerSettingsIssue] {
         var issues: [VMLXServerSettingsIssue] = []
 
+        if network.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append(.error(
+                field: "network.host",
+                message: "Server host cannot be empty."))
+        }
+        if let port = network.port,
+           !(1...65_535).contains(port) {
+            issues.append(.error(
+                field: "network.port",
+                message: "Server port must be between 1 and 65535."))
+        }
+        if let rateLimit = network.rateLimitRequestsPerMinute,
+           rateLimit <= 0 {
+            issues.append(.error(
+                field: "network.rateLimitRequestsPerMinute",
+                message: "Rate limit must be positive. Use nil to disable rate limiting."))
+        }
+        if let timeout = network.timeoutSeconds,
+           timeout <= 0 {
+            issues.append(.error(
+                field: "network.timeoutSeconds",
+                message: "Timeout must be positive. Use nil for no timeout."))
+        }
+        if let maxConcurrent = concurrency.maxConcurrentSequences,
+           maxConcurrent <= 0 {
+            issues.append(.error(
+                field: "concurrency.maxConcurrentSequences",
+                message: "Max concurrent sequences must be positive."))
+        }
+        if let prefillBatchSize = concurrency.prefillBatchSize,
+           prefillBatchSize <= 0 {
+            issues.append(.error(
+                field: "concurrency.prefillBatchSize",
+                message: "Prefill batch size must be positive."))
+        }
+        if let prefillStepSize = concurrency.prefillStepSize,
+           prefillStepSize <= 0 {
+            issues.append(.error(
+                field: "concurrency.prefillStepSize",
+                message: "Prefill step size must be positive."))
+        }
+        if let completionBatchSize = concurrency.completionBatchSize,
+           completionBatchSize <= 0 {
+            issues.append(.error(
+                field: "concurrency.completionBatchSize",
+                message: "Completion batch size must be positive."))
+        }
         if cache.pagedKV.enabled && cache.legacyDisk.enabled {
             issues.append(.error(
                 field: "cache.legacyDisk.enabled",
@@ -98,6 +145,22 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             issues.append(.error(
                 field: "generation.repetitionPenalty",
                 message: "Repetition penalty must be positive."))
+        }
+        if let memoryLimit = cache.prefix.memoryLimitMB, memoryLimit <= 0 {
+            issues.append(.error(
+                field: "cache.prefix.memoryLimitMB",
+                message: "Prefix cache memory limit must be positive."))
+        }
+        if let memoryPercent = cache.prefix.memoryPercent,
+           memoryPercent <= 0 || memoryPercent > 100 {
+            issues.append(.error(
+                field: "cache.prefix.memoryPercent",
+                message: "Prefix cache memory percent must be greater than 0 and at most 100."))
+        }
+        if let ttl = cache.prefix.ttlMinutes, ttl <= 0 {
+            issues.append(.error(
+                field: "cache.prefix.ttlMinutes",
+                message: "Prefix cache TTL must be positive. Use nil for no expiration."))
         }
         if let blockSize = cache.pagedKV.blockSize, blockSize <= 0 {
             issues.append(.error(

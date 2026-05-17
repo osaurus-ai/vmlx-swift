@@ -311,6 +311,35 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(fields.contains("mtp.draftTokenLimit"))
     }
 
+    @Test("invalid server numeric settings report issues instead of clamping")
+    func invalidServerNumericSettingsReportIssuesInsteadOfClamping() {
+        var settings = VMLXServerRuntimeSettings()
+        settings.network.host = " "
+        settings.network.port = 0
+        settings.network.rateLimitRequestsPerMinute = -1
+        settings.network.timeoutSeconds = 0
+        settings.concurrency.maxConcurrentSequences = 0
+        settings.concurrency.prefillBatchSize = -8
+        settings.concurrency.prefillStepSize = 0
+        settings.concurrency.completionBatchSize = -1
+        settings.cache.prefix.memoryLimitMB = 0
+        settings.cache.prefix.memoryPercent = 150
+        settings.cache.prefix.ttlMinutes = -5
+
+        let fields = Set(settings.validationIssues().map(\.field))
+        #expect(fields.contains("network.host"))
+        #expect(fields.contains("network.port"))
+        #expect(fields.contains("network.rateLimitRequestsPerMinute"))
+        #expect(fields.contains("network.timeoutSeconds"))
+        #expect(fields.contains("concurrency.maxConcurrentSequences"))
+        #expect(fields.contains("concurrency.prefillBatchSize"))
+        #expect(fields.contains("concurrency.prefillStepSize"))
+        #expect(fields.contains("concurrency.completionBatchSize"))
+        #expect(fields.contains("cache.prefix.memoryLimitMB"))
+        #expect(fields.contains("cache.prefix.memoryPercent"))
+        #expect(fields.contains("cache.prefix.ttlMinutes"))
+    }
+
     @Test("server cache settings build concrete coordinator config")
     func serverCacheSettingsBuildConcreteCoordinatorConfig() {
         var settings = VMLXServerRuntimeSettings()

@@ -50,6 +50,7 @@ docs/local/production-readiness/20260517T1300_hy3_mixed_qkv_runtime_contracts/
 docs/local/production-readiness/20260517T1315_harmony_prompt_tail_parser/
 docs/local/production-readiness/20260517T1320_no_hidden_reasoning_regression/
 docs/local/production-readiness/20260517T1325_gemma4_swa_compile_policy/
+docs/local/production-readiness/20260517T1335_server_settings_validation/
 ```
 
 That inventory contains 28 non-excluded local bundles:
@@ -198,6 +199,11 @@ docs/local/production-readiness/20260517T174743Z_qwen_mtp_chunk_policy_finalize/
   `sequential_repair` candidate for UI/reporting, but auto launch stays off and
   no draft strategy is emitted. A force-on request against a blocked verified
   profile such as Qwen3.6 JANG_2K now produces a settings error before launch.
+- Fresh 13:35 PDT settings-validation recheck passes
+  `VMLINUXServerRuntimeSettingsTests.log` 16/16. It adds fail-loud validation
+  for network host/port/rate-limit/timeout, concurrency batch sizes, and prefix
+  cache sizing/TTL, so Osaurus can reject impossible panel settings instead of
+  clamping them silently or launching an invalid server.
 
 ## Qwen3.5 35B 4-bit Loader Repair - 2026-05-17
 
