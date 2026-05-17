@@ -174,6 +174,19 @@ Current pushed branch state:
   chars, normal EOS, and no unclosed reasoning. This clears the single-turn
   long-budget Harmony reasoning gap; a full multi-turn/API reasoning matrix is
   still open.
+- 2026-05-17 `vmlx-swift-lm` comparison refresh for Ling/Hy3/Gemma4:
+  `../vmlx-swift-lm` is dirty and behind `origin/main` at the time of this
+  audit, so it was used as reference material only. Gemma4 model files match
+  this checkout. The differing high-risk files are intentionally newer in
+  `vmlx-swift` for this pass: `ReasoningParser.swift` keeps Harmony channel
+  state and normalized product aliases; `Hy3.swift` keeps mixed-width q/k/v
+  dequantize-then-fuse fallback plus load-verification failure when metadata is
+  insufficient; `CacheCoordinator.swift` keeps UI/server stats snapshots and
+  avoids unusable full-prefix disk hits for hybrid state; `BatchArraysCache`
+  propagates model-mutated recurrent offsets back to each slot. The sibling
+  `BailingHybrid.swift` comment still maps `deepseek` to DSML, while this
+  package maps the Ling/Bailing `deepseek` capability to the GLM/DeepSeek-V3
+  arg-key parser per current focused tests.
 - 2026-05-17 Osaurus PR/pin and extended-family audit update:
   `docs/VMLX_OSAURUS_PR_PIN_LINEAGE_2026_05_17.md` records the resolver-truth
   lineage for Osaurus PRs #1037, #1057, #1066, #1073, and open #1110. The active
