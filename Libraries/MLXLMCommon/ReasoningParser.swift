@@ -579,6 +579,14 @@ extension ReasoningParser {
             return ReasoningParser(startInReasoning: true)
         }
 
+        if compact.hasPrefix("hy3")
+            || normalized == "hy_v3"
+            || normalized.hasPrefix("hy_v3_")
+            || compact.hasPrefix("hunyuan")
+        {
+            return ReasoningParser(startInReasoning: true)
+        }
+
         switch n {
         case "think_xml", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
             "deepseek_r1", "deepseek-r1", "deepseek", "glm", "glm4", "glm5",

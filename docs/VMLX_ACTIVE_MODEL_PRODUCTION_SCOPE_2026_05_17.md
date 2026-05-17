@@ -886,6 +886,12 @@ docs/local/production-readiness/20260517T_laguna_mistral_gemma4_active_contracts
   bug: `ToolCallFormat.fromCapabilityName("deepseek_v4" | "deepseek_v4_flash" |
   "deepseekv4")` now resolves to DSML before the generic DeepSeek/GLM prefix,
   while `deepseek` and `deepseek_v3` remain GLM-style.
+- 2026-05-17 Hy3 product-alias facade recheck fixed a second parser source gap:
+  stamped `hy3-preview` product capabilities now resolve directly to think-XML
+  reasoning plus Hunyuan tools through `ParserResolution`, not only through the
+  `model_type` heuristic. The focused parser suite passes 51/51 and the full
+  active focused target passes 186/186 in
+  `docs/local/production-readiness/20260517T1355_hy3_product_alias_parser/`.
 - The same current-checkout recheck activated old inactive Mistral/Laguna/Gemma4
   contracts: `mistral3`/`mistral3_text`/`ministral3` remain no-reasoning and
   use the Mistral tool parser, Laguna template/RoPE contracts are active, and

@@ -409,6 +409,17 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .glm4
         }
 
+        // Tencent Hunyuan / Hy3 parser aliases. Product capability stamps
+        // may carry a suffix (`hy3-preview`, `hy_v3_preview`) rather than
+        // the exact parser family name.
+        if compact.hasPrefix("hy3")
+            || normalized == "hy_v3"
+            || normalized.hasPrefix("hy_v3_")
+            || compact.hasPrefix("hunyuan")
+        {
+            return .hunyuan
+        }
+
         switch n {
         // Qwen 3.5 / 3.6 family — XML-style <tool_call>…</tool_call>
         // (vLLM ecosystem name `qwen3_coder` aliased here).

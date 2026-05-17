@@ -119,6 +119,16 @@ Current pushed branch state:
   Harmony + Gemma4 tools, `glm-5.1-flash`/`glm_5_1_flash` to think-XML +
   GLM tools, and `gpt-oss`/`gptoss` to Harmony reasoning + GLM-style tool
   parsing instead of returning nil and leaking controls to visible output.
+- 2026-05-17 Hy3 product-alias facade follow-up:
+  `docs/local/production-readiness/20260517T1355_hy3_product_alias_parser/`
+  contains the red/green evidence for product/version parser aliases through
+  the public `ParserResolution` facade. The red run proved stamped
+  `hy3-preview` capabilities returned nil for both reasoning and Hunyuan tools
+  even though `model_type` fallback worked. The green focused parser run passes
+  51/51 rows and the aggregate `MLXLMCommonFocusedTests` run passes 186/186
+  after resolving `hy3*` / `hy_v3*` / `hunyuan*` capability stamps directly.
+  The same pass updates public comments so `deepseek` remains GLM/DeepSeek-V3
+  arg-key tools, while `deepseek_v4` remains DSML.
 - Latest pushed runtime checkpoint for the Qwen text-SSM/private-MTP cache
   fix: `3146fac` (`fix(mtp): repair qwen ssm reject cache`)
 - The MTP/cache work for task-local load-time native MTP activation, MXFP8

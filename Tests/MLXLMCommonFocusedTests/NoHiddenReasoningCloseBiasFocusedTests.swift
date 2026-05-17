@@ -724,6 +724,70 @@ struct DirectCapabilityParserAliasFocusedTests {
         }
     }
 
+    @Test("ParserResolution facade preserves product/version aliases")
+    func parserResolutionFacadePreservesProductVersionAliases() {
+        let stampedCases: [(String, ToolCallFormat)] = [
+            ("gemma-4-27b", .gemma4),
+            ("gpt-oss-20b", .glm4),
+            ("glm-5.1-flash", .glm4),
+            ("Ling-2.6-flash", .glm4),
+            ("hy3-preview", .hunyuan),
+        ]
+
+        for (stamp, expectedTool) in stampedCases {
+            let cap = JangCapabilities(
+                reasoningParser: stamp,
+                toolParser: stamp)
+            let (parser, parserSource) = ParserResolution.reasoning(
+                capabilities: cap,
+                modelType: "llama")
+            let (toolFormat, toolSource) = ParserResolution.toolCall(
+                capabilities: cap,
+                modelType: "llama")
+
+            #expect(parser != nil, "\(stamp) should resolve through ParserResolution")
+            #expect(parserSource == .jangStamped)
+            #expect(toolFormat == expectedTool)
+            #expect(toolSource == .jangStamped)
+        }
+
+        let heuristicCases: [(String, String, ToolCallFormat)] = [
+            ("gemma-4-text", "harmony", .gemma4),
+            ("gpt-oss-20b", "harmony", .glm4),
+            ("glm-5.1-flash", "think_xml", .glm4),
+            ("Ling-2.6-flash", "think_xml", .glm4),
+            ("hy3-preview", "think_xml", .hunyuan),
+        ]
+
+        for (modelType, expectedStamp, expectedTool) in heuristicCases {
+            let (parser, parserSource) = ParserResolution.reasoning(
+                capabilities: nil,
+                modelType: modelType)
+            let (toolFormat, toolSource) = ParserResolution.toolCall(
+                capabilities: nil,
+                modelType: modelType)
+
+            #expect(reasoningStampFromModelType(modelType) == expectedStamp)
+            #expect(parser != nil, "\(modelType) should resolve through model_type fallback")
+            #expect(parserSource == .modelTypeHeuristic)
+            #expect(toolFormat == expectedTool)
+            #expect(toolSource == .modelTypeHeuristic)
+        }
+    }
+
+    @Test("Parser aliases trim metadata whitespace without demoting known families")
+    func parserAliasesTrimMetadataWhitespace() {
+        for modelType in [" Ling-2.6-flash ", "\tgemma-4-text\n", " glm-5.1-flash "] {
+            #expect(reasoningStampFromModelType(modelType) != "none")
+            #expect(ToolCallFormat.infer(from: modelType) != nil)
+        }
+
+        for stamp in [" Ling-2.6-flash ", "\tgpt-oss-20b\n", " gemma-4-27b "] {
+            #expect(ReasoningParser.fromCapabilityName(stamp) != nil)
+            #expect(ToolCallFormat.fromCapabilityName(stamp) != nil)
+        }
+    }
+
     @Test("direct think-XML family aliases resolve to parser")
     func thinkXmlCapabilityAliasesResolve() {
         for stamp in [

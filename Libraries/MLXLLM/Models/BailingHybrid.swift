@@ -35,7 +35,7 @@
 //
 // Capability defaults (from jang_config.json `capabilities`):
 //   reasoning_parser = "deepseek_r1"  → think_xml stamp
-//   tool_parser      = "deepseek"     → DSML tool format
+//   tool_parser      = "deepseek"     → GLM/DeepSeek-V3 arg_key tool format
 //   think_in_template = false         → "detailed thinking off" default;
 //                                       template scans system message for
 //                                       "detailed thinking on" to flip.

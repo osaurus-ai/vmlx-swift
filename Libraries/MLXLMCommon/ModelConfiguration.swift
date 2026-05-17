@@ -100,14 +100,16 @@ public struct ModelConfiguration: Sendable {
     ///
     /// Accepted values match `ReasoningParser.fromCapabilityName(_:)`:
     /// - `"think_xml"`, `"qwen3"`, `"qwen3_5"`, `"qwen3_6"`, `"deepseek_r1"`,
-    ///   `"glm4"`, `"nemotron"`, `"minimax"` and suffixed direct capability
-    ///   aliases such as `"glm5_air"` / `"laguna_glm_thinking_v5"` →
-    ///   strip `<think>...</think>`.
+    ///   `"glm4"`, `"glm5"`, `"nemotron"`, `"minimax"`, `"bailing*"`,
+    ///   `"ling*"`, `"hy3*"` / `"hunyuan*"`, `"laguna*"`, `"zaya*"`, and
+    ///   suffixed direct capability aliases such as `"glm-5.1-flash"` /
+    ///   `"laguna_glm_thinking_v5"` → strip `<think>...</think>`.
     ///   These stamps use `startInReasoning=true` because the Qwen 3.x
     ///   chat templates prefill `<think>\n` at prompt tail when
     ///   `enable_thinking=true` (the template default).
     /// - `"harmony"` / `"harmony_channel"` / `"gemma4_channel"` /
-    ///   `"gemma4*"` / `"gpt_oss*"` → strip Harmony channel envelopes
+    ///   `"gemma4*"` / `"gemma-4*"` / `"gpt_oss*"` / `"gpt-oss*"` →
+    ///   strip Harmony channel envelopes
     ///   (`<|channel>thought\n...<channel|>` for Gemma 4 and
     ///   `<|channel|>analysis/final<|message|>...` for GPT-OSS).
     /// - explicit `"mistral4*"` capability stamps → strip

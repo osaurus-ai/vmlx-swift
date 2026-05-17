@@ -157,14 +157,17 @@ public struct JangRuntime: Sendable, Equatable {
 /// `ReasoningParser.fromCapabilityName(_:)`.
 public struct JangCapabilities: Sendable {
     /// Reasoning-tag style. Known values: `qwen3`, `deepseek_r1`,
-    /// `think_xml` (all → `<think>...</think>`); `mistral`, `gemma4`, `none`
-    /// (no reasoning tags emitted). `nil` means unknown.
+    /// `think_xml` (all → `<think>...</think>`); `gemma4` / `harmony`
+    /// (Harmony channel envelopes); explicit `mistral4` capability stamps
+    /// (`[THINK]...[/THINK]`); `none` / legacy `mistral` / legacy `gemma`
+    /// (no reasoning parser). `nil` means unknown.
     public let reasoningParser: String?
 
     /// Tool-call format. Known values: `qwen`, `qwen3_coder` → `xml_function`;
-    /// `minimax` → `minimax_m2`; `glm47`, `deepseek` → `glm4`; `nemotron` →
-    /// `xml_function`; plus any canonical `ToolCallFormat` rawValue. `nil`
-    /// means unknown.
+    /// `minimax` → `minimax_m2`; `glm47`, `deepseek` → `glm4`; `deepseek_v4`
+    /// → `dsml`; `gemma4` → `gemma4`; `hy3*` / `hunyuan*` → `hunyuan`;
+    /// `nemotron` → `xml_function`; plus any canonical `ToolCallFormat`
+    /// rawValue. `nil` means unknown.
     public let toolParser: String?
 
     /// Whether the model's chat template natively gates `<think>` blocks
@@ -278,8 +281,9 @@ public enum ParserResolution {
     ///   - modelType: the `model_type` field from `config.json` — used as
     ///     a heuristic fallback when no stamp is present.
     /// - Returns: a parser instance and the source it came from. The
-    ///   parser is `nil` for models that don't emit reasoning (Mistral 4,
-    ///   Gemma 4) — callers should skip parsing and stream raw.
+    ///   parser is `nil` for models that don't emit reasoning (legacy
+    ///   Mistral/Gemma, Llama, Phi, etc.) — callers should skip parsing and
+    ///   stream raw.
     public static func reasoning(
         capabilities: JangCapabilities?,
         modelType: String?
