@@ -1,10 +1,11 @@
 # vMLX Active Model Production Scope - 2026-05-17
 
-This note records the current active scope after the explicit user direction to
-exclude Kimi, DSV4 Flash, and JANGTQ_K variants for now. It is not a
+This note records the current active scope after the latest explicit user
+direction: exclude Kimi, but include DSV4 Flash and every other local
+`~/models` family in the systematic production matrix. It is not a
 production-ready claim. It is the checklist for the remaining model families
-that still need live
-multi-turn/cache/VL/Omni proof before Osaurus moves fully onto `vmlx-swift`.
+that still need live multi-turn/cache/VL/Omni proof before Osaurus moves fully
+onto `vmlx-swift`.
 
 ## Current Exclusions
 
@@ -12,22 +13,24 @@ Do not include these in the active production matrix until the user reopens
 them:
 
 - Kimi / Kimi-K2.x
-- DeepSeek-V4 / DSV4 Flash
-- JANGTQ_K / `*-JANGTQ_K` routed variants. Existing K diagnostics stay in this
-  document for traceability, but they are not active Osaurus switch blockers
-  unless the user reopens that lane.
+
+DSV4 Flash is back in scope. Generic `JANGTQ_K` rows are not globally excluded
+anymore under the "all models except Kimi" instruction, but old rows that were
+marked historical remain historical until re-run under the current non-Kimi
+matrix. Do not promote them from old evidence.
 
 The harness supports this directly:
 
 ```sh
 scripts/vmlx-live-model-matrix.sh \
   --profile inventory \
-  --exclude-regex 'Kimi|DeepSeek-V4|DSV4|JANGTQ_K|JANGTQ-K'
+  --exclude-regex 'Kimi'
 ```
 
 Fresh inventory artifact:
 
 ```text
+docs/local/live-model-matrix/20260517T_non_kimi_inventory_dsv4_included/
 docs/local/live-model-matrix/20260517T_scope_exclude_kimi_dsv4_inventory/
 ```
 
@@ -68,9 +71,18 @@ Fresh live Gemma4 schema/VL artifacts:
 ```text
 docs/local/live-model-matrix/20260517T210417Z_gemma4_vl_chat_cache/
 docs/local/live-model-matrix/20260517T212204Z_gemma4_batch_toolcall_real_schema/
+docs/local/live-model-matrix/20260517T_reasoning_turn_matrix_harness/
+docs/local/live-model-matrix/20260517T_gemma4_e2b_osaurus_loop_report/
 ```
 
-That inventory contains 28 non-excluded local bundles:
+The current non-Kimi inventory contains 30 local `~/models` bundles:
+
+- 12 text bundles
+- 15 VL bundles
+- 3 Omni bundles
+
+The older Kimi+DSV4+K-excluded inventory contains 28 local bundles and remains
+in this note only as historical context:
 
 - 12 text bundles
 - 13 VL bundles
@@ -84,24 +96,23 @@ docs/VMLX_OSAURUS_PR_PIN_LINEAGE_2026_05_17.md
 
 ## Extended Family Status After PR/Pin Review
 
-This section is the current working status for the non-excluded families the
-user explicitly called out after Qwen MTP, Kimi, DSV4, and JANGTQ_K variants
-were de-scoped for this pass. A `PASS` row still does not mean package-wide
-production complete; it means the named surface has a current artifact. Rows
-marked `PARTIAL` or `OPEN` must not be hidden by sampler guards, repetition
-penalties, forced thinking closure, or name-based MTP activation.
+This section is the current working status for the non-Kimi families the user
+explicitly called out. A `PASS` row still does not mean package-wide production
+complete; it means the named surface has a current artifact. Rows marked
+`PARTIAL` or `OPEN` must not be hidden by sampler guards, repetition penalties,
+forced thinking closure, or name-based MTP activation.
 
 | Family | Current evidence | Status | Production concern |
 | --- | --- | --- | --- |
 | Ling / Bailing hybrid | `20260517T170008Z_release_turnmatrix_ling_jangtq2/` and `20260517T180538Z_release_turnmatrix_ling_mxfp4_current/` pass config/template, production cache off/on, BatchEngine single/chat/disk/B=2/per-slot/TurboQuant rows. Fresh `20260517T2148_nonexcluded_parser_cache_refresh/` rechecks Bailing/Ling aliases and actual hybrid cache topology. | PASS for text JANGTQ2 and MXFP4 | Generic paged prefix hit is `N-A` by topology; disk-backed restore and SSM companion state are the real cache proof. The harness MTP metadata row is not native-MTP activation. |
-| Hy3 / Hunyuan | `20260517T180931Z_release_turnmatrix_hy3_jangtq_current/` passes JANGTQ release rows. `20260517T184132Z_hy3_jangtqk_streaming_autodir_after_fix/` remains historical K-only evidence. Fresh `20260517T2148_nonexcluded_parser_cache_refresh/` rechecks Hy3/Hunyuan parser/no-leak, mixed qkv sanitizer, and nextn exclusion. | PASS for JANGTQ; JANGTQ_K de-scoped | JANGTQ_K active-streaming speed/store isolation is no longer an active blocker for this pass. Preserved nextn layers stay excluded from base decode cache. |
-| Gemma 4 / Harmony | `20260517T160608Z_release_turnmatrix_gemma4_26b/` passes text rows. `20260517T210417Z_gemma4_vl_chat_cache/` proves image cache salt and grounded follow-up. `20260517T212204Z_gemma4_batch_toolcall_real_schema/` proves real `UserInput.tools` schema -> structured `get_weather` tool call. Fresh `20260517T2148_nonexcluded_parser_cache_refresh/` rechecks Harmony fragmentation/no-leak plus Gemma4 SWA/full-attention cache compile policy. Fresh `20260517T2150_gemma4_harmony_long_reasoning/` proves long-budget single-turn thinking on/off with 1420 reasoning chars ON and zero reasoning chars OFF. | PASS for text, VL image cache, tool schema, and single-turn Harmony reasoning on/off; PARTIAL for multi-turn reasoning matrix | Default heterogeneous SWA/full-attention cache is correctly uncompiled; explicit all-rotating bounded cache is compile-eligible. The remaining reasoning gap is multi-turn/API matrix coverage, not single-turn Harmony parser leakage. |
+| Hy3 / Hunyuan | `20260517T180931Z_release_turnmatrix_hy3_jangtq_current/` passes JANGTQ release rows. `20260517T184132Z_hy3_jangtqk_streaming_autodir_after_fix/` remains historical K-only evidence until re-run under the current all-non-Kimi matrix. Fresh `20260517T2148_nonexcluded_parser_cache_refresh/` rechecks Hy3/Hunyuan parser/no-leak, mixed qkv sanitizer, and nextn exclusion. | PASS for JANGTQ; JANGTQ_K needs current re-run before promotion | Preserved nextn layers stay excluded from base decode cache. The K row is not allowed to ride on old evidence if Osaurus exposes it. |
+| Gemma 4 / Harmony | `20260517T160608Z_release_turnmatrix_gemma4_26b/` passes text rows. `20260517T210417Z_gemma4_vl_chat_cache/` proves image cache salt and grounded follow-up. `20260517T212204Z_gemma4_batch_toolcall_real_schema/` proves real `UserInput.tools` schema -> structured `get_weather` tool call. Fresh `20260517T2148_nonexcluded_parser_cache_refresh/` rechecks Harmony fragmentation/no-leak plus Gemma4 SWA/full-attention cache compile policy. Fresh `20260517T2150_gemma4_harmony_long_reasoning/` proves long-budget single-turn thinking on/off with 1420 reasoning chars ON and zero reasoning chars OFF. Fresh `20260517T_reasoning_turn_matrix_harness/` proves one loaded BatchEngine multi-turn ON/OFF/ON with prior assistant `reasoningContent` carried forward and effort `low/medium/high/max` closing with visible output on 26B. Fresh `20260517T_gemma4_e2b_osaurus_loop_report/` proves the local Osaurus `gemma-4-e2b-it-4bit` bundle passes cache ON/OFF, BatchEngine chat, TurboQuant B=2 isolation, VL chat/cache, VL batch chat, and the same reasoning turn matrix when the budget is raised; the retained 256-token row fails by length before visible output and is a real product-setting caveat. | PASS for text, VL image cache, tool schema, Harmony reasoning on/off, E2B cache/VL, and multi-turn reasoning matrix | Default heterogeneous SWA/full-attention cache is correctly uncompiled; explicit all-rotating bounded cache is compile-eligible. Do not hide low-budget thinking failures with forced reasoning closure. API route matrix coverage is still package-wide, not a Gemma4 parser leak gap. |
 | GPT-OSS / GLM5 / Mistral4 / Pixtral parsers | `20260517T2148_nonexcluded_parser_cache_refresh/` covers GPT-OSS Harmony, GLM5 aliases, Mistral4/Pixtral aliases, and marker leak prevention in the current tree. | UNIT ONLY / OPEN for runtime | No local GPT-OSS, GLM5, Mistral4, or Pixtral bundle has a live decode row in this pass. Parser coverage is not model production readiness. |
 | Laguna XS.2 | `20260517T_release_turnmatrix_laguna_xs_after_b2_fix/` passes release rows. Production decode is about `31 tok/s`, bundle defaults are `temp=0.700 topP=0.900 topK=0 rep=nil`, disk L2 hits, and TurboQuant B=2 isolation passes. | PASS for text | Paged prefix hit is `N-A` by topology; disk-backed restore is the accepted cache proof. |
-| ZAYA text | `20260517T_release_turnmatrix_zaya_scope/` passes JANGTQ4 and MXFP4 text rows; its JANGTQ_K evidence is historical after the de-scope. `20260517T_zaya_speed_regression/` shows non-K rows around `64-68 tok/s`, no loops/leaks, disk L2 plus SSM companion states. | PASS for active text rows; JANGTQ_K de-scoped | Keep the 50+ tok/s watch active. Do not treat the ZAYA CCA path as generic paged cache; it is path-dependent and disk/SSM-backed. |
-| ZAYA1-VL | `20260517T_release_turnmatrix_zaya_scope/` and targeted rows prove MXFP4 and JANGTQ4 image/text/cache surfaces, media-salt isolation, and VL cache hits. | PASS for MXFP4 and JANGTQ4 implemented image/text/cache; JANGTQ_K de-scoped | The K variant keeps a historical math/top-k diagnostic, but it is not an active switch blocker in this pass. Video is `N-A` because the processor does not implement video input. |
+| ZAYA text | `20260517T_release_turnmatrix_zaya_scope/` passes JANGTQ4 and MXFP4 text rows; its JANGTQ_K evidence is historical until re-run under the current all-non-Kimi matrix. `20260517T_zaya_speed_regression/` shows non-K rows around `64-68 tok/s`, no loops/leaks, disk L2 plus SSM companion states. | PASS for current non-K rows; JANGTQ_K needs current re-run before promotion | Keep the 50+ tok/s watch active. Do not treat the ZAYA CCA path as generic paged cache; it is path-dependent and disk/SSM-backed. |
+| ZAYA1-VL | `20260517T_release_turnmatrix_zaya_scope/` and targeted rows prove MXFP4 and JANGTQ4 image/text/cache surfaces, media-salt isolation, and VL cache hits. | PASS for MXFP4 and JANGTQ4 implemented image/text/cache; JANGTQ_K needs current re-run before promotion | The K variant keeps a historical math/top-k diagnostic and cannot be promoted from old evidence. Video is `N-A` because the processor does not implement video input. |
 | Nemotron Omni / Parakeet / RADIO | JANGTQ4 core artifacts under `20260517T170614Z_omni_live_voice_fresh_recheck/` and related Omni rows prove wrapper-token parity, pre-encoded Parakeet shape, raw PCM/pre-encoded paths, and 65-76 tok/s cache-off streaming rows without literal sound-marker leaks. Fresh `20260517T214045Z_nemotron_jangtq_omni_recheck/` passes the JANGTQ 48-token Omni matrix 18/18 with text, image, video/audio LMInput, media salt, hybrid SSM, and BatchEngine rows. Fresh `20260517T2215_nemotron_mxfp4_omni_recheck/` passes the MXFP4 48-token Omni matrix 18/18 with the same core surfaces. | PASS for JANGTQ, JANGTQ4, and MXFP4 core; PARTIAL for repeated cache-on audio | Independently encoded Parakeet chunks are not concat-safe. Live voice must retain PCM and submit full-snapshot pre-encoded audio or raw PCM at endpoint. Repeated cache-on live audio still needs a focused quality/root-cause gate before full live-voice production promotion. |
-| MiniMax M2.7 | Small JANGTQ rows prove generation config (`temp=1.000 topP=0.950 topK=40 rep=nil`), greedy/no-guard behavior, coherent thinking on/off alternation, and no loops/leaks at 38-47 tok/s depending on row. | PARTIAL | CRACK models are not MTP models unless tensor evidence proves otherwise. K variants are de-scoped for this pass; larger non-K/JANG CRACK proof still needs real low-footprint active routed evidence, and no hidden sampler guard is allowed to compensate for any failure. |
+| MiniMax M2.7 | Small JANGTQ rows prove generation config (`temp=1.000 topP=0.950 topK=40 rep=nil`), greedy/no-guard behavior, coherent thinking on/off alternation, and no loops/leaks at 38-47 tok/s depending on row. | PARTIAL | CRACK models are not MTP models unless tensor evidence proves otherwise. Larger JANG/JANGTQ_K CRACK proof still needs real low-footprint active routed evidence, and no hidden sampler guard is allowed to compensate for any failure. |
 | Qwen3.5 35B non-MTP | `20260517T164940Z_release_turnmatrix_qwen35_35b_4bit_after_compat_split/` passes config/template, production cache off/on, BatchEngine, TQ B=2 compatibility split, VL cache, media salt, and mixed text/image/video. | PASS with throughput watch | High-resolution video can be very slow; Qwen hybrid SSM cache restore must stay topology-specific. |
 
 ## No-Fake-Guard Invariants For The Remaining Rows
@@ -474,9 +485,9 @@ Open boundary:
 |---|---|---|---|
 | Qwen3.6/Qwen3.5 text+VL MXFP/JANG/JANGTQ | Qwen3.6 MTP, Qwen3.6 CRACK, Qwen3.5 A3B 4-bit | Qwen chat template, `generation_config.json`, GatedDelta/hybrid SSM cache, disk L2 + SSM companion, VL media salt, text-only continuation after media, reasoning on/off | Only Qwen bundles with real MTP tensor evidence may be manually requested. No auto-launch yet. |
 | ZAYA text/VL JANGTQ/MXFP | JANGQ and Osaurus ZAYA1 text/VL | Zaya CCA cache, JANGTQ/MXFP decode, VL adapters, media salt, Hadamard/matmul shape coverage, multi-turn cache hit | No native MTP. |
-| MiniMax M2.7 JANG/JANGTQ | Small JANGTQ and CRACK JANG; JANGTQ_K historical only | MiniMax template, reasoning on/off, JANGTQ streaming experts, low-footprint active routed decode, prefix/paged/disk/TurboQuant KV, multi-turn coherence | Local MiniMax CRACK rows are non-MTP unless real MTP tensor evidence appears. K variants are de-scoped for this pass. |
+| MiniMax M2.7 JANG/JANGTQ | Small JANGTQ and CRACK JANG; JANGTQ_K needs current re-run | MiniMax template, reasoning on/off, JANGTQ streaming experts, low-footprint active routed decode, prefix/paged/disk/TurboQuant KV, multi-turn coherence | Local MiniMax CRACK rows are non-MTP unless real MTP tensor evidence appears. Larger K/JANG CRACK rows need fresh current evidence before Osaurus promotion. |
 | Ling/Bailing hybrid | Ling JANGTQ2 and MXFP4 CRACK | Bailing thinking template, hybrid cache/SSM rederive, nextn metadata handling, JANGTQ/MXFP decode, multi-turn coherence | Extra nextn-layer evidence exists, but Swift native-MTP auto-launch remains off. |
-| Hy3 | HYV3 JANGTQ; JANGTQ_K historical only | Hy3 template kwargs, native runtime registration, compiled decode guard, nextn metadata handling, routed/JANGTQ decode, cache topology | Extra nextn-layer evidence exists, but Swift native-MTP auto-launch remains off. JANGTQ is live-proven; K variants are de-scoped for this pass. |
+| Hy3 | HYV3 JANGTQ; JANGTQ_K needs current re-run | Hy3 template kwargs, native runtime registration, compiled decode guard, nextn metadata handling, routed/JANGTQ decode, cache topology | Extra nextn-layer evidence exists, but Swift native-MTP auto-launch remains off. JANGTQ is live-proven; K variants need fresh current evidence before Osaurus promotion. |
 | Gemma 4 | Gemma-4 JANG_4M CRACK | Gemma4 template fallback/tools, sliding-window cache topology, RMSNorm no-scale parity, reasoning parser, multi-turn coherence | No native MTP. |
 | Nemotron Omni | JANGTQ/JANGTQ4/MXFP4 Omni Nano | Parakeet audio encoder, RADIO vision, Omni text/image/audio/video ingest, BatchEngine stress, cache/media state, text output coherence | No native MTP. |
 | Laguna | Laguna XS JANGTQ | Laguna/Mistral-style template and RoPE params, JANGTQ decode, prefix/paged/disk cache, multi-turn coherence | No native MTP. |
@@ -516,7 +527,7 @@ Release speed rows, compared to the older handoff floor:
 | Bundle | Older documented row | 2026-05-17 release row | Result |
 |---|---:|---:|---|
 | ZAYA1-8B-JANGTQ4 | 54.7 tok/s, `8831/1365` graph/asType | 66.5 tok/s median, 66.6 best; graph `8831/1365` | PASS |
-| ZAYA1-8B-JANGTQ_K | no older speed floor recorded in the handoff table | 65.7 tok/s median, 65.8 best | HISTORICAL after K de-scope |
+| ZAYA1-8B-JANGTQ_K | no older speed floor recorded in the handoff table | 65.7 tok/s median, 65.8 best | Historical until re-run under current non-Kimi matrix |
 | ZAYA1-8B-MXFP4 | 66.8 tok/s, `8791/1285` graph/asType | 66.2 tok/s median, 66.7 best; graph `8791/1285` | PASS |
 
 The earlier ~16 tok/s measurements came from `.build/debug/RunBench`; those
@@ -811,7 +822,8 @@ docs/local/live-model-matrix/20260517T180931Z_release_turnmatrix_hy3_jangtq_curr
   pass. The TurboQuant B=2 row preserves the plain slot exactly against the B=2
   plain/plain reference with `compatibilitySplits=10`.
 
-Hy3 JANGTQ_K is de-scoped for the active pass. The current historical failure
+Hy3 JANGTQ_K is not promoted for the active pass until it is re-run under the
+current non-Kimi matrix. The current historical failure
 mode is still retained here because it was narrowed and documented:
 
 ```text
@@ -856,8 +868,8 @@ docs/local/live-model-matrix/20260517T184132Z_hy3_jangtqk_streaming_autodir_afte
   experiment, but it will not raise another model's trained top-k and it does
   not silently mutate the bundle default.
 
-Boundary: Hy3 JANGTQ_K is no longer an active switch-readiness blocker in this
-pass. If reopened, it is correctness/low-footprint proven through active expert
+Boundary: Hy3 JANGTQ_K is not production-clear for the current pass without a
+fresh current re-run. It is correctness/low-footprint proven through active expert
 streaming but still speed-blocked at about 1.4 tok/s on the short production
 row. The remaining work is active expert residency/stacked bank speed, not a
 fake repetition penalty, temperature floor, or template guard. Also, the

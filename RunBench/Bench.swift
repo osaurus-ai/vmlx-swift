@@ -289,6 +289,16 @@ struct Bench {
             return
         }
 
+        // BENCH_REASONING_TURN_MATRIX=1: generic BatchEngine multi-turn
+        // reasoning gate. It keeps one loaded model, appends assistant
+        // reasoning_content back into the transcript, and verifies that
+        // thinking OFF stays visible-only while thinking ON/effort modes do
+        // not leak raw control tokens into .chunk output.
+        if (env["BENCH_REASONING_TURN_MATRIX"] ?? "0") == "1" {
+            try await runReasoningTurnMatrix(modelPath: modelPath, maxNew: maxNew)
+            return
+        }
+
         // BENCH_ORPHAN_SLOT_REPRO=1: reproduce the consumer-cancellation
         // → orphan-slot → next-request-Metal-collision pattern reported
         // 2026-04-27. Submits request A, breaks the consumer loop after
@@ -5726,6 +5736,318 @@ private func lagunaPromptFixture(env: [String: String]) throws -> String {
 // MARK: - DSV4 FIM vs Chat coherence probe
 
 // MARK: - DSV4 production coherence gate
+
+/// Generic reasoning multi-turn gate for Harmony/Qwen/think-XML-style models.
+/// It is intentionally a live BatchEngine harness rather than a unit parser
+/// test: the goal is to prove a growing chat transcript, prior assistant
+/// reasoning_content, bundle generation defaults, and stream routing together.
+func runReasoningTurnMatrix(modelPath: String, maxNew: Int) async throws {
+    let modelDir = URL(fileURLWithPath: modelPath)
+    let modelName = modelDir.lastPathComponent
+    let env = ProcessInfo.processInfo.environment
+    let budget = max(maxNew, 256)
+    let effortBudget = max(
+        Int(env["BENCH_REASONING_EFFORT_MAX_TOKENS"] ?? "1024") ?? 1024,
+        budget)
+    let cacheRoot = env["BENCH_REASONING_CACHE_DIR"] ??
+        "/tmp/vmlx-reasoning-turn-matrix/\(modelName)"
+    try? FileManager.default.createDirectory(
+        atPath: cacheRoot, withIntermediateDirectories: true)
+
+    print("\n=== BENCH_REASONING_TURN_MATRIX — \(modelName) ===")
+    print("Cache dir: \(cacheRoot)")
+    let rss0 = currentRSSMiB()
+    let loadStart = CFAbsoluteTimeGetCurrent()
+    let context = try await MLXLMCommon.loadModel(
+        from: modelDir, using: #huggingFaceTokenizerLoader())
+    let loadSec = CFAbsoluteTimeGetCurrent() - loadStart
+    let rss1 = currentRSSMiB()
+    print(String(format: "Load: %.2fs  Model: %@  RSS +%.0f MiB",
+        loadSec, String(describing: type(of: context.model)), rss1 - rss0))
+    print("Reasoning stamp: \(context.configuration.reasoningParserName ?? "nil")")
+    print("Tool format: \(context.configuration.toolCallFormat.map{"\($0)"} ?? "json")")
+
+    let ctx = context
+    let cfg = CacheCoordinatorConfig(
+        usePagedCache: true, enableDiskCache: true,
+        pagedBlockSize: 64, maxCacheBlocks: 512,
+        diskCacheMaxGB: 4.0,
+        diskCacheDir: URL(fileURLWithPath: cacheRoot),
+        ssmMaxEntries: 32, modelKey: modelName)
+    let coordinator = CacheCoordinator(config: cfg)
+    let engine = BatchEngine(
+        context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
+
+    let randomSeed = env["BENCH_REASONING_SEED"].flatMap(UInt64.init)
+    let fallback = GenerateParameters(
+        maxTokens: budget, randomSeed: randomSeed, prefillStepSize: 512)
+    var params = GenerateParameters(
+        generationConfig: context.configuration.generationDefaults,
+        fallback: fallback)
+    params.maxTokens = budget
+    params.randomSeed = randomSeed
+    print(String(format:
+        "Sampling: maxTokens=%d temp=%.3f topP=%.3f topK=%d minP=%.3f rep=%@ seed=%@",
+        params.maxTokens ?? -1,
+        Double(params.temperature),
+        Double(params.topP),
+        params.topK,
+        Double(params.minP),
+        params.repetitionPenalty.map { String(format: "%.3f", Double($0)) } ?? "nil",
+        params.randomSeed.map(String.init) ?? "nil"))
+
+    func additional(thinking: Bool, effort: String? = nil) -> [String: any Sendable] {
+        var context: [String: any Sendable] = ["enable_thinking": thinking]
+        if let effort {
+            context["reasoning_effort"] = effort
+        }
+        return context
+    }
+
+    func promptTail(thinking: Bool, effort: String? = nil) async throws -> String {
+        let ui = UserInput(
+            chat: [.user("Probe reasoning template routing.")],
+            additionalContext: additional(thinking: thinking, effort: effort))
+        let input = try await ctx.processor.prepare(input: ui)
+        let ids = input.text.tokens.reshaped(-1).asArray(Int32.self).map { Int($0) }
+        return ctx.tokenizer.decode(
+            tokenIds: Array(ids.suffix(128)), skipSpecialTokens: false)
+    }
+
+    func tailHasReasoningRail(_ text: String) -> Bool {
+        text.contains("<think>")
+            || text.contains("<|think|>")
+            || text.contains("[THINK]")
+            || text.contains("<|channel>")
+            || text.contains("<|channel|>analysis")
+            || text.contains("<channel|>")
+    }
+
+    let thinkingOnTail = try await promptTail(thinking: true)
+    let thinkingOffTail = try await promptTail(thinking: false)
+    let reasoningPromptToggleActive =
+        thinkingOnTail != thinkingOffTail && tailHasReasoningRail(thinkingOnTail)
+    print(
+        "Reasoning prompt toggle: \(reasoningPromptToggleActive ? "active" : "not-template-active")"
+            + " onTail=\(thinkingOnTail.suffix(96).debugDescription)"
+            + " offTail=\(thinkingOffTail.suffix(96).debugDescription)")
+
+    final class ReasoningState {
+        var thinkingOnRoutedCount = 0
+    }
+    let reasoningState = ReasoningState()
+
+    struct MatrixAnswer {
+        var label: String
+        var text: String
+        var reasoning: String
+        var promptTokens: Int
+        var completionTokens: Int
+        var ttftMs: Int
+        var wall: Double
+        var tokps: Double
+        var stop: String
+        var unclosedReasoning: Bool
+    }
+
+    func stopString(_ info: GenerateCompletionInfo?) -> String {
+        guard let info else { return "nil" }
+        switch info.stopReason {
+        case .stop: return "stop"
+        case .length: return "length"
+        case .cancelled: return "cancelled"
+        }
+    }
+
+    func hasRawControlMarker(_ text: String) -> String? {
+        [
+            "<think>", "</think>",
+            "[THINK]", "[/THINK]",
+            "<|channel>", "<channel|>",
+            "<|channel|>analysis", "<|channel|>final",
+            "<|message|>", "<|end|>",
+        ].first { text.contains($0) }
+    }
+
+    func assistantMessage(from answer: MatrixAnswer) -> Chat.Message {
+        Chat.Message(
+            role: .assistant,
+            content: answer.text.trimmingCharacters(in: .whitespacesAndNewlines),
+            reasoningContent: answer.reasoning.isEmpty ? nil : answer.reasoning)
+    }
+
+    func ask(
+        label: String,
+        chat: [Chat.Message],
+        thinking: Bool,
+        effort: String? = nil,
+        maxTokens: Int? = nil
+    ) async throws -> MatrixAnswer {
+        let ui = UserInput(
+            chat: chat,
+            additionalContext: additional(thinking: thinking, effort: effort))
+        let prepared = try await ctx.processor.prepare(input: ui)
+        let promptTokens = prepared.text.tokens.size
+        nonisolated(unsafe) let sendable = prepared
+        let t0 = CFAbsoluteTimeGetCurrent()
+        var turnParams = params
+        if let maxTokens {
+            turnParams.maxTokens = maxTokens
+        }
+        let stream = await engine.generate(input: sendable, parameters: turnParams)
+        var text = ""
+        var reasoning = ""
+        var info: GenerateCompletionInfo?
+        var ttft: Double?
+        var chunks = 0
+        for await event in stream {
+            switch event {
+            case .chunk(let c):
+                if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
+                text += c
+                chunks += 1
+            case .reasoning(let r):
+                if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
+                reasoning += r
+                chunks += 1
+            case .info(let i):
+                info = i
+            default:
+                break
+            }
+        }
+        let wall = CFAbsoluteTimeGetCurrent() - t0
+        let completionTokens = info?.generationTokenCount ?? chunks
+        let genSec = info?.generateTime ?? wall
+        let tokps = genSec > 0 ? Double(completionTokens) / genSec : 0
+        let answer = MatrixAnswer(
+            label: label,
+            text: text,
+            reasoning: reasoning,
+            promptTokens: promptTokens,
+            completionTokens: completionTokens,
+            ttftMs: Int((ttft ?? 0) * 1000),
+            wall: wall,
+            tokps: tokps,
+            stop: stopString(info),
+            unclosedReasoning: info?.unclosedReasoning ?? false)
+        let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let previewSource = visible.isEmpty ? reasoning : visible
+        let preview = String(previewSource.prefix(180))
+            .replacingOccurrences(of: "\n", with: "\\n")
+        print(String(format:
+            "TURN label=%@ thinking=%@ effort=%@ prompt=%d completion=%d ttft=%dms wall=%.2fs tokps=%.2f stop=%@ unclosedReasoning=%@ textChars=%d reasoningChars=%d sample=\"%@\"",
+            label, thinking.description, effort ?? "nil",
+            promptTokens, completionTokens, answer.ttftMs, wall, tokps,
+            answer.stop, answer.unclosedReasoning.description,
+            text.count, reasoning.count, preview))
+        return answer
+    }
+
+    func fail(_ code: Int, _ message: String) throws -> Never {
+        throw NSError(
+            domain: "BENCH_REASONING_TURN_MATRIX",
+            code: code,
+            userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    func requireCommon(_ answer: MatrixAnswer) throws {
+        if answer.stop == "length" {
+            try fail(20, "\(answer.label): stopped by length")
+        }
+        if answer.unclosedReasoning {
+            try fail(21, "\(answer.label): ended inside reasoning")
+        }
+        if let marker = hasRawControlMarker(answer.text) {
+            try fail(22, "\(answer.label): visible chunk leaked \(marker)")
+        }
+        if answer.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try fail(23, "\(answer.label): empty visible output")
+        }
+    }
+
+    func requireThinkingOff(_ answer: MatrixAnswer) throws {
+        try requireCommon(answer)
+        if !answer.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try fail(24, "\(answer.label): reasoning emitted while thinking off")
+        }
+    }
+
+    func requireThinkingOn(_ answer: MatrixAnswer) throws {
+        try requireCommon(answer)
+        if !answer.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            reasoningState.thinkingOnRoutedCount += 1
+        }
+    }
+
+    func requireContains(_ answer: MatrixAnswer, _ terms: [String]) throws {
+        let lower = answer.text.lowercased()
+        for term in terms where !lower.contains(term.lowercased()) {
+            try fail(26, "\(answer.label): missing visible term \(term)")
+        }
+    }
+
+    var transcript: [Chat.Message] = [
+        .system("You are a concise assistant. Follow the user's requested format."),
+        .user("Remember this exact phrase: copper-lantern. Reply with only: saved.")
+    ]
+    let turn1 = try await ask(
+        label: "turn1-off-save", chat: transcript, thinking: false)
+    try requireThinkingOff(turn1)
+    try requireContains(turn1, ["saved"])
+    transcript.append(assistantMessage(from: turn1))
+
+    transcript.append(.user("What exact phrase did I ask you to remember? Answer with only that phrase."))
+    let turn2 = try await ask(
+        label: "turn2-on-recall", chat: transcript, thinking: true)
+    try requireThinkingOn(turn2)
+    try requireContains(turn2, ["copper", "lantern"])
+    transcript.append(assistantMessage(from: turn2))
+
+    transcript.append(.user("Now answer only the color of a clear daytime sky."))
+    let turn3 = try await ask(
+        label: "turn3-off-after-reasoning", chat: transcript, thinking: false)
+    try requireThinkingOff(turn3)
+    transcript.append(assistantMessage(from: turn3))
+
+    transcript.append(.user("Compute 12 + 8. Reply with only the number."))
+    let turn4 = try await ask(
+        label: "turn4-on-math-max", chat: transcript,
+        thinking: true, effort: "max")
+    try requireThinkingOn(turn4)
+    try requireContains(turn4, ["20"])
+
+    let efforts = (env["BENCH_REASONING_EFFORTS"] ?? "low,medium,high,max")
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+    for effort in efforts {
+        let answer = try await ask(
+            label: "effort-\(effort)",
+            chat: [.user("Say one short sentence about why cache boundaries matter.")],
+            thinking: true,
+            effort: effort,
+            maxTokens: effortBudget)
+        try requireThinkingOn(answer)
+    }
+
+    if reasoningPromptToggleActive && reasoningState.thinkingOnRoutedCount == 0 {
+        try fail(25, "thinking-on prompt rail was active but no ON row routed reasoning")
+    }
+
+    let snapshot = coordinator.snapshotStats()
+    let paged = snapshot.pagedStats.map {
+        "hits=\($0.cacheHits),misses=\($0.cacheMisses),allocated=\($0.allocatedBlocks),free=\($0.freeBlocks),evictions=\($0.evictions)"
+    } ?? "disabled"
+    let disk = snapshot.diskStats.map {
+        "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),maxBytes=\($0.maxSizeBytes)"
+    } ?? "disabled"
+    let ssm = snapshot.ssmStats
+    print(
+        "REASONING_CACHE_STATS hybrid=\(snapshot.isHybrid) pagedIncompatible=\(snapshot.isPagedIncompatible) paged{\(paged)} disk{\(disk)} ssm{hits=\(ssm.hits),misses=\(ssm.misses),reDerives=\(ssm.reDerives)}"
+    )
+    print("=== BENCH_REASONING_TURN_MATRIX: PASS ===")
+}
 
 /// Production DSV4 chat coherence gate. Unlike the generic
 /// `BENCH_BATCH_CHAT` row, this uses `UserInput(chat:)` for every turn so the
