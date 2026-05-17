@@ -165,6 +165,7 @@ Fresh artifacts:
 docs/local/live-model-matrix/20260517T_qwen35_jangtq_vl_fix/
 docs/local/live-model-matrix/20260517T_qwen35_jangtq_vl_matrix_after_fix/
 docs/local/live-model-matrix/20260517T_qwen35_jangtq_turnmatrix_after_vl_fix/
+docs/local/live-model-matrix/20260517T_qwen35_qwen3vl_video_config_fix/
 ```
 
 Root cause:
@@ -194,14 +195,21 @@ Current proof:
   OFF/ON, BatchEngine single/chat/disk-restore/concurrent/per-slot/TurboQuant
   rows, VL batch chat, VL chat cache, and media-salt isolation. The generic
   batch cache-hit row remains `N-A` by topology/harness semantics.
+- Qwen3VL video processor config is now wired through the real
+  `video_preprocessor_config.json` contract. The focused video smoke row loads
+  `Qwen35MoE` with `Qwen3VLProcessor`, attaches `LMInput.video` with pixels
+  shape `[560, 1536]` on the resized 1080p fixture, and returns coherent
+  visible content with `enable_thinking=false`.
 
 Open boundary:
 
 - `vl_mixed_text_image_video` completed T1 text reasoning-on, T2 repeated text
   cache, and T3 image with thinking off, then stayed in the T4 high-resolution
   video prefill/forward path for more than seven minutes on the 1080p fixture.
-  That row was stopped and remains blocked for a focused Qwen3VL video scaling
-  gate. Do not count video as production-clear for this bundle yet.
+  The config repair does not fake-clamp the video budget: this bundle's
+  `video_preprocessor_config.json` declares a large `longest_edge=25165824`, so
+  the true high-resolution video row still needs a throughput/scaling gate. Do
+  not count high-res video as production-clear for this bundle yet.
 
 ## Active Non-Excluded Family Matrix
 

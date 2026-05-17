@@ -163,12 +163,17 @@ weights.
   `Qwen3.6-35B-A3B-JANGTQ-CRACK` now loads the VLM path as `Qwen35MoE` with
   `Qwen3VLProcessor`; image turns ground the red/blue gradient, text-only
   follow-up works, same-image media-salt restore hits, and different-image
-  media-salt restore misses.
+  media-salt restore misses. Qwen3VL video processing now reads
+  `video_preprocessor_config.json` and uses frame-count-aware video resize math;
+  the resized 1080p video smoke attaches `LMInput.video` and returns coherent
+  visible content with thinking disabled.
 - Current issues: thinking-on can emit reasoning without visible answer within
   small budgets on some rows, so higher-budget closure proof is still required.
   The 35B JANGTQ mixed text/image/video row is also blocked on the high-res
-  Qwen3VL video turn after more than seven minutes in prefill/forward; image VL
-  is green, video is not production-clear for that bundle.
+  Qwen3VL video turn after more than seven minutes in prefill/forward. The
+  video config path is fixed, but the full high-resolution row remains a
+  throughput/scaling gate because the bundle declares a large video pixel
+  budget.
 
 ### MiniMax M2.7
 

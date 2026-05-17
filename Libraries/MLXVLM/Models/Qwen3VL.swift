@@ -31,6 +31,67 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
     }
 
+    static func videoTargetSize(
+        frameCount: Int,
+        height: Int,
+        width: Int,
+        temporalFactor: Int,
+        factor: Int,
+        minPixels: Int,
+        maxPixels: Int
+    ) throws -> (Int, Int) {
+        if frameCount <= 0 {
+            throw VLMError.imageProcessingFailure("Video must contain at least one frame")
+        }
+        if temporalFactor <= 0 || factor <= 0 {
+            throw VLMError.imageProcessingFailure(
+                "Invalid video resize factors temporal=\(temporalFactor) spatial=\(factor)")
+        }
+        if height < factor {
+            throw VLMError.imageProcessingFailure(
+                "Height: \(height) must be larger than factor: \(factor)")
+        }
+        if width < factor {
+            throw VLMError.imageProcessingFailure(
+                "Width: \(width) must be larger than factor: \(factor)")
+        }
+        if max(height, width) / min(height, width) > 200 {
+            throw VLMError.imageProcessingFailure(
+                "Absolute aspect ratio must be smaller than 200: \(width) × \(height)")
+        }
+        if minPixels <= 0 || maxPixels <= 0 || maxPixels < minPixels {
+            throw VLMError.imageProcessingFailure(
+                "Invalid video pixel budget min=\(minPixels) max=\(maxPixels)")
+        }
+
+        let factorD = Double(factor)
+        let heightD = Double(height)
+        let widthD = Double(width)
+
+        var hBar = max(factor, Int((heightD / factorD).rounded()) * factor)
+        var wBar = max(factor, Int((widthD / factorD).rounded()) * factor)
+        let tBar =
+            ((frameCount + temporalFactor - 1) / temporalFactor) * temporalFactor
+
+        let roundedPixels = Double(tBar) * Double(hBar) * Double(wBar)
+        if roundedPixels > Double(maxPixels) {
+            let beta = sqrt(Double(frameCount) * heightD * widthD / Double(maxPixels))
+            hBar = max(factor, Int(floor(heightD / beta / factorD)) * factor)
+            wBar = max(factor, Int(floor(widthD / beta / factorD)) * factor)
+        } else if roundedPixels < Double(minPixels) {
+            let beta = sqrt(Double(minPixels) / (Double(frameCount) * heightD * widthD))
+            hBar = Int(ceil(heightD * beta / factorD)) * factor
+            wBar = Int(ceil(widthD * beta / factorD)) * factor
+        }
+
+        if hBar <= 0 || wBar <= 0 {
+            throw VLMError.imageProcessingFailure(
+                "Invalid video target dimensions: \(wBar) × \(hBar)")
+        }
+
+        return (hBar, wBar)
+    }
+
     public func preprocess(images: [CIImage], processing: UserInput.Processing?) throws -> (
         MLXArray, THW
     ) {
@@ -108,25 +169,32 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             var accumulatedFrames: [[MLXArray]] = []
 
             for video in input.videos {
-                var resizedSize: CGSize = .zero
-                let sequence = try await MediaProcessing.asProcessedSequence(
-                    video, targetFPS: { _ in Double(2) }
+                let sequence = try await MediaProcessing.asProcessedVideoFrames(
+                    video,
+                    targetFPS: { _ in config.videoFPS },
+                    minFrames: config.videoMinFrames,
+                    maxFrames: config.videoMaxFrames
                 ) { frame in
                     let processed = MediaProcessing.apply(frame.frame, processing: input.processing)
-                    if resizedSize == .zero {
-                        let (extentH, extentW) = try QwenVL.intExtent(processed.extent.size)
-                        let (height, width) = try QwenVL.targetSize(
-                            height: extentH,
-                            width: extentW,
-                            factor: config.patchSize * config.mergeSize,
-                            minPixels: config.minPixels,
-                            maxPixels: config.maxPixels)
-                        resizedSize = CGSize(width: width, height: height)
-                    }
-                    let finalImage = preprocess(image: processed, resizedSize: resizedSize)
-                    return VideoFrame(frame: finalImage, timeStamp: frame.timeStamp)
+                    return VideoFrame(frame: processed, timeStamp: frame.timeStamp)
                 }
-                accumulatedFrames.append(sequence.frames)
+                guard let firstFrame = sequence.frames.first else {
+                    throw VLMError.imageProcessingFailure("No video frames were decoded")
+                }
+                let (extentH, extentW) = try QwenVL.intExtent(firstFrame.frame.extent.size)
+                let (height, width) = try Self.videoTargetSize(
+                    frameCount: sequence.frames.count,
+                    height: extentH,
+                    width: extentW,
+                    temporalFactor: config.temporalPatchSize,
+                    factor: config.patchSize * config.mergeSize,
+                    minPixels: config.videoMinPixels,
+                    maxPixels: config.videoMaxPixels)
+                let resizedSize = CGSize(width: width, height: height)
+                accumulatedFrames.append(
+                    sequence.frames.map {
+                        preprocess(image: $0.frame, resizedSize: resizedSize).asMLXArray()
+                    })
             }
 
             let videoFrames = try accumulatedFrames.map {
@@ -170,22 +238,76 @@ public struct Qwen3VLProcessorConfiguration: Codable, Sendable {
         enum CodingKeys: String, CodingKey {
             case maxPixels = "max_pixels"
             case minPixels = "min_pixels"
+            case longestEdge = "longest_edge"
+            case shortestEdge = "shortest_edge"
+        }
+
+        public init(maxPixels: Int, minPixels: Int) {
+            self.maxPixels = maxPixels
+            self.minPixels = minPixels
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.maxPixels =
+                try c.decodeIfPresent(Int.self, forKey: .maxPixels)
+                ?? c.decode(Int.self, forKey: .longestEdge)
+            self.minPixels =
+                try c.decodeIfPresent(Int.self, forKey: .minPixels)
+                ?? c.decode(Int.self, forKey: .shortestEdge)
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(maxPixels, forKey: .maxPixels)
+            try c.encode(minPixels, forKey: .minPixels)
+        }
+    }
+
+    public struct VideoConfiguration: Codable, Sendable {
+        private let _size: Size?
+        private let _minPixels: Int?
+        private let _maxPixels: Int?
+        private let _fps: Double?
+        private let _minFrames: Int?
+        private let _maxFrames: Int?
+
+        public var minPixels: Int? { _minPixels ?? _size?.minPixels }
+        public var maxPixels: Int? { _maxPixels ?? _size?.maxPixels }
+        public var fps: Double? { _fps }
+        public var minFrames: Int? { _minFrames }
+        public var maxFrames: Int? { _maxFrames }
+
+        enum CodingKeys: String, CodingKey {
+            case _size = "size"
+            case _minPixels = "min_pixels"
+            case _maxPixels = "max_pixels"
+            case _fps = "fps"
+            case _minFrames = "min_frames"
+            case _maxFrames = "max_frames"
         }
     }
 
     public let imageMean: [CGFloat]
     public let imageStd: [CGFloat]
+    private let _size: Size?
     private let _minPixels: Int?
     private let _maxPixels: Int?
+    private let _videoConfiguration: VideoConfiguration?
     public let mergeSize: Int
     public let patchSize: Int
     public let temporalPatchSize: Int
     public let imageProcessorType: String
 
-    public var minPixels: Int { _minPixels ?? 4 * 28 * 28 }  // 3,136
-    public var maxPixels: Int { _maxPixels ?? 16384 * 28 * 28 }  // 12,845,056
+    public var minPixels: Int { _minPixels ?? _size?.minPixels ?? 4 * 28 * 28 }  // 3,136
+    public var maxPixels: Int { _maxPixels ?? _size?.maxPixels ?? 16384 * 28 * 28 }  // 12,845,056
 
     public var size: Size { .init(maxPixels: maxPixels, minPixels: minPixels) }
+    public var videoMinPixels: Int { _videoConfiguration?.minPixels ?? minPixels }
+    public var videoMaxPixels: Int { _videoConfiguration?.maxPixels ?? maxPixels }
+    public var videoFPS: Double { _videoConfiguration?.fps ?? 2 }
+    public var videoMinFrames: Int { _videoConfiguration?.minFrames ?? 4 }
+    public var videoMaxFrames: Int { _videoConfiguration?.maxFrames ?? 768 }
 
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
         (imageMean[0], imageMean[1], imageMean[2])
@@ -198,8 +320,10 @@ public struct Qwen3VLProcessorConfiguration: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case imageMean = "image_mean"
         case imageStd = "image_std"
+        case _size = "size"
         case _minPixels = "min_pixels"
         case _maxPixels = "max_pixels"
+        case _videoConfiguration = "video_preprocessor_config"
         case mergeSize = "merge_size"
         case patchSize = "patch_size"
         case temporalPatchSize = "temporal_patch_size"

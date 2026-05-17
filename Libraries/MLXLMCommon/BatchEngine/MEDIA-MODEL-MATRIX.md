@@ -18,7 +18,7 @@ at host); ◐ = supported via base modality (e.g. video as image stream).
 |---|---|---|---|---|---|---|
 | **Nemotron-3-Nano-Omni** | `nemotron_h_omni` / `NemotronH_Nano_Omni_Reasoning_V3` | ✓ RADIO ViT | ✓ AVAsset frames | ✓ Parakeet ASR | per-layer mixed: `MambaCache` (23) + `KVCacheSimple` (6 attn) + nil (E layers) | ✓ YES — eager `setHybrid(true)` |
 | **Qwen 2 VL** (qwen2-vl-* / qwen2.5-vl-*) | `qwen2_vl`, `qwen2_5_vl` | ✓ ViT + window-attn | ✓ temporal patch | ⨯ | dense `KVCacheSimple` per layer | no |
-| **Qwen 3 VL** (qwen3-vl-9b/30b-vl-*) | `qwen3_vl` | ✓ ViT | ✓ targetFPS=2 | ⨯ | dense `KVCacheSimple` | no |
+| **Qwen 3 VL** (qwen3-vl-9b/30b-vl-*) | `qwen3_vl` | ✓ ViT | ✓ config-driven FPS | ⨯ | dense `KVCacheSimple` | no |
 | **Qwen 3.5 / 3.6 MoE** (qwen3.5/3.6-VL bundles) | `qwen3_5`, `qwen3_5_moe` | ✓ via Qwen35 path | ✓ video tokens | ⨯ | per-expert routed; **eager `setHybrid(true)`** via osaurus matcher (substring qwen3.5/qwen3.6) | gated SSM in some layers |
 | **Gemma 3** | `gemma3` | ✓ SigLIP-ish | ⨯ | ⨯ | dense + sliding | sliding-window only |
 | **Gemma 4** | `gemma4` | ✓ MobileNet vision | ⨯ | ⨯ | sliding + full mixed | SWA hybrid (not Mamba) |
@@ -122,8 +122,13 @@ JANGTQ-aware via the same merge.
 
 ### Qwen 3 VL (`qwen3_vl`)
 
-- targetFPS hardcoded: `Double(2)` (2 fps sampling) in `Qwen3VL.swift:111`
-- Frame extraction loops `input.videos`, accumulates frames per video
+- targetFPS: `video_preprocessor_config.json.fps` when present, defaulting to
+  Qwen3VL's 2 fps processor default.
+- Resize: frame-count-aware video smart resize using
+  `video_preprocessor_config.json.size.shortest_edge` /
+  `size.longest_edge` as the model's temporal pixel budget.
+- Frame extraction loops `input.videos`, samples frames before resizing so the
+  target H/W can use the real frame count.
 - Padding token: `<|video_pad|>`
 - Video token defaults: id=151_656
 

@@ -719,15 +719,51 @@ private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
 ) {
     let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
     let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
+    let videoPreprocessorConfigURL = modelDirectory.appending(
+        component: "video_preprocessor_config.json")
     let url =
         FileManager.default.fileExists(atPath: preprocessorConfigURL.path)
         ? preprocessorConfigURL
         : processorConfigURL
     do {
-        let data = try Data(contentsOf: url)
+        var data = try Data(contentsOf: url)
+        if FileManager.default.fileExists(atPath: videoPreprocessorConfigURL.path) {
+            do {
+                guard
+                    var processorObject = try JSONSerialization.jsonObject(with: data)
+                        as? [String: Any]
+                else {
+                    throw DecodingError.dataCorrupted(
+                        .init(
+                            codingPath: [],
+                            debugDescription: "\(url.lastPathComponent) is not a JSON object"))
+                }
+                let videoData = try Data(contentsOf: videoPreprocessorConfigURL)
+                guard
+                    let videoObject = try JSONSerialization.jsonObject(with: videoData)
+                        as? [String: Any]
+                else {
+                    throw DecodingError.dataCorrupted(
+                        .init(
+                            codingPath: [],
+                            debugDescription:
+                                "\(videoPreprocessorConfigURL.lastPathComponent) is not a JSON object"
+                        ))
+                }
+                processorObject["video_preprocessor_config"] = videoObject
+                data = try JSONSerialization.data(withJSONObject: processorObject)
+            } catch {
+                throw ProcessorConfigError(
+                    filename: videoPreprocessorConfigURL.lastPathComponent,
+                    underlying: error)
+            }
+        }
         let config = try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: data)
         return (data, config)
     } catch {
+        if let error = error as? ProcessorConfigError {
+            throw error
+        }
         throw ProcessorConfigError(filename: url.lastPathComponent, underlying: error)
     }
 }

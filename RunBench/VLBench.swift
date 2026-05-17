@@ -1081,6 +1081,7 @@ enum VLBench {
             prompt: "Describe what happens in this short video in one sentence.",
             videos: [.url(videoURL)]
         )
+        userInput.additionalContext = ["enable_thinking": false]
         // Resize keeps the preprocessor in a predictable small-input
         // regime across models (Qwen3-VL wants multiples of 14).
         userInput.processing = .init(resize: CGSize(width: 224, height: 224))
