@@ -310,3 +310,39 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 }
+
+@Suite("Runtime MoE top-k override focused contracts")
+struct RuntimeMoETopKOverrideFocusedTests {
+    @Test("explicit MoE top-k override only lowers routed expert count")
+    func overrideOnlyLowersRoutedExpertCount() {
+        let lowered = RuntimeMoETopKOverride.resolve(
+            currentTopK: 8,
+            modelType: "hy_v3",
+            field: "num_experts_per_tok",
+            environment: ["VMLX_MOE_TOPK_OVERRIDE": "4"])
+        #expect(lowered.effectiveTopK == 4)
+        #expect(lowered.applied)
+
+        let neverRaises = RuntimeMoETopKOverride.resolve(
+            currentTopK: 1,
+            modelType: "zaya",
+            field: "moe_router_topk",
+            environment: ["VMLX_MOE_TOPK_OVERRIDE": "4"])
+        #expect(neverRaises.effectiveTopK == 1)
+        #expect(!neverRaises.applied)
+        #expect(neverRaises.reason == .requestedTopKAboveCurrent)
+    }
+
+    @Test("MoE top-k override scopes cache keys and ignores invalid values")
+    func overrideScopesCacheKeys() {
+        #expect(RuntimeMoETopKOverride.cacheScopedModelKey(
+            "hy3",
+            environment: ["VMLX_MOE_TOPK_OVERRIDE": "4"]) == "hy3|moeTopK=4")
+        #expect(RuntimeMoETopKOverride.cacheScopedModelKey(
+            "hy3",
+            environment: ["VMLINUX_MOE_TOPK_OVERRIDE": "2"]) == "hy3|moeTopK=2")
+        #expect(RuntimeMoETopKOverride.cacheScopedModelKey(
+            "hy3",
+            environment: ["VMLX_MOE_TOPK_OVERRIDE": "0"]) == "hy3")
+    }
+}

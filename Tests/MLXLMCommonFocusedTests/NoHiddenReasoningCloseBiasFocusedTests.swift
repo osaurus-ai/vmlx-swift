@@ -3,6 +3,7 @@
 
 import Foundation
 import Jinja
+import MLX
 import Testing
 @testable import MLXLLM
 @testable import MLXLMCommon
@@ -386,6 +387,46 @@ struct Hy3ParserFocusedTests {
         #expect(!content.contains("Let me work this out..."))
     }
 
+    @Test("Hy3 native model drops preserved nextn layer from base decode cache")
+    func nativeModelDropsPreservedNextnFromBaseDecodeCache() throws {
+        let config = try minimalHy3Config(numHiddenLayers: 2, numNextnPredictLayers: 1)
+        let model = Hy3Model(config)
+
+        #expect(model.kvHeads == [1, 1])
+        #expect(model.newCache(parameters: nil).count == 2)
+        #expect(model.loraLayers.count == 2)
+    }
+
+    @Test("Hy3 sanitizer fuses qkv and drops preserved nextn tensors")
+    func sanitizerFusesQKVAndDropsPreservedNextnTensors() throws {
+        try FocusedMLXTestSupport.withLock {
+            let config = try minimalHy3Config(
+                numHiddenLayers: 1,
+                firstKDenseReplace: 1,
+                numNextnPredictLayers: 1)
+            let model = Hy3Model(config)
+            let prefix = "model.layers.0.self_attn"
+            let weights: [String: MLXArray] = [
+                "\(prefix).q_proj.weight": MLXArray.ones([8, 4]),
+                "\(prefix).k_proj.weight": MLXArray.ones([4, 4]) * 2,
+                "\(prefix).v_proj.weight": MLXArray.ones([4, 4]) * 3,
+                "\(prefix).q_proj.scales": MLXArray.ones([8, 1]),
+                "\(prefix).k_proj.scales": MLXArray.ones([4, 1]) * 2,
+                "\(prefix).v_proj.scales": MLXArray.ones([4, 1]) * 3,
+                "model.layers.1.self_attn.q_proj.weight": MLXArray.ones([8, 4]) * 9,
+            ]
+
+            let sanitized = model.sanitize(weights: weights)
+
+            #expect(sanitized["\(prefix).qkv_proj.weight"]?.shape == [16, 4])
+            #expect(sanitized["\(prefix).qkv_proj.scales"]?.shape == [16, 1])
+            #expect(sanitized["\(prefix).q_proj.weight"] == nil)
+            #expect(sanitized["\(prefix).k_proj.weight"] == nil)
+            #expect(sanitized["\(prefix).v_proj.weight"] == nil)
+            #expect(sanitized["model.layers.1.self_attn.q_proj.weight"] == nil)
+        }
+    }
+
     private func collectParser(
         _ parser: inout ReasoningParser,
         _ text: String
@@ -403,6 +444,46 @@ struct Hy3ParserFocusedTests {
             }
         }
         return (reasoning, content)
+    }
+
+    private func minimalHy3Config(
+        numHiddenLayers: Int = 2,
+        firstKDenseReplace: Int = 1,
+        numExperts: Int = 2,
+        numNextnPredictLayers: Int = 0
+    ) throws -> Hy3Configuration {
+        let json = """
+            {
+              "model_type": "hy_v3",
+              "architectures": ["HYV3ForCausalLM"],
+              "hidden_size": 8,
+              "num_hidden_layers": \(numHiddenLayers),
+              "num_attention_heads": 2,
+              "num_key_value_heads": 1,
+              "head_dim": 4,
+              "intermediate_size": 16,
+              "moe_intermediate_size": 4,
+              "expert_hidden_dim": 4,
+              "first_k_dense_replace": \(firstKDenseReplace),
+              "num_experts": \(numExperts),
+              "num_experts_per_tok": 1,
+              "num_shared_experts": 1,
+              "qk_norm": true,
+              "rms_norm_eps": 1e-5,
+              "rope_parameters": {"rope_theta": 11158840.0, "rope_type": "default"},
+              "max_position_embeddings": 262144,
+              "route_norm": true,
+              "router_scaling_factor": 2.826,
+              "moe_router_enable_expert_bias": true,
+              "moe_router_use_sigmoid": true,
+              "tie_word_embeddings": false,
+              "vocab_size": 32,
+              "mxtq_seed": 42,
+              "mxtq_bits": 2,
+              "num_nextn_predict_layers": \(numNextnPredictLayers)
+            }
+            """
+        return try JSONDecoder.json5().decode(Hy3Configuration.self, from: Data(json.utf8))
     }
 }
 

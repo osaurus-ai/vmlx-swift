@@ -421,6 +421,141 @@ struct Gemma4CacheTopologyFocusedTests {
         #expect(sliding.maxSize == 1024)
         #expect(full.maxSize == 4096)
     }
+
+    @Test("actual Gemma4TextModel newCache matches mixed and maxKVSize topologies")
+    func actualModelNewCacheMatchesTopologyContract() throws {
+        let config = try JSONDecoder().decode(
+            Gemma4TextConfiguration.self,
+            from: Data(Self.minimalGemma4Config.utf8))
+        let model = Gemma4TextModel(config)
+
+        let defaultCache = model.newCache(parameters: nil)
+        #expect(defaultCache.count == 4)
+        #expect(defaultCache[0] is RotatingKVCache)
+        #expect(defaultCache[1] is KVCacheSimple)
+        #expect(defaultCache[2] is RotatingKVCache)
+        #expect(defaultCache[3] is KVCacheSimple)
+        #expect(CacheFamily.classify(defaultCache) == .heterogeneous)
+
+        var params = GenerateParameters()
+        params.maxKVSize = 2048
+        let boundedCache = model.newCache(parameters: params)
+        #expect(boundedCache.count == 4)
+        for layer in boundedCache {
+            #expect(layer is RotatingKVCache)
+        }
+        #expect(CacheFamily.classify(boundedCache) == .rotating)
+    }
+
+    private static let minimalGemma4Config = #"""
+    {
+      "model_type": "gemma4_text",
+      "hidden_size": 64,
+      "num_hidden_layers": 4,
+      "num_attention_heads": 4,
+      "num_key_value_heads": 2,
+      "global_head_dim": 16,
+      "head_dim": 16,
+      "intermediate_size": 128,
+      "vocab_size": 256,
+      "rms_norm_eps": 1e-6,
+      "sliding_window": 64,
+      "layer_types": ["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
+      "tie_word_embeddings": true,
+      "attention_k_eq_v": false
+    }
+    """#
+}
+
+@Suite("Bailing/Ling hybrid cache topology focused contracts")
+struct BailingLingHybridCacheTopologyFocusedTests {
+    @Test("actual BailingHybridModel uses ArraysCache for linear layers and KV for global layers")
+    func bailingHybridNewCacheMatchesAttentionTopology() throws {
+        let config = try JSONDecoder().decode(
+            BailingHybridConfiguration.self,
+            from: Data(Self.minimalBailingHybridConfig.utf8))
+        let model = BailingHybridModel(config)
+
+        let defaultCache = model.newCache(parameters: nil)
+        #expect(defaultCache.count == 5)
+        #expect(defaultCache[0] is ArraysCache)
+        #expect(defaultCache[1] is KVCacheSimple)
+        #expect(defaultCache[2] is ArraysCache)
+        #expect(defaultCache[3] is KVCacheSimple)
+        #expect(defaultCache[4] is KVCacheSimple)
+        #expect(cacheRequiresDiskBackedCoordinatorRestore(defaultCache))
+
+        var params = GenerateParameters()
+        params.maxKVSize = 2048
+        let boundedCache = model.newCache(parameters: params)
+        #expect(boundedCache[0] is ArraysCache)
+        #expect(boundedCache[1] is RotatingKVCache)
+        #expect(boundedCache[2] is ArraysCache)
+        #expect(boundedCache[3] is RotatingKVCache)
+        #expect(boundedCache[4] is RotatingKVCache)
+        #expect(cacheRequiresDiskBackedCoordinatorRestore(boundedCache))
+    }
+
+    @Test("trailing partial Bailing/Ling layer group is global attention")
+    func trailingPartialLayerGroupIsGlobalAttention() throws {
+        let config = try JSONDecoder().decode(
+            BailingHybridConfiguration.self,
+            from: Data(Self.minimalBailingHybridConfig.utf8))
+
+        #expect(config.isGlobalLayer(0) == false)
+        #expect(config.isGlobalLayer(1) == true)
+        #expect(config.isGlobalLayer(2) == false)
+        #expect(config.isGlobalLayer(3) == true)
+        #expect(config.isGlobalLayer(4) == true)
+    }
+
+    private static let minimalBailingHybridConfig = #"""
+    {
+      "model_type": "bailing_hybrid",
+      "hidden_size": 32,
+      "intermediate_size": 64,
+      "max_position_embeddings": 4096,
+      "moe_intermediate_size": 16,
+      "num_experts": 4,
+      "num_shared_experts": 1,
+      "num_attention_heads": 4,
+      "num_experts_per_tok": 2,
+      "num_hidden_layers": 5,
+      "num_key_value_heads": 2,
+      "rms_norm_eps": 1e-6,
+      "rope_theta": 1000000.0,
+      "vocab_size": 256,
+      "first_k_dense_replace": 1,
+      "layer_group_size": 2,
+      "group_norm_size": 4,
+      "q_lora_rank": 8,
+      "qk_rope_head_dim": 4,
+      "qk_nope_head_dim": 4,
+      "v_head_dim": 4,
+      "kv_lora_rank": 8,
+      "rope_interleave": true,
+      "num_nextn_predict_layers": 1,
+      "norm_topk_prob": true,
+      "routed_scaling_factor": 1.0,
+      "n_group": 1,
+      "topk_group": 1,
+      "score_function": "sigmoid",
+      "moe_router_enable_expert_bias": true,
+      "moe_router_enable_routed_scaling": true,
+      "moe_router_enable_shared_expert": true,
+      "rope_traditional": false,
+      "use_bias": false,
+      "use_qkv_bias": false,
+      "use_qk_norm": true,
+      "tie_word_embeddings": false,
+      "partial_rotary_factor": 0.5,
+      "head_dim": 8,
+      "attention_bias": false,
+      "weight_format": "mxtq",
+      "mxtq_bits": {"routed_expert": 2, "attention": 8},
+      "mxtq_seed": 42
+    }
+    """#
 }
 
 @Suite("BatchKVCache rotating-slot focused contracts", .serialized)

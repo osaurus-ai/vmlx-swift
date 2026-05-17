@@ -44,6 +44,7 @@ Fresh focused MTP/settings artifact:
 ```text
 docs/local/production-readiness/20260517T160343Z_qwen_mtp_settings_current/
 docs/local/production-readiness/20260517T165508Z_qwen_mtp_settings_recheck/
+docs/local/production-readiness/20260517T1252_ling_hy3_gemma4_runtime_contracts/
 ```
 
 That inventory contains 28 non-excluded local bundles:
@@ -643,6 +644,12 @@ MXFP4 Ling status:
   `detailed thinking on`, `enable_thinking=false` inserts or replaces
   `detailed thinking off`, and non-Bailing or missing-toggle paths remain
   unchanged.
+- fresh active focused Bailing/Ling cache coverage now runs in
+  `CacheCoordinatorTopologyFocusedTests`: the actual `BailingHybridModel`
+  allocates `ArraysCache` for linear-attention layers and KV/RotatingKV caches
+  for global MLA layers, keeps trailing partial layer groups global, and remains
+  marked for disk-backed coordinator restore rather than accepting a generic
+  prefix hit.
 
 Boundary: Ling/Bailing is now live-proven for the current text turnmatrix on
 both JANGTQ2 and MXFP4. Native MTP stays fail-closed unless the family gets a
@@ -706,6 +713,15 @@ docs/local/live-model-matrix/20260517T184132Z_hy3_jangtqk_streaming_autodir_afte
   tool calls plus `think_xml` reasoning, Hunyuan parses multiple scalar-argument
   calls, reasoning-before-tool-call streaming does not leak markers, and
   prompt-tail open/closed `<think>` states route reasoning/content correctly.
+- the same focused suite now pins active Hy3 nextn handling instead of relying
+  on metadata absence: `Hy3Model.newCache(parameters:nil)` allocates only the
+  base decode layers, `loraLayers` excludes preserved nextn/MTP layers, and the
+  sanitizer fuses real q/k/v projection tensors while dropping preserved nextn
+  tensors from the base runtime load path.
+- `RuntimeMoETopKOverrideFocusedTests` pins the override as lower-only and
+  cache-key-scoped: an explicit override may reduce Hy3 routed experts for an
+  experiment, but it will not raise another model's trained top-k and it does
+  not silently mutate the bundle default.
 
 Boundary: Hy3 JANGTQ_K is correctness/low-footprint proven through active
 expert streaming, but it is still speed-blocked at about 1.4 tok/s on the
@@ -741,12 +757,13 @@ turnmatrix:
 - BatchEngine single, chat, disk restore, B=2 concurrent, B=2 per-slot sampler,
   and TurboQuant-KV B=2 isolation: PASS;
 - active focused SWA/cache coverage is now wired under
-  `CacheCoordinatorTopologyFocusedTests`: 3 Gemma 4 topology tests prove the
-  mixed RotatingKVCache+KVCacheSimple no-`maxKVSize` path stays
-  `.heterogeneous`/uncompiled, the all-rotating `maxKVSize` path stays
-  `.rotating`/compile-eligible, and full-attention rotating caches keep the
-  attention-sink shape; 4 BatchKVCache rotating-slot tests prove post-wrap
-  masks use the capped effective key length instead of `offset + n`;
+  `CacheCoordinatorTopologyFocusedTests`: 4 Gemma 4 topology tests prove the
+  actual `Gemma4TextModel.newCache` allocation matches the mixed
+  RotatingKVCache+KVCacheSimple no-`maxKVSize` path, the all-rotating
+  `maxKVSize` path stays `.rotating`/compile-eligible, and full-attention
+  rotating caches keep the attention-sink shape; 4 BatchKVCache rotating-slot
+  tests prove post-wrap masks use the capped effective key length instead of
+  `offset + n`;
 - the generic prefix-extension paged cache-hit row is N-A because this model is
   routed through the disk-backed paged-incompatible cache path.
 
@@ -799,8 +816,8 @@ docs/local/production-readiness/20260517T_laguna_mistral_gemma4_active_contracts
   proves `weight_format=mxtq` and `MXTQ` route to `Mistral3TextJANGTQModel`,
   `mxtq_bits=4` changes the packed dense width, and `mxfp4` or missing
   `weight_format` stays on the vanilla `Mistral3TextModel` path.
-- The aggregate active focused target passes 160 tests in 24 suites in
-  `MLXLMCommonFocusedTests_all.log`.
+- The fresh aggregate active focused target passes 167 tests in 26 suites in
+  `docs/local/production-readiness/20260517T1252_ling_hy3_gemma4_runtime_contracts/MLXLMCommonFocusedTests_after_ling_hy3_gemma4.log`.
 - A post-fix live Gemma 4 `BENCH_HARMONY_CHECK` row passes: marker strings are
   absent from `.chunk`, the output is coherent visible README guidance, and
   generation stops through the normal path.
