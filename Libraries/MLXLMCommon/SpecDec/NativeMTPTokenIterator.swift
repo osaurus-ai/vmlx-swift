@@ -1158,9 +1158,6 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         if ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_FORCE_SEQUENTIAL_REPAIR"] == "1" {
             return true
         }
-        if !speculativeSampler.isGreedy && cache.contains(where: { $0 is MambaCache }) {
-            return true
-        }
         switch nativeMTPHybridVerifySetting()?.lowercased() {
         case "chunk", "chunk_commit", "capture_commit", "fast", "chunk_replay", "chunk_repair",
             "chunk_step_repair", "chunk_lazy_repair", "lazy_repair", "lazy", "fast_lazy":
@@ -1169,6 +1166,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return true
         default:
             break
+        }
+        if !speculativeSampler.isGreedy && cache.contains(where: { $0 is MambaCache }) {
+            return true
         }
         return cache.contains { $0 is MambaCache }
     }

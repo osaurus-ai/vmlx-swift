@@ -466,6 +466,18 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
+    @Test("native MTP prefix recurrent snapshots materialize before cache commit")
+    func nativeMTPPrefixRecurrentSnapshotsMaterializeBeforeCacheCommit() throws {
+        let source = try Self.source("Libraries/MLXLMCommon/KVCache.swift")
+        let record = try #require(source.range(
+            of: "public func recordPrefixCommitState(length: Int, arrays: [MLXArray], offset: Int)"))
+        let eval = try #require(source.range(of: "MLX.eval(snapshotArrays)"))
+        let store = try #require(source.range(of: "prefixCommitStates[length] = PrefixCommitState"))
+
+        #expect(record.lowerBound < eval.lowerBound)
+        #expect(eval.lowerBound < store.lowerBound)
+    }
+
     @Test("native MTP lazy repair skips capture until partial rejection")
     func nativeMTPLazyRepairSkipsCaptureUntilPartialRejection() throws {
         let runtime = try Self.source("Libraries/MLXLMCommon/SpecDec/MTPRuntime.swift")
@@ -565,6 +577,19 @@ struct MTPRuntimeFocusedTests {
         #expect(source.contains("throw NativeMTPRuntimeError.invalidDepth(requestedDepth)"))
         #expect(source.contains("case \"sequential\", \"sequential_repair\", \"repair\":"))
         #expect(source.contains("return cache.contains { $0 is MambaCache }"))
+    }
+
+    @Test("native MTP chunk-lazy env overrides stochastic Mamba fallback")
+    func nativeMTPChunkLazyEnvOverridesStochasticMambaFallback() throws {
+        let source = try Self.source(
+            "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift")
+
+        let overrideSwitch = try #require(source.range(
+            of: "switch nativeMTPHybridVerifySetting()?.lowercased()"))
+        let stochasticMambaFallback = try #require(source.range(
+            of: "if !speculativeSampler.isGreedy && cache.contains(where: { $0 is MambaCache })"))
+
+        #expect(overrideSwitch.lowerBound < stochasticMambaFallback.lowerBound)
     }
 
     @Test("BatchEngine.generate rejects native MTP without an active MTP head")

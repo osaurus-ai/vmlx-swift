@@ -1223,8 +1223,10 @@ public class MambaCache: ArraysCache {
 
     public func recordPrefixCommitState(length: Int, arrays: [MLXArray], offset: Int) {
         guard length > 0, !arrays.isEmpty else { return }
+        let snapshotArrays = arrays.map { $0[.ellipsis] }
+        MLX.eval(snapshotArrays)
         prefixCommitStates[length] = PrefixCommitState(
-            arrays: arrays.map { $0[.ellipsis] },
+            arrays: snapshotArrays,
             offset: offset)
     }
 

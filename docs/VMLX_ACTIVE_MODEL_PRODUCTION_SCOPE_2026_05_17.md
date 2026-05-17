@@ -52,7 +52,7 @@ That inventory contains 28 non-excluded local bundles:
 - 13 VL bundles
 - 3 Omni bundles
 
-## Best Native-MTP Speed Rows So Far
+## Native-MTP Speed Rows and Current Regression Watch
 
 These are prompt-specific Qwen3.6 count-prompt rows. They prove the native-MTP
 loop and cache behavior for those artifacts only; they do not prove global
@@ -64,17 +64,18 @@ Prompt:
 Count from 1 to 50 in order, separated by commas.
 ```
 
-All rows below produced exact visible `1..50`, stopped normally, and did not use
+Passing rows produced exact visible `1..50`, stopped normally, and did not use
 hidden sampling guards, forced repetition penalties, or forced reasoning closure.
+Rows marked historical are useful targets, not current release proof.
 
-| Bundle | Without MTP AR tok/s | Best MTP tok/s | Best depth | Cache row | Current decision |
-|---|---:|---:|---:|---|---|
-| Qwen3.6 27B JANG_4M | 27.4 | 48.9 | D2 | disk L2 + SSM hit | MTP explicit only; D2 is current speed row. |
-| Qwen3.6 27B MXFP4 | 31.8 | 50.5 | D3 | disk L2 + SSM hit | D3 reaches the 45 tok/s target in cache-warm rows. |
-| Qwen3.6 27B MXFP8 | 17.3 | 31.7 | D2 | disk L2 + SSM hit | D2 wins; D3 is coherent but slower on this prompt. |
-| Qwen3.6 35B JANG_2K | 120.1 | n-a | n-a | n-a | Chunk MTP is blocked by correctness failures; use AR. |
-| Qwen3.6 35B MXFP4 | 105.3 | 171.4 | D3 | disk L2 + SSM hit | D3 is the current speed row. |
-| Qwen3.6 35B MXFP8 | 79.1 | 129.9 | D3 | disk L2 + SSM hit | D3 is the current speed row. |
+| Bundle | Historical best MTP tok/s | Fresh current Swift row | Current decision |
+|---|---:|---|---|
+| Qwen3.6 27B JANG_4M | 48.9 D2 | not part of the current MXFP-only verifier recheck | Explicit-only MTP target; re-run before release claim. |
+| Qwen3.6 27B MXFP4 | 50.5 D3 | 26.1 tok/s D3 `chunk_commit`, exact `1..50`, no diagnostics | Correctness fixed; 45 tok/s target remains open in current Swift. |
+| Qwen3.6 27B MXFP8 | 31.7 D2 | not re-run after the prefix-snapshot fix in this artifact | Correctness/speed recheck still required. |
+| Qwen3.6 35B JANG_2K | n-a | not in current scope | Excluded from the current MXFP-only MTP focus. |
+| Qwen3.6 35B MXFP4 | 171.4 D3 | 84.7 tok/s D3 `chunk_commit`, exact `1..50`, no diagnostics; fresh AR was 91.0 tok/s | Correctness fixed; speed-positive claim remains open for this row. |
+| Qwen3.6 35B MXFP8 | 129.9 D3 | not re-run after the prefix-snapshot fix in this artifact | Re-run before release claim. |
 
 The latest sampler sweeps did not justify hidden overrides:
 
@@ -109,9 +110,9 @@ explicit, tensor-gated, and non-batched until the remaining 35B JANG_2K VL and
 server scheduling gates are proven.
 
 Current hybrid-SSM verifier policy update: stochastic exact-pq native MTP does
-not use the fast chunk verifier. A 35B MXFP4 growing-chat row failed under
-bundle defaults when forced through `chunk_commit`; D1 reproduced it, while
-sequential repair passed. Post-fix rows under
+not use the fast chunk verifier unless an explicit verifier env requests it. A
+35B MXFP4 growing-chat row failed under bundle defaults when forced through
+`chunk_commit`; D1 reproduced it, while sequential repair passed. Post-fix rows under
 `docs/local/qwen36-mtp-current/20260517T131050Z-mxfp-growing-chat-mtp-d3-exact-postfix/`
 and
 `docs/local/qwen36-mtp-current/20260517T131024Z-35b-mxfp4-growing-chat-mtp-d3-exact-postfix/`
@@ -119,22 +120,46 @@ prove all four MXFP variants now run bundle-default D3 exact-pq with
 `verifierMode=sequential_repair`, coherent two-turn output, disk-prefix hits,
 and SSM hits. Greedy rows still use `chunk_commit` where proven.
 
+Fresh current verifier-root-cause artifact:
+
+```text
+docs/local/production-readiness/20260517T174743Z_qwen_mtp_chunk_policy_finalize/
+```
+
+This artifact found a real no-diagnostics `chunk_commit` bug, not a sampling
+problem. With `VMLINUX_NATIVE_MTP_PHASE_DIAG` and GDN diagnostics disabled,
+35B MXFP4 D3 `chunk_commit` originally stored lazy recurrent prefix state and
+degenerated into garbage until length stop (`acceptedByDepth=0:382`,
+`avgAcceptP=0.000`, `33.6 tok/s`). The fix materializes Mamba/GDN prefix
+snapshots in `MambaCache.recordPrefixCommitState(...)` before storing a
+verifier commit point. After the fix, the same no-diagnostics row returns exact
+`1..50`, stops normally, reaches `84.7 tok/s`, and reports
+`acceptedByDepth=2:3,3:45`, `avgCommittedPerVerify=3.94`, `avgAcceptP=0.979`.
+
+The same artifact proves 27B MXFP4 no-diagnostics D3 `chunk_commit` correctness
+at `26.1 tok/s` with exact `1..50`. That is not enough for the requested
+45 tok/s 27B target; it is a correctness baseline for the next speed pass.
+
 Current focused gate at 2026-05-17 09:03 PDT:
 
 ```text
 docs/local/production-readiness/20260517T160343Z_qwen_mtp_settings_current/
 docs/local/production-readiness/20260517T165508Z_qwen_mtp_settings_recheck/
+docs/local/production-readiness/20260517T174743Z_qwen_mtp_chunk_policy_finalize/
 ```
 
-- `MTPRuntimeFocusedTests.log`: 40/40 pass. Coverage includes cached verifier
+- `MTPRuntimeFocusedTests_after_prefix_snapshot_materialize.log`: 42/42 pass.
+  Coverage includes cached verifier
   masks carrying cache offsets, preserved-only MTP detection without
   auto-enable, metadata-only bundles without tensor evidence, explicit
   tensor-gated Qwen3.5 MoE activation, task-local activation and env override
   behavior, JANG metadata parsing, tensor/runtime-evidence-gated auto policy,
   recursive D3 hidden-state draft/verify contract, Qwen3.5 SSM accepted-prefix
   offsets, partial-reject lazy repair, private draft-cache refresh, greedy
-  chunk verifier telemetry, BatchEngine native-MTP exclusive lane, and rejection
-  of native MTP through batched `submit`.
+  chunk verifier telemetry, explicit verifier env override ordering before the
+  stochastic Mamba fallback, materialized prefix recurrent snapshots before
+  verifier commit, BatchEngine native-MTP exclusive lane, and rejection of
+  native MTP through batched `submit`.
 - The same focused run also pins shape-walk quantization for MXFP4,
   JANG_2K, stock MLX affine embeddings, Qwen3.6 linear attention value dim,
   ZAYA CCA output width, JANG shared-expert gate width, Qwen3.5 norm convention
@@ -156,6 +181,10 @@ docs/local/production-readiness/20260517T165508Z_qwen_mtp_settings_recheck/
   private draft-cache refresh, BatchEngine exclusive native-MTP lane, bundle
   generation defaults, top-k reaching sampler probabilities, and invalid
   settings reporting instead of clamping.
+- Fresh 10:54 PDT recheck after the prefix-snapshot materialization fix keeps
+  server settings green: `VMLINUXServerRuntimeSettingsTests_after_prefix_snapshot_materialize.log`
+  passes 12/12, and the release `RunBench` product builds successfully in
+  `build_RunBench_release_after_prefix_snapshot_materialize.log`.
 
 ## Qwen3.5 35B 4-bit Loader Repair - 2026-05-17
 
