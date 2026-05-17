@@ -15,9 +15,9 @@ Focused same-build evidence:
 
 | Mode | Tok/s | Target forwards | Verify input tokens | Output | Artifact |
 |---|---:|---:|---:|---|---|
-| AR baseline | 31.7 | N/A | N/A | Coherent `1..50` count | `docs/local/qwen36-mtp-opt/20260517T045102Z-27b-mxfp4-verifier-mode/ar_baseline.log` |
-| Default D3 | 27.1 | 188 | 188 | Coherent `1..50` count | `docs/local/qwen36-mtp-opt/20260517T045102Z-27b-mxfp4-verifier-mode/default_d3.log` |
-| Chunk-commit D3 | 49.6 | 56 | 224 | Coherent `1..50` count | `docs/local/qwen36-mtp-opt/20260517T045102Z-27b-mxfp4-verifier-mode/chunk_commit_d3.log` |
+| AR baseline | 31.7 | N/A | N/A | Coherent `1..50` count | `docs/local/qwen36-mtp-opt/20260517T045451Z-27b-mxfp4-verifier-mode/ar_baseline.log` |
+| Default D3 | 27.1 | 188 | 188 | Coherent `1..50` count | `docs/local/qwen36-mtp-opt/20260517T045451Z-27b-mxfp4-verifier-mode/default_d3.log` |
+| Chunk-commit D3 | 49.6 | 56 | 224 | Coherent `1..50` count | `docs/local/qwen36-mtp-opt/20260517T045451Z-27b-mxfp4-verifier-mode/chunk_commit_d3.log` |
 
 The default D3 row is therefore a real slowdown. The chunk-commit row is the
 real MTP speed path and clears the 44 tok/s target for this 27B MXFP4 artifact
@@ -81,7 +81,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test --filt
 Focused tests passed:
 
 ```text
-27 tests in MTP runtime metadata passed
+28 tests in MTP runtime metadata passed
 ```
 
 ## Production Boundary
