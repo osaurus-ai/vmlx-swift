@@ -109,7 +109,7 @@ weights.
 | `Osaurus/ZAYA1-8B-MXFP4` | 5.5G | `zaya` | no | file | `PASS` | `TODO` |
 | `Osaurus/ZAYA1-VL-8B-MXFP4` | 7.1G | `zaya1_vl` | no | tokenizer | `FAIL` - tool schema/name missing | `PARTIAL` |
 | `Tencent/Hy3-preview` | 557G | `hy_v3` | no | file | `PASS` | `TODO` |
-| `dealign.ai/Gemma-4-26B-A4B-it-JANG_4M-CRACK` | 15G | `gemma4` | no | file | `PASS` | `TODO` |
+| `dealign.ai/Gemma-4-26B-A4B-it-JANG_4M-CRACK` | 15G | `gemma4` | no | file | `PASS` | `PARTIAL` |
 | `dealign.ai/Ling-2.6-flash-JANGTQ2-CRACK` | 29G | `bailing_hybrid` | yes | file | `PASS` | `TODO` |
 | `dealign.ai/Ling-2.6-flash-MXFP4-CRACK` | 63G | `bailing_hybrid` | no | file | `PASS` | `TODO` |
 | `dealign.ai/MiniMax-M2.7-JANGTQ_K-CRACK` | 74G | `minimax_m2` | yes | file | `PASS` | `TODO` |
@@ -245,8 +245,13 @@ weights.
   sliding layers use `RotatingKVCache`.
 - Template/reasoning/tools: template smoke passes; Gemma 4 harmony/channel
   reasoning parser and Gemma 4 tool parser are wired.
-- Current status: no live multi-turn row in this snapshot. Needs harmony
-  reasoning check, tool-call row, multi-turn coherence, and cache proof.
+- Current status: `docs/local/live-model-matrix/20260517T160608Z_release_turnmatrix_gemma4_26b/`
+  passes the text release turnmatrix: config/template, cache OFF/ON
+  `BENCH_PROD` 7/7, BatchEngine single/chat, disk restore, B=2 concurrent,
+  B=2 per-slot sampler, and TurboQuant-KV B=2 isolation. Cache ON is
+  `pagedIncompatible=true`, so paged counters remain zero by design while disk
+  L2 records a real hit/store row. Remaining open rows are long-budget harmony
+  reasoning, live tool-call schema, and any VL-specific proof.
 
 ### Nemotron Omni / Nemotron H
 

@@ -8,6 +8,8 @@ artifact or source reference. Everything else stays `open`.
 Current pushed branch state:
 
 - Branch: `vmlx-0.31.3`
+- Latest pushed documentation checkpoint in this pass:
+  `ec689d0` (`docs: record qwen mtp settings gate`).
 - 2026-05-17 local update: the latest six-variant Qwen3.6 matrix is documented
   in `docs/VMLX_QWEN36_MTP_MATRIX_2026_05_17.md`. It supersedes earlier
   optimistic MTP speed wording in this audit: current Swift D3 text rows are
@@ -19,10 +21,10 @@ Current pushed branch state:
   short-budget failures for those rows.
 - Latest pushed runtime checkpoint for the Qwen text-SSM/private-MTP cache
   fix: `3146fac` (`fix(mtp): repair qwen ssm reject cache`)
-- Current local, not-yet-pushed MTP/cache work adds task-local load-time native
-  MTP activation, MXFP8 metadata/norm handling, native-MTP cache telemetry, and
-  CacheCoordinator restore/store wiring for native MTP. Artifacts are under
-  `docs/local/production-readiness/20260517Tswift-mtp-current/`.
+- The MTP/cache work for task-local load-time native MTP activation, MXFP8
+  metadata/norm handling, native-MTP cache telemetry, and CacheCoordinator
+  restore/store wiring is now represented by pushed docs and focused artifacts
+  under `docs/local/production-readiness/`.
 - Prior non-MTP checkpoints in this pass: `50df533`, `0deb14b`,
   `6e435d7`, `7962647`, `9a56de1`, and `ed04161`.
 - Previous MTP runtime checkpoint: `0fdb164`
@@ -87,6 +89,7 @@ The package is complete only when all of these are true:
 | Reasoning on/off/effort matrix. | Focused DSV4 pass-through exists. MiniMax Small now has live thinking ON/OFF alternation with `.reasoning` deltas ON and zero reasoning OFF. Ling/Bailing template has no active thinking rail in this bundle and returns visible content with no marker leak. Full model-family reasoning-effort matrix is not complete. | partial |
 | Tool parser matrix by family. | DSV4 and selected templates have focused proof; full dsml/deepseek/gemma4/kimi/jang/zaya/llama/qwen/mistral matrix remains open. | open |
 | Generation config defaults apply. | `docs/local/live-model-matrix/20260516Tguard-removal/Ling-2.6-flash-JANGTQ2-CRACK_prod_bundle_defaults_coord.out` proves the Ling folder has no sampling defaults and resolves through fallback to `temp=0.600 topP=1.000 topK=0 minP=0.000 rep=nil`. `.../MiniMax-M2.7-Small-JANGTQ_prod_bundle_defaults_coord.out` proves MiniMax's `generation_config.json` applies `temp=1.000 topP=0.950 topK=40 rep=nil`. `.../Gemma-4-26B-A4B-it-JANG_4M-CRACK_prod_bundle_defaults_coord.out` proves Gemma 4's folder config applies `temp=1.000 topP=0.950 topK=64 rep=nil`. `docs/local/production-readiness/20260517T160343Z_qwen_mtp_settings_current/VMLXServerRuntimeSettingsTests.log` passes 12/12 and pins bundle generation config before server overrides, nil server fields preserving engine/bundle defaults, top-k reaching speculative sampler probabilities, and invalid sampling values reporting instead of clamping. Package-wide live override matrix remains incomplete. | partial |
+| Gemma 4 text turnmatrix. | `docs/local/live-model-matrix/20260517T160608Z_release_turnmatrix_gemma4_26b/REPORT.md` passes config/template, `BENCH_PROD` cache OFF/ON 7/7, BatchEngine single/chat, disk restore, B=2 concurrent, B=2 per-slot sampler, and TurboQuant-KV B=2 isolation. Cache ON stats show `pagedIncompatible=true` with zero paged counters by design and disk L2 `hits=1`, `stores=14`, `maxBytes=4294967296`; the generic paged prefix-hit row is correctly N-A. | live-proven for text path; broader reasoning/tool/VL partial |
 | Single-batch and continuous batching. | Omni BatchEngine harness now forces `maxBatchSize=2` for B=1 rows so it exercises the scheduler path instead of the solo fast path. Text B=1, text B=2, image B=1, and audio B=1 pass after the no-thinking media-tail fix in `docs/local/live-model-matrix/20260516Tomni-nonmtp/Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_batch_nothink_tail_fix.out`. Ling and MiniMax Small have coordinated `BENCH_PROD` rows with same-prompt TTFT checks. Full per-family B>1 batching remains incomplete. | live-proven for Omni JANGTQ4; package-wide partial |
 | TurboQuant/JANGTQ encode/decode and acceleration toggles. | Focused JANGTQ/Hadamard/matmul proof exists; live low-footprint active routed expert pass for all relevant models remains open. | open |
 | Distributed mode. | Targets exist (`MLXDistributed*`, `TPRankWorker`), but no no-peer distributed clean artifact is recorded for this audit. | open |

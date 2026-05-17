@@ -461,6 +461,38 @@ Harness fix from this row:
   monopolize the actor executor, so the release gate now drains streams while
   observing both live `activeCount` and the engine's high-water mark.
 
+## Gemma 4 Text Release Matrix - 2026-05-17
+
+Clean release artifact:
+
+```text
+docs/local/live-model-matrix/20260517T160608Z_release_turnmatrix_gemma4_26b/
+```
+
+`Gemma-4-26B-A4B-it-JANG_4M-CRACK` is now green for the current text
+turnmatrix:
+
+- config smoke: PASS, with `modelType=gemma4`, `dispatch=gemma4_text`,
+  30 layers, sliding-window topology, `tokenizerEOSCovered=true`, and
+  `bosInEOS=false`;
+- template smoke: PASS for plain, thinking false/true, `reasoning_effort=max`,
+  tools, large tool context, multi-turn off, and reasoning-history rendering;
+- `BENCH_PROD` cache OFF and cache ON: 7/7 each, coherent visible output,
+  normal stops, no loop/leak, and bundle defaults applied through the engine;
+- footprint stayed stable across cache modes: `peakRSS=13140MiB` cache OFF and
+  `peakRSS=13234MiB` cache ON;
+- cache ON stats showed this Gemma topology is `pagedIncompatible=true`; paged
+  counters correctly stayed zero, while disk L2 recorded `hits=1`, `misses=16`,
+  `stores=14`, and `maxBytes=4294967296`;
+- BatchEngine single, chat, disk restore, B=2 concurrent, B=2 per-slot sampler,
+  and TurboQuant-KV B=2 isolation: PASS;
+- the generic prefix-extension paged cache-hit row is N-A because this model is
+  routed through the disk-backed paged-incompatible cache path.
+
+This clears the current Gemma 4 text multi-turn/cache/batching row. It does not
+yet close separate long-budget harmony reasoning, live tool-call schema, or VL
+rows.
+
 ## Nemotron Omni JANGTQ Release Matrix - 2026-05-17
 
 Clean post-failgate artifact:
