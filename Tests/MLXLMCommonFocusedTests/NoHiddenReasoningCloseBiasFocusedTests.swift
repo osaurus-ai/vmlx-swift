@@ -1,6 +1,8 @@
 // Copyright 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
 
+import Foundation
+import Jinja
 import Testing
 @testable import MLXLLM
 @testable import MLXLMCommon
@@ -591,5 +593,211 @@ struct DirectCapabilityParserAliasFocusedTests {
             index = end
         }
         return chunks
+    }
+}
+
+@Suite("Laguna focused parser, template, and rope contracts")
+struct LagunaFocusedContractsTests {
+    @Test("Laguna parser aliases align with GLM tools and think XML")
+    func lagunaParserAliasesAlign() {
+        for stamp in ["laguna", "laguna_xs", "laguna_s", "laguna_glm_thinking_v5"] {
+            #expect(reasoningStampFromModelType(stamp) == "think_xml")
+            #expect(ReasoningParser.fromCapabilityName(stamp) != nil)
+            #expect(ToolCallFormat.infer(from: stamp) == .glm4)
+            #expect(ToolCallFormat.fromCapabilityName(stamp) == .glm4)
+        }
+    }
+
+    @Test("Laguna minimal template thinking off closes reasoning in prompt")
+    func lagunaTemplateThinkingOffClosesReasoning() throws {
+        let rendered = try renderLaguna([
+            "messages": [
+                ["role": "user", "content": "hi"],
+            ],
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+        ])
+
+        #expect(rendered.contains("<system>\n\nYou are a helpful"))
+        #expect(rendered.contains("<user>\nhi\n</user>\n"))
+        #expect(rendered.hasSuffix("<assistant>\n</think>\n"))
+        #expect(!rendered.contains("<|im_start|>"))
+
+        var parser = ReasoningParser.forPrompt(
+            stampName: "laguna",
+            promptTail: String(rendered.suffix(128)))!
+        let (reasoning, content) = collectParser(&parser, "Visible answer.")
+        #expect(reasoning.isEmpty)
+        #expect(content == "Visible answer.")
+    }
+
+    @Test("Laguna minimal template thinking on opens reasoning in prompt")
+    func lagunaTemplateThinkingOnOpensReasoning() throws {
+        let rendered = try renderLaguna([
+            "messages": [
+                ["role": "user", "content": "hi"],
+            ],
+            "add_generation_prompt": true,
+            "enable_thinking": true,
+        ])
+
+        #expect(rendered.hasSuffix("<assistant>\n<think>\n"))
+
+        var parser = ReasoningParser.forPrompt(
+            stampName: "laguna",
+            promptTail: String(rendered.suffix(128)))!
+        let (reasoning, content) = collectParser(
+            &parser,
+            "private plan</think>Visible answer.")
+        #expect(reasoning == "private plan")
+        #expect(content == "Visible answer.")
+        #expect(!content.contains("</think>"))
+    }
+
+    @Test("Laguna assistant history preserves reasoning and content")
+    func lagunaAssistantHistoryPreservesReasoningAndContent() throws {
+        let rendered = try renderLaguna([
+            "messages": [
+                ["role": "user", "content": "hi"],
+                [
+                    "role": "assistant",
+                    "reasoning_content": "brief internal note",
+                    "content": "Hello!",
+                ],
+                ["role": "user", "content": "again"],
+            ],
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+        ])
+
+        #expect(rendered.contains("<think>\nbrief internal note\n</think>\nHello!\n</assistant>\n"))
+        #expect(rendered.contains("<user>\nagain\n</user>\n"))
+        #expect(rendered.hasSuffix("<assistant>\n</think>\n"))
+    }
+
+    @Test("Laguna mixed rope_parameters decodes dict entries only")
+    func lagunaMixedRopeParametersDecode() throws {
+        let cfg = try JSONDecoder().decode(
+            LagunaConfiguration.self,
+            from: #"""
+            {
+              "model_type": "laguna",
+              "hidden_size": 64,
+              "intermediate_size": 128,
+              "num_hidden_layers": 2,
+              "num_attention_heads": 4,
+              "num_key_value_heads": 2,
+              "head_dim": 16,
+              "max_position_embeddings": 4096,
+              "vocab_size": 1024,
+              "rms_norm_eps": 1.0e-5,
+              "tie_word_embeddings": true,
+              "layer_types": ["sliding_attention", "full_attention"],
+              "moe_intermediate_size": 64,
+              "num_experts_per_tok": 2,
+              "num_local_experts": 4,
+              "num_shared_experts": 1,
+              "use_qk_norm": true,
+              "rope_parameters": {
+                "full_attention": {
+                  "rope_theta": 500000.0,
+                  "rope_type": "default"
+                },
+                "sliding_attention": {
+                  "rope_theta": 500000.0,
+                  "rope_type": "default"
+                },
+                "original_max_position_embeddings": 4096
+              }
+            }
+            """#.data(using: .utf8)!)
+
+        #expect(cfg.ropeParameters.keys.contains("full_attention"))
+        #expect(cfg.ropeParameters.keys.contains("sliding_attention"))
+        #expect(!cfg.ropeParameters.keys.contains("original_max_position_embeddings"))
+    }
+
+    private func renderLaguna(_ context: [String: Any]) throws -> String {
+        let template = try Template(ChatTemplateFallbacks.lagunaMinimal)
+        var values: [String: Value] = [:]
+        for (key, value) in context {
+            values[key] = try Value(any: value)
+        }
+        return try template.render(values)
+    }
+
+    private func collectParser(
+        _ parser: inout ReasoningParser,
+        _ text: String
+    ) -> (reasoning: String, content: String) {
+        var segments = parser.feed(text)
+        segments.append(contentsOf: parser.flush())
+        var reasoning = ""
+        var content = ""
+        for segment in segments {
+            switch segment {
+            case .reasoning(let text):
+                reasoning += text
+            case .content(let text):
+                content += text
+            }
+        }
+        return (reasoning, content)
+    }
+}
+
+@Suite("Mistral and Ministral focused parser boundaries")
+struct MistralMinistralFocusedContractsTests {
+    @Test("Mistral3 and Ministral3 stay no-reasoning")
+    func mistral3AndMinistral3StayNoReasoning() {
+        for modelType in ["mistral3", "mistral3_text", "Mistral3", "ministral3"] {
+            #expect(reasoningStampFromModelType(modelType) == "none")
+            #expect(ReasoningParser.fromCapabilityName(
+                reasoningStampFromModelType(modelType)) == nil)
+        }
+    }
+
+    @Test("Mistral3 and Ministral3 route to Mistral tool parser")
+    func mistral3AndMinistral3ToolParser() {
+        for modelType in ["mistral3", "mistral3_text", "ministral3"] {
+            #expect(ToolCallFormat.infer(from: modelType) == .mistral)
+        }
+    }
+
+    @Test("None reasoning stamp leaves literal think tags visible")
+    func noneReasoningStampDoesNotHideLiteralThinkTags() {
+        let parser = ReasoningParser.fromCapabilityName("none")
+        #expect(parser == nil)
+
+        let visible = "<think>literal model text</think>Visible."
+        #expect(visible.contains("<think>"))
+        #expect(visible.contains("</think>"))
+    }
+}
+
+@Suite("Gemma4 VLM focused source contracts")
+struct Gemma4VLMFocusedSourceContractsTests {
+    @Test("Gemma4 prepare rejects unsupported audio explicitly")
+    func audioGuardIsPresent() throws {
+        let source = try gemma4VLMSource()
+
+        #expect(source.contains("if input.audio != nil {"))
+        #expect(source.contains("throw VLMError.processing("))
+        #expect(source.contains("LMInput.audio must be nil"))
+        #expect(source.contains("audio_tower.*") || source.contains("audio_tower.\\*"))
+    }
+
+    @Test("Gemma4 processor resolves image token without encode special-token drift")
+    func imageTokenIdUsesConvertTokenToId() throws {
+        let source = try gemma4VLMSource()
+
+        #expect(source.contains("tokenizer.convertTokenToId(\"<|image|>\")"))
+        #expect(!source.contains("tokenizer.encode(text: \"<|image|>\").last"))
+        #expect(source.contains("?? 258880"))
+    }
+
+    private func gemma4VLMSource() throws -> String {
+        let url = URL(fileURLWithPath: "Libraries/MLXVLM/Models/Gemma4.swift")
+        return try String(contentsOf: url, encoding: .utf8)
     }
 }

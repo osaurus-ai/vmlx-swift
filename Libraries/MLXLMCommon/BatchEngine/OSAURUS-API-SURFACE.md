@@ -41,7 +41,7 @@ on 2026-04-19. Every row is a live import in one of those branches.
 | `public enum TokenizerSource: Sendable, Equatable { .id(String, revision:), .directory(URL) }` | |
 | `public struct ResolvedModelConfiguration: Sendable` | Same fields, all URLs resolved. Factories return this inside `ModelContext`. |
 | `public enum ToolCallFormat: String, Sendable, CaseIterable` | `.json`, `.lfm2`, `.xmlFunction`, `.glm4`, `.gemma`, `.gemma4`, `.kimiK2`, `.minimaxM2`, `.mistral`, `.llama3`, `.dsml`, `.zayaXml`, `.hunyuan`. |
-| `public static func ToolCallFormat.infer(from: String, configData: Data? = nil) -> ToolCallFormat?` | Model-type heuristic with Llama-3 secondary-signal (`vocab_size >= 128000` or `rope_scaling.rope_type == "llama3"`). |
+| `public static func ToolCallFormat.infer(from: String, configData: Data? = nil) -> ToolCallFormat?` | Model-type heuristic with Llama-3 secondary-signal (`vocab_size >= 128000` or `rope_scaling.rope_type == "llama3"`). Also covers Mistral3/Ministral3/Mistral4/Pixtral family aliases, Laguna GLM-style tools, Hy3 Hunyuan tools, ZAYA XML tools, and explicit DeepSeek V4 DSML. |
 | `public static func ToolCallFormat.fromCapabilityName(_: String?) -> ToolCallFormat?` | JANG-stamp → canonical enum. Accepts `qwen` / `qwen3_6` / `minimax` / `glm47` / `glm5*` / `deepseek_v3` / `deepseek_v4*` / `nemotron` / `gemma4` / `mistral` / `mistral4*` / `pixtral*` / `lfm2` / `kimi_k2` / `dsml` / `zaya_xml` / `hunyuan` / `hy3` plus every direct rawValue. DeepSeek V4 aliases route to DSML before the generic DeepSeek/GLM parser. Returns nil for unknown. |
 | `public func ToolCallFormat.createParser() -> any ToolCallParser` | Factory used by `ToolCallProcessor.init`. |
 
@@ -75,7 +75,7 @@ on 2026-04-19. Every row is a live import in one of those branches.
 | `parser.feed(_: String) -> [ReasoningSegment]` | Per-chunk streaming. |
 | `parser.flush() -> [ReasoningSegment]` | End of stream. |
 | `public enum ReasoningSegment: Sendable, Equatable { .content(String), .reasoning(String) }` | Osaurus routes `.content` → visible answer, `.reasoning` → think pane. |
-| `static ReasoningParser.fromCapabilityName(_: String?) -> ReasoningParser?` | JANG-stamp → parser (or nil for `"none"`/`"mistral"`/`"gemma"`). Accepts canonical stamps plus suffixed direct capability aliases: `gemma4*` / `gpt_oss*` → Harmony, `glm4_moe*` / `glm5*` / `deepseek*` / `laguna*` → think XML, and explicit `mistral4*` → `[THINK]...[/THINK]`. |
+| `static ReasoningParser.fromCapabilityName(_: String?) -> ReasoningParser?` | JANG-stamp → parser (or nil for `"none"`/`"mistral"`/`"gemma"`). Accepts canonical stamps plus suffixed direct capability aliases: `gemma4*` / `gpt_oss*` → Harmony, `glm4_moe*` / `glm5*` / `deepseek*` / `laguna*` → think XML, and explicit `mistral4*` → `[THINK]...[/THINK]`. Mistral3/Ministral3 model-type fallback stays `"none"` unless a bundle explicitly stamps a reasoning parser. |
 | `static ReasoningParser.split(_: String, startTag:, endTag:) -> (reasoning: String, content: String)` | Whole-string convenience for non-streaming reveal. |
 
 ## 6. JANG capability stamps

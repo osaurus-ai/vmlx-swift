@@ -573,6 +573,13 @@ Laguna is now green for the current text turnmatrix:
   uses disk-backed restore;
 - B=2 concurrent, per-slot sampler, and TurboQuant-KV B=2: PASS with
   `activeCountHighWatermarkForDiagnostics >= 2`.
+- active focused Laguna contracts now run in
+  `NoHiddenReasoningCloseBiasFocusedTests`: parser aliases route to
+  think-XML reasoning plus GLM tools, thinking-off prompt tails start visible
+  content instead of hidden reasoning, thinking-on prompt tails route only
+  pre-`</think>` bytes into reasoning, assistant-history reasoning/content is
+  preserved, and mixed-shape `rope_parameters` drops only top-level scalar
+  entries.
 
 Harness fix from this row:
 
@@ -752,6 +759,7 @@ Additional Harmony parser follow-up:
 ```text
 docs/local/live-model-matrix/20260517T_harmony_parser_fix_current/
 docs/local/production-readiness/20260517T_parser_cache_nonexcluded_current/
+docs/local/production-readiness/20260517T_laguna_mistral_gemma4_active_contracts/
 ```
 
 - The shared Harmony reasoning parser now covers both Gemma 4
@@ -777,8 +785,14 @@ docs/local/production-readiness/20260517T_parser_cache_nonexcluded_current/
 - 2026-05-17 current-checkout parser/cache recheck fixed one real parser-order
   bug: `ToolCallFormat.fromCapabilityName("deepseek_v4" | "deepseek_v4_flash" |
   "deepseekv4")` now resolves to DSML before the generic DeepSeek/GLM prefix,
-  while `deepseek` and `deepseek_v3` remain GLM-style. The aggregate active
-  focused target passes 142 tests in 20 suites in
+  while `deepseek` and `deepseek_v3` remain GLM-style.
+- The same current-checkout recheck activated old inactive Mistral/Laguna/Gemma4
+  contracts: `mistral3`/`mistral3_text`/`ministral3` remain no-reasoning and
+  use the Mistral tool parser, Laguna template/RoPE contracts are active, and
+  Gemma4 VLM source guards reject unsupported `LMInput.audio` explicitly while
+  resolving `<|image|>` through `convertTokenToId` instead of `encode().last`.
+  These are parser/source contracts, not a live Gemma4 VL production row.
+- The aggregate active focused target passes 152 tests in 23 suites in
   `MLXLMCommonFocusedTests_all.log`.
 - A post-fix live Gemma 4 `BENCH_HARMONY_CHECK` row passes: marker strings are
   absent from `.chunk`, the output is coherent visible README guidance, and
