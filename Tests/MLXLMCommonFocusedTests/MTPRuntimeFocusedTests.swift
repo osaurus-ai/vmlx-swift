@@ -341,6 +341,20 @@ struct MTPRuntimeFocusedTests {
         #expect(!source.contains("trimPromptCache(mtpCache"))
     }
 
+    @Test("native MTP verifier mode telemetry is explicit")
+    func nativeMTPVerifierModeTelemetryIsExplicit() throws {
+        let source = try Self.source(
+            "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift")
+
+        #expect(source.contains("VMLX_NATIVE_MTP_HYBRID_VERIFY"))
+        #expect(source.contains("verifierMode=%@"))
+        #expect(source.contains("targetForwards=%d"))
+        #expect(source.contains("verifyInputTokens=%d"))
+        #expect(source.contains("repairForwards=%d"))
+        #expect(source.contains("chunk_commit"))
+        #expect(source.contains("sequential_repair"))
+    }
+
     @Test("BatchEngine.generate rejects native MTP without an active MTP head")
     func batchEngineGenerateRejectsNativeMTPWithoutActiveHead() async throws {
         try await FocusedMLXTestSupport.withLock {

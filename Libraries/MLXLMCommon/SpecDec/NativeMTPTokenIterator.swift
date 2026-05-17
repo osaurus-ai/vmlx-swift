@@ -76,6 +76,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var prefixCommitCount = 0
     private(set) var rollbackRepairCount = 0
     private(set) var mtpCacheRefreshCount = 0
+    private(set) var chunkVerifierCount = 0
+    private(set) var sequentialVerifierCount = 0
+    private(set) var targetForwardCount = 0
+    private(set) var verifyInputTokenCount = 0
+    private(set) var repairForwardCount = 0
     private(set) var targetVerifyTime: TimeInterval = 0
     private(set) var mtpDraftTime: TimeInterval = 0
     private(set) var samplingTime: TimeInterval = 0
@@ -387,9 +392,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let avgAcceptP = acceptanceProbabilityCount > 0
             ? acceptanceProbabilitySum / Double(acceptanceProbabilityCount)
             : 0
+        let verifierMode: String
+        if chunkVerifierCount > 0 && sequentialVerifierCount > 0 {
+            verifierMode = "mixed"
+        } else if chunkVerifierCount > 0 {
+            verifierMode = "chunk_commit"
+        } else {
+            verifierMode = "sequential_repair"
+        }
         let line = String(
             format:
-                "[NativeMTP] depth=%d verifyCalls=%d outputTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f targetVerifySec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f samplingMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",
+                "[NativeMTP] depth=%d verifyCalls=%d outputTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f targetVerifySec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",
             depth,
             verifyCalls,
             generatedTokenIds.count,
@@ -400,13 +413,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             prefixCommitCount,
             rollbackRepairCount,
             mtpCacheRefreshCount,
+            targetForwardCount,
+            verifyInputTokenCount,
+            repairForwardCount,
             avgCommitted,
             avgAcceptP,
             targetVerifyTime,
             mtpDraftTime,
             samplingTime,
             cacheCommitTime,
-            speculativeSampler.isGreedy ? "greedy" : "exact-pq")
+            speculativeSampler.isGreedy ? "greedy" : "exact-pq",
+            verifierMode)
         FileHandle.standardError.write(Data(line.utf8))
     }
 
@@ -477,6 +494,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let verifier = model.nativeBackboneMTPVerifyForward(input, cache: cache)
         MLX.eval(verifier.logits, verifier.hiddenStates)
         targetVerifyTime += Date.timeIntervalSinceReferenceDate - verifyStart
+        targetForwardCount += 1
+        verifyInputTokenCount += requested.count
+        chunkVerifierCount += 1
 
         let sampleStart = Date.timeIntervalSinceReferenceDate
         let verifyDecision = Self.verifyDrafts(
@@ -522,6 +542,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             ).reshaped(1, accepted + 1)
             let repaired = model.nativeBackboneForward(acceptedInput, cache: cache)
             MLX.eval(repaired.logits, repaired.hiddenStates)
+            repairForwardCount += 1
 
             var repairedProcessor = processor
             nextVerifiedToken = Self.sampleLast(
@@ -589,6 +610,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 ).reshaped(1, accepted + 1)
                 let repaired = model.nativeBackboneForward(acceptedInput, cache: cache)
                 MLX.eval(repaired.logits, repaired.hiddenStates)
+                repairForwardCount += 1
                 hiddenForNextMTP =
                     repaired.hiddenStates[0..., accepted ..< (accepted + 1), 0...]
             }
@@ -627,12 +649,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         targetTokenIds.reserveCapacity(drafts.count + 1)
 
         verifyCalls += 1
+        sequentialVerifierCount += 1
 
         for index in 0 ... drafts.count {
             let verifyStart = Date.timeIntervalSinceReferenceDate
             let verifier = model.nativeBackboneForward(Self.tokenInput(currentInput), cache: cache)
             MLX.eval(verifier.logits, verifier.hiddenStates)
             targetVerifyTime += Date.timeIntervalSinceReferenceDate - verifyStart
+            targetForwardCount += 1
+            verifyInputTokenCount += 1
 
             hiddenForNextMTP = Self.lastHidden(verifier.hiddenStates)
 
@@ -920,6 +945,16 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static func requiresSequentialVerifierRepair(_ cache: [KVCache]) -> Bool {
         if ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_FORCE_SEQUENTIAL_REPAIR"] == "1" {
             return true
+        }
+        switch ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_HYBRID_VERIFY"]?
+            .lowercased()
+        {
+        case "chunk", "chunk_commit", "capture_commit", "fast":
+            return false
+        case "sequential", "sequential_repair", "repair":
+            return true
+        default:
+            break
         }
         return cache.contains { $0 is MambaCache }
     }
