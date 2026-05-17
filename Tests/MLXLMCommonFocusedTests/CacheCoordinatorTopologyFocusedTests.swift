@@ -282,6 +282,93 @@ struct CacheCoordinatorTopologyFocusedTests {
         }
     }
 
+    @Test("dynamic reasoning scope isolates every coordinator hash tier")
+    func dynamicReasoningScopeIsolatesCoordinatorHashTiers() {
+        let tokens = [101, 102, 103, 104]
+        let reasoningOff = "bundle-a|kv=fp16|reasoning=off"
+        let reasoningOn = "bundle-a|kv=fp16|reasoning=on"
+
+        #expect(
+            DiskCache.hashTokens(tokens, modelKey: reasoningOff)
+            != DiskCache.hashTokens(tokens, modelKey: reasoningOn))
+        #expect(
+            CacheBlock.computeBlockHash(
+                parentHash: nil,
+                tokenIds: tokens,
+                modelKey: reasoningOff)
+            != CacheBlock.computeBlockHash(
+                parentHash: nil,
+                tokenIds: tokens,
+                modelKey: reasoningOn))
+        #expect(
+            SSMStateCache.makeKey(
+                tokens: tokens,
+                boundary: tokens.count,
+                modelKey: reasoningOff)
+            != SSMStateCache.makeKey(
+                tokens: tokens,
+                boundary: tokens.count,
+                modelKey: reasoningOn))
+    }
+
+    @Test("cache scope salt includes only semantic reasoning keys")
+    func cacheScopeSaltIncludesOnlySemanticReasoningKeys() {
+        #expect(cacheScopeSalt(from: ["reasoning_effort": "high"]) == "effort=high")
+        #expect(cacheScopeSalt(from: ["reasoning_effort": " No_Think "]) == "effort=no_think")
+        #expect(cacheScopeSalt(from: [
+            "enable_thinking": true,
+            "reasoning_effort": "low",
+        ]) == "reasoning=on|effort=low")
+        #expect(cacheScopeSalt(from: [
+            "enable_thinking": false,
+            "reasoning_effort": "max",
+        ]) == "reasoning=off|effort=max")
+        #expect(cacheScopeSalt(from: [
+            "ui_panel": "visible",
+            "temperature_source": "default",
+        ]) == nil)
+    }
+
+    @Test("cache policy salt always scopes text-only requests")
+    func cachePolicySaltAlwaysScopesTextOnlyRequests() {
+        let tokenArray = MLXArray([Int32(701), Int32(702), Int32(703)])
+            .expandedDimensions(axis: 0)
+        let text = LMInput.Text(tokens: tokenArray)
+        let input = LMInput(text: text)
+
+        #expect(computeCacheSalt(for: input) == nil)
+        #expect(computeCacheSalt(for: input, parameters: GenerateParameters()) != nil)
+        #expect(
+            computeCacheSalt(for: input, parameters: GenerateParameters())
+            != computeCacheSalt(
+                for: LMInput(text: text, cacheScopeSalt: "reasoning=on"),
+                parameters: GenerateParameters()))
+    }
+
+    @Test("KV policy changes dynamic cache salt")
+    func kvPolicyChangesDynamicCacheSalt() {
+        let tokenArray = MLXArray([Int32(801), Int32(802), Int32(803)])
+            .expandedDimensions(axis: 0)
+        let input = LMInput(text: LMInput.Text(tokens: tokenArray))
+
+        let plain = GenerateParameters()
+        let affine = GenerateParameters(kvBits: 4, kvGroupSize: 64)
+        let turboQuant = GenerateParameters(
+            kvMode: .turboQuant(keyBits: 3, valueBits: 3))
+        let rotating = GenerateParameters(maxKVSize: 4096)
+
+        let plainSalt = computeCacheSalt(for: input, parameters: plain)
+        let affineSalt = computeCacheSalt(for: input, parameters: affine)
+        let turboSalt = computeCacheSalt(for: input, parameters: turboQuant)
+        let rotatingSalt = computeCacheSalt(for: input, parameters: rotating)
+
+        #expect(plainSalt != nil)
+        #expect(plainSalt != affineSalt)
+        #expect(plainSalt != turboSalt)
+        #expect(plainSalt != rotatingSalt)
+        #expect(affineSalt != turboSalt)
+    }
+
     private func makeCoordinator(
         usePagedCache: Bool,
         enableDiskCache: Bool,

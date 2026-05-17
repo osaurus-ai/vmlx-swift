@@ -51,6 +51,7 @@ docs/local/production-readiness/20260517T1315_harmony_prompt_tail_parser/
 docs/local/production-readiness/20260517T1320_no_hidden_reasoning_regression/
 docs/local/production-readiness/20260517T1325_gemma4_swa_compile_policy/
 docs/local/production-readiness/20260517T1335_server_settings_validation/
+docs/local/production-readiness/20260517T1348_cache_policy_salt_active/
 ```
 
 That inventory contains 28 non-excluded local bundles:
@@ -204,6 +205,12 @@ docs/local/production-readiness/20260517T174743Z_qwen_mtp_chunk_policy_finalize/
   for network host/port/rate-limit/timeout, concurrency batch sizes, and prefix
   cache sizing/TTL, so Osaurus can reject impossible panel settings instead of
   clamping them silently or launching an invalid server.
+- Fresh 13:48 PDT active cache-policy recheck passes
+  `CacheCoordinatorTopologyFocusedTests.log` 24/24. It moves the cache-scope
+  and KV-policy salt checks into the active focused target, proving reasoning
+  scope, reasoning effort, KV codec, and max-KV policy change the coordinator
+  cache key instead of sharing paged/disk/SSM state across incompatible modes.
+  This is focused cache-key proof, not a live multi-turn substitute.
 
 ## Qwen3.5 35B 4-bit Loader Repair - 2026-05-17
 
