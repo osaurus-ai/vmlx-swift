@@ -494,6 +494,20 @@ public final class VLMModelFactory: ModelFactory {
             {
                 configDict["mxtq_seed"] = seed
             }
+            if var textConfig = configDict["text_config"] as? [String: Any] {
+                for key in [
+                    "weight_format",
+                    "mxtq_bits",
+                    "mxtq_gate_up_bits",
+                    "mxtq_down_bits",
+                    "mxtq_seed",
+                ] {
+                    if textConfig[key] == nil, let value = configDict[key] {
+                        textConfig[key] = value
+                    }
+                }
+                configDict["text_config"] = textConfig
+            }
             if let merged = try? JSONSerialization.data(withJSONObject: configDict) {
                 mergedConfigData = merged
             }

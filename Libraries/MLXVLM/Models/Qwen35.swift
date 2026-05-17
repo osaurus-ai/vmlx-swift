@@ -419,6 +419,11 @@ public struct Qwen35Configuration: Codable, Sendable {
         public var ropeParameters: [String: StringOrNumber]?
         public var fullAttentionInterval: Int = 4
         public var mtpNumHiddenLayers: Int = 0
+        public var weightFormat: String = ""
+        public var mxtqBits: Int = 2
+        public var mxtqGateUpBits: Int = 2
+        public var mxtqDownBits: Int = 2
+        public var mxtqSeed: Int = 42
 
         // MoE fields
         public var numExperts: Int = 0
@@ -451,6 +456,11 @@ public struct Qwen35Configuration: Codable, Sendable {
             case ropeParameters = "rope_parameters"
             case fullAttentionInterval = "full_attention_interval"
             case mtpNumHiddenLayers = "mtp_num_hidden_layers"
+            case weightFormat = "weight_format"
+            case mxtqBits = "mxtq_bits"
+            case mxtqGateUpBits = "mxtq_gate_up_bits"
+            case mxtqDownBits = "mxtq_down_bits"
+            case mxtqSeed = "mxtq_seed"
             case numExperts = "num_experts"
             case numExpertsPerTok = "num_experts_per_tok"
             case decoderSparseStep = "decoder_sparse_step"
@@ -494,6 +504,17 @@ public struct Qwen35Configuration: Codable, Sendable {
                 try container.decodeIfPresent(Int.self, forKey: .fullAttentionInterval) ?? 4
             self.mtpNumHiddenLayers =
                 try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
+            self.weightFormat =
+                try container.decodeIfPresent(String.self, forKey: .weightFormat) ?? ""
+            if let flatBits = try? container.decodeIfPresent(Int.self, forKey: .mxtqBits) {
+                self.mxtqBits = flatBits
+            }
+            self.mxtqGateUpBits =
+                try container.decodeIfPresent(Int.self, forKey: .mxtqGateUpBits) ?? self.mxtqBits
+            self.mxtqDownBits =
+                try container.decodeIfPresent(Int.self, forKey: .mxtqDownBits) ?? self.mxtqBits
+            self.mxtqSeed =
+                try container.decodeIfPresent(Int.self, forKey: .mxtqSeed) ?? 42
 
             self.numExperts = try container.decodeIfPresent(Int.self, forKey: .numExperts) ?? 0
             self.numExpertsPerTok =
@@ -1054,22 +1075,48 @@ enum Qwen35Language {
         let topK: Int
 
         @ModuleInfo(key: "gate") var gate: Linear
-        @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+        @ModuleInfo(key: "switch_mlp") var switchMLP: Module
 
         @ModuleInfo(key: "shared_expert") var sharedExpert: MLP
         @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
-        init(_ args: Qwen35Configuration.TextConfiguration) {
+        init(_ args: Qwen35Configuration.TextConfiguration, layerIdx: Int = -1) {
             self.normTopkProb = args.normTopkProb
             self.numExperts = args.numExperts
             self.topK = args.numExpertsPerTok
 
             _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
-            _switchMLP.wrappedValue = SwitchGLU(
-                inputDims: args.hiddenSize,
-                hiddenDims: args.moeIntermediateSize,
-                numExperts: args.numExperts
-            )
+            let weightFormat = args.weightFormat.lowercased()
+            let usesTurboQuant =
+                weightFormat == "mxtq"
+                || weightFormat.hasPrefix("jangtq")
+                || weightFormat == "turboquant"
+            if usesTurboQuant {
+                if JANGTQStreamingExperts.isEnabled && layerIdx >= 0 {
+                    _switchMLP.wrappedValue = StreamingTurboQuantSwitchGLU(
+                        inputDims: args.hiddenSize,
+                        hiddenDims: args.moeIntermediateSize,
+                        numExperts: args.numExperts,
+                        gateUpBits: args.mxtqGateUpBits,
+                        downBits: args.mxtqDownBits,
+                        seed: args.mxtqSeed,
+                        layerIdx: layerIdx)
+                } else {
+                    _switchMLP.wrappedValue = TurboQuantSwitchGLU(
+                        inputDims: args.hiddenSize,
+                        hiddenDims: args.moeIntermediateSize,
+                        numExperts: args.numExperts,
+                        gateUpBits: args.mxtqGateUpBits,
+                        downBits: args.mxtqDownBits,
+                        seed: args.mxtqSeed)
+                }
+            } else {
+                _switchMLP.wrappedValue = SwitchGLU(
+                    inputDims: args.hiddenSize,
+                    hiddenDims: args.moeIntermediateSize,
+                    numExperts: args.numExperts
+                )
+            }
 
             _sharedExpert.wrappedValue = MLP(
                 dimensions: args.hiddenSize,
@@ -1090,8 +1137,18 @@ enum Qwen35Language {
                 scores = scores / scores.sum(axis: -1, keepDims: true)
             }
 
-            let y = switchMLP(x, inds)
-            let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+            let combined: MLXArray
+            if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
+                combined = streaming.reduced(x, indices: inds, scores: scores)
+            } else if let turbo = switchMLP as? TurboQuantSwitchGLU {
+                let y = turbo(x, inds)
+                combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+            } else if let affine = switchMLP as? SwitchGLU {
+                let y = affine(x, inds)
+                combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+            } else {
+                fatalError("Unsupported Qwen35 VLM MoE switch_mlp: \(type(of: switchMLP))")
+            }
 
             let sharedY = sharedExpert(x)
             let gatedSharedY = compiledSigmoidGate(sharedExpertGate(x), sharedY)
@@ -1121,7 +1178,7 @@ enum Qwen35Language {
             }
 
             if args.numExperts > 0 {
-                _mlp.wrappedValue = SparseMoeBlock(args)
+                _mlp.wrappedValue = SparseMoeBlock(args, layerIdx: layerIdx)
             } else {
                 _mlp.wrappedValue = MLP(
                     dimensions: args.hiddenSize, hiddenDimensions: args.intermediateSize)

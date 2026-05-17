@@ -157,6 +157,52 @@ Earlier failing diagnostics for this exact root cause are preserved under:
 docs/local/live-model-matrix/20260517T_qwen35_embedding_fix/
 ```
 
+## Qwen3.6 35B JANGTQ VLM Routed-Expert Repair - 2026-05-17
+
+Fresh artifacts:
+
+```text
+docs/local/live-model-matrix/20260517T_qwen35_jangtq_vl_fix/
+docs/local/live-model-matrix/20260517T_qwen35_jangtq_vl_matrix_after_fix/
+docs/local/live-model-matrix/20260517T_qwen35_jangtq_turnmatrix_after_vl_fix/
+```
+
+Root cause:
+
+- `Qwen3.6-35B-A3B-JANGTQ-CRACK` advertised `Qwen3VLProcessor` and vision
+  tensors, but the VLM MoE path bound the text stack as affine `SwitchGLU`.
+  Loader binding then rejected `switch_mlp.*.{tq_packed,tq_norms,tq_bits}` and
+  fell back to the text-only `Qwen35JANGTQModel`, silently dropping the image.
+- The fix is real routed-expert support in the VLM `Qwen35MoE` path:
+  `text_config` receives the resolved JANGTQ metadata, VLM sparse MoE layers use
+  `TurboQuantSwitchGLU` or `StreamingTurboQuantSwitchGLU`, and metadata-aware
+  sanitize stacks per-expert JANGTQ tensors while dropping `tq_bits` sidecar
+  keys that are not module parameters.
+
+Current proof:
+
+- pre-fix `BENCH_VL_BATCH_CHAT=1` loads `Qwen35JANGTQModel` with
+  `LLMUserInputProcessor` and fails image grounding;
+- post-fix `BENCH_VL_BATCH_CHAT=1` loads `Qwen35MoE` with `Qwen3VLProcessor`;
+  compile OFF and ON both ground the red/blue gradient image and answer the
+  follow-up text turn as `Red`;
+- focused `vl` matrix passes `vl_batch_chat` and `vl_media_salt`;
+- media-salt row proves same-image disk-backed restore HIT and different-image
+  MISS with identical token counts, so image cache isolation is not a false
+  positive;
+- broader turn matrix passes config, template, production defaults with cache
+  OFF/ON, BatchEngine single/chat/disk-restore/concurrent/per-slot/TurboQuant
+  rows, VL batch chat, VL chat cache, and media-salt isolation. The generic
+  batch cache-hit row remains `N-A` by topology/harness semantics.
+
+Open boundary:
+
+- `vl_mixed_text_image_video` completed T1 text reasoning-on, T2 repeated text
+  cache, and T3 image with thinking off, then stayed in the T4 high-resolution
+  video prefill/forward path for more than seven minutes on the 1080p fixture.
+  That row was stopped and remains blocked for a focused Qwen3VL video scaling
+  gate. Do not count video as production-clear for this bundle yet.
+
 ## Active Non-Excluded Family Matrix
 
 | Family | Local bundles | Engine surfaces to prove | Current MTP policy |

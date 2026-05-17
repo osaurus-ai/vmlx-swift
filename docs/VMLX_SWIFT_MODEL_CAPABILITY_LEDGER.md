@@ -118,7 +118,7 @@ weights.
 | `dealign.ai/Nemotron-Omni-Nano-MXFP4-CRACK` | 21G | `nemotron_h` | no | file | `PASS` | `TODO` |
 | `dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` | 16G | `qwen3_5` | no | file | `PASS` | `TODO` |
 | `dealign.ai/Qwen3.6-27B-MXFP4-CRACK` | 14G | `qwen3_5` | no | file | `PASS` | `PARTIAL` |
-| `dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK` | 11G | `qwen3_5_moe` | yes | file | `PASS` | `TODO` |
+| `dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK` | 11G | `qwen3_5_moe` | yes | file | `PASS` | `PARTIAL` |
 | `Qwen3.5-35B-A3B-4bit` | 19G | `qwen3_5_moe` | no | file | `PASS` | `TODO` |
 
 ## Engine Function Coverage By Family
@@ -160,9 +160,15 @@ weights.
 - Template/reasoning: template smoke passes; reasoning parser routes Qwen-style
   `<think>` output.
 - Live proof: Qwen3.6 MXFP4 has coherent 3-turn chat and SSM warm second-turn.
-- Current issue: thinking-on emits reasoning but no visible answer within the
-  current budget. Needs either higher-budget closure proof or a launch/request
-  default that keeps normal chat in thinking-off mode.
+  `Qwen3.6-35B-A3B-JANGTQ-CRACK` now loads the VLM path as `Qwen35MoE` with
+  `Qwen3VLProcessor`; image turns ground the red/blue gradient, text-only
+  follow-up works, same-image media-salt restore hits, and different-image
+  media-salt restore misses.
+- Current issues: thinking-on can emit reasoning without visible answer within
+  small budgets on some rows, so higher-budget closure proof is still required.
+  The 35B JANGTQ mixed text/image/video row is also blocked on the high-res
+  Qwen3VL video turn after more than seven minutes in prefill/forward; image VL
+  is green, video is not production-clear for that bundle.
 
 ### MiniMax M2.7
 
