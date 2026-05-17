@@ -756,9 +756,18 @@ struct DirectCapabilityParserAliasFocusedTests {
 
     @Test("Ling/Bailing model-type fallback routes tools to GLM parser")
     func bailingModelTypeFallbackRoutesToolsToGLMParser() {
-        for modelType in ["bailing_hybrid", "bailing_moe", "bailing_moe_v2_5"] {
+        for modelType in ["bailing_hybrid", "bailing_moe", "bailing_moe_v2_5", "ling", "ling_bailing"] {
+            #expect(reasoningStampFromModelType(modelType) == "think_xml")
             #expect(ToolCallFormat.infer(from: modelType) == .glm4)
             #expect(ToolCallFormat.infer(from: modelType.uppercased()) == .glm4)
+        }
+    }
+
+    @Test("Ling/Bailing capability aliases resolve to thinking and GLM tools")
+    func bailingCapabilityAliasesResolveToThinkingAndTools() {
+        for stamp in ["bailing", "bailing_hybrid", "bailing_moe_v2_5", "ling", "ling_bailing"] {
+            #expect(ReasoningParser.fromCapabilityName(stamp) != nil)
+            #expect(ToolCallFormat.fromCapabilityName(stamp) == .glm4)
         }
     }
 

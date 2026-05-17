@@ -219,7 +219,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // Ling/Bailing hybrid bundles stamp `tool_parser = "deepseek"` in
         // JANG metadata, but non-JANG/config-only fallbacks still need the
         // same GLM-style arg_key/arg_value parser instead of default JSON.
-        if type.hasPrefix("bailing") {
+        if type.hasPrefix("bailing") || type == "ling" || type.hasPrefix("ling_") {
             return .glm4
         }
 
@@ -384,6 +384,13 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             || normalized.hasPrefix("qwen3_6_vl")
         {
             return .xmlFunction
+        }
+
+        if normalized.hasPrefix("bailing")
+            || normalized == "ling"
+            || normalized.hasPrefix("ling_")
+        {
+            return .glm4
         }
 
         switch n {

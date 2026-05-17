@@ -569,6 +569,13 @@ extension ReasoningParser {
             return ReasoningParser(startInReasoning: true)
         }
 
+        if normalized.hasPrefix("bailing")
+            || normalized == "ling"
+            || normalized.hasPrefix("ling_")
+        {
+            return ReasoningParser(startInReasoning: true)
+        }
+
         switch n {
         case "think_xml", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
             "deepseek_r1", "deepseek-r1", "deepseek", "glm", "glm4", "glm5",
@@ -788,6 +795,8 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
                         // jang_config.capabilities.reasoning_parser is
                         // "deepseek_r1" but stamping via model_type prefix
                         // lets non-JANG bundles also resolve correctly.
+        "ling",         // Product-name aliases for the same Bailing/Ling
+                        // runtime should not bypass the think_xml parser.
         "laguna",       // Poolside Laguna — `laguna_glm_thinking_v5/chat_template.jinja`
                         // emits `<think>...</think>` when enable_thinking=true.
                         // Pre-registered here so that on the day the vmlx

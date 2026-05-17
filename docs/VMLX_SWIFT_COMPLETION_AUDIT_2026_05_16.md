@@ -106,6 +106,12 @@ Current pushed branch state:
   `KVCacheSimple`, leaving all-rotating Gemma4/SWA caches uncompiled outside
   BatchEngine. The green logs pass the Gemma4 suite 6/6 and the broader cache
   topology suite 25/25 after adding real `CompilableRotatingKVCache` promotion.
+- 2026-05-17 Ling/Bailing capability-alias follow-up:
+  `docs/local/production-readiness/20260517T1505_ling_bailing_capability_aliases/`
+  contains a red/green pair for direct `bailing*` and `ling*` capability
+  stamps. The pre-fix red log proved those direct stamps could bypass
+  think-XML reasoning and GLM/deepseek-style tool parsing; the green direct
+  suite passes 10/10 and the broader no-hidden/parser sweep passes 48/48.
 - Latest pushed runtime checkpoint for the Qwen text-SSM/private-MTP cache
   fix: `3146fac` (`fix(mtp): repair qwen ssm reject cache`)
 - The MTP/cache work for task-local load-time native MTP activation, MXFP8

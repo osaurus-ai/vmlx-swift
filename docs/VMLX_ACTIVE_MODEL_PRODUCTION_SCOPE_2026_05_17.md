@@ -56,6 +56,7 @@ docs/local/production-readiness/20260517T1405_parser_fallback_matrix/
 docs/local/production-readiness/20260517T1415_qwen_vl_capability_aliases/
 docs/local/production-readiness/20260517T1435_harmony_fragment_leak/
 docs/local/production-readiness/20260517T1450_gemma4_rotating_compile_direct/
+docs/local/production-readiness/20260517T1505_ling_bailing_capability_aliases/
 ```
 
 That inventory contains 28 non-excluded local bundles:
@@ -248,6 +249,13 @@ docs/local/production-readiness/20260517T174743Z_qwen_mtp_chunk_policy_finalize/
   promotion; the broader cache topology sweep passes 25/25 across Gemma4,
   Ling/Bailing hybrid cache, ZAYA CCA, DSV4 disk-pool restore, media salts, and
   BatchKV rotating masks.
+- Fresh 15:05 PDT Ling/Bailing capability-alias recheck has a red/green pair
+  for direct capability stamps. The red log proved `bailing*` and `ling*`
+  capability names could bypass both the think-XML reasoning parser and the
+  GLM/deepseek arg-key tool parser even though model-type fallback was already
+  covered. The green direct-alias suite passes 10/10 and the broader
+  no-hidden/parser sweep passes 48/48 after routing those direct stamps to the
+  same real Ling/Bailing parser contracts.
 
 ## Qwen3.5 35B 4-bit Loader Repair - 2026-05-17
 
