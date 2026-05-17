@@ -8,9 +8,8 @@ artifact or source reference. Everything else stays `open`.
 Current pushed branch state:
 
 - Branch: `vmlx-0.31.3`
-- Latest pushed runtime checkpoint before the Qwen text-SSM MTP offset fix:
-  `689e9d2`
-  (`fix(mtp): support qwen vl moe sidecars`)
+- Latest pushed runtime checkpoint for the Qwen text-SSM/private-MTP cache
+  fix: `3146fac` (`fix(mtp): repair qwen ssm reject cache`)
 - Prior non-MTP checkpoints in this pass: `50df533`, `0deb14b`,
   `6e435d7`, `7962647`, `9a56de1`, and `ed04161`.
 - Previous MTP runtime checkpoint: `0fdb164`
