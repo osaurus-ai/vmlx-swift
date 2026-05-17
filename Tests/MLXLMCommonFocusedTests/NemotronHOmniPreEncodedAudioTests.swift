@@ -44,6 +44,77 @@ private struct FocusedOmniTokenizer: Tokenizer {
     }
 }
 
+private struct FocusedOmniMediaTokenizer: Tokenizer {
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        var ids: [Int] = addSpecialTokens ? [1] : []
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            let suffix = text[cursor...]
+            if suffix.hasPrefix("<so_start>") {
+                ids.append(28)
+                cursor = text.index(cursor, offsetBy: "<so_start>".count)
+            } else if suffix.hasPrefix("<so_end>") {
+                ids.append(29)
+                cursor = text.index(cursor, offsetBy: "<so_end>".count)
+            } else if suffix.hasPrefix("<so_embedding>") {
+                ids.append(27)
+                cursor = text.index(cursor, offsetBy: "<so_embedding>".count)
+            } else if suffix.hasPrefix("<sound>") {
+                ids.append(contentsOf: [1060, 95_690, 1062])
+                cursor = text.index(cursor, offsetBy: "<sound>".count)
+            } else if suffix.hasPrefix("</sound>") {
+                ids.append(contentsOf: [1885, 95_690, 1062])
+                cursor = text.index(cursor, offsetBy: "</sound>".count)
+            } else if suffix.hasPrefix("<image>") {
+                ids.append(18)
+                cursor = text.index(cursor, offsetBy: "<image>".count)
+            } else {
+                cursor = text.index(after: cursor)
+            }
+        }
+        if addSpecialTokens { ids.append(2) }
+        return ids
+    }
+
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.map(String.init).joined(separator: " ")
+    }
+
+    func convertTokenToId(_ token: String) -> Int? {
+        switch token {
+        case "<image>": 18
+        case "<so_embedding>": 27
+        case "<so_start>": 28
+        case "<so_end>": 29
+        default: nil
+        }
+    }
+
+    func convertIdToToken(_ id: Int) -> String? {
+        switch id {
+        case 18: "<image>"
+        case 27: "<so_embedding>"
+        case 28: "<so_start>"
+        case 29: "<so_end>"
+        default: String(id)
+        }
+    }
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        let text = messages.compactMap { $0["content"].map(String.init(describing:)) }
+            .joined(separator: "\n")
+        return [1] + encode(text: text, addSpecialTokens: false) + [2]
+    }
+}
+
 @Suite("Nemotron H Omni pre-encoded audio")
 struct NemotronHOmniPreEncodedAudioTests {
     @Test("live audio buffer keeps full snapshot while streaming chunks")
@@ -92,6 +163,32 @@ struct NemotronHOmniPreEncodedAudioTests {
             #expect(lmInput.audio?.sampleRate == 16_000)
             #expect(lmInput.audio?.preEncodedEmbedding?.shape == [5, 2_688])
             #expect(lmInput.mediaTokenIds == [18, 27])
+        }
+    }
+
+    @Test("processor uses source-compatible audio wrapper tokens")
+    func processorUsesSourceCompatibleAudioWrapperTokens() async throws {
+        try await FocusedMLXTestSupport.withLock {
+            let processor = NemotronHOmniProcessor(
+                NemotronHOmniProcessorConfiguration(),
+                tokenizer: FocusedOmniMediaTokenizer())
+            let embedding = MLXArray.zeros([5, 2_688])
+            let input = UserInput(
+                prompt: "Briefly describe what you hear.",
+                audios: [
+                    .preEncoded(
+                        samples: [Float](repeating: 0.0, count: 1_600),
+                        sampleRate: 16_000,
+                        embedding: embedding)
+                ])
+
+            let lmInput = try await processor.prepare(input: input)
+            let tokens = lmInput.text.tokens.reshaped(-1).asArray(Int.self)
+
+            #expect(tokens.contains(28))
+            #expect(tokens.contains(29))
+            #expect(tokens.filter { $0 == 27 }.count == 5)
+            #expect(!tokens.contains(95_690))
         }
     }
 

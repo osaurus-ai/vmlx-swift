@@ -292,19 +292,22 @@ weights.
 - Current status: JANGTQ4 core Omni path is live-proven in
   `docs/local/live-model-matrix/20260517T164618Z_omni_live_voice_current_recheck/`,
   `docs/local/live-model-matrix/20260517T164640Z_omni_live_audio_streaming_jangtq4_current/`,
-  and `docs/local/live-model-matrix/20260517T164702Z_omni_integrated_jangtq4_current/`.
-  Focused pre-encoded audio tests pass 8/8; release `BENCH_OMNI=1`
-  `BENCH_OMNI_BATCH=1` passes 18/18 at 48 tokens; raw PCM and pre-encoded
-  Parakeet stream through BatchEngine and TokenIterator with bundle defaults at
-  66.0-75.6 tok/s.
+  `docs/local/live-model-matrix/20260517T164702Z_omni_integrated_jangtq4_current/`,
+  and `docs/local/live-model-matrix/20260517T170614Z_omni_live_voice_fresh_recheck/`.
+  The latest recheck fixed the audio wrapper parity bug: Swift now emits the
+  bundled processor's `<so_start>`/`<so_end>` tokens around `<so_embedding>`
+  slots instead of literal `<sound>` text. Focused pre-encoded audio tests pass
+  9/9; release `BENCH_OMNI=1` `BENCH_OMNI_BATCH=1` passes 18/18 at 48 tokens;
+  raw PCM and pre-encoded Parakeet stream through BatchEngine and TokenIterator
+  with bundle defaults at 65.4-76.6 tok/s in cache-off rows.
   Chunked Parakeet embeddings are not concat-safe, so live voice must retain
   PCM and submit a full-snapshot pre-encode or raw PCM at endpoint.
-- Open: repeated audio with disk cache ON still has an output-quality edge
-  (sampled marker leak/weak rows). Cache OFF repeated rows are clean, and the
-  integrated Omni matrix passes, but cache-on live audio stays PARTIAL until a
-  focused root-cause gate is added. The JANGTQ and MXFP4 sibling bundles have
-  only short streaming smoke rows in the latest artifact, not production
-  coherency proof.
+- Open: cache-off repeated rows no longer leak literal sound markers after the
+  wrapper fix, but some short BatchEngine/pre-encoded rows are still weak.
+  Repeated audio with disk cache ON remains a separate output-quality edge from
+  the earlier gate. Cache-on live audio stays PARTIAL until a focused root-cause
+  gate is added. The JANGTQ and MXFP4 sibling bundles have only short streaming
+  smoke rows in the latest artifact, not production coherency proof.
 
 ### Kimi K2.6
 

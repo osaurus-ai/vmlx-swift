@@ -64,13 +64,30 @@ sampled rows were weak. Keep this as a cache-hit output-quality/root-cause item,
 not a reason to add hidden sampler clamps, forced stop tokens, or post-hoc text
 cleanup.
 
+2026-05-17 10:06 PDT source-wrapper fix under
+`docs/local/live-model-matrix/20260517T170614Z_omni_live_voice_fresh_recheck/`:
+the Swift processor had been wrapping audio slots as literal `<sound>` and
+`</sound>` text. The bundled processor uses `<so_start>` and `<so_end>` around
+the repeated `<so_embedding>` slots. The new focused regression failed before
+the fix with literal sound-marker token `95690` and missing wrapper token IDs
+`28`/`29`, then passed after the processor emitted the source-compatible wrapper.
+The full focused suite now passes 9/9. Cache-off live audio after the fix uses
+bundle defaults, pre-encodes the fixture to `63 x 2688` in 46.7 ms, streams all
+raw/pre-encoded BatchEngine and TokenIterator paths at 65.4-76.1 tok/s, and no
+longer emits literal sound-marker text. A 12-row cache-off repeat stayed marker
+clean. Short BatchEngine/pre-encoded rows can still be weak, so this is a real
+token-wrapper fix but not a claim that every short stochastic audio row is
+quality-complete.
+
 ## Implemented
 
 - `UserInput.Audio.preEncoded(samples:sampleRate:embedding:)` exists for live
   voice handoff when another component has already produced Parakeet/sound
   projection embeddings.
 - `NemotronHOmniProcessor` preserves pre-encoded audio embeddings while still
-  carrying the waveform for media salt and fallback behavior.
+  carrying the waveform for media salt and fallback behavior. Audio placeholders
+  are wrapped with the bundled processor's `<so_start>`/`<so_end>` tokens, not
+  literal `<sound>` text.
 - `NemotronHOmni.prepare(_:)` uses `audio.preEncodedEmbedding` when present and
   otherwise runs the mel + Parakeet + sound projection encoder path.
 - The Python vMLX Omni dispatcher hashes user media bytes/paths into its

@@ -719,9 +719,9 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         }
 
         // Insert media placeholders into the user message before tokenization.
-        // Source convention (Python `model.py`):
+        // Source convention (bundled `processing.py`):
         //   "<img>" + N×"<image>" + "</img>\n"
-        //   "<sound>" + N×"<so_embedding>" + "</sound>\n"
+        //   "<so_start>" + N×"<so_embedding>" + "<so_end>\n"
         var media = ""
         if totalImageTokens > 0 {
             media += "<img>"
@@ -739,9 +739,9 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             media += "</img>\n"
         }
         if totalAudioTokens > 0 {
-            media += "<sound>"
+            media += "<so_start>"
             media += String(repeating: "<so_embedding>", count: totalAudioTokens)
-            media += "</sound>\n"
+            media += "<so_end>\n"
         }
 
         // Build text-only message dictionaries, then inject the expanded

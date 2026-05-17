@@ -388,6 +388,7 @@ docs/local/live-model-matrix/20260517T155603Z_omni_live_voice_current_verify/
 docs/local/live-model-matrix/20260517T164618Z_omni_live_voice_current_recheck/
 docs/local/live-model-matrix/20260517T164640Z_omni_live_audio_streaming_jangtq4_current/
 docs/local/live-model-matrix/20260517T164702Z_omni_integrated_jangtq4_current/
+docs/local/live-model-matrix/20260517T170614Z_omni_live_voice_fresh_recheck/
 ```
 
 Current result on `Nemotron-Omni-Nano-JANGTQ4-CRACK`:
@@ -854,6 +855,44 @@ docs/local/live-model-matrix/20260517T163112Z_omni_live_voice_reverify_current/
   answers were too weak to count as coherency proof. Use JANGTQ4 as the current
   live-voice production candidate; do not promote JANGTQ or MXFP4 live-audio
   rows without longer grounded repeat gates.
+
+Fresh source-wrapper fix and recheck at 2026-05-17 10:06 PDT:
+
+```text
+docs/local/live-model-matrix/20260517T170614Z_omni_live_voice_fresh_recheck/
+```
+
+- Root cause fixed: Swift was emitting audio media placeholders as literal
+  `<sound>` and `</sound>` text around `<so_embedding>` slots. The bundled
+  Nemotron processor uses `<so_start>` and `<so_end>` wrapper tokens. The
+  processor now emits source-compatible wrapper tokens; this is a real
+  tokenization/parity fix, not a sampler guard or text cleanup.
+- `processor_audio_wrapper_red.log`: the focused regression failed before the
+  fix because token `95690` from the literal sound marker was present and
+  wrapper token IDs `28`/`29` were missing.
+- `processor_audio_wrapper_green.log` passes after the fix, and
+  `NemotronHOmniPreEncodedAudioTests_after_audio_wrapper_fix.log` passes the
+  full focused Omni/Parakeet suite at 9/9.
+- `omni_audio_latency_jangtq4_both_paths_cache_off_32_after_audio_wrapper_fix.jsonl`
+  loads JANGTQ4 in 1.91 s, uses bundle defaults from `generation_config.json`,
+  pre-encodes the 5.04 s fixture to `63 x 2688` in 46.7 ms, and streams
+  raw PCM plus pre-encoded audio through BatchEngine and TokenIterator at
+  65.4-76.1 tok/s. No literal sound-marker leak appears.
+- `omni_audio_latency_jangtq4_both_paths_cache_off_32_repeats3_after_audio_wrapper_fix.jsonl`
+  repeats all four path/mode rows three times with cache OFF. No marker leak
+  appears in 12/12 rows. Iterator raw/pre-encoded rows are mostly grounded
+  around note/chime/beep descriptions at 70.6-76.6 tok/s. BatchEngine
+  pre-encoded turns 2 and 3 remain weak, so this is not a full audio-quality
+  promotion for every short stochastic row.
+- `omni_runbench_jangtq4_48_after_audio_wrapper_fix.log` passes the integrated
+  `BENCH_OMNI=1` `BENCH_OMNI_BATCH=1` matrix: 18 passed, 0 failed at
+  `maxTokens=48`. Direct audio grounds the fixture as a sharp electronic tone;
+  mixed image+audio mentions a distinct synthetic/electronic sound. BatchEngine
+  audio B=1 is still structurally passing but semantically weak.
+- `omni_audio_chunk_stability_jangtq4_after_audio_wrapper_fix.jsonl` remains
+  intentionally negative: `chunk_concat_safe_default=false` and 10 unstable
+  comparisons. Retain PCM and pre-encode the full current snapshot, or send raw
+  PCM at endpoint. Do not concatenate independently encoded Parakeet chunks.
 
 ## Required Proof Per Active Bundle
 
