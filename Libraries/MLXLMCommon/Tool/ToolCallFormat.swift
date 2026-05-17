@@ -208,8 +208,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .lfm2
         }
 
-        // GLM4 family (glm4, glm4_moe, glm4_moe_lite, etc.)
-        if type.hasPrefix("glm4") {
+        // GLM/GLM-style families (glm4, glm4_moe, glm5, glm47, etc.).
+        if type.hasPrefix("glm4")
+            || type.hasPrefix("glm5")
+            || type.hasPrefix("glm47")
+        {
             return .glm4
         }
 

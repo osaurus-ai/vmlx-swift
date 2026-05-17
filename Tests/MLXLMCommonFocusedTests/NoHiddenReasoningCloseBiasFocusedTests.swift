@@ -507,6 +507,14 @@ struct DirectCapabilityParserAliasFocusedTests {
         }
     }
 
+    @Test("GLM5 model-type fallback keeps reasoning and tool parser aligned")
+    func glm5ModelTypeFallbackKeepsParsersAligned() {
+        for modelType in ["glm5", "glm5_air", "glm5_1_flash"] {
+            #expect(reasoningStampFromModelType(modelType) == "think_xml")
+            #expect(ToolCallFormat.infer(from: modelType) == .glm4)
+        }
+    }
+
     @Test("explicit Mistral-4 reasoning capability uses bracket THINK parser")
     func explicitMistral4ReasoningCapabilityUsesBracketThinkParser() {
         #expect(reasoningStampFromModelType("mistral4") == "none",

@@ -769,7 +769,10 @@ docs/local/live-model-matrix/20260517T_harmony_parser_fix_current/
   `laguna_glm_thinking_v5` route to think-XML; explicit `mistral4*` reasoning
   capability stamps route `[THINK]...[/THINK]` while the `mistral4` model-type
   fallback remains no-reasoning unless a bundle stamps that parser. Mistral 4
-  and Pixtral tool aliases route to the Mistral tool parser.
+  and Pixtral tool aliases route to the Mistral tool parser. GLM 5 model-type
+  fallback now also infers the GLM tool parser (`glm5`, `glm5_air`,
+  `glm5_1_flash`) so reasoning and tool parsing stay aligned without relying
+  on a JANG capability stamp.
 - A post-fix live Gemma 4 `BENCH_HARMONY_CHECK` row passes: marker strings are
   absent from `.chunk`, the output is coherent visible README guidance, and
   generation stops through the normal path.

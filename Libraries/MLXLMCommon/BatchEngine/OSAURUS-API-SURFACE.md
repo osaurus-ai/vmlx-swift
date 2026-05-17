@@ -40,9 +40,9 @@ on 2026-04-19. Every row is a live import in one of those branches.
 | `public struct ModelConfiguration: Sendable, Equatable` | `id`, `tokenizerSource`, `defaultPrompt`, `extraEOSTokens`, `eosTokenIds`, `toolCallFormat: ToolCallFormat?`, **`reasoningParserName: String?`** (iter 66). |
 | `public enum TokenizerSource: Sendable, Equatable { .id(String, revision:), .directory(URL) }` | |
 | `public struct ResolvedModelConfiguration: Sendable` | Same fields, all URLs resolved. Factories return this inside `ModelContext`. |
-| `public enum ToolCallFormat: String, Sendable, CaseIterable` | `.json`, `.lfm2`, `.xmlFunction`, `.glm4`, `.gemma`, `.gemma4`, `.kimiK2`, `.minimaxM2`, `.mistral`, `.llama3`, `.dsml`, `.zayaXml`. |
+| `public enum ToolCallFormat: String, Sendable, CaseIterable` | `.json`, `.lfm2`, `.xmlFunction`, `.glm4`, `.gemma`, `.gemma4`, `.kimiK2`, `.minimaxM2`, `.mistral`, `.llama3`, `.dsml`, `.zayaXml`, `.hunyuan`. |
 | `public static func ToolCallFormat.infer(from: String, configData: Data? = nil) -> ToolCallFormat?` | Model-type heuristic with Llama-3 secondary-signal (`vocab_size >= 128000` or `rope_scaling.rope_type == "llama3"`). |
-| `public static func ToolCallFormat.fromCapabilityName(_: String?) -> ToolCallFormat?` | JANG-stamp → canonical enum. Accepts `qwen` / `qwen3_6` / `minimax` / `glm47` / `nemotron` / `gemma4` / `mistral` / `lfm2` / `kimi_k2` / `dsml` / `zaya_xml` plus every direct rawValue. Returns nil for unknown. |
+| `public static func ToolCallFormat.fromCapabilityName(_: String?) -> ToolCallFormat?` | JANG-stamp → canonical enum. Accepts `qwen` / `qwen3_6` / `minimax` / `glm47` / `glm5*` / `nemotron` / `gemma4` / `mistral` / `mistral4*` / `pixtral*` / `lfm2` / `kimi_k2` / `dsml` / `zaya_xml` / `hunyuan` / `hy3` plus every direct rawValue. Returns nil for unknown. |
 | `public func ToolCallFormat.createParser() -> any ToolCallParser` | Factory used by `ToolCallProcessor.init`. |
 
 ## 4. Tool-call parsing — **byte-identical with upstream ml-explore/mlx-swift-lm**
@@ -59,7 +59,7 @@ on 2026-04-19. Every row is a live import in one of those branches.
 | `public struct ToolCall: Hashable, Codable, Sendable { let function: Function }` | `StreamAccumulator.drainNewToolCalls()` remaps to osaurus's internal `ToolCall`. |
 | `ToolCall.Function { let name: String; let arguments: [String: JSONValue]; init(name:, arguments: [String: JSONValue]); init(name:, arguments: [String: any Sendable]) }` | Both inits are public. |
 | `public enum JSONValue` (+ `JSONValue.from(_: any Sendable)` converter, `anyValue` readback) | `StreamAccumulator` serializes arguments via `serializeArguments` → JSON string. |
-| All family-specific parsers (`JSONToolCallParser`, `XMLFunctionParser`, `GemmaFunctionParser`, `GLM4ToolCallParser`, `KimiK2ToolCallParser`, `MiniMaxM2ToolCallParser`, `MistralToolCallParser`, `PythonicToolCallParser`, `Llama3ToolCallParser`, `DSMLToolCallParser`) | Constructed via `ToolCallFormat.createParser()`, never touched directly. ZAYA reuses `XMLFunctionParser` with `<zyphra_tool_call>` wrapper tags. |
+| All family-specific parsers (`JSONToolCallParser`, `XMLFunctionParser`, `GemmaFunctionParser`, `GLM4ToolCallParser`, `KimiK2ToolCallParser`, `MiniMaxM2ToolCallParser`, `MistralToolCallParser`, `PythonicToolCallParser`, `Llama3ToolCallParser`, `DSMLToolCallParser`, `HunyuanToolCallParser`) | Constructed via `ToolCallFormat.createParser()`, never touched directly. ZAYA reuses `XMLFunctionParser` with `<zyphra_tool_call>` wrapper tags. |
 
 ### Iter-67 parity fixes
 
