@@ -53,6 +53,7 @@ docs/local/production-readiness/20260517T1325_gemma4_swa_compile_policy/
 docs/local/production-readiness/20260517T1335_server_settings_validation/
 docs/local/production-readiness/20260517T1348_cache_policy_salt_active/
 docs/local/production-readiness/20260517T1405_parser_fallback_matrix/
+docs/local/production-readiness/20260517T1415_qwen_vl_capability_aliases/
 ```
 
 That inventory contains 28 non-excluded local bundles:
@@ -220,6 +221,14 @@ docs/local/production-readiness/20260517T174743Z_qwen_mtp_chunk_policy_finalize/
   XML-function parser. JANG capability stamps still remain the highest-priority
   source when present. The broader no-hidden/parser sweep also passes 44/44 in
   `NoHiddenReasoningCloseBiasFocusedTests_green.log`.
+- Fresh 14:15 PDT Qwen-VL capability-alias recheck has a red/green pair for
+  direct parser capability stamps. The red log proves `qwen3_vl`,
+  `qwen3_5_vl`, and `qwen3_6_vl` capability names could bypass both the
+  reasoning parser and XML tool parser when the bundle exposed the capability
+  name directly instead of relying on model-type fallback. The green log passes
+  9/9 in `DirectCapabilityParserAliasFocusedTests_green.log`, and the broader
+  no-hidden/parser sweep passes 45/45 after routing those direct capability
+  stamps to Qwen thinking and XML-function tools.
 
 ## Qwen3.5 35B 4-bit Loader Repair - 2026-05-17
 

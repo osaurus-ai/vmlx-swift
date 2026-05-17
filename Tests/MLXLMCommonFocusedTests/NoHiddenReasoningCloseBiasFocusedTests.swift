@@ -726,6 +726,14 @@ struct DirectCapabilityParserAliasFocusedTests {
         }
     }
 
+    @Test("Qwen-VL capability aliases resolve to thinking and XML tools")
+    func qwenVLCapabilityAliasesResolve() {
+        for stamp in ["qwen3_vl", "qwen3_5_vl", "qwen3_6_vl"] {
+            #expect(ReasoningParser.fromCapabilityName(stamp) != nil)
+            #expect(ToolCallFormat.fromCapabilityName(stamp) == .xmlFunction)
+        }
+    }
+
     private func collectParser(
         _ parser: inout ReasoningParser?,
         _ text: String

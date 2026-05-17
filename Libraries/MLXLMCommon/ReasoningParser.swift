@@ -548,6 +548,13 @@ extension ReasoningParser {
                 startInReasoning: false)
         }
 
+        if normalized.hasPrefix("qwen3_vl")
+            || normalized.hasPrefix("qwen3_5_vl")
+            || normalized.hasPrefix("qwen3_6_vl")
+        {
+            return ReasoningParser(startInReasoning: true)
+        }
+
         switch n {
         case "think_xml", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
             "deepseek_r1", "deepseek-r1", "deepseek", "glm", "glm4", "glm5",

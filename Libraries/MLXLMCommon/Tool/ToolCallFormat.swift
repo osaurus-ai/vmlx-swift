@@ -379,6 +379,13 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .glm4
         }
 
+        if normalized.hasPrefix("qwen3_vl")
+            || normalized.hasPrefix("qwen3_5_vl")
+            || normalized.hasPrefix("qwen3_6_vl")
+        {
+            return .xmlFunction
+        }
+
         switch n {
         // Qwen 3.5 / 3.6 family — XML-style <tool_call>…</tool_call>
         // (vLLM ecosystem name `qwen3_coder` aliased here).
