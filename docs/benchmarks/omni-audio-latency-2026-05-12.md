@@ -49,6 +49,17 @@ boundary. First-delta timings were 223-234 ms for BatchEngine raw PCM, 188-210
 ms for BatchEngine pre-encoded Parakeet, 201-205 ms for TokenIterator raw PCM,
 and 171-172 ms for TokenIterator pre-encoded Parakeet.
 
+2026-05-17 10:43 PDT post-wrapper-fix spot-check:
+`docs/local/live-model-matrix/20260517T174343Z_omni_parakeet_fresh_verify/omni_audio_latency_jangtq4_both_paths_cache_off_32_fresh.jsonl`
+reloads `Nemotron-Omni-Nano-JANGTQ4-CRACK`, uses bundle sampling defaults, and
+keeps audio wrapper tokens source-compatible (`<so_start>`, `<so_end>`,
+repeated `<so_embedding>` slots). Parakeet pre-encode produced 63 audio tokens
+at hidden size 2,688 in 45.8 ms. The cache-off first-delta/tok-s rows were:
+BatchEngine raw PCM 223.6 ms / 64.5 tok/s, BatchEngine pre-encoded 169.5 ms /
+72.4 tok/s, TokenIterator raw PCM 183.9 ms / 68.9 tok/s, and TokenIterator
+pre-encoded 151.6 ms / 74.8 tok/s. All four visible outputs were grounded in
+the same beep/chime fixture and did not leak literal sound-marker text.
+
 ## Command
 
 ```sh

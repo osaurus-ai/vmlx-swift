@@ -79,6 +79,30 @@ clean. Short BatchEngine/pre-encoded rows can still be weak, so this is a real
 token-wrapper fix but not a claim that every short stochastic audio row is
 quality-complete.
 
+2026-05-17 10:43 PDT fresh post-fix integration proof under
+`docs/local/live-model-matrix/20260517T174343Z_omni_parakeet_fresh_verify/`:
+the current checkout passes the Xcode-backed focused Omni/Parakeet suite 9/9,
+release-builds `OmniAudioLatencyBench` and `RunBench`, and reloads the local
+`Nemotron-Omni-Nano-JANGTQ4-CRACK` bundle. The live audio bench uses bundle
+defaults (`temperature=0.600`, `top_p=0.950`, `top_k=0`, `min_p=0.000`,
+`repetition_penalty=1.000`), pre-encodes Parakeet audio to `63 x 2688` in
+45.8 ms, and streams all four paths:
+
+- BatchEngine raw PCM: first delta 223.6 ms, 64.5 tok/s, grounded chime/beep
+  description.
+- BatchEngine pre-encoded Parakeet: first delta 169.5 ms, 72.4 tok/s.
+- TokenIterator raw PCM: first delta 183.9 ms, 68.9 tok/s.
+- TokenIterator pre-encoded Parakeet: first delta 151.6 ms, 74.8 tok/s.
+
+The same artifact records prompt topology of 93 prompt tokens, 63 audio
+placeholder tokens, media token ids `[18, 27]`, and 9 media tokens after the
+64-token cache boundary. The integrated `BENCH_OMNI=1 BENCH_OMNI_BATCH=1`
+`RunBench` row passes 18/18 at 48 tokens, including BatchEngine audio B=1 and
+hybrid SSM warm-pass parity. This confirms the live voice input path is real
+for cache-off/fresh prompt-boundary use. Cache-on repeated live audio remains a
+separate output-quality/root-cause item; keep it honest, not patched over with
+hidden sampling or text cleanup.
+
 ## Implemented
 
 - `UserInput.Audio.preEncoded(samples:sampleRate:embedding:)` exists for live
