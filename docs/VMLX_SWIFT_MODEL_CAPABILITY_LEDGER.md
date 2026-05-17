@@ -7,6 +7,11 @@ not production-ready unless it has a live multi-turn coherence artifact. Config
 and template checks only prove that the bundle is readable and the prompt path
 renders.
 
+Scope update, 2026-05-17: JANGTQ_K variants are currently de-scoped by user
+direction for the active Osaurus switch-readiness pass. Their rows remain here
+as historical/runtime diagnostics only; they are not active blockers unless the
+K lane is explicitly reopened.
+
 ## Status Key
 
 - `PASS`: exercised live or by a focused gate and met the row contract.
@@ -80,14 +85,14 @@ Focused fix artifacts live under `docs/local/swift-release-gates/dsv4-fixes/`.
 | Model | Family / Swift model | Live result | What worked | What did not pass yet |
 | --- | --- | --- | --- | --- |
 | `JANGQ/DeepSeek-V4-Flash-JANGTQ-K` | `deepseek_v4` / `DeepseekV4JANGTQModel` | `PARTIAL` | Live 3-turn chat with `enable_thinking=false` is coherent: saves `sapphire-42`, recalls it, answers the follow-up; no raw `<think>` leakage; stop reason is `.stop`; tok/s is emitted. DSV4 paged-incompatible cache restores through disk with salted hit and nil-salt miss. Explicit arithmetic prompts now pass for reasoning off/on/max; `reasoning_effort=max` reaches the model instead of being downgraded. | Long-context/vector drift, broader reasoning matrix, greedy/rep behavior on other DSV4 bundles, and full speed matrix still open. |
-| `JANGQ/ZAYA1-8B-JANGTQ_K` | `zaya` / `ZayaModel` | `PASS` | Release turnmatrix passes config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Bundle defaults apply, reasoning ON/OFF flips produce visible answers, disk L2 and SSM hits are recorded, and release decode is about 64-66 tok/s. | Older weak previous-answer diagnostic is superseded by the deterministic phrase/turnmatrix rows; generic paged prefix hit remains `N-A` by topology. |
+| `JANGQ/ZAYA1-8B-JANGTQ_K` | `zaya` / `ZayaModel` | `PASS / DE-SCOPED` | Historical K evidence: release turnmatrix passes config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Bundle defaults apply, reasoning ON/OFF flips produce visible answers, disk L2 and SSM hits are recorded, and release decode is about 64-66 tok/s. | Not an active switch blocker or active proof target in this pass. Generic paged prefix hit remains `N-A` by topology. |
 | `dealign.ai/Qwen3.6-27B-MXFP4-CRACK` | `qwen3_5` / `Qwen35` | `PARTIAL` | Loads in 1.7s; 3-turn chat is coherent; no loop; SSM warm second-turn row recorded; avg prompt around 360 tok/s; decode around 21.7 tok/s. | Thinking-on probe produced 377 chars of reasoning and no visible answer within budget. Footprint rises to about 16.2 GB, expected for MXFP4 but not a low-footprint routed row. |
 | `JANGQ/MiniMax-M2.7-Small-JANGTQ` | `minimax_m2` / `MiniMaxJANGTQModel` | `PARTIAL` | Loads in 9.7s; 3-turn chat is coherent; no loop; TQ disk round-trip passes; decode around 30.6 tok/s; tracked mmap buffers about 37 GB. | Thinking-on probe produced 483 chars reasoning and no visible answer. Activity Monitor-style footprint reaches about 38.2 GB, so this is not a low-RAM active-streaming pass. |
 | `Osaurus/ZAYA1-VL-8B-MXFP4` | `zaya1_vl` / `Zaya1VL` | `PASS` | Release turnmatrix passes config/template, production defaults cache OFF/ON, BatchEngine rows, VL batch chat, structured chat cache, and media-salt isolation. Video is reported `N-A` because ZAYA1-VL processor does not implement video input. | None for implemented image/text/cache surfaces; video remains a family capability gap, not a failed row. |
-| `JANGQ/ZAYA1-VL-8B-JANGTQ_K` | `zaya1_vl` / `Zaya1VL` | `PARTIAL` | Config/template, batch single/chat/disk restore/per-slot/TurboQuant B=2, and media-salt rows pass. Focused decoder test preserves nested `mxtq_bits.routed_expert` widths as gate/up=2 and down=4, and kernel probes match CPU dequant on sampled layer/expert rows. | Real coherence blocker remains: math/top-k evidence ranks the wrong first token before decoding, `prod_defaults` fails `7+8-11`, and structured VL cache exhausts the 192-token budget. |
+| `JANGQ/ZAYA1-VL-8B-JANGTQ_K` | `zaya1_vl` / `Zaya1VL` | `PARTIAL / DE-SCOPED` | Config/template, batch single/chat/disk restore/per-slot/TurboQuant B=2, and media-salt rows pass. Focused decoder test preserves nested `mxtq_bits.routed_expert` widths as gate/up=2 and down=4, and kernel probes match CPU dequant on sampled layer/expert rows. | Historical K diagnostic only for the active pass: math/top-k evidence ranks the wrong first token before decoding, `prod_defaults` fails `7+8-11`, and structured VL cache exhausts the 192-token budget. |
 | `dealign.ai/Ling-2.6-flash-MXFP4-CRACK` | `bailing_hybrid` / `BailingHybridModel` | `PASS` | Current release turnmatrix passes config/template/MTP metadata, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Bundle defaults apply with `rep=nil`; disk L2 and SSM companion hits are recorded. | Generic paged prefix hit is `N-A` by topology because Ling/Bailing uses disk-backed restore. |
-| `JANGQ/Hy3-preview-JANGTQ` | `hy_v3` / `Hy3Model` | `PASS` | Current release turnmatrix passes config/template/MTP metadata, production defaults cache OFF/ON, paged cache hit, disk restore, B=2 concurrent, per-slot sampler, and TurboQuant B=2. Bundle defaults apply as `temp=0.900 topP=1.000 topK=-1 minP=0.000 rep=nil`. | Cold first prompt is slow; JANGTQ_K is tracked separately because it needs active expert streaming. |
-| `JANGQ/Hy3-preview-JANGTQ_K` | `hy_v3` / `Hy3Model` | `PARTIAL` | Eager load was killed, but active expert streaming now passes the short production matrix without a process-global model-dir override after `loadWeights` binds the loaded model directory. It skips 91,008 per-expert tensors, indexes 79 layers x 192 experts, and passes 7/7 at about 6.2 GiB RSS. | Speed remains blocked at about 1.4 tok/s. This is correctness/low-footprint proof only; multi-model active streaming still needs a per-loaded-model store before Osaurus exposes simultaneous JANGTQ_K sessions. |
+| `JANGQ/Hy3-preview-JANGTQ` | `hy_v3` / `Hy3Model` | `PASS` | Current release turnmatrix passes config/template/MTP metadata, production defaults cache OFF/ON, paged cache hit, disk restore, B=2 concurrent, per-slot sampler, and TurboQuant B=2. Bundle defaults apply as `temp=0.900 topP=1.000 topK=-1 minP=0.000 rep=nil`. | Cold first prompt is slow; JANGTQ_K is now historical/de-scoped for this pass. |
+| `JANGQ/Hy3-preview-JANGTQ_K` | `hy_v3` / `Hy3Model` | `PARTIAL / DE-SCOPED` | Eager load was killed, but active expert streaming now passes the short production matrix without a process-global model-dir override after `loadWeights` binds the loaded model directory. It skips 91,008 per-expert tensors, indexes 79 layers x 192 experts, and passes 7/7 at about 6.2 GiB RSS. | Historical K diagnostic only for the active pass. Speed remains blocked at about 1.4 tok/s, and multi-model active streaming still needs a per-loaded-model store before Osaurus exposes simultaneous JANGTQ_K sessions. |
 | `dealign.ai/Gemma-4-26B-A4B-it-JANG_4M-CRACK` | `gemma4` / `Gemma4` | `PARTIAL` | Text release turnmatrix passes config/template, cache OFF/ON `BENCH_PROD` 7/7, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Structured VL chat-cache row now passes: image A cold, same-image replay disk hit `308/308`, different-image miss, and text-only follow-up stays grounded. Live tool-call schema row now passes through `UserInput.tools` with `get_weather({"location":"Tokyo"})`, `toolCalls=1`, and no raw marker leak. Long-budget single-turn Harmony reasoning on/off now passes with 1420 reasoning chars ON and zero reasoning chars OFF. | Multi-turn reasoning matrix remains open; GPT-OSS is parser-contract only because no local GPT-OSS bundle is present. |
 
 Fresh parser/cache contract refresh:
@@ -199,7 +204,8 @@ weights.
 
 ### MiniMax M2.7
 
-- Local bundles: small JANGTQ and CRACK JANGTQ_K.
+- Local bundles: small JANGTQ; CRACK JANGTQ_K is historical/de-scoped for the
+  current active pass.
 - Swift dispatch: `minimax_m2`; JANGTQ bundles route to `MiniMaxJANGTQModel`.
 - Cache topology: standard KV layers, BatchEngine cache coordinator, TQ disk
   serializer, and compiled decode path where cache types allow it.
@@ -213,16 +219,19 @@ weights.
 
 ### ZAYA Text
 
-- Local bundles: JANGTQ4, JANGTQ_K, MXFP4.
+- Local bundles: JANGTQ4, JANGTQ_K, MXFP4. JANGTQ_K is historical/de-scoped
+  for the current active pass.
 - Swift dispatch: `zaya` through `ZayaModel`.
 - Cache topology: ZAYA CCA alternates `ZayaCCACache` with normal KV cache;
   BatchEngine has `BatchZayaCCACache`; disk serializer supports `zayaCCA`.
 - JANGTQ/TurboQuant: sidecar present on JANGQ bundles; release rows prove
-  TurboQuant-KV B=2 isolation for JANGTQ4, JANGTQ_K, and MXFP4.
+  TurboQuant-KV B=2 isolation for active JANGTQ4/MXFP4 rows. JANGTQ_K evidence
+  is historical.
 - Template/reasoning/tools: template smoke passes; tool parser is ZAYA XML;
   reasoning parser is ZAYA/think-XML style.
 - Live proof: `docs/local/live-model-matrix/20260517T_release_turnmatrix_zaya_scope/`
-  passes the text release turnmatrix for JANGTQ4, JANGTQ_K, and MXFP4:
+  passes the active text release turnmatrix for JANGTQ4 and MXFP4; JANGTQ_K
+  rows in that artifact are historical:
   config/template, production defaults cache OFF/ON, BatchEngine single/chat,
   disk restore, B=2 concurrent, B=2 per-slot sampler, and TurboQuant-KV B=2.
   Bundle defaults apply (`temp=0.600`, `topP=1.000`, `topK=0`, `rep=nil`),
@@ -234,7 +243,8 @@ weights.
 
 ### ZAYA VL
 
-- Local bundles: JANGTQ4, JANGTQ_K, MXFP4.
+- Local bundles: JANGTQ4, JANGTQ_K, MXFP4. JANGTQ_K is historical/de-scoped
+  for the current active pass.
 - Swift dispatch: `zaya1_vl` through `Zaya1VL`.
 - Cache topology: text side uses ZAYA CCA state; media path uses media salt and
   VLM processor state; BatchEngine has VL chat/cache matrix harnesses.
@@ -251,7 +261,8 @@ weights.
   production defaults cache OFF/ON, BatchEngine rows, VL batch chat, structured
   cache, and media-salt isolation. Video rows are explicitly `N-A` because this
   processor throws `ZAYA1-VL video input is not implemented`.
-- Current issue: `ZAYA1-VL-8B-JANGTQ_K` remains a real blocker. Its math/top-k
+- Historical K issue: `ZAYA1-VL-8B-JANGTQ_K` remains a real blocker if reopened.
+  Its math/top-k
   evidence ranks the wrong first token before decoding, `prod_defaults` fails
   `7+8-11`, and the structured VL cache row exhausts the 192-token cold-image
   budget. Kernel probes pass on sampled layers, so this is not closed by a
@@ -366,7 +377,8 @@ weights.
 
 ### Hy3
 
-- Local bundles: JANGTQ, JANGTQ_K, full Tencent BF16.
+- Local bundles: JANGTQ, JANGTQ_K, full Tencent BF16. JANGTQ_K is
+  historical/de-scoped for the current active pass.
 - Swift dispatch: `hy_v3` through `Hy3Model`.
 - Cache topology: standard generation cache plus JANGTQ sidecar on JANGQ rows;
   JANGTQ is paged-compatible in the current row, while JANGTQ_K requires active
@@ -382,8 +394,8 @@ weights.
   was killed before load completion, but
   `docs/local/live-model-matrix/20260517T184132Z_hy3_jangtqk_streaming_autodir_after_fix/`
   passes 7/7 through active expert streaming at about 6.2 GiB RSS after
-  `loadWeights` binds the loaded model directory. JANGTQ_K remains speed-blocked
-  at about 1.4 tok/s.
+  `loadWeights` binds the loaded model directory. This K evidence is historical;
+  if reopened, JANGTQ_K remains speed-blocked at about 1.4 tok/s.
 
 ### Laguna XS.2
 
@@ -406,9 +418,11 @@ weights.
 
 ## Immediate Engine Gaps Found
 
-1. `ZAYA1-VL-8B-JANGTQ_K` remains a real production blocker: the release matrix
-   still fails the math production row and structured VL cache row, and top-k
-   evidence shows the wrong first token before decoding policy.
+1. Historical/de-scoped K lane: `ZAYA1-VL-8B-JANGTQ_K` remains a real blocker
+   if reopened because the release matrix still fails the math production row
+   and structured VL cache row, and top-k evidence shows the wrong first token
+   before decoding policy. It is not an active Osaurus switch blocker in the
+   current pass.
 2. ZAYA-VL video remains `N-A` for JANGTQ4/MXFP4 because the processor does not
    implement video input. Text/image/cache surfaces are live-proven for those
    two bundles.

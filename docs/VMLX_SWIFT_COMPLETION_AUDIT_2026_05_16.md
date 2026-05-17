@@ -238,9 +238,13 @@ Current pushed branch state:
   (`feat(runtime): add exact native mtp sampling`)
 - Current worktree is not clean because another agent is working on Flux-native
   Swift files. The dirty Flux files are excluded from this audit's commit scope.
-- Current focus: DSV4 Flash, Nemotron Omni, ZAYA1-VL, cache/template
-  correctness, live coherent multi-turn rows, and explicit-only Qwen3.6 native
-  MTP readiness. Native MTP is not auto-launch eligible yet.
+- 2026-05-17 scope update: Kimi, DSV4 Flash, and JANGTQ_K variants are
+  de-scoped for the active Osaurus switch-readiness pass by user direction.
+  Existing DSV4/K diagnostics remain in this audit for traceability, but they
+  are not active blockers unless the user reopens those lanes.
+- Current focus: Nemotron Omni, non-K ZAYA1-VL, cache/template correctness,
+  live coherent multi-turn rows, and explicit-only Qwen3.6 native MTP
+  readiness. Native MTP is not auto-launch eligible yet.
 
 ## Objective Restated as Deliverables
 
@@ -299,10 +303,10 @@ The package is complete only when all of these are true:
 | Tool parser matrix by family. | DSV4 and selected templates have focused proof. Gemma 4 has focused proof that Harmony reasoning followed by a Gemma 4 tool-call envelope produces one structured tool call and no visible marker leak, plus live schema proof in `docs/local/live-model-matrix/20260517T212204Z_gemma4_batch_toolcall_real_schema/gemma4_batch_toolcall.out` that real `UserInput.tools` produces `get_weather({"location":"Tokyo"})` as a structured `.toolCall` with no marker leak. Hy3 now has focused Hunyuan parser proof for multiple scalar-argument calls and a reasoning-then-tool-call stream with no visible marker leak. GLM/DeepSeek/Laguna capability aliases with suffixes (`glm4_moe_lite`, `glm5_air`, `deepseek_v3`, `laguna_*`) now route through the GLM arg_key/arg_value parser instead of returning nil, and `glm5*` model-type fallback also infers the GLM parser so GLM-5.1-style bundles do not require a JANG stamp. The alias-normalization follow-up also pins `gemma_4`/`gemma-4` to Gemma4 tools, `glm_5_1_flash`/`glm-5.1-flash` to GLM tools, and GPT-OSS aliases (`gpt_oss`, `gpt-oss`, `gptoss`) to GLM-style tools while their reasoning remains Harmony. Fresh red/green proof in `docs/local/production-readiness/20260517T1405_parser_fallback_matrix/` adds Ling/Bailing model-type fallback to the same GLM/deepseek arg-key parser and Qwen3.6/Qwen3-VL model-type fallback to XML-function tools. The follow-up `docs/local/production-readiness/20260517T1415_qwen_vl_capability_aliases/` proves direct Qwen-VL capability stamps now route to XML-function tools instead of bypassing the parser. DSV4 capability aliases now resolve before that generic DeepSeek branch: `deepseek_v4`, `deepseek_v4_flash`, and `deepseekv4` route to DSML, while `deepseek` and `deepseek_v3` remain GLM-style. Mistral3/Ministral3, Mistral 4, and Pixtral model-type/capability aliases now route to the Mistral tool parser (`mistral3`, `ministral3`, `mistral4`, `mistral4_large`, `mistral_small_4`, `pixtral*`). Focused factory-dispatch tests now also prove Mistral3 `mxtq` routes to `Mistral3TextJANGTQModel` while `mxfp4`/missing format stay vanilla. Full dsml/deepseek/jang/zaya/llama/qwen/mistral live matrix remains open, and Kimi is intentionally outside the current active sweep. | partial |
 | Generation config defaults apply. | `docs/local/live-model-matrix/20260516Tguard-removal/Ling-2.6-flash-JANGTQ2-CRACK_prod_bundle_defaults_coord.out` proves the Ling folder has no sampling defaults and resolves through fallback to `temp=0.600 topP=1.000 topK=0 minP=0.000 rep=nil`. `.../MiniMax-M2.7-Small-JANGTQ_prod_bundle_defaults_coord.out` proves MiniMax's `generation_config.json` applies `temp=1.000 topP=0.950 topK=40 rep=nil`. `.../Gemma-4-26B-A4B-it-JANG_4M-CRACK_prod_bundle_defaults_coord.out` proves Gemma 4's folder config applies `temp=1.000 topP=0.950 topK=64 rep=nil`. `docs/local/production-readiness/20260517T165508Z_qwen_mtp_settings_recheck/VMLXServerRuntimeSettingsTests.log` passes 12/12 and pins bundle generation config before server overrides, nil server fields preserving engine/bundle defaults, top-k reaching speculative sampler probabilities, no hidden sampler guards, and invalid sampling values reporting instead of clamping. Package-wide live override matrix remains incomplete. | partial |
 | Ling/Bailing release turnmatrix. | `docs/local/live-model-matrix/20260517T170008Z_release_turnmatrix_ling_jangtq2/REPORT.md` passes all runnable rows for `Ling-2.6-flash-JANGTQ2-CRACK`: config/template, MTP metadata, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. The larger `Ling-2.6-flash-MXFP4-CRACK` row at `docs/local/live-model-matrix/20260517T180538Z_release_turnmatrix_ling_mxfp4_current/REPORT.md` also passes config/template/MTP metadata, production cache OFF/ON 7/7, disk+SSM cache stats, disk restore, B=2 concurrent, per-slot sampler, and TurboQuant B=2 plain-slot isolation. Both resolve bundle/default sampling to `temp=0.600 topP=1.000 topK=0 minP=0.000 rep=nil`; active focused Bailing/Ling directive tests now pass in `NoHiddenReasoningCloseBiasFocusedTests`. Fresh focused cache proof instantiates `BailingHybridModel` and proves linear layers allocate `ArraysCache`, global MLA layers allocate KV/RotatingKV caches, trailing partial layer groups are global, and disk-backed coordinator restore remains required. MXFP4 is slower at about 9.7-10.1 tok/s and carries a high resident footprint, so speed/footprint should be watched separately. | live-proven for JANGTQ2 and MXFP4 text rows |
-| Hy3 JANGTQ/JANGTQ_K release turnmatrix. | `docs/local/live-model-matrix/20260517T180931Z_release_turnmatrix_hy3_jangtq_current/REPORT.md` passes all runnable rows for `Hy3-preview-JANGTQ`: config/template/MTP metadata, production defaults cache OFF/ON 7/7, paged/disk cache stats, disk restore, B=2 concurrent, per-slot sampler, and TurboQuant B=2 isolation. Bundle sampling reaches runtime as `temp=0.900 topP=1.000 topK=-1 minP=0.000 rep=nil`. `Hy3-preview-JANGTQ_K` initially failed/killed under eager load in `docs/local/live-model-matrix/20260517T182455Z_release_turnmatrix_hy3_jangtqk_current/`; the active-streaming probe without a bound model dir failed with `missing active JANGTQ gate/up tensors for layer 1`; explicit model-dir streaming then passed 7/7 at low footprint, and the post-fix no-env proof `docs/local/live-model-matrix/20260517T184132Z_hy3_jangtqk_streaming_autodir_after_fix/` passes 7/7 after `loadWeights` binds the loaded model directory. Active focused Hy3 parser/no-leak tests now pass in `NoHiddenReasoningCloseBiasFocusedTests`; the same focused suite now pins preserved nextn exclusion from base decode cache, normal q/k/v sanitizer fusion while dropping nextn tensors, and mixed-bit q/k/v dequantize-then-fuse fallback instead of process abort. `RuntimeMoETopKOverrideFocusedTests` also pins explicit top-k override as lower-only and cache-key-scoped, not a hidden runtime mutation. | live-proven for JANGTQ; JANGTQ_K correctness/low-footprint partial, speed blocked |
+| Hy3 JANGTQ release turnmatrix. | `docs/local/live-model-matrix/20260517T180931Z_release_turnmatrix_hy3_jangtq_current/REPORT.md` passes all runnable rows for `Hy3-preview-JANGTQ`: config/template/MTP metadata, production defaults cache OFF/ON 7/7, paged/disk cache stats, disk restore, B=2 concurrent, per-slot sampler, and TurboQuant B=2 isolation. Bundle sampling reaches runtime as `temp=0.900 topP=1.000 topK=-1 minP=0.000 rep=nil`. `Hy3-preview-JANGTQ_K` evidence is retained as historical/de-scoped: it was killed under eager load, then active-streaming proof passed 7/7 at low footprint after `loadWeights` bound the loaded model directory, but speed stayed blocked. Active focused Hy3 parser/no-leak tests now pass in `NoHiddenReasoningCloseBiasFocusedTests`; the same focused suite now pins preserved nextn exclusion from base decode cache, normal q/k/v sanitizer fusion while dropping nextn tensors, and mixed-bit q/k/v dequantize-then-fuse fallback instead of process abort. `RuntimeMoETopKOverrideFocusedTests` also pins explicit top-k override as lower-only and cache-key-scoped, not a hidden runtime mutation. | live-proven for JANGTQ; JANGTQ_K de-scoped |
 | Gemma 4 text/VL turnmatrix. | `docs/local/live-model-matrix/20260517T160608Z_release_turnmatrix_gemma4_26b/REPORT.md` passes config/template, `BENCH_PROD` cache OFF/ON 7/7, BatchEngine single/chat, disk restore, B=2 concurrent, B=2 per-slot sampler, and TurboQuant-KV B=2 isolation. Cache ON stats show `pagedIncompatible=true` with zero paged counters by design and disk L2 `hits=1`, `stores=14`, `maxBytes=4294967296`; the generic paged prefix-hit row is correctly N-A. `docs/local/live-model-matrix/20260517T210417Z_gemma4_vl_chat_cache/gemma4_vl_chat_cache.out` passes structured Gemma4 VL chat-cache with grounded image output, same-media disk hit `308/308`, different-media miss, and grounded text-only follow-up. `docs/local/live-model-matrix/20260517T212204Z_gemma4_batch_toolcall_real_schema/gemma4_batch_toolcall.out` passes live Gemma4 tool-call schema with `toolCalls=1`, `get_weather({"location":"Tokyo"})`, normal stop, and no raw marker leak. Fresh Harmony parser artifact `docs/local/live-model-matrix/20260517T_harmony_parser_fix_current/` adds focused Gemma 4 + GPT-OSS channel proof and a live Gemma 4 no-marker-leak smoke. Active focused Gemma4 SWA/cache coverage now passes cache-topology tests, including actual `Gemma4TextModel.newCache` mixed/no-maxKV and all-rotating/maxKVSize allocation, plus 4 BatchKVCache rotating-slot mask tests in `CacheCoordinatorTopologyFocusedTests`. Fresh compile-policy proof `docs/local/production-readiness/20260517T1325_gemma4_swa_compile_policy/Gemma4CacheTopologyFocusedTests.log` passes 5/5 and pins the speed/correctness boundary: default heterogeneous SWA/full-attention cache is not compile-eligible, while explicit bounded all-rotating cache is. Active Gemma4 VLM contracts also pin explicit audio rejection, direct `<|image|>` token lookup, `rmsNormNoScale` parity/dtype preservation, and Gemma3/Gemma4 maskedScatter recoverable errors instead of process aborts. | live-proven for text path, structured image cache, and Gemma4 tool-call; long-budget reasoning partial |
 | Single-batch and continuous batching. | Omni BatchEngine harness now forces `maxBatchSize=2` for B=1 rows so it exercises the scheduler path instead of the solo fast path. Text B=1, text B=2, image B=1, and audio B=1 pass after the no-thinking media-tail fix in `docs/local/live-model-matrix/20260516Tomni-nonmtp/Nemotron-Omni-Nano-JANGTQ4-CRACK_omni_batch_nothink_tail_fix.out`. Qwen3.5 35B post-fix turnmatrix passes BatchEngine single/chat/disk restore/B=2/per-slot/TurboQuant B=2, with mixed plain/TurboQuant decode split by cache compatibility and preserving the plain-slot output exactly. Ling and MiniMax Small have coordinated `BENCH_PROD` rows with same-prompt TTFT checks. Full per-family B>1 batching remains incomplete. | live-proven for Omni JANGTQ4 and Qwen3.5 35B; package-wide partial |
-| TurboQuant/JANGTQ encode/decode and acceleration toggles. | Focused JANGTQ/Hadamard/matmul proof exists. Current live rows now include Ling JANGTQ2/MXFP4 TurboQuant-KV B=2 isolation, Hy3 JANGTQ TurboQuant B=2 isolation, and Hy3 JANGTQ_K active-expert streaming correctness after binding the loaded model directory. JANGTQ_K speed is still blocked at about 1.4 tok/s, and full acceleration toggle coverage remains open. | partial |
+| TurboQuant/JANGTQ encode/decode and acceleration toggles. | Focused JANGTQ/Hadamard/matmul proof exists. Current live rows now include Ling JANGTQ2/MXFP4 TurboQuant-KV B=2 isolation and Hy3 JANGTQ TurboQuant B=2 isolation. Hy3 JANGTQ_K active-expert streaming correctness remains historical evidence only after the K de-scope. Full acceleration toggle coverage remains open. | partial |
 | Distributed mode. | Targets exist (`MLXDistributed*`, `TPRankWorker`), but no no-peer distributed clean artifact is recorded for this audit. | open |
 | Full `swift test`. | Full package test remains open, but the local `Testing`/`XCTest` import blocker was narrowed to the shell toolchain/framework search path, not source. The passing local invocation is `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test ... -Xswiftc -F -Xswiftc /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks`. Focused artifacts: `docs/local/live-model-matrix/20260516Tnonmtp-tests/NemotronHOmniPreEncodedAudioTests_expanded_xcode.out`, the MLXPress policy run from the same invocation, and `docs/local/production-readiness/20260517Tswift-mtp-current/mtp_runtime_focused_postaudit.log`, which passes 22/22 `MTPRuntimeFocusedTests`. Fresh current-checkout focused Omni command `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test --filter NemotronHOmniPreEncodedAudioTests --jobs 2 -Xswiftc -F -Xswiftc /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks` passes 8/8 rows in `docs/local/live-model-matrix/20260517T_omni_current_recheck/NemotronHOmniPreEncodedAudioTests.log`: live audio buffer, pre-encoded Parakeet embedding, video EVS token count, RADIO pixel shuffle, Parakeet relative shift, projector remaps, Parakeet weight transpose, and latency-bench generation-default plumbing. Fresh post-toolcall `MLXLMCommonFocusedTests` command passes 187/187 Swift Testing rows plus the selected XCTest focused rows, including the new Gemma4 tool-schema guard; the older artifact `docs/local/production-readiness/20260517T1300_hy3_mixed_qkv_runtime_contracts/MLXLMCommonFocusedTests_after_hy3_mixed_qkv.log` remains the saved pre-toolcall 168/168 snapshot. Fresh server-settings profile validation passes 15/15 under `docs/local/production-readiness/20260517T1305_mtp_settings_profile_validation/VMLXServerRuntimeSettingsTests_profile_validation.log`; the later server-settings validation run passes 16/16 under `docs/local/production-readiness/20260517T1335_server_settings_validation/VMLXServerRuntimeSettingsTests.log`, and the current direct recheck passes 14/14 for the active suite. Fresh active cache topology passes 24/24 under `docs/local/production-readiness/20260517T1348_cache_policy_salt_active/CacheCoordinatorTopologyFocusedTests.log`, including the cache-policy salt rows that were previously only present in inactive `Tests/MLXLMTests`. `Tests/MLXLMTests/NemotronHOmniSmokeTests.swift` is currently not wired into an active package test target, so the earlier filtered row that ran 0 tests is not counted. | partial |
 | Release build. | `swift build -c release --product RunBench --jobs 2` passed after the non-MTP Omni tail fix; artifact: `docs/local/live-model-matrix/20260516Tnonmtp-tests/RunBench_release_build.out`. Fresh current-checkout release build also passed before the Hy3 JANGTQ_K post-fix proof, using `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift build -c release --product RunBench`. | live-proven |
@@ -315,7 +319,8 @@ Local raw matrix: `docs/local/live-model-matrix/20260515Tinfer-under20/`.
 Notable pass rows:
 
 - Laguna XS.2 JANGTQ config/template/prod defaults.
-- ZAYA text JANGTQ4, JANGTQ_K, and MXFP4 config/template/prod defaults.
+- ZAYA text JANGTQ4 and MXFP4 config/template/prod defaults. JANGTQ_K evidence
+  in this snapshot is historical/de-scoped after the 2026-05-17 scope update.
 - ZAYA-VL config/template and VL batch chat rows.
 - Qwen3.5 35B A3B config/template/prod defaults/VL batch chat.
 - Gemma4 JANG_4M config/template/prod defaults.
@@ -358,12 +363,14 @@ Known failing rows from that snapshot:
   `.../ZAYA1-VL-8B-JANGTQ4_vl_chat_cache.out`.
 - `ZAYA1-VL-8B-MXFP4` now passes `BENCH_PROD=1` at
   `docs/local/live-model-matrix/20260516Tzaya-vl-think-template-fix/ZAYA1-VL-8B-MXFP4_prod.out`.
-- `ZAYA1-VL-8B-JANGTQ_K` remains blocked: bundle-default sampling and explicit
+- Historical K lane: `ZAYA1-VL-8B-JANGTQ_K` remains blocked if reopened.
+  Bundle-default sampling and explicit
   greedy both fail the same `7+8-11` row (`7`/`8` stochastic, `6` greedy) while
   other short rows pass. Artifacts:
   `docs/local/live-model-matrix/20260516Tzaya-vl-think-template-fix/ZAYA1-VL-8B-JANGTQ_K_prod.out`
-  and `.../ZAYA1-VL-8B-JANGTQ_K_prod_greedy.out`. Do not call this variant
-  production-ready until the quant/runtime cause is found.
+  and `.../ZAYA1-VL-8B-JANGTQ_K_prod_greedy.out`. This variant is not an
+  active switch blocker in the current pass, but do not call it production-ready
+  if the K lane is reopened until the quant/runtime cause is found.
 - Follow-up on `ZAYA1-VL-8B-JANGTQ_K` narrows the failure away from cache,
   streaming, parser, EOS, and sampler policy. The real prompt/logit probe at
   `docs/local/live-model-matrix/20260516Tzaya-vl-jangtqk-debug/ZAYA1-VL-8B-JANGTQ_K_topk_math.out`
@@ -378,7 +385,7 @@ Known failing rows from that snapshot:
   The `BENCH_ZAYA_CONTRACT` gate was corrected to understand ZAYA1-VL's
   40-layer CCA+MoE topology and vision-LoRA `local_experts`; K, JANGTQ4, and
   MXFP4 now pass contract at `.../*_contract_v2.out`.
-- The remaining K blocker is also not explained by the Swift Metal mixed-bit
+- The historical K blocker is also not explained by the Swift Metal mixed-bit
   JANGTQ kernels. `BENCH_ZAYA_TQ_KERNEL_PROBE=1` loads actual
   `ZAYA1-VL-8B-JANGTQ_K` layer tensors plus the real sidecar and compares
   gate/up 2-bit, fused SwiGLU, and down 4-bit kernels against a CPU dequant
@@ -387,9 +394,9 @@ Known failing rows from that snapshot:
   Cross-layer proof:
   `.../ZAYA1-VL-8B-JANGTQ_K_tq_kernel_probe_layers.out` covers layers
   `0,1,10,20,39` and experts `0,7,15`; all max diffs are about `1e-5`.
-  Treat the math-row failure as a real K artifact/runtime-quality blocker until
-  a packer-side dequant comparison or a rebuilt K bundle proves otherwise. Do
-  not add a sampler/template guard for it.
+  Treat the math-row failure as a real K artifact/runtime-quality blocker if
+  that lane is reopened, until a packer-side dequant comparison or a rebuilt K
+  bundle proves otherwise. Do not add a sampler/template guard for it.
 
 2026-05-16 non-MTP DSV4 follow-up:
 
@@ -725,12 +732,10 @@ Not yet complete:
 
 ## Immediate Next Gates
 
-1. Continue diagnosing the remaining `fail:133` rows without MTP scope:
-   `ZAYA1-VL-8B-JANGTQ_K` is still a real coherence failure on one math row,
-   but the Swift mixed-bit JANGTQ kernel path now has actual-tensor CPU parity
-   proof. The next useful check is packer-side/reference dequant comparison or a
-   rebuilt K artifact, not a runtime sampler workaround. The JANGTQ4/MXFP4
-   ZAYA1-VL text-template failures are fixed and live-proven.
+1. Continue diagnosing the remaining active non-K `fail:133` rows without MTP
+   scope. The JANGTQ4/MXFP4 ZAYA1-VL text-template failures are fixed and
+   live-proven. The old `ZAYA1-VL-8B-JANGTQ_K` math failure remains a real
+   historical K diagnostic, but it is no longer an active gate in this pass.
 2. Finish migrating any still-useful lightweight rows from
    `Tests/MLXLMTests/NemotronHOmniSmokeTests.swift` into an active test target.
    The critical EVS/remap/shape rows are now covered by
@@ -750,14 +755,12 @@ Not yet complete:
 5. Keep native MTP explicit-only until the speed and cache-composition gates
    close. The current BatchEngine fix prevents false positives; it does not
    make native MTP auto-launch eligible.
-6. Fix DSV4 16k+ long-context memory behavior, then rerun B7-style
-   long-context and vector drift. Current pushed engine passes the DSV4 disk
-   restore/cache topology row but fails the 16k long-context row with Metal OOM;
-   the ds4 official vector fixture is also absent locally.
+6. DSV4 16k+ long-context memory behavior remains a historical/open blocker for
+   the DSV4 lane, but DSV4 is de-scoped from the active pass until reopened.
 7. Expand the active model matrix beyond the 20GB cutoff for MiniMax, Ling,
    Hy3, Gemma 4, ZAYA/ZAYA-VL, Qwen, and Nemotron one family at a time, with
-   process checks before and after each run. DSV4 and Kimi are intentionally
-   deferred in the current sweep.
+   process checks before and after each run. DSV4, Kimi, and JANGTQ_K variants
+   are intentionally deferred in the current sweep.
 
 ## Mergeability Call
 
