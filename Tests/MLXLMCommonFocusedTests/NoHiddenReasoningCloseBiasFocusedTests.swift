@@ -775,6 +775,79 @@ struct MistralMinistralFocusedContractsTests {
     }
 }
 
+@Suite("Mistral3 JANGTQ dispatch focused contracts")
+struct Mistral3JANGTQDispatchFocusedTests {
+    @Test("mxtq Mistral3 dispatch routes to JANGTQ model")
+    func mxtqDispatchRoutesToJANGTQModel() async throws {
+        let model = try await LLMTypeRegistry.shared.createModel(
+            configuration: minimalMistral3Config(weightFormat: "mxtq", mxtqBits: 2),
+            modelType: "mistral3")
+
+        #expect(model is Mistral3TextJANGTQModel)
+        let typed = try #require(model as? Mistral3TextJANGTQModel)
+        #expect(typed.model.layers.count == 2)
+    }
+
+    @Test("mxtq bits propagate into packed dense width")
+    func mxtqBitsPropagateIntoPackedDenseWidth() async throws {
+        let model = try await LLMTypeRegistry.shared.createModel(
+            configuration: minimalMistral3Config(weightFormat: "mxtq", mxtqBits: 4),
+            modelType: "mistral3")
+
+        let typed = try #require(model as? Mistral3TextJANGTQModel)
+        let qPacked = typed.model.layers[0].attention.wq.packed
+        #expect(qPacked.shape == [64, 8])
+        #expect(qPacked.dim(-1) == 8)
+    }
+
+    @Test("mxfp4 and missing format stay on vanilla Mistral3 path")
+    func nonMxtqFormatsStayVanilla() async throws {
+        for format in ["mxfp4", nil] as [String?] {
+            let model = try await LLMTypeRegistry.shared.createModel(
+                configuration: minimalMistral3Config(weightFormat: format, mxtqBits: nil),
+                modelType: "mistral3")
+            #expect(model is Mistral3TextModel)
+            #expect(!(model is Mistral3TextJANGTQModel))
+        }
+    }
+
+    @Test("mxtq dispatch is case-insensitive")
+    func mxtqDispatchIsCaseInsensitive() async throws {
+        let model = try await LLMTypeRegistry.shared.createModel(
+            configuration: minimalMistral3Config(weightFormat: "MXTQ", mxtqBits: 2),
+            modelType: "mistral3")
+        #expect(model is Mistral3TextJANGTQModel)
+    }
+
+    private func minimalMistral3Config(
+        weightFormat: String?,
+        mxtqBits: Int?
+    ) throws -> Data {
+        var dict: [String: Any] = [
+            "model_type": "ministral3",
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 1_000_000.0,
+            "head_dim": 16,
+            "max_position_embeddings": 512,
+            "tie_word_embeddings": true,
+            "layer_types": Array(repeating: "full_attention", count: 2),
+        ]
+        if let weightFormat {
+            dict["weight_format"] = weightFormat
+        }
+        if let mxtqBits {
+            dict["mxtq_bits"] = mxtqBits
+        }
+        return try JSONSerialization.data(withJSONObject: dict)
+    }
+}
+
 @Suite("Gemma4 VLM focused source contracts")
 struct Gemma4VLMFocusedSourceContractsTests {
     @Test("Gemma4 prepare rejects unsupported audio explicitly")
