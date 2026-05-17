@@ -1399,6 +1399,8 @@ public struct JangLoader: Sendable {
                 || basePath.hasSuffix("mtp.fc")
             let isLinearAttnOutputProjection =
                 basePath.hasSuffix(".linear_attn.out_proj")
+            let isZayaCCAOutputProjection =
+                basePath.hasSuffix(".sub.o_proj")
             let isExpertDownProjection =
                 basePath.hasSuffix("switch_mlp.down_proj")
                 || basePath.hasSuffix("switch_glu.down_proj")
@@ -1462,6 +1464,21 @@ public struct JangLoader: Sendable {
                     knownGroupSize: groupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: valueDim)
+            } else if isZayaCCAOutputProjection,
+                      let hiddenSize = hiddenSizeHint, hiddenSize > 1
+            {
+                // ZAYA text sanitizes the CCA attention block under `sub`.
+                // Its `o_proj` consumes the 8-head CCA output (1024 for the
+                // 2048-wide 8B artifacts), not the full hidden width. Shape
+                // ambiguity otherwise maps `[2048,256]` to 4-bit/64 and makes
+                // quantized_matmul expect a 2048-wide input at runtime.
+                let ccaOutputDim = hiddenSize / 2
+                (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
+                    packedDim: packedDim,
+                    numGroups: numGroups,
+                    knownGroupSize: groupSize,
+                    bitWidthsUsed: bitWidthsUsed,
+                    expectedInDim: ccaOutputDim)
             } else if let picked = inferFromUniqueValidInDim() {
                 (bits, inferredGroupSize) = picked
             } else if isExpertDownProjection && !validInDims.isEmpty {

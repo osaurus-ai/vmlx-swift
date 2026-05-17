@@ -34,8 +34,18 @@ func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> 
 
 // MARK: - Metal Kernel
 
-private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+private func makeGatedDeltaKernel(
+    hasMask: Bool,
+    roundStateEachStep: Bool = false
+) -> MLXFast.MLXFastKernel? {
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
+    let stepRoundSource = roundStateEachStep
+        ? """
+                for (int i = 0; i < n_per_t; ++i) {
+                  state[i] = static_cast<float>(static_cast<InT>(state[i]));
+                }
+        """
+        : ""
 
     let source = """
             auto n = thread_position_in_grid.z;
@@ -91,6 +101,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
                 if (thread_index_in_simdgroup == 0) {
                   y[dv_idx] = static_cast<InT>(out);
                 }
+        \(stepRoundSource)
               }
               // Increment data pointers to next time step
               q_ += Hk * Dk;
@@ -111,7 +122,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
         inputNames.append("mask")
     }
 
-    let suffix = hasMask ? "_mask" : ""
+    let suffix = (hasMask ? "_mask" : "") + (roundStateEachStep ? "_strict" : "_fast")
 
     return MLXFast.metalKernel(
         name: "gated_delta_step\(suffix)",
@@ -126,10 +137,23 @@ private final class GatedDeltaKernelManager: Sendable {
 
     let kernel: MLXFast.MLXFastKernel?
     let kernelMasked: MLXFast.MLXFastKernel?
+    let strictKernel: MLXFast.MLXFastKernel?
+    let strictKernelMasked: MLXFast.MLXFastKernel?
 
     private init() {
-        kernel = makeGatedDeltaKernel(hasMask: false)
-        kernelMasked = makeGatedDeltaKernel(hasMask: true)
+        kernel = makeGatedDeltaKernel(hasMask: false, roundStateEachStep: false)
+        kernelMasked = makeGatedDeltaKernel(hasMask: true, roundStateEachStep: false)
+        strictKernel = makeGatedDeltaKernel(hasMask: false, roundStateEachStep: true)
+        strictKernelMasked = makeGatedDeltaKernel(hasMask: true, roundStateEachStep: true)
+    }
+
+    func kernel(hasMask: Bool, roundStateEachStep: Bool) -> MLXFast.MLXFastKernel? {
+        switch (hasMask, roundStateEachStep) {
+        case (false, false): return kernel
+        case (true, false): return kernelMasked
+        case (false, true): return strictKernel
+        case (true, true): return strictKernelMasked
+        }
     }
 }
 
@@ -142,7 +166,8 @@ func gatedDeltaKernel(
     g: MLXArray,
     beta: MLXArray,
     state: MLXArray,
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    roundStateEachStep: Bool = false
 ) -> (MLXArray, MLXArray) {
     let B = k.dim(0)
     let T = k.dim(1)
@@ -155,10 +180,14 @@ func gatedDeltaKernel(
     let selectedKernel: MLXFast.MLXFastKernel?
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
     if let mask {
-        selectedKernel = GatedDeltaKernelManager.shared.kernelMasked
+        selectedKernel = GatedDeltaKernelManager.shared.kernel(
+            hasMask: true,
+            roundStateEachStep: roundStateEachStep)
         inputs.append(mask)
     } else {
-        selectedKernel = GatedDeltaKernelManager.shared.kernel
+        selectedKernel = GatedDeltaKernelManager.shared.kernel(
+            hasMask: false,
+            roundStateEachStep: roundStateEachStep)
     }
 
     guard let kernel = selectedKernel else {
@@ -256,7 +285,8 @@ func gatedDeltaOps(
     g: MLXArray,
     beta: MLXArray,
     state: MLXArray? = nil,
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    roundStateEachStep: Bool = false
 ) -> (MLXArray, MLXArray) {
     let B = q.dim(0)
     let T = q.dim(1)
@@ -297,7 +327,7 @@ func gatedDeltaOps(
             mask: maskT
         )
         ys.append(y)
-        state = newState
+        state = roundStateEachStep ? newState.asType(q.dtype) : newState
     }
 
     let y = MLX.stacked(ys, axis: 1)
@@ -315,7 +345,8 @@ func gatedDeltaUpdate(
     aLog: MLXArray,
     dtBias: MLXArray,
     state: MLXArray? = nil,
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    roundStateEachStep: Bool = false
 ) -> (MLXArray, MLXArray) {
     let beta = sigmoid(b)
     let g = computeGatedDeltaG(aLog, a, dtBias)
@@ -338,10 +369,16 @@ func gatedDeltaUpdate(
     //     always taken there; only narrow synthetic configs hit the ops
     //     fallback.
     let manager = GatedDeltaKernelManager.shared
-    let selectedKernel = mask == nil ? manager.kernel : manager.kernelMasked
+    let selectedKernel = manager.kernel(
+        hasMask: mask != nil,
+        roundStateEachStep: roundStateEachStep)
     if selectedKernel != nil && Dk >= 32 && Dk % 32 == 0 {
-        return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+        return gatedDeltaKernel(
+            q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask,
+            roundStateEachStep: roundStateEachStep)
     }
 
-    return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+    return gatedDeltaOps(
+        q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask,
+        roundStateEachStep: roundStateEachStep)
 }

@@ -141,7 +141,8 @@ private func gatedDeltaOps(
     g: MLXArray,
     beta: MLXArray,
     state: MLXArray? = nil,
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    roundStateEachStep: Bool = false
 ) -> (MLXArray, MLXArray) {
     let B = q.dim(0)
     let T = q.dim(1)
@@ -182,7 +183,7 @@ private func gatedDeltaOps(
             mask: maskT
         )
         ys.append(y)
-        state = newState
+        state = roundStateEachStep ? newState.asType(q.dtype) : newState
     }
 
     let y = MLX.stacked(ys, axis: 1)
@@ -196,8 +197,18 @@ private func gatedDeltaOps(
 // For Qwen3.5 with 30 linear_attention layers this eliminates ~210 dispatches
 // per decode step, closing most of the Python ↔ Swift gap on SSM+MoE models.
 
-private func makeVLMGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+private func makeVLMGatedDeltaKernel(
+    hasMask: Bool,
+    roundStateEachStep: Bool = false
+) -> MLXFast.MLXFastKernel? {
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
+    let stepRoundSource = roundStateEachStep
+        ? """
+                for (int i = 0; i < n_per_t; ++i) {
+                  state[i] = static_cast<float>(static_cast<InT>(state[i]));
+                }
+        """
+        : ""
     let source = """
             auto n = thread_position_in_grid.z;
             auto b_idx = n / Hv;
@@ -248,6 +259,7 @@ private func makeVLMGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
                 if (thread_index_in_simdgroup == 0) {
                   y[dv_idx] = static_cast<InT>(out);
                 }
+        \(stepRoundSource)
               }
               q_ += Hk * Dk;
               k_ += Hk * Dk;
@@ -263,7 +275,7 @@ private func makeVLMGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
         """
     var inputNames = ["q", "k", "v", "g", "beta", "state_in", "T"]
     if hasMask { inputNames.append("mask") }
-    let suffix = hasMask ? "_mask" : ""
+    let suffix = (hasMask ? "_mask" : "") + (roundStateEachStep ? "_strict" : "_fast")
     return MLXFast.metalKernel(
         name: "vlm_gated_delta_step\(suffix)",
         inputNames: inputNames,
@@ -276,16 +288,30 @@ private final class VLMGatedDeltaKernelManager: @unchecked Sendable {
     static let shared = VLMGatedDeltaKernelManager()
     let kernel: MLXFast.MLXFastKernel?
     let kernelMasked: MLXFast.MLXFastKernel?
+    let strictKernel: MLXFast.MLXFastKernel?
+    let strictKernelMasked: MLXFast.MLXFastKernel?
     private init() {
-        kernel = makeVLMGatedDeltaKernel(hasMask: false)
-        kernelMasked = makeVLMGatedDeltaKernel(hasMask: true)
+        kernel = makeVLMGatedDeltaKernel(hasMask: false, roundStateEachStep: false)
+        kernelMasked = makeVLMGatedDeltaKernel(hasMask: true, roundStateEachStep: false)
+        strictKernel = makeVLMGatedDeltaKernel(hasMask: false, roundStateEachStep: true)
+        strictKernelMasked = makeVLMGatedDeltaKernel(hasMask: true, roundStateEachStep: true)
+    }
+
+    func kernel(hasMask: Bool, roundStateEachStep: Bool) -> MLXFast.MLXFastKernel? {
+        switch (hasMask, roundStateEachStep) {
+        case (false, false): return kernel
+        case (true, false): return kernelMasked
+        case (false, true): return strictKernel
+        case (true, true): return strictKernelMasked
+        }
     }
 }
 
 private func vlmGatedDeltaKernel(
     q: MLXArray, k: MLXArray, v: MLXArray,
     g: MLXArray, beta: MLXArray, state: MLXArray,
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    roundStateEachStep: Bool = false
 ) -> (MLXArray, MLXArray) {
     let B = k.dim(0)
     let T = k.dim(1)
@@ -298,10 +324,14 @@ private func vlmGatedDeltaKernel(
     let selectedKernel: MLXFast.MLXFastKernel?
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
     if let mask {
-        selectedKernel = VLMGatedDeltaKernelManager.shared.kernelMasked
+        selectedKernel = VLMGatedDeltaKernelManager.shared.kernel(
+            hasMask: true,
+            roundStateEachStep: roundStateEachStep)
         inputs.append(mask)
     } else {
-        selectedKernel = VLMGatedDeltaKernelManager.shared.kernel
+        selectedKernel = VLMGatedDeltaKernelManager.shared.kernel(
+            hasMask: false,
+            roundStateEachStep: roundStateEachStep)
     }
     guard let kernel = selectedKernel else {
         fatalError("VLM gated delta kernel not available")
@@ -332,7 +362,8 @@ private func gatedDeltaUpdate(
     aLog: MLXArray,
     dtBias: MLXArray,
     state: MLXArray? = nil,
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    roundStateEachStep: Bool = false
 ) -> (MLXArray, MLXArray) {
     let beta = sigmoid(b)
     let g = computeGatedDeltaG(aLog, a, dtBias)
@@ -348,11 +379,17 @@ private func gatedDeltaUpdate(
     // The kernel tiles Dk in 32-wide SIMD chunks; unsupported head widths must
     // use the ops fallback instead of compiling an invalid zero/remainder tile.
     let manager = VLMGatedDeltaKernelManager.shared
-    let selectedKernel = mask == nil ? manager.kernel : manager.kernelMasked
+    let selectedKernel = manager.kernel(
+        hasMask: mask != nil,
+        roundStateEachStep: roundStateEachStep)
     if selectedKernel != nil && Dk >= 32 && Dk % 32 == 0 {
-        return vlmGatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+        return vlmGatedDeltaKernel(
+            q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask,
+            roundStateEachStep: roundStateEachStep)
     }
-    return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+    return gatedDeltaOps(
+        q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask,
+        roundStateEachStep: roundStateEachStep)
 }
 
 // MARK: - Configuration
@@ -922,12 +959,15 @@ enum Qwen35Language {
                 aLog: aLog,
                 dtBias: dtBias,
                 state: state,
-                mask: mask
+                mask: mask,
+                roundStateEachStep: recordPrefixCommitStates
+                    && NativeMTPVerifierStatePolicy.shouldRoundGDNStateEachVerifierStep
             )
             let finalState = state!
 
             if let cache {
-                if recordPrefixCommitStates, S > 1 {
+                if recordPrefixCommitStates, S > 1,
+                   NativeMTPVerifierStatePolicy.shouldRecordAcceptedPrefixStates {
                     self.recordPrefixCommitStates(
                         cache: cache,
                         convInput: convInput,
@@ -937,7 +977,6 @@ enum Qwen35Language {
                         a: a,
                         b: b,
                         initialState: initialState,
-                        finalState: finalState,
                         mask: mask,
                         baseOffset: cache.offset)
                 }
@@ -958,51 +997,54 @@ enum Qwen35Language {
             a: MLXArray,
             b: MLXArray,
             initialState: MLXArray?,
-            finalState: MLXArray,
             mask: MLXArray?,
             baseOffset: Int
         ) {
             let sequenceLength = q.dim(1)
-            guard sequenceLength > 0 else { return }
+            guard sequenceLength > 1 else { return }
 
-            for prefixLength in 1 ... sequenceLength {
+            let replayStart = Date.timeIntervalSinceReferenceDate
+            var recurrentState = initialState
+            for prefixLength in 1 ..< sequenceLength {
+                let tokenRange = (prefixLength - 1) ..< prefixLength
+                let (_, prefixState) = gatedDeltaUpdate(
+                    q: q[0..., tokenRange, 0..., 0...],
+                    k: k[0..., tokenRange, 0..., 0...],
+                    v: v[0..., tokenRange, 0..., 0...],
+                    a: a[0..., tokenRange, 0...],
+                    b: b[0..., tokenRange, 0...],
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: recurrentState,
+                    mask: stepMask(mask, index: prefixLength - 1),
+                    roundStateEachStep: NativeMTPVerifierStatePolicy
+                        .shouldRoundGDNStateEachVerifierStep)
+                recurrentState = prefixState
+
                 let convEnd = convInput.dim(1) - sequenceLength + prefixLength
                 let convStart = max(0, convEnd - max(0, convKernelSize - 1))
                 let convState = convInput[0..., convStart ..< convEnd, 0...]
 
-                let recurrentState: MLXArray
-                if prefixLength == sequenceLength {
-                    recurrentState = finalState
-                } else {
-                    let (_, prefixState) = gatedDeltaUpdate(
-                        q: q[0..., 0 ..< prefixLength, 0..., 0...],
-                        k: k[0..., 0 ..< prefixLength, 0..., 0...],
-                        v: v[0..., 0 ..< prefixLength, 0..., 0...],
-                        a: a[0..., 0 ..< prefixLength, 0...],
-                        b: b[0..., 0 ..< prefixLength, 0...],
-                        aLog: aLog,
-                        dtBias: dtBias,
-                        state: initialState,
-                        mask: prefixMask(mask, length: prefixLength))
-                    recurrentState = prefixState
-                }
-
                 cache.recordPrefixCommitState(
                     length: prefixLength,
-                    arrays: [convState, recurrentState],
+                    arrays: [convState, prefixState],
                     offset: baseOffset + prefixLength)
             }
+            NativeMTPGDNReplayDiagnostics.recordPrefixReplay(
+                prefixStates: sequenceLength - 1,
+                seconds: Date.timeIntervalSinceReferenceDate - replayStart)
         }
 
-        private func prefixMask(_ mask: MLXArray?, length: Int) -> MLXArray? {
+        private func stepMask(_ mask: MLXArray?, index: Int) -> MLXArray? {
             guard let mask else { return nil }
+            let range = index ..< (index + 1)
             if mask.ndim == 1 {
-                return mask[0 ..< length]
+                return mask[range]
             }
             if mask.ndim == 2 {
-                return mask[0..., 0 ..< length]
+                return mask[0..., range]
             }
-            return mask[0..., 0 ..< length, 0...]
+            return mask[0..., range, 0...]
         }
     }
 
@@ -1102,7 +1144,25 @@ enum Qwen35Language {
             recordPrefixCommitStates: Bool = false
         ) -> MLXArray {
             let r: MLXArray
-            if isLinear {
+            if NativeMTPPhaseDiagnostics.enabled {
+                let phase = isLinear ? "vlm_gdn" : "vlm_attention"
+                let start = Date.timeIntervalSinceReferenceDate
+                if isLinear {
+                    r = linearAttn!(
+                        inputLayerNorm(x),
+                        mask: ssmMask,
+                        cache: cache as? MambaCache,
+                        recordPrefixCommitStates: recordPrefixCommitStates)
+                } else {
+                    r = selfAttn!(
+                        inputLayerNorm(x), mask: attentionMask, cache: cache,
+                        positionIds: positionIds)
+                }
+                MLX.eval(r)
+                NativeMTPPhaseDiagnostics.record(
+                    phase,
+                    seconds: Date.timeIntervalSinceReferenceDate - start)
+            } else if isLinear {
                 r = linearAttn!(
                     inputLayerNorm(x),
                     mask: ssmMask,
@@ -1114,6 +1174,15 @@ enum Qwen35Language {
             }
 
             let h = x + r
+            if NativeMTPPhaseDiagnostics.enabled {
+                let start = Date.timeIntervalSinceReferenceDate
+                let out = (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+                MLX.eval(out)
+                NativeMTPPhaseDiagnostics.record(
+                    "vlm_mlp",
+                    seconds: Date.timeIntervalSinceReferenceDate - start)
+                return h + out
+            }
             return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
         }
     }
@@ -1583,7 +1652,18 @@ enum Qwen35Language {
                 positionIds: positionIds,
                 recordPrefixCommitStates: recordPrefixCommitStates)
             let logits: MLXArray
-            if let lmHead {
+            if NativeMTPPhaseDiagnostics.enabled {
+                let start = Date.timeIntervalSinceReferenceDate
+                if let lmHead {
+                    logits = lmHead(model.norm(hidden))
+                } else {
+                    logits = model.embedTokens.asLinear(model.norm(hidden))
+                }
+                MLX.eval(logits)
+                NativeMTPPhaseDiagnostics.record(
+                    "vlm_lm_head",
+                    seconds: Date.timeIntervalSinceReferenceDate - start)
+            } else if let lmHead {
                 logits = lmHead(model.norm(hidden))
             } else {
                 logits = model.embedTokens.asLinear(model.norm(hidden))
@@ -1598,6 +1678,31 @@ enum Qwen35Language {
         ) -> NativeMTPForwardResult {
             guard let mtp else {
                 fatalError("Qwen35 VLM nativeMTPForward called without an MTP module")
+            }
+            if NativeMTPPhaseDiagnostics.enabled {
+                let blockStart = Date.timeIntervalSinceReferenceDate
+                let hidden = mtp.preNormHidden(
+                    hiddenStates: hiddenStates,
+                    nextTokenIds: nextTokenIds,
+                    embedTokens: model.embedTokens,
+                    cache: cache)
+                MLX.eval(hidden)
+                NativeMTPPhaseDiagnostics.record(
+                    "vlm_mtp_block",
+                    seconds: Date.timeIntervalSinceReferenceDate - blockStart)
+
+                let headStart = Date.timeIntervalSinceReferenceDate
+                let logits: MLXArray
+                if let lmHead {
+                    logits = lmHead(mtp.norm(hidden))
+                } else {
+                    logits = model.embedTokens.asLinear(mtp.norm(hidden))
+                }
+                MLX.eval(logits)
+                NativeMTPPhaseDiagnostics.record(
+                    "vlm_mtp_lm_head",
+                    seconds: Date.timeIntervalSinceReferenceDate - headStart)
+                return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
             }
             let hidden = mtp.preNormHidden(
                 hiddenStates: hiddenStates,

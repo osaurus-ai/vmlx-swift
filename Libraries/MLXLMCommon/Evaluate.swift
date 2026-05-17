@@ -1785,7 +1785,14 @@ public struct TokenIterator: TokenIteratorProtocol {
                     input: boundaryInput))
             {
             case .tokens(let remaining):
-                _ = model(remaining, cache: cache, state: nil)
+                // Keep the solo TokenIterator rederive path aligned with
+                // normal prefill/decode: models expect batch-first tokens.
+                // ZAYA CCA reaches a 2D activation and traps if this helper
+                // feeds the 1D `remaining` tensor directly.
+                _ = model(
+                    remaining[text: .newAxis],
+                    cache: cache,
+                    state: nil)
             case .logits:
                 break
             }

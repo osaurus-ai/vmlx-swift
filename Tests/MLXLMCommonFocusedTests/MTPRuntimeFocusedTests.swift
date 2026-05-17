@@ -191,8 +191,8 @@ struct MTPRuntimeFocusedTests {
 
     @Test("native MTP task-local false overrides poisoned process env")
     func nativeMTPTaskLocalFalseOverridesPoisonedEnv() async throws {
-        setenv("VMLINUX_NATIVE_MTP", "1", 1)
-        defer { unsetenv("VMLINUX_NATIVE_MTP") }
+        setenv("VMLX_NATIVE_MTP", "1", 1)
+        defer { unsetenv("VMLINUX_NATIVE_MTP"); unsetenv("VMLX_NATIVE_MTP") }
 
         let config = """
         {
@@ -217,6 +217,29 @@ struct MTPRuntimeFocusedTests {
                 status: status)
         }
         #expect(!inactive)
+    }
+
+    @Test("native MTP env aliases keep canonical VMLX spelling live")
+    func nativeMTPEnvAliasesKeepCanonicalVMLXSpellingLive() {
+        setenv("VMLX_NATIVE_MTP", "1", 1)
+        setenv("VMLX_NATIVE_MTP_HYBRID_VERIFY", "chunk_lazy_repair", 1)
+        defer {
+            unsetenv("VMLX_NATIVE_MTP")
+            unsetenv("VMLINUX_NATIVE_MTP")
+            unsetenv("VMLX_NATIVE_MTP_HYBRID_VERIFY")
+            unsetenv("VMLINUX_NATIVE_MTP_HYBRID_VERIFY")
+        }
+
+        #expect(NativeMTPActivation.isExplicitlyRequested)
+        #expect(NativeMTPVerifierStatePolicy.mode == .lazyRepair)
+
+        unsetenv("VMLX_NATIVE_MTP")
+        unsetenv("VMLX_NATIVE_MTP_HYBRID_VERIFY")
+        setenv("VMLINUX_NATIVE_MTP", "1", 1)
+        setenv("VMLINUX_NATIVE_MTP_HYBRID_VERIFY", "chunk_fast", 1)
+
+        #expect(NativeMTPActivation.isExplicitlyRequested)
+        #expect(NativeMTPVerifierStatePolicy.mode == .captureCommit)
     }
 
     @Test("JANG MTP metadata without tensor evidence is not treated as an MTP bundle")
@@ -300,6 +323,78 @@ struct MTPRuntimeFocusedTests {
         #expect(resolved.mtpStatus?.requiresAcceptRejectBeforeEnable == true)
     }
 
+    @Test("native MTP auto decode policy is tensor and runtime evidence gated")
+    func nativeMTPAutoDecodePolicyIsTensorAndRuntimeEvidenceGated() throws {
+        let denseMXFP8Config = """
+        {
+          "model_type": "qwen3_vl",
+          "text_config": { "model_type": "qwen3_5", "mtp_num_hidden_layers": 1 },
+          "quantization": { "mode": "mxfp8", "bits": 8 }
+        }
+        """.data(using: .utf8)!
+        let moeMXFP8Config = """
+        {
+          "model_type": "qwen3_5_moe",
+          "text_config": { "model_type": "qwen3_5_moe_text", "mtp_num_hidden_layers": 1 },
+          "quantization": { "mode": "mxfp8", "bits": 8 }
+        }
+        """.data(using: .utf8)!
+        let preserved = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 31,
+            visionTensorCount: 333,
+            mode: .preservedEnabled)
+        let verified = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 31,
+            visionTensorCount: 333,
+            mode: .speculativeVerified)
+        let missingWeights = MTPBundleStatus(
+            bundleHasMTP: false,
+            configuredLayers: 1,
+            tensorCount: 0,
+            mode: .metadataOnlyMissingWeights)
+
+        #expect(NativeMTPAutoDecodePolicy.recommendation(
+            configData: denseMXFP8Config,
+            jangConfig: nil,
+            status: preserved) == nil)
+        #expect(NativeMTPAutoDecodePolicy.recommendation(
+            configData: denseMXFP8Config,
+            jangConfig: nil,
+            status: missingWeights,
+            requireVerifiedRuntime: false) == nil)
+
+        let denseReporting = NativeMTPAutoDecodePolicy.recommendation(
+            configData: denseMXFP8Config,
+            jangConfig: nil,
+            status: preserved,
+            requireVerifiedRuntime: false)
+        #expect(denseReporting?.depth == 2)
+
+        let moeVerified = NativeMTPAutoDecodePolicy.recommendation(
+            configData: moeMXFP8Config,
+            jangConfig: nil,
+            status: verified)
+        #expect(moeVerified?.depth == 3)
+
+        let jang2k = NativeMTPAutoDecodePolicy.recommendation(
+            configData: denseMXFP8Config,
+            jangConfig: JangConfig(
+                quantization: JangQuantization(
+                    method: "jang",
+                    profile: "JANG_2K",
+                    targetBits: 2,
+                    actualBits: 2,
+                    bitWidthsUsed: [2, 3, 6, 8]),
+                sourceModel: JangSourceModel(architecture: "qwen3_5_moe"),
+                architecture: JangArchitecture(hasMoE: true)),
+            status: verified)
+        #expect(jang2k == nil)
+    }
+
     @Test("recursive MTP contract models D3 hidden-state draft verify")
     func recursiveMTPContractModelsD3HiddenStateDraftVerify() {
         let contract = MTPRecursiveDraftContract.mtplxDepth3
@@ -331,6 +426,56 @@ struct MTPRuntimeFocusedTests {
         #expect(!source.contains("offset: baseOffset)"))
     }
 
+    @Test("Qwen3.5 SSM accepted-prefix capture advances token by token")
+    func qwen35SSMAcceptedPrefixCaptureAdvancesTokenByToken() throws {
+        let textSource = try Self.source("Libraries/MLXLLM/Models/Qwen35.swift")
+        let vlSource = try Self.source("Libraries/MLXVLM/Models/Qwen35.swift")
+
+        for source in [textSource, vlSource] {
+            #expect(source.contains("var recurrentState = initialState"))
+            #expect(source.contains("let tokenRange = (prefixLength - 1) ..< prefixLength"))
+            #expect(source.contains("state: recurrentState"))
+            #expect(source.contains("recurrentState = prefixState"))
+            #expect(source.contains("stepMask(mask, index: prefixLength - 1)"))
+            #expect(!source.contains("prefixMask(mask, length: prefixLength)"))
+        }
+    }
+
+    @Test("Qwen3.5 GDN verifier state has strict and fast modes")
+    func qwen35GDNVerifierStateHasStrictAndFastModes() throws {
+        let textGDN = try Self.source("Libraries/MLXLLM/Models/GatedDelta.swift")
+        let vlGDN = try Self.source("Libraries/MLXVLM/Models/Qwen35.swift")
+
+        for source in [textGDN, vlGDN] {
+            #expect(source.contains("roundStateEachStep"))
+            #expect(source.contains("_strict"))
+            #expect(source.contains("_fast"))
+            #expect(source.contains("state[i] = static_cast<float>(static_cast<InT>(state[i]));"))
+            #expect(source.contains("roundStateEachStep ? newState.asType(q.dtype) : newState"))
+        }
+
+        let textQwen = try Self.source("Libraries/MLXLLM/Models/Qwen35.swift")
+        let vlQwen = try Self.source("Libraries/MLXVLM/Models/Qwen35.swift")
+        for source in [textQwen, vlQwen] {
+            #expect(source.contains("NativeMTPVerifierStatePolicy.shouldRoundGDNStateEachVerifierStep"))
+            #expect(source.contains("NativeMTPVerifierStatePolicy.shouldRecordAcceptedPrefixStates"))
+        }
+    }
+
+    @Test("native MTP lazy repair skips capture until partial rejection")
+    func nativeMTPLazyRepairSkipsCaptureUntilPartialRejection() throws {
+        let runtime = try Self.source("Libraries/MLXLMCommon/SpecDec/MTPRuntime.swift")
+        let iterator = try Self.source(
+            "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift")
+
+        #expect(runtime.contains("case lazyRepair = \"lazy_repair\""))
+        #expect(runtime.contains("\"chunk_lazy_repair\""))
+        #expect(runtime.contains("mode != .lazyRepair"))
+        #expect(iterator.contains("private static func requiresLazyChunkRepair"))
+        #expect(iterator.contains("lazyChunkRepair && accepted < drafts.count"))
+        #expect(iterator.contains("verifierMode = NativeMTPVerifierStatePolicy.mode == .lazyRepair"))
+    }
+
     @Test("native MTP partial reject refreshes private draft cache")
     func nativeMTPPartialRejectRefreshesPrivateDraftCache() throws {
         let source = try Self.source(
@@ -339,6 +484,53 @@ struct MTPRuntimeFocusedTests {
         #expect(source.contains("mtpCache = model.makeNativeMTPCache()"))
         #expect(source.contains("mtpCacheRefreshCount += 1"))
         #expect(!source.contains("trimPromptCache(mtpCache"))
+    }
+
+    @Test("native MTP greedy verifier batches target argmax rows")
+    func nativeMTPGreedyVerifierBatchesTargetArgmaxRows() throws {
+        let source = try Self.source(
+            "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift")
+
+        #expect(source.contains("batchedGreedyTargetTokenIds"))
+        #expect(source.contains("argMax(candidateLogits, axis: -1).asType(.int32)"))
+        #expect(source.contains("processor == nil"))
+        #expect(source.contains("let batch = batchedGreedyTargetTokenIds("))
+    }
+
+    @Test("native MTP chunk verifier env alias is applied in iterator")
+    func nativeMTPChunkVerifierEnvAliasIsAppliedInIterator() throws {
+        let source = try Self.source(
+            "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift")
+
+        #expect(source.contains("private static func nativeMTPHybridVerifySetting"))
+        #expect(source.contains("env[\"VMLX_NATIVE_MTP_HYBRID_VERIFY\"]"))
+        #expect(source.contains("env[\"VMLINUX_NATIVE_MTP_HYBRID_VERIFY\"]"))
+        #expect(source.contains("switch nativeMTPHybridVerifySetting()?"))
+    }
+
+    @Test("RunBench perf can use bundle generation defaults")
+    func runBenchPerfCanUseBundleGenerationDefaults() throws {
+        let source = try Self.source("RunBench/Bench.swift")
+
+        #expect(source.contains("BENCH_PERF_USE_GENERATION_CONFIG"))
+        #expect(source.contains("samplingSource"))
+        #expect(source.contains("BENCH_PERF_SEED"))
+        #expect(source.contains("randomSeed: perfSeed"))
+        #expect(source.contains("GenerateParameters(generationConfig: context.configuration.generationDefaults"))
+        #expect(source.contains("samplingSource=%@"))
+        #expect(source.contains("BENCH_PERF_PHASE_SNAPSHOT"))
+        #expect(source.contains("PERF_PHASE label=%@"))
+    }
+
+    @Test("Qwen native MTP phase diagnostics include draft sidecar phases")
+    func qwenNativeMTPPhaseDiagnosticsIncludeDraftSidecarPhases() throws {
+        let llmSource = try Self.source("Libraries/MLXLLM/Models/Qwen35.swift")
+        let vlmSource = try Self.source("Libraries/MLXVLM/Models/Qwen35.swift")
+
+        #expect(llmSource.contains("\"llm_mtp_block\""))
+        #expect(llmSource.contains("\"llm_mtp_lm_head\""))
+        #expect(vlmSource.contains("\"vlm_mtp_block\""))
+        #expect(vlmSource.contains("\"vlm_mtp_lm_head\""))
     }
 
     @Test("native MTP verifier mode telemetry is explicit")
@@ -360,7 +552,9 @@ struct MTPRuntimeFocusedTests {
         let source = try Self.source(
             "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift")
 
-        #expect(source.contains("case \"chunk\", \"chunk_commit\", \"capture_commit\", \"fast\":"))
+        #expect(source.contains("\"chunk_commit\""))
+        #expect(source.contains("\"chunk_replay\""))
+        #expect(source.contains("private static func requiresChunkTokenReplayRepair"))
         #expect(source.contains("case \"sequential\", \"sequential_repair\", \"repair\":"))
         #expect(source.contains("return cache.contains { $0 is MambaCache }"))
     }
@@ -519,6 +713,33 @@ struct MTPRuntimeFocusedTests {
             #expect(override.groupSize == 128)
         } else {
             Issue.record("Expected linear attention output override to use value dim")
+        }
+    }
+
+    @Test("shape-walk quantization uses ZAYA CCA output width for o_proj")
+    func shapeWalkQuantizationUsesZayaCCAOutputWidthForOProj() {
+        let base = "model.layers.0.sub.o_proj"
+        let weights: [String: MLXArray] = [
+            "\(base).weight": MLXArray.zeros([2048, 256], dtype: .uint32),
+            "\(base).scales": MLXArray.zeros([2048, 32], dtype: .float32),
+        ]
+
+        let inferred = JangLoader.inferPerLayerQuantization(
+            weights: weights,
+            jangConfig: JangConfig(
+                quantization: JangQuantization(
+                    blockSize: 32,
+                    bitWidthsUsed: [4, 8])),
+            hiddenSizeHint: 2048,
+            validInDims: [2048],
+            declaredDefaultQuantization: BaseConfiguration.Quantization(
+                groupSize: 32, bits: 8))
+
+        if case .quantize(let override)? = inferred.perLayerQuantization[base] {
+            #expect(override.bits == 8)
+            #expect(override.groupSize == 32)
+        } else {
+            Issue.record("Expected ZAYA CCA o_proj override to use 1024-wide attention input")
         }
     }
 

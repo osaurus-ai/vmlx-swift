@@ -315,12 +315,15 @@ final class Qwen35GatedDeltaNet: Module {
             aLog: aLog,
             dtBias: dtBias,
             state: state,
-            mask: mask
+            mask: mask,
+            roundStateEachStep: recordPrefixCommitStates
+                && NativeMTPVerifierStatePolicy.shouldRoundGDNStateEachVerifierStep
         )
         let finalState = state!
 
         if let cache {
-            if recordPrefixCommitStates, S > 1 {
+            if recordPrefixCommitStates, S > 1,
+               NativeMTPVerifierStatePolicy.shouldRecordAcceptedPrefixStates {
                 self.recordPrefixCommitStates(
                     cache: cache,
                     convInput: convInput,
@@ -330,7 +333,6 @@ final class Qwen35GatedDeltaNet: Module {
                     a: a,
                     b: b,
                     initialState: initialState,
-                    finalState: finalState,
                     mask: mask,
                     baseOffset: cache.offset)
             }
@@ -351,51 +353,54 @@ final class Qwen35GatedDeltaNet: Module {
         a: MLXArray,
         b: MLXArray,
         initialState: MLXArray?,
-        finalState: MLXArray,
         mask: MLXArray?,
         baseOffset: Int
     ) {
         let sequenceLength = q.dim(1)
-        guard sequenceLength > 0 else { return }
+        guard sequenceLength > 1 else { return }
 
-        for prefixLength in 1 ... sequenceLength {
+        let replayStart = Date.timeIntervalSinceReferenceDate
+        var recurrentState = initialState
+        for prefixLength in 1 ..< sequenceLength {
+            let tokenRange = (prefixLength - 1) ..< prefixLength
+            let (_, prefixState) = gatedDeltaUpdate(
+                q: q[0..., tokenRange, 0..., 0...],
+                k: k[0..., tokenRange, 0..., 0...],
+                v: v[0..., tokenRange, 0..., 0...],
+                a: a[0..., tokenRange, 0...],
+                b: b[0..., tokenRange, 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: recurrentState,
+                mask: stepMask(mask, index: prefixLength - 1),
+                roundStateEachStep: NativeMTPVerifierStatePolicy
+                    .shouldRoundGDNStateEachVerifierStep)
+            recurrentState = prefixState
+
             let convEnd = convInput.dim(1) - sequenceLength + prefixLength
             let convStart = max(0, convEnd - max(0, convKernelSize - 1))
             let convState = convInput[0..., convStart ..< convEnd, 0...]
 
-            let recurrentState: MLXArray
-            if prefixLength == sequenceLength {
-                recurrentState = finalState
-            } else {
-                let (_, prefixState) = gatedDeltaUpdate(
-                    q: q[0..., 0 ..< prefixLength, 0..., 0...],
-                    k: k[0..., 0 ..< prefixLength, 0..., 0...],
-                    v: v[0..., 0 ..< prefixLength, 0..., 0...],
-                    a: a[0..., 0 ..< prefixLength, 0...],
-                    b: b[0..., 0 ..< prefixLength, 0...],
-                    aLog: aLog,
-                    dtBias: dtBias,
-                    state: initialState,
-                    mask: prefixMask(mask, length: prefixLength))
-                recurrentState = prefixState
-            }
-
             cache.recordPrefixCommitState(
                 length: prefixLength,
-                arrays: [convState, recurrentState],
+                arrays: [convState, prefixState],
                 offset: baseOffset + prefixLength)
         }
+        NativeMTPGDNReplayDiagnostics.recordPrefixReplay(
+            prefixStates: sequenceLength - 1,
+            seconds: Date.timeIntervalSinceReferenceDate - replayStart)
     }
 
-    private func prefixMask(_ mask: MLXArray?, length: Int) -> MLXArray? {
+    private func stepMask(_ mask: MLXArray?, index: Int) -> MLXArray? {
         guard let mask else { return nil }
+        let range = index ..< (index + 1)
         if mask.ndim == 1 {
-            return mask[0 ..< length]
+            return mask[range]
         }
         if mask.ndim == 2 {
-            return mask[0..., 0 ..< length]
+            return mask[0..., range]
         }
-        return mask[0..., 0 ..< length, 0...]
+        return mask[0..., range, 0...]
     }
 }
 
@@ -590,7 +595,23 @@ final class Qwen35DecoderLayer: Module {
         recordPrefixCommitStates: Bool = false
     ) -> MLXArray {
         let r: MLXArray
-        if isLinear {
+        if NativeMTPPhaseDiagnostics.enabled {
+            let phase = isLinear ? "llm_gdn" : "llm_attention"
+            let start = Date.timeIntervalSinceReferenceDate
+            if isLinear {
+                r = linearAttn!(
+                    inputLayerNorm(x),
+                    mask: ssmMask,
+                    cache: cache as? MambaCache,
+                    recordPrefixCommitStates: recordPrefixCommitStates)
+            } else {
+                r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
+            }
+            MLX.eval(r)
+            NativeMTPPhaseDiagnostics.record(
+                phase,
+                seconds: Date.timeIntervalSinceReferenceDate - start)
+        } else if isLinear {
             r = linearAttn!(
                 inputLayerNorm(x),
                 mask: ssmMask,
@@ -601,6 +622,15 @@ final class Qwen35DecoderLayer: Module {
         }
 
         let h = x + r
+        if NativeMTPPhaseDiagnostics.enabled {
+            let start = Date.timeIntervalSinceReferenceDate
+            let out = (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+            MLX.eval(out)
+            NativeMTPPhaseDiagnostics.record(
+                "llm_mlp",
+                seconds: Date.timeIntervalSinceReferenceDate - start)
+            return h + out
+        }
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
 }
@@ -884,6 +914,15 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
     ) -> NativeMTPForwardResult {
         let cacheOpt: [KVCache?]? = cache?.map { $0 as KVCache? }
         let hidden = model.callAsFunctionPreNorm(inputs, cache: cacheOpt)
+        if NativeMTPPhaseDiagnostics.enabled {
+            let start = Date.timeIntervalSinceReferenceDate
+            let logits = projectToLogits(model.norm(hidden))
+            MLX.eval(logits)
+            NativeMTPPhaseDiagnostics.record(
+                "llm_lm_head",
+                seconds: Date.timeIntervalSinceReferenceDate - start)
+            return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
+        }
         return NativeMTPForwardResult(
             logits: projectToLogits(model.norm(hidden)),
             hiddenStates: hidden)
@@ -898,6 +937,15 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
             inputs,
             cache: cacheOpt,
             recordPrefixCommitStates: true)
+        if NativeMTPPhaseDiagnostics.enabled {
+            let start = Date.timeIntervalSinceReferenceDate
+            let logits = projectToLogits(model.norm(hidden))
+            MLX.eval(logits)
+            NativeMTPPhaseDiagnostics.record(
+                "llm_lm_head",
+                seconds: Date.timeIntervalSinceReferenceDate - start)
+            return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
+        }
         return NativeMTPForwardResult(
             logits: projectToLogits(model.norm(hidden)),
             hiddenStates: hidden)
@@ -910,6 +958,26 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
     ) -> NativeMTPForwardResult {
         guard let mtp else {
             fatalError("Qwen35 nativeMTPForward called without an MTP module")
+        }
+        if NativeMTPPhaseDiagnostics.enabled {
+            let blockStart = Date.timeIntervalSinceReferenceDate
+            let hidden = mtp.preNormHidden(
+                hiddenStates: hiddenStates,
+                nextTokenIds: nextTokenIds,
+                embedTokens: model.embedTokens,
+                cache: cache)
+            MLX.eval(hidden)
+            NativeMTPPhaseDiagnostics.record(
+                "llm_mtp_block",
+                seconds: Date.timeIntervalSinceReferenceDate - blockStart)
+
+            let headStart = Date.timeIntervalSinceReferenceDate
+            let logits = projectToLogits(mtp.norm(hidden))
+            MLX.eval(logits)
+            NativeMTPPhaseDiagnostics.record(
+                "llm_mtp_lm_head",
+                seconds: Date.timeIntervalSinceReferenceDate - headStart)
+            return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
         }
         let hidden = mtp.preNormHidden(
             hiddenStates: hiddenStates,

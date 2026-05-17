@@ -16,6 +16,8 @@ Options:
                           Default: inventory
   --max-size-gb N         Skip live load above N GB unless --allow-huge. Default: 20
   --allow-huge            Permit live loads above --max-size-gb.
+  --exclude-regex REGEX   Skip discovered/model paths matching REGEX. Repeatable
+                          patterns are ORed. Example: 'Kimi|DeepSeek-V4|DSV4'.
   --no-build              Reuse existing .build/debug/RunBench.
   --dry-run               Write planned commands but do not execute live loads.
   -h, --help              Show this help.
@@ -48,6 +50,7 @@ ALLOW_HUGE=0
 BUILD=1
 DRY_RUN=0
 MODELS=()
+EXCLUDE_REGEX=""
 SWIFT_DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 
 while [[ $# -gt 0 ]]; do
@@ -69,6 +72,14 @@ while [[ $# -gt 0 ]]; do
       MAX_SIZE_GB="$2"; shift 2 ;;
     --allow-huge)
       ALLOW_HUGE=1; shift ;;
+    --exclude-regex)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      if [[ -z "$EXCLUDE_REGEX" ]]; then
+        EXCLUDE_REGEX="$2"
+      else
+        EXCLUDE_REGEX="${EXCLUDE_REGEX}|${2}"
+      fi
+      shift 2 ;;
     --no-build)
       BUILD=0; shift ;;
     --dry-run)
@@ -212,7 +223,13 @@ discover_models() {
     find "$MODELS_ROOT" -maxdepth 3 -name config.json -print |
       sed 's#/config.json$##' |
       sort -u
-  fi
+  fi | {
+    if [[ -n "$EXCLUDE_REGEX" ]]; then
+      grep -E -v "$EXCLUDE_REGEX" || true
+    else
+      cat
+    fi
+  }
 }
 
 write_inventory() {
@@ -431,6 +448,7 @@ if [[ "$PROFILE" == "inventory" ]]; then
     printf "# vMLX Live Model Matrix\n\n"
     printf -- "- run dir: %s\n" "$RUN_DIR"
     printf -- "- profile: inventory\n"
+    printf -- "- exclude regex: %s\n" "${EXCLUDE_REGEX:-none}"
     printf -- "- inventory: models.tsv\n"
   } >"${RUN_DIR}/REPORT.md"
   echo "inventory: ${RUN_DIR}/models.tsv" >&2
@@ -506,6 +524,7 @@ done <"${RUN_DIR}/models.tsv"
   printf "# vMLX Live Model Matrix\n\n"
   printf -- "- run dir: %s\n" "$RUN_DIR"
   printf -- "- profile: %s\n" "$PROFILE"
+  printf -- "- exclude regex: %s\n" "${EXCLUDE_REGEX:-none}"
   printf -- "- max size GB: %s\n" "$MAX_SIZE_GB"
   printf -- "- prod max tokens: %s\n" "$(matrix_prod_max_tokens)"
   printf -- "- prod seed: %s\n" "$(matrix_prod_seed)"

@@ -1,6 +1,7 @@
 // Copyright 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
 
+import MLX
 import MLXLMCommon
 import Testing
 
@@ -72,6 +73,29 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(params.topK == 17)
         #expect(params.minP == 0.05)
         #expect(params.repetitionPenalty == 1.08)
+    }
+
+    @Test("bundle top-k reaches speculative sampler probabilities")
+    func bundleTopKReachesSpeculativeSamplerProbabilities() {
+        let settings = VMLXServerRuntimeSettings()
+        let bundle = GenerationConfigFile(
+            temperature: 1.0,
+            topP: 1.0,
+            topK: 2,
+            minP: 0.0,
+            doSample: true)
+        let params = settings.resolvedGenerateParameters(generationConfig: bundle)
+        let sampler = SpeculativeSamplingController(parameters: params)
+        let logits =
+            MLXArray([0.0 as Float, 4.0 as Float, 3.0 as Float, 1.0 as Float])[.newAxis, .ellipsis]
+
+        let probabilities = sampler.probabilities(logits: logits)[0].asArray(Float.self)
+
+        #expect(abs(probabilities[0]) < 1e-6)
+        #expect(probabilities[1] > 0)
+        #expect(probabilities[2] > 0)
+        #expect(abs(probabilities[3]) < 1e-6)
+        #expect(abs(probabilities.reduce(0, +) - 1) < 1e-5)
     }
 
     @Test("nil server sampling fields do not add fake guards")

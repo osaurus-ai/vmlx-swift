@@ -2141,7 +2141,14 @@ public actor BatchEngine {
                             cache: cache))
                     {
                     case .tokens(let remaining):
-                        _ = context.model(remaining, cache: cache, state: nil)
+                        // Match the main prefill path's batch-first shape.
+                        // ZAYA CCA reads B/T from activation rank and traps
+                        // on a 1D token tensor during coordinator-only
+                        // history-boundary cache rederive.
+                        _ = context.model(
+                            remaining[text: .newAxis],
+                            cache: cache,
+                            state: nil)
                     case .logits:
                         break
                     }

@@ -208,7 +208,8 @@ public enum NativeMTPActivation {
         if let explicitRequestOverride {
             return explicitRequestOverride
         }
-        let raw = ProcessInfo.processInfo.environment["VMLINUX_NATIVE_MTP"]?
+        let env = ProcessInfo.processInfo.environment
+        let raw = (env["VMLX_NATIVE_MTP"] ?? env["VMLINUX_NATIVE_MTP"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? "0"
         return ["1", "true", "yes", "on"].contains(raw)
@@ -280,6 +281,312 @@ public enum NativeMTPActivation {
             || normalized == "qwen3_5_moe_text"
             || normalized == "qwen3_5_vl"
             || normalized == "qwen3_vl"
+    }
+}
+
+public struct NativeMTPAutoDecodeRecommendation: Codable, Sendable, Equatable {
+    public let depth: Int
+    public let verifierMode: String
+    public let reason: String
+    public let evidence: [String]
+
+    public init(
+        depth: Int,
+        verifierMode: String = "chunk_commit",
+        reason: String,
+        evidence: [String] = []
+    ) {
+        self.depth = depth
+        self.verifierMode = verifierMode
+        self.reason = reason
+        self.evidence = evidence
+    }
+}
+
+/// Fail-closed native-MTP depth policy for verified Qwen3.5/Qwen3.6 artifacts.
+///
+/// This policy never looks at the model path or marketing name. It uses config
+/// metadata, JANG quantization/profile metadata, and the MTP tensor census.
+/// Preserved-only bundles can receive a candidate depth for UI/reporting with
+/// `requireVerifiedRuntime: false`, but production auto-launch keeps
+/// `requireVerifiedRuntime: true`.
+public enum NativeMTPAutoDecodePolicy {
+    public static func recommendation(
+        configData: Data?,
+        jangConfig: JangConfig?,
+        status: MTPBundleStatus?,
+        requireVerifiedRuntime: Bool = true
+    ) -> NativeMTPAutoDecodeRecommendation? {
+        guard let status, status.hasCompleteMTPArtifact else { return nil }
+        guard !requireVerifiedRuntime || status.speculativeDecodeEnabled else { return nil }
+
+        let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
+            as? [String: Any]
+        let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
+        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else { return nil }
+
+        let mode = quantizationMode(config: config, jangConfig: jangConfig)
+        let bits = intValue((config?["quantization"] as? [String: Any])?["bits"])
+            ?? Int(jangConfig?.quantization.targetBits.rounded() ?? 0)
+        let profile = jangConfig?.quantization.profile.lowercased()
+        let isMoE = modelTypes.contains { $0.contains("moe") }
+            || (jangConfig?.architecture.hasMoE == true)
+        let evidence = [
+            "model_types=\(modelTypes.sorted().joined(separator: ","))",
+            "quantization_mode=\(mode ?? "unknown")",
+            "quantization_bits=\(bits)",
+            "profile=\(profile ?? "none")",
+            "moe=\(isMoE)",
+            "mtp_tensors=\(status.tensorCount)",
+            "runtime_mode=\(status.mode.rawValue)",
+        ]
+
+        if profile == "jang_2k" || (isMoE && bits <= 2) {
+            return nil
+        }
+        if profile == "jang_4m" {
+            return NativeMTPAutoDecodeRecommendation(
+                depth: 2,
+                reason: "Qwen3.6 dense JANG_4M local gate was fastest at D2.",
+                evidence: evidence)
+        }
+        if mode == "mxfp8" {
+            return NativeMTPAutoDecodeRecommendation(
+                depth: isMoE ? 3 : 2,
+                reason: isMoE
+                    ? "Qwen3.6 MoE MXFP8 local gate was fastest at D3."
+                    : "Qwen3.6 dense MXFP8 local gate was fastest at D2.",
+                evidence: evidence)
+        }
+        if mode == "mxfp4" || (mode == "affine" && bits == 4) || bits == 4 {
+            return NativeMTPAutoDecodeRecommendation(
+                depth: 3,
+                reason: isMoE
+                    ? "Qwen3.6 MoE 4-bit local gate was fastest at D3."
+                    : "Qwen3.6 dense MXFP4 D3 clears the local MTP speed target.",
+                evidence: evidence)
+        }
+
+        return nil
+    }
+
+    private static func modelTypes(config: [String: Any]?, fallback: String?) -> [String] {
+        var result = Set<String>()
+        if let fallback, !fallback.isEmpty {
+            result.insert(normalize(fallback))
+        }
+        if let top = config?["model_type"] as? String {
+            result.insert(normalize(top))
+        }
+        if let textConfig = config?["text_config"] as? [String: Any],
+            let text = textConfig["model_type"] as? String
+        {
+            result.insert(normalize(text))
+        }
+        return Array(result)
+    }
+
+    private static func quantizationMode(
+        config: [String: Any]?,
+        jangConfig: JangConfig?
+    ) -> String? {
+        let configQuant = config?["quantization"] as? [String: Any]
+        if let mode = configQuant?["mode"] as? String {
+            return normalize(mode)
+        }
+        if let method = jangConfig?.quantization.method, !method.isEmpty {
+            let normalized = normalize(method)
+            if normalized == "mxfp8" || normalized == "mxfp4" || normalized == "affine" {
+                return normalized
+            }
+        }
+        return nil
+    }
+
+    private static func isSupportedQwenMTPModelType(_ value: String) -> Bool {
+        value == "qwen3_5"
+            || value == "qwen3_5_text"
+            || value == "qwen3_5_moe"
+            || value == "qwen3_5_moe_text"
+            || value == "qwen3_5_vl"
+            || value == "qwen3_vl"
+    }
+
+    private static func normalize(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+    }
+
+    private static func intValue(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? Double { return Int(value) }
+        if let value = value as? Float { return Int(value) }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value) }
+        return nil
+    }
+}
+
+public struct NativeMTPGDNReplaySnapshot: Sendable, Equatable {
+    public let calls: Int
+    public let prefixStates: Int
+    public let seconds: Double
+
+    public init(calls: Int, prefixStates: Int, seconds: Double) {
+        self.calls = calls
+        self.prefixStates = prefixStates
+        self.seconds = seconds
+    }
+}
+
+public enum NativeMTPGDNReplayDiagnostics {
+    private final class Storage: @unchecked Sendable {
+        let lock = NSLock()
+        var calls = 0
+        var prefixStates = 0
+        var seconds = 0.0
+    }
+
+    private static let storage = Storage()
+
+    public static var enabled: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return env["VMLX_NATIVE_MTP_GDN_DIAG"] == "1"
+            || env["VMLINUX_NATIVE_MTP_GDN_DIAG"] == "1"
+    }
+
+    public static func reset() {
+        storage.lock.lock()
+        defer { storage.lock.unlock() }
+        storage.calls = 0
+        storage.prefixStates = 0
+        storage.seconds = 0
+    }
+
+    public static func recordPrefixReplay(prefixStates count: Int, seconds elapsed: Double) {
+        guard enabled else { return }
+        storage.lock.lock()
+        storage.calls += 1
+        storage.prefixStates += count
+        storage.seconds += elapsed
+        storage.lock.unlock()
+    }
+
+    public static func snapshot(reset: Bool = false) -> NativeMTPGDNReplaySnapshot {
+        storage.lock.lock()
+        let result = NativeMTPGDNReplaySnapshot(
+            calls: storage.calls,
+            prefixStates: storage.prefixStates,
+            seconds: storage.seconds)
+        if reset {
+            storage.calls = 0
+            storage.prefixStates = 0
+            storage.seconds = 0
+        }
+        storage.lock.unlock()
+        return result
+    }
+}
+
+public struct NativeMTPPhaseSnapshot: Sendable, Equatable {
+    public let calls: [String: Int]
+    public let seconds: [String: Double]
+
+    public init(calls: [String: Int], seconds: [String: Double]) {
+        self.calls = calls
+        self.seconds = seconds
+    }
+}
+
+public enum NativeMTPPhaseDiagnostics {
+    private final class Storage: @unchecked Sendable {
+        let lock = NSLock()
+        var calls: [String: Int] = [:]
+        var seconds: [String: Double] = [:]
+    }
+
+    private static let storage = Storage()
+
+    public static var enabled: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return env["VMLX_NATIVE_MTP_PHASE_DIAG"] == "1"
+            || env["VMLINUX_NATIVE_MTP_PHASE_DIAG"] == "1"
+    }
+
+    public static func reset() {
+        storage.lock.lock()
+        defer { storage.lock.unlock() }
+        storage.calls.removeAll(keepingCapacity: true)
+        storage.seconds.removeAll(keepingCapacity: true)
+    }
+
+    public static func record(_ phase: String, seconds elapsed: Double) {
+        guard enabled else { return }
+        storage.lock.lock()
+        storage.calls[phase, default: 0] += 1
+        storage.seconds[phase, default: 0] += elapsed
+        storage.lock.unlock()
+    }
+
+    public static func snapshot(reset: Bool = false) -> NativeMTPPhaseSnapshot {
+        storage.lock.lock()
+        let result = NativeMTPPhaseSnapshot(calls: storage.calls, seconds: storage.seconds)
+        if reset {
+            storage.calls.removeAll(keepingCapacity: true)
+            storage.seconds.removeAll(keepingCapacity: true)
+        }
+        storage.lock.unlock()
+        return result
+    }
+
+    public static func summary(limit: Int = 8) -> String {
+        let snap = snapshot()
+        let rows = snap.seconds
+            .sorted { lhs, rhs in lhs.value == rhs.value ? lhs.key < rhs.key : lhs.value > rhs.value }
+            .prefix(limit)
+            .map { key, seconds in
+                let calls = snap.calls[key, default: 0]
+                return String(format: "%@:%d/%.3f", key, calls, seconds)
+            }
+        return rows.isEmpty ? "none" : rows.joined(separator: ",")
+    }
+}
+
+public enum NativeMTPVerifierStatePolicy {
+    public enum Mode: String, Sendable, Equatable {
+        case captureCommit = "capture_commit"
+        case strictCapture = "strict_capture"
+        case lazyRepair = "lazy_repair"
+    }
+
+    public static var mode: Mode {
+        let env = ProcessInfo.processInfo.environment
+        let raw =
+            (env["VMLX_NATIVE_MTP_STATE_COMMIT"]
+                ?? env["VMLINUX_NATIVE_MTP_STATE_COMMIT"]
+                ?? env["VMLX_NATIVE_MTP_HYBRID_VERIFY"]
+                ?? env["VMLINUX_NATIVE_MTP_HYBRID_VERIFY"]
+                ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        switch raw {
+        case "chunk_lazy_repair", "lazy_repair", "lazy", "fast_lazy":
+            return .lazyRepair
+        case "chunk_fast", "fast", "capture_commit", "chunk_commit":
+            return .captureCommit
+        default:
+            return .strictCapture
+        }
+    }
+
+    public static var shouldRecordAcceptedPrefixStates: Bool {
+        mode != .lazyRepair
+    }
+
+    public static var shouldRoundGDNStateEachVerifierStep: Bool {
+        mode == .strictCapture
     }
 }
 

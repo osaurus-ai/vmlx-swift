@@ -178,6 +178,9 @@ struct Bench {
         //   BENCH_PERF_VARIANT — label emitted in the output
         //   BENCH_PERF_WARMUP  — run N warmup turns first (default 1)
         //   BENCH_PERF_RUNS    — measurement turns, picks median (default 3)
+        //   BENCH_PERF_SEED    — deterministic stochastic-sampler seed
+        //   BENCH_PERF_USE_GENERATION_CONFIG=1 — seed sampling from the
+        //     bundle's generation_config.json before explicit env overrides.
         if (env["BENCH_PERF"] ?? "0") == "1" {
             try await runPerfBench(
                 modelPath: modelPath, maxNew: maxNew,
@@ -6149,8 +6152,12 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
 ///
 ///   PERF model=<name> variant=<label> genTokens=N genSec=F tokps=F
 ///
-/// Temperature 0, fixed token budget, no chat template (just raw
-/// prompt) so the only variable is the decode hot path.
+/// Default mode uses temperature 0 and a fixed token budget so the only
+/// variable is the decode hot path. Set BENCH_PERF_USE_GENERATION_CONFIG=1
+/// to seed sampling from the bundle's generation_config.json, with explicit
+/// BENCH_PERF_TEMP/TOP_P/TOP_K/MIN_P/REPETITION_PENALTY env overrides still
+/// taking final precedence. Set BENCH_PERF_SEED to make stochastic rows
+/// reproducible.
 func runPerfBench(
     modelPath: String,
     maxNew: Int,
@@ -6334,25 +6341,79 @@ func runPerfBench(
             ].filter { text.contains($0) }
         }
 
+        let useGenerationConfigSampling = env["BENCH_PERF_USE_GENERATION_CONFIG"] == "1"
+        let samplingSource = useGenerationConfigSampling
+            ? "bundle-defaults"
+            : "explicit-env"
+        let perfSeed = env["BENCH_PERF_SEED"].flatMap(UInt64.init)
+        let perfSeedLabel = perfSeed.map(String.init) ?? "nil"
+
         func oneTurn(_ label: String) async throws -> PerfTurnResult {
             let input = LMInput(text: LMInput.Text(tokens: promptIds))
             nonisolated(unsafe) let sendable = input
-            let perfTemperature = Float(env["BENCH_PERF_TEMP"] ?? "0") ?? 0
-            let perfTopP = Float(env["BENCH_PERF_TOP_P"] ?? "1.0") ?? 1.0
-            let perfTopK = Int(env["BENCH_PERF_TOP_K"] ?? "0") ?? 0
-            let perfMinP = Float(env["BENCH_PERF_MIN_P"] ?? "0") ?? 0
-            let perfRepetitionPenalty = env["BENCH_PERF_REPETITION_PENALTY"]
-                .flatMap(Float.init)
             let perfRepetitionContext = Int(env["BENCH_PERF_REPETITION_CONTEXT"] ?? "20") ?? 20
-            var params = GenerateParameters(
-                maxTokens: maxNew,
-                temperature: perfTemperature,
-                topP: perfTopP,
-                topK: perfTopK,
-                minP: perfMinP,
-                repetitionPenalty: perfRepetitionPenalty,
-                repetitionContextSize: perfRepetitionContext,
-                prefillStepSize: 512)
+            let printPhaseSnapshot = env["BENCH_PERF_PHASE_SNAPSHOT"] == "1"
+            if printPhaseSnapshot {
+                if NativeMTPPhaseDiagnostics.enabled {
+                    NativeMTPPhaseDiagnostics.reset()
+                }
+                if NativeMTPGDNReplayDiagnostics.enabled {
+                    NativeMTPGDNReplayDiagnostics.reset()
+                }
+            }
+            var params: GenerateParameters
+            if useGenerationConfigSampling {
+                let fallback = GenerateParameters(
+                    maxTokens: maxNew,
+                    temperature: 0,
+                    topP: 1,
+                    topK: 0,
+                    minP: 0,
+                    randomSeed: perfSeed,
+                    repetitionPenalty: nil,
+                    repetitionContextSize: perfRepetitionContext,
+                    prefillStepSize: 512)
+                params = GenerateParameters(generationConfig: context.configuration.generationDefaults,
+                    fallback: fallback)
+                params.maxTokens = maxNew
+                params.prefillStepSize = 512
+                params.repetitionContextSize = perfRepetitionContext
+            } else {
+                let perfTemperature = Float(env["BENCH_PERF_TEMP"] ?? "0") ?? 0
+                let perfTopP = Float(env["BENCH_PERF_TOP_P"] ?? "1.0") ?? 1.0
+                let perfTopK = Int(env["BENCH_PERF_TOP_K"] ?? "0") ?? 0
+                let perfMinP = Float(env["BENCH_PERF_MIN_P"] ?? "0") ?? 0
+                let perfRepetitionPenalty = env["BENCH_PERF_REPETITION_PENALTY"]
+                    .flatMap(Float.init)
+                params = GenerateParameters(
+                    maxTokens: maxNew,
+                    temperature: perfTemperature,
+                    topP: perfTopP,
+                    topK: perfTopK,
+                    minP: perfMinP,
+                    randomSeed: perfSeed,
+                    repetitionPenalty: perfRepetitionPenalty,
+                    repetitionContextSize: perfRepetitionContext,
+                    prefillStepSize: 512)
+            }
+            if let perfSeed {
+                params.randomSeed = perfSeed
+            }
+            if let override = env["BENCH_PERF_TEMP"].flatMap(Float.init) {
+                params.temperature = override
+            }
+            if let override = env["BENCH_PERF_TOP_P"].flatMap(Float.init) {
+                params.topP = override
+            }
+            if let override = env["BENCH_PERF_TOP_K"].flatMap(Int.init) {
+                params.topK = override
+            }
+            if let override = env["BENCH_PERF_MIN_P"].flatMap(Float.init) {
+                params.minP = override
+            }
+            if let override = env["BENCH_PERF_REPETITION_PENALTY"].flatMap(Float.init) {
+                params.repetitionPenalty = override
+            }
             if env["BENCH_PERF_COMPILED"] == "1" {
                 params.enableCompiledDecode = useTokenIterator
                 params.enableCompiledBatchDecode = !useTokenIterator
@@ -6460,13 +6521,29 @@ func runPerfBench(
             result.footprintMiB = currentPhysFootprintMiB()
             peakRSSMiB = max(peakRSSMiB, result.rssMiB)
             peakFootprintMiB = max(peakFootprintMiB, result.footprintMiB)
+            if printPhaseSnapshot {
+                let phaseSummary = NativeMTPPhaseDiagnostics.enabled
+                    ? NativeMTPPhaseDiagnostics.summary(limit: 12)
+                    : "disabled"
+                let gdnReplay = NativeMTPGDNReplayDiagnostics.enabled
+                    ? NativeMTPGDNReplayDiagnostics.snapshot(reset: true)
+                    : NativeMTPGDNReplaySnapshot(calls: 0, prefixStates: 0, seconds: 0)
+                if NativeMTPPhaseDiagnostics.enabled {
+                    _ = NativeMTPPhaseDiagnostics.snapshot(reset: true)
+                }
+                print(String(format:
+                    "  PERF_PHASE label=%@ phaseDiag=%@ gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f",
+                    label, phaseSummary, gdnReplay.calls, gdnReplay.prefixStates,
+                    gdnReplay.seconds))
+            }
             if label.hasPrefix("run") {
                 let visible = result.text.isEmpty ? result.reasoning : result.text
                 let leaks = markerLeaks(in: result.text).joined(separator: ",")
                 let loop = lagunaLoopHeuristic(visible)
                 print(String(format:
-                    "  PERF_RUN label=%@ ttft_ms=%.0f prompt_ms=%.0f prompt_tps=%.0f genTokens=%d genSec=%.3f tokps=%.1f rss_mib=%.0f footprint_mib=%.0f temp=%.2f topP=%.2f topK=%d minP=%.2f rep=%@ stop=%@ unclosedReasoning=%@ textChars=%d reasoningChars=%d toolCalls=%d loop=%@ leaks=%@",
-                    label, result.ttftSec * 1000,
+                    "  PERF_RUN label=%@ samplingSource=%@ seed=%@ ttft_ms=%.0f prompt_ms=%.0f prompt_tps=%.0f genTokens=%d genSec=%.3f tokps=%.1f rss_mib=%.0f footprint_mib=%.0f temp=%.2f topP=%.2f topK=%d minP=%.2f rep=%@ stop=%@ unclosedReasoning=%@ textChars=%d reasoningChars=%d toolCalls=%d loop=%@ leaks=%@",
+                    label, samplingSource, perfSeedLabel,
+                    result.ttftSec * 1000,
                     result.promptSec * 1000,
                     result.promptTokensPerSecond(promptTokenCount: promptTokens.count),
                     result.genTokens, result.genSec, result.tokps,
@@ -6531,8 +6608,8 @@ func runPerfBench(
         let head = String(
             gitShortHead(modelDir: FileManager.default.currentDirectoryPath))
         perfLine = String(format:
-            "PERF model=%@ variant=%@ path=%@ kvMode=%@ jangpress=%@ mmap=%@ commit=%@ loadSec=%.2f promptTokens=%d peak_rss_mib=%.0f peak_footprint_mib=%.0f graphNodes=%@ asType=%@ genTokens=%d genSec=%.3f tokps_median=%.1f tokps_best=%.1f runs=%@ stop=%@ unclosedReasoning=%@ loop=%@ leaks=%@",
-            modelName, variant, pathLabel,
+            "PERF model=%@ variant=%@ path=%@ samplingSource=%@ seed=%@ kvMode=%@ jangpress=%@ mmap=%@ commit=%@ loadSec=%.2f promptTokens=%d peak_rss_mib=%.0f peak_footprint_mib=%.0f graphNodes=%@ asType=%@ genTokens=%d genSec=%.3f tokps_median=%.1f tokps_best=%.1f runs=%@ stop=%@ unclosedReasoning=%@ loop=%@ leaks=%@",
+            modelName, variant, pathLabel, samplingSource, perfSeedLabel,
             env["BENCH_PERF_KV_MODE"] ?? "none",
             useJangPressLoad ? "on" : "off",
             useMmap ? "on" : "off",

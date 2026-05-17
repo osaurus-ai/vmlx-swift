@@ -34,4 +34,12 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(
             quantized3.describeExtra(0), "(embeddingCount=512, dimensions=1024)")
     }
+
+    func testQuantizedLinearInitializerPreservesMXFP8Mode() {
+        let linear = Linear(64, 32, bias: false)
+        let quantized = QuantizedLinear(linear, groupSize: 32, bits: 8, mode: .mxfp8)
+
+        XCTAssertEqual(quantized.mode, .mxfp8)
+        XCTAssertNil(quantized.biases)
+    }
 }

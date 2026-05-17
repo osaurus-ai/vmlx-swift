@@ -14,6 +14,7 @@ scripts/vmlx-live-model-matrix.sh --profile all --max-size-gb 20
 scripts/vmlx-live-model-matrix.sh --profile turnmatrix --max-size-gb 6
 scripts/vmlx-live-model-matrix.sh --profile batch --model ~/models/<bundle>
 scripts/vmlx-live-model-matrix.sh --profile all --allow-huge
+scripts/vmlx-live-model-matrix.sh --profile inventory --exclude-regex 'Kimi|DeepSeek-V4|DSV4'
 ```
 
 Artifacts are written under:
