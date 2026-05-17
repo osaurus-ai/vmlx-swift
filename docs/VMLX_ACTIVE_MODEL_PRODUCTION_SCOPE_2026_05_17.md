@@ -723,6 +723,13 @@ turnmatrix:
   `stores=14`, and `maxBytes=4294967296`;
 - BatchEngine single, chat, disk restore, B=2 concurrent, B=2 per-slot sampler,
   and TurboQuant-KV B=2 isolation: PASS;
+- active focused SWA/cache coverage is now wired under
+  `CacheCoordinatorTopologyFocusedTests`: 3 Gemma 4 topology tests prove the
+  mixed RotatingKVCache+KVCacheSimple no-`maxKVSize` path stays
+  `.heterogeneous`/uncompiled, the all-rotating `maxKVSize` path stays
+  `.rotating`/compile-eligible, and full-attention rotating caches keep the
+  attention-sink shape; 4 BatchKVCache rotating-slot tests prove post-wrap
+  masks use the capped effective key length instead of `offset + n`;
 - the generic prefix-extension paged cache-hit row is N-A because this model is
   routed through the disk-backed paged-incompatible cache path.
 

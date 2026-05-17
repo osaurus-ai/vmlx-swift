@@ -364,6 +364,190 @@ struct BatchArraysCacheFocusedTests {
     }
 }
 
+@Suite("Gemma4 cache topology focused contracts")
+struct Gemma4CacheTopologyFocusedTests {
+    private static func mixedRotatingSimpleCache(slidingWindow: Int = 64) -> [KVCache] {
+        [
+            RotatingKVCache(maxSize: slidingWindow, keep: 0),
+            KVCacheSimple(),
+            RotatingKVCache(maxSize: slidingWindow, keep: 0),
+            KVCacheSimple(),
+        ]
+    }
+
+    private static func allRotatingCache(slidingWindow: Int = 64, maxKVSize: Int = 2048) -> [KVCache] {
+        [
+            RotatingKVCache(maxSize: slidingWindow, keep: 0),
+            RotatingKVCache(maxSize: maxKVSize, keep: 4),
+            RotatingKVCache(maxSize: slidingWindow, keep: 0),
+            RotatingKVCache(maxSize: maxKVSize, keep: 4),
+        ]
+    }
+
+    @Test("Mixed Rotating+Simple Gemma4 cache classifies as heterogeneous")
+    func cacheWithoutMaxKVSizeIsHeterogeneous() {
+        let cache = Self.mixedRotatingSimpleCache()
+
+        #expect(cache.count == 4)
+        #expect(cache[0] is RotatingKVCache)
+        #expect(cache[1] is KVCacheSimple)
+        #expect(cache[2] is RotatingKVCache)
+        #expect(cache[3] is KVCacheSimple)
+
+        let family = CacheFamily.classify(cache)
+        #expect(family == .heterogeneous)
+        #expect(family.isCompileEligibleAtCurrentStage == false)
+    }
+
+    @Test("All-Rotating Gemma4 cache classifies as rotating")
+    func cacheWithMaxKVSizeIsRotating() {
+        let cache = Self.allRotatingCache()
+
+        #expect(cache.count == 4)
+        for layer in cache {
+            #expect(layer is RotatingKVCache)
+        }
+
+        let family = CacheFamily.classify(cache)
+        #expect(family == .rotating)
+        #expect(family.isCompileEligibleAtCurrentStage == true)
+    }
+
+    @Test("Full-attention rotating cache uses the attention-sink shape")
+    func attentionSinkContract() {
+        let sliding = RotatingKVCache(maxSize: 1024, keep: 0)
+        let full = RotatingKVCache(maxSize: 4096, keep: 4)
+
+        #expect(sliding.maxSize == 1024)
+        #expect(full.maxSize == 4096)
+    }
+}
+
+@Suite("BatchKVCache rotating-slot focused contracts", .serialized)
+struct BatchKVCacheRotatingSlotFocusedTests {
+    @Test("makeMask last axis matches update key count after ring wrap")
+    func maskMatchesUpdatedKeyShape() {
+        FocusedMLXTestSupport.withLock {
+            prepareMLXMetallibForCacheTopologyTests()
+
+            let maxSize = 16
+            let prompt = 40
+            let heads = 4
+            let headDim = 8
+            let rotating = RotatingKVCache(maxSize: maxSize, keep: 0)
+            _ = rotating.update(
+                keys: MLXArray.ones([1, heads, prompt, headDim]),
+                values: MLXArray.ones([1, heads, prompt, headDim]))
+            #expect(rotating.offset == prompt)
+
+            let batchCache = BatchKVCache(slotCaches: [rotating])
+            let mask = batchCache.makeMask(n: 1, windowSize: maxSize, returnArray: false)
+
+            let newK = MLXArray.ones([1, heads, 1, headDim])
+            let newV = MLXArray.ones([1, heads, 1, headDim])
+            let (rotatingKeys, _) = batchCache.update(keys: newK, values: newV)
+            #expect(rotatingKeys.shape == [1, heads, maxSize, headDim])
+
+            guard case .array(let maskArray) = mask else {
+                Issue.record("Expected .array mask, got \(mask)")
+                return
+            }
+            #expect(maskArray.shape.last == rotatingKeys.shape[2])
+            #expect(maskArray.shape == [1, 1, 1, maxSize])
+            for column in 0..<maxSize {
+                #expect(maskArray[0, 0, 0, column].item(Bool.self) == true)
+            }
+        }
+    }
+
+    @Test("pre-wrap rotating slot still gets standard causal mask")
+    func preWrapMaskUnchanged() {
+        FocusedMLXTestSupport.withLock {
+            prepareMLXMetallibForCacheTopologyTests()
+
+            let maxSize = 32
+            let prompt = 8
+            let rotating = RotatingKVCache(maxSize: maxSize, keep: 0)
+            _ = rotating.update(
+                keys: MLXArray.ones([1, 2, prompt, 4]),
+                values: MLXArray.ones([1, 2, prompt, 4]))
+
+            let batchCache = BatchKVCache(slotCaches: [rotating])
+            let mask = batchCache.makeMask(n: 1, windowSize: maxSize, returnArray: false)
+
+            guard case .array(let maskArray) = mask else {
+                Issue.record("Expected .array mask, got \(mask)")
+                return
+            }
+            #expect(maskArray.shape == [1, 1, 1, prompt + 1])
+            for column in 0..<(prompt + 1) {
+                #expect(maskArray[0, 0, 0, column].item(Bool.self) == true)
+            }
+        }
+    }
+
+    @Test("mixed wrapped rotating and unbounded slot produces compatible mask")
+    func mixedWrappedAndUnboundedMask() {
+        FocusedMLXTestSupport.withLock {
+            prepareMLXMetallibForCacheTopologyTests()
+
+            let maxSize = 16
+            let rotating = RotatingKVCache(maxSize: maxSize, keep: 0)
+            _ = rotating.update(
+                keys: MLXArray.ones([1, 2, 40, 4]),
+                values: MLXArray.ones([1, 2, 40, 4]))
+
+            let simple = KVCacheSimple()
+            _ = simple.update(
+                keys: MLXArray.ones([1, 2, 5, 4]),
+                values: MLXArray.ones([1, 2, 5, 4]))
+
+            let batch = BatchKVCache(slotCaches: [rotating, simple])
+            let mask = batch.makeMask(n: 1, windowSize: maxSize, returnArray: false)
+
+            guard case .array(let maskArray) = mask else {
+                Issue.record("Expected .array mask, got \(mask)")
+                return
+            }
+            #expect(maskArray.shape == [2, 1, 1, maxSize])
+
+            for column in 0..<maxSize {
+                #expect(maskArray[0, 0, 0, column].item(Bool.self) == true)
+            }
+            for column in 0..<6 {
+                #expect(maskArray[1, 0, 0, column].item(Bool.self) == true)
+            }
+            for column in 6..<maxSize {
+                #expect(maskArray[1, 0, 0, column].item(Bool.self) == false)
+            }
+        }
+    }
+
+    @Test("explicit effectiveKeyLens caps batch causal mask maxTotal")
+    func explicitEffectiveKeyLensCapsMaxTotal() {
+        FocusedMLXTestSupport.withLock {
+            prepareMLXMetallibForCacheTopologyTests()
+
+            let mask = createBatchCausalMask(
+                queryLen: 1,
+                offsets: [100, 5],
+                effectiveKeyLens: [16, 6],
+                windowSize: nil)
+
+            #expect(mask.shape == [2, 1, 1, 16])
+            for column in 0..<16 {
+                #expect(mask[0, 0, 0, column].item(Bool.self) == true)
+            }
+            for column in 0..<6 {
+                #expect(mask[1, 0, 0, column].item(Bool.self) == true)
+            }
+            for column in 6..<16 {
+                #expect(mask[1, 0, 0, column].item(Bool.self) == false)
+            }
+        }
+    }
+}
+
 private let cacheTopologyTestRepoRoot = URL(fileURLWithPath: #filePath)
     .deletingLastPathComponent()
     .deletingLastPathComponent()
