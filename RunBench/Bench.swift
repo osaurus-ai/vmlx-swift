@@ -1128,13 +1128,10 @@ func runBatchEngineTurn(
 /// Submit a tool-bearing prompt through `BatchEngine.generate(...)` on a
 /// real model, collecting `.chunk` / `.toolCall` events. Assert the
 /// library-level pipeline contract:
+///   - a real tool schema MUST be passed through `UserInput.tools`.
+///   - the model MUST emit at least one structured `.toolCall`.
 ///   - `.chunk` output MUST NOT contain raw tool-call markers.
 ///   - `.chunk` output MUST NOT contain raw `<think>...</think>` markers.
-///
-/// The model is nondeterministic at the system level (tokenizer template,
-/// weights, decode path) so we do not require a `.toolCall` event — we
-/// only require that IF markers appear in the raw stream they get
-/// extracted or stripped rather than leaking to osaurus.
 func runBatchEngineToolCall(modelPath: String, maxNew: Int) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     print("\n=== BatchEngine tool-call pipeline (iter 66) ===")
@@ -1149,44 +1146,74 @@ func runBatchEngineToolCall(modelPath: String, maxNew: Int) async throws {
     nonisolated(unsafe) let ctx = context
     let engine = BatchEngine(context: ctx, maxBatchSize: 1)
 
-    // Prompt that encourages the model to call a tool. Exact format is
-    // family-specific, but the same user text paired with the model's
-    // own chat template is the realistic path.
+    let weatherParams: [String: any Sendable] = [
+        "type": "object",
+        "properties": [
+            "location": ["type": "string", "description": "City or region name"] as [String: any Sendable],
+        ] as [String: any Sendable],
+        "required": ["location"],
+    ]
+    let weatherFn: [String: any Sendable] = [
+        "name": "get_weather",
+        "description": "Get current weather for a location.",
+        "parameters": weatherParams,
+    ]
+    let weatherTool: [String: any Sendable] = [
+        "type": "function",
+        "function": weatherFn,
+    ]
+
+    // Strict tool-only request. A text answer with no `.toolCall` is useful
+    // evidence, but it is not a passing tool-call pipeline row.
     let prompt = """
-        You have access to a tool:
-        - get_weather(location: string) → returns the current weather
-
-        User question: What is the weather in Tokyo right now?
-
-        If you need external data to answer, emit a tool call in the
-        format your training expects, otherwise just answer directly.
+        Call get_weather for location Tokyo.
+        Emit only the tool call. Do not answer in prose.
         """
 
     var params = GenerateParameters(
         maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
     params.enableCompiledBatchDecode = false
 
-    let input = try await ctx.processor.prepare(input: UserInput(prompt: prompt))
+    let input = try await ctx.processor.prepare(input: UserInput(
+        prompt: prompt,
+        tools: [weatherTool],
+        additionalContext: ["enable_thinking": false]))
     nonisolated(unsafe) let sendable = input
     let stream = await engine.generate(input: sendable, parameters: params)
 
     var chunkText = ""
     var toolCallCount = 0
+    var toolCallDetails = [String]()
+    var reasoningChars = 0
+    var info: GenerateCompletionInfo?
     for await event in stream {
         switch event {
         case .chunk(let c):
             chunkText += c
-        case .reasoning:
-            break
-        case .toolCall:
+        case .reasoning(let r):
+            reasoningChars += r.count
+        case .toolCall(let call):
             toolCallCount += 1
-        case .info:
-            break
+            let args = call.function.arguments.mapValues { $0.anyValue }
+            let argText: String
+            if JSONSerialization.isValidJSONObject(args),
+               let data = try? JSONSerialization.data(withJSONObject: args, options: [.sortedKeys]),
+               let text = String(data: data, encoding: .utf8) {
+                argText = text
+            } else {
+                argText = String(describing: call.function.arguments)
+            }
+            toolCallDetails.append("\(call.function.name)(\(argText))")
+        case .info(let i):
+            info = i
         }
     }
 
     let preview = chunkText.count > 240 ? String(chunkText.prefix(240)) + "..." : chunkText
-    print("  chunks: \(chunkText.count) chars, toolCalls: \(toolCallCount)")
+    let stop = info.map { "\($0.stopReason)" } ?? "nil"
+    let genTokens = info.map { "\($0.generationTokenCount)" } ?? "nil"
+    print("  chunks: \(chunkText.count) chars, reasoning: \(reasoningChars) chars, toolCalls: \(toolCallCount), stop: \(stop), genTokens: \(genTokens)")
+    print("  tool calls: \(toolCallDetails.joined(separator: "; "))")
     print("  text preview: \"\(preview)\"")
 
     // Contract assertions. These must hold on *every* family: osaurus
@@ -1207,7 +1234,21 @@ func runBatchEngineToolCall(modelPath: String, maxNew: Int) async throws {
             userInfo: [NSLocalizedDescriptionKey:
                 "Raw library-level markers leaked into .chunk: \(leakedMarkers)."])
     }
-    print("  OK — no raw tool-call / reasoning markers leaked to .chunk.")
+    if toolCallCount == 0 && chunkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        print("  FAIL — no structured tool call and no visible fallback output.")
+        throw NSError(
+            domain: "BENCH_BATCH_TOOLCALL", code: 2,
+            userInfo: [NSLocalizedDescriptionKey:
+                "No structured tool call and no visible fallback output."])
+    }
+    if toolCallCount == 0 {
+        print("  FAIL — generation completed without a structured .toolCall event.")
+        throw NSError(
+            domain: "BENCH_BATCH_TOOLCALL", code: 3,
+            userInfo: [NSLocalizedDescriptionKey:
+                "Tool schema was supplied, but the generation produced no structured .toolCall event."])
+    }
+    print("  OK — structured tool call emitted and no raw markers leaked to .chunk.")
 
     print("\n=== BatchEngine tool-call pipeline done ===")
 }

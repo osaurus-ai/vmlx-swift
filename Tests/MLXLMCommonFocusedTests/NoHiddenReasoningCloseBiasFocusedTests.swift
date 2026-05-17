@@ -308,6 +308,27 @@ struct HarmonyParserFocusedTests {
         #expect(!visible.contains("<|tool_call>"))
     }
 
+    @Test("BatchEngine tool-call live probe supplies tools and rejects empty rows")
+    func batchEngineToolCallProbeRequiresBehavioralEvidence() throws {
+        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let function = try #require(
+            Self.extractFunction(named: "runBatchEngineToolCall", from: bench),
+            "runBatchEngineToolCall not found"
+        )
+
+        #expect(function.body.contains("let weatherTool: [String: any Sendable]"))
+        #expect(
+            function.body.contains("tools: [weatherTool]")
+                || function.body.contains("ui.tools = [weatherTool]"),
+            "The live probe must pass a real tool schema through UserInput."
+        )
+        #expect(
+            function.body.contains("toolCallCount == 0")
+                && function.body.contains("trimmingCharacters(in: .whitespacesAndNewlines).isEmpty"),
+            "The live probe must fail empty-output/no-tool rows instead of counting them as leak-free."
+        )
+    }
+
     private func chunked(_ text: String, by size: Int) -> [String] {
         var chunks: [String] = []
         var index = text.startIndex
@@ -317,6 +338,29 @@ struct HarmonyParserFocusedTests {
             index = end
         }
         return chunks
+    }
+
+    private static func extractFunction(named name: String, from source: String) -> (line: Int, body: String)? {
+        guard let range = source.range(of: "func \(name)") else { return nil }
+        guard let brace = source[range.lowerBound...].firstIndex(of: "{") else { return nil }
+        let line = source[..<range.lowerBound].reduce(1) { count, character in
+            character == "\n" ? count + 1 : count
+        }
+        var depth = 0
+        var index = brace
+        while index < source.endIndex {
+            let character = source[index]
+            if character == "{" {
+                depth += 1
+            } else if character == "}" {
+                depth -= 1
+                if depth == 0 {
+                    return (line, String(source[range.lowerBound...index]))
+                }
+            }
+            index = source.index(after: index)
+        }
+        return nil
     }
 
     private func collect(_ segments: [ReasoningSegment]) -> (reasoning: String, content: String) {

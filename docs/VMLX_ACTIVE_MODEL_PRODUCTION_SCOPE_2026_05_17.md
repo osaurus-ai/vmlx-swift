@@ -59,6 +59,13 @@ docs/local/production-readiness/20260517T1450_gemma4_rotating_compile_direct/
 docs/local/production-readiness/20260517T1505_ling_bailing_capability_aliases/
 ```
 
+Fresh live Gemma4 schema/VL artifacts:
+
+```text
+docs/local/live-model-matrix/20260517T210417Z_gemma4_vl_chat_cache/
+docs/local/live-model-matrix/20260517T212204Z_gemma4_batch_toolcall_real_schema/
+```
+
 That inventory contains 28 non-excluded local bundles:
 
 - 12 text bundles
@@ -846,10 +853,10 @@ turnmatrix:
 - the generic prefix-extension paged cache-hit row is N-A because this model is
   routed through the disk-backed paged-incompatible cache path.
 
-This clears the current Gemma 4 text multi-turn/cache/batching row. It does not
-yet close separate long-budget harmony reasoning or live tool-call schema rows.
-The image/text VL cache row is now covered by the structured chat-cache artifact
-below.
+This clears the current Gemma 4 text multi-turn/cache/batching row. The
+image/text VL cache row and live tool-call schema row are now covered by the
+fresh artifacts below. Long-budget Harmony reasoning remains a separate open
+row.
 
 Fresh Gemma 4 VL structured chat-cache artifact:
 
@@ -869,6 +876,24 @@ docs/local/live-model-matrix/20260517T210417Z_gemma4_vl_chat_cache/
 - text-only follow-up remains grounded in the earlier image colors and leaks no
   raw `<think>`, `<image>`, or media markers;
 - `/usr/bin/time -l` records peak memory footprint `30617874576` bytes.
+
+Fresh Gemma 4 live tool-call schema artifact:
+
+```text
+docs/local/live-model-matrix/20260517T212204Z_gemma4_batch_toolcall_real_schema/
+```
+
+`BENCH_BATCH_TOOLCALL=1` now passes on the current release `RunBench` binary
+after the harness was tightened to send a real `get_weather` schema through
+`UserInput.tools` and to fail empty-output/no-tool rows:
+
+- model loads as `Gemma4`;
+- `Tool format: gemma4` and `Reasoning stamp: harmony` are active;
+- stream emits `toolCalls: 1`, `stop`, `genTokens=14`;
+- structured call is `get_weather({"location":"Tokyo"})`;
+- visible chunks and reasoning chars are both zero, so no raw Harmony or
+  tool-call markers leak to `.chunk`;
+- `/usr/bin/time -l` records peak memory footprint `25524235616` bytes.
 
 Additional Harmony parser follow-up:
 
@@ -934,8 +959,8 @@ docs/local/production-readiness/20260517T_laguna_mistral_gemma4_active_contracts
 Boundary: the Gemma 4 live Harmony smoke did not elicit reasoning deltas on
 that prompt, and there is no local GPT-OSS bundle in `~/models` for a live
 GPT-OSS decode row. The GPT-OSS claim is therefore parser-contract proof only,
-not a model-runtime production pass. Long-budget Gemma 4 thinking and live
-Gemma 4 tool-call schema remain separate rows.
+not a model-runtime production pass. Long-budget Gemma 4 thinking remains a
+separate open row.
 
 ## Nemotron Omni JANGTQ Release Matrix - 2026-05-17
 
