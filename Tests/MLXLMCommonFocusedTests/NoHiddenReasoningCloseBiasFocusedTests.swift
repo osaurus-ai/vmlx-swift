@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import Testing
+@testable import MLXLLM
 @testable import MLXLMCommon
 
 @Suite("No hidden reasoning close bias")
@@ -240,5 +241,211 @@ struct HarmonyParserFocusedTests {
             }
         }
         return (reasoning, content)
+    }
+}
+
+@Suite("Hy3 parser and no-leak focused contracts")
+struct Hy3ParserFocusedTests {
+    @Test("Hy3 parser aliases resolve to Hunyuan tools and think XML reasoning")
+    func aliasesResolve() {
+        for stamp in ["hunyuan", "tencent", "hy3", "hy_v3", "hy-v3"] {
+            #expect(ToolCallFormat.fromCapabilityName(stamp) == .hunyuan)
+            #expect(ReasoningParser.fromCapabilityName(stamp) != nil)
+        }
+        for modelType in ["hy_v3", "hy-v3", "hy3", "Hy3"] {
+            #expect(reasoningStampFromModelType(modelType) == "think_xml")
+            #expect(ToolCallFormat.infer(from: modelType) == .hunyuan)
+        }
+    }
+
+    @Test("Hy3 Hunyuan parser extracts multiple scalar-argument calls")
+    func hunyuanParserExtractsCalls() {
+        let parser = HunyuanToolCallParser()
+        let calls = parser.parseEOS(
+            """
+            <tool_calls>
+            <tool_call>search_web<tool_sep>
+            <arg_key>query</arg_key><arg_value>"hy3 runtime"</arg_value>
+            <arg_key>limit</arg_key><arg_value>3</arg_value>
+            <arg_key>safe</arg_key><arg_value>true</arg_value>
+            </tool_call>
+            <tool_call>open_file<tool_sep>
+            <arg_key>path</arg_key><arg_value>"/tmp/a b.txt"</arg_value>
+            </tool_call>
+            </tool_calls>
+            """,
+            tools: nil)
+
+        #expect(calls.count == 2)
+        #expect(calls[0].function.name == "search_web")
+        #expect(calls[0].function.arguments["query"] == .string("hy3 runtime"))
+        #expect(calls[0].function.arguments["limit"] == .int(3))
+        #expect(calls[0].function.arguments["safe"] == .bool(true))
+        #expect(calls[1].function.name == "open_file")
+        #expect(calls[1].function.arguments["path"] == .string("/tmp/a b.txt"))
+    }
+
+    @Test("Hy3 reasoning and Hunyuan tool-call pipeline does not leak markers")
+    func reasoningToolPipelineDoesNotLeakMarkers() {
+        var reasoningParser = ReasoningParser.fromCapabilityName("hy_v3")
+        let toolProcessor = ToolCallProcessor(format: .hunyuan)
+        let stream = """
+            <think>choose the lookup tool</think>
+            <tool_calls>
+            <tool_call>search_web<tool_sep>
+            <arg_key>query</arg_key><arg_value>"hy3 swift"</arg_value>
+            </tool_call>
+            <tool_call>open_file<tool_sep>
+            <arg_key>path</arg_key><arg_value>"/tmp/hy3.md"</arg_value>
+            </tool_call>
+            </tool_calls>
+            Final answer after tools.
+            """
+
+        var visible = ""
+        var reasoning = ""
+        for scalar in stream {
+            if var parser = reasoningParser {
+                for segment in parser.feed(String(scalar)) {
+                    switch segment {
+                    case .reasoning(let text):
+                        reasoning += text
+                    case .content(let text):
+                        visible += toolProcessor.processChunk(text) ?? ""
+                    }
+                }
+                reasoningParser = parser
+            }
+        }
+        if var parser = reasoningParser {
+            for segment in parser.flush() {
+                switch segment {
+                case .reasoning(let text):
+                    reasoning += text
+                case .content(let text):
+                    visible += toolProcessor.processChunk(text) ?? ""
+                }
+            }
+        }
+        _ = toolProcessor.processEOS()
+
+        #expect(reasoning.contains("choose the lookup tool"))
+        #expect(toolProcessor.toolCalls.map(\.function.name) == ["search_web", "open_file"])
+        #expect(toolProcessor.toolCalls[0].function.arguments["query"] == .string("hy3 swift"))
+        #expect(toolProcessor.toolCalls[1].function.arguments["path"] == .string("/tmp/hy3.md"))
+        #expect(visible.contains("Final answer after tools."))
+        for marker in ["<think>", "</think>", "<tool_calls>", "<tool_call>", "<arg_key>", "<arg_value>"] {
+            #expect(!visible.contains(marker))
+        }
+        #expect(!visible.contains("choose the lookup tool"))
+    }
+
+    @Test("Hy3 prompt-tail closed think keeps answer content visible")
+    func noThinkPromptKeepsContentVisible() {
+        let promptTail = "<｜hy_Assistant｜><think>\n\n</think>\n\n"
+        var parser = ReasoningParser.forPrompt(stampName: "hy_v3", promptTail: promptTail)!
+        let (reasoning, content) = collectParser(&parser, "The capital of France is Paris.")
+
+        #expect(reasoning.isEmpty)
+        #expect(content == "The capital of France is Paris.")
+    }
+
+    @Test("Hy3 prompt-tail open think routes pre-close text to reasoning only")
+    func openThinkPromptSeparatesReasoningAndContent() {
+        let promptTail = "<｜hy_Assistant｜><think>\n"
+        var parser = ReasoningParser.forPrompt(stampName: "hy_v3", promptTail: promptTail)!
+        let (reasoning, content) = collectParser(
+            &parser,
+            "Let me work this out...\n</think>\nThe answer is 42.")
+
+        #expect(reasoning.contains("Let me work this out..."))
+        #expect(content.contains("The answer is 42."))
+        #expect(!reasoning.contains("The answer is 42."))
+        #expect(!content.contains("Let me work this out..."))
+    }
+
+    private func collectParser(
+        _ parser: inout ReasoningParser,
+        _ text: String
+    ) -> (reasoning: String, content: String) {
+        var segments = parser.feed(text)
+        segments.append(contentsOf: parser.flush())
+        var reasoning = ""
+        var content = ""
+        for segment in segments {
+            switch segment {
+            case .reasoning(let text):
+                reasoning += text
+            case .content(let text):
+                content += text
+            }
+        }
+        return (reasoning, content)
+    }
+}
+
+@Suite("Bailing/Ling thinking-template focused contracts")
+struct BailingThinkingTemplateFocusedTests {
+    @Test("enable_thinking=true prepends detailed thinking on")
+    func enableThinkingTruePrependsDirective() {
+        let messages: [Message] = [
+            ["role": "system", "content": "You are concise."],
+            ["role": "user", "content": "hello"],
+        ]
+
+        let out = BailingThinkingTemplateContext.apply(
+            to: messages,
+            modelType: "bailing_hybrid",
+            additionalContext: ["enable_thinking": true])
+
+        #expect(out[0]["role"] as? String == "system")
+        #expect(out[0]["content"] as? String == "detailed thinking on\n\nYou are concise.")
+        #expect(out[1]["content"] as? String == "hello")
+    }
+
+    @Test("enable_thinking=false inserts or replaces detailed thinking off")
+    func enableThinkingFalseNormalizesDirective() {
+        let missingSystem: [Message] = [["role": "user", "content": "hello"]]
+        let inserted = BailingThinkingTemplateContext.apply(
+            to: missingSystem,
+            modelType: "bailing_moe_v2_5",
+            additionalContext: ["enable_thinking": false])
+
+        #expect(inserted.count == 2)
+        #expect(inserted[0]["role"] as? String == "system")
+        #expect(inserted[0]["content"] as? String == "detailed thinking off")
+
+        let existingDirective: [Message] = [
+            ["role": "system", "content": "detailed thinking on\n\nYou are concise."],
+            ["role": "user", "content": "hello"],
+        ]
+        let replaced = BailingThinkingTemplateContext.apply(
+            to: existingDirective,
+            modelType: "bailing_hybrid",
+            additionalContext: ["enable_thinking": false])
+
+        #expect(replaced[0]["content"] as? String == "detailed thinking off\n\nYou are concise.")
+    }
+
+    @Test("non-Bailing model and missing toggle are unchanged")
+    func nonBailingOrMissingToggleUnchanged() {
+        let messages: [Message] = [
+            ["role": "system", "content": "You are concise."],
+            ["role": "user", "content": "hello"],
+        ]
+
+        let nonBailing = BailingThinkingTemplateContext.apply(
+            to: messages,
+            modelType: "laguna",
+            additionalContext: ["enable_thinking": false])
+        #expect(nonBailing[0]["content"] as? String == "You are concise.")
+        #expect(nonBailing.count == messages.count)
+
+        let noToggle = BailingThinkingTemplateContext.apply(
+            to: messages,
+            modelType: "bailing_hybrid",
+            additionalContext: nil)
+        #expect(noToggle[0]["content"] as? String == "You are concise.")
+        #expect(noToggle.count == messages.count)
     }
 }

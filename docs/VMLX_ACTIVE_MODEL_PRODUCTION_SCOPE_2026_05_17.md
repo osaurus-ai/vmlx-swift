@@ -631,6 +631,11 @@ MXFP4 Ling status:
 - BatchEngine single/chat/disk-restore/B=2/per-slot/TurboQuant B=2 all pass,
   and the TurboQuant B=2 row preserves the plain slot exactly against the B=2
   plain/plain reference with `compatibilitySplits=9`.
+- active focused Bailing/Ling template coverage now runs in
+  `NoHiddenReasoningCloseBiasFocusedTests`: `enable_thinking=true` inserts
+  `detailed thinking on`, `enable_thinking=false` inserts or replaces
+  `detailed thinking off`, and non-Bailing or missing-toggle paths remain
+  unchanged.
 
 Boundary: Ling/Bailing is now live-proven for the current text turnmatrix on
 both JANGTQ2 and MXFP4. Native MTP stays fail-closed unless the family gets a
@@ -689,6 +694,11 @@ docs/local/live-model-matrix/20260517T184132Z_hy3_jangtqk_streaming_autodir_afte
   active streaming is enabled, so the same row passes without requiring a
   process-global `MLXPRESS_MODEL_DIR`: load `3.84s`, peak RSS `6168MiB`, same
   active expert index, and 7/7 coherent content rows.
+- active focused Hy3 parser/no-leak coverage now runs in
+  `NoHiddenReasoningCloseBiasFocusedTests`: Hy3 aliases resolve to Hunyuan
+  tool calls plus `think_xml` reasoning, Hunyuan parses multiple scalar-argument
+  calls, reasoning-before-tool-call streaming does not leak markers, and
+  prompt-tail open/closed `<think>` states route reasoning/content correctly.
 
 Boundary: Hy3 JANGTQ_K is correctness/low-footprint proven through active
 expert streaming, but it is still speed-blocked at about 1.4 tok/s on the
