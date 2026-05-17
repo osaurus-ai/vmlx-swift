@@ -6,6 +6,14 @@ import MLX
 import SQLite3
 import os
 
+/// Thread-safe snapshot of ``DiskCache`` counters.
+public struct DiskCacheStats: Sendable {
+    public let hits: Int
+    public let misses: Int
+    public let stores: Int
+    public let maxSizeBytes: Int
+}
+
 /// Process-wide guard for MLX safetensors disk-cache IO.
 ///
 /// Each model owns its own ``DiskCache`` instance, so an instance-local lock
@@ -54,6 +62,17 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Number of store operations initiated.
     public private(set) var stores: Int = 0
+
+    /// Thread-safe copy of current disk-cache counters.
+    public func snapshotStats() -> DiskCacheStats {
+        lock.lock()
+        defer { lock.unlock() }
+        return DiskCacheStats(
+            hits: hits,
+            misses: misses,
+            stores: stores,
+            maxSizeBytes: maxSizeBytes)
+    }
 
     // MARK: - Initialization
 

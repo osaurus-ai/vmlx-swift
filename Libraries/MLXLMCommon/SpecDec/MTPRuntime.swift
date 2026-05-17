@@ -199,14 +199,28 @@ public enum NativeMTPActivationError: Error, CustomStringConvertible {
 /// Fail-closed native-MTP activation policy.
 ///
 /// The runtime never enables native MTP from a path or marketing name. The first
-/// Swift implementation is deliberately Qwen3.6/Qwen3.5 only and requires:
-/// `VMLINUX_NATIVE_MTP=1`, supported config model type, and real MTP tensor keys.
+/// Swift implementation is deliberately Qwen3.6/Qwen3.5 only and requires an
+/// explicit per-load request, supported config model type, and real MTP tensor keys.
 public enum NativeMTPActivation {
+    @TaskLocal public static var explicitRequestOverride: Bool?
+
     public static var isExplicitlyRequested: Bool {
+        if let explicitRequestOverride {
+            return explicitRequestOverride
+        }
         let raw = ProcessInfo.processInfo.environment["VMLINUX_NATIVE_MTP"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? "0"
         return ["1", "true", "yes", "on"].contains(raw)
+    }
+
+    public static func withExplicitRequest<R>(
+        _ enabled: Bool,
+        _ operation: () async throws -> R
+    ) async throws -> R {
+        try await $explicitRequestOverride.withValue(enabled) {
+            try await operation()
+        }
     }
 
     public static func shouldLoadNativeMTPWeights(

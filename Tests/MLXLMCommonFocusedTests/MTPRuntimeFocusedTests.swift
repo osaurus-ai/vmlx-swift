@@ -111,7 +111,62 @@ struct MTPRuntimeFocusedTests {
     }
 
     @Test("native MTP activation supports Qwen3.5 MoE only with explicit tensor evidence")
-    func nativeMTPActivationSupportsQwen35MoEWithTensorEvidence() throws {
+    func nativeMTPActivationSupportsQwen35MoEWithTensorEvidence() async throws {
+        let config = """
+        {
+          "model_type": "qwen3_5_moe",
+          "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "mtp_num_hidden_layers": 1
+          }
+        }
+        """.data(using: .utf8)!
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 42,
+            visionTensorCount: 333,
+            mode: .preservedEnabled)
+
+        let shouldLoad = try await NativeMTPActivation.withExplicitRequest(true) {
+            try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                configData: config,
+                baseModelType: "qwen3_5_moe",
+                status: status)
+        }
+
+        #expect(shouldLoad)
+    }
+
+    @Test("native MTP activation can be requested task-locally without process env")
+    func nativeMTPActivationSupportsTaskLocalRequest() async throws {
+        let config = """
+        {
+          "model_type": "qwen3_5_moe",
+          "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "mtp_num_hidden_layers": 1
+          }
+        }
+        """.data(using: .utf8)!
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 42,
+            visionTensorCount: 333,
+            mode: .preservedEnabled)
+
+        let active = try await NativeMTPActivation.withExplicitRequest(true) {
+            try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                configData: config,
+                baseModelType: "qwen3_5_moe",
+                status: status)
+        }
+        #expect(active)
+    }
+
+    @Test("native MTP task-local false overrides poisoned process env")
+    func nativeMTPTaskLocalFalseOverridesPoisonedEnv() async throws {
         setenv("VMLINUX_NATIVE_MTP", "1", 1)
         defer { unsetenv("VMLINUX_NATIVE_MTP") }
 
@@ -131,12 +186,13 @@ struct MTPRuntimeFocusedTests {
             visionTensorCount: 333,
             mode: .preservedEnabled)
 
-        let shouldLoad = try NativeMTPActivation.shouldLoadNativeMTPWeights(
-            configData: config,
-            baseModelType: "qwen3_5_moe",
-            status: status)
-
-        #expect(shouldLoad)
+        let inactive = try await NativeMTPActivation.withExplicitRequest(false) {
+            try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                configData: config,
+                baseModelType: "qwen3_5_moe",
+                status: status)
+        }
+        #expect(!inactive)
     }
 
     @Test("JANG MTP metadata without tensor evidence is not treated as an MTP bundle")
@@ -414,6 +470,31 @@ struct MTPRuntimeFocusedTests {
             #expect(
                 explicitNative["mtp.layers.0.input_layernorm.weight"]?.asArray(Float.self)
                     == [Float](repeating: 0.5, count: 16))
+        }
+    }
+
+    @Test("Qwen3.5 sanitize can shift raw MTP norms without shifting MLX-ready backbone")
+    func qwen35SanitizeShiftsRawMTPNormsIndependently() async throws {
+        try await FocusedMLXTestSupport.withLock {
+            let model = try Qwen35TextModel(Self.tinyQwen35Config(mtpLayers: 1))
+            let backboneReady = MLXArray([Float](repeating: 1.0, count: 16))
+            let mtpRaw = MLXArray([Float](repeating: 0.0, count: 16))
+
+            let sanitized = model.sanitize(weights: [
+                "model.layers.0.input_layernorm.weight": backboneReady,
+                "mtp.layers.0.input_layernorm.weight": mtpRaw,
+                "mtp.pre_fc_norm_hidden.weight": mtpRaw,
+            ])
+
+            #expect(
+                sanitized["model.layers.0.input_layernorm.weight"]?.asArray(Float.self)
+                    == [Float](repeating: 1.0, count: 16))
+            #expect(
+                sanitized["mtp.layers.0.input_layernorm.weight"]?.asArray(Float.self)
+                    == [Float](repeating: 1.0, count: 16))
+            #expect(
+                sanitized["mtp.pre_fc_norm_hidden.weight"]?.asArray(Float.self)
+                    == [Float](repeating: 1.0, count: 16))
         }
     }
 

@@ -32,13 +32,15 @@ runtime work are:
 
 - `/Users/eric/models/JANGQ/Qwen3.6-27B-JANG_4M-MTP`
 - `/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP4-MTP`
-- `/Users/eric/models/JANGQ/Qwen3.6-35B-A3B-MXFP4-MTP`
+- `/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP8-MTP`
+- `/Users/eric/models/JANGQ/Qwen3.6-35B-A3B-MXFP8-MTP`
 
-Use the 27B JANG_4M and 27B MXFP4 bundles as the first live probes: JANG_4M
-proves the JANG affine/mixed format path, and MXFP4 proves the native MXFP4
-path. Use the 35B A3B MXFP4 bundle for MoE/VL native-MTP module-layout work.
-Do not substitute CRACK artifacts when testing MTP; the CRACK variants
-intentionally do not carry MTP tensors.
+Use the 27B JANG_4M, 27B MXFP4, and 27B MXFP8 bundles as the first live
+probes: JANG_4M proves the JANG affine/mixed format path, MXFP4 proves the
+native MXFP4 path, and MXFP8 proves the true MXFP8/no-bias path. Use the 35B
+A3B MXFP8 bundle for MoE/VL native-MTP module-layout and speed work. Do not
+substitute CRACK artifacts when testing MTP; the CRACK variants intentionally
+do not carry MTP tensors.
 
 The verified JANG_4M MTP bundle has these properties:
 
@@ -53,24 +55,21 @@ The verified JANG_4M MTP bundle has these properties:
 - Text probe answered `2 + 2` as `4`.
 - Image probe on a generated red square answered `red`.
 
-The copied 35B A3B MXFP4-MTP bundle has these properties:
+The copied 35B A3B MXFP8-MTP bundle has these properties:
 
-- local path: `/Users/eric/models/JANGQ/Qwen3.6-35B-A3B-MXFP4-MTP`
+- local path: `/Users/eric/models/JANGQ/Qwen3.6-35B-A3B-MXFP8-MTP`
 - copied from:
-  `erics-m5-max2.local:/Volumes/eric/models/JANGQ/Qwen3.6-35B-A3B-MXFP4-MTP`
-- 37 local regular files, 22G on disk.
+  `erics-m5-max.local:/Users/eric/models/JANGQ/Qwen3.6-35B-A3B-MXFP8-MTP`
+- 47 local regular files, 35G on disk.
 - `model_type=qwen3_5_moe`
-- `text_config.model_type=qwen3_5_moe_text`
-- `text_config.num_hidden_layers=40`
-- `text_config.mtp_num_hidden_layers=1`
-- `runtime.total_weight_bytes=23115460648`
-- `runtime.total_weight_gb=21.53`
+- `architectures=["Qwen3_5MoeForConditionalGeneration"]`
+- `runtime.total_weight_bytes=37530167888`
+- `runtime.total_weight_gb=34.95`
 - `runtime.mtp_mode=preserved_enabled`
-- 42 MTP tensor entries and 333 vision tensor entries.
-- MTP MoE tensors are already split under
-  `mtp.layers.0.mlp.switch_mlp.{gate,up,down}_proj.*` plus
-  `shared_expert.*`; the Swift VLM MTP module must instantiate a sparse MoE
-  MTP layer for this artifact, not a dense MLP.
+- 31 MTP tensor entries and 333 vision tensor entries.
+- `quantization.mode=mxfp8`, `group_size=32`, `bits=8`
+- `quantization.norm_convention=qwen3_5_language_mlx_plus_one`
+- no MTP `.biases`; MTP linears use MXFP8 weights/scales plus fp16 norms.
 
 That proves the artifact preserves MTP and VL. Swift must still distinguish
 artifact preservation from runtime readiness:
@@ -160,14 +159,18 @@ pretend speculative MTP ran.
 ## Explicit Swift Runtime Activation
 
 The package has an opt-in Qwen3.6 native-MTP path behind
-`VMLINUX_NATIVE_MTP=1` plus `DraftStrategy.nativeMTP(depth:)`. Activation is
-not inferred from model names and is not inferred from `mtp_num_hidden_layers`
-alone. It requires:
+`LoadConfiguration.nativeMTP=true` plus `DraftStrategy.nativeMTP(depth:)`.
+`ModelFactory.loadModel` passes that load-time decision through a task-local
+activation override so concurrent loads do not share a process-global MTP env
+flag. The `VMLINUX_NATIVE_MTP=1` environment knob remains compatibility-only
+for direct factory callers that bypass `ModelFactory.loadModel`; Osaurus should
+use the typed load configuration. Activation is not inferred from model names
+and is not inferred from `mtp_num_hidden_layers` alone. It requires:
 
 - supported Qwen3.5/Qwen3.6 text, VL, or Qwen3.5 MoE model type;
 - complete MTP tensor evidence from the index or safetensors headers;
 - an active Swift model exposing `NativeMTPModel`;
-- explicit runtime selection;
+- explicit load-time and request-time runtime selection;
 - greedy `temperature=0` or the native exact p/q stochastic verifier path
   described below.
 
@@ -181,19 +184,63 @@ mtp: metadata_only_missing_weights, layers=1, tensors=0, speculative=off
 ```
 
 The implementation uses private MTP draft cache and target-model verification.
-For Qwen3.6 hybrid SSM/KV, the verifier now records accepted-prefix Mamba state
-and trims rejected attention-KV suffixes, so rejected draft state is not kept in
-the backbone cache. This is real D3 prefix-commit semantics, but it is not yet a
-production speed path because the small-M verifier and prefix-state capture are
-still eager Swift/MLX work rather than a tuned compiled verifier kernel.
+For Qwen3.6 hybrid SSM/KV, the verifier records accepted-prefix Mamba state and
+trims rejected attention-KV suffixes, so rejected draft state is not kept in the
+backbone cache. Partial rejects recreate the private MTP draft cache instead of
+trimming stale rejected state. This is real D3 prefix-commit semantics, not an
+all-or-nothing guard.
 
-Qwen3.6 35B A3B MXFP4-MTP is allowed through the explicit activation check only
-because its config reports `qwen3_5_moe` / `qwen3_5_moe_text` and its index has
-real MTP tensor evidence. This is not name-based activation. The VLM native-MTP
-decoder now uses `SparseMoeBlock` when `numExperts > 0`, which matches the
-35B sidecar's `switch_mlp` and `shared_expert` tensor layout. It has not yet
-been promoted to live production proof; load/generate/coherency/token-s and
-cache/VL multi-turn rows are still required.
+Native MTP now accepts a `CacheCoordinator` through both public
+`Evaluate.generate(...)` and `BatchEngine.generate(...)` exclusive solo paths.
+For Qwen3.6 hybrid/Mamba cache topology the correct cache route is
+`pagedIncompatible=true`: generic paged KV counters stay zero by design, and
+the restorable store is disk L2 plus SSM companion state. Osaurus should show
+this as "Block/L2 + SSM companion active" rather than "paged cache failed."
+The current repeated exact-prompt rows prove store/fetch counters and safe
+restoration, not a native-MTP TTFT compute-reuse win: path-dependent exact full
+hits intentionally reset to full prefill to avoid double-counting recurrent SSM
+state. A growing-chat partial-hit native-MTP row is still required before
+claiming prompt-compute reuse for this topology.
+
+Qwen3.6 35B A3B MXFP8-MTP is allowed through the explicit activation check only
+because its config reports `qwen3_5_moe` and its index has real MTP tensor
+evidence. This is not name-based activation. Text MTP D3 load/generate/speed and
+disk+SSM cache rows now pass in Swift; VL multi-turn with native MTP is still a
+separate row and must not be inferred from text proof.
+
+## Current Swift Live Proof - 2026-05-17
+
+Artifacts are under
+`docs/local/production-readiness/20260517Tswift-mtp-current/`.
+
+| Bundle | Row | Artifact | Result |
+| --- | --- | --- | --- |
+| 27B JANG_4M MTP | D3 count prompt | `qwen36_27b_jang4m_mtp_d3_count_python_prompt_normfix_regression.log` | coherent, `47.7 tok/s`, `verifyCalls=54`, `acceptedByDepth=0:1,1:5,2:12,3:36`, no loop/leak |
+| 27B MXFP4 MTP | D3 count prompt | `qwen36_27b_mxfp4_mtp_d3_count_python_prompt_normfix.log` | coherent, `50.5 tok/s`, `verifyCalls=57`, `acceptedByDepth=0:3,1:8,2:12,3:34`, no loop/leak |
+| 27B MXFP8 MTP | D3 count prompt | `qwen36_27b_mxfp8_mtp_d3_count_python_prompt_normfix.log` | coherent, `29.5 tok/s`, accepts depths 1/2/3 after independent MTP norm shift; speed still below Python reference |
+| 35B A3B MXFP8 MTP | D3 count prompt | `qwen36_35b_mxfp8_mtp_d3_count_python_prompt.log` | coherent, `130.6 tok/s`, `verifyCalls=48`, `acceptedByDepth=2:2,3:46`, no loop/leak |
+| 27B MXFP4 MTP | hybrid disk cache repeated prompt | `qwen36_27b_mxfp4_mtp_d3_hybrid_disk_cache_repeated_prompt.log` | run1 disk hit increments to `1`, SSM hit increments to `1`, paged remains zero with `pagedIncompatible=true` |
+| 27B MXFP8 MTP | hybrid disk cache repeated prompt | `qwen36_27b_mxfp8_mtp_d3_hybrid_disk_cache_repeated_prompt.log` | run1 disk hit increments to `1`, SSM hit increments to `1`, coherent output |
+| 35B A3B MXFP8 MTP | hybrid disk cache repeated prompt | `qwen36_35b_mxfp8_mtp_d3_hybrid_disk_cache_repeated_prompt.log` | run1 disk hit increments to `1`, SSM hit increments to `1`, coherent output |
+| 27B MXFP4 MTP | post-audit D3 count prompt | `qwen36_27b_mxfp4_mtp_d3_count_python_prompt_postaudit_count.log` | task-local load activation with process env unset, coherent `1..50`, `49.6 tok/s`, `verifyCalls=56`, `acceptedByDepth=0:5,1:5,2:11,3:35`, `stop=stop`, no loop/leak |
+| 27B MXFP4 MTP | post-audit hybrid disk cache repeated prompt | `qwen36_27b_mxfp4_mtp_d3_hybrid_disk_cache_postaudit.log` | run0 stores disk entries, run1 `disk hits=1`, `ssm hits=1`, `pagedIncompatible=true`, coherent `1..50`, no loop/leak |
+
+Cache-proof caveat: the three hybrid disk-cache rows above are exact repeated
+prompt probes. They prove the coordinator records, fetches, and restores the
+right disk+SSM payload and that coherent generation survives the restore path.
+They do not prove native-MTP growing-chat partial-hit compute reuse yet.
+
+Pre-fix evidence is intentionally retained:
+
+- `qwen36_27b_mxfp8_mtp_d3_count_python_prompt.log`: MXFP8 MTP accepted zero
+  drafts (`acceptedByDepth=0:190`) and ran at `7.0 tok/s`.
+- `qwen36_27b_mxfp4_mtp_d3_count_python_prompt_loadmtp.log`: MXFP4 MTP accepted
+  zero drafts before independent MTP norm handling.
+
+The root cause was not bad model behavior and not a sampling guard issue. The
+repaired MXFP4/MXFP8 language backbones are already MLX-ready, while preserved
+MTP norm tensors can still be raw; Swift now shifts MTP norms independently of
+the backbone norm convention.
 
 ## Clean-Room Runtime Comparison - 2026-05-16
 
@@ -279,6 +326,12 @@ Focused test proof for the same dispatch contract:
 
 - `MTPRuntimeFocusedTests` passes 17/17 after the 2026-05-17 text hybrid-SSM
   offset fix and private MTP-cache reject refresh fix.
+- Post-audit rerun
+  `docs/local/production-readiness/20260517Tswift-mtp-current/mtp_runtime_focused_postaudit.log`
+  passes 22/22 `MTPRuntimeFocusedTests`, including task-local activation,
+  MXFP8 norm metadata rows, text-SSM offset capture, private MTP-cache refresh,
+  active BatchEngine native-MTP dispatch, missing-head fail-closed dispatch, and
+  `BatchEngine.submit` rejection.
 - `BatchEngine.generate` with active native MTP reaches the real
   `NativeMTPTokenIterator` and emits native-MTP telemetry.
 - `BatchEngine.generate` with a requested native-MTP strategy but no active MTP

@@ -595,8 +595,10 @@ public func loadModel(
         tensorBuffers: useTensorMmapBuffers,
         startColdPercent: useTensorMmapBuffers ? resolvedOptions.compressPct : nil
     ) {
-        try await load {
-            try await $0.load(from: loadDirectory, using: tokenizerLoader)
+        try await NativeMTPActivation.withExplicitRequest(loadConfiguration.nativeMTP) {
+            try await load {
+                try await $0.load(from: loadDirectory, using: tokenizerLoader)
+            }
         }
     }
     _ = adviseCanonicalMmapRoutedExpertsIfAvailable(

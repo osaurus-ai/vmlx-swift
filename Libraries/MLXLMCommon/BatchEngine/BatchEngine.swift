@@ -871,7 +871,8 @@ public actor BatchEngine {
                     model: nativeModel,
                     cache: nil,
                     parameters: soloParameters,
-                    depth: depth)
+                    depth: depth,
+                    cacheCoordinator: cacheCoordinator)
                 (sourceStream, generationTask) = generateTask(
                     promptTokenCount: promptTokenCount,
                     modelConfiguration: context.configuration,

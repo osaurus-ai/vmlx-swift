@@ -961,6 +961,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
         let shouldShiftNormWeights = Self.usesQwenPlusOneNormConvention(normConvention)
             || (!explicitNormConvention
                 && (hasUnsanitizedConv1d || Self.baseNormWeightsNeedShift(weights)))
+        let shouldShiftMTPNormWeights = loadNativeMTP
+            && (shouldShiftNormWeights || Self.mtpNormWeightsNeedShift(weights))
 
         if configuration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
@@ -986,7 +988,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
                 && (k.contains("norm") || k.contains("q_norm") || k.contains("k_norm"))
             let shouldShiftBaseNorm = shouldShiftNormWeights
                 && normKeysToShift.contains(where: { k.hasSuffix($0) })
-            let shouldShiftMTPNorm = isMTPNorm && shouldShiftNormWeights
+            let shouldShiftMTPNorm = isMTPNorm && shouldShiftMTPNormWeights
             if (shouldShiftBaseNorm || shouldShiftMTPNorm)
                 && v.ndim == 1
             {
@@ -995,6 +997,23 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
         }
 
         return weights
+    }
+
+    private static func mtpNormWeightsNeedShift(_ weights: [String: MLXArray]) -> Bool {
+        let probeSuffixes = [
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+        ]
+        for suffix in probeSuffixes {
+            for (key, value) in weights where value.ndim == 1 {
+                guard Self.isMTPWeightKey(key), key.hasSuffix(suffix) else {
+                    continue
+                }
+                return value.asType(.float32).mean().item(Float.self) < 0.5
+            }
+        }
+        return false
     }
 
     private static func normConvention(_ metadata: [String: String]) -> String? {

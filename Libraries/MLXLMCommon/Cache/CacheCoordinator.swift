@@ -41,6 +41,19 @@ public enum CacheFetchResult: Sendable {
     case miss
 }
 
+// MARK: - CacheCoordinatorStatsSnapshot
+
+/// Snapshot of the unified cache stack for UI and server telemetry.
+public struct CacheCoordinatorStatsSnapshot: Sendable {
+    public let pagedEnabled: Bool
+    public let pagedStats: CacheStats?
+    public let diskEnabled: Bool
+    public let diskStats: DiskCacheStats?
+    public let ssmStats: SSMStateCacheStats
+    public let isHybrid: Bool
+    public let isPagedIncompatible: Bool
+}
+
 // MARK: - CacheCoordinator
 
 /// Unified cache coordinator that cascades lookups across paged (L1),
@@ -164,6 +177,18 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// Whether the model is paged-incompatible (hybrid pool caches).
     public var isPagedIncompatible: Bool {
         lock.withLock { _isPagedIncompatible }
+    }
+
+    /// Thread-safe snapshot for diagnostics, UI status, and admin routes.
+    public func snapshotStats() -> CacheCoordinatorStatsSnapshot {
+        CacheCoordinatorStatsSnapshot(
+            pagedEnabled: pagedCache != nil,
+            pagedStats: pagedCache?.snapshotStats(),
+            diskEnabled: diskCache != nil,
+            diskStats: diskCache?.snapshotStats(),
+            ssmStats: ssmStateCache.snapshotStats(),
+            isHybrid: isHybrid,
+            isPagedIncompatible: isPagedIncompatible)
     }
 
     /// Release paged-cache blocks returned by ``fetch(tokens:mediaSalt:)``.

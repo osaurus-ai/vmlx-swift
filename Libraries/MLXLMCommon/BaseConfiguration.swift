@@ -179,6 +179,13 @@ public struct BaseConfiguration: Codable, Sendable {
                         if !f {
                             perLayerQuantization[key.stringValue] = .skip
                         }
+                    } else if Self.isScalarMetadata(container, key: key) {
+                        // MXFP/JANG metadata can live beside MLX's affine
+                        // quantization defaults. Per-layer overrides are
+                        // dictionaries; scalar/list siblings describe
+                        // converter/runtime policy and must not be decoded as
+                        // layer quantization.
+                        continue
                     } else {
                         perLayerQuantization[key.stringValue] = .quantize(
                             try container.decode(Quantization.self, forKey: key))
@@ -187,6 +194,17 @@ public struct BaseConfiguration: Codable, Sendable {
             }
             self.perLayerQuantization = PerLayerQuantization(
                 quantization: quantization, perLayerQuantization: perLayerQuantization)
+        }
+
+        private static func isScalarMetadata(
+            _ container: KeyedDecodingContainer<_DictionaryCodingKey>,
+            key: _DictionaryCodingKey
+        ) -> Bool {
+            (try? container.decode(String.self, forKey: key)) != nil
+                || (try? container.decode(Int.self, forKey: key)) != nil
+                || (try? container.decode(Double.self, forKey: key)) != nil
+                || (try? container.decode([String].self, forKey: key)) != nil
+                || (try? container.decode([Int].self, forKey: key)) != nil
         }
 
         public func encode(to encoder: any Encoder) throws {

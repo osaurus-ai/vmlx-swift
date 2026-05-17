@@ -147,6 +147,16 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// strict pre-mmap loader parity.
     public var useMmapSafetensors: Bool
 
+    /// Load preserved native-MTP tensors and instantiate model-owned MTP
+    /// modules when the bundle has real tensor evidence and the family is
+    /// supported by ``NativeMTPActivation``.
+    ///
+    /// This is intentionally a load-time switch, separate from per-request
+    /// ``GenerateParameters/draftStrategy``. A request can only use native MTP
+    /// if the model was loaded with the sidecar weights present; conversely,
+    /// loading the sidecar does not force speculative decode for every request.
+    public var nativeMTP: Bool
+
     /// Production default — MLXPress `.disabled` (opt-in), 70% cache +
     /// memory caps, mmap-backed safetensors enabled. Osaurus and other
     /// host integrators get spike-survival memory caps and the patched
@@ -166,7 +176,8 @@ public struct LoadConfiguration: Sendable, Equatable {
         jangPress: .auto(envFallback: true),
         maxResidentBytes: .default,
         memoryLimit: .default,
-        useMmapSafetensors: true)
+        useMmapSafetensors: true,
+        nativeMTP: false)
 
     /// Everything off — strict byte-compat with pre-iter-23 behavior.
     /// MLXPress disabled, no caps, no mmap loader.
@@ -174,18 +185,21 @@ public struct LoadConfiguration: Sendable, Equatable {
         jangPress: .disabled,
         maxResidentBytes: .unlimited,
         memoryLimit: .unlimited,
-        useMmapSafetensors: false)
+        useMmapSafetensors: false,
+        nativeMTP: false)
 
     public init(
         jangPress: JangPressPolicy = .disabled,
         maxResidentBytes: ResidentCap = .default,
         memoryLimit: ResidentCap = .default,
-        useMmapSafetensors: Bool = true
+        useMmapSafetensors: Bool = true,
+        nativeMTP: Bool = false
     ) {
         self.jangPress = jangPress
         self.maxResidentBytes = maxResidentBytes
         self.memoryLimit = memoryLimit
         self.useMmapSafetensors = useMmapSafetensors
+        self.nativeMTP = nativeMTP
     }
 }
 

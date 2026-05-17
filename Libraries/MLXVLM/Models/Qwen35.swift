@@ -1883,13 +1883,17 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         let shouldShiftNormWeights = Self.usesQwenPlusOneNormConvention(normConvention)
             || (!explicitNormConvention
                 && (hasUnsanitizedConv1d || Self.baseNormWeightsNeedShift(weights)))
+        let shouldShiftMTPNormWeights = loadNativeMTP
+            && (shouldShiftNormWeights || Self.mtpNormWeightsNeedShift(weights))
 
         if config.textConfiguration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
         }
 
         // MLX-native models with no unsanitized conv1d may still need key remapping.
-        if isMLXFormat && !hasUnsanitizedConv1d && !shouldShiftNormWeights {
+        if isMLXFormat && !hasUnsanitizedConv1d && !shouldShiftNormWeights
+            && !shouldShiftMTPNormWeights
+        {
             let needsRemap = weights.keys.contains { $0.contains("model.language_model") || $0.contains("model.visual") }
             if !needsRemap {
                 return weights
@@ -1940,7 +1944,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 && (key.contains("norm") || key.contains("q_norm") || key.contains("k_norm"))
             let shouldShiftBaseNorm = shouldShiftNormWeights
                 && normKeys.contains(where: { key.hasSuffix($0) })
-            let shouldShiftMTPNorm = isMTPNorm && shouldShiftNormWeights
+            let shouldShiftMTPNorm = isMTPNorm && shouldShiftMTPNormWeights
             if (shouldShiftBaseNorm || shouldShiftMTPNorm) && value.ndim == 1 {
                 value = value + MLXArray(1, dtype: value.dtype)
             }
@@ -1949,6 +1953,23 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         }
 
         return visionModel.sanitize(weights: sanitized)
+    }
+
+    private static func mtpNormWeightsNeedShift(_ weights: [String: MLXArray]) -> Bool {
+        let probeSuffixes = [
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+        ]
+        for suffix in probeSuffixes {
+            for (key, value) in weights where value.ndim == 1 {
+                guard Self.isMTPWeightKey(key), key.hasSuffix(suffix) else {
+                    continue
+                }
+                return value.asType(.float32).mean().item(Float.self) < 0.5
+            }
+        }
+        return false
     }
 
     private static func normConvention(_ metadata: [String: String]) -> String? {

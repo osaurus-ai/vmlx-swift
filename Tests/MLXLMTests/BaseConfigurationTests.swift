@@ -110,4 +110,47 @@ public class BaseConfigurationTests: XCTestCase {
             "DSV4 routed_expert_bit_plan is consumed by DeepseekV4Configuration/JANGTQ, not by BaseConfiguration per-layer affine overrides")
     }
 
+    func testMXFPQuantizationMetadataDoesNotDecodeAsLayerOverride() throws {
+        let json =
+            """
+            {
+                "model_type": "qwen3_5",
+                "quantization": {
+                    "bits": 8,
+                    "group_size": 32,
+                    "mode": "mxfp8",
+                    "quantization_backend": "mx.quantize",
+                    "vision": "fp16_passthrough",
+                    "mtp": "preserved",
+                    "mtp_policy": "native_mxfp8_linears_fp16_norms",
+                    "passthrough_bit_widths_used": [16],
+                    "norm_convention": "qwen3_5_language_mlx_plus_one",
+                    "model.embed_tokens": {
+                        "bits": 8,
+                        "group_size": 32,
+                        "mode": "mxfp8"
+                    },
+                    "model.layers.0.self_attn.q_norm": false
+                }
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            BaseConfiguration.self, from: json.data(using: .utf8)!)
+
+        let fallback = config.perLayerQuantization?.quantization(layer: "model.layers.0.mlp.down_proj")
+        XCTAssertEqual(fallback?.groupSize, 32)
+        XCTAssertEqual(fallback?.bits, 8)
+        XCTAssertEqual(fallback?.mode, .mxfp8)
+        XCTAssertEqual(
+            config.perLayerQuantization?.quantization(layer: "model.embed_tokens")?.mode,
+            .mxfp8)
+        XCTAssertNil(
+            config.perLayerQuantization?.quantization(layer: "model.layers.0.self_attn.q_norm"))
+        XCTAssertEqual(
+            config.perLayerQuantization?.perLayerQuantization.count,
+            2,
+            "Only real per-layer dictionary overrides and false skips should enter the override map.")
+    }
+
 }

@@ -46,12 +46,18 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     let model: any NativeMTPModel
     var cache: [KVCache]
     var mtpCache: [KVCache]
+    let cacheCoordinator: CacheCoordinator?
     var processor: LogitProcessor?
     let sampler: LogitSampler
     let speculativeSampler: SpeculativeSamplingController
     let maxTokens: Int?
     let depth: Int
     let promptTokenIds: [Int]
+    let cachePrefixTokenCounts: [Int]
+    let originalInput: LMInput
+    let cacheInitParameters: GenerateParameters
+    var promptCacheSnapshot: [KVCache]?
+    let mediaSalt: String?
 
     var tokenCount = 0
     var promptPrefillTime: TimeInterval = 0
@@ -82,7 +88,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         model: any NativeMTPModel,
         cache: [KVCache]? = nil,
         parameters: GenerateParameters,
-        depth requestedDepth: Int
+        depth requestedDepth: Int,
+        cacheCoordinator: CacheCoordinator? = nil
     ) throws {
         guard model.nativeMTPAvailable else {
             throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
@@ -94,20 +101,120 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             throw NativeMTPRuntimeError.emptyPrompt
         }
 
+        var effectiveParameters = parameters
+        if let coordinator = cacheCoordinator {
+            let policy = coordinator.config.resolveKVPolicy(
+                kvMode: parameters.kvMode,
+                maxKVSize: parameters.maxKVSize,
+                promptTokenCount: input.text.tokens.size)
+            effectiveParameters.kvMode = policy.kvMode
+            effectiveParameters.maxKVSize = policy.maxKVSize
+        }
+
         self.model = model
-        self.cache = cache ?? model.newCache(parameters: parameters)
+        self.cache = cache ?? model.newCache(parameters: effectiveParameters)
         self.mtpCache = model.makeNativeMTPCache()
-        self.processor = parameters.processor()
-        self.sampler = parameters.sampler()
-        self.speculativeSampler = SpeculativeSamplingController(parameters: parameters)
-        self.maxTokens = parameters.maxTokens
+        self.cacheCoordinator = cacheCoordinator
+        self.processor = effectiveParameters.processor()
+        self.sampler = effectiveParameters.sampler()
+        self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
+        self.maxTokens = effectiveParameters.maxTokens
         self.depth = Swift.max(1, requestedDepth)
         self.promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
+        self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
+        self.originalInput = input
+        self.cacheInitParameters = effectiveParameters
+        self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters)
+
+        if let coordinator = cacheCoordinator,
+           effectiveParameters.kvBits != nil || effectiveParameters.kvMode != .none
+        {
+            coordinator.setPagedIncompatible(true)
+        }
+
+        var inputForPrepare = input
+        if let coordinator = cacheCoordinator, !promptTokenIds.isEmpty {
+            if !coordinator.isHybrid, cacheContainsPathDependentState(self.cache) {
+                coordinator.setHybrid(true)
+            }
+            if !coordinator.isPagedIncompatible,
+               cacheRequiresDiskBackedCoordinatorRestore(self.cache)
+            {
+                coordinator.setPagedIncompatible(true)
+            }
+            switch coordinator.fetch(tokens: promptTokenIds, mediaSalt: mediaSalt) {
+            case .hit(_, let remainingTokens, _, let blocks, let ssmStates, let diskArrays):
+                var restored = false
+                if !blocks.isEmpty {
+                    let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
+                    coordinator.release(blocks: blocks)
+                    if restoredTokens > 0 {
+                        if let ssm = ssmStates {
+                            restoreSSMStates(ssm, into: self.cache)
+                        }
+                        restored = true
+                    }
+                }
+
+                if let diskArrays, !restored {
+                    let diskRestored = restoreFromDiskArrays(diskArrays, into: &self.cache)
+                    if diskRestored > 0 {
+                        if let ssm = ssmStates,
+                           TQDiskSerializer.formatVersion(of: diskArrays) < 2
+                        {
+                            restoreSSMStates(ssm, into: self.cache)
+                        }
+                        MLX.eval(self.cache)
+                        restored = true
+                    }
+                }
+
+                if restored {
+                    let hasPathDependentLayer = self.cache.contains { layer in
+                        layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache
+                    }
+                    let unsafePartial =
+                        input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
+                    let unsafeFullHit = remainingTokens.isEmpty && hasPathDependentLayer
+                    if unsafePartial || unsafeFullHit {
+                        self.cache = model.newCache(parameters: effectiveParameters)
+                        inputForPrepare = input
+                    } else if remainingTokens.isEmpty, let last = promptTokenIds.last {
+                        let promptLen = promptTokenIds.count
+                        let cacheOffset = self.cache.first?.offset ?? promptLen
+                        let trimNeeded = cacheOffset - (promptLen - 1)
+                        if trimNeeded < 0 {
+                            self.cache = model.newCache(parameters: effectiveParameters)
+                            inputForPrepare = input
+                        } else {
+                            if trimNeeded > 0 {
+                                for layer in self.cache where layer.isTrimmable {
+                                    _ = layer.trim(trimNeeded)
+                                }
+                            }
+                            let lastToken = MLXArray([Int32(last)])
+                                .expandedDimensions(axis: 0)
+                            inputForPrepare = LMInput(text: LMInput.Text(tokens: lastToken))
+                        }
+                    } else {
+                        let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
+                            .expandedDimensions(axis: 0)
+                        inputForPrepare = LMInput(text: LMInput.Text(tokens: remainingArray))
+                    }
+                }
+            case .miss:
+                break
+            }
+        }
 
         let start = Date.timeIntervalSinceReferenceDate
         processor?.prompt(input.text.tokens)
-        let prepared = try model.prepare(input, cache: self.cache, windowSize: parameters.prefillStepSize)
+        let prepared = try model.prepare(
+            inputForPrepare,
+            cache: self.cache,
+            windowSize: effectiveParameters.prefillStepSize)
         self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - start
+        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
 
         let firstToken: MLXArray
         switch prepared {
@@ -184,8 +291,92 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
-        includeGeneratedBoundary _: Bool
+        includeGeneratedBoundary: Bool
     ) {
+        if let coordinator = cacheCoordinator,
+           !promptTokenIds.isEmpty,
+           let promptCacheSnapshot
+        {
+            func store(tokens: [Int], snapshot: [KVCache], label _: String) {
+                guard !tokens.isEmpty else { return }
+                let cacheSnapshot = snapshot.map { $0.copy() }
+                MLX.eval(cacheSnapshot)
+                let requiresDiskBackedRestore =
+                    cacheRequiresDiskBackedCoordinatorRestore(cacheSnapshot)
+                let perLayerData = requiresDiskBackedRestore
+                    ? []
+                    : extractLayerData(from: cacheSnapshot)
+                let ssmCapture: [MLXArray]? = coordinator.isHybrid &&
+                    coordinator.config.enableSSMReDerive &&
+                    !requiresDiskBackedRestore
+                    ? reDeriveAndStoreSSMStatesForPromptBoundaries(
+                        coordinator: coordinator,
+                        model: model,
+                        promptTokenIds: tokens,
+                        mediaSalt: mediaSalt,
+                        prefillStepSize: cacheInitParameters.prefillStepSize)
+                    : (coordinator.isHybrid ? extractSSMStates(from: cacheSnapshot) : nil)
+                let diskStoreCache = makeDiskStoreCache(
+                    fromPromptBoundary: cacheSnapshot,
+                    parameters: cacheInitParameters)
+                coordinator.storeAfterGeneration(
+                    promptTokens: tokens,
+                    perLayerData: perLayerData,
+                    ssmStates: ssmCapture,
+                    cache: diskStoreCache,
+                    mediaSalt: mediaSalt)
+            }
+
+            store(
+                tokens: promptTokenIds,
+                snapshot: promptCacheSnapshot,
+                label: "prompt-boundary")
+
+            for boundary in Set(cachePrefixTokenCounts).sorted()
+            where boundary > 0 && boundary < promptTokenIds.count {
+                let boundaryTokens = Array(promptTokenIds.prefix(boundary))
+                if let boundarySnapshot = cacheSnapshotForBoundary(
+                    tokens: boundaryTokens,
+                    promptSnapshot: promptCacheSnapshot)
+                {
+                    store(
+                        tokens: boundaryTokens,
+                        snapshot: boundarySnapshot,
+                        label: "history-boundary")
+                }
+            }
+
+            if includeGeneratedBoundary,
+               !generatedTokenIds.isEmpty,
+               !cache.isEmpty
+            {
+                let postAnswerTokens = promptTokenIds + generatedTokenIds
+                let postAnswerSnapshot = cache.map { $0.copy() }
+                let offsets = postAnswerSnapshot.map(\.offset)
+                if let offset = offsets.first,
+                   offsets.allSatisfy({ $0 == offset })
+                {
+                    if offset == postAnswerTokens.count {
+                        store(
+                            tokens: postAnswerTokens,
+                            snapshot: postAnswerSnapshot,
+                            label: "post-answer")
+                    } else if offset > postAnswerTokens.count {
+                        let trimCount = offset - postAnswerTokens.count
+                        if canTrimPromptCache(postAnswerSnapshot),
+                           trimPromptCache(postAnswerSnapshot, numTokens: trimCount) == trimCount
+                        {
+                            MLX.eval(postAnswerSnapshot)
+                            store(
+                                tokens: postAnswerTokens,
+                                snapshot: postAnswerSnapshot,
+                                label: "post-answer")
+                        }
+                    }
+                }
+            }
+        }
+
         let accepted = acceptedByDepth
             .sorted { $0.key < $1.key }
             .map { "\($0.key):\($0.value)" }
@@ -217,6 +408,52 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             cacheCommitTime,
             speculativeSampler.isGreedy ? "greedy" : "exact-pq")
         FileHandle.standardError.write(Data(line.utf8))
+    }
+
+    private func cacheSnapshotForBoundary(
+        tokens: [Int],
+        promptSnapshot: [KVCache]
+    ) -> [KVCache]? {
+        guard !tokens.isEmpty, tokens.count < promptTokenIds.count else {
+            return nil
+        }
+        let trimCount = promptTokenIds.count - tokens.count
+        let trimmed = promptSnapshot.map { $0.copy() }
+        if canTrimPromptCache(trimmed),
+           trimPromptCache(trimmed, numTokens: trimCount) == trimCount
+        {
+            MLX.eval(trimmed)
+            return trimmed
+        }
+
+        do {
+            let boundaryTokens = MLXArray(tokens.map { Int32($0) })
+                .reshaped(1, tokens.count)
+            let boundaryInput = LMInput(
+                text: LMInput.Text(tokens: boundaryTokens),
+                image: originalInput.image,
+                video: originalInput.video,
+                audio: originalInput.audio,
+                mediaTokenIds: originalInput.mediaTokenIds,
+                cacheScopeSalt: originalInput.cacheScopeSalt)
+            let boundaryCache = model.newCache(parameters: cacheInitParameters)
+            switch try model.prepare(
+                boundaryInput,
+                cache: boundaryCache,
+                windowSize: cacheInitParameters.prefillStepSize)
+            {
+            case .tokens(let remaining):
+                _ = model.nativeBackboneForward(
+                    Self.sequenceInput(remaining.tokens),
+                    cache: boundaryCache)
+            case .logits:
+                break
+            }
+            MLX.eval(boundaryCache)
+            return boundaryCache
+        } catch {
+            return nil
+        }
     }
 
     private mutating func verifyCycle() throws {

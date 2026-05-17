@@ -6160,6 +6160,7 @@ func runPerfBench(
         let loadStart = CFAbsoluteTimeGetCurrent()
         let context: ModelContext
         let jangPressRuntime: JangPressRuntime?
+        let nativeMTPRequestedAtLoad = env["BENCH_PERF_NATIVE_MTP_DEPTH"] != nil
         if useJangPressLoad {
             let loaded = try await MLXLMCommon.loadModel(
                 from: modelDir,
@@ -6168,7 +6169,20 @@ func runPerfBench(
                     jangPress: .enabled(coldFraction: 0.70),
                     maxResidentBytes: .fraction(0.70),
                     memoryLimit: .fraction(0.70),
-                    useMmapSafetensors: useMmap))
+                    useMmapSafetensors: useMmap,
+                    nativeMTP: nativeMTPRequestedAtLoad))
+            context = loaded.0
+            jangPressRuntime = loaded.1
+        } else if nativeMTPRequestedAtLoad {
+            let loaded = try await MLXLMCommon.loadModel(
+                from: modelDir,
+                using: #huggingFaceTokenizerLoader(),
+                loadConfiguration: LoadConfiguration(
+                    jangPress: .disabled,
+                    maxResidentBytes: .unlimited,
+                    memoryLimit: .unlimited,
+                    useMmapSafetensors: useMmap,
+                    nativeMTP: true))
             context = loaded.0
             jangPressRuntime = loaded.1
         } else {
@@ -6218,9 +6232,14 @@ func runPerfBench(
         let perfCacheCoordinator: CacheCoordinator?
         if env["BENCH_PERF_CACHE_COORDINATOR"] == "1" {
             let modelKey = "\(modelName)|perf-cache-coordinator"
+            let diskDir = env["BENCH_PERF_CACHE_DIR"].map {
+                URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath)
+            }
             let config = CacheCoordinatorConfig(
                 usePagedCache: env["BENCH_PERF_CACHE_PAGED"] != "0",
-                enableDiskCache: false,
+                enableDiskCache: env["BENCH_PERF_CACHE_DISK"] == "1",
+                diskCacheMaxGB: Float(env["BENCH_PERF_CACHE_DISK_MAX_GB"] ?? "1") ?? 1,
+                diskCacheDir: diskDir,
                 enableSSMReDerive: env["BENCH_PERF_CACHE_SSM_REDERIVE"] == "1",
                 modelKey: modelKey)
             let coordinator = CacheCoordinator(config: config)
@@ -6229,7 +6248,7 @@ func runPerfBench(
             }
             perfCacheCoordinator = coordinator
             print(
-                "PERF_CACHE_COORDINATOR enabled paged=\(config.usePagedCache) hybrid=\(coordinator.isHybrid) modelKey=\(modelKey)"
+                "PERF_CACHE_COORDINATOR enabled paged=\(config.usePagedCache) disk=\(config.enableDiskCache) hybrid=\(coordinator.isHybrid) modelKey=\(modelKey)"
             )
         } else {
             perfCacheCoordinator = nil
@@ -6420,6 +6439,23 @@ func runPerfBench(
                     print("    REASONING_PREVIEW \"\(compactPreview(result.reasoning))\"")
                 }
                 print("    TEXT_PREVIEW \"\(compactPreview(result.text.isEmpty ? result.reasoning : result.text))\"")
+                if env["BENCH_PERF_FULL_TEXT"] == "1" {
+                    printDecodedOutput(
+                        label: label,
+                        text: result.text.isEmpty ? result.reasoning : result.text)
+                }
+            }
+            if let snapshot = perfCacheCoordinator?.snapshotStats() {
+                let paged = snapshot.pagedStats.map {
+                    "hits=\($0.cacheHits),misses=\($0.cacheMisses),allocated=\($0.allocatedBlocks),free=\($0.freeBlocks),evictions=\($0.evictions)"
+                } ?? "disabled"
+                let disk = snapshot.diskStats.map {
+                    "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),maxBytes=\($0.maxSizeBytes)"
+                } ?? "disabled"
+                let ssm = snapshot.ssmStats
+                print(
+                    "PERF_CACHE_STATS label=\(label) hybrid=\(snapshot.isHybrid) pagedIncompatible=\(snapshot.isPagedIncompatible) paged{\(paged)} disk{\(disk)} ssm{hits=\(ssm.hits),misses=\(ssm.misses),reDerives=\(ssm.reDerives)}"
+                )
             }
             return result
         }

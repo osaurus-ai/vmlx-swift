@@ -2492,7 +2492,8 @@ public func generate(
             model: nativeModel,
             cache: cache,
             parameters: parameters,
-            depth: depth)
+            depth: depth,
+            cacheCoordinator: cacheCoordinator)
         let (stream, _) = generateTask(
             promptTokenCount: input.text.tokens.size,
             modelConfiguration: context.configuration,
@@ -2818,7 +2819,8 @@ public func generateTokensTask(
             model: nativeModel,
             cache: cache,
             parameters: parameters,
-            depth: depth)
+            depth: depth,
+            cacheCoordinator: cacheCoordinator)
         return generateTokenTask(
             promptTokenCount: input.text.tokens.size,
             modelConfiguration: context.configuration,

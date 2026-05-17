@@ -5,6 +5,13 @@ import Foundation
 import MLX
 import os
 
+/// Thread-safe snapshot of ``SSMStateCache`` counters.
+public struct SSMStateCacheStats: Sendable {
+    public let hits: Int
+    public let misses: Int
+    public let reDerives: Int
+}
+
 /// An LRU companion cache for SSM layer state in hybrid models
 /// (Nemotron-H, Qwen3.5-A3B, Jamba).
 ///
@@ -64,6 +71,16 @@ public final class SSMStateCache: @unchecked Sendable {
         lock.lock()
         reDerives &+= 1
         lock.unlock()
+    }
+
+    /// Thread-safe copy of current companion-cache counters.
+    public func snapshotStats() -> SSMStateCacheStats {
+        lock.lock()
+        defer { lock.unlock() }
+        return SSMStateCacheStats(
+            hits: hits,
+            misses: misses,
+            reDerives: reDerives)
     }
 
     // MARK: - Initialization

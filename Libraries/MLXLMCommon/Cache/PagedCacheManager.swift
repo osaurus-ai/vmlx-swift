@@ -63,6 +63,13 @@ public final class PagedCacheManager: @unchecked Sendable {
     /// Cache statistics.
     public private(set) var stats = CacheStats()
 
+    /// Thread-safe copy of current cache statistics.
+    public func snapshotStats() -> CacheStats {
+        lock.lock()
+        defer { lock.unlock() }
+        return stats
+    }
+
     // MARK: - Initialization
 
     /// Create a paged cache manager.
