@@ -49,6 +49,7 @@ docs/local/production-readiness/20260517T1252_ling_hy3_gemma4_runtime_contracts/
 docs/local/production-readiness/20260517T1300_hy3_mixed_qkv_runtime_contracts/
 docs/local/production-readiness/20260517T1315_harmony_prompt_tail_parser/
 docs/local/production-readiness/20260517T1320_no_hidden_reasoning_regression/
+docs/local/production-readiness/20260517T1325_gemma4_swa_compile_policy/
 ```
 
 That inventory contains 28 non-excluded local bundles:

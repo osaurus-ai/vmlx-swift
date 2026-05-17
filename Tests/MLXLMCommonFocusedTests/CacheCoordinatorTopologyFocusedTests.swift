@@ -413,6 +413,24 @@ struct Gemma4CacheTopologyFocusedTests {
         #expect(family.isCompileEligibleAtCurrentStage == true)
     }
 
+    @Test("Gemma4 compile policy follows actual cache topology")
+    func compilePolicyFollowsActualCacheTopology() throws {
+        let config = try JSONDecoder().decode(
+            Gemma4TextConfiguration.self,
+            from: Data(Self.minimalGemma4Config.utf8))
+        let model = Gemma4TextModel(config)
+
+        let defaultFamily = CacheFamily.classify(model.newCache(parameters: nil))
+        #expect(defaultFamily == .heterogeneous)
+        #expect(defaultFamily.isCompileEligibleAtCurrentStage == false)
+
+        var params = GenerateParameters()
+        params.maxKVSize = 2048
+        let boundedFamily = CacheFamily.classify(model.newCache(parameters: params))
+        #expect(boundedFamily == .rotating)
+        #expect(boundedFamily.isCompileEligibleAtCurrentStage == true)
+    }
+
     @Test("Full-attention rotating cache uses the attention-sink shape")
     func attentionSinkContract() {
         let sliding = RotatingKVCache(maxSize: 1024, keep: 0)
