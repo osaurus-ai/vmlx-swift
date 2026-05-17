@@ -355,6 +355,16 @@ struct MTPRuntimeFocusedTests {
         #expect(source.contains("sequential_repair"))
     }
 
+    @Test("native MTP chunk verifier stays opt-in for Mamba cache")
+    func nativeMTPChunkVerifierStaysOptInForMambaCache() throws {
+        let source = try Self.source(
+            "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift")
+
+        #expect(source.contains("case \"chunk\", \"chunk_commit\", \"capture_commit\", \"fast\":"))
+        #expect(source.contains("case \"sequential\", \"sequential_repair\", \"repair\":"))
+        #expect(source.contains("return cache.contains { $0 is MambaCache }"))
+    }
+
     @Test("BatchEngine.generate rejects native MTP without an active MTP head")
     func batchEngineGenerateRejectsNativeMTPWithoutActiveHead() async throws {
         try await FocusedMLXTestSupport.withLock {
