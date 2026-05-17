@@ -43,6 +43,7 @@ Fresh focused MTP/settings artifact:
 
 ```text
 docs/local/production-readiness/20260517T160343Z_qwen_mtp_settings_current/
+docs/local/production-readiness/20260517T165508Z_qwen_mtp_settings_recheck/
 ```
 
 That inventory contains 28 non-excluded local bundles:
@@ -122,6 +123,7 @@ Current focused gate at 2026-05-17 09:03 PDT:
 
 ```text
 docs/local/production-readiness/20260517T160343Z_qwen_mtp_settings_current/
+docs/local/production-readiness/20260517T165508Z_qwen_mtp_settings_recheck/
 ```
 
 - `MTPRuntimeFocusedTests.log`: 40/40 pass. Coverage includes cached verifier
@@ -146,6 +148,14 @@ docs/local/production-readiness/20260517T160343Z_qwen_mtp_settings_current/
   settings, paged-vs-legacy disk conflict rejection, TurboQuant KV bit-width
   validation, preserved-only MTP auto-launch denial, force-on requiring verified
   accept/reject runtime, and policy/draft-limit launch resolution.
+- Fresh 09:55 PDT recheck after the BatchEngine mixed-codec patch keeps both
+  gates green on the current checkout: `MTPRuntimeFocusedTests.log` passes
+  40/40 and `VMLINUXServerRuntimeSettingsTests.log` passes 12/12. The rerun
+  specifically re-confirms tensor-evidence-only MTP activation, task-local/env
+  override behavior, D3 hidden-state draft/verify, SSM accepted-prefix offsets,
+  private draft-cache refresh, BatchEngine exclusive native-MTP lane, bundle
+  generation defaults, top-k reaching sampler probabilities, and invalid
+  settings reporting instead of clamping.
 
 ## Qwen3.5 35B 4-bit Loader Repair - 2026-05-17
 
