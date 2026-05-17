@@ -515,6 +515,15 @@ struct DirectCapabilityParserAliasFocusedTests {
         }
     }
 
+    @Test("DeepSeek V4 capability aliases route to DSML before generic DeepSeek")
+    func deepseekV4CapabilityAliasesRouteToDSML() {
+        for stamp in ["deepseek_v4", "deepseek_v4_flash", "deepseekv4"] {
+            #expect(ToolCallFormat.fromCapabilityName(stamp) == .dsml)
+        }
+        #expect(ToolCallFormat.fromCapabilityName("deepseek") == .glm4)
+        #expect(ToolCallFormat.fromCapabilityName("deepseek_v3") == .glm4)
+    }
+
     @Test("explicit Mistral-4 reasoning capability uses bracket THINK parser")
     func explicitMistral4ReasoningCapabilityUsesBracketThinkParser() {
         #expect(reasoningStampFromModelType("mistral4") == "none",

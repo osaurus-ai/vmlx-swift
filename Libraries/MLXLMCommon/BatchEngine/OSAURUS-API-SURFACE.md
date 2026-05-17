@@ -42,7 +42,7 @@ on 2026-04-19. Every row is a live import in one of those branches.
 | `public struct ResolvedModelConfiguration: Sendable` | Same fields, all URLs resolved. Factories return this inside `ModelContext`. |
 | `public enum ToolCallFormat: String, Sendable, CaseIterable` | `.json`, `.lfm2`, `.xmlFunction`, `.glm4`, `.gemma`, `.gemma4`, `.kimiK2`, `.minimaxM2`, `.mistral`, `.llama3`, `.dsml`, `.zayaXml`, `.hunyuan`. |
 | `public static func ToolCallFormat.infer(from: String, configData: Data? = nil) -> ToolCallFormat?` | Model-type heuristic with Llama-3 secondary-signal (`vocab_size >= 128000` or `rope_scaling.rope_type == "llama3"`). |
-| `public static func ToolCallFormat.fromCapabilityName(_: String?) -> ToolCallFormat?` | JANG-stamp → canonical enum. Accepts `qwen` / `qwen3_6` / `minimax` / `glm47` / `glm5*` / `nemotron` / `gemma4` / `mistral` / `mistral4*` / `pixtral*` / `lfm2` / `kimi_k2` / `dsml` / `zaya_xml` / `hunyuan` / `hy3` plus every direct rawValue. Returns nil for unknown. |
+| `public static func ToolCallFormat.fromCapabilityName(_: String?) -> ToolCallFormat?` | JANG-stamp → canonical enum. Accepts `qwen` / `qwen3_6` / `minimax` / `glm47` / `glm5*` / `deepseek_v3` / `deepseek_v4*` / `nemotron` / `gemma4` / `mistral` / `mistral4*` / `pixtral*` / `lfm2` / `kimi_k2` / `dsml` / `zaya_xml` / `hunyuan` / `hy3` plus every direct rawValue. DeepSeek V4 aliases route to DSML before the generic DeepSeek/GLM parser. Returns nil for unknown. |
 | `public func ToolCallFormat.createParser() -> any ToolCallParser` | Factory used by `ToolCallProcessor.init`. |
 
 ## 4. Tool-call parsing — **byte-identical with upstream ml-explore/mlx-swift-lm**

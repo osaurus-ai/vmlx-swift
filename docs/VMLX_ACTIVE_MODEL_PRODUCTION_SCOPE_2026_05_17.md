@@ -751,6 +751,7 @@ Additional Harmony parser follow-up:
 
 ```text
 docs/local/live-model-matrix/20260517T_harmony_parser_fix_current/
+docs/local/production-readiness/20260517T_parser_cache_nonexcluded_current/
 ```
 
 - The shared Harmony reasoning parser now covers both Gemma 4
@@ -773,6 +774,12 @@ docs/local/live-model-matrix/20260517T_harmony_parser_fix_current/
   fallback now also infers the GLM tool parser (`glm5`, `glm5_air`,
   `glm5_1_flash`) so reasoning and tool parsing stay aligned without relying
   on a JANG capability stamp.
+- 2026-05-17 current-checkout parser/cache recheck fixed one real parser-order
+  bug: `ToolCallFormat.fromCapabilityName("deepseek_v4" | "deepseek_v4_flash" |
+  "deepseekv4")` now resolves to DSML before the generic DeepSeek/GLM prefix,
+  while `deepseek` and `deepseek_v3` remain GLM-style. The aggregate active
+  focused target passes 142 tests in 20 suites in
+  `MLXLMCommonFocusedTests_all.log`.
 - A post-fix live Gemma 4 `BENCH_HARMONY_CHECK` row passes: marker strings are
   absent from `.chunk`, the output is coherent visible README guidance, and
   generation stops through the normal path.

@@ -341,10 +341,20 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .mistral
         }
 
+        // DSV4 must resolve before the generic DeepSeek/GLM parser family.
+        // V3-style DeepSeek aliases use the GLM arg_key/arg_value format, but
+        // V4 Flash/Pro uses DSML.
+        if normalized.hasPrefix("deepseek_v4")
+            || normalized.hasPrefix("deepseekv4")
+        {
+            return .dsml
+        }
+
         // Family aliases with minor-version suffixes. Capability metadata is
         // often stamped at the family level (`glm5_air`, `glm4_moe_lite`,
         // `deepseek_v3`, `laguna_glm_thinking_v5`) rather than the exact enum
-        // raw value, and all of these use the GLM/DeepSeek arg_key/arg_value
+        // raw value, and all of these non-DSV4 aliases use the
+        // GLM/DeepSeek arg_key/arg_value
         // parser.
         if n.hasPrefix("glm4_")
             || n.hasPrefix("glm5")
