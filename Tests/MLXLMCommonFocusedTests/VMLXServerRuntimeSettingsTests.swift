@@ -197,6 +197,47 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
+    @Test("preserved Qwen MTP recommendation is visible but does not auto-launch")
+    func preservedQwenMTPCandidateDoesNotAutoLaunch() {
+        let config = """
+        {
+          "model_type": "qwen3_vl",
+          "text_config": { "model_type": "qwen3_5_moe_text", "mtp_num_hidden_layers": 1 },
+          "quantization": { "mode": "mxfp4", "bits": 4 }
+        }
+        """.data(using: .utf8)!
+        let preserved = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 42,
+            visionTensorCount: 333,
+            mode: .preservedEnabled)
+        let settings = VMLXServerRuntimeSettings()
+
+        let candidate = NativeMTPAutoDecodePolicy.recommendation(
+            configData: config,
+            jangConfig: nil,
+            status: preserved,
+            requireVerifiedRuntime: false)
+        let launch = settings.resolvedMTPLaunch(
+            configData: config,
+            jangConfig: nil,
+            status: preserved)
+
+        #expect(candidate?.depth == 3)
+        #expect(candidate?.verifierMode == "sequential_repair")
+        #expect(settings.effectiveMTPLaunchMode(for: preserved) == .off)
+        #expect(launch.launchMode == .off)
+        #expect(settings.resolvedMTPDraftStrategy(
+            configData: config,
+            jangConfig: nil,
+            status: preserved) == nil)
+        #expect(settings.validationIssues(
+            configData: config,
+            jangConfig: nil,
+            mtpStatus: preserved).isEmpty)
+    }
+
     @Test("MTP launch resolution blocks unsupported verified profiles")
     func mtpLaunchResolutionBlocksUnsupportedVerifiedProfiles() {
         let config = """
@@ -230,6 +271,20 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.effectiveMTPLaunchMode(for: verified) == .speculative)
         #expect(launch.launchMode == .blocked)
         #expect(launch.recommendation == nil)
+        #expect(settings.validationIssues(
+            configData: config,
+            jangConfig: JangConfig(
+                quantization: JangQuantization(
+                    method: "jang",
+                    profile: "JANG_2K",
+                    targetBits: 2,
+                    actualBits: 2,
+                    bitWidthsUsed: [2, 3, 6, 8]),
+                sourceModel: JangSourceModel(architecture: "qwen3_5_moe"),
+                architecture: JangArchitecture(hasMoE: true)),
+            mtpStatus: verified).contains {
+                $0.severity == .error && $0.field == "mtp.mode"
+            })
         if settings.resolvedMTPDraftStrategy(
             configData: config,
             jangConfig: nil,

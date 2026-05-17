@@ -168,6 +168,41 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         return issues
     }
 
+    /// Validate settings with the same evidence used to resolve native-MTP
+    /// launch policy.
+    ///
+    /// ``validationIssues(mtpStatus:)`` intentionally stays status-only for
+    /// cheap UI checks. Osaurus should use this overload before launching a
+    /// session when it has `config.json` bytes and optional `jang_config.json`
+    /// metadata, because a bundle can be generally `speculative_verified` while
+    /// a specific profile, such as Qwen3.6 JANG_2K, is still blocked by the
+    /// verified runtime policy.
+    public func validationIssues(
+        configData: Data?,
+        jangConfig: JangConfig?,
+        mtpStatus: MTPBundleStatus?
+    ) -> [VMLXServerSettingsIssue] {
+        var issues = validationIssues(mtpStatus: mtpStatus)
+        guard mtp.mode == .forceOn,
+              !issues.contains(where: {
+                  $0.severity == .error && $0.field == "mtp.mode"
+              })
+        else {
+            return issues
+        }
+
+        let launch = resolvedMTPLaunch(
+            configData: configData,
+            jangConfig: jangConfig,
+            status: mtpStatus)
+        if launch.launchMode == .blocked {
+            issues.append(.error(
+                field: "mtp.mode",
+                message: "MTP force-on is blocked for this bundle profile: \(launch.reason)"))
+        }
+        return issues
+    }
+
     public func effectiveMTPLaunchMode(
         for status: MTPBundleStatus?
     ) -> VMLXMTPLaunchMode {

@@ -44,8 +44,11 @@ Fresh focused MTP/settings artifact:
 ```text
 docs/local/production-readiness/20260517T160343Z_qwen_mtp_settings_current/
 docs/local/production-readiness/20260517T165508Z_qwen_mtp_settings_recheck/
+docs/local/production-readiness/20260517T1305_mtp_settings_profile_validation/
 docs/local/production-readiness/20260517T1252_ling_hy3_gemma4_runtime_contracts/
 docs/local/production-readiness/20260517T1300_hy3_mixed_qkv_runtime_contracts/
+docs/local/production-readiness/20260517T1315_harmony_prompt_tail_parser/
+docs/local/production-readiness/20260517T1320_no_hidden_reasoning_regression/
 ```
 
 That inventory contains 28 non-excluded local bundles:
@@ -187,6 +190,13 @@ docs/local/production-readiness/20260517T174743Z_qwen_mtp_chunk_policy_finalize/
   server settings green: `VMLINUXServerRuntimeSettingsTests_after_prefix_snapshot_materialize.log`
   passes 12/12, and the release `RunBench` product builds successfully in
   `build_RunBench_release_after_prefix_snapshot_materialize.log`.
+- Fresh 13:05 PDT profile-validation recheck keeps server settings green:
+  `VMLINUXServerRuntimeSettingsTests_profile_validation.log` passes 15/15 and
+  proves Osaurus launch-time validation can use full `config.json` plus optional
+  `jang_config.json` evidence. A preserved Qwen MTP bundle is visible as a D3
+  `sequential_repair` candidate for UI/reporting, but auto launch stays off and
+  no draft strategy is emitted. A force-on request against a blocked verified
+  profile such as Qwen3.6 JANG_2K now produces a settings error before launch.
 
 ## Qwen3.5 35B 4-bit Loader Repair - 2026-05-17
 

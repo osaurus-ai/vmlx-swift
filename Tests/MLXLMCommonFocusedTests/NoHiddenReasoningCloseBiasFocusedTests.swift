@@ -181,6 +181,29 @@ struct HarmonyParserFocusedTests {
         #expect(!reasoning.contains("<|end|>"))
     }
 
+    @Test("Harmony prompt-tail parser preserves GPT-OSS channel stripping")
+    func harmonyForPromptPreservesGPTOSSChannelStripping() {
+        var parser = ReasoningParser.forPrompt(
+            stampName: "gpt_oss_120b",
+            promptTail: "<|start|>assistant")
+        let stream =
+            "<|start|>assistant<|channel|>analysis<|message|>hidden-plan<|end|>"
+            + "<|start|>assistant<|channel|>final<|message|>visible answer<|return|>"
+        var segments: [ReasoningSegment] = []
+        for chunk in chunked(stream, by: 3) {
+            segments.append(contentsOf: parser?.feed(chunk) ?? [])
+        }
+        segments.append(contentsOf: parser?.flush() ?? [])
+
+        let (reasoning, content) = collect(segments)
+        #expect(reasoning == "hidden-plan")
+        #expect(content == "visible answer")
+        for marker in ["<|start|>", "<|channel|>", "<|message|>", "<|end|>", "<|return|>"] {
+            #expect(!reasoning.contains(marker))
+            #expect(!content.contains(marker))
+        }
+    }
+
     @Test("GPT-OSS model types resolve to Harmony, not think XML")
     func gptOSSModelTypesResolveToHarmony() {
         for modelType in ["gpt_oss", "gpt_oss_20b", "gpt_oss_120b", "GPT_OSS"] {
