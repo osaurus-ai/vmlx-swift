@@ -955,7 +955,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
         let loadNativeMTP = configuration.mtpNumHiddenLayers > 0
         var weights = loadNativeMTP ? weights : weights.filter { !Self.isMTPWeightKey($0.key) }
         let hasUnsanitizedConv1d = weights.contains { key, value in
-            key.contains("conv1d.weight") && value.dim(-1) != 1
+            !Self.isMTPWeightKey(key) && key.contains("conv1d.weight") && value.dim(-1) != 1
         }
         let explicitNormConvention = normConvention != nil
         let shouldShiftNormWeights = Self.usesQwenPlusOneNormConvention(normConvention)
@@ -1040,7 +1040,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
             ".post_attention_layernorm.weight",
         ]
         for (key, value) in weights where value.ndim == 1 {
-            guard probeSuffixes.contains(where: { key.hasSuffix($0) }) else {
+            guard !Self.isMTPWeightKey(key),
+                  probeSuffixes.contains(where: { key.hasSuffix($0) }) else {
                 continue
             }
             let mean = value.asType(.float32).mean().item(Float.self)

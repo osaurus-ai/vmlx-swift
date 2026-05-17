@@ -1323,6 +1323,7 @@ public struct JangLoader: Sendable {
         weights: [String: MLXArray],
         jangConfig: JangConfig,
         hiddenSizeHint: Int? = nil,
+        linearAttnValueDimHint: Int? = nil,
         validInDims: Set<Int> = [],
         declaredDefaultQuantization: BaseConfiguration.Quantization? = nil
     ) -> BaseConfiguration.PerLayerQuantization {
@@ -1387,16 +1388,21 @@ public struct JangLoader: Sendable {
                 || basePath.hasSuffix(".attn.v_proj")
                 || basePath.hasSuffix(".mlp.gate_proj")
                 || basePath.hasSuffix(".mlp.up_proj")
+                || basePath.hasSuffix(".switch_mlp.gate_proj")
+                || basePath.hasSuffix(".switch_mlp.up_proj")
+                || basePath.hasSuffix(".switch_glu.gate_proj")
+                || basePath.hasSuffix(".switch_glu.up_proj")
+                || basePath.hasSuffix(".shared_expert.gate_proj")
+                || basePath.hasSuffix(".shared_expert.up_proj")
             let isMTPFusionFC =
                 basePath.hasSuffix(".mtp.fc")
                 || basePath.hasSuffix("mtp.fc")
-            let isSwitchMLPDown =
+            let isLinearAttnOutputProjection =
+                basePath.hasSuffix(".linear_attn.out_proj")
+            let isExpertDownProjection =
                 basePath.hasSuffix("switch_mlp.down_proj")
                 || basePath.hasSuffix("switch_glu.down_proj")
-                || basePath.contains("switch_mlp.up_proj")
-                || basePath.contains("switch_mlp.gate_proj")
-                || basePath.contains("switch_glu.up_proj")
-                || basePath.contains("switch_glu.gate_proj")
+                || basePath.hasSuffix("shared_expert.down_proj")
 
             func inferFromUniqueValidInDim() -> (bits: Int, groupSize: Int)? {
                 guard !validInDims.isEmpty else { return nil }
@@ -1404,8 +1410,9 @@ public struct JangLoader: Sendable {
                     (8, 32), (8, 64), (8, 128),
                     (4, 32), (4, 64), (4, 128),
                     (2, 32), (2, 64), (2, 128),
-                    (3, 32), (6, 32),
-                    (5, 32), (5, 64), (3, 64), (6, 64),
+                    (3, 32), (3, 64), (3, 128),
+                    (5, 32), (5, 64), (5, 128),
+                    (6, 32), (6, 64), (6, 128),
                 ]
                 var matches: [(bits: Int, groupSize: Int, inDim: Int)] = []
                 for (candidateBits, candidateGroupSize) in preferred {
@@ -1446,13 +1453,25 @@ public struct JangLoader: Sendable {
                     knownGroupSize: groupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: hiddenSize * 2)
+            } else if isLinearAttnOutputProjection,
+                      let valueDim = linearAttnValueDimHint, valueDim > 0
+            {
+                (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
+                    packedDim: packedDim,
+                    numGroups: numGroups,
+                    knownGroupSize: groupSize,
+                    bitWidthsUsed: bitWidthsUsed,
+                    expectedInDim: valueDim)
             } else if let picked = inferFromUniqueValidInDim() {
                 (bits, inferredGroupSize) = picked
-            } else if isSwitchMLPDown && !validInDims.isEmpty {
+            } else if isExpertDownProjection && !validInDims.isEmpty {
                 let preferred: [(Int, Int)] = [
                     (8, 32), (8, 64), (8, 128),
                     (4, 32), (4, 64), (4, 128),
                     (2, 32), (2, 64), (2, 128),
+                    (3, 32), (3, 64), (3, 128),
+                    (5, 32), (5, 64), (5, 128),
+                    (6, 32), (6, 64), (6, 128),
                 ]
                 var picked: (Int, Int)? = nil
                 for (candidateBits, candidateGroupSize) in preferred {
@@ -1564,8 +1583,9 @@ public struct JangLoader: Sendable {
             (8, 32), (8, 64), (8, 128),
             (4, 32), (4, 64), (4, 128),
             (2, 32), (2, 64), (2, 128),
-            (3, 32), (6, 32),
-            (5, 32), (5, 64), (3, 64), (6, 64),
+            (3, 32), (3, 64), (3, 128),
+            (5, 32), (5, 64), (5, 128),
+            (6, 32), (6, 64), (6, 128),
         ]
         for (bits, groupSize) in preferred {
             guard (packedDim * 32) % bits == 0 else { continue }
@@ -1608,8 +1628,9 @@ public struct JangLoader: Sendable {
             (8, 32), (8, 64), (8, 128),
             (4, 32), (4, 64), (4, 128),
             (2, 32), (2, 64), (2, 128),
-            (3, 32), (6, 32),
-            (5, 32), (5, 64), (3, 64), (6, 64),
+            (3, 32), (3, 64), (3, 128),
+            (5, 32), (5, 64), (5, 128),
+            (6, 32), (6, 64), (6, 128),
         ]
         for (bits, groupSize) in preferred {
             guard (packedDim * 32) % bits == 0 else { continue }
@@ -1644,7 +1665,10 @@ public struct JangLoader: Sendable {
     /// - `.mixer.gate.weight` — Nemotron-H
     /// - `.router.proj.weight` — Gemma4 (already handled separately)
     public static func dequantizeMoEGates(
-        weights: inout [String: MLXArray], groupSize: Int, bitWidthsUsed: [Int] = []
+        weights: inout [String: MLXArray],
+        groupSize: Int,
+        bitWidthsUsed: [Int] = [],
+        hiddenSizeHint: Int? = nil
     ) {
         // Find gate weight keys that have .scales companion (meaning they're quantized)
         var gateBasePaths = Set<String>()
@@ -1672,35 +1696,24 @@ public struct JangLoader: Sendable {
             let packedDim = gateWeight.shape.last ?? 0
             let numGroups = gateScales.shape.last ?? 1
 
-            // Infer bits using bitWidthsUsed (highest first — gates are CRITICAL tier).
-            // Shape-only inference is ambiguous: multiple (bits, gs) produce the same
-            // packed shapes. Using the known bit widths resolves the ambiguity.
-            // For each candidate bits, compute inDim = packedDim * 32 / bits and check
-            // that numGroups divides it evenly.
-            var inferredBits = 4
-            var inferredGroupSize = groupSize
-
-            let candidates = bitWidthsUsed.isEmpty
-                ? [8, 6, 5, 4, 3, 2]
-                : bitWidthsUsed.sorted(by: >)
-
-            for bits in candidates {
-                guard bits > 0 && (packedDim * 32) % bits == 0 else { continue }
-                let inDim = (packedDim * 32) / bits
-                guard numGroups > 0 && inDim % numGroups == 0 else { continue }
-                let gs = inDim / numGroups
-                // Verify round-trip: packing inDim at this bits produces packedDim
-                if (inDim * bits + 31) / 32 == packedDim || inDim * bits / 32 == packedDim {
-                    inferredBits = bits
-                    inferredGroupSize = gs
-                    break
-                }
-            }
+            let inferred = hiddenSizeHint.flatMap { hiddenSize -> (bits: Int, groupSize: Int)? in
+                guard hiddenSize > 0 else { return nil }
+                return inferBitWidthAndGroupSize(
+                    packedDim: packedDim,
+                    numGroups: numGroups,
+                    knownGroupSize: groupSize,
+                    bitWidthsUsed: bitWidthsUsed,
+                    expectedInDim: hiddenSize)
+            } ?? inferBitWidthAndGroupSize(
+                packedDim: packedDim,
+                numGroups: numGroups,
+                knownGroupSize: groupSize,
+                bitWidthsUsed: bitWidthsUsed)
 
             // Dequantize to float32 for routing precision
             let dequantized = MLX.dequantized(
                 gateWeight, scales: gateScales, biases: gateBiases,
-                groupSize: inferredGroupSize, bits: inferredBits)
+                groupSize: inferred.groupSize, bits: inferred.bits)
 
             // Replace quantized gate with float version, remove scales/biases
             weights[basePath + ".weight"] = dequantized.asType(.float32)

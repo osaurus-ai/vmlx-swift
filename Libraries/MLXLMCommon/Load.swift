@@ -304,7 +304,8 @@ public func loadWeights(
             weights: &weights,
             groupSize: declaredAffineQuantization?.groupSize
                 ?? jangConfig.quantization.blockSize,
-            bitWidthsUsed: gateBitWidths)
+            bitWidthsUsed: gateBitWidths,
+            hiddenSizeHint: readHiddenSizeHint(at: modelDirectory))
     }
 
     // Determine quantization: JANG models infer per-layer bit widths from tensor shapes.
@@ -331,10 +332,12 @@ public func loadWeights(
         // `(gs=32, bits=8)` for layers actually packed at `(gs=64,
         // bits=4)`) and would re-introduce the wrong values.
         let hiddenHint = readHiddenSizeHint(at: modelDirectory)
+        let linearAttnValueDimHint = readLinearAttnValueDimHint(at: modelDirectory)
         let validInDims = readValidInDims(at: modelDirectory)
         let inferred = JangLoader.inferPerLayerQuantization(
             weights: weights, jangConfig: jangConfig,
             hiddenSizeHint: hiddenHint,
+            linearAttnValueDimHint: linearAttnValueDimHint,
             validInDims: validInDims,
             declaredDefaultQuantization: declaredAffineQuantization ?? quantization)
 
@@ -698,6 +701,19 @@ private func readHiddenSizeHint(at modelDirectory: URL) -> Int? {
         return hiddenSize
     }
     return nil
+}
+
+private func readLinearAttnValueDimHint(at modelDirectory: URL) -> Int? {
+    let configURL = modelDirectory.appendingPathComponent("config.json")
+    guard let data = try? Data(contentsOf: configURL),
+          let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    let config = (top["text_config"] as? [String: Any]) ?? top
+    guard let valueHeads = config["linear_num_value_heads"] as? Int,
+          let valueHeadDim = config["linear_value_head_dim"] as? Int,
+          valueHeads > 0, valueHeadDim > 0
+    else { return nil }
+    return valueHeads * valueHeadDim
 }
 
 /// Build architecture-valid input dimensions for JANG bit/group-size

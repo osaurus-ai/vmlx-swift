@@ -206,8 +206,11 @@ open class BaseKVCache: KVCache {
             return .none
         }
 
-        // For multi-token sequences
-        if returnArray || (windowSize != nil && n > windowSize!) {
+        // For a cached multi-token continuation, symbolic `.causal` does not
+        // carry the cache offset. Native MTP verifier passes and prefix-cache
+        // resumes need the explicit offset-aware mask so row 1...N sees the
+        // correct prior prompt and earlier verifier tokens.
+        if offset > 0 || returnArray || (windowSize != nil && n > windowSize!) {
             return .array(createCausalMask(n: n, offset: offset, windowSize: windowSize))
         }
 

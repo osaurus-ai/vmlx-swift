@@ -5,6 +5,30 @@ Osaurus. Native MTP now exists as an explicit, tensor-gated runtime path for
 Qwen3.6, but it is still not an automatic production launch mode. Auto-launch
 requires the cache, VL, multi-turn, and speed gates below.
 
+## 2026-05-17 Matrix Update
+
+The current six-variant Qwen3.6 Swift matrix is recorded in
+`docs/VMLX_QWEN36_MTP_MATRIX_2026_05_17.md`.
+
+Key changes since this plan was first written:
+
+- All six local Qwen3.6 MTP/VL bundles are now present:
+  27B JANG_4M, 27B MXFP4, 27B MXFP8, 35B JANG_2K, 35B MXFP4, and 35B MXFP8.
+- MTP activation remains explicit and tensor-gated. `canAutoLaunch=false` is
+  still the correct product state.
+- Text MTP D3 is coherent for all six variants and exact-cache repeat rows hit
+  disk L2 plus SSM companion state.
+- MTP D3 is currently slower than AR in the latest Swift text matrix, so speed
+  is not production-complete despite coherent output.
+- VL+MTP must use `BatchEngine.generate`/`Evaluate.generate` exclusive paths.
+  `BatchEngine.submit` raw native-MTP scheduling is intentionally rejected until
+  per-slot draft/verify/cache scheduling is implemented.
+- Strict VL+MTP currently passes 27B JANG_4M, 27B MXFP4, 27B MXFP8, and 35B
+  MXFP8. 35B JANG_2K and 35B MXFP4 fail because the cold image row exhausts the
+  token budget; that is not accepted as a pass.
+- Multi-turn reasoning with MTP D3 still has visible-answer failures in
+  thinking mode and must be fixed without forced close tags or sampling clamps.
+
 ## Current Boundary
 
 The package now has a no-load MTP inspector:

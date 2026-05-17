@@ -44,6 +44,17 @@ struct Bench {
         let compileMaxLen = Int(env["BENCH_COMPILE_MAXLEN"] ?? "16384") ?? 16384
         let modelDir = URL(fileURLWithPath: modelPath)
 
+        if (env["BENCH_MTP_CENSUS"] ?? "0") == "1" {
+            let status = try MTPBundleInspector.inspect(modelDirectory: modelDir)
+            let data = try JSONEncoder().encode(status)
+            let json = String(data: data, encoding: .utf8) ?? "{}"
+            print("MTP_CENSUS model=\(modelDir.lastPathComponent) \(json)")
+            print(
+                "MTP_CENSUS_SUMMARY bundleHasMTP=\(status.bundleHasMTP) complete=\(status.hasCompleteMTPArtifact) canAutoLaunch=\(status.canAutoLaunchMTP) vision=\(status.bundleHasVision) line=\"\(status.statusLine)\""
+            )
+            return
+        }
+
         // BENCH_JANGPRESS=1 activates the JangPress cold-weight tier
         // (axis E) for THIS bench run. Holds the runtime alive for
         // the full bench so the controller's failsafe state machine
@@ -6157,10 +6168,19 @@ func runPerfBench(
         var perfLine = ""
 
         do {
+        let rssBeforeLoad = currentRSSMiB()
+        let footprintBeforeLoad = currentPhysFootprintMiB()
+        print(String(format:
+            "PERF_MEMORY label=before_load rss_mib=%.0f footprint_mib=%.0f",
+            rssBeforeLoad, footprintBeforeLoad))
+        var peakRSSMiB = rssBeforeLoad
+        var peakFootprintMiB = footprintBeforeLoad
         let loadStart = CFAbsoluteTimeGetCurrent()
         let context: ModelContext
         let jangPressRuntime: JangPressRuntime?
-        let nativeMTPRequestedAtLoad = env["BENCH_PERF_NATIVE_MTP_DEPTH"] != nil
+        let nativeMTPRequestedAtLoad =
+            env["BENCH_PERF_NATIVE_MTP_DEPTH"] != nil
+            || env["BENCH_PERF_LOAD_NATIVE_MTP"] == "1"
         if useJangPressLoad {
             let loaded = try await MLXLMCommon.loadModel(
                 from: modelDir,
@@ -6190,12 +6210,19 @@ func runPerfBench(
                 from: modelDir, using: #huggingFaceTokenizerLoader())
             jangPressRuntime = nil
         }
+        let rssAfterLoad = currentRSSMiB()
+        let footprintAfterLoad = currentPhysFootprintMiB()
+        peakRSSMiB = max(peakRSSMiB, rssAfterLoad)
+        peakFootprintMiB = max(peakFootprintMiB, footprintAfterLoad)
         defer {
             if let jangPressRuntime {
                 JangPressActivation.deactivate(jangPressRuntime)
             }
         }
         let loadSec = CFAbsoluteTimeGetCurrent() - loadStart
+        print(String(format:
+            "PERF_MEMORY label=after_load rss_mib=%.0f footprint_mib=%.0f loadSec=%.2f",
+            rssAfterLoad, footprintAfterLoad, loadSec))
 
         let promptText = env[
             "BENCH_PERF_PROMPT"]
@@ -6264,14 +6291,21 @@ func runPerfBench(
             var genTokens = 0
             var genSec = 0.0
             var ttftSec = 0.0
+            var promptSec = 0.0
             var text = ""
             var reasoning = ""
             var toolCalls = 0
             var stopReason = "unknown"
             var unclosedReasoning = false
+            var rssMiB = 0.0
+            var footprintMiB = 0.0
 
             var tokps: Double {
                 genSec > 0 ? Double(genTokens) / genSec : 0
+            }
+
+            func promptTokensPerSecond(promptTokenCount: Int) -> Double {
+                promptSec > 0 ? Double(promptTokenCount) / promptSec : 0
             }
         }
 
@@ -6367,6 +6401,7 @@ func runPerfBench(
                         result.toolCalls += 1
                     case .info(let info):
                         result.genTokens = info.generationTokenCount
+                        result.promptSec = info.promptTime
                         result.genSec = info.generateTime
                         result.stopReason = stopLabel(info.stopReason)
                         result.unclosedReasoning = info.unclosedReasoning
@@ -6385,6 +6420,7 @@ func runPerfBench(
                         rawTokens.append(token)
                     case .info(let info):
                         result.genTokens = info.generationTokenCount
+                        result.promptSec = info.promptTime
                         result.genSec = info.generateTime
                         result.stopReason = stopLabel(info.stopReason)
                         result.unclosedReasoning = info.unclosedReasoning
@@ -6413,20 +6449,28 @@ func runPerfBench(
                         result.toolCalls += 1
                     case .info(let info):
                         result.genTokens = info.generationTokenCount
+                        result.promptSec = info.promptTime
                         result.genSec = info.generateTime
                         result.stopReason = stopLabel(info.stopReason)
                         result.unclosedReasoning = info.unclosedReasoning
                     }
                 }
             }
+            result.rssMiB = currentRSSMiB()
+            result.footprintMiB = currentPhysFootprintMiB()
+            peakRSSMiB = max(peakRSSMiB, result.rssMiB)
+            peakFootprintMiB = max(peakFootprintMiB, result.footprintMiB)
             if label.hasPrefix("run") {
                 let visible = result.text.isEmpty ? result.reasoning : result.text
                 let leaks = markerLeaks(in: result.text).joined(separator: ",")
                 let loop = lagunaLoopHeuristic(visible)
                 print(String(format:
-                    "  PERF_RUN label=%@ ttft_ms=%.0f genTokens=%d genSec=%.3f tokps=%.1f temp=%.2f topP=%.2f topK=%d minP=%.2f rep=%@ stop=%@ unclosedReasoning=%@ textChars=%d reasoningChars=%d toolCalls=%d loop=%@ leaks=%@",
-                    label, result.ttftSec * 1000, result.genTokens,
-                    result.genSec, result.tokps,
+                    "  PERF_RUN label=%@ ttft_ms=%.0f prompt_ms=%.0f prompt_tps=%.0f genTokens=%d genSec=%.3f tokps=%.1f rss_mib=%.0f footprint_mib=%.0f temp=%.2f topP=%.2f topK=%d minP=%.2f rep=%@ stop=%@ unclosedReasoning=%@ textChars=%d reasoningChars=%d toolCalls=%d loop=%@ leaks=%@",
+                    label, result.ttftSec * 1000,
+                    result.promptSec * 1000,
+                    result.promptTokensPerSecond(promptTokenCount: promptTokens.count),
+                    result.genTokens, result.genSec, result.tokps,
+                    result.rssMiB, result.footprintMiB,
                     Double(params.temperature), Double(params.topP),
                     params.topK, Double(params.minP),
                     params.repetitionPenalty.map { String(format: "%.2f", Double($0)) } ?? "nil",
@@ -6487,12 +6531,13 @@ func runPerfBench(
         let head = String(
             gitShortHead(modelDir: FileManager.default.currentDirectoryPath))
         perfLine = String(format:
-            "PERF model=%@ variant=%@ path=%@ kvMode=%@ jangpress=%@ mmap=%@ commit=%@ loadSec=%.2f promptTokens=%d graphNodes=%@ asType=%@ genTokens=%d genSec=%.3f tokps_median=%.1f tokps_best=%.1f runs=%@ stop=%@ unclosedReasoning=%@ loop=%@ leaks=%@",
+            "PERF model=%@ variant=%@ path=%@ kvMode=%@ jangpress=%@ mmap=%@ commit=%@ loadSec=%.2f promptTokens=%d peak_rss_mib=%.0f peak_footprint_mib=%.0f graphNodes=%@ asType=%@ genTokens=%d genSec=%.3f tokps_median=%.1f tokps_best=%.1f runs=%@ stop=%@ unclosedReasoning=%@ loop=%@ leaks=%@",
             modelName, variant, pathLabel,
             env["BENCH_PERF_KV_MODE"] ?? "none",
             useJangPressLoad ? "on" : "off",
             useMmap ? "on" : "off",
             head, loadSec, promptTokens.count,
+            peakRSSMiB, peakFootprintMiB,
             graphStats.map { String($0.nodes) } ?? "na",
             graphStats.map { String($0.asType) } ?? "na",
             lastGenTokens, lastGenSec,
@@ -7063,6 +7108,28 @@ fileprivate func currentRSSMiB() -> Double {
     return Double(info.resident_size) / (1024.0 * 1024.0)
 }
 
+/// Current physical footprint in MiB. This mirrors Activity Monitor's
+/// process footprint better than RSS for mmap-backed model diagnostics.
+fileprivate func currentPhysFootprintMiB() -> Double {
+    #if canImport(Darwin)
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(
+                mach_task_self_,
+                task_flavor_t(TASK_VM_INFO),
+                $0, &count)
+        }
+    }
+    guard kr == KERN_SUCCESS else { return -1 }
+    return Double(info.phys_footprint) / (1024.0 * 1024.0)
+    #else
+    return -1
+    #endif
+}
+
 func runOfficialMultiTurn(modelPath: String, maxNew: Int) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     let modelName = modelDir.lastPathComponent
@@ -7358,10 +7425,25 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
         atPath: cacheRoot, withIntermediateDirectories: true)
     print("Cache dir: \(cacheRoot)")
 
+    let nativeMTPDepth = env["BENCH_PROD_NATIVE_MTP_DEPTH"].flatMap(Int.init)
     let rss0 = currentRSSMiB()
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader())
+    let context: ModelContext
+    if nativeMTPDepth != nil {
+        let loaded = try await MLXLMCommon.loadModel(
+            from: modelDir,
+            using: #huggingFaceTokenizerLoader(),
+            loadConfiguration: LoadConfiguration(
+                jangPress: .disabled,
+                maxResidentBytes: .unlimited,
+                memoryLimit: .unlimited,
+                useMmapSafetensors: true,
+                nativeMTP: true))
+        context = loaded.0
+    } else {
+        context = try await MLXLMCommon.loadModel(
+            from: modelDir, using: #huggingFaceTokenizerLoader())
+    }
     let loadSec = CFAbsoluteTimeGetCurrent() - loadStart
     let rss1 = currentRSSMiB()
     print(String(format: "Load: %.2fs  Model: %@  RSS +%.0f MiB",
@@ -7383,8 +7465,12 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
             diskCacheMaxGB: 4.0,
             diskCacheDir: URL(fileURLWithPath: cacheRoot),
             ssmMaxEntries: 32, modelKey: modelName)
-        coordinator = CacheCoordinator(config: cfg)
-        print("Coordinator: enabled (L2 disk at \(cacheRoot))")
+        let coord = CacheCoordinator(config: cfg)
+        if env["BENCH_PROD_CACHE_HYBRID"] == "1" {
+            coord.setHybrid(true)
+        }
+        coordinator = coord
+        print("Coordinator: enabled (L2 disk at \(cacheRoot), hybrid=\(coord.isHybrid))")
     } else {
         coordinator = nil
     }
@@ -7409,9 +7495,13 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
         params.maxTokens = budget
         params.randomSeed = randomSeed
     }
+    if let nativeMTPDepth {
+        params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
+    }
     print(String(format:
-        "Sampling: mode=%@ maxTokens=%d temp=%.3f topP=%.3f topK=%d minP=%.3f rep=%@ seed=%@",
+        "Sampling: mode=%@ mtpDepth=%@ maxTokens=%d temp=%.3f topP=%.3f topK=%d minP=%.3f rep=%@ seed=%@",
         greedy ? "explicit-greedy" : "bundle-defaults",
+        nativeMTPDepth.map(String.init) ?? "off",
         params.maxTokens ?? -1,
         Double(params.temperature),
         Double(params.topP),
@@ -7460,6 +7550,10 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
         var ttftMs = 0
         var totalSec = 0.0
         var tokps = 0.0
+        var promptSec = 0.0
+        var genTokens = 0
+        var genSec = 0.0
+        var stop = "unknown"
     }
 
     func runTurn(
@@ -7490,11 +7584,23 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
                 if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
                 r.reasoning += rs; deltas += 1
             case .toolCall: r.tools += 1
-            case .info: break
+            case .info(let info):
+                r.promptSec = info.promptTime
+                r.genTokens = info.generationTokenCount
+                r.genSec = info.generateTime
+                switch info.stopReason {
+                case .stop:
+                    r.stop = "stop"
+                case .length:
+                    r.stop = "length"
+                case .cancelled:
+                    r.stop = "cancelled"
+                }
             }
         }
         r.totalSec = CFAbsoluteTimeGetCurrent() - t0
-        r.tokps = r.totalSec > 0 ? Double(deltas) / r.totalSec : 0
+        r.tokps = r.genSec > 0 ? Double(r.genTokens) / r.genSec :
+            (r.totalSec > 0 ? Double(deltas) / r.totalSec : 0)
         r.ttftMs = Int((ttft ?? 0) * 1000)
         stats.ttftByLabel[label] = r.ttftMs
         let now = currentRSSMiB()
@@ -7506,8 +7612,9 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
         let preview = r.text.isEmpty ? r.reasoning : r.text
         let short = preview.count > 120 ? String(preview.prefix(120)) + "…" : preview
         print(String(format:
-            "  [%@] %@  ttft=%4dms total=%5.2fs tokps=%5.1f chunks=%4d reasoning=%4d tools=%d rss=%.0fMiB %@-> \"%@\"",
-            status, label, r.ttftMs, r.totalSec, r.tokps,
+            "  [%@] %@  ttft=%4dms prompt=%4.0fms total=%5.2fs genTokens=%d tokps=%5.1f stop=%@ chunks=%4d reasoning=%4d tools=%d rss=%.0fMiB %@-> \"%@\"",
+            status, label, r.ttftMs, r.promptSec * 1000,
+            r.totalSec, r.genTokens, r.tokps, r.stop,
             r.text.count, r.reasoning.count, r.tools, now,
             v.ok ? "" : "WHY=\(v.why) ",
             short.replacingOccurrences(of: "\n", with: "\\n")))
@@ -7636,6 +7743,18 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
     print(String(format:
         "\n=== BENCH_PROD summary: model=%@ pass=%d fail=%d peakRSS=%.0fMiB loadSec=%.2f ===",
         modelName, stats.pass, stats.fail, stats.peakRSS, loadSec))
+    if let snapshot = coordinator?.snapshotStats() {
+        let paged = snapshot.pagedStats.map {
+            "hits=\($0.cacheHits),misses=\($0.cacheMisses),allocated=\($0.allocatedBlocks),free=\($0.freeBlocks),evictions=\($0.evictions)"
+        } ?? "disabled"
+        let disk = snapshot.diskStats.map {
+            "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),maxBytes=\($0.maxSizeBytes)"
+        } ?? "disabled"
+        let ssm = snapshot.ssmStats
+        print(
+            "PROD_CACHE_STATS hybrid=\(snapshot.isHybrid) pagedIncompatible=\(snapshot.isPagedIncompatible) paged{\(paged)} disk{\(disk)} ssm{hits=\(ssm.hits),misses=\(ssm.misses),reDerives=\(ssm.reDerives)}"
+        )
+    }
     if stats.fail > 0 {
         throw NSError(domain: "BENCH_PROD", code: 1, userInfo: [
             NSLocalizedDescriptionKey: "\(stats.fail) scenario(s) failed validation",

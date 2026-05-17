@@ -8,6 +8,13 @@ artifact or source reference. Everything else stays `open`.
 Current pushed branch state:
 
 - Branch: `vmlx-0.31.3`
+- 2026-05-17 local update: the latest six-variant Qwen3.6 matrix is documented
+  in `docs/VMLX_QWEN36_MTP_MATRIX_2026_05_17.md`. It supersedes earlier
+  optimistic MTP speed wording in this audit: current Swift D3 text rows are
+  coherent for all six variants and cache repeat rows hit disk+SSM, but D3 is
+  slower than AR in this matrix, VL+MTP still fails 35B JANG_2K and 35B MXFP4
+  under strict no-length-cap criteria, and thinking-mode multi-turn rows still
+  have visible-answer failures.
 - Latest pushed runtime checkpoint for the Qwen text-SSM/private-MTP cache
   fix: `3146fac` (`fix(mtp): repair qwen ssm reject cache`)
 - Current local, not-yet-pushed MTP/cache work adds task-local load-time native

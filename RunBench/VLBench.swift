@@ -794,18 +794,38 @@ enum VLBench {
     ///   through BatchEngine without raw media/reasoning marker leakage.
     static func runChatCacheMatrix(modelPath: String, maxNewTokens: Int) async throws {
         let modelDir = URL(fileURLWithPath: modelPath)
+        let env = ProcessInfo.processInfo.environment
+        let nativeMTPDepth = env["BENCH_VL_NATIVE_MTP_DEPTH"].flatMap(Int.init)
         print("=== VLBench structured chat cache matrix ===")
         print("model: \(modelDir.lastPathComponent)")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context: ModelContext
+        if nativeMTPDepth != nil {
+            let loaded = try await MLXLMCommon.loadModel(
+                from: modelDir,
+                using: #huggingFaceTokenizerLoader(),
+                loadConfiguration: LoadConfiguration(
+                    jangPress: .disabled,
+                    maxResidentBytes: .unlimited,
+                    memoryLimit: .unlimited,
+                    useMmapSafetensors: true,
+                    nativeMTP: true))
+            context = loaded.0
+        } else {
+            context = try await MLXLMCommon.loadModel(
+                from: modelDir, using: #huggingFaceTokenizerLoader())
+        }
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
 
-        let params = GenerateParameters(
+        var params = GenerateParameters(
             maxTokens: maxNewTokens, temperature: 0, prefillStepSize: 512)
+        if let nativeMTPDepth {
+            params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
+        }
+        print("Native MTP depth: \(nativeMTPDepth.map(String.init) ?? "off")")
         let coordinator = makeProofCoordinator(
             modelDir: modelDir, context: context, parameters: params,
             label: "chat-cache")
@@ -835,11 +855,7 @@ enum VLBench {
         let first = await submitAndCollect(
             label: "A cold", engine: engine, context: context,
             input: inputA, parameters: params, maxNew: maxNewTokens)
-        if first.tokens == 0 {
-            throw NSError(
-                domain: "VLBench", code: 52,
-                userInfo: [NSLocalizedDescriptionKey: "A cold generated zero tokens"])
-        }
+        try validateChatCacheGeneration(first, label: "A cold", maxNew: maxNewTokens, code: 52)
 
         switch coordinator.fetch(tokens: tokensA, mediaSalt: saltA) {
         case .hit(let matched, _, let detail, _, _, _):
@@ -863,11 +879,7 @@ enum VLBench {
         let replay = await submitAndCollect(
             label: "A replay", engine: engine, context: context,
             input: inputAReplay, parameters: params, maxNew: maxNewTokens)
-        if replay.tokens == 0 {
-            throw NSError(
-                domain: "VLBench", code: 55,
-                userInfo: [NSLocalizedDescriptionKey: "A replay generated zero tokens"])
-        }
+        try validateChatCacheGeneration(replay, label: "A replay", maxNew: maxNewTokens, code: 55)
 
         let imageBChat: [Chat.Message] = [
             .system("Answer briefly and do not mention hidden reasoning."),
@@ -901,12 +913,7 @@ enum VLBench {
         let follow = await submitAndCollect(
             label: "follow-up", engine: engine, context: context,
             input: followInput, parameters: params, maxNew: maxNewTokens)
-        if follow.tokens == 0 || follow.text.isEmpty {
-            throw NSError(
-                domain: "VLBench", code: 58,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "structured follow-up generated no visible text"])
-        }
+        try validateChatCacheGeneration(follow, label: "follow-up", maxNew: maxNewTokens, code: 58)
         if follow.text.contains("<think>") || follow.text.contains("</think>") ||
             follow.text.contains("<image>") || follow.text.contains("<so_embedding>")
         {
@@ -917,6 +924,30 @@ enum VLBench {
         }
 
         print("=== VLBench structured chat cache matrix: passed ===")
+    }
+
+    private static func validateChatCacheGeneration(
+        _ result: (tokens: Int, text: String, promptTime: Double),
+        label: String,
+        maxNew: Int,
+        code: Int
+    ) throws {
+        if result.tokens == 0 {
+            throw NSError(
+                domain: "VLBench", code: code,
+                userInfo: [NSLocalizedDescriptionKey: "\(label) generated zero tokens"])
+        }
+        if result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw NSError(
+                domain: "VLBench", code: code,
+                userInfo: [NSLocalizedDescriptionKey: "\(label) generated no visible text"])
+        }
+        if result.tokens >= maxNew {
+            throw NSError(
+                domain: "VLBench", code: code,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "\(label) exhausted max token budget (\(result.tokens)/\(maxNew)); not a valid brief-output pass"])
+        }
     }
 
     private static func prepareChat(
@@ -935,6 +966,14 @@ enum VLBench {
         parameters: GenerateParameters,
         maxNew: Int
     ) async -> (tokens: Int, text: String, promptTime: Double) {
+        if parameters.draftStrategy?.usesNativeMTP == true {
+            return await generateAndCollect(
+                label: label,
+                engine: engine,
+                input: input,
+                parameters: parameters)
+        }
+
         nonisolated(unsafe) let sendable = input
         let t0 = CFAbsoluteTimeGetCurrent()
         let (_, stream) = await engine.submit(input: sendable, parameters: parameters)
@@ -957,6 +996,44 @@ enum VLBench {
             "  %@: tokens=%d TTFT=%dms prompt=%.3fs text=\"%@\"",
             label, tokenIds.count, Int((ttft ?? 0) * 1000), promptTime, preview))
         return (tokenIds.count, text, promptTime)
+    }
+
+    private static func generateAndCollect(
+        label: String,
+        engine: BatchEngine,
+        input: LMInput,
+        parameters: GenerateParameters
+    ) async -> (tokens: Int, text: String, promptTime: Double) {
+        nonisolated(unsafe) let sendable = input
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let stream = await engine.generate(input: sendable, parameters: parameters)
+        var text = ""
+        var reasoning = ""
+        var tokenCount = 0
+        var promptTime = 0.0
+        var ttft: Double?
+        for await event in stream {
+            switch event {
+            case .chunk(let chunk):
+                if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
+                text += chunk
+            case .reasoning(let chunk):
+                reasoning += chunk
+            case .info(let info):
+                promptTime = info.promptTime
+                tokenCount = info.generationTokenCount
+            case .toolCall:
+                break
+            }
+        }
+
+        let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preview = visible.count > 180 ? String(visible.prefix(180)) + "..." : visible
+        print(String(format:
+            "  %@: tokens=%d TTFT=%dms prompt=%.3fs reasoning=%d text=\"%@\"",
+            label, tokenCount, Int((ttft ?? 0) * 1000), promptTime,
+            reasoning.count, preview))
+        return (tokenCount, visible, promptTime)
     }
 
     // MARK: - Video input smoke (iter 49)

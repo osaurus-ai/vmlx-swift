@@ -8,8 +8,32 @@ import MLXLMCommon
 import MLXNN
 import Testing
 
-@Suite("MTP runtime metadata")
+@Suite("MTP runtime metadata", .serialized)
 struct MTPRuntimeFocusedTests {
+    @Test("cached multi-token verifier mask carries cache offset")
+    func cachedMultiTokenVerifierMaskCarriesCacheOffset() {
+        let cache = KVCacheSimple()
+        _ = cache.update(
+            keys: MLXArray.ones([1, 2, 5, 4]),
+            values: MLXArray.ones([1, 2, 5, 4]))
+
+        let mask = cache.makeMask(n: 3, windowSize: nil, returnArray: false)
+        guard case .array(let maskArray) = mask else {
+            Issue.record("expected explicit offset-aware mask for cached multi-token forward")
+            return
+        }
+
+        MLX.eval(maskArray)
+        #expect(maskArray.shape == [3, 8])
+        #expect(maskArray[0, 4].item(Bool.self))
+        #expect(maskArray[0, 5].item(Bool.self))
+        #expect(!maskArray[0, 6].item(Bool.self))
+        #expect(!maskArray[0, 7].item(Bool.self))
+        #expect(maskArray[1, 6].item(Bool.self))
+        #expect(!maskArray[1, 7].item(Bool.self))
+        #expect(maskArray[2, 7].item(Bool.self))
+    }
+
     @Test("Qwen-style preserved MTP bundle is detected but not auto-enabled")
     func qwenPreservedMTPBundleIsDetectedButNotAutoEnabled() throws {
         let root = try makeTemporaryBundle(name: "qwen-mtp-detected")
@@ -404,6 +428,94 @@ struct MTPRuntimeFocusedTests {
         } else {
             Issue.record("Expected 8-bit MXFP4 per-layer override")
         }
+    }
+
+    @Test("shape-walk quantization supports JANG_2K 3-bit group-128 projections")
+    func shapeWalkQuantizationSupportsJang2KThreeBitGroup128() {
+        let inferred = JangLoader.inferBitWidthAndGroupSize(
+            packedDim: 192,
+            numGroups: 16,
+            knownGroupSize: 128,
+            bitWidthsUsed: [2, 3, 6, 8],
+            expectedInDim: 2048)
+
+        #expect(inferred.bits == 3)
+        #expect(inferred.groupSize == 128)
+    }
+
+    @Test("shape-walk quantization uses hidden size for JANG_2K routed expert inputs")
+    func shapeWalkQuantizationUsesHiddenSizeForJang2KRoutedExpertInputs() {
+        let base = "model.layers.0.mlp.switch_mlp.gate_proj"
+        let weights: [String: MLXArray] = [
+            "\(base).weight": MLXArray.zeros([1, 128], dtype: .uint32),
+            "\(base).scales": MLXArray.zeros([1, 16], dtype: .float32),
+        ]
+
+        let inferred = JangLoader.inferPerLayerQuantization(
+            weights: weights,
+            jangConfig: JangConfig(
+                quantization: JangQuantization(
+                    blockSize: 32,
+                    bitWidthsUsed: [2, 3, 6, 8])),
+            hiddenSizeHint: 2048,
+            validInDims: [512, 2048],
+            declaredDefaultQuantization: BaseConfiguration.Quantization(
+                groupSize: 32, bits: 8))
+
+        if case .quantize(let override)? = inferred.perLayerQuantization[base] {
+            #expect(override.bits == 2)
+            #expect(override.groupSize == 128)
+        } else {
+            Issue.record("Expected routed expert input override to use hidden input dim")
+        }
+    }
+
+    @Test("shape-walk quantization uses value dim for Qwen3.6 linear attention output")
+    func shapeWalkQuantizationUsesValueDimForQwen36LinearAttentionOutput() {
+        let base = "model.language_model.layers.0.linear_attn.out_proj"
+        let weights: [String: MLXArray] = [
+            "\(base).weight": MLXArray.zeros([1, 256], dtype: .uint32),
+            "\(base).scales": MLXArray.zeros([1, 32], dtype: .float32),
+        ]
+
+        let inferred = JangLoader.inferPerLayerQuantization(
+            weights: weights,
+            jangConfig: JangConfig(
+                quantization: JangQuantization(
+                    blockSize: 32,
+                    bitWidthsUsed: [2, 3, 6, 8])),
+            hiddenSizeHint: 2048,
+            linearAttnValueDimHint: 4096,
+            validInDims: [512, 2048, 4096, 8192],
+            declaredDefaultQuantization: BaseConfiguration.Quantization(
+                groupSize: 32, bits: 8))
+
+        if case .quantize(let override)? = inferred.perLayerQuantization[base] {
+            #expect(override.bits == 2)
+            #expect(override.groupSize == 128)
+        } else {
+            Issue.record("Expected linear attention output override to use value dim")
+        }
+    }
+
+    @Test("JANG gate dequantization uses hidden size for 6-bit shared expert gate")
+    func jangGateDequantizationUsesHiddenSizeForSixBitSharedExpertGate() {
+        let base = "model.layers.0.mlp.shared_expert_gate"
+        var weights: [String: MLXArray] = [
+            "\(base).weight": MLXArray.zeros([1, 384], dtype: .uint32),
+            "\(base).scales": MLXArray.zeros([1, 32], dtype: .float32),
+            "\(base).biases": MLXArray.zeros([1, 32], dtype: .float32),
+        ]
+
+        JangLoader.dequantizeMoEGates(
+            weights: &weights,
+            groupSize: 128,
+            bitWidthsUsed: [2, 3, 6, 8],
+            hiddenSizeHint: 2048)
+
+        #expect(weights["\(base).weight"]?.shape == [1, 2048])
+        #expect(weights["\(base).scales"] == nil)
+        #expect(weights["\(base).biases"] == nil)
     }
 
     @Test("Qwen3.5 sanitize does not shift base norms just because MTP tensors exist")

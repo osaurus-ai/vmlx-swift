@@ -461,10 +461,18 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             throw NativeMTPRuntimeError.verifierProducedNoTokens
         }
 
+        if Self.requiresSequentialVerifierRepair(cache) {
+            try verifyCycleSequential(primary: primary)
+            return
+        }
+
         let requested = [primary] + drafts
         let input = MLXArray(requested.map { Int32($0.item(Int.self)) }).reshaped(1, requested.count)
         let canCommitVerifierCache = Self.canCommitVerifierCache(cache)
-        let checkpoint = canCommitVerifierCache ? nil : NativeMTPCacheCheckpoint(cache)
+        let requiresSequentialRepair = Self.requiresSequentialVerifierRepair(cache)
+        let checkpoint = (canCommitVerifierCache && !requiresSequentialRepair)
+            ? nil
+            : NativeMTPCacheCheckpoint(cache)
         let verifyStart = Date.timeIntervalSinceReferenceDate
         let verifier = model.nativeBackboneMTPVerifyForward(input, cache: cache)
         MLX.eval(verifier.logits, verifier.hiddenStates)
@@ -481,7 +489,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         samplingTime += Date.timeIntervalSinceReferenceDate - sampleStart
 
         let accepted = verifyDecision.accepted
-        let nextVerifiedToken = verifyDecision.nextToken
+        var nextVerifiedToken = verifyDecision.nextToken
+        var repairedHiddenForNextMTP: MLXArray? = nil
         if !speculativeSampler.isGreedy {
             acceptanceProbabilitySum += verifyDecision.acceptanceProbabilitySum
             acceptanceProbabilityCount += verifyDecision.acceptanceProbabilityCount
@@ -489,18 +498,54 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         verifyCalls += 1
         acceptedByDepth[accepted, default: 0] += 1
+        if Self.traceEnabled {
+            let requestedIDs = requested.map { $0.item(Int.self) }
+            let draftIDs = drafts.map { $0.item(Int.self) }
+            let line =
+                "[NativeMTPTrace] call=\(verifyCalls) emitted=\(tokenCount) requested=\(requestedIDs) drafts=\(draftIDs) target=\(verifyDecision.targetTokenIds) accepted=\(accepted) next=\(nextVerifiedToken.item(Int.self))\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
 
         for token in drafts.prefix(accepted) {
             processor?.didSample(token: token)
             pendingTokens.append(token.item(Int.self))
         }
 
+        if requiresSequentialRepair && accepted > 0 {
+            guard let checkpoint else {
+                throw NativeMTPRuntimeError.verifierCacheCommitFailed
+            }
+            checkpoint.restore(into: &cache)
+
+            let acceptedInput = MLXArray(
+                requested.prefix(accepted + 1).map { Int32($0.item(Int.self)) }
+            ).reshaped(1, accepted + 1)
+            let repaired = model.nativeBackboneForward(acceptedInput, cache: cache)
+            MLX.eval(repaired.logits, repaired.hiddenStates)
+
+            var repairedProcessor = processor
+            nextVerifiedToken = Self.sampleLast(
+                logits: repaired.logits,
+                sampler: sampler,
+                speculativeSampler: speculativeSampler,
+                processor: &repairedProcessor)
+                .token
+            MLX.eval(nextVerifiedToken)
+            repairedHiddenForNextMTP =
+                repaired.hiddenStates[0..., accepted ..< (accepted + 1), 0...]
+            rollbackRepairCount += 1
+        }
+
         let committedInputCount = accepted + 1
         let commitStart = Date.timeIntervalSinceReferenceDate
-        let committedCache = Self.commitVerifierCache(
-            &cache,
-            committedInputCount: committedInputCount,
-            totalInputCount: requested.count)
+        let committedCache = repairedHiddenForNextMTP != nil
+            ? true
+            : canCommitVerifierCache
+            ? Self.commitVerifierCache(
+                &cache,
+                committedInputCount: committedInputCount,
+                totalInputCount: requested.count)
+            : false
         cacheCommitTime += Date.timeIntervalSinceReferenceDate - commitStart
         if committedCache {
             prefixCommitCount += 1
@@ -514,7 +559,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             processor?.didSample(token: bonus)
             pendingTokens.append(bonus.item(Int.self))
             nextToken = bonus
-            hiddenForNextMTP = verifier.hiddenStates[0..., drafts.count ..< (drafts.count + 1), 0...]
+            hiddenForNextMTP = repairedHiddenForNextMTP
+                ?? verifier.hiddenStates[0..., drafts.count ..< (drafts.count + 1), 0...]
         } else {
             rejectedCount += 1
             if !speculativeSampler.isGreedy {
@@ -526,7 +572,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             pendingTokens.append(correction.item(Int.self))
             nextToken = correction
 
-            if committedCache {
+            if let repairedHiddenForNextMTP {
+                hiddenForNextMTP = repairedHiddenForNextMTP
+            } else if committedCache {
                 hiddenForNextMTP =
                     verifier.hiddenStates[0..., accepted ..< (accepted + 1), 0...]
             } else {
@@ -569,9 +617,141 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
     }
 
+    private mutating func verifyCycleSequential(primary: MLXArray) throws {
+        let requested = [primary] + drafts
+        var accepted = 0
+        var currentInput = primary
+        var nextToken: MLXArray?
+        var hiddenForNextMTP: MLXArray?
+        var targetTokenIds: [Int] = []
+        targetTokenIds.reserveCapacity(drafts.count + 1)
+
+        verifyCalls += 1
+
+        for index in 0 ... drafts.count {
+            let verifyStart = Date.timeIntervalSinceReferenceDate
+            let verifier = model.nativeBackboneForward(Self.tokenInput(currentInput), cache: cache)
+            MLX.eval(verifier.logits, verifier.hiddenStates)
+            targetVerifyTime += Date.timeIntervalSinceReferenceDate - verifyStart
+
+            hiddenForNextMTP = Self.lastHidden(verifier.hiddenStates)
+
+            if speculativeSampler.isGreedy {
+                let sampleStart = Date.timeIntervalSinceReferenceDate
+                let sample = Self.sampleLast(
+                    logits: verifier.logits,
+                    sampler: sampler,
+                    speculativeSampler: speculativeSampler,
+                    processor: &processor)
+                MLX.eval(sample.token)
+                samplingTime += Date.timeIntervalSinceReferenceDate - sampleStart
+
+                let targetID = sample.token.item(Int.self)
+                targetTokenIds.append(targetID)
+
+                if index < drafts.count,
+                   targetID == drafts[index].item(Int.self)
+                {
+                    accepted += 1
+                    pendingTokens.append(targetID)
+                    currentInput = drafts[index]
+                    continue
+                }
+
+                nextToken = sample.token
+                pendingTokens.append(targetID)
+                if index == drafts.count {
+                    bonusCount += 1
+                } else {
+                    rejectedCount += 1
+                    mtpCache = model.makeNativeMTPCache()
+                    mtpCacheRefreshCount += 1
+                }
+                break
+            }
+
+            let sampleStart = Date.timeIntervalSinceReferenceDate
+            let probabilities = Self.processedProbabilities(
+                logits: verifier.logits[0..., -1, 0...],
+                speculativeSampler: speculativeSampler,
+                processor: &processor)
+            MLX.eval(probabilities)
+            samplingTime += Date.timeIntervalSinceReferenceDate - sampleStart
+
+            if index < drafts.count {
+                let decision = speculativeSampler.acceptOrCorrect(
+                    draftToken: drafts[index],
+                    targetProbabilities: probabilities,
+                    draftProbabilities: draftProbabilities[index])
+                acceptanceProbabilitySum += Double(decision.acceptanceProbability)
+                acceptanceProbabilityCount += 1
+
+                if decision.accepted {
+                    accepted += 1
+                    processor?.didSample(token: drafts[index])
+                    pendingTokens.append(drafts[index].item(Int.self))
+                    currentInput = drafts[index]
+                    continue
+                }
+
+                guard let correction = decision.correction else {
+                    preconditionFailure("rejected speculative token must return a residual correction")
+                }
+                MLX.eval(correction)
+                processor?.didSample(token: correction)
+                nextToken = correction
+                pendingTokens.append(correction.item(Int.self))
+                rejectedCount += 1
+                residualCorrectionCount += 1
+                mtpCache = model.makeNativeMTPCache()
+                mtpCacheRefreshCount += 1
+                break
+            }
+
+            let bonus = speculativeSampler.sampleFromTarget(probabilities: probabilities)
+            MLX.eval(bonus)
+            processor?.didSample(token: bonus)
+            nextToken = bonus
+            pendingTokens.append(bonus.item(Int.self))
+            bonusCount += 1
+            break
+        }
+
+        acceptedByDepth[accepted, default: 0] += 1
+        prefixCommitCount += 1
+
+        guard let nextToken, let hiddenForNextMTP else {
+            throw NativeMTPRuntimeError.verifierProducedNoTokens
+        }
+
+        if Self.traceEnabled {
+            let requestedIDs = requested.map { $0.item(Int.self) }
+            let draftIDs = drafts.map { $0.item(Int.self) }
+            let line =
+                "[NativeMTPTrace] call=\(verifyCalls) emitted=\(tokenCount) requested=\(requestedIDs) drafts=\(draftIDs) target=\(targetTokenIds) accepted=\(accepted) next=\(nextToken.item(Int.self)) sequential=1\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
+
+        nextMain = nextToken
+        let draftStart = Date.timeIntervalSinceReferenceDate
+        let draftBatch = Self.makeDrafts(
+            model: model,
+            hidden: hiddenForNextMTP,
+            nextToken: nextToken,
+            mtpCache: mtpCache,
+            depth: depth,
+            sampler: sampler,
+            speculativeSampler: speculativeSampler,
+            processor: processor)
+        drafts = draftBatch.tokens
+        draftProbabilities = draftBatch.probabilities
+        mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
+    }
+
     private struct VerifyDecision {
         let accepted: Int
         let nextToken: MLXArray
+        let targetTokenIds: [Int]
         let acceptanceProbabilitySum: Double
         let acceptanceProbabilityCount: Int
     }
@@ -614,9 +794,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 accepted += 1
             }
 
+            if ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_FORCE_REJECT_ALL"] == "1" {
+                return VerifyDecision(
+                    accepted: 0,
+                    nextToken: sampled[0],
+                    targetTokenIds: sampledIDs,
+                    acceptanceProbabilitySum: 0,
+                    acceptanceProbabilityCount: 0)
+            }
+
             return VerifyDecision(
                 accepted: accepted,
                 nextToken: sampled[accepted],
+                targetTokenIds: sampledIDs,
                 acceptanceProbabilitySum: 0,
                 acceptanceProbabilityCount: 0)
         }
@@ -659,6 +849,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return VerifyDecision(
                 accepted: accepted,
                 nextToken: correction,
+                targetTokenIds: [],
                 acceptanceProbabilitySum: probabilitySum,
                 acceptanceProbabilityCount: probabilityCount)
         }
@@ -668,8 +859,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         return VerifyDecision(
             accepted: accepted,
             nextToken: bonus,
+            targetTokenIds: [],
             acceptanceProbabilitySum: probabilitySum,
             acceptanceProbabilityCount: probabilityCount)
+    }
+
+    private static var traceEnabled: Bool {
+        ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_TRACE"] == "1"
     }
 
     private static func makeDrafts(
@@ -713,9 +909,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     private static func canCommitVerifierCache(_ cache: [KVCache]) -> Bool {
-        cache.allSatisfy { layer in
+        if ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_FORCE_ROLLBACK_REPAIR"] == "1" {
+            return false
+        }
+        return cache.allSatisfy { layer in
             layer.isTrimmable || layer is MambaCache
         }
+    }
+
+    private static func requiresSequentialVerifierRepair(_ cache: [KVCache]) -> Bool {
+        if ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_FORCE_SEQUENTIAL_REPAIR"] == "1" {
+            return true
+        }
+        return cache.contains { $0 is MambaCache }
     }
 
     private static func commitVerifierCache(
