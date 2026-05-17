@@ -10,6 +10,7 @@ Local artifact roots:
 - `docs/local/qwen36-mtp-matrix/20260517T042923Z-six-variant-matrix/`
 - `docs/local/qwen36-mtp-matrix/20260517T043859Z-vl-mtp-strict-rerun/`
 - `docs/local/qwen36-mtp-current/*-prod-budget384/`
+- `docs/local/qwen36-mtp-current/20260517T124945Z-35b-mxfp4-vl-mtp-budget384/`
 
 `docs/local/` is gitignored; the artifact paths are local evidence references.
 
@@ -98,7 +99,7 @@ not proof that the current runtime needs fake reasoning guards.
 
 ## VL + MTP Matrix
 
-After routing native MTP through `BatchEngine.generate`, four of six strict VL
+After routing native MTP through `BatchEngine.generate`, five of six strict VL
 rows pass with same-media disk hits, different-media misses, and coherent
 follow-up answers.
 
@@ -108,12 +109,15 @@ follow-up answers.
 | 27B MXFP4 | PASS | Red/blue gradient described; replay hit; follow-up `Red and blue.` |
 | 27B MXFP8 | PASS | Red/blue gradient described; replay hit; follow-up `Red and blue.` |
 | 35B JANG_2K | FAIL | Cold image response exhausted 96/96 tokens; length-cap pass rejected. |
-| 35B MXFP4 | FAIL | Cold image response looped and exhausted 96/96 tokens; length-cap pass rejected. |
+| 35B MXFP4 | PASS | Fresh 384-token strict rerun described the red/blue gradient, replay hit `84/84`, different-media miss was correct, and text-only follow-up returned `Red and blue`. |
 | 35B MXFP8 | PASS | Red/blue gradient described; replay hit; follow-up `Red and blue.` |
 
 The earlier six-variant matrix showed all VL+MTP rows as zero-token failures
 because the bench used `BatchEngine.submit`, which rejects native MTP by design.
-That was a harness-path bug. The strict rerun is the current evidence.
+That was a harness-path bug. The 96-token strict rerun remains valid evidence
+for 35B JANG_2K. The 35B MXFP4 rerun with `BENCH_MAX_TOKENS=384` is the current
+evidence for that MXFP row, because the 96-token row was a budget artifact rather
+than a demonstrated runtime failure.
 
 ## Still Open Before Production
 
@@ -124,8 +128,8 @@ That was a harness-path bug. The strict rerun is the current evidence.
 - Production gates must use enough max tokens for thinking-enabled prompts.
   Short-budget visible-answer failures are not runtime failures by themselves;
   they must be rerun with a sufficient budget before changing code.
-- 35B JANG2K and 35B MXFP4 VL+MTP need root-cause work. The strict bench now
-  blocks their length-exhausted/looping outputs instead of accepting them.
+- 35B JANG2K VL+MTP still needs root-cause work. The strict bench blocks its
+  length-exhausted output instead of accepting it.
 - Raw batched native-MTP scheduling is not implemented. Osaurus must route MTP
   as an exclusive generate path or keep MTP disabled for concurrent batched
   server mode until the scheduler owns draft/verify/cache state per slot.

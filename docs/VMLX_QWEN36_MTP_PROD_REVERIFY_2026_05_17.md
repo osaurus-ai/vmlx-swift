@@ -55,6 +55,21 @@ and an SSM companion hit. The previous "answer only appeared in reasoning" rows
 were caused by the short production-gate budget for these MXFP artifacts. With
 384 tokens, the model naturally closes reasoning and emits visible content.
 
+## VL Follow-Up
+
+`Qwen3.6-35B-A3B-MXFP4-MTP` also passed the strict VL+MTP chat-cache rerun with
+the same 384-token budget:
+
+```text
+docs/local/qwen36-mtp-current/20260517T124945Z-35b-mxfp4-vl-mtp-budget384/vl_chat_cache_mtp_d3_budget384.log
+```
+
+The row used `BENCH_VL_CHAT_CACHE=1`, `BENCH_VL_NATIVE_MTP_DEPTH=3`, and
+`VMLINUX_NATIVE_MTP_HYBRID_VERIFY=chunk_commit`. It described the red/blue
+gradient on a cold image turn, hit same-media disk restore `84/84`, correctly
+missed a different-media probe, and answered the text-only follow-up with
+`Red and blue`. Peak footprint was `20,528,187,816` bytes.
+
 ## Still Open
 
 - This does not change the default: AR remains global default and native MTP
@@ -63,6 +78,5 @@ were caused by the short production-gate budget for these MXFP artifacts. With
   `BatchEngine.generate` / `Evaluate.generate` path.
 - 27B MXFP8 D3 is correct but not the best speed policy; earlier speed sweeps
   still recommend D2 for the count-prompt speed row.
-- The strict VL+MTP blocker for `Qwen3.6-35B-A3B-MXFP4-MTP` is not resolved by
-  this text-production rerun. It still needs root-cause work before full
-  text+VL production readiness.
+- 35B JANG_2K still has an unresolved strict VL+MTP length-exhausted row. The
+  MXFP4 VL row above is now a pass with a sufficient token budget.
