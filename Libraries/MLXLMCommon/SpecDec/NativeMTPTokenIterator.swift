@@ -69,6 +69,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var bonusCount = 0
     private(set) var prefixCommitCount = 0
     private(set) var rollbackRepairCount = 0
+    private(set) var mtpCacheRefreshCount = 0
     private(set) var targetVerifyTime: TimeInterval = 0
     private(set) var mtpDraftTime: TimeInterval = 0
     private(set) var samplingTime: TimeInterval = 0
@@ -197,7 +198,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             : 0
         let line = String(
             format:
-                "[NativeMTP] depth=%d verifyCalls=%d outputTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f targetVerifySec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f samplingMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",
+                "[NativeMTP] depth=%d verifyCalls=%d outputTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f targetVerifySec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f samplingMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",
             depth,
             verifyCalls,
             generatedTokenIds.count,
@@ -207,6 +208,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             residualCorrectionCount,
             prefixCommitCount,
             rollbackRepairCount,
+            mtpCacheRefreshCount,
             avgCommitted,
             avgAcceptP,
             targetVerifyTime,
@@ -306,10 +308,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     repaired.hiddenStates[0..., accepted ..< (accepted + 1), 0...]
             }
 
-            let trimCount = Swift.max(0, depth - accepted - 1)
-            if trimCount > 0 {
-                _ = trimPromptCache(mtpCache, numTokens: trimCount)
-            }
+            mtpCache = model.makeNativeMTPCache()
+            mtpCacheRefreshCount += 1
         }
 
         guard !pendingTokens.isEmpty else {

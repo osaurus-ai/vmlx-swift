@@ -8,9 +8,9 @@ artifact or source reference. Everything else stays `open`.
 Current pushed branch state:
 
 - Branch: `vmlx-0.31.3`
-- Latest pushed runtime checkpoint entering the Qwen cache-boundary fix:
-  `ea34c0d`
-  (`fix(runtime): surface unclosed reasoning telemetry`)
+- Latest pushed runtime checkpoint before the Qwen text-SSM MTP offset fix:
+  `689e9d2`
+  (`fix(mtp): support qwen vl moe sidecars`)
 - Prior non-MTP checkpoints in this pass: `50df533`, `0deb14b`,
   `6e435d7`, `7962647`, `9a56de1`, and `ed04161`.
 - Previous MTP runtime checkpoint: `0fdb164`
@@ -60,6 +60,7 @@ The package is complete only when all of these are true:
 | MTP depth-3 production acceleration. | Current D3 rows prove recursive draft plus accepted-prefix cache commit, but remain below the current 45 tok/s acceptance threshold and older 50 tok/s target. Small-M verifier tuning is still open. | open |
 | Qwen3.6 MTP coherency and token/s. | D1 artifacts `jang4m-mtp-artifact-native-d1-postrevert-96.log` and `mx-mtp-artifact-native-d1-postrevert-96.log`: coherent, `30.2` and `34.0 tok/s` short rows. D3 prefix-commit artifacts under `docs/local/native-mtp-qwen36-20260516-d3-prefix-commit/`: coherent, `prefixCommit>0`, `rollbackRepair=0`, no loops. | live-proven for explicit MTP diagnostic rows |
 | Qwen3.6 native-MTP speed target. | Not achieved. Current rows are below the current 45 tok/s acceptance threshold and older 50 tok/s target; the rejected verifier argmax experiment was not committed. | open |
+| Qwen3.6 text hybrid-SSM accepted-prefix cache commit and private MTP-cache reject semantics. | 2026-05-17 fixes align the text Qwen3.5/Qwen3.6 `GatedDeltaNet` with the VLM path: regular SSM forwards now advance `MambaCache.offset`, recorded partial-prefix snapshots store `baseOffset + prefixLength`, and partial rejects recreate the private MTP draft cache instead of trimming stale rejected state. Focused proof: `docs/local/production-readiness/20260517Tqwen36-mtp-ssm-offset/mtp_runtime_focused_after_private_mtp_refresh.log` passes 17/17 `MTPRuntimeFocusedTests`. | unit-tested |
 | DSV4 native encoder, CSA/HSA/SWA, long context, vector drift. | New non-MTP DSV4 JANGTQ-K rows under `docs/local/live-model-matrix/20260516Tdsv4-nonmtp/` prove config/template, three-turn recall, reasoning off/on/max with rep=1.0, a 5.5k-token semantic recall row, and DSV4 paged-incompatible salted disk-cache restore. A 16k-token long-context row currently fails with Metal OOM, and the ds4 official vector fixture is not present locally. | partial/failing |
 | Prefix cache OFF/ON and cache hit proof. | Existing matrix/harness describes rows; not complete for every topology and model family. | open |
 | Paged cache OFF/ON. | Existing focused tests and some model rows exist, but no package-wide matrix artifact proves all relevant architectures. | open |
@@ -385,9 +386,10 @@ Live-proven:
 - `BatchEngine.generate` now honors `DraftStrategy.nativeMTP(depth:)` through
   the exclusive solo native-MTP lane instead of silently falling through to
   ordinary AR batching. Focused test proof:
-  `MTPRuntimeFocusedTests` passes 15/15, including active native-MTP dispatch,
-  missing-head fail-closed dispatch, and `BatchEngine.submit` rejection for raw
-  batched native-MTP. Real bundle proof:
+  `MTPRuntimeFocusedTests` passes 17/17, including active native-MTP dispatch,
+  missing-head fail-closed dispatch, private MTP-cache refresh on partial
+  reject, and `BatchEngine.submit` rejection for raw batched native-MTP. Real
+  bundle proof:
   `docs/local/live-model-matrix/20260516Tbatch-mtp-dispatch/Qwen3.6-27B-JANG_4M-MTP_batch_native_mtp_d3.out`
   and `.err` show path=`batch`, coherent text, `33.3 tok/s`, `loop=NO`,
   `leaks=none`, and `[NativeMTP] depth=3 ... prefixCommit=13`.
@@ -429,6 +431,28 @@ Live-proven:
   passes 81/81 tests across 13 suites. The 35B row is not a live load/generate
   pass yet; it is a tensor-evidence, activation, and module-layout readiness
   pass before the heavy live smoke.
+- Qwen3.6 text hybrid-SSM partial-prefix commit was aligned with the VLM path
+  on 2026-05-17. The text `Qwen35GatedDeltaNet` now advances
+  `MambaCache.offset` during regular forwards and records D3 verifier
+  accepted-prefix snapshots at `baseOffset + prefixLength`. That prevents a
+  partial MTP rejection from restoring recurrent state with the pre-verify SSM
+  offset. This is cache-boundary correctness, not a sampler/top-k/repetition
+  guard. Focused proof:
+  `docs/local/production-readiness/20260517Tqwen36-mtp-ssm-offset/mtp_runtime_focused_after_private_mtp_refresh.log`
+  passes 17/17 `MTPRuntimeFocusedTests`, including the new text-SSM offset row.
+  The private MTP draft cache also now refreshes on partial reject instead of
+  trimming the old cache; telemetry reports this as `mtpCacheRefresh`. That
+  prevents stale rejected draft KV/state from surviving into the next draft
+  round.
+  Matching live JANG_4M text rows on the same prompt are recorded at
+  `docs/local/production-readiness/20260517Tqwen36-mtp-ssm-offset/qwen36_27b_jang4m_ar_text_live.log`
+  and
+  `docs/local/production-readiness/20260517Tqwen36-mtp-ssm-offset/qwen36_27b_jang4m_mtp_d3_private_cache_refresh_live.log`.
+  Both are coherent with no loops or marker leaks; AR is `20.0 tok/s` and D3
+  native MTP is `18.0 tok/s` with `prefixCommit=50`, `rollbackRepair=0`,
+  `mtpCacheRefresh=46`, and `avgCommittedPerVerify=1.92`. This confirms the
+  cache-boundary fixes did not create a coherency regression, but it also
+  confirms this Swift path is still below the 45 tok/s production MTP threshold.
 - The broader active focused target was rerun after the ZAYA template fix:
   `docs/local/live-model-matrix/20260516Tshape-template-audit/mlxlmcommon_focused_target_after_zaya_fix.out`
   passes 78/78 tests across 13 suites. Covered surfaces include CacheCoordinator

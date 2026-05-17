@@ -242,6 +242,25 @@ struct MTPRuntimeFocusedTests {
         #expect(contract.speedBenchRequirements.requiresOutputTailReview)
     }
 
+    @Test("Qwen3.5 text SSM cache records accepted-prefix offsets")
+    func qwen35TextSSMCacheRecordsAcceptedPrefixOffsets() throws {
+        let source = try Self.source("Libraries/MLXLLM/Models/Qwen35.swift")
+
+        #expect(source.contains("cache.offset += S"))
+        #expect(source.contains("offset: baseOffset + prefixLength"))
+        #expect(!source.contains("offset: baseOffset)"))
+    }
+
+    @Test("native MTP partial reject refreshes private draft cache")
+    func nativeMTPPartialRejectRefreshesPrivateDraftCache() throws {
+        let source = try Self.source(
+            "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift")
+
+        #expect(source.contains("mtpCache = model.makeNativeMTPCache()"))
+        #expect(source.contains("mtpCacheRefreshCount += 1"))
+        #expect(!source.contains("trimPromptCache(mtpCache"))
+    }
+
     @Test("BatchEngine.generate rejects native MTP without an active MTP head")
     func batchEngineGenerateRejectsNativeMTPWithoutActiveHead() async throws {
         try await FocusedMLXTestSupport.withLock {
@@ -439,6 +458,12 @@ struct MTPRuntimeFocusedTests {
             withJSONObject: object,
             options: [.prettyPrinted, .sortedKeys])
         try data.write(to: url)
+    }
+
+    private static func source(_ relativePath: String) throws -> String {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let url = root.appendingPathComponent(relativePath)
+        return try String(contentsOf: url, encoding: .utf8)
     }
 
     private static func tinyQwen35Config(mtpLayers: Int) throws -> Qwen35TextConfiguration {

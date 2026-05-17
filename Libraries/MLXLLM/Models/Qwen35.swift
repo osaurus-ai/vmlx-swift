@@ -335,6 +335,7 @@ final class Qwen35GatedDeltaNet: Module {
                     baseOffset: cache.offset)
             }
             cache[1] = finalState
+            cache.offset += S
         }
 
         out = norm(out, gate: z)
@@ -382,7 +383,7 @@ final class Qwen35GatedDeltaNet: Module {
             cache.recordPrefixCommitState(
                 length: prefixLength,
                 arrays: [convState, recurrentState],
-                offset: baseOffset)
+                offset: baseOffset + prefixLength)
         }
     }
 

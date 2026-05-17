@@ -277,7 +277,8 @@ Live 2026-05-16 BatchEngine dispatch artifacts under
 
 Focused test proof for the same dispatch contract:
 
-- `MTPRuntimeFocusedTests` passes 15/15.
+- `MTPRuntimeFocusedTests` passes 17/17 after the 2026-05-17 text hybrid-SSM
+  offset fix and private MTP-cache reject refresh fix.
 - `BatchEngine.generate` with active native MTP reaches the real
   `NativeMTPTokenIterator` and emits native-MTP telemetry.
 - `BatchEngine.generate` with a requested native-MTP strategy but no active MTP
@@ -285,6 +286,26 @@ Focused test proof for the same dispatch contract:
 - `BatchEngine.submit` rejects native MTP instead of silently treating it as
   ordinary batched decode. Raw multi-slot native-MTP scheduling is not
   implemented yet.
+- `Qwen35GatedDeltaNet` in the text path now matches the VLM path for SSM
+  offsets: normal forwards advance `MambaCache.offset`, and verifier
+  accepted-prefix snapshots store `baseOffset + prefixLength`. The focused log
+  is
+  `docs/local/production-readiness/20260517Tqwen36-mtp-ssm-offset/mtp_runtime_focused_after_private_mtp_refresh.log`.
+- Partial rejection now recreates the private MTP draft cache before drafting
+  from the correction token. It no longer trims the old private cache, so stale
+  rejected draft KV/state cannot survive into the next draft round. Telemetry
+  reports this as `mtpCacheRefresh`.
+
+Live 2026-05-17 paired JANG_4M text rows after the text-SSM offset fix:
+
+| Bundle | Mode | Artifact | Result |
+| --- | --- | --- | --- |
+| `/Users/eric/models/JANGQ/Qwen3.6-27B-JANG_4M-MTP` | AR baseline, same prompt | `qwen36_27b_jang4m_ar_text_live.log` | coherent, `20.0 tok/s`, `stop=length`, `loop=NO`, `leaks=none` |
+| `/Users/eric/models/JANGQ/Qwen3.6-27B-JANG_4M-MTP` | native MTP D3, same prompt | `qwen36_27b_jang4m_mtp_d3_private_cache_refresh_live.log` | coherent, `18.0 tok/s`, `prefixCommit=50`, `rollbackRepair=0`, `mtpCacheRefresh=46`, `avgCommittedPerVerify=1.92`, `loop=NO`, `leaks=none` |
+
+The D3 row is a correctness/coherency check for text hybrid-SSM partial-prefix
+commit. It is not a production speed pass, because it is slower than the
+matching AR row on this prompt and remains far below the 45 tok/s threshold.
 
 2026-05-16 Qwen3.6 VLM/MRoPE follow-up:
 
@@ -374,7 +395,8 @@ backbone commit, variable `0...depth` accepted-prefix commit, and a compiled or
 tuned small-M verifier hot path before any speed claim is accepted.
 
 Current runtime state: D3 MLLM native-MTP has correct cache boundaries for the
-Qwen3.6 text path, the Qwen3VL native-MTP backbone verifier now shares the
+Qwen3.6 text path, including text hybrid-SSM accepted-prefix offsets during
+partial rejection, the Qwen3VL native-MTP backbone verifier now shares the
 normal VLM MRoPE continuation-state resolver, and the VLM MTP decoder chooses
 sparse MoE layers for Qwen3.6 35B-style MoE sidecars. `Evaluate.generate` and
 `BatchEngine.generate` both honor an explicit `.nativeMTP(depth:)` request. The
