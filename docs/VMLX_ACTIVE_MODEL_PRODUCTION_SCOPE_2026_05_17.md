@@ -730,6 +730,28 @@ This clears the current Gemma 4 text multi-turn/cache/batching row. It does not
 yet close separate long-budget harmony reasoning, live tool-call schema, or VL
 rows.
 
+Additional Harmony parser follow-up:
+
+```text
+docs/local/live-model-matrix/20260517T_harmony_parser_fix_current/
+```
+
+- The shared Harmony reasoning parser now covers both Gemma 4
+  `<|channel>...<channel|>` envelopes and GPT-OSS/Harmony
+  `<|channel|>analysis|final<|message|>...<|end|>/<|return|>` channels.
+- Focused tests in `NoHiddenReasoningCloseBiasFocusedTests` prove Gemma 4
+  reasoning/content separation, GPT-OSS analysis/final splitting, and Gemma 4
+  reasoning followed by a structured tool call without leaking control markers.
+- A post-fix live Gemma 4 `BENCH_HARMONY_CHECK` row passes: marker strings are
+  absent from `.chunk`, the output is coherent visible README guidance, and
+  generation stops through the normal path.
+
+Boundary: the Gemma 4 live smoke did not elicit reasoning deltas on that prompt,
+and there is no local GPT-OSS bundle in `~/models` for a live GPT-OSS decode row.
+The GPT-OSS claim is therefore parser-contract proof only, not a model-runtime
+production pass. Long-budget Gemma 4 thinking, live Gemma 4 tool-call schema,
+and Gemma 4 VL remain separate rows.
+
 ## Nemotron Omni JANGTQ Release Matrix - 2026-05-17
 
 Clean post-failgate artifact:

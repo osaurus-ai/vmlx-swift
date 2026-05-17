@@ -92,6 +92,17 @@ public struct ReasoningParser: Sendable {
     /// Whether we're currently inside a reasoning block.
     private var insideReasoning: Bool = false
 
+    /// Harmony-specific channel state. Gemma 4 uses
+    /// `<|channel>...<channel|>`, while GPT-OSS uses
+    /// `<|channel|>analysis<|message|>...<|end|>` and
+    /// `<|channel|>final<|message|>...<|return|>`. A single
+    /// `insideReasoning` bit is not enough for GPT-OSS final channels
+    /// because final payloads are visible content but still need their
+    /// control tags stripped.
+    private var insideHarmonyChannel: Bool = false
+    private var harmonyChannelIsReasoning: Bool = false
+    private var harmonyChannelEndTags: [String] = []
+
     /// Read-only access to the current parser state — true when the
     /// stream is currently inside a `<think>…</think>` block (or the
     /// family-specific equivalent). Useful at end-of-stream to detect
@@ -136,12 +147,31 @@ public struct ReasoningParser: Sendable {
     public mutating func feed(_ chunk: String) -> [ReasoningSegment] {
         guard !chunk.isEmpty else { return [] }
         buffer.append(chunk)
+        if isHarmonyChannelParser {
+            return drainHarmonyChannel()
+        }
         return drain()
     }
 
     /// Call once when the stream ends. Flushes any buffered partial text
     /// as `.content` (so we never silently drop tokens).
     public mutating func flush() -> [ReasoningSegment] {
+        if isHarmonyChannelParser {
+            var out = drainHarmonyChannel(allowPartialTagAtEnd: false)
+            if !buffer.isEmpty {
+                let text = insideHarmonyChannel ? buffer : stripHarmonyControlText(buffer)
+                if !text.isEmpty {
+                    out.append(harmonyChannelIsReasoning ? .reasoning(text) : .content(text))
+                }
+                buffer.removeAll(keepingCapacity: false)
+            }
+            insideHarmonyChannel = false
+            harmonyChannelIsReasoning = false
+            harmonyChannelEndTags = []
+            insideReasoning = false
+            return out
+        }
+
         var out = drain(allowPartialTagAtEnd: false)
         if !buffer.isEmpty {
             // Anything left over after the final drain is plain text — emit
@@ -154,6 +184,203 @@ public struct ReasoningParser: Sendable {
     }
 
     // MARK: Internals
+
+    private var isHarmonyChannelParser: Bool {
+        startTag == "<|channel>" && endTag == "<channel|>" && !stripStrayTags
+    }
+
+    /// Harmony parser that accepts both:
+    ///
+    /// - Gemma 4: `<|channel>thought\n...<channel|>`.
+    /// - GPT-OSS: `<|channel|>analysis<|message|>...<|end|>` and
+    ///   `<|channel|>final<|message|>...<|return|>`.
+    ///
+    /// The Gemma path keeps historical semantics: all channel payloads route
+    /// to reasoning and the channel name remains part of the reasoning text.
+    /// The GPT-OSS path strips control tokens and routes `final` to visible
+    /// content while routing other channels to reasoning.
+    private mutating func drainHarmonyChannel(allowPartialTagAtEnd: Bool = true)
+        -> [ReasoningSegment]
+    {
+        let gemmaStart = "<|channel>"
+        let gptStart = "<|channel|>"
+        let gptMessage = "<|message|>"
+        let gptStartControl = "<|start|>"
+        let gptEndTags = ["<|end|>", "<|return|>"]
+        let openerTags = [gemmaStart, gptStart]
+        let holdTags = openerTags + [gptMessage, gptStartControl, endTag] + gptEndTags
+
+        var out: [ReasoningSegment] = []
+
+        while !buffer.isEmpty {
+            if insideHarmonyChannel {
+                let endTags = harmonyChannelEndTags.isEmpty ? [endTag] : harmonyChannelEndTags
+                guard let (range, _) = firstRange(of: endTags, in: buffer) else {
+                    emitSafeHarmonyChannelPrefix(
+                        into: &out,
+                        tags: holdTags,
+                        allowPartialTagAtEnd: allowPartialTagAtEnd)
+                    break
+                }
+
+                let before = String(buffer[..<range.lowerBound])
+                appendHarmonyChannelText(before, into: &out)
+                buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+                insideHarmonyChannel = false
+                harmonyChannelIsReasoning = false
+                harmonyChannelEndTags = []
+                insideReasoning = false
+                continue
+            }
+
+            guard let (range, tag) = firstRange(of: openerTags, in: buffer) else {
+                if allowPartialTagAtEnd,
+                    buffer.contains(gptStartControl)
+                        || holdTags.contains(where: { hasPartialSuffix(of: $0, in: buffer) })
+                {
+                    break
+                }
+                emitSafeHarmonyPrefix(
+                    into: &out,
+                    tags: holdTags,
+                    allowPartialTagAtEnd: allowPartialTagAtEnd)
+                break
+            }
+
+            if tag == gptStart {
+                guard let messageRange = buffer.range(
+                    of: gptMessage,
+                    range: range.upperBound..<buffer.endIndex)
+                else {
+                    let before = stripHarmonyControlText(String(buffer[..<range.lowerBound]))
+                    if !before.isEmpty {
+                        out.append(.content(before))
+                    }
+                    buffer = String(buffer[range.lowerBound...])
+                    break
+                }
+
+                let before = stripHarmonyControlText(String(buffer[..<range.lowerBound]))
+                if !before.isEmpty {
+                    out.append(.content(before))
+                }
+                let channelName = String(buffer[range.upperBound..<messageRange.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                buffer.removeSubrange(buffer.startIndex..<messageRange.upperBound)
+                insideHarmonyChannel = true
+                harmonyChannelIsReasoning = channelName != "final"
+                harmonyChannelEndTags = gptEndTags
+                insideReasoning = harmonyChannelIsReasoning
+                continue
+            }
+
+            let before = stripHarmonyControlText(String(buffer[..<range.lowerBound]))
+            if !before.isEmpty {
+                out.append(.content(before))
+            }
+            buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+            insideHarmonyChannel = true
+            harmonyChannelIsReasoning = true
+            harmonyChannelEndTags = [endTag]
+            insideReasoning = true
+        }
+
+        return out
+    }
+
+    private func appendHarmonyChannelText(_ text: String, into out: inout [ReasoningSegment]) {
+        guard !text.isEmpty else { return }
+        out.append(harmonyChannelIsReasoning ? .reasoning(text) : .content(text))
+    }
+
+    private mutating func emitSafeHarmonyPrefix(
+        into out: inout [ReasoningSegment],
+        tags: [String],
+        allowPartialTagAtEnd: Bool
+    ) {
+        if allowPartialTagAtEnd {
+            let safeTail = max(0, (tags.map(\.count).max() ?? 1) - 1)
+            guard buffer.count > safeTail else { return }
+            let splitAt = buffer.index(buffer.endIndex, offsetBy: -safeTail)
+            let safe = String(buffer[..<splitAt])
+            appendHarmonyFreeText(safe, into: &out)
+            buffer = String(buffer[splitAt...])
+        } else {
+            appendHarmonyFreeText(buffer, into: &out)
+            buffer.removeAll(keepingCapacity: false)
+        }
+    }
+
+    private mutating func emitSafeHarmonyChannelPrefix(
+        into out: inout [ReasoningSegment],
+        tags: [String],
+        allowPartialTagAtEnd: Bool
+    ) {
+        if allowPartialTagAtEnd {
+            let safeTail = max(0, (tags.map(\.count).max() ?? 1) - 1)
+            guard buffer.count > safeTail else { return }
+            let splitAt = buffer.index(buffer.endIndex, offsetBy: -safeTail)
+            let safe = String(buffer[..<splitAt])
+            appendHarmonyChannelText(safe, into: &out)
+            buffer = String(buffer[splitAt...])
+        } else {
+            appendHarmonyChannelText(buffer, into: &out)
+            buffer.removeAll(keepingCapacity: false)
+        }
+    }
+
+    private func appendHarmonyFreeText(_ text: String, into out: inout [ReasoningSegment]) {
+        let cleaned = stripHarmonyControlText(text)
+        guard !cleaned.isEmpty else { return }
+        out.append(.content(cleaned))
+    }
+
+    private func firstRange(of tags: [String], in text: String) -> (Range<String.Index>, String)? {
+        var best: (Range<String.Index>, String)?
+        for tag in tags where !tag.isEmpty {
+            guard let range = text.range(of: tag) else { continue }
+            if let current = best {
+                if range.lowerBound < current.0.lowerBound
+                    || (range.lowerBound == current.0.lowerBound && tag.count > current.1.count)
+                {
+                    best = (range, tag)
+                }
+            } else {
+                best = (range, tag)
+            }
+        }
+        return best
+    }
+
+    private func hasPartialSuffix(of tag: String, in text: String) -> Bool {
+        guard !tag.isEmpty else { return false }
+        let maxLength = min(tag.count - 1, text.count)
+        guard maxLength > 0 else { return false }
+        for length in stride(from: maxLength, through: 1, by: -1) {
+            let suffix = String(text.suffix(length))
+            if tag.hasPrefix(suffix) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func stripHarmonyControlText(_ text: String) -> String {
+        var cleaned = text
+        for marker in [
+            "<|start|>assistant",
+            "<|start|>system",
+            "<|start|>user",
+            "<|start|>tool",
+            "<|start|>",
+            "<|end|>",
+            "<|return|>",
+        ] {
+            cleaned = cleaned.replacingOccurrences(of: marker, with: "")
+        }
+        return cleaned
+    }
 
     /// Process the buffer, peeling off as many complete segments as possible.
     /// `allowPartialTagAtEnd` keeps a tail of up to `max(startTag, endTag).count - 1`
