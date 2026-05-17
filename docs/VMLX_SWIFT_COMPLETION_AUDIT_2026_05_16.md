@@ -152,6 +152,18 @@ Current pushed branch state:
   Gemma4 SWA/cache/VLM guards, MTP metadata/SSM cache contracts, Omni
   Parakeet/RADIO focused rows, JANGTQ/Hadamard/matmul rows, and server settings
   no-hidden-sampler-guard rows.
+- 2026-05-17 non-excluded parser/cache refresh:
+  `docs/local/production-readiness/20260517T2148_nonexcluded_parser_cache_refresh/`
+  passes 77 Swift Testing rows in 14 suites using the full Xcode toolchain.
+  This freshly rechecks the exact surfaces called out for this pass: no forced
+  reasoning close, Harmony/GPT-OSS/Gemma4 fragmentation and leak handling,
+  Ling/Bailing aliases and hybrid cache topology, Hy3/Hunyuan parser/no-leak
+  plus mixed-qkv sanitizer and nextn exclusion, Gemma4 SWA/full-attention cache
+  compile policy, Mistral4/Pixtral/GLM5.1 aliases, media salt, hybrid companion
+  cache requirements, disk fallback, dynamic reasoning/KV cache salts, and ZAYA
+  CCA disk payload. The same command under CommandLineTools failed before test
+  execution with `no such module 'Testing'`, so future local sweeps should set
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
 - 2026-05-17 Osaurus PR/pin and extended-family audit update:
   `docs/VMLX_OSAURUS_PR_PIN_LINEAGE_2026_05_17.md` records the resolver-truth
   lineage for Osaurus PRs #1037, #1057, #1066, #1073, and open #1110. The active

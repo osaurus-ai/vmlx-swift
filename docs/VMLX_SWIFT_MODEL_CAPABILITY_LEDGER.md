@@ -90,6 +90,13 @@ Focused fix artifacts live under `docs/local/swift-release-gates/dsv4-fixes/`.
 | `JANGQ/Hy3-preview-JANGTQ_K` | `hy_v3` / `Hy3Model` | `PARTIAL` | Eager load was killed, but active expert streaming now passes the short production matrix without a process-global model-dir override after `loadWeights` binds the loaded model directory. It skips 91,008 per-expert tensors, indexes 79 layers x 192 experts, and passes 7/7 at about 6.2 GiB RSS. | Speed remains blocked at about 1.4 tok/s. This is correctness/low-footprint proof only; multi-model active streaming still needs a per-loaded-model store before Osaurus exposes simultaneous JANGTQ_K sessions. |
 | `dealign.ai/Gemma-4-26B-A4B-it-JANG_4M-CRACK` | `gemma4` / `Gemma4` | `PARTIAL` | Text release turnmatrix passes config/template, cache OFF/ON `BENCH_PROD` 7/7, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Structured VL chat-cache row now passes: image A cold, same-image replay disk hit `308/308`, different-image miss, and text-only follow-up stays grounded. Live tool-call schema row now passes through `UserInput.tools` with `get_weather({"location":"Tokyo"})`, `toolCalls=1`, and no raw marker leak. | Long-budget Harmony reasoning remains open; GPT-OSS is parser-contract only because no local GPT-OSS bundle is present. |
 
+Fresh parser/cache contract refresh:
+`docs/local/production-readiness/20260517T2148_nonexcluded_parser_cache_refresh/`
+passes 77 Swift Testing rows in 14 suites under the full Xcode toolchain. This
+keeps the Ling/Bailing, Hy3/Hunyuan, Gemma4/Harmony, Mistral4/Pixtral, GLM5.1,
+GPT-OSS, media-salt, hybrid companion, disk fallback, and no-forced-close
+contracts current against the checked-out tree.
+
 ## Local Bundle Inventory
 
 All listed bundles have `config.json`. Config smoke passed for every row in this
