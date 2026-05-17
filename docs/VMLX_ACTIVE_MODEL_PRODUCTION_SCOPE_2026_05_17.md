@@ -200,6 +200,7 @@ Fresh focused artifacts:
 docs/local/live-model-matrix/20260517T161305Z_release_turnmatrix_qwen35_35b_4bit/
 docs/local/live-model-matrix/20260517T163920Z_qwen35_tq_b2_after_compat_split/
 docs/local/live-model-matrix/20260517T164102Z_batch_arrays_cache_offset_focused/
+docs/local/live-model-matrix/20260517T164940Z_release_turnmatrix_qwen35_35b_4bit_after_compat_split/
 ```
 
 The full Qwen3.5 35B 4-bit release turnmatrix was green except
@@ -235,9 +236,16 @@ Proof:
 - `qwen35_batch_tq_b2.out` passes the focused live row. Slot 0 plain output
   beside a TurboQuant neighbor is identical to the B=2 plain/plain reference,
   and diagnostics report `compatibilitySplits=191`.
-- Full post-fix release turnmatrix rerun is still pending. The focused failing
-  row is resolved, but the package-wide production ledger should stay partial
-  until the complete matrix is rerun on the patched scheduler.
+- Full post-fix release turnmatrix now passes. `REPORT.md` records config,
+  template, production defaults cache OFF/ON, BatchEngine single/chat/disk
+  restore/concurrent/per-slot/TurboQuant B=2, VL batch chat, VL structured
+  cache, media-salt isolation, and mixed text/image/video as `pass`. The
+  generic `batch_cache_hit` row is `N-A` by topology/harness semantics.
+- The mixed text/image/video row is coherent, including reasoning ON text,
+  text-cache replay, image grounding, and video grounding. It is not a speed
+  win: the video turn reports `TTFT 136312ms` and total `138.20s`, so high-res
+  video throughput remains a performance watch even though the row is
+  functionally correct.
 
 ## Qwen3.6 35B JANGTQ VLM Routed-Expert Repair - 2026-05-17
 
