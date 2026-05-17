@@ -119,7 +119,7 @@ weights.
 | `dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` | 16G | `qwen3_5` | no | file | `PASS` | `TODO` |
 | `dealign.ai/Qwen3.6-27B-MXFP4-CRACK` | 14G | `qwen3_5` | no | file | `PASS` | `PARTIAL` |
 | `dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK` | 11G | `qwen3_5_moe` | yes | file | `PASS` | `PARTIAL` |
-| `Qwen3.5-35B-A3B-4bit` | 19G | `qwen3_5_moe` | no | file | `PASS` | `TODO` |
+| `Qwen3.5-35B-A3B-4bit` | 19G | `qwen3_5_moe` | no | file | `PASS` | `PARTIAL` |
 
 ## Engine Function Coverage By Family
 
@@ -167,6 +167,14 @@ weights.
   `video_preprocessor_config.json` and uses frame-count-aware video resize math;
   the resized 1080p video smoke attaches `LMInput.video` and returns coherent
   visible content with thinking disabled.
+- Qwen3.5 35B 4-bit now has loader, template, production defaults, VL, and
+  focused BatchEngine mixed-codec proof. The release turnmatrix artifact
+  `docs/local/live-model-matrix/20260517T161305Z_release_turnmatrix_qwen35_35b_4bit/`
+  was green except `batch_tq_b2`. The focused post-fix row
+  `docs/local/live-model-matrix/20260517T163920Z_qwen35_tq_b2_after_compat_split/qwen35_batch_tq_b2.out`
+  passes with the plain slot identical to the B=2 plain/plain reference and
+  `compatibilitySplits=191`; `BatchArraysCacheFocusedTests.log` separately pins
+  recurrent-offset propagation.
 - Current issues: thinking-on can emit reasoning without visible answer within
   small budgets on some rows, so higher-budget closure proof is still required.
   The 35B JANGTQ mixed text/image/video row is also blocked on the high-res

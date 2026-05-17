@@ -329,6 +329,41 @@ struct CacheCoordinatorTopologyFocusedTests {
     }
 }
 
+@Suite("BatchArraysCache focused contracts", .serialized)
+struct BatchArraysCacheFocusedTests {
+    @Test("splitBack propagates model-mutated recurrent offset")
+    func splitBackPropagatesModelMutatedOffset() {
+        FocusedMLXTestSupport.withLock {
+            let cache0 = MambaCache()
+            let cache1 = MambaCache()
+            cache0.offset = 10
+            cache1.offset = 8
+            cache0[0] = MLXArray.ones([1, 2, 4], dtype: .float32)
+            cache0[1] = MLXArray.ones([1, 2, 4], dtype: .float32)
+            cache1[0] = MLXArray.ones([1, 2, 4], dtype: .float32) * 3
+            cache1[1] = MLXArray.ones([1, 2, 4], dtype: .float32) * 5
+
+            let batch = BatchArraysCache(slotCaches: [cache0, cache1])
+            batch[0] = MLXArray.ones([2, 2, 4], dtype: .float32) * 7
+            batch[1] = MLXArray.ones([2, 2, 4], dtype: .float32) * 11
+
+            // Mirrors Qwen35GatedDeltaNet: the model mutates the wrapper's
+            // scalar offset directly instead of calling BatchArraysCache.advance.
+            batch.offset += 1
+            batch.splitBack()
+
+            #expect(batch.offset == 11)
+            #expect(batch.offsetArray.asArray(Int32.self) == [11, 9])
+            #expect(cache0.offset == 11)
+            #expect(cache1.offset == 9)
+            #expect(cache0[0]?.shape == [1, 2, 4])
+            #expect(cache0[1]?.shape == [1, 2, 4])
+            #expect(cache1[0]?.shape == [1, 2, 4])
+            #expect(cache1[1]?.shape == [1, 2, 4])
+        }
+    }
+}
+
 private let cacheTopologyTestRepoRoot = URL(fileURLWithPath: #filePath)
     .deletingLastPathComponent()
     .deletingLastPathComponent()

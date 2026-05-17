@@ -2930,6 +2930,7 @@ func runBatchEngineTurboQuantB2(modelPath: String, maxNew: Int) async throws {
         streams: [(0, streamA0), (1, streamA1)],
         maxTokens: maxNew,
         label: "TQ B=2 pass A")
+    let compatibilitySplitsA = await engineA.decodeCompatibilitySplitCountForDiagnostics
     for (slot, ids) in resultsA {
         let tag = slot == 0 ? "plain" : "TQ(4,4)"
         let text = tokenizer.decode(tokenIds: ids)
@@ -2987,13 +2988,22 @@ func runBatchEngineTurboQuantB2(modelPath: String, maxNew: Int) async throws {
               "using B=2 plain/plain as the isolation baseline.")
     }
     let isolationOk = a0 == refB2Slot0
+    let isolatedByScheduler = compatibilitySplitsA > 0 && a0 == refTokens
+    let isolationLabel: String
+    if isolationOk {
+        isolationLabel = "IDENTICAL to B=2 plain/plain reference"
+    } else if isolatedByScheduler {
+        isolationLabel = "ISOLATED to B=1 plain reference after compatibility split"
+    } else {
+        isolationLabel = "DIVERGED"
+    }
     print(String(format:
-        "\n  Slot 0 plain with TQ neighbour vs B=2 plain/plain reference: %@ (%d vs %d tokens)",
-        isolationOk ? "IDENTICAL ✓" : "DIVERGED ✗",
-        a0.count, refB2Slot0.count))
-    if !isolationOk {
+        "\n  Slot 0 plain with TQ neighbour isolation: %@ (%d vs B2 %d, solo %d tokens; compatibilitySplits=%d)",
+        isolationLabel,
+        a0.count, refB2Slot0.count, refTokens.count, compatibilitySplitsA))
+    if !(isolationOk || isolatedByScheduler) {
         fputs("[TQ B=2] FAIL: slot 0 plain output drifted from the B=2 plain/plain reference " +
-              "when slot 1 ran TurboQuant concurrently. Cross-slot corruption.\n",
+              "or the scheduler-isolated B=1 reference when slot 1 used TurboQuant. Cross-slot corruption.\n",
               stderr)
         let firstDiff = firstDiffIndex(a0, refB2Slot0) ?? -1
         fputs("  first divergence index = \(firstDiff)\n", stderr)

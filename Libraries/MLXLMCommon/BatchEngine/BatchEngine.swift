@@ -253,6 +253,12 @@ public actor BatchEngine {
     /// miss short-lived overlap while a model forward monopolizes the executor.
     private var activeCountHighWatermark: Int = 0
 
+    /// Decode iterations split because admitted slots had incompatible live
+    /// cache/codec signatures. Mixed plain/TurboQuant KV slots may be active
+    /// at the same time, but the scheduler must not force incompatible cache
+    /// representations into one model forward.
+    private var decodeCompatibilitySplitCount: Int = 0
+
     /// Background scheduling loop task handle.
     private var loopTask: Task<Void, Never>?
 
@@ -1008,6 +1014,11 @@ public actor BatchEngine {
 
     /// Maximum active-slot count observed since engine creation.
     public var activeCountHighWatermarkForDiagnostics: Int { activeCountHighWatermark }
+
+    /// Number of decode compatibility splits observed since engine creation.
+    public var decodeCompatibilitySplitCountForDiagnostics: Int {
+        decodeCompatibilitySplitCount
+    }
 
     /// Whether the engine is currently running (has active or pending work).
     public var isRunning: Bool { loopTask != nil || soloFastPathTask != nil }
@@ -1868,6 +1879,20 @@ public actor BatchEngine {
     /// ``BatchKVCache`` wrappers, runs one model forward pass, then samples
     /// independently per sequence.
     private func stepBatchDecode(slotIndices: [Int]) {
+        if slotIndices.count > 1 {
+            let grouped = decodeCompatibilityGroups(slotIndices: slotIndices)
+            if grouped.count > 1 {
+                decodeCompatibilitySplitCount += 1
+                Self.logger.debug(
+                    "Splitting decode into \(grouped.count, privacy: .public) cache-compatible groups"
+                )
+                for group in grouped {
+                    stepBatchDecode(slotIndices: group)
+                }
+                return
+            }
+        }
+
         // Stage 1B.3: single-slot compiled decode path. When this slot was
         // promoted to a compiled-forward during `stepPrefill`, route through
         // the compiled closure instead of constructing per-step BatchKVCache
@@ -2029,6 +2054,48 @@ public actor BatchEngine {
 
             activeSlots[slotIdx] = slot
         }
+    }
+
+    /// Preserve admission-level concurrency while only batching decode slots
+    /// whose cache topology and requested live KV codec are compatible.
+    ///
+    /// Homogeneous plain/plain and TurboQuant/TurboQuant groups still batch
+    /// normally. Incompatible groups step independently in the same scheduler
+    /// iteration; this is correctness routing, not a sampling or model-behavior
+    /// guard.
+    private func decodeCompatibilityGroups(slotIndices: [Int]) -> [[Int]] {
+        var orderedKeys: [String] = []
+        var groups: [String: [Int]] = [:]
+        for index in slotIndices {
+            let key = decodeCompatibilityKey(for: activeSlots[index])
+            if groups[key] == nil {
+                orderedKeys.append(key)
+                groups[key] = []
+            }
+            groups[key]?.append(index)
+        }
+        return orderedKeys.compactMap { groups[$0] }
+    }
+
+    private func decodeCompatibilityKey(for slot: BatchSlot) -> String {
+        let kvModeKey: String
+        switch slot.parameters.kvMode {
+        case .none:
+            kvModeKey = "kv:none"
+        case .affine(let bits, let groupSize):
+            kvModeKey = "kv:affine:\(bits):\(groupSize)"
+        case .turboQuant(let keyBits, let valueBits):
+            kvModeKey = "kv:tq:\(keyBits):\(valueBits)"
+        }
+
+        let cacheKey = slot.cache.map { layer -> String in
+            if let tq = layer as? TurboQuantKVCache {
+                return "TurboQuantKVCache:\(tq.keyBits):\(tq.valueBits):\(tq.phase)"
+            }
+            return String(reflecting: type(of: layer))
+        }.joined(separator: "|")
+
+        return kvModeKey + ";" + cacheKey
     }
 
     // MARK: - Completion

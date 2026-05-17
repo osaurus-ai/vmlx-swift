@@ -192,6 +192,53 @@ Earlier failing diagnostics for this exact root cause are preserved under:
 docs/local/live-model-matrix/20260517T_qwen35_embedding_fix/
 ```
 
+## Qwen3.5 35B BatchEngine TurboQuant B=2 Isolation - 2026-05-17
+
+Fresh focused artifacts:
+
+```text
+docs/local/live-model-matrix/20260517T161305Z_release_turnmatrix_qwen35_35b_4bit/
+docs/local/live-model-matrix/20260517T163920Z_qwen35_tq_b2_after_compat_split/
+docs/local/live-model-matrix/20260517T164102Z_batch_arrays_cache_offset_focused/
+```
+
+The full Qwen3.5 35B 4-bit release turnmatrix was green except
+`batch_tq_b2`. That row exposed real BatchEngine/cache corruption: slot 0 plain
+KV drifted when slot 1 decoded with TurboQuant KV in the same model forward.
+This was not a model-quality issue and not a sampler issue.
+
+Root causes:
+
+- `BatchArraysCache.splitBack()` copied updated recurrent state arrays back to
+  each per-slot `MambaCache`, but did not propagate the wrapper `offset` that
+  Qwen35/GatedDeltaNet mutates during recurrent decode. B>1 hybrid SSM decode
+  could therefore carry fresh state arrays with stale logical positions.
+- Mixed plain KV and TurboQuant KV slots were admitted together and then forced
+  into one decode forward even though their live cache codec signatures are not
+  compatible.
+
+Fix:
+
+- `BatchArraysCache.splitBack()` now pushes the model-mutated decode-step
+  advance back into every wrapped per-slot Mamba cache and refreshes the wrapper
+  `offsetArray`.
+- `BatchEngine` now groups active decode slots by cache topology and live KV
+  codec before batching. Homogeneous plain/plain and TurboQuant/TurboQuant rows
+  still batch normally. Mixed incompatible groups remain concurrently admitted
+  but decode in separate compatible forwards in the same scheduler iteration.
+  This is cache-topology routing, not a hidden generation guard.
+
+Proof:
+
+- `BatchArraysCacheFocusedTests.log` passes 1/1 and pins offset propagation for
+  the model-mutated wrapper path.
+- `qwen35_batch_tq_b2.out` passes the focused live row. Slot 0 plain output
+  beside a TurboQuant neighbor is identical to the B=2 plain/plain reference,
+  and diagnostics report `compatibilitySplits=191`.
+- Full post-fix release turnmatrix rerun is still pending. The focused failing
+  row is resolved, but the package-wide production ledger should stay partial
+  until the complete matrix is rerun on the patched scheduler.
+
 ## Qwen3.6 35B JANGTQ VLM Routed-Expert Repair - 2026-05-17
 
 Fresh artifacts:

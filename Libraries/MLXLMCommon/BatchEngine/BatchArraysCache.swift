@@ -102,6 +102,17 @@ public final class BatchArraysCache: MambaCache {
     /// Call this AFTER the model forward pass to write updated states back
     /// to each sequence's original MambaCache.
     public func splitBack() {
+        // The model mutates `offset` on this BatchArraysCache wrapper after
+        // recurrent update. Push the same decode-step advance back to every
+        // wrapped per-sequence cache; otherwise B>1 hybrid SSM decode updates
+        // the state arrays while leaving each slot's logical position stale.
+        let previousMaxOffset = offsets.max() ?? 0
+        let advancedBy = max(0, offset - previousMaxOffset)
+        if advancedBy > 0 {
+            offsets = offsets.map { $0 + advancedBy }
+            offsetArray = MLXArray(offsets.map { Int32($0) })
+        }
+
         for i in 0 ..< numSlots {
             guard let merged = self[i] else { continue }
             for (j, slotCache) in slotCaches.enumerated() {
@@ -109,6 +120,7 @@ public final class BatchArraysCache: MambaCache {
                 slotCache.offset = offsets[j]
             }
         }
+        offset = offsets.max() ?? 0
     }
 
     /// Advance every wrapped sequence by the same number of processed tokens.
