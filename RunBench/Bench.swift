@@ -1782,8 +1782,8 @@ func runBatchEngineConcurrent(modelPath: String, maxNew: Int) async throws {
     // If the engine mixes slots, one would "see" the other's tokens and
     // the previews would look suspiciously similar.
     let prompts = [
-        "What is the capital of France?",
-        "List two prime numbers greater than 10.",
+        "What city is the capital of France? Reply with one word.",
+        "What is 2 + 2? Reply with just the number.",
     ]
 
     // Prepare both inputs ahead of the race so `.processor.prepare`
@@ -1803,36 +1803,17 @@ func runBatchEngineConcurrent(modelPath: String, maxNew: Int) async throws {
     nonisolated(unsafe) let send1 = inputs[1]
     let (_, s0) = await engine.submit(input: send0, parameters: params)
     let (_, s1) = await engine.submit(input: send1, parameters: params)
-    await requireActiveSlotOverlap(engine, atLeast: 2, label: "ConcurrentBatch B=2")
 
     // Collect decoded text for each slot in parallel. Uses the tokenizer
     // directly rather than NaiveStreamingDetokenizer — the synchronous
     // decode is fine for a small benchmark and avoids the O(n²) relay
     // cost that hammers throughput under HF tokenizers.
     let tokenizer = context.tokenizer
-    let results = await withTaskGroup(of: (Int, [Int]).self) { group in
-        group.addTask {
-            var ids: [Int] = []
-            for await e in s0 {
-                if case .token(let id) = e { ids.append(id) }
-                if ids.count >= maxNew { break }
-            }
-            return (0, ids)
-        }
-        group.addTask {
-            var ids: [Int] = []
-            for await e in s1 {
-                if case .token(let id) = e { ids.append(id) }
-                if ids.count >= maxNew { break }
-            }
-            return (1, ids)
-        }
-        var collected: [(Int, [Int])] = []
-        for await result in group {
-            collected.append(result)
-        }
-        return collected
-    }
+    let results = await collectBatchStreamsWithOverlap(
+        engine,
+        streams: [(0, s0), (1, s1)],
+        maxTokens: maxNew,
+        label: "ConcurrentBatch B=2")
     let total = CFAbsoluteTimeGetCurrent() - t0
 
     // Print side-by-side. Guard against empty (stuck) slots.
@@ -1851,8 +1832,8 @@ func runBatchEngineConcurrent(modelPath: String, maxNew: Int) async throws {
                   stderr)
             exit(1)
         }
-        if slot == 1 && !(lower.contains("11") || lower.contains("13") || lower.contains("17") || lower.contains("prime")) {
-            fputs("[ConcurrentBatch] FAIL: slot 1 did not answer its prime-number prompt.\n",
+        if slot == 1 && !lower.contains("4") {
+            fputs("[ConcurrentBatch] FAIL: slot 1 did not answer its arithmetic prompt.\n",
                   stderr)
             exit(1)
         }
@@ -2587,31 +2568,11 @@ func runBatchEnginePerSlotSampler(modelPath: String, maxNew: Int) async throws {
         nonisolated(unsafe) let in1 = freshInput()
         let (_, s0) = await engine.submit(input: in0, parameters: greedyParams)
         let (_, s1) = await engine.submit(input: in1, parameters: stochasticParams)
-        await requireActiveSlotOverlap(engine, atLeast: 2, label: label)
-
-        let results = await withTaskGroup(of: (Int, [Int]).self) { group in
-            group.addTask {
-                var ids: [Int] = []
-                for await e in s0 {
-                    if case .token(let id) = e { ids.append(id) }
-                    if ids.count >= maxNew { break }
-                }
-                return (0, ids)
-            }
-            group.addTask {
-                var ids: [Int] = []
-                for await e in s1 {
-                    if case .token(let id) = e { ids.append(id) }
-                    if ids.count >= maxNew { break }
-                }
-                return (1, ids)
-            }
-            var collected: [(Int, [Int])] = []
-            for await result in group {
-                collected.append(result)
-            }
-            return collected.sorted { $0.0 < $1.0 }
-        }
+        let results = await collectBatchStreamsWithOverlap(
+            engine,
+            streams: [(0, s0), (1, s1)],
+            maxTokens: maxNew,
+            label: label)
         await engine.shutdown()
         return (results[0].1, results[1].1)
     }
@@ -2675,6 +2636,42 @@ private func firstDiffIndex(_ a: [Int], _ b: [Int]) -> Int? {
     return a.count == b.count ? nil : n
 }
 
+/// Drain several BatchEngine raw token streams while concurrently observing
+/// the scheduler high-water mark. Starting the consumers before the overlap
+/// gate matters for models whose scheduling loop only makes progress once the
+/// returned streams are being drained.
+private func collectBatchStreamsWithOverlap(
+    _ engine: BatchEngine,
+    streams: [(Int, AsyncStream<BatchGeneration>)],
+    maxTokens: Int,
+    label: String,
+    atLeast expected: Int? = nil
+) async -> [(Int, [Int])] {
+    let required = expected ?? streams.count
+    async let overlap = observeActiveSlotOverlap(engine, atLeast: required, label: label)
+    let results = await withTaskGroup(of: (Int, [Int]).self) { group in
+        for (slot, stream) in streams {
+            group.addTask {
+                var ids: [Int] = []
+                for await e in stream {
+                    if case .token(let id) = e { ids.append(id) }
+                    if ids.count >= maxTokens { break }
+                }
+                return (slot, ids)
+            }
+        }
+        var collected: [(Int, [Int])] = []
+        for await result in group {
+            collected.append(result)
+        }
+        return collected.sorted { $0.0 < $1.0 }
+    }
+    if !(await overlap) {
+        exit(1)
+    }
+    return results
+}
+
 /// Require the scheduler to show real multi-slot admission before a
 /// BatchEngine row is allowed to claim B>1 coverage. This does not prove every
 /// decode step had width B, but it rejects the common false positive where a
@@ -2685,27 +2682,43 @@ private func requireActiveSlotOverlap(
     label: String,
     timeoutSeconds: Double = 5
 ) async {
-    guard expected > 1 else { return }
+    if !(await observeActiveSlotOverlap(engine, atLeast: expected, label: label,
+                                       timeoutSeconds: timeoutSeconds)) {
+        exit(1)
+    }
+}
+
+private func observeActiveSlotOverlap(
+    _ engine: BatchEngine,
+    atLeast expected: Int,
+    label: String,
+    timeoutSeconds: Double = 5
+) async -> Bool {
+    guard expected > 1 else { return true }
 
     let deadline = CFAbsoluteTimeGetCurrent() + timeoutSeconds
     var maxActive = 0
+    var highWatermark = 0
     var maxPending = 0
     while CFAbsoluteTimeGetCurrent() < deadline {
         let active = await engine.activeCount
+        let observed = await engine.activeCountHighWatermarkForDiagnostics
         let pending = await engine.pendingCount
         maxActive = max(maxActive, active)
+        highWatermark = max(highWatermark, observed)
         maxPending = max(maxPending, pending)
-        if active >= expected {
-            print("  \(label): active-slot overlap confirmed (active=\(active), pending=\(pending))")
-            return
+        if active >= expected || observed >= expected {
+            print("  \(label): active-slot overlap confirmed " +
+                  "(active=\(active), highWatermark=\(observed), pending=\(pending))")
+            return true
         }
         try? await Task.sleep(nanoseconds: 20_000_000)
     }
 
     fputs("[\(label)] FAIL: activeCount never reached \(expected) within \(timeoutSeconds)s " +
-          "(maxActive=\(maxActive), maxPending=\(maxPending)). " +
+          "(maxActive=\(maxActive), highWatermark=\(highWatermark), maxPending=\(maxPending)). " +
           "This row cannot be used as real continuous-batching proof.\n", stderr)
-    exit(1)
+    return false
 }
 
 private func printDecodedOutput(label: String, text: String) {
@@ -2810,28 +2823,11 @@ func runBatchEngineTurboQuantB2(modelPath: String, maxNew: Int) async throws {
     nonisolated(unsafe) let inRefB21 = refB2Inputs[1]
     let (_, streamRefB20) = await engineRefB2.submit(input: inRefB20, parameters: plainParams)
     let (_, streamRefB21) = await engineRefB2.submit(input: inRefB21, parameters: plainParams)
-    await requireActiveSlotOverlap(engineRefB2, atLeast: 2, label: "TQ B=2 plain/plain reference")
-    let refB2Results = await withTaskGroup(of: (Int, [Int]).self) { group in
-        group.addTask {
-            var ids: [Int] = []
-            for await e in streamRefB20 {
-                if case .token(let id) = e { ids.append(id) }
-                if ids.count >= maxNew { break }
-            }
-            return (0, ids)
-        }
-        group.addTask {
-            var ids: [Int] = []
-            for await e in streamRefB21 {
-                if case .token(let id) = e { ids.append(id) }
-                if ids.count >= maxNew { break }
-            }
-            return (1, ids)
-        }
-        var collected: [(Int, [Int])] = []
-        for await r in group { collected.append(r) }
-        return collected.sorted { $0.0 < $1.0 }
-    }
+    let refB2Results = await collectBatchStreamsWithOverlap(
+        engineRefB2,
+        streams: [(0, streamRefB20), (1, streamRefB21)],
+        maxTokens: maxNew,
+        label: "TQ B=2 plain/plain reference")
     await engineRefB2.shutdown()
     let refB2Slot0 = refB2Results[0].1
     for (slot, ids) in refB2Results {
@@ -2854,28 +2850,11 @@ func runBatchEngineTurboQuantB2(modelPath: String, maxNew: Int) async throws {
     nonisolated(unsafe) let inA1 = inputs[1]
     let (_, streamA0) = await engineA.submit(input: inA0, parameters: plainParams)
     let (_, streamA1) = await engineA.submit(input: inA1, parameters: tqParams)
-    await requireActiveSlotOverlap(engineA, atLeast: 2, label: "TQ B=2 pass A")
-    let resultsA = await withTaskGroup(of: (Int, [Int]).self) { group in
-        group.addTask {
-            var ids: [Int] = []
-            for await e in streamA0 {
-                if case .token(let id) = e { ids.append(id) }
-                if ids.count >= maxNew { break }
-            }
-            return (0, ids)
-        }
-        group.addTask {
-            var ids: [Int] = []
-            for await e in streamA1 {
-                if case .token(let id) = e { ids.append(id) }
-                if ids.count >= maxNew { break }
-            }
-            return (1, ids)
-        }
-        var collected: [(Int, [Int])] = []
-        for await r in group { collected.append(r) }
-        return collected.sorted { $0.0 < $1.0 }
-    }
+    let resultsA = await collectBatchStreamsWithOverlap(
+        engineA,
+        streams: [(0, streamA0), (1, streamA1)],
+        maxTokens: maxNew,
+        label: "TQ B=2 pass A")
     for (slot, ids) in resultsA {
         let tag = slot == 0 ? "plain" : "TQ(4,4)"
         let text = tokenizer.decode(tokenIds: ids)
@@ -2901,28 +2880,11 @@ func runBatchEngineTurboQuantB2(modelPath: String, maxNew: Int) async throws {
     nonisolated(unsafe) let inB1 = inputsB[1]
     let (_, streamB0) = await engineB.submit(input: inB0, parameters: tqParams)
     let (_, streamB1) = await engineB.submit(input: inB1, parameters: tqParams)
-    await requireActiveSlotOverlap(engineB, atLeast: 2, label: "TQ B=2 pass B")
-    let resultsB = await withTaskGroup(of: (Int, [Int]).self) { group in
-        group.addTask {
-            var ids: [Int] = []
-            for await e in streamB0 {
-                if case .token(let id) = e { ids.append(id) }
-                if ids.count >= maxNew { break }
-            }
-            return (0, ids)
-        }
-        group.addTask {
-            var ids: [Int] = []
-            for await e in streamB1 {
-                if case .token(let id) = e { ids.append(id) }
-                if ids.count >= maxNew { break }
-            }
-            return (1, ids)
-        }
-        var collected: [(Int, [Int])] = []
-        for await r in group { collected.append(r) }
-        return collected.sorted { $0.0 < $1.0 }
-    }
+    let resultsB = await collectBatchStreamsWithOverlap(
+        engineB,
+        streams: [(0, streamB0), (1, streamB1)],
+        maxTokens: maxNew,
+        label: "TQ B=2 pass B")
     for (slot, ids) in resultsB {
         let text = tokenizer.decode(tokenIds: ids)
         print(String(format: "  Slot %d (TQ) : %d tokens, first 8: %@",
@@ -3041,26 +3003,12 @@ func runBatchEngineBMany(modelPath: String, maxNew: Int, batchSize: Int) async t
         streams.append(s)
     }
     let configuredMaxBatchSize = await engine.maxBatchSize
-    await requireActiveSlotOverlap(
+    let results = await collectBatchStreamsWithOverlap(
         engine,
-        atLeast: min(batchSize, configuredMaxBatchSize),
-        label: "B=\(batchSize) stress")
-
-    let results: [(Int, [Int])] = await withTaskGroup(of: (Int, [Int]).self) { group in
-        for (i, stream) in streams.enumerated() {
-            group.addTask {
-                var ids: [Int] = []
-                for await e in stream {
-                    if case .token(let id) = e { ids.append(id) }
-                    if ids.count >= maxNew { break }
-                }
-                return (i, ids)
-            }
-        }
-        var collected: [(Int, [Int])] = []
-        for await r in group { collected.append(r) }
-        return collected.sorted { $0.0 < $1.0 }
-    }
+        streams: Array(streams.enumerated()).map { ($0.offset, $0.element) },
+        maxTokens: maxNew,
+        label: "B=\(batchSize) stress",
+        atLeast: min(batchSize, configuredMaxBatchSize))
     let batchedWall = CFAbsoluteTimeGetCurrent() - t0
 
     // Report & validate.

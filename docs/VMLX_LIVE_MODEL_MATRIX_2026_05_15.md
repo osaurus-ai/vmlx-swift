@@ -110,7 +110,9 @@ A model is not production-ready unless the artifact proves:
 - cache topology is shown for the model family;
 - cache OFF and cache ON rows both produce coherent multi-turn output;
 - single-batch and multi-batch rows prove actual active slot overlap, not
-  serialized reads from a fake concurrent harness;
+  serialized reads from a fake concurrent harness; the overlap proof may use
+  BatchEngine's internal active-slot high-water mark because actor-external
+  polling can miss short-lived overlap during model forwards;
 - TurboQuant KV rows prove B=2 mixed plain/TQ and all-TQ slots complete
   coherently without cross-slot drift; the plain-slot isolation baseline must
   be shape-matched B=2 plain/plain, not a B=1 solo decode that can legitimately

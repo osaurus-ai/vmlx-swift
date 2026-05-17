@@ -248,6 +248,11 @@ public actor BatchEngine {
     /// Active generation slots (max `maxBatchSize`).
     private var activeSlots: [BatchSlot] = []
 
+    /// High-water mark for concurrently admitted slots. This is exposed for
+    /// release gates because polling `activeCount` from outside the actor can
+    /// miss short-lived overlap while a model forward monopolizes the executor.
+    private var activeCountHighWatermark: Int = 0
+
     /// Background scheduling loop task handle.
     private var loopTask: Task<Void, Never>?
 
@@ -1001,6 +1006,9 @@ public actor BatchEngine {
     /// The number of sequences currently being generated.
     public var activeCount: Int { activeSlots.count + (soloFastPathTask == nil ? 0 : 1) }
 
+    /// Maximum active-slot count observed since engine creation.
+    public var activeCountHighWatermarkForDiagnostics: Int { activeCountHighWatermark }
+
     /// Whether the engine is currently running (has active or pending work).
     public var isRunning: Bool { loopTask != nil || soloFastPathTask != nil }
 
@@ -1195,6 +1203,7 @@ public actor BatchEngine {
 
             let slot = BatchSlot(from: request, cache: cache, stopTokenIDs: stopTokenIDs)
             activeSlots.append(slot)
+            activeCountHighWatermark = max(activeCountHighWatermark, activeSlots.count)
         }
     }
 

@@ -188,6 +188,34 @@ Remaining non-false-positive blocker:
   with tiny max diffs, so the next investigation is broader artifact/runtime
   parity across layers or conversion, not a sampling fallback.
 
+## Laguna XS Release Matrix - 2026-05-17
+
+Clean release artifact:
+
+```text
+docs/local/live-model-matrix/20260517T_release_turnmatrix_laguna_xs_after_b2_fix/
+```
+
+Laguna is now green for the current text turnmatrix:
+
+- config/template smoke: PASS;
+- `BENCH_PROD` cache OFF and cache ON: 7/7 each, coherent visible output,
+  normal stops, reasoning on/off routed correctly, bundle defaults applied
+  (`temp=0.700`, `topP=0.900`, `topK=0`, `rep=nil`, `seed=0`);
+- release decode telemetry: about 31 tok/s on the production rows;
+- disk restore row: PASS, with the disk cache directory populated;
+- generic paged prefix hit row: N-A because Laguna is paged-incompatible and
+  uses disk-backed restore;
+- B=2 concurrent, per-slot sampler, and TurboQuant-KV B=2: PASS with
+  `activeCountHighWatermarkForDiagnostics >= 2`.
+
+Harness fix from this row:
+
+- The B=2 proof now records an internal BatchEngine active-slot high-water
+  mark. External polling can miss short-lived overlap while model forwards
+  monopolize the actor executor, so the release gate now drains streams while
+  observing both live `activeCount` and the engine's high-water mark.
+
 ## Required Proof Per Active Bundle
 
 For each non-excluded bundle, the production row must include:
