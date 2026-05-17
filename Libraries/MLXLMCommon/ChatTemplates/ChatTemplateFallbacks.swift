@@ -301,6 +301,10 @@ public enum ChatTemplateFallbacks {
 {%- if tools -%}
 {{- render_tools(tools) -}}
 {%- endif -%}
+{%- set next_role = messages[loop.index0 + 1]['role'] if loop.index0 + 1 < messages|length else none -%}
+{%- if next_role -%}
+{{- '\n' -}}
+{%- endif -%}
 {%- elif message['role'] == 'user' or message['role'] == 'developer' -%}
 {{- user_token -}}{{- message['content'] -}}
 {%- if tools and not (messages|length > 0 and messages[0]['role'] == 'system') and loop.index0 == ns.last_user_index -%}

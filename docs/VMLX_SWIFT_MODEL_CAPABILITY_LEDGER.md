@@ -85,7 +85,8 @@ Focused fix artifacts live under `docs/local/swift-release-gates/dsv4-fixes/`.
 
 | Model | Family / Swift model | Live result | What worked | What did not pass yet |
 | --- | --- | --- | --- | --- |
-| `JANGQ/DeepSeek-V4-Flash-JANGTQ-K` | `deepseek_v4` / `DeepseekV4JANGTQModel` | `PARTIAL` | Live 3-turn chat with `enable_thinking=false` is coherent: saves `sapphire-42`, recalls it, answers the follow-up; no raw `<think>` leakage; stop reason is `.stop`; tok/s is emitted. DSV4 paged-incompatible cache restores through disk with salted hit and nil-salt miss. Explicit arithmetic prompts now pass for reasoning off/on/max; `reasoning_effort=max` reaches the model instead of being downgraded. | Long-context/vector drift, broader reasoning matrix, greedy/rep behavior on other DSV4 bundles, and full speed matrix still open. |
+| `JANGQ/DeepSeek-V4-Flash-JANGTQ2` | `deepseek_v4` / `DeepseekV4JANGTQModel` | `PARTIAL` | Current non-Kimi DSV4 artifact proves the prompt-boundary root cause and fix. Pre-fix, the system string glued to `<User>` and live chat drifted into `sappberry-42`; post-fix the standalone Jinja, compiled fallback, and Swift encoder all insert a newline separator, with 13/13 focused tests passing. Live cache OFF and cache ON 3-turn chat is coherent with `rep=1.0`, no raw `<think>` leakage, normal `.stop`, and visible tok/s. `BENCH_PROD` passes 7/7 using bundle defaults (`temp=1.000 topP=1.000 topK=0 rep=nil`) and shows reasoning on/off routing through `.reasoning` vs visible chunks. | Not low-footprint production-cleared: production row reports about 61.5 GiB peak RSS. DSV4 is `pagedIncompatible=true`; generic paged prefix hit is explicitly `N-A`, while disk L2 stats show `hits=1,misses=19,stores=14`. Long-context/vector drift, API routes, sleep/wake, and speed matrix remain open. |
+| `JANGQ/DeepSeek-V4-Flash-JANGTQ-K` | `deepseek_v4` / `DeepseekV4JANGTQModel` | `PARTIAL` | Current post-fix 3-turn chat row passes on the second DSV4 bundle with the corrected system/User separator, visible `sapphire-42` recall, coherent follow-up, no raw reasoning leakage, `.stop`, and tok/s. Template kwargs for thinking off/on/max pass. | Needs the same bundle-default production/cache-stat/speed/long-context/API matrix as JANGTQ2 before promotion. The old pre-fix exact gate failed with `sappium-42`, so do not promote stale DSV4 evidence. |
 | `JANGQ/ZAYA1-8B-JANGTQ_K` | `zaya` / `ZayaModel` | `PASS / NEEDS CURRENT RE-RUN` | Historical K evidence: release turnmatrix passes config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Bundle defaults apply, reasoning ON/OFF flips produce visible answers, disk L2 and SSM hits are recorded, and release decode is about 64-66 tok/s. | Needs a current all-non-Kimi matrix re-run before Osaurus promotion. Generic paged prefix hit remains `N-A` by topology. |
 | `dealign.ai/Qwen3.6-27B-MXFP4-CRACK` | `qwen3_5` / `Qwen35` | `PARTIAL` | Loads in 1.7s; 3-turn chat is coherent; no loop; SSM warm second-turn row recorded; avg prompt around 360 tok/s; decode around 21.7 tok/s. | Thinking-on probe produced 377 chars of reasoning and no visible answer within budget. Footprint rises to about 16.2 GB, expected for MXFP4 but not a low-footprint routed row. |
 | `JANGQ/MiniMax-M2.7-Small-JANGTQ` | `minimax_m2` / `MiniMaxJANGTQModel` | `PARTIAL` | Loads in 9.7s; 3-turn chat is coherent; no loop; TQ disk round-trip passes; decode around 30.6 tok/s; tracked mmap buffers about 37 GB. | Thinking-on probe produced 483 chars reasoning and no visible answer. Activity Monitor-style footprint reaches about 38.2 GB, so this is not a low-RAM active-streaming pass. |
@@ -155,16 +156,23 @@ weights.
 - Current template status: fixed in this checkout. The fallback now renders the
   DSML tool schema block for both normal and Osaurus-sized top-level OpenAI
   tools, and `reasoning_effort=max` passes through to the DSV4 max preface
-  without an environment-gated downgrade.
-- Current live proof: JANGTQ-K chat coherence passes with visible output,
-  `.stop`, no raw reasoning leakage, and tok/s; DSV4 paged-incompatible cache
-  restores through disk with salted hits and nil-salt misses.
+  without an environment-gated downgrade. The current non-Kimi pass also fixes
+  the DSV4 system/User boundary in all three prompt paths; pre-fix logs show
+  `system<User>` glue causing `sappberry/sappium` drift, while post-fix logs
+  show `system\n<User>`.
+- Current live proof: JANGTQ2 passes cache OFF/ON 3-turn chat and bundle-default
+  `BENCH_PROD` 7/7; JANGTQ-K passes post-fix 3-turn chat. Reasoning on/off
+  routes correctly, visible output is coherent, stop reason is `.stop`, no raw
+  reasoning leaks, and tok/s is emitted. DSV4 cache stats are topology-specific:
+  `pagedIncompatible=true`; generic paged prefix hits are `N-A`, while L2 disk
+  stats are recorded when disk cache is enabled.
 - Current live nuance: the older arithmetic gate used an ambiguous "7 + 5"
   wording and failed; the explicit `Q: What is 7 + 5? ... A:` gate now passes
   for reasoning off/on/max on JANGTQ-K. This is a gate prompt correction, not a
   hidden sampling clamp.
 - Required live gates still open: long-context regression, vector drift,
-  full speed matrix, and broader reasoning matrix.
+  full speed matrix, API routes, low-footprint mode, and broader reasoning
+  matrix.
 
 ### Qwen3.6 / Qwen3.5 Hybrid
 

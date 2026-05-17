@@ -107,6 +107,36 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         assertNoSystemToolsRenderBetweenUserAndAssistant(rendered)
     }
 
+    @Test("compiled DSV4 fallback separates system preface from first user turn")
+    func compiledDSV4FallbackSeparatesSystemFromFirstUser() throws {
+        let template = try Template(ChatTemplateFallbacks.dsv4Minimal)
+        let rendered = try template.renderDSV4(systemThenUserContext())
+
+        assertSystemSeparatedFromUser(rendered)
+    }
+
+    @Test("standalone DSV4 template separates system preface from first user turn")
+    func standaloneDSV4TemplateSeparatesSystemFromFirstUser() throws {
+        let source = try repositoryFile("Libraries/MLXLMCommon/ChatTemplates/DSV4Minimal.jinja")
+        let template = try Template(source)
+        let rendered = try template.renderDSV4(systemThenUserContext())
+
+        assertSystemSeparatedFromUser(rendered)
+    }
+
+    @Test("Swift DSV4 encoder separates system preface from first user turn")
+    func swiftDSV4EncoderSeparatesSystemFromFirstUser() {
+        let encoder = DeepseekV4ChatEncoder()
+        let rendered = encoder.encode(
+            messages: [
+                .init(role: .system, content: "You are concise."),
+                .init(role: .user, content: "Remember sapphire-42."),
+            ],
+            thinkingMode: .chat)
+
+        assertSystemSeparatedFromUser(rendered)
+    }
+
     private func noSystemToolProbeContext() -> [String: any Sendable] {
         [
             "messages": [
@@ -132,6 +162,17 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         ]
     }
 
+    private func systemThenUserContext() -> [String: any Sendable] {
+        [
+            "messages": [
+                ["role": "system", "content": "You are concise."],
+                ["role": "user", "content": "Remember sapphire-42."],
+            ],
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+        ]
+    }
+
     private func assertNoSystemToolsRenderBetweenUserAndAssistant(_ rendered: String) {
         #expect(rendered.contains("## Tools"))
         #expect(rendered.contains("osaurus_no_system_probe"))
@@ -145,6 +186,13 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         } else {
             Issue.record("DSV4 no-system tool probe is missing expected turn markers")
         }
+    }
+
+    private func assertSystemSeparatedFromUser(_ rendered: String) {
+        let separated = "You are concise.\n\(DeepseekV4Tokens.user)Remember sapphire-42."
+        let glued = "You are concise.\(DeepseekV4Tokens.user)Remember sapphire-42."
+        #expect(rendered.contains(separated))
+        #expect(!rendered.contains(glued))
     }
 
     @Test("Swift Jinja tojson accepts Python separators kwarg used by Kimi tools")

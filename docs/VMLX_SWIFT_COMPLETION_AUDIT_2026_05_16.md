@@ -245,6 +245,20 @@ Current pushed branch state:
   contains 30 local bundles from `~/models` after excluding Kimi. Older K-lane
   rows that this audit calls historical remain historical until re-run under
   the current matrix; they are not promoted by stale evidence.
+- 2026-05-17 DSV4 current non-Kimi follow-up:
+  `docs/local/live-model-matrix/20260517T_dsv4_current_non_kimi_scope/`
+  records the live root cause and partial fix state. The pre-fix prompt debug
+  row proved DSV4 system text was glued directly to `<｜User｜>`, and the live
+  output drifted into `sappberry-42`/`sappium-42`. The fix adds a newline
+  separator in `DSV4Minimal.jinja`, the compiled fallback, and
+  `DeepseekV4ChatEncoder`; the focused red/green test log passes 13/13. Post-fix
+  JANGTQ2 cache OFF/ON and JANGTQ-K cache ON 3-turn chat rows are coherent with
+  `rep=1.0`, stop normally, emit tok/s, and leak no raw reasoning. The JANGTQ2
+  `BENCH_PROD` row passes 7/7 using bundle defaults
+  (`temp=1.000 topP=1.000 topK=0 rep=nil`) and records
+  `PROD_CACHE_STATS`. This is not a production-clearance claim: the row still
+  reports about 61.5 GiB peak RSS, `pagedIncompatible=true`, no generic paged
+  hits, and open long-context/vector/speed/API gates.
 - 2026-05-17 Gemma4 multi-turn reasoning follow-up:
   `docs/local/live-model-matrix/20260517T_reasoning_turn_matrix_harness/`
   adds `BENCH_REASONING_TURN_MATRIX=1` and passes Gemma4 through one loaded

@@ -6060,6 +6060,8 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
     let longRepeat = Int(env["BENCH_DSV4_LONG_REPEAT"] ?? "220") ?? 220
     let longMaxNew = Int(env["BENCH_DSV4_LONG_MAX_TOKENS"] ?? "\(max(96, maxNew))")
         ?? max(96, maxNew)
+    let chatMaxNew = Int(env["BENCH_DSV4_CHAT_MAX_TOKENS"] ?? "\(max(160, maxNew))")
+        ?? max(160, maxNew)
     let reasoningMaxNew = Int(env["BENCH_DSV4_REASONING_MAX_TOKENS"] ?? "384")
         ?? 384
     let dsv4Temperature = Float(env["BENCH_DSV4_TEMP"] ?? "0") ?? 0
@@ -6070,6 +6072,13 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
         Float(env["BENCH_DSV4_MAX_REPETITION_PENALTY"] ?? "1.05") ?? 1.05
     let dsv4RepetitionContext =
         Int(env["BENCH_DSV4_REPETITION_CONTEXT"] ?? "64") ?? 64
+    let useCacheCoordinator =
+        (env["BENCH_DSV4_CACHE"] ?? "on").lowercased() != "off"
+    let launchKey = env["BENCH_DSV4_KEY"] ?? "sapphire-42"
+    let systemText = env["BENCH_DSV4_SYSTEM"] ??
+        "You are a concise assistant. Answer directly."
+    let includeSystem =
+        (env["BENCH_DSV4_NO_SYSTEM"] ?? "0") != "1"
 
     do {
     print("\n=== BENCH_DSV4_COHERENCE: production chat coherence gate ===")
@@ -6081,17 +6090,26 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
     print("Model: \(type(of: context.model))")
     print("Reasoning stamp: \(context.configuration.reasoningParserName ?? "nil")")
 
-    var cfg = CacheCoordinatorConfig()
-    cfg.usePagedCache = true
-    cfg.enableDiskCache = false
-    cfg.pagedBlockSize = 256
-    cfg.maxCacheBlocks = 1024
-    cfg.modelKey = modelDir.lastPathComponent
-    let coordinator = CacheCoordinator(config: cfg)
-
     nonisolated(unsafe) let ctx = context
-    let engine = BatchEngine(
-        context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
+    let engine: BatchEngine
+    let coordinator: CacheCoordinator?
+    if useCacheCoordinator {
+        var cfg = CacheCoordinatorConfig()
+        cfg.usePagedCache = true
+        cfg.enableDiskCache = false
+        cfg.pagedBlockSize = 256
+        cfg.maxCacheBlocks = 1024
+        cfg.modelKey = modelDir.lastPathComponent
+        let coord = CacheCoordinator(config: cfg)
+        coordinator = coord
+        engine = BatchEngine(
+            context: ctx, maxBatchSize: 1, cacheCoordinator: coord)
+        print("DSV4 cache coordinator: on")
+    } else {
+        coordinator = nil
+        engine = BatchEngine(context: ctx, maxBatchSize: 1)
+        print("DSV4 cache coordinator: off")
+    }
 
     func shouldRun(_ row: String) -> Bool {
         rowFilter == "all" || rowFilter == row
@@ -6146,6 +6164,12 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
         let lm = try await ctx.processor.prepare(input: ui)
         let promptTokens = lm.text.tokens.size
         print("  \(label): prepared prompt=\(promptTokens) maxNew=\(maxTokens)")
+        if (env["BENCH_DSV4_DEBUG_PROMPT"] ?? "0") == "1" {
+            let ids = lm.text.tokens.reshaped(-1).asArray(Int32.self).map { Int($0) }
+            let tail = ctx.tokenizer.decode(
+                tokenIds: Array(ids.suffix(256)), skipSpecialTokens: false)
+            print("  \(label): prompt tail = \(tail.debugDescription)")
+        }
         nonisolated(unsafe) let sendable = lm
 
         let requestedPenalty =
@@ -6230,10 +6254,10 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
     // 1. Production multi-turn chat with thinking disabled.
     if shouldRun("chat") {
         print("\n[DSV4 chat multi-turn, thinking off]")
-        var chat: [Chat.Message] = [
-            .system("You are a concise assistant. Answer directly."),
-            .user("Remember this exact launch key: sapphire-42. Reply with only: saved.")
-        ]
+        var chat: [Chat.Message] = includeSystem
+            ? [.system(systemText)]
+            : []
+        chat.append(.user("Remember this exact launch key: \(launchKey). Reply with only: saved."))
         let t1 = try await ask(
             label: "turn1-save", chat: chat, enableThinking: false,
             maxTokens: max(48, min(maxNew, 96)))
@@ -6242,19 +6266,32 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
         if t1.info?.unclosedReasoning == true {
             try fail(22, "turn1 ended inside reasoning despite enable_thinking=false")
         }
+        if stoppedByLength(t1) {
+            try fail(25, "turn1 stopped by length instead of EOS/stop")
+        }
         chat.append(.assistant(t1.visible))
 
-        chat.append(.user("What exact launch key did I ask you to remember?"))
+        chat.append(.user("What exact launch key did I ask you to remember? Answer with only the key."))
         let t2 = try await ask(
             label: "turn2-recall", chat: chat, enableThinking: false,
-            maxTokens: max(64, min(maxNew, 128)))
+            maxTokens: chatMaxNew)
         printBlock("DSV4_T2_TEXT", t2.text)
         if !t2.reasoning.isEmpty { printBlock("DSV4_T2_REASONING", t2.reasoning) }
         if t2.info?.unclosedReasoning == true {
             try fail(23, "turn2 ended inside reasoning despite enable_thinking=false")
         }
-        if !containsAll(t2.visible, ["sapphire", "42"]) {
-            try fail(20, "turn2 did not recall sapphire-42")
+        if stoppedByLength(t2) {
+            try fail(26, "turn2 stopped by length instead of EOS/stop")
+        }
+        let t2Visible = t2.visible.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t2Lower = t2Visible.lowercased()
+        if !t2Lower.contains(launchKey.lowercased()) {
+            try fail(20, "turn2 did not recall exact \(launchKey)")
+        }
+        if t2Lower.contains("sappberry") || t2Visible.count > 80 {
+            try fail(
+                28,
+                "turn2 did not follow exact-only recall; chars=\(t2Visible.count)")
         }
         chat.append(.assistant(t2.visible))
 
@@ -6266,6 +6303,9 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
         if !t3.reasoning.isEmpty { printBlock("DSV4_T3_REASONING", t3.reasoning) }
         if t3.info?.unclosedReasoning == true {
             try fail(24, "turn3 ended inside reasoning despite enable_thinking=false")
+        }
+        if stoppedByLength(t3) {
+            try fail(27, "turn3 stopped by length instead of EOS/stop")
         }
         if !containsAll(t3.visible, ["yes"]) && !t3.visible.lowercased().contains("blue") {
             try fail(21, "turn3 did not coherently answer the sapphire/blue follow-up")
@@ -6368,6 +6408,19 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
                 40,
                 "long-context answer missed CERULEAN RIVER / OSLO; promptTokens=\(long.promptTokens)")
         }
+    }
+
+    if let snapshot = coordinator?.snapshotStats() {
+        let paged = snapshot.pagedStats.map {
+            "hits=\($0.cacheHits),misses=\($0.cacheMisses),allocated=\($0.allocatedBlocks),free=\($0.freeBlocks),evictions=\($0.evictions)"
+        } ?? "disabled"
+        let disk = snapshot.diskStats.map {
+            "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),maxBytes=\($0.maxSizeBytes)"
+        } ?? "disabled"
+        let ssm = snapshot.ssmStats
+        print(
+            "DSV4_CACHE_STATS hybrid=\(snapshot.isHybrid) pagedIncompatible=\(snapshot.isPagedIncompatible) paged{\(paged)} disk{\(disk)} ssm{hits=\(ssm.hits),misses=\(ssm.misses),reDerives=\(ssm.reDerives)}"
+        )
     }
 
     await engine.shutdown()

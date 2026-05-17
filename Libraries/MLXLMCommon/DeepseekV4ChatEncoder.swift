@@ -175,6 +175,9 @@ public struct DeepseekV4ChatEncoder: Sendable {
             if let rf = msg.responseFormat {
                 out += "\n\n" + Self.renderResponseFormat(rf)
             }
+            if index + 1 < messages.count {
+                out += "\n"
+            }
 
         case .developer:
             var s = DeepseekV4Tokens.user
