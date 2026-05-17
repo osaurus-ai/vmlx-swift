@@ -35,6 +35,20 @@ bundle sampling defaults, and passes both streaming surfaces:
 - Prompt topology remains media-aware: 96 prompt tokens, 63 audio placeholders,
   media token ids `[18, 27]`, 11 media tokens after the 64-token cache boundary.
 
+2026-05-17 current checkout spot-check:
+`docs/local/live-model-matrix/20260517T130344Z_omni_current_audio_grounding_probe/omni_audio_grounding_probe.log`
+was run from the release-built `OmniAudioLatencyBench` with
+`BENCH_MAX_TOKENS=32`, `BENCH_AUDIO_REPEATS=2`,
+`BENCH_OMNI_AUDIO_PATH=both`, and bundle sampling defaults. It reloaded the
+JANGTQ4 Omni bundle as `NemotronHOmni`, pre-encoded Parakeet into 63 audio
+tokens in 45.9 ms, and produced grounded audio descriptions on BatchEngine and
+TokenIterator for both raw PCM and pre-encoded audio. The same run recorded
+media-aware prompt topology with 102 prompt tokens, 63 audio placeholders,
+media ids `[18, 27]`, and 11 media placeholders after the 64-token cache
+boundary. First-delta timings were 223-234 ms for BatchEngine raw PCM, 188-210
+ms for BatchEngine pre-encoded Parakeet, 201-205 ms for TokenIterator raw PCM,
+and 171-172 ms for TokenIterator pre-encoded Parakeet.
+
 ## Command
 
 ```sh
