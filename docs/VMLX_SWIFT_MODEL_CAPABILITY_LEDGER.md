@@ -110,7 +110,7 @@ weights.
 | `Osaurus/ZAYA1-VL-8B-MXFP4` | 7.1G | `zaya1_vl` | no | tokenizer | `PASS` | `PASS` |
 | `Tencent/Hy3-preview` | 557G | `hy_v3` | no | file | `PASS` | `TODO` |
 | `dealign.ai/Gemma-4-26B-A4B-it-JANG_4M-CRACK` | 15G | `gemma4` | no | file | `PASS` | `PARTIAL` |
-| `dealign.ai/Ling-2.6-flash-JANGTQ2-CRACK` | 29G | `bailing_hybrid` | yes | file | `PASS` | `TODO` |
+| `dealign.ai/Ling-2.6-flash-JANGTQ2-CRACK` | 29G | `bailing_hybrid` | yes | file | `PASS` | `PASS` |
 | `dealign.ai/Ling-2.6-flash-MXFP4-CRACK` | 63G | `bailing_hybrid` | no | file | `PASS` | `TODO` |
 | `dealign.ai/MiniMax-M2.7-JANGTQ_K-CRACK` | 74G | `minimax_m2` | yes | file | `PASS` | `TODO` |
 | `dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK` | 12G | `nemotron_h` | yes | file | `PASS` | `TODO` |
@@ -254,8 +254,15 @@ weights.
   layers use `ArraysCache`; BatchEngine has `BatchArraysCache`.
 - Template/reasoning/tools: template smoke passes; Bailing/Ling template context
   maps thinking controls; tool parser maps to GLM/deepseek-style format.
-- Current status: no live multi-turn row in this snapshot. Must run Ling-specific
-  loop probe and SSM/cache rows before production-ready.
+- Current status: `docs/local/live-model-matrix/20260517T170008Z_release_turnmatrix_ling_jangtq2/REPORT.md`
+  passes all runnable rows for the JANGTQ2 CRACK bundle: config/template, MTP
+  metadata, production defaults cache OFF/ON, BatchEngine single/chat, disk
+  restore, B=2 concurrent, B=2 per-slot sampler, and TurboQuant-KV B=2. Bundle
+  defaults resolve to `temp=0.600`, `topP=1.000`, `topK=0`, `minP=0.000`,
+  `rep=nil`; release decode telemetry is about 37-39 tok/s. Cache ON records
+  disk L2 and SSM hits with `pagedIncompatible=true`; generic paged prefix hit
+  is `N-A`.
+- Boundary: `Ling-2.6-flash-MXFP4-CRACK` still needs its own live turnmatrix.
 
 ### Gemma 4
 

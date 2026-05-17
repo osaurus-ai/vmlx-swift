@@ -551,6 +551,34 @@ Harness fix from this row:
   monopolize the actor executor, so the release gate now drains streams while
   observing both live `activeCount` and the engine's high-water mark.
 
+## Ling/Bailing JANGTQ2 Release Matrix - 2026-05-17
+
+Fresh release artifact:
+
+```text
+docs/local/live-model-matrix/20260517T170008Z_release_turnmatrix_ling_jangtq2/
+```
+
+`Ling-2.6-flash-JANGTQ2-CRACK` is green for the current text turnmatrix:
+
+- config/template smoke: PASS;
+- MTP metadata gate: PASS, while native MTP stays inactive/explicit unless a
+  verified runtime profile exists;
+- `BENCH_PROD` cache OFF and cache ON: 7/7 each, coherent visible output,
+  normal stop reasons, no reasoning marker leak, and no hidden sampler guard;
+- bundle-default sampling resolved to `temp=0.600`, `topP=1.000`, `topK=0`,
+  `minP=0.000`, `rep=nil`, `seed=0`;
+- release decode telemetry is about 37-39 tok/s on production rows;
+- cache ON records `disk{hits=1,stores=21}` and `ssm{hits=1,reDerives=0}`;
+- generic paged prefix hit row is `N-A` because Ling/Bailing is
+  paged-incompatible and uses disk-backed restore;
+- BatchEngine single/chat/disk-restore/B=2/per-slot/TurboQuant B=2 all pass.
+  The TurboQuant B=2 row preserves the plain slot exactly against the B=2
+  plain/plain reference and records `compatibilitySplits=9`.
+
+Boundary: this is the JANGTQ2 CRACK bundle. The larger MXFP4 Ling bundle still
+needs its own live turnmatrix before it is promoted.
+
 ## Gemma 4 Text Release Matrix - 2026-05-17
 
 Clean release artifact:
