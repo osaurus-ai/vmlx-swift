@@ -70,6 +70,22 @@ enum OmniAudioLatencyRunner {
             "load_ms": rounded(loadMs),
             "rss_mib": rounded(currentRSSMiB()),
         ])
+        let samplingProbe = generationParameters(
+            context: context, maxNewTokens: maxNewTokens)
+        let repetitionPenalty: Any = samplingProbe.repetitionPenalty.map {
+            rounded(Double($0))
+        } ?? NSNull()
+        printJSON([
+            "event": "sampling",
+            "model": modelDir.lastPathComponent,
+            "source": "generation_config",
+            "max_tokens": samplingProbe.maxTokens ?? -1,
+            "temperature": rounded(Double(samplingProbe.temperature), places: 3),
+            "top_p": rounded(Double(samplingProbe.topP), places: 3),
+            "top_k": samplingProbe.topK,
+            "min_p": rounded(Double(samplingProbe.minP), places: 3),
+            "repetition_penalty": repetitionPenalty,
+        ])
 
         let fileDecodeStart = CFAbsoluteTimeGetCurrent()
         let pcm = try nemotronOmniLoadAudioFile(audioURL, targetSampleRate: 16_000)
@@ -237,7 +253,8 @@ enum OmniAudioLatencyRunner {
         let lmInput = try await context.processor.prepare(input: input)
         let prepareMs = elapsedMs(since: prepareStart)
         let promptDiagnostics = promptDiagnostics(for: lmInput)
-        let params = generationParameters(maxNewTokens: maxNewTokens)
+        let params = generationParameters(
+            context: context, maxNewTokens: maxNewTokens)
 
         let iteratorStart = CFAbsoluteTimeGetCurrent()
         let iterator = try TokenIterator(
@@ -295,7 +312,8 @@ enum OmniAudioLatencyRunner {
         let lmInput = try await context.processor.prepare(input: input)
         let prepareMs = elapsedMs(since: prepareStart)
         let promptDiagnostics = promptDiagnostics(for: lmInput)
-        let params = generationParameters(maxNewTokens: maxNewTokens)
+        let params = generationParameters(
+            context: context, maxNewTokens: maxNewTokens)
 
         let streamStart = CFAbsoluteTimeGetCurrent()
         nonisolated(unsafe) let sendableInput = lmInput
@@ -404,9 +422,13 @@ enum OmniAudioLatencyRunner {
         return userInput
     }
 
-    private static func generationParameters(maxNewTokens: Int) -> GenerateParameters {
-        var params = GenerateParameters(maxTokens: maxNewTokens)
-        params.temperature = 0.0
+    private static func generationParameters(
+        context: ModelContext,
+        maxNewTokens: Int
+    ) -> GenerateParameters {
+        var params = GenerateParameters(
+            generationConfig: context.configuration.generationDefaults)
+        params.maxTokens = maxNewTokens
         params.prefillStepSize = 512
         return params
     }
@@ -500,8 +522,13 @@ enum OmniAudioLatencyRunner {
     }
 
     private static func rounded(_ value: Double) -> Double {
+        rounded(value, places: 1)
+    }
+
+    private static func rounded(_ value: Double, places: Int) -> Double {
         guard value.isFinite else { return value }
-        return (value * 10).rounded() / 10
+        let scale = pow(10.0, Double(max(0, places)))
+        return (value * scale).rounded() / scale
     }
 
     private static func currentRSSMiB() -> Double {

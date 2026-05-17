@@ -1,5 +1,6 @@
 // Copyright © 2026 Osaurus AI. All rights reserved.
 
+import Foundation
 import MLX
 import MLXLMCommon
 import MLXVLM
@@ -186,5 +187,17 @@ struct NemotronHOmniPreEncodedAudioTests {
             let conv1dOut = remapParakeetWeights(conv1d)
             #expect(conv1dOut["layers.0.conv.pointwise_conv1.weight"]?.shape == [2048, 1, 1024])
         }
+    }
+
+    @Test("audio latency bench uses bundle generation defaults")
+    func audioLatencyBenchUsesGenerationConfig() throws {
+        let path = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: "tools/OmniAudioLatencyBench/main.swift")
+        let source = try String(contentsOf: path)
+        #expect(source.contains(
+            "GenerateParameters(\n            generationConfig: context.configuration.generationDefaults)"))
+        #expect(!source.contains("params.temperature = 0.0"))
+        #expect(source.contains("\"event\": \"sampling\""))
+        #expect(source.contains("rounded(Double(samplingProbe.topP), places: 3)"))
     }
 }

@@ -11,6 +11,13 @@ top-level `vmlx-swift` package. The measurements below are the original
 standalone Swift LM evidence; current release-built `vmlx-swift` artifacts are
 listed in `docs/VMLX_ACTIVE_MODEL_PRODUCTION_SCOPE_2026_05_17.md`.
 
+2026-05-17 current-source correction: the bench now constructs
+`GenerateParameters` from `context.configuration.generationDefaults` and prints
+the resolved sampling row. The current JANGTQ artifact shows
+`temperature=0.600`, `top_p=0.950`, `top_k=0`, `min_p=0.000`, and
+`repetition_penalty=1.000`; no greedy temperature override is applied unless a
+caller adds one explicitly outside this bench.
+
 ## Command
 
 ```sh

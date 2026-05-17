@@ -268,6 +268,10 @@ Fresh local JANGTQ live voice artifacts:
 docs/local/live-model-matrix/20260517T_omni_audio_latency_jangtq.jsonl
 docs/local/live-model-matrix/20260517T_omni_audio_latency_jangtq_prompt48.jsonl
 docs/local/live-model-matrix/20260517T_omni_audio_chunk_stability_jangtq.jsonl
+docs/local/live-model-matrix/20260517T_omni_live_voice_current/omni_audio_latency_both_paths_genconfig_precise.log
+docs/local/live-model-matrix/20260517T_omni_live_voice_current/omni_audio_latency_both_paths_explicit_prompt.log
+docs/local/live-model-matrix/20260517T_omni_live_voice_current/omni_audio_chunk_stability.log
+docs/local/live-model-matrix/20260517T_omni_live_voice_current/omni_full_bench_48_rebuilt_runbench.log
 ```
 
 Latency bench findings:
@@ -275,10 +279,15 @@ Latency bench findings:
 - the fixture decodes to 80,620 samples at 16 kHz, about 5.04 seconds of audio;
 - Parakeet pre-encoding produced 63 audio tokens with hidden width 2688 in
   about 44-48 ms;
+- the current release-built latency bench resolves sampling from the bundle's
+  `generation_config.json`, not a hardcoded greedy fallback:
+  `temperature=0.600`, `top_p=0.950`, `top_k=0`, `min_p=0.000`,
+  `repetition_penalty=1.000`;
 - raw and pre-encoded BatchEngine paths both stream; pre-encoded first-delta
-  was about 173 ms on the 48-token prompt, versus about 226 ms for raw audio;
+  is about 172-186 ms on the explicit/current prompts, versus about 236 ms for
+  the current raw-audio default prompt;
 - raw and pre-encoded TokenIterator paths also stream; pre-encoded first-delta
-  was about 165 ms on the 48-token prompt, versus about 196 ms for raw audio;
+  is about 156-163 ms, versus about 186-195 ms for raw audio;
 - the cache directory contains safetensors entries, `cache_index.db`, and
   `ssm_companion`, proving the disk/SSM cache side is being exercised.
 
@@ -329,6 +338,20 @@ Result at `BENCH_MAX_TOKENS=192`, `BENCH_OMNI_RANDOM_SEED=20260517`,
   BatchEngine audio row, with explicit repeated-phrase diagnostics;
 - this improves the evidence path but still does not make Omni media
   production-clear at long budgets.
+
+Current 48-token full Omni matrix after rebuilding `RunBench`:
+
+- 17/18 rows pass on
+  `Nemotron-Omni-Nano-JANGTQ-CRACK` with bundle generation defaults;
+- passing rows include text single-turn, text multi-turn, image single-turn,
+  image reasoning-off direct, video encoder, audio encoder, video LMInput,
+  audio LMInput, reasoning OFF, reasoning toggle, mixed image+audio,
+  media-salt isolation, hybrid SSM parity, BatchEngine text B=1/B=2,
+  BatchEngine image B=1, and BatchEngine audio B=1;
+- the remaining failure is `image multi-turn x2` with default thinking enabled,
+  where the output loops on decoded image-placeholder text (`br br`). This is
+  not an audio/Parakeet failure and must remain visible as a non-audio Omni
+  media/runtime blocker. Do not hide it with sampler clamps.
 
 ## Required Proof Per Active Bundle
 

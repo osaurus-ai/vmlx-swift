@@ -11,6 +11,13 @@ top-level `vmlx-swift` package. The measurements below are the original
 standalone Swift LM evidence; current release-built `vmlx-swift` artifacts are
 listed in `docs/VMLX_ACTIVE_MODEL_PRODUCTION_SCOPE_2026_05_17.md`.
 
+2026-05-17 current-source rerun:
+`docs/local/live-model-matrix/20260517T_omni_live_voice_current/omni_audio_chunk_stability.log`
+keeps the same contract. Full retained-audio Parakeet encode produced 63
+tokens in about 48 ms, every prefix/full comparison still had
+`stable_tokens_default=0`, and independently encoded chunks remain unsafe to
+concatenate into the model context.
+
 ## Command
 
 ```sh

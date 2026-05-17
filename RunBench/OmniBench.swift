@@ -8,9 +8,9 @@
 //   3. Image single-turn             — RADIO ViT + mlp1 + splice via prepare()
 //   4. Image multi-turn (×2)         — image cache + MediaSalt
 //   5. Video encoder smoke           — extractImageEmbeds(video:true) shape + finiteness
-//   6. Audio encoder smoke           — extractAudioEmbeds(waveform:) shape + finiteness
-//      (LMInput has no audio field today — full splice flow is documented in
-//      OMNI-OSAURUS-HOOKUP.md §3.1; here we validate the encoder runs on real weights)
+//   6. Audio rows                    — extractAudioEmbeds(waveform:) shape + finiteness,
+//                                      plus UserInput.audios -> LMInput -> sound splice
+//                                      through TokenIterator on real weights
 //   7. Reasoning OFF (enable_thinking=false) parity
 //
 // Each row is independent — failures are caught and reported, the bench
