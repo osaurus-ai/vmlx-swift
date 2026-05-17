@@ -2226,14 +2226,30 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
 
     print("\n=== BENCH_GROWING_CHAT_CACHE — \(modelName) ===")
     print("Cache dir: \(cacheDir.path)")
+    let nativeMTPDepth = env["BENCH_GROWING_NATIVE_MTP_DEPTH"].flatMap(Int.init)
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader())
+    let context: ModelContext
+    if nativeMTPDepth != nil {
+        let loaded = try await MLXLMCommon.loadModel(
+            from: modelDir,
+            using: #huggingFaceTokenizerLoader(),
+            loadConfiguration: LoadConfiguration(
+                jangPress: .disabled,
+                maxResidentBytes: .unlimited,
+                memoryLimit: .unlimited,
+                useMmapSafetensors: true,
+                nativeMTP: true))
+        context = loaded.0
+    } else {
+        context = try await MLXLMCommon.loadModel(
+            from: modelDir, using: #huggingFaceTokenizerLoader())
+    }
     print(String(format: "Load: %.2fs  Model: %@",
         CFAbsoluteTimeGetCurrent() - loadStart,
         String(describing: type(of: context.model))))
     print("Tool format: \(context.configuration.toolCallFormat.map { "\($0)" } ?? "json")")
     print("Reasoning stamp: \(context.configuration.reasoningParserName ?? "nil")")
+    print("Native MTP depth: \(nativeMTPDepth.map(String.init) ?? "off")")
 
     let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
         usePagedCache: true,
@@ -2246,8 +2262,34 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         modelKey: modelName))
 
     let budget = max(maxNew, 48)
-    let params = GenerateParameters(
-        maxTokens: budget, temperature: 0, prefillStepSize: 512)
+    var params: GenerateParameters
+    if env["BENCH_GROWING_BUNDLE_DEFAULTS"] == "1" {
+        let fallback = GenerateParameters(
+            maxTokens: budget,
+            randomSeed: env["BENCH_GROWING_SEED"].flatMap(UInt64.init),
+            prefillStepSize: 512)
+        params = GenerateParameters(
+            generationConfig: context.configuration.generationDefaults,
+            fallback: fallback)
+        params.maxTokens = budget
+        params.randomSeed = env["BENCH_GROWING_SEED"].flatMap(UInt64.init)
+        params.prefillStepSize = 512
+    } else {
+        params = GenerateParameters(
+            maxTokens: budget, temperature: 0, prefillStepSize: 512)
+    }
+    if let nativeMTPDepth {
+        params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
+    }
+    print(String(format:
+        "Sampling: mode=%@ maxTokens=%d temp=%.3f topP=%.3f topK=%d minP=%.3f rep=%@",
+        env["BENCH_GROWING_BUNDLE_DEFAULTS"] == "1" ? "bundle-defaults" : "explicit-greedy",
+        params.maxTokens ?? -1,
+        Double(params.temperature),
+        Double(params.topP),
+        params.topK,
+        Double(params.minP),
+        params.repetitionPenalty.map { String(format: "%.3f", Double($0)) } ?? "nil"))
     nonisolated(unsafe) let ctx = context
     let engine = BatchEngine(
         context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
@@ -2293,20 +2335,38 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         cachePrefixTokenCounts: cachePrefixTokenCounts)
     print("  Cache history-boundary counts: \(cachePrefixTokenCounts)")
 
-    func run(label: String, input: sending LMInput) async
+    func run(label: String, input: sending LMInput) async throws
         -> (tokens: [Int], info: GenerateCompletionInfo?, wall: Double)
     {
         let promptSize = input.text.tokens.size
         let t0 = CFAbsoluteTimeGetCurrent()
-        let (_, stream) = await engine.submit(input: input, parameters: params)
         var out: [Int] = []
         var info: GenerateCompletionInfo?
-        for await event in stream {
-            switch event {
-            case .token(let id):
-                out.append(id)
-            case .info(let i):
-                info = i
+
+        if nativeMTPDepth != nil {
+            let (stream, task) = try generateTokensTask(
+                input: input,
+                parameters: params,
+                context: ctx,
+                cacheCoordinator: coordinator)
+            for await event in stream {
+                switch event {
+                case .token(let id):
+                    out.append(id)
+                case .info(let i):
+                    info = i
+                }
+            }
+            await task.value
+        } else {
+            let (_, stream) = await engine.submit(input: input, parameters: params)
+            for await event in stream {
+                switch event {
+                case .token(let id):
+                    out.append(id)
+                case .info(let i):
+                    info = i
+                }
             }
         }
         let wall = CFAbsoluteTimeGetCurrent() - t0
@@ -2326,7 +2386,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     }
 
     nonisolated(unsafe) let t1Send = turn1
-    let r1 = await run(label: "Turn 1 cold", input: t1Send)
+    let r1 = try await run(label: "Turn 1 cold", input: t1Send)
     guard let info1 = r1.info else {
         throw NSError(domain: "BENCH_GROWING_CHAT_CACHE", code: 1,
             userInfo: [NSLocalizedDescriptionKey: "turn 1 emitted no completion info"])
@@ -2359,6 +2419,19 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         case .miss:
             writeDiagnostic("  \(label): MISS tokens=\(tokens.count)")
         }
+    }
+
+    func printCoordinatorStats(_ label: String) {
+        let snapshot = coordinator.snapshotStats()
+        let paged = snapshot.pagedStats.map {
+            "hits=\($0.cacheHits),misses=\($0.cacheMisses),allocated=\($0.allocatedBlocks),free=\($0.freeBlocks),evictions=\($0.evictions)"
+        } ?? "disabled"
+        let disk = snapshot.diskStats.map {
+            "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),maxBytes=\($0.maxSizeBytes)"
+        } ?? "disabled"
+        let ssm = snapshot.ssmStats
+        print(
+            "  \(label) cache stats: hybrid=\(snapshot.isHybrid) pagedIncompatible=\(snapshot.isPagedIncompatible) paged{\(paged)} disk{\(disk)} ssm{hits=\(ssm.hits),misses=\(ssm.misses),reDerives=\(ssm.reDerives)}")
     }
 
     let turn1Text = context.tokenizer.decode(tokenIds: r1.tokens)
@@ -2434,6 +2507,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     describeProbe("Post-answer salted probe", tokens: boundaryTokens + [-1], mediaSalt: turn2Salt)
     describeProbe("Prompt-boundary nil-salt probe", tokens: promptTokens + [-1], mediaSalt: nil)
     describeProbe("Post-answer nil-salt probe", tokens: boundaryTokens + [-1], mediaSalt: nil)
+    printCoordinatorStats("Before turn 2")
     let probe = coordinator.fetch(tokens: turn2Tokens, mediaSalt: turn2Salt)
     switch probe {
     case .hit(let matched, let remaining, let detail, _, _, let diskArrays):
@@ -2475,7 +2549,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     }
 
     nonisolated(unsafe) let t2Send = turn2
-    let r2 = await run(label: "Turn 2 growing", input: t2Send)
+    let r2 = try await run(label: "Turn 2 growing", input: t2Send)
     guard let info2 = r2.info, info2.stopReason == .stop else {
         throw NSError(domain: "BENCH_GROWING_CHAT_CACHE", code: 6,
             userInfo: [NSLocalizedDescriptionKey:
@@ -2510,6 +2584,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         ? (r2.info?.promptTime ?? 0) / (r1.info?.promptTime ?? 1)
         : 1.0
     print(String(format: "  promptTime ratio turn2/turn1 = %.2f", ratio))
+    printCoordinatorStats("After turn 2")
     await engine.shutdown()
     print("=== BENCH_GROWING_CHAT_CACHE: passed ===")
 }

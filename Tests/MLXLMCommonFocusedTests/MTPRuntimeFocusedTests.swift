@@ -555,6 +555,8 @@ struct MTPRuntimeFocusedTests {
         #expect(source.contains("\"chunk_commit\""))
         #expect(source.contains("\"chunk_replay\""))
         #expect(source.contains("private static func requiresChunkTokenReplayRepair"))
+        #expect(source.contains("speculativeSampler: SpeculativeSamplingController"))
+        #expect(source.contains("!speculativeSampler.isGreedy && cache.contains(where: { $0 is MambaCache })"))
         #expect(source.contains("case \"sequential\", \"sequential_repair\", \"repair\":"))
         #expect(source.contains("return cache.contains { $0 is MambaCache }"))
     }

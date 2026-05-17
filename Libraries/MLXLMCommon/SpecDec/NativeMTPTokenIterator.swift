@@ -551,7 +551,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             throw NativeMTPRuntimeError.verifierProducedNoTokens
         }
 
-        if Self.requiresSequentialVerifierRepair(cache) {
+        if Self.requiresSequentialVerifierRepair(cache, speculativeSampler: speculativeSampler) {
             try verifyCycleSequential(primary: primary)
             return
         }
@@ -564,7 +564,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let replayChunkCommit = Self.requiresChunkTokenReplayRepair(cache)
         let lazyChunkRepair = Self.requiresLazyChunkRepair(cache)
         let canCommitVerifierCache = Self.canCommitVerifierCache(cache)
-        let requiresSequentialRepair = Self.requiresSequentialVerifierRepair(cache)
+        let requiresSequentialRepair = Self.requiresSequentialVerifierRepair(
+            cache, speculativeSampler: speculativeSampler)
         let checkpointStart = Date.timeIntervalSinceReferenceDate
         let checkpoint =
             (canCommitVerifierCache && !requiresSequentialRepair && !replayChunkCommit
@@ -1144,8 +1145,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
     }
 
-    private static func requiresSequentialVerifierRepair(_ cache: [KVCache]) -> Bool {
+    private static func requiresSequentialVerifierRepair(
+        _ cache: [KVCache],
+        speculativeSampler: SpeculativeSamplingController
+    ) -> Bool {
         if ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_FORCE_SEQUENTIAL_REPAIR"] == "1" {
+            return true
+        }
+        if !speculativeSampler.isGreedy && cache.contains(where: { $0 is MambaCache }) {
             return true
         }
         switch nativeMTPHybridVerifySetting()?.lowercased() {

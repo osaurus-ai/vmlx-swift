@@ -26,9 +26,11 @@ Local artifact roots:
   keeping an all-or-nothing verifier cache. The default correctness path is
   sequential repair: advance the backbone through the primary and accepted
   drafts one token at a time, stop before rejected draft state, and only draft
-  again from the committed state. The speed path is opt-in
-  `VMLINUX_NATIVE_MTP_HYBRID_VERIFY=chunk_commit` and must keep per-prefix cache
-  commit semantics explicit in every gate.
+  again from the committed state. The speed path remains opt-in
+  `VMLINUX_NATIVE_MTP_HYBRID_VERIFY=chunk_commit` for greedy rows, but
+  non-greedy exact-pq over hybrid SSM now always routes to `sequential_repair`
+  because the chunk verifier produced incoherent residual-correction output on
+  `Qwen3.6-35B-A3B-MXFP4-MTP`.
 - `BatchEngine.submit` intentionally rejects raw batched native MTP. VL+MTP proof
   must use `BatchEngine.generate` or `Evaluate.generate`, which route through the
   exclusive solo native-MTP iterator. Osaurus should wire native MTP as an
@@ -93,6 +95,20 @@ Each fresh row used bundle defaults
 `chunk_commit`, L2 disk cache, and SSM companion state. Every row emitted
 visible answers, normal stops, no loop/leak, a disk hit, and an SSM hit.
 
+Growing-chat exact-pq rerun after the hybrid verifier policy fix:
+
+```text
+docs/local/qwen36-mtp-current/20260517T131024Z-35b-mxfp4-growing-chat-mtp-d3-exact-postfix/growing_chat_mtp_d3_bundle_defaults_postfix.log
+docs/local/qwen36-mtp-current/20260517T131050Z-mxfp-growing-chat-mtp-d3-exact-postfix/
+```
+
+Those rows use bundle defaults plus `BENCH_GROWING_NATIVE_MTP_DEPTH=3` and even
+with `VMLINUX_NATIVE_MTP_HYBRID_VERIFY=chunk_commit` they report
+`verifierMode=sequential_repair`. All four MXFP rows stop normally, answer
+`vmlx-cache-green` across two turns, hit a canonical growing-chat disk prefix
+before turn 2, and increment SSM companion hits. The matched prefix is the
+real rendered history boundary (`18/53`), not a fabricated full-prompt hit.
+
 JANG_4M and JANG_2K were not rerun in this current MXFP-only pass. The earlier
 short-budget failures remain historical evidence only for those old settings,
 not proof that the current runtime needs fake reasoning guards.
@@ -133,6 +149,6 @@ than a demonstrated runtime failure.
 - Raw batched native-MTP scheduling is not implemented. Osaurus must route MTP
   as an exclusive generate path or keep MTP disabled for concurrent batched
   server mode until the scheduler owns draft/verify/cache state per slot.
-- The sequential hybrid verifier remains the conservative correctness path.
-  The explicit `chunk_commit` path now has MXFP text-production evidence, but it
-  still needs broader VL/MRoPE and scheduler coverage before becoming a default.
+- The sequential hybrid verifier remains the stochastic correctness path.
+  Explicit `chunk_commit` remains a greedy speed path only until a per-artifact
+  equivalence gate proves stochastic chunk probabilities are safe.

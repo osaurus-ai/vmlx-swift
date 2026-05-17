@@ -33,6 +33,33 @@ was used.
 do not justify auto-launching native MTP for every Qwen3.6 bundle or enabling it
 inside generic batched scheduling.
 
+2026-05-17 follow-up: stochastic/native-MTP rows over hybrid SSM must not use
+the fast chunk verifier. `Qwen3.6-35B-A3B-MXFP4-MTP` reproduced a real failure
+under bundle defaults with `samplingMode=exact-pq` and forced `chunk_commit`:
+
+```text
+docs/local/qwen36-mtp-current/20260517T125723Z-mxfp-growing-chat-mtp-d3-stats/35b-mxfp4/growing_chat_mtp_d3_bundle_defaults.log
+```
+
+The same prompt passed in AR and passed with explicit greedy MTP. A D1 exact-pq
+row reproduced the same failure, proving it was not recursive D3 depth
+corruption:
+
+```text
+docs/local/qwen36-mtp-current/20260517T130655Z-35b-mxfp4-growing-chat-mtp-d1-exact/growing_chat_mtp_d1_bundle_defaults.log
+```
+
+Sequential verifier repair fixed the row without sampler clamps:
+
+```text
+docs/local/qwen36-mtp-current/20260517T130725Z-35b-mxfp4-growing-chat-mtp-d1-sequential-exact/growing_chat_mtp_d1_sequential_bundle_defaults.log
+```
+
+The runtime policy is now: non-greedy native MTP with `MambaCache`/hybrid SSM
+uses `sequential_repair` even when the fast chunk env is set. Greedy MTP can
+still use `chunk_commit`. This is a cache-state correctness boundary, not a
+fake generation guard.
+
 ## Results
 
 | Bundle | Artifact | Result | Reasoning-row tok/s | Cache proof | Memory |
@@ -76,6 +103,9 @@ missed a different-media probe, and answered the text-only follow-up with
   remains tensor-gated plus explicit opt-in.
 - Raw batched native-MTP scheduling is still not implemented; use the exclusive
   `BatchEngine.generate` / `Evaluate.generate` path.
+- Fast chunk verification is not a stochastic hybrid-SSM path. Bundle-default
+  stochastic rows now run `sequential_repair`, while explicit greedy rows may
+  use `chunk_commit`.
 - 27B MXFP8 D3 is correct but not the best speed policy; earlier speed sweeps
   still recommend D2 for the count-prompt speed row.
 - 35B JANG_2K still has an unresolved strict VL+MTP length-exhausted row. The

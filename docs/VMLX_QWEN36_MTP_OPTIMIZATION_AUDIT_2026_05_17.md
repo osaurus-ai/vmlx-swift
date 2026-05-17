@@ -11,7 +11,7 @@ global production claim, and it does not enable MTP automatically.
 | Map the Swift MTP loop end to end. | `NativeMTPTokenIterator` now reports prefill/generation outcome, verifier mode, accepted depth counts, target forward count, verifier input token count, repair count, and phase timings. See `docs/VMLX_QWEN36_MTP_SPEED_ROOT_CAUSE_2026_05_17.md`. |
 | Instrument before optimizing. | Live logs include `acceptedByDepth`, `targetVerifySec`, `mtpDraftSec`, `samplingSec`, `cacheCommitSec`, `targetForwards`, `verifyInputTokens`, `repairForwards`, RSS, footprint, and cache stats where enabled. |
 | Explain why D3 was slower. | The old default hybrid path used `sequential_repair`, producing almost one target forward per generated token. Explicit `chunk_commit` verifies `[primary, d1, d2, d3]` in one target forward. |
-| Implement the real fast verifier path. | The chunk path commits accepted verifier prefixes through `MambaCache.recordPrefixCommitState` and `commitRecordedPrefix`; it is opt-in with `VMLX_NATIVE_MTP_HYBRID_VERIFY=chunk_commit`. |
+| Implement the real fast verifier path. | The chunk path commits accepted verifier prefixes through `MambaCache.recordPrefixCommitState` and `commitRecordedPrefix`; it remains a greedy-only hybrid speed path. Non-greedy exact-pq hybrid rows use sequential repair after the 35B MXFP4 residual-correction failure. |
 | Compare against Python vMLX / MTPLX concepts. | Swift now has recursive D1/D2/D3 drafting, one chunk verifier forward, accepted-prefix commit, and per-phase telemetry. Swift still lacks GraphBank/compiled small-M verifier shapes, dedicated draft-only sidecar heads, and a production self-test that promotes chunk mode per artifact. |
 | Review autodetect/startup. | The census rows use `MTPBundleInspector` and real tensor evidence. All six local bundles report `bundleHasMTP=true`, `complete=true`, `canAutoLaunch=false`, and `vision=true`. |
 | Validate six artifacts. | Speed rows are under `docs/local/qwen36-mtp-opt/20260517T050311Z-six-artifact-chunk-speed/`. Cache rows are under `docs/local/qwen36-mtp-opt/20260517T050824Z-27b-mxfp4-d3-cache/` and `docs/local/qwen36-mtp-opt/20260517T050858Z-recommended-depth-cache-rows/`. |
@@ -91,6 +91,36 @@ per-artifact equivalence gate proves chunk accepted-prefix commits are exact.
 This is not a hidden guard. It is a scheduler/correctness capability gate. The
 runtime must not patch the output stream or force sampling values.
 
+## Exact-PQ Hybrid Verifier Boundary
+
+Current artifacts:
+
+```text
+docs/local/qwen36-mtp-current/20260517T125723Z-mxfp-growing-chat-mtp-d3-stats/35b-mxfp4/growing_chat_mtp_d3_bundle_defaults.log
+docs/local/qwen36-mtp-current/20260517T130655Z-35b-mxfp4-growing-chat-mtp-d1-exact/growing_chat_mtp_d1_bundle_defaults.log
+docs/local/qwen36-mtp-current/20260517T130725Z-35b-mxfp4-growing-chat-mtp-d1-sequential-exact/growing_chat_mtp_d1_sequential_bundle_defaults.log
+docs/local/qwen36-mtp-current/20260517T131024Z-35b-mxfp4-growing-chat-mtp-d3-exact-postfix/growing_chat_mtp_d3_bundle_defaults_postfix.log
+docs/local/qwen36-mtp-current/20260517T131050Z-mxfp-growing-chat-mtp-d3-exact-postfix/
+docs/local/qwen36-mtp-current/20260517T131117Z-35b-mxfp4-growing-chat-mtp-d3-greedy-postfix/growing_chat_mtp_d3_greedy_postfix.log
+```
+
+The 35B MXFP4 growing-chat row isolated a real non-greedy failure:
+
+- AR with bundle defaults passed the two-turn cache row.
+- Greedy native-MTP D3 with `chunk_commit` passed.
+- D3 exact-pq with `chunk_commit` emitted repeated garbage and stopped by
+  length.
+- D1 exact-pq with `chunk_commit` reproduced the same stream, so the issue was
+  not recursive D3 draft depth.
+- D1 exact-pq with sequential repair passed.
+
+The runtime now routes non-greedy native MTP over `MambaCache`/hybrid SSM to
+`sequential_repair` regardless of the fast chunk env. The post-fix D3 exact-pq
+rows for 27B MXFP4, 27B MXFP8, 35B MXFP4, and 35B MXFP8 all pass with bundle
+defaults, coherent two-turn output, disk-prefix hits, and SSM hits. Greedy
+still reports `verifierMode=chunk_commit` and passes, so the speed path remains
+available where the sampler does not need target/draft probability ratios.
+
 ## MTPLX Comparison
 
 Swift now has the core runtime shape needed for MTPLX-style speed:
@@ -116,7 +146,9 @@ faster at D2 than D3 on this prompt, while 35B MXFP4/MXFP8 are fastest at D3.
 
 - Keep AR as the global default.
 - Do not infer MTP from model names.
-- Keep `chunk_commit` explicit for hybrid/Mamba caches.
+- Keep `chunk_commit` explicit and greedy-only for hybrid/Mamba caches.
+- Use `sequential_repair` for stochastic exact-pq hybrid MTP until a real
+  chunk-probability equivalence gate proves otherwise.
 - For proven local explicit rows:
   - 27B JANG_4M: D2;
   - 27B MXFP4: D3 is allowed for the D3 target; D2 remains a lower-variance fallback;

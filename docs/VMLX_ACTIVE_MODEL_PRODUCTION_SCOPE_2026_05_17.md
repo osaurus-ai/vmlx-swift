@@ -101,6 +101,17 @@ follow-up are coherent. It does not change the default policy: native MTP stays
 explicit, tensor-gated, and non-batched until the remaining 35B JANG_2K VL and
 server scheduling gates are proven.
 
+Current hybrid-SSM verifier policy update: stochastic exact-pq native MTP does
+not use the fast chunk verifier. A 35B MXFP4 growing-chat row failed under
+bundle defaults when forced through `chunk_commit`; D1 reproduced it, while
+sequential repair passed. Post-fix rows under
+`docs/local/qwen36-mtp-current/20260517T131050Z-mxfp-growing-chat-mtp-d3-exact-postfix/`
+and
+`docs/local/qwen36-mtp-current/20260517T131024Z-35b-mxfp4-growing-chat-mtp-d3-exact-postfix/`
+prove all four MXFP variants now run bundle-default D3 exact-pq with
+`verifierMode=sequential_repair`, coherent two-turn output, disk-prefix hits,
+and SSM hits. Greedy rows still use `chunk_commit` where proven.
+
 ## Active Non-Excluded Family Matrix
 
 | Family | Local bundles | Engine surfaces to prove | Current MTP policy |
