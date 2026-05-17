@@ -70,6 +70,23 @@ enum OmniBench {
             loadSecs,
             String(describing: type(of: context.model)),
             String(describing: type(of: context.processor))))
+        let samplingProbe = makeOmniParameters(
+            context: context,
+            maxNewTokens: maxNewTokens)
+        print(String(format:
+            "Sampling: source=%@ maxTokens=%d temp=%.3f topP=%.3f topK=%d minP=%.3f rep=%@ seed=%@",
+            (ProcessInfo.processInfo.environment["BENCH_OMNI_GREEDY"] == "1")
+                ? "explicit-greedy-env"
+                : "generation_config",
+            samplingProbe.maxTokens ?? -1,
+            Double(samplingProbe.temperature),
+            Double(samplingProbe.topP),
+            samplingProbe.topK,
+            Double(samplingProbe.minP),
+            samplingProbe.repetitionPenalty.map {
+                String(format: "%.3f", Double($0))
+            } ?? "nil",
+            samplingProbe.randomSeed.map(String.init) ?? "nil"))
 
         guard let omni = context.model as? NemotronHOmni else {
             print("FAIL: dispatch — got \(type(of: context.model)), expected NemotronHOmni")
@@ -333,9 +350,9 @@ enum OmniBench {
                     images: [.ciImage(img)],
                     audios: [.url(audioFixture)])
                 let lmInput = try await context.processor.prepare(input: userInput)
-                var params = GenerateParameters(maxTokens: maxNewTokens)
-                params.temperature = 0.0
-                params.prefillStepSize = 512
+                let params = makeOmniParameters(
+                    context: context,
+                    maxNewTokens: maxNewTokens)
                 let iter = try TokenIterator(
                     input: lmInput, model: context.model, cache: cache,
                     parameters: params)
@@ -375,9 +392,9 @@ enum OmniBench {
                     prompt: "What's in this audio?",
                     audios: [.samples(toneB, sampleRate: 16_000)])
                 let lmB = try await context.processor.prepare(input: userB)
-                var params = GenerateParameters(maxTokens: maxNewTokens)
-                params.temperature = 0.0
-                params.prefillStepSize = 512
+                let params = makeOmniParameters(
+                    context: context,
+                    maxNewTokens: maxNewTokens)
                 let iter = try TokenIterator(
                     input: lmB, model: context.model, cache: cacheB,
                     parameters: params)
@@ -451,8 +468,9 @@ enum OmniBench {
             results.append(await runRow("B1. BatchEngine text B=1", maxNew: maxNewTokens) {
                 nonisolated(unsafe) let ctxLocal = ctxBatch
                 let engine = BatchEngine(context: ctxLocal, maxBatchSize: 2)
-                var params = GenerateParameters(maxTokens: maxNewTokens, temperature: 0)
-                params.prefillStepSize = 512
+                let params = makeOmniParameters(
+                    context: ctxBatch,
+                    maxNewTokens: maxNewTokens)
                 var userInput = UserInput(prompt: "What is the capital of France?")
                 userInput.additionalContext = ["enable_thinking": false]
                 let lmInput = try await ctxBatch.processor.prepare(input: userInput)
@@ -488,8 +506,9 @@ enum OmniBench {
             results.append(await runRow("B2. BatchEngine text B=2 concurrent", maxNew: maxNewTokens) {
                 nonisolated(unsafe) let ctxLocal = ctxBatch
                 let engine = BatchEngine(context: ctxLocal, maxBatchSize: 2)
-                var params = GenerateParameters(maxTokens: maxNewTokens, temperature: 0)
-                params.prefillStepSize = 512
+                let params = makeOmniParameters(
+                    context: ctxBatch,
+                    maxNewTokens: maxNewTokens)
                 let prompts = [
                     "Capital of Japan?",
                     "Capital of Brazil?",
@@ -532,8 +551,9 @@ enum OmniBench {
             results.append(await runRow("B3. BatchEngine image B=1", maxNew: maxNewTokens) {
                 nonisolated(unsafe) let ctxLocal = ctxBatch
                 let engine = BatchEngine(context: ctxLocal, maxBatchSize: 2)
-                var params = GenerateParameters(maxTokens: maxNewTokens, temperature: 0)
-                params.prefillStepSize = 512
+                let params = makeOmniParameters(
+                    context: ctxBatch,
+                    maxNewTokens: maxNewTokens)
                 let img = try synthesiseGradient(side: 224)
                 var userInput = UserInput(
                     prompt: "Describe this image briefly.",
@@ -573,8 +593,9 @@ enum OmniBench {
                 results.append(await runRow("B4. BatchEngine audio B=1", maxNew: maxNewTokens) {
                     nonisolated(unsafe) let ctxLocal = ctxBatch
                     let engine = BatchEngine(context: ctxLocal, maxBatchSize: 2)
-                    var params = GenerateParameters(maxTokens: maxNewTokens, temperature: 0)
-                    params.prefillStepSize = 512
+                    let params = makeOmniParameters(
+                        context: ctxBatch,
+                        maxNewTokens: maxNewTokens)
                     var userInput = UserInput(
                         prompt: "Briefly describe the audio.",
                         audios: [.url(audioFixture)])
@@ -650,8 +671,9 @@ enum OmniBench {
                              secs: secs, tokPerSec: tps)
         } catch {
             let secs = CFAbsoluteTimeGetCurrent() - t0
+            let errorText = (error as NSError).localizedDescription
             return RowResult(row: label, passed: false,
-                             detail: "ERROR: \(error)", secs: secs, tokPerSec: nil)
+                             detail: "ERROR: \(errorText)", secs: secs, tokPerSec: nil)
         }
     }
 
@@ -661,6 +683,29 @@ enum OmniBench {
         let shortText: String
         let tokens: Int
         let secs: Double
+    }
+
+    private static func makeOmniParameters(
+        context: ModelContext,
+        maxNewTokens: Int
+    ) -> GenerateParameters {
+        var params = GenerateParameters(
+            generationConfig: context.configuration.generationDefaults)
+        params.maxTokens = maxNewTokens
+        params.prefillStepSize = 512
+        if let seedText = ProcessInfo.processInfo.environment["BENCH_OMNI_RANDOM_SEED"],
+           let seed = UInt64(seedText)
+        {
+            params.randomSeed = seed
+        }
+        if ProcessInfo.processInfo.environment["BENCH_OMNI_GREEDY"] == "1" {
+            params.temperature = 0.0
+            params.topP = 1.0
+            params.topK = 0
+            params.minP = 0.0
+            params.repetitionPenalty = nil
+        }
+        return params
     }
 
     private static func runTextTurn(
@@ -674,9 +719,9 @@ enum OmniBench {
         userInput.additionalContext = ["enable_thinking": enableThinking]
         let lmInput = try await context.processor.prepare(input: userInput)
 
-        var params = GenerateParameters(maxTokens: maxNewTokens)
-        params.temperature = 0.0
-        params.prefillStepSize = 512
+        let params = makeOmniParameters(
+            context: context,
+            maxNewTokens: maxNewTokens)
 
         let iter = try TokenIterator(
             input: lmInput, model: context.model, cache: cache,
@@ -712,9 +757,9 @@ enum OmniBench {
         userInput.additionalContext = ["enable_thinking": enableThinking]
         let lmInput = try await context.processor.prepare(input: userInput)
 
-        var params = GenerateParameters(maxTokens: maxNewTokens)
-        params.temperature = 0.0
-        params.prefillStepSize = 512
+        let params = makeOmniParameters(
+            context: context,
+            maxNewTokens: maxNewTokens)
 
         let iter = try TokenIterator(
             input: lmInput, model: context.model, cache: cache,
@@ -760,9 +805,9 @@ enum OmniBench {
                 tokenizer: context.tokenizer,
                 replacementTail: variant.tail)
             let cache = context.model.newCache(parameters: .init())
-            var params = GenerateParameters(maxTokens: maxNewTokens)
-            params.temperature = 0.0
-            params.prefillStepSize = 512
+            let params = makeOmniParameters(
+                context: context,
+                maxNewTokens: maxNewTokens)
 
             let iter = try TokenIterator(
                 input: lmInput, model: context.model, cache: cache,
@@ -850,9 +895,9 @@ enum OmniBench {
         let userInput = UserInput(prompt: prompt, videos: [.url(videoURL)])
         let lmInput = try await context.processor.prepare(input: userInput)
 
-        var params = GenerateParameters(maxTokens: maxNewTokens)
-        params.temperature = 0.0
-        params.prefillStepSize = 512
+        let params = makeOmniParameters(
+            context: context,
+            maxNewTokens: maxNewTokens)
 
         let iter = try TokenIterator(
             input: lmInput, model: context.model, cache: cache,
@@ -913,9 +958,9 @@ enum OmniBench {
         let userInput = UserInput(prompt: prompt, audios: [.url(audioURL)])
         let lmInput = try await context.processor.prepare(input: userInput)
 
-        var params = GenerateParameters(maxTokens: maxNewTokens)
-        params.temperature = 0.0
-        params.prefillStepSize = 512
+        let params = makeOmniParameters(
+            context: context,
+            maxNewTokens: maxNewTokens)
 
         let iter = try TokenIterator(
             input: lmInput, model: context.model, cache: cache,
@@ -1031,10 +1076,15 @@ enum OmniBench {
                 domain: "OmniBench", code: 22,
                 userInfo: [NSLocalizedDescriptionKey: "\(row): repeated filler phrase loop"])
         }
-        if maxRepeatedBigramCount(in: lower) >= 4 {
+        let repeatedBigram = maxRepeatedBigram(in: lower)
+        if repeatedBigram.count >= 4 {
+            let head = String(trimmed.prefix(220))
+            let tail = String(trimmed.suffix(220))
             throw NSError(
                 domain: "OmniBench", code: 23,
-                userInfo: [NSLocalizedDescriptionKey: "\(row): repeated bigram loop"])
+                userInfo: [NSLocalizedDescriptionKey:
+                    "\(row): repeated bigram loop bigram=\"\(repeatedBigram.bigram)\" "
+                    + "count=\(repeatedBigram.count) head=\(head) tail=\(tail)"])
         }
         if row.lowercased().contains("image") {
             let missingMediaPhrases = [
@@ -1066,21 +1116,24 @@ enum OmniBench {
         return count
     }
 
-    private static func maxRepeatedBigramCount(in text: String) -> Int {
+    private static func maxRepeatedBigram(in text: String) -> (bigram: String, count: Int) {
         let stopBigrams: Set<String> = [
             "of the", "in the", "to the", "and the", "is a", "it is",
         ]
         let words = text
             .split { !$0.isLetter && !$0.isNumber && $0 != "'" }
             .map(String.init)
-        guard words.count >= 2 else { return 0 }
+        guard words.count >= 2 else { return ("", 0) }
         var counts: [String: Int] = [:]
         for i in 0..<(words.count - 1) {
             let key = words[i] + " " + words[i + 1]
             guard !stopBigrams.contains(key) else { continue }
             counts[key, default: 0] += 1
         }
-        return counts.values.max() ?? 0
+        return counts.max { lhs, rhs in
+            if lhs.value == rhs.value { return lhs.key > rhs.key }
+            return lhs.value < rhs.value
+        }.map { ($0.key, $0.value) } ?? ("", 0)
     }
 
     // MARK: - Synthesizers

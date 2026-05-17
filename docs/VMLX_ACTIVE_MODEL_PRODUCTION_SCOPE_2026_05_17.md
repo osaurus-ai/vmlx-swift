@@ -302,6 +302,34 @@ Chunk stability findings:
   or pass raw PCM for the model turn. Do not concatenate independently encoded
   chunk embeddings into the model context.
 
+OmniBench generation defaults correction:
+
+- the older 192-token Omni aggregate forced greedy `temperature=0.0`, which
+  bypassed the bundle `generation_config.json`;
+- `OmniBench` now resolves sampling from the model's generation defaults by
+  default (`temp=0.600`, `topP=0.950`, `rep=1.000` for the current JANGTQ
+  bundle) and only uses greedy when `BENCH_OMNI_GREEDY=1` is explicitly set;
+- failure diagnostics now print the repeated phrase and output excerpt instead
+  of only reporting `repeated bigram loop`.
+
+Fresh generation-config artifact:
+
+```text
+docs/local/live-model-matrix/20260517T_omni_generation_config_fix/omni.out
+```
+
+Result at `BENCH_MAX_TOKENS=192`, `BENCH_OMNI_RANDOM_SEED=20260517`,
+`BENCH_OMNI_BATCH=1`:
+
+- 12/18 rows pass;
+- text-only, text multi-turn, audio encoder, audio LMInput, reasoning OFF,
+  reasoning toggle, mixed image+audio, media-salt isolation, hybrid SSM parity,
+  BatchEngine text B=1, and BatchEngine text B=2 pass;
+- remaining failures are image/video long-budget continuation rows and one
+  BatchEngine audio row, with explicit repeated-phrase diagnostics;
+- this improves the evidence path but still does not make Omni media
+  production-clear at long budgets.
+
 ## Required Proof Per Active Bundle
 
 For each non-excluded bundle, the production row must include:
