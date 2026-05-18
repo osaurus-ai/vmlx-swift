@@ -146,6 +146,10 @@ unblocked, and carries a positive `best_depth`. Missing or blocked tuning keeps
 tensors indicate MTP compatibility but the file is absent, status evidence now
 includes `tuning_file_missing=vmlx_mtp_tuning.json` so Osaurus can show that the
 runtime looked for the bundle-local tuning row and failed closed.
+A valid-looking tuning file is not tensor evidence: if `vmlx_mtp_tuning.json`
+is present but the safetensors index/header has no MTP weights, the bundle still
+reports `metadata_only_missing_weights`, native launch stays off, and force-on
+validation returns an `mtp.mode` error.
 
 It detects VL tensors separately from:
 
@@ -258,7 +262,7 @@ and is not inferred from `mtp_num_hidden_layers` alone. It requires:
   described below.
 
 Bundles whose config advertises MTP but whose weights do not contain MTP tensors
-fail closed. The local CRACK bundle
+fail closed even if a stale or copied tuning sidecar exists. The local CRACK bundle
 `/Users/eric/models/dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` currently reports:
 
 ```text

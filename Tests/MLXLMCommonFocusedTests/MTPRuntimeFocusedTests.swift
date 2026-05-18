@@ -301,6 +301,74 @@ struct MTPRuntimeFocusedTests {
         #expect(!status.canAutoLaunchMTP)
     }
 
+    @Test("valid tuning sidecar without MTP tensors stays non auto launch")
+    func validTuningWithoutMTPTensorsStaysNonAutoLaunch() throws {
+        let root = try makeTemporaryBundle(name: "qwen-valid-tuning-missing-weights")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try writeJSON([
+            "model_type": "qwen3_vl",
+            "text_config": [
+                "model_type": "qwen3_5_moe_text",
+                "num_hidden_layers": 48,
+                "mtp_num_hidden_layers": 1,
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("config.json"))
+        try writeJSON([
+            "runtime": [
+                "bundle_has_mtp": true,
+                "mtp_layers": 1,
+                "mtp_mode": "preserved_enabled",
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("jang_config.json"))
+        try writeJSON([
+            "weight_map": [
+                "model.embed_tokens.weight": "model-00001-of-00001.safetensors",
+                "model.layers.0.self_attn.q_proj.weight": "model-00001-of-00001.safetensors",
+                "vision_tower.blocks.0.attn.qkv.weight": "model-00001-of-00001.safetensors",
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("model.safetensors.index.json"))
+        try writeJSON([
+            "native_mtp": [
+                "best_depth": 3,
+                "validated": true,
+                "output_equivalent": true,
+                "artifact": "docs/internal/release-gates/qwen-depth3/result.json",
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("vmlx_mtp_tuning.json"))
+
+        let status = try MTPBundleInspector.inspect(modelDirectory: root)
+        let configData = try Data(contentsOf: root.appendingPathComponent("config.json"))
+        let jangConfig = try JangLoader.loadConfig(at: root)
+        let settings = VMLXServerRuntimeSettings()
+
+        #expect(!status.bundleHasMTP)
+        #expect(status.bundleHasVision)
+        #expect(status.nativeMTPTuning?.usableBestDepth == 3)
+        #expect(status.configEvidence.contains("tuning_file=vmlx_mtp_tuning.json"))
+        #expect(status.mode == .metadataOnlyMissingWeights)
+        #expect(!status.hasCompleteMTPArtifact)
+        #expect(!status.canAutoLaunchMTP)
+        #expect(NativeMTPAutoDecodePolicy.recommendation(
+            configData: configData,
+            jangConfig: jangConfig,
+            status: status,
+            requireVerifiedRuntime: false) == nil)
+        #expect(settings.resolvedLoadConfiguration(
+            configData: configData,
+            jangConfig: jangConfig,
+            status: status).nativeMTP == false)
+
+        var forceOn = settings
+        forceOn.mtp.mode = .forceOn
+        #expect(forceOn.validationIssues(
+            configData: configData,
+            jangConfig: jangConfig,
+            mtpStatus: status).contains {
+                $0.severity == .error && $0.field == "mtp.mode"
+            })
+    }
+
     @Test("inactive native MTP scrub does not touch generic nextn metadata")
     func inactiveNativeMTPScrubDoesNotTouchGenericNextnMetadata() throws {
         let config = """
