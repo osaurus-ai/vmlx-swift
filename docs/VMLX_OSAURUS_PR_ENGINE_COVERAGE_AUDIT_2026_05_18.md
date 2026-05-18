@@ -333,6 +333,27 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   `RuntimePolicySourceTests` 28/28. Local `shellcheck` was not installed; the
   GitHub `shellcheck` job is the authoritative shellcheck signal for this row.
 
+2026-05-18 14:34 PDT Osaurus PR #1147 cache-stats admin route fix:
+
+- Osaurus PR #1147 head `857ecad3` adds a read-only `/admin/cache-stats`
+  endpoint in `HTTPHandler` backed by `ModelRuntime.cachedModelSummaries()` and
+  vmlx `CacheCoordinator.snapshotStats()` when models are loaded. The route
+  returns a cold snapshot without loading any model.
+- Live metadata probe before the fix:
+  `docs/internal/live-gates/pr1147/http-route-probe-metadata-20260518T1425/`
+  shows `/admin/cache-stats` returned HTTP 404 with body `Not Found`.
+- The rebuilt debug app was launched through the keychain-safe LaunchServices
+  helper with real `HOME` and `/Users/eric/models`, bound `127.0.0.1:4242`,
+  and post-fix probe
+  `docs/internal/live-gates/pr1147/http-route-probe-metadata-20260518Tpost-cache-stats/`
+  shows `/admin/cache-stats` returning HTTP 200 with empty `models` and zero
+  aggregate counters for prefix, paged, block-L2, and SSM companion fields.
+- Verification for the checkpoint: `git diff --check`,
+  `RuntimePolicySourceTests` 28/28, and
+  `MCPHTTPHandlerTests/admin_cache_stats_returns_empty_snapshot_without_loading_model`
+  1/1. This is metadata/admin-route proof only; it is not model-specific cache
+  hit, L2 write, SSM rederive, coherency, speed, or memory proof.
+
 2026-05-17 20:25 PDT live refresh:
 
 - `gh pr list --repo osaurus-ai/osaurus --state all --limit 20` shows the
