@@ -22,10 +22,19 @@ public struct ToolCall: Hashable, Codable, Sendable {
         }
     }
 
+    /// Stable id for correlating a later tool-role result with this call.
+    public let id: String?
+
     /// The function to be called
     public let function: Function
 
-    public init(function: Function) {
+    public init(function: Function, id: String? = nil) {
+        self.id = id
+        self.function = function
+    }
+
+    public init(id: String?, function: Function) {
+        self.id = id
         self.function = function
     }
 }

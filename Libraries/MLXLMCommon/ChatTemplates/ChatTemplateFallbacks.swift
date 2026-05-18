@@ -291,6 +291,30 @@ public enum ChatTemplateFallbacks {
 {%- endfor -%}
 {{- '\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.' -}}
 {%- endmacro -%}
+{%- macro render_dsml_invoke(tool_call) -%}
+{%- set fn = tool_call['function'] if tool_call['function'] is defined else tool_call -%}
+{%- set args = fn['arguments'] if fn['arguments'] is defined else {} -%}
+{{- '<' + dsml + 'invoke name="' + fn['name'] + '">\n' -}}
+{%- if args is mapping -%}
+{%- for k, v in args | dictsort -%}
+{%- if v is string -%}
+{{- '<' + dsml + 'parameter name="' + k + '" string="true">' + v + '</' + dsml + 'parameter>\n' -}}
+{%- else -%}
+{{- '<' + dsml + 'parameter name="' + k + '" string="false">' + (v | tojson) + '</' + dsml + 'parameter>\n' -}}
+{%- endif -%}
+{%- endfor -%}
+{%- elif args is string -%}
+{{- '<' + dsml + 'parameter name="arguments" string="true">' + args + '</' + dsml + 'parameter>\n' -}}
+{%- endif -%}
+{{- '</' + dsml + 'invoke>\n' -}}
+{%- endmacro -%}
+{%- macro render_dsml_tool_calls(tool_calls) -%}
+{{- '\n\n<' + dsml + 'tool_calls>\n' -}}
+{%- for tool_call in tool_calls -%}
+{{- render_dsml_invoke(tool_call) -}}
+{%- endfor -%}
+{{- '</' + dsml + 'tool_calls>' -}}
+{%- endmacro -%}
 {{- bos -}}
 {%- if enable_thinking and reasoning_effort == 'max' -%}
 {{- 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -}}
@@ -324,7 +348,21 @@ public enum ChatTemplateFallbacks {
 {{- message['reasoning_content'] -}}{{- think_close -}}
 {%- endif -%}
 {{- message['content'] or '' -}}
+{%- if message['tool_calls'] is defined and message['tool_calls'] -%}
+{{- render_dsml_tool_calls(message['tool_calls']) -}}
+{%- endif -%}
 {{- eos -}}
+{%- elif message['role'] == 'tool' -%}
+{{- user_token -}}{{- '<tool_result>' -}}{{- message['content'] -}}{{- '</tool_result>' -}}
+{%- set next_role = messages[loop.index0 + 1]['role'] if loop.index0 + 1 < messages|length else none -%}
+{%- if next_role == 'assistant' or loop.last and add_generation_prompt -%}
+{{- asst_token -}}
+{%- if enable_thinking and loop.index0 >= ns.last_user_index -%}
+{{- think_open -}}
+{%- else -%}
+{{- think_close -}}
+{%- endif -%}
+{%- endif -%}
 {%- endif -%}
 {%- endfor -%}
 """#

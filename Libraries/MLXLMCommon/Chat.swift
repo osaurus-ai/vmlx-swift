@@ -306,9 +306,9 @@ private func toolCallDict(call: ToolCall, index: Int) -> [String: any Sendable] 
 
     return [
         // Synthesized unique id per message (OpenAI requires one; when
-        // the caller set a specific id via a future overload it can
-        // be threaded here). Stable across renders for a given message.
-        "id": "call_\(index)_\(name)",
+        // the caller supplied an OpenAI `tool_call.id`, preserve it so
+        // later `role=tool` messages can correlate with the right call.
+        "id": call.id ?? "call_\(index)_\(name)",
         "type": "function",
         // Flat view — MiniMax, Llama 3.1 Groq, others.
         "name": name,

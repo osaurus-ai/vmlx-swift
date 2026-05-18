@@ -98,6 +98,57 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         assertNoSystemToolsRenderBetweenUserAndAssistant(rendered)
     }
 
+    @Test("compiled DSV4 fallback renders assistant DSML tool history and tool results")
+    func compiledDSV4FallbackRendersAssistantToolHistory() throws {
+        let template = try Template(ChatTemplateFallbacks.dsv4Minimal)
+        let rendered = try template.renderDSV4([
+            "messages": [
+                ["role": "user", "content": "Check Paris weather."],
+                [
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        [
+                            "id": "call_weather",
+                            "type": "function",
+                            "name": "get_weather",
+                            "arguments": ["city": "Paris", "units": "metric"],
+                            "function": [
+                                "name": "get_weather",
+                                "arguments": ["city": "Paris", "units": "metric"],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                    ],
+                ] as [String: any Sendable],
+                ["role": "tool", "tool_call_id": "call_weather", "content": "{\"temp_c\":18}"],
+                ["role": "user", "content": "Summarize."],
+            ],
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+        ])
+
+        #expect(rendered.contains("<\u{FF5C}DSML\u{FF5C}tool_calls>"))
+        #expect(rendered.contains("<\u{FF5C}DSML\u{FF5C}invoke name=\"get_weather\">"))
+        #expect(rendered.contains("<\u{FF5C}DSML\u{FF5C}parameter name=\"city\" string=\"true\">Paris</\u{FF5C}DSML\u{FF5C}parameter>"))
+        #expect(rendered.contains("<\u{FF5C}DSML\u{FF5C}parameter name=\"units\" string=\"true\">metric</\u{FF5C}DSML\u{FF5C}parameter>"))
+        #expect(rendered.contains("<tool_result>{\"temp_c\":18}</tool_result>"))
+        #expect(rendered.hasSuffix("<\u{FF5C}User\u{FF5C}>Summarize.<\u{FF5C}Assistant\u{FF5C}></think>"))
+    }
+
+    @Test("default message generator preserves explicit tool-call ids")
+    func defaultMessageGeneratorPreservesExplicitToolCallIDs() throws {
+        let call = ToolCall(
+            id: "call_weather",
+            function: .init(name: "get_weather", arguments: ["city": .string("Paris")])
+        )
+        let raw = DefaultMessageGenerator().generate(
+            message: .assistant("", toolCalls: [call])
+        )
+        let calls = try #require(raw["tool_calls"] as? [[String: any Sendable]])
+
+        #expect(calls.first?["id"] as? String == "call_weather")
+    }
+
     @Test("standalone DSV4 template renders tools without a system message")
     func standaloneDSV4TemplateRendersToolsWithoutSystemMessage() throws {
         let source = try repositoryFile("Libraries/MLXLMCommon/ChatTemplates/DSV4Minimal.jinja")
