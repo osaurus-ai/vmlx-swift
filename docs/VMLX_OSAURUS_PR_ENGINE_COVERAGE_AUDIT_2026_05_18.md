@@ -431,8 +431,16 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   image and text-only follow-up, but the blue-image turn still describes red;
   Responses returns generic "media" explanations instead of grounded image
   answers; ZAYA1-VL video returns HTTP 500 `ZAYA1-VL video input is not
-  implemented`; and `/health` plus `/admin/cache-stats` continue to report no
-  loaded model/cache counters throughout the sequence.
+  implemented`; and the run did not collect cache-hit proof under a residency
+  mode that keeps the loaded model visible after non-streaming requests.
+- Osaurus PR #1147 head `ee8be5f6` clarifies the cache-stat nuance: source
+  trace shows `ServerConfiguration.default.modelIdleResidencyPolicy` is
+  `.immediately`, and `ModelRuntime.generateEventStream` schedules idle unload
+  when the generation lease releases. Empty post-request `/health.loaded` and
+  `/admin/cache-stats.models` can therefore be a settings/probe limitation,
+  not proof that cache did or did not hit. Real cache rows must set
+  non-immediate residency through the app/settings path or capture stream-time
+  snapshots before the generation lease releases.
 - Verification for the checkpoint: `python3 -m unittest
   scripts/tests/test_pr1147_live_sequence_probe.py` passes 4/4,
   `python3 -m py_compile scripts/pr1147_live_sequence_probe.py
@@ -441,9 +449,9 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
 - Engine consequence: this confirms the live Osaurus UI/API gate is correctly
   exposing real failures now. `vmlx-swift` should not treat ZAYA-VL as
   production-clear until media switch/cache-state, Responses media handling,
-  unsupported-video capability reporting, and loaded-model/cache-stats
-  reporting are root-caused and fixed without sampler, prompt, or output
-  guards.
+  unsupported-video capability reporting, and cache proof under the correct
+  residency conditions are root-caused and fixed without sampler, prompt, or
+  output guards.
 
 2026-05-17 20:25 PDT live refresh:
 
