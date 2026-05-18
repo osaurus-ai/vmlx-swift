@@ -477,6 +477,28 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   answer, handles or hides unsupported ZAYA video, and collects cache proof
   under non-immediate residency or stream-time snapshots.
 
+2026-05-18 15:35 PDT Osaurus PR #1147 ZAYA-VL image-only capability fix:
+
+- Osaurus PR #1147 head `ee423158` marks ZAYA1-VL as `.imageOnly` from
+  `ModelMediaCapabilities.from(modelId:)` and keeps `model_type=zaya1_vl`
+  directory detection image-only. This matches the current vmlx-swift boundary:
+  ZAYA1-VL image/text is implemented, but video still throws
+  `ZAYA1-VL video input is not implemented` until a real ZAYA video processor
+  exists.
+- Focused Osaurus tests now pin the behavior across picker, bundle directory
+  detection, drag-drop gating, end-to-end composer accept sets, and MC/DC
+  capability coverage. ZAYA1-VL image is accepted; video and audio are rejected.
+- Verification for the checkpoint: `CapabilityFromModelIdTests` 5/5,
+  `CapabilityFromDirectoryTests` 5/5, `DragDropAcceptMatrixTests` 6/6,
+  `EndToEndComposerAcceptSetTests` 1/1 with 33 cases,
+  `ModelMediaCapabilitiesMCDCTests` 32/32, `RuntimePolicySourceTests` 28/28,
+  and `git diff --check`.
+- Boundary: this prevents Osaurus UI/composer from advertising fake ZAYA video.
+  It does not make the live ZAYA-VL different-image grounding row pass, does
+  not prove Responses image grounding after the route-conversion fix, and does
+  not prove cache hits until a keychain-safe rerun uses non-immediate residency
+  or stream-time cache snapshots.
+
 2026-05-17 20:25 PDT live refresh:
 
 - `gh pr list --repo osaurus-ai/osaurus --state all --limit 20` shows the
