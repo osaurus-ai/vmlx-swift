@@ -252,6 +252,24 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   `bundle_census.json`, `git diff --check`, and focused
   `RuntimePolicySourceTests` 28/28.
 
+2026-05-18 14:09 PDT Osaurus PR #1147 HTTP route probe scaffold:
+
+- Osaurus PR #1147 head `902d810a` adds
+  `scripts/pr1147_http_route_probe.py`. It captures `/health`, `/v1/models`,
+  `/models`, `/tags`, `/mcp/health`, and `/admin/cache-stats` by default and
+  can opt into generation rows for `/v1/chat/completions`, `/v1/responses`,
+  `/v1/messages`, `/api/chat`, and `/api/generate` when a model is explicitly
+  supplied with `--run-generation`.
+- The helper writes request bodies, full response bodies, status/content-type,
+  body byte counts, and excerpts to `http_route_probe.json` plus a route
+  summary. It intentionally refuses generation rows without `--model`.
+- This is still a scaffold unless run against a live Osaurus server and paired
+  with cache stats, visible output review, parser/no-leak review, timing, and
+  memory artifacts for the same model row.
+- Verification for the checkpoint: `python3 -m py_compile
+  scripts/pr1147_http_route_probe.py scripts/pr1147_collect_bundle_census.py`,
+  `git diff --check`, and focused `RuntimePolicySourceTests` 28/28.
+
 2026-05-17 20:25 PDT live refresh:
 
 - `gh pr list --repo osaurus-ai/osaurus --state all --limit 20` shows the
