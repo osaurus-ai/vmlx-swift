@@ -377,6 +377,22 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   for the new matrix. This remains checklist/source-policy evidence, not live
   model production proof.
 
+2026-05-18 14:44 PDT Osaurus PR #1147 route artifact helper hardening:
+
+- Osaurus PR #1147 head `3fb88d40` updates
+  `scripts/pr1147_http_route_probe.py` so generation route artifacts no longer
+  overwrite stream and non-stream outputs for the same path. Each route row now
+  carries a label and unique request/body filenames.
+- In generation mode the helper captures before/after `/health`,
+  `/admin/cache-stats`, and process-memory snapshots around each route, plus
+  before/after the full generation set. This makes API artifacts diagnosable
+  for route status, cache counter movement, and RSS context before a human
+  reviews output tails and parser leakage.
+- Verification for the checkpoint: `python3 -m py_compile
+  scripts/pr1147_http_route_probe.py`, `--help`, `git diff --check`, and
+  focused Osaurus `RuntimePolicySourceTests` 28/28. This remains harness
+  readiness, not live model production proof.
+
 2026-05-17 20:25 PDT live refresh:
 
 - `gh pr list --repo osaurus-ai/osaurus --state all --limit 20` shows the
