@@ -3085,10 +3085,10 @@ public struct GenerateCompletionInfo: Sendable {
     /// Reasoning-trained models (Qwen3.6-A3B fine-tunes, some DeepSeek-V4
     /// variants) exhibit this on validation-style prompts ("give me a
     /// 20-digit number") because their training data extends thought
-    /// through arbitrary self-verification. The fix is at the prompt
-    /// layer (use `enable_thinking: false` for chat workloads, or
-    /// implement a UI-level "answer trapped in thinking" fallback that
-    /// surfaces the last sentence of `Generation.reasoning`).
+    /// through arbitrary self-verification. The runtime must report this
+    /// state honestly so callers can raise the decode budget or explicitly
+    /// disable thinking for that request; it must not synthesize a visible
+    /// answer, force-close the reasoning parser, or add sampling guards.
     ///
     /// `false` for any caller that didn't wire a reasoning parser
     /// (no behavior change on non-reasoning workloads).
