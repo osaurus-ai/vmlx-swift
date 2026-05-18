@@ -104,6 +104,23 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// Lock protecting `_isHybrid` and `_isPagedIncompatible`.
     private let lock = OSAllocatedUnfairLock()
 
+    private struct PostPrepareCacheKeyAlias: Hashable {
+        let rawTokenHash: String
+        let mediaSalt: String
+    }
+
+    /// Maps a raw/pre-prepare media prompt to the model-derived token stream
+    /// that actually describes the prompt-boundary KV cache.
+    ///
+    /// Nemotron Omni video EVS is the motivating case: the tokenizer emits a
+    /// full run of video placeholders, `prepare` prunes that run after media
+    /// embeddings exist, and cache storage must use the post-pruned token
+    /// stream. A later identical or growing prompt only has the raw token
+    /// stream before `prepare`; this alias lets it safely fetch the existing
+    /// post-pruned cache entry without re-running the media path first.
+    private var postPrepareAliases: [PostPrepareCacheKeyAlias: [Int]] = [:]
+    private var postPrepareAliasCountsBySalt: [String: Set<Int>] = [:]
+
     // MARK: - Initialization
 
     /// Creates a new cache coordinator.
@@ -206,6 +223,78 @@ public final class CacheCoordinator: @unchecked Sendable {
         for block in blocks {
             pagedCache.freeBlock(block)
         }
+    }
+
+    // MARK: - Post-Prepare Cache-Key Aliases
+
+    /// Record a raw-to-effective prompt-token mapping for media prompts whose
+    /// final cache key is only known after model preparation.
+    ///
+    /// The alias is deliberately scoped by `mediaSalt`. This prevents a prompt
+    /// with the same text but different video/audio/image bytes, reasoning
+    /// scope, or KV policy from reusing an incompatible post-prepare key.
+    public func recordPostPrepareCacheKeyAlias(
+        rawTokens: [Int],
+        effectiveTokens: [Int],
+        mediaSalt: String?
+    ) {
+        guard let mediaSalt, !rawTokens.isEmpty, !effectiveTokens.isEmpty else {
+            return
+        }
+        let key = postPrepareAliasKey(rawTokens: rawTokens, mediaSalt: mediaSalt)
+        lock.withLock {
+            postPrepareAliases[key] = effectiveTokens
+            var counts = postPrepareAliasCountsBySalt[mediaSalt] ?? []
+            counts.insert(rawTokens.count)
+            postPrepareAliasCountsBySalt[mediaSalt] = counts
+        }
+    }
+
+    /// Resolve a pre-prepare media prompt to the effective token sequence used
+    /// by cache storage, if this coordinator has already seen that raw prompt.
+    ///
+    /// Exact repeats return the recorded effective sequence. Growing turns use
+    /// the longest recorded raw prefix and append the raw suffix, which is safe
+    /// only inside the same `mediaSalt` namespace.
+    public func resolvePostPrepareCacheKeyAlias(
+        rawTokens: [Int],
+        mediaSalt: String?
+    ) -> [Int]? {
+        guard let mediaSalt, !rawTokens.isEmpty else {
+            return nil
+        }
+        return lock.withLock {
+            let counts = postPrepareAliasCountsBySalt[mediaSalt] ?? []
+            for count in counts
+                .filter({ $0 <= rawTokens.count })
+                .sorted(by: >)
+            {
+                let prefix = count == rawTokens.count
+                    ? rawTokens
+                    : Array(rawTokens.prefix(count))
+                let key = postPrepareAliasKey(rawTokens: prefix, mediaSalt: mediaSalt)
+                guard let effectiveTokens = postPrepareAliases[key] else {
+                    continue
+                }
+                if count == rawTokens.count {
+                    return effectiveTokens
+                }
+                return effectiveTokens + Array(rawTokens.dropFirst(count))
+            }
+            return nil
+        }
+    }
+
+    private func postPrepareAliasKey(
+        rawTokens: [Int],
+        mediaSalt: String
+    ) -> PostPrepareCacheKeyAlias {
+        PostPrepareCacheKeyAlias(
+            rawTokenHash: DiskCache.hashTokens(
+                rawTokens,
+                modelKey: config.modelKey,
+                mediaSalt: mediaSalt),
+            mediaSalt: mediaSalt)
     }
 
     // MARK: - Fetch

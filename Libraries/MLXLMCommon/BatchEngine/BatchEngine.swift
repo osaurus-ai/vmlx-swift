@@ -1301,10 +1301,30 @@ public actor BatchEngine {
         // LayerKind. Sliding-window models (Gemma3/Gemma4 SWA, Mistral4
         // with maxKVSize, MiMoV2Flash, BaichuanM1, Qwen3.5-VL inherited)
         // now hit paged + L2 disk on the same path as standard KV.
-        if let coordinator = cacheCoordinator,
-           !slot.originalInput.requiresPostPrepareCacheKey
-        {
-            let tokenIds = slot.originalInput.text.tokens.asArray(Int.self)
+        if let coordinator = cacheCoordinator {
+            let rawTokenIds = slot.originalInput.text.tokens.asArray(Int.self)
+            var tokenIds = rawTokenIds
+            var usesPostPrepareAlias = false
+            if slot.originalInput.requiresPostPrepareCacheKey {
+                if let effectiveTokens = coordinator.resolvePostPrepareCacheKeyAlias(
+                    rawTokens: rawTokenIds,
+                    mediaSalt: slot.mediaSalt)
+                {
+                    tokenIds = effectiveTokens
+                    usesPostPrepareAlias = true
+                    Self.logger.info(
+                        "Slot \(slot.id.description, privacy: .public): resolved post-prepare cache-key alias for \(rawTokenIds.count) raw tokens -> \(effectiveTokens.count) effective tokens"
+                    )
+                } else {
+                    Self.logger.info(
+                        "Slot \(slot.id.description, privacy: .public): skipped pre-prepare cache fetch because this input requires model-derived effective prompt tokens"
+                    )
+                }
+            }
+            guard !slot.originalInput.requiresPostPrepareCacheKey || usesPostPrepareAlias else {
+                activeSlots[slotIndex] = slot
+                return stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare)
+            }
             let result = coordinator.fetch(tokens: tokenIds, mediaSalt: slot.mediaSalt)
             if case .hit(_, let remaining, let detail, let blocks, let ssmStates, let diskArrays) = result {
                 var restored = false
@@ -1359,6 +1379,10 @@ public actor BatchEngine {
                 }
 
                 if restored {
+                    if usesPostPrepareAlias {
+                        slot.cachePromptTokenIds = tokenIds
+                        slot.cachePromptUsesPostPrepareKey = true
+                    }
                     // Two classes of partial-restore that must roll back to
                     // full prefill rather than feed "remaining" tokens into
                     // model.prepare — correctness over speed in both cases:
@@ -1480,13 +1504,17 @@ public actor BatchEngine {
                     }
                 }
             }
-        } else if cacheCoordinator != nil,
-                  slot.originalInput.requiresPostPrepareCacheKey
-        {
-            Self.logger.info(
-                "Slot \(slot.id.description, privacy: .public): skipped pre-prepare cache fetch because this input requires model-derived effective prompt tokens"
-            )
         }
+
+        stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare, slot: slot)
+    }
+
+    private func stepPrefillAfterCacheLookup(
+        slotIndex: Int,
+        inputForPrepare: LMInput,
+        slot initialSlot: BatchSlot? = nil
+    ) {
+        var slot = initialSlot ?? activeSlots[slotIndex]
 
         // Prefill: either full input (cache miss) or remaining tokens (cache hit).
         let prepareResult: PrepareResult
@@ -1528,6 +1556,12 @@ public actor BatchEngine {
             {
                 slot.cachePromptTokenIds = effectivePromptTokens
                 slot.cachePromptUsesPostPrepareKey = true
+                if slot.originalInput.requiresPostPrepareCacheKey {
+                    cacheCoordinator?.recordPostPrepareCacheKeyAlias(
+                        rawTokens: slot.originalInput.text.tokens.reshaped(-1).asArray(Int.self),
+                        effectiveTokens: effectivePromptTokens,
+                        mediaSalt: slot.mediaSalt)
+                }
                 let promptTokens = MLXArray(effectivePromptTokens.map { Int32($0) })
                     .expandedDimensions(axis: 0)
                 slot.processor?.prompt(promptTokens)

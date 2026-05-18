@@ -165,9 +165,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         var inputForPrepare = input
+        var cacheLookupTokenIds = promptTokenIds
+        var cacheLookupUsesPostPrepareAlias = false
+        if input.requiresPostPrepareCacheKey,
+           let effectiveTokens = cacheCoordinator?.resolvePostPrepareCacheKeyAlias(
+                rawTokens: promptTokenIds,
+                mediaSalt: mediaSalt)
+        {
+            cacheLookupTokenIds = effectiveTokens
+            cacheLookupUsesPostPrepareAlias = true
+        }
         if let coordinator = cacheCoordinator,
-           !promptTokenIds.isEmpty,
-           !input.requiresPostPrepareCacheKey
+           !cacheLookupTokenIds.isEmpty,
+           (!input.requiresPostPrepareCacheKey || cacheLookupUsesPostPrepareAlias)
         {
             if !coordinator.isHybrid, cacheContainsPathDependentState(self.cache) {
                 coordinator.setHybrid(true)
@@ -177,7 +187,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             {
                 coordinator.setPagedIncompatible(true)
             }
-            switch coordinator.fetch(tokens: promptTokenIds, mediaSalt: mediaSalt) {
+            switch coordinator.fetch(tokens: cacheLookupTokenIds, mediaSalt: mediaSalt) {
             case .hit(_, let remainingTokens, _, let blocks, let ssmStates, let diskArrays):
                 var restored = false
                 if !blocks.isEmpty {
@@ -205,6 +215,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 }
 
                 if restored {
+                    if cacheLookupUsesPostPrepareAlias {
+                        self.promptTokenIds = cacheLookupTokenIds
+                    }
                     let hasPathDependentLayer = self.cache.contains { layer in
                         layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache
                     }
@@ -214,8 +227,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     if unsafePartial || unsafeFullHit {
                         self.cache = model.newCache(parameters: effectiveParameters)
                         inputForPrepare = input
-                    } else if remainingTokens.isEmpty, let last = promptTokenIds.last {
-                        let promptLen = promptTokenIds.count
+                    } else if remainingTokens.isEmpty, let last = cacheLookupTokenIds.last {
+                        let promptLen = cacheLookupTokenIds.count
                         let cacheOffset = self.cache.first?.offset ?? promptLen
                         let trimNeeded = cacheOffset - (promptLen - 1)
                         if trimNeeded < 0 {
@@ -274,6 +287,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                !effectivePromptTokens.isEmpty
             {
                 self.promptTokenIds = effectivePromptTokens
+                if originalInput.requiresPostPrepareCacheKey {
+                    cacheCoordinator?.recordPostPrepareCacheKeyAlias(
+                        rawTokens: originalInput.text.tokens.reshaped(-1).asArray(Int.self),
+                        effectiveTokens: effectivePromptTokens,
+                        mediaSalt: mediaSalt)
+                }
                 let promptTokens = MLXArray(effectivePromptTokens.map { Int32($0) })
                     .expandedDimensions(axis: 0)
                 processor?.prompt(promptTokens)

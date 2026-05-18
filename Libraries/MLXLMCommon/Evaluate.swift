@@ -1211,9 +1211,25 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Gemma3n, Gemma4 SWA layers, Mistral4 with maxKVSize, MiMoV2Flash,
         // BaichuanM1, Qwen3.5-VL inherited) now get full L2 disk
         // persistence + paged restore on cache hit.
+        var cacheLookupTokenIds = promptTokenIds
+        var cacheLookupUsesPostPrepareAlias = false
+        if input.requiresPostPrepareCacheKey,
+           let effectiveTokens = cacheCoordinator?.resolvePostPrepareCacheKeyAlias(
+                rawTokens: promptTokenIds,
+                mediaSalt: mediaSalt)
+        {
+            cacheLookupTokenIds = effectiveTokens
+            cacheLookupUsesPostPrepareAlias = true
+            let rawCount = promptTokenIds.count
+            let effectiveCount = effectiveTokens.count
+            Self.logger.info(
+                "TokenIterator: resolved post-prepare cache-key alias for \(rawCount) raw tokens -> \(effectiveCount) effective tokens"
+            )
+        }
+
         if let coordinator = cacheCoordinator,
-           !promptTokenIds.isEmpty,
-           !input.requiresPostPrepareCacheKey
+           !cacheLookupTokenIds.isEmpty,
+           (!input.requiresPostPrepareCacheKey || cacheLookupUsesPostPrepareAlias)
         {
             if !coordinator.isHybrid {
                 if cacheContainsPathDependentState(self.cache) {
@@ -1238,7 +1254,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
             let result = coordinator.fetch(
-                tokens: promptTokenIds, mediaSalt: mediaSalt)
+                tokens: cacheLookupTokenIds, mediaSalt: mediaSalt)
             switch result {
             case .hit(_, let remainingTokens, let detail, let blocks, let ssmStates, let diskArrays):
                 var restored = false
@@ -1278,6 +1294,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
 
                 if restored {
+                    if cacheLookupUsesPostPrepareAlias {
+                        self.promptTokenIds = cacheLookupTokenIds
+                    }
                     let hasPathDependentLayer = self.cache.contains { layer in
                         layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache
                     }
@@ -1307,7 +1326,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                         // when fed a 1D tensor. Emitting 2D works uniformly
                         // because all `callAsFunction` paths either broadcast
                         // 2D already or tolerate the extra leading axis.
-                        if remainingTokens.isEmpty, let last = promptTokenIds.last {
+                        if remainingTokens.isEmpty, let last = cacheLookupTokenIds.last {
                             // Full cache hit — feed just the last token to seed decode.
                             // Match BatchEngine.stepPrefill: the restored cache already
                             // contains the full prompt, so trim it back to promptLen - 1
@@ -1316,7 +1335,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                             // position too far to the right after a full disk/paged hit,
                             // which can produce blank/newline-only first-token behavior
                             // on the B=1 solo path used by osaurus.
-                            let promptLen = promptTokenIds.count
+                            let promptLen = cacheLookupTokenIds.count
                             let cacheOffset = self.cache.first?.offset ?? promptLen
                             let trimNeeded = cacheOffset - (promptLen - 1)
                             if trimNeeded > 0 {
@@ -1339,7 +1358,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     }
                 }
             case .miss:
-                let count = promptTokenIds.count
+                let count = cacheLookupTokenIds.count
                 Self.logger.debug("Cache miss for \(count) prompt tokens")
 
                 // 2026-05-05 (Ling-2.6-flash multi-turn fix): coordinator
@@ -1367,7 +1386,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // to "forget". Reset the cache and prefill the full new
                 // prompt from scratch.
                 if let cacheOffset = self.cache.first?.offset, cacheOffset > 0 {
-                    if cacheOffset > promptTokenIds.count {
+                    if cacheOffset > cacheLookupTokenIds.count {
                         // Reasoning-strip mismatch — replace cache entirely.
                         // Some chat templates (Bailing, DeepSeek-R1, Qwen3
                         // reasoning) drop `<think>...</think>` blocks from
@@ -1377,11 +1396,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                         // know exactly which positions to drop. Replace the
                         // cache with a fresh one — full re-prefill is
                         // O(prompt) but correct, vs producing garbage.
-                        let resetMsg = "Populated-cache miss: cache offset (\(cacheOffset)) > prompt length (\(promptTokenIds.count)) — likely reasoning-strip in chat template; reset cache for full prefill"
+                        let resetMsg = "Populated-cache miss: cache offset (\(cacheOffset)) > prompt length (\(cacheLookupTokenIds.count)) — likely reasoning-strip in chat template; reset cache for full prefill"
                         self.cache = self.model.newCache(parameters: effectiveParameters)
                         Self.logger.info("\(resetMsg)")
-                    } else if cacheOffset == promptTokenIds.count,
-                              let last = promptTokenIds.last
+                    } else if cacheOffset == cacheLookupTokenIds.count,
+                              let last = cacheLookupTokenIds.last
                     {
                         let lastToken = MLXArray([Int32(last)])
                             .expandedDimensions(axis: 0)
@@ -1395,7 +1414,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                         // cacheOffset < promptTokenIds.count — assume
                         // prefix matches (safe for templates that don't
                         // strip past content). Trim and prefill remainder.
-                        let remaining = Array(promptTokenIds[cacheOffset...])
+                        let remaining = Array(cacheLookupTokenIds[cacheOffset...])
                         let remainingArray = MLXArray(remaining.map { Int32($0) })
                             .expandedDimensions(axis: 0)
                         inputForPrepare = LMInput(
@@ -1502,6 +1521,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         case .logits(let result):
             if let effectivePromptTokens = result.effectivePromptTokens {
                 promptTokenIds = effectivePromptTokens
+                if originalInput.requiresPostPrepareCacheKey {
+                    cacheCoordinator?.recordPostPrepareCacheKeyAlias(
+                        rawTokens: originalInput.text.tokens.reshaped(-1).asArray(Int.self),
+                        effectiveTokens: effectivePromptTokens,
+                        mediaSalt: mediaSalt)
+                }
                 let promptTokens = MLXArray(effectivePromptTokens.map { Int32($0) })
                     .expandedDimensions(axis: 0)
                 processor?.prompt(promptTokens)

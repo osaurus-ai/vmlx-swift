@@ -63,6 +63,63 @@ struct CacheCoordinatorTopologyFocusedTests {
         }
     }
 
+    @Test("post-prepare media aliases resolve effective cache keys")
+    func postPrepareMediaAliasesResolveEffectiveCacheKeys() {
+        FocusedMLXTestSupport.withLock {
+        let coordinator = makeCoordinator(usePagedCache: true, enableDiskCache: false, blockSize: 1)
+        let rawVideoPrompt = [101, 27, 27, 27, 102]
+        let effectiveVideoPrompt = [101, 27, 102]
+        let growingTurn = rawVideoPrompt + [201, 202]
+
+        #expect(
+            coordinator.resolvePostPrepareCacheKeyAlias(
+                rawTokens: rawVideoPrompt,
+                mediaSalt: "video-a") == nil)
+
+        coordinator.recordPostPrepareCacheKeyAlias(
+            rawTokens: rawVideoPrompt,
+            effectiveTokens: effectiveVideoPrompt,
+            mediaSalt: "video-a")
+        coordinator.storeAfterGeneration(
+            promptTokens: effectiveVideoPrompt,
+            perLayerData: fakeLayerData(tokenCount: effectiveVideoPrompt.count),
+            ssmStates: nil,
+            mediaSalt: "video-a")
+
+        #expect(
+            coordinator.resolvePostPrepareCacheKeyAlias(
+                rawTokens: rawVideoPrompt,
+                mediaSalt: "video-a") == effectiveVideoPrompt)
+        #expect(
+            coordinator.resolvePostPrepareCacheKeyAlias(
+                rawTokens: growingTurn,
+                mediaSalt: "video-a") == effectiveVideoPrompt + [201, 202])
+        #expect(
+            coordinator.resolvePostPrepareCacheKeyAlias(
+                rawTokens: rawVideoPrompt,
+                mediaSalt: "video-b") == nil)
+        #expect(
+            coordinator.resolvePostPrepareCacheKeyAlias(
+                rawTokens: rawVideoPrompt,
+                mediaSalt: nil) == nil)
+
+        switch coordinator.fetch(
+            tokens: coordinator.resolvePostPrepareCacheKeyAlias(
+                rawTokens: growingTurn,
+                mediaSalt: "video-a") ?? [],
+            mediaSalt: "video-a")
+        {
+        case .hit(let matchedTokens, let remainingTokens, let detail, let blocks, _, _):
+            #expect(matchedTokens == effectiveVideoPrompt.count)
+            #expect(remainingTokens == [201, 202])
+            #expect(detail == .paged)
+            coordinator.release(blocks: blocks)
+        case .miss:
+            Issue.record("resolved post-prepare alias should fetch the stored effective prefix")
+        }
+        }
+    }
+
     @Test("prompt tool-surface edits never return a full cached prompt hit")
     func promptToolSurfaceEditsNeverReturnFullPromptHit() {
         FocusedMLXTestSupport.withLock {

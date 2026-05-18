@@ -483,6 +483,15 @@ weights.
   with bundle defaults at 65.4-76.6 tok/s in cache-off rows.
   Chunked Parakeet embeddings are not concat-safe, so live voice must retain
   PCM and submit a full-snapshot pre-encode or raw PCM at endpoint.
+- 2026-05-18 post-prepare media cache refresh: `CacheCoordinator` now records
+  and resolves media-salted raw-to-effective prompt aliases for post-EVS
+  prompts, and `BatchEngine`, `TokenIterator`, and `NativeMTPTokenIterator`
+  use that alias before cache fetch. Focused proof:
+  `MediaCachePlaceholderTests|CacheCoordinatorTopologyFocusedTests` passes 30
+  tests across 6 suites, and the broader `MLXLMCommonFocusedTests` gate passes
+  241 Swift Testing tests across 28 suites plus 22 XCTest rows. This clears the
+  static alias-contract blocker but still needs a live repeated-video cache-hit
+  row before full Omni video cache production sign-off.
 - Open: cache-off repeated rows no longer leak literal sound markers after the
   wrapper fix, but some short BatchEngine/pre-encoded rows are still weak.
   Fresh cache-on repeat gate

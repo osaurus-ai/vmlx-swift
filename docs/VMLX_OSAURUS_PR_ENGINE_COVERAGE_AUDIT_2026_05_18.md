@@ -156,10 +156,11 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   pre-pruned token stream. History-boundary aliases are also skipped when their
   saved counts are in the pre-pruned coordinate space. This is correctness
   routing, not a sampler/parser workaround.
-- Remaining cache gap: video EVS does not yet have a pre-prepare effective-key
-  resolver or durable alias table, so repeated video prompts will not get a
-  real prefix hit until that contract is added. Do not claim full video cache
-  production readiness from the 20/20 structural matrix alone.
+- Remaining cache gap at this point in the audit was video EVS pre-prepare
+  effective-key resolution. See the 06:35 PDT update below: the in-memory
+  alias contract is now implemented and focused-tested, but a live repeated
+  video cache-hit row is still required before calling full video cache
+  production-clear.
 
 2026-05-18 04:25 PDT Nemotron Omni live-behavior correction:
 
@@ -229,11 +230,42 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   `docs/local/live-model-matrix/20260518T_omni_jangtq_media_direct_contract_prompt_postfix/omni_jangtq.log`
   passes 19/19 using bundle defaults
   (`temp=0.600 topP=0.950 topK=0 minP=0.000 rep=1.000 seed=20260517`).
-  Covered rows include text single-turn, text multi-turn, image single-turn,
+ Covered rows include text single-turn, text multi-turn, image single-turn,
   image reasoning-off direct, image multi-turn, video encoder, Parakeet audio
   encoder, video LMInput, audio LMInput, text reasoning OFF, text ON/OFF/ON
   reasoning toggle, mixed image+audio, media-salt isolation, hybrid SSM
   warm-pass parity, and BatchEngine text/image/audio rows.
+
+2026-05-18 06:35 PDT post-prepare media cache alias refresh:
+
+- Root cause: post-EVS media prompts were stored under
+  `LMOutput.effectivePromptTokens`, but future requests only have the raw
+  pre-EVS token stream before `prepare`. The previous safe behavior skipped
+  pre-prepare fetch forever. That avoided false hits but also prevented
+  repeated video prompts from using the existing prefix/paged/L2 cache entry.
+- Fix: `CacheCoordinator` now records and resolves media-salted raw-to-effective
+  prompt aliases. Exact repeats resolve to the stored effective token sequence;
+  growing prompts use the longest recorded raw prefix and append the raw suffix.
+  The alias refuses nil or mismatched media/cache salt, so same-text/different-
+  media, different reasoning scope, and different KV policy still miss.
+- Wiring: `BatchEngine`, `TokenIterator`, and `NativeMTPTokenIterator` now
+  resolve the alias before fetch and record it when `prepare` returns effective
+  prompt tokens. This is cache-key routing only; it does not change sampler,
+  stop-token, repetition, or reasoning behavior.
+- Focused verification:
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test
+  --filter 'MediaCachePlaceholderTests|CacheCoordinatorTopologyFocusedTests'
+  --jobs 2` passes 30 tests across 6 suites. The new behavior test proves
+  exact and growing raw prompts resolve to effective tokens, different media
+  salts miss, nil salt misses, and the resolved effective prefix fetches the
+  stored paged cache entry.
+- Full focused policy gate:
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test
+  --filter MLXLMCommonFocusedTests --jobs 2` passes 241 Swift Testing tests
+  across 28 suites plus 22 selected XCTest focused rows.
+- Boundary: this clears the engine alias-contract blocker. It is not yet a
+  live repeated-video production proof; the next Omni video cache row must show
+  an actual second-turn prefix/paged or L2 hit with coherent visible output.
 
 2026-05-18 04:45 PDT build/coverage/live refresh:
 
@@ -247,7 +279,7 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
 - Full active focused runtime-policy gate:
   `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test
   --filter MLXLMCommonFocusedTests --jobs 2` passes. Current count after the
-  Omni media-contract refresh: 240 Swift Testing tests across 28 suites plus
+  post-prepare media cache alias refresh: 241 Swift Testing tests across 28 suites plus
   22 selected XCTest focused rows.
 - Source-coverage fix: `BatchEngineGrowingChatCacheSourceTests` was still in
   inactive `Tests/MLXLMTests` and filtered runs executed zero tests. The guard
@@ -496,10 +528,11 @@ promotion blockers:
 - GPT-OSS / GLM5 / Mistral4 / Pixtral: parser/unit coverage exists, but there
   are no local live decode rows in this pass.
 - Omni live voice: text, image, audio, video, mixed-media, media-salt, hybrid
-  SSM, and BatchEngine rows now pass structurally in the 20/20 JANGTQ matrix.
-  No-thinking image/video grounding remains weak, and video EVS cache prefetch
-  is correctness-blocked until a real post-prepare key resolver or alias
-  contract exists.
+  SSM, and BatchEngine rows pass in the latest strict JANGTQ matrices, with
+  direct-answer media mode separated from text reasoning. The post-prepare
+  video EVS alias contract is now implemented and focused-tested, but a live
+  repeated-video cache-hit row is still required. Repeated cache-on audio
+  semantic quality/termination also remains partial.
 - Qwen high-resolution video: bounded media resize rows pass; raw 1080p video
   is not production-clear because the pre-fix row peaked at 164.2 GiB physical
   footprint.
@@ -530,7 +563,7 @@ row below has current `vmlx-swift` live proof.
 | #1037 `Ling/ZAYA hardening + BatchEngine lifecycle` | merged | Ling/Bailing, ZAYA, BatchEngine lifecycle, topology-aware cache. | Ling JANGTQ2/MXFP4 pass; ZAYA text JANGTQ4/JANGTQ_K pass; ZAYA1-VL JANGTQ4 passes. Cache proof is topology-specific: disk/SSM/CCA, not generic prefix hit. | ZAYA1-VL JANGTQ_K remains partial; Hy3 K needs current rerun. |
 | #1057 `MiniMax speed fix` | merged | MiniMax speed/lifecycle, typed load config, VLM detection, tokenizer/Jinja compatibility. | Large MiniMax JANGTQ_K/JANG cache-off infer rows pass; production-shaped chat-cache row passes; strict TQ B=2 now passes after `6560879`. | Low-footprint active-routed MiniMax proof is still open. Shape-inferred 6-bit metadata repair in JANG_K should be corrected in bundle or explicitly accepted. |
 | #1066 `pin DSV4 vmlx update` | merged | DSV4 tokenizer/cache/runtime pin, local tokenizer fallback. | DSV4 separator fix and template kwargs rows pass; DSV4 live cache OFF/ON chat is coherent. | DSV4 remains partial until long-context/vector/API/speed/low-footprint gates pass. |
-| #1073 `Nemotron Omni live voice input path` | merged | Live voice, Parakeet/RADIO, media-cache token-aware restore, DSV4 pool/compressor fixes. | Omni JANGTQ/JANGTQ4/MXFP4 core matrices pass; the latest strict JANGTQ media-direct row is 19/19 with bundle sampling defaults and proves text reasoning remains separate from direct-answer media mode. Focused 2026-05-18 repeat-audio gate proves block-L2 and `ssm_companion` writes for BatchEngine and manual TokenIterator paths after the bench store fix. DSV4 pool/compressor lineage is recorded. | Video EVS prefetch-key contract, repeated cache-on audio semantic quality/termination, broader Omni media-thinking research, and package-wide HTTP route proof remain open. |
+| #1073 `Nemotron Omni live voice input path` | merged | Live voice, Parakeet/RADIO, media-cache token-aware restore, DSV4 pool/compressor fixes. | Omni JANGTQ/JANGTQ4/MXFP4 core matrices pass; the latest strict JANGTQ media-direct row is 19/19 with bundle sampling defaults and proves text reasoning remains separate from direct-answer media mode. Focused 2026-05-18 repeat-audio gate proves block-L2 and `ssm_companion` writes for BatchEngine and manual TokenIterator paths after the bench store fix. The post-prepare EVS alias contract now resolves raw media prompts to effective cache keys in `BatchEngine`, `TokenIterator`, and `NativeMTPTokenIterator`. DSV4 pool/compressor lineage is recorded. | Live repeated-video cache-hit proof, repeated cache-on audio semantic quality/termination, broader Omni media-thinking research, and package-wide HTTP route proof remain open. |
 | #1110 `Harden DSV4 reasoning gates and runtime proof` | open, dirty | Native DSV4 chat encoder/tokenizer bridge, live DSV4 proof, runtime pin check. Current Osaurus head pins `vmlx-swift-lm 2cc64dd`. | `vmlx-swift` has DSV4 prompt-boundary fix and partial live proof, but it does not yet close the full #1110 bar. | Do not treat #1110 as merged release state; switch PR must resolve dirty state and rerun DSV4 release gates. |
 | #1118 `Add PocketTTS language selection` | open, behind | TTS language UI/config and resolver-pin churn. | No direct vmlx inference-engine change; keep Omni/Parakeet input-audio evidence separate from output TTS. | Re-run pin-integrity checks after any rebase/merge before the package switch. |
 | #1119 `Add model idle residency policy` | merged | Server idle residency, unload/sleep policy, runtime lifecycle hooks. | `VMLXServerRuntimeSettings.power` documents light/deep sleep settings and cache release/disable APIs exist. | Needs live Osaurus server deep-sleep/wake proof with loaded models before lifecycle readiness is claimed. |
@@ -574,7 +607,7 @@ Recent dependency scan, 2026-05-04 through 2026-05-18:
 | Generation defaults | Bundle defaults are source of truth before explicit request override. | Ledger rows print temp/topP/topK/minP/rep per family. | Covered for tested rows; require same telemetry for new rows. |
 | Hybrid SSM / CCA / SWA cache | Cache proof must be topology-specific, not generic prefix-hit. | Qwen/Ling/ZAYA/Gemma4 rows record disk L2, SSM companion, CCA, SWA incompatibility, and media salt where applicable. Fresh Gemma E2B refresh records disk hits/stores plus VL media-salt restore; fresh Ling no-guard refresh confirms Bailing template/decode stress without fake sampler fixes. | Covered for listed PASS rows; DSV4 long-context and ZAYA1-VL K remain open. |
 | TurboQuant KV | Explicit TQ mode must preserve coherency and prove actual compression. | `20260518T_minimax_m27_jangtqk_tq_tail_fix_exact/` proves actual TQ transitions and exact outputs after tail preservation. | Fixed for MiniMax strict row; keep family-by-family gates. |
-| VL/media salt | Image/video/audio state must be isolated across turns and cache hits. | Qwen, ZAYA1-VL, Gemma4, and Omni rows prove same/different media behavior where implemented. Omni video EVS now stores under post-prepare effective tokens instead of the pre-pruned prompt key. | Raw Qwen high-res video, Omni video EVS prefetch/alias hits, and repeated Omni cache-on audio remain open. |
+| VL/media salt | Image/video/audio state must be isolated across turns and cache hits. | Qwen, ZAYA1-VL, Gemma4, and Omni rows prove same/different media behavior where implemented. Omni video EVS now stores under post-prepare effective tokens and has a focused-tested raw-to-effective alias contract for pre-prepare cache lookup. | Raw Qwen high-res video, live Omni repeated-video cache-hit proof, and repeated Omni cache-on audio semantics remain open. |
 | Reasoning on/off | No fake close; reasoning off must affect template/runtime where supported, and visible output must remain coherent. | Gemma4 reasoning matrix, MiniMax rows, DSV4 reasoning kwargs, Ling/Bailing aliases. Fresh Gemma E2B no-guard red/green pair proves the harness now accepts coherent stellar equivalents instead of forcing decode behavior; fresh Ling row proves the Russian stress prompt with `temp=0.7` stops normally. | Covered for tested families; package-wide model matrix still open for absent local bundles. |
 | MTP autodetect | Only real tensor evidence plus usable tuning may enable MTP; model names and stale metadata are insufficient. Qwen auto-depth must come from bundle-local `vmlx_mtp_tuning.json`, not profile/name rules. | Non-Kimi MTP census and Qwen MTP settings docs; CRACK rows explicitly stay MTP off. Focused tests cover tuned D2, validated D3, missing tuning, blocked tuning rows, valid tuning without MTP tensors, `MTPBundleStatus.snapshot`, missing-tuning evidence, and LLM/VLM factory wiring into `ModelConfiguration`. | Correct fail-closed policy covered; full MTP speed target remains separate/open. |
 
