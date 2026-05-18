@@ -13,6 +13,9 @@ public enum DeepseekV4ReasoningPolicy {
     /// Deprecated compatibility key. `reasoning_effort=max` now passes through
     /// without an opt-in environment variable.
     public static let rawMaxEnvironmentKey = "VMLINUX_DSV4_RAW_MAX"
+
+    /// Deprecated compatibility key. Public request/template controls must win;
+    /// process environment must not silently force direct-answer rails.
     public static let forceDirectRailEnvironmentKey = "VMLINUX_DSV4_FORCE_DIRECT_RAIL"
 
     public static func isDeepseekV4(modelType: String?) -> Bool {
@@ -33,6 +36,7 @@ public enum DeepseekV4ReasoningPolicy {
         truthy(environment[rawMaxEnvironmentKey])
     }
 
+    @available(*, deprecated, message: "Do not use process env to override explicit reasoning controls.")
     public static func forceDirectRailEnabled(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
@@ -72,11 +76,6 @@ public enum DeepseekV4ReasoningPolicy {
         guard isDeepseekV4(modelType: modelType) else { return context }
 
         var normalized = context ?? [:]
-        if forceDirectRailEnabled(environment: environment) {
-            normalized["enable_thinking"] = false
-            normalized.removeValue(forKey: "reasoning_effort")
-            return normalized.isEmpty ? nil : normalized
-        }
 
         let rawEffort = normalized["reasoning_effort"]
         if let effort = normalizedReasoningEffort(rawEffort) {

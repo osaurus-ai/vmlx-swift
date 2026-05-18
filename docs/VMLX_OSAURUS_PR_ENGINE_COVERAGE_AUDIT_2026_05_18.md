@@ -20,7 +20,7 @@ gh api repos/osaurus-ai/{repo}/compare/{pin}...main
 Current `vmlx-swift` branch head at this refresh:
 
 ```text
-b4c89c7 test(vlm): keep quantization guard in focused suite
+47c5d15 docs(osaurus): refresh live pr pin audit
 ```
 
 2026-05-18 continuation refresh:
@@ -57,6 +57,18 @@ b4c89c7 test(vlm): keep quantization guard in focused suite
   the production `WiredMemoryManager` event surface unchanged. Focused release
   tests now pass for `vlmJangLoadUsesQuantizationContainer` and
   `nilServerSamplingFieldsDoNotAddFakeGuards`.
+- DSV4 reasoning policy no longer lets the deprecated
+  `VMLINUX_DSV4_FORCE_DIRECT_RAIL` environment key silently override an explicit
+  `reasoning_effort=max` request. The first red test proved the old behavior
+  rewrote the request to `enable_thinking=false`; the fixed release test suite
+  now passes 6/6 for `DeepseekV4ReasoningPolicyTests`.
+- Qwen native-MTP auto-launch is now driven by the bundle-local
+  `vmlx_mtp_tuning.json`. `MTPBundleInspector` reads the file into
+  `MTPBundleStatus`, and `NativeMTPAutoDecodePolicy` returns a depth only when
+  the tuning row is validated, output-equivalent, unblocked, and tensor-proven.
+  The old hardcoded Qwen profile/depth rules are removed; local 27B MXFP4 proves
+  `best_depth=2` is honored, and local 35B JANG_2K proves a blocked tuning row
+  keeps auto-launch off.
 
 ## Current Switch Verdict
 
@@ -149,7 +161,7 @@ Recent dependency scan, 2026-05-04 through 2026-05-18:
 | TurboQuant KV | Explicit TQ mode must preserve coherency and prove actual compression. | `20260518T_minimax_m27_jangtqk_tq_tail_fix_exact/` proves actual TQ transitions and exact outputs after tail preservation. | Fixed for MiniMax strict row; keep family-by-family gates. |
 | VL/media salt | Image/video/audio state must be isolated across turns and cache hits. | Qwen, ZAYA1-VL, Gemma4, and Omni rows prove same/different media behavior where implemented. | Raw Qwen high-res video and repeated Omni cache-on audio remain open. |
 | Reasoning on/off | No fake close; reasoning off must affect template/runtime where supported, and visible output must remain coherent. | Gemma4 reasoning matrix, MiniMax rows, DSV4 reasoning kwargs, Ling/Bailing aliases. Fresh Gemma E2B no-guard red/green pair proves the harness now accepts coherent stellar equivalents instead of forcing decode behavior; fresh Ling row proves the Russian stress prompt with `temp=0.7` stops normally. | Covered for tested families; package-wide model matrix still open for absent local bundles. |
-| MTP autodetect | Only real tensor evidence may enable MTP; model names and stale metadata are insufficient. | Non-Kimi MTP census and Qwen MTP settings docs; CRACK rows explicitly stay MTP off. | Correct policy documented; full MTP speed target remains separate/open. |
+| MTP autodetect | Only real tensor evidence may enable MTP; model names and stale metadata are insufficient. Qwen auto-depth must come from bundle-local `vmlx_mtp_tuning.json`, not profile/name rules. | Non-Kimi MTP census and Qwen MTP settings docs; CRACK rows explicitly stay MTP off. Focused tests cover tuned D2, validated D3, missing tuning, and blocked tuning rows. | Correct fail-closed policy covered; full MTP speed target remains separate/open. |
 
 ## Production-Quality Checklist Still Required
 

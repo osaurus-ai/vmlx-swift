@@ -82,6 +82,63 @@ struct MTPRuntimeFocusedTests {
         #expect(status.statusLine.contains("speculative=on"))
     }
 
+    @Test("Qwen MTP auto decode uses vmlx_mtp_tuning json")
+    func qwenMTPAutoDecodeUsesVMLXTuningJSON() throws {
+        let root = try makeTemporaryBundle(name: "qwen-mtp-tuning")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try writeJSON([
+            "model_type": "qwen3_vl",
+            "text_config": [
+                "model_type": "qwen3_5_moe_text",
+                "num_hidden_layers": 48,
+                "mtp_num_hidden_layers": 1,
+            ] as [String: Any],
+            "quantization": [
+                "mode": "mxfp4",
+                "bits": 4,
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("config.json"))
+        try writeJSON([
+            "runtime": [
+                "bundle_has_mtp": true,
+                "mtp_layers": 1,
+                "mtp_mode": "preserved_enabled",
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("jang_config.json"))
+        try writeJSON([
+            "weight_map": [
+                "mtp.fc.weight": "model-00029-of-00029.safetensors",
+                "mtp.layers.0.self_attn.q_proj.weight": "model-00029-of-00029.safetensors",
+                "model.layers.0.self_attn.q_proj.weight": "model-00001-of-00029.safetensors",
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("model.safetensors.index.json"))
+        try writeJSON([
+            "native_mtp": [
+                "best_depth": 2,
+                "validated": true,
+                "output_equivalent": true,
+                "cache_mode": "off",
+                "artifact": "docs/internal/release-gates/qwen-depth2/result.json",
+                "baseline_tok_s": 24.655,
+                "best_tok_s": 45.712,
+                "speedup_vs_baseline": 1.854,
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("vmlx_mtp_tuning.json"))
+
+        let status = try MTPBundleInspector.inspect(modelDirectory: root)
+        let configData = try Data(contentsOf: root.appendingPathComponent("config.json"))
+        let recommendation = NativeMTPAutoDecodePolicy.recommendation(
+            configData: configData,
+            jangConfig: try? JangLoader.loadConfig(at: root),
+            status: status)
+
+        #expect(recommendation?.depth == 2)
+        #expect(recommendation?.verifierMode == "sequential_repair")
+        #expect(recommendation?.evidence.contains("tuning_file=vmlx_mtp_tuning.json") == true)
+        #expect(recommendation?.reason.contains("vmlx_mtp_tuning.json") == true)
+    }
+
     @Test("MTP config without tensors is reported as metadata-only")
     func configOnlyMTPIsMetadataOnlyMissingWeights() throws {
         let root = try makeTemporaryBundle(name: "qwen-mtp-missing-weights")
@@ -346,8 +403,35 @@ struct MTPRuntimeFocusedTests {
             configuredLayers: 1,
             tensorCount: 31,
             visionTensorCount: 333,
-            mode: .preservedEnabled)
+            mode: .preservedEnabled,
+            nativeMTPTuning: NativeMTPTuning(
+                bestDepth: 3,
+                validated: true,
+                outputEquivalent: true,
+                artifact: "docs/internal/release-gates/qwen-depth3/result.json"))
         let verified = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 31,
+            visionTensorCount: 333,
+            mode: .speculativeVerified,
+            nativeMTPTuning: NativeMTPTuning(
+                bestDepth: 3,
+                validated: true,
+                outputEquivalent: true,
+                artifact: "docs/internal/release-gates/qwen-depth3/result.json"))
+        let blockedTuning = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 31,
+            visionTensorCount: 333,
+            mode: .speculativeVerified,
+            nativeMTPTuning: NativeMTPTuning(
+                validated: false,
+                outputEquivalent: false,
+                blocked: true,
+                reason: "forced diagnostic was not production-valid"))
+        let noTuning = MTPBundleStatus(
             bundleHasMTP: true,
             configuredLayers: 1,
             tensorCount: 31,
@@ -365,6 +449,11 @@ struct MTPRuntimeFocusedTests {
             status: preserved)
         #expect(denseAuto?.depth == 3)
         #expect(denseAuto?.verifierMode == "sequential_repair")
+        #expect(denseAuto?.evidence.contains("tuning_file=vmlx_mtp_tuning.json") == true)
+        #expect(NativeMTPAutoDecodePolicy.recommendation(
+            configData: denseMXFP8Config,
+            jangConfig: nil,
+            status: noTuning) == nil)
         #expect(NativeMTPAutoDecodePolicy.recommendation(
             configData: denseMXFP8Config,
             jangConfig: nil,
@@ -397,7 +486,7 @@ struct MTPRuntimeFocusedTests {
                     bitWidthsUsed: [2, 3, 6, 8]),
                 sourceModel: JangSourceModel(architecture: "qwen3_5_moe"),
                 architecture: JangArchitecture(hasMoE: true)),
-            status: verified)
+            status: blockedTuning)
         #expect(jang2k == nil)
     }
 
@@ -1004,7 +1093,8 @@ struct MTPRuntimeFocusedTests {
         } else {
             #expect(status.canAutoLaunchMTP)
             #expect(launch.launchMode == .speculative)
-            #expect(launch.recommendation?.depth == 3)
+            #expect(launch.recommendation?.depth == status.nativeMTPTuning?.usableBestDepth)
+            #expect(launch.recommendation?.evidence.contains("tuning_file=vmlx_mtp_tuning.json") == true)
             #expect(loadConfiguration.nativeMTP)
         }
     }

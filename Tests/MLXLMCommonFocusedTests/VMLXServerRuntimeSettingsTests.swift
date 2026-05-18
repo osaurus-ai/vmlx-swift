@@ -188,7 +188,12 @@ struct VMLXServerRuntimeSettingsTests {
             bundleHasMTP: true,
             configuredLayers: 1,
             tensorCount: 31,
-            mode: .speculativeVerified)
+            mode: .speculativeVerified,
+            nativeMTPTuning: NativeMTPTuning(
+                bestDepth: 3,
+                validated: true,
+                outputEquivalent: true,
+                artifact: "docs/internal/release-gates/qwen-depth3/result.json"))
         var settings = VMLXServerRuntimeSettings()
         settings.mtp.draftTokenLimit = 2
 
@@ -226,7 +231,12 @@ struct VMLXServerRuntimeSettingsTests {
             configuredLayers: 1,
             tensorCount: 42,
             visionTensorCount: 333,
-            mode: .preservedEnabled)
+            mode: .preservedEnabled,
+            nativeMTPTuning: NativeMTPTuning(
+                bestDepth: 3,
+                validated: true,
+                outputEquivalent: true,
+                artifact: "docs/internal/release-gates/qwen-depth3/result.json"))
         let settings = VMLXServerRuntimeSettings()
 
         let candidate = NativeMTPAutoDecodePolicy.recommendation(

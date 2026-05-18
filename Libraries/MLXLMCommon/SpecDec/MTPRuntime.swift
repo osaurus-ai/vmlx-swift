@@ -55,6 +55,123 @@ public enum MTPRuntimeMode: String, Codable, Sendable, Equatable {
     }
 }
 
+/// Per-bundle native-MTP tuning metadata.
+///
+/// This is intentionally stored in `vmlx_mtp_tuning.json`, next to the model
+/// weights, so Qwen MTP launch depth follows the measured artifact rather than
+/// a model name, quantization label, or stale hard-coded profile rule.
+public struct NativeMTPTuning: Codable, Sendable, Equatable {
+    public static let fileName = "vmlx_mtp_tuning.json"
+
+    public let bestDepth: Int?
+    public let verifierMode: String?
+    public let validated: Bool
+    public let outputEquivalent: Bool
+    public let blocked: Bool
+    public let cacheMode: String?
+    public let promptClass: String?
+    public let measuredAt: String?
+    public let artifact: String?
+    public let baselineTokensPerSecond: Double?
+    public let bestTokensPerSecond: Double?
+    public let speedupVsBaseline: Double?
+    public let note: String?
+    public let reason: String?
+
+    public init(
+        bestDepth: Int? = nil,
+        verifierMode: String? = nil,
+        validated: Bool = false,
+        outputEquivalent: Bool = false,
+        blocked: Bool = false,
+        cacheMode: String? = nil,
+        promptClass: String? = nil,
+        measuredAt: String? = nil,
+        artifact: String? = nil,
+        baselineTokensPerSecond: Double? = nil,
+        bestTokensPerSecond: Double? = nil,
+        speedupVsBaseline: Double? = nil,
+        note: String? = nil,
+        reason: String? = nil
+    ) {
+        self.bestDepth = bestDepth
+        self.verifierMode = verifierMode
+        self.validated = validated
+        self.outputEquivalent = outputEquivalent
+        self.blocked = blocked
+        self.cacheMode = cacheMode
+        self.promptClass = promptClass
+        self.measuredAt = measuredAt
+        self.artifact = artifact
+        self.baselineTokensPerSecond = baselineTokensPerSecond
+        self.bestTokensPerSecond = bestTokensPerSecond
+        self.speedupVsBaseline = speedupVsBaseline
+        self.note = note
+        self.reason = reason
+    }
+
+    public var usableBestDepth: Int? {
+        guard !blocked,
+              validated,
+              outputEquivalent,
+              let bestDepth,
+              bestDepth > 0
+        else {
+            return nil
+        }
+        return bestDepth
+    }
+
+    public var resolvedVerifierMode: String {
+        let normalized = verifierMode?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        guard let normalized, !normalized.isEmpty else {
+            return "sequential_repair"
+        }
+        return normalized
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            bestDepth: try c.decodeIfPresent(Int.self, forKey: .bestDepth),
+            verifierMode: try c.decodeIfPresent(String.self, forKey: .verifierMode),
+            validated: try c.decodeIfPresent(Bool.self, forKey: .validated) ?? false,
+            outputEquivalent: try c.decodeIfPresent(Bool.self, forKey: .outputEquivalent) ?? false,
+            blocked: try c.decodeIfPresent(Bool.self, forKey: .blocked) ?? false,
+            cacheMode: try c.decodeIfPresent(String.self, forKey: .cacheMode),
+            promptClass: try c.decodeIfPresent(String.self, forKey: .promptClass),
+            measuredAt: try c.decodeIfPresent(String.self, forKey: .measuredAt),
+            artifact: try c.decodeIfPresent(String.self, forKey: .artifact),
+            baselineTokensPerSecond: try c.decodeIfPresent(
+                Double.self, forKey: .baselineTokensPerSecond),
+            bestTokensPerSecond: try c.decodeIfPresent(
+                Double.self, forKey: .bestTokensPerSecond),
+            speedupVsBaseline: try c.decodeIfPresent(Double.self, forKey: .speedupVsBaseline),
+            note: try c.decodeIfPresent(String.self, forKey: .note),
+            reason: try c.decodeIfPresent(String.self, forKey: .reason))
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case bestDepth = "best_depth"
+        case verifierMode = "verifier_mode"
+        case validated
+        case outputEquivalent = "output_equivalent"
+        case blocked
+        case cacheMode = "cache_mode"
+        case promptClass = "prompt_class"
+        case measuredAt = "measured_at"
+        case artifact
+        case baselineTokensPerSecond = "baseline_tok_s"
+        case bestTokensPerSecond = "best_tok_s"
+        case speedupVsBaseline = "speedup_vs_baseline"
+        case note
+        case reason
+    }
+}
+
 /// No-load MTP status derived from `config.json`, `jang_config.json`, and tensor
 /// names. This type is safe to expose through Osaurus capability/status APIs.
 public struct MTPBundleStatus: Codable, Sendable, Equatable {
@@ -66,6 +183,7 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
     public let tensorSamples: [String]
     public let visionTensorSamples: [String]
     public let configEvidence: [String]
+    public let nativeMTPTuning: NativeMTPTuning?
 
     public init(
         bundleHasMTP: Bool = false,
@@ -75,7 +193,8 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         mode: MTPRuntimeMode = .none,
         tensorSamples: [String] = [],
         visionTensorSamples: [String] = [],
-        configEvidence: [String] = []
+        configEvidence: [String] = [],
+        nativeMTPTuning: NativeMTPTuning? = nil
     ) {
         self.bundleHasMTP = bundleHasMTP
         self.configuredLayers = configuredLayers
@@ -85,6 +204,7 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         self.tensorSamples = tensorSamples
         self.visionTensorSamples = visionTensorSamples
         self.configEvidence = configEvidence
+        self.nativeMTPTuning = nativeMTPTuning
     }
 
     public var hasCompleteMTPArtifact: Bool {
@@ -109,16 +229,17 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
 
     public var statusLine: String {
         let base = "mtp: \(mode.rawValue), layers=\(configuredLayers), tensors=\(tensorCount)"
+        let tuned = nativeMTPTuning?.usableBestDepth.map { ", tuning=d\($0)" } ?? ""
         if speculativeDecodeEnabled {
-            return "\(base), speculative=on"
+            return "\(base)\(tuned), speculative=on"
         }
         if requiresAcceptRejectBeforeEnable {
-            return "\(base), speculative=off (accept/reject required)"
+            return "\(base)\(tuned), speculative=off (accept/reject required)"
         }
         if configuredLayers > 0 && tensorCount == 0 {
-            return "\(base), speculative=off (metadata only; MTP weights missing)"
+            return "\(base)\(tuned), speculative=off (metadata only; MTP weights missing)"
         }
-        return "\(base), speculative=off"
+        return "\(base)\(tuned), speculative=off"
     }
 }
 
@@ -341,35 +462,39 @@ public enum NativeMTPAutoDecodePolicy {
             "runtime_mode=\(status.mode.rawValue)",
         ]
 
-        if profile == "jang_2k" || (isMoE && bits <= 2) {
-            return nil
-        }
-        if profile == "jang_4m" {
+        if let tuning = status.nativeMTPTuning {
+            guard let depth = tuning.usableBestDepth else { return nil }
+            var tuningEvidence = evidence + [
+                "tuning_file=\(NativeMTPTuning.fileName)",
+                "tuning.validated=\(tuning.validated)",
+                "tuning.output_equivalent=\(tuning.outputEquivalent)",
+                "tuning.blocked=\(tuning.blocked)",
+                "tuning.best_depth=\(depth)",
+                "tuning.verifier_mode=\(tuning.resolvedVerifierMode)",
+            ]
+            if let cacheMode = tuning.cacheMode {
+                tuningEvidence.append("tuning.cache_mode=\(cacheMode)")
+            }
+            if let artifact = tuning.artifact {
+                tuningEvidence.append("tuning.artifact=\(artifact)")
+            }
+            if let bestTokensPerSecond = tuning.bestTokensPerSecond {
+                tuningEvidence.append("tuning.best_tok_s=\(bestTokensPerSecond)")
+            }
+            if let speedupVsBaseline = tuning.speedupVsBaseline {
+                tuningEvidence.append("tuning.speedup_vs_baseline=\(speedupVsBaseline)")
+            }
             return NativeMTPAutoDecodeRecommendation(
-                depth: 3,
-                verifierMode: "sequential_repair",
-                reason: "Qwen3.6 JANG_4M has real MTP tensors and uses native D3 auto decode.",
-                evidence: evidence)
-        }
-        if mode == "mxfp8" {
-            return NativeMTPAutoDecodeRecommendation(
-                depth: 3,
-                verifierMode: "sequential_repair",
-                reason: isMoE
-                    ? "Qwen3.6 MoE MXFP8 local gate was fastest at D3."
-                    : "Qwen3.6 dense MXFP8 has real MTP tensors and uses native D3 auto decode.",
-                evidence: evidence)
-        }
-        if mode == "mxfp4" || (mode == "affine" && bits == 4) || bits == 4 {
-            return NativeMTPAutoDecodeRecommendation(
-                depth: 3,
-                verifierMode: "sequential_repair",
-                reason: isMoE
-                    ? "Qwen3.6 MoE 4-bit local gate was fastest at D3."
-                    : "Qwen3.6 dense MXFP4 D3 clears the local MTP speed target.",
-                evidence: evidence)
+                depth: depth,
+                verifierMode: tuning.resolvedVerifierMode,
+                reason: "Qwen native MTP uses \(NativeMTPTuning.fileName) best_depth=\(depth).",
+                evidence: tuningEvidence)
         }
 
+        // Qwen native MTP is tuning-file driven. A complete tensor artifact
+        // without `vmlx_mtp_tuning.json` is loadable, but it does not receive
+        // automatic speculative launch because depth must come from measured
+        // artifact-local proof, not from path/name/profile assumptions.
         return nil
     }
 
@@ -767,6 +892,7 @@ public enum MTPBundleInspector {
         let tensorNames = try loadTensorNames(from: modelDirectory)
         let mtpNames = tensorNames.filter { isMTPName($0, mtpLayerPrefixes: mtpLayerPrefixes) }
         let visionNames = tensorNames.filter(isVisionName)
+        let nativeMTPTuning = try loadNativeMTPTuning(from: modelDirectory)
 
         let runtimeMode = jangConfig?.runtime.mtpMode ?? .none
         let runtimeBundleHasMTP = jangConfig?.runtime.bundleHasMTP ?? false
@@ -775,6 +901,15 @@ public enum MTPBundleInspector {
         var statusEvidence = evidence
         if runtimeBundleHasMTP {
             statusEvidence.append("jang_config.runtime.bundle_has_mtp=true")
+        }
+        if let nativeMTPTuning {
+            statusEvidence.append("tuning_file=\(NativeMTPTuning.fileName)")
+            if let bestDepth = nativeMTPTuning.bestDepth {
+                statusEvidence.append("tuning.best_depth=\(bestDepth)")
+            }
+            statusEvidence.append("tuning.validated=\(nativeMTPTuning.validated)")
+            statusEvidence.append("tuning.output_equivalent=\(nativeMTPTuning.outputEquivalent)")
+            statusEvidence.append("tuning.blocked=\(nativeMTPTuning.blocked)")
         }
 
         let mode: MTPRuntimeMode
@@ -796,7 +931,8 @@ public enum MTPBundleInspector {
             mode: mode,
             tensorSamples: Array(mtpNames.sorted().prefix(8)),
             visionTensorSamples: Array(visionNames.sorted().prefix(8)),
-            configEvidence: Array(Set(statusEvidence)).sorted())
+            configEvidence: Array(Set(statusEvidence)).sorted(),
+            nativeMTPTuning: nativeMTPTuning)
     }
 
     private static func configuredMTPLayers(
@@ -863,6 +999,21 @@ public enum MTPBundleInspector {
             names.append(contentsOf: try safetensorsHeaderNames(file))
         }
         return names
+    }
+
+    private struct NativeMTPTuningDocument: Decodable {
+        let nativeMTP: NativeMTPTuning?
+
+        private enum CodingKeys: String, CodingKey {
+            case nativeMTP = "native_mtp"
+        }
+    }
+
+    private static func loadNativeMTPTuning(from directory: URL) throws -> NativeMTPTuning? {
+        let url = directory.appendingPathComponent(NativeMTPTuning.fileName)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(NativeMTPTuningDocument.self, from: data).nativeMTP
     }
 
     private static func safetensorsHeaderNames(_ url: URL) throws -> [String] {

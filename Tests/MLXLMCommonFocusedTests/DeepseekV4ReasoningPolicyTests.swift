@@ -64,16 +64,16 @@ struct DeepseekV4ReasoningPolicyTests {
         #expect(cacheScopeSalt(from: context) == "reasoning=off")
     }
 
-    @Test("force direct environment overrides reasoning request")
-    func forceDirectRailEnvironmentWins() {
+    @Test("force direct environment does not override explicit reasoning request")
+    func forceDirectRailEnvironmentDoesNotOverrideRequest() {
         let context = DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
             ["reasoning_effort": "max"],
             modelType: "deepseek_v4",
             environment: [DeepseekV4ReasoningPolicy.forceDirectRailEnvironmentKey: "true"]
         )
 
-        #expect(context?["enable_thinking"] as? Bool == false)
-        #expect(context?["reasoning_effort"] == nil)
+        #expect(context?["enable_thinking"] as? Bool == true)
+        #expect(context?["reasoning_effort"] as? String == "max")
     }
 
     @Test("non DSV4 context is not rewritten")
