@@ -843,6 +843,26 @@ Recent dependency scan, 2026-05-04 through 2026-05-18:
 | Reasoning on/off | No fake close; reasoning off must affect template/runtime where supported, and visible output must remain coherent. | Gemma4 reasoning matrix, MiniMax rows, DSV4 reasoning kwargs, Ling/Bailing aliases. Fresh Gemma E2B no-guard red/green pair proves the harness now accepts coherent stellar equivalents instead of forcing decode behavior; fresh Ling row proves the Russian stress prompt with `temp=0.7` stops normally. | Covered for tested families; package-wide model matrix still open for absent local bundles. |
 | MTP autodetect | Only real tensor evidence plus usable tuning may enable MTP; model names and stale metadata are insufficient. Qwen auto-depth must come from bundle-local `vmlx_mtp_tuning.json`, not profile/name rules. | Non-Kimi MTP census and Qwen MTP settings docs; CRACK rows explicitly stay MTP off. Focused tests cover tuned D2, validated D3, missing tuning, blocked tuning rows, valid tuning without MTP tensors, `MTPBundleStatus.snapshot`, missing-tuning evidence, and LLM/VLM factory wiring into `ModelConfiguration`. | Correct fail-closed policy covered; full MTP speed target remains separate/open. |
 
+## Osaurus PR #1147 Function-Level Gate
+
+The Osaurus package-switch PR now carries an F1-F11 live checklist in
+`docs/VMLX_SWIFT_OSAURUS_LIVE_MATRIX_2026_05_18.md`. Treat those rows as the
+engine-facing contract for any new `vmlx-swift` runtime proof:
+
+| Row | Engine evidence `vmlx-swift` must emit or preserve |
+| --- | --- |
+| F1 Model detection and metadata | Bundle path, family, parser, JANG/JANGTQ sidecars, VLM/audio/video support, MTP tensor count, `vmlx_mtp_tuning.json`, `generation_config.json`, `top_k`, and `jang_config.json`. |
+| F2 UI defaults and saved settings | Capability/default snapshots with DSV4 `instruct`/`max`, Qwen/ZAYA/Nemotron/Ling no-thinking defaults, Gemma Harmony support, cache topology, and per-model scoping keys so Osaurus does not carry stale settings across families. |
+| F3 Request construction | Stable request telemetry showing omitted sampler fields resolved from metadata, explicit sampler fields preserved, native `top_k` applied, tools injected only where supported, and media/content parts preserved. |
+| F4 VL/video/audio preprocessing | Processor stamps and media facts: Qwen3VLProcessor/MRoPE, Gemma VLM path, ZAYA CCA, Nemotron Parakeet/RADIO, image size, video frame count, audio/pre-encode facts, media token count, media salt, and unsupported-media errors. |
+| F5 Media cache boundaries | Media-salt nil/absent on text-only turns, different-media misses, repeated-media hits, restart/unload restore, and no cross-model/session media-state reuse. |
+| F6 Cache stack and memory | Prefix, paged, block L2, SSM companion, DSV4 native cache, ZAYA CCA, media cache, TurboQuant KV status, L2 max-GB, TTFT, tok/s, RSS, physical footprint, and disk bytes. |
+| F7 Cache inverses | ON/OFF behavior for prefix, paged, block L2, SSM companion, media cache, TurboQuant KV, reasoning, tools, streaming, VLM force-off, sleep/wake, and diagnostic flags without changing sampler defaults. |
+| F8 Scheduler and lifecycle | Single-user local-chat shape, same-model continuous batching, different-model isolation, cancel/stop drain, sleep/wake restoration, no zombie Swift engine, and no stale listener/orphaned Metal context. |
+| F9 Parser/channel separation | Reasoning, tools, and visible content split by family; no leaked `<think>`, DSML, Harmony, Gemma4, Qwen XML, MiniMax XML, GLM/Hunyuan, Nemotron, JSON tool schema, or tool-result markers in visible chunks. |
+| F10 Old-library sweep | Consolidated modules only: `MLX`, `MLXLLM`, `MLXVLM`, `MLXLMCommon`, `VMLINUXTokenizers`, and `VMLINUXJinja`; no active dependency on old `vmlx-swift-lm`, standalone `mlx-swift`, standalone `swift-transformers`, or standalone `Jinja`. |
+| F11 No fake runtime guards | Red rows stay red until root-caused. No forced repetition penalties, hidden sampler floors, forced reasoning close tags, parser repairs, fake cache fallbacks, name-only MTP, permanent overlays, or length-cap-only success. |
+
 ## Production-Quality Checklist Still Required
 
 Before the Osaurus switch PR can honestly say `vmlx-swift` replaces the split
