@@ -85,4 +85,16 @@ struct MediaCachePlaceholderTests {
         #expect(nativeMTP.contains("!input.requiresPostPrepareCacheKey"))
         #expect(nativeMTP.contains("!originalInput.requiresPostPrepareCacheKey"))
     }
+
+    @Test("OmniBench carries live repeated-video post-prepare alias proof")
+    func omniBenchCarriesRepeatedVideoAliasProof() throws {
+        let omniBench = try String(
+            contentsOfFile: "RunBench/OmniBench.swift",
+            encoding: .utf8)
+
+        #expect(omniBench.contains("5d. video repeated cache alias"))
+        #expect(omniBench.contains("BENCH_OMNI_VIDEO_CACHE_ALIAS"))
+        #expect(omniBench.contains("resolvePostPrepareCacheKeyAlias"))
+        #expect(omniBench.contains("same-video post-prepare alias"))
+    }
 }

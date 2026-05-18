@@ -303,6 +303,15 @@ enum OmniBench {
                     maxNewTokens: maxNewTokens,
                     enableThinking: false)
             })
+            if (ProcessInfo.processInfo.environment["BENCH_OMNI_VIDEO_CACHE_ALIAS"] ?? "0") == "1" {
+                results.append(await runRow("5d. video repeated cache alias", maxNew: maxNewTokens) {
+                    return try await runVideoRepeatedCacheAliasProof(
+                        videoURL: videoFixture,
+                        modelDir: modelDir,
+                        context: context,
+                        maxNewTokens: maxNewTokens)
+                })
+            }
         }
 
         // Row 6b: Audio LMInput END-TO-END — full UserInput.audio →
@@ -1057,6 +1066,136 @@ enum OmniBench {
             tokens: tokens.count, secs: secs)
     }
 
+    private static func runVideoRepeatedCacheAliasProof(
+        videoURL: URL,
+        modelDir: URL,
+        context: ModelContext,
+        maxNewTokens: Int
+    ) async throws -> TurnResult {
+        var params = makeOmniParameters(
+            context: context,
+            maxNewTokens: maxNewTokens)
+        params.maxTokens = min(maxNewTokens, 48)
+
+        let coordinator = makeOmniProofCoordinator(
+            modelDir: modelDir,
+            context: context,
+            label: "same-video post-prepare alias")
+
+        let firstInput = try await makeVideoProofInput(
+            videoURL: videoURL,
+            context: context)
+        let firstRawTokens = firstInput.text.tokens.reshaped(-1).asArray(Int.self)
+        guard firstInput.requiresPostPrepareCacheKey else {
+            throw NSError(
+                domain: "OmniBench", code: 120,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "video proof input did not require a post-prepare cache key"])
+        }
+        guard let salt = computeCacheSalt(for: firstInput, parameters: params) else {
+            throw NSError(
+                domain: "OmniBench", code: 121,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "video proof input did not produce a media salt"])
+        }
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let first = try await collectGenerationText(
+            stream: MLXLMCommon.generate(
+                input: firstInput,
+                parameters: params,
+                context: context,
+                cacheCoordinator: coordinator),
+            maxNewTokens: params.maxTokens ?? maxNewTokens)
+        try validateVisibleOmniText(first.text, row: "video repeated cache alias first")
+
+        guard let effectiveTokens = coordinator.resolvePostPrepareCacheKeyAlias(
+            rawTokens: firstRawTokens,
+            mediaSalt: salt)
+        else {
+            throw NSError(
+                domain: "OmniBench", code: 122,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "same-video post-prepare alias was not recorded after first generation"])
+        }
+        guard effectiveTokens != firstRawTokens else {
+            throw NSError(
+                domain: "OmniBench", code: 123,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "same-video post-prepare alias did not change raw video tokens"])
+        }
+
+        let directDetail: String
+        switch coordinator.fetch(tokens: effectiveTokens, mediaSalt: salt) {
+        case .hit(let matched, let remaining, let detail, let blocks, _, _):
+            directDetail = "\(detail.rawValue) matched=\(matched)/\(effectiveTokens.count) remaining=\(remaining.count)"
+            coordinator.release(blocks: blocks)
+        case .miss:
+            throw NSError(
+                domain: "OmniBench", code: 124,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "same-video post-prepare alias resolved but cache fetch missed"])
+        }
+
+        let replayInput = try await makeVideoProofInput(
+            videoURL: videoURL,
+            context: context)
+        let replayRawTokens = replayInput.text.tokens.reshaped(-1).asArray(Int.self)
+        guard replayRawTokens == firstRawTokens,
+              computeCacheSalt(for: replayInput, parameters: params) == salt
+        else {
+            throw NSError(
+                domain: "OmniBench", code: 125,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "same video did not reproduce raw tokens/media salt"])
+        }
+        guard coordinator.resolvePostPrepareCacheKeyAlias(
+            rawTokens: replayRawTokens,
+            mediaSalt: salt) == effectiveTokens
+        else {
+            throw NSError(
+                domain: "OmniBench", code: 126,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "replayed video did not resolve to the same effective cache key"])
+        }
+
+        let beforeReplay = coordinator.snapshotStats()
+        let replay = try await collectGenerationText(
+            stream: MLXLMCommon.generate(
+                input: replayInput,
+                parameters: params,
+                context: context,
+                cacheCoordinator: coordinator),
+            maxNewTokens: params.maxTokens ?? maxNewTokens)
+        try validateVisibleOmniText(replay.text, row: "video repeated cache alias replay")
+        let afterReplay = coordinator.snapshotStats()
+        let beforeHits = totalCacheHits(beforeReplay)
+        let afterHits = totalCacheHits(afterReplay)
+        guard afterHits > beforeHits else {
+            throw NSError(
+                domain: "OmniBench", code: 127,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "replayed video did not increment paged/disk cache hits"])
+        }
+
+        let secs = CFAbsoluteTimeGetCurrent() - t0
+        let detail = [
+            "same-video post-prepare alias",
+            "raw=\(firstRawTokens.count)",
+            "effective=\(effectiveTokens.count)",
+            "salt=\(salt.prefix(12))",
+            "probe=\(directDetail)",
+            "hits \(beforeHits)->\(afterHits)",
+            "first=\(first.text.prefix(60))",
+            "replay=\(replay.text.prefix(60))",
+            "stats=\(cacheStatsSummary(afterReplay))",
+        ].joined(separator: " | ")
+        return TurnResult(
+            shortText: detail,
+            tokens: first.tokens + replay.tokens,
+            secs: secs)
+    }
+
     /// Helper for B>1 BatchEngine harness rows: collect a single
     /// slot's stream output. Used to drive multiple slots concurrently
     /// via `async let`.
@@ -1085,6 +1224,98 @@ enum OmniBench {
             if chunks > maxNew * 2 { break }
         }
         return (text, chunks)
+    }
+
+    private static func collectGenerationText(
+        stream: AsyncStream<Generation>,
+        maxNewTokens: Int
+    ) async throws -> (text: String, reasoning: String, tokens: Int, info: GenerateCompletionInfo?) {
+        var text = ""
+        var reasoning = ""
+        var info: GenerateCompletionInfo?
+        var events = 0
+        for await event in stream {
+            switch event {
+            case .chunk(let chunk):
+                text += chunk
+                events += 1
+            case .reasoning(let chunk):
+                reasoning += chunk
+                events += 1
+            case .info(let generationInfo):
+                info = generationInfo
+            case .toolCall:
+                break
+            }
+            if events > maxNewTokens * 2 {
+                throw NSError(
+                    domain: "OmniBench", code: 128,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "generation emitted too many chunks without completing"])
+            }
+        }
+        let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (
+            visible.isEmpty ? reasoning.trimmingCharacters(in: .whitespacesAndNewlines) : visible,
+            reasoning,
+            info?.generationTokenCount ?? events,
+            info)
+    }
+
+    private static func makeVideoProofInput(
+        videoURL: URL,
+        context: ModelContext
+    ) async throws -> LMInput {
+        var userInput = UserInput(
+            prompt: "Describe this video briefly.",
+            videos: [.url(videoURL)])
+        userInput.additionalContext = ["enable_thinking": false]
+        return try await context.processor.prepare(input: userInput)
+    }
+
+    private static func makeOmniProofCoordinator(
+        modelDir: URL,
+        context: ModelContext,
+        label: String
+    ) -> CacheCoordinator {
+        let safeModelName = modelDir.lastPathComponent
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+        let safeLabel = label
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+        let cacheDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-omni-\(safeModelName)-\(safeLabel)-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(
+            at: cacheDir,
+            withIntermediateDirectories: true)
+        return CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: true,
+            enableDiskCache: true,
+            pagedBlockSize: 64,
+            maxCacheBlocks: 4096,
+            diskCacheMaxGB: 2.0,
+            diskCacheDir: cacheDir,
+            ssmMaxEntries: 64,
+            enableSSMReDerive: true,
+            modelKey: "\(modelDir.path)|\(String(describing: type(of: context.model)))|\(label)"))
+    }
+
+    private static func totalCacheHits(_ stats: CacheCoordinatorStatsSnapshot) -> Int {
+        (stats.pagedStats?.cacheHits ?? 0)
+            + (stats.diskStats?.hits ?? 0)
+            + stats.ssmStats.hits
+    }
+
+    private static func cacheStatsSummary(_ stats: CacheCoordinatorStatsSnapshot) -> String {
+        let paged = stats.pagedStats.map {
+            "paged(h=\($0.cacheHits),m=\($0.cacheMisses),a=\($0.allocatedBlocks))"
+        } ?? "paged(off)"
+        let disk = stats.diskStats.map {
+            "disk(h=\($0.hits),m=\($0.misses),s=\($0.stores))"
+        } ?? "disk(off)"
+        let ssm = "ssm(h=\(stats.ssmStats.hits),m=\(stats.ssmStats.misses),r=\(stats.ssmStats.reDerives))"
+        return "\(paged),\(disk),\(ssm),hybrid=\(stats.isHybrid)"
     }
 
     private static func runAudioTurn(

@@ -487,11 +487,16 @@ weights.
   and resolves media-salted raw-to-effective prompt aliases for post-EVS
   prompts, and `BatchEngine`, `TokenIterator`, and `NativeMTPTokenIterator`
   use that alias before cache fetch. Focused proof:
-  `MediaCachePlaceholderTests|CacheCoordinatorTopologyFocusedTests` passes 30
+  `MediaCachePlaceholderTests|CacheCoordinatorTopologyFocusedTests` passes 31
   tests across 6 suites, and the broader `MLXLMCommonFocusedTests` gate passes
-  241 Swift Testing tests across 28 suites plus 22 XCTest rows. This clears the
-  static alias-contract blocker but still needs a live repeated-video cache-hit
-  row before full Omni video cache production sign-off.
+  242 Swift Testing tests across 28 suites plus 22 XCTest rows. Live strict
+  proof:
+  `docs/local/live-model-matrix/20260518T134746Z_omni_jangtq_strict_192_video_cache_alias/omni_jangtq_strict_192_video_cache_alias.log`
+  passes `20/20` with `BENCH_OMNI_VIDEO_CACHE_ALIAS=1`; row `5d` records
+  `raw=4028`, `effective=1382`, direct probe
+  `disk matched=1382/1382 remaining=0`, and replay hit counter `1->2` with
+  coherent visible video output. This clears the live repeated-video cache-hit
+  blocker for the tested JANGTQ Omni bundle.
 - Open: cache-off repeated rows no longer leak literal sound markers after the
   wrapper fix, but some short BatchEngine/pre-encoded rows are still weak.
   Fresh cache-on repeat gate
