@@ -192,6 +192,12 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   re-prefill the modified suffix. Fresh focused coverage added:
   `promptToolSurfaceEditsNeverReturnFullPromptHit` in
   `CacheCoordinatorTopologyFocusedTests`; the focused suite now passes 26/26.
+- Real local Qwen tuning-file proof was refreshed with
+  `VMLINUX_MTP_REAL_BUNDLE=/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP4-MTP`
+  and `VMLINUX_MTP_REAL_BUNDLE_EXPECTS_VL=1`; the optional real-bundle
+  `MTPRuntimeFocusedTests/optionalRealLocalMTPBundleInspection` row passed and
+  proved current code sees tensor evidence, VL tensors, usable
+  `vmlx_mtp_tuning.json`, speculative launch, and `loadConfiguration.nativeMTP`.
 - #1119 adds Osaurus model idle residency policy. `vmlx-swift` already exposes
   server runtime power settings and cache coordinator release/disable surfaces,
   but the switch PR still needs a live deep-sleep/wake proof against the actual
