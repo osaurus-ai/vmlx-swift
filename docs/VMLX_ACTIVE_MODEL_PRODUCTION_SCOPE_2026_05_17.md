@@ -149,7 +149,7 @@ forced thinking closure, or name-based MTP activation.
 | Gemma 4 E4B | Current `20260518T_current_gemma4_e4b_prod_text_cache/` covers the Osaurus-local `gemma-4-e4b-it-4bit` bundle. `prod_default_cache.log` passes 7/7 with bundle defaults `temp=1.000 topP=0.950 topK=64 rep=nil`, Harmony parser, S2 TTFT `73ms -> 29ms`, about `118-129 tok/s`, peak RSS `4727 MiB`, and disk L2 `hits=1,misses=17,stores=14`. `reasoning_turn_matrix.log` passes transcript ON/OFF/ON plus effort `low,medium,high,max`, with no unclosed reasoning and `disk{hits=1,misses=24,stores=16}`. `vl_chat_cache.log` proves structured image cache: same-media HIT `disk 301/301`, replay TTFT `168ms -> 26ms`, different-media MISS, and grounded follow-up (`red, white, and blue`). | PASS for text, Harmony reasoning, and image VL cache | Same Gemma4 cache topology as E2B/26B: heterogeneous SWA/full-attention cache is path-dependent and uses disk-backed restore in these rows; do not claim generic paged prefix hits. |
 | Gemma3n E2B | Current `20260518T_current_gemma3n_e2b_prod_default_vs_greedy/` re-runs the local `/Users/eric/models/mlx-community/gemma-3n-E2B-it-4bit` text path after rebuilding `RunBench`. Fresh-cache bundle defaults pass 7/7 with `temp=0.600 topP=0.950 topK=64 rep=nil`, S2 TTFT `65ms -> 23ms`, about `123-125 tok/s`, peak RSS `2771 MiB`, and disk L2 `hits=1,misses=21,stores=21`. Fresh-cache explicit greedy also passes 7/7 with `temp=0.000 topP=1.000 topK=0 rep=nil`, about `129-131 tok/s`, peak RSS `2753 MiB`, and disk L2 `hits=1,misses=21,stores=20`. Earlier Gemma3n loop artifacts are superseded by the prompt/RoPE/embedding-scale fixes recorded in the coverage audit. | PASS / TEXT-ONLY | The Swift path intentionally sanitizes the conditional-generation bundle to text keys and drops Gemma3n vision/audio towers. Do not claim Gemma3n VLM/audio support until a native processor and media-cache row exists. |
 | GPT-OSS / GLM5 / Mistral4 / Pixtral parsers | `20260517T2148_nonexcluded_parser_cache_refresh/` covers GPT-OSS Harmony, GLM5 aliases, Mistral4/Pixtral aliases, and marker leak prevention in the current tree. | UNIT ONLY / OPEN for runtime | No local GPT-OSS, GLM5, Mistral4, or Pixtral bundle has a live decode row in this pass. Parser coverage is not model production readiness. |
-| Laguna XS.2 | `20260517T_release_turnmatrix_laguna_xs_after_b2_fix/` passes release rows. Production decode is about `31 tok/s`, bundle defaults are `temp=0.700 topP=0.900 topK=0 rep=nil`, disk L2 hits, and TurboQuant B=2 isolation passes. | PASS for text | Paged prefix hit is `N-A` by topology; disk-backed restore is the accepted cache proof. |
+| Laguna XS.2 | Current refresh `20260518T_current_laguna_xs_turnmatrix_after_compile_gate/` passes release rows after the pre-fix `20260518T_current_laguna_xs_turnmatrix/` exposed a Laguna compiled-decode loop in the 3-turn chat row. Production decode is about `33 tok/s`, bundle defaults are `temp=0.700 topP=0.900 topK=0 rep=nil`, disk L2 hits, and TurboQuant B=2 isolation passes. | PASS for text; compiled decode disabled until parity | Paged prefix hit is `N-A` by topology; disk-backed restore is the accepted cache proof. The compile gate is an engine capability gate for an unsafe optional acceleration path, not a sampler/repetition/reasoning guard. |
 | ZAYA text | Fresh current `20260517T_zaya_jangtq4_current_non_kimi_turnmatrix/` passes JANGTQ4 config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk/B=2/per-slot/TurboQuant rows; generic prefix cache hit is correctly `N-A`. Fresh current `20260518T001613Z_zaya_jangtqk_current_turnmatrix/` now passes the same implemented JANGTQ_K text rows, with `temp=0.600 topP=1.000 topK=0 rep=nil`, cache-on speed about `61-63 tok/s`, peak RSS about `3.8 GiB`, and `PROD_CACHE_STATS` recording disk L2 plus SSM companion state. Earlier `20260517T_release_turnmatrix_zaya_scope/` also passes JANGTQ4 and MXFP4 text rows. | PASS for current JANGTQ4, current JANGTQ_K, and prior MXFP4 | Keep the 50+ tok/s watch active. Do not treat the ZAYA CCA path as generic paged cache; it is path-dependent and disk/SSM-backed. The JANGTQ_K tokenizer/effective-EOS warning remains visible and is not handled by a sampler guard. |
 | ZAYA1-VL | Fresh current `20260517T_zaya_vl_jangtq4_current_non_kimi_turnmatrix/` passes JANGTQ4 config/template, production defaults cache OFF/ON, BatchEngine text rows, disk restore, B=2 concurrent/per-slot/TurboQuant rows, VL batch chat, structured VL chat cache, and media-salt isolation. The VL row grounds the image with compile OFF/ON, answers the follow-up color as `blue`, hits disk restore for same-media prompts (`97/97`), and correctly misses when the image changes. Fresh current `20260518T_zaya_vl_jangtqk_current_turnmatrix/` improves the K lane by passing config/template, BatchEngine single/chat/disk/B=2/per-slot/TurboQuant, VL batch chat, media-salt, and text/image mixed rows, with video `N-A`. Root-cause refresh `20260518T_zaya_vl_jangtqk_rootcause_topk/` proves the K failure is first-token logits on identical rendered prompt IDs; K ranks `6,7,8,4`, while JANGTQ4 ranks `4` first. It also proves the reflected Swift modules use the real intended K plan, and the K/JANGTQ4 systematic tensor-plan delta is gate/up 2-bit versus 4-bit while sampled regular/down tensors are byte-identical. Earlier targeted rows also prove MXFP4 image/text/cache surfaces. | PASS for current JANGTQ4 and prior MXFP4 implemented image/text/cache; PARTIAL current for JANGTQ_K | JANGTQ_K still fails production defaults S1/S2 by returning `8` for `7+8-11`, and structured VL chat cache exhausts the 512-token cold-image budget. Current evidence points at a ZAYA1-VL K-profile fidelity blocker, not sampler/cache/parser/EOS. Do not promote this K lane or mask it with temperature, top-k, repetition, forced-stop, or reasoning-closure guards. Video is `N-A` because the processor does not implement video input. |
 | Nemotron Omni / Parakeet / RADIO | JANGTQ4 core artifacts under `20260517T170614Z_omni_live_voice_fresh_recheck/` and related Omni rows prove wrapper-token parity, pre-encoded Parakeet shape, raw PCM/pre-encoded paths, and 65-76 tok/s cache-off streaming rows without literal sound-marker leaks. Fresh `20260517T214045Z_nemotron_jangtq_omni_recheck/` passes the JANGTQ 48-token Omni matrix 18/18 with text, image, video/audio LMInput, media salt, hybrid SSM, and BatchEngine rows. Fresh `20260517T2215_nemotron_mxfp4_omni_recheck/` passes the MXFP4 48-token Omni matrix 18/18 with the same core surfaces. | PASS for JANGTQ, JANGTQ4, and MXFP4 core; PARTIAL for repeated cache-on audio | Independently encoded Parakeet chunks are not concat-safe. Live voice must retain PCM and submit full-snapshot pre-encoded audio or raw PCM at endpoint. Repeated cache-on live audio still needs a focused quality/root-cause gate before full live-voice production promotion. |
@@ -819,21 +819,37 @@ Historical K-only diagnostic retained for traceability:
   this as a K-profile fidelity blocker unless a future gate-safe mixed runtime
   profile is built and live-proven.
 
-## Laguna XS Release Matrix - 2026-05-17
+## Laguna XS Release Matrix - 2026-05-17 / 2026-05-18
 
-Clean release artifact:
+Original clean release artifact:
 
 ```text
 docs/local/live-model-matrix/20260517T_release_turnmatrix_laguna_xs_after_b2_fix/
 ```
 
-Laguna is now green for the current text turnmatrix:
+Current-head refresh artifacts:
+
+```text
+docs/local/live-model-matrix/20260518T_current_laguna_xs_turnmatrix/
+docs/local/live-model-matrix/20260518T_current_laguna_xs_turnmatrix_after_compile_gate/
+```
+
+The first current-head refresh found a real compiled-decode parity failure:
+the compile-on 3-turn chat repeated `Blue is a cool...` while compile-off was
+coherent. The fix keeps Laguna off the optional compiled decode path in both
+`TokenIterator` and `BatchEngine` until a real compiled-parity fix exists. The
+post-fix matrix proves the compile-labeled row now falls back to the coherent
+path and matches the compile-off transcript across all three turns.
+
+Laguna is green for the current text turnmatrix with that caveat:
 
 - config/template smoke: PASS;
 - `BENCH_PROD` cache OFF and cache ON: 7/7 each, coherent visible output,
   normal stops, reasoning on/off routed correctly, bundle defaults applied
   (`temp=0.700`, `topP=0.900`, `topK=0`, `rep=nil`, `seed=0`);
-- release decode telemetry: about 31 tok/s on the production rows;
+- current decode telemetry: about 33 tok/s on the production rows;
+- current cache-on stats: `disk{hits=1,misses=23,stores=21}` with
+  `pagedIncompatible=true`;
 - disk restore row: PASS, with the disk cache directory populated;
 - generic paged prefix hit row: N-A because Laguna is paged-incompatible and
   uses disk-backed restore;

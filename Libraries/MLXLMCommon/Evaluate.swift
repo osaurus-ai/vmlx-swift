@@ -998,6 +998,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         if typeName.contains("hy3") || typeName.contains("hunyuan") {
             return true
         }
+        if typeName.contains("laguna") {
+            return true
+        }
         if typeName.contains("minimax") {
             return !compiledDecodeAllowsMiniMax()
         }

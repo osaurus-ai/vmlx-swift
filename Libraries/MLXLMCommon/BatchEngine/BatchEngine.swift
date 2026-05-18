@@ -291,7 +291,7 @@ public actor BatchEngine {
     /// Maximum B=1 decode steps before yielding back to the actor executor.
     private let controlPlaneYieldInterval: Int = 8
 
-    /// Hy3/Hunyuan and MiniMax currently decode coherently on the uncompiled
+    /// Hy3/Hunyuan, Laguna, and MiniMax currently decode coherently on the uncompiled
     /// path but diverge on the single-slot compiled trace. Keep compile opt-in
     /// from silently taking those unsafe routes until each model path has a
     /// dedicated compiled-vs-uncompiled parity test.
@@ -303,6 +303,7 @@ public actor BatchEngine {
         let modelTypeName = String(describing: type(of: context.model)).lowercased()
         return modelName.contains("hy3") || modelName.contains("hy_v3") || modelName.contains("hy-v3")
             || modelTypeName.contains("hy3") || modelTypeName.contains("hunyuan")
+            || modelName.contains("laguna") || modelTypeName.contains("laguna")
             || modelName.contains("minimax") || modelTypeName.contains("minimax")
     }
 

@@ -586,19 +586,24 @@ weights.
 - Local bundle: `Laguna-XS.2-JANGTQ`.
 - Swift dispatch: `laguna` through `LagunaModel`.
 - Cache topology: sliding layers use `RotatingKVCache`; full layers can use
-  simple or full-sized rotating KV; comments indicate this was made
-  compile-friendly.
+  simple or full-sized rotating KV. The uncompiled path is the production path;
+  the optional compiled trace is denied for Laguna until compile-on/off parity
+  is fixed.
 - JANGTQ/TurboQuant: sidecar present; routed experts use JANGTQ/TurboQuant
   switch layers.
 - Template/reasoning/tools: template smoke passes; tool parser maps to GLM-style
   parser; reasoning parser maps to Laguna.
-- Current status: `docs/local/live-model-matrix/20260517T_release_turnmatrix_laguna_xs_after_b2_fix/REPORT.md`
+- Current status: `docs/local/live-model-matrix/20260518T_current_laguna_xs_turnmatrix_after_compile_gate/REPORT.md`
   passes the text release turnmatrix: config/template, production defaults with
   cache OFF/ON, BatchEngine single/chat, disk restore, B=2 concurrent, B=2
   per-slot sampler, and TurboQuant-KV B=2 isolation. Bundle defaults apply
   (`temp=0.700`, `topP=0.900`, `topK=0`, `rep=nil`) and decode telemetry is
-  about 31 tok/s on production rows. Generic paged prefix hit is `N-A` because
-  Laguna is paged-incompatible and uses disk-backed restore.
+  about 33 tok/s on production rows. Generic paged prefix hit is `N-A` because
+  Laguna is paged-incompatible and uses disk-backed restore. The pre-fix
+  current artifact `20260518T_current_laguna_xs_turnmatrix/` is retained as the
+  red evidence: its compile-on 3-turn chat looped while compile-off was
+  coherent. The fix is an engine capability gate that keeps Laguna off compiled
+  decode, not a hidden sampler or forced-stop guard.
 
 ## Immediate Engine Gaps Found
 

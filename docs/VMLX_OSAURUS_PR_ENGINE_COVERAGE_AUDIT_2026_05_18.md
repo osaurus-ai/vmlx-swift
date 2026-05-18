@@ -48,6 +48,16 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   `20260518T_ling_jangtq2_no_guard_refresh/`. Both prove no hidden sampler
   guard behavior; failures, where present, were harness/product-budget issues,
   not decode fixes.
+- Laguna current-head refresh added
+  `20260518T_current_laguna_xs_turnmatrix/` and
+  `20260518T_current_laguna_xs_turnmatrix_after_compile_gate/`. The first
+  artifact exposed a real optional compiled-decode parity failure: compile-on
+  3-turn chat looped while compile-off stayed coherent. The fix keeps Laguna
+  off compiled decode in both `TokenIterator` and `BatchEngine` until parity is
+  proven; the post-fix artifact passes release rows with bundle defaults
+  (`temp=0.700 topP=0.900 topK=0 rep=nil`), about 33 tok/s production decode,
+  disk L2 `hits=1,misses=23,stores=21`, and no sampler/repetition/reasoning
+  guard.
 - MiniMax JANG_K evidence was refreshed under
   `20260518T_minimax_m27_jangk_crack_turnmatrix_after_quant_diag_fix/`.
   The row upgrades the large JANG_K CRACK bundle from infer-only to

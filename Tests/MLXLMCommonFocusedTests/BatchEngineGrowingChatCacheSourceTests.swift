@@ -139,4 +139,18 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(engine.contains("modelName.contains(\"minimax\")"))
         #expect(engine.contains("modelTypeName.contains(\"minimax\")"))
     }
+
+    @Test("Laguna stays off compiled decode until parity is proven")
+    func lagunaCompiledDecodeIsDenied() throws {
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+        let engine = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+
+        #expect(evaluate.contains("typeName.contains(\"laguna\")"))
+        #expect(engine.contains("modelName.contains(\"laguna\")"))
+        #expect(engine.contains("modelTypeName.contains(\"laguna\")"))
+    }
 }
