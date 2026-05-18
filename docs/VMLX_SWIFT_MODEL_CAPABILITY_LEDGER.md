@@ -98,6 +98,8 @@ Focused fix artifacts live under `docs/local/swift-release-gates/dsv4-fixes/`.
 | `dealign.ai/Ling-2.6-flash-MXFP4-CRACK` | `bailing_hybrid` / `BailingHybridModel` | `PASS` | Current release turnmatrix passes config/template/MTP metadata, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Bundle defaults apply with `rep=nil`; disk L2 and SSM companion hits are recorded. | Generic paged prefix hit is `N-A` by topology because Ling/Bailing uses disk-backed restore. |
 | `JANGQ/Hy3-preview-JANGTQ` | `hy_v3` / `Hy3Model` | `PASS` | Current release turnmatrix passes config/template/MTP metadata, production defaults cache OFF/ON, paged cache hit, disk restore, B=2 concurrent, per-slot sampler, and TurboQuant B=2. Bundle defaults apply as `temp=0.900 topP=1.000 topK=-1 minP=0.000 rep=nil`. | Cold first prompt is slow; JANGTQ_K needs a current all-non-Kimi matrix re-run before Osaurus promotion. |
 | `JANGQ/Hy3-preview-JANGTQ_K` | `hy_v3` / `Hy3Model` | `PARTIAL / NEEDS CURRENT RE-RUN` | Eager load was killed, but active expert streaming now passes the short production matrix without a process-global model-dir override after `loadWeights` binds the loaded model directory. It skips 91,008 per-expert tensors, indexes 79 layers x 192 experts, and passes 7/7 at about 6.2 GiB RSS. | Needs a current all-non-Kimi matrix re-run before Osaurus promotion. Speed remains blocked at about 1.4 tok/s, and multi-model active streaming still needs a per-loaded-model store before Osaurus exposes simultaneous JANGTQ_K sessions. |
+| `dealign.ai/MiniMax-M2.7-JANGTQ_K-CRACK` | `minimax_m2` / `MiniMaxJANGTQModel` | `PARTIAL / INFER PASS` | Fresh `20260518T001219Z_minimax_m27_jangtqk_crack_infer/` passes config/template plus cache-off `BENCH_PROD` 7/7. Bundle defaults apply as `temp=1.000 topP=0.950 topK=40 rep=nil`; MTP depth is `off`; reasoning ON/OFF alternation is coherent with OFF rows carrying zero reasoning; decode is about `48-49 tok/s`; peak RSS is about `55.9 GiB`. | Needs full cache/multibatch/disk/TurboQuant matrix and low-footprint active-routed proof before Osaurus promotion. |
+| `dealign.ai/MiniMax-M2.7-JANG_K-CRACK` | `minimax_m2` / `MiniMaxModel` | `PARTIAL / INFER PASS` | Fresh `20260518T001257Z_minimax_m27_jangk_crack_infer/` passes config/template plus cache-off `BENCH_PROD` 7/7. Bundle defaults apply as `temp=1.000 topP=0.950 topK=40 rep=nil`; MTP depth is `off`; reasoning ON/OFF alternation is coherent; decode is about `45-50 tok/s`; peak RSS is about `41.0 GiB`; loader logs an in-memory shape-inferred 6-bit metadata repair. | Needs full cache/multibatch/disk matrix and an explicit decision on whether the shape-inferred metadata repair is acceptable as production metadata handling or should be corrected in the bundle. |
 | `dealign.ai/Gemma-4-26B-A4B-it-JANG_4M-CRACK` | `gemma4` / `Gemma4` | `PASS` | Text release turnmatrix passes config/template, cache OFF/ON `BENCH_PROD` 7/7, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Structured VL chat-cache row passes: image A cold, same-image replay disk hit `308/308`, different-image miss, and text-only follow-up stays grounded. Live tool-call schema row passes through `UserInput.tools` with `get_weather({"location":"Tokyo"})`, `toolCalls=1`, and no raw marker leak. Long-budget single-turn Harmony reasoning on/off passes with 1420 reasoning chars ON and zero reasoning chars OFF. Fresh `20260517T_reasoning_turn_matrix_harness/` proves one loaded BatchEngine multi-turn ON/OFF/ON with prior assistant `reasoningContent` carried forward, and effort `low/medium/high/max` closes with visible output. | No active Gemma4 text/VL/tool/reasoning blocker from this row. GPT-OSS remains parser-contract only because no local GPT-OSS bundle is present. |
 | `/Users/eric/osaurus_models/finished/gemma-4-e2b-it-4bit` | `gemma4` / `Gemma4` | `PASS` | Osaurus-local E2B bundle passes template smoke, `BENCH_PROD` cache OFF/ON, BatchEngine chat, TurboQuant B=2 isolation, VL chat/cache, VL batch chat, and `BENCH_REASONING_TURN_MATRIX=1` at realistic budgets. Bundle defaults apply as `temp=1.000 topP=0.950 topK=64 rep=nil`; cache-on rows use disk-backed restore because Gemma4 heterogeneous SWA/full-attention cache is paged-incompatible in this topology. | The retained 256-token thinking-on row failed by length before visible output; this is a real server/UI budget setting caveat, not a reason to force-close reasoning or inject sampler guards. This bundle is outside `~/models` and was tested because Osaurus logs reported E2B looping. |
 
@@ -134,7 +136,8 @@ weights.
 | `dealign.ai/Gemma-4-26B-A4B-it-JANG_4M-CRACK` | 15G | `gemma4` | no | file | `PASS` | `PARTIAL` |
 | `dealign.ai/Ling-2.6-flash-JANGTQ2-CRACK` | 29G | `bailing_hybrid` | yes | file | `PASS` | `PASS` |
 | `dealign.ai/Ling-2.6-flash-MXFP4-CRACK` | 63G | `bailing_hybrid` | no | file | `PASS` | `PASS` |
-| `dealign.ai/MiniMax-M2.7-JANGTQ_K-CRACK` | 74G | `minimax_m2` | yes | file | `PASS` | `TODO` |
+| `dealign.ai/MiniMax-M2.7-JANGTQ_K-CRACK` | 74G | `minimax_m2` | yes | file | `PASS` | `PARTIAL` |
+| `dealign.ai/MiniMax-M2.7-JANG_K-CRACK` | 80G | `minimax_m2` | no | file | `PASS` | `PARTIAL` |
 | `dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK` | 12G | `nemotron_h` | yes | file | `PASS` | `PASS` |
 | `dealign.ai/Nemotron-Omni-Nano-JANGTQ4-CRACK` | 19G | `nemotron_h` | yes | file | `PASS` | `PASS` |
 | `dealign.ai/Nemotron-Omni-Nano-MXFP4-CRACK` | 21G | `nemotron_h` | no | file | `PASS` | `PASS` |
@@ -240,8 +243,7 @@ weights.
 
 ### MiniMax M2.7
 
-- Local bundles: small JANGTQ plus larger CRACK JANG/JANGTQ_K rows. The larger
-  rows need current all-non-Kimi re-runs before Osaurus promotion.
+- Local bundles: small JANGTQ plus larger CRACK JANG/JANGTQ_K rows.
 - Swift dispatch: `minimax_m2`; JANGTQ bundles route to `MiniMaxJANGTQModel`.
 - Cache topology: standard KV layers, BatchEngine cache coordinator, TQ disk
   serializer, and compiled decode path where cache types allow it.
@@ -250,8 +252,13 @@ weights.
 - Template/reasoning/tools: template smoke passes; tool parser is MiniMax M2
   invoke/parameter format.
 - Live proof: small JANGTQ has coherent 3-turn chat and TQ disk round-trip.
-- Current issues: thinking-on no visible answer within budget; low-RAM active
-  streaming is not proven because footprint reached full model scale.
+  Fresh large CRACK infer artifacts prove both JANGTQ_K and JANG_K pass
+  cache-off production defaults with coherent reasoning ON/OFF flips, MTP off,
+  no hidden repetition penalty, and about `45-50 tok/s`.
+- Current issues: full cache/multibatch/disk/TurboQuant rows are still open for
+  the large CRACK bundles. The JANGTQ_K infer row peaks around `55.9 GiB`, and
+  the JANG_K row logs an in-memory shape-inferred 6-bit metadata repair, so
+  these are not full Osaurus promotion rows yet.
 
 ### ZAYA Text
 
