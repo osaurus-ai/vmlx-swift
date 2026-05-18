@@ -676,7 +676,7 @@ metadata/template only.
 | Nemotron Omni Nano JANGTQ `BENCH_OMNI=1 BENCH_OMNI_BATCH=1` | PASS. 17/17 rows passed: text single/multi-turn, image, video encoder, audio encoder, video/audio LMInput, reasoning ON/OFF toggle, mixed image+audio, media-salt isolation, hybrid SSM warm-pass, BatchEngine B=1/B=2/image/audio. |
 | Production bundle `BENCH_CONFIG_SMOKE=1` sweep | PASS for Qwen 35B, Qwen 27B, Gemma4, Laguna, MiniMax JANGTQ/JANGTQ_K, Ling JANGTQ2/MXFP4, Nemotron Omni JANGTQ, and DSV4 Flash. DSV4 reports `sidecar=true` after local sidecar rebuild. |
 | Production bundle `BENCH_TEMPLATE_SMOKE=1` sweep | PASS for the same set. DSV4 now works with both the local bundle template and the Swift `DSV4Minimal` fallback: `thinking_false` closes `</think>`, `thinking_true` opens `<think>`, and max-effort preface is gated by `enable_thinking=true`. Laguna uses the Swift `LagunaMinimal` Poolside template when the bundle exposes only an include wrapper. Qwen/MiniMax/Nemotron close thinking for `thinking_false`. Ling renders the Bailing "detailed thinking off" system hint in all tested toggle rows. |
-| DSV4 Flash `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=reasoning` | PASS. Reasoning-off, reasoning-on, and max-effort all answered `12`; thinking rows routed thought text through `.reasoning`, closed reasoning, stopped by EOS/stop, and did not leak raw `<think>` markers. Max-effort needs the larger `BENCH_DSV4_REASONING_MAX_TOKENS=384` budget and the max-only repetition penalty. |
+| DSV4 Flash `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=reasoning` | HISTORICAL PASS. Reasoning-off, reasoning-on, and max-effort all answered `12`; thinking rows routed thought text through `.reasoning`, closed reasoning, stopped by EOS/stop, and did not leak raw `<think>` markers. The historical max-effort row used a larger `BENCH_DSV4_REASONING_MAX_TOKENS=384` budget and an explicit repetition-penalty override. Current Osaurus wiring must not turn that artifact into a hidden default; preserve request/bundle sampling and report failures honestly. |
 
 Runtime fix made after this matrix: `MiniMaxJANGTQConfiguration` now decodes
 the real JANGTQ_K nested bit map directly from `mxtq_bits.routed_expert`, not
@@ -1204,8 +1204,9 @@ Reasoning modes:
   visible `.chunk` text with `unclosedReasoning=false`.
 - `enable_thinking=true`: normal reasoning stream.
 - `reasoning_effort="max"`: template preface is applied and can consume more
-  budget before visible answer. Use a larger budget; the live max row passed
-  with 384 tokens and a max-only repetition penalty.
+  budget before visible answer. Use a larger budget and the explicit
+  request/bundle sampling values; do not add a hidden repetition penalty or
+  sampler clamp because a historical diagnostic used one.
 
 Live DSV4 gate added:
 

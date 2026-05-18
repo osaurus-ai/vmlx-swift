@@ -147,10 +147,12 @@ for await event in stream {
 **Sampling note.** Earlier DSV4 debugging saw degenerate output when greedy
 sampling was paired with stale pins or the wrong prompt mode. The current
 2026-05-06 strict DSV4 gate passes at `temperature=0` for normal chat and
-reasoning rows; max-effort reasoning uses a larger token budget and a
-max-only repetition penalty. If product traffic uses the bundle defaults
-(`temperature=0.6`, `top_p=0.95`), keep the reasoning parser and stop-state
-telemetry enabled so loops or length finishes are visible.
+reasoning rows; max-effort reasoning uses a larger token budget and the
+request/bundle sampling values as provided. If product traffic uses the bundle
+defaults (`temperature=0.6`, `top_p=0.95`), keep the reasoning parser and
+stop-state telemetry enabled so loops or length finishes are visible. Do not
+add a hidden repetition-penalty rescue, top-k clamp, forced stop, or fake
+reasoning close when a row fails.
 
 ---
 
@@ -161,7 +163,7 @@ If a JANGTQ bundle loads but emits `"matters Reasons | claiming aims allow…"`:
 | Cause | How to test | Fix |
 |---|---|---|
 | **Stale vmlx pin** | `nm osaurus \| grep sniffCodebookBits` — empty? | `rm -rf .build && swift package update && swift build -c release` |
-| **Prompt/sampling mismatch** | Check the rendered chat prompt tail, reasoning kwargs, token budget, and repetition settings. | Use `UserInput(chat:)`; `enable_thinking=false` for normal chat; allocate larger budgets for reasoning/max; use the validated max-only repetition penalty for max-effort rows. |
+| **Prompt/sampling mismatch** | Check the rendered chat prompt tail, reasoning kwargs, token budget, and explicit request/bundle sampling settings. | Use `UserInput(chat:)`; `enable_thinking=false` for normal chat; allocate larger budgets for reasoning/max; preserve explicit request or bundle sampling. Do not add hidden repetition penalties or sampler clamps as a rescue. |
 | **Empty/corrupted sidecar** | `ls -la $BUNDLE/jangtq_runtime.safetensors` — < 1 KB? | Re-download bundle (this is the 29-byte case) |
 
 If all three are clean and gibberish persists, capture for the vmlx maintainers:
