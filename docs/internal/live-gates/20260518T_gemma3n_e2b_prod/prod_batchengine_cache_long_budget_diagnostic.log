@@ -1,0 +1,21 @@
+[STDERR] Bench main() started
+
+=== BENCH_PROD — gemma-3n-E2B-it-4bit ===
+Cache dir: /tmp/vmlx-prod-cache-gemma3n-e2b-long-20260518
+Load: 1.09s  Model: Gemma3nTextModel  RSS +2692 MiB
+Tool format: gemma
+Reasoning stamp: none
+Coordinator: enabled (L2 disk at /tmp/vmlx-prod-cache-gemma3n-e2b-long-20260518, hybrid=false)
+Sampling: mode=bundle-defaults mtpDepth=off maxTokens=256 temp=0.600 topP=0.950 topK=64 minP=0.000 rep=nil seed=42
+Reasoning prompt toggle: not-template-active onTail="s><start_of_turn>user\nProbe reasoning toggle.<end_of_turn>\n<start_of_turn>model\n" offTail="s><start_of_turn>user\nProbe reasoning toggle.<end_of_turn>\n<start_of_turn>model\n"
+  [PASS] S1 think=ON math(7+8-11)  ttft=  60ms prompt=  56ms total= 0.96s genTokens=106 tokps=118.5 stop=stop chunks= 290 reasoning=   0 tools=0 rss=2736MiB -> "To solve the equation 7 + 8 - 11, we need to perform the addition and subtraction in order.\n\nFirst, we calculate the sum…"
+  [PASS] S2 cache-hit think=ON same prompt  ttft=  25ms prompt=  17ms total= 0.46s genTokens=52 tokps=120.7 stop=stop chunks= 121 reasoning=   0 tools=0 rss=2740MiB -> "Here's how to solve the equation:\n\n1. **7 + 8 = 15**\n2. **15 - 11 = 4**\n\nTherefore, the answer is **4**.\n\n\n\n**Answer: 4*…"
+  [PASS] S3 think=OFF math(2+2)  ttft=  42ms prompt=  38ms total= 0.15s genTokens=12 tokps=119.2 stop=stop chunks=  24 reasoning=   0 tools=0 rss=2743MiB -> "**2 + 2**\n\n**Answer:** 4"
+  [PASS] S4.1 flip-back think=ON math(12+3)  ttft=  41ms prompt=  38ms total= 0.20s genTokens=18 tokps=120.7 stop=stop chunks=  31 reasoning=   0 tools=0 rss=2743MiB -> "**12 + 3 = 15**\n\n**Answer:** 15"
+  [PASS] S4.2 flip think=OFF name  ttft=  40ms prompt=  38ms total= 0.28s genTokens=28 tokps=119.3 stop=stop chunks=  89 reasoning=   0 tools=0 rss=2743MiB -> "Okay, here's the answer:\n\n**Mars**\n\nHere's the answer in the requested format:\n\n**Mars**\n"
+  [PASS] S4.3 flip-back think=ON math(5 times 4)  ttft=  40ms prompt=  37ms total= 1.31s genTokens=142 tokps=112.9 stop=stop chunks= 477 reasoning=   0 tools=0 rss=2750MiB -> "Okay, let's break this down!\n\nThe question is a bit of a word puzzle. Here's how to solve it:\n\n* **5 times 4:** This mea…"
+  [FAIL] S5 utf8 inclusion  ttft=  44ms prompt=  39ms total= 1.51s genTokens=175 tokps=119.9 stop=stop chunks= 521 reasoning=   0 tools=0 rss=2758MiB WHY=missing expected UTF-8 words in visible output -> "Here's a sentence incorporating "该" (gāi - should), "了" (le - past particle), "试" (shì - try), "此" (cǐ - this), "是" (shì…"
+
+=== BENCH_PROD summary: model=gemma-3n-E2B-it-4bit pass=6 fail=1 peakRSS=2758MiB loadSec=1.09 ===
+PROD_CACHE_STATS hybrid=false pagedIncompatible=true paged{hits=0,misses=0,allocated=0,free=511,evictions=0} disk{hits=1,misses=25,stores=21,maxBytes=4294967296} ssm{hits=0,misses=0,reDerives=0}
+Swift/ErrorType.swift:254: Fatal error: Error raised at top level: Error Domain=BENCH_PROD Code=1 "1 scenario(s) failed validation" UserInfo={NSLocalizedDescription=1 scenario(s) failed validation}

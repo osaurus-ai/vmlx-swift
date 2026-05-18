@@ -149,6 +149,17 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   Osaurus app/API rows. This is intentionally not a green production claim:
   several rows are still pending live Osaurus UI/API evidence even where vmlx
   has source tests or direct `RunBench` artifacts.
+- Fresh Gemma3n E2B production-path probe was run from this checkout under
+  `docs/internal/live-gates/20260518T_gemma3n_e2b_prod/`. The harness prompt
+  for the UTF-8 row was tightened to require exact literal `café` and `你好`
+  strings instead of relying on an ambiguous "word" instruction. The model is
+  coherent and fast on the math/reasoning-on/off/cache rows (about 120 tok/s,
+  ~2.7 GiB RSS, no reasoning marker leakage, and disk L2 hits/stores when the
+  coordinator is enabled), but it is not production-clear: the UTF literal row
+  fails at bundle defaults and under greedy diagnostics by translating or
+  drifting into unrelated Chinese text. Keep this as a real Gemma3n live red
+  row until tokenizer/template/decode behavior is root-caused; do not hide it
+  with sampler clamps or app-side output repair.
 
 2026-05-17 20:25 PDT live refresh:
 

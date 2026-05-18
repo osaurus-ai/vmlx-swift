@@ -8466,7 +8466,7 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
     // ──────────────── S5  UTF-8 inclusion ────────────────
     try await runTurn(
         label: "S5 utf8 inclusion",
-        prompt: "Write one short sentence that includes both words café and 你好.",
+        prompt: "Write one short sentence that includes the exact literal strings café and 你好. Do not translate either string.",
         thinking: false
     ) { r in
         let visible = requireReasoningOffVisible(r)
