@@ -453,6 +453,30 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   residency conditions are root-caused and fixed without sampler, prompt, or
   output guards.
 
+2026-05-18 15:14 PDT Osaurus PR #1147 Responses media fix:
+
+- Osaurus PR #1147 head `287f5f42` fixes one source-side cause from the ZAYA-VL
+  red artifact: `/v1/responses` converted input messages with
+  `OpenResponsesMessageContent.plainText`, which keeps `input_text` but drops
+  `input_image` before the request reaches `MLXBatchAdapter`.
+- The PR now converts Responses `input_text` and `input_image` parts into
+  Chat Completions `MessageContentPart` values, so `ChatMessage.imageUrls`
+  carries the image URL into the same multimodal mapping path used by
+  `/v1/chat/completions`.
+- Regression test:
+  `ChatEngineTests.openResponsesRequest_preservesInputImageIntoChatRequest`
+  decodes a Responses payload with `input_text` plus `input_image` and proves
+  the converted chat request preserves both plain text and `imageUrls`.
+- Verification for the checkpoint: the focused regression test passes 1/1,
+  `ChatEngineTests` passes 12/12, `MultimodalContentPartTests` passes 13/13
+  with the two existing MLXArray fixture skips, `RuntimePolicySourceTests`
+  passes 28/28, and `git diff --check` passes.
+- Boundary: this fixes the source route-conversion bug only. The ZAYA-VL row is
+  still not production-clear until a fresh keychain-safe live rerun shows
+  grounded Responses image output, resolves the Chat blue-image stale-red
+  answer, handles or hides unsupported ZAYA video, and collects cache proof
+  under non-immediate residency or stream-time snapshots.
+
 2026-05-17 20:25 PDT live refresh:
 
 - `gh pr list --repo osaurus-ai/osaurus --state all --limit 20` shows the
