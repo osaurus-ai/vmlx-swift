@@ -1878,10 +1878,12 @@ request with TurboQuant params and the engine does the following per slot:
    request uses the unsupported affine / legacy `kvBits` path. No-op for TQ.
 2. After prefill completes and the slot transitions to `.decode`,
    `BatchQuantize.maybeCompress` swaps `KVCacheSimple` layers for
-   `TurboQuantKVCache` when `offset > max(quantizedKVStart, 8)`.
+   `TurboQuantKVCache` only when the cache has enough tokens to keep the sink
+   span and recent prompt/decode tail exact while compressing an older middle
+   span.
 3. After every batched decode step, the same hook runs per slot so
    short-prompt requests eventually compress once decode pushes them past
-   the threshold.
+   the sink/residual/middle threshold.
 4. In `stepBatchDecode`, TurboQuant slot caches are wrapped natively by the
    existing `BatchKVCache` — no dedicated subclass. This works because
    `TurboQuantKVCache.update()` returns plain float `[1, H, L, D]` matching

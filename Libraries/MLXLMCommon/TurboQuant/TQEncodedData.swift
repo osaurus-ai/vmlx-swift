@@ -52,7 +52,15 @@ public struct EncodedKeys: @unchecked Sendable {
     /// Full-precision sink tokens (first N tokens preserved uncompressed).
     public let sinkData: MLXArray?
 
+    /// Full-precision recent tail tokens preserved uncompressed.
+    ///
+    /// Live KV compression must not perturb the newest prompt tokens because
+    /// they usually carry the active instruction and EOS boundary. The encoded
+    /// tensor shape excludes both `sinkData` and `tailData`.
+    public let tailData: MLXArray?
+
     public var sinkCount: Int { sinkData?.dim(2) ?? 0 }
+    public var tailCount: Int { tailData?.dim(2) ?? 0 }
 
     public init(
         indicesPacked: MLXArray,
@@ -62,7 +70,8 @@ public struct EncodedKeys: @unchecked Sendable {
         shape: [Int],
         indexBits: Int,
         seed: Int = 42,
-        sinkData: MLXArray? = nil
+        sinkData: MLXArray? = nil,
+        tailData: MLXArray? = nil
     ) {
         self.indicesPacked = indicesPacked
         self.qjlPacked = qjlPacked
@@ -72,18 +81,22 @@ public struct EncodedKeys: @unchecked Sendable {
         self.indexBits = indexBits
         self.seed = seed
         self.sinkData = sinkData
+        self.tailData = tailData
     }
 
     public var estimatedBytes: Int {
         var total = indicesPacked.nbytes + qjlPacked.nbytes
             + residualNorms.nbytes + vectorNorms.nbytes
         if let sink = sinkData { total += sink.nbytes }
+        if let tail = tailData { total += tail.nbytes }
         return total
     }
 
     public var compressionRatio: Float {
         guard shape.count == 4 else { return 1.0 }
-        let originalBytes = shape.reduce(1, *) * 2
+        let exactTokens = sinkCount + tailCount
+        let originalTokens = shape[2] + exactTokens
+        let originalBytes = shape[0] * shape[1] * originalTokens * shape[3] * 2
         guard estimatedBytes > 0 else { return Float.infinity }
         return Float(originalBytes) / Float(estimatedBytes)
     }
@@ -116,8 +129,10 @@ public struct EncodedValues: @unchecked Sendable {
     public let indexBits: Int
     public let seed: Int
     public let sinkData: MLXArray?
+    public let tailData: MLXArray?
 
     public var sinkCount: Int { sinkData?.dim(2) ?? 0 }
+    public var tailCount: Int { tailData?.dim(2) ?? 0 }
 
     public init(
         indicesPacked: MLXArray,
@@ -125,7 +140,8 @@ public struct EncodedValues: @unchecked Sendable {
         shape: [Int],
         indexBits: Int,
         seed: Int = 42,
-        sinkData: MLXArray? = nil
+        sinkData: MLXArray? = nil,
+        tailData: MLXArray? = nil
     ) {
         self.indicesPacked = indicesPacked
         self.vectorNorms = vectorNorms
@@ -133,17 +149,21 @@ public struct EncodedValues: @unchecked Sendable {
         self.indexBits = indexBits
         self.seed = seed
         self.sinkData = sinkData
+        self.tailData = tailData
     }
 
     public var estimatedBytes: Int {
         var total = indicesPacked.nbytes + vectorNorms.nbytes
         if let sink = sinkData { total += sink.nbytes }
+        if let tail = tailData { total += tail.nbytes }
         return total
     }
 
     public var compressionRatio: Float {
         guard shape.count == 4 else { return 1.0 }
-        let originalBytes = shape.reduce(1, *) * 2
+        let exactTokens = sinkCount + tailCount
+        let originalTokens = shape[2] + exactTokens
+        let originalBytes = shape[0] * shape[1] * originalTokens * shape[3] * 2
         guard estimatedBytes > 0 else { return Float.infinity }
         return Float(originalBytes) / Float(estimatedBytes)
     }

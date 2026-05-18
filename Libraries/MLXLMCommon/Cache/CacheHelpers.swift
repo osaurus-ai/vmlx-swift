@@ -842,7 +842,15 @@ private func makeTurboQuantLayer(
     let keyBits = comp.encodedKeys.indexBits + 1
     let valueBits = comp.encodedValues.indexBits
     let sinkTokens = max(comp.encodedKeys.sinkCount, comp.encodedValues.sinkCount, 4)
-    return TurboQuantKVCache(keyBits: keyBits, valueBits: valueBits, sinkTokens: sinkTokens)
+    let residualTokens = max(
+        comp.encodedKeys.tailCount,
+        comp.encodedValues.tailCount,
+        TurboQuantKVCache.defaultResidualTokens)
+    return TurboQuantKVCache(
+        keyBits: keyBits,
+        valueBits: valueBits,
+        sinkTokens: sinkTokens,
+        residualTokens: residualTokens)
 }
 
 /// Helper: restore RotatingKVCache state (ring buffer + metaState) into a

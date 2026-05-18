@@ -259,6 +259,11 @@ public actor BatchEngine {
     /// representations into one model forward.
     private var decodeCompatibilitySplitCount: Int = 0
 
+    /// Number of slot cache arrays that actually crossed from plain KV into
+    /// TurboQuant KV. Exposed only for release gates; kvMode alone is not
+    /// proof that the live codec activated.
+    private var turboQuantCompressionCount: Int = 0
+
     /// Background scheduling loop task handle.
     private var loopTask: Task<Void, Never>?
 
@@ -1020,6 +1025,11 @@ public actor BatchEngine {
         decodeCompatibilitySplitCount
     }
 
+    /// Number of successful KVCacheSimple -> TurboQuantKVCache transitions.
+    public var turboQuantCompressionCountForDiagnostics: Int {
+        turboQuantCompressionCount
+    }
+
     /// Whether the engine is currently running (has active or pending work).
     public var isRunning: Bool { loopTask != nil || soloFastPathTask != nil }
 
@@ -1578,10 +1588,7 @@ public actor BatchEngine {
             // TQ minimum threshold. Running after `yield(.token)` keeps TQ's
             // one-time encode/decode cost out of first-token latency while
             // preserving the compressed path for sustained decode.
-            BatchQuantize.maybeCompress(
-                cache: &slot.cache,
-                parameters: slot.parameters
-            )
+            maybeCompressSlotCache(&slot)
 
             // Stage 1B.3: compile-decode promotion hook.
             self.maybePromoteToCompiledDecode(slot: &slot)
@@ -1643,10 +1650,7 @@ public actor BatchEngine {
         // have already run during prefill promotion or be blocked). Kept
         // for symmetry with `stepBatchDecode` so any future compile+quant
         // mode finds the hook wired in.
-        BatchQuantize.maybeCompress(
-            cache: &slot.cache,
-            parameters: slot.parameters
-        )
+        maybeCompressSlotCache(&slot)
 
         // Stop conditions (same rules as uncompiled path).
         if stopTokenIDs.contains(tokenID) {
@@ -2030,10 +2034,7 @@ public actor BatchEngine {
             // Slots already in TurboQuant phase short-circuit via the internal
             // `cache.contains(where: { $0 is TurboQuantKVCache })` guard, so
             // this is a cheap no-op once compressed.
-            BatchQuantize.maybeCompress(
-                cache: &slot.cache,
-                parameters: slot.parameters
-            )
+            maybeCompressSlotCache(&slot)
 
             // Check stop conditions BEFORE yielding — don't emit EOS tokens to callers.
             // This matches TokenIterator behavior where the stop token is never surfaced.
@@ -2096,6 +2097,18 @@ public actor BatchEngine {
         }.joined(separator: "|")
 
         return kvModeKey + ";" + cacheKey
+    }
+
+    private func maybeCompressSlotCache(_ slot: inout BatchSlot) {
+        let hadTQ = slot.cache.contains { $0 is TurboQuantKVCache }
+        BatchQuantize.maybeCompress(
+            cache: &slot.cache,
+            parameters: slot.parameters
+        )
+        let hasTQ = slot.cache.contains { $0 is TurboQuantKVCache }
+        if !hadTQ && hasTQ {
+            turboQuantCompressionCount += 1
+        }
     }
 
     // MARK: - Completion

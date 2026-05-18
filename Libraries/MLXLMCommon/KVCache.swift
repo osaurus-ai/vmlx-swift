@@ -1751,12 +1751,18 @@ public func maybeQuantizeKVCache(
     switch kvMode {
     case .turboQuant(let keyBits, let valueBits):
         // Already compressed? Skip. Check if any layer is already TQ.
-        // TQ has a minimum threshold of 8 tokens — compressing fewer tokens
-        // than sink tokens (4) + a small buffer is wasteful and produces
-        // degenerate compressed representations.
-        let tqMinStart = max(quantizedKVStart, 8)
+        // TQ keeps exact sink tokens plus an exact recent tail; compression only
+        // begins once there is a real middle span to encode. This preserves the
+        // active prompt/instruction boundary instead of trying to repair model
+        // behavior with sampler guards.
+        let tqMinStart = max(
+            quantizedKVStart,
+            4 + TurboQuantKVCache.defaultResidualTokens
+                + TurboQuantKVCache.minimumCompressedTokens)
         guard !cache.contains(where: { $0 is TurboQuantKVCache }),
-              let ref = firstSimple, ref.offset > tqMinStart
+              let ref = firstSimple,
+              ref.offset > tqMinStart,
+              TurboQuantKVCache.hasCompressibleMiddle(tokenCount: ref.offset)
         else { return }
 
         for i in 0..<cache.count {

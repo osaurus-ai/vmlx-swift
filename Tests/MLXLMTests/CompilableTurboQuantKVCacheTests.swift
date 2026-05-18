@@ -44,7 +44,7 @@ class CompilableTurboQuantKVCacheTests: XCTestCase {
             let tq: [KVCache] = simple.map { layer in
                 TurboQuantKVCache.fromSimpleCache(
                     layer as! KVCacheSimple,
-                    keyBits: 3, valueBits: 3) as KVCache
+                    keyBits: 3, valueBits: 3, residualTokens: 0) as KVCache
             }
             MLX.eval(tq)
             return tq
@@ -113,7 +113,7 @@ class CompilableTurboQuantKVCacheTests: XCTestCase {
                 values: MLXArray.ones([1, 4, 1, 64]))
         }
         let tq = TurboQuantKVCache.fromSimpleCache(
-            simple, keyBits: 3, valueBits: 3)
+            simple, keyBits: 3, valueBits: 3, residualTokens: 0)
         XCTAssertEqual(tq.phase, .compressed)
 
         let compilable = CompilableTurboQuantKVCache(from: tq)

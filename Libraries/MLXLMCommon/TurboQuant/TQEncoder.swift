@@ -121,22 +121,37 @@ public struct TQEncoder: Sendable {
     public static func encodeKeys(
         _ keys: MLXArray,
         state: EncoderState,
-        sinkTokens: Int = defaultSinkTokens
+        sinkTokens: Int = defaultSinkTokens,
+        tailTokens: Int = 0
     ) -> EncodedKeys {
         let origShape = keys.shape
         let seqLen = origShape[2]
         let dim = origShape[origShape.count - 1]
 
-        // Extract sink tokens at full precision
+        let prefixCount = min(max(sinkTokens, 0), seqLen)
+        let tailCount = min(max(tailTokens, 0), max(0, seqLen - prefixCount))
+        let middleStart = prefixCount
+        let middleEnd = seqLen - tailCount
+
+        precondition(
+            middleEnd > middleStart,
+            "TurboQuant encodeKeys requires at least one compressible token")
+
+        // Extract sink and recent tail tokens at full precision.
         let sinkData: MLXArray?
+        let tailData: MLXArray?
         let compressKeys: MLXArray
-        if sinkTokens > 0 && seqLen > sinkTokens {
-            sinkData = keys[.ellipsis, 0..<sinkTokens, 0...]
-            compressKeys = keys[.ellipsis, sinkTokens..., 0...]
+        if prefixCount > 0 {
+            sinkData = keys[.ellipsis, 0..<prefixCount, 0...]
         } else {
             sinkData = nil
-            compressKeys = keys
         }
+        if tailCount > 0 {
+            tailData = keys[.ellipsis, middleEnd..<seqLen, 0...]
+        } else {
+            tailData = nil
+        }
+        compressKeys = keys[.ellipsis, middleStart..<middleEnd, 0...]
 
         let compressShape = compressKeys.shape
 
@@ -171,7 +186,8 @@ public struct TQEncoder: Sendable {
             shape: compressShape,
             indexBits: state.keyIndexBits,
             seed: state.seed,
-            sinkData: sinkData
+            sinkData: sinkData,
+            tailData: tailData
         )
     }
 
@@ -216,6 +232,9 @@ public struct TQEncoder: Sendable {
         if let sink = encoded.sinkData {
             decoded = concatenated([sink, decoded], axis: 2)
         }
+        if let tail = encoded.tailData {
+            decoded = concatenated([decoded, tail], axis: 2)
+        }
 
         return decoded
     }
@@ -229,21 +248,36 @@ public struct TQEncoder: Sendable {
     public static func encodeValues(
         _ values: MLXArray,
         state: EncoderState,
-        sinkTokens: Int = defaultSinkTokens
+        sinkTokens: Int = defaultSinkTokens,
+        tailTokens: Int = 0
     ) -> EncodedValues {
         let origShape = values.shape
         let seqLen = origShape[2]
         let dim = origShape[origShape.count - 1]
 
+        let prefixCount = min(max(sinkTokens, 0), seqLen)
+        let tailCount = min(max(tailTokens, 0), max(0, seqLen - prefixCount))
+        let middleStart = prefixCount
+        let middleEnd = seqLen - tailCount
+
+        precondition(
+            middleEnd > middleStart,
+            "TurboQuant encodeValues requires at least one compressible token")
+
         let sinkData: MLXArray?
+        let tailData: MLXArray?
         let compressValues: MLXArray
-        if sinkTokens > 0 && seqLen > sinkTokens {
-            sinkData = values[.ellipsis, 0..<sinkTokens, 0...]
-            compressValues = values[.ellipsis, sinkTokens..., 0...]
+        if prefixCount > 0 {
+            sinkData = values[.ellipsis, 0..<prefixCount, 0...]
         } else {
             sinkData = nil
-            compressValues = values
         }
+        if tailCount > 0 {
+            tailData = values[.ellipsis, middleEnd..<seqLen, 0...]
+        } else {
+            tailData = nil
+        }
+        compressValues = values[.ellipsis, middleStart..<middleEnd, 0...]
 
         let compressShape = compressValues.shape
 
@@ -267,7 +301,8 @@ public struct TQEncoder: Sendable {
             shape: compressShape,
             indexBits: state.valueIndexBits,
             seed: state.seed,
-            sinkData: sinkData
+            sinkData: sinkData,
+            tailData: tailData
         )
     }
 
@@ -300,6 +335,9 @@ public struct TQEncoder: Sendable {
         // Prepend sink tokens
         if let sink = encoded.sinkData {
             decoded = concatenated([sink, decoded], axis: 2)
+        }
+        if let tail = encoded.tailData {
+            decoded = concatenated([decoded, tail], axis: 2)
         }
 
         return decoded

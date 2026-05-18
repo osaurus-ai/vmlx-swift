@@ -2944,12 +2944,17 @@ func runBatchEngineTurboQuantB2(modelPath: String, maxNew: Int) async throws {
     nonisolated(unsafe) let ctx = context
     let tokenizer = context.tokenizer
 
-    // Prompt pair that's long enough to cross the TQ minimum-compression
-    // threshold (`max(quantizedKVStart, 8)` in BatchQuantize). 30+ tokens
-    // is comfortably above both defaults.
+    // Prompt pair long enough to leave exact sink + exact recent tail tokens
+    // while still crossing the TurboQuant middle-compression threshold. The
+    // final instruction stays in the exact tail; older filler is the region
+    // the live KV codec is supposed to compress.
+    let tqFiller = Array(repeating:
+        "Background cache-validation note: keep following the final user instruction exactly.",
+        count: 12
+    ).joined(separator: " ")
     let prompts = [
-        "List five distinct countries in Europe, one per line.",
-        "Give me five adjectives that describe a summer morning.",
+        "\(tqFiller)\nFinal instruction: Reply with exactly these five country names, one per line, and no other text: France; Germany; Italy; Spain; Sweden.",
+        "\(tqFiller)\nFinal instruction: Reply with exactly these five adjectives, comma-separated, and no other text: warm, bright, fresh, quiet, golden.",
     ]
     func makeVisibleAnswerInput(_ prompt: String) async throws -> LMInput {
         var input = UserInput(prompt: prompt)
@@ -3083,6 +3088,7 @@ func runBatchEngineTurboQuantB2(modelPath: String, maxNew: Int) async throws {
         streams: [(0, streamA0), (1, streamA1)],
         label: "TQ B=2 pass A")
     let compatibilitySplitsA = await engineA.decodeCompatibilitySplitCountForDiagnostics
+    let compressionCountA = await engineA.turboQuantCompressionCountForDiagnostics
     for (slot, ids, info) in resultsA {
         let tag = slot == 0 ? "plain" : "TQ(4,4)"
         let text = tokenizer.decode(tokenIds: ids)
@@ -3113,6 +3119,7 @@ func runBatchEngineTurboQuantB2(modelPath: String, maxNew: Int) async throws {
         engineB,
         streams: [(0, streamB0), (1, streamB1)],
         label: "TQ B=2 pass B")
+    let compressionCountB = await engineB.turboQuantCompressionCountForDiagnostics
     for (slot, ids, info) in resultsB {
         let text = tokenizer.decode(tokenIds: ids)
         print(String(format: "  Slot %d (TQ) : %d tokens, first 8: %@",
@@ -3151,9 +3158,16 @@ func runBatchEngineTurboQuantB2(modelPath: String, maxNew: Int) async throws {
         isolationLabel = "DIVERGED"
     }
     print(String(format:
-        "\n  Slot 0 plain with TQ neighbour isolation: %@ (%d vs B2 %d, solo %d tokens; compatibilitySplits=%d)",
+        "\n  Slot 0 plain with TQ neighbour isolation: %@ (%d vs B2 %d, solo %d tokens; compatibilitySplits=%d; tqCompressionsA=%d; tqCompressionsB=%d)",
         isolationLabel,
-        a0.count, refB2Slot0.count, refTokens.count, compatibilitySplitsA))
+        a0.count, refB2Slot0.count, refTokens.count, compatibilitySplitsA,
+        compressionCountA, compressionCountB))
+    if compressionCountA == 0 || compressionCountB < 2 {
+        fputs("[TQ B=2] FAIL: TurboQuant mode did not actually compress the expected slots " +
+              "(passA=\(compressionCountA), passB=\(compressionCountB)).\n",
+              stderr)
+        exit(1)
+    }
     if !(isolationOk || isolatedByScheduler) {
         fputs("[TQ B=2] FAIL: slot 0 plain output drifted from the B=2 plain/plain reference " +
               "or the scheduler-isolated B=1 reference when slot 1 used TurboQuant. Cross-slot corruption.\n",

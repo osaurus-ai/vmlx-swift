@@ -66,6 +66,15 @@ public enum TQPhase: Sendable {
 ///   This only happens if speculative decoding rejects ALL generated tokens
 ///   AND the prefix, which is extremely rare.
 public class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
+    /// Full-precision recent-token window retained across the compression
+    /// boundary. This is cache-codec state, not a generation guard: the newest
+    /// prompt tokens carry the active instruction and stop boundary, so lossy
+    /// live KV compression must leave them exact.
+    public static let defaultResidualTokens = 64
+
+    /// Minimum number of middle tokens worth compressing after exact sink and
+    /// exact tail tokens are removed.
+    public static let minimumCompressedTokens = 8
 
     public private(set) var phase: TQPhase = .fill
 
@@ -111,6 +120,7 @@ public class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
     public let keyBits: Int
     public let valueBits: Int
     public let sinkTokens: Int
+    public let residualTokens: Int
 
     // MARK: - Init
 
@@ -123,11 +133,30 @@ public class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
     ///   - keyBits: Total bits per key element (e.g., 3 = 2-bit codebook + 1-bit QJL)
     ///   - valueBits: Total bits per value element (e.g., 3 = 3-bit codebook)
     ///   - sinkTokens: Tokens to preserve at full precision (default 4)
-    public init(keyBits: Int = 3, valueBits: Int = 3, sinkTokens: Int = 4) {
+    ///   - residualTokens: Recent prompt tokens to preserve at full precision.
+    public init(
+        keyBits: Int = 3,
+        valueBits: Int = 3,
+        sinkTokens: Int = 4,
+        residualTokens: Int = TurboQuantKVCache.defaultResidualTokens
+    ) {
         self.keyBits = keyBits
         self.valueBits = valueBits
         self.sinkTokens = sinkTokens
+        self.residualTokens = max(0, residualTokens)
         super.init()
+    }
+
+    public static func hasCompressibleMiddle(
+        tokenCount: Int,
+        sinkTokens: Int = 4,
+        residualTokens: Int = TurboQuantKVCache.defaultResidualTokens,
+        minimumCompressedTokens: Int = TurboQuantKVCache.minimumCompressedTokens
+    ) -> Bool {
+        let prefixCount = min(max(sinkTokens, 0), max(tokenCount, 0))
+        let tailCount = min(max(residualTokens, 0), max(0, tokenCount - prefixCount))
+        let middleCount = tokenCount - prefixCount - tailCount
+        return middleCount >= minimumCompressedTokens
     }
 
     // MARK: - Restore from disk
@@ -255,10 +284,14 @@ public class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
         _ source: KVCacheSimple,
         keyBits: Int,
         valueBits: Int,
-        sinkTokens: Int = 4
+        sinkTokens: Int = 4,
+        residualTokens: Int = TurboQuantKVCache.defaultResidualTokens
     ) -> TurboQuantKVCache {
         let tqCache = TurboQuantKVCache(
-            keyBits: keyBits, valueBits: valueBits, sinkTokens: sinkTokens)
+            keyBits: keyBits,
+            valueBits: valueBits,
+            sinkTokens: sinkTokens,
+            residualTokens: residualTokens)
 
         // Get the current float KV from the source cache
         let state = source.state
@@ -267,7 +300,12 @@ public class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
         let keys = state[0]
         let values = state[1]
 
-        guard keys.ndim == 4, values.ndim == 4, source.offset > 0 else {
+        guard keys.ndim == 4, values.ndim == 4, source.offset > 0,
+              Self.hasCompressibleMiddle(
+                tokenCount: source.offset,
+                sinkTokens: sinkTokens,
+                residualTokens: residualTokens)
+        else {
             return tqCache
         }
 
@@ -291,8 +329,16 @@ public class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
         self.valueEncoderState = valueState
 
         // Encode
-        let encodedKeys = TQEncoder.encodeKeys(keys, state: keyState, sinkTokens: sinkTokens)
-        let encodedValues = TQEncoder.encodeValues(values, state: valueState, sinkTokens: sinkTokens)
+        let encodedKeys = TQEncoder.encodeKeys(
+            keys,
+            state: keyState,
+            sinkTokens: sinkTokens,
+            tailTokens: residualTokens)
+        let encodedValues = TQEncoder.encodeValues(
+            values,
+            state: valueState,
+            sinkTokens: sinkTokens,
+            tailTokens: residualTokens)
 
         // Evaluate immediately so MLX doesn't graph 30+ layers at once and freeze.
         // MLX.eval() is MLX's lazy tensor materialization — NOT code evaluation.
@@ -526,7 +572,10 @@ public class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
 
     public override func copy() -> any KVCache {
         let new = TurboQuantKVCache(
-            keyBits: keyBits, valueBits: valueBits, sinkTokens: sinkTokens)
+            keyBits: keyBits,
+            valueBits: valueBits,
+            sinkTokens: sinkTokens,
+            residualTokens: residualTokens)
         new.phase = phase
         new.offset = offset
         new.prefixTokenCount = prefixTokenCount

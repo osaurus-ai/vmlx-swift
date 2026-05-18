@@ -86,10 +86,19 @@ public final class CompilableTurboQuantKVCache: TurboQuantKVCache, @unchecked Se
     /// from `keyBits` / `valueBits` / `sinkTokens`. Callers normally use
     /// ``init(from:)`` instead — this direct init exists primarily for
     /// testing.
-    public override init(keyBits: Int = 3, valueBits: Int = 3, sinkTokens: Int = 4) {
+    public override init(
+        keyBits: Int = 3,
+        valueBits: Int = 3,
+        sinkTokens: Int = 4,
+        residualTokens: Int = TurboQuantKVCache.defaultResidualTokens
+    ) {
         self.writePosArray = MLXArray([Int32(0)])
         self.offsetArray = MLXArray([Int32(0)])
-        super.init(keyBits: keyBits, valueBits: valueBits, sinkTokens: sinkTokens)
+        super.init(
+            keyBits: keyBits,
+            valueBits: valueBits,
+            sinkTokens: sinkTokens,
+            residualTokens: residualTokens)
     }
 
     /// Promote an existing ``TurboQuantKVCache`` (in `.compressed` phase)
@@ -102,7 +111,11 @@ public final class CompilableTurboQuantKVCache: TurboQuantKVCache, @unchecked Se
         precondition(tq.phase == .compressed,
             "CompilableTurboQuantKVCache(from:) requires source to be in .compressed phase")
 
-        self.init(keyBits: tq.keyBits, valueBits: tq.valueBits, sinkTokens: tq.sinkTokens)
+        self.init(
+            keyBits: tq.keyBits,
+            valueBits: tq.valueBits,
+            sinkTokens: tq.sinkTokens,
+            residualTokens: tq.residualTokens)
 
         // Copy state references from tq. All fields are `internal` now so
         // same-module subclass access works.

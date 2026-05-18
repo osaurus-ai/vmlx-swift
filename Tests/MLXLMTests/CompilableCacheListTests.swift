@@ -104,7 +104,8 @@ class CompilableCacheListTests: XCTestCase {
                 keys: MLXArray.ones([1, 2, 1, 64]),
                 values: MLXArray.ones([1, 2, 1, 64]))
         }
-        let tq = TurboQuantKVCache.fromSimpleCache(s, keyBits: 3, valueBits: 3)
+        let tq = TurboQuantKVCache.fromSimpleCache(
+            s, keyBits: 3, valueBits: 3, residualTokens: 0)
 
         let list = CacheList([tq as KVCache])
 

@@ -154,7 +154,7 @@ func testTQDiskRestoreMaterializesFreshSimpleCache() async throws {
     defer { mlxTestLock.unlock() }
 
     let sourceSimple = KVCacheSimple()
-    let (keys, values) = smallKV(seqLen: 8)
+    let (keys, values) = smallKV(seqLen: 96)
     _ = sourceSimple.update(keys: keys, values: values)
     let sourceTQ = TurboQuantKVCache.fromSimpleCache(
         sourceSimple,
@@ -172,6 +172,7 @@ func testTQDiskRestoreMaterializesFreshSimpleCache() async throws {
     guard let tq = restored[0] as? TurboQuantKVCache else { return }
     #expect(TQDiskSerializer.isTQCompressed(tq))
     #expect(tq.offset == sourceSimple.offset)
+    #expect(tq.compressedKeys?.tailCount == TurboQuantKVCache.defaultResidualTokens)
 }
 
 // MARK: - Hybrid mix (KV + Mamba) + SSM companion state

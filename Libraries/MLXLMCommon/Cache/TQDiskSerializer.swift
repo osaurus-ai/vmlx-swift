@@ -34,6 +34,7 @@ import MLX
 ///       tq_{i}_ck_res_norms     — EncodedKeys.residualNorms (float16)
 ///       tq_{i}_ck_vec_norms     — EncodedKeys.vectorNorms (float16)
 ///       tq_{i}_ck_sink          — EncodedKeys.sinkData (float16, optional)
+///       tq_{i}_ck_tail          — EncodedKeys.tailData (float16, optional)
 ///       __tq_{i}_ck_shape__     — original compressed key shape (int32 array)
 ///       __tq_{i}_ck_index_bits__— key index bits (int32 scalar)
 ///       __tq_{i}_ck_seed__      — key encoding seed (int32 scalar)
@@ -301,6 +302,9 @@ public enum TQDiskSerializer {
             if let sink = ck.sinkData {
                 result["tq_\(i)_ck_sink"] = sink
             }
+            if let tail = ck.tailData {
+                result["tq_\(i)_ck_tail"] = tail
+            }
 
             result["__tq_\(i)_ck_shape__"] = MLXArray(ck.shape.map { Int32($0) })
             result["__tq_\(i)_ck_index_bits__"] = metaInt32(Int32(ck.indexBits))
@@ -314,6 +318,9 @@ public enum TQDiskSerializer {
 
             if let sink = cv.sinkData {
                 result["tq_\(i)_cv_sink"] = sink
+            }
+            if let tail = cv.tailData {
+                result["tq_\(i)_cv_tail"] = tail
             }
 
             result["__tq_\(i)_cv_shape__"] = MLXArray(cv.shape.map { Int32($0) })
@@ -971,7 +978,9 @@ public enum TQDiskSerializer {
         let cvSeed = Int(readMetaInt32(cvSeedArr))
 
         let ckSink = arrays["tq_\(i)_ck_sink"]
+        let ckTail = arrays["tq_\(i)_ck_tail"]
         let cvSink = arrays["tq_\(i)_cv_sink"]
+        let cvTail = arrays["tq_\(i)_cv_tail"]
 
         let encodedKeys = EncodedKeys(
             indicesPacked: ckIndices,
@@ -981,7 +990,8 @@ public enum TQDiskSerializer {
             shape: ckShape,
             indexBits: ckIndexBits,
             seed: ckSeed,
-            sinkData: ckSink
+            sinkData: ckSink,
+            tailData: ckTail
         )
 
         let encodedValues = EncodedValues(
@@ -990,7 +1000,8 @@ public enum TQDiskSerializer {
             shape: cvShape,
             indexBits: cvIndexBits,
             seed: cvSeed,
-            sinkData: cvSink
+            sinkData: cvSink,
+            tailData: cvTail
         )
 
         let offset: Int

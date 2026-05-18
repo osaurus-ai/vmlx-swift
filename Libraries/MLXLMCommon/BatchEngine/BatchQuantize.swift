@@ -18,7 +18,9 @@ import os
 ///
 /// - **`.turboQuant(keyBits, valueBits)`** — fully supported. After prefill,
 ///   `KVCacheSimple` layers are swapped for ``TurboQuantKVCache`` via
-///   ``TurboQuantKVCache/fromSimpleCache(_:keyBits:valueBits:sinkTokens:)``.
+///   ``TurboQuantKVCache/fromSimpleCache(_:keyBits:valueBits:sinkTokens:residualTokens:)``.
+///   The codec keeps sink tokens and the recent prompt/decode tail exact, then
+///   compresses only the older middle span.
 ///   `TurboQuantKVCache.update()` returns plain `(MLXArray, MLXArray)` matching
 ///   `KVCacheSimple`'s shape contract, so the existing ``BatchKVCache`` split/
 ///   pad/stack logic wraps TQ slot caches natively — no dedicated subclass
@@ -67,7 +69,8 @@ public enum BatchQuantize {
         switch parameters.kvMode {
         case .turboQuant:
             // Supported. Actual compression happens in `maybeCompress` after
-            // prefill once offset > quantizedKVStart + 8 (TQ minimum threshold).
+            // prefill once there is a compressible middle span between exact
+            // sink tokens and the exact recent tail.
             break
 
         case .affine:
@@ -97,8 +100,9 @@ public enum BatchQuantize {
     /// ``wrapNewCacheIfNeeded(slotID:parameters:)``).
     ///
     /// For TQ mode, delegates to ``maybeQuantizeKVCache`` which:
-    /// - Checks the first `KVCacheSimple` layer's offset against
-    ///   `max(quantizedKVStart, 8)` (TQ minimum threshold).
+    /// - Checks the first `KVCacheSimple` layer's offset against the
+    ///   configured quantization start and the TurboQuant sink/residual/middle
+    ///   token threshold.
     /// - Skips if any layer is already `TurboQuantKVCache`.
     /// - Preserves `RotatingKVCache`, `DeepseekV4Cache`, `MambaCache`,
     ///   `CacheList` layers (hybrid models have mixed cache arrays — only

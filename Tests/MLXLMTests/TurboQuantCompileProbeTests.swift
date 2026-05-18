@@ -70,7 +70,7 @@ class TurboQuantCompileProbeTests: XCTestCase {
         let tqCache: [KVCache] = simpleCache.map { layer in
             TurboQuantKVCache.fromSimpleCache(
                 layer as! KVCacheSimple,
-                keyBits: 3, valueBits: 3) as KVCache
+                keyBits: 3, valueBits: 3, residualTokens: 0) as KVCache
         }
         MLX.eval(tqCache)
 
@@ -183,7 +183,7 @@ class TurboQuantCompileProbeTests: XCTestCase {
             let tq: [KVCache] = simpleCache.map { layer in
                 TurboQuantKVCache.fromSimpleCache(
                     layer as! KVCacheSimple,
-                    keyBits: 3, valueBits: 3) as KVCache
+                    keyBits: 3, valueBits: 3, residualTokens: 0) as KVCache
             }
             MLX.eval(tq)
             return tq
@@ -302,7 +302,7 @@ class TurboQuantCompileProbeTests: XCTestCase {
             let tq: [KVCache] = simpleCache.map { layer in
                 TurboQuantKVCache.fromSimpleCache(
                     layer as! KVCacheSimple,
-                    keyBits: 3, valueBits: 3) as KVCache
+                    keyBits: 3, valueBits: 3, residualTokens: 0) as KVCache
             }
             MLX.eval(tq)
             return tq

@@ -51,7 +51,7 @@ struct BatchKVCacheWithTQSlotsTests {
         }
         #expect(simple.offset == tokens)
         return TurboQuantKVCache.fromSimpleCache(
-            simple, keyBits: 3, valueBits: 3, sinkTokens: 4)
+            simple, keyBits: 3, valueBits: 3, sinkTokens: 4, residualTokens: 0)
     }
 
     /// Build a compressed cache with MLA-style asymmetric K/V widths.
@@ -66,7 +66,7 @@ struct BatchKVCacheWithTQSlotsTests {
         _ = simple.update(keys: k, values: v)
         #expect(simple.offset == tokens)
         return TurboQuantKVCache.fromSimpleCache(
-            simple, keyBits: 4, valueBits: 4, sinkTokens: 4)
+            simple, keyBits: 4, valueBits: 4, sinkTokens: 4, residualTokens: 0)
     }
 
     @Test("BatchKVCache wraps two TQ slot caches at different offsets")
@@ -212,12 +212,13 @@ struct BatchQuantizeHookTests {
         return c
     }
 
-    @Test("maybeCompress swaps simple to TurboQuant when threshold crossed")
+    @Test("maybeCompress swaps simple to TurboQuant when safe middle threshold crossed")
     func testThresholdTriggersSwap() {
         MLXMetalTestLock.withLock {
-            // 4-layer cache, 10 tokens each — above the TQ minimum threshold of 8.
+            // 4-layer cache with enough tokens to keep exact sink + exact
+            // recent tail while still leaving a middle span to compress.
             var cache: [KVCache] = (0 ..< 4).map { _ in
-                makePopulatedSimpleCache(tokens: 10)
+                makePopulatedSimpleCache(tokens: 96)
             }
             #expect(cache.allSatisfy { $0 is KVCacheSimple })
 
@@ -233,17 +234,21 @@ struct BatchQuantizeHookTests {
             for layer in cache {
                 let tq = layer as! TurboQuantKVCache
                 #expect(tq.phase == .compressed)
-                #expect(tq.offset == 10)
+                #expect(tq.offset == 96)
+                #expect(tq.compressedKeys?.sinkCount == 4)
+                #expect(tq.compressedKeys?.tailCount == TurboQuantKVCache.defaultResidualTokens)
             }
         }
     }
 
-    @Test("maybeCompress is a no-op below the threshold")
+    @Test("maybeCompress is a no-op below the exact-tail threshold")
     func testBelowThresholdNoOp() {
         MLXMetalTestLock.withLock {
-            // 6 tokens — below the TQ minimum of 8. Should NOT swap.
+            // 64-token recent tail + 4-token sink leaves no useful middle
+            // span, so compression waits instead of quantizing the active
+            // instruction boundary.
             var cache: [KVCache] = (0 ..< 4).map { _ in
-                makePopulatedSimpleCache(tokens: 6)
+                makePopulatedSimpleCache(tokens: 64)
             }
             let params = GenerateParameters(
                 maxTokens: 5,
@@ -252,7 +257,7 @@ struct BatchQuantizeHookTests {
             )
             BatchQuantize.maybeCompress(cache: &cache, parameters: params)
 
-            #expect(cache.allSatisfy { $0 is KVCacheSimple }, "Below threshold, cache must remain uncompressed")
+            #expect(cache.allSatisfy { $0 is KVCacheSimple }, "Below safe middle threshold, cache must remain uncompressed")
         }
     }
 
@@ -294,7 +299,7 @@ struct BatchQuantizeHookTests {
     func testIdempotent() {
         MLXMetalTestLock.withLock {
             var cache: [KVCache] = (0 ..< 4).map { _ in
-                makePopulatedSimpleCache(tokens: 10)
+                makePopulatedSimpleCache(tokens: 96)
             }
             let params = GenerateParameters(
                 maxTokens: 5,
@@ -320,9 +325,9 @@ struct BatchQuantizeHookTests {
             // touches KVCacheSimple layers, preserving SSM/state layers for
             // hybrid models (Qwen3.5 Mamba, Qwen3Next GDN, LFM2, Jamba, etc.).
             var cache: [KVCache] = [
-                makePopulatedSimpleCache(tokens: 10),
+                makePopulatedSimpleCache(tokens: 96),
                 MambaCache(),
-                makePopulatedSimpleCache(tokens: 10),
+                makePopulatedSimpleCache(tokens: 96),
                 MambaCache(),
             ]
             let params = GenerateParameters(
