@@ -96,6 +96,16 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   The old hardcoded Qwen profile/depth rules are removed; local 27B MXFP4 proves
   `best_depth=2` is honored, and local 35B JANG_2K proves a blocked tuning row
   keeps auto-launch off.
+- Fresh Qwen MTP census refresh was run from this checkout under
+  `docs/internal/live-gates/20260518T_qwen_mtp_census_refresh/`. The four MXFP
+  MTP bundles all require real `mtp.*` tensor evidence plus bundle-local
+  `vmlx_mtp_tuning.json` before `canAutoLaunchMTP=true`, and all report VL
+  tensor evidence. Current tuning rows are: 27B MXFP4 `best_depth=2` at
+  45.712 tok/s, 27B MXFP8 `best_depth=3` at 28.936 tok/s, 35B MXFP4
+  `best_depth=3` at 131.187 tok/s, and 35B MXFP8 `best_depth=3` at
+  101.605 tok/s. This is a metadata/tuning census, not fresh decode proof; the
+  27B MXFP8 speed remains below the desired 35 tok/s class and needs runtime
+  optimization rather than a fake activation guard.
 - Fresh live process rows after explicit user approval to load models:
   `20260518T_dsv4_fresh_no_fake_rep_coherence/` passes DSV4 JANGTQ-K chat,
   reasoning off/on/max, and 5.5k-token semantic recall with
