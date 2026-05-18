@@ -372,6 +372,18 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(fields.contains("mtp.draftTokenLimit"))
     }
 
+    @Test("nonpositive sleep timers report issues instead of clamping")
+    func nonpositiveSleepTimersReportIssuesInsteadOfClamping() {
+        var settings = VMLXServerRuntimeSettings()
+        settings.power.lightSleepAfterSeconds = -1
+        settings.power.deepSleepAfterSeconds = 0
+
+        let fields = Set(settings.validationIssues().map(\.field))
+
+        #expect(fields.contains("power.lightSleepAfterSeconds"))
+        #expect(fields.contains("power.deepSleepAfterSeconds"))
+    }
+
     @Test("invalid server numeric settings report issues instead of clamping")
     func invalidServerNumericSettingsReportIssuesInsteadOfClamping() {
         var settings = VMLXServerRuntimeSettings()

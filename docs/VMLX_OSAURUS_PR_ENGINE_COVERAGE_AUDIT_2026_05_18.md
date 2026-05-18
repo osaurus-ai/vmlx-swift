@@ -226,6 +226,13 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   unsupported-lane JSON shape, unknown-lane fail-closed/default behavior,
   `.allowUnknown`, and UserInput-derived request summaries that do not leak
   prompt content.
+- Follow-up #1119 settings validation tightened the server power contract:
+  positive light/deep sleep timers are now required when set, and deep sleep
+  ordering is checked only after both timers are valid. This prevents Osaurus
+  from silently accepting negative or zero idle-residency values before the live
+  deep-sleep/wake gate is run. Focused verification:
+  `VMLINUXServerRuntimeSettingsTests|RuntimeMoETopKOverrideFocusedTests`
+  passes 18/18 with the Xcode framework path.
 
 ## Current Switch Verdict
 

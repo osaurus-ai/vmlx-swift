@@ -104,7 +104,21 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 message: "Continuous batching is off, so prefix/paged/block-disk cache reuse will be limited or disabled."))
         }
         if let light = power.lightSleepAfterSeconds,
+           light <= 0 {
+            issues.append(.error(
+                field: "power.lightSleepAfterSeconds",
+                message: "Light sleep must be positive. Use nil to disable light sleep."))
+        }
+        if let deep = power.deepSleepAfterSeconds,
+           deep <= 0 {
+            issues.append(.error(
+                field: "power.deepSleepAfterSeconds",
+                message: "Deep sleep must be positive. Use nil to disable deep sleep."))
+        }
+        if let light = power.lightSleepAfterSeconds,
            let deep = power.deepSleepAfterSeconds,
+           light > 0,
+           deep > 0,
            deep <= light {
             issues.append(.error(
                 field: "power.deepSleepAfterSeconds",

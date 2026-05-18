@@ -22,7 +22,7 @@ fallbacks.
 | KV Cache Quantization | `VMLXKVCacheCodec`, `turboQuantKeyBits`, `turboQuantValueBits`, and `VMLXStoredKVCacheCodec` | Live codec and stored codec are separate so TurboQuant KV can be live while disk storage remains engine-selected. TurboQuant live KV requires explicit key/value bit widths. |
 | Disk Cache | `VMLXDiskCacheSettings` | Legacy prompt disk cache only. The validator errors if this runs with paged KV. |
 | Block Disk Cache L2 | `VMLXBlockDiskCacheSettings` | Persistent cache layer for paged KV and architecture-specific cache blocks. |
-| Power Management | `VMLXServerPowerSettings` | JIT load, wake-on-request, light sleep, deep sleep. Deep sleep must be later than light sleep. |
+| Power Management | `VMLXServerPowerSettings` | JIT load, wake-on-request, light sleep, deep sleep. Sleep timers must be positive when set, and deep sleep must be later than light sleep. |
 | Performance & Generation | `VMLXServerGenerationDefaults` | `nil` means bundle metadata first, then documented engine fallback. Do not write hidden default sampling guards here. |
 | Tool Integration | `VMLXServerToolSettings` | MCP config, auto tool choice, parser overrides, reasoning parser override, optional custom template. |
 | Multimodal Support | `VMLXServerMultimodalSettings` | Auto/force off/force on VLM mode plus video/audio toggles and media-salt cache requirement. |
