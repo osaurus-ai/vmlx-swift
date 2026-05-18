@@ -78,7 +78,6 @@ struct MTPRuntimeFocusedTests {
         #expect(status.hasCompleteMTPArtifact)
         #expect(!status.requiresAcceptRejectBeforeEnable)
         #expect(status.speculativeDecodeEnabled)
-        #expect(status.canAutoLaunchMTP)
         #expect(status.configEvidence.contains("text_config.mtp_num_hidden_layers=1"))
         #expect(status.statusLine.contains("speculative=on"))
     }
@@ -973,7 +972,6 @@ struct MTPRuntimeFocusedTests {
         #expect(status.configuredLayers > 0)
         #expect(status.tensorCount > 0)
         #expect(status.hasCompleteMTPArtifact)
-        #expect(status.canAutoLaunchMTP)
         if ProcessInfo.processInfo.environment["VMLX_MTP_REAL_BUNDLE_EXPECTS_VL"] == "1" {
             #expect(status.visionTensorCount > 0)
             #expect(status.bundleHasVision)
@@ -1004,6 +1002,7 @@ struct MTPRuntimeFocusedTests {
                     $0.severity == .error && $0.field == "mtp.mode"
                 })
         } else {
+            #expect(status.canAutoLaunchMTP)
             #expect(launch.launchMode == .speculative)
             #expect(launch.recommendation?.depth == 3)
             #expect(loadConfiguration.nativeMTP)

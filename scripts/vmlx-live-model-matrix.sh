@@ -24,7 +24,9 @@ Options:
   -h, --help              Show this help.
 
 Profiles:
-  inventory   Write models.tsv only.
+  inventory   Write models.tsv only, including separate mtp_tensors and
+              mtp_auto columns so tensor evidence is not confused with a
+              supported native-MTP launch policy.
   metadata    Run no/low-load config and template smokes.
   infer       Run plain inference rows only: metadata, BENCH_PROD without a
               cache coordinator, plus direct media inference for VL/Omni.
@@ -209,6 +211,82 @@ sys.exit(0 if any(is_mtp_tensor(name) for name in tensor_names()) else 1)
 PY
 }
 
+supports_mtp_auto_launch() {
+  local dir="$1"
+  python3 - "$dir" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+
+def load_json(path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+def normalize(value):
+    return str(value or "").strip().lower().replace("-", "_")
+
+def int_value(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except ValueError:
+            return None
+    return None
+
+config = load_json(root / "config.json")
+text_config = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
+jang = load_json(root / "jang_config.json")
+
+model_types = set()
+for value in (
+    config.get("model_type"),
+    text_config.get("model_type"),
+    (jang.get("source_model") or {}).get("architecture") if isinstance(jang.get("source_model"), dict) else None,
+):
+    value = normalize(value)
+    if value:
+        model_types.add(value)
+
+supported = {
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+    "qwen3_5_vl",
+    "qwen3_vl",
+}
+if not any(value in supported for value in model_types):
+    sys.exit(1)
+
+quant = jang.get("quantization") if isinstance(jang.get("quantization"), dict) else {}
+arch = jang.get("architecture") if isinstance(jang.get("architecture"), dict) else {}
+config_quant = config.get("quantization") if isinstance(config.get("quantization"), dict) else {}
+
+profile = normalize(quant.get("profile"))
+bits = int_value(config_quant.get("bits"))
+if bits is None:
+    bits = int_value(quant.get("target_bits"))
+is_moe = any("moe" in value for value in model_types) or bool(arch.get("has_moe"))
+
+if profile == "jang_2k":
+    sys.exit(1)
+if is_moe and bits is not None and bits <= 2:
+    sys.exit(1)
+
+sys.exit(0)
+PY
+}
+
 classify_profile() {
   local dir="$1" arch="$2"
   if [[ "$arch" == NemotronHForCausalLM* ]]; then
@@ -237,18 +315,22 @@ discover_models() {
 }
 
 write_inventory() {
-  printf "status\tsize_gb\tbytes\tprofile\tmtp\tarchitecture\tmodel_type\tgen_max_new_tokens\tgen_temperature\tgen_top_p\tgen_top_k\tgen_min_p\tgen_repetition_penalty\tgen_do_sample\tpath\n" \
+  printf "status\tsize_gb\tbytes\tprofile\tmtp_tensors\tmtp_auto\tarchitecture\tmodel_type\tgen_max_new_tokens\tgen_temperature\tgen_top_p\tgen_top_k\tgen_min_p\tgen_repetition_penalty\tgen_do_sample\tpath\n" \
     >"${RUN_DIR}/models.tsv"
   while IFS= read -r dir; do
     [[ -n "$dir" && -f "$dir/config.json" ]] || continue
-    local bytes size arch model_type profile mtp gen_config gen_max gen_temp gen_top_p gen_top_k gen_min_p gen_rep gen_do_sample
+    local bytes size arch model_type profile mtp_tensors mtp_auto gen_config gen_max gen_temp gen_top_p gen_top_k gen_min_p gen_rep gen_do_sample
     bytes="$(model_size_bytes "$dir")"
     size="$(model_size_gb "$bytes")"
     arch="$(json_value "$dir/config.json" '.architectures?[0]' unknown)"
     model_type="$(json_value "$dir/config.json" '.model_type // .text_config.model_type' unknown)"
     profile="$(classify_profile "$dir" "$arch")"
-    mtp="no"
-    if contains_mtp_evidence "$dir"; then mtp="yes"; fi
+    mtp_tensors="no"
+    mtp_auto="no"
+    if contains_mtp_evidence "$dir"; then
+      mtp_tensors="yes"
+      if supports_mtp_auto_launch "$dir"; then mtp_auto="yes"; fi
+    fi
     gen_config="$dir/generation_config.json"
     if [[ -f "$gen_config" ]]; then
       gen_max="$(json_value "$gen_config" '.max_new_tokens' nil)"
@@ -263,8 +345,8 @@ write_inventory() {
       gen_top_k="missing"; gen_min_p="missing"; gen_rep="missing"
       gen_do_sample="missing"
     fi
-    printf "discovered\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-      "$size" "$bytes" "$profile" "$mtp" "$arch" "$model_type" \
+    printf "discovered\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+      "$size" "$bytes" "$profile" "$mtp_tensors" "$mtp_auto" "$arch" "$model_type" \
       "$gen_max" "$gen_temp" "$gen_top_p" "$gen_top_k" "$gen_min_p" \
       "$gen_rep" "$gen_do_sample" "$dir" \
       >>"${RUN_DIR}/models.tsv"
@@ -467,7 +549,7 @@ if [[ "$PROFILE" == "inventory" ]]; then
   exit 0
 fi
 
-while IFS=$'\t' read -r status size_gb bytes family_profile mtp arch model_type gen_max gen_temp gen_top_p gen_top_k gen_min_p gen_rep gen_do_sample dir; do
+while IFS=$'\t' read -r status size_gb bytes family_profile mtp_tensors mtp_auto arch model_type gen_max gen_temp gen_top_p gen_top_k gen_min_p gen_rep gen_do_sample dir; do
   [[ "$status" == "discovered" ]] || continue
   name="$(safe_name "$dir")"
   if [[ "$ALLOW_HUGE" -eq 0 ]] && is_gt_gb "$bytes" "$MAX_SIZE_GB"; then
@@ -480,15 +562,18 @@ while IFS=$'\t' read -r status size_gb bytes family_profile mtp arch model_type 
     run_runbench "${name}.template" BENCH_MODEL="$dir" BENCH_TEMPLATE_SMOKE=1 BENCH_MAX_TOKENS=8 || true
   fi
 
-  if [[ "$PROFILE" == "mtp" && "$mtp" != "yes" ]]; then
+  if [[ "$PROFILE" == "mtp" && "$mtp_tensors" != "yes" ]]; then
     mark_status "${name}.mtp" "n-a:no-mtp-tensors"
-  elif [[ "$PROFILE" == "mtp" || ( ( "$PROFILE" == "all" || "$PROFILE" == "turnmatrix" ) && "$mtp" == "yes" ) ]]; then
+  elif [[ "$PROFILE" == "mtp" || ( ( "$PROFILE" == "all" || "$PROFILE" == "turnmatrix" ) && "$mtp_tensors" == "yes" ) ]]; then
     expects_vl=0
     [[ "$family_profile" == "vl" ]] && expects_vl=1
+    expects_blocked=0
+    [[ "$mtp_auto" == "yes" ]] || expects_blocked=1
     run_logged "${name}.mtp" env \
       DEVELOPER_DIR="$SWIFT_DEVELOPER_DIR" \
       VMLX_MTP_REAL_BUNDLE="$dir" \
       VMLX_MTP_REAL_BUNDLE_EXPECTS_VL="$expects_vl" \
+      VMLX_MTP_REAL_BUNDLE_EXPECTS_BLOCKED="$expects_blocked" \
       swift test --filter MTPRuntimeFocusedTests --jobs 2 || true
   fi
 

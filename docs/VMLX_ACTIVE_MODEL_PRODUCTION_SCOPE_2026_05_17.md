@@ -32,12 +32,14 @@ Fresh inventory artifact:
 ```text
 docs/local/live-model-matrix/20260517T_non_kimi_inventory_dsv4_included/
 docs/local/live-model-matrix/20260517T_scope_exclude_kimi_dsv4_inventory/
+docs/local/live-model-matrix/20260517T235436Z_non_kimi_inventory_mtp_auto_refresh/
 ```
 
 No-load MTP census artifact:
 
 ```text
 docs/local/live-model-matrix/20260517T_scope_exclude_kimi_dsv4_mtp_census/
+docs/local/live-model-matrix/20260518T000022Z_non_kimi_mtp_auto_policy_postfix/
 ```
 
 No-load config/template metadata artifact:
@@ -174,7 +176,7 @@ Rows marked historical are useful targets, not current release proof.
 
 | Bundle | Historical best MTP tok/s | Fresh current Swift row | Current decision |
 |---|---:|---|---|
-| Qwen3.6 27B JANG_4M | 48.9 D2 | not part of the current MXFP-only verifier recheck | Explicit-only MTP target; re-run before release claim. |
+| Qwen3.6 27B JANG_4M | 48.9 D2 | not part of the current MXFP-only verifier recheck | Tensor-proven supported Qwen target; auto-resolves native D3, but re-run speed/coherency before release claim. |
 | Qwen3.6 27B MXFP4 | 50.5 D3 | 26.1 tok/s D3 `chunk_commit`, exact `1..50`, no diagnostics | Correctness fixed; 45 tok/s target remains open in current Swift. |
 | Qwen3.6 27B MXFP8 | 31.7 D2 | not re-run after the prefix-snapshot fix in this artifact | Correctness/speed recheck still required. |
 | Qwen3.6 35B JANG_2K | n-a | not in current scope | Excluded from the current MXFP-only MTP focus. |
@@ -209,9 +211,10 @@ temperature clamp, repetition penalty, or forced reasoning close.
 This resolves the earlier short-budget visible-answer failures for the MXFP
 variants. The 35B MXFP4 VL+MTP row also passes with the larger budget: cold
 red/blue image, same-media disk hit, different-media miss, and text-only
-follow-up are coherent. It does not change the default policy: native MTP stays
-explicit, tensor-gated, and non-batched until the remaining 35B JANG_2K VL and
-server scheduling gates are proven.
+follow-up are coherent. The current default policy is tensor-gated auto-launch
+for supported Qwen MXFP/JANG_4M bundles only; native MTP remains non-batched
+until the server scheduling gates are proven, and blocked profiles such as
+35B JANG_2K stay off.
 
 Current hybrid-SSM verifier policy update: stochastic exact-pq native MTP does
 not use the fast chunk verifier unless an explicit verifier env requests it. A
@@ -549,10 +552,10 @@ Open boundary:
 | Nemotron Omni | JANGTQ/JANGTQ4/MXFP4 Omni Nano | Parakeet audio encoder, RADIO vision, Omni text/image/audio/video ingest, BatchEngine stress, cache/media state, text output coherence | No native MTP. |
 | Laguna | Laguna XS JANGTQ | Laguna/Mistral-style template and RoPE params, JANGTQ decode, prefix/paged/disk cache, multi-turn coherence | No native MTP. |
 
-The no-load MTP census now distinguishes supported Qwen MTP from metadata-only
-or unsupported nextn/MTP rows. Tensor-proven supported Qwen MTP resolves native
-D3 through the settings bridge; Hy3/Ling nextn-style rows and JANG_2K remain off
-or blocked until their own runtime policy is proven.
+The no-load MTP census now distinguishes `mtp_tensors` from `mtp_auto`.
+Tensor-proven supported Qwen MTP resolves native D3 through the settings bridge;
+Hy3/Ling/DSV4 nextn-style rows can report tensor evidence while `mtp_auto=no`,
+and JANG_2K remains blocked until its own runtime policy is proven.
 
 The no-load metadata/template sweep passed 56/56 rows across the 28
 non-excluded bundles. Warnings remain visible and must not be collapsed into a
