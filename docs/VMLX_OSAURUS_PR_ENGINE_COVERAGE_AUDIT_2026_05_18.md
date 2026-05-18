@@ -286,6 +286,36 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
 - Verification for the checkpoint: focused `RuntimePolicySourceTests` 28/28
   after pinning the launch note.
 
+2026-05-18 14:19 PDT Osaurus PR #1147 live execution manifest:
+
+- Osaurus PR #1147 head `d8e2e233` adds
+  `docs/internal/live-gates/20260518T_pr1147_live_user_api_execution_manifest.md`.
+  The manifest is an execution checklist, not a pass report. It names the
+  source anchors that live rows must exercise: `ModelRuntime.swift`,
+  `MLXBatchAdapter.swift`, `GenerationEventMapper.swift`,
+  `LocalGenerationDefaults.swift`, `ModelMediaCapabilities.swift`,
+  `ModelFamilyNames.swift`, `HTTPHandler.swift`, and the single consolidated
+  `vmlx-swift` SwiftPM graph.
+- The manifest defines the exact artifact folder shape under
+  `docs/internal/live-gates/pr1147/<model-slug>/`: UI model picker, chat
+  settings, server settings/CLI preview, health snapshots, cache stats,
+  process memory, chat UI turns, route outputs, tool/reasoning parser review,
+  media sequence, carryover inverse, and row summary.
+- It expands the remaining live rows for DSV4, Qwen VL/Qwen3.6 MTP VL,
+  Gemma4/Gemma VLM, Gemma3n text, ZAYA/ZAYA-VL, Nemotron Omni/Parakeet/RADIO,
+  MiniMax, Ling/Hy3 hybrid SSM, and other local parser families. Each row names
+  required UI defaults, app turn sequence, API sequence, cache/memory proof,
+  parser/no-leak checks, and inverse OFF/ON states.
+- It explicitly keeps MTP activation gated by real `mtp.*` tensors plus
+  validated `vmlx_mtp_tuning.json`, keeps sampler/default checks tied to
+  `jang_config.json` and `generation_config.json` including native `top_k`, and
+  requires saved-setting carryover proof for reasoning, DSV4 `max`, media,
+  cache mode, and tool/coding context.
+- Osaurus focused source policy verification after the manifest change:
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+  --package-path Packages/OsaurusCore --filter RuntimePolicySourceTests --jobs 2`
+  passes 28/28.
+
 2026-05-17 20:25 PDT live refresh:
 
 - `gh pr list --repo osaurus-ai/osaurus --state all --limit 20` shows the
