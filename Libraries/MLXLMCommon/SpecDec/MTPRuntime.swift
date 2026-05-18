@@ -1125,6 +1125,8 @@ public enum MTPBundleInspector {
             statusEvidence.append("tuning.validated=\(nativeMTPTuning.validated)")
             statusEvidence.append("tuning.output_equivalent=\(nativeMTPTuning.outputEquivalent)")
             statusEvidence.append("tuning.blocked=\(nativeMTPTuning.blocked)")
+        } else if metadataClaimsMTP || bundleHasMTP {
+            statusEvidence.append("tuning_file_missing=\(NativeMTPTuning.fileName)")
         }
 
         let mode: MTPRuntimeMode

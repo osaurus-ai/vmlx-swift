@@ -138,7 +138,9 @@ request asks for MTP but the loader scrubbed the sidecar weights.
 For capability/status JSON, serialize `MTPBundleStatus.snapshot`; it includes
 the computed tuning gates (`has_usable_native_mtp_tuning`, `can_auto_launch`,
 and `requires_native_mtp_tuning_before_auto_launch`) that are not plain stored
-fields on the raw status value.
+fields on the raw status value. Missing bundle-local tuning is also present in
+`config_evidence` as `tuning_file_missing=vmlx_mtp_tuning.json` when the bundle
+metadata or tensor names indicate MTP compatibility.
 
 MTP cache rules:
 

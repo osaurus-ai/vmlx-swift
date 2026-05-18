@@ -185,6 +185,7 @@ struct MTPRuntimeFocusedTests {
         #expect(status.hasCompleteMTPArtifact)
         #expect(!status.canAutoLaunchMTP)
         #expect(status.statusLine.contains("tuning required"))
+        #expect(status.configEvidence.contains("tuning_file_missing=vmlx_mtp_tuning.json"))
     }
 
     @Test("MTP status snapshot exposes tuning gate fields for Osaurus")
@@ -1247,6 +1248,31 @@ struct MTPRuntimeFocusedTests {
         #expect(loadSource.contains("\"norm_convention\""))
         #expect(vlmSource.contains("normConvention: Self.normConvention(metadata)"))
         #expect(vlmSource.contains("usesQwenPlusOneNormConvention"))
+    }
+
+    @Test("LLM and VLM factories carry MTP tuning status like generation config")
+    func factoriesCarryMTPTuningStatusLikeGenerationConfig() throws {
+        let files = [
+            "Libraries/MLXLLM/LLMModelFactory.swift",
+            "Libraries/MLXVLM/VLMModelFactory.swift",
+        ]
+
+        for file in files {
+            let source = try Self.source(file)
+            #expect(source.contains("MTPBundleInspector.inspect("), "\(file) must inspect MTP")
+            #expect(
+                source.contains("NativeMTPActivation.shouldLoadNativeMTPWeights"),
+                "\(file) must resolve native-MTP activation before loading weights")
+            #expect(
+                source.contains("loadPreservedMTP: loadNativeMTP"),
+                "\(file) must pass the resolved MTP decision to weight loading")
+            #expect(
+                source.contains("generationDefaults: generationConfig"),
+                "\(file) must keep bundle generation_config defaults wired")
+            #expect(
+                source.contains("mtpStatus: mtpStatus"),
+                "\(file) must carry MTP status into ModelConfiguration")
+        }
     }
 
     private func makeTemporaryBundle(name: String) throws -> URL {

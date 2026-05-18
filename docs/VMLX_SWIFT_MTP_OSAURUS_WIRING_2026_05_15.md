@@ -142,7 +142,10 @@ For Qwen native MTP, tensor evidence is still not enough to auto-launch. The
 inspector also reads `vmlx_mtp_tuning.json` from the bundle root. Auto launch is
 allowed only when that file's `native_mtp` row is validated, output-equivalent,
 unblocked, and carries a positive `best_depth`. Missing or blocked tuning keeps
-`canAutoLaunchMTP=false`, even if the MTP tensors are present.
+`canAutoLaunchMTP=false`, even if the MTP tensors are present. When metadata or
+tensors indicate MTP compatibility but the file is absent, status evidence now
+includes `tuning_file_missing=vmlx_mtp_tuning.json` so Osaurus can show that the
+runtime looked for the bundle-local tuning row and failed closed.
 
 It detects VL tensors separately from:
 
