@@ -276,23 +276,38 @@ struct VMLXUmbrellaProductTests {
     @Test("capability request from UserInput records media without prompt content")
     func capabilityRequestFromUserInputRecordsMediaWithoutPromptContent() throws {
         let image = UserInput.Image.array(MLXArray.zeros([1, 1, 3]))
+        let video = UserInput.Video.frames([])
         let audio = UserInput.Audio.samples([0.0, 0.1], sampleRate: 16_000)
+        let tool: ToolSpec = [
+            "type": "function",
+            "function": [
+                "name": "private_tool_name",
+                "parameters": ["type": "object"] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
         let input = UserInput(
             prompt: "private prompt text that must not enter capability logs",
             images: [image],
-            audios: [audio])
+            videos: [video],
+            audios: [audio],
+            tools: [tool])
 
         let request = ModelRuntimeCapabilityRequest(
             input: input,
             usesReasoning: true,
             usesNativeMTP: true)
 
-        #expect(request.sortedModalities == [.text, .vision, .audio, .reasoning, .nativeMTP])
+        #expect(request.sortedModalities == [
+            .text, .vision, .video, .audio, .tools, .reasoning, .nativeMTP,
+        ])
         let data = try JSONEncoder().encode(request)
         let encoded = String(decoding: data, as: UTF8.self)
         #expect(encoded.contains("vision"))
+        #expect(encoded.contains("video"))
         #expect(encoded.contains("audio"))
+        #expect(encoded.contains("tools"))
         #expect(encoded.contains("native_mtp"))
         #expect(!encoded.contains("private prompt text"))
+        #expect(!encoded.contains("private_tool_name"))
     }
 }

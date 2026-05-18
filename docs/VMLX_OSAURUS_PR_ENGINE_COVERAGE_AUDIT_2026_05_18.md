@@ -249,6 +249,11 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   `toolParserOverride` / `reasoningParserOverride` strings while allowing known
   aliases and explicit no-op values (`auto`, `none`, `off`, `disabled`). This
   keeps Osaurus parser pickers from passing stale UI labels into the engine.
+- Follow-up request-summary redaction coverage now verifies
+  `ModelRuntimeCapabilityRequest(input:)` records text, image, video, audio,
+  tools, reasoning, and native-MTP lanes from `UserInput` without serializing
+  prompt content or tool names. Focused verification:
+  `VMLINUXUmbrellaProductTests` passes 7/7 with the Xcode framework path.
 
 ## Current Switch Verdict
 
