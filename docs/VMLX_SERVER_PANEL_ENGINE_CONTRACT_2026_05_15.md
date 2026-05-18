@@ -88,7 +88,11 @@ reason. Do not show a fake zero counter as a pass.
 `VMLXServerRuntimeSettings.cacheCoordinatorConfig(...)` is the panel-to-engine
 bridge. It maps paged cache, block-disk/legacy disk selection, disk max GB,
 disk directory, SSM re-derive, model-key isolation, default max KV size, and
-explicit TurboQuant KV bit widths into `CacheCoordinatorConfig`. If
+explicit TurboQuant KV bit widths into `CacheCoordinatorConfig`.
+`cache.prefix.enabled=false` disables prompt-reuse tiers in that bridge:
+`usePagedCache=false` and `enableDiskCache=false` even if stale UI state still
+has paged/block/legacy disk toggles on. This does not rewrite the live KV codec;
+TurboQuant KV remains an explicit decode/cache representation choice. If
 `liveKVCodec == .turboQuant` but the bit widths are missing, validation errors
 and the builder does not silently invent 3/3 or any other hidden codec.
 

@@ -524,24 +524,29 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         diskCacheDirectory: URL? = nil,
         ssmMaxEntries: Int = 50
     ) -> CacheCoordinatorConfig {
+        let reuseEnabled = cache.prefix.enabled
         let diskEnabled: Bool
         let diskMaxSizeGB: Double?
         let diskDirectory: String?
-        if cache.pagedKV.enabled {
+        if reuseEnabled, cache.pagedKV.enabled {
             diskEnabled = cache.blockDisk.enabled
             diskMaxSizeGB = cache.blockDisk.maxSizeGB
             diskDirectory = cache.blockDisk.directory
-        } else {
+        } else if reuseEnabled {
             diskEnabled = cache.legacyDisk.enabled
             diskMaxSizeGB = cache.legacyDisk.maxSizeGB
             diskDirectory = cache.legacyDisk.directory
+        } else {
+            diskEnabled = false
+            diskMaxSizeGB = nil
+            diskDirectory = nil
         }
         let diskDir = diskCacheDirectory
             ?? VMLXServerRuntimeSettings.resolvedDirectory(diskDirectory)
         let diskMaxGB = Float(diskMaxSizeGB ?? 10.0)
 
         return CacheCoordinatorConfig(
-            usePagedCache: cache.pagedKV.enabled,
+            usePagedCache: reuseEnabled && cache.pagedKV.enabled,
             enableDiskCache: diskEnabled,
             pagedBlockSize: cache.pagedKV.blockSize ?? 64,
             maxCacheBlocks: cache.pagedKV.maxBlocks ?? 1000,

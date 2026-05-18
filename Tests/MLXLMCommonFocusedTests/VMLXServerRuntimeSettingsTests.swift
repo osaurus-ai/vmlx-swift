@@ -566,6 +566,20 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
+    @Test("prefix cache off disables coordinator reuse tiers")
+    func prefixCacheOffDisablesCoordinatorReuseTiers() {
+        var settings = VMLXServerRuntimeSettings()
+        settings.cache.prefix.enabled = false
+        settings.cache.pagedKV.enabled = true
+        settings.cache.blockDisk.enabled = true
+        settings.cache.legacyDisk.enabled = true
+
+        let config = settings.cacheCoordinatorConfig()
+
+        #expect(!config.usePagedCache)
+        #expect(!config.enableDiskCache)
+    }
+
     @Test("parser overrides validate known aliases")
     func parserOverridesValidateKnownAliases() {
         var valid = VMLXServerRuntimeSettings()

@@ -610,6 +610,16 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   `multimodal.requireMediaSaltForCache=false` whenever prefix, paged KV,
   block-L2, or legacy disk cache reuse is enabled. This keeps image/video/audio
   requests from sharing cache keys by text alone.
+- Follow-up prefix-toggle hardening now makes
+  `VMLXServerRuntimeSettings.cacheCoordinatorConfig(...)` honor
+  `cache.prefix.enabled=false` by disabling both paged prompt reuse and
+  block/legacy disk L2 in the concrete `CacheCoordinatorConfig`. This closes a
+  real Osaurus panel edge case where stale paged/block toggles could keep prompt
+  cache reuse active after the user turned Prefix Cache off. The fix leaves
+  live KV codec selection alone, so it is not a hidden sampler, repetition, or
+  TurboQuant quality workaround. Focused verification:
+  `VMLXServerRuntimeSettingsTests|RuntimeMoETopKOverrideFocusedTests` passes
+  25/25 with the Xcode framework path.
 - Follow-up native-MTP activation hardening now applies the same tuning gate to
   the low-level direct factory path: explicit `LoadConfiguration.nativeMTP=true`
   / `VMLX_NATIVE_MTP=1` activation requires complete tensor evidence and usable
