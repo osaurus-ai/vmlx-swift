@@ -22,6 +22,8 @@ MTP tuning behavior commits covered by this refresh:
 ```text
 3889499 fix(mtp): use qwen tuning file for auto depth
 6af1096 fix(mtp): require tuning for qwen auto launch
+d228fdd fix(mtp): expose tuning-gated status snapshot
+1a166ad test(mtp): record missing qwen tuning evidence
 ```
 
 2026-05-18 continuation refresh:
@@ -93,6 +95,30 @@ MTP tuning behavior commits covered by this refresh:
   `vmlx_mtp_tuning.json` metadata, not just tensor evidence. Tensor-proven Qwen
   bundles missing tuning report off/blocked and `statusLine` says tuning is
   required.
+
+2026-05-17 20:44 PDT live refresh:
+
+- `gh pr list --repo osaurus-ai/osaurus --state all --limit 12` shows one newer
+  merged README-only PR, #1146, plus the same app/plugin/UI/coordinator/doc
+  merges (#1145, #1144, #1141, #1140, #1139, #1138, #1137, #1136, #1135,
+  #1134). Open PR #1133 remains a draft plugin-host multimodal contract. These
+  do not change the vMLX runtime pin window.
+- `vmlx-swift` head now exposes `MTPBundleStatus.snapshot` for Osaurus status
+  JSON, including computed gates that raw `Codable` fields do not carry:
+  `has_usable_native_mtp_tuning`, `can_auto_launch`, and
+  `requires_native_mtp_tuning_before_auto_launch`.
+- If metadata or tensor names indicate MTP compatibility and the bundle-local
+  `vmlx_mtp_tuning.json` file is absent, `MTPBundleInspector` records
+  `tuning_file_missing=vmlx_mtp_tuning.json` in `configEvidence`. This proves the
+  runtime looked for the same kind of bundle-local sidecar as
+  `generation_config.json` and failed closed instead of falling back to a name
+  or profile rule.
+- Focused verification for this refresh:
+  `MTPRuntimeFocusedTests|VMLXServerRuntimeSettingsTests` passes 65/65 with the
+  Xcode framework path, including the new factory source guard that both LLM and
+  VLM factories inspect MTP, resolve native activation before weight loading,
+  pass `loadPreservedMTP: loadNativeMTP`, preserve `generationDefaults:
+  generationConfig`, and carry `mtpStatus` into `ModelConfiguration`.
 
 ## Current Switch Verdict
 
@@ -185,7 +211,7 @@ Recent dependency scan, 2026-05-04 through 2026-05-18:
 | TurboQuant KV | Explicit TQ mode must preserve coherency and prove actual compression. | `20260518T_minimax_m27_jangtqk_tq_tail_fix_exact/` proves actual TQ transitions and exact outputs after tail preservation. | Fixed for MiniMax strict row; keep family-by-family gates. |
 | VL/media salt | Image/video/audio state must be isolated across turns and cache hits. | Qwen, ZAYA1-VL, Gemma4, and Omni rows prove same/different media behavior where implemented. | Raw Qwen high-res video and repeated Omni cache-on audio remain open. |
 | Reasoning on/off | No fake close; reasoning off must affect template/runtime where supported, and visible output must remain coherent. | Gemma4 reasoning matrix, MiniMax rows, DSV4 reasoning kwargs, Ling/Bailing aliases. Fresh Gemma E2B no-guard red/green pair proves the harness now accepts coherent stellar equivalents instead of forcing decode behavior; fresh Ling row proves the Russian stress prompt with `temp=0.7` stops normally. | Covered for tested families; package-wide model matrix still open for absent local bundles. |
-| MTP autodetect | Only real tensor evidence plus usable tuning may enable MTP; model names and stale metadata are insufficient. Qwen auto-depth must come from bundle-local `vmlx_mtp_tuning.json`, not profile/name rules. | Non-Kimi MTP census and Qwen MTP settings docs; CRACK rows explicitly stay MTP off. Focused tests cover tuned D2, validated D3, missing tuning, blocked tuning rows, and status/helper display behavior. | Correct fail-closed policy covered; full MTP speed target remains separate/open. |
+| MTP autodetect | Only real tensor evidence plus usable tuning may enable MTP; model names and stale metadata are insufficient. Qwen auto-depth must come from bundle-local `vmlx_mtp_tuning.json`, not profile/name rules. | Non-Kimi MTP census and Qwen MTP settings docs; CRACK rows explicitly stay MTP off. Focused tests cover tuned D2, validated D3, missing tuning, blocked tuning rows, `MTPBundleStatus.snapshot`, missing-tuning evidence, and LLM/VLM factory wiring into `ModelConfiguration`. | Correct fail-closed policy covered; full MTP speed target remains separate/open. |
 
 ## Production-Quality Checklist Still Required
 
