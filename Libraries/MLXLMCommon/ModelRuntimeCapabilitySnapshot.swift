@@ -299,6 +299,23 @@ public struct ModelRuntimeCapabilityIssue: Codable, Sendable, Equatable {
             ])
     }
 
+    public static func disabledByServerSettings(
+        modality: ModelRuntimeRequestModality,
+        field: String
+    ) -> Self {
+        Self(
+            code: "server_modality_disabled",
+            modality: modality,
+            support: .unsupported,
+            message: "Server settings disable \(modality.rawValue) for this request.",
+            redactedLogFields: [
+                "code": "server_modality_disabled",
+                "field": field,
+                "modality": modality.rawValue,
+                "support": ModelRuntimeCapabilitySupport.unsupported.rawValue,
+            ])
+    }
+
     enum CodingKeys: String, CodingKey {
         case code
         case modality

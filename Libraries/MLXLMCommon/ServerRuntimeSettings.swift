@@ -436,6 +436,59 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         return resolved
     }
 
+    /// Validate a request shape against server policy and, when supplied, the
+    /// model's capability snapshot.
+    ///
+    /// This is the request-time companion to ``validationIssues``. It prevents
+    /// Osaurus plugin or gateway routes from bypassing server toggles such as
+    /// VLM force-off, video/audio off, or native-MTP off, while reusing the same
+    /// redacted capability-error JSON shape.
+    public func validateRequest(
+        _ request: ModelRuntimeCapabilityRequest,
+        capabilitySnapshot: ModelRuntimeCapabilitySnapshot? = nil,
+        unknownPolicy: ModelRuntimeCapabilityValidationPolicy = .rejectUnknown
+    ) -> ModelRuntimeCapabilityValidationResult {
+        var issues =
+            capabilitySnapshot?
+            .validate(request: request, unknownPolicy: unknownPolicy)
+            .issues ?? []
+
+        if multimodal.vlmMode == .forceOff {
+            appendDisabled(
+                [.vision, .video, .audio],
+                requestedBy: request,
+                field: "multimodal.vlmMode",
+                to: &issues)
+        } else {
+            if !multimodal.enableVideo {
+                appendDisabled(
+                    [.video],
+                    requestedBy: request,
+                    field: "multimodal.enableVideo",
+                    to: &issues)
+            }
+            if !multimodal.enableAudio {
+                appendDisabled(
+                    [.audio],
+                    requestedBy: request,
+                    field: "multimodal.enableAudio",
+                    to: &issues)
+            }
+        }
+
+        if mtp.mode == .off {
+            appendDisabled(
+                [.nativeMTP],
+                requestedBy: request,
+                field: "mtp.mode",
+                to: &issues)
+        }
+
+        return ModelRuntimeCapabilityValidationResult(
+            requestedModalities: request.sortedModalities,
+            issues: issues)
+    }
+
     /// Build the concrete cache coordinator configuration used by
     /// `BatchEngine`.
     ///
@@ -490,6 +543,17 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 .appendingPathComponent(suffix)
         }
         return URL(fileURLWithPath: path)
+    }
+
+    private func appendDisabled(
+        _ disabled: [ModelRuntimeRequestModality],
+        requestedBy request: ModelRuntimeCapabilityRequest,
+        field: String,
+        to issues: inout [ModelRuntimeCapabilityIssue]
+    ) {
+        for modality in disabled where request.modalities.contains(modality) {
+            issues.append(.disabledByServerSettings(modality: modality, field: field))
+        }
     }
 }
 

@@ -29,10 +29,11 @@ fallbacks.
 | Speculative Decoding / MTP | `VMLXServerMTPSettings` | Auto launches native MTP only when real tensor evidence plus usable bundle-local `vmlx_mtp_tuning.json` resolve a launch depth. Force-on errors for metadata-only, missing-tuning, blocked-tuning, or unsupported profiles. Draft cache must stay private, and only accepted verifier tokens may enter the base cache. |
 
 The panel/server should validate each request against
-`ModelRuntimeCapabilitySnapshot.validate(request:unknownPolicy:)` before it
-routes plugin or multimodal traffic. The default validator is fail-closed:
+`VMLXServerRuntimeSettings.validateRequest(_:capabilitySnapshot:unknownPolicy:)`
+before it routes plugin or multimodal traffic. The default path is fail-closed:
 explicitly unsupported lanes return `unsupported_modality`, unknown lanes return
-`unknown_modality_support`, and the JSON/log fields contain only lane/support
+`unknown_modality_support`, and server-disabled lanes return
+`server_modality_disabled`. The JSON/log fields contain only lane/support
 metadata rather than prompt text, media bytes, or local paths.
 
 ## Gateway Runtime States

@@ -238,6 +238,13 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   `acceptedTokensOnlyEnterBaseCache=false` are now validation errors. This keeps
   Qwen MTP sidecar/private draft state out of the committed prefix/paged/SSM
   cache unless the verifier accepted the tokens.
+- Follow-up request-time server validation layers the support matrix with
+  server toggles. `VMLXServerRuntimeSettings.validateRequest` now returns
+  `server_modality_disabled` for `multimodal.vlmMode = force_off`, disabled
+  video/audio lanes, or `mtp.mode = off`, while preserving the same redacted
+  issue JSON shape. Focused verification:
+  `VMLINUXServerRuntimeSettingsTests|RuntimeMoETopKOverrideFocusedTests`
+  passes 22/22 with the Xcode framework path.
 
 ## Current Switch Verdict
 

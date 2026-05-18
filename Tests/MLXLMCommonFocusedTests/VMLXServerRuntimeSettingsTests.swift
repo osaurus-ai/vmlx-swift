@@ -396,6 +396,74 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(fields.contains("power.deepSleepAfterSeconds"))
     }
 
+    @Test("request validation rejects multimodal force-off lanes")
+    func requestValidationRejectsMultimodalForceOffLanes() throws {
+        var settings = VMLXServerRuntimeSettings()
+        settings.multimodal.vlmMode = .forceOff
+        let snapshot = ModelRuntimeCapabilitySnapshot(
+            configuration: ModelConfiguration(directory: URL(fileURLWithPath: "/tmp/private/omni")),
+            capabilities: JangCapabilities(
+                supportsText: true,
+                supportsVision: true,
+                supportsVideo: true,
+                supportsAudio: true,
+                family: "nemotron_h_omni",
+                modality: "omni"))
+        let request = ModelRuntimeCapabilityRequest(
+            modalities: [.text, .vision, .video, .audio])
+
+        let result = settings.validateRequest(request, capabilitySnapshot: snapshot)
+
+        #expect(!result.allowed)
+        #expect(result.issues.map(\.code) == [
+            "server_modality_disabled",
+            "server_modality_disabled",
+            "server_modality_disabled",
+        ])
+        #expect(result.issues.map(\.modality) == [.vision, .video, .audio])
+        #expect(result.issues.first?.redactedLogFields["field"] == "multimodal.vlmMode")
+        let encoded = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+        #expect(!encoded.contains("/tmp/private"))
+        #expect(!encoded.contains("omni"))
+    }
+
+    @Test("request validation rejects disabled audio and video lanes")
+    func requestValidationRejectsDisabledAudioAndVideoLanes() {
+        var settings = VMLXServerRuntimeSettings()
+        settings.multimodal.enableVideo = false
+        settings.multimodal.enableAudio = false
+        let request = ModelRuntimeCapabilityRequest(
+            modalities: [.text, .vision, .video, .audio])
+
+        let result = settings.validateRequest(request)
+
+        #expect(!result.allowed)
+        #expect(result.issues.map(\.code) == [
+            "server_modality_disabled",
+            "server_modality_disabled",
+        ])
+        #expect(result.issues.map(\.modality) == [.video, .audio])
+        #expect(result.issues.map { $0.redactedLogFields["field"] ?? "" } == [
+            "multimodal.enableVideo",
+            "multimodal.enableAudio",
+        ])
+    }
+
+    @Test("request validation rejects native MTP when server mode is off")
+    func requestValidationRejectsNativeMTPWhenServerModeIsOff() {
+        var settings = VMLXServerRuntimeSettings()
+        settings.mtp.mode = .off
+        let request = ModelRuntimeCapabilityRequest(
+            modalities: [.text, .nativeMTP])
+
+        let result = settings.validateRequest(request)
+
+        #expect(!result.allowed)
+        #expect(result.issues.map(\.code) == ["server_modality_disabled"])
+        #expect(result.issues.first?.modality == .nativeMTP)
+        #expect(result.issues.first?.redactedLogFields["field"] == "mtp.mode")
+    }
+
     @Test("invalid server numeric settings report issues instead of clamping")
     func invalidServerNumericSettingsReportIssuesInsteadOfClamping() {
         var settings = VMLXServerRuntimeSettings()
