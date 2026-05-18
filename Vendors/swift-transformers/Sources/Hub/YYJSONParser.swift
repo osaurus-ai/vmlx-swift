@@ -6,7 +6,7 @@
 //
 
 import Foundation
-import VMLXyyjson
+import yyjson
 
 /// A high-performance JSON parser using yyjson.
 ///
