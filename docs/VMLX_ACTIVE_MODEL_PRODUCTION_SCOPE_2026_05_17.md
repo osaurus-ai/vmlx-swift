@@ -1131,8 +1131,9 @@ Clean post-failgate artifact:
 docs/local/live-model-matrix/20260517T_release_turnmatrix_nemotron_omni_jangtq_after_omni_failgate_v2/
 ```
 
-The text/cache/batch side is healthy, but the Omni media row is not
-production-clear:
+That artifact is now retained as a red pre-fix row. It proved the text/cache/
+batch side was healthy, but the Omni media path was not production-clear at the
+time:
 
 - config/template smoke: PASS;
 - `BENCH_PROD` cache OFF and cache ON: PASS with visible coherent answers,
@@ -1141,7 +1142,7 @@ production-clear:
 - disk restore row: PASS, with `cache_index.db`, safetensors entries, and
   `ssm_companion` present in the cache directory;
 - BatchEngine text B=1 and B=2: PASS;
-- Omni aggregate row: FAIL by design, because 5 of 18 subrows fail with
+- Omni aggregate row: FAIL by design, because 5 of 18 subrows failed with
   repeated bigram loops on image/audio LMInput paths:
   image single-turn, image reasoning-off direct, image multi-turn,
   audio LMInput end-to-end, and BatchEngine image B=1.
@@ -1151,8 +1152,8 @@ Harness fix from this row:
 - `OmniBench` now exits nonzero when any printed subrow fails. The previous
   artifact reported `.omni | pass` despite a summary of `13 passed, 5 failed`;
   the fresh artifact reports `.omni | fail:1` and keeps the failed media rows
-  visible for root-cause work. This is a real blocked media-runtime row, not a
-  sampling-policy issue.
+  visible for root-cause work. This was a real blocked media-runtime row, not a
+  sampling-policy issue, and it should not be used as current status.
 
 ## Nemotron Omni Live Voice Consolidation - 2026-05-17
 
@@ -1206,9 +1207,10 @@ Coherency boundary:
   beep, notification, or alert;
 - at 48 tokens the answer repeats the concise sentence twice, so this is
   coherent audio grounding but not a clean long-budget termination pass;
-- at 192 tokens, `OmniBench` still records repeated-bigram failures on several
-  media rows. That remains an engine/runtime stop or continuation issue to
-  root-cause, not a reason to clamp sampler settings.
+- the old 192-token `OmniBench` rows below are preserved as pre-fix evidence.
+  The current 2026-05-18 rebuilt strict JANGTQ gate passes 20/20 at 192 tokens
+  with bundle defaults and the video cache-alias proof; do not carry the old
+  repeated-bigram status forward as current.
 
 Chunk stability findings:
 
@@ -1234,8 +1236,8 @@ Fresh generation-config artifact:
 docs/local/live-model-matrix/20260517T_omni_generation_config_fix/omni.out
 ```
 
-Result at `BENCH_MAX_TOKENS=192`, `BENCH_OMNI_RANDOM_SEED=20260517`,
-`BENCH_OMNI_BATCH=1`:
+Pre-fix result at `BENCH_MAX_TOKENS=192`,
+`BENCH_OMNI_RANDOM_SEED=20260517`, `BENCH_OMNI_BATCH=1`:
 
 - 12/18 rows pass;
 - text-only, text multi-turn, audio encoder, audio LMInput, reasoning OFF,
@@ -1243,10 +1245,10 @@ Result at `BENCH_MAX_TOKENS=192`, `BENCH_OMNI_RANDOM_SEED=20260517`,
   BatchEngine text B=1, and BatchEngine text B=2 pass;
 - remaining failures are image/video long-budget continuation rows and one
   BatchEngine audio row, with explicit repeated-phrase diagnostics;
-- this improves the evidence path but still does not make Omni media
-  production-clear at long budgets.
+- this improved the evidence path but did not make Omni media production-clear
+  at long budgets.
 
-Current 48-token full Omni matrix after rebuilding `RunBench`:
+Superseded 48-token full Omni matrix after rebuilding `RunBench`:
 
 - 17/18 rows pass on
   `Nemotron-Omni-Nano-JANGTQ-CRACK` with bundle generation defaults;
@@ -1259,6 +1261,31 @@ Current 48-token full Omni matrix after rebuilding `RunBench`:
   where the output loops on decoded image-placeholder text (`br br`). This is
   not an audio/Parakeet failure and must remain visible as a non-audio Omni
   media/runtime blocker. Do not hide it with sampler clamps.
+
+Current strict 192-token JANGTQ matrix after rebuilding `RunBench` on
+2026-05-18 07:40 PDT:
+
+```text
+docs/local/live-model-matrix/20260518T_current_omni_jangtq_strict_after_rebuild/omni_jangtq_strict.log
+```
+
+- `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift build
+  -c release --product RunBench --jobs 2` passed immediately before the run.
+- Command used bundle defaults plus a fixed seed:
+  `BENCH_OMNI=1 BENCH_OMNI_BATCH=1 BENCH_OMNI_VIDEO_CACHE_ALIAS=1
+  BENCH_MAX_TOKENS=192 BENCH_OMNI_RANDOM_SEED=20260517`.
+- Result: `20 passed, 0 failed | load 1.92s`.
+- Sampling line: `source=generation_config maxTokens=192 temp=0.600
+  topP=0.950 topK=0 minP=0.000 rep=1.000 seed=20260517`.
+- Live rows cover text single-turn, text multi-turn, image single-turn, image
+  reasoning-off direct, image multi-turn, video encoder, audio encoder, video
+  LMInput, video reasoning-off direct, repeated-video cache alias, audio
+  LMInput, reasoning OFF, ON/OFF/ON toggle, mixed image+audio, audio media-salt
+  isolation, hybrid SSM warm-pass, and BatchEngine text/image/audio rows.
+- The repeated-video alias row reports `raw=4028`, `effective=1382`,
+  `disk matched=1382/1382 remaining=0`, replay hits `1->2`, and coherent
+  visible video output. This clears the previously open repeated-video
+  cache-hit proof for the tested JANGTQ Omni bundle.
 
 Fresh live voice recheck at 2026-05-17 08:10 PDT:
 

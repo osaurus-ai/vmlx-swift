@@ -495,8 +495,14 @@ weights.
   passes `20/20` with `BENCH_OMNI_VIDEO_CACHE_ALIAS=1`; row `5d` records
   `raw=4028`, `effective=1382`, direct probe
   `disk matched=1382/1382 remaining=0`, and replay hit counter `1->2` with
-  coherent visible video output. This clears the live repeated-video cache-hit
-  blocker for the tested JANGTQ Omni bundle.
+  coherent visible video output. Fresh rebuild proof:
+  `docs/local/live-model-matrix/20260518T_current_omni_jangtq_strict_after_rebuild/omni_jangtq_strict.log`
+  was run after rebuilding release `RunBench` and again passes `20/20` at
+  192 tokens with bundle defaults, including image multi-turn, video/audio
+  LMInput, audio media-salt isolation, hybrid SSM warm-pass, BatchEngine
+  text/image/audio rows, and the repeated-video alias row (`raw=4028`,
+  `effective=1382`, disk hit `1->2`). This clears the live repeated-video
+  cache-hit blocker for the tested JANGTQ Omni bundle.
 - Open: cache-off repeated rows no longer leak literal sound markers after the
   wrapper fix, but some short BatchEngine/pre-encoded rows are still weak.
   Fresh cache-on repeat gate

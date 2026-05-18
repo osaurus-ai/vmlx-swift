@@ -284,6 +284,24 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   replay runs. This clears the live repeated-video cache-hit gap for the
   tested JANGTQ Omni bundle.
 
+2026-05-18 07:40 PDT rebuilt strict Omni confirmation:
+
+- Release `RunBench` was rebuilt after the current source timestamp:
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift build
+  -c release --product RunBench --jobs 2` completed successfully.
+- Fresh artifact:
+  `docs/local/live-model-matrix/20260518T_current_omni_jangtq_strict_after_rebuild/omni_jangtq_strict.log`
+  exits 0 and reports `20 passed, 0 failed | load 1.92s` on
+  `/Users/eric/models/dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK` with
+  `BENCH_OMNI=1`, `BENCH_OMNI_BATCH=1`,
+  `BENCH_OMNI_VIDEO_CACHE_ALIAS=1`, `BENCH_MAX_TOKENS=192`, and
+  `BENCH_OMNI_RANDOM_SEED=20260517`.
+- The live sampling line again comes from `generation_config.json`:
+  `temp=0.600 topP=0.950 topK=0 minP=0.000 rep=1.000`; no sampler,
+  repetition, EOS, or forced reasoning-close guard was added.
+- The repeated-video row again reports `raw=4028`, `effective=1382`,
+  `disk matched=1382/1382 remaining=0`, and replay hits `1->2`.
+
 2026-05-18 07:00 PDT clean consumer package repair:
 
 - Osaurus PR #1147 pin testing exposed a clean-resolve package failure at
