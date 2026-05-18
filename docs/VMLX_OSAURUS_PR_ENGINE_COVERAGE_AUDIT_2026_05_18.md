@@ -479,7 +479,7 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
 
 2026-05-18 15:35 PDT Osaurus PR #1147 ZAYA-VL image-only capability fix:
 
-- Osaurus PR #1147 head `ee423158` marks ZAYA1-VL as `.imageOnly` from
+- Osaurus PR #1147 head `c70a5dcb` marks ZAYA1-VL as `.imageOnly` from
   `ModelMediaCapabilities.from(modelId:)` and keeps `model_type=zaya1_vl`
   directory detection image-only. This matches the current vmlx-swift boundary:
   ZAYA1-VL image/text is implemented, but video still throws
