@@ -333,6 +333,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-certificates.git", from: "1.5.0"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.5.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0"..<"5.0.0"),
+        .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.33.0"),
     ],
     targets: [
         cmlx,
@@ -411,6 +412,11 @@ let package = Package(
         ),
         .target(
             name: "VMLXEventSource",
+            dependencies: [
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+            ],
             path: "Vendors/EventSource/Sources/EventSource"
         ),
         .target(
