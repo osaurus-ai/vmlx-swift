@@ -11,4 +11,3 @@
 @_exported import MLXRandom
 @_exported import MLXVLM
 @_exported import Tokenizers
-@_exported import vMLXFlux

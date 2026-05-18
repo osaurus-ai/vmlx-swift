@@ -284,6 +284,21 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   replay runs. This clears the live repeated-video cache-hit gap for the
   tested JANGTQ Omni bundle.
 
+2026-05-18 07:00 PDT clean consumer package repair:
+
+- Osaurus PR #1147 pin testing exposed a clean-resolve package failure at
+  `vmlx-swift@d2c6356`: `Package.swift` referenced `Libraries/vMLXFluxVideo`
+  and sibling Flux targets that were present only as untracked concurrent-agent
+  work in this checkout. A clean Osaurus consumer therefore failed before
+  exercising the consolidated inference package.
+- Fix: remove the untracked Flux products, targets, probe, tests, and umbrella
+  re-export from the production manifest until that work lands as tracked
+  source. This does not touch or delete the other agent's local Flux files; it
+  restores clean package resolution for the shipped inference engine.
+- Verification: `swift package describe --type json` succeeds after the
+  manifest repair. The Osaurus switch PR pin can move to the next pushed
+  `vmlx-swift` revision instead of inheriting the missing-target failure.
+
 2026-05-18 04:45 PDT build/coverage/live refresh:
 
 - Consolidated package build gate: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer

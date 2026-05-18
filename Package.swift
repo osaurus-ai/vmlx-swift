@@ -315,10 +315,6 @@ let package = Package(
         .library(name: "MLXDistributedJACCL", targets: ["MLXDistributedJACCL"]),
         .library(name: "MLXDistributedTP", targets: ["MLXDistributedTP"]),
         .library(name: "MLXPress", targets: ["MLXPress"]),
-        .library(name: "vMLXFlux", targets: ["vMLXFlux"]),
-        .library(name: "vMLXFluxKit", targets: ["vMLXFluxKit"]),
-        .library(name: "vMLXFluxModels", targets: ["vMLXFluxModels"]),
-        .library(name: "vMLXFluxVideo", targets: ["vMLXFluxVideo"]),
         .library(name: "VMLX", targets: ["VMLX"]),
         .executable(name: "RunBench", targets: ["RunBench"]),
         .executable(name: "ANEProbe", targets: ["ANEProbe"]),
@@ -326,7 +322,6 @@ let package = Package(
         .executable(name: "OmniAudioChunkStabilityBench", targets: ["OmniAudioChunkStabilityBench"]),
         .executable(name: "mlxpress", targets: ["MLXPressCLI"]),
         .executable(name: "mlxpress-selfcheck", targets: ["MLXPressSelfCheck"]),
-        .executable(name: "vmlxflux-probe", targets: ["vMLXFluxProbe"]),
     ],
     dependencies: [
         // for Complex type
@@ -587,45 +582,6 @@ let package = Package(
             path: "Sources/MLXPress"
         ),
         .target(
-            name: "vMLXFluxKit",
-            dependencies: [
-                "MLX",
-                "MLXNN",
-                "MLXRandom",
-                "MLXLMCommon",
-            ],
-            path: "Libraries/vMLXFluxKit"
-        ),
-        .target(
-            name: "vMLXFluxModels",
-            dependencies: [
-                "vMLXFluxKit",
-                "MLX",
-                "MLXNN",
-                "Tokenizers",
-            ],
-            path: "Libraries/vMLXFluxModels"
-        ),
-        .target(
-            name: "vMLXFluxVideo",
-            dependencies: [
-                "vMLXFluxKit",
-                "MLX",
-                "MLXNN",
-                "MLXRandom",
-            ],
-            path: "Libraries/vMLXFluxVideo"
-        ),
-        .target(
-            name: "vMLXFlux",
-            dependencies: [
-                "vMLXFluxKit",
-                "vMLXFluxModels",
-                "vMLXFluxVideo",
-            ],
-            path: "Libraries/vMLXFlux"
-        ),
-        .target(
             name: "VMLX",
             dependencies: [
                 "MLX",
@@ -650,7 +606,6 @@ let package = Package(
                 "MLXDistributedJACCL",
                 "MLXDistributedTP",
                 "MLXPress",
-                "vMLXFlux",
             ],
             path: "Libraries/VMLX",
             swiftSettings: [
@@ -666,11 +621,6 @@ let package = Package(
             name: "MLXPressSelfCheck",
             dependencies: ["MLXPress"],
             path: "Sources/MLXPressSelfCheck"
-        ),
-        .executableTarget(
-            name: "vMLXFluxProbe",
-            dependencies: ["vMLXFlux", "vMLXFluxKit"],
-            path: "tools/vMLXFluxProbe"
         ),
         .executableTarget(
             name: "CompileBench",
@@ -749,11 +699,6 @@ let package = Package(
             name: "MLXPressPolicyTests",
             path: "Tests/MLXPressPolicyTests",
             sources: ["MLXPressLowRamPolicySourceTests.swift"]
-        ),
-        .testTarget(
-            name: "vMLXFluxTests",
-            dependencies: ["vMLXFlux"],
-            path: "Tests/vMLXFluxTests"
         ),
         .testTarget(
             name: "MLXLMCommonFocusedTests",
