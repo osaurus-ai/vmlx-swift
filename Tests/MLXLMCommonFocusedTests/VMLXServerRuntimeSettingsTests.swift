@@ -101,6 +101,35 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
+    @Test("temperature is applied before nucleus sampling")
+    func temperatureIsAppliedBeforeNucleusSampling() {
+        FocusedMLXTestSupport.withLock {
+            let logits = MLXArray([0.0 as Float, -0.3 as Float, -0.8 as Float])[.newAxis, .ellipsis]
+            let directSampler = TopPSampler(
+                temperature: 0.5,
+                topP: 0.55,
+                randomSeed: 17)
+
+            for _ in 0 ..< 64 {
+                #expect(directSampler.sample(logits: logits).item(Int.self) == 0)
+            }
+
+            let speculativeSampler = SpeculativeSamplingController(
+                parameters: GenerateParameters(
+                    temperature: 0.5,
+                    topP: 0.55,
+                    topK: 0,
+                    minP: 0.0,
+                    randomSeed: 17))
+
+            let probabilities = speculativeSampler.probabilities(logits: logits)[0].asArray(Float.self)
+
+            #expect(abs(probabilities[0] - 1) < 1e-6)
+            #expect(abs(probabilities[1]) < 1e-6)
+            #expect(abs(probabilities[2]) < 1e-6)
+        }
+    }
+
     @Test("nil server sampling fields do not add fake guards")
     func nilServerSamplingFieldsDoNotAddFakeGuards() {
         let settings = VMLXServerRuntimeSettings()

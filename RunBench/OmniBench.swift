@@ -575,6 +575,7 @@ enum OmniBench {
                             "BatchEngine image B=1: empty output stream"])
                 }
                 try validateVisibleOmniText(text, row: "BatchEngine image B=1")
+                try validateGradientImageDescription(text, row: "BatchEngine image B=1")
                 return TurnResult(
                     shortText: text.replacingOccurrences(of: "\n", with: " "),
                     tokens: chunks, secs: secs)
@@ -763,8 +764,10 @@ enum OmniBench {
             iter, context: context, maxNewTokens: maxNewTokens)
         let secs = CFAbsoluteTimeGetCurrent() - t0
         let text = userVisibleText(
-            context: context, lmInput: lmInput, tokenIds: tokens)
+            context: context, lmInput: lmInput, tokenIds: tokens,
+            allowReasoningFallback: enableThinking)
         try validateVisibleOmniText(text, row: "image turn")
+        try validateGradientImageDescription(text, row: "image turn")
         return TurnResult(
             shortText: text.replacingOccurrences(of: "\n", with: " "),
             tokens: tokens.count, secs: secs)
@@ -819,6 +822,7 @@ enum OmniBench {
             totalSecs += secs
             do {
                 try validateVisibleOmniText(text, row: "image tail \(variant.name)")
+                try validateGradientImageDescription(text, row: "image tail \(variant.name)")
                 groundedPasses += 1
                 details.append("\(variant.name)=PASS:\(text.prefix(70))")
             } catch {
@@ -877,6 +881,7 @@ enum OmniBench {
             input: firstInput,
             parameters: params)
         try validateVisibleOmniText(first.text, row: "structured image chat T1")
+        try validateGradientImageDescription(first.text, row: "structured image chat T1")
 
         switch coordinator.fetch(tokens: firstTokens, mediaSalt: firstSalt) {
         case .hit(let matched, _, let detail, _, _, _):
@@ -1312,6 +1317,27 @@ enum OmniBench {
                     userInfo: [NSLocalizedDescriptionKey:
                         "\(row): image not grounded; excerpt=\(excerpt)"])
             }
+        }
+    }
+
+    private static func validateGradientImageDescription(_ text: String, row: String) throws {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        let seesExpectedColors =
+            (lower.contains("orange") || lower.contains("red"))
+            && (lower.contains("blue") || lower.contains("cyan"))
+        let seesGradient = lower.contains("gradient") || lower.contains("transition")
+            || lower.contains("blend") || lower.contains("vertical")
+        let promptEcho = lower.contains("describe this image")
+            || lower.contains("simple instruction")
+            || lower.contains("white background with the text")
+
+        if promptEcho || !seesExpectedColors || !seesGradient {
+            let excerpt = String(trimmed.prefix(220))
+            throw NSError(
+                domain: "OmniBench", code: 25,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "\(row): synthetic gradient not grounded; excerpt=\(excerpt)"])
         }
     }
 

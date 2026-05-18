@@ -391,9 +391,10 @@ public struct ArgMaxSampler: LogitSampler {
 /// Sampler that uses probability filters (`topP`, `topK`, `minP`) and `temperature`
 /// to sample the logits.
 ///
-/// Filters are applied in the same order as Python mlx-lm: top_p → min_p → top_k.
-/// Each filter operates on the full vocabulary in original token order, masking
-/// rejected tokens with `-inf`. This matches the composable filter chain in
+/// Temperature is applied before probability filters, then filters are applied
+/// in the same order as Python mlx-lm: top_p → min_p → top_k. Each filter
+/// operates on the full vocabulary in original token order, masking rejected
+/// tokens with `-inf`. This matches the composable filter chain in
 /// `mlx_lm.sample_utils.make_sampler`.
 public struct TopPSampler: LogitSampler {
     let temp: MLXArray
@@ -427,9 +428,9 @@ public struct TopPSampler: LogitSampler {
         }
 
         return withRandomState(randomState) {
-            var logprobs = logSoftmax(logits)
+            var logprobs = logSoftmax(logits * (1 / temp))
 
-            // Apply filters in Python mlx-lm order: top_p → min_p → top_k.
+            // Apply filters in Python mlx-lm order after temperature scaling.
             if let topP {
                 logprobs = applyTopP(logprobs, topP: topP)
             }
@@ -440,7 +441,7 @@ public struct TopPSampler: LogitSampler {
                 logprobs = applyTopK(logprobs, topK: topK)
             }
 
-            return categorical(logprobs * (1 / temp))
+            return categorical(logprobs)
         }
     }
 
@@ -552,7 +553,7 @@ public struct SpeculativeSamplingController {
             logits = logits.asType(.float32)
         }
 
-        var logprobs = logSoftmax(logits)
+        var logprobs = logSoftmax(logits * (1 / MLXArray(temperature)))
         if topP > 0 && topP < 1 {
             logprobs = applyTopP(logprobs, topP: MLXArray(topP))
         }
@@ -563,7 +564,7 @@ public struct SpeculativeSamplingController {
             logprobs = applyTopK(logprobs, topK: topK)
         }
 
-        return softmax(logprobs * (1 / MLXArray(temperature)), axis: -1, precise: true)
+        return softmax(logprobs, axis: -1, precise: true)
     }
 
     public func sample(logits: MLXArray) -> Sample {

@@ -145,7 +145,7 @@ weights.
 | `dealign.ai/Ling-2.6-flash-MXFP4-CRACK` | 63G | `bailing_hybrid` | no | file | `PASS` | `PASS` |
 | `dealign.ai/MiniMax-M2.7-JANGTQ_K-CRACK` | 74G | `minimax_m2` | yes | file | `PASS` | `PARTIAL` |
 | `dealign.ai/MiniMax-M2.7-JANG_K-CRACK` | 80G | `minimax_m2` | no | file | `PASS` | `PARTIAL` |
-| `dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK` | 12G | `nemotron_h` | yes | file | `PASS` | `PASS` |
+| `dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK` | 12G | `nemotron_h` | yes | file | `PASS` | `PARTIAL` |
 | `dealign.ai/Nemotron-Omni-Nano-JANGTQ4-CRACK` | 19G | `nemotron_h` | yes | file | `PASS` | `PASS` |
 | `dealign.ai/Nemotron-Omni-Nano-MXFP4-CRACK` | 21G | `nemotron_h` | no | file | `PASS` | `PASS` |
 | `dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` | 16G | `qwen3_5` | no | file | `PASS` | `PASS` |
@@ -435,7 +435,8 @@ weights.
   video, audio, and pre-encoded audio handling.
 - Template/reasoning/tools: template smoke passes; reasoning parser maps to
   Nemotron H; tool parser maps to Nemotron format.
-- Current status: JANGTQ, JANGTQ4, and MXFP4 core Omni paths are live-proven. The
+- Current status: JANGTQ4 and MXFP4 core Omni paths are live-proven, while the
+  current JANGTQ production media row is PARTIAL under stricter validation. The
   fresh JANGTQ artifact
   `docs/local/live-model-matrix/20260517T214045Z_nemotron_jangtq_omni_recheck/omni_jangtq_48.log`
   passes 18/18 at 48 tokens with bundle generation defaults, `NemotronHOmni`
@@ -492,6 +493,18 @@ weights.
   no-thinking VL follow-ups both loop on "Orange and light blue", and the audio
   media-salt row still repeats "bass note". This is not a cache-hit failure and
   must not be hidden with sampler or stop-token guards.
+- 2026-05-18 sampler and strict media gate: shared sampling now applies
+  temperature before top-p/min-p/top-k filters in both `TopPSampler` and
+  `SpeculativeSamplingController`, with focused red/green proof in
+  `VMLXServerRuntimeSettingsTests/temperatureIsAppliedBeforeNucleusSampling`.
+  This fixed sampler-order parity without adding a repetition, temperature,
+  stop-token, or parser guard. It did not close current JANGTQ Omni media:
+  `omni_max128_seed0_after_temp_filter_fix.out` still reports `14 passed, 4
+  failed`. The stricter gradient-grounding gate then shows seed-sensitive
+  failures instead of prompt-echo false positives:
+  `omni_tail_probe_seed0_max96_strict_gradient.out` is `14 passed, 5 failed`,
+  seed 1 is `14 passed, 5 failed`, seed 2 is `16 passed, 3 failed`, seed 3 is
+  `13 passed, 6 failed`, and greedy is `13 passed, 6 failed`.
 
 ### Kimi K2.6
 
