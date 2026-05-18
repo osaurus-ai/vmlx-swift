@@ -29,4 +29,18 @@ struct GenerationConfigFactorySourceCoverageTests {
             "Factories decode generation_config.json but do not carry defaults into ModelConfiguration: \(failures)"
         )
     }
+
+    @Test("VLM JANG load uses quantization container, not deprecated alias")
+    func vlmJangLoadUsesQuantizationContainer() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repoRoot.appending(path: "Libraries/MLXVLM/VLMModelFactory.swift"),
+            encoding: .utf8)
+
+        #expect(source.contains("baseConfig.quantizationContainer?.quantization"))
+        #expect(!source.contains("baseConfig.quantization : nil"))
+    }
 }

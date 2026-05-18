@@ -625,7 +625,7 @@ public final class VLMModelFactory: ModelFactory {
             // gs. Without it, MXFP4 omni fell back to `jangConfig.blockSize`'s
             // default 64 instead of the actual gs=32, mis-inferring layers
             // and causing mid-prefill rmsNorm shape traps.
-            quantization: jangConfig != nil ? baseConfig.quantization : nil,
+            quantization: jangConfig != nil ? baseConfig.quantizationContainer?.quantization : nil,
             perLayerQuantization: baseConfig.perLayerQuantization,
             jangConfig: jangConfig,
             loadPreservedMTP: loadNativeMTP)

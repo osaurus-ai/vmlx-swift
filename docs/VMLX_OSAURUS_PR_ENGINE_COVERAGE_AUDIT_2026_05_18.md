@@ -17,10 +17,11 @@ gh api 'repos/osaurus-ai/{repo}/commits?since=2026-04-24T00:00:00Z&until=2026-05
 gh api repos/osaurus-ai/{repo}/compare/{pin}...main
 ```
 
-Current `vmlx-swift` branch head at audit time:
+Current `vmlx-swift` branch head at the latest committed refresh before this
+source-hygiene edit:
 
 ```text
-eb4cade docs(ling): refresh no-guard evidence
+e8dad80 fix(vlm): clean media preprocessing warnings
 ```
 
 2026-05-18 continuation refresh:
@@ -35,6 +36,15 @@ eb4cade docs(ling): refresh no-guard evidence
   `20260518T_ling_jangtq2_no_guard_refresh/`. Both prove no hidden sampler
   guard behavior; failures, where present, were harness/product-budget issues,
   not decode fixes.
+- VLM JANG weight loading now matches the LLM factory and passes the real
+  `quantizationContainer?.quantization` value into `loadWeights` instead of the
+  deprecated `baseConfig.quantization` alias. This keeps MXFP4/MXFP8 group-size
+  inference source-backed for VL/Omni bundles; it is not a sampler, parser, or
+  EOS workaround. `swift build -c release --product RunBench` passed after the
+  change. A filtered Swift Testing run was attempted under full Xcode, but the
+  package currently fails earlier in unrelated `MLXTests/WiredMemoryTests.swift`
+  because those tests call `WiredMemoryManager.makeForTesting`, which no longer
+  exists on the current API.
 
 ## Current Switch Verdict
 
