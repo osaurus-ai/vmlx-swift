@@ -599,6 +599,33 @@ struct MTPRuntimeFocusedTests {
         #expect(config.runtime.mtpMode == .preservedEnabled)
     }
 
+    @Test("JANG config parses role-level MXTQ metadata")
+    func jangConfigParsesRoleLevelMXTQMetadata() throws {
+        let config = try JangLoader.parseConfig(from: [
+            "quantization": [
+                "method": "affine+mxtq",
+                "group_size": 64,
+                "bits_default": 4,
+            ] as [String: Any],
+            "mxtq_bits": [
+                "attention": 8,
+                "shared_expert": 8,
+                "mamba_proj": 8,
+                "routed_expert": 4,
+                "embed_tokens": 8,
+                "lm_head": 8,
+            ] as [String: Any],
+        ])
+
+        #expect(config.quantization.blockSize == 64)
+        #expect(config.mxtqBits["attention"] == 8)
+        #expect(config.mxtqBits["shared_expert"] == 8)
+        #expect(config.mxtqBits["mamba_proj"] == 8)
+        #expect(config.mxtqBits["routed_expert"] == 4)
+        #expect(config.mxtqBits["embed_tokens"] == 8)
+        #expect(config.mxtqBits["lm_head"] == 8)
+    }
+
     @Test("ModelConfiguration carries MTP status into resolved configuration")
     func modelConfigurationCarriesMTPStatusIntoResolvedConfiguration() {
         let root = URL(fileURLWithPath: "/tmp/qwen-mtp")
@@ -1082,6 +1109,33 @@ struct MTPRuntimeFocusedTests {
             #expect(override.groupSize == 128)
         } else {
             Issue.record("Expected routed expert input override to use hidden input dim")
+        }
+    }
+
+    @Test("shape-walk honors role-level MXTQ metadata for dense JANGTQ roles")
+    func shapeWalkHonorsRoleLevelMXTQMetadata() {
+        let base = "backbone.layers.0.mixer.in_proj"
+        let weights: [String: MLXArray] = [
+            "\(base).weight": MLXArray.zeros([1, 128], dtype: .uint32),
+            "\(base).scales": MLXArray.zeros([1, 8], dtype: .float32),
+        ]
+
+        let inferred = JangLoader.inferPerLayerQuantization(
+            weights: weights,
+            jangConfig: JangConfig(
+                quantization: JangQuantization(blockSize: 64),
+                mxtqBits: [
+                    "mamba_proj": 8,
+                    "routed_expert": 4,
+                ]),
+            declaredDefaultQuantization: BaseConfiguration.Quantization(
+                groupSize: 64, bits: 4))
+
+        if case .quantize(let override)? = inferred.perLayerQuantization[base] {
+            #expect(override.bits == 8)
+            #expect(override.groupSize == 64)
+        } else {
+            Issue.record("Expected mamba projection override from role-level mxtq_bits")
         }
     }
 

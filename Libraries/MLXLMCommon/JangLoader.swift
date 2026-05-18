@@ -561,6 +561,7 @@ public struct JangConfig: Sendable {
     public let formatVersion: String
     public var isV2: Bool { formatVersion.hasPrefix("2") }
     public let quantization: JangQuantization
+    public let mxtqBits: [String: Int]
     public let sourceModel: JangSourceModel
     public let architecture: JangArchitecture
     public let runtime: JangRuntime
@@ -586,6 +587,7 @@ public struct JangConfig: Sendable {
         format: String = "jang",
         formatVersion: String = "2.0",
         quantization: JangQuantization = JangQuantization(),
+        mxtqBits: [String: Int] = [:],
         sourceModel: JangSourceModel = JangSourceModel(),
         architecture: JangArchitecture = JangArchitecture(),
         runtime: JangRuntime = JangRuntime(),
@@ -596,6 +598,7 @@ public struct JangConfig: Sendable {
         self.format = format
         self.formatVersion = formatVersion
         self.quantization = quantization
+        self.mxtqBits = mxtqBits
         self.sourceModel = sourceModel
         self.architecture = architecture
         self.runtime = runtime
@@ -1059,7 +1062,7 @@ public struct JangLoader: Sendable {
                 profile: qDict["profile"] as? String ?? "JANG_2S",
                 targetBits: floatValue(qDict["target_bits"]) ?? 2.5,
                 actualBits: floatValue(qDict["actual_bits"]) ?? 2.5,
-                blockSize: qDict["block_size"] as? Int ?? 64,
+                blockSize: (qDict["block_size"] as? Int) ?? (qDict["group_size"] as? Int) ?? 64,
                 bitWidthsUsed: qDict["bit_widths_used"] as? [Int] ?? [],
                 quantizationScheme: qDict["quantization_scheme"] as? String ?? "asymmetric",
                 quantizationBackend: qDict["quantization_backend"] as? String ?? "mx.quantize"
@@ -1067,6 +1070,8 @@ public struct JangLoader: Sendable {
         } else {
             quantization = JangQuantization()
         }
+
+        let mxtqBits = parseMXTQBits(json["mxtq_bits"])
 
         let sourceModel = parseSourceModel(json["source_model"])
 
@@ -1193,6 +1198,7 @@ public struct JangLoader: Sendable {
             format: format,
             formatVersion: formatVersion,
             quantization: quantization,
+            mxtqBits: mxtqBits,
             sourceModel: sourceModel,
             architecture: architecture,
             runtime: runtime,
@@ -1200,6 +1206,26 @@ public struct JangLoader: Sendable {
             modelFamily: modelFamily,
             chat: chat
         )
+    }
+
+    private static func parseMXTQBits(_ value: Any?) -> [String: Int] {
+        if let bits = value as? Int {
+            return ["routed_expert": bits]
+        }
+        guard let dict = value as? [String: Any] else { return [:] }
+        var out: [String: Int] = [:]
+        for (role, raw) in dict {
+            if let bits = raw as? Int {
+                out[role] = bits
+            } else if let nested = raw as? [String: Any] {
+                for (projection, nestedRaw) in nested {
+                    if let bits = nestedRaw as? Int {
+                        out["\(role).\(projection)"] = bits
+                    }
+                }
+            }
+        }
+        return out
     }
 
     private static func parseSourceModel(_ raw: Any?) -> JangSourceModel {
@@ -1385,6 +1411,65 @@ public struct JangLoader: Sendable {
             }
         }
 
+        func declaredMXTQRoleBits(for basePath: String) -> Int? {
+            let roles = jangConfig.mxtqBits
+            guard !roles.isEmpty else { return nil }
+
+            if basePath.hasSuffix("lm_head") {
+                return roles["lm_head"] ?? roles["embed_lm_head"]
+            }
+            if basePath.hasSuffix("embed_tokens")
+                || basePath.hasSuffix("embeddings")
+                || basePath.hasSuffix("embed")
+            {
+                return roles["embed_tokens"] ?? roles["embed_lm_head"]
+            }
+            if basePath.hasSuffix(".self_attn.q_proj")
+                || basePath.hasSuffix(".self_attn.k_proj")
+                || basePath.hasSuffix(".self_attn.v_proj")
+                || basePath.hasSuffix(".self_attn.o_proj")
+                || basePath.hasSuffix(".attn.q_proj")
+                || basePath.hasSuffix(".attn.k_proj")
+                || basePath.hasSuffix(".attn.v_proj")
+                || basePath.hasSuffix(".attn.o_proj")
+                || basePath.hasSuffix(".mixer.q_proj")
+                || basePath.hasSuffix(".mixer.k_proj")
+                || basePath.hasSuffix(".mixer.v_proj")
+                || basePath.hasSuffix(".mixer.o_proj")
+            {
+                return roles["attention"]
+            }
+            if basePath.hasSuffix(".mixer.in_proj")
+                || basePath.hasSuffix(".mixer.out_proj")
+                || basePath.hasSuffix(".linear_attn.in_proj_qkv")
+                || basePath.hasSuffix(".linear_attn.in_proj_z")
+                || basePath.hasSuffix(".linear_attn.in_proj_a")
+                || basePath.hasSuffix(".linear_attn.in_proj_b")
+                || basePath.hasSuffix(".linear_attn.out_proj")
+            {
+                return roles["mamba_proj"] ?? roles["linear_attn"]
+            }
+            if basePath.contains(".shared_experts.")
+                || basePath.contains(".shared_expert.")
+            {
+                return roles["shared_expert"]
+            }
+            if basePath.contains(".switch_mlp.")
+                || basePath.contains(".switch_glu.")
+            {
+                if basePath.hasSuffix(".gate_proj") {
+                    return roles["routed_expert.gate_proj"] ?? roles["routed_expert"]
+                }
+                if basePath.hasSuffix(".up_proj") {
+                    return roles["routed_expert.up_proj"] ?? roles["routed_expert"]
+                }
+                if basePath.hasSuffix(".down_proj") {
+                    return roles["routed_expert.down_proj"] ?? roles["routed_expert"]
+                }
+            }
+            return nil
+        }
+
         func declaredQuantization(for basePath: String) -> BaseConfiguration.Quantization? {
             func variants(_ key: String) -> [String] {
                 var out = [key]
@@ -1406,20 +1491,23 @@ public struct JangLoader: Sendable {
                 return Array(Set(out))
             }
 
-            guard let declaredPerLayerQuantization else {
-                return declaredDefaultQuantization
-            }
-            for key in variants(basePath) {
-                if let declared = declaredPerLayerQuantization.perLayerQuantization[key] {
-                    switch declared {
-                    case .quantize(let quantization):
-                        return quantization
-                    case .skip:
-                        return nil
+            if let declaredPerLayerQuantization {
+                for key in variants(basePath) {
+                    if let declared = declaredPerLayerQuantization.perLayerQuantization[key] {
+                        switch declared {
+                        case .quantize(let quantization):
+                            return quantization
+                        case .skip:
+                            return nil
+                        }
                     }
                 }
             }
-            return declaredPerLayerQuantization.quantization
+            if let roleBits = declaredMXTQRoleBits(for: basePath) {
+                return BaseConfiguration.Quantization(
+                    groupSize: groupSize, bits: roleBits, mode: defaultMode)
+            }
+            return declaredPerLayerQuantization?.quantization
                 ?? declaredDefaultQuantization
         }
 

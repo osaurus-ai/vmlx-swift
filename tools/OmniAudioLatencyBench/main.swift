@@ -85,6 +85,7 @@ enum OmniAudioLatencyRunner {
             "top_k": samplingProbe.topK,
             "min_p": rounded(Double(samplingProbe.minP), places: 3),
             "repetition_penalty": repetitionPenalty,
+            "seed": samplingProbe.randomSeed.map(String.init) ?? NSNull(),
         ])
 
         let fileDecodeStart = CFAbsoluteTimeGetCurrent()
@@ -433,6 +434,11 @@ enum OmniAudioLatencyRunner {
             generationConfig: context.configuration.generationDefaults)
         params.maxTokens = maxNewTokens
         params.prefillStepSize = 512
+        if let seedText = ProcessInfo.processInfo.environment["BENCH_OMNI_AUDIO_RANDOM_SEED"],
+           let seed = UInt64(seedText)
+        {
+            params.randomSeed = seed
+        }
         return params
     }
 

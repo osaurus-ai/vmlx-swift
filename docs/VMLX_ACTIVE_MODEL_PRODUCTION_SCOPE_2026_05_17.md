@@ -1497,6 +1497,28 @@ docs/local/live-model-matrix/20260517T170614Z_omni_live_voice_fresh_recheck/
   the simple beep as guitar/voice/drum. Cache-on repeated live audio therefore
   remains PARTIAL for semantic quality/termination, not because of missing
   cache writes or hidden sampler policy.
+- Current-head 2026-05-18 fix/proof:
+  `JangLoader` now parses role-level top-level `mxtq_bits` from
+  `jang_config.json` and uses those role declarations when comparing
+  shape-walk quantization against declared JANGTQ metadata. This removes the
+  false `config-metadata mismatch patched in-memory` warning for the JANGTQ4
+  Omni bundle. Focused proof: `swift test --filter MTPRuntimeFocusedTests --jobs 2`
+  passes 52/52 with new role-metadata coverage. Live proof:
+  `docs/local/live-model-matrix/20260518T_omni_jangtq4_audio_cache_repeats_after_mxtq_role_metadata/`
+  loads JANGTQ4 with bundle defaults and writes block-L2 plus `ssm_companion`
+  state for batch and iterator rows; stderr has only expected Nemotron tensor
+  stacking plus the shape-walk override summary.
+- Cache-root-cause check: `BENCH_OMNI_AUDIO_RANDOM_SEED=20260518` was added to
+  `OmniAudioLatencyBench` as bench-only instrumentation, not a runtime policy
+  guard. Seeded cache-ON artifact
+  `docs/local/live-model-matrix/20260518T_omni_jangtq4_audio_seeded_cache_on_after_mxtq_role_metadata/`
+  and seeded cache-OFF artifact
+  `docs/local/live-model-matrix/20260518T_omni_jangtq4_audio_seeded_cache_off_after_mxtq_role_metadata/`
+  produce the same visible text across all 12 raw/pre-encoded
+  BatchEngine/TokenIterator repeat rows while still using bundle defaults
+  (`temp=0.600 topP=0.950 topK=0 minP=0.000 rep=1.000`). Cache ON writes 433 MB
+  of prompt/SSM cache artifacts; cache OFF writes 0 B. This proves the
+  repeated-audio semantic variance is not L2/prefix/SSM cache corruption.
 
 ## Required Proof Per Active Bundle
 

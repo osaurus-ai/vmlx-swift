@@ -537,6 +537,14 @@ weights.
   63.6-71.5 tok/s, but every row reaches the 32-token cap and several samples
   repeat phrases or mislabel the simple beep. Cache-on live audio remains
   PARTIAL for semantic quality/termination, not cache write coverage.
+- 2026-05-18 role-metadata refresh: the JANG loader now parses top-level
+  role-level `mxtq_bits` and uses those declarations when comparing dense
+  JANGTQ affine roles against shape-walk inference. The JANGTQ4 Omni load no
+  longer emits the false `config-metadata mismatch patched in-memory` warning.
+  Seeded cache-on/cache-off repeat artifacts prove the remaining short-audio
+  semantic variance is not a cache-restore issue: all 12 visible outputs match
+  with `BENCH_OMNI_AUDIO_RANDOM_SEED=20260518`, cache ON writes 433 MB of
+  block-L2/SSM cache artifacts, and cache OFF writes 0 B.
 
 ### Kimi K2.6
 
