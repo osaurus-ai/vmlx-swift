@@ -301,6 +301,34 @@ Bundle dispatch / quantization knobs:
 DSV4 always uses the SWA+CSA+HSA cache topology unless the operator sets
 one of the explicit diagnostic `DSV4_KV_MODE` overrides above.
 
+### Osaurus DSV4 settings renderer gate
+
+The Osaurus server/settings renderer must treat DSV4 as a dedicated topology,
+not as a generic paged-KV or generic q4/q8-KV model. A release row for the
+final rendered settings panel / CLI preview must verify all of:
+
+- native DSV4 cache copy is present and surfaced as the active
+  SWA+CSA+HSA / `DeepseekV4Cache` topology;
+- paged block-size control is fixed/disabled for DSV4, with the DSV4 renderer
+  row checking the expected 256 display value when the active metadata reports
+  that value, and no user-provided generic paged block size passed back into
+  the DSV4 launch;
+- generic KV q4/q8 controls are disabled for DSV4 unless the operator
+  explicitly selects the diagnostic `DSV4_KV_MODE=tq` path;
+- pool quant state is visible as DSV4 pool/compressor metadata, not hidden in
+  an implicit environment choice;
+- JIT is disabled for DSV4 in the production renderer;
+- generation defaults shown in the UI come from bundle metadata
+  (`generation_config.json` / `jang_config.json`) before any explicit user
+  overrides; and
+- CLI preview omits flags that are invalid for this topology:
+  `--kv-cache-quantization`, `--enable-jit`, `--is-mllm`, and
+  `--speculative-model`.
+
+If any of those renderer rows fails, fix the DSV4 capability/settings mapping.
+Do not compensate by forcing sampler defaults or swapping DSV4 onto a generic
+cache path.
+
 Loader robustness (2026-04-25): the per-layer quantization inference walks every `.scales` key in the bundle and chooses `(bits, group_size)` from a fixed empirical preference order — `(8,32) (8,64) (8,128) (4,32) (4,64) (4,128) (2,32) (2,64) (2,128) (3,32) (6,32)`. This is shape-authoritative: bundles whose `config.json` got re-stamped with mismatched per-layer overrides (or uniform `bits: 8` while routed experts are actually `bits: 2`) load correctly without manual config patching. Idempotent — clean configs add zero overrides.
 
 **Prompt-mode guidance (live-tested 2026-04-25 on DSV4-Flash JANGTQ):**

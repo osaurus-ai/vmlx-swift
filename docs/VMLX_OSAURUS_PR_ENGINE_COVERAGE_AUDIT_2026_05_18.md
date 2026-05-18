@@ -105,6 +105,15 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   post-answer disk restore: turn 2 hits disk at `25/43`, prompt time drops
   `4.329s -> 0.215s`, and generic paged counters remain zero because
   `pagedIncompatible=true` is the correct DSV4 topology.
+- Add the Python-side final-renderer DSV4 checklist to the Osaurus switch gate:
+  the server settings renderer must surface native DSV4 cache copy / SWA+CSA+HSA
+  topology, keep the paged block-size control fixed/disabled for DSV4 with the
+  expected 256 display row when active metadata reports it, disable generic KV
+  q4/q8 and JIT controls, show DSV4 pool quant state, show generation defaults
+  from bundle metadata, and ensure CLI preview omits invalid flags
+  `--kv-cache-quantization`, `--enable-jit`, `--is-mllm`, and
+  `--speculative-model`. This is a UI/settings mapping gate, not an engine
+  sampler guard.
 - Fresh Ling, MiniMax, and Hy3 rows were re-run from this checkout:
   `20260518T_ling_jangtq2_fresh_prod_cache/` passes 7/7 with bundle defaults
   (`temp=0.600 topP=1.000 topK=0 rep=nil`) and disk/SSM stats
