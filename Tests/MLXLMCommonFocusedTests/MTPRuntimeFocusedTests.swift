@@ -395,8 +395,41 @@ struct MTPRuntimeFocusedTests {
         #expect(textConfig["num_nextn_predict_layers"] as? Int == 3)
     }
 
-    @Test("native MTP activation supports Qwen3.5 MoE only with explicit tensor evidence")
+    @Test("native MTP activation supports Qwen3.5 MoE only with explicit tensor evidence and tuning")
     func nativeMTPActivationSupportsQwen35MoEWithTensorEvidence() async throws {
+        let config = """
+        {
+          "model_type": "qwen3_5_moe",
+          "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "mtp_num_hidden_layers": 1
+          }
+        }
+        """.data(using: .utf8)!
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 42,
+            visionTensorCount: 333,
+            mode: .preservedEnabled,
+            nativeMTPTuning: NativeMTPTuning(
+                bestDepth: 3,
+                validated: true,
+                outputEquivalent: true,
+                artifact: "docs/internal/release-gates/qwen-depth3/result.json"))
+
+        let shouldLoad = try await NativeMTPActivation.withExplicitRequest(true) {
+            try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                configData: config,
+                baseModelType: "qwen3_5_moe",
+                status: status)
+        }
+
+        #expect(shouldLoad)
+    }
+
+    @Test("native MTP activation requires usable tuning even when tensors exist")
+    func nativeMTPActivationRequiresUsableTuningEvenWhenTensorsExist() async throws {
         let config = """
         {
           "model_type": "qwen3_5_moe",
@@ -413,14 +446,14 @@ struct MTPRuntimeFocusedTests {
             visionTensorCount: 333,
             mode: .preservedEnabled)
 
-        let shouldLoad = try await NativeMTPActivation.withExplicitRequest(true) {
-            try NativeMTPActivation.shouldLoadNativeMTPWeights(
-                configData: config,
-                baseModelType: "qwen3_5_moe",
-                status: status)
+        await #expect(throws: NativeMTPActivationError.self) {
+            _ = try await NativeMTPActivation.withExplicitRequest(true) {
+                try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                    configData: config,
+                    baseModelType: "qwen3_5_moe",
+                    status: status)
+            }
         }
-
-        #expect(shouldLoad)
     }
 
     @Test("native MTP activation can be requested task-locally without process env")
@@ -439,7 +472,12 @@ struct MTPRuntimeFocusedTests {
             configuredLayers: 1,
             tensorCount: 42,
             visionTensorCount: 333,
-            mode: .preservedEnabled)
+            mode: .preservedEnabled,
+            nativeMTPTuning: NativeMTPTuning(
+                bestDepth: 3,
+                validated: true,
+                outputEquivalent: true,
+                artifact: "docs/internal/release-gates/qwen-depth3/result.json"))
 
         let active = try await NativeMTPActivation.withExplicitRequest(true) {
             try NativeMTPActivation.shouldLoadNativeMTPWeights(

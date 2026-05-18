@@ -142,6 +142,9 @@ bundle-local `vmlx_mtp_tuning.json` best depth. A non-MTP CRACK bundle,
 metadata-only bundle, missing/unusable tuning row, or unsupported profile
 resolves with native MTP off. This avoids the broken middle state where the
 request asks for MTP but the loader scrubbed the sidecar weights.
+The direct low-level activation path is also tuning-gated: an explicit
+`LoadConfiguration.nativeMTP=true` request cannot preserve sidecar weights from
+MTP tensor evidence alone unless `vmlx_mtp_tuning.json` is usable.
 
 For capability/status JSON, serialize `MTPBundleStatus.snapshot`; it includes
 the computed tuning gates (`has_usable_native_mtp_tuning`, `can_auto_launch`,

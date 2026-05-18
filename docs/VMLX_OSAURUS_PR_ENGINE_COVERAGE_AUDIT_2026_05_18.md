@@ -258,6 +258,11 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   `multimodal.requireMediaSaltForCache=false` whenever prefix, paged KV,
   block-L2, or legacy disk cache reuse is enabled. This keeps image/video/audio
   requests from sharing cache keys by text alone.
+- Follow-up native-MTP activation hardening now applies the same tuning gate to
+  the low-level direct factory path: explicit `LoadConfiguration.nativeMTP=true`
+  / `VMLX_NATIVE_MTP=1` activation requires complete tensor evidence and usable
+  bundle-local `vmlx_mtp_tuning.json`; tensor evidence alone throws
+  `requestedWithoutUsableTuning` instead of preserving MTP sidecar weights.
 
 ## Current Switch Verdict
 

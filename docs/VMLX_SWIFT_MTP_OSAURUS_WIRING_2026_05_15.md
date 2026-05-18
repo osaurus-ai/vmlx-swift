@@ -263,7 +263,11 @@ not inferred from `mtp_num_hidden_layers` alone. It requires:
   described below.
 
 Bundles whose config advertises MTP but whose weights do not contain MTP tensors
-fail closed even if a stale or copied tuning sidecar exists. The local CRACK bundle
+fail closed even if a stale or copied tuning sidecar exists. Conversely, a
+tensor-proven bundle without usable tuning also fails closed: direct
+`LoadConfiguration.nativeMTP=true` / `VMLX_NATIVE_MTP=1` activation now throws a
+`requestedWithoutUsableTuning` error instead of loading MTP sidecar weights from
+tensors alone. The local CRACK bundle
 `/Users/eric/models/dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` currently reports:
 
 ```text

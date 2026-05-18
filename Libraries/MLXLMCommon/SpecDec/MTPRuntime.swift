@@ -517,6 +517,7 @@ public extension NativeMTPModel {
 
 public enum NativeMTPActivationError: Error, CustomStringConvertible {
     case requestedButMissingArtifact(MTPBundleStatus?)
+    case requestedWithoutUsableTuning(MTPBundleStatus?)
     case requestedForUnsupportedModel([String])
     case invalidConfigData
 
@@ -524,6 +525,8 @@ public enum NativeMTPActivationError: Error, CustomStringConvertible {
         switch self {
         case .requestedButMissingArtifact(let status):
             return "native MTP was requested but this bundle does not have complete MTP tensor evidence: \(status?.statusLine ?? "no status")"
+        case .requestedWithoutUsableTuning(let status):
+            return "native MTP was requested but this bundle does not have usable \(NativeMTPTuning.fileName) metadata: \(status?.statusLine ?? "no status")"
         case .requestedForUnsupportedModel(let types):
             return "native MTP was requested for unsupported model type(s): \(types.joined(separator: ", "))"
         case .invalidConfigData:
@@ -572,6 +575,9 @@ public enum NativeMTPActivation {
         }
         guard status?.hasCompleteMTPArtifact == true else {
             throw NativeMTPActivationError.requestedButMissingArtifact(status)
+        }
+        guard status?.canAutoLaunchMTP == true else {
+            throw NativeMTPActivationError.requestedWithoutUsableTuning(status)
         }
         return true
     }
