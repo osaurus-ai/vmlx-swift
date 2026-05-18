@@ -90,6 +90,7 @@ Focused fix artifacts live under `docs/local/swift-release-gates/dsv4-fixes/`.
 | `JANGQ/ZAYA1-8B-JANGTQ4` | `zaya` / `ZayaModel` | `PASS` | Fresh current turnmatrix passes config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Bundle defaults apply as `temp=0.600 topP=1.000 topK=0 rep=nil`; reasoning ON/OFF flips produce visible answers, cache-on speed is about `64.7-66.3 tok/s`, peak RSS is about `5.1 GiB`, disk L2 has hits/stores, and SSM companion hits are recorded. | Generic paged prefix hit is `N-A` by topology because ZAYA CCA is path-dependent and disk/SSM-backed. |
 | `JANGQ/ZAYA1-8B-JANGTQ_K` | `zaya` / `ZayaModel` | `PASS / NEEDS CURRENT RE-RUN` | Historical K evidence: release turnmatrix passes config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Bundle defaults apply, reasoning ON/OFF flips produce visible answers, disk L2 and SSM hits are recorded, and release decode is about 64-66 tok/s. | Needs a current all-non-Kimi matrix re-run before Osaurus promotion. Generic paged prefix hit remains `N-A` by topology. |
 | `dealign.ai/Qwen3.6-27B-MXFP4-CRACK` | `qwen3_5` / `Qwen35` | `PASS / HIGH-RES VIDEO WATCH` | Fresh current turnmatrix `20260517T_qwen36_27b_mxfp4_crack_video_resize_postfix_turnmatrix/` passes config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2, VL batch chat, structured VL chat cache, media-salt isolation, and mixed text/image/video. Bundle defaults apply as `temp=1.000 topP=0.950 topK=20 minP=0.000 rep=nil`; MTP depth is `off`; reasoning ON/OFF closes with visible answers at a 2048-token budget; same-media image cache hits disk `99/99`; video passes with explicit `BENCH_VL_VIDEO_RESIZE=224` and `video pixels shape: [560, 1536]`. | Raw 1080p video is not production-cleared. The preserved pre-fix artifact peaked at 164.2 GiB physical footprint in MLX/Metal allocation before termination. Osaurus needs an explicit Qwen video media resize/token-budget setting; do not auto-enable MTP on this CRACK bundle. |
+| `dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` | `qwen3_5` / `Qwen35` | `PASS / HIGH-RES VIDEO WATCH` | Fresh current turnmatrix `20260518T000445Z_qwen36_27b_jang4m_crack_turnmatrix/` passes config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2, VL batch chat, structured VL chat cache, media-salt isolation, and mixed text/image/video. Bundle defaults apply as `temp=1.000 topP=0.950 topK=20 minP=0.000 rep=nil`; MTP depth is `off`; production decode is about `28 tok/s`; peak RSS is about `14.4 GiB` cache-off and `15.5 GiB` cache-on; same-media image cache hits disk `99/99`; bounded video passes with `BENCH_VL_VIDEO_RESIZE=224` and `video pixels shape: [560, 1536]`. | Raw high-resolution video remains unproven, and this CRACK bundle must not auto-enable native MTP without tensor evidence. Generic paged cache hit is `N-A` by Qwen hybrid topology; disk L2 and SSM companion stats are the cache proof. |
 | `JANGQ/MiniMax-M2.7-Small-JANGTQ` | `minimax_m2` / `MiniMaxJANGTQModel` | `PARTIAL` | Loads in 9.7s; 3-turn chat is coherent; no loop; TQ disk round-trip passes; decode around 30.6 tok/s; tracked mmap buffers about 37 GB. | Thinking-on probe produced 483 chars reasoning and no visible answer. Activity Monitor-style footprint reaches about 38.2 GB, so this is not a low-RAM active-streaming pass. |
 | `JANGQ/ZAYA1-VL-8B-JANGTQ4` | `zaya1_vl` / `Zaya1VL` | `PASS` | Fresh current turnmatrix passes config/template, production defaults cache OFF/ON, BatchEngine text rows, disk restore, B=2 concurrent/per-slot/TurboQuant B=2, VL batch chat, structured VL chat cache, and media-salt isolation. Bundle defaults apply as `temp=0.600 topP=1.000 topK=0 rep=nil`; cache-on speed is about `59.4-63.6 tok/s` on short turns, peak RSS is about `6.8 GiB`, same-media disk restore hits `97/97`, different-media probe misses correctly, and compile OFF/ON VL two-turn chat both ground the image and answer the color follow-up as `blue`. | Generic paged prefix hit is `N-A` by topology. Video remains `N-A` because `ZAYA1-VL video input is not implemented`; this is a family capability gap, not a failed implemented row. |
 | `Osaurus/ZAYA1-VL-8B-MXFP4` | `zaya1_vl` / `Zaya1VL` | `PASS` | Release turnmatrix passes config/template, production defaults cache OFF/ON, BatchEngine rows, VL batch chat, structured chat cache, and media-salt isolation. Video is reported `N-A` because ZAYA1-VL processor does not implement video input. | None for implemented image/text/cache surfaces; video remains a family capability gap, not a failed row. |
@@ -137,7 +138,7 @@ weights.
 | `dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK` | 12G | `nemotron_h` | yes | file | `PASS` | `PASS` |
 | `dealign.ai/Nemotron-Omni-Nano-JANGTQ4-CRACK` | 19G | `nemotron_h` | yes | file | `PASS` | `PASS` |
 | `dealign.ai/Nemotron-Omni-Nano-MXFP4-CRACK` | 21G | `nemotron_h` | no | file | `PASS` | `PASS` |
-| `dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` | 16G | `qwen3_5` | no | file | `PASS` | `TODO` |
+| `dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` | 16G | `qwen3_5` | no | file | `PASS` | `PASS` |
 | `dealign.ai/Qwen3.6-27B-MXFP4-CRACK` | 14G | `qwen3_5` | no | file | `PASS` | `PARTIAL` |
 | `dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK` | 11G | `qwen3_5_moe` | yes | file | `PASS` | `PARTIAL` |
 | `Qwen3.5-35B-A3B-4bit` | 19G | `qwen3_5_moe` | no | file | `PASS` | `PASS` |
@@ -202,6 +203,17 @@ weights.
   matrix therefore uses explicit `BENCH_VL_VIDEO_RESIZE=224` and logs
   `video pixels shape: [560, 1536]`; raw high-resolution video remains a
   throughput/resource gate, not a sampler/model-coherency failure.
+- `Qwen3.6-27B-JANG_4M-CRACK` now has a fresh current turnmatrix under
+  `docs/local/live-model-matrix/20260518T000445Z_qwen36_27b_jang4m_crack_turnmatrix/`.
+  It passes config/template, production cache OFF/ON, BatchEngine
+  single/chat/disk/concurrent/per-slot/TurboQuant B=2 rows, VL batch chat,
+  structured VL cache, media-salt isolation, and mixed text/image/video.
+  Bundle defaults apply as `temp=1.000 topP=0.950 topK=20 rep=nil`; MTP remains
+  `off`; production decode is about `28 tok/s`; peak RSS is about `14.4 GiB`
+  cache-off and `15.5 GiB` cache-on; same-media image restore hits disk
+  `99/99`; `PROD_CACHE_STATS` records `pagedIncompatible=true`, disk L2
+  hits/stores, and SSM companion hit. The bounded video row uses
+  `BENCH_VL_VIDEO_RESIZE=224` and logs `video pixels shape: [560, 1536]`.
 - `Qwen3.6-35B-A3B-JANGTQ-CRACK` now loads the VLM path as `Qwen35MoE` with
   `Qwen3VLProcessor`; image turns ground the red/blue gradient, text-only
   follow-up works, same-image media-salt restore hits, and different-image
