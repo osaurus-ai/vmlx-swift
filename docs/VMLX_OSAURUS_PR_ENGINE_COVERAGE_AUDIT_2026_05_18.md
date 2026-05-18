@@ -393,6 +393,25 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   focused Osaurus `RuntimePolicySourceTests` 28/28. This remains harness
   readiness, not live model production proof.
 
+2026-05-18 14:51 PDT Osaurus PR #1147 VLM live sequence probe:
+
+- Osaurus PR #1147 head `e27e5b55` adds
+  `scripts/pr1147_live_sequence_probe.py` and
+  `scripts/tests/test_pr1147_live_sequence_probe.py`. The probe drives the
+  VLM/Omni artifact shape the PR gate now requires: image+text, text-only,
+  different-image, repeat-image, video, and audio turns when media inputs are
+  supplied.
+- The helper builds OpenAI Chat Completions media parts (`image_url`,
+  `video_url`, `input_audio`) and Open Responses text/image input items,
+  records raw request/response bodies, per-turn `/health` and
+  `/admin/cache-stats` snapshots, process-memory JSON, and extracted output
+  tails for later human review.
+- Verification for the checkpoint: Python unit tests for media-boundary turn
+  planning and chat/responses request shapes pass 2/2; `python3 -m py_compile`
+  passes for the live sequence and route probes; focused Osaurus
+  `RuntimePolicySourceTests` passes 28/28. This is still harness readiness and
+  not a live model production-clear row.
+
 2026-05-17 20:25 PDT live refresh:
 
 - `gh pr list --repo osaurus-ai/osaurus --state all --limit 20` shows the
