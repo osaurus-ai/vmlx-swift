@@ -10,16 +10,31 @@ Fresh inspection commands used in this pass:
 
 ```sh
 gh pr list -R osaurus-ai/osaurus --author @me --state all --search "created:>=2026-04-24" --json number,title,state,url,headRefOid,updatedAt,mergedAt,closedAt,isDraft,mergeStateStatus --limit 100
+gh pr list --repo osaurus-ai/osaurus --state all --author @me --limit 60 --json number,title,state,isDraft,author,headRefName,baseRefName,updatedAt,createdAt,mergedAt,url
 gh pr view -R osaurus-ai/osaurus <pr> --json number,title,state,headRefOid,mergeCommit,commits,files
 git -C /Users/eric/osaurus-staging show HEAD:osaurus.xcworkspace/xcshareddata/swiftpm/Package.resolved
 gh api 'repos/osaurus-ai/{repo}/commits?since=2026-04-24T00:00:00Z&until=2026-05-18T23:59:59Z&per_page=100'
+gh api repos/osaurus-ai/{repo}/compare/{pin}...main
 ```
 
 Current `vmlx-swift` branch head at audit time:
 
 ```text
-6560879 fix(cache): preserve prompt tail in TurboQuant KV
+eb4cade docs(ling): refresh no-guard evidence
 ```
+
+2026-05-18 continuation refresh:
+
+- GitHub still reports Osaurus PR #1110 as open, non-draft, all checks green,
+  and `mergeStateStatus=DIRTY`; do not treat it as merged switch state.
+- Current `osaurus-staging` branch is `feat/dsv4-vmlx-pin` at
+  `b0a96dd4 Wire native DSV4 tokenizer bridge`, with local uncommitted Osaurus
+  edits present. Those local edits are not part of the pinned public PR state.
+- Fresh `vmlx-swift` evidence added after the first audit:
+  `20260518T_gemma4_e2b_refresh_no_fake_guards/` and
+  `20260518T_ling_jangtq2_no_guard_refresh/`. Both prove no hidden sampler
+  guard behavior; failures, where present, were harness/product-budget issues,
+  not decode fixes.
 
 ## Current Switch Verdict
 
@@ -46,10 +61,20 @@ promotion blockers:
 
 ## Osaurus PR Crosswalk
 
+The main crosswalk below focuses on the active 2026-04-24 and newer runtime
+pin window. Earlier April PRs still matter as lineage inputs, especially #917
+structured tool calls/thinking defaults, #878 Qwen 3.6/JANGTQ, #867
+template-driven reasoning detection, #863 runtime pin and lifecycle fixes, #799
+Gemma4 hybrid KV, #795 VLM classification/media persistence, and tool/document
+surface fixes in #827/#791/#779. Those older PRs are not counted as
+switch-ready by age or merge state; they are covered only when the corresponding
+row below has current `vmlx-swift` live proof.
+
 | PR | State | Runtime payload | Current `vmlx-swift` coverage | Remaining requirement |
 | --- | --- | --- | --- | --- |
 | #931 `fix(ci): bump vmlx-swift-lm pin to 5b84387` | merged | Early resolver pin movement. | Captured in `docs/VMLX_OSAURUS_PR_PIN_LINEAGE_2026_05_17.md`; later pins supersede this. | No standalone engine blocker; use as lineage only. |
 | #932 `feat: honor per-model generation_config.json sampling defaults` | merged | Bundle `generation_config.json` defaults must flow into local generation. | Current ledger rows report bundle defaults per family: e.g. MiniMax `temp=1.000 topP=0.950 topK=40 rep=nil`, Qwen `topK=20`, ZAYA `temp=0.600 topP=1.000 topK=0`, Laguna `temp=0.700 topP=0.900`. | Keep every new live row printing resolved defaults. Do not add hidden fallback penalties or top-k clamps when a model loops. |
+| #943 `feat: jang_config.json chat metadata + LFM false-thinking-block fix` | closed/unmerged | Early branch for chat metadata and false-thinking-block handling. | Superseded by #944 and later parser/no-hidden-reasoning rows. | Lineage only. Do not count #943 as shipped resolver state. |
 | #944 `feat: jang_config.json chat metadata + vmlx bump` | merged | `jang_config.json` chat metadata, DSV4/Kimi/LFM routing, reasoning capability metadata. | DSV4 template/metadata rows and the non-Kimi config/template sweep are current. Kimi is deliberately excluded by user direction. | LFM is not live-cleared by this matrix; if Osaurus exposes it, add a live multi-turn/cache row. |
 | #946 `feat(model-picker): Performance filter` | merged | UI filtering based on model performance/fit. | Engine docs now record speed/RSS caveats by family, especially DSV4, MiniMax, ZAYA, Qwen, Gemma4, and Omni. | Osaurus UI must consume these as explicit capability/performance metadata, not infer from name or size alone. |
 | #953 `fix(preflight): detect mislabeled JANGTQ bundles + vmlx fa77575 auto-correct` | merged | Mislabeled JANGTQ detection, sidecar/family preflight, streaming/event mapping. | Current ledger keeps tensor/sidecar evidence separate from model names. ZAYA/MiniMax/Qwen CRACK rows explicitly state non-MTP unless tensor evidence exists. | Add switch-PR resolver tests that reject name-only MTP/JANGTQ claims. |
@@ -67,22 +92,28 @@ promotion blockers:
 
 Current open Osaurus PR head (#1110) resolves:
 
-| Package | Revision | Commit fact | `vmlx-swift` requirement |
-| --- | --- | --- | --- |
-| `osaurus-ai/mlx-swift` | `0a56f904` | `2026-05-01 deps(mlx): advance submodule to 96aa27a5 (mx::malloc tracer for Bug 2)` | Compare behavior through local Cmlx/MLX checkout; package identity alone is not enough. |
-| `osaurus-ai/Jinja` | `58d21aa` | `2026-05-01 fix(parser): for-loop iterable accepts binary expressions` | Vendored Jinja fallback tests must keep binary iterable and `tojson(separators:)` behavior. |
-| `osaurus-ai/swift-transformers` | `087a66b` | `2026-05-11 fix(tokenizer): skip unused placeholders in delimiter regex` | Tokenizers must skip `<unusedN>` placeholders and preserve wrapper-token paths for MiniMax, DSV4, Qwen, and Omni. |
-| `osaurus-ai/vmlx-swift-lm` | `2cc64dd` | `2026-05-15 Wire native DSV4 chat encoder` | DSV4 native chat encoder/tokenizer bridge is part of the switch-readiness target, not yet fully released in `vmlx-swift` by a complete DSV4 gate. |
+| Package | Revision | Commit fact | Pin topology | `vmlx-swift` requirement |
+| --- | --- | --- | --- | --- |
+| `osaurus-ai/mlx-swift` | `0a56f904` | `2026-05-01 deps(mlx): advance submodule to 96aa27a5 (mx::malloc tracer for Bug 2)` | Diverged from default `main`: pin carries Osaurus stream/default-stream, wired-limit, evalLock removal, custom-kernel lifetime, and malloc-tracer work; default main also has unrelated doc/API changes not in the pin. | Compare behavior through local Cmlx/MLX checkout; package identity alone is not enough. Large-allocation tracing and stream behavior remain perf/debug surfaces for long-prompt and M5 speed gates. |
+| `osaurus-ai/Jinja` | `58d21aa` | `2026-05-01 fix(parser): for-loop iterable accepts binary expressions` | Identical to default `main` at refresh time. | Vendored Jinja fallback tests must keep binary iterable and `tojson(separators:)` behavior. |
+| `osaurus-ai/swift-transformers` | `087a66b` | `2026-05-11 fix(tokenizer): skip unused placeholders in delimiter regex` | Diverged from default `main`: pin carries `deps: use osaurus Jinja` plus unused-placeholder delimiter skip; default `main` carries later tokenizer speed work (MetaspaceDecoder, byte-level regex/table, Bert regex, Unigram O(N)). | Tokenizers must skip `<unusedN>` placeholders and preserve wrapper-token paths for MiniMax, DSV4, Qwen, and Omni. Later speed commits are performance-watch items unless the switch PR repins or vendors them. |
+| `osaurus-ai/vmlx-swift-lm` | `2cc64dd` | `2026-05-16 Wire native DSV4 chat encoder` | Pin is two commits ahead of default `main`: `c90898fb test(tooling): keep MiniMax stream open across chunks` and `2cc64dd Wire native DSV4 chat encoder`. | DSV4 native chat encoder/tokenizer bridge is part of the switch-readiness target, not yet fully released in `vmlx-swift` by a complete DSV4 gate. MiniMax streaming/open-chunk behavior must stay covered by the no-hidden-guard and chat-cache rows. |
 
-GitHub commit scan for `swift-transformers` also shows default-branch tokenizer
-speed work (`MetaspaceDecoder`, byte-level pre-tokenizer, Bert regex,
-SentencePiece O(N) improvements). Those are not the current Osaurus resolver
-pin unless the switch PR moves the pin or vendors equivalent code. Treat them
-as performance-watch items, not proven-current Osaurus runtime behavior.
+Recent dependency scan, 2026-05-04 through 2026-05-18:
 
-GitHub commit scan for `mlx-swift` returned no additional commits in the
-2026-04-24 to 2026-05-18 window beyond the pinned `0a56f904` fact checked
-directly above.
+- `vmlx-swift-lm` contains the bulk of recent runtime fixes: DSV4 SWA/CSA/HSA
+  correctness, DSV4 paged-incompatible disk restore, MiniMax template and
+  streaming fixes, Ling/Bailing hybrid cache handling, ZAYA CCA cache and
+  JANGTQ_K bit decoding, Omni live audio/RADIO/Parakeet/media-cache work, and
+  DSV4 native chat encoder/tokenizer bridge. `vmlx-swift` cannot be called a
+  complete replacement until the local ledger maps each of those families to
+  real multi-turn/cache/media proofs or an explicit blocker.
+- `swift-transformers` default-branch tokenizer speed work is not in #1110's
+  pinned runtime. It should be tracked as Osaurus-switch performance risk, not
+  cited as current proof.
+- `mlx-swift` pin is intentionally an Osaurus fork lane, not default upstream
+  `main`; stream/default-stream and malloc-tracer behavior are part of the
+  low-level performance/debug contract.
 
 ## Dependency Fixes Mapped To Engine Surfaces
 
@@ -91,10 +122,10 @@ directly above.
 | Jinja parser and compact tool JSON | DSV4/Kimi/Gemma4/ZAYA/Laguna tool templates render without broken syntax or bloated separators. | `docs/local/production-readiness/20260517T2200_jinja_pin_parity/` and parser/cache refresh rows. | Covered for non-Kimi; Kimi excluded by instruction. |
 | Swift-transformers unused placeholder skip | Added-token delimiter regex must not include thousands of unused placeholders and must preserve special wrapper tokens. | Vendored tokenizer static check plus MiniMax/DSV4/Qwen/Omni live template rows. | Covered for pinned behavior; later speed commits not yet part of Osaurus pin. |
 | Generation defaults | Bundle defaults are source of truth before explicit request override. | Ledger rows print temp/topP/topK/minP/rep per family. | Covered for tested rows; require same telemetry for new rows. |
-| Hybrid SSM / CCA / SWA cache | Cache proof must be topology-specific, not generic prefix-hit. | Qwen/Ling/ZAYA/Gemma4 rows record disk L2, SSM companion, CCA, SWA incompatibility, and media salt where applicable. | Covered for listed PASS rows; DSV4 long-context and ZAYA1-VL K remain open. |
+| Hybrid SSM / CCA / SWA cache | Cache proof must be topology-specific, not generic prefix-hit. | Qwen/Ling/ZAYA/Gemma4 rows record disk L2, SSM companion, CCA, SWA incompatibility, and media salt where applicable. Fresh Gemma E2B refresh records disk hits/stores plus VL media-salt restore; fresh Ling no-guard refresh confirms Bailing template/decode stress without fake sampler fixes. | Covered for listed PASS rows; DSV4 long-context and ZAYA1-VL K remain open. |
 | TurboQuant KV | Explicit TQ mode must preserve coherency and prove actual compression. | `20260518T_minimax_m27_jangtqk_tq_tail_fix_exact/` proves actual TQ transitions and exact outputs after tail preservation. | Fixed for MiniMax strict row; keep family-by-family gates. |
 | VL/media salt | Image/video/audio state must be isolated across turns and cache hits. | Qwen, ZAYA1-VL, Gemma4, and Omni rows prove same/different media behavior where implemented. | Raw Qwen high-res video and repeated Omni cache-on audio remain open. |
-| Reasoning on/off | No fake close; reasoning off must affect template/runtime where supported, and visible output must remain coherent. | Gemma4 reasoning matrix, MiniMax rows, DSV4 reasoning kwargs, Ling/Bailing aliases. | Covered for tested families; package-wide model matrix still open for absent local bundles. |
+| Reasoning on/off | No fake close; reasoning off must affect template/runtime where supported, and visible output must remain coherent. | Gemma4 reasoning matrix, MiniMax rows, DSV4 reasoning kwargs, Ling/Bailing aliases. Fresh Gemma E2B no-guard red/green pair proves the harness now accepts coherent stellar equivalents instead of forcing decode behavior; fresh Ling row proves the Russian stress prompt with `temp=0.7` stops normally. | Covered for tested families; package-wide model matrix still open for absent local bundles. |
 | MTP autodetect | Only real tensor evidence may enable MTP; model names and stale metadata are insufficient. | Non-Kimi MTP census and Qwen MTP settings docs; CRACK rows explicitly stay MTP off. | Correct policy documented; full MTP speed target remains separate/open. |
 
 ## Production-Quality Checklist Still Required
