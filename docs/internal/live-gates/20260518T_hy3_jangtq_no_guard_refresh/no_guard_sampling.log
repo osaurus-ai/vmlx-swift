@@ -1,0 +1,30 @@
+[0/1] Planning build
+Building for production...
+[0/2] Write swift-version--1AB21518FC5DEDBE.txt
+Build of product 'RunBench' complete! (2.27s)
+[STDERR] Bench main() started
+
+=== BENCH_NO_GUARD_SAMPLING — Hy3-preview-JANGTQ ===
+[Load] JANG shape walk produced 402 per-layer quant override(s) over default (bits=8, gs=64)
+Load: 33.20s  Model: Hy3Model
+Tool format: hunyuan
+Reasoning stamp: qwen3
+Tokenizer BOS: <｜hy_begin▁of▁sentence｜>
+
+--- A_hi_greedy_no_rep ---
+Prompt tokens: 17
+Prompt tail: "<｜hy_begin▁of▁sentence｜><｜reasoning_mode｜>reasoning_effort:no_think<｜hy_User｜>say hi<｜hy_Assistant｜><think></think>"
+Sampling: maxTokens=96 temp=0.000 topP=1.000 topK=0 minP=0.000 rep=nil enable_thinking=omitted
+Result: stop=stop unclosedReasoning=NO genTokens=12 genSec=0.515 tokps=23.3 ttft_ms=70544 textChars=37 reasoningChars=0 tools=0 loop=NO bosRepeats=0 leaks=none
+First 400 visible: "Hi there! 👋 How can I help you today?"
+Last 200 visible: "Hi there! 👋 How can I help you today?"
+
+--- B_star_story_temp06_rep1_think_on ---
+Prompt tokens: 26
+Prompt tail: "<｜hy_begin▁of▁sentence｜><｜reasoning_mode｜>reasoning_effort:no_think<｜hy_User｜>tell me a 2-sentence story about a star<｜hy_Assistant｜><think></think>"
+Sampling: maxTokens=256 temp=0.600 topP=1.000 topK=0 minP=0.000 rep=1.000 enable_thinking=true
+Result: stop=stop unclosedReasoning=NO genTokens=44 genSec=1.904 tokps=23.1 ttft_ms=422 textChars=188 reasoningChars=0 tools=0 loop=NO bosRepeats=0 leaks=none
+First 400 visible: "The old star flickered for the last time, casting a final golden glow across the silent nebula. In that fleeting moment, it birthed a new world, hidden within the dust of its own collapse."
+Last 200 visible: "The old star flickered for the last time, casting a final golden glow across the silent nebula. In that fleeting moment, it birthed a new world, hidden within the dust of its own collapse."
+
+=== BENCH_NO_GUARD_SAMPLING: passed ===

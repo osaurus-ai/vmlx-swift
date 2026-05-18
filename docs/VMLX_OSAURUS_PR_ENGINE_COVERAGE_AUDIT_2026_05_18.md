@@ -1224,6 +1224,25 @@ Recent dependency scan, 2026-05-04 through 2026-05-18:
   not production-clear Ling or Hy3 in Osaurus until app/API long-output,
   cache/SSM, memory, route, and saved-setting carryover artifacts are attached.
 
+2026-05-18 16:12 PDT Hy3 no-guard and native reasoning refresh:
+
+- vmlx runtime proof lives in
+  `docs/internal/live-gates/20260518T_hy3_jangtq_no_guard_refresh/`.
+  `BENCH_NO_GUARD_SAMPLING=1` loaded
+  `/Users/eric/models/JANGQ/Hy3-preview-JANGTQ` as `Hy3Model`, then passed
+  greedy no-repetition and `rep=1.0` rows with no loop, BOS repetition, marker
+  leak, or empty visible output.
+- The no-guard artifact also exposed an important contract boundary: generic
+  `enable_thinking=true` is not Hy3's native reasoning control. The rendered
+  prompt tail stayed at `reasoning_effort:no_think`, so Osaurus must keep Hy3
+  on the native `reasoning_effort` mapping rather than treating it like Qwen.
+- `BENCH_REASONING_TURN_MATRIX=1` then proved the live multi-turn path:
+  saved/recalled `copper-lantern`, answered sky color and math, native
+  `reasoning_effort=low/high` routed reasoning deltas without marker leaks, and
+  every row stopped normally. Cache stats recorded paged misses plus disk L2
+  hit/store counters. This is still vmlx proof only; Osaurus app/API route,
+  UI, cache, memory, tool-result, and saved-setting artifacts remain open.
+
 ## Osaurus PR #1147 Function-Level Gate
 
 The Osaurus package-switch PR now carries an F1-F12 live checklist in

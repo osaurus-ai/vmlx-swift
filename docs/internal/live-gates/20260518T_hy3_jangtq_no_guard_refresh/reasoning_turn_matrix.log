@@ -1,0 +1,24 @@
+[0/1] Planning build
+Building for production...
+[0/2] Write swift-version--1AB21518FC5DEDBE.txt
+Build of product 'RunBench' complete! (2.47s)
+[STDERR] Bench main() started
+
+=== BENCH_REASONING_TURN_MATRIX — Hy3-preview-JANGTQ ===
+Cache dir: /tmp/vmlx-reasoning-turn-matrix/Hy3-preview-JANGTQ
+[Load] JANG shape walk produced 402 per-layer quant override(s) over default (bits=8, gs=64)
+Load: 32.20s  Model: Hy3Model  RSS +6414 MiB
+Reasoning stamp: qwen3
+Tool format: hunyuan
+Sampling: maxTokens=256 temp=0.900 topP=1.000 topK=-1 minP=0.000 rep=nil seed=nil
+Reasoning prompt toggle: not-template-active onTail="oning_effort:no_think<｜hy_User｜>Probe reasoning template routing.<｜hy_Assistant｜><think></think>" offTail="oning_effort:no_think<｜hy_User｜>Probe reasoning template routing.<｜hy_Assistant｜><think></think>"
+TURN label=turn1-off-save thinking=false effort=nil prompt=44 completion=1 ttft=62873ms wall=62.90s tokps=22.71 stop=stop unclosedReasoning=false textChars=5 reasoningChars=0 sample="saved"
+TURN label=turn2-on-recall thinking=true effort=nil prompt=66 completion=5 ttft=778ms wall=0.95s tokps=22.99 stop=stop unclosedReasoning=false textChars=14 reasoningChars=0 sample="copper-lantern"
+TURN label=turn3-off-after-reasoning thinking=false effort=nil prompt=87 completion=1 ttft=712ms wall=0.75s tokps=22.88 stop=stop unclosedReasoning=false textChars=4 reasoningChars=0 sample="blue"
+TURN label=turn4-on-math-max thinking=true effort=max prompt=106 completion=1 ttft=1077ms wall=1.12s tokps=22.57 stop=stop unclosedReasoning=false textChars=2 reasoningChars=0 sample="20"
+TURN label=effort-low thinking=true effort=low prompt=22 completion=381 ttft=391ms wall=16.93s tokps=22.99 stop=stop unclosedReasoning=false textChars=126 reasoningChars=1862 sample="Cache boundaries matter because they define the limits of fast memory access, impacting system performance and data coherence."
+TURN label=effort-medium thinking=true effort=medium prompt=25 completion=18 ttft=378ms wall=1.14s tokps=23.17 stop=stop unclosedReasoning=false textChars=114 reasoningChars=0 sample="Cache boundaries matter because they define the performance gap between fast local access and slow remote fetches."
+TURN label=effort-high thinking=true effort=high prompt=22 completion=323 ttft=404ms wall=55.32s tokps=5.89 stop=stop unclosedReasoning=false textChars=111 reasoningChars=1622 sample="Cache boundaries matter because they define the scope of data coherence and performance between storage layers."
+TURN label=effort-max thinking=true effort=max prompt=25 completion=15 ttft=439ms wall=1.13s tokps=20.80 stop=stop unclosedReasoning=false textChars=97 reasoningChars=0 sample="Cache boundaries matter because they prevent stale or inconsistent data reads when updates occur."
+REASONING_CACHE_STATS hybrid=false pagedIncompatible=false paged{hits=0,misses=8,allocated=0,free=511,evictions=0} disk{hits=1,misses=36,stores=24,maxBytes=4294967296} ssm{hits=0,misses=0,reDerives=0}
+=== BENCH_REASONING_TURN_MATRIX: PASS ===
