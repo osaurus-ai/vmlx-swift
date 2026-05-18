@@ -88,7 +88,7 @@ Focused fix artifacts live under `docs/local/swift-release-gates/dsv4-fixes/`.
 | `JANGQ/DeepSeek-V4-Flash-JANGTQ2` | `deepseek_v4` / `DeepseekV4JANGTQModel` | `PARTIAL` | Current non-Kimi DSV4 artifact proves the prompt-boundary root cause and fix. Pre-fix, the system string glued to `<User>` and live chat drifted into `sappberry-42`; post-fix the standalone Jinja, compiled fallback, and Swift encoder all insert a newline separator, with 13/13 focused tests passing. Live cache OFF and cache ON 3-turn chat is coherent with `rep=1.0`, no raw `<think>` leakage, normal `.stop`, and visible tok/s. `BENCH_PROD` passes 7/7 using bundle defaults (`temp=1.000 topP=1.000 topK=0 rep=nil`) and shows reasoning on/off routing through `.reasoning` vs visible chunks. | Not low-footprint production-cleared: production row reports about 61.5 GiB peak RSS. DSV4 is `pagedIncompatible=true`; generic paged prefix hit is explicitly `N-A`, while disk L2 stats show `hits=1,misses=19,stores=14`. Long-context/vector drift, API routes, sleep/wake, and speed matrix remain open. |
 | `JANGQ/DeepSeek-V4-Flash-JANGTQ-K` | `deepseek_v4` / `DeepseekV4JANGTQModel` | `PARTIAL` | Current post-fix 3-turn chat row passes on the second DSV4 bundle with the corrected system/User separator, visible `sapphire-42` recall, coherent follow-up, no raw reasoning leakage, `.stop`, and tok/s. Template kwargs for thinking off/on/max pass. | Needs the same bundle-default production/cache-stat/speed/long-context/API matrix as JANGTQ2 before promotion. The old pre-fix exact gate failed with `sappium-42`, so do not promote stale DSV4 evidence. |
 | `JANGQ/ZAYA1-8B-JANGTQ4` | `zaya` / `ZayaModel` | `PASS` | Fresh current turnmatrix passes config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Bundle defaults apply as `temp=0.600 topP=1.000 topK=0 rep=nil`; reasoning ON/OFF flips produce visible answers, cache-on speed is about `64.7-66.3 tok/s`, peak RSS is about `5.1 GiB`, disk L2 has hits/stores, and SSM companion hits are recorded. | Generic paged prefix hit is `N-A` by topology because ZAYA CCA is path-dependent and disk/SSM-backed. |
-| `JANGQ/ZAYA1-8B-JANGTQ_K` | `zaya` / `ZayaModel` | `PASS / NEEDS CURRENT RE-RUN` | Historical K evidence: release turnmatrix passes config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Bundle defaults apply, reasoning ON/OFF flips produce visible answers, disk L2 and SSM hits are recorded, and release decode is about 64-66 tok/s. | Needs a current all-non-Kimi matrix re-run before Osaurus promotion. Generic paged prefix hit remains `N-A` by topology. |
+| `JANGQ/ZAYA1-8B-JANGTQ_K` | `zaya` / `ZayaModel` | `PASS` | Fresh current turnmatrix `20260518T001613Z_zaya_jangtqk_current_turnmatrix/` passes config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2. Bundle defaults apply as `temp=0.600 topP=1.000 topK=0 rep=nil`; reasoning ON/OFF flips produce visible answers with zero reasoning on OFF rows; cache-on speed is about `61-63 tok/s`, peak RSS is about `3.8 GiB`, disk L2 has hits/stores, and SSM companion hits are recorded. | Generic paged prefix hit is `N-A` by topology because ZAYA CCA is path-dependent and disk/SSM-backed. Config still warns that tokenizer EOS `106` is not in effective EOS `[1]`; keep this visible and do not paper over it with a sampler guard. |
 | `dealign.ai/Qwen3.6-27B-MXFP4-CRACK` | `qwen3_5` / `Qwen35` | `PASS / HIGH-RES VIDEO WATCH` | Fresh current turnmatrix `20260517T_qwen36_27b_mxfp4_crack_video_resize_postfix_turnmatrix/` passes config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2, VL batch chat, structured VL chat cache, media-salt isolation, and mixed text/image/video. Bundle defaults apply as `temp=1.000 topP=0.950 topK=20 minP=0.000 rep=nil`; MTP depth is `off`; reasoning ON/OFF closes with visible answers at a 2048-token budget; same-media image cache hits disk `99/99`; video passes with explicit `BENCH_VL_VIDEO_RESIZE=224` and `video pixels shape: [560, 1536]`. | Raw 1080p video is not production-cleared. The preserved pre-fix artifact peaked at 164.2 GiB physical footprint in MLX/Metal allocation before termination. Osaurus needs an explicit Qwen video media resize/token-budget setting; do not auto-enable MTP on this CRACK bundle. |
 | `dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` | `qwen3_5` / `Qwen35` | `PASS / HIGH-RES VIDEO WATCH` | Fresh current turnmatrix `20260518T000445Z_qwen36_27b_jang4m_crack_turnmatrix/` passes config/template, production defaults cache OFF/ON, BatchEngine single/chat/disk restore/concurrent/per-slot/TurboQuant B=2, VL batch chat, structured VL chat cache, media-salt isolation, and mixed text/image/video. Bundle defaults apply as `temp=1.000 topP=0.950 topK=20 minP=0.000 rep=nil`; MTP depth is `off`; production decode is about `28 tok/s`; peak RSS is about `14.4 GiB` cache-off and `15.5 GiB` cache-on; same-media image cache hits disk `99/99`; bounded video passes with `BENCH_VL_VIDEO_RESIZE=224` and `video pixels shape: [560, 1536]`. | Raw high-resolution video remains unproven, and this CRACK bundle must not auto-enable native MTP without tensor evidence. Generic paged cache hit is `N-A` by Qwen hybrid topology; disk L2 and SSM companion stats are the cache proof. |
 | `JANGQ/MiniMax-M2.7-Small-JANGTQ` | `minimax_m2` / `MiniMaxJANGTQModel` | `PARTIAL` | Loads in 9.7s; 3-turn chat is coherent; no loop; TQ disk round-trip passes; decode around 30.6 tok/s; tracked mmap buffers about 37 GB. | Thinking-on probe produced 483 chars reasoning and no visible answer. Activity Monitor-style footprint reaches about 38.2 GB, so this is not a low-RAM active-streaming pass. |
@@ -262,14 +262,14 @@ weights.
 
 ### ZAYA Text
 
-- Local bundles: JANGTQ4, JANGTQ_K, MXFP4. JANGTQ_K needs a current
-  all-non-Kimi re-run before Osaurus promotion.
+- Local bundles: JANGTQ4, JANGTQ_K, MXFP4. JANGTQ_K now has a current
+  all-non-Kimi turnmatrix artifact.
 - Swift dispatch: `zaya` through `ZayaModel`.
 - Cache topology: ZAYA CCA alternates `ZayaCCACache` with normal KV cache;
   BatchEngine has `BatchZayaCCACache`; disk serializer supports `zayaCCA`.
 - JANGTQ/TurboQuant: sidecar present on JANGQ bundles; release rows prove
-  TurboQuant-KV B=2 isolation for active JANGTQ4/MXFP4 rows. JANGTQ_K evidence
-  is historical.
+  TurboQuant-KV B=2 isolation for active JANGTQ4/MXFP4 rows, and the current
+  JANGTQ_K turnmatrix proves the same implemented B=2 isolation row.
 - Template/reasoning/tools: template smoke passes; tool parser is ZAYA XML;
   reasoning parser is ZAYA/think-XML style.
 - Live proof:
@@ -283,12 +283,14 @@ weights.
   companion hits are recorded, and generic paged cache is `N-A`.
   `docs/local/live-model-matrix/20260517T_release_turnmatrix_zaya_scope/`
   also passes the prior active text release turnmatrix for JANGTQ4 and MXFP4;
-  JANGTQ_K rows in that artifact are historical:
+  `docs/local/live-model-matrix/20260518T001613Z_zaya_jangtqk_current_turnmatrix/`
+  freshly passes the JANGTQ_K text turnmatrix under the current scope:
   config/template, production defaults cache OFF/ON, BatchEngine single/chat,
   disk restore, B=2 concurrent, B=2 per-slot sampler, and TurboQuant-KV B=2.
   Bundle defaults apply (`temp=0.600`, `topP=1.000`, `topK=0`, `rep=nil`),
-  reasoning ON/OFF flips produce visible answers, disk L2 and SSM hits are
-  recorded, and release speed rows are about 64-66 tok/s.
+  reasoning ON/OFF flips produce visible answers, cache-on speed is about
+  61-63 tok/s, peak RSS is about 3.8 GiB, disk L2 and SSM hits are recorded,
+  and generic paged cache is `N-A`.
 - Current issue: generic paged prefix hit is `N-A` because ZAYA is
   paged-incompatible and uses disk-backed restore. Do not advertise generic
   paged hits for this topology.
