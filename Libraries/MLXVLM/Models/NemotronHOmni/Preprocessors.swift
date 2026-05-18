@@ -153,32 +153,89 @@ public func nemotronOmniDynamicPreprocess(
 
 /// Render a CIImage tile (sized imageSize×imageSize) into a planar
 /// (3, imageSize, imageSize) Float32 array, normalized by CLIP mean/std.
-private func rasterizeTile(
+private func rasterizeImage(
     _ tile: CIImage,
-    imageSize: Int,
+    width: Int,
+    height: Int,
     mean: [Float], std: [Float]
 ) -> MLXArray {
     // Render to RGBA Float32 bitmap.
-    let bytesPerRow = imageSize * 4 * MemoryLayout<Float>.size
-    var data = Data(count: imageSize * imageSize * 4 * MemoryLayout<Float>.size)
+    let bytesPerRow = width * 4 * MemoryLayout<Float>.size
+    var data = Data(count: width * height * 4 * MemoryLayout<Float>.size)
     data.withUnsafeMutableBytes { ptr in
         imagePreprocessContext.render(
             tile,
             toBitmap: ptr.baseAddress!,
             rowBytes: bytesPerRow,
-            bounds: CGRect(x: 0, y: 0, width: imageSize, height: imageSize),
+            bounds: CGRect(x: 0, y: 0, width: width, height: height),
             format: .RGBAf,
             colorSpace: nil)
     }
 
     // Build (H, W, 4) array, drop alpha → (H, W, 3), normalize, transpose to (3, H, W)
-    var arr = MLXArray(data, [imageSize, imageSize, 4], type: Float32.self)
+    var arr = MLXArray(data, [height, width, 4], type: Float32.self)
     arr = arr[0..., 0..., ..<3] // (H, W, 3)
     let meanT = MLXArray(mean).reshaped([1, 1, 3])
     let stdT = MLXArray(std).reshaped([1, 1, 3])
     arr = (arr - meanT) / stdT
     // (H, W, 3) → (3, H, W)
     return arr.transposed(2, 0, 1)
+}
+
+private func pythonRoundToInt(_ value: Double) -> Int {
+    let floorValue = floor(value)
+    let fraction = value - floorValue
+    if fraction < 0.5 { return Int(floorValue) }
+    if fraction > 0.5 { return Int(floorValue) + 1 }
+    let base = Int(floorValue)
+    return base.isMultiple(of: 2) ? base : base + 1
+}
+
+private func nemotronOmniSourceTargetPatches(
+    image: CIImage,
+    tokensAvailable: Int,
+    minNumPatches: Int,
+    patchSize: Int,
+    downsampleFactor: Int
+) -> (widthPatches: Int, heightPatches: Int) {
+    let extent = image.extent
+    let origW = max(1, Int(extent.width.rounded()))
+    let origH = max(1, Int(extent.height.rounded()))
+    let closestPatchH = pythonRoundToInt(Double(origH) / Double(patchSize) + 0.5)
+    let closestPatchW = pythonRoundToInt(Double(origW) / Double(patchSize) + 0.5)
+    let patches = max(1, closestPatchH * closestPatchW)
+
+    let factor = min(sqrt(Double(tokensAvailable) / Double(patches)), 1.0)
+    var targetH = max(1, Int(floor(factor * Double(closestPatchH))))
+    var targetW = max(1, Int(floor(factor * Double(closestPatchW))))
+
+    if tokensAvailable > minNumPatches, targetH * targetW < minNumPatches {
+        let up = sqrt(Double(minNumPatches) / Double(max(1, targetH * targetW)))
+        targetH = max(1, Int(ceil(up * Double(targetH))))
+        targetW = max(1, Int(ceil(up * Double(targetW))))
+    }
+
+    let divisor = max(1, downsampleFactor)
+    let remH = targetH % divisor
+    if remH != 0 {
+        let incH = divisor - remH
+        if (targetH + incH) * targetW <= tokensAvailable {
+            targetH += incH
+        } else {
+            targetH = max(divisor, targetH - remH)
+        }
+    }
+    let remW = targetW % divisor
+    if remW != 0 {
+        let incW = divisor - remW
+        if targetH * (targetW + incW) <= tokensAvailable {
+            targetW += incW
+        } else {
+            targetW = max(divisor, targetW - remW)
+        }
+    }
+
+    return (targetW, targetH)
 }
 
 /// Process one or more CIImages into model-ready tile pixel values.
@@ -188,29 +245,55 @@ private func rasterizeTile(
 public func nemotronOmniPreprocessImages(
     _ images: [CIImage],
     imageSize: Int = 512,
-    minNum: Int = 1,
-    maxNum: Int = 12,
-    useThumbnail: Bool = true
-) -> (pixelValues: MLXArray, tileCounts: [Int]) {
-    var allTiles: [MLXArray] = []
-    var counts: [Int] = []
+    minNum: Int = 1024,
+    maxNum: Int = 13312,
+    useThumbnail _: Bool = false,
+    patchSize: Int = 16,
+    downsampleRatio: Float = 0.5,
+    maxModelLen: Int = 16384
+) throws -> (pixelValues: MLXArray, tokenCounts: [Int]) {
+    var allImages: [MLXArray] = []
+    var tokenCounts: [Int] = []
+    let downsampleFactor = max(1, Int(round(1.0 / Double(downsampleRatio))))
+    let rawBudget = max(0, maxModelLen - 4) * downsampleFactor * downsampleFactor
+    let budget = max(rawBudget, minNum * max(1, images.count))
+    let maxBudget = maxNum > 0 ? maxNum : Int.max
+    let tokensAvailable = max(min(budget, maxBudget), minNum)
+
     for img in images {
-        let tiles = nemotronOmniDynamicPreprocess(
-            img, imageSize: imageSize,
-            minNum: minNum, maxNum: maxNum,
-            useThumbnail: useThumbnail)
-        for t in tiles {
-            allTiles.append(rasterizeTile(
-                t, imageSize: imageSize,
-                mean: NEMOTRON_OMNI_CLIP_MEAN, std: NEMOTRON_OMNI_CLIP_STD))
-        }
-        counts.append(tiles.count)
+        let target = nemotronOmniSourceTargetPatches(
+            image: img,
+            tokensAvailable: tokensAvailable,
+            minNumPatches: minNum,
+            patchSize: patchSize,
+            downsampleFactor: downsampleFactor)
+        let targetW = target.widthPatches * patchSize
+        let targetH = target.heightPatches * patchSize
+        let resized = MediaProcessing.resampleBicubic(
+            MediaProcessing.inSRGBToneCurveSpace(img),
+            to: CGSize(width: targetW, height: targetH))
+        allImages.append(rasterizeImage(
+            resized,
+            width: targetW,
+            height: targetH,
+            mean: NEMOTRON_OMNI_CLIP_MEAN,
+            std: NEMOTRON_OMNI_CLIP_STD))
+        tokenCounts.append(
+            (target.widthPatches * target.heightPatches)
+                / (downsampleFactor * downsampleFactor))
     }
-    if allTiles.isEmpty {
+    if allImages.isEmpty {
         return (MLXArray.zeros([0, 3, imageSize, imageSize]), [])
     }
-    let stacked = MLX.stacked(allTiles, axis: 0) // (N, 3, H, W)
-    return (stacked, counts)
+    let referenceShape = allImages[0].shape
+    guard allImages.allSatisfy({ $0.shape == referenceShape }) else {
+        throw NSError(
+            domain: "NemotronHOmni", code: -12,
+            userInfo: [NSLocalizedDescriptionKey:
+                "Nemotron Omni image batches with mixed dynamic resolutions are not yet supported"])
+    }
+    let stacked = MLX.stacked(allImages, axis: 0) // (N, 3, H, W)
+    return (stacked, tokenCounts)
 }
 
 // MARK: - Audio preprocessing (parakeet mel STFT)

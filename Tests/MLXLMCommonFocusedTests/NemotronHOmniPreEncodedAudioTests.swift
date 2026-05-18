@@ -323,6 +323,49 @@ struct NemotronHOmniPreEncodedAudioTests {
         }
     }
 
+    @Test("image preprocessing keeps both red and blue gradient endpoints")
+    func imagePreprocessingKeepsGradientEndpoints() throws {
+        try FocusedMLXTestSupport.withLock {
+            let image = try Self.syntheticRedBlueGradient(side: 224)
+            let (pixels, counts) = try nemotronOmniPreprocessImages([image])
+
+            #expect(counts == [256])
+            #expect(pixels.shape == [1, 3, 512, 512])
+
+            let values = pixels.asArray(Float.self)
+            let plane = 512 * 512
+            func channel(_ c: Int, _ y: Int, _ x: Int) -> Float {
+                values[c * plane + y * 512 + x]
+            }
+            func denormalize(_ value: Float, channel c: Int) -> Float {
+                value * NEMOTRON_OMNI_CLIP_STD[c] + NEMOTRON_OMNI_CLIP_MEAN[c]
+            }
+
+            let edgeA = (
+                r: denormalize(channel(0, 8, 256), channel: 0),
+                b: denormalize(channel(2, 8, 256), channel: 2))
+            let edgeB = (
+                r: denormalize(channel(0, 503, 256), channel: 0),
+                b: denormalize(channel(2, 503, 256), channel: 2))
+
+            let hasRedDominantEdge = edgeA.r > edgeA.b + 0.4 || edgeB.r > edgeB.b + 0.4
+            let hasBlueDominantEdge = edgeA.b > edgeA.r + 0.4 || edgeB.b > edgeB.r + 0.4
+            #expect(hasRedDominantEdge)
+            #expect(hasBlueDominantEdge)
+        }
+    }
+
+    @Test("image preprocessing follows source dynamic-resolution token count")
+    func imagePreprocessingFollowsSourceDynamicResolution() throws {
+        try FocusedMLXTestSupport.withLock {
+            let image = Self.syntheticSolidImage(width: 224, height: 448)
+            let (pixels, counts) = try nemotronOmniPreprocessImages([image])
+
+            #expect(counts == [276])
+            #expect(pixels.shape == [1, 3, 736, 384])
+        }
+    }
+
     @Test("video EVS count matches LMInput placeholder contract")
     func videoEVSCountMatchesSourceTokenCount() {
         FocusedMLXTestSupport.withLock {
@@ -342,6 +385,47 @@ struct NemotronHOmniPreEncodedAudioTests {
                 embeddingTokenCount: 1228)
             #expect(video.embeddingTokenCount == 1228)
         }
+    }
+
+    private static func syntheticRedBlueGradient(side: Int) throws -> CIImage {
+        var bytes = [UInt8](repeating: 0, count: side * side * 4)
+        for y in 0 ..< side {
+            let r = UInt8(255 - (255 * y) / max(side - 1, 1))
+            let b = UInt8((255 * y) / max(side - 1, 1))
+            for x in 0 ..< side {
+                let off = (y * side + x) * 4
+                bytes[off + 0] = r
+                bytes[off + 1] = 64
+                bytes[off + 2] = b
+                bytes[off + 3] = 255
+            }
+        }
+        let image = CIImage(
+            bitmapData: Data(bytes),
+            bytesPerRow: side * 4,
+            size: CGSize(width: side, height: side),
+            format: .RGBA8,
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+        return image
+    }
+
+    private static func syntheticSolidImage(width: Int, height: Int) -> CIImage {
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        for y in 0 ..< height {
+            for x in 0 ..< width {
+                let off = (y * width + x) * 4
+                bytes[off + 0] = 180
+                bytes[off + 1] = 64
+                bytes[off + 2] = 32
+                bytes[off + 3] = 255
+            }
+        }
+        return CIImage(
+            bitmapData: Data(bytes),
+            bytesPerRow: width * 4,
+            size: CGSize(width: width, height: height),
+            format: .RGBA8,
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
     }
 
     @Test("RADIO pixel shuffle preserves expected downsample shape")

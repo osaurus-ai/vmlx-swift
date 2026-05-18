@@ -165,6 +165,29 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   `omni_max128_seed0_after_temp_filter_fix.out` still reports `14 passed, 4
   failed`, with image follow-up and audio media-salt loops still visible, so
   the sampler fix does not close the media blocker.
+- Nemotron Omni image preprocessing now follows the V3 dynamic-resolution
+  image-token contract instead of the old NVLM square-tile contract. Swift now
+  reads `min_num_patches`, `max_num_patches`, `max_model_len`, `patch_size`,
+  and `downsample_ratio`, computes the source-style per-image target patch
+  grid, treats processor counts as final post-shuffle image-token counts, and
+  reshapes RADIO outputs from the actual pixel tensor grid instead of assuming
+  a square `sqrt(P)` grid. Focused proof:
+  `swift test --filter NemotronHOmniPreEncodedAudioTests --jobs 2` passes 12/12
+  including square `256`-token and non-square `276`-token image rows; release
+  `swift build -c release --product RunBench --jobs 2` passes. Live proof:
+  `docs/local/live-model-matrix/20260518T_omni_dynamic_image_final_recheck/jangtq_seed0_strict.out`
+  reports `15 passed, 4 failed`; the primary image single-turn row now grounds
+  the synthetic orange-to-blue gradient. Remaining failures are still
+  no-thinking direct image, no-thinking tail variants, image follow-up looping
+  in both cold and cached paths, and BatchEngine image B=1. No sampler,
+  repetition-penalty, EOS, top-k, or hidden prompt guard was added.
+- Rejected Nemotron Omni hypothesis: replacing the CoreImage resize with the
+  existing MLX/PyTorch-style bicubic interpolation kernel was tested and
+  reverted because it worsened live coherency. Artifact:
+  `docs/local/live-model-matrix/20260518T_omni_torch_bicubic_afterfix/jangtq_seed0_strict.out`
+  still reports `15 passed, 4 failed` but regresses the primary image
+  single-turn and structured image T1 rows. Keep the dynamic-resolution/token
+  count fix; do not reintroduce the resize-kernel change without new evidence.
 - Release-mode Swift Testing initially failed before focused MLXLM tests because
   `MLXTests/WiredMemoryTests.swift` referenced DEBUG-only wired-memory event
   helpers. The tests are now explicitly DEBUG-gated with a release skip, keeping

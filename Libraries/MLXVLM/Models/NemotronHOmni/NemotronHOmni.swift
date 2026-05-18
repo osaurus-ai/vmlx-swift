@@ -301,14 +301,19 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         var feats = radioModel(pixelValues, video: video)
         // Strip cls/register tokens (first numClsTokens)
         feats = feats[0..., config.visionNumClsTokens..., 0...]
-        // Reshape (N, P, D) → (N, h, w, D) where h=w=sqrt(P)
+        // Reshape (N, P, D) → (N, h, w, D) using the dynamic-resolution
+        // patch grid from the actual pixel tensor. The source processor can
+        // emit non-square images (for example 736x384), so sqrt(P) is not a
+        // valid production contract.
         let N = feats.dim(0)
         let P = feats.dim(1)
         let D = feats.dim(2)
-        let side = Int(Double(P).squareRoot())
-        precondition(side * side == P,
-                     "RADIO patch count must be a perfect square; got P=\(P)")
-        feats = feats.reshaped([N, side, side, D])
+        let gridH = pixelValues.dim(2) / config.visionPatchSize
+        let gridW = pixelValues.dim(3) / config.visionPatchSize
+        precondition(
+            gridH * gridW == P,
+            "RADIO patch count \(P) does not match pixel grid \(gridH)x\(gridW)")
+        feats = feats.reshaped([N, gridH, gridW, D])
         // Pixel shuffle (scale = 0.5)
         feats = nemotronOmniPixelShuffle(feats, scaleFactor: config.downsampleRatio)
         // Flatten spatial dims → (N, tokens, post_shuffle_dim)
@@ -495,16 +500,22 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
 public struct NemotronHOmniProcessorConfiguration: Codable, Sendable {
     public let processorClass: String?
     public let imageSize: Int
-    public let minNumTiles: Int
-    public let maxNumTiles: Int
+    public let minNumPatches: Int
+    public let maxNumPatches: Int
+    public let maxModelLen: Int
+    public let patchSize: Int
+    public let downsampleRatio: Float
     public let useThumbnail: Bool
     public let videoPruningRate: Float
 
     public init() {
         self.processorClass = nil
         self.imageSize = 512
-        self.minNumTiles = 1
-        self.maxNumTiles = 12
+        self.minNumPatches = 1024
+        self.maxNumPatches = 13312
+        self.maxModelLen = 16384
+        self.patchSize = 16
+        self.downsampleRatio = 0.5
         self.useThumbnail = true
         self.videoPruningRate = 0.7
     }
@@ -513,8 +524,11 @@ public struct NemotronHOmniProcessorConfiguration: Codable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.processorClass = try c.decodeIfPresent(String.self, forKey: .processorClass)
         self.imageSize = try c.decodeIfPresent(Int.self, forKey: .imageSize) ?? 512
-        self.minNumTiles = try c.decodeIfPresent(Int.self, forKey: .minNumTiles) ?? 1
-        self.maxNumTiles = try c.decodeIfPresent(Int.self, forKey: .maxNumTiles) ?? 12
+        self.minNumPatches = try c.decodeIfPresent(Int.self, forKey: .minNumPatches) ?? 1024
+        self.maxNumPatches = try c.decodeIfPresent(Int.self, forKey: .maxNumPatches) ?? 13312
+        self.maxModelLen = try c.decodeIfPresent(Int.self, forKey: .maxModelLen) ?? 16384
+        self.patchSize = try c.decodeIfPresent(Int.self, forKey: .patchSize) ?? 16
+        self.downsampleRatio = try c.decodeIfPresent(Float.self, forKey: .downsampleRatio) ?? 0.5
         self.useThumbnail = try c.decodeIfPresent(Bool.self, forKey: .useThumbnail) ?? true
         self.videoPruningRate = try c.decodeIfPresent(Float.self, forKey: .videoPruningRate) ?? 0.7
     }
@@ -522,8 +536,11 @@ public struct NemotronHOmniProcessorConfiguration: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case processorClass = "processor_class"
         case imageSize = "image_size"
-        case minNumTiles = "min_num_tiles"
-        case maxNumTiles = "max_num_tiles"
+        case minNumPatches = "min_num_patches"
+        case maxNumPatches = "max_num_patches"
+        case maxModelLen = "max_model_len"
+        case patchSize = "patch_size"
+        case downsampleRatio = "downsample_ratio"
         case useThumbnail = "use_thumbnail"
         case videoPruningRate = "video_pruning_rate"
     }
@@ -548,13 +565,16 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
 
     /// Tile-preprocess images into (totalTiles, 3, H, W) MLX pixel values.
     public func preprocess(images: [CIImage]) throws -> (MLXArray, [Int]) {
-        let (pixels, counts) = nemotronOmniPreprocessImages(
+        let (pixels, tokenCounts) = try nemotronOmniPreprocessImages(
             images,
             imageSize: config.imageSize,
-            minNum: config.minNumTiles,
-            maxNum: config.maxNumTiles,
-            useThumbnail: config.useThumbnail)
-        return (pixels, counts)
+            minNum: config.minNumPatches,
+            maxNum: config.maxNumPatches,
+            useThumbnail: config.useThumbnail,
+            patchSize: config.patchSize,
+            downsampleRatio: config.downsampleRatio,
+            maxModelLen: config.maxModelLen)
+        return (pixels, tokenCounts)
     }
 
     /// Decode + resample audio resources into 16 kHz mono Float32 PCM
@@ -665,18 +685,17 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
 
         if !input.images.isEmpty {
             let ciImages = try input.images.map { try $0.asCIImage() }
-            let (pixels, counts) = try preprocess(images: ciImages)
+            let (pixels, tokenCounts) = try preprocess(images: ciImages)
             processedImage = LMInput.ProcessedImage(
                 pixels: pixels,
-                frames: counts.map { THW($0, config.imageSize, config.imageSize) })
-            let totalTiles = counts.reduce(0, +)
-            totalImageTokens = totalTiles * tokensPerTile
+                frames: tokenCounts.map { _ in THW(1, pixels.dim(2), pixels.dim(3)) })
+            totalImageTokens = tokenCounts.reduce(0, +)
             if let chatMessages {
                 var imageIndex = 0
                 for (messageIndex, message) in chatMessages.enumerated() where !message.images.isEmpty {
                     var messageTokens = 0
-                    for _ in message.images where imageIndex < counts.count {
-                        messageTokens += counts[imageIndex] * tokensPerTile
+                    for _ in message.images where imageIndex < tokenCounts.count {
+                        messageTokens += tokenCounts[imageIndex]
                         imageIndex += 1
                     }
                     if messageTokens > 0 {
