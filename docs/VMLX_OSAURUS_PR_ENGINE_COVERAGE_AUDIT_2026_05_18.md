@@ -354,6 +354,29 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   1/1. This is metadata/admin-route proof only; it is not model-specific cache
   hit, L2 write, SSM rederive, coherency, speed, or memory proof.
 
+2026-05-18 14:48 PDT Osaurus PR #1147 component edge-case matrix:
+
+- Osaurus PR #1147 head `ad27a35f` adds
+  `docs/internal/live-gates/20260518T_pr1147_component_edge_case_matrix.md`.
+  The matrix breaks the remaining production-clear requirement into concrete
+  source-to-artifact wiring for `ModelOptions`, `ModelMediaCapabilities`,
+  `LocalGenerationDefaults`, `MLXBatchAdapter`, `GenerationEventMapper`,
+  `ModelRuntime`, `HTTPHandler`, and the SwiftPM old-library sweep.
+- The matrix names per-family live proof for DSV4, Qwen3.6 MTP/VL and
+  non-MTP controls, Gemma4 VLM, Gemma3n text, ZAYA/ZAYA-VL, Nemotron Omni /
+  Parakeet / RADIO, MiniMax, Ling/Hy3 hybrid SSM, and local GLM/GPT-OSS/Mistral
+  parser families. Kimi remains intentionally excluded from this PR budget.
+- The new gate explicitly requires UI clicked/default state proof, route parity
+  across chat/responses/messages/Ollama where supported, real media sequences,
+  saved-setting carryover inverses, native `top_k` and bundle defaults,
+  coding/tool context injection checks, prefix/paged/block-L2/SSM/media cache
+  hit proof, TTFT/tok/s/RSS/physical footprint, no parser leakage, no name-only
+  MTP, and no hidden sampler/EOS/repetition/forced reasoning-close repair.
+- Verification for the checkpoint: focused Osaurus
+  `RuntimePolicySourceTests` passes 28/28 after adding source-policy coverage
+  for the new matrix. This remains checklist/source-policy evidence, not live
+  model production proof.
+
 2026-05-17 20:25 PDT live refresh:
 
 - `gh pr list --repo osaurus-ai/osaurus --state all --limit 20` shows the
