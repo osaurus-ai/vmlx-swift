@@ -193,8 +193,8 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   `promptToolSurfaceEditsNeverReturnFullPromptHit` in
   `CacheCoordinatorTopologyFocusedTests`; the focused suite now passes 26/26.
 - Real local Qwen tuning-file proof was refreshed with
-  `VMLINUX_MTP_REAL_BUNDLE=/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP4-MTP`
-  and `VMLINUX_MTP_REAL_BUNDLE_EXPECTS_VL=1`; the optional real-bundle
+  `VMLX_MTP_REAL_BUNDLE=/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP4-MTP`
+  and `VMLX_MTP_REAL_BUNDLE_EXPECTS_VL=1`; the optional real-bundle
   `MTPRuntimeFocusedTests/optionalRealLocalMTPBundleInspection` row passed and
   proved current code sees tensor evidence, VL tensors, usable
   `vmlx_mtp_tuning.json`, speculative launch, and `loadConfiguration.nativeMTP`.
@@ -231,7 +231,7 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   ordering is checked only after both timers are valid. This prevents Osaurus
   from silently accepting negative or zero idle-residency values before the live
   deep-sleep/wake gate is run. Focused verification:
-  `VMLINUXServerRuntimeSettingsTests|RuntimeMoETopKOverrideFocusedTests`
+  `VMLXServerRuntimeSettingsTests|RuntimeMoETopKOverrideFocusedTests`
   passes 19/19 with the Xcode framework path.
 - Follow-up native-MTP settings validation made the cache-boundary policy
   non-optional: `keepDraftCacheSeparate=false` and
@@ -243,7 +243,7 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   `server_modality_disabled` for `multimodal.vlmMode = force_off`, disabled
   video/audio lanes, or `mtp.mode = off`, while preserving the same redacted
   issue JSON shape. Focused verification:
-  `VMLINUXServerRuntimeSettingsTests|RuntimeMoETopKOverrideFocusedTests`
+  `VMLXServerRuntimeSettingsTests|RuntimeMoETopKOverrideFocusedTests`
   passes 23/23 with the Xcode framework path.
 - Follow-up parser settings validation rejects unknown
   `toolParserOverride` / `reasoningParserOverride` strings while allowing known
@@ -253,7 +253,7 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   `ModelRuntimeCapabilityRequest(input:)` records text, image, video, audio,
   tools, reasoning, and native-MTP lanes from `UserInput` without serializing
   prompt content or tool names. Focused verification:
-  `VMLINUXUmbrellaProductTests` passes 7/7 with the Xcode framework path.
+  `VMLXUmbrellaProductTests` passes 7/7 with the Xcode framework path.
 - Follow-up media-cache settings validation now rejects
   `multimodal.requireMediaSaltForCache=false` whenever prefix, paged KV,
   block-L2, or legacy disk cache reuse is enabled. This keeps image/video/audio

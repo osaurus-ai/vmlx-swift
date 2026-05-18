@@ -247,10 +247,11 @@ concrete runtime still uses `LoadConfiguration.nativeMTP=true` plus
 from the same evidence snapshot.
 `ModelFactory.loadModel` passes that load-time decision through a task-local
 activation override so concurrent loads do not share a process-global MTP env
-flag. The `VMLINUX_NATIVE_MTP=1` environment knob remains compatibility-only
-for direct factory callers that bypass `ModelFactory.loadModel`; Osaurus should
-use the typed load configuration. Activation is not inferred from model names
-and is not inferred from `mtp_num_hidden_layers` alone. It requires:
+flag. The `VMLX_NATIVE_MTP=1` environment knob remains compatibility-only for
+direct factory callers that bypass `ModelFactory.loadModel`; the legacy
+`VMLINUX_NATIVE_MTP=1` spelling is accepted only as an alias. Osaurus should use
+the typed load configuration. Activation is not inferred from model names and is
+not inferred from `mtp_num_hidden_layers` alone. It requires:
 
 - supported Qwen3.5/Qwen3.6 text, VL, or Qwen3.5 MoE model type;
 - complete MTP tensor evidence from the index or safetensors headers;

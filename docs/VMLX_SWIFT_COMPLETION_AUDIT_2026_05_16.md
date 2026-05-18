@@ -44,7 +44,7 @@ Current pushed branch state:
   weights.
 - 2026-05-17 MTP launch-settings follow-up:
   `docs/local/production-readiness/20260517T1305_mtp_settings_profile_validation/`
-  passes `VMLINUXServerRuntimeSettingsTests` with 15 Swift Testing rows. The
+  passes `VMLXServerRuntimeSettingsTests` with 15 Swift Testing rows. The
   server settings surface now has a full-evidence validation path so tensor-
   proven Qwen MTP resolves native D3, while a force-on launch against blocked
   profiles such as Qwen3.6 JANG_2K is rejected before an Osaurus session starts.
@@ -66,7 +66,7 @@ Current pushed branch state:
   `.rotating` and compile-eligible.
 - 2026-05-17 server-settings validation follow-up:
   `docs/local/production-readiness/20260517T1335_server_settings_validation/`
-  passes `VMLINUXServerRuntimeSettingsTests` with 16/16 rows. The server
+  passes `VMLXServerRuntimeSettingsTests` with 16/16 rows. The server
   settings contract now rejects invalid network, concurrency, prefix-cache,
   generation, sleep, TurboQuant KV, and MTP values instead of clamping.
 - 2026-05-17 active cache-policy salt follow-up:
@@ -679,8 +679,9 @@ Live-proven:
 - MTP activation is resolved per session through
   `VMLXServerRuntimeSettings.resolvedLoadConfiguration(...)` and
   `resolvedMTPDraftStrategy(...)`; the underlying load still uses
-  `LoadConfiguration.nativeMTP`. `VMLINUX_NATIVE_MTP=1` remains a compatibility
-  override for direct factory callers only.
+  `LoadConfiguration.nativeMTP`. `VMLX_NATIVE_MTP=1` remains a compatibility
+  override for direct factory callers only; the legacy `VMLINUX_NATIVE_MTP=1`
+  spelling is accepted as an alias.
 - Supported Qwen model types must expose real MTP tensor evidence.
 - CRACK config metadata without tensors fails closed.
 - Qwen3.6 MTP proof targets are
@@ -736,7 +737,7 @@ Live-proven:
   The artifact has 37 local regular files, 22G on disk, and
   `runtime.total_weight_bytes=23115460648`.
 - Native MTP activation now recognizes `qwen3_5_moe` and
-  `qwen3_5_moe_text`, but still requires `VMLINUX_NATIVE_MTP=1` and real MTP
+  `qwen3_5_moe_text`, but still requires `VMLX_NATIVE_MTP=1` and real MTP
   tensor evidence. The VLM native-MTP decoder now instantiates
   `SparseMoeBlock` for MoE MTP sidecars instead of a dense MLP, so the 35B
   `mtp.layers.0.mlp.switch_mlp.*` / `shared_expert.*` layout matches the Swift
