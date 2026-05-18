@@ -28,6 +28,51 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
 
 2026-05-18 continuation refresh:
 
+- Single-package Osaurus switch status, current checkpoint:
+  package/wiring readiness is high but still draft-gated; full runtime
+  production readiness remains partial until the live model matrix closes the
+  family-specific rows below. Current rough split is package wiring ~90%,
+  overall Osaurus production readiness ~60-65%.
+- Consolidated package graph proof now exists on the vmlx-swift PR lane:
+  `swift package describe --type json`, focused target builds for Hub,
+  HuggingFace, and Tokenizers, focused runtime tests, and release
+  `RunBench` build all pass after the vendored module prefix and yyjson
+  dependency cleanup.
+- OsaurusCore has a draft switch PR wired to the consolidated `vmlx-swift`
+  revision. `OsaurusCore` builds against the single package, and focused
+  runtime/template/batch adapter tests pass, but the PR must stay draft until
+  the live runtime rows below and downstream app/server probes are complete.
+- New non-Kimi inventory/metadata/MTP policy proof:
+  `docs/local/live-model-matrix/20260518T054941Z_non_kimi_inventory_pr1/`
+  found 30 non-Kimi local bundles, with 5 tensor-proven MTP candidates and no
+  MTP inferred from CRACK names. Metadata/template rerun with `--allow-huge`
+  passed 60/60 rows under
+  `docs/local/live-model-matrix/20260518T055141Z_non_kimi_metadata_allowhuge_pr1/`.
+  Focused MTP policy profile recorded 11 pass rows and 19
+  `n-a:no-mtp-tensors` rows under
+  `docs/local/live-model-matrix/20260518T055344Z_non_kimi_mtp_policy_pr1/`.
+- Representative MTP census proof:
+  `/Users/eric/models/JANGQ/Qwen3.6-27B-MXFP4-MTP` is tensor-proven,
+  `vmlx_mtp_tuning.json` driven, and auto-launches with tuned depth 2.
+  `/Users/eric/models/JANGQ/Qwen3.6-35B-A3B-JANG_2K-MTP` is tensor-proven but
+  tuning-blocked, so auto-launch remains off. The Qwen and MiniMax CRACK
+  bundles inspected in the same census had no usable MTP tensors and stay off.
+- ZAYA1-8B-JANGTQ4 release-path checkpoint:
+  `docs/local/live-model-matrix/20260518T061037Z_zaya_jangtq4_turnmatrix_pr1_post_applicability/`
+  passes config/template, production tiered cache off/on, batch single/chat,
+  growing chat cache, disk restore, B=2 concurrent, and per-slot sampler rows.
+  Production rows decode around 66-67 tok/s with ~5.1 GiB RSS and coherent
+  reasoning on/off behavior. ZAYA CCA is a path-dependent hybrid cache topology,
+  so pure paged-prefix cache-hit and live TurboQuant KV B=2 probes are now
+  explicit `n-a` rows; the correct proof path is disk/SSM restore plus JANGTQ
+  expert-kernel config/runtime evidence, not a sampler guard.
+- Harness fix from the ZAYA checkpoint:
+  `RunBench` now checks `cacheRequiresDiskBackedCoordinatorRestore` before
+  running pure paged-prefix cache-hit and live TurboQuant KV B=2 rows. This
+  prevents path-dependent CCA/SSM/sliding-window models from being mislabeled
+  failed by a non-applicable probe. Focused regression:
+  `RunBenchApplicabilityFocusedTests` passes 2/2.
+
 - Live GitHub refresh at `2026-05-17 19:57 PDT` still returns 15
   user-authored Osaurus PRs in the 2026-04-24+ runtime-pin window. The
   crosswalk rows below cover each returned PR: #931, #932, #943, #944, #946,

@@ -1937,6 +1937,15 @@ func runBatchEngineCacheHit(modelPath: String, maxNew: Int) async throws {
     let params = GenerateParameters(
         maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
 
+    let topologyProbeCache = context.model.newCache(parameters: params)
+    if cacheRequiresDiskBackedCoordinatorRestore(topologyProbeCache) {
+        print("  Cache topology requires disk-backed/path-dependent restore; " +
+              "pure paged-prefix cache-hit is not applicable.")
+        print("=== BatchEngine cache-hit: not applicable (paged-incompatible topology; " +
+              "use growing_chat_cache or disk_restore for hybrid cache proof) ===")
+        return
+    }
+
     nonisolated(unsafe) let ctx = context
     let engine = BatchEngine(
         context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
@@ -2992,11 +3001,6 @@ func runBatchEngineTurboQuantB2(modelPath: String, maxNew: Int) async throws {
         }
     }
 
-    var inputs: [LMInput] = []
-    for p in prompts {
-        inputs.append(try await makeVisibleAnswerInput(p))
-    }
-
     let plainParams = GenerateParameters(
         maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
     // kvMode defaults to plain on `plainParams`.
@@ -3010,6 +3014,20 @@ func runBatchEngineTurboQuantB2(modelPath: String, maxNew: Int) async throws {
         maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
     tqParams.kvMode = .turboQuant(keyBits: 4, valueBits: 4)
     tqParams.quantizedKVStart = 8
+
+    let topologyProbeCache = context.model.newCache(parameters: tqParams)
+    if cacheRequiresDiskBackedCoordinatorRestore(topologyProbeCache) {
+        print("  Cache topology requires disk-backed/path-dependent restore; " +
+              "live TurboQuant KV B=2 is not applicable.")
+        print("=== BatchEngine TurboQuant B=2: not applicable (paged-incompatible topology; " +
+              "JANGTQ expert kernels and disk/SSM cache rows remain the correct proof path) ===")
+        return
+    }
+
+    var inputs: [LMInput] = []
+    for p in prompts {
+        inputs.append(try await makeVisibleAnswerInput(p))
+    }
 
     // Reference run: slot 0 plain KV ALONE. Gives us the expected
     // plain-output baseline to compare against "slot 0 plain beside a

@@ -663,6 +663,7 @@ let package = Package(
                 "MTPRuntimeFocusedTests.swift",
                 "VMLXServerRuntimeSettingsTests.swift",
                 "NoHiddenReasoningCloseBiasFocusedTests.swift",
+                "RunBenchApplicabilityFocusedTests.swift",
             ]
         ),
 
