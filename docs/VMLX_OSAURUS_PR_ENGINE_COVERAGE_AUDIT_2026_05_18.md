@@ -160,6 +160,14 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   drifting into unrelated Chinese text. Keep this as a real Gemma3n live red
   row until tokenizer/template/decode behavior is root-caused; do not hide it
   with sampler clamps or app-side output repair.
+- Fresh DSV4 DSML tool-call refresh was run from this checkout under
+  `docs/internal/live-gates/20260518T_dsv4_dsml_toolcall_refresh/`. The row
+  loads `DeepseekV4JANGTQModel`, reports `Tool format: dsml` and
+  `Reasoning stamp: think_xml`, emits one structured
+  `get_weather({"location":"Tokyo"})` event through `BatchEngine.generate`,
+  stops normally after 43 generated tokens, and leaks no raw DSML or thinking
+  markers into `.chunk`. This is parser/template evidence only; DSV4 remains
+  partial until long-context/vector/API/speed/low-footprint rows close.
 
 2026-05-17 20:25 PDT live refresh:
 

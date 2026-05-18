@@ -1,0 +1,36 @@
+[STDERR] Bench main() started
+
+=== BatchEngine tool-call pipeline (iter 66) ===
+[Load] JANG shape walk produced 512 per-layer quant override(s) over default (bits=8, gs=32)
+Load: 9.52s
+Model: DeepseekV4JANGTQModel
+Tool format: dsml
+Reasoning stamp: think_xml
+  chunks: 2 chars, reasoning: 0 chars, toolCalls: 1, stop: stop, genTokens: 43
+  tool calls: get_weather({"location":"Tokyo"})
+  text preview: "
+
+"
+  OK — structured tool call emitted and no raw markers leaked to .chunk.
+
+=== BatchEngine tool-call pipeline done ===
+real 19.61
+user 3.57
+sys 18.89
+         63114166272  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             5255930  page reclaims
+                 121  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                3726  voluntary context switches
+              356598  involuntary context switches
+        189188727847  instructions retired
+         92406652229  cycles elapsed
+         91495740928  peak memory footprint
