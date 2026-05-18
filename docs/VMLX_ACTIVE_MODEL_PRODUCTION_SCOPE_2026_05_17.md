@@ -46,6 +46,7 @@ No-load config/template metadata artifact:
 
 ```text
 docs/local/live-model-matrix/20260517T_scope_exclude_kimi_dsv4_metadata/
+docs/local/live-model-matrix/20260518T000255Z_non_kimi_metadata_current/
 ```
 
 Fresh focused MTP/settings artifact:
@@ -557,11 +558,11 @@ Tensor-proven supported Qwen MTP resolves native D3 through the settings bridge;
 Hy3/Ling/DSV4 nextn-style rows can report tensor evidence while `mtp_auto=no`,
 and JANG_2K remains blocked until its own runtime policy is proven.
 
-The no-load metadata/template sweep passed 56/56 rows across the 28
-non-excluded bundles. Warnings remain visible and must not be collapsed into a
-production pass; current warnings include BOS/EOS overlap on some Qwen/Laguna
-bundles, MiniMax tokenizer/config BOS mismatch, and ZAYA1 JANGTQ_K tokenizer EOS
-not present in the effective EOS set.
+The current no-load metadata/template sweep passed 60/60 rows across the 30
+non-Kimi `~/models` bundles. Warnings remain visible and must not be collapsed
+into a production pass; current warnings include BOS/EOS overlap on some
+Qwen/Laguna bundles, MiniMax tokenizer/config BOS mismatch, and ZAYA1 JANGTQ_K
+tokenizer EOS not present in the effective EOS set.
 
 ## ZAYA Cache and Release-Speed Checkpoint
 
