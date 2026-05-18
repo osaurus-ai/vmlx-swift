@@ -159,7 +159,10 @@ metadata-only bundles.
 ## Osaurus Status Surface
 
 Osaurus should read `context.configuration.mtpStatus` after the model context is
-loaded. Suggested capability/health shape:
+loaded and serialize `context.configuration.mtpStatus?.snapshot`. The raw
+`MTPBundleStatus` remains `Codable`, but `snapshot` is the stable status payload
+that includes computed gates such as `can_auto_launch=false` for missing or
+blocked tuning. Suggested capability/health shape:
 
 ```json
 {

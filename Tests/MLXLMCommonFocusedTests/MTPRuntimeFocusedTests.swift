@@ -187,6 +187,92 @@ struct MTPRuntimeFocusedTests {
         #expect(status.statusLine.contains("tuning required"))
     }
 
+    @Test("MTP status snapshot exposes tuning gate fields for Osaurus")
+    func mtpStatusSnapshotExposesTuningGateFieldsForOsaurus() throws {
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 31,
+            visionTensorCount: 333,
+            mode: .preservedEnabled,
+            tensorSamples: ["mtp.fc.weight"],
+            visionTensorSamples: ["vision_tower.blocks.0.attn.qkv.weight"],
+            configEvidence: ["tuning_file=vmlx_mtp_tuning.json"],
+            nativeMTPTuning: NativeMTPTuning(
+                bestDepth: 3,
+                verifierMode: "sequential-repair",
+                validated: true,
+                outputEquivalent: true,
+                cacheMode: "paged+ssm",
+                artifact: "docs/internal/qwen36-mtp.json",
+                baselineTokensPerSecond: 24.0,
+                bestTokensPerSecond: 45.0,
+                speedupVsBaseline: 1.875))
+
+        let snapshot = status.snapshot
+
+        #expect(snapshot.hasCompleteArtifact)
+        #expect(snapshot.hasUsableNativeMTPTuning)
+        #expect(snapshot.canAutoLaunch)
+        #expect(snapshot.speculativeDecodeEnabled)
+        #expect(snapshot.statusLine.contains("tuning=d3"))
+        #expect(snapshot.tuning?.file == "vmlx_mtp_tuning.json")
+        #expect(snapshot.tuning?.bestDepth == 3)
+        #expect(snapshot.tuning?.verifierMode == "sequential_repair")
+
+        let encoded = try JSONEncoder().encode(snapshot)
+        let object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        #expect(object["has_complete_artifact"] as? Bool == true)
+        #expect(object["has_usable_native_mtp_tuning"] as? Bool == true)
+        #expect(object["can_auto_launch"] as? Bool == true)
+        let tuning = try #require(object["tuning"] as? [String: Any])
+        #expect(tuning["file"] as? String == "vmlx_mtp_tuning.json")
+        #expect(tuning["best_depth"] as? Int == 3)
+    }
+
+    @Test("MTP status snapshot reports missing tuning before auto launch")
+    func mtpStatusSnapshotReportsMissingTuningBeforeAutoLaunch() throws {
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 31,
+            visionTensorCount: 0,
+            mode: .preservedEnabled)
+
+        let snapshot = status.snapshot
+
+        #expect(snapshot.hasCompleteArtifact)
+        #expect(!snapshot.hasUsableNativeMTPTuning)
+        #expect(!snapshot.canAutoLaunch)
+        #expect(!snapshot.speculativeDecodeEnabled)
+        #expect(snapshot.requiresNativeMTPTuningBeforeAutoLaunch)
+        #expect(snapshot.statusLine.contains("vmlx_mtp_tuning.json"))
+        #expect(snapshot.tuning == nil)
+    }
+
+    @Test("MTP status snapshot reports blocked tuning as non auto launch")
+    func mtpStatusSnapshotReportsBlockedTuningAsNonAutoLaunch() throws {
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 31,
+            mode: .speculativeVerified,
+            nativeMTPTuning: NativeMTPTuning(
+                bestDepth: 3,
+                validated: false,
+                outputEquivalent: false,
+                blocked: true,
+                reason: "diagnostic row was not production-valid"))
+
+        let snapshot = status.snapshot
+
+        #expect(!snapshot.hasUsableNativeMTPTuning)
+        #expect(!snapshot.canAutoLaunch)
+        #expect(snapshot.requiresNativeMTPTuningBeforeAutoLaunch)
+        #expect(snapshot.tuning?.blocked == true)
+        #expect(snapshot.tuning?.reason == "diagnostic row was not production-valid")
+    }
+
     @Test("MTP config without tensors is reported as metadata-only")
     func configOnlyMTPIsMetadataOnlyMissingWeights() throws {
         let root = try makeTemporaryBundle(name: "qwen-mtp-missing-weights")

@@ -172,6 +172,184 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
     }
 }
 
+public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
+    public let file: String
+    public let bestDepth: Int?
+    public let usableBestDepth: Int?
+    public let verifierMode: String
+    public let validated: Bool
+    public let outputEquivalent: Bool
+    public let blocked: Bool
+    public let cacheMode: String?
+    public let promptClass: String?
+    public let measuredAt: String?
+    public let artifact: String?
+    public let baselineTokensPerSecond: Double?
+    public let bestTokensPerSecond: Double?
+    public let speedupVsBaseline: Double?
+    public let note: String?
+    public let reason: String?
+
+    public init(
+        file: String = NativeMTPTuning.fileName,
+        bestDepth: Int?,
+        usableBestDepth: Int?,
+        verifierMode: String,
+        validated: Bool,
+        outputEquivalent: Bool,
+        blocked: Bool,
+        cacheMode: String? = nil,
+        promptClass: String? = nil,
+        measuredAt: String? = nil,
+        artifact: String? = nil,
+        baselineTokensPerSecond: Double? = nil,
+        bestTokensPerSecond: Double? = nil,
+        speedupVsBaseline: Double? = nil,
+        note: String? = nil,
+        reason: String? = nil
+    ) {
+        self.file = file
+        self.bestDepth = bestDepth
+        self.usableBestDepth = usableBestDepth
+        self.verifierMode = verifierMode
+        self.validated = validated
+        self.outputEquivalent = outputEquivalent
+        self.blocked = blocked
+        self.cacheMode = cacheMode
+        self.promptClass = promptClass
+        self.measuredAt = measuredAt
+        self.artifact = artifact
+        self.baselineTokensPerSecond = baselineTokensPerSecond
+        self.bestTokensPerSecond = bestTokensPerSecond
+        self.speedupVsBaseline = speedupVsBaseline
+        self.note = note
+        self.reason = reason
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case file
+        case bestDepth = "best_depth"
+        case usableBestDepth = "usable_best_depth"
+        case verifierMode = "verifier_mode"
+        case validated
+        case outputEquivalent = "output_equivalent"
+        case blocked
+        case cacheMode = "cache_mode"
+        case promptClass = "prompt_class"
+        case measuredAt = "measured_at"
+        case artifact
+        case baselineTokensPerSecond = "baseline_tok_s"
+        case bestTokensPerSecond = "best_tok_s"
+        case speedupVsBaseline = "speedup_vs_baseline"
+        case note
+        case reason
+    }
+}
+
+public struct MTPBundleStatusSnapshot: Codable, Sendable, Equatable {
+    public let mode: MTPRuntimeMode
+    public let bundleHasMTP: Bool
+    public let configuredLayers: Int
+    public let tensorCount: Int
+    public let visionTensorCount: Int
+    public let hasCompleteArtifact: Bool
+    public let hasUsableNativeMTPTuning: Bool
+    public let runtimeCanSpeculativelyDecodeMTP: Bool
+    public let speculativeDecodeEnabled: Bool
+    public let canAutoLaunch: Bool
+    public let requiresAcceptRejectBeforeEnable: Bool
+    public let requiresNativeMTPTuningBeforeAutoLaunch: Bool
+    public let bundleHasVision: Bool
+    public let statusLine: String
+    public let tensorSamples: [String]
+    public let visionTensorSamples: [String]
+    public let configEvidence: [String]
+    public let tuning: NativeMTPTuningSnapshot?
+
+    public init(
+        mode: MTPRuntimeMode,
+        bundleHasMTP: Bool,
+        configuredLayers: Int,
+        tensorCount: Int,
+        visionTensorCount: Int,
+        hasCompleteArtifact: Bool,
+        hasUsableNativeMTPTuning: Bool,
+        runtimeCanSpeculativelyDecodeMTP: Bool,
+        speculativeDecodeEnabled: Bool,
+        canAutoLaunch: Bool,
+        requiresAcceptRejectBeforeEnable: Bool,
+        requiresNativeMTPTuningBeforeAutoLaunch: Bool,
+        bundleHasVision: Bool,
+        statusLine: String,
+        tensorSamples: [String] = [],
+        visionTensorSamples: [String] = [],
+        configEvidence: [String] = [],
+        tuning: NativeMTPTuningSnapshot? = nil
+    ) {
+        self.mode = mode
+        self.bundleHasMTP = bundleHasMTP
+        self.configuredLayers = configuredLayers
+        self.tensorCount = tensorCount
+        self.visionTensorCount = visionTensorCount
+        self.hasCompleteArtifact = hasCompleteArtifact
+        self.hasUsableNativeMTPTuning = hasUsableNativeMTPTuning
+        self.runtimeCanSpeculativelyDecodeMTP = runtimeCanSpeculativelyDecodeMTP
+        self.speculativeDecodeEnabled = speculativeDecodeEnabled
+        self.canAutoLaunch = canAutoLaunch
+        self.requiresAcceptRejectBeforeEnable = requiresAcceptRejectBeforeEnable
+        self.requiresNativeMTPTuningBeforeAutoLaunch = requiresNativeMTPTuningBeforeAutoLaunch
+        self.bundleHasVision = bundleHasVision
+        self.statusLine = statusLine
+        self.tensorSamples = tensorSamples
+        self.visionTensorSamples = visionTensorSamples
+        self.configEvidence = configEvidence
+        self.tuning = tuning
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case mode
+        case bundleHasMTP = "bundle_has_mtp"
+        case configuredLayers = "configured_layers"
+        case tensorCount = "tensor_count"
+        case visionTensorCount = "vision_tensor_count"
+        case hasCompleteArtifact = "has_complete_artifact"
+        case hasUsableNativeMTPTuning = "has_usable_native_mtp_tuning"
+        case runtimeCanSpeculativelyDecodeMTP = "runtime_can_speculatively_decode_mtp"
+        case speculativeDecodeEnabled = "speculative_decode_enabled"
+        case canAutoLaunch = "can_auto_launch"
+        case requiresAcceptRejectBeforeEnable = "requires_accept_reject_before_enable"
+        case requiresNativeMTPTuningBeforeAutoLaunch =
+            "requires_native_mtp_tuning_before_auto_launch"
+        case bundleHasVision = "bundle_has_vision"
+        case statusLine = "status_line"
+        case tensorSamples = "tensor_samples"
+        case visionTensorSamples = "vision_tensor_samples"
+        case configEvidence = "config_evidence"
+        case tuning
+    }
+}
+
+extension NativeMTPTuning {
+    public var snapshot: NativeMTPTuningSnapshot {
+        NativeMTPTuningSnapshot(
+            bestDepth: bestDepth,
+            usableBestDepth: usableBestDepth,
+            verifierMode: resolvedVerifierMode,
+            validated: validated,
+            outputEquivalent: outputEquivalent,
+            blocked: blocked,
+            cacheMode: cacheMode,
+            promptClass: promptClass,
+            measuredAt: measuredAt,
+            artifact: artifact,
+            baselineTokensPerSecond: baselineTokensPerSecond,
+            bestTokensPerSecond: bestTokensPerSecond,
+            speedupVsBaseline: speedupVsBaseline,
+            note: note,
+            reason: reason)
+    }
+}
+
 /// No-load MTP status derived from `config.json`, `jang_config.json`, and tensor
 /// names. This type is safe to expose through Osaurus capability/status APIs.
 public struct MTPBundleStatus: Codable, Sendable, Equatable {
@@ -255,6 +433,28 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
             return "\(base)\(tuned), speculative=off (metadata only; MTP weights missing)"
         }
         return "\(base)\(tuned), speculative=off"
+    }
+
+    public var snapshot: MTPBundleStatusSnapshot {
+        MTPBundleStatusSnapshot(
+            mode: mode,
+            bundleHasMTP: bundleHasMTP,
+            configuredLayers: configuredLayers,
+            tensorCount: tensorCount,
+            visionTensorCount: visionTensorCount,
+            hasCompleteArtifact: hasCompleteMTPArtifact,
+            hasUsableNativeMTPTuning: hasUsableNativeMTPTuning,
+            runtimeCanSpeculativelyDecodeMTP: runtimeCanSpeculativelyDecodeMTP,
+            speculativeDecodeEnabled: speculativeDecodeEnabled,
+            canAutoLaunch: canAutoLaunchMTP,
+            requiresAcceptRejectBeforeEnable: requiresAcceptRejectBeforeEnable,
+            requiresNativeMTPTuningBeforeAutoLaunch: requiresNativeMTPTuningBeforeAutoLaunch,
+            bundleHasVision: bundleHasVision,
+            statusLine: statusLine,
+            tensorSamples: tensorSamples,
+            visionTensorSamples: visionTensorSamples,
+            configEvidence: configEvidence,
+            tuning: nativeMTPTuning?.snapshot)
     }
 }
 
@@ -444,8 +644,8 @@ public struct NativeMTPAutoDecodeRecommendation: Codable, Sendable, Equatable {
 /// This policy never looks at the model path or marketing name. It uses config
 /// metadata, JANG quantization/profile metadata, and the MTP tensor census.
 /// Metadata-only bundles never receive a recommendation. Complete tensor-proven
-/// supported Qwen bundles resolve to a production launch recommendation even
-/// when their source metadata says `preserved_enabled`.
+/// supported Qwen bundles resolve to a production launch recommendation only
+/// when their bundle-local `vmlx_mtp_tuning.json` row is usable.
 public enum NativeMTPAutoDecodePolicy {
     public static func recommendation(
         configData: Data?,

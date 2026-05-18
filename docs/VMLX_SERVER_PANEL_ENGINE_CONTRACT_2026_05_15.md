@@ -135,6 +135,11 @@ metadata-only bundle, missing/unusable tuning row, or unsupported profile
 resolves with native MTP off. This avoids the broken middle state where the
 request asks for MTP but the loader scrubbed the sidecar weights.
 
+For capability/status JSON, serialize `MTPBundleStatus.snapshot`; it includes
+the computed tuning gates (`has_usable_native_mtp_tuning`, `can_auto_launch`,
+and `requires_native_mtp_tuning_before_auto_launch`) that are not plain stored
+fields on the raw status value.
+
 MTP cache rules:
 
 - draft cache is separate from base cache;
