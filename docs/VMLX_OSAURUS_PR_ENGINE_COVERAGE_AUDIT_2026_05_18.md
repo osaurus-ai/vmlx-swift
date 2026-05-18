@@ -17,20 +17,29 @@ gh api 'repos/osaurus-ai/{repo}/commits?since=2026-04-24T00:00:00Z&until=2026-05
 gh api repos/osaurus-ai/{repo}/compare/{pin}...main
 ```
 
-Current `vmlx-swift` branch head at the latest committed refresh before this
-source-hygiene edit:
+Current `vmlx-swift` branch head at this refresh:
 
 ```text
-e8dad80 fix(vlm): clean media preprocessing warnings
+b4c89c7 test(vlm): keep quantization guard in focused suite
 ```
 
 2026-05-18 continuation refresh:
 
+- Live GitHub refresh at `2026-05-17 19:57 PDT` still returns 15
+  user-authored Osaurus PRs in the 2026-04-24+ runtime-pin window. The
+  crosswalk rows below cover each returned PR: #931, #932, #943, #944, #946,
+  #953, #967, #990, #993, #998, #1037, #1057, #1066, #1073, and #1110.
 - GitHub still reports Osaurus PR #1110 as open, non-draft, all checks green,
   and `mergeStateStatus=DIRTY`; do not treat it as merged switch state.
 - Current `osaurus-staging` branch is `feat/dsv4-vmlx-pin` at
   `b0a96dd4 Wire native DSV4 tokenizer bridge`, with local uncommitted Osaurus
   edits present. Those local edits are not part of the pinned public PR state.
+- Live compare refresh of the four pinned runtime repos found no topology change
+  from the prior audit: `Jinja` is identical to default `main`,
+  `vmlx-swift-lm` pin `2cc64dd` is two commits ahead of its default `main`,
+  `swift-transformers` pin `087a66b` is still fork-diverged from tokenizer
+  speed commits on default `main`, and `mlx-swift` pin `0a56f904` is still an
+  Osaurus fork lane with stream/wired-limit work rather than upstream parity.
 - Fresh `vmlx-swift` evidence added after the first audit:
   `20260518T_gemma4_e2b_refresh_no_fake_guards/` and
   `20260518T_ling_jangtq2_no_guard_refresh/`. Both prove no hidden sampler
