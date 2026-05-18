@@ -138,6 +138,17 @@ d228fdd fix(mtp): expose tuning-gated status snapshot
   promote ZAYA text as fully reasoning/direct-mode production-clear from stale
   blue-sky rows, and do not hide this with repetition, temperature, forced
   thinking closure, or top-k policy.
+- Osaurus PR #1147 now carries a dedicated live UI/API matrix document,
+  `docs/VMLX_SWIFT_OSAURUS_LIVE_MATRIX_2026_05_18.md`, and policy tests that
+  require it to cover the remaining switch gates. The matrix explicitly keeps
+  Qwen-VL, Gemma VLM/Gemma3n, ZAYA-VL, Nemotron Omni audio/video, DSV4,
+  MiniMax, Ling, Hy3, MTP tuning, saved reasoning settings, generation
+  defaults, tool/reasoning parser leakage, `/v1/chat/completions`,
+  `/v1/responses`, `/v1/messages`, Ollama routes, prefix/paged/block-L2/SSM
+  cache stats, media salt, TTFT, tok/s, and memory proof as required live
+  Osaurus app/API rows. This is intentionally not a green production claim:
+  several rows are still pending live Osaurus UI/API evidence even where vmlx
+  has source tests or direct `RunBench` artifacts.
 
 2026-05-17 20:25 PDT live refresh:
 
