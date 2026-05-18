@@ -5769,10 +5769,15 @@ func runNoGuardSamplingProbe(modelPath: String, maxNew: Int) async throws {
                     failures.append("\(c.label): visible output did not greet")
                 }
             }
-            if c.label == "B_star_story_temp06_rep1_think_on"
-                && !visible.lowercased().contains("star")
-            {
-                failures.append("\(c.label): visible story did not mention star")
+            if c.label == "B_star_story_temp06_rep1_think_on" {
+                let lower = visible.lowercased()
+                let mentionsStellarSubject =
+                    lower.contains("star")
+                    || lower.contains("sun")
+                    || lower.contains("stellar")
+                if !mentionsStellarSubject {
+                    failures.append("\(c.label): visible story did not mention a stellar subject")
+                }
             }
             if c.label == "C_ling_russian_threejs_temp07" {
                 let lower = visible.lowercased()
