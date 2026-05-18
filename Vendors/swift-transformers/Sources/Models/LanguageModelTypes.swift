@@ -8,8 +8,8 @@
 #if canImport(CoreML)
 import CoreML
 
-import Generation
-import Tokenizers
+import VMLXGeneration
+import VMLXTokenizers
 
 /// Protocol defining the core interface for language model implementations.
 ///

@@ -7,7 +7,7 @@ import MLXLLM
 import MLXLMCommon
 @testable import MLXVLM
 import Testing
-@preconcurrency import Tokenizers
+@preconcurrency import VMLXTokenizers
 import XCTest
 
 @Suite("ZAYA1-VL registration and metadata", .serialized)

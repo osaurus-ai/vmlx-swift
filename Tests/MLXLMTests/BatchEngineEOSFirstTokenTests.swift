@@ -16,7 +16,7 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXNN
-@preconcurrency import Tokenizers
+@preconcurrency import VMLXTokenizers
 import XCTest
 
 class BatchEngineEOSFirstTokenTests: XCTestCase {

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
-import Jinja
+import VMLXJinja
 import MLX
 import Testing
 @testable import MLXLLM

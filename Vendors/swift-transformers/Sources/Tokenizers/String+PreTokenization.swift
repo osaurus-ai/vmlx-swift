@@ -1,6 +1,6 @@
 import Foundation
 
-import struct Hub.Config
+import struct VMLXHub.Config
 
 enum StringSplitPattern {
     case regexp(regexp: String)

@@ -7,7 +7,7 @@
 //
 
 import Foundation
-import Hub
+import VMLXHub
 
 /// A Unigram tokenizer implementation based on the SentencePiece algorithm.
 ///

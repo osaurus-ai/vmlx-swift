@@ -3,7 +3,7 @@ import MLX
 import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
-@preconcurrency import Tokenizers
+@preconcurrency import VMLXTokenizers
 
 #if canImport(Darwin)
 import Darwin

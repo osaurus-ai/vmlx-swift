@@ -25,7 +25,7 @@ public struct DownloaderMacro: ExpressionMacro {
             """
             // make sure you:
             //
-            // import HuggingFace
+            // import VMLXHuggingFace
             //
             { (hubApi: HubClient) -> MLXLMCommon.Downloader in
                 struct HubBridge: MLXLMCommon.Downloader {
@@ -42,7 +42,7 @@ public struct DownloaderMacro: ExpressionMacro {
                         useLatest: Bool,
                         progressHandler: @Sendable @escaping (Progress) -> Void
                     ) async throws -> URL {
-                        guard let repoID = HuggingFace.Repo.ID(rawValue: id) else {
+                        guard let repoID = VMLXHuggingFace.Repo.ID(rawValue: id) else {
                             throw HuggingFaceDownloaderError.invalidRepositoryID(id)
                         }
                         let revision = revision ?? "main"
@@ -77,13 +77,13 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
             """
             // make sure you:
             //
-            // import Tokenizers
+            // import VMLXTokenizers
             //
-            { (huggingFaceTokenizer: Tokenizers.Tokenizer) -> MLXLMCommon.Tokenizer in
+            { (huggingFaceTokenizer: VMLXTokenizers.Tokenizer) -> MLXLMCommon.Tokenizer in
                 struct TokenizerBridge: MLXLMCommon.GenerationPromptControllableTokenizer {
-                    private let upstream: any Tokenizers.Tokenizer
+                    private let upstream: any VMLXTokenizers.Tokenizer
 
-                    init(_ upstream: any Tokenizers.Tokenizer) {
+                    init(_ upstream: any VMLXTokenizers.Tokenizer) {
                         self.upstream = upstream
                     }
 
@@ -127,13 +127,13 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             do {
                                 return try upstream.applyChatTemplate(
                                     messages: messages,
-                                    chatTemplate: Tokenizers.ChatTemplateArgument.literal(src),
+                                    chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(src),
                                     addGenerationPrompt: true,
                                     truncation: false,
                                     maxLength: nil,
                                     tools: tools,
                                     additionalContext: additionalContext)
-                            } catch Tokenizers.TokenizerError.missingChatTemplate {
+                            } catch VMLXTokenizers.TokenizerError.missingChatTemplate {
                                 throw MLXLMCommon.TokenizerError.missingChatTemplate
                             }
                         }
@@ -157,7 +157,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             }
                             return try upstream.applyChatTemplate(
                                 messages: messages,
-                                chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
                                     MLXLMCommon.ChatTemplateFallbacks.lagunaMinimal),
                                 addGenerationPrompt: true,
                                 truncation: false,
@@ -190,7 +190,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             }
                             return try upstream.applyChatTemplate(
                                 messages: messages,
-                                chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
                                     MLXLMCommon.ChatTemplateFallbacks.minimaxM2Minimal),
                                 addGenerationPrompt: true,
                                 truncation: false,
@@ -236,7 +236,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         do {
                             return try upstream.applyChatTemplate(
                                 messages: messages, tools: tools, additionalContext: adjustedContext)
-                        } catch Tokenizers.TokenizerError.missingChatTemplate {
+                        } catch VMLXTokenizers.TokenizerError.missingChatTemplate {
                             // Missing-template fallbacks for bundles that ship
                             // tokenizer special tokens but no tokenizer_config
                             // chat_template field. VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE=1
@@ -250,7 +250,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                     }
                                     return try upstream.applyChatTemplate(
                                         messages: messages,
-                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                        chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
                                             MLXLMCommon.ChatTemplateFallbacks.lagunaMinimal),
                                         addGenerationPrompt: true,
                                         truncation: false,
@@ -266,7 +266,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                     }
                                     return try upstream.applyChatTemplate(
                                         messages: messages,
-                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                        chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
                                             MLXLMCommon.ChatTemplateFallbacks.dsv4Minimal),
                                         addGenerationPrompt: true,
                                         truncation: false,
@@ -283,7 +283,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                     }
                                     return try upstream.applyChatTemplate(
                                         messages: messages,
-                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                        chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
                                             MLXLMCommon.ChatTemplateFallbacks.minimaxM2Minimal),
                                         addGenerationPrompt: true,
                                         truncation: false,
@@ -302,7 +302,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                         : MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools
                                     return try upstream.applyChatTemplate(
                                         messages: messages,
-                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(template),
+                                        chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(template),
                                         addGenerationPrompt: true,
                                         truncation: false,
                                         maxLength: nil,
@@ -318,7 +318,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                     }
                                     return try upstream.applyChatTemplate(
                                         messages: messages,
-                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                        chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
                                             MLXLMCommon.ChatTemplateFallbacks.nemotronMinimal),
                                         addGenerationPrompt: true,
                                         truncation: false,
@@ -375,7 +375,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 do {
                                     let ids = try upstream.applyChatTemplate(
                                         messages: messages,
-                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(candidate.template),
+                                        chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(candidate.template),
                                         addGenerationPrompt: true,
                                         truncation: false,
                                         maxLength: nil,
@@ -407,13 +407,13 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             do {
                                 return try upstream.applyChatTemplate(
                                     messages: messages,
-                                    chatTemplate: Tokenizers.ChatTemplateArgument.literal(src),
+                                    chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(src),
                                     addGenerationPrompt: addGenerationPrompt,
                                     truncation: false,
                                     maxLength: nil,
                                     tools: tools,
                                     additionalContext: additionalContext)
-                            } catch Tokenizers.TokenizerError.missingChatTemplate {
+                            } catch VMLXTokenizers.TokenizerError.missingChatTemplate {
                                 throw MLXLMCommon.TokenizerError.missingChatTemplate
                             }
                         }
@@ -424,7 +424,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            upstream.eosToken == "[e~[" {
                             return try upstream.applyChatTemplate(
                                 messages: messages,
-                                chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
                                     MLXLMCommon.ChatTemplateFallbacks.minimaxM2Minimal),
                                 addGenerationPrompt: addGenerationPrompt,
                                 truncation: false,
@@ -441,12 +441,12 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 maxLength: nil,
                                 tools: tools,
                                 additionalContext: additionalContext)
-                        } catch Tokenizers.TokenizerError.missingChatTemplate {
+                        } catch VMLXTokenizers.TokenizerError.missingChatTemplate {
                             if upstream.bosToken == "]~!b[",
                                upstream.eosToken == "[e~[" {
                                 return try upstream.applyChatTemplate(
                                     messages: messages,
-                                    chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                    chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
                                         MLXLMCommon.ChatTemplateFallbacks.minimaxM2Minimal),
                                     addGenerationPrompt: addGenerationPrompt,
                                     truncation: false,
@@ -479,9 +479,9 @@ public struct TokenizerLoaderMacro: ExpressionMacro {
                     public func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
                         // make sure you:
                         //
-                        // import Tokenizers
+                        // import VMLXTokenizers
                         //
-                        let upstream = try await AutoTokenizer.from(modelFolder: directory)
+                        let upstream = try await VMLXTokenizers.AutoTokenizer.from(modelFolder: directory)
                         return #adaptHuggingFaceTokenizer(upstream)
                     }
                 }

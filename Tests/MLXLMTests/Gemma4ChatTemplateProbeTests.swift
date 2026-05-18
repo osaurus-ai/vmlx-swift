@@ -11,12 +11,12 @@
 // (sliding-window, Gemma-4-E2B, Gemma-4-E4B, Gemma-4-26B-A4B).
 //
 // These tests do NOT require any model weights. They exercise the template
-// file directly via `Jinja.Template`.
+// file directly via `VMLXJinja.Template`.
 
 import Foundation
 import XCTest
 
-import Jinja
+import VMLXJinja
 
 // Convert a heterogeneous `[String: Any]` context into the
 // `[String: Value]` shape swift-jinja 2.x expects. Used by the

@@ -28,7 +28,7 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 import MLXVLM
-@preconcurrency import Tokenizers
+@preconcurrency import VMLXTokenizers
 
 enum OmniBench {
 

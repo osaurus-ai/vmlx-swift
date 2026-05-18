@@ -1,7 +1,7 @@
 // Copyright 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-import Jinja
+import VMLXJinja
 import MLXLMCommon
 import XCTest
 

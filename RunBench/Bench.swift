@@ -6,8 +6,8 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 import MLXVLM
-@preconcurrency import Jinja
-@preconcurrency import Tokenizers
+@preconcurrency import VMLXJinja
+@preconcurrency import VMLXTokenizers
 
 // Multi-turn benchmark for gemma-4-26b-a4b-it-4bit
 // Loads pre-tokenized turns from /tmp/gemma4_multiturn_tokens.json

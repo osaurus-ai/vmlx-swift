@@ -23,7 +23,7 @@
 
 import Foundation
 import XCTest
-@preconcurrency import Tokenizers
+@preconcurrency import VMLXTokenizers
 
 @testable import MLXLMCommon
 

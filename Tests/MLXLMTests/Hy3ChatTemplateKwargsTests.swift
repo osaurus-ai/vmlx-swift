@@ -30,7 +30,7 @@
 // machines don't fail).
 
 import Foundation
-import Jinja
+import VMLXJinja
 import XCTest
 
 final class Hy3ChatTemplateKwargsTests: XCTestCase {

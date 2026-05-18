@@ -31,7 +31,7 @@ import MLXDistributedJACCL
 import MLXDistributedTP
 import MLXHuggingFace
 import MLXNN
-@preconcurrency import Tokenizers
+@preconcurrency import VMLXTokenizers
 
 @main
 struct TPRankWorker {

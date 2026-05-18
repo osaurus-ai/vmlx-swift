@@ -35,7 +35,7 @@ public typealias PredictionStringCallback = (String) -> Void
 
 #if canImport(CoreML)
 import CoreML
-import Tokenizers
+import VMLXTokenizers
 
 /// A callable model that predicts the next token after a given sequence.
 ///

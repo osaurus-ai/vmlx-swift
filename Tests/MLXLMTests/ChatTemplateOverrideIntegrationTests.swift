@@ -17,7 +17,7 @@
 
 import Foundation
 import XCTest
-@preconcurrency import Tokenizers
+@preconcurrency import VMLXTokenizers
 
 @testable import MLXHuggingFace
 @testable import MLXLMCommon
@@ -177,7 +177,7 @@ final class ChatTemplateOverrideIntegrationTests: XCTestCase {
     // MARK: - Shipped Gemma4Minimal roundtrips via the bridge
 
     /// The template shipped in iter 50 must also work through the
-    /// bridge path end-to-end (not just isolated Jinja.Template).
+    /// bridge path end-to-end (not just isolated VMLXJinja.Template).
     /// Catches packaging / whitespace / comment-stripping issues that
     /// might sneak in between disk and render.
     func testShippedGemma4MinimalTemplateRendersViaBridge() async throws {

@@ -5,7 +5,7 @@
 import BenchmarkHelpers
 import Foundation
 import MLX
-@preconcurrency import Tokenizers
+@preconcurrency import VMLXTokenizers
 @testable import MLXHuggingFace
 @testable import MLXLLM
 @testable import MLXLMCommon

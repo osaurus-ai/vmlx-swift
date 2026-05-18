@@ -5,7 +5,7 @@
 //  Created by Piotr Kowalczuk on 06.03.25.
 
 import Foundation
-import Jinja
+import VMLXJinja
 
 // MARK: - Configuration files with dynamic lookup
 
@@ -444,12 +444,12 @@ public struct Config: Hashable, Sendable,
         self.dictionary(or: or)
     }
 
-    public func jinjaValue() -> Jinja.Value {
+    public func jinjaValue() -> VMLXJinja.Value {
         switch self.value {
         case let .array(val):
             return .array(val.map { $0.jinjaValue() })
         case let .dictionary(val):
-            var result: [String: Jinja.Value] = [:]
+            var result: [String: VMLXJinja.Value] = [:]
             for (key, config) in val {
                 result[key.string] = config.jinjaValue()
             }

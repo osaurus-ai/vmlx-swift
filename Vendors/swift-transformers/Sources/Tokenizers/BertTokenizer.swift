@@ -7,7 +7,7 @@
 //
 
 import Foundation
-import Hub
+import VMLXHub
 
 /// A BERT-style tokenizer implementing WordPiece tokenization.
 ///

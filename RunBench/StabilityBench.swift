@@ -30,7 +30,7 @@ import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
 import MLXVLM
-@preconcurrency import Tokenizers
+@preconcurrency import VMLXTokenizers
 
 enum StabilityBench {
 

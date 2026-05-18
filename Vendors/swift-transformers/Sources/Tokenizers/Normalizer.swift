@@ -6,7 +6,7 @@
 //
 
 import Foundation
-import Hub
+import VMLXHub
 
 /// A protocol for text normalization operations applied before tokenization.
 ///

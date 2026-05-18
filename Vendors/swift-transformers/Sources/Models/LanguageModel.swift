@@ -8,9 +8,9 @@
 #if canImport(CoreML)
 import CoreML
 
-import Generation
-import Hub
-import Tokenizers
+import VMLXGeneration
+import VMLXHub
+import VMLXTokenizers
 
 @available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, watchOS 11.0, *)
 /// A high-level interface for language model inference using CoreML.

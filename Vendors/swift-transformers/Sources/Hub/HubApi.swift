@@ -7,7 +7,7 @@
 
 import Crypto
 import Foundation
-import HuggingFace
+import VMLXHuggingFace
 
 #if canImport(FoundationNetworking)
 import FoundationNetworking
@@ -243,8 +243,8 @@ private extension HubApi {
         #endif
     }
 
-    func resolveHubClientRepoID(for repo: Repo) async throws -> HuggingFace.Repo.ID {
-        if let parsed = HuggingFace.Repo.ID(rawValue: repo.id) {
+    func resolveHubClientRepoID(for repo: Repo) async throws -> VMLXHuggingFace.Repo.ID {
+        if let parsed = VMLXHuggingFace.Repo.ID(rawValue: repo.id) {
             return parsed
         }
 
@@ -262,19 +262,19 @@ private extension HubApi {
                 .appending(path: repo.id)
             let (data, _) = try await httpGet(for: url)
             let response = try JSONDecoder().decode(ModelInfoResponse.self, from: data)
-            if let canonical = HuggingFace.Repo.ID(rawValue: response.id) {
+            if let canonical = VMLXHuggingFace.Repo.ID(rawValue: response.id) {
                 await Self.hubRepoIdCache.set(repo.id, value: canonical)
                 return canonical
             }
         }
 
         // Keep historical behavior for non-qualified IDs when canonicalization fails.
-        return HuggingFace.Repo.ID(namespace: "", name: repo.id)
+        return VMLXHuggingFace.Repo.ID(namespace: "", name: repo.id)
     }
 }
 
 private extension Hub.RepoType {
-    var hubClientKind: HuggingFace.Repo.Kind {
+    var hubClientKind: VMLXHuggingFace.Repo.Kind {
         switch self {
         case .models:
             return .model
@@ -1423,13 +1423,13 @@ private actor RedirectSessionActor {
 }
 
 private actor HubRepoIDCacheActor {
-    private var values: [String: HuggingFace.Repo.ID] = [:]
+    private var values: [String: VMLXHuggingFace.Repo.ID] = [:]
 
-    func get(_ key: String) -> HuggingFace.Repo.ID? {
+    func get(_ key: String) -> VMLXHuggingFace.Repo.ID? {
         values[key]
     }
 
-    func set(_ key: String, value: HuggingFace.Repo.ID) {
+    func set(_ key: String, value: VMLXHuggingFace.Repo.ID) {
         values[key] = value
     }
 }
