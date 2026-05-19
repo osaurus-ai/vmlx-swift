@@ -352,12 +352,32 @@ public func loadWeights(
                 Data("[Load] JANG shape walk produced \(inferred.perLayerQuantization.count) per-layer quant override(s) over default (bits=\(b), gs=\(g))\n".utf8))
         }
         func variants(_ key: String) -> [String] {
-            var out = [key]
-            if key.contains(".attn.") || key.hasSuffix(".attn") {
-                out.append(key.replacingOccurrences(of: ".attn.", with: ".self_attn."))
-                if key.hasSuffix(".attn") {
-                    out.append(String(key.dropLast(".attn".count)) + ".self_attn")
+            var seen = Set<String>()
+            var out: [String] = []
+            func add(_ value: String) {
+                if seen.insert(value).inserted {
+                    out.append(value)
                 }
+            }
+
+            add(key)
+            if key.contains(".attn.") || key.hasSuffix(".attn") {
+                add(key.replacingOccurrences(of: ".attn.", with: ".self_attn."))
+                if key.hasSuffix(".attn") {
+                    add(String(key.dropLast(".attn".count)) + ".self_attn")
+                }
+            }
+            if key.hasPrefix("language_model.model.") {
+                add(String(key.dropFirst("language_model.".count)))
+                add(String(key.dropFirst("language_model.model.".count)))
+            } else if key.hasPrefix("language_model.") {
+                add(String(key.dropFirst("language_model.".count)))
+            } else if key.hasPrefix("model.") {
+                add("language_model.\(key)")
+            } else {
+                add("model.\(key)")
+                add("language_model.\(key)")
+                add("language_model.model.\(key)")
             }
             return out
         }
@@ -491,22 +511,71 @@ public func loadWeights(
 
     // quantize if needed
     if quantization != nil || effectivePerLayerQuantization != nil {
+        func quantizedWeightBaseCandidates(_ path: String) -> [String] {
+            var seen = Set<String>()
+            var out: [String] = []
+            func add(_ value: String) {
+                if seen.insert(value).inserted {
+                    out.append(value)
+                }
+            }
+
+            add(path)
+            if path.hasPrefix("language_model.model.") {
+                add(String(path.dropFirst("language_model.".count)))
+                add(String(path.dropFirst("language_model.model.".count)))
+            } else if path.hasPrefix("language_model.") {
+                add(String(path.dropFirst("language_model.".count)))
+            } else if path.hasPrefix("model.") {
+                add("language_model.\(path)")
+                add(String(path.dropFirst("model.".count)))
+            } else {
+                add("model.\(path)")
+                add("language_model.\(path)")
+                add("language_model.model.\(path)")
+            }
+            return out
+        }
+
         // Inline quantize with error logging instead of try! crash
         let updates = model.leafModules().flattened().compactMap { (path, m) -> (String, Module)? in
-            let weightKey = "\(path).weight"
-            let scalesKey = "\(path).scales"
-            let biasesKey = "\(path).biases"
-            let biasKey = "\(path).bias"
-            guard let loadedWeight = weights[weightKey],
-                let loadedScales = weights[scalesKey]
+            let baseCandidates = quantizedWeightBaseCandidates(path)
+            let matchedBase = baseCandidates.first {
+                weights["\($0).weight"] != nil && weights["\($0).scales"] != nil
+            }
+            guard let matchedBase,
+                let loadedWeight = weights["\(matchedBase).weight"],
+                let loadedScales = weights["\(matchedBase).scales"]
             else { return nil }
+            let biasesKey = "\(matchedBase).biases"
+            let biasKey = "\(matchedBase).bias"
             let tup: (groupSize: Int, bits: Int, mode: QuantizationMode)?
             if let effectivePerLayerQuantization {
-                tup = effectivePerLayerQuantization.quantization(layer: path)?.asTuple
+                let explicit = baseCandidates.lazy.compactMap { candidate -> BaseConfiguration.Quantization? in
+                    guard let option = effectivePerLayerQuantization.perLayerQuantization[candidate] else {
+                        return nil
+                    }
+                    switch option {
+                    case .skip:
+                        return nil
+                    case .quantize(let quantization):
+                        return quantization
+                    }
+                }.first
+                tup = (explicit ?? effectivePerLayerQuantization.quantization)?.asTuple
             } else {
                 tup = quantization?.asTuple
             }
-            guard let (gs, b, mode) = tup else { return nil }
+            guard let resolvedQuantization = tup else { return nil }
+            let gs = resolvedQuantization.groupSize
+            let b = resolvedQuantization.bits
+            var mode = resolvedQuantization.mode
+            if weights[biasesKey] != nil && (mode == .mxfp4 || mode == .mxfp8) {
+                // MXFP kernels have no affine zero-point/bias companion. If a
+                // converter stamped the bundle as MXFP but emitted `.biases`,
+                // the tensor payload is affine and must be loaded that way.
+                mode = .affine
+            }
 
             let quantBiases =
                 (mode == .mxfp4 || mode == .mxfp8) ? nil : weights[biasesKey]

@@ -1045,6 +1045,59 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
+    @Test("shape-walk quantization treats bias-bearing MXFP metadata as affine")
+    func shapeWalkQuantizationTreatsBiasBearingMXFPMetadataAsAffine() {
+        let base = "language_model.model.layers.0.mlp.gate"
+        let weights: [String: MLXArray] = [
+            "\(base).weight": MLXArray.zeros([2, 16], dtype: .uint32),
+            "\(base).scales": MLXArray.zeros([2, 4], dtype: .float32),
+            "\(base).biases": MLXArray.zeros([2, 4], dtype: .float32),
+        ]
+
+        let inferred = JangLoader.inferPerLayerQuantizationFromShapes(
+            weights: weights,
+            defaultBits: 4,
+            defaultGroupSize: 32,
+            defaultMode: .mxfp4)
+
+        if case .quantize(let override)? = inferred?.perLayerQuantization[base] {
+            #expect(override.bits == 4)
+            #expect(override.groupSize == 32)
+            #expect(override.mode == .affine)
+        } else {
+            Issue.record("Expected affine override for bias-bearing MXFP metadata")
+        }
+    }
+
+    @Test("JANG shape-walk treats bias-bearing MXFP metadata as affine")
+    func jangShapeWalkTreatsBiasBearingMXFPMetadataAsAffine() {
+        let base = "language_model.model.layers.0.mlp.switch_mlp.gate_proj"
+        let weights: [String: MLXArray] = [
+            "\(base).weight": MLXArray.zeros([2, 16], dtype: .uint32),
+            "\(base).scales": MLXArray.zeros([2, 4], dtype: .float32),
+            "\(base).biases": MLXArray.zeros([2, 4], dtype: .float32),
+        ]
+
+        let inferred = JangLoader.inferPerLayerQuantization(
+            weights: weights,
+            jangConfig: JangConfig(
+                quantization: JangQuantization(
+                    blockSize: 32,
+                    bitWidthsUsed: [4])),
+            declaredDefaultQuantization: BaseConfiguration.Quantization(
+                groupSize: 32,
+                bits: 4,
+                mode: .mxfp4))
+
+        if case .quantize(let override)? = inferred.perLayerQuantization[base] {
+            #expect(override.bits == 4)
+            #expect(override.groupSize == 32)
+            #expect(override.mode == .affine)
+        } else {
+            Issue.record("Expected affine override for JANG bias-bearing MXFP metadata")
+        }
+    }
+
     @Test("shape-walk quantization supports JANG_2K 3-bit group-128 projections")
     func shapeWalkQuantizationSupportsJang2KThreeBitGroup128() {
         let inferred = JangLoader.inferBitWidthAndGroupSize(

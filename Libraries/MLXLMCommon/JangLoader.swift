@@ -1327,7 +1327,7 @@ public struct JangLoader: Sendable {
         let hintToUse: [Int] =
             bitWidthsHint.isEmpty ? [8, 6, 5, 4, 3, 2] : bitWidthsHint
 
-        var inferred = [String: (bits: Int, groupSize: Int)]()
+        var inferred = [String: (bits: Int, groupSize: Int, mode: QuantizationMode)]()
         for basePath in quantizedLayers {
             guard let weightArray = weights[basePath + ".weight"],
                 let scalesArray = weights[basePath + ".scales"]
@@ -1336,7 +1336,8 @@ public struct JangLoader: Sendable {
                 weight: weightArray, scales: scalesArray,
                 knownGroupSize: defaultGroupSize,
                 bitWidthsUsed: hintToUse)
-            inferred[basePath] = (bits, gs)
+            let mode = weights[basePath + ".biases"] == nil ? defaultMode : .affine
+            inferred[basePath] = (bits, gs, mode)
         }
         guard !inferred.isEmpty else { return nil }
 
@@ -1363,10 +1364,11 @@ public struct JangLoader: Sendable {
         for (path, t) in inferred {
             if t.bits != chosenDefault.bits
                 || t.groupSize != chosenDefault.groupSize
+                || t.mode != defaultMode
             {
                 perLayer[path] = .quantize(
                     BaseConfiguration.Quantization(
-                        groupSize: t.groupSize, bits: t.bits, mode: defaultMode))
+                        groupSize: t.groupSize, bits: t.bits, mode: t.mode))
             }
         }
         return BaseConfiguration.PerLayerQuantization(
@@ -1678,11 +1680,12 @@ public struct JangLoader: Sendable {
                     bitWidthsUsed: bitWidthsUsed)
             }
 
+            let mode = weights[basePath + ".biases"] == nil ? defaultMode : .affine
             let declaredForLayer = declaredQuantization(for: basePath)
             let declaredMatches =
                 declaredForLayer?.bits == bits
                 && declaredForLayer?.groupSize == inferredGroupSize
-                && (declaredForLayer?.mode ?? defaultMode) == defaultMode
+                && (declaredForLayer?.mode ?? defaultMode) == mode
             let layerHasMetadataDrift =
                 declaredForLayer == nil
                 || !declaredMatches
@@ -1702,7 +1705,7 @@ public struct JangLoader: Sendable {
                 BaseConfiguration.Quantization(
                     groupSize: inferredGroupSize,
                     bits: bits,
-                    mode: defaultMode))
+                    mode: mode))
         }
 
         if disagreementCount > 0,

@@ -1317,6 +1317,9 @@ public enum ModuleValue {
         guard let value else {
             return .none
         }
+        guard let value = unwrapOptional(value) else {
+            return .none
+        }
 
         switch value {
         case let v as MLXArray:
@@ -1654,7 +1657,11 @@ private func unwrapProperty(_ property: Any) -> (String?, Any?)? {
         value = p.value!
     case let p as ParameterInfo<MLXArray?>:
         label = p.key
-        value = p.value as Any?
+        if let stored = p.value {
+            value = stored as Any
+        } else {
+            value = Optional<MLXArray>.none as Any
+        }
     case let p as ParameterInfo<(MLXArray, MLXArray)>:
         label = p.key
         value = p.value!
@@ -1672,6 +1679,20 @@ private func unwrapProperty(_ property: Any) -> (String?, Any?)? {
     }
 
     return (label, value)
+}
+
+private func unwrapOptional(_ value: Any) -> Any? {
+    var current = value
+    while true {
+        let mirror = Mirror(reflecting: current)
+        guard mirror.displayStyle == .optional else {
+            return current
+        }
+        guard let child = mirror.children.first else {
+            return nil
+        }
+        current = child.value
+    }
 }
 
 private func isModuleInfo(_ property: Any) -> (String?, Any, TypeErasedSetter)? {

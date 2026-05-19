@@ -157,8 +157,8 @@ open class QuantizedEmbedding: Embedding, Quantized {
     public let bits: Int
 
     public let mode: QuantizationMode
-    public let scales: MLXArray
-    public let biases: MLXArray?
+    @ParameterInfo(key: "scales") public var scales: MLXArray
+    @ParameterInfo(key: "biases") public var biases: MLXArray?
 
     open override var shape: (Int, Int) {
         let (embeddingCount, dimensions) = super.shape
@@ -193,8 +193,8 @@ open class QuantizedEmbedding: Embedding, Quantized {
         let (quantizedWeight, scales, biases) = MLX.quantized(
             weight, groupSize: groupSize, bits: bits, mode: mode)
 
-        self.scales = scales
-        self.biases = biases
+        self._scales.wrappedValue = scales
+        self._biases.wrappedValue = biases
 
         super.init(weight: quantizedWeight)
 
@@ -219,8 +219,8 @@ open class QuantizedEmbedding: Embedding, Quantized {
         self.groupSize = groupSize
         self.bits = bits
         self.mode = mode
-        self.scales = scales
-        self.biases = biases
+        self._scales.wrappedValue = scales
+        self._biases.wrappedValue = biases
         super.init(weight: weight)
 
         self.freeze()
@@ -266,8 +266,8 @@ open class QuantizedLinear: Linear, Quantized {
     public let bits: Int
 
     public let mode: QuantizationMode
-    public let scales: MLXArray
-    public let biases: MLXArray?
+    @ParameterInfo(key: "scales") public var scales: MLXArray
+    @ParameterInfo(key: "biases") public var biases: MLXArray?
 
     open override var shape: (Int, Int) {
         let shape = weight.shape2
@@ -326,8 +326,8 @@ open class QuantizedLinear: Linear, Quantized {
         let (quantizedWeight, scales, biases) = MLX.quantized(
             weight, groupSize: groupSize, bits: bits, mode: mode)
 
-        self.scales = scales
-        self.biases = biases
+        self._scales.wrappedValue = scales
+        self._biases.wrappedValue = biases
 
         super.init(weight: quantizedWeight, bias: bias)
 
@@ -346,8 +346,8 @@ open class QuantizedLinear: Linear, Quantized {
         self.groupSize = groupSize
         self.bits = bits
         self.mode = mode
-        self.scales = scales
-        self.biases = biases
+        self._scales.wrappedValue = scales
+        self._biases.wrappedValue = biases
         super.init(weight: weight, bias: bias)
     }
 
