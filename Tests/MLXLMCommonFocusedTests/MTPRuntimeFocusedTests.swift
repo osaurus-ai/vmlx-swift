@@ -1369,7 +1369,8 @@ struct MTPRuntimeFocusedTests {
         let root = URL(fileURLWithPath: path)
         let configData = try Data(contentsOf: root.appendingPathComponent("config.json"))
         let jangConfig = try? JangLoader.loadConfig(at: root)
-        let settings = VMLXServerRuntimeSettings()
+        var settings = VMLXServerRuntimeSettings()
+        settings.mtp.mode = .auto
         let launch = settings.resolvedMTPLaunch(
             configData: configData,
             jangConfig: jangConfig,

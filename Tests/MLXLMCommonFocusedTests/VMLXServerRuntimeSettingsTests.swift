@@ -26,6 +26,7 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.generation.topK == nil)
         #expect(settings.generation.minP == nil)
         #expect(settings.generation.repetitionPenalty == nil)
+        #expect(settings.mtp.mode == .off)
         #expect(settings.mtp.keepDraftCacheSeparate)
         #expect(settings.mtp.acceptedTokensOnlyEnterBaseCache)
     }
@@ -141,7 +142,8 @@ struct VMLXServerRuntimeSettingsTests {
 
     @Test("MTP auto helper requires bundle tuning file")
     func mtpAutoHelperRequiresBundleTuningFile() {
-        let settings = VMLXServerRuntimeSettings()
+        var settings = VMLXServerRuntimeSettings()
+        settings.mtp.mode = .auto
         let missingTuning = MTPBundleStatus(
             bundleHasMTP: true,
             configuredLayers: 4,
@@ -232,6 +234,7 @@ struct VMLXServerRuntimeSettingsTests {
                 outputEquivalent: true,
                 artifact: "docs/internal/release-gates/qwen-depth3/result.json"))
         var settings = VMLXServerRuntimeSettings()
+        settings.mtp.mode = .auto
         settings.mtp.draftTokenLimit = 2
 
         let launch = settings.resolvedMTPLaunch(
@@ -274,7 +277,8 @@ struct VMLXServerRuntimeSettingsTests {
                 validated: true,
                 outputEquivalent: true,
                 artifact: "docs/internal/release-gates/qwen-depth3/result.json"))
-        let settings = VMLXServerRuntimeSettings()
+        var settings = VMLXServerRuntimeSettings()
+        settings.mtp.mode = .auto
 
         let candidate = NativeMTPAutoDecodePolicy.recommendation(
             configData: config,

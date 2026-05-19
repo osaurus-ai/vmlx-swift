@@ -901,7 +901,7 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     public var acceptedTokensOnlyEnterBaseCache: Bool
 
     public init(
-        mode: VMLXMTPServerMode = .auto,
+        mode: VMLXMTPServerMode = .off,
         draftTokenLimit: Int? = nil,
         keepDraftCacheSeparate: Bool = true,
         acceptedTokensOnlyEnterBaseCache: Bool = true
