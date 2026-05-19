@@ -234,7 +234,7 @@ public struct ReasoningParser: Sendable {
             }
 
             guard let (range, tag) = firstRange(of: openerTags, in: buffer) else {
-                let strayControlTags = holdTags.filter { $0 != gptStartControl }
+                let strayControlTags = [gptMessage] + gptEndTags
                 if let (controlRange, _) = firstRange(of: strayControlTags, in: buffer) {
                     let before = stripHarmonyControlText(String(buffer[..<controlRange.lowerBound]))
                     if !before.isEmpty {
@@ -386,8 +386,6 @@ public struct ReasoningParser: Sendable {
             "<|start|>",
             "<|channel|>",
             "<|message|>",
-            "<|channel>",
-            "<channel|>",
             "<|end|>",
             "<|return|>",
         ] {

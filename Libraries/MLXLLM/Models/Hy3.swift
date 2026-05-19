@@ -200,27 +200,89 @@ public struct Hy3Configuration: Codable, Sendable {
         guard container.contains(.mxtqBits) else {
             return (nil, nil, nil)
         }
-        if let dict = try? container.decode([String: Int].self, forKey: .mxtqBits) {
-            let uniform = dict["routed_expert"] ?? dict["experts"] ?? dict.values.min()
-            return (uniform, nil, nil)
+
+        let dict = try container.nestedContainer(
+            keyedBy: DynamicCodingKey.self, forKey: .mxtqBits)
+
+        for keyName in ["routed_expert", "experts", "routed"] {
+            guard let key = DynamicCodingKey(stringValue: keyName) else { continue }
+            if let uniform = try? dict.decode(Int.self, forKey: key) {
+                return (uniform, nil, nil)
+            }
+            if let routed = try? dict.nestedContainer(
+                keyedBy: DynamicCodingKey.self, forKey: key)
+            {
+                let bits = try decodeProjectionBits(
+                    from: routed, codingPath: dict.codingPath + [key])
+                return (bits.gateUp, bits.gateUp, bits.down)
+            }
         }
-        let nested = try container.decode([String: [String: Int]].self, forKey: .mxtqBits)
-        let routed = nested["routed_expert"] ?? nested["experts"] ?? [:]
-        let gate = routed["gate_proj"]
-        let up = routed["up_proj"]
-        let down = routed["down_proj"]
-        if let gate, let up, gate != up {
-            throw DecodingError.dataCorruptedError(
-                forKey: .mxtqBits,
-                in: container,
+
+        if let direct = try decodeProjectionBitsIfPresent(from: dict) {
+            return (direct.gateUp, direct.gateUp, direct.down)
+        }
+
+        let roleValues = dict.allKeys.compactMap { key in
+            try? dict.decode(Int.self, forKey: key)
+        }
+        return (roleValues.min(), nil, nil)
+    }
+
+    private struct RoutedExpertBitWidths {
+        let gateUp: Int
+        let down: Int
+    }
+
+    private struct DynamicCodingKey: CodingKey {
+        let stringValue: String
+        let intValue: Int?
+
+        init?(stringValue: String) {
+            self.stringValue = stringValue
+            self.intValue = nil
+        }
+
+        init?(intValue: Int) {
+            self.stringValue = "\(intValue)"
+            self.intValue = intValue
+        }
+    }
+
+    private static func decodeProjectionBitsIfPresent(
+        from container: KeyedDecodingContainer<DynamicCodingKey>
+    ) throws -> RoutedExpertBitWidths? {
+        let gateKey = DynamicCodingKey(stringValue: "gate_proj")!
+        let upKey = DynamicCodingKey(stringValue: "up_proj")!
+        let downKey = DynamicCodingKey(stringValue: "down_proj")!
+        guard container.contains(gateKey) || container.contains(upKey) || container.contains(downKey)
+        else { return nil }
+        return try decodeProjectionBits(from: container, codingPath: container.codingPath)
+    }
+
+    private static func decodeProjectionBits(
+        from container: KeyedDecodingContainer<DynamicCodingKey>,
+        codingPath: [any CodingKey]
+    ) throws -> RoutedExpertBitWidths {
+        let gateKey = DynamicCodingKey(stringValue: "gate_proj")!
+        let upKey = DynamicCodingKey(stringValue: "up_proj")!
+        let downKey = DynamicCodingKey(stringValue: "down_proj")!
+
+        let gate = try container.decodeIfPresent(Int.self, forKey: gateKey)
+        let up = try container.decodeIfPresent(Int.self, forKey: upKey)
+        let down = try container.decodeIfPresent(Int.self, forKey: downKey)
+        guard let gateUp = gate ?? up else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: codingPath,
                 debugDescription:
-                    "Hy3 JANGTQ_K requires gate_proj and up_proj to use the same codebook bit width")
+                    "Hy3 mxtq_bits.routed_expert must include gate_proj or up_proj"))
         }
-        let gateUp = gate ?? up
-        // Keep `routedExpertBits` as the legacy gate/up width even for mixed
-        // JANGTQ_K bundles; `routedExpertDownBits` carries the independent
-        // down-projection width.
-        return (gateUp, gateUp, down)
+        if let gate, let up, gate != up {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: codingPath,
+                debugDescription:
+                    "Hy3 JANGTQ_K requires gate_proj and up_proj to use the same codebook bit width"))
+        }
+        return RoutedExpertBitWidths(gateUp: gateUp, down: down ?? gateUp)
     }
 
     public var numKeyValueGroups: Int {
