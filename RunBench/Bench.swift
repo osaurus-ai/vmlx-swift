@@ -1125,8 +1125,9 @@ func runBatchEngineTurn(
         }
     }
     let total = CFAbsoluteTimeGetCurrent() - t0
-    let visible = text.isEmpty ? reasoning : text
-    let preview = visible.count > 150 ? String(visible.prefix(150)) + "..." : visible
+    let visible = text
+    let previewSource = visible.isEmpty ? "[empty visible; reasoning chars=\(reasoning.count)]" : visible
+    let preview = previewSource.count > 150 ? String(previewSource.prefix(150)) + "..." : previewSource
     print("    TTFT \(Int((ttft ?? 0) * 1000))ms, total \(String(format: "%.2fs", total))")
     print("    \"\(preview)\"")
     return visible
@@ -6269,9 +6270,7 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
         let chunks: Int
         let info: GenerateCompletionInfo?
 
-        var visible: String {
-            text.isEmpty ? reasoning : text
-        }
+        var visible: String { text }
     }
 
     func hasRawReasoningMarker(_ s: String) -> Bool {
@@ -6350,8 +6349,9 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
             }
         }
         let wall = CFAbsoluteTimeGetCurrent() - t0
-        let visible = text.isEmpty ? reasoning : text
-        let sample = String(visible.prefix(180)).replacingOccurrences(of: "\n", with: " ")
+        let visible = text
+        let sampleSource = visible.isEmpty ? "[empty visible; reasoning chars=\(reasoning.count)]" : visible
+        let sample = String(sampleSource.prefix(180)).replacingOccurrences(of: "\n", with: " ")
         let infoSuffix: String
         let tokps: Double
         if let info {
@@ -7942,7 +7942,7 @@ func runOfficialMultiTurn(modelPath: String, maxNew: Int) async throws {
         let deltas = chunks + reasoningDeltas
         let tokps = total > 0 ? Double(deltas) / total : 0
         let ttftMs = Int((ttft ?? 0) * 1000)
-        let preview = (text.isEmpty ? reasoning : text)
+        let preview = text.isEmpty ? "[empty visible; reasoning chars=\(reasoning.count)]" : text
         let short = preview.count > 100 ? String(preview.prefix(100)) + "…" : preview
 
         let v = validate(text, reasoning, toolCalls)
@@ -7961,9 +7961,9 @@ func runOfficialMultiTurn(modelPath: String, maxNew: Int) async throws {
         label: "S1 reasoning=ON  math 7+8-11", prompt: "Compute 7 + 8 - 11. Respond with just the number.",
         thinking: true
     ) { text, reasoning, _ in
-        // Any of {text, reasoning} must contain "4" for pass.
-        let combined = text + reasoning
-        if combined.contains("4") {
+        // The answer must be visible content. Reasoning-only output is a
+        // red row, not a fallback pass.
+        if text.contains("4") {
             return (true, "")
         }
         return (false, "answer not found")
@@ -7975,8 +7975,7 @@ func runOfficialMultiTurn(modelPath: String, maxNew: Int) async throws {
         prompt: "Compute 7 + 8 - 11. Respond with just the number.",
         thinking: true
     ) { text, reasoning, _ in
-        let combined = text + reasoning
-        if combined.contains("4") {
+        if text.contains("4") {
             return (true, "")
         }
         return (false, "answer not found on cache hit")
@@ -7989,8 +7988,7 @@ func runOfficialMultiTurn(modelPath: String, maxNew: Int) async throws {
         prompt: "Compute 2 + 2. Respond with just the number.",
         thinking: false
     ) { text, reasoning, _ in
-        let combined = text + reasoning
-        if combined.contains("4") {
+        if text.contains("4") {
             return (true, "")
         }
         return (false, "answer not found")
@@ -8048,8 +8046,8 @@ func runOfficialMultiTurn(modelPath: String, maxNew: Int) async throws {
         // parser doesn't recognize for this model). Primary metric:
         // no crash + non-empty output.
         if tools >= 1 { return (true, "extracted \(tools) tool call(s)") }
-        if (text + reasoning).count >= 10 {
-            return (true, "no tool call but \(text.count + reasoning.count) chars emitted")
+        if text.count >= 10 {
+            return (true, "no tool call but \(text.count) visible chars emitted")
         }
         return (false, "empty output, no tool call")
     }
@@ -8062,7 +8060,7 @@ func runOfficialMultiTurn(modelPath: String, maxNew: Int) async throws {
         prompt: "Write one short sentence that includes both words café and 你好.",
         thinking: false
     ) { text, reasoning, _ in
-        if !(text + reasoning).lowercased().contains("café") || !(text + reasoning).contains("你好") {
+        if !text.lowercased().contains("café") || !text.contains("你好") {
             return (false, "missing expected UTF-8 words")
         }
         return (true, "")
@@ -8083,7 +8081,7 @@ func runOfficialMultiTurn(modelPath: String, maxNew: Int) async throws {
             label: "S6.\(i+1) rapid",
             prompt: p, thinking: false
         ) { text, reasoning, _ in
-            if (text + reasoning).isEmpty { return (false, "empty") }
+            if text.isEmpty { return (false, "empty visible output") }
             return (true, "")
         }
     }

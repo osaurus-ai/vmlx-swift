@@ -166,10 +166,9 @@ enum StabilityBench {
                 context: ctx, maxBatchSize: 1,
                 cacheCoordinator: coord)
             let r = try await ask(engine, prompt: "Name one fruit.", maxNew: 24)
-            let combined = r.reasoning.isEmpty ? r.text : r.reasoning
-            if combined.isEmpty {
+            if r.text.isEmpty {
                 throw NSError(domain: "S1", code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "empty stream"])
+                    userInfo: [NSLocalizedDescriptionKey: "empty visible stream"])
             }
             return "chunks=\(r.chunks) tps=\(String(format: "%.1f", Double(r.chunks) / r.secs))"
         })
@@ -192,12 +191,10 @@ enum StabilityBench {
                 cacheCoordinator: coord)
             let r1 = try await ask(engine, prompt: "Name one fruit.", maxNew: 32)
             let r2 = try await ask(engine, prompt: "Name one fruit.", maxNew: 32)
-            let c1 = r1.reasoning.isEmpty ? r1.text : r1.reasoning
-            let c2 = r2.reasoning.isEmpty ? r2.text : r2.reasoning
-            if c1.isEmpty || c2.isEmpty {
+            if r1.text.isEmpty || r2.text.isEmpty {
                 throw NSError(domain: "S2", code: 1,
                     userInfo: [NSLocalizedDescriptionKey:
-                        "empty stream (1st=\(c1.count), 2nd=\(c2.count))"])
+                        "empty visible stream (1st=\(r1.text.count), 2nd=\(r2.text.count))"])
             }
             return String(
                 format: "1st %.1fs / 2nd %.1fs (cache should help on 2nd)",
@@ -217,11 +214,9 @@ enum StabilityBench {
             let prefix = "Hi! I'm a calculator. " + String(repeating: "Computing. ", count: 64)
             let r1 = try await ask(engine, prompt: prefix + "What is 2+2?", maxNew: 16)
             let r2 = try await ask(engine, prompt: prefix + "What is 3+3?", maxNew: 16)
-            let c1 = r1.reasoning.isEmpty ? r1.text : r1.reasoning
-            let c2 = r2.reasoning.isEmpty ? r2.text : r2.reasoning
-            if c1.isEmpty || c2.isEmpty {
+            if r1.text.isEmpty || r2.text.isEmpty {
                 throw NSError(domain: "S3", code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "one or both empty"])
+                    userInfo: [NSLocalizedDescriptionKey: "one or both visible outputs empty"])
             }
             return String(format: "1st %.1fs / 2nd %.1fs", r1.secs, r2.secs)
         })
@@ -239,13 +234,12 @@ enum StabilityBench {
             for i in 0..<8 {
                 transcript += "USER: Step \(i): give me one fact about the moon.\n"
                 let r = try await ask(engine, prompt: transcript, maxNew: 24)
-                let answer = r.reasoning.isEmpty ? r.text : r.reasoning
-                if answer.isEmpty {
+                if r.text.isEmpty {
                     throw NSError(domain: "S4", code: i,
                         userInfo: [NSLocalizedDescriptionKey:
-                            "turn \(i) empty"])
+                            "turn \(i) empty visible output"])
                 }
-                transcript += "ASSISTANT: \(answer)\nTOOL_RESULT: ok\n"
+                transcript += "ASSISTANT: \(r.text)\nTOOL_RESULT: ok\n"
             }
             return "8 turns OK, final transcript=\(transcript.count) chars"
         })
@@ -262,10 +256,9 @@ enum StabilityBench {
             let body = String(repeating: "fact ", count: 12_000)
             let prompt = "Summarize: \(body)\nSummary:"
             let r = try await ask(engine, prompt: prompt, maxNew: 24)
-            let c = r.reasoning.isEmpty ? r.text : r.reasoning
-            if c.isEmpty {
+            if r.text.isEmpty {
                 throw NSError(domain: "S5", code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "empty"])
+                    userInfo: [NSLocalizedDescriptionKey: "empty visible output"])
             }
             return "prompt~\(prompt.count) chars chunks=\(r.chunks) %.1fs"
         })
@@ -281,12 +274,10 @@ enum StabilityBench {
             async let r1 = ask(engine, prompt: "Name one fruit.", maxNew: 16)
             async let r2 = ask(engine, prompt: "Name one planet.", maxNew: 16)
             let (a, b) = try await (r1, r2)
-            let ca = a.reasoning.isEmpty ? a.text : a.reasoning
-            let cb = b.reasoning.isEmpty ? b.text : b.reasoning
-            if ca.isEmpty || cb.isEmpty {
+            if a.text.isEmpty || b.text.isEmpty {
                 throw NSError(domain: "S6", code: 1,
                     userInfo: [NSLocalizedDescriptionKey:
-                        "empty (\(ca.count), \(cb.count))"])
+                        "empty visible output (\(a.text.count), \(b.text.count))"])
             }
             return "both ok"
         })
@@ -317,11 +308,10 @@ enum StabilityBench {
             }
             // Second request: must complete normally.
             let r = try await ask(engine, prompt: "Name one fruit.", maxNew: 16)
-            let c = r.reasoning.isEmpty ? r.text : r.reasoning
-            if c.isEmpty {
+            if r.text.isEmpty {
                 throw NSError(domain: "S7", code: 1,
                     userInfo: [NSLocalizedDescriptionKey:
-                        "second request empty after cancel"])
+                        "second request empty visible output after cancel"])
             }
             return "cancel ok, recovery ok"
         })
@@ -344,11 +334,10 @@ enum StabilityBench {
                 context: ctx, maxBatchSize: 1,
                 cacheCoordinator: coord)
             let r = try await ask(e2, prompt: "Capital of Japan?", maxNew: 24)
-            let c = r.reasoning.isEmpty ? r.text : r.reasoning
-            if c.isEmpty {
+            if r.text.isEmpty {
                 throw NSError(domain: "S8", code: 1,
                     userInfo: [NSLocalizedDescriptionKey:
-                        "second engine produced no output"])
+                        "second engine produced no visible output"])
             }
             return "TQ disk hit ok %.1fs".replacingOccurrences(
                 of: "%.1f", with: String(format: "%.1f", r.secs))
@@ -366,11 +355,10 @@ enum StabilityBench {
             _ = try await ask(engine, prompt: "Capital of France?", maxNew: 16)
             MLX.GPU.clearCache()
             let r = try await ask(engine, prompt: "Capital of France?", maxNew: 16)
-            let c = r.reasoning.isEmpty ? r.text : r.reasoning
-            if c.isEmpty {
+            if r.text.isEmpty {
                 throw NSError(domain: "S9", code: 1,
                     userInfo: [NSLocalizedDescriptionKey:
-                        "post-clearCache empty"])
+                        "post-clearCache empty visible output"])
             }
             return "OK"
         })
@@ -390,11 +378,10 @@ enum StabilityBench {
                 context: ctx, maxBatchSize: 1,
                 cacheCoordinator: coord)
             let r = try await ask(e2, prompt: "List 3 planets.", maxNew: 24)
-            let c = r.reasoning.isEmpty ? r.text : r.reasoning
-            if c.isEmpty {
+            if r.text.isEmpty {
                 throw NSError(domain: "S10", code: 1,
                     userInfo: [NSLocalizedDescriptionKey:
-                        "hybrid SSM round-trip empty"])
+                        "hybrid SSM round-trip empty visible output"])
             }
             return "ok"
         })
@@ -427,10 +414,9 @@ enum StabilityBench {
             let body = String(repeating: "fact ", count: 50_000)
             let prompt = "Summarize:\n\(body)\nSummary:"
             let r = try await ask(engine, prompt: prompt, maxNew: 12)
-            let c = r.reasoning.isEmpty ? r.text : r.reasoning
-            if c.isEmpty {
+            if r.text.isEmpty {
                 throw NSError(domain: "S11", code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "empty"])
+                    userInfo: [NSLocalizedDescriptionKey: "empty visible output"])
             }
             return "prompt~\(prompt.count) chars chunks=\(r.chunks)"
         })
@@ -474,11 +460,10 @@ enum StabilityBench {
                 context: ctx, maxBatchSize: 1,
                 cacheCoordinator: coord)
             let r2 = try await ask(engine2, prompt: "Explain step by step: 17×23.", maxNew: 24)
-            let c2 = r2.reasoning.isEmpty ? r2.text : r2.reasoning
-            if c2.isEmpty {
+            if r2.text.isEmpty {
                 throw NSError(domain: "S12", code: 1,
                     userInfo: [NSLocalizedDescriptionKey:
-                        "warm disk + mid-reasoning second request empty"])
+                        "warm disk + mid-reasoning second request empty visible output"])
             }
             return "turn1 cap-mid-think=\(r1.chunks) chunks; turn2 disk-hit ok=\(r2.chunks) chunks"
         })

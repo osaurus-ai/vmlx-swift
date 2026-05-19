@@ -1401,3 +1401,23 @@ DSV4 generic paged/KV/JIT flag use
 global TurboQuant KV quality default
 saved reasoning/tool/media/cache setting crossing incompatible families
 ```
+
+2026-05-18 17:58 PDT vmlx source-harness forced-behavior fix:
+
+- A source scan found a harness-level false-green pattern in `RunBench`: generic
+  batch turns and DSV4 coherence rows used
+  `text.isEmpty ? reasoning : text` when constructing "visible" output. That
+  could let a reasoning-only response count as visible user content in a
+  release artifact.
+- The fix keeps reasoning and visible text separate in the benches. Preview logs
+  may still print the reasoning byte count for diagnostics, but pass/fail
+  predicates now require actual `.chunk` text unless the row is explicitly a
+  reasoning-channel inspection. UTF, math, rapid-turn, DSV4 recall, and fallback
+  tool-content checks no longer accept reasoning-only text as visible output.
+- Focused guard:
+  `NoHiddenReasoningCloseBiasFocusedTests.runBenchGatesDoNotCountReasoningOnlyOutputAsVisible`
+  searches the active `RunBench` production harness files so this fallback is
+  not reintroduced in normal, stability, VL, or Omni rows. The same pass also
+  removed the reasoning-as-output fallback from `StabilityBench` rows S1, S2,
+  S3, S4, S5, S6, S7, S8, S9, S10, S11, and S12. JangPress is not part of the
+  current active Osaurus switch-readiness gate.

@@ -31,6 +31,35 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(!engine.contains("_parametersWithAutomaticReasoningCloseBias"))
     }
 
+    @Test("RunBench gates do not count reasoning-only output as visible")
+    func runBenchGatesDoNotCountReasoningOnlyOutputAsVisible() throws {
+        let files = [
+            "RunBench/Bench.swift",
+            "RunBench/StabilityBench.swift",
+            "RunBench/VLBench.swift",
+            "RunBench/OmniBench.swift",
+        ]
+        for file in files {
+            let source = try String(contentsOfFile: file, encoding: .utf8)
+            #expect(!source.contains("text.isEmpty ? reasoning : text"))
+            #expect(!source.contains("reasoning.isEmpty ? r.text : r.reasoning"))
+            #expect(!source.contains("r1.reasoning.isEmpty ? r1.text : r1.reasoning"))
+            #expect(!source.contains("r2.reasoning.isEmpty ? r2.text : r2.reasoning"))
+            #expect(!source.contains("a.reasoning.isEmpty ? a.text : a.reasoning"))
+            #expect(!source.contains("b.reasoning.isEmpty ? b.text : b.reasoning"))
+            #expect(!source.contains("let combined = text + reasoning"))
+            #expect(!source.contains("(text + reasoning).count"))
+            #expect(!source.contains("(text + reasoning).isEmpty"))
+        }
+
+        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        #expect(bench.contains("Reasoning-only output is a"))
+        let stability = try String(
+            contentsOfFile: "RunBench/StabilityBench.swift",
+            encoding: .utf8)
+        #expect(stability.contains("empty visible output"))
+    }
+
     @Test("terminal info snapshots unclosed reasoning before parser flush")
     func terminalInfoSnapshotsUnclosedReasoningBeforeParserFlush() throws {
         let evaluate = try String(
