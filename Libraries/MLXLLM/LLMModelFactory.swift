@@ -344,11 +344,15 @@ public enum LLMTypeRegistry {
             || weightFormat == "jangtq4"
             || routedBits != nil
 
-        let context: ZayaMoEContext? = isJANGTQ ? .jangtq(
-            gateUpBits: probe?.mxtqGateUpBits ?? projectedBits.gateUp ?? routedBits ?? 2,
-            downBits:   probe?.mxtqDownBits   ?? projectedBits.down   ?? routedBits ?? 2,
-            seed:       probe?.mxtqSeed ?? 42
-        ) : nil
+        let context: ZayaMoEContext?
+        if isJANGTQ {
+            let gateUpBits = probe?.mxtqGateUpBits ?? projectedBits.gateUp ?? routedBits ?? 2
+            let downBits = probe?.mxtqDownBits ?? projectedBits.down ?? routedBits ?? 2
+            let seed = probe?.mxtqSeed ?? 42
+            context = .jangtq(gateUpBits: gateUpBits, downBits: downBits, seed: seed)
+        } else {
+            context = nil
+        }
         return ZayaModel(config, moe: context)
     }
 
