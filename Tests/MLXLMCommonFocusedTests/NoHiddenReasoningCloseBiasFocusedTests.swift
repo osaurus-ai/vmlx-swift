@@ -181,7 +181,7 @@ struct HarmonyParserFocusedTests {
         segments.append(contentsOf: parser?.flush() ?? [])
 
         let (reasoning, content) = collect(segments)
-        #expect(reasoning == "thought\ninner")
+        #expect(reasoning == "inner")
         #expect(content == "preanswer")
         #expect(!content.contains("<|channel>"))
         #expect(!content.contains("<channel|>"))
@@ -225,7 +225,7 @@ struct HarmonyParserFocusedTests {
         segments.append(contentsOf: parser?.flush() ?? [])
 
         let (reasoning, content) = collect(segments)
-        #expect(reasoning == "hiddenthought\nextra")
+        #expect(reasoning == "hiddenextra")
         #expect(content == "leadvisibletail")
         for marker in [
             "<|start|>", "<|channel|>", "<|message|>", "<|end|>", "<|return|>",
@@ -328,7 +328,7 @@ struct HarmonyParserFocusedTests {
         }
         visible += tools.processEOS() ?? ""
 
-        #expect(reasoning == "thought\nNeed weather.")
+        #expect(reasoning == "Need weather.")
         #expect(visible == "Done.")
         #expect(tools.toolCalls.count == 1)
         #expect(tools.toolCalls.first?.function.name == "get_weather")
