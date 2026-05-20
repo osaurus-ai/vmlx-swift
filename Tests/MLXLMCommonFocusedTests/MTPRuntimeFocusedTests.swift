@@ -861,7 +861,8 @@ struct MTPRuntimeFocusedTests {
         #expect(runtime.contains("\"chunk_lazy_repair\""))
         #expect(runtime.contains("mode != .lazyRepair"))
         #expect(iterator.contains("private static func requiresLazyChunkRepair"))
-        #expect(iterator.contains("let shouldReplayAcceptedPrefix = (replayChunkCommit || lazyChunkRepair)"))
+        #expect(iterator.contains("let shouldReplayAcceptedPrefix = replayChunkCommit"))
+        #expect(iterator.contains("|| (lazyChunkRepair && accepted < drafts.count)"))
         #expect(iterator.contains("&& accepted < drafts.count"))
         #expect(iterator.contains("NativeMTPVerifierStatePolicy.mode(for: verifierModeSetting) == .lazyRepair"))
     }
