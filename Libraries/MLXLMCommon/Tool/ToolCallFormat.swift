@@ -19,6 +19,14 @@ public protocol ToolCallParser: Sendable {
     /// Returns `nil` for inline formats that don't use wrapper tags.
     var endTag: String? { get }
 
+    /// Additional accepted start tags for formats whose live model output
+    /// contains known spelling variants. The canonical ``startTag`` remains
+    /// first in matching order.
+    var startTagAliases: [String] { get }
+
+    /// Additional accepted end tags matching ``startTagAliases``.
+    var endTagAliases: [String] { get }
+
     /// Parse the content into a `ToolCall`.
     /// - Parameters:
     ///   - content: The text content to parse (may include tags)
@@ -41,6 +49,14 @@ public protocol ToolCallParser: Sendable {
 }
 
 extension ToolCallParser {
+    public var startTagAliases: [String] {
+        startTag.map { [$0] } ?? []
+    }
+
+    public var endTagAliases: [String] {
+        endTag.map { [$0] } ?? []
+    }
+
     public func isValidPartialContent(_ toolCallBuffer: String) -> Bool {
         true
     }

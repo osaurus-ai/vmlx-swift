@@ -63,7 +63,7 @@ public class ToolCallProcessor {
 
     /// The first character of the start tag for quick detection.
     private var startTagFirstChar: Character? {
-        parser.startTag?.first
+        parser.startTagAliases.first?.first
     }
 
     // MARK: - Public Methods
@@ -177,7 +177,8 @@ public class ToolCallProcessor {
 
     /// Process chunk for tagged formats.
     private func processTaggedChunk(_ chunk: String) -> String? {
-        guard let startTag = parser.startTag,
+        let startTags = parser.startTagAliases
+        guard !startTags.isEmpty,
             let startChar = startTagFirstChar
         else {
             return chunk
@@ -203,8 +204,8 @@ public class ToolCallProcessor {
 
             fallthrough
         case .potentialToolCall:
-            if partialMatch(buffer: toolCallBuffer, tag: startTag) {
-                if toolCallBuffer.starts(with: startTag) {
+            if partialMatch(buffer: toolCallBuffer, tags: startTags) {
+                if startTags.contains(where: { toolCallBuffer.starts(with: $0) }) {
                     state = .collectingToolCall
                     fallthrough
                 } else {
@@ -220,7 +221,8 @@ public class ToolCallProcessor {
                 return visible
             }
         case .collectingToolCall:
-            guard let endTag = parser.endTag else {
+            let endTags = parser.endTagAliases
+            guard !endTags.isEmpty else {
                 return nil
             }
 
@@ -233,10 +235,10 @@ public class ToolCallProcessor {
                 return visible.isEmpty ? nil : visible
             }
 
-            if toolCallBuffer.contains(endTag) {
+            if let matchedEndTag = firstTag(in: toolCallBuffer, tags: endTags) {
                 // Separate the trailing token
                 let trailingToken = separateToken(
-                    from: &toolCallBuffer, separator: endTag, returnLeading: false)
+                    from: &toolCallBuffer, separator: matchedEndTag, returnLeading: false)
 
                 // Parse the completed wrapper. Some formats, including Hy3 /
                 // Hunyuan, can carry multiple calls inside one outer block.
@@ -288,6 +290,12 @@ public class ToolCallProcessor {
         return token
     }
 
+    private func partialMatch(buffer: String, tags: [String]) -> Bool {
+        tags.contains { tag in
+            partialMatch(buffer: buffer, tag: tag)
+        }
+    }
+
     private func partialMatch(buffer: String, tag: String) -> Bool {
         for (tagIndex, bufferIndex) in zip(tag.indices, buffer.indices) {
             if buffer[bufferIndex] != tag[tagIndex] {
@@ -296,5 +304,14 @@ public class ToolCallProcessor {
         }
 
         return true
+    }
+
+    private func firstTag(in text: String, tags: [String]) -> String? {
+        tags
+            .compactMap { tag -> (String, Range<String.Index>)? in
+                text.range(of: tag).map { (tag, $0) }
+            }
+            .min { $0.1.lowerBound < $1.1.lowerBound }?
+            .0
     }
 }

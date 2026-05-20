@@ -45,16 +45,25 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
 
     public let startTag: String? = "<\u{FF5C}DSML\u{FF5C}tool_calls>"
     public let endTag: String? = "</\u{FF5C}DSML\u{FF5C}tool_calls>"
+    public let startTagAliases: [String] = [
+        "<\u{FF5C}DSML\u{FF5C}tool_calls>",
+        // Live DeepSeek V4 Flash sometimes drops the second "l".
+        "<\u{FF5C}DSML\u{FF5C}tool_cals>",
+    ]
+    public let endTagAliases: [String] = [
+        "</\u{FF5C}DSML\u{FF5C}tool_calls>",
+        "</\u{FF5C}DSML\u{FF5C}tool_cals>",
+    ]
 
     public init() {}
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         // Strip outer block if present.
         var text = content
-        if let start = startTag {
+        for start in startTagAliases {
             text = text.replacingOccurrences(of: start, with: "")
         }
-        if let end = endTag {
+        for end in endTagAliases {
             text = text.replacingOccurrences(of: end, with: "")
         }
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -75,10 +84,10 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         // internally by `<｜DSML｜invoke ...>` per call. Parse all
         // invokes in order.
         var buffer = toolCallBuffer
-        if let start = startTag {
+        for start in startTagAliases {
             buffer = buffer.replacingOccurrences(of: start, with: "")
         }
-        if let end = endTag {
+        for end in endTagAliases {
             buffer = buffer.replacingOccurrences(of: end, with: "")
         }
         return parseAllInvokes(in: buffer, tools: tools)

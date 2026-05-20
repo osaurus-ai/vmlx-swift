@@ -41,11 +41,11 @@ struct DSMLToolCallParserFocusedTests {
     func parserAcceptsAbbreviatedInvokeClose() {
         let dsml = DeepseekV4Tokens.dsml
         let output = """
-            <\(dsml)tool_calls>
+            <\(dsml)tool_cals>
             <\(dsml)invoke name="get_weather">
             <\(dsml)parameter name="location" string="true">Tokyo</\(dsml)parameter>
             </\(dsml)inv>
-            </\(dsml)tool_calls>
+            </\(dsml)tool_cals>
             """
 
         let calls = DSMLToolCallParser().parseEOS(output, tools: nil)
@@ -53,6 +53,35 @@ struct DSMLToolCallParserFocusedTests {
         #expect(calls.count == 1)
         #expect(calls.first?.function.name == "get_weather")
         #expect(calls.first?.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    @Test("DSML processor buffers observed misspelled outer block instead of leaking markup")
+    func processorBuffersObservedMisspelledOuterBlock() {
+        let dsml = DeepseekV4Tokens.dsml
+        let output = """
+            Let me take a look.
+            <\(dsml)tool_cals>
+            <\(dsml)invoke name="file_read">
+            <\(dsml)parameter name="path" string="true">/Users/eric/Desktop/testmandel/mandelbrot.py</\(dsml)parameter>
+            </\(dsml)inv>
+            </\(dsml)tool_cals>
+            """
+        let processor = ToolCallProcessor(format: .dsml)
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls.first?.function.name == "file_read")
+        #expect(
+            processor.toolCalls.first?.function.arguments["path"]
+                == .string("/Users/eric/Desktop/testmandel/mandelbrot.py")
+        )
+        #expect(!visible.contains("DSML"))
+        #expect(!visible.contains("tool_cals"))
+        #expect(!visible.contains("invoke name"))
     }
 
     @Test("DSV4 instruct prompt routes DSML output to tool calls without reasoning leakage")

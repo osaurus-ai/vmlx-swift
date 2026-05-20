@@ -31,6 +31,23 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.mtp.acceptedTokensOnlyEnterBaseCache)
     }
 
+    @Test("Osaurus production preset enables MLXPress auto while preserving MTP resolution")
+    func osaurusProductionPresetEnablesMLXPressAutoWhilePreservingMTPResolution() {
+        let settings = VMLXServerRuntimeSettings()
+
+        let resolved = settings.resolvedLoadConfiguration(
+            base: .osaurusProduction,
+            configData: nil,
+            jangConfig: nil,
+            status: nil)
+
+        #expect(resolved.jangPress == .auto(envFallback: true))
+        #expect(resolved.maxResidentBytes == .default)
+        #expect(resolved.memoryLimit == .default)
+        #expect(resolved.useMmapSafetensors)
+        #expect(!resolved.nativeMTP)
+    }
+
     @Test("paged cache rejects legacy disk cache conflict")
     func pagedCacheRejectsLegacyDiskCacheConflict() {
         var settings = VMLXServerRuntimeSettings()
