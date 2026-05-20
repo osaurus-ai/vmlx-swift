@@ -218,6 +218,18 @@ public struct LoadConfiguration: Sendable, Equatable {
 /// pulled once at load entry so the resolver doesn't re-walk the
 /// directory or re-parse `config.json`.
 public struct LoadBundleFacts: Sendable, Equatable {
+    /// Top-level or nested `model_type` from config metadata, when available.
+    public var modelType: String?
+
+    /// Top-level or JANG-sidecar `weight_format`, lowercased when available.
+    public var weightFormat: String?
+
+    /// True when the bundle has a `jang_config.json` sidecar.
+    public var hasJangConfig: Bool
+
+    /// True when the bundle has a `jangtq_runtime.safetensors` sidecar.
+    public var hasJangTQRuntime: Bool
+
     /// Sum of `*.safetensors` byte sizes in the bundle. `0` when
     /// inspection failed (treat as unknown — `.auto` falls through to
     /// disabled in that case).
@@ -247,9 +259,17 @@ public struct LoadBundleFacts: Sendable, Equatable {
         totalSafetensorsBytes: UInt64,
         isRouted: Bool,
         physicalMemory: UInt64,
+        modelType: String? = nil,
+        weightFormat: String? = nil,
+        hasJangConfig: Bool = false,
+        hasJangTQRuntime: Bool = false,
         numRoutedExperts: Int? = nil,
         topK: Int? = nil
     ) {
+        self.modelType = modelType
+        self.weightFormat = weightFormat?.lowercased()
+        self.hasJangConfig = hasJangConfig
+        self.hasJangTQRuntime = hasJangTQRuntime
         self.totalSafetensorsBytes = totalSafetensorsBytes
         self.isRouted = isRouted
         self.physicalMemory = physicalMemory
@@ -284,6 +304,8 @@ public struct LoadBundleFacts: Sendable, Equatable {
         var routed = false
         var numRoutedExperts: Int?
         var topK: Int?
+        var modelType: String?
+        var weightFormat: String?
         let configURL = url.appendingPathComponent("config.json")
         if let data = try? Data(contentsOf: configURL),
             let json = try? JSONSerialization.jsonObject(with: data)
@@ -323,6 +345,8 @@ public struct LoadBundleFacts: Sendable, Equatable {
             numRoutedExperts = firstPositiveInt(
                 in: json, keys: routedExpertKeys)
             topK = firstPositiveInt(in: json, keys: topKKeys)
+            modelType = json["model_type"] as? String
+            weightFormat = (json["weight_format"] as? String)?.lowercased()
             for key in routedKeys {
                 if let n = json[key] as? Int, n > 1 {
                     routed = true
@@ -342,6 +366,12 @@ public struct LoadBundleFacts: Sendable, Equatable {
                     if topK == nil {
                         topK = firstPositiveInt(in: nested, keys: topKKeys)
                     }
+                    if modelType == nil {
+                        modelType = nested["model_type"] as? String
+                    }
+                    if weightFormat == nil {
+                        weightFormat = (nested["weight_format"] as? String)?.lowercased()
+                    }
                     if !routed {
                         for key in routedKeys {
                             if let n = nested[key] as? Int, n > 1 {
@@ -356,13 +386,50 @@ public struct LoadBundleFacts: Sendable, Equatable {
                 routed = true
             }
         }
+        let jangConfigURL = url.appendingPathComponent("jang_config.json")
+        let hasJangConfig = fm.fileExists(atPath: jangConfigURL.path)
+        if hasJangConfig,
+            let data = try? Data(contentsOf: jangConfigURL),
+            let json = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any]
+        {
+            if modelType == nil {
+                modelType = json["model_type"] as? String
+            }
+            if weightFormat == nil {
+                weightFormat = (json["weight_format"] as? String)?.lowercased()
+            }
+        }
+        let hasJangTQRuntime = fm.fileExists(
+            atPath: url.appendingPathComponent("jangtq_runtime.safetensors").path)
 
         return LoadBundleFacts(
             totalSafetensorsBytes: totalBytes,
             isRouted: routed,
             physicalMemory: physical,
+            modelType: modelType,
+            weightFormat: weightFormat,
+            hasJangConfig: hasJangConfig,
+            hasJangTQRuntime: hasJangTQRuntime,
             numRoutedExperts: numRoutedExperts,
             topK: topK)
+    }
+
+    public var isPlainDeepseekV4AffineJANG: Bool {
+        let type = modelType?.lowercased() ?? ""
+        let format = weightFormat?.lowercased() ?? ""
+        let declaresAffine = format.isEmpty || format == "affine" || format == "jang"
+        return type == "deepseek_v4"
+            && hasJangConfig
+            && !hasJangTQRuntime
+            && declaresAffine
+            && isRouted
+            && (numRoutedExperts ?? 0) >= 128
+    }
+
+    public var productionBlockReason: String? {
+        guard isPlainDeepseekV4AffineJANG else { return nil }
+        return "Plain DeepSeek V4 JANG uses the unsupported affine routed-MoE SwitchGLU path. Use a JANGTQ bundle, or set VMLX_ALLOW_EXPERIMENTAL_DSV4_AFFINE_JANG=1 for diagnostics only."
     }
 }
 

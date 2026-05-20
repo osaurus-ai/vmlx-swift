@@ -288,6 +288,57 @@ struct LoadConfigurationTests {
         #expect(facts.isRouted == false)
     }
 
+    @Test("plain DSV4 affine JANG is production-blocked")
+    func plainDSV4AffineJANGIsProductionBlocked() throws {
+        let cfg = [
+            "model_type": "deepseek_v4",
+            "weight_format": "affine",
+            "n_routed_experts": 256,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 2048,
+        ] as [String: Any]
+        let jang = [
+            "weight_format": "affine"
+        ] as [String: Any]
+        let dir = try Self.makeBundle(files: [
+            ("config.json", try JSONSerialization.data(withJSONObject: cfg)),
+            ("jang_config.json", try JSONSerialization.data(withJSONObject: jang)),
+            ("model-00001-of-00001.safetensors", Data(count: 1024)),
+        ])
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let facts = LoadBundleFacts.inspect(bundleURL: dir)
+        #expect(facts.modelType == "deepseek_v4")
+        #expect(facts.weightFormat == "affine")
+        #expect(facts.hasJangConfig)
+        #expect(!facts.hasJangTQRuntime)
+        #expect(facts.isPlainDeepseekV4AffineJANG)
+        #expect(facts.productionBlockReason?.contains("unsupported affine routed-MoE") == true)
+    }
+
+    @Test("DSV4 JANGTQ is not blocked by the affine-JANG guard")
+    func dsv4JANGTQIsNotBlockedByAffineGuard() throws {
+        let cfg = [
+            "model_type": "deepseek_v4",
+            "weight_format": "mxtq",
+            "n_routed_experts": 256,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 2048,
+        ] as [String: Any]
+        let dir = try Self.makeBundle(files: [
+            ("config.json", try JSONSerialization.data(withJSONObject: cfg)),
+            ("jang_config.json", Data("{}".utf8)),
+            ("jangtq_runtime.safetensors", Data(count: 16)),
+            ("model-00001-of-00001.safetensors", Data(count: 1024)),
+        ])
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let facts = LoadBundleFacts.inspect(bundleURL: dir)
+        #expect(facts.hasJangTQRuntime)
+        #expect(!facts.isPlainDeepseekV4AffineJANG)
+        #expect(facts.productionBlockReason == nil)
+    }
+
     @Test("inspect on missing dir returns zeroed facts")
     func inspectMissingDir() {
         let facts = LoadBundleFacts.inspect(

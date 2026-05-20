@@ -518,6 +518,15 @@ public func loadModel(
 ) async throws -> (ModelContext, JangPressRuntime) {
     // 1. Inspect bundle once.
     let facts = LoadBundleFacts.inspect(bundleURL: directory)
+    if let reason = facts.productionBlockReason {
+        let raw = ProcessInfo.processInfo.environment[
+            "VMLINUX_ALLOW_EXPERIMENTAL_DSV4_AFFINE_JANG"
+        ]?.lowercased()
+        let allowDiagnostic = raw == "1" || raw == "true" || raw == "on" || raw == "yes"
+        if !allowDiagnostic {
+            throw ModelFactoryError.unsupportedModelType(reason)
+        }
+    }
 
     // 2. Resolve JangPress policy → concrete options.
     let resolvedOptions = loadConfiguration.jangPress.resolve(facts: facts)
