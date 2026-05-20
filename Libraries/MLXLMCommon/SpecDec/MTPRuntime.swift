@@ -621,8 +621,6 @@ public enum NativeMTPActivation {
             || normalized == "qwen3_5_text"
             || normalized == "qwen3_5_moe"
             || normalized == "qwen3_5_moe_text"
-            || normalized == "qwen3_5_vl"
-            || normalized == "qwen3_vl"
     }
 }
 
@@ -757,8 +755,6 @@ public enum NativeMTPAutoDecodePolicy {
             || value == "qwen3_5_text"
             || value == "qwen3_5_moe"
             || value == "qwen3_5_moe_text"
-            || value == "qwen3_5_vl"
-            || value == "qwen3_vl"
     }
 
     private static func normalize(_ value: String) -> String {

@@ -55,6 +55,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     let speculativeSampler: SpeculativeSamplingController
     let maxTokens: Int?
     let depth: Int
+    private var currentDepth: Int
     let verifierModeSetting: String?
     var promptTokenIds: [Int]
     let cachePrefixTokenCounts: [Int]
@@ -91,6 +92,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var replayMainForwardCount = 0
     private(set) var mtpForwardCount = 0
     private(set) var autoregressiveFallbackTokenCount = 0
+    private(set) var adaptiveDepthDownshiftCount = 0
     private(set) var seedMainForwardTime: TimeInterval = 0
     private(set) var verifyMainForwardTime: TimeInterval = 0
     private(set) var replayMainForwardTime: TimeInterval = 0
@@ -104,10 +106,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var acceptanceProbabilityCount = 0
     private var forceAutoregressiveFallback = false
     private var hybridSafetyWarmupComplete = false
+    private var adaptiveWindow: [AdaptiveCycle] = []
+    private var adaptiveFallbackReason: String?
     private let iteratorStartTime = Date.timeIntervalSinceReferenceDate
 
     private var usesHybridMambaCache: Bool {
         cache.contains { $0 is MambaCache }
+    }
+
+    private struct AdaptiveCycle {
+        let depth: Int
+        let accepted: Int
     }
 
     init(
@@ -146,6 +155,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             effectiveParameters.kvMode = policy.kvMode
             effectiveParameters.maxKVSize = policy.maxKVSize
         }
+        guard effectiveParameters.canUseNativeMTP(for: input) else {
+            throw NativeMTPRuntimeError.unsupportedSampling(
+                "native MTP is enabled only for text-only greedy requests with temperature=0, top_p>=1, top_k=0, min_p=0, and no active penalties")
+        }
 
         self.model = model
         self.cache = cache ?? model.newCache(parameters: effectiveParameters)
@@ -156,6 +169,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
         self.maxTokens = effectiveParameters.maxTokens
         self.depth = requestedDepth
+        self.currentDepth = requestedDepth
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode
         let promptTokenStart = Date.timeIntervalSinceReferenceDate
         let promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
@@ -346,7 +360,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             hidden: Self.lastHidden(bridge.hiddenStates),
             nextToken: secondToken,
             mtpCache: mtpCache,
-            depth: self.depth,
+            depth: self.currentDepth,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
             processor: processor)
@@ -490,6 +504,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let gdnReplay = NativeMTPGDNReplayDiagnostics.snapshot()
         let phaseSummary = NativeMTPPhaseDiagnostics.summary()
         let iteratorWallTime = Date.timeIntervalSinceReferenceDate - iteratorStartTime
+        let adaptiveFallback = adaptiveFallbackReason ?? "none"
         let verifierMode: String
         if chunkVerifierCount > 0 && sequentialVerifierCount > 0 {
             verifierMode = "mixed"
@@ -504,8 +519,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         let line = String(
             format:
-                "[NativeMTP] depth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f targetVerifySec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",
+                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",
             depth,
+            currentDepth,
             verifyCalls,
             generatedTokenIds.count,
             autoregressiveFallbackTokenCount,
@@ -525,6 +541,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             mtpForwardCount,
             avgCommitted,
             avgAcceptP,
+            adaptiveDepthDownshiftCount,
+            adaptiveFallback,
             targetVerifyTime,
             seedMainForwardTime,
             verifyMainForwardTime,
@@ -750,7 +768,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         verifyCalls += 1
         acceptedByDepth[accepted, default: 0] += 1
-        updateHybridFallbackState()
+        recordAdaptiveCycle(accepted: accepted)
         if Self.traceEnabled {
             let requestedIDs = recordMaterializeSync { requested.map { $0.item(Int.self) } }
             let currentDrafts = drafts
@@ -873,13 +891,18 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         nextMain = nextToken
+        if forceAutoregressiveFallback {
+            drafts.removeAll(keepingCapacity: true)
+            draftProbabilities.removeAll(keepingCapacity: true)
+            return
+        }
         let draftStart = Date.timeIntervalSinceReferenceDate
         let draftBatch = Self.makeDrafts(
             model: model,
             hidden: hiddenForNextMTP,
             nextToken: nextToken,
             mtpCache: mtpCache,
-            depth: depth,
+            depth: currentDepth,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
             processor: processor)
@@ -890,28 +913,70 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
     }
 
-    private mutating func updateHybridFallbackState() {
-        guard usesHybridMambaCache,
-              speculativeSampler.isGreedy,
-              processor == nil,
-              !hybridSafetyWarmupComplete
+    private mutating func recordAdaptiveCycle(accepted: Int) {
+        adaptiveWindow.append(AdaptiveCycle(depth: currentDepth, accepted: accepted))
+        if adaptiveWindow.count > Self.adaptiveWindowSize {
+            adaptiveWindow.removeFirst(adaptiveWindow.count - Self.adaptiveWindowSize)
+        }
+
+        if usesHybridMambaCache,
+           speculativeSampler.isGreedy,
+           processor == nil,
+           !hybridSafetyWarmupComplete,
+           verifyCalls >= Self.hybridWarmupCycleCount
+        {
+            let acceptedTokens = acceptedByDepth.reduce(0) { partial, item in
+                partial + item.key * item.value
+            }
+            let averageAccepted = Double(acceptedTokens) / Double(Swift.max(verifyCalls, 1))
+            if averageAccepted >= Self.hybridWarmupMinimumAverageAccepted {
+                hybridSafetyWarmupComplete = true
+            } else {
+                enableAutoregressiveFallback(
+                    reason: String(
+                        format: "hybrid_warmup_avg_accept=%.2f",
+                        averageAccepted))
+                return
+            }
+        }
+
+        guard adaptiveWindow.count >= Self.adaptiveWindowSize,
+              !forceAutoregressiveFallback
         else { return }
 
-        guard verifyCalls >= 16 else { return }
+        let activeSamples = adaptiveWindow.filter { $0.depth == currentDepth }
+        guard activeSamples.count >= Self.adaptiveMinimumSamplesPerDepth else { return }
 
-        let acceptedTokens = acceptedByDepth.reduce(0) { partial, item in
-            partial + item.key * item.value
-        }
-        let averageAccepted = Double(acceptedTokens) / Double(Swift.max(verifyCalls, 1))
-        if averageAccepted >= 2.75 {
-            hybridSafetyWarmupComplete = true
-        } else {
-            forceAutoregressiveFallback = true
-            drafts.removeAll(keepingCapacity: true)
-            draftProbabilities.removeAll(keepingCapacity: true)
+        let acceptedTokens = activeSamples.reduce(0) { $0 + $1.accepted }
+        let possibleDraftTokens = activeSamples.reduce(0) { $0 + $1.depth }
+        guard possibleDraftTokens > 0 else { return }
+
+        let acceptanceRatio = Double(acceptedTokens) / Double(possibleDraftTokens)
+        if currentDepth >= 3, acceptanceRatio < Self.depthThreeMinimumAcceptanceRatio {
+            currentDepth = 2
+            adaptiveDepthDownshiftCount += 1
+            adaptiveWindow.removeAll(keepingCapacity: true)
             mtpCache = model.makeNativeMTPCache()
             mtpCacheRefreshCount += 1
+            return
         }
+
+        if currentDepth <= 2, acceptanceRatio < Self.depthTwoMinimumAcceptanceRatio {
+            enableAutoregressiveFallback(
+                reason: String(
+                    format: "adaptive_accept_ratio=%.2f_depth=%d",
+                    acceptanceRatio,
+                    currentDepth))
+        }
+    }
+
+    private mutating func enableAutoregressiveFallback(reason: String) {
+        forceAutoregressiveFallback = true
+        adaptiveFallbackReason = reason
+        drafts.removeAll(keepingCapacity: true)
+        draftProbabilities.removeAll(keepingCapacity: true)
+        mtpCache = model.makeNativeMTPCache()
+        mtpCacheRefreshCount += 1
     }
 
     private mutating func generateAutoregressiveToken() throws {
@@ -1063,7 +1128,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         acceptedByDepth[accepted, default: 0] += 1
-        updateHybridFallbackState()
+        recordAdaptiveCycle(accepted: accepted)
         prefixCommitCount += 1
 
         guard let nextToken, let hiddenForNextMTP else {
@@ -1081,13 +1146,18 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         nextMain = nextToken
+        if forceAutoregressiveFallback {
+            drafts.removeAll(keepingCapacity: true)
+            draftProbabilities.removeAll(keepingCapacity: true)
+            return
+        }
         let draftStart = Date.timeIntervalSinceReferenceDate
         let draftBatch = Self.makeDrafts(
             model: model,
             hidden: hiddenForNextMTP,
             nextToken: nextToken,
             mtpCache: mtpCache,
-            depth: depth,
+            depth: currentDepth,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
             processor: processor)
@@ -1249,6 +1319,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static var traceEnabled: Bool {
         ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_TRACE"] == "1"
     }
+
+    private static let adaptiveWindowSize = 12
+    private static let adaptiveMinimumSamplesPerDepth = 6
+    private static let depthThreeMinimumAcceptanceRatio = 0.85
+    private static let depthTwoMinimumAcceptanceRatio = 0.75
+    private static let hybridWarmupCycleCount = 16
+    private static let hybridWarmupMinimumAverageAccepted = 2.75
 
     private static func nativeMTPHybridVerifySetting(_ verifierMode: String? = nil) -> String? {
         let env = ProcessInfo.processInfo.environment
