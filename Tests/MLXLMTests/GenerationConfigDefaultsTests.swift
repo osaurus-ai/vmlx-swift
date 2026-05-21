@@ -200,11 +200,45 @@ final class GenerationConfigDefaultsTests: XCTestCase {
         XCTAssertEqual(result.maxTokens, 99)
         XCTAssertEqual(result.temperature, 0.33)
     }
+
+    func testModelContainerCacheTopologySnapshotUsesLiveCacheTypes() async {
+        let modelConfig = ModelConfiguration(id: "org/hybrid-model")
+        let context = ModelContext(
+            configuration: modelConfig,
+            model: TestStubLanguageModel(cache: [
+                KVCacheSimple(),
+                MambaCache(),
+                ArraysCache(size: 2),
+                ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8),
+                CacheList(RotatingKVCache(maxSize: 16), MambaCache()),
+            ]),
+            processor: TestStubUserInputProcessor(),
+            tokenizer: TestStubTokenizer())
+        let container = ModelContainer(context: context)
+
+        let topology = await container.cacheTopologySnapshot()
+
+        XCTAssertEqual(topology.layerCount, 5)
+        XCTAssertEqual(topology.kvLayerCount, 1)
+        XCTAssertEqual(topology.rotatingKVLayerCount, 1)
+        XCTAssertEqual(topology.mambaLayerCount, 2)
+        XCTAssertEqual(topology.arraysLayerCount, 1)
+        XCTAssertEqual(topology.zayaCCALayerCount, 1)
+        XCTAssertEqual(topology.cacheListLayerCount, 1)
+        XCTAssertTrue(topology.requiresSSMCompanionState)
+        XCTAssertTrue(topology.topologyTags.contains("companion=ssm"))
+    }
 }
 
 // MARK: - Test stubs
 
 private final class TestStubLanguageModel: Module, LanguageModel {
+    let cache: [any KVCache]
+
+    init(cache: [any KVCache] = []) {
+        self.cache = cache
+    }
+
     var kvHeads: [Int] { [] }
     var vocabularySize: Int { 0 }
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
@@ -213,7 +247,7 @@ private final class TestStubLanguageModel: Module, LanguageModel {
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         MLXArray.zeros([1, 1, 1])
     }
-    func newCache(parameters: GenerateParameters?) -> [KVCache] { [] }
+    func newCache(parameters: GenerateParameters?) -> [KVCache] { cache.map { $0.copy() } }
 }
 
 private struct TestStubUserInputProcessor: UserInputProcessor {

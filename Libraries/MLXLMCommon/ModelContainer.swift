@@ -5,6 +5,85 @@ import MLX
 import MLXNN
 import os
 
+/// Source-backed cache topology reported by a loaded model.
+///
+/// This is intentionally derived from `LanguageModel.newCache(parameters:)`
+/// rather than model ids or config strings, so host apps can make cache reuse
+/// decisions from the same cache classes the runtime will actually allocate.
+public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
+    public var layerCount: Int
+    public var kvLayerCount: Int
+    public var rotatingKVLayerCount: Int
+    public var mambaLayerCount: Int
+    public var arraysLayerCount: Int
+    public var zayaCCALayerCount: Int
+    public var cacheListLayerCount: Int
+
+    public init(
+        layerCount: Int = 0,
+        kvLayerCount: Int = 0,
+        rotatingKVLayerCount: Int = 0,
+        mambaLayerCount: Int = 0,
+        arraysLayerCount: Int = 0,
+        zayaCCALayerCount: Int = 0,
+        cacheListLayerCount: Int = 0
+    ) {
+        self.layerCount = layerCount
+        self.kvLayerCount = kvLayerCount
+        self.rotatingKVLayerCount = rotatingKVLayerCount
+        self.mambaLayerCount = mambaLayerCount
+        self.arraysLayerCount = arraysLayerCount
+        self.zayaCCALayerCount = zayaCCALayerCount
+        self.cacheListLayerCount = cacheListLayerCount
+    }
+
+    public init(cache: [any KVCache]) {
+        self.init()
+        layerCount = cache.count
+        for layer in cache {
+            record(layer)
+        }
+    }
+
+    public var requiresSSMCompanionState: Bool {
+        mambaLayerCount > 0 || arraysLayerCount > 0 || zayaCCALayerCount > 0
+    }
+
+    public var topologyTags: [String] {
+        var tags: [String] = ["layers=\(layerCount)"]
+        if kvLayerCount > 0 { tags.append("kv=\(kvLayerCount)") }
+        if rotatingKVLayerCount > 0 { tags.append("rotating=\(rotatingKVLayerCount)") }
+        if mambaLayerCount > 0 { tags.append("mamba=\(mambaLayerCount)") }
+        if arraysLayerCount > 0 { tags.append("arrays=\(arraysLayerCount)") }
+        if zayaCCALayerCount > 0 { tags.append("zayaCCA=\(zayaCCALayerCount)") }
+        if cacheListLayerCount > 0 { tags.append("cacheList=\(cacheListLayerCount)") }
+        if requiresSSMCompanionState { tags.append("companion=ssm") }
+        return tags
+    }
+
+    private mutating func record(_ cache: any KVCache) {
+        switch cache {
+        case let list as CacheList:
+            cacheListLayerCount += 1
+            for index in 0..<list.count {
+                record(list[index])
+            }
+        case is ZayaCCACache:
+            zayaCCALayerCount += 1
+        case is MambaCache:
+            mambaLayerCount += 1
+        case is ArraysCache:
+            arraysLayerCount += 1
+        case is RotatingKVCache:
+            rotatingKVLayerCount += 1
+        case is KVCacheSimple:
+            kvLayerCount += 1
+        default:
+            kvLayerCount += 1
+        }
+    }
+}
+
 /// Container for models that guarantees single threaded access.
 ///
 /// Wrap models used by e.g. the UI in a ModelContainer. Callers can access
@@ -74,15 +153,8 @@ public final class ModelContainer: Sendable {
             config.modelKey = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
         }
 
-        // Auto-detect hybrid: check if model creates MambaCache/ArraysCache/ZayaCCACache layers.
-        // ZAYA1's CCA-attention layers carry path-dependent `conv_state` + `prev_hs` alongside
-        // the KV pair — same multi-turn contamination problem as Mamba SSM state. Including
-        // ZayaCCACache here flips the coordinator's `isHybrid` flag so the SSM state cache /
-        // re-derive plumbing fires for ZAYA models too.
-        let isHybrid = await context.read { ctx -> Bool in
-            let testCache = ctx.model.newCache(parameters: nil)
-            return testCache.contains { $0 is MambaCache || $0 is ArraysCache || $0 is ZayaCCACache }
-        }
+        let topology = await cacheTopologySnapshot()
+        let isHybrid = topology.requiresSSMCompanionState
 
         // 2026-05-05 (Ling-2.6-flash multi-turn fix): hybrid models with
         // ArraysCache (Linear-Attn / GLA recurrence) live or die by the
@@ -108,6 +180,21 @@ public final class ModelContainer: Sendable {
         coordinator.setHybrid(isHybrid)
 
         _cacheCoordinator.withLock { $0 = coordinator }
+    }
+
+    /// Inspect the loaded model's real cache topology without relying on
+    /// model names or bundle path heuristics.
+    ///
+    /// Hosts use this to namespace disk-cache records and to decide whether
+    /// prefix reuse needs companion recurrent/CCA state. The snapshot is
+    /// derived from `model.newCache(parameters:)`, which is the same factory
+    /// BatchEngine uses to create live request caches.
+    public func cacheTopologySnapshot(
+        parameters: GenerateParameters? = nil
+    ) async -> ModelCacheTopologySnapshot {
+        await context.read { ctx in
+            ModelCacheTopologySnapshot(cache: ctx.model.newCache(parameters: parameters))
+        }
     }
 
     /// Disable caching and release all cached state.
