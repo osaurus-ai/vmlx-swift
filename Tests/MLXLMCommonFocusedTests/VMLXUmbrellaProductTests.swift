@@ -287,9 +287,9 @@ struct VMLXUmbrellaProductTests {
             """
             {
               "model_type": "qwen3_5_moe",
-              "weight_format": "mxfp8",
               "quantization": {
-                "bits": 8
+                "bits": 4,
+                "mode": "mxfp4"
               }
             }
             """.utf8
@@ -325,9 +325,11 @@ struct VMLXUmbrellaProductTests {
         let jangTrace = try ModelRuntimeDetectionSnapshot(modelDirectory: jangRoot)
 
         #expect(mxfpTrace.bundleFormat == .mxfp)
-        #expect(mxfpTrace.effectiveWeightFormat == "mxfp8")
-        #expect(mxfpTrace.quantizationBits == 8)
+        #expect(mxfpTrace.effectiveWeightFormat == nil)
+        #expect(mxfpTrace.quantizationBits == 4)
+        #expect(mxfpTrace.quantizationMode == "mxfp4")
         #expect(mxfpTrace.mxtqBits == nil)
+        #expect(mxfpTrace.evidence.contains("config.quantization.mode=mxfp4"))
 
         #expect(jangTrace.bundleFormat == .jang)
         #expect(jangTrace.jangWeightFormat == "bf16")

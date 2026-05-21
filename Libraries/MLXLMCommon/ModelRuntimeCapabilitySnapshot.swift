@@ -43,6 +43,7 @@ public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
     public let hasPreprocessorConfig: Bool
 
     public let configWeightFormat: String?
+    public let textConfigWeightFormat: String?
     public let jangWeightFormat: String?
     public let effectiveWeightFormat: String?
     public let hasJangConfig: Bool
@@ -51,6 +52,8 @@ public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
     public let jangQuantizationMethod: String?
 
     public let quantizationBits: Int?
+    public let quantizationMode: String?
+    public let textConfigQuantizationMode: String?
     public let mxtqBits: Int?
     public let mxtqBitsSource: String?
     public let hasJANGTQSidecar: Bool
@@ -72,6 +75,7 @@ public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
         case hasVisionConfig = "has_vision_config"
         case hasPreprocessorConfig = "has_preprocessor_config"
         case configWeightFormat = "config_weight_format"
+        case textConfigWeightFormat = "text_config_weight_format"
         case jangWeightFormat = "jang_weight_format"
         case effectiveWeightFormat = "effective_weight_format"
         case hasJangConfig = "has_jang_config"
@@ -79,6 +83,8 @@ public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
         case jangProfile = "jang_profile"
         case jangQuantizationMethod = "jang_quantization_method"
         case quantizationBits = "quantization_bits"
+        case quantizationMode = "quantization_mode"
+        case textConfigQuantizationMode = "text_config_quantization_mode"
         case mxtqBits = "mxtq_bits"
         case mxtqBitsSource = "mxtq_bits_source"
         case hasJANGTQSidecar = "has_jangtq_sidecar"
@@ -100,6 +106,7 @@ public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
             modelDirectory.appendingPathComponent("jang_config.json"))
         let textConfig = config?["text_config"] as? [String: Any]
         let quantization = config?["quantization"] as? [String: Any]
+        let textConfigQuantization = textConfig?["quantization"] as? [String: Any]
         let jangQuantization = jang?["quantization"] as? [String: Any]
         let sidecarURL = modelDirectory.appendingPathComponent("jangtq_runtime.safetensors")
         let hasSidecar = FileManager.default.fileExists(atPath: sidecarURL.path)
@@ -110,8 +117,9 @@ public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
                 modelDirectory: modelDirectory))
 
         let configWeightFormat = Self.lowerString(config?["weight_format"])
+        let textConfigWeightFormat = Self.lowerString(textConfig?["weight_format"])
         let jangWeightFormat = Self.lowerString(jang?["weight_format"])
-        let effectiveWeightFormat = jangWeightFormat ?? configWeightFormat
+        let effectiveWeightFormat = jangWeightFormat ?? configWeightFormat ?? textConfigWeightFormat
         let configModelType = Self.string(config?["model_type"])
         let textConfigModelType = Self.string(textConfig?["model_type"])
         let hasVisionConfig =
@@ -133,6 +141,8 @@ public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
             jang?["mxtq_bits"],
             preferredSources: ["jang_config.mxtq_bits"])
         let quantizationBits = Self.intValue(quantization?["bits"])
+        let quantizationMode = Self.lowerString(quantization?["mode"])
+        let textConfigQuantizationMode = Self.lowerString(textConfigQuantization?["mode"])
         let jangProfile = Self.string(jangQuantization?["profile"])
         let profileBits = jangtqBitsFromProfile(jangProfile)
         let resolvedBits: (Int?, String?) = {
@@ -151,7 +161,14 @@ public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
             evidence.append("text_config.model_type=\(textConfigModelType)")
         }
         if let configWeightFormat { evidence.append("config.weight_format=\(configWeightFormat)") }
+        if let textConfigWeightFormat {
+            evidence.append("text_config.weight_format=\(textConfigWeightFormat)")
+        }
         if let jangWeightFormat { evidence.append("jang_config.weight_format=\(jangWeightFormat)") }
+        if let quantizationMode { evidence.append("config.quantization.mode=\(quantizationMode)") }
+        if let textConfigQuantizationMode {
+            evidence.append("text_config.quantization.mode=\(textConfigQuantizationMode)")
+        }
         if hasSidecar { evidence.append("jangtq_runtime.safetensors") }
         if let sidecarBits { evidence.append("sidecar.codebook_bits=\(sidecarBits)") }
         if let profileBits { evidence.append("jang_config.profile_bits=\(profileBits)") }
@@ -162,8 +179,9 @@ public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
         let format: ModelRuntimeBundleFormat
         if effectiveWeightFormat == "mxtq" || resolvedBits.0 != nil || hasSidecar {
             format = .jangtq
-        } else if let wf = effectiveWeightFormat,
-            wf.contains("mxfp") || wf.contains("mx-fp")
+        } else if Self.isMXFP(effectiveWeightFormat)
+            || Self.isMXFP(quantizationMode)
+            || Self.isMXFP(textConfigQuantizationMode)
         {
             format = .mxfp
         } else if jang != nil {
@@ -183,6 +201,7 @@ public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
         self.hasVisionConfig = hasVisionConfig || (mtpStatus?.bundleHasVision == true)
         self.hasPreprocessorConfig = hasPreprocessorConfig
         self.configWeightFormat = configWeightFormat
+        self.textConfigWeightFormat = textConfigWeightFormat
         self.jangWeightFormat = jangWeightFormat
         self.effectiveWeightFormat = effectiveWeightFormat
         self.hasJangConfig = jang != nil
@@ -190,6 +209,8 @@ public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
         self.jangProfile = jangProfile
         self.jangQuantizationMethod = Self.string(jangQuantization?["method"])
         self.quantizationBits = quantizationBits
+        self.quantizationMode = quantizationMode
+        self.textConfigQuantizationMode = textConfigQuantizationMode
         self.mxtqBits = resolvedBits.0
         self.mxtqBitsSource = resolvedBits.1
         self.hasJANGTQSidecar = hasSidecar
@@ -245,6 +266,11 @@ public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
     private static func bool(_ value: Any?) -> Bool {
         if let value = value as? Bool { return value }
         return value != nil
+    }
+
+    private static func isMXFP(_ value: String?) -> Bool {
+        guard let value else { return false }
+        return value.contains("mxfp") || value.contains("mx-fp")
     }
 
     private static func intValue(_ value: Any?) -> Int? {
