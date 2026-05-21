@@ -17,6 +17,246 @@ public enum ModelRuntimeCapabilitySupport: String, Codable, Sendable, Equatable 
     }
 }
 
+/// Coarse no-load bundle format classification for status and UI routing.
+public enum ModelRuntimeBundleFormat: String, Codable, Sendable, Equatable {
+    case mlx
+    case jang
+    case jangtq
+    case mxfp
+    case unknown
+}
+
+/// Source-backed trace explaining how a local model bundle was classified.
+///
+/// This is intentionally metadata-only. It reads JSON files, the optional
+/// JANGTQ runtime sidecar header, and the existing MTP bundle status. It does
+/// not load model weights or claim that generation is production-ready.
+public struct ModelRuntimeDetectionSnapshot: Codable, Sendable, Equatable {
+    public let bundleFormat: ModelRuntimeBundleFormat
+    public let evidence: [String]
+
+    public let configModelType: String?
+    public let textConfigModelType: String?
+    public let dispatchModelType: String?
+    public let hasTextConfig: Bool
+    public let hasVisionConfig: Bool
+    public let hasPreprocessorConfig: Bool
+
+    public let configWeightFormat: String?
+    public let jangWeightFormat: String?
+    public let effectiveWeightFormat: String?
+    public let hasJangConfig: Bool
+    public let jangFormat: String?
+    public let jangProfile: String?
+    public let jangQuantizationMethod: String?
+
+    public let quantizationBits: Int?
+    public let mxtqBits: Int?
+    public let mxtqBitsSource: String?
+    public let hasJANGTQSidecar: Bool
+    public let sidecarCodebookBits: Int?
+
+    public let nativeMTPMode: MTPRuntimeMode?
+    public let nativeMTPConfiguredLayers: Int?
+    public let nativeMTPTensorCount: Int?
+    public let visionTensorCount: Int?
+    public let nativeMTPCanAutoLaunch: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case bundleFormat = "bundle_format"
+        case evidence
+        case configModelType = "config_model_type"
+        case textConfigModelType = "text_config_model_type"
+        case dispatchModelType = "dispatch_model_type"
+        case hasTextConfig = "has_text_config"
+        case hasVisionConfig = "has_vision_config"
+        case hasPreprocessorConfig = "has_preprocessor_config"
+        case configWeightFormat = "config_weight_format"
+        case jangWeightFormat = "jang_weight_format"
+        case effectiveWeightFormat = "effective_weight_format"
+        case hasJangConfig = "has_jang_config"
+        case jangFormat = "jang_format"
+        case jangProfile = "jang_profile"
+        case jangQuantizationMethod = "jang_quantization_method"
+        case quantizationBits = "quantization_bits"
+        case mxtqBits = "mxtq_bits"
+        case mxtqBitsSource = "mxtq_bits_source"
+        case hasJANGTQSidecar = "has_jangtq_sidecar"
+        case sidecarCodebookBits = "sidecar_codebook_bits"
+        case nativeMTPMode = "native_mtp_mode"
+        case nativeMTPConfiguredLayers = "native_mtp_configured_layers"
+        case nativeMTPTensorCount = "native_mtp_tensor_count"
+        case visionTensorCount = "vision_tensor_count"
+        case nativeMTPCanAutoLaunch = "native_mtp_can_auto_launch"
+    }
+
+    public init(
+        modelDirectory: URL,
+        mtpStatus suppliedMTPStatus: MTPBundleStatus? = nil
+    ) throws {
+        let config = try Self.loadJSONObjectIfExists(
+            modelDirectory.appendingPathComponent("config.json"))
+        let jang = try Self.loadJSONObjectIfExists(
+            modelDirectory.appendingPathComponent("jang_config.json"))
+        let textConfig = config?["text_config"] as? [String: Any]
+        let quantization = config?["quantization"] as? [String: Any]
+        let jangQuantization = jang?["quantization"] as? [String: Any]
+        let sidecarURL = modelDirectory.appendingPathComponent("jangtq_runtime.safetensors")
+        let hasSidecar = FileManager.default.fileExists(atPath: sidecarURL.path)
+        let sidecarBits = hasSidecar ? JANGTQRuntimeCache.sniffCodebookBits(at: sidecarURL) : nil
+        let mtpStatus =
+            suppliedMTPStatus
+            ?? (try? MTPBundleInspector.inspect(
+                modelDirectory: modelDirectory))
+
+        let configWeightFormat = Self.lowerString(config?["weight_format"])
+        let jangWeightFormat = Self.lowerString(jang?["weight_format"])
+        let effectiveWeightFormat = jangWeightFormat ?? configWeightFormat
+        let configModelType = Self.string(config?["model_type"])
+        let textConfigModelType = Self.string(textConfig?["model_type"])
+        let hasVisionConfig =
+            Self.bool(config?["vision_config"])
+            || (config?["vision_config"] as? [String: Any]) != nil
+        let hasPreprocessorConfig =
+            FileManager.default.fileExists(
+                atPath: modelDirectory.appendingPathComponent("preprocessor_config.json").path)
+            || FileManager.default.fileExists(
+                atPath: modelDirectory.appendingPathComponent("processor_config.json").path)
+            || FileManager.default.fileExists(
+                atPath: modelDirectory.appendingPathComponent("video_preprocessor_config.json").path
+            )
+
+        let configMxtq = Self.resolveMXTQBits(
+            config?["mxtq_bits"],
+            preferredSources: ["config.mxtq_bits"])
+        let jangMxtq = Self.resolveMXTQBits(
+            jang?["mxtq_bits"],
+            preferredSources: ["jang_config.mxtq_bits"])
+        let quantizationBits = Self.intValue(quantization?["bits"])
+        let jangProfile = Self.string(jangQuantization?["profile"])
+        let profileBits = jangtqBitsFromProfile(jangProfile)
+        let resolvedBits: (Int?, String?) = {
+            if let configMxtq { return (configMxtq.value, configMxtq.source) }
+            if let jangMxtq { return (jangMxtq.value, jangMxtq.source) }
+            if let sidecarBits { return (sidecarBits, "jangtq_runtime.safetensors.codebook") }
+            if let profileBits { return (profileBits, "jang_config.quantization.profile") }
+            return (nil, nil)
+        }()
+
+        var evidence: [String] = []
+        if config != nil { evidence.append("config.json") }
+        if jang != nil { evidence.append("jang_config.json") }
+        if let configModelType { evidence.append("config.model_type=\(configModelType)") }
+        if let textConfigModelType {
+            evidence.append("text_config.model_type=\(textConfigModelType)")
+        }
+        if let configWeightFormat { evidence.append("config.weight_format=\(configWeightFormat)") }
+        if let jangWeightFormat { evidence.append("jang_config.weight_format=\(jangWeightFormat)") }
+        if hasSidecar { evidence.append("jangtq_runtime.safetensors") }
+        if let sidecarBits { evidence.append("sidecar.codebook_bits=\(sidecarBits)") }
+        if let profileBits { evidence.append("jang_config.profile_bits=\(profileBits)") }
+        if let mode = mtpStatus?.mode { evidence.append("native_mtp.mode=\(mode.rawValue)") }
+        if mtpStatus?.bundleHasVision == true { evidence.append("native_mtp.vision_tensors=true") }
+        if hasPreprocessorConfig { evidence.append("preprocessor_config=true") }
+
+        let format: ModelRuntimeBundleFormat
+        if effectiveWeightFormat == "mxtq" || resolvedBits.0 != nil || hasSidecar {
+            format = .jangtq
+        } else if let wf = effectiveWeightFormat,
+            wf.contains("mxfp") || wf.contains("mx-fp")
+        {
+            format = .mxfp
+        } else if jang != nil {
+            format = .jang
+        } else if config != nil {
+            format = .mlx
+        } else {
+            format = .unknown
+        }
+
+        self.bundleFormat = format
+        self.evidence = Array(Set(evidence)).sorted()
+        self.configModelType = configModelType
+        self.textConfigModelType = textConfigModelType
+        self.dispatchModelType = textConfigModelType ?? configModelType
+        self.hasTextConfig = textConfig != nil
+        self.hasVisionConfig = hasVisionConfig || (mtpStatus?.bundleHasVision == true)
+        self.hasPreprocessorConfig = hasPreprocessorConfig
+        self.configWeightFormat = configWeightFormat
+        self.jangWeightFormat = jangWeightFormat
+        self.effectiveWeightFormat = effectiveWeightFormat
+        self.hasJangConfig = jang != nil
+        self.jangFormat = Self.string(jang?["format"])
+        self.jangProfile = jangProfile
+        self.jangQuantizationMethod = Self.string(jangQuantization?["method"])
+        self.quantizationBits = quantizationBits
+        self.mxtqBits = resolvedBits.0
+        self.mxtqBitsSource = resolvedBits.1
+        self.hasJANGTQSidecar = hasSidecar
+        self.sidecarCodebookBits = sidecarBits
+        self.nativeMTPMode = mtpStatus?.mode
+        self.nativeMTPConfiguredLayers = mtpStatus?.configuredLayers
+        self.nativeMTPTensorCount = mtpStatus?.tensorCount
+        self.visionTensorCount = mtpStatus?.visionTensorCount
+        self.nativeMTPCanAutoLaunch = mtpStatus?.canAutoLaunchMTP
+    }
+
+    private static func resolveMXTQBits(
+        _ value: Any?,
+        preferredSources: [String]
+    ) -> (value: Int, source: String)? {
+        if let int = intValue(value) {
+            return (int, preferredSources[0])
+        }
+        guard let dict = value as? [String: Any] else { return nil }
+        if let routed = intValue(dict["routed_expert"]) {
+            return (routed, "\(preferredSources[0]).routed_expert")
+        }
+        if let routed = dict["routed_expert"] as? [String: Any] {
+            for key in ["gate_proj", "up_proj", "down_proj"] {
+                if let bits = intValue(routed[key]) {
+                    return (bits, "\(preferredSources[0]).routed_expert.\(key)")
+                }
+            }
+        }
+        for key in ["gate_proj", "up_proj", "down_proj", "q_proj", "k_proj", "v_proj", "o_proj"] {
+            if let bits = intValue(dict[key]) {
+                return (bits, "\(preferredSources[0]).\(key)")
+            }
+        }
+        return nil
+    }
+
+    private static func loadJSONObjectIfExists(_ url: URL) throws -> [String: Any]? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let data = try Data(contentsOf: url)
+        return try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    private static func string(_ value: Any?) -> String? {
+        guard let value = value as? String, !value.isEmpty else { return nil }
+        return value
+    }
+
+    private static func lowerString(_ value: Any?) -> String? {
+        string(value)?.lowercased()
+    }
+
+    private static func bool(_ value: Any?) -> Bool {
+        if let value = value as? Bool { return value }
+        return value != nil
+    }
+
+    private static func intValue(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? Double { return Int(value) }
+        if let value = value as? Float { return Int(value) }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value) }
+        return nil
+    }
+}
+
 /// Codable capability snapshot for Osaurus-style model status endpoints.
 ///
 /// This is a no-load data surface. It combines the resolved model configuration,
@@ -42,11 +282,13 @@ public struct ModelRuntimeCapabilitySnapshot: Codable, Sendable, Equatable {
     public let reasoningParser: String?
     public let generationDefaults: GenerationConfigFile?
     public let nativeMTP: MTPBundleStatusSnapshot?
+    public let detection: ModelRuntimeDetectionSnapshot?
 
     public init(
         configuration: ModelConfiguration,
         capabilities: JangCapabilities? = nil,
-        modelType: String? = nil
+        modelType: String? = nil,
+        detection: ModelRuntimeDetectionSnapshot? = nil
     ) {
         self.modelName = configuration.name
         self.modelType = modelType
@@ -72,12 +314,20 @@ public struct ModelRuntimeCapabilitySnapshot: Codable, Sendable, Equatable {
         self.reasoningParser = capabilities?.reasoningParser ?? configuration.reasoningParserName
         self.generationDefaults = configuration.generationDefaults
         self.nativeMTP = configuration.mtpStatus?.snapshot
+        self.detection =
+            detection
+            ?? (try? configuration.modelDirectory).flatMap {
+                try? ModelRuntimeDetectionSnapshot(
+                    modelDirectory: $0,
+                    mtpStatus: configuration.mtpStatus)
+            }
     }
 
     public init(
         resolvedConfiguration: ResolvedModelConfiguration,
         capabilities: JangCapabilities? = nil,
-        modelType: String? = nil
+        modelType: String? = nil,
+        detection: ModelRuntimeDetectionSnapshot? = nil
     ) {
         self.modelName = resolvedConfiguration.name
         self.modelType = modelType
@@ -100,10 +350,16 @@ public struct ModelRuntimeCapabilitySnapshot: Codable, Sendable, Equatable {
             resolvedConfiguration.mtpStatus?.canAutoLaunchMTP == true ? .supported : .unsupported
         self.thinkInTemplate = capabilities?.thinkInTemplate
         self.toolParser = capabilities?.toolParser ?? resolvedConfiguration.toolCallFormat?.rawValue
-        self.reasoningParser = capabilities?.reasoningParser
+        self.reasoningParser =
+            capabilities?.reasoningParser
             ?? resolvedConfiguration.reasoningParserName
         self.generationDefaults = resolvedConfiguration.generationDefaults
         self.nativeMTP = resolvedConfiguration.mtpStatus?.snapshot
+        self.detection =
+            detection
+            ?? (try? ModelRuntimeDetectionSnapshot(
+                modelDirectory: resolvedConfiguration.modelDirectory,
+                mtpStatus: resolvedConfiguration.mtpStatus))
     }
 
     enum CodingKeys: String, CodingKey {
@@ -124,6 +380,7 @@ public struct ModelRuntimeCapabilitySnapshot: Codable, Sendable, Equatable {
         case reasoningParser = "reasoning_parser"
         case generationDefaults = "generation_defaults"
         case nativeMTP = "native_mtp"
+        case detection
     }
 
     public func validate(
@@ -346,12 +603,14 @@ public struct ModelRuntimeCapabilityValidationResult: Codable, Sendable, Equatab
     }
 }
 
-private extension ModelRuntimeCapabilitySnapshot {
-    static func textSupport(_ capabilities: JangCapabilities?) -> ModelRuntimeCapabilitySupport {
+extension ModelRuntimeCapabilitySnapshot {
+    fileprivate static func textSupport(_ capabilities: JangCapabilities?)
+        -> ModelRuntimeCapabilitySupport
+    {
         ModelRuntimeCapabilitySupport.from(capabilities?.supportsText) ?? .supported
     }
 
-    static func visionSupport(
+    fileprivate static func visionSupport(
         capabilities: JangCapabilities?,
         mtpStatus: MTPBundleStatus?
     ) -> ModelRuntimeCapabilitySupport {
@@ -367,7 +626,9 @@ private extension ModelRuntimeCapabilitySnapshot {
             unsupportedTokens: ["text"])
     }
 
-    static func videoSupport(_ capabilities: JangCapabilities?) -> ModelRuntimeCapabilitySupport {
+    fileprivate static func videoSupport(_ capabilities: JangCapabilities?)
+        -> ModelRuntimeCapabilitySupport
+    {
         if let explicit = ModelRuntimeCapabilitySupport.from(capabilities?.supportsVideo) {
             return explicit
         }
@@ -377,7 +638,9 @@ private extension ModelRuntimeCapabilitySnapshot {
             unsupportedTokens: ["text", "audio"])
     }
 
-    static func audioSupport(_ capabilities: JangCapabilities?) -> ModelRuntimeCapabilitySupport {
+    fileprivate static func audioSupport(_ capabilities: JangCapabilities?)
+        -> ModelRuntimeCapabilitySupport
+    {
         if let explicit = ModelRuntimeCapabilitySupport.from(capabilities?.supportsAudio) {
             return explicit
         }
@@ -387,7 +650,7 @@ private extension ModelRuntimeCapabilitySnapshot {
             unsupportedTokens: ["text", "vision", "image", "images", "vl", "vlm", "video"])
     }
 
-    static func toolSupport(
+    fileprivate static func toolSupport(
         capabilities: JangCapabilities?,
         toolCallFormat: ToolCallFormat?
     ) -> ModelRuntimeCapabilitySupport {
@@ -400,7 +663,7 @@ private extension ModelRuntimeCapabilitySnapshot {
         return .unknown
     }
 
-    static func reasoningSupport(
+    fileprivate static func reasoningSupport(
         capabilities: JangCapabilities?,
         reasoningParserName: String?
     ) -> ModelRuntimeCapabilitySupport {
@@ -412,7 +675,7 @@ private extension ModelRuntimeCapabilitySnapshot {
         return ReasoningParser.fromCapabilityName(stamp) == nil ? .unsupported : .supported
     }
 
-    static func supportFromModality(
+    fileprivate static func supportFromModality(
         _ modality: String?,
         supportedTokens: Set<String>,
         unsupportedTokens: Set<String>
@@ -427,7 +690,7 @@ private extension ModelRuntimeCapabilitySnapshot {
         return .unknown
     }
 
-    static func modalityTokens(_ modality: String?) -> Set<String> {
+    fileprivate static func modalityTokens(_ modality: String?) -> Set<String> {
         guard let modality else { return [] }
         return Set(
             modality.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init))

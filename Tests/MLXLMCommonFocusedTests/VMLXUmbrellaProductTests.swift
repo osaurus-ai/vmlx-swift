@@ -29,6 +29,8 @@ struct VMLXUmbrellaProductTests {
         let _: NativeMTPTuning.Type = NativeMTPTuning.self
         let _: NativeMTPTuningSnapshot.Type = NativeMTPTuningSnapshot.self
         let _: ModelRuntimeCapabilitySnapshot.Type = ModelRuntimeCapabilitySnapshot.self
+        let _: ModelRuntimeDetectionSnapshot.Type = ModelRuntimeDetectionSnapshot.self
+        let _: ModelRuntimeBundleFormat.Type = ModelRuntimeBundleFormat.self
         let _: ModelRuntimeCapabilityRequest.Type = ModelRuntimeCapabilityRequest.self
         let _: ModelRuntimeCapabilityValidationResult.Type =
             ModelRuntimeCapabilityValidationResult.self
@@ -165,6 +167,175 @@ struct VMLXUmbrellaProductTests {
         #expect(resolvedSnapshot.modelName == "served-qwen36-mtp")
     }
 
+    @Test("runtime detection trace explains JANGTQ VL native-MTP classification")
+    func runtimeDetectionTraceExplainsJANGTQVLMTPClassification() throws {
+        let root = try Self.makeTemporaryDirectory("vmlx-runtime-trace-jangtq-vl")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try Data(
+            """
+            {
+              "model_type": "qwen3_5_vl",
+              "num_hidden_layers": 64,
+              "num_nextn_predict_layers": 3,
+              "text_config": {
+                "model_type": "qwen3_5_moe",
+                "num_hidden_layers": 64,
+                "num_nextn_predict_layers": 3
+              },
+              "vision_config": {
+                "model_type": "qwen3_5_vision"
+              }
+            }
+            """.utf8
+        )
+        .write(to: root.appendingPathComponent("config.json"))
+
+        try Data(
+            """
+            {
+              "format": "jang",
+              "format_version": "2.0",
+              "weight_format": "mxtq",
+              "mxtq_bits": {
+                "routed_expert": {
+                  "gate_proj": 4,
+                  "up_proj": 4,
+                  "down_proj": 4
+                }
+              },
+              "quantization": {
+                "method": "jang",
+                "profile": "JANGTQ4",
+                "bit_widths_used": [2, 4, 8]
+              },
+              "runtime": {
+                "bundle_has_mtp": true,
+                "mtp_layers": 3,
+                "mtp_mode": "preserved_enabled"
+              },
+              "capabilities": {
+                "family": "qwen3_6",
+                "modality": "vision"
+              }
+            }
+            """.utf8
+        )
+        .write(to: root.appendingPathComponent("jang_config.json"))
+
+        try Data("{}".utf8).write(to: root.appendingPathComponent("preprocessor_config.json"))
+        try Data(
+            """
+            {
+              "weight_map": {
+                "model.layers.64.mtp_fc.weight": "model-00001-of-00001.safetensors",
+                "vision_tower.blocks.0.attn.qkv.weight": "model-00001-of-00001.safetensors"
+              }
+            }
+            """.utf8
+        )
+        .write(to: root.appendingPathComponent("model.safetensors.index.json"))
+
+        let trace = try ModelRuntimeDetectionSnapshot(modelDirectory: root)
+
+        #expect(trace.bundleFormat == .jangtq)
+        #expect(trace.configModelType == "qwen3_5_vl")
+        #expect(trace.textConfigModelType == "qwen3_5_moe")
+        #expect(trace.dispatchModelType == "qwen3_5_moe")
+        #expect(trace.hasTextConfig)
+        #expect(trace.hasVisionConfig)
+        #expect(trace.hasPreprocessorConfig)
+        #expect(trace.hasJangConfig)
+        #expect(trace.jangWeightFormat == "mxtq")
+        #expect(trace.effectiveWeightFormat == "mxtq")
+        #expect(trace.mxtqBits == 4)
+        #expect(trace.mxtqBitsSource == "jang_config.mxtq_bits.routed_expert.gate_proj")
+        #expect(trace.nativeMTPMode == .preservedEnabled)
+        #expect(trace.nativeMTPConfiguredLayers == 3)
+        #expect(trace.nativeMTPTensorCount == 1)
+        #expect(trace.visionTensorCount == 1)
+        #expect(trace.evidence.contains("jang_config.weight_format=mxtq"))
+        #expect(trace.evidence.contains("native_mtp.mode=preserved_enabled"))
+
+        let snapshot = ModelRuntimeCapabilitySnapshot(
+            configuration: ModelConfiguration(directory: root),
+            capabilities: JangCapabilities(
+                supportsText: true,
+                supportsVision: true,
+                family: "qwen3_6",
+                modality: "vision"))
+        #expect(snapshot.detection == trace)
+
+        let encoded = String(decoding: try JSONEncoder().encode(snapshot), as: UTF8.self)
+        #expect(encoded.contains("\"bundle_format\":\"jangtq\""))
+        #expect(
+            encoded.contains(
+                "\"mxtq_bits_source\":\"jang_config.mxtq_bits.routed_expert.gate_proj\""))
+        #expect(!encoded.contains(root.path))
+    }
+
+    @Test("runtime detection trace separates MXFP bundles from JANG affine bundles")
+    func runtimeDetectionTraceSeparatesMXFPFromJANGAffine() throws {
+        let mxfpRoot = try Self.makeTemporaryDirectory("vmlx-runtime-trace-mxfp")
+        let jangRoot = try Self.makeTemporaryDirectory("vmlx-runtime-trace-jang")
+        defer {
+            try? FileManager.default.removeItem(at: mxfpRoot)
+            try? FileManager.default.removeItem(at: jangRoot)
+        }
+
+        try Data(
+            """
+            {
+              "model_type": "qwen3_5_moe",
+              "weight_format": "mxfp8",
+              "quantization": {
+                "bits": 8
+              }
+            }
+            """.utf8
+        )
+        .write(to: mxfpRoot.appendingPathComponent("config.json"))
+
+        try Data(
+            """
+            {
+              "model_type": "deepseek_v4",
+              "weight_format": "bf16"
+            }
+            """.utf8
+        )
+        .write(to: jangRoot.appendingPathComponent("config.json"))
+        try Data(
+            """
+            {
+              "format": "jang",
+              "format_version": "2.0",
+              "weight_format": "bf16",
+              "quantization": {
+                "method": "jang-affine",
+                "profile": "JANG_4M",
+                "bit_widths_used": [2, 4, 6, 8]
+              }
+            }
+            """.utf8
+        )
+        .write(to: jangRoot.appendingPathComponent("jang_config.json"))
+
+        let mxfpTrace = try ModelRuntimeDetectionSnapshot(modelDirectory: mxfpRoot)
+        let jangTrace = try ModelRuntimeDetectionSnapshot(modelDirectory: jangRoot)
+
+        #expect(mxfpTrace.bundleFormat == .mxfp)
+        #expect(mxfpTrace.effectiveWeightFormat == "mxfp8")
+        #expect(mxfpTrace.quantizationBits == 8)
+        #expect(mxfpTrace.mxtqBits == nil)
+
+        #expect(jangTrace.bundleFormat == .jang)
+        #expect(jangTrace.jangWeightFormat == "bf16")
+        #expect(jangTrace.jangProfile == "JANG_4M")
+        #expect(jangTrace.jangQuantizationMethod == "jang-affine")
+        #expect(jangTrace.mxtqBits == nil)
+    }
+
     @Test("jang capabilities parse explicit media support booleans")
     func parsesExplicitMediaSupportBooleans() throws {
         let root = FileManager.default.temporaryDirectory
@@ -172,23 +343,24 @@ struct VMLXUmbrellaProductTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let data = Data("""
-        {
-          "format": "jang",
-          "format_version": "1.0",
-          "capabilities": {
-            "family": "nemotron_h_omni",
-            "modality": "omni",
-            "cache_type": "hybrid",
-            "supports_tools": true,
-            "supports_thinking": true,
-            "supports_text": true,
-            "supports_vision": true,
-            "supports_video": true,
-            "supports_audio": true
-          }
-        }
-        """.utf8)
+        let data = Data(
+            """
+            {
+              "format": "jang",
+              "format_version": "1.0",
+              "capabilities": {
+                "family": "nemotron_h_omni",
+                "modality": "omni",
+                "cache_type": "hybrid",
+                "supports_tools": true,
+                "supports_thinking": true,
+                "supports_text": true,
+                "supports_vision": true,
+                "supports_video": true,
+                "supports_audio": true
+              }
+            }
+            """.utf8)
         try data.write(to: root.appendingPathComponent("jang_config.json"))
 
         let config = try JangLoader.loadConfig(at: root)
@@ -225,12 +397,13 @@ struct VMLXUmbrellaProductTests {
 
         #expect(!result.allowed)
         #expect(result.requestedModalities == [.text, .vision, .video, .audio, .tools, .reasoning])
-        #expect(result.issues.map(\.code) == [
-            "unknown_modality_support",
-            "unsupported_modality",
-            "unsupported_modality",
-            "unknown_modality_support",
-        ])
+        #expect(
+            result.issues.map(\.code) == [
+                "unknown_modality_support",
+                "unsupported_modality",
+                "unsupported_modality",
+                "unknown_modality_support",
+            ])
         #expect(result.issues.map(\.modality) == [.video, .audio, .tools, .reasoning])
         #expect(result.issues.first?.redactedLogFields["modality"] == "video")
 
@@ -261,11 +434,12 @@ struct VMLXUmbrellaProductTests {
 
         let strict = snapshot.validate(request: request)
         #expect(!strict.allowed)
-        #expect(strict.issues.map(\.code) == [
-            "unsupported_modality",
-            "unknown_modality_support",
-            "unknown_modality_support",
-        ])
+        #expect(
+            strict.issues.map(\.code) == [
+                "unsupported_modality",
+                "unknown_modality_support",
+                "unknown_modality_support",
+            ])
 
         let permissive = snapshot.validate(request: request, unknownPolicy: .allowUnknown)
         #expect(!permissive.allowed)
@@ -297,9 +471,10 @@ struct VMLXUmbrellaProductTests {
             usesReasoning: true,
             usesNativeMTP: true)
 
-        #expect(request.sortedModalities == [
-            .text, .vision, .video, .audio, .tools, .reasoning, .nativeMTP,
-        ])
+        #expect(
+            request.sortedModalities == [
+                .text, .vision, .video, .audio, .tools, .reasoning, .nativeMTP,
+            ])
         let data = try JSONEncoder().encode(request)
         let encoded = String(decoding: data, as: UTF8.self)
         #expect(encoded.contains("vision"))
@@ -309,5 +484,12 @@ struct VMLXUmbrellaProductTests {
         #expect(encoded.contains("native_mtp"))
         #expect(!encoded.contains("private prompt text"))
         #expect(!encoded.contains("private_tool_name"))
+    }
+
+    private static func makeTemporaryDirectory(_ prefix: String) throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(prefix)-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
     }
 }
