@@ -622,11 +622,22 @@ public enum NativeMTPActivation {
     }
 
     private static func isSupportedQwenMTPModelType(_ value: String) -> Bool {
-        let normalized = value.lowercased().replacingOccurrences(of: "-", with: "_")
-        return normalized == "qwen3_5"
-            || normalized == "qwen3_5_text"
-            || normalized == "qwen3_5_moe"
-            || normalized == "qwen3_5_moe_text"
+        switch normalize(value) {
+        case "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
+             "qwen3_6", "qwen3_6_text", "qwen3_6_moe", "qwen3_6_moe_text",
+             "qwen35", "qwen35_text", "qwen35_moe", "qwen35_moe_text",
+             "qwen36", "qwen36_text", "qwen36_moe", "qwen36_moe_text":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func normalize(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: ".", with: "_")
     }
 }
 
@@ -757,16 +768,22 @@ public enum NativeMTPAutoDecodePolicy {
     }
 
     private static func isSupportedQwenMTPModelType(_ value: String) -> Bool {
-        value == "qwen3_5"
-            || value == "qwen3_5_text"
-            || value == "qwen3_5_moe"
-            || value == "qwen3_5_moe_text"
+        switch value {
+        case "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
+             "qwen3_6", "qwen3_6_text", "qwen3_6_moe", "qwen3_6_moe_text",
+             "qwen35", "qwen35_text", "qwen35_moe", "qwen35_moe_text",
+             "qwen36", "qwen36_text", "qwen36_moe", "qwen36_moe_text":
+            return true
+        default:
+            return false
+        }
     }
 
     private static func normalize(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: ".", with: "_")
     }
 
     private static func intValue(_ value: Any?) -> Int? {

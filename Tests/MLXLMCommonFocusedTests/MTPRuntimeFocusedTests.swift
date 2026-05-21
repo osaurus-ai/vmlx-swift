@@ -479,6 +479,45 @@ struct MTPRuntimeFocusedTests {
         #expect(shouldLoad)
     }
 
+    @Test("native MTP activation supports Qwen3.6 aliases with tensor evidence and tuning")
+    func nativeMTPActivationSupportsQwen36AliasesWithTensorEvidence() async throws {
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 42,
+            visionTensorCount: 333,
+            mode: .preservedEnabled,
+            nativeMTPTuning: NativeMTPTuning(
+                bestDepth: 3,
+                validated: true,
+                outputEquivalent: true,
+                artifact: "docs/internal/release-gates/qwen-depth3/result.json",
+                baselineTokensPerSecond: 24.0,
+                bestTokensPerSecond: 36.0,
+                speedupVsBaseline: 1.5))
+
+        for modelType in ["qwen3_6_moe", "qwen3.6-moe", "qwen36_moe"] {
+            let config = """
+            {
+              "model_type": "\(modelType)",
+              "text_config": {
+                "model_type": "\(modelType)_text",
+                "mtp_num_hidden_layers": 1
+              }
+            }
+            """.data(using: .utf8)!
+
+            let shouldLoad = try await NativeMTPActivation.withExplicitRequest(true) {
+                try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                    configData: config,
+                    baseModelType: modelType,
+                    status: status)
+            }
+
+            #expect(shouldLoad)
+        }
+    }
+
     @Test("native MTP activation requires usable tuning even when tensors exist")
     func nativeMTPActivationRequiresUsableTuningEvenWhenTensorsExist() async throws {
         let config = """
@@ -737,6 +776,13 @@ struct MTPRuntimeFocusedTests {
           "quantization": { "mode": "mxfp8", "bits": 8 }
         }
         """.data(using: .utf8)!
+        let qwen36MXFP8Config = """
+        {
+          "model_type": "qwen3.6-moe",
+          "text_config": { "model_type": "qwen3.6-moe-text", "mtp_num_hidden_layers": 1 },
+          "quantization": { "mode": "mxfp8", "bits": 8 }
+        }
+        """.data(using: .utf8)!
         let preserved = MTPBundleStatus(
             bundleHasMTP: true,
             configuredLayers: 1,
@@ -819,6 +865,13 @@ struct MTPRuntimeFocusedTests {
             status: verified)
         #expect(moeVerified?.depth == 3)
         #expect(moeVerified?.verifierMode == "chunk_lazy_repair")
+
+        let qwen36Verified = NativeMTPAutoDecodePolicy.recommendation(
+            configData: qwen36MXFP8Config,
+            jangConfig: nil,
+            status: verified)
+        #expect(qwen36Verified?.depth == 3)
+        #expect(qwen36Verified?.evidence.contains("model_types=qwen3_6_moe,qwen3_6_moe_text") == true)
 
         let jang2k = NativeMTPAutoDecodePolicy.recommendation(
             configData: denseMXFP8Config,
