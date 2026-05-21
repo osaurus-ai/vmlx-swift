@@ -1176,6 +1176,49 @@ public final class LLMModelFactory: ModelFactory {
     /// registry of model id to configuration, e.g. `mlx-community/Llama-3.2-3B-Instruct-4bit`
     public let modelRegistry: AbstractModelRegistry
 
+    static func mergeJANGTQSidecarStartupMetadata(
+        _ configData: Data,
+        modelDirectory: URL
+    ) -> Data {
+        guard var configDict = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any]
+        else { return configData }
+
+        let sidecarURL = modelDirectory.appending(component: "jangtq_runtime.safetensors")
+        guard let sniffed = JANGTQRuntimeCache.sniffCodebookBits(at: sidecarURL) else {
+            return configData
+        }
+
+        let priorFormat = (configDict["weight_format"] as? String) ?? "(unset)"
+        let isMxtqStampAlready = (priorFormat.lowercased() == "mxtq")
+            || (priorFormat.lowercased() == "jangtq1")
+            || (priorFormat.lowercased() == "jangtq2")
+            || (priorFormat.lowercased() == "jangtq4")
+        if !isMxtqStampAlready {
+            configDict["weight_format"] = "mxtq"
+            FileHandle.standardError.write(
+                Data("[Load] sidecar codebook present (\(sniffed)-bit) — forced weight_format \"mxtq\" (was: \"\(priorFormat)\"); fix the bundle's startup metadata\n".utf8))
+        }
+        if configDict["mxtq_bits"] == nil {
+            configDict["mxtq_bits"] = sniffed
+        }
+        if configDict["routed_expert_bits"] == nil {
+            configDict["routed_expert_bits"] = configDict["mxtq_bits"]
+        }
+        if var textConfig = configDict["text_config"] as? [String: Any] {
+            for key in [
+                "weight_format", "mxtq_seed", "mxtq_bits",
+                "mxtq_gate_up_bits", "mxtq_down_bits",
+                "routed_expert_bits",
+            ] {
+                if textConfig[key] == nil, let value = configDict[key] {
+                    textConfig[key] = value
+                }
+            }
+            configDict["text_config"] = textConfig
+        }
+        return (try? JSONSerialization.data(withJSONObject: configDict)) ?? configData
+    }
+
     public func _load(
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
@@ -1387,6 +1430,9 @@ public final class LLMModelFactory: ModelFactory {
                 configData = merged
             }
         }
+        configData = Self.mergeJANGTQSidecarStartupMetadata(
+            configData,
+            modelDirectory: modelDirectory)
 
         let baseConfig: BaseConfiguration
         do {
