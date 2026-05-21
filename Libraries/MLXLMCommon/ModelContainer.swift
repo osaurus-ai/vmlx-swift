@@ -13,8 +13,17 @@ import os
 public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
     public var layerCount: Int
     public var kvLayerCount: Int
+    public var chunkedKVLayerCount: Int
+    public var quantizedKVLayerCount: Int
+    public var turboQuantKVLayerCount: Int
+    public var compilableKVLayerCount: Int
+    public var compilableTurboQuantKVLayerCount: Int
     public var rotatingKVLayerCount: Int
+    public var compilableRotatingKVLayerCount: Int
+    public var rotatingWrapperLayerCount: Int
+    public var hybridPoolLayerCount: Int
     public var mambaLayerCount: Int
+    public var compilableMambaLayerCount: Int
     public var arraysLayerCount: Int
     public var zayaCCALayerCount: Int
     public var cacheListLayerCount: Int
@@ -22,16 +31,34 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
     public init(
         layerCount: Int = 0,
         kvLayerCount: Int = 0,
+        chunkedKVLayerCount: Int = 0,
+        quantizedKVLayerCount: Int = 0,
+        turboQuantKVLayerCount: Int = 0,
+        compilableKVLayerCount: Int = 0,
+        compilableTurboQuantKVLayerCount: Int = 0,
         rotatingKVLayerCount: Int = 0,
+        compilableRotatingKVLayerCount: Int = 0,
+        rotatingWrapperLayerCount: Int = 0,
+        hybridPoolLayerCount: Int = 0,
         mambaLayerCount: Int = 0,
+        compilableMambaLayerCount: Int = 0,
         arraysLayerCount: Int = 0,
         zayaCCALayerCount: Int = 0,
         cacheListLayerCount: Int = 0
     ) {
         self.layerCount = layerCount
         self.kvLayerCount = kvLayerCount
+        self.chunkedKVLayerCount = chunkedKVLayerCount
+        self.quantizedKVLayerCount = quantizedKVLayerCount
+        self.turboQuantKVLayerCount = turboQuantKVLayerCount
+        self.compilableKVLayerCount = compilableKVLayerCount
+        self.compilableTurboQuantKVLayerCount = compilableTurboQuantKVLayerCount
         self.rotatingKVLayerCount = rotatingKVLayerCount
+        self.compilableRotatingKVLayerCount = compilableRotatingKVLayerCount
+        self.rotatingWrapperLayerCount = rotatingWrapperLayerCount
+        self.hybridPoolLayerCount = hybridPoolLayerCount
         self.mambaLayerCount = mambaLayerCount
+        self.compilableMambaLayerCount = compilableMambaLayerCount
         self.arraysLayerCount = arraysLayerCount
         self.zayaCCALayerCount = zayaCCALayerCount
         self.cacheListLayerCount = cacheListLayerCount
@@ -49,15 +76,40 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
         mambaLayerCount > 0 || arraysLayerCount > 0 || zayaCCALayerCount > 0
     }
 
+    public var requiresDiskBackedCoordinatorRestore: Bool {
+        requiresSSMCompanionState
+            || rotatingKVLayerCount > 0
+            || compilableRotatingKVLayerCount > 0
+            || rotatingWrapperLayerCount > 0
+            || hybridPoolLayerCount > 0
+            || quantizedKVLayerCount > 0
+            || turboQuantKVLayerCount > 0
+            || compilableTurboQuantKVLayerCount > 0
+    }
+
     public var topologyTags: [String] {
         var tags: [String] = ["layers=\(layerCount)"]
-        if kvLayerCount > 0 { tags.append("kv=\(kvLayerCount)") }
-        if rotatingKVLayerCount > 0 { tags.append("rotating=\(rotatingKVLayerCount)") }
-        if mambaLayerCount > 0 { tags.append("mamba=\(mambaLayerCount)") }
-        if arraysLayerCount > 0 { tags.append("arrays=\(arraysLayerCount)") }
-        if zayaCCALayerCount > 0 { tags.append("zayaCCA=\(zayaCCALayerCount)") }
-        if cacheListLayerCount > 0 { tags.append("cacheList=\(cacheListLayerCount)") }
+        if kvLayerCount > 0 { tags.append("kvLayers=\(kvLayerCount)") }
+        if chunkedKVLayerCount > 0 { tags.append("chunkedKVLayers=\(chunkedKVLayerCount)") }
+        if quantizedKVLayerCount > 0 { tags.append("quantizedKVLayers=\(quantizedKVLayerCount)") }
+        if turboQuantKVLayerCount > 0 { tags.append("turboQuantKVLayers=\(turboQuantKVLayerCount)") }
+        if compilableKVLayerCount > 0 { tags.append("compilableKVLayers=\(compilableKVLayerCount)") }
+        if compilableTurboQuantKVLayerCount > 0 {
+            tags.append("compilableTurboQuantKVLayers=\(compilableTurboQuantKVLayerCount)")
+        }
+        if rotatingKVLayerCount > 0 { tags.append("rotatingLayers=\(rotatingKVLayerCount)") }
+        if compilableRotatingKVLayerCount > 0 {
+            tags.append("compilableRotatingLayers=\(compilableRotatingKVLayerCount)")
+        }
+        if rotatingWrapperLayerCount > 0 { tags.append("rotatingWrapperLayers=\(rotatingWrapperLayerCount)") }
+        if hybridPoolLayerCount > 0 { tags.append("hybridPoolLayers=\(hybridPoolLayerCount)") }
+        if mambaLayerCount > 0 { tags.append("mambaLayers=\(mambaLayerCount)") }
+        if compilableMambaLayerCount > 0 { tags.append("compilableMambaLayers=\(compilableMambaLayerCount)") }
+        if arraysLayerCount > 0 { tags.append("arraysLayers=\(arraysLayerCount)") }
+        if zayaCCALayerCount > 0 { tags.append("zayaCCALayers=\(zayaCCALayerCount)") }
+        if cacheListLayerCount > 0 { tags.append("cacheListLayers=\(cacheListLayerCount)") }
         if requiresSSMCompanionState { tags.append("companion=ssm") }
+        if requiresDiskBackedCoordinatorRestore { tags.append("restore=disk-backed") }
         return tags
     }
 
@@ -68,14 +120,38 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
             for index in 0..<list.count {
                 record(list[index])
             }
+        case is CompilableTurboQuantKVCache:
+            compilableTurboQuantKVLayerCount += 1
+            turboQuantKVLayerCount += 1
+        case is TurboQuantKVCache:
+            turboQuantKVLayerCount += 1
+        case is QuantizedKVCache:
+            quantizedKVLayerCount += 1
+        case is CompilableRotatingKVCache:
+            compilableRotatingKVLayerCount += 1
+            rotatingKVLayerCount += 1
+        case is HybridPoolCache:
+            hybridPoolLayerCount += 1
+            rotatingWrapperLayerCount += 1
+        case is RotatingKVCacheWrapper:
+            rotatingWrapperLayerCount += 1
         case is ZayaCCACache:
             zayaCCALayerCount += 1
+        case is CompilableMambaCache:
+            compilableMambaLayerCount += 1
+            mambaLayerCount += 1
         case is MambaCache:
             mambaLayerCount += 1
         case is ArraysCache:
             arraysLayerCount += 1
         case is RotatingKVCache:
             rotatingKVLayerCount += 1
+        case is CompilableKVCache:
+            compilableKVLayerCount += 1
+            kvLayerCount += 1
+        case is ChunkedKVCache:
+            chunkedKVLayerCount += 1
+            kvLayerCount += 1
         case is KVCacheSimple:
             kvLayerCount += 1
         default:

@@ -207,26 +207,47 @@ final class GenerationConfigDefaultsTests: XCTestCase {
             configuration: modelConfig,
             model: TestStubLanguageModel(cache: [
                 KVCacheSimple(),
+                ChunkedKVCache(chunkSize: 8),
+                QuantizedKVCache(groupSize: 32, bits: 4),
+                TurboQuantKVCache(keyBits: 4, valueBits: 3),
+                CompilableKVCache(maxLength: 32),
+                CompilableTurboQuantKVCache(keyBits: 4, valueBits: 3),
                 MambaCache(),
+                CompilableMambaCache(),
                 ArraysCache(size: 2),
                 ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8),
+                CompilableRotatingKVCache(maxSize: 16),
+                TestHybridPoolCache(),
                 CacheList(RotatingKVCache(maxSize: 16), MambaCache()),
-            ]),
+            ], copyCacheOnNewCache: false),
             processor: TestStubUserInputProcessor(),
             tokenizer: TestStubTokenizer())
         let container = ModelContainer(context: context)
 
         let topology = await container.cacheTopologySnapshot()
 
-        XCTAssertEqual(topology.layerCount, 5)
-        XCTAssertEqual(topology.kvLayerCount, 1)
-        XCTAssertEqual(topology.rotatingKVLayerCount, 1)
-        XCTAssertEqual(topology.mambaLayerCount, 2)
+        XCTAssertEqual(topology.layerCount, 13)
+        XCTAssertEqual(topology.kvLayerCount, 3)
+        XCTAssertEqual(topology.chunkedKVLayerCount, 1)
+        XCTAssertEqual(topology.quantizedKVLayerCount, 1)
+        XCTAssertEqual(topology.turboQuantKVLayerCount, 2)
+        XCTAssertEqual(topology.compilableKVLayerCount, 1)
+        XCTAssertEqual(topology.compilableTurboQuantKVLayerCount, 1)
+        XCTAssertEqual(topology.rotatingKVLayerCount, 2)
+        XCTAssertEqual(topology.compilableRotatingKVLayerCount, 1)
+        XCTAssertEqual(topology.rotatingWrapperLayerCount, 1)
+        XCTAssertEqual(topology.hybridPoolLayerCount, 1)
+        XCTAssertEqual(topology.mambaLayerCount, 3)
+        XCTAssertEqual(topology.compilableMambaLayerCount, 1)
         XCTAssertEqual(topology.arraysLayerCount, 1)
         XCTAssertEqual(topology.zayaCCALayerCount, 1)
         XCTAssertEqual(topology.cacheListLayerCount, 1)
         XCTAssertTrue(topology.requiresSSMCompanionState)
+        XCTAssertTrue(topology.requiresDiskBackedCoordinatorRestore)
         XCTAssertTrue(topology.topologyTags.contains("companion=ssm"))
+        XCTAssertTrue(topology.topologyTags.contains("restore=disk-backed"))
+        XCTAssertTrue(topology.topologyTags.contains("turboQuantKVLayers=2"))
+        XCTAssertTrue(topology.topologyTags.contains("hybridPoolLayers=1"))
     }
 }
 
@@ -234,9 +255,11 @@ final class GenerationConfigDefaultsTests: XCTestCase {
 
 private final class TestStubLanguageModel: Module, LanguageModel {
     let cache: [any KVCache]
+    let copyCacheOnNewCache: Bool
 
-    init(cache: [any KVCache] = []) {
+    init(cache: [any KVCache] = [], copyCacheOnNewCache: Bool = true) {
         self.cache = cache
+        self.copyCacheOnNewCache = copyCacheOnNewCache
     }
 
     var kvHeads: [Int] { [] }
@@ -247,7 +270,34 @@ private final class TestStubLanguageModel: Module, LanguageModel {
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         MLXArray.zeros([1, 1, 1])
     }
-    func newCache(parameters: GenerateParameters?) -> [KVCache] { cache.map { $0.copy() } }
+    func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        copyCacheOnNewCache ? cache.map { $0.copy() } : cache
+    }
+}
+
+private final class TestHybridPoolCache: BaseKVCache, HybridPoolCache {
+    let rotating = RotatingKVCache(maxSize: 16)
+    let compressRatio = 4
+    let slidingWindow = 16
+
+    override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        rotating.update(keys: keys, values: values)
+    }
+
+    override func innerState() -> [MLXArray] {
+        rotating.state
+    }
+
+    override func copy() -> KVCache {
+        TestHybridPoolCache()
+    }
+
+    func hybridPool(branch: HybridPoolBranch) -> MLXArray? { nil }
+    func setHybridPool(branch: HybridPoolBranch, value: MLXArray?) {}
+    func hybridBuffers(branch: HybridPoolBranch) -> (kv: MLXArray?, gate: MLXArray?) {
+        (nil, nil)
+    }
+    func setHybridBuffers(branch: HybridPoolBranch, kv: MLXArray?, gate: MLXArray?) {}
 }
 
 private struct TestStubUserInputProcessor: UserInputProcessor {
