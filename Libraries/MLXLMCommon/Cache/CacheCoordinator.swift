@@ -357,7 +357,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             var canUsePagedHit = true
 
             if isHybrid {
-                ssmStates = ssmStateCache.fetch(
+                ssmStates = fetchCompleteSSMStates(
                     tokens: tokens,
                     boundary: result.matchedTokens,
                     mediaSalt: mediaSalt
@@ -448,7 +448,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         mediaSalt: String? = nil
     ) -> [MLXArray]? {
         guard isHybrid else { return nil }
-        if let l1 = ssmStateCache.fetch(
+        if let l1 = fetchCompleteSSMStates(
             tokens: tokens,
             boundary: boundary,
             mediaSalt: mediaSalt)
@@ -464,6 +464,24 @@ public final class CacheCoordinator: @unchecked Sendable {
             boundary: boundary,
             mediaSalt: mediaSalt)
         return folded
+    }
+
+    /// Fetch companion SSM state only when the stored boundary is safe to
+    /// extend. Partial entries represent mid-prefill snapshots and must not
+    /// satisfy prefix reuse for a later growing turn.
+    private func fetchCompleteSSMStates(
+        tokens: [Int],
+        boundary: Int,
+        mediaSalt: String? = nil
+    ) -> [MLXArray]? {
+        guard let entry = ssmStateCache.fetchEntry(
+            tokens: tokens,
+            boundary: boundary,
+            mediaSalt: mediaSalt)
+        else {
+            return nil
+        }
+        return entry.isComplete ? entry.states : nil
     }
 
     // MARK: - Store

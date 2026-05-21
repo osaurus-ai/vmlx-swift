@@ -194,6 +194,29 @@ struct CacheCoordinatorTopologyFocusedTests {
         }
     }
 
+    @Test("hybrid paged hit rejects partial companion state")
+    func hybridPagedHitRejectsPartialSSMCompanion() {
+        FocusedMLXTestSupport.withLock {
+        let coordinator = makeCoordinator(usePagedCache: true, enableDiskCache: false)
+        coordinator.setHybrid(true)
+
+        let tokens = [71, 72, 73, 74, 75, 76, 77, 78]
+        coordinator.storeAfterGeneration(
+            promptTokens: tokens,
+            perLayerData: fakeLayerData(tokenCount: tokens.count),
+            ssmStates: nil)
+        coordinator.ssmStateCache.store(
+            ssmStates: [MLXArray.ones([1, 4], dtype: .float32)],
+            tokens: tokens,
+            boundary: tokens.count,
+            isComplete: false)
+
+        if case .hit = coordinator.fetch(tokens: tokens + [79]) {
+            Issue.record("hybrid paged cache must not extend partial SSM companion state")
+        }
+        }
+    }
+
     @Test("disk tier restores the longest stored prefix after paged cache is unavailable")
     func diskTierRestoresLongestStoredPrefix() {
         FocusedMLXTestSupport.withLock {
@@ -220,6 +243,35 @@ struct CacheCoordinatorTopologyFocusedTests {
             #expect(diskArrays != nil)
         case .miss:
             Issue.record("disk tier should restore the longest stored prompt boundary")
+        }
+        }
+    }
+
+    @Test("hybrid disk hit rejects partial companion state")
+    func hybridDiskHitRejectsPartialSSMCompanion() {
+        FocusedMLXTestSupport.withLock {
+        let tmp = makeTempDir("hybrid-disk-partial-ssm")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let coordinator = makeCoordinator(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheDir: tmp,
+            modelKey: "hybrid-disk-partial-ssm-focused")
+        coordinator.setHybrid(true)
+        let tokens = [81, 82, 83, 84]
+
+        coordinator.storeAfterGeneration(
+            promptTokens: tokens,
+            perLayerData: fakeLayerData(tokenCount: tokens.count),
+            ssmStates: nil)
+        coordinator.ssmStateCache.store(
+            ssmStates: [MLXArray.ones([1, 4], dtype: .float32)],
+            tokens: tokens,
+            boundary: tokens.count,
+            isComplete: false)
+
+        if case .hit = coordinator.fetch(tokens: tokens + [85]) {
+            Issue.record("hybrid disk cache must not extend partial SSM companion state")
         }
         }
     }
