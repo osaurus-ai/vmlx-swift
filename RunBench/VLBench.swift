@@ -70,12 +70,29 @@ enum VLBench {
         let modelDir = URL(fileURLWithPath: modelPath)
         print("=== VLBench BATCH — \(modelDir.lastPathComponent) ===")
 
+        let modelMiB = directorySizeMiB(modelDir)
+        let preLoadRSS = currentRSSMiB()
+        let preLoadFootprint = currentPhysFootprintMiB()
+        var peakRSS = preLoadRSS
+        var peakFootprint = preLoadFootprint
+        print(String(format:
+            "  VL batch memory pre-load: rssMiB=%.0f footprintMiB=%.0f modelMiB=%.0f",
+            preLoadRSS, preLoadFootprint, modelMiB))
+
         let loadStart = CFAbsoluteTimeGetCurrent()
         let context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader())
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
+        let postLoadRSS = currentRSSMiB()
+        let postLoadFootprint = currentPhysFootprintMiB()
+        peakRSS = max(peakRSS, postLoadRSS)
+        peakFootprint = max(peakFootprint, postLoadFootprint)
+        print(String(format:
+            "  VL batch memory post-load: rssMiB=%.0f footprintMiB=%.0f rssDeltaMiB=%+.0f footprintDeltaMiB=%+.0f",
+            postLoadRSS, postLoadFootprint, postLoadRSS - preLoadRSS,
+            postLoadFootprint - preLoadFootprint))
 
         let image = try synthesiseGradientImage(side: 224)
         nonisolated(unsafe) let ctx = context
@@ -95,13 +112,33 @@ enum VLBench {
                 "Describe what you see in this image in one sentence.",
                 "Name one colour visible in the image. Answer with one word.",
             ].enumerated() {
-                try await runBatchTurn(
+                let turnFootprint = try await runBatchTurn(
                     engine: engine, context: ctx,
                     prompt: prompt, image: image,
                     label: "Turn \(i + 1)",
                     parameters: params, maxNew: maxNewTokens
                 )
+                peakFootprint = max(peakFootprint, turnFootprint)
+                peakRSS = max(peakRSS, currentRSSMiB())
             }
+        }
+
+        let batchPeakDelta = peakFootprint - preLoadFootprint
+        let peakPercent = modelMiB > 0 ? (batchPeakDelta / modelMiB) * 100 : -1
+        print(String(format:
+            "  VL batch memory peak: rssMiB=%.0f footprintMiB=%.0f rssDeltaMiB=%+.0f footprintDeltaMiB=%+.0f modelMiB=%.0f ratio=%.1f%%",
+            peakRSS, peakFootprint, peakRSS - preLoadRSS, batchPeakDelta,
+            modelMiB, peakPercent))
+        print(String(format:
+            "  VL batch gate: footprintDeltaMiB=%.0f modelMiB=%.0f ratio=%.1f%% verdict=%@",
+            batchPeakDelta, modelMiB, peakPercent,
+            (modelMiB <= 0 || batchPeakDelta <= modelMiB) ? "passed" : "failed"))
+        if modelMiB > 0, batchPeakDelta > modelMiB {
+            fputs(String(format:
+                "[VL Batch] FAIL: VL batch gate failed " +
+                "(footprintDeltaMiB=%.0f modelMiB=%.0f ratio=%.1f%%).\n",
+                batchPeakDelta, modelMiB, peakPercent), stderr)
+            exit(1)
         }
 
         print("\n=== VLBench BATCH done ===")
@@ -116,7 +153,7 @@ enum VLBench {
         label: String,
         parameters: GenerateParameters,
         maxNew: Int
-    ) async throws {
+    ) async throws -> Double {
         print("  \(label) [\(parameters.enableCompiledBatchDecode ? "compile" : "uncomp")]:")
         let t0 = CFAbsoluteTimeGetCurrent()
 
@@ -196,6 +233,7 @@ enum VLBench {
                         "\(label) did not ground a visible image colour: \(preview)"
                 ])
         }
+        return footprintAfter
     }
 
     private static func containsAnyWord(_ text: String, words: Set<String>) -> Bool {
@@ -534,12 +572,29 @@ enum VLBench {
         let modelDir = URL(fileURLWithPath: modelPath)
         print("=== VLBench mediaSalt isolation (iter 37) ===")
 
+        let modelMiB = directorySizeMiB(modelDir)
+        let preLoadRSS = currentRSSMiB()
+        let preLoadFootprint = currentPhysFootprintMiB()
+        var peakRSS = preLoadRSS
+        var peakFootprint = preLoadFootprint
+        print(String(format:
+            "  mediaSalt memory pre-load: rssMiB=%.0f footprintMiB=%.0f modelMiB=%.0f",
+            preLoadRSS, preLoadFootprint, modelMiB))
+
         let loadStart = CFAbsoluteTimeGetCurrent()
         let context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader())
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
+        let postLoadRSS = currentRSSMiB()
+        let postLoadFootprint = currentPhysFootprintMiB()
+        peakRSS = max(peakRSS, postLoadRSS)
+        peakFootprint = max(peakFootprint, postLoadFootprint)
+        print(String(format:
+            "  mediaSalt memory post-load: rssMiB=%.0f footprintMiB=%.0f rssDeltaMiB=%+.0f footprintDeltaMiB=%+.0f",
+            postLoadRSS, postLoadFootprint, postLoadRSS - preLoadRSS,
+            postLoadFootprint - preLoadFootprint))
 
         let params = GenerateParameters(
             maxTokens: maxNewTokens, temperature: 0, prefillStepSize: 512)
@@ -564,6 +619,8 @@ enum VLBench {
         // Turn 1: image A, prompt P → submit and drain.
         let inputA = try await context.processor.prepare(
             input: UserInput(prompt: prompt, images: [.ciImage(imageA)]))
+        peakRSS = max(peakRSS, currentRSSMiB())
+        peakFootprint = max(peakFootprint, currentPhysFootprintMiB())
         let tokensA = inputA.text.tokens.reshaped(-1).asArray(Int.self)
         let saltA = computeCacheSalt(for: inputA, parameters: params)
         print("  image A: tokens=\(tokensA.count), image attached=\(inputA.image != nil), " +
@@ -572,12 +629,18 @@ enum VLBench {
               "mediaSalt=\(saltA?.prefix(12) ?? "nil")")
 
         nonisolated(unsafe) let sendA = inputA
+        let genStart = CFAbsoluteTimeGetCurrent()
         let (_, streamA) = await engine.submit(input: sendA, parameters: params)
         var genA = 0
         for await event in streamA {
             if case .token = event { genA += 1 }
+            peakRSS = max(peakRSS, currentRSSMiB())
+            peakFootprint = max(peakFootprint, currentPhysFootprintMiB())
         }
-        print("  Turn 1 (store): generated \(genA) tokens with image A")
+        let genSeconds = max(CFAbsoluteTimeGetCurrent() - genStart, 0.001)
+        print(String(format:
+            "  Turn 1 (store): generated %d tokens at %.2f tok/s with image A",
+            genA, Double(genA) / genSeconds))
 
         // Probe 1: same prompt + same image A → must HIT.
         let probeHit = coordinator.fetch(tokens: tokensA, mediaSalt: saltA)
@@ -598,6 +661,8 @@ enum VLBench {
         // identical by using the same 224×224 size.
         let inputB = try await context.processor.prepare(
             input: UserInput(prompt: prompt, images: [.ciImage(imageB)]))
+        peakRSS = max(peakRSS, currentRSSMiB())
+        peakFootprint = max(peakFootprint, currentPhysFootprintMiB())
         let tokensB = inputB.text.tokens.reshaped(-1).asArray(Int.self)
         let saltB = computeCacheSalt(for: inputB, parameters: params)
         let tokensEqual = tokensA == tokensB
@@ -620,7 +685,43 @@ enum VLBench {
         case .miss:
             print("  Probe B (different image): MISS (correct — isolation holds)")
         }
+        let peakDelta = peakFootprint - preLoadFootprint
+        let peakPercent = modelMiB > 0 ? (peakDelta / modelMiB) * 100 : -1
+        print(String(format:
+            "  mediaSalt memory peak: rssMiB=%.0f footprintMiB=%.0f rssDeltaMiB=%+.0f footprintDeltaMiB=%+.0f modelMiB=%.0f ratio=%.1f%%",
+            peakRSS, peakFootprint, peakRSS - preLoadRSS, peakDelta,
+            modelMiB, peakPercent))
+        print(String(format:
+            "  mediaSalt gate: footprintDeltaMiB=%.0f modelMiB=%.0f ratio=%.1f%% verdict=%@",
+            peakDelta, modelMiB, peakPercent,
+            (modelMiB <= 0 || peakDelta <= modelMiB) ? "passed" : "failed"))
+        if modelMiB > 0, peakDelta > modelMiB {
+            fputs(String(format:
+                "[VL MediaSalt] FAIL: mediaSalt gate failed " +
+                "(footprintDeltaMiB=%.0f modelMiB=%.0f ratio=%.1f%%).\n",
+                peakDelta, modelMiB, peakPercent), stderr)
+            exit(1)
+        }
         print("=== VLBench mediaSalt isolation: passed ===")
+    }
+
+    private static func directorySizeMiB(_ url: URL) -> Double {
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles])
+        else {
+            return 0
+        }
+        var total = 0
+        for case let fileURL as URL in enumerator {
+            let values = try? fileURL.resourceValues(
+                forKeys: [.fileSizeKey, .isRegularFileKey])
+            if values?.isRegularFile == true {
+                total += values?.fileSize ?? 0
+            }
+        }
+        return Double(total) / (1024.0 * 1024.0)
     }
 
     // MARK: - Cross-engine byte-identity on VL (iter 47)

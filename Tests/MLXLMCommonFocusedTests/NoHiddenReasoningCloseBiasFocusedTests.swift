@@ -60,6 +60,42 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(stability.contains("empty visible output"))
     }
 
+    @Test("VL media-salt proof reports token rate and peak memory gate")
+    func vlMediaSaltProofReportsTokenRateAndPeakMemoryGate() throws {
+        let source = try String(contentsOfFile: "RunBench/VLBench.swift", encoding: .utf8)
+
+        #expect(source.contains("mediaSalt memory pre-load"))
+        #expect(source.contains("mediaSalt memory post-load"))
+        #expect(source.contains("mediaSalt memory peak"))
+        #expect(source.contains("mediaSalt gate:"))
+        #expect(source.contains("mediaSalt gate failed"))
+        #expect(source.contains("peakDelta > modelMiB"))
+        #expect(source.contains("Turn 1 (store): generated %d tokens at %.2f tok/s"))
+    }
+
+    @Test("VL batch chat reports peak memory gate")
+    func vlBatchChatReportsPeakMemoryGate() throws {
+        let source = try String(contentsOfFile: "RunBench/VLBench.swift", encoding: .utf8)
+
+        #expect(source.contains("VL batch memory pre-load"))
+        #expect(source.contains("VL batch memory post-load"))
+        #expect(source.contains("VL batch memory peak"))
+        #expect(source.contains("VL batch gate:"))
+        #expect(source.contains("VL batch gate failed"))
+        #expect(source.contains("batchPeakDelta > modelMiB"))
+    }
+
+    @Test("live model matrix exits nonzero when rows fail")
+    func liveModelMatrixExitsNonzeroWhenRowsFail() throws {
+        let source = try String(
+            contentsOfFile: "scripts/vmlx-live-model-matrix.sh",
+            encoding: .utf8)
+
+        #expect(source.contains("grep -q $'\\tfail:'"))
+        #expect(source.contains("matrix completed with failing rows"))
+        #expect(source.contains("exit 1"))
+    }
+
     @Test("terminal info snapshots unclosed reasoning before parser flush")
     func terminalInfoSnapshotsUnclosedReasoningBeforeParserFlush() throws {
         let evaluate = try String(
@@ -392,6 +428,33 @@ struct HarmonyParserFocusedTests {
                 && function.body.contains("trimmingCharacters(in: .whitespacesAndNewlines).isEmpty"),
             "The live probe must fail empty-output/no-tool rows instead of counting them as leak-free."
         )
+    }
+
+    @Test("Harmony live reasoning probe honors generation defaults")
+    func harmonyLiveReasoningProbeHonorsGenerationDefaults() throws {
+        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let function = try #require(
+            Self.extractFunction(named: "runHarmonyReasoningCheck", from: bench),
+            "runHarmonyReasoningCheck not found"
+        )
+
+        #expect(function.body.contains("generationConfig: context.configuration.generationDefaults"))
+        #expect(!function.body.contains("temperature: 0"))
+    }
+
+    @Test("Qwen multi-turn tool probe honors generation defaults")
+    func qwenMultiturnToolProbeHonorsGenerationDefaults() throws {
+        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let function = try #require(
+            Self.extractFunction(named: "runQwenMultiturnToolCheck", from: bench),
+            "runQwenMultiturnToolCheck not found"
+        )
+
+        #expect(function.body.contains("generationConfig: context.configuration.generationDefaults"))
+        #expect(!function.body.contains("temperature: 0"))
+        #expect(function.body.contains("tokps"))
+        #expect(function.body.contains("emptyVisible"))
+        #expect(function.body.contains("reasoning-only"))
     }
 
     private func chunked(_ text: String, by size: Int) -> [String] {

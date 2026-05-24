@@ -3680,8 +3680,12 @@ func runHarmonyReasoningCheck(modelPath: String, maxNew: Int) async throws {
 
     do {
         let engine = BatchEngine(context: ctxSendable, maxBatchSize: 1)
-        let params = GenerateParameters(
-            maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
+        let fallback = GenerateParameters(maxTokens: maxNew, prefillStepSize: 512)
+        var params = GenerateParameters(
+            generationConfig: context.configuration.generationDefaults,
+            fallback: fallback)
+        params.maxTokens = maxNew
+        params.prefillStepSize = 512
         let stream = await engine.generate(input: sendable, parameters: params)
 
         for await ev in stream {
@@ -6702,9 +6706,11 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
         let chunks: Int
         let reasoningDeltas: Int
         let toolCalls: Int
+        let tokps: Double
         let chunkSample: String
         let reasoningSample: String
         let leakedThink: Bool
+        let emptyVisible: Bool
     }
 
     // Simulated 3-turn conversation mirroring tpae's screenshots.
@@ -6757,8 +6763,12 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
         nonisolated(unsafe) let sendable = input
 
         let engine = BatchEngine(context: ctxSendable, maxBatchSize: 1)
-        let params = GenerateParameters(
-            maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
+        let fallback = GenerateParameters(maxTokens: maxNew, prefillStepSize: 512)
+        var params = GenerateParameters(
+            generationConfig: context.configuration.generationDefaults,
+            fallback: fallback)
+        params.maxTokens = maxNew
+        params.prefillStepSize = 512
         let stream = await engine.generate(input: sendable, parameters: params)
 
         var chunkText = ""
@@ -6766,6 +6776,7 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
         var chunkCount = 0
         var reasoningCount = 0
         var toolCallCount = 0
+        let streamStart = CFAbsoluteTimeGetCurrent()
         for await ev in stream {
             switch ev {
             case .chunk(let c):
@@ -6780,6 +6791,9 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
                 break
             }
         }
+        let elapsed = max(CFAbsoluteTimeGetCurrent() - streamStart, 0.001)
+        let generatedDeltas = chunkCount + reasoningCount
+        let tokps = Double(generatedDeltas) / elapsed
         // Check every envelope pattern we support — whichever the model's
         // family uses. If ANY leaks, the test fails.
         let leakedMarkers = [
@@ -6788,31 +6802,45 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
         ]
         let leaked = leakedMarkers.contains { chunkText.contains($0) }
         if leaked { anyLeak = true }
+        let emptyVisible = chunkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let r = TurnResult(
             idx: idx + 1,
             promptTokens: promptTokens.count,
             chunks: chunkCount,
             reasoningDeltas: reasoningCount,
             toolCalls: toolCallCount,
+            tokps: tokps,
             chunkSample: String(chunkText.prefix(160)),
             reasoningSample: String(reasoningText.prefix(160)),
-            leakedThink: leaked)
+            leakedThink: leaked,
+            emptyVisible: emptyVisible)
         results.append(r)
         print("\n[\(turn.label)] promptTokens=\(promptTokens.count)")
-        print("  chunks=\(chunkCount) reasoning=\(reasoningCount) toolCalls=\(toolCallCount) leakedThinkMarkers=\(leaked)")
+        print(String(format:
+            "  chunks=%d reasoning=%d toolCalls=%d tokps=%.1f leakedThinkMarkers=%@ emptyVisible=%@",
+            chunkCount, reasoningCount, toolCallCount, tokps,
+            leaked ? "true" : "false", emptyVisible ? "true" : "false"))
         print("  .chunk: \"\(r.chunkSample)\"")
         print("  .reasoning: \"\(r.reasoningSample)\"")
     }
 
     print("\n=== Turn-by-turn summary ===")
     for r in results {
-        print("  Turn \(r.idx): prompt=\(r.promptTokens), chunks=\(r.chunks), reasoning=\(r.reasoningDeltas), toolCalls=\(r.toolCalls), leak=\(r.leakedThink)")
+        print(String(format:
+            "  Turn %d: prompt=%d, chunks=%d, reasoning=%d, toolCalls=%d, tokps=%.1f, leak=%@, emptyVisible=%@",
+            r.idx, r.promptTokens, r.chunks, r.reasoningDeltas, r.toolCalls,
+            r.tokps, r.leakedThink ? "true" : "false", r.emptyVisible ? "true" : "false"))
     }
     if anyLeak {
         fputs("\nFAIL: at least one turn leaked reasoning envelope markers in .chunk\n", stderr)
         exit(1)
     }
+    if results.contains(where: \.emptyVisible) {
+        fputs("\nFAIL: at least one turn produced reasoning-only output with no visible chunk\n", stderr)
+        exit(2)
+    }
     print("\nPASS: all turns have zero reasoning envelope markers in .chunk")
+    print("PASS: no reasoning-only empty-visible turns")
     print("=== BENCH_QWEN_MULTITURN_TOOL: passed ===")
 }
 

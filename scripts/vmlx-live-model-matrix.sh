@@ -687,3 +687,7 @@ done <"${RUN_DIR}/models.tsv"
 } >"${RUN_DIR}/REPORT.md"
 
 echo "report: ${RUN_DIR}/REPORT.md" >&2
+if grep -q $'\tfail:' "${RUN_DIR}/status.tsv"; then
+  echo "matrix completed with failing rows; see ${RUN_DIR}/REPORT.md" >&2
+  exit 1
+fi
