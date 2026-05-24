@@ -2391,6 +2391,9 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         params.topK,
         Double(params.minP),
         params.repetitionPenalty.map { String(format: "%.3f", Double($0)) } ?? "nil"))
+
+    let topology = ModelCacheTopologySnapshot(cache: context.model.newCache(parameters: params))
+    print("  Cache topology: \(topology.topologyTags.joined(separator: ","))")
     nonisolated(unsafe) let ctx = context
     let engine = BatchEngine(
         context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
@@ -2506,6 +2509,21 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         FileHandle.standardError.write(Data((message + "\n").utf8))
     }
 
+    func diskArraySummary(_ arrays: [String: MLXArray]?) -> String {
+        guard let arrays else { return "no" }
+        let keys = arrays.keys
+        let dsv4Keys = keys.filter { $0.contains("_keys") }.count
+        let dsv4Values = keys.filter { $0.contains("_values") }.count
+        let dsv4PoolComp = keys.filter { $0.contains("_pool_comp") }.count
+        let dsv4PoolIdx = keys.filter { $0.contains("_pool_idx") }.count
+        let dsv4BufferComp = keys.filter { $0.contains("_buf_comp") }.count
+        let dsv4BufferIdx = keys.filter { $0.contains("_buf_idx") }.count
+        if dsv4PoolComp > 0 || dsv4PoolIdx > 0 {
+            return "dsv4(keys=\(dsv4Keys),values=\(dsv4Values),poolComp=\(dsv4PoolComp),poolIdx=\(dsv4PoolIdx),bufComp=\(dsv4BufferComp),bufIdx=\(dsv4BufferIdx),total=\(arrays.count))"
+        }
+        return "yes(total=\(arrays.count))"
+    }
+
     func describeProbe(_ label: String, tokens: [Int], mediaSalt: String?) {
         switch coordinator.fetch(tokens: tokens, mediaSalt: mediaSalt) {
         case .hit(let matched, let remaining, let detail, _, _, let diskArrays):
@@ -2516,7 +2534,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
                 matched,
                 tokens.count,
                 remaining.count,
-                diskArrays == nil ? "no" : "yes"))
+                diskArraySummary(diskArrays)))
         case .miss:
             writeDiagnostic("  \(label): MISS tokens=\(tokens.count)")
         }
@@ -2618,7 +2636,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             matched,
             turn2Tokens.count,
             remaining.count,
-            diskArrays == nil ? "no" : "yes"))
+            diskArraySummary(diskArrays)))
         let expectedPromptBoundary = promptCommon < promptTokens.count
             ? (cachePrefixTokenCounts.max() ?? promptTokens.count)
             : promptTokens.count

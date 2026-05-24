@@ -405,6 +405,21 @@ raw_prefix_cache_probe_applicable() {
   return 0
 }
 
+turboquant_kv_probe_applicable() {
+  local dir="$1" model_type arch lowered
+  model_type="$(json_value "$dir/config.json" '.model_type // .text_config.model_type' unknown)"
+  arch="$(json_value "$dir/config.json" '.architectures?[0]' unknown)"
+  lowered="$(printf "%s %s" "$model_type" "$arch" | tr '[:upper:]' '[:lower:]')"
+
+  # DeepSeek V4 is a SWA + CSA + HSA hybrid-pool cache topology. Its matrix
+  # proof must exercise prefix/L2 restore for those companion pools, not the
+  # generic TurboQuant KV diagnostic used by dense/hybrid-KV models.
+  case "$lowered" in
+    *deepseek_v4*|*deepseekv4*) return 1 ;;
+  esac
+  return 0
+}
+
 matrix_max_tokens() {
   printf "%s" "${VMLX_MATRIX_MAX_TOKENS:-${VMLINUX_MATRIX_MAX_TOKENS:-192}}"
 }
@@ -502,9 +517,14 @@ run_batch_stack() {
   run_runbench "${name}.batch_perslot_sampler_b2" \
     BENCH_MODEL="$dir" BENCH_BATCH_PERSLOT_SAMPLER=1 \
     BENCH_MAX_TOKENS="$max_tokens" || true
-  run_runbench "${name}.batch_tq_b2" \
-    BENCH_MODEL="$dir" BENCH_BATCH_TQ_B2=1 \
-    BENCH_MAX_TOKENS="$max_tokens" || true
+  if turboquant_kv_probe_applicable "$dir"; then
+    run_runbench "${name}.batch_tq_b2" \
+      BENCH_MODEL="$dir" BENCH_BATCH_TQ_B2=1 \
+      BENCH_MAX_TOKENS="$max_tokens" || true
+  else
+    mark_status "${name}.batch_tq_b2" \
+      "n-a:deepseek-v4-uses-swa-csa-hsa-hybrid-pool-cache-not-turboquant-kv"
+  fi
 }
 
 run_vl_turn_matrix() {
@@ -551,13 +571,15 @@ safe_name() {
 
 maybe_build() {
   [[ "$BUILD" -eq 0 || "$PROFILE" == "inventory" ]] && return 0
-  local config_args=()
   if [[ "$BUILD_CONFIGURATION" == "release" ]]; then
-    config_args=(-c release)
+    run_logged build_runbench env DEVELOPER_DIR="$SWIFT_DEVELOPER_DIR" \
+      swift build -c release --jobs "${VMLINUX_SWIFT_BUILD_JOBS:-2}" \
+        --product RunBench
+  else
+    run_logged build_runbench env DEVELOPER_DIR="$SWIFT_DEVELOPER_DIR" \
+      swift build --jobs "${VMLINUX_SWIFT_BUILD_JOBS:-2}" \
+        --product RunBench
   fi
-  run_logged build_runbench env DEVELOPER_DIR="$SWIFT_DEVELOPER_DIR" \
-    swift build "${config_args[@]}" --jobs "${VMLINUX_SWIFT_BUILD_JOBS:-2}" \
-      --product RunBench
 }
 
 write_inventory
