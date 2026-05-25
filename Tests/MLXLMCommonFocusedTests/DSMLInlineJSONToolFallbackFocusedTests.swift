@@ -131,6 +131,35 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
         #expect(!visible.contains("Wait, I will read"))
     }
 
+    @Test("live DSV4 bare-name JSON file_read attempt is captured without visible leakage")
+    func liveDSV4BareNameJSONFileReadAttemptIsCapturedWithoutVisibleLeakage() {
+        let output = #"""
+            file_read
+            {"path":"/Users/eric/Desktop/testmandel/mandelbrot.py","start_line":33,"end_line":39}
+            DSV4_UI_TOUT_OK: post-tool prose should not leak before tool execution.
+            """#
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        let call = processor.toolCalls.first
+        #expect(call?.function.name == "file_read")
+        #expect(
+            call?.function.arguments["path"]
+                == .string("/Users/eric/Desktop/testmandel/mandelbrot.py")
+        )
+        #expect(call?.function.arguments["start_line"] == .int(33))
+        #expect(call?.function.arguments["end_line"] == .int(39))
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("file_read"))
+        #expect(!visible.contains(#""path":"#))
+        #expect(!visible.contains("DSV4_UI_TOUT_OK"))
+    }
+
     @Test("truncated schema-less DSV4 JSON tool intent is quarantined without visible leakage")
     func truncatedSchemaLessDSV4JSONToolIntentIsQuarantinedWithoutVisibleLeakage() {
         let output = """
@@ -161,6 +190,20 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
 
         #expect(processor.toolCalls.isEmpty)
         #expect(visible.contains(#""name":"file_read""#))
+    }
+
+    @Test("bare tool name followed by prose remains visible")
+    func bareToolNameFollowedByProseRemainsVisible() {
+        let output = "file_read is available, but this sentence is not a call."
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.isEmpty)
+        #expect(visible == output)
     }
 
     @Test("unknown top-level JSON tool fallback remains visible")
