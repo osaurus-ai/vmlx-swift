@@ -354,6 +354,26 @@ struct ToolCallEdgeCasesTests {
         #expect(processor.toolCalls.first?.function.arguments[" location"] == nil)
     }
 
+    @Test("Gemma-4 parser preserves native escaped-string arrays as JSON arrays")
+    func testGemma4ToolCallEscapedStringArrayArgument() {
+        let parser = ToolCallFormat.gemma4.createParser()
+        let calls = parser.parseEOS(
+            """
+            <|tool_call>call:capabilities_search{queries:[<|"|>file writing<|"|>,<|"|>create file<|"|>]}<tool_call|>
+            """,
+            tools: nil
+        )
+
+        #expect(calls.count == 1)
+        #expect(calls.first?.function.name == "capabilities_search")
+        #expect(
+            calls.first?.function.arguments["queries"] == .array([
+                .string("file writing"),
+                .string("create file"),
+            ])
+        )
+    }
+
     // MARK: - Back-to-back tool calls, no delimiter between
 
     @Test("JSON format: two tool calls back-to-back, character-streamed")

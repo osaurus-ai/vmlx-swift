@@ -59,43 +59,100 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
         // Parse key:value pairs
         while !argsStr.isEmpty {
+            argsStr = argsStr.trimmingCharacters(in: .whitespacesAndNewlines)
+            if argsStr.isEmpty { break }
+
             // Find the key (everything before :)
             guard let colonIdx = argsStr.firstIndex(of: ":") else { break }
             let key = String(argsStr[..<colonIdx])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             argsStr = String(argsStr[argsStr.index(after: colonIdx)...])
 
-            // Handle escaped strings
-            if argsStr.hasPrefix(escapeMarker) {
-                argsStr = String(argsStr.dropFirst(escapeMarker.count))
-                guard let endEscape = argsStr.range(of: escapeMarker) else { break }
-                let value = String(argsStr[..<endEscape.lowerBound])
-                arguments[key] = value
-                argsStr = String(argsStr[endEscape.upperBound...])
-                // Skip comma if present
-                if argsStr.hasPrefix(",") {
-                    argsStr = String(argsStr.dropFirst())
-                }
-                continue
-            }
+            guard let value = parseValue(from: &argsStr) else { break }
+            arguments[key] = value
 
-            // Handle regular values (until comma or end)
-            let commaIdx = argsStr.firstIndex(of: ",") ?? argsStr.endIndex
-            let value = String(argsStr[..<commaIdx])
-            argsStr =
-                commaIdx < argsStr.endIndex
-                ? String(argsStr[argsStr.index(after: commaIdx)...]) : ""
-
-            // Try JSON decode, fallback to string
-            if let data = value.data(using: .utf8),
-                let json = deserializeJSON(data)
-            {
-                arguments[key] = json
-            } else {
-                arguments[key] = value
+            argsStr = argsStr.trimmingCharacters(in: .whitespacesAndNewlines)
+            if argsStr.hasPrefix(",") {
+                argsStr = String(argsStr.dropFirst())
             }
         }
 
         return ToolCall(function: .init(name: funcName, arguments: arguments))
+    }
+
+    private func parseValue(from text: inout String) -> (any Sendable)? {
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.hasPrefix(escapeMarker) {
+            text = String(text.dropFirst(escapeMarker.count))
+            guard let endEscape = text.range(of: escapeMarker) else { return nil }
+            let value = String(text[..<endEscape.lowerBound])
+            text = String(text[endEscape.upperBound...])
+            return value
+        }
+
+        if text.hasPrefix("[") {
+            return parseArray(from: &text)
+        }
+
+        let value = takeRawValue(from: &text, terminators: [","])
+        return decodeRawValue(value)
+    }
+
+    private func parseArray(from text: inout String) -> [any Sendable]? {
+        guard text.hasPrefix("[") else { return nil }
+        text = String(text.dropFirst())
+        var values: [any Sendable] = []
+
+        while true {
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.hasPrefix("]") {
+                text = String(text.dropFirst())
+                return values
+            }
+
+            if text.isEmpty { return nil }
+
+            if let value = parseValue(from: &text) {
+                values.append(value)
+            } else {
+                return nil
+            }
+
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.hasPrefix(",") {
+                text = String(text.dropFirst())
+                continue
+            }
+            if text.hasPrefix("]") {
+                text = String(text.dropFirst())
+                return values
+            }
+            return nil
+        }
+    }
+
+    private func takeRawValue(from text: inout String, terminators: Set<Character>) -> String {
+        var index = text.startIndex
+        while index < text.endIndex {
+            let character = text[index]
+            if terminators.contains(character) || character == "]" {
+                break
+            }
+            index = text.index(after: index)
+        }
+
+        let value = String(text[..<index]).trimmingCharacters(in: .whitespacesAndNewlines)
+        text = String(text[index...])
+        return value
+    }
+
+    private func decodeRawValue(_ value: String) -> any Sendable {
+        guard !value.isEmpty else { return "" }
+        if let data = value.data(using: .utf8),
+            let json = deserializeJSON(data)
+        {
+            return json
+        }
+        return value
     }
 }
