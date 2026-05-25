@@ -160,6 +160,100 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
         #expect(!visible.contains("DSV4_UI_TOUT_OK"))
     }
 
+    @Test("live DSV4 bare-name key-value file_read attempt is captured without visible leakage")
+    func liveDSV4BareNameKeyValueFileReadAttemptIsCapturedWithoutVisibleLeakage() {
+        let output = #"""
+            file_read
+            path=/Users/eric/Desktop/testmandel/mdsnbrt.py
+
+            DSV4_UI_TOOL_OK
+            The file basename is mandsndbrt.py and the red-channel expression is something like (mandsndbrt.py).
+            """#
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        let call = processor.toolCalls.first
+        #expect(call?.function.name == "file_read")
+        #expect(
+            call?.function.arguments["path"]
+                == .string("/Users/eric/Desktop/testmandel/mdsnbrt.py")
+        )
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("file_read"))
+        #expect(!visible.contains("path="))
+        #expect(!visible.contains("DSV4_UI_TOOL_OK"))
+        #expect(!visible.contains("red-channel expression"))
+    }
+
+    @Test("DSV4 parser accepts terminated bare-name key-value file_read")
+    func dsv4ParserAcceptsTerminatedBareNameKeyValueFileRead() {
+        let output = #"""
+            file_read
+            path=/Users/eric/Desktop/testmandel/mdsnbrt.py
+
+            """#
+        let parser = DSMLToolCallParser()
+        let call = parser.parse(content: output, tools: fileReadToolSchema())
+
+        #expect(call?.function.name == "file_read")
+        #expect(
+            call?.function.arguments["path"]
+                == .string("/Users/eric/Desktop/testmandel/mdsnbrt.py")
+        )
+    }
+
+    @Test("live DSV4 bare-name colon key-value file_read attempt is captured")
+    func liveDSV4BareNameColonKeyValueFileReadAttemptIsCaptured() {
+        let output = #"""
+            file_read
+            path: /Users/eric/Desktop/testmandel/mandelbrot.py
+            start_line: 33
+            end_line: 39
+            """#
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        let call = processor.toolCalls.first
+        #expect(call?.function.name == "file_read")
+        #expect(
+            call?.function.arguments["path"]
+                == .string("/Users/eric/Desktop/testmandel/mandelbrot.py")
+        )
+        #expect(call?.function.arguments["start_line"] == .int(33))
+        #expect(call?.function.arguments["end_line"] == .int(39))
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    @Test("DSV4 parser accepts colon key-value file_read")
+    func dsv4ParserAcceptsColonKeyValueFileRead() {
+        let output = #"""
+            file_read
+            path: /Users/eric/Desktop/testmandel/mandelbrot.py
+            start_line: 33
+            end_line: 39
+            """#
+        let parser = DSMLToolCallParser()
+        let call = parser.parseEOS(output, tools: fileReadToolSchema()).first
+
+        #expect(call?.function.name == "file_read")
+        #expect(
+            call?.function.arguments["path"]
+                == .string("/Users/eric/Desktop/testmandel/mandelbrot.py")
+        )
+        #expect(call?.function.arguments["start_line"] == .int(33))
+        #expect(call?.function.arguments["end_line"] == .int(39))
+    }
+
     @Test("live DSV4 bare-name fenced JSON file_read attempt is captured without visible leakage")
     func liveDSV4BareNameFencedJSONFileReadAttemptIsCapturedWithoutVisibleLeakage() {
         let output = #"""

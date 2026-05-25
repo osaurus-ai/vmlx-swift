@@ -82,6 +82,13 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         if let bareNameJSONCall = parseBareNameJSONToolFallback(in: text, tools: tools) {
             return bareNameJSONCall
         }
+        if let bareNameKeyValueCall = parseBareNameKeyValueToolFallback(
+            in: text,
+            tools: tools,
+            allowEOF: true)
+        {
+            return bareNameKeyValueCall
+        }
         return parseInlineJSONToolFallback(in: text, tools: tools)
     }
 
@@ -101,6 +108,13 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         }
         if let bareNameJSONCall = parseBareNameJSONToolFallback(in: buffer, tools: tools) {
             return [bareNameJSONCall]
+        }
+        if let bareNameKeyValueCall = parseBareNameKeyValueToolFallback(
+            in: buffer,
+            tools: tools,
+            allowEOF: true)
+        {
+            return [bareNameKeyValueCall]
         }
         return parseInlineJSONToolFallback(in: buffer, tools: tools).map { [$0] } ?? []
     }
@@ -396,6 +410,217 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         return nil
     }
 
+    /// Live DSV4 JANGTQ2 UI rows can emit a bare tool name followed by
+    /// shell-like key/value arguments, for example:
+    ///
+    ///     file_read
+    ///     path=/tmp/file.swift
+    ///
+    /// This is a tool attempt, not assistant prose. Parse only consecutive
+    /// key/value lines immediately after a known tool name; trailing text is
+    /// deliberately ignored so a post-tool answer cannot leak before the tool
+    /// result has been fed back through the chat loop.
+    private func parseBareNameKeyValueToolFallback(
+        in text: String,
+        tools: [[String: any Sendable]]?,
+        allowEOF: Bool
+    ) -> ToolCall? {
+        var leadingStart = text.startIndex
+        while leadingStart < text.endIndex, isInlineFallbackWhitespace(text[leadingStart]) {
+            leadingStart = text.index(after: leadingStart)
+        }
+        let trimmed = String(text[leadingStart...])
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("{") else { return nil }
+
+        for name in pythonStyleToolNames(from: tools) {
+            guard trimmed.hasPrefix(name) else { continue }
+            guard
+                let afterName = trimmed.index(
+                    trimmed.startIndex,
+                    offsetBy: name.count,
+                    limitedBy: trimmed.endIndex)
+            else { continue }
+            guard afterName < trimmed.endIndex,
+                isInlineFallbackWhitespace(trimmed[afterName])
+            else { continue }
+
+            let tail = String(trimmed[afterName...])
+            let args = parseLeadingKeyValueLines(tail)
+            guard !args.isEmpty else { continue }
+            guard allowEOF || bareNameKeyValueTailIsTerminated(tail, toolName: name, tools: tools)
+            else { continue }
+
+            if let tools, !tools.isEmpty {
+                guard let spec = functionSpec(named: name, in: tools) else { return nil }
+                if let invalidArgs = inlineSchemaValidationFailure(
+                    toolName: name,
+                    arguments: args,
+                    functionSpec: spec)
+                {
+                    return ToolCall(function: .init(name: name, arguments: invalidArgs))
+                }
+            } else if !Self.schemaLessFallbackToolNames.contains(name) {
+                return nil
+            }
+            return ToolCall(function: .init(name: name, arguments: args))
+        }
+        return nil
+    }
+
+    private func parseLeadingKeyValueLines(_ text: String) -> [String: any Sendable] {
+        var result: [String: any Sendable] = [:]
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }
+            guard let separator = firstKeyValueSeparator(in: line) else {
+                break
+            }
+            let key = line[..<separator]
+                .trimmingCharacters(in: .whitespaces)
+            guard !key.isEmpty, key.allSatisfy(isKeyValueIdentifierCharacter) else {
+                break
+            }
+            var value = line[line.index(after: separator)...]
+                .trimmingCharacters(in: .whitespaces)
+            guard !value.isEmpty else { break }
+            if (value.hasPrefix("'") && value.hasSuffix("'"))
+                || (value.hasPrefix("\"") && value.hasSuffix("\""))
+            {
+                value = String(value.dropFirst().dropLast())
+                result[key] = value
+            } else {
+                result[key] = decodeJSONValue(value, fallbackString: value)
+            }
+        }
+        return result
+    }
+
+    private func bareNameKeyValueTailIsTerminated(
+        _ text: String,
+        toolName: String,
+        tools: [[String: any Sendable]]?
+    ) -> Bool {
+        let lines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        let endsWithNewline = text.last?.isNewline == true
+        var sawKeyValue = false
+        for (index, rawLine) in lines.enumerated() {
+            let isLastLine = index == lines.count - 1
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty {
+                if isLastLine { return false }
+                if sawKeyValue { return true }
+                continue
+            }
+            if isKeyValueArgumentLine(line, toolName: toolName, tools: tools) {
+                sawKeyValue = true
+                continue
+            }
+            if sawKeyValue {
+                if isLastLine && !endsWithNewline
+                    && (line.allSatisfy(isKeyValueIdentifierCharacter)
+                        || isPartialKeyValueArgumentLine(line, toolName: toolName, tools: tools))
+                {
+                    return false
+                }
+                return true
+            }
+            return false
+        }
+        return false
+    }
+
+    private func isPartialKeyValueArgumentLine(
+        _ line: String,
+        toolName: String,
+        tools: [[String: any Sendable]]?
+    ) -> Bool {
+        guard let separator = firstKeyValueSeparator(in: line) else { return false }
+        let key = line[..<separator]
+            .trimmingCharacters(in: .whitespaces)
+        guard !key.isEmpty, key.allSatisfy(isKeyValueIdentifierCharacter) else {
+            return false
+        }
+        let value = line[line.index(after: separator)...]
+            .trimmingCharacters(in: .whitespaces)
+        guard value.isEmpty else { return false }
+        if let allowed = keyValueArgumentNames(for: toolName, tools: tools),
+            allowed.contains(String(key))
+        {
+            return true
+        }
+        if Self.schemaLessKeyValueArgumentNames.contains(String(key)) {
+            return true
+        }
+        if let allowed = keyValueArgumentNames(for: toolName, tools: tools), !allowed.isEmpty {
+            return allowed.contains(String(key))
+        }
+        return false
+    }
+
+    private func isKeyValueArgumentLine(
+        _ line: String,
+        toolName: String,
+        tools: [[String: any Sendable]]?
+    ) -> Bool {
+        guard let separator = firstKeyValueSeparator(in: line) else { return false }
+        let key = line[..<separator]
+            .trimmingCharacters(in: .whitespaces)
+        guard !key.isEmpty, key.allSatisfy(isKeyValueIdentifierCharacter) else {
+            return false
+        }
+        let value = line[line.index(after: separator)...]
+            .trimmingCharacters(in: .whitespaces)
+        guard !value.isEmpty else { return false }
+        if let allowed = keyValueArgumentNames(for: toolName, tools: tools),
+            allowed.contains(String(key))
+        {
+            return true
+        }
+        if Self.schemaLessKeyValueArgumentNames.contains(String(key)) {
+            return true
+        }
+        if let allowed = keyValueArgumentNames(for: toolName, tools: tools), !allowed.isEmpty {
+            return allowed.contains(String(key))
+        }
+        return false
+    }
+
+    private func keyValueArgumentNames(
+        for toolName: String,
+        tools: [[String: any Sendable]]?
+    ) -> Set<String>? {
+        guard let tools else { return nil }
+        for tool in tools {
+            let function = (tool["function"] as? [String: any Sendable]) ?? tool
+            guard function["name"] as? String == toolName else { continue }
+            guard
+                let parameters = function["parameters"] as? [String: any Sendable],
+                let properties = parameters["properties"] as? [String: any Sendable]
+            else { return nil }
+            return Set(properties.keys)
+        }
+        return nil
+    }
+
+    private func firstKeyValueSeparator(in line: String) -> String.Index? {
+        let equals = line.firstIndex(of: "=")
+        let colon = line.firstIndex(of: ":")
+        switch (equals, colon) {
+        case (let e?, let c?):
+            return e < c ? e : c
+        case (let e?, nil):
+            return e
+        case (nil, let c?):
+            return c
+        case (nil, nil):
+            return nil
+        }
+    }
+
+    private func isKeyValueIdentifierCharacter(_ character: Character) -> Bool {
+        character == "_" || character.isLetter || character.isNumber
+    }
+
     private func bareNameJSONTailObjectStart(
         in text: String,
         afterName: String.Index
@@ -434,6 +659,22 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         "git_status",
         "git_diff",
         "git_commit",
+    ]
+
+    private static let schemaLessKeyValueArgumentNames: Set<String> = [
+        "path",
+        "start_line",
+        "end_line",
+        "content",
+        "command",
+        "query",
+        "pattern",
+        "replacement",
+        "old",
+        "new",
+        "message",
+        "cwd",
+        "recursive",
     ]
 
     private func firstPythonStyleToolCallCandidate(

@@ -50,6 +50,13 @@ public class ToolCallProcessor {
         case json
         case functionCall
         case bareNameJSON
+        case bareNameKeyValue
+    }
+
+    private enum BareNameKeyValueTailState {
+        case none
+        case partial
+        case started
     }
 
     // MARK: - Initialization
@@ -191,6 +198,29 @@ public class ToolCallProcessor {
                 return visible.isEmpty ? nil : visible
             }
 
+            if let callIndex = firstInlineBareNameKeyValueToolCallStart(in: inlineText) {
+                let leading = String(inlineText[..<callIndex])
+                inlineToolCallKind = .bareNameKeyValue
+                toolCallBuffer = String(inlineText[callIndex...])
+                state = .collectingInlineToolCall
+
+                if bareNameKeyValueCallComplete(toolCallBuffer),
+                    let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
+                {
+                    toolCalls.append(toolCall)
+                    toolCallBuffer = ""
+                    state = .normal
+                    suppressingTextAfterInlineToolCall = true
+                }
+                return leading.isEmpty ? nil : leading
+            }
+
+            if let pendingIndex = partialInlineBareNameKeyValueToolCallStart(in: inlineText) {
+                let visible = String(inlineText[..<pendingIndex])
+                leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
+                return visible.isEmpty ? nil : visible
+            }
+
             // Check if this chunk starts what looks like a JSON tool call
             if let braceIndex = inlineText.firstIndex(of: "{") {
                 let leading = String(inlineText[..<braceIndex])
@@ -224,11 +254,17 @@ public class ToolCallProcessor {
         case .potentialToolCall, .collectingToolCall, .collectingInlineToolCall:
             toolCallBuffer += chunk
 
-            if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
+            if (inlineToolCallKind != .bareNameKeyValue
+                || bareNameKeyValueCallComplete(toolCallBuffer)),
+                let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
+            {
                 toolCalls.append(toolCall)
                 toolCallBuffer = ""
                 state = .normal
-                if inlineToolCallKind == .functionCall || inlineToolCallKind == .bareNameJSON {
+                if inlineToolCallKind == .functionCall
+                    || inlineToolCallKind == .bareNameJSON
+                    || inlineToolCallKind == .bareNameKeyValue
+                {
                     suppressingTextAfterInlineToolCall = true
                 }
                 return nil
@@ -269,6 +305,8 @@ public class ToolCallProcessor {
             return functionCallParenthesesBalanced(text)
         case .bareNameJSON:
             return bareNameJSONCallBalanced(text)
+        case .bareNameKeyValue:
+            return bareNameKeyValueCallComplete(text)
         }
     }
 
@@ -334,7 +372,8 @@ public class ToolCallProcessor {
             compact.hasPrefix("\($0)(")
                 || compact.hasPrefix("\($0){")
                 || compact.hasPrefix("\($0)```")
-        }
+        } || firstInlineBareNameKeyValueToolCallStart(in: text) != nil
+            || partialInlineBareNameKeyValueToolCallStart(in: text) != nil
     }
 
     private func firstInlineFunctionToolCallStart(in text: String) -> String.Index? {
@@ -420,6 +459,224 @@ public class ToolCallProcessor {
         return best
     }
 
+    private func firstInlineBareNameKeyValueToolCallStart(in text: String) -> String.Index? {
+        inlineFunctionToolNames()
+            .compactMap { name -> String.Index? in
+                var searchStart = text.startIndex
+                while let range = text.range(of: name, range: searchStart ..< text.endIndex) {
+                    if isInlineFunctionBoundary(text, before: range.lowerBound)
+                        && bareNameKeyValueTailState(
+                            in: text,
+                            toolName: name,
+                            afterName: range.upperBound) == .started
+                    {
+                        return range.lowerBound
+                    }
+                    searchStart = range.upperBound
+                }
+                return nil
+            }
+            .min()
+    }
+
+    private func partialInlineBareNameKeyValueToolCallStart(in text: String) -> String.Index? {
+        guard !text.isEmpty else { return nil }
+        var best: String.Index?
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            if isInlineFunctionBoundary(text, before: cursor) {
+                let suffix = String(text[cursor...])
+                for name in inlineFunctionToolNames() {
+                    if name.hasPrefix(suffix) && suffix.count < name.count {
+                        best = cursor
+                        break
+                    }
+                    guard suffix.hasPrefix(name),
+                        let afterName = text.index(
+                            cursor,
+                            offsetBy: name.count,
+                            limitedBy: text.endIndex)
+                    else { continue }
+                    if bareNameKeyValueTailState(
+                        in: text,
+                        toolName: name,
+                        afterName: afterName) == .partial
+                    {
+                        best = cursor
+                        break
+                    }
+                }
+            }
+            cursor = text.index(after: cursor)
+        }
+        return best
+    }
+
+    private func bareNameKeyValueTailState(
+        in text: String,
+        toolName: String,
+        afterName: String.Index
+    ) -> BareNameKeyValueTailState {
+        guard afterName <= text.endIndex else { return .none }
+        guard afterName < text.endIndex else { return .partial }
+        guard isInlineWhitespace(text[afterName]) else { return .none }
+
+        var cursor = afterName
+        while cursor < text.endIndex, isInlineWhitespace(text[cursor]) {
+            cursor = text.index(after: cursor)
+        }
+        guard cursor < text.endIndex else { return .partial }
+        guard text[cursor] != "{", !text[cursor...].hasPrefix("```") else { return .none }
+
+        let lineEnd = text[cursor...].firstIndex(where: \.isNewline) ?? text.endIndex
+        let line = text[cursor ..< lineEnd].trimmingCharacters(in: .whitespaces)
+        guard !line.isEmpty else { return .partial }
+        if isInlineKeyValueArgumentLine(line, toolName: toolName) {
+            return .started
+        }
+        if isPartialInlineKeyValueArgumentLine(line, toolName: toolName) {
+            return .partial
+        }
+        if line.allSatisfy(isInlineKeyValueIdentifierCharacter) {
+            return .partial
+        }
+        return .none
+    }
+
+    private func bareNameKeyValueCallComplete(_ text: String) -> Bool {
+        var leadingStart = text.startIndex
+        while leadingStart < text.endIndex, isInlineWhitespace(text[leadingStart]) {
+            leadingStart = text.index(after: leadingStart)
+        }
+        let trimmed = String(text[leadingStart...])
+        guard
+            let name = inlineFunctionToolNames().first(where: { name in
+                trimmed.hasPrefix(name)
+                    && trimmed.index(trimmed.startIndex, offsetBy: name.count) <= trimmed.endIndex
+            }),
+            let afterName = trimmed.index(
+                trimmed.startIndex,
+                offsetBy: name.count,
+                limitedBy: trimmed.endIndex),
+            afterName < trimmed.endIndex,
+            isInlineWhitespace(trimmed[afterName])
+        else { return false }
+
+        let tail = String(trimmed[afterName...])
+        let lines = tail.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        let endsWithNewline = tail.last?.isNewline == true
+        var sawKeyValue = false
+        for (index, rawLine) in lines.enumerated() {
+            let isLastLine = index == lines.count - 1
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty {
+                if isLastLine { return false }
+                if sawKeyValue { return true }
+                continue
+            }
+            if isInlineKeyValueArgumentLine(line, toolName: name) {
+                sawKeyValue = true
+                continue
+            }
+            if sawKeyValue {
+                if isLastLine && !endsWithNewline
+                    && (line.allSatisfy(isInlineKeyValueIdentifierCharacter)
+                        || isPartialInlineKeyValueArgumentLine(line, toolName: name))
+                {
+                    return false
+                }
+                return true
+            }
+            return false
+        }
+        return false
+    }
+
+    private func isInlineKeyValueArgumentLine(_ line: String, toolName: String) -> Bool {
+        guard let separator = firstInlineKeyValueSeparator(in: line) else { return false }
+        let key = line[..<separator].trimmingCharacters(in: .whitespaces)
+        guard !key.isEmpty, key.allSatisfy(isInlineKeyValueIdentifierCharacter) else {
+            return false
+        }
+        let value = line[line.index(after: separator)...]
+            .trimmingCharacters(in: .whitespaces)
+        guard !value.isEmpty else { return false }
+        return isAllowedInlineKeyValueArgumentName(String(key), toolName: toolName)
+    }
+
+    private func isPartialInlineKeyValueArgumentLine(_ line: String, toolName: String) -> Bool {
+        guard let separator = firstInlineKeyValueSeparator(in: line) else { return false }
+        let key = line[..<separator].trimmingCharacters(in: .whitespaces)
+        guard !key.isEmpty, key.allSatisfy(isInlineKeyValueIdentifierCharacter) else {
+            return false
+        }
+        let value = line[line.index(after: separator)...]
+            .trimmingCharacters(in: .whitespaces)
+        return value.isEmpty && isAllowedInlineKeyValueArgumentName(String(key), toolName: toolName)
+    }
+
+    private func isAllowedInlineKeyValueArgumentName(_ key: String, toolName: String) -> Bool {
+        if let names = inlineArgumentNames(for: toolName), names.contains(key) {
+            return true
+        }
+        if Self.schemaLessKeyValueArgumentNames.contains(key) {
+            return true
+        }
+        if let names = inlineArgumentNames(for: toolName), !names.isEmpty {
+            return names.contains(key)
+        }
+        return false
+    }
+
+    private func inlineArgumentNames(for toolName: String) -> Set<String>? {
+        guard let tools else { return nil }
+        for tool in tools {
+            let function = (tool["function"] as? [String: any Sendable]) ?? tool
+            guard function["name"] as? String == toolName else { continue }
+            guard
+                let parameters = function["parameters"] as? [String: any Sendable],
+                let properties = parameters["properties"] as? [String: any Sendable]
+            else { return nil }
+            return Set(properties.keys)
+        }
+        return nil
+    }
+
+    private func firstInlineKeyValueSeparator(in line: String) -> String.Index? {
+        let equals = line.firstIndex(of: "=")
+        let colon = line.firstIndex(of: ":")
+        switch (equals, colon) {
+        case (let e?, let c?):
+            return e < c ? e : c
+        case (let e?, nil):
+            return e
+        case (nil, let c?):
+            return c
+        case (nil, nil):
+            return nil
+        }
+    }
+
+    private func isInlineKeyValueIdentifierCharacter(_ character: Character) -> Bool {
+        character == "_" || character.isLetter || character.isNumber
+    }
+
+    private static let schemaLessKeyValueArgumentNames: Set<String> = [
+        "path",
+        "start_line",
+        "end_line",
+        "content",
+        "command",
+        "query",
+        "pattern",
+        "replacement",
+        "old",
+        "new",
+        "message",
+        "cwd",
+        "recursive",
+    ]
+
     private func bareNameJSONTailStartsObject(in text: String, afterName: String.Index) -> Bool {
         let cursor = bareNameJSONTailObjectStart(in: text, afterName: afterName)
         return cursor < text.endIndex && text[cursor] == "{"
@@ -498,6 +755,8 @@ public class ToolCallProcessor {
                     || partialInlineFunctionToolCallStart(in: chunk) != nil
                     || firstInlineBareNameJSONToolCallStart(in: chunk) != nil
                     || partialInlineBareNameJSONToolCallStart(in: chunk) != nil
+                    || firstInlineBareNameKeyValueToolCallStart(in: chunk) != nil
+                    || partialInlineBareNameKeyValueToolCallStart(in: chunk) != nil
                 {
                     return processInlineChunk(chunk)
                 }
