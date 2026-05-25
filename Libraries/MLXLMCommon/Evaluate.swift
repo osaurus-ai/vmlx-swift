@@ -3050,18 +3050,16 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 stopReason: stopReason ?? .cancelled,
                 unclosedReasoning: unclosedReasoning
             )
-            _ = continuation.yield(handler.infoEvent(info))
-
-            // Multi-tier cache: store cache state after completion info is
-            // visible to stream consumers, but keep the store serialized on
-            // this generation task. Detached SSM re-derive previously raced
-            // Metal command encoders; yielding `.info` first removes the UI
-            // end-of-stream wait without reintroducing concurrent model use.
+            // Multi-tier cache: drain the final async token eval before cache
+            // snapshot/store, then keep completion info behind the cache-store
+            // drain. Local chat/tool consumers may start a post-tool decode as
+            // soon as `.info` closes the stream, so `.info` must not be visible
+            // while this generation task can still touch MLX command encoders.
+            Stream().synchronize()
             iterator.storeCacheAfterGeneration(
                 generatedTokenIds: generatedTokenIds,
                 includeGeneratedBoundary: stopReason == .stop && !handler.stopSequenceHit)
 
-            // Synchronize with the stream to ensure tasks are completed
             Stream().synchronize()
 
             // Router-advice readback runs on its own Dispatch queue. Drain it
@@ -3069,6 +3067,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             // paths do not tear down runtime state while the advisor is still
             // applying mmap page advice.
             MLXPressCanonicalExpertAdvisor.shared.waitUntilIdle()
+
+            _ = continuation.yield(handler.infoEvent(info))
 
             // Finalize the stream
             continuation.finish()
