@@ -98,6 +98,33 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         assertNoSystemToolsRenderBetweenUserAndAssistant(rendered)
     }
 
+    @Test("DSV4 required tool choice reaches DSML protocol block")
+    func dsv4RequiredToolChoiceReachesDSMLProtocolBlock() throws {
+        var context = noSystemToolProbeContext()
+        context["tool_choice"] = "required"
+
+        let compiled = try Template(ChatTemplateFallbacks.dsv4Minimal).renderDSV4(context)
+        assertRequiredToolChoiceDirective(compiled)
+
+        let source = try repositoryFile("Libraries/MLXLMCommon/ChatTemplates/DSV4Minimal.jinja")
+        let standalone = try Template(source).renderDSV4(context)
+        assertRequiredToolChoiceDirective(standalone)
+
+        let swiftRendered = DeepseekV4ChatEncoder().encode(
+            messages: [
+                .init(
+                    role: .system,
+                    content: "You are a local agent.",
+                    tools: [fileReadToolSpec()]
+                ),
+                .init(role: .user, content: "Use file_read."),
+            ],
+            thinkingMode: .chat,
+            toolChoiceRequired: true
+        )
+        assertRequiredToolChoiceDirective(swiftRendered)
+    }
+
     @Test("compiled DSV4 fallback renders assistant DSML tool history and tool results")
     func compiledDSV4FallbackRendersAssistantToolHistory() throws {
         let template = try Template(ChatTemplateFallbacks.dsv4Minimal)
@@ -273,6 +300,23 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         ] as [String: any Sendable]
     }
 
+    private func fileReadToolSpec() -> [String: any Sendable] {
+        [
+            "type": "function",
+            "function": [
+                "name": "file_read",
+                "description": "Read a file.",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "path": ["type": "string"] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                    "required": ["path"] as [String],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ] as [String: any Sendable]
+    }
+
     private func assertNoSystemToolsRenderBetweenUserAndAssistant(_ rendered: String) {
         #expect(rendered.contains("## Tools"))
         #expect(rendered.contains("osaurus_no_system_probe"))
@@ -297,6 +341,13 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             )
         )
         #expect(rendered.contains("Do not emit JSON objects for tool calls"))
+    }
+
+    private func assertRequiredToolChoiceDirective(_ rendered: String) {
+        #expect(rendered.contains("file_read") || rendered.contains("osaurus_no_system_probe"))
+        #expect(rendered.contains("The current assistant response MUST be a tool call"))
+        #expect(rendered.contains("Start with a \"<\u{FF5C}DSML\u{FF5C}tool_calls>\" block"))
+        #expect(rendered.contains("do not answer in prose before the tool result"))
     }
 
     private func assertSystemSeparatedFromUser(_ rendered: String) {
