@@ -296,6 +296,9 @@ public enum ChatTemplateFallbacks {
 {%- endif -%}
 {%- endfor -%}
 {{- '\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.' -}}
+{%- if tool_choice is defined and tool_choice == 'required' -%}
+{{- '\n\nThe current assistant response MUST be a tool call. Start with a "<' + dsml + 'tool_calls>" block and do not answer in prose before the tool result.' -}}
+{%- endif -%}
 {%- endmacro -%}
 {%- macro render_dsml_invoke(tool_call) -%}
 {%- set fn = tool_call['function'] if tool_call['function'] is defined else tool_call -%}

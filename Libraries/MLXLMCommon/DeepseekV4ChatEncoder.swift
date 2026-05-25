@@ -104,7 +104,8 @@ public struct DeepseekV4ChatEncoder: Sendable {
         reasoningEffort: DeepseekV4ReasoningEffort? = nil,
         dropEarlierReasoning: Bool = true,
         context: [Message] = [],
-        addBOS: Bool = true
+        addBOS: Bool = true,
+        toolChoiceRequired: Bool = false
     ) -> String {
         // Preprocess: merge tool messages into user, sort tool_result
         // blocks by the order they were called in the prior assistant.
@@ -141,7 +142,8 @@ public struct DeepseekV4ChatEncoder: Sendable {
                 in: rendered,
                 thinkingMode: thinkingMode,
                 dropThinking: effectiveDrop,
-                reasoningEffort: reasoningEffort
+                reasoningEffort: reasoningEffort,
+                toolChoiceRequired: toolChoiceRequired
             )
         }
 
@@ -155,7 +157,8 @@ public struct DeepseekV4ChatEncoder: Sendable {
         in messages: [Message],
         thinkingMode: DeepseekV4ThinkingMode,
         dropThinking: Bool,
-        reasoningEffort: DeepseekV4ReasoningEffort?
+        reasoningEffort: DeepseekV4ReasoningEffort?,
+        toolChoiceRequired: Bool
     ) -> String {
         let msg = messages[index]
         let lastUserIdx = Self.findLastUserIndex(messages)
@@ -170,7 +173,10 @@ public struct DeepseekV4ChatEncoder: Sendable {
         case .system:
             out += msg.content ?? ""
             if let tools = msg.tools, !tools.isEmpty {
-                out += "\n\n" + Self.renderTools(tools)
+                out += "\n\n" + Self.renderTools(
+                    tools,
+                    toolChoiceRequired: toolChoiceRequired
+                )
             }
             if let rf = msg.responseFormat {
                 out += "\n\n" + Self.renderResponseFormat(rf)
@@ -183,7 +189,10 @@ public struct DeepseekV4ChatEncoder: Sendable {
             var s = DeepseekV4Tokens.user
             s += msg.content ?? ""
             if let tools = msg.tools, !tools.isEmpty {
-                s += "\n\n" + Self.renderTools(tools)
+                s += "\n\n" + Self.renderTools(
+                    tools,
+                    toolChoiceRequired: toolChoiceRequired
+                )
             }
             if let rf = msg.responseFormat {
                 s += "\n\n" + Self.renderResponseFormat(rf)
@@ -326,11 +335,21 @@ public struct DeepseekV4ChatEncoder: Sendable {
         You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
         """
 
-    static func renderTools(_ tools: [[String: any Sendable]]) -> String {
+    static func renderTools(
+        _ tools: [[String: any Sendable]],
+        toolChoiceRequired: Bool = false
+    ) -> String {
         let schemas = tools.map { Self.functionSpec(from: $0) }
         let schemaJson = schemas.map { $0.jsonSerialized() }
         let schemasBlock = schemaJson.joined(separator: "\n")
-        return toolsTemplate.replacingOccurrences(of: "%@", with: schemasBlock)
+        var rendered = toolsTemplate.replacingOccurrences(of: "%@", with: schemasBlock)
+        if toolChoiceRequired {
+            rendered +=
+                "\n\nThe current assistant response MUST be a tool call. "
+                + "Start with a \"<\(DeepseekV4Tokens.dsml)tool_calls>\" block "
+                + "and do not answer in prose before the tool result."
+        }
+        return rendered
     }
 
     static func renderResponseFormat(_ rf: [String: any Sendable]) -> String {
