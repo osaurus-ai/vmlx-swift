@@ -47,6 +47,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         // Extract function name (word characters until {)
         guard let braceStart = remaining.firstIndex(of: "{") else { return nil }
         let funcName = String(remaining[..<braceStart])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !funcName.isEmpty else { return nil }
 
@@ -61,6 +62,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             // Find the key (everything before :)
             guard let colonIdx = argsStr.firstIndex(of: ":") else { break }
             let key = String(argsStr[..<colonIdx])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             argsStr = String(argsStr[argsStr.index(after: colonIdx)...])
 
             // Handle escaped strings

@@ -318,11 +318,9 @@ struct ToolCallEdgeCasesTests {
     /// channel markers. With tool calls mixed in, both signals need to land
     /// in their right places.
     ///
-    /// Current `gemma4` parser doesn't know about channels — this test pins
-    /// the CURRENT behaviour so a future channel-stripping fix can replace
-    /// the expectation deliberately. When the parser adds channel support,
-    /// update this test to assert channel content is stripped / emitted
-    /// separately.
+    /// Tool parsing still needs to recover the call even if native Gemma-4
+    /// channel markers precede it. Reasoning-channel stripping itself is
+    /// covered in `HarmonyParserFocusedTests`.
     @Test("Gemma-4 with interleaved channel + tool-call: tool call extracted")
     func testGemma4InterleavedChannelAndToolCall() {
         let processor = ToolCallProcessor(format: .gemma4)
@@ -337,6 +335,23 @@ struct ToolCallEdgeCasesTests {
             "Gemma-4 tool call must extract even when a channel block precedes it.")
         #expect(processor.toolCalls.first?.function.name == "get_weather")
         #expect(processor.toolCalls.first?.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    @Test("Gemma-4 tool-call parser trims whitespace around function names and keys")
+    func testGemma4ToolCallWhitespaceAroundFunctionAndKeys() {
+        let processor = ToolCallProcessor(format: .gemma4)
+        let stream = """
+            <|tool_call>call:get_weather
+            {
+              location:<|"|>Tokyo<|"|>
+            }<tool_call|>
+            """
+        _ = feedInChunks(stream, chunkSize: 4, into: processor)
+
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls.first?.function.name == "get_weather")
+        #expect(processor.toolCalls.first?.function.arguments["location"] == .string("Tokyo"))
+        #expect(processor.toolCalls.first?.function.arguments[" location"] == nil)
     }
 
     // MARK: - Back-to-back tool calls, no delimiter between

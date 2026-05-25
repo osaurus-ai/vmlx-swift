@@ -209,6 +209,7 @@ check_osaurus_vmlx_pin_reproducible() {
   if git -C "$REPO_ROOT" diff --quiet -- \
       Package.swift \
       Libraries/MLXLMCommon/ReasoningParser.swift \
+      Libraries/MLXLMCommon/Tool/Parsers/GemmaFunctionParser.swift \
       Tests/MLXLMCommonFocusedTests/Gemma4ThoughtChannelParserFocusedTests.swift; then
     pass "vMLX parser fix/regression files are committed at the pinned revision"
   else
@@ -229,6 +230,20 @@ check_osaurus_vmlx_pin_reproducible() {
     fail_msg "pinned vMLX HEAD lacks Gemma parser regression"
   fi
 
+  if git -C "$REPO_ROOT" show "HEAD:Libraries/MLXLMCommon/Tool/Parsers/GemmaFunctionParser.swift" 2>/dev/null \
+      | rg -q 'trimmingCharacters\(in: \.whitespacesAndNewlines\)'; then
+    pass "pinned vMLX HEAD contains Gemma tool whitespace parser fix"
+  else
+    fail_msg "pinned vMLX HEAD lacks Gemma tool whitespace parser fix"
+  fi
+
+  if git -C "$REPO_ROOT" show "HEAD:Tests/MLXLMTests/ToolCallEdgeCasesTests.swift" 2>/dev/null \
+      | rg -q 'Gemma-4 tool-call parser trims whitespace around function names and keys'; then
+    pass "pinned vMLX HEAD contains Gemma tool whitespace regression"
+  else
+    fail_msg "pinned vMLX HEAD lacks Gemma tool whitespace regression"
+  fi
+
   if git -C "$REPO_ROOT" show "HEAD:Package.swift" \
       | rg -q 'Gemma4ThoughtChannelParserFocusedTests\.swift'; then
     pass "pinned vMLX HEAD includes Gemma parser regression in the focused test target"
@@ -239,13 +254,20 @@ check_osaurus_vmlx_pin_reproducible() {
 
 check_vmlx_gemma_parser_source() {
   local parser="$REPO_ROOT/Libraries/MLXLMCommon/ReasoningParser.swift"
+  local tool_parser="$REPO_ROOT/Libraries/MLXLMCommon/Tool/Parsers/GemmaFunctionParser.swift"
   local tests="$REPO_ROOT/Tests/MLXLMCommonFocusedTests/Gemma4ThoughtChannelParserFocusedTests.swift"
+  local tool_tests="$REPO_ROOT/Tests/MLXLMTests/ToolCallEdgeCasesTests.swift"
   require_file "$parser" "vMLX ReasoningParser.swift"
+  require_file "$tool_parser" "vMLX GemmaFunctionParser.swift"
   require_file "$tests" "vMLX Gemma parser focused tests"
+  require_file "$tool_tests" "vMLX Gemma tool parser edge-case tests"
   require_text "$parser" 'stripIdentifierOnlyAtEnd: true\)' "vMLX Gemma empty thought-channel source fix"
   require_text "$tests" 'empty thought channel without newline does not surface thought' "vMLX Gemma no-newline thought regression"
   require_text "$tests" 'pre<\|channel>thought<channel\|>answer' "vMLX Gemma no-newline thought fixture"
   require_text "$REPO_ROOT/Package.swift" 'Gemma4ThoughtChannelParserFocusedTests\.swift' "vMLX Gemma parser regression target wiring"
+  require_text "$tool_parser" 'trimmingCharacters\(in: \.whitespacesAndNewlines\)' "vMLX Gemma tool parser trims whitespace"
+  require_text "$tool_tests" 'Gemma-4 tool-call parser trims whitespace around function names and keys' "vMLX Gemma tool whitespace regression"
+  require_text "$tool_tests" 'arguments\[" location"\] == nil' "vMLX Gemma tool whitespace negative-key assertion"
 }
 
 check_vmlx_no_hidden_defaults_source() {
@@ -267,7 +289,8 @@ check_vmlx_no_hidden_defaults_source() {
   require_text "$matrix" 'bundle-derived' "live matrix reports bundle-derived defaults"
   reject_text "$jangpress" 'var p = GenerateParameters\(maxTokens: maxNewTokens, temperature: 0\)' "JangPress forced temperature zero"
   reject_text "$bench" 'BENCH_DSV4_REPETITION_PENALTY"\] \?\? "1\.0"|BENCH_DSV4_MAX_REPETITION_PENALTY"\] \?\? "1\.05"|dsv4MaxReasoningRepetitionPenalty' "DSV4 hidden repetition-penalty rescue"
-  reject_text "$bench" 'text\.isEmpty \? reasoning : text|reasoning\.isEmpty \? r\.text : r\.reasoning|let combined = text \+ reasoning' "reasoning-only output counted as visible answer"
+  reject_text "$bench" 'text\.isEmpty \? reasoning : text|visible\.isEmpty \? reasoning : visible|visible\.isEmpty \? r\.reasoning : visible|r\.text\.isEmpty \? r\.reasoning : r\.text|reasoning\.isEmpty \? r\.text : r\.reasoning|let combined = text \+ reasoning' "reasoning-only output counted as visible answer"
+  reject_text "$REPO_ROOT/RunBench/OmniBench.swift" 'visible\.isEmpty \? reasoning\.trimmingCharacters|text\.isEmpty \? reasoning : text' "OmniBench reasoning-only output counted as visible answer"
 }
 
 check_active_processes
