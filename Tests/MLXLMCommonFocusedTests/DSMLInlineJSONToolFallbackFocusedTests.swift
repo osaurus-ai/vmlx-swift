@@ -263,6 +263,18 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
         #expect(visible == output)
     }
 
+    @Test("bare tool name alone does not emit invalid args")
+    func bareToolNameAloneDoesNotEmitInvalidArgs() {
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        visible += processor.processChunk("file") ?? ""
+        visible += processor.processChunk("_read") ?? ""
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.isEmpty)
+        #expect(visible == "file_read")
+    }
+
     @Test("unknown top-level JSON tool fallback remains visible")
     func unknownTopLevelJSONToolFallbackRemainsVisible() {
         let output = #"{"tool":"not_registered","path":"mandelbrot.py"}"#
