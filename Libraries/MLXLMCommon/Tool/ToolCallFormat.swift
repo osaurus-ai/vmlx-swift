@@ -27,6 +27,15 @@ public protocol ToolCallParser: Sendable {
     /// Additional accepted end tags matching ``startTagAliases``.
     var endTagAliases: [String] { get }
 
+    /// Prefixes for tagged formats whose model output may drift within a
+    /// protocol namespace but still carry a valid body. When a generated
+    /// token begins with one of these prefixes, ``ToolCallProcessor`` buffers
+    /// until the closing `>` rather than leaking the partial protocol marker.
+    var startTagPrefixes: [String] { get }
+
+    /// Prefixes for dynamic end tags matching ``startTagPrefixes``.
+    var endTagPrefixes: [String] { get }
+
     /// Parse the content into a `ToolCall`.
     /// - Parameters:
     ///   - content: The text content to parse (may include tags)
@@ -56,6 +65,10 @@ extension ToolCallParser {
     public var endTagAliases: [String] {
         endTag.map { [$0] } ?? []
     }
+
+    public var startTagPrefixes: [String] { [] }
+
+    public var endTagPrefixes: [String] { [] }
 
     public func isValidPartialContent(_ toolCallBuffer: String) -> Bool {
         true

@@ -114,6 +114,36 @@ struct DSMLToolCallParserFocusedTests {
         #expect(!visible.contains("invoke name"))
     }
 
+    @Test("DSML processor treats live tool_cimport wrapper as protocol")
+    func processorAcceptsLiveToolCImportWrapper() {
+        let dsml = DeepseekV4Tokens.dsml
+        let output = """
+            <\(dsml)tool_cimport>
+            <\(dsml)invoke name="file_read">
+            <\(dsml)parameter name="path" string="true">mandelbrot.py</\(dsml)parameter>
+            <\(dsml)parameter name="start_line" string="false">1</\(dsml)parameter>
+            <\(dsml)parameter name="end_line" string="false">1</\(dsml)parameter>
+            </\(dsml)inv>
+            </\(dsml)tool_cimport>
+            """
+        let processor = ToolCallProcessor(format: .dsml)
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls.first?.function.name == "file_read")
+        #expect(processor.toolCalls.first?.function.arguments["path"] == .string("mandelbrot.py"))
+        #expect(processor.toolCalls.first?.function.arguments["start_line"] == .int(1))
+        #expect(processor.toolCalls.first?.function.arguments["end_line"] == .int(1))
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("DSML"))
+        #expect(!visible.contains("tool_cimport"))
+        #expect(!visible.contains("invoke name"))
+    }
+
     @Test("DSV4 instruct prompt routes DSML output to tool calls without reasoning leakage")
     func instructPromptRoutesDSMLWithoutReasoningLeakage() {
         let prompt = DeepseekV4ChatEncoder().encode(

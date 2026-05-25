@@ -63,7 +63,7 @@ public class ToolCallProcessor {
 
     /// The first character of the start tag for quick detection.
     private var startTagFirstChar: Character? {
-        parser.startTagAliases.first?.first
+        parser.startTagAliases.first?.first ?? parser.startTagPrefixes.first?.first
     }
 
     // MARK: - Public Methods
@@ -178,7 +178,8 @@ public class ToolCallProcessor {
     /// Process chunk for tagged formats.
     private func processTaggedChunk(_ chunk: String) -> String? {
         let startTags = parser.startTagAliases
-        guard !startTags.isEmpty,
+        let startTagPrefixes = parser.startTagPrefixes
+        guard (!startTags.isEmpty || !startTagPrefixes.isEmpty),
             let startChar = startTagFirstChar
         else {
             return chunk
@@ -204,8 +205,8 @@ public class ToolCallProcessor {
 
             fallthrough
         case .potentialToolCall:
-            if partialMatch(buffer: toolCallBuffer, tags: startTags) {
-                if startTags.contains(where: { toolCallBuffer.starts(with: $0) }) {
+            if partialMatch(buffer: toolCallBuffer, tags: startTags, prefixes: startTagPrefixes) {
+                if startsWithCompleteTag(buffer: toolCallBuffer, tags: startTags, prefixes: startTagPrefixes) {
                     state = .collectingToolCall
                     fallthrough
                 } else {
@@ -222,7 +223,8 @@ public class ToolCallProcessor {
             }
         case .collectingToolCall:
             let endTags = parser.endTagAliases
-            guard !endTags.isEmpty else {
+            let endTagPrefixes = parser.endTagPrefixes
+            guard !endTags.isEmpty || !endTagPrefixes.isEmpty else {
                 return nil
             }
 
@@ -235,7 +237,11 @@ public class ToolCallProcessor {
                 return visible.isEmpty ? nil : visible
             }
 
-            if let matchedEndTag = firstTag(in: toolCallBuffer, tags: endTags) {
+            if let matchedEndTag = firstTag(
+                in: toolCallBuffer,
+                tags: endTags,
+                prefixes: endTagPrefixes
+            ) {
                 // Separate the trailing token
                 let trailingToken = separateToken(
                     from: &toolCallBuffer, separator: matchedEndTag, returnLeading: false)
@@ -290,10 +296,9 @@ public class ToolCallProcessor {
         return token
     }
 
-    private func partialMatch(buffer: String, tags: [String]) -> Bool {
-        tags.contains { tag in
-            partialMatch(buffer: buffer, tag: tag)
-        }
+    private func partialMatch(buffer: String, tags: [String], prefixes: [String]) -> Bool {
+        tags.contains { partialMatch(buffer: buffer, tag: $0) }
+            || prefixes.contains { partialMatch(buffer: buffer, tag: $0) || buffer.starts(with: $0) }
     }
 
     private func partialMatch(buffer: String, tag: String) -> Bool {
@@ -306,12 +311,62 @@ public class ToolCallProcessor {
         return true
     }
 
-    private func firstTag(in text: String, tags: [String]) -> String? {
-        tags
+    private func startsWithCompleteTag(
+        buffer: String,
+        tags: [String],
+        prefixes: [String]
+    ) -> Bool {
+        tags.contains(where: { buffer.starts(with: $0) })
+            || prefixes.contains {
+                completedPrefixedTag(
+                    in: buffer,
+                    prefix: $0,
+                    range: buffer.startIndex ..< buffer.endIndex
+                )?.lowerBound == buffer.startIndex
+            }
+    }
+
+    private func firstTag(in text: String, tags: [String], prefixes: [String]) -> String? {
+        let exactMatch = tags
             .compactMap { tag -> (String, Range<String.Index>)? in
                 text.range(of: tag).map { (tag, $0) }
             }
-            .min { $0.1.lowerBound < $1.1.lowerBound }?
-            .0
+            .min { $0.1.lowerBound < $1.1.lowerBound }
+
+        let prefixedMatch = prefixes
+            .compactMap { prefix -> (String, Range<String.Index>)? in
+                guard
+                    let match = completedPrefixedTag(
+                        in: text,
+                        prefix: prefix,
+                        range: text.startIndex ..< text.endIndex
+                    )
+                else { return nil }
+                return (String(text[match]), match)
+            }
+            .min { $0.1.lowerBound < $1.1.lowerBound }
+
+        switch (exactMatch, prefixedMatch) {
+        case (nil, nil):
+            return nil
+        case let (exact?, nil):
+            return exact.0
+        case let (nil, prefixed?):
+            return prefixed.0
+        case let (exact?, prefixed?):
+            return exact.1.lowerBound <= prefixed.1.lowerBound ? exact.0 : prefixed.0
+        }
+    }
+
+    private func completedPrefixedTag(
+        in text: String,
+        prefix: String,
+        range: Range<String.Index>
+    ) -> Range<String.Index>? {
+        guard
+            let prefixRange = text.range(of: prefix, range: range),
+            let close = text[prefixRange.upperBound...].firstIndex(of: ">")
+        else { return nil }
+        return prefixRange.lowerBound ..< text.index(after: close)
     }
 }

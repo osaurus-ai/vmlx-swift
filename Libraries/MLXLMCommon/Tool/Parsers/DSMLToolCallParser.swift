@@ -42,6 +42,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
     // Curly-quote pipe U+FF5C.
     static let dsmlPrefix = "<\u{FF5C}DSML\u{FF5C}"
     static let dsmlPrefixClose = "</\u{FF5C}DSML\u{FF5C}"
+    static let dsmlToolStartPrefix = "<\u{FF5C}DSML\u{FF5C}tool_"
+    static let dsmlToolEndPrefix = "</\u{FF5C}DSML\u{FF5C}tool_"
 
     public let startTag: String? = "<\u{FF5C}DSML\u{FF5C}tool_calls>"
     public let endTag: String? = "</\u{FF5C}DSML\u{FF5C}tool_calls>"
@@ -60,19 +62,14 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         // suffix rather than the middle of the token.
         "</\u{FF5C}DSML\u{FF5C}tool_cs>",
     ]
+    public let startTagPrefixes: [String] = [Self.dsmlToolStartPrefix]
+    public let endTagPrefixes: [String] = [Self.dsmlToolEndPrefix]
 
     public init() {}
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         // Strip outer block if present.
-        var text = content
-        for start in startTagAliases {
-            text = text.replacingOccurrences(of: start, with: "")
-        }
-        for end in endTagAliases {
-            text = text.replacingOccurrences(of: end, with: "")
-        }
-        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = strippedOuterToolTags(from: content)
 
         // Find first <｜DSML｜invoke name="...">
         guard let firstCall = parseFirstInvoke(in: text, tools: tools) else {
@@ -89,13 +86,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         // block is ONE `startTag..endTag` outer envelope, split
         // internally by `<｜DSML｜invoke ...>` per call. Parse all
         // invokes in order.
-        var buffer = toolCallBuffer
-        for start in startTagAliases {
-            buffer = buffer.replacingOccurrences(of: start, with: "")
-        }
-        for end in endTagAliases {
-            buffer = buffer.replacingOccurrences(of: end, with: "")
-        }
+        let buffer = strippedOuterToolTags(from: toolCallBuffer)
         return parseAllInvokes(in: buffer, tools: tools)
     }
 
@@ -166,6 +157,33 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         needles
             .compactMap { text.range(of: $0, range: range) }
             .min { $0.lowerBound < $1.lowerBound }
+    }
+
+    private func strippedOuterToolTags(from content: String) -> String {
+        var text = content
+        for start in startTagAliases {
+            text = text.replacingOccurrences(of: start, with: "")
+        }
+        for end in endTagAliases {
+            text = text.replacingOccurrences(of: end, with: "")
+        }
+        text = removingCompletedTags(withPrefix: Self.dsmlToolStartPrefix, from: text)
+        text = removingCompletedTags(withPrefix: Self.dsmlToolEndPrefix, from: text)
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func removingCompletedTags(withPrefix prefix: String, from content: String) -> String {
+        var text = content
+        var searchStart = text.startIndex
+        while
+            let prefixRange = text.range(of: prefix, range: searchStart ..< text.endIndex),
+            let close = text[prefixRange.upperBound...].firstIndex(of: ">")
+        {
+            let removalEnd = text.index(after: close)
+            text.removeSubrange(prefixRange.lowerBound ..< removalEnd)
+            searchStart = prefixRange.lowerBound
+        }
+        return text
     }
 
     /// Enumerate every `<｜DSML｜parameter name="NAME" string="BOOL">VALUE</｜DSML｜parameter>`
