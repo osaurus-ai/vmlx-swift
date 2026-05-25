@@ -304,6 +304,15 @@ public struct DeepseekV4ChatEncoder: Sendable {
         </\(DeepseekV4Tokens.dsml)invoke>
         </\(DeepseekV4Tokens.dsml)tool_calls>
 
+        For tools with no parameters, emit an empty invoke with no parameter lines:
+
+        <\(DeepseekV4Tokens.dsml)tool_calls>
+        <\(DeepseekV4Tokens.dsml)invoke name="$TOOL_NAME_WITHOUT_PARAMETERS">
+        </\(DeepseekV4Tokens.dsml)invoke>
+        </\(DeepseekV4Tokens.dsml)tool_calls>
+
+        Do not emit JSON objects for tool calls; tool calls must use DSML invoke blocks.
+
         String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
 
         If thinking_mode is enabled (triggered by \(DeepseekV4Tokens.thinkStart)), you MUST output your complete reasoning inside \(DeepseekV4Tokens.thinkStart)...\(DeepseekV4Tokens.thinkEnd) BEFORE any tool calls or final response.

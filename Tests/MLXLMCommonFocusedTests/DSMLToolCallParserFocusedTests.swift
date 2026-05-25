@@ -114,6 +114,100 @@ struct DSMLToolCallParserFocusedTests {
         #expect(!visible.contains("invoke name"))
     }
 
+    @Test("DSML processor routes Osaurus folder and git tools through live aliases")
+    func processorRoutesOsaurusFolderAndGitToolsThroughLiveAliases() {
+        let fixtures: [DSMLToolFixture] = [
+            .init(
+                name: "file_tree",
+                parameters: [
+                    .init(name: "path", value: ".", string: true, expected: .string(".")),
+                    .init(name: "max_depth", value: "2", string: false, expected: .int(2)),
+                ]
+            ),
+            .init(
+                name: "file_read",
+                parameters: [
+                    .init(name: "path", value: "mandelbrot.py", string: true, expected: .string("mandelbrot.py")),
+                    .init(name: "start_line", value: "38", string: false, expected: .int(38)),
+                    .init(name: "end_line", value: "41", string: false, expected: .int(41)),
+                ]
+            ),
+            .init(
+                name: "file_write",
+                parameters: [
+                    .init(name: "path", value: "osaurus_probe.txt", string: true, expected: .string("osaurus_probe.txt")),
+                    .init(name: "content", value: "alpha\nbeta", string: true, expected: .string("alpha\nbeta")),
+                ]
+            ),
+            .init(
+                name: "file_edit",
+                parameters: [
+                    .init(name: "path", value: "osaurus_probe.txt", string: true, expected: .string("osaurus_probe.txt")),
+                    .init(name: "old_string", value: "alpha", string: true, expected: .string("alpha")),
+                    .init(name: "new_string", value: "beta", string: true, expected: .string("beta")),
+                ]
+            ),
+            .init(
+                name: "file_search",
+                parameters: [
+                    .init(name: "pattern", value: "np.clip", string: true, expected: .string("np.clip")),
+                    .init(name: "path", value: "mandelbrot.py", string: true, expected: .string("mandelbrot.py")),
+                    .init(name: "max_results", value: "3", string: false, expected: .int(3)),
+                ]
+            ),
+            .init(
+                name: "shell_run",
+                parameters: [
+                    .init(name: "command", value: "printf ok", string: true, expected: .string("printf ok")),
+                    .init(name: "timeout", value: "5", string: false, expected: .int(5)),
+                ]
+            ),
+            .init(name: "git_status", parameters: []),
+            .init(
+                name: "git_diff",
+                parameters: [
+                    .init(name: "path", value: "mandelbrot.py", string: true, expected: .string("mandelbrot.py")),
+                    .init(name: "staged", value: "false", string: false, expected: .bool(false)),
+                ]
+            ),
+            .init(
+                name: "git_commit",
+                parameters: [
+                    .init(name: "message", value: "probe commit", string: true, expected: .string("probe commit")),
+                ]
+            ),
+        ]
+
+        for fixture in fixtures {
+            let processor = ToolCallProcessor(format: .dsml)
+            var visible = ""
+            for ch in liveAliasDSML(for: fixture) {
+                visible += processor.processChunk(String(ch)) ?? ""
+            }
+            visible += processor.processEOS() ?? ""
+
+            #expect(
+                visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "\(fixture.name) DSML leaked visible text: \(visible)"
+            )
+            #expect(!visible.contains("DSML"), "\(fixture.name) leaked DSML marker: \(visible)")
+            #expect(!visible.contains("tool_ccalls"), "\(fixture.name) leaked start alias: \(visible)")
+            #expect(!visible.contains("tool_cs"), "\(fixture.name) leaked end alias: \(visible)")
+            #expect(processor.toolCalls.count == 1, "\(fixture.name) should emit one tool call")
+
+            let call = processor.toolCalls.first
+            #expect(call?.function.name == fixture.name)
+            for parameter in fixture.parameters {
+                assertArgument(
+                    call?.function.arguments[parameter.name],
+                    matches: parameter.expected,
+                    tool: fixture.name,
+                    parameter: parameter.name
+                )
+            }
+        }
+    }
+
     @Test("DSML processor treats live tool_cimport wrapper as protocol")
     func processorAcceptsLiveToolCImportWrapper() {
         let dsml = DeepseekV4Tokens.dsml
@@ -142,6 +236,44 @@ struct DSMLToolCallParserFocusedTests {
         #expect(!visible.contains("DSML"))
         #expect(!visible.contains("tool_cimport"))
         #expect(!visible.contains("invoke name"))
+    }
+
+    @Test("DSML inline JSON fallback routes only schema-valid tool objects")
+    func inlineJSONFallbackRoutesOnlySchemaValidToolObjects() {
+        let output = """
+            {"tool":"file_read","path":"mandelbrot.py","start_line":38,"end_line":41}
+            """
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(processor.toolCalls.count == 1)
+        let call = processor.toolCalls.first
+        #expect(call?.function.name == "file_read")
+        #expect(call?.function.arguments["path"] == .string("mandelbrot.py"))
+        #expect(call?.function.arguments["start_line"] == .int(38))
+        #expect(call?.function.arguments["end_line"] == .int(41))
+    }
+
+    @Test("DSML inline JSON fallback leaves schema-invalid tool-shaped answers visible")
+    func inlineJSONFallbackLeavesSchemaInvalidToolShapedAnswersVisible() {
+        let output = """
+            {"tool":"file_read","r":"np.clip(esc * 4.0 - 1.0, 0.0, 1.0)","g":"np.clip(1.0 - np.abs(esc * 2.0 - 1.0), 0.0, 1.0)","b":"np.clip(1.0 - esc * 2.0, 0.0, 1.0)"}
+            """
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.isEmpty)
+        #expect(visible.contains("\"tool\":\"file_read\""))
+        #expect(visible.contains("np.clip"))
     }
 
     @Test("DSV4 instruct prompt routes DSML output to tool calls without reasoning leakage")
@@ -221,4 +353,75 @@ struct DSMLToolCallParserFocusedTests {
             ) ?? prompt.startIndex
         return String(prompt[start...])
     }
+
+    private struct DSMLToolFixture {
+        let name: String
+        let parameters: [DSMLParameterFixture]
+    }
+
+    private struct DSMLParameterFixture {
+        let name: String
+        let value: String
+        let string: Bool
+        let expected: DSMLExpectedArgument
+    }
+
+    private enum DSMLExpectedArgument {
+        case string(String)
+        case int(Int)
+        case bool(Bool)
+    }
+
+    private func liveAliasDSML(for fixture: DSMLToolFixture) -> String {
+        let dsml = DeepseekV4Tokens.dsml
+        var lines = [
+            "<\(dsml)tool_ccalls>",
+            "<\(dsml)invoke name=\"\(fixture.name)\">",
+        ]
+        lines += fixture.parameters.map { parameter in
+            "<\(dsml)parameter name=\"\(parameter.name)\" string=\"\(parameter.string ? "true" : "false")\">\(parameter.value)</\(dsml)parameter>"
+        }
+        lines += [
+            "</\(dsml)inv>",
+            "</\(dsml)tool_cs>",
+        ]
+        return lines.joined(separator: "\n")
+    }
+
+    private func assertArgument(
+        _ actual: (any Sendable)?,
+        matches expected: DSMLExpectedArgument,
+        tool: String,
+        parameter: String
+    ) {
+        switch expected {
+        case .string(let value):
+            #expect(actual as? JSONValue == .string(value), "\(tool).\(parameter) mismatch")
+        case .int(let value):
+            #expect(actual as? JSONValue == .int(value), "\(tool).\(parameter) mismatch")
+        case .bool(let value):
+            #expect(actual as? JSONValue == .bool(value), "\(tool).\(parameter) mismatch")
+        }
+    }
+
+    private func fileReadToolSchema() -> [[String: any Sendable]] {
+        [
+            [
+                "type": "function",
+                "function": [
+                    "name": "file_read",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "path": ["type": "string"] as [String: any Sendable],
+                            "start_line": ["type": "integer"] as [String: any Sendable],
+                            "end_line": ["type": "integer"] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "required": ["path"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+    }
+
 }

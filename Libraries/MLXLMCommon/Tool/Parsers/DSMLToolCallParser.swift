@@ -261,7 +261,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         else { return nil }
 
         guard let name = fallbackToolName(in: object),
-            knownToolNames(in: tools).contains(name)
+            let functionSpec = functionSpec(named: name, in: tools)
         else { return nil }
 
         let argsObject: Any
@@ -283,6 +283,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         }
 
         let args = normalizeInlineArguments(argsObject)
+        guard inlineFallbackArguments(args, satisfy: functionSpec) else { return nil }
         return ToolCall(function: .init(name: name, arguments: args))
     }
 
@@ -298,13 +299,107 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         return nil
     }
 
-    private func knownToolNames(in tools: [[String: any Sendable]]) -> Set<String> {
-        Set(
-            tools.compactMap { tool in
-                let function = (tool["function"] as? [String: any Sendable]) ?? tool
-                return function["name"] as? String
+    private func functionSpec(
+        named name: String,
+        in tools: [[String: any Sendable]]
+    ) -> [String: any Sendable]? {
+        for tool in tools {
+            let function = (tool["function"] as? [String: any Sendable]) ?? tool
+            if function["name"] as? String == name {
+                return function
             }
-        )
+        }
+        return nil
+    }
+
+    private func inlineFallbackArguments(
+        _ args: [String: any Sendable],
+        satisfy function: [String: any Sendable]
+    ) -> Bool {
+        guard let parameters = function["parameters"] as? [String: any Sendable] else {
+            return true
+        }
+
+        let required = requiredParameterNames(in: parameters)
+        for key in required where args[key] == nil {
+            return false
+        }
+
+        guard let properties = parameters["properties"] as? [String: any Sendable] else {
+            return true
+        }
+
+        for (name, value) in args {
+            guard let schema = properties[name] as? [String: any Sendable] else {
+                continue
+            }
+            if !inlineFallbackValue(value, matches: schema) {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    private func requiredParameterNames(in parameters: [String: any Sendable]) -> [String] {
+        if let required = parameters["required"] as? [String] {
+            return required
+        }
+        if let required = parameters["required"] as? [any Sendable] {
+            return required.compactMap { $0 as? String }
+        }
+        return []
+    }
+
+    private func inlineFallbackValue(
+        _ value: any Sendable,
+        matches schema: [String: any Sendable]
+    ) -> Bool {
+        let types = schemaTypes(from: schema["type"])
+        guard !types.isEmpty else { return true }
+
+        for type in types {
+            switch type {
+            case "string":
+                if value is String { return true }
+                if case .some(.string) = value as? JSONValue { return true }
+            case "integer":
+                if value is Int { return true }
+                if case .some(.int) = value as? JSONValue { return true }
+            case "number":
+                if value is Int || value is Double || value is Float { return true }
+                if case .some(.int) = value as? JSONValue { return true }
+                if case .some(.double) = value as? JSONValue { return true }
+            case "boolean":
+                if value is Bool { return true }
+                if case .some(.bool) = value as? JSONValue { return true }
+            case "array":
+                if value is [any Sendable] { return true }
+                if case .some(.array) = value as? JSONValue { return true }
+            case "object":
+                if value is [String: any Sendable] { return true }
+                if case .some(.object) = value as? JSONValue { return true }
+            case "null":
+                if case .some(.null) = value as? JSONValue { return true }
+            default:
+                continue
+            }
+        }
+
+        return false
+    }
+
+    private func schemaTypes(from raw: (any Sendable)?) -> [String] {
+        if let type = raw as? String {
+            return [type]
+        }
+        if let types = raw as? [String] {
+            return types
+        }
+        if let types = raw as? [any Sendable] {
+            return types.compactMap { $0 as? String }
+        }
+        return []
     }
 
     private func normalizeInlineArguments(_ value: Any) -> [String: any Sendable] {

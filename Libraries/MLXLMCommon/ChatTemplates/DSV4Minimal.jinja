@@ -54,6 +54,12 @@
 {{- '...\n' -}}
 {{- '</' + dsml + 'invoke>\n' -}}
 {{- '</' + dsml + 'tool_calls>\n\n' -}}
+{{- 'For tools with no parameters, emit an empty invoke with no parameter lines:\n\n' -}}
+{{- '<' + dsml + 'tool_calls>\n' -}}
+{{- '<' + dsml + 'invoke name="$TOOL_NAME_WITHOUT_PARAMETERS">\n' -}}
+{{- '</' + dsml + 'invoke>\n' -}}
+{{- '</' + dsml + 'tool_calls>\n\n' -}}
+{{- 'Do not emit JSON objects for tool calls; tool calls must use DSML invoke blocks.\n\n' -}}
 {{- 'String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.\n\n' -}}
 {{- 'If thinking_mode is enabled (triggered by ' + think_open + '), you MUST output your complete reasoning inside ' + think_open + '...' + think_close + ' BEFORE any tool calls or final response.\n\n' -}}
 {{- 'Otherwise, output directly after ' + think_close + ' with tool calls or final response.\n\n' -}}

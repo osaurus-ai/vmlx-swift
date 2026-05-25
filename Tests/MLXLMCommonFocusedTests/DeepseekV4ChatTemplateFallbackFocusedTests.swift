@@ -160,6 +160,27 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         assertNoSystemToolsRenderBetweenUserAndAssistant(rendered)
     }
 
+    @Test("DSV4 tool instructions include no-argument invoke protocol")
+    func dsv4ToolInstructionsIncludeNoArgumentInvokeProtocol() throws {
+        let compiled = try Template(ChatTemplateFallbacks.dsv4Minimal)
+            .renderDSV4(noArgumentToolProbeContext())
+        assertNoArgumentToolProtocol(compiled)
+
+        let source = try repositoryFile("Libraries/MLXLMCommon/ChatTemplates/DSV4Minimal.jinja")
+        let standalone = try Template(source).renderDSV4(noArgumentToolProbeContext())
+        assertNoArgumentToolProtocol(standalone)
+
+        let swiftEncoder = DeepseekV4ChatEncoder()
+        let swiftRendered = swiftEncoder.encode(
+            messages: [
+                .init(role: .system, content: "You are a local agent.", tools: [gitStatusToolSpec()]),
+                .init(role: .user, content: "Check git status."),
+            ],
+            thinkingMode: .chat
+        )
+        assertNoArgumentToolProtocol(swiftRendered)
+    }
+
     @Test("compiled DSV4 fallback separates system preface from first user turn")
     func compiledDSV4FallbackSeparatesSystemFromFirstUser() throws {
         let template = try Template(ChatTemplateFallbacks.dsv4Minimal)
@@ -226,6 +247,32 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         ]
     }
 
+    private func noArgumentToolProbeContext() -> [String: any Sendable] {
+        [
+            "messages": [
+                ["role": "user", "content": "Check git status."],
+            ],
+            "tools": [gitStatusToolSpec()],
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+        ]
+    }
+
+    private func gitStatusToolSpec() -> [String: any Sendable] {
+        [
+            "type": "function",
+            "function": [
+                "name": "git_status",
+                "description": "Show working tree status.",
+                "parameters": [
+                    "type": "object",
+                    "properties": [:] as [String: any Sendable],
+                    "required": [] as [String],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ] as [String: any Sendable]
+    }
+
     private func assertNoSystemToolsRenderBetweenUserAndAssistant(_ rendered: String) {
         #expect(rendered.contains("## Tools"))
         #expect(rendered.contains("osaurus_no_system_probe"))
@@ -239,6 +286,17 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         } else {
             Issue.record("DSV4 no-system tool probe is missing expected turn markers")
         }
+    }
+
+    private func assertNoArgumentToolProtocol(_ rendered: String) {
+        #expect(rendered.contains("git_status"))
+        #expect(rendered.contains("For tools with no parameters"))
+        #expect(
+            rendered.contains(
+                "<\u{FF5C}DSML\u{FF5C}invoke name=\"$TOOL_NAME_WITHOUT_PARAMETERS\">\n</\u{FF5C}DSML\u{FF5C}invoke>"
+            )
+        )
+        #expect(rendered.contains("Do not emit JSON objects for tool calls"))
     }
 
     private func assertSystemSeparatedFromUser(_ rendered: String) {
