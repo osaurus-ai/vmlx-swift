@@ -266,10 +266,6 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         let hasSchemaList = tools?.isEmpty == false
         guard let name = fallbackToolName(in: object, allowBareName: hasSchemaList)
         else { return nil }
-        if let tools, !tools.isEmpty {
-            guard functionSpec(named: name, in: tools) != nil else { return nil }
-        }
-
         let argsObject: Any
         if let function = object["function"] as? [String: Any] {
             if let arguments = function["arguments"] {
@@ -289,6 +285,16 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         }
 
         let args = normalizeInlineArguments(argsObject)
+        if let tools, !tools.isEmpty {
+            guard let spec = functionSpec(named: name, in: tools) else { return nil }
+            if let invalidArgs = inlineSchemaValidationFailure(
+                toolName: name,
+                arguments: args,
+                functionSpec: spec)
+            {
+                return ToolCall(function: .init(name: name, arguments: invalidArgs))
+            }
+        }
         return ToolCall(function: .init(name: name, arguments: args))
     }
 
@@ -313,6 +319,94 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             if function["name"] as? String == name {
                 return function
             }
+        }
+        return nil
+    }
+
+    private func inlineSchemaValidationFailure(
+        toolName: String,
+        arguments: [String: any Sendable],
+        functionSpec: [String: any Sendable]
+    ) -> [String: any Sendable]? {
+        guard let parameters = sendableObject(functionSpec["parameters"]) else {
+            return nil
+        }
+
+        for required in sendableStringArray(parameters["required"]) {
+            if arguments[required] == nil {
+                return invalidInlineToolArguments(
+                    toolName: toolName,
+                    message: "missing required argument: \(required)",
+                    field: required,
+                    expected: "required parameter")
+            }
+        }
+
+        guard sendableBool(parameters["additionalProperties"]) == false,
+            let properties = sendableObject(parameters["properties"])
+        else { return nil }
+
+        let allowed = Set(properties.keys)
+        if let unknown = arguments.keys.sorted().first(where: { !allowed.contains($0) }) {
+            return invalidInlineToolArguments(
+                toolName: toolName,
+                message: "unknown argument: \(unknown)",
+                field: unknown,
+                expected: "declared parameter")
+        }
+        return nil
+    }
+
+    private func invalidInlineToolArguments(
+        toolName: String,
+        message: String,
+        field: String,
+        expected: String
+    ) -> [String: any Sendable] {
+        [
+            "_error": "invalid_tool_arguments",
+            "_tool": toolName,
+            "_message": message,
+            "_field": field,
+            "_expected": expected,
+        ]
+    }
+
+    private func sendableObject(_ value: (any Sendable)?) -> [String: any Sendable]? {
+        if let object = value as? [String: any Sendable] {
+            return object
+        }
+        if case .object(let object)? = value as? JSONValue {
+            return object.mapValues { $0.sendableValue }
+        }
+        return nil
+    }
+
+    private func sendableStringArray(_ value: (any Sendable)?) -> [String] {
+        if let strings = value as? [String] {
+            return strings
+        }
+        if let values = value as? [any Sendable] {
+            return values.compactMap { $0 as? String }
+        }
+        if case .array(let values)? = value as? JSONValue {
+            return values.compactMap {
+                if case .string(let value) = $0 { return value }
+                return nil
+            }
+        }
+        return []
+    }
+
+    private func sendableBool(_ value: (any Sendable)?) -> Bool? {
+        if let bool = value as? Bool {
+            return bool
+        }
+        if let number = value as? NSNumber {
+            return number.boolValue
+        }
+        if case .bool(let bool)? = value as? JSONValue {
+            return bool
         }
         return nil
     }

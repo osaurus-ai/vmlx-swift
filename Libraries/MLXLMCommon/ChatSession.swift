@@ -427,6 +427,7 @@ public final class ChatSession {
                             chat: messages, processing: processing,
                             tools: tools, additionalContext: additionalContext)
                         let input = try await processor.prepare(input: userInput)
+                            .withToolSchemas(tools)
                         messages.removeAll()
 
                         // generate output
@@ -439,7 +440,8 @@ public final class ChatSession {
                             promptTokenCount: input.text.tokens.size,
                             modelConfiguration: modelConfiguration,
                             tokenizer: tokenizer,
-                            iterator: iterator
+                            iterator: iterator,
+                            toolSchemas: input.toolSchemas
                         )
 
                         var pendingToolCalls: [ToolCall] = []

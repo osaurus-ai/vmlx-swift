@@ -480,8 +480,10 @@ public final class ModelContainer: Sendable {
     /// - Note: The `sending` keyword indicates the return value is transferred (not shared),
     ///   allowing non-Sendable types like `LMInput` to safely cross isolation boundaries.
     public func prepare(input: consuming sending UserInput) async throws -> sending LMInput {
+        let toolSchemas = input.tools
         let processor = await self.processor
-        return try await processor.prepare(input: input)
+        let prepared = try await processor.prepare(input: input)
+        return prepared.withToolSchemas(toolSchemas)
     }
 
     /// Generate tokens from prepared input, returning an AsyncStream.

@@ -500,7 +500,8 @@ public actor BatchEngine {
                 context: context,
                 maxNewTokens: parameters.maxTokens ?? 256,
                 stopTokenIDs: [],
-                temperature: parameters.temperature)
+                temperature: parameters.temperature,
+                toolSchemas: input.toolSchemas)
         {
             return stream
         }
@@ -510,6 +511,7 @@ public actor BatchEngine {
         // configuration so the background task doesn't need to reach
         // back into the actor.
         let toolCallFormat = context.configuration.toolCallFormat ?? .json
+        let toolSchemas = input.toolSchemas
         let reasoningParserName = context.configuration.reasoningParserName
         let extraStopStrings = mergeStopStrings(parameters.extraStopStrings, defaultStopStrings)
 
@@ -602,7 +604,7 @@ public actor BatchEngine {
 
         Task {
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-            let toolCallProcessor = ToolCallProcessor(format: toolCallFormat)
+            let toolCallProcessor = ToolCallProcessor(format: toolCallFormat, tools: toolSchemas)
             var reasoningParser = ReasoningParser.forPrompt(
                 stampName: reasoningParserName,
                 promptTail: promptTail)
@@ -819,6 +821,7 @@ public actor BatchEngine {
         promptTail: String?
     ) -> AsyncStream<Generation> {
         let promptTokenCount = input.text.tokens.size
+        let toolSchemas = input.toolSchemas
         let fastPathID = UUID()
         var soloParameters = parameters
         soloParameters.extraStopStrings = mergeStopStrings(
@@ -862,7 +865,8 @@ public actor BatchEngine {
                     tokenizer: context.tokenizer,
                     iterator: iterator,
                     extraStopStrings: soloParameters.extraStopStrings,
-                    promptTail: promptTail)
+                    promptTail: promptTail,
+                    toolSchemas: toolSchemas)
             } else {
                 let iterator = try TokenIterator(
                     input: input,
@@ -876,7 +880,8 @@ public actor BatchEngine {
                     tokenizer: context.tokenizer,
                     iterator: iterator,
                     extraStopStrings: soloParameters.extraStopStrings,
-                    promptTail: promptTail)
+                    promptTail: promptTail,
+                    toolSchemas: toolSchemas)
             }
         } catch {
             Self.logger.error(

@@ -2552,7 +2552,8 @@ public func generate(
             iterator: iterator,
             wiredMemoryTicket: wiredMemoryTicket,
             extraStopStrings: parameters.extraStopStrings,
-            promptTail: promptTail)
+            promptTail: promptTail,
+            toolSchemas: input.toolSchemas)
         return stream
     }
     // Block-diffusion speculative decoding dispatch. When
@@ -2569,7 +2570,8 @@ public func generate(
             context: context,
             maxNewTokens: parameters.maxTokens ?? 256,
             stopTokenIDs: [],
-            temperature: parameters.temperature)
+            temperature: parameters.temperature,
+            toolSchemas: input.toolSchemas)
     {
         return stream
     }
@@ -2583,7 +2585,8 @@ public func generate(
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
         extraStopStrings: parameters.extraStopStrings,
-        promptTail: promptTail)
+        promptTail: promptTail,
+        toolSchemas: input.toolSchemas)
     return stream
 }
 
@@ -2668,6 +2671,7 @@ public func generate(
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
             format: context.configuration.toolCallFormat ?? .json,
+            tools: input.toolSchemas,
             reasoningParser: ReasoningParser.forPrompt(
                 stampName: context.configuration.reasoningParserName,
                 promptTail: _decodePromptTail(
@@ -2693,7 +2697,8 @@ public func generate(
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
         iterator: iterator,
-        wiredMemoryTicket: wiredMemoryTicket)
+        wiredMemoryTicket: wiredMemoryTicket,
+        toolSchemas: input.toolSchemas)
     return stream
 }
 
@@ -2718,7 +2723,8 @@ public func generateTask(
     iterator: consuming any TokenIteratorProtocol,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     extraStopStrings: [String] = [],
-    promptTail: String? = nil
+    promptTail: String? = nil,
+    toolSchemas: [ToolSpec]? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     let effectivePromptTail =
         promptTail
@@ -2739,6 +2745,7 @@ public func generateTask(
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
             format: modelConfiguration.toolCallFormat ?? .json,
+            tools: toolSchemas,
             reasoningParser: ReasoningParser.forPrompt(
                 stampName: modelConfiguration.reasoningParserName,
                 promptTail: effectivePromptTail),
@@ -3358,11 +3365,12 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     init(
         tokenizer: Tokenizer,
         format: ToolCallFormat,
+        tools: [[String: any Sendable]]? = nil,
         reasoningParser: ReasoningParser? = nil,
         stopStringMatcher: StopStringMatcher = StopStringMatcher(stopStrings: [])
     ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-        toolCallProcessor = ToolCallProcessor(format: format)
+        toolCallProcessor = ToolCallProcessor(format: format, tools: tools)
         self.reasoningParser = reasoningParser
         self.stopStringMatcher = stopStringMatcher
     }

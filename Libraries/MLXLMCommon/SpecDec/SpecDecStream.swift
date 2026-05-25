@@ -43,7 +43,8 @@ public enum SpecDecStream {
         args: DFlashLinearArgs,
         tokenizer: any Tokenizer,
         toolCallFormat: ToolCallFormat = .json,
-        reasoningParserName: String? = nil
+        reasoningParserName: String? = nil,
+        toolSchemas: [ToolSpec]? = nil
     ) -> AsyncStream<Generation> {
         AsyncStream<Generation> { continuation in
             Task {
@@ -53,7 +54,8 @@ public enum SpecDecStream {
                     var detokenizer = NaiveStreamingDetokenizer(
                         tokenizer: tokenizer)
                     let toolCallProcessor = ToolCallProcessor(
-                        format: toolCallFormat)
+                        format: toolCallFormat,
+                        tools: toolSchemas)
                     var reasoningParser = ReasoningParser
                         .fromCapabilityName(reasoningParserName)
 
@@ -103,7 +105,8 @@ public enum SpecDecStream {
         args: DDTreeArgs,
         tokenizer: any Tokenizer,
         toolCallFormat: ToolCallFormat = .json,
-        reasoningParserName: String? = nil
+        reasoningParserName: String? = nil,
+        toolSchemas: [ToolSpec]? = nil
     ) -> AsyncStream<Generation> {
         AsyncStream<Generation> { continuation in
             Task {
@@ -113,7 +116,8 @@ public enum SpecDecStream {
                     var detokenizer = NaiveStreamingDetokenizer(
                         tokenizer: tokenizer)
                     let toolCallProcessor = ToolCallProcessor(
-                        format: toolCallFormat)
+                        format: toolCallFormat,
+                        tools: toolSchemas)
                     var reasoningParser = ReasoningParser
                         .fromCapabilityName(reasoningParserName)
 
@@ -174,6 +178,7 @@ public enum SpecDecStream {
         maxNewTokens: Int,
         stopTokenIDs: Set<Int32> = [],
         temperature: Float = 0,
+        toolSchemas: [ToolSpec]? = nil,
         resolver: SpecDecDrafterResolver = .shared
     ) -> AsyncStream<Generation>? {
         guard strategy.usesBlockDiffusion else { return nil }
@@ -219,7 +224,9 @@ public enum SpecDecStream {
                 let promptTokenCount = box.inputIds.dim(1)
                 var detokenizer = NaiveStreamingDetokenizer(
                     tokenizer: tokenizer)
-                let toolCallProcessor = ToolCallProcessor(format: toolCallFormat)
+                let toolCallProcessor = ToolCallProcessor(
+                    format: toolCallFormat,
+                    tools: toolSchemas)
                 var reasoningParser = ReasoningParser
                     .forPrompt(
                         stampName: reasoningParserName,

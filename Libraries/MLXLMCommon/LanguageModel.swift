@@ -53,6 +53,14 @@ public struct LMInput {
     /// `computeCacheSalt(for:)` to form the final per-request cache
     /// salt that the coordinator mixes into its block hash.
     public let cacheScopeSalt: String?
+    /// Request-scope tool schemas used by streaming tool-call parsers.
+    ///
+    /// Chat templates consume ``UserInput/tools`` during prompt rendering, but
+    /// the decode loop runs later from prepared ``LMInput``. Keeping the same
+    /// schemas here lets parsers validate inline fallback tool attempts against
+    /// the actual request contract instead of accepting a tool-shaped object by
+    /// name alone.
+    public let toolSchemas: [ToolSpec]?
 
     /// Additional prompt-prefix lengths that are safe to store in the cache.
     ///
@@ -165,12 +173,14 @@ public struct LMInput {
         tokens: MLXArray,
         mask: MLXArray? = nil,
         cacheScopeSalt: String? = nil,
-        cachePrefixTokenCounts: [Int] = []
+        cachePrefixTokenCounts: [Int] = [],
+        toolSchemas: [ToolSpec]? = nil
     ) {
         self.init(
             text: .init(tokens: tokens, mask: mask),
             cacheScopeSalt: cacheScopeSalt,
-            cachePrefixTokenCounts: cachePrefixTokenCounts)
+            cachePrefixTokenCounts: cachePrefixTokenCounts,
+            toolSchemas: toolSchemas)
     }
 
     public init(
@@ -179,7 +189,8 @@ public struct LMInput {
         audio: LMInput.ProcessedAudio? = nil,
         mediaTokenIds: [Int]? = nil,
         cacheScopeSalt: String? = nil,
-        cachePrefixTokenCounts: [Int] = []
+        cachePrefixTokenCounts: [Int] = [],
+        toolSchemas: [ToolSpec]? = nil
     ) {
         self.text = text
         self.image = image
@@ -188,6 +199,19 @@ public struct LMInput {
         self.mediaTokenIds = mediaTokenIds
         self.cacheScopeSalt = cacheScopeSalt
         self.cachePrefixTokenCounts = cachePrefixTokenCounts
+        self.toolSchemas = toolSchemas
+    }
+
+    public func withToolSchemas(_ schemas: [ToolSpec]?) -> LMInput {
+        LMInput(
+            text: text,
+            image: image,
+            video: video,
+            audio: audio,
+            mediaTokenIds: mediaTokenIds,
+            cacheScopeSalt: cacheScopeSalt,
+            cachePrefixTokenCounts: cachePrefixTokenCounts,
+            toolSchemas: schemas)
     }
 }
 

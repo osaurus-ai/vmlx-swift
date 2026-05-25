@@ -7,6 +7,25 @@ import Testing
 
 @Suite("DSV4 DSML inline JSON fallback focused contracts")
 struct DSMLInlineJSONToolFallbackFocusedTests {
+    @Test("decode loop receives prepared tool schemas for schema-aware fallback")
+    func decodeLoopReceivesPreparedToolSchemasForSchemaAwareFallback() throws {
+        let lmInput = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/LanguageModel.swift",
+            encoding: .utf8)
+        let batchEngine = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+
+        #expect(lmInput.contains("public let toolSchemas: [ToolSpec]?"))
+        #expect(lmInput.contains("public func withToolSchemas"))
+        #expect(batchEngine.contains("let toolSchemas = input.toolSchemas"))
+        #expect(batchEngine.contains("ToolCallProcessor(format: toolCallFormat, tools: toolSchemas)"))
+        #expect(evaluate.contains("toolCallProcessor = ToolCallProcessor(format: format, tools: tools)"))
+    }
+
     @Test("registered top-level JSON tool fallback is parsed without visible leakage")
     func registeredTopLevelJSONToolFallbackIsParsedWithoutVisibleLeakage() {
         let output = """
@@ -22,10 +41,9 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
         #expect(processor.toolCalls.count == 1)
         #expect(processor.toolCalls.first?.function.name == "file_read")
         #expect(processor.toolCalls.first?.function.arguments["path"] == nil)
-        #expect(
-            processor.toolCalls.first?.function.arguments["r"]
-                == .string("np.clip(esc * 4.0 - 1.0, 0.0, 1.0)")
-        )
+        #expect(processor.toolCalls.first?.function.arguments["_error"] == .string("invalid_tool_arguments"))
+        #expect(processor.toolCalls.first?.function.arguments["_field"] == .string("path"))
+        #expect(processor.toolCalls.first?.function.arguments["r"] == nil)
         #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         #expect(!visible.contains("\"tool\":\"file_read\""))
         #expect(!visible.contains("np.clip"))
