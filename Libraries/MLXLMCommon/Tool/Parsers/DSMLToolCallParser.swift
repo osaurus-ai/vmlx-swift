@@ -368,10 +368,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
                 || trimmed[afterName] == "{"
             else { continue }
 
-            var cursor = afterName
-            while cursor < trimmed.endIndex, isInlineFallbackWhitespace(trimmed[cursor]) {
-                cursor = trimmed.index(after: cursor)
-            }
+            let cursor = bareNameJSONTailObjectStart(in: trimmed, afterName: afterName)
             guard cursor < trimmed.endIndex, trimmed[cursor] == "{" else { continue }
             guard let jsonObject = firstBalancedJSONObject(in: trimmed[cursor...]) else {
                 continue
@@ -397,6 +394,34 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             return ToolCall(function: .init(name: name, arguments: args))
         }
         return nil
+    }
+
+    private func bareNameJSONTailObjectStart(
+        in text: String,
+        afterName: String.Index
+    ) -> String.Index {
+        var cursor = afterName
+        while cursor < text.endIndex, isInlineFallbackWhitespace(text[cursor]) {
+            cursor = text.index(after: cursor)
+        }
+        guard cursor < text.endIndex else { return cursor }
+        guard text[cursor...].hasPrefix("```") else { return cursor }
+
+        var fenceCursor = cursor
+        for _ in 0..<3 {
+            guard fenceCursor < text.endIndex else { return cursor }
+            fenceCursor = text.index(after: fenceCursor)
+        }
+        while fenceCursor < text.endIndex,
+            text[fenceCursor] != "\n",
+            text[fenceCursor] != "\r"
+        {
+            fenceCursor = text.index(after: fenceCursor)
+        }
+        while fenceCursor < text.endIndex, isInlineFallbackWhitespace(text[fenceCursor]) {
+            fenceCursor = text.index(after: fenceCursor)
+        }
+        return fenceCursor
     }
 
     private static let schemaLessFallbackToolNames: Set<String> = [

@@ -331,7 +331,9 @@ public class ToolCallProcessor {
             }
         }
         return inlineFunctionToolNames().contains {
-            compact.hasPrefix("\($0)(") || compact.hasPrefix("\($0){")
+            compact.hasPrefix("\($0)(")
+                || compact.hasPrefix("\($0){")
+                || compact.hasPrefix("\($0)```")
         }
     }
 
@@ -403,10 +405,7 @@ public class ToolCallProcessor {
                             offsetBy: name.count,
                             limitedBy: text.endIndex)
                     else { continue }
-                    var tailCursor = afterName
-                    while tailCursor < text.endIndex, isInlineWhitespace(text[tailCursor]) {
-                        tailCursor = text.index(after: tailCursor)
-                    }
+                    let tailCursor = bareNameJSONTailObjectStart(in: text, afterName: afterName)
                     if tailCursor == text.endIndex {
                         best = cursor
                         break
@@ -422,11 +421,36 @@ public class ToolCallProcessor {
     }
 
     private func bareNameJSONTailStartsObject(in text: String, afterName: String.Index) -> Bool {
+        let cursor = bareNameJSONTailObjectStart(in: text, afterName: afterName)
+        return cursor < text.endIndex && text[cursor] == "{"
+    }
+
+    private func bareNameJSONTailObjectStart(
+        in text: String,
+        afterName: String.Index
+    ) -> String.Index {
         var cursor = afterName
         while cursor < text.endIndex, isInlineWhitespace(text[cursor]) {
             cursor = text.index(after: cursor)
         }
-        return cursor < text.endIndex && text[cursor] == "{"
+        guard cursor < text.endIndex else { return cursor }
+        guard text[cursor...].hasPrefix("```") else { return cursor }
+
+        var fenceCursor = cursor
+        for _ in 0..<3 {
+            guard fenceCursor < text.endIndex else { return cursor }
+            fenceCursor = text.index(after: fenceCursor)
+        }
+        while fenceCursor < text.endIndex,
+            text[fenceCursor] != "\n",
+            text[fenceCursor] != "\r"
+        {
+            fenceCursor = text.index(after: fenceCursor)
+        }
+        while fenceCursor < text.endIndex, isInlineWhitespace(text[fenceCursor]) {
+            fenceCursor = text.index(after: fenceCursor)
+        }
+        return fenceCursor
     }
 
     private func isInlineWhitespace(_ character: Character) -> Bool {

@@ -160,6 +160,63 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
         #expect(!visible.contains("DSV4_UI_TOUT_OK"))
     }
 
+    @Test("live DSV4 bare-name fenced JSON file_read attempt is captured without visible leakage")
+    func liveDSV4BareNameFencedJSONFileReadAttemptIsCapturedWithoutVisibleLeakage() {
+        let output = #"""
+            file_read
+            ```json
+            {"path": "/Users/eric/Desktop/testmandel/mandelbrot.py", "start_line": 33, "end_line": 39}
+            ```
+            DSV4_UI_TOUT_OK: post-tool prose should not leak before tool execution.
+            """#
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        let visible = processor.processChunk(output) ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        let call = processor.toolCalls.first
+        #expect(call?.function.name == "file_read")
+        #expect(
+            call?.function.arguments["path"]
+                == .string("/Users/eric/Desktop/testmandel/mandelbrot.py")
+        )
+        #expect(call?.function.arguments["start_line"] == .int(33))
+        #expect(call?.function.arguments["end_line"] == .int(39))
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(processor.processEOS()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        #expect(!visible.contains("file_read"))
+        #expect(!visible.contains("```json"))
+        #expect(!visible.contains("DSV4_UI_TOUT_OK"))
+    }
+
+    @Test("split DSV4 bare-name fenced JSON file_read attempt stays buffered")
+    func splitDSV4BareNameFencedJSONFileReadAttemptStaysBuffered() {
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for chunk in [
+            "file_read\n```json\n",
+            #"{"path": "/Users/eric/Desktop/testmandel/mandelbrot.py", "start_line": 33"#,
+            #", "end_line": 39}"#,
+            "\n```\nDSV4_UI_TOUT_OK: post-tool prose should not leak.",
+        ] {
+            visible += processor.processChunk(chunk) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        let call = processor.toolCalls.first
+        #expect(call?.function.name == "file_read")
+        #expect(
+            call?.function.arguments["path"]
+                == .string("/Users/eric/Desktop/testmandel/mandelbrot.py")
+        )
+        #expect(call?.function.arguments["start_line"] == .int(33))
+        #expect(call?.function.arguments["end_line"] == .int(39))
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("file_read"))
+        #expect(!visible.contains("```json"))
+        #expect(!visible.contains("DSV4_UI_TOUT_OK"))
+    }
+
     @Test("truncated schema-less DSV4 JSON tool intent is quarantined without visible leakage")
     func truncatedSchemaLessDSV4JSONToolIntentIsQuarantinedWithoutVisibleLeakage() {
         let output = """
