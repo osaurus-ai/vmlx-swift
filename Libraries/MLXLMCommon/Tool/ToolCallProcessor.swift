@@ -100,7 +100,15 @@ public class ToolCallProcessor {
 
         let parsed = parser.parseEOS(toolCallBuffer, tools: tools)
         toolCalls.append(contentsOf: parsed)
-        let unparsedText = parsed.isEmpty ? leadingTextBeforeToolCall + toolCallBuffer : nil
+        let suppressUnparsedInlineToolIntent =
+            parsed.isEmpty
+            && state == .collectingInlineToolCall
+            && parser.supportsInlineJSONToolFallback
+            && looksLikeExplicitInlineToolIntent(toolCallBuffer)
+        let unparsedText =
+            parsed.isEmpty && !suppressUnparsedInlineToolIntent
+            ? leadingTextBeforeToolCall + toolCallBuffer
+            : nil
 
         toolCallBuffer = ""
         leadingTextBeforeToolCall = ""
@@ -177,6 +185,19 @@ public class ToolCallProcessor {
             if ch == "{" { depth += 1 } else if ch == "}" { depth -= 1 }
         }
         return depth == 0
+    }
+
+    private func looksLikeExplicitInlineToolIntent(_ text: String) -> Bool {
+        let compact = text.unicodeScalars.filter {
+            !CharacterSet.whitespacesAndNewlines.contains($0)
+        }.map(String.init).joined()
+        guard compact.hasPrefix("{") else { return false }
+        return compact.hasPrefix(#"{"tool":"#)
+            || compact.hasPrefix(#"{"tool_name":"#)
+            || compact.hasPrefix(#"{"function":{"#)
+            || compact.contains(#","tool":"#)
+            || compact.contains(#","tool_name":"#)
+            || compact.contains(#","function":{"#)
     }
 
     /// Process chunk for tagged formats.
