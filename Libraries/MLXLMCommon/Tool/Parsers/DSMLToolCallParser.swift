@@ -76,6 +76,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         if let firstCall = parseFirstInvoke(in: text, tools: tools) {
             return firstCall
         }
+        if let pythonCall = parsePythonStyleToolFallback(in: text, tools: tools) {
+            return pythonCall
+        }
         return parseInlineJSONToolFallback(in: text, tools: tools)
     }
 
@@ -90,6 +93,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         let buffer = strippedOuterToolTags(from: toolCallBuffer)
         let calls = parseAllInvokes(in: buffer, tools: tools)
         if !calls.isEmpty { return calls }
+        if let pythonCall = parsePythonStyleToolFallback(in: buffer, tools: tools) {
+            return [pythonCall]
+        }
         return parseInlineJSONToolFallback(in: buffer, tools: tools).map { [$0] } ?? []
     }
 
@@ -296,6 +302,157 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             }
         }
         return ToolCall(function: .init(name: name, arguments: args))
+    }
+
+    /// Some live DSV4 JANGTQ2 app rows try to invoke folder tools as a
+    /// Python-like function with JSON-style labels, for example:
+    /// `file_read("path": "...", "start_line": 33, "end_line": 39)`.
+    /// Treat that as a tool attempt instead of visible answer text.
+    private func parsePythonStyleToolFallback(
+        in text: String,
+        tools: [[String: any Sendable]]?
+    ) -> ToolCall? {
+        guard
+            let candidate = firstPythonStyleToolCallCandidate(in: text, tools: tools)
+        else { return nil }
+
+        let args = normalizePythonStyleArguments(candidate.arguments)
+        if let tools, !tools.isEmpty {
+            guard let spec = functionSpec(named: candidate.name, in: tools) else { return nil }
+            if let invalidArgs = inlineSchemaValidationFailure(
+                toolName: candidate.name,
+                arguments: args,
+                functionSpec: spec)
+            {
+                return ToolCall(function: .init(name: candidate.name, arguments: invalidArgs))
+            }
+        } else if !Self.schemaLessFallbackToolNames.contains(candidate.name) {
+            return nil
+        }
+        return ToolCall(function: .init(name: candidate.name, arguments: args))
+    }
+
+    private static let schemaLessFallbackToolNames: Set<String> = [
+        "file_tree",
+        "file_read",
+        "file_write",
+        "file_edit",
+        "file_search",
+        "shell_run",
+        "git_status",
+        "git_diff",
+        "git_commit",
+    ]
+
+    private func firstPythonStyleToolCallCandidate(
+        in text: String,
+        tools: [[String: any Sendable]]?
+    ) -> (name: String, arguments: String)? {
+        let names = pythonStyleToolNames(from: tools)
+        for name in names {
+            var searchStart = text.startIndex
+            let needle = "\(name)("
+            while let range = text.range(of: needle, range: searchStart ..< text.endIndex) {
+                guard isFunctionNameBoundary(text, before: range.lowerBound) else {
+                    searchStart = range.upperBound
+                    continue
+                }
+                let openParen = text.index(before: range.upperBound)
+                guard let closeParen = matchingCloseParen(in: text, openParen: openParen) else {
+                    return nil
+                }
+                let argsStart = text.index(after: openParen)
+                return (name, String(text[argsStart ..< closeParen]))
+            }
+        }
+        return nil
+    }
+
+    private func pythonStyleToolNames(from tools: [[String: any Sendable]]?) -> [String] {
+        let schemaNames = tools?.compactMap { tool -> String? in
+            let function = (tool["function"] as? [String: any Sendable]) ?? tool
+            return function["name"] as? String
+        } ?? []
+        if !schemaNames.isEmpty {
+            return schemaNames.sorted { $0.count > $1.count }
+        }
+        return Self.schemaLessFallbackToolNames.sorted { $0.count > $1.count }
+    }
+
+    private func isFunctionNameBoundary(_ text: String, before index: String.Index) -> Bool {
+        guard index > text.startIndex else { return true }
+        let previous = text[text.index(before: index)]
+        return !(previous.isLetter || previous.isNumber || previous == "_")
+    }
+
+    private func matchingCloseParen(in text: String, openParen: String.Index) -> String.Index? {
+        var depth = 0
+        var quote: Character?
+        var escaped = false
+        var cursor = openParen
+        while cursor < text.endIndex {
+            let ch = text[cursor]
+            defer { cursor = text.index(after: cursor) }
+            if escaped {
+                escaped = false
+                continue
+            }
+            if ch == "\\" {
+                escaped = quote != nil
+                continue
+            }
+            if let activeQuote = quote {
+                if ch == activeQuote { quote = nil }
+                continue
+            }
+            if ch == "\"" || ch == "'" {
+                quote = ch
+                continue
+            }
+            if ch == "(" {
+                depth += 1
+            } else if ch == ")" {
+                depth -= 1
+                if depth == 0 { return cursor }
+                if depth < 0 { return nil }
+            }
+        }
+        return nil
+    }
+
+    private func normalizePythonStyleArguments(_ arguments: String) -> [String: any Sendable] {
+        let trimmed = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let data = "{\(trimmed)}".data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let normalized = normalizeJSON(object) as? [String: any Sendable]
+        {
+            return normalized
+        }
+        return normalizePythonKeywordArguments(trimmed)
+    }
+
+    private func normalizePythonKeywordArguments(_ arguments: String) -> [String: any Sendable] {
+        var result: [String: any Sendable] = [:]
+        let pattern = #"(\w+)\s*=\s*('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^,\)]+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return result }
+        let range = NSRange(arguments.startIndex ..< arguments.endIndex, in: arguments)
+        for match in regex.matches(in: arguments, range: range) {
+            guard
+                let keyRange = Range(match.range(at: 1), in: arguments),
+                let valueRange = Range(match.range(at: 2), in: arguments)
+            else { continue }
+            let key = String(arguments[keyRange])
+            var value = String(arguments[valueRange]).trimmingCharacters(in: .whitespaces)
+            if (value.hasPrefix("'") && value.hasSuffix("'"))
+                || (value.hasPrefix("\"") && value.hasSuffix("\""))
+            {
+                value = String(value.dropFirst().dropLast())
+                result[key] = value
+            } else {
+                result[key] = decodeJSONValue(value, fallbackString: value)
+            }
+        }
+        return result
     }
 
     private func fallbackToolName(in object: [String: Any], allowBareName: Bool) -> String? {

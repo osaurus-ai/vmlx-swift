@@ -104,6 +104,33 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
         }
     }
 
+    @Test("live DSV4 python-style file_read attempt is captured without visible leakage")
+    func liveDSV4PythonStyleFileReadAttemptIsCapturedWithoutVisibleLeakage() {
+        let output = #"""
+            file_read("path": "/Users/eric/Desktop/testmandel/mandelbrot.py", "start_line": 33, "end_line": 39)???
+            Wait, I will read precisely.
+            """#
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        let call = processor.toolCalls.first
+        #expect(call?.function.name == "file_read")
+        #expect(
+            call?.function.arguments["path"]
+                == .string("/Users/eric/Desktop/testmandel/mandelbrot.py")
+        )
+        #expect(call?.function.arguments["start_line"] == .int(33))
+        #expect(call?.function.arguments["end_line"] == .int(39))
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("file_read"))
+        #expect(!visible.contains("Wait, I will read"))
+    }
+
     @Test("truncated schema-less DSV4 JSON tool intent is quarantined without visible leakage")
     func truncatedSchemaLessDSV4JSONToolIntentIsQuarantinedWithoutVisibleLeakage() {
         let output = """

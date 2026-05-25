@@ -31,6 +31,8 @@ public class ToolCallProcessor {
     private var state = State.normal
     private var toolCallBuffer = ""
     private var leadingTextBeforeToolCall = ""
+    private var inlineToolCallKind = InlineToolCallKind.json
+    private var suppressingTextAfterInlineToolCall = false
 
     /// The tool calls extracted during processing.
     public var toolCalls: [ToolCall] = []
@@ -42,6 +44,11 @@ public class ToolCallProcessor {
         case potentialToolCall
         case collectingToolCall
         case collectingInlineToolCall
+    }
+
+    private enum InlineToolCallKind {
+        case json
+        case functionCall
     }
 
     // MARK: - Initialization
@@ -73,6 +80,9 @@ public class ToolCallProcessor {
     /// - Parameter chunk: The text chunk to process
     /// - Returns: Regular text that should be displayed (non-tool call content), or `nil` if buffering
     public func processChunk(_ chunk: String) -> String? {
+        if suppressingTextAfterInlineToolCall {
+            return nil
+        }
         if isInlineFormat {
             return processInlineChunk(chunk)
         }
@@ -89,6 +99,15 @@ public class ToolCallProcessor {
     /// will already be empty at generation end, making this a no-op.
     @discardableResult
     public func processEOS() -> String? {
+        defer {
+            suppressingTextAfterInlineToolCall = false
+            inlineToolCallKind = .json
+        }
+        if state == .normal, !leadingTextBeforeToolCall.isEmpty {
+            let visible = leadingTextBeforeToolCall
+            leadingTextBeforeToolCall = ""
+            return visible.isEmpty ? nil : visible
+        }
         guard
             state == .collectingToolCall || state == .potentialToolCall
                 || state == .collectingInlineToolCall
@@ -126,10 +145,35 @@ public class ToolCallProcessor {
     private func processInlineChunk(_ chunk: String) -> String? {
         switch state {
         case .normal:
+            let inlineText = leadingTextBeforeToolCall + chunk
+            leadingTextBeforeToolCall = ""
+
+            if let callIndex = firstInlineFunctionToolCallStart(in: inlineText) {
+                let leading = String(inlineText[..<callIndex])
+                inlineToolCallKind = .functionCall
+                toolCallBuffer = String(inlineText[callIndex...])
+                state = .collectingInlineToolCall
+
+                if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
+                    toolCalls.append(toolCall)
+                    toolCallBuffer = ""
+                    state = .normal
+                    suppressingTextAfterInlineToolCall = true
+                }
+                return leading.isEmpty ? nil : leading
+            }
+
+            if let pendingIndex = partialInlineFunctionToolCallStart(in: inlineText) {
+                let visible = String(inlineText[..<pendingIndex])
+                leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
+                return visible.isEmpty ? nil : visible
+            }
+
             // Check if this chunk starts what looks like a JSON tool call
-            if let braceIndex = chunk.firstIndex(of: "{") {
-                let leading = String(chunk[..<braceIndex])
-                let jsonPart = String(chunk[braceIndex...])
+            if let braceIndex = inlineText.firstIndex(of: "{") {
+                let leading = String(inlineText[..<braceIndex])
+                let jsonPart = String(inlineText[braceIndex...])
+                inlineToolCallKind = .json
                 toolCallBuffer = jsonPart
                 state = .collectingInlineToolCall
 
@@ -153,7 +197,7 @@ public class ToolCallProcessor {
             }
 
             // No brace seen — pass through as regular text
-            return chunk
+            return inlineText
 
         case .potentialToolCall, .collectingToolCall, .collectingInlineToolCall:
             toolCallBuffer += chunk
@@ -162,15 +206,23 @@ public class ToolCallProcessor {
                 toolCalls.append(toolCall)
                 toolCallBuffer = ""
                 state = .normal
+                if inlineToolCallKind == .functionCall {
+                    suppressingTextAfterInlineToolCall = true
+                }
                 return nil
             }
 
-            // If braces are balanced but parse failed, this isn't a tool call — flush
-            if jsonBracesBalanced(toolCallBuffer) {
+            // If the explicit inline candidate is complete but parse failed,
+            // keep tool-shaped DSV4 fallback bytes out of the visible answer.
+            if inlineToolCallComplete(toolCallBuffer) {
+                let suppressUnparsedInlineToolIntent =
+                    parser.supportsInlineJSONToolFallback
+                    && looksLikeExplicitInlineToolIntent(toolCallBuffer)
                 state = .normal
                 let buffer = toolCallBuffer
                 toolCallBuffer = ""
-                return buffer
+                inlineToolCallKind = .json
+                return suppressUnparsedInlineToolIntent ? nil : buffer
             }
 
             // Still collecting
@@ -187,17 +239,129 @@ public class ToolCallProcessor {
         return depth == 0
     }
 
+    private func inlineToolCallComplete(_ text: String) -> Bool {
+        switch inlineToolCallKind {
+        case .json:
+            return jsonBracesBalanced(text)
+        case .functionCall:
+            return functionCallParenthesesBalanced(text)
+        }
+    }
+
+    private func functionCallParenthesesBalanced(_ text: String) -> Bool {
+        guard let open = text.firstIndex(of: "(") else { return false }
+        var depth = 0
+        var quote: Character?
+        var escaped = false
+        var sawClose = false
+        var cursor = open
+        while cursor < text.endIndex {
+            let ch = text[cursor]
+            defer { cursor = text.index(after: cursor) }
+            if escaped {
+                escaped = false
+                continue
+            }
+            if ch == "\\" {
+                escaped = quote != nil
+                continue
+            }
+            if let activeQuote = quote {
+                if ch == activeQuote { quote = nil }
+                continue
+            }
+            if ch == "\"" || ch == "'" {
+                quote = ch
+                continue
+            }
+            if ch == "(" {
+                depth += 1
+            } else if ch == ")" {
+                depth -= 1
+                if depth == 0 {
+                    sawClose = true
+                    break
+                }
+                if depth < 0 { return false }
+            }
+        }
+        return sawClose
+    }
+
     private func looksLikeExplicitInlineToolIntent(_ text: String) -> Bool {
         let compact = text.unicodeScalars.filter {
             !CharacterSet.whitespacesAndNewlines.contains($0)
         }.map(String.init).joined()
-        guard compact.hasPrefix("{") else { return false }
-        return compact.hasPrefix(#"{"tool":"#)
-            || compact.hasPrefix(#"{"tool_name":"#)
-            || compact.hasPrefix(#"{"function":{"#)
-            || compact.contains(#","tool":"#)
-            || compact.contains(#","tool_name":"#)
-            || compact.contains(#","function":{"#)
+        if compact.hasPrefix("{") {
+            return inlineFunctionToolNames().contains { name in
+                compact.contains(#""tool":"\#(name)""#)
+                    || compact.contains(#""tool_name":"\#(name)""#)
+                    || compact.contains(#""function":{"name":"\#(name)""#)
+                    || compact.contains(#""function":{"#)
+                        && compact.contains(#""name":"\#(name)""#)
+            }
+        }
+        return inlineFunctionToolNames().contains { compact.hasPrefix("\($0)(") }
+    }
+
+    private func firstInlineFunctionToolCallStart(in text: String) -> String.Index? {
+        inlineFunctionToolNames()
+            .compactMap { name -> String.Index? in
+                var searchStart = text.startIndex
+                let needle = "\(name)("
+                while let range = text.range(of: needle, range: searchStart ..< text.endIndex) {
+                    if isInlineFunctionBoundary(text, before: range.lowerBound) {
+                        return range.lowerBound
+                    }
+                    searchStart = range.upperBound
+                }
+                return nil
+            }
+            .min()
+    }
+
+    private func partialInlineFunctionToolCallStart(in text: String) -> String.Index? {
+        guard !text.isEmpty else { return nil }
+        let needles = inlineFunctionToolNames().map { "\($0)(" }
+        var best: String.Index?
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            if isInlineFunctionBoundary(text, before: cursor) {
+                let suffix = String(text[cursor...])
+                if needles.contains(where: { $0.hasPrefix(suffix) && suffix.count < $0.count }) {
+                    best = cursor
+                }
+            }
+            cursor = text.index(after: cursor)
+        }
+        return best
+    }
+
+    private func isInlineFunctionBoundary(_ text: String, before index: String.Index) -> Bool {
+        guard index > text.startIndex else { return true }
+        let previous = text[text.index(before: index)]
+        return !(previous.isLetter || previous.isNumber || previous == "_")
+    }
+
+    private func inlineFunctionToolNames() -> [String] {
+        let schemaNames = tools?.compactMap { tool -> String? in
+            let function = (tool["function"] as? [String: any Sendable]) ?? tool
+            return function["name"] as? String
+        } ?? []
+        if !schemaNames.isEmpty {
+            return schemaNames.sorted { $0.count > $1.count }
+        }
+        return [
+            "file_search",
+            "file_read",
+            "file_tree",
+            "file_write",
+            "file_edit",
+            "shell_run",
+            "git_status",
+            "git_diff",
+            "git_commit",
+        ]
     }
 
     /// Process chunk for tagged formats.
@@ -207,6 +371,12 @@ public class ToolCallProcessor {
             case .collectingInlineToolCall:
                 return processInlineChunk(chunk)
             case .normal:
+                if !leadingTextBeforeToolCall.isEmpty
+                    || firstInlineFunctionToolCallStart(in: chunk) != nil
+                    || partialInlineFunctionToolCallStart(in: chunk) != nil
+                {
+                    return processInlineChunk(chunk)
+                }
                 if let braceIndex = chunk.firstIndex(of: "{") {
                     let taggedIndex = startTagFirstChar.flatMap { chunk.firstIndex(of: $0) }
                     if taggedIndex == nil || braceIndex < taggedIndex! {
