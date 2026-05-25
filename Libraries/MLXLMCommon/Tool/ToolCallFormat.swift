@@ -55,6 +55,13 @@ public protocol ToolCallParser: Sendable {
     /// stricter formats can reject impossible prefixes so literal tag-looking
     /// prose is surfaced instead of being buffered forever.
     func isValidPartialContent(_ toolCallBuffer: String) -> Bool
+
+    /// Whether a tagged parser should also buffer a top-level JSON object as a
+    /// possible tool call. This is intentionally opt-in: most tagged formats
+    /// should leave ordinary JSON answers visible. DSV4 uses this for live
+    /// outputs that fall back from DSML to `{"tool": "name", ...}` while still
+    /// carrying a registered tool name.
+    var supportsInlineJSONToolFallback: Bool { get }
 }
 
 extension ToolCallParser {
@@ -73,6 +80,8 @@ extension ToolCallParser {
     public func isValidPartialContent(_ toolCallBuffer: String) -> Bool {
         true
     }
+
+    public var supportsInlineJSONToolFallback: Bool { false }
 
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         if let startTag {

@@ -64,6 +64,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
     ]
     public let startTagPrefixes: [String] = [Self.dsmlToolStartPrefix]
     public let endTagPrefixes: [String] = [Self.dsmlToolEndPrefix]
+    public let supportsInlineJSONToolFallback = true
 
     public init() {}
 
@@ -72,10 +73,10 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         let text = strippedOuterToolTags(from: content)
 
         // Find first <｜DSML｜invoke name="...">
-        guard let firstCall = parseFirstInvoke(in: text, tools: tools) else {
-            return nil
+        if let firstCall = parseFirstInvoke(in: text, tools: tools) {
+            return firstCall
         }
-        return firstCall
+        return parseInlineJSONToolFallback(in: text, tools: tools)
     }
 
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall]
@@ -87,7 +88,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         // internally by `<｜DSML｜invoke ...>` per call. Parse all
         // invokes in order.
         let buffer = strippedOuterToolTags(from: toolCallBuffer)
-        return parseAllInvokes(in: buffer, tools: tools)
+        let calls = parseAllInvokes(in: buffer, tools: tools)
+        if !calls.isEmpty { return calls }
+        return parseInlineJSONToolFallback(in: buffer, tools: tools).map { [$0] } ?? []
     }
 
     // MARK: - Internals
@@ -240,6 +243,82 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             cursor = paramEnd.upperBound
         }
         return args
+    }
+
+    /// DSV4 live rows have occasionally fallen back from DSML to a top-level
+    /// JSON object such as `{"tool":"file_read", ...}`. Treat that as a tool
+    /// intent only when the named tool is present in the provided schema list.
+    /// Unknown names and ordinary JSON answers remain visible text.
+    private func parseInlineJSONToolFallback(
+        in text: String,
+        tools: [[String: any Sendable]]?
+    ) -> ToolCall? {
+        guard let tools, !tools.isEmpty else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("{"), trimmed.hasSuffix("}"),
+            let data = trimmed.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+
+        guard let name = fallbackToolName(in: object),
+            knownToolNames(in: tools).contains(name)
+        else { return nil }
+
+        let argsObject: Any
+        if let function = object["function"] as? [String: Any] {
+            if let arguments = function["arguments"] {
+                argsObject = arguments
+            } else if let parameters = function["parameters"] {
+                argsObject = parameters
+            } else {
+                argsObject = [:] as [String: Any]
+            }
+        } else if let arguments = object["arguments"] {
+            argsObject = arguments
+        } else if let parameters = object["parameters"] {
+            argsObject = parameters
+        } else {
+            let reserved = Set(["tool", "tool_name", "name", "function", "arguments", "parameters", "type", "id"])
+            argsObject = object.filter { !reserved.contains($0.key) }
+        }
+
+        let args = normalizeInlineArguments(argsObject)
+        return ToolCall(function: .init(name: name, arguments: args))
+    }
+
+    private func fallbackToolName(in object: [String: Any]) -> String? {
+        if let tool = object["tool"] as? String { return tool }
+        if let toolName = object["tool_name"] as? String { return toolName }
+        if let name = object["name"] as? String { return name }
+        if let function = object["function"] as? [String: Any],
+            let name = function["name"] as? String
+        {
+            return name
+        }
+        return nil
+    }
+
+    private func knownToolNames(in tools: [[String: any Sendable]]) -> Set<String> {
+        Set(
+            tools.compactMap { tool in
+                let function = (tool["function"] as? [String: any Sendable]) ?? tool
+                return function["name"] as? String
+            }
+        )
+    }
+
+    private func normalizeInlineArguments(_ value: Any) -> [String: any Sendable] {
+        if let string = value as? String,
+            let data = string.data(using: .utf8),
+            let parsed = try? JSONSerialization.jsonObject(with: data),
+            let normalized = normalizeJSON(parsed) as? [String: any Sendable]
+        {
+            return normalized
+        }
+        if let normalized = normalizeJSON(value) as? [String: any Sendable] {
+            return normalized
+        }
+        return [:]
     }
 
     /// Extract `attr="VALUE"` from a header string. When

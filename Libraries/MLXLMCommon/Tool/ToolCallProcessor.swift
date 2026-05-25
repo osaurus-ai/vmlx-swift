@@ -41,6 +41,7 @@ public class ToolCallProcessor {
         case normal
         case potentialToolCall
         case collectingToolCall
+        case collectingInlineToolCall
     }
 
     // MARK: - Initialization
@@ -88,7 +89,10 @@ public class ToolCallProcessor {
     /// will already be empty at generation end, making this a no-op.
     @discardableResult
     public func processEOS() -> String? {
-        guard state == .collectingToolCall || state == .potentialToolCall else { return nil }
+        guard
+            state == .collectingToolCall || state == .potentialToolCall
+                || state == .collectingInlineToolCall
+        else { return nil }
         guard !toolCallBuffer.isEmpty else {
             state = .normal
             return nil
@@ -119,7 +123,7 @@ public class ToolCallProcessor {
                 let leading = String(chunk[..<braceIndex])
                 let jsonPart = String(chunk[braceIndex...])
                 toolCallBuffer = jsonPart
-                state = .collectingToolCall
+                state = .collectingInlineToolCall
 
                 if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
                     toolCalls.append(toolCall)
@@ -143,7 +147,7 @@ public class ToolCallProcessor {
             // No brace seen — pass through as regular text
             return chunk
 
-        case .potentialToolCall, .collectingToolCall:
+        case .potentialToolCall, .collectingToolCall, .collectingInlineToolCall:
             toolCallBuffer += chunk
 
             if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
@@ -177,6 +181,22 @@ public class ToolCallProcessor {
 
     /// Process chunk for tagged formats.
     private func processTaggedChunk(_ chunk: String) -> String? {
+        if parser.supportsInlineJSONToolFallback {
+            switch state {
+            case .collectingInlineToolCall:
+                return processInlineChunk(chunk)
+            case .normal:
+                if let braceIndex = chunk.firstIndex(of: "{") {
+                    let taggedIndex = startTagFirstChar.flatMap { chunk.firstIndex(of: $0) }
+                    if taggedIndex == nil || braceIndex < taggedIndex! {
+                        return processInlineChunk(chunk)
+                    }
+                }
+            case .potentialToolCall, .collectingToolCall:
+                break
+            }
+        }
+
         let startTags = parser.startTagAliases
         let startTagPrefixes = parser.startTagPrefixes
         guard (!startTags.isEmpty || !startTagPrefixes.isEmpty),
@@ -270,6 +290,8 @@ public class ToolCallProcessor {
             } else {
                 return nil
             }
+        case .collectingInlineToolCall:
+            return processInlineChunk(chunk)
         }
     }
 
