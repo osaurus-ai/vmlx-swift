@@ -617,7 +617,10 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
                         "parameters": [
                             "type": "object",
                             "properties": [
-                                "query": ["type": "string"] as [String: any Sendable],
+                                "query": [
+                                    "type": "string",
+                                    "description": "Search query text.",
+                                ] as [String: any Sendable],
                             ] as [String: any Sendable],
                             "required": ["query"],
                         ] as [String: any Sendable],
@@ -627,12 +630,20 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             "bos_token": "<bos>",
             "add_generation_prompt": true,
             "enable_thinking": false,
+            "tool_choice": "required",
+            "tool_choice_name": "osaurus_probe_tool_0",
         ])
 
         #expect(rendered.contains("<|vision_start|><image><|vision_end|>"))
         #expect(rendered.contains("Describe the image"))
         #expect(rendered.contains("<name>osaurus_probe_tool_0</name>"))
+        #expect(rendered.contains("<name>query</name>"))
+        #expect(rendered.contains("<type>string</type>"))
+        #expect(rendered.contains("<description>Search query text.</description>"))
+        #expect(rendered.contains("<required>[\"query\"]</required>"))
         #expect(rendered.contains("<zyphra_tool_call>"))
+        #expect(rendered.contains("The current assistant response MUST be a tool call"))
+        #expect(rendered.contains("Use the `osaurus_probe_tool_0` function."))
         #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
         #expect(!rendered.contains("<think>"))
         #expect(!rendered.contains("enable_thinking"))

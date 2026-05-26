@@ -787,6 +787,18 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
 {%- if tools is not defined -%}
     {%- set tools = [] -%}
 {%- endif -%}
+{%- set required_tool_choice = false -%}
+{%- set required_tool_name = '' -%}
+{%- if tool_choice is defined and tool_choice == 'required' -%}
+    {%- set required_tool_choice = true -%}
+{%- elif additionalContext is defined and additionalContext['tool_choice'] == 'required' -%}
+    {%- set required_tool_choice = true -%}
+{%- endif -%}
+{%- if tool_choice_name is defined -%}
+    {%- set required_tool_name = tool_choice_name -%}
+{%- elif additionalContext is defined and additionalContext['tool_choice_name'] is defined -%}
+    {%- set required_tool_name = additionalContext['tool_choice_name'] -%}
+{%- endif -%}
 
 {%- macro render_content(content) -%}
     {%- if content is string -%}
@@ -838,12 +850,35 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
             {%- if tool['description'] is defined -%}
                 {{- '\n<description>' ~ (tool['description'] | trim) ~ '</description>' -}}
             {%- endif -%}
-            {%- if tool['parameters'] is defined -%}
+            {%- if tool['parameters'] is defined and tool['parameters']['properties'] is defined -%}
+                {{- '\n<parameters>' -}}
+                {%- for param_name, param in tool['parameters']['properties'] | dictsort -%}
+                    {{- '\n<parameter>\n<name>' ~ param_name ~ '</name>' -}}
+                    {%- if param['type'] is defined -%}
+                        {{- '\n<type>' ~ param['type'] ~ '</type>' -}}
+                    {%- endif -%}
+                    {%- if param['description'] is defined -%}
+                        {{- '\n<description>' ~ (param['description'] | trim) ~ '</description>' -}}
+                    {%- endif -%}
+                    {{- '\n</parameter>' -}}
+                {%- endfor -%}
+                {%- if tool['parameters']['required'] is defined -%}
+                    {{- '\n<required>' ~ (tool['parameters']['required'] | tojson | safe) ~ '</required>' -}}
+                {%- endif -%}
+                {{- '\n</parameters>' -}}
+            {%- elif tool['parameters'] is defined -%}
                 {{- '\n<parameters>' ~ (tool['parameters'] | tojson | safe) ~ '</parameters>' -}}
             {%- endif -%}
             {{- '\n</function>' -}}
         {%- endfor -%}
         {{- '\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<zyphra_tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</zyphra_tool_call>' -}}
+        {%- if required_tool_choice -%}
+            {{- '\n\n<IMPORTANT>\nThe current assistant response MUST be a tool call. Reply only with a `<zyphra_tool_call>` block for one available function and no prose before the tool result. Include every required `<parameter=...>` value exactly as requested.' -}}
+            {%- if required_tool_name -%}
+                {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
+            {%- endif -%}
+            {{- '\n</IMPORTANT>' -}}
+        {%- endif -%}
     {%- endif -%}
     {{- '<|im_end|>\n' -}}
 {%- endif -%}
