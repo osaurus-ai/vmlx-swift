@@ -155,6 +155,27 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(ssm.contains("try save(arrays: arrays, metadata: [\"format\": \"mlx\"], url: safetensorsURL)"))
     }
 
+    @Test("SSM companion cache serializes in-memory MLX materialization")
+    func ssmCompanionCacheSerializesInMemoryMLXMaterialization() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Cache/SSMStateCache.swift",
+            encoding: .utf8)
+        let store = try #require(source.range(of: "public func store("))
+        let storeSource = String(source[store.lowerBound...])
+
+        #expect(storeSource.contains("MLXDiskCacheIOLock.shared.lock()"))
+        #expect(storeSource.contains("MLX.eval(copies)"))
+        #expect(storeSource.contains("Stream.gpu.synchronize()"))
+        #expect(storeSource.contains("let disk: SSMCompanionDiskStore?"))
+
+        let materialize = try #require(storeSource.range(of: "MLX.eval(copies)"))
+        let lruLock = try #require(storeSource.range(of: "lock.lock()"))
+        let diskWrite = try #require(storeSource.range(of: "try? disk.store("))
+
+        #expect(materialize.lowerBound < lruLock.lowerBound)
+        #expect(lruLock.lowerBound < diskWrite.lowerBound)
+    }
+
     @Test("token iterator trims full cache hits before one-token seed prefill")
     func tokenIteratorTrimsFullCacheHitBeforeSeedPrefill() throws {
         let source = try String(

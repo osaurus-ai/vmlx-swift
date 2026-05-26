@@ -130,12 +130,6 @@ public final class SSMStateCache: @unchecked Sendable {
     ) {
         let key = Self.makeKey(tokens: tokens, boundary: boundary, mediaSalt: mediaSalt, modelKey: modelKey)
 
-        lock.lock()
-        defer { lock.unlock() }
-
-        // Remove existing entry with same key (if any)
-        entries.removeAll { $0.key == key }
-
         // Materialize each state array into a FRESH buffer. The prior
         // `arr[.ellipsis]` was a shape-preserving slice view that shared
         // the source tensor's storage, so any in-place mutation of the
@@ -146,11 +140,32 @@ public final class SSMStateCache: @unchecked Sendable {
         // the lazy graph. Historical precedent: "fetch returned shared
         // refs → model mutated in-place → deep-copy fix" from session
         // 2026-03-28b.
-        let copies = ssmStates.map { arr -> MLXArray in
-            let copy = arr * 1
-            MLX.eval(copy)
-            return copy
+        //
+        // Materialization must not race other cache/disk MLX I/O. A live Ling
+        // row hit a Metal command-buffer assertion when this path started a
+        // new encoder while cache store was still draining. Use the same
+        // process-wide MLX disk/cache I/O lock as DiskCache and
+        // SSMCompanionDiskStore, and keep the in-memory LRU lock out of the
+        // MLX.eval section so cache readers are not blocked by GPU work.
+        MLXDiskCacheIOLock.shared.lock()
+        let copies: [MLXArray]
+        do {
+            defer {
+                Stream.gpu.synchronize()
+                MLXDiskCacheIOLock.shared.unlock()
+            }
+            copies = ssmStates.map { $0 * 1 }
+            if !copies.isEmpty {
+                MLX.eval(copies)
+            }
+            Stream.gpu.synchronize()
         }
+
+        let disk: SSMCompanionDiskStore?
+        lock.lock()
+
+        // Remove existing entry with same key (if any)
+        entries.removeAll { $0.key == key }
 
         // Append to end (most recently used position)
         entries.append((key: key, states: copies, isComplete: isComplete))
@@ -159,6 +174,8 @@ public final class SSMStateCache: @unchecked Sendable {
         if entries.count > maxEntries {
             entries.removeFirst()
         }
+        disk = diskStore
+        lock.unlock()
 
         // §441 — write-through to disk tier if configured. Done outside
         // the in-memory critical path's hot section by capturing the
@@ -171,7 +188,7 @@ public final class SSMStateCache: @unchecked Sendable {
         // Omni hybrid prefixes don't collide with text-only prefixes
         // sharing the same token sequence. Previously hardcoded nil
         // here → silent L2 alias on cold start of the next session.
-        if let disk = diskStore {
+        if let disk {
             try? disk.store(
                 ssmStates: copies,
                 tokens: tokens,
