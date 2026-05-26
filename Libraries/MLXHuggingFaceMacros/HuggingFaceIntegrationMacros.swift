@@ -234,6 +234,28 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            adjustedContext?["reasoning_effort"] != nil {
                             adjustedContext?.removeValue(forKey: "reasoning_effort")
                         }
+                        if !(tools?.isEmpty ?? true),
+                           upstream.bosToken == "<s>",
+                           upstream.convertTokenToId("<|im_end|>") != nil,
+                           upstream.convertTokenToId("[AVAILABLE_TOOLS]") != nil,
+                           upstream.convertTokenToId("<tool_call>") != nil,
+                           upstream.convertTokenToId("<tool_response>") != nil,
+                           (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
+                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                FileHandle.standardError.write(
+                                    "[vmlx] chat-template tools -> NemotronMinimal fallback engaged\\n"
+                                        .data(using: .utf8)!)
+                            }
+                            return try upstream.applyChatTemplate(
+                                messages: messages,
+                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
+                                    MLXLMCommon.ChatTemplateFallbacks.nemotronMinimal),
+                                addGenerationPrompt: true,
+                                truncation: false,
+                                maxLength: nil,
+                                tools: chatTemplateTools,
+                                additionalContext: adjustedContext)
+                        }
                         do {
                             return try upstream.applyChatTemplate(
                                 messages: messages, tools: chatTemplateTools, additionalContext: adjustedContext)
@@ -476,6 +498,23 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            enableThinking == false,
                            adjustedContext?["reasoning_effort"] != nil {
                             adjustedContext?.removeValue(forKey: "reasoning_effort")
+                        }
+                        if !(tools?.isEmpty ?? true),
+                           upstream.bosToken == "<s>",
+                           upstream.convertTokenToId("<|im_end|>") != nil,
+                           upstream.convertTokenToId("[AVAILABLE_TOOLS]") != nil,
+                           upstream.convertTokenToId("<tool_call>") != nil,
+                           upstream.convertTokenToId("<tool_response>") != nil,
+                           (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
+                            return try upstream.applyChatTemplate(
+                                messages: messages,
+                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
+                                    MLXLMCommon.ChatTemplateFallbacks.nemotronMinimal),
+                                addGenerationPrompt: addGenerationPrompt,
+                                truncation: false,
+                                maxLength: nil,
+                                tools: chatTemplateTools,
+                                additionalContext: adjustedContext)
                         }
                         do {
                             return try upstream.applyChatTemplate(
