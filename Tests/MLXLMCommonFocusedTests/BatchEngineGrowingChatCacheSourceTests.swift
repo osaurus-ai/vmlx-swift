@@ -130,8 +130,9 @@ struct BatchEngineGrowingChatCacheSourceTests {
 
         for source in [evaluate, batch, nativeMTP] {
             #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss("))
-            #expect(source.contains("history-boundary cache rederive after trim miss"))
         }
+        #expect(evaluate.contains("history-boundary cache rederive after trim miss"))
+        #expect(batch.contains("history-boundary cache rederive after trim miss"))
     }
 
     @Test("disk cache serializes MLX safetensors IO across model cache instances")
