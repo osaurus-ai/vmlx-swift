@@ -378,6 +378,22 @@ struct CacheCoordinatorTopologyFocusedTests {
         #expect(!source.contains("zaya.writeCCA(conv: conv, prev: prev)"))
     }
 
+    @Test("ZAYA CCA topology advertises CCA companion, not recurrent SSM")
+    func zayaCCATopologyUsesCCACompanionTag() {
+        let topology = ModelCacheTopologySnapshot(
+            layerCount: 2,
+            kvLayerCount: 1,
+            zayaCCALayerCount: 1
+        )
+
+        #expect(topology.requiresSSMCompanionState)
+        #expect(topology.requiresZayaCCACompanionState)
+        #expect(!topology.requiresRecurrentSSMCompanionState)
+        #expect(topology.topologyTags.contains("zayaCCALayers=1"))
+        #expect(topology.topologyTags.contains("companion=zaya-cca"))
+        #expect(!topology.topologyTags.contains("companion=ssm"))
+    }
+
     @Test("hybrid disk media-salt prompt boundary returns exact hit")
     func hybridDiskMediaSaltPromptBoundaryReturnsExactHit() {
         FocusedMLXTestSupport.withLock {

@@ -76,6 +76,14 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
         mambaLayerCount > 0 || arraysLayerCount > 0 || zayaCCALayerCount > 0
     }
 
+    public var requiresZayaCCACompanionState: Bool {
+        zayaCCALayerCount > 0
+    }
+
+    public var requiresRecurrentSSMCompanionState: Bool {
+        mambaLayerCount > 0 || arraysLayerCount > 0
+    }
+
     public var requiresDiskBackedCoordinatorRestore: Bool {
         requiresSSMCompanionState
             || rotatingKVLayerCount > 0
@@ -108,7 +116,8 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
         if arraysLayerCount > 0 { tags.append("arraysLayers=\(arraysLayerCount)") }
         if zayaCCALayerCount > 0 { tags.append("zayaCCALayers=\(zayaCCALayerCount)") }
         if cacheListLayerCount > 0 { tags.append("cacheListLayers=\(cacheListLayerCount)") }
-        if requiresSSMCompanionState { tags.append("companion=ssm") }
+        if requiresRecurrentSSMCompanionState { tags.append("companion=ssm") }
+        if requiresZayaCCACompanionState { tags.append("companion=zaya-cca") }
         if requiresDiskBackedCoordinatorRestore { tags.append("restore=disk-backed") }
         return tags
     }
