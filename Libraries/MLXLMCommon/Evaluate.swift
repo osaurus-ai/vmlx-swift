@@ -3638,7 +3638,9 @@ internal func _decodePromptTail(
     } else {
         tailArray = promptTokens[.ellipsis, startIdx ..< total]
     }
-    let tailInts = tailArray.asArray(Int32.self).map { Int($0) }
+    let tailInts = MLXCacheIOLock.withSerializedMLXCacheIO {
+        tailArray.asArray(Int32.self).map { Int($0) }
+    }
     return tokenizer.decode(tokenIds: tailInts, skipSpecialTokens: false)
 }
 

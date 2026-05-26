@@ -162,13 +162,20 @@ struct BatchEngineGrowingChatCacheSourceTests {
         let source = try String(
             contentsOfFile: "Libraries/MLXLMCommon/Cache/SSMStateCache.swift",
             encoding: .utf8)
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
         let store = try #require(source.range(of: "public func store("))
         let storeSource = String(source[store.lowerBound...])
+        let promptTail = try #require(evaluate.range(of: "internal func _decodePromptTail("))
+        let promptTailSource = String(evaluate[promptTail.lowerBound...])
 
         #expect(storeSource.contains("MLXCacheIOLock.withSerializedMLXCacheIO"))
         #expect(storeSource.contains("MLX.eval(materialized)"))
         #expect(storeSource.contains("Stream.gpu.synchronize()"))
         #expect(storeSource.contains("let disk: SSMCompanionDiskStore?"))
+        #expect(promptTailSource.contains("MLXCacheIOLock.withSerializedMLXCacheIO"))
+        #expect(promptTailSource.contains("tailArray.asArray(Int32.self)"))
 
         let materialize = try #require(storeSource.range(of: "MLX.eval(materialized)"))
         let lruLock = try #require(storeSource.range(of: "lock.lock()"))
