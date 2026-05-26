@@ -132,10 +132,26 @@ public class ToolCallProcessor {
             && state == .collectingInlineToolCall
             && parser.supportsInlineJSONToolFallback
             && looksLikeExplicitInlineToolIntent(toolCallBuffer)
-        let unparsedText =
-            parsed.isEmpty && !suppressUnparsedInlineToolIntent
-            ? leadingTextBeforeToolCall + toolCallBuffer
-            : nil
+        let suppressUnparsedTaggedProtocolTail =
+            parsed.isEmpty
+            && (state == .collectingToolCall || state == .potentialToolCall)
+            && looksLikeTaggedProtocolTail(toolCallBuffer)
+        let unparsedText: String?
+        if parsed.isEmpty {
+            if suppressUnparsedInlineToolIntent {
+                unparsedText = nil
+            } else if suppressUnparsedTaggedProtocolTail {
+                unparsedText =
+                    leadingTextBeforeToolCall.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .isEmpty
+                    ? nil
+                    : leadingTextBeforeToolCall
+            } else {
+                unparsedText = leadingTextBeforeToolCall + toolCallBuffer
+            }
+        } else {
+            unparsedText = nil
+        }
 
         toolCallBuffer = ""
         leadingTextBeforeToolCall = ""
@@ -374,6 +390,24 @@ public class ToolCallProcessor {
                 || compact.hasPrefix("\($0)```")
         } || firstInlineBareNameKeyValueToolCallStart(in: text) != nil
             || partialInlineBareNameKeyValueToolCallStart(in: text) != nil
+    }
+
+    private func looksLikeTaggedProtocolTail(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("<") || trimmed.hasPrefix("[") else { return false }
+
+        let tags =
+            parser.startTagAliases + parser.endTagAliases
+            + parser.startTagPrefixes + parser.endTagPrefixes
+
+        if tags.contains(where: { trimmed.hasPrefix($0) }) {
+            return true
+        }
+
+        guard trimmed.count >= 2 else { return false }
+        return tags.contains { tag in
+            tag.hasPrefix(trimmed)
+        }
     }
 
     private func firstInlineFunctionToolCallStart(in text: String) -> String.Index? {

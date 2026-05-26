@@ -168,6 +168,23 @@ struct DSMLToolCallParserFocusedTests {
         #expect(!visible.contains(#"{"text":"#))
     }
 
+    @Test("DSML processor suppresses incomplete protocol opener at EOS")
+    func processorSuppressesIncompleteProtocolOpenerAtEOS() {
+        let dsml = DeepseekV4Tokens.dsml
+        let output = "\n\n<\(dsml)tool_c"
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.isEmpty)
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("DSML"))
+        #expect(!visible.contains("tool_c"))
+    }
+
     @Test("DSML processor routes Osaurus folder and git tools through live aliases")
     func processorRoutesOsaurusFolderAndGitToolsThroughLiveAliases() {
         let fixtures: [DSMLToolFixture] = [
