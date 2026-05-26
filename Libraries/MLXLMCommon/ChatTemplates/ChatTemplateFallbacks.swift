@@ -227,7 +227,6 @@ value_1
 <IMPORTANT>
 The current assistant response MUST be a tool call. Reply only with a `<tool_call>` block for one available tool and no prose before the tool result.
 Include every required parameter declared for the selected tool. Do not emit an empty `<function=...></function>` call.
-For string parameter values with line breaks, put the real line breaks inside the `<parameter=...>` body. Do not write literal `\n` escape sequences.
 Use the available tool names and parameter names exactly:
 {%- for tool in tools %}
   {%- set fn = tool['function'] if tool['function'] is defined else tool %}
