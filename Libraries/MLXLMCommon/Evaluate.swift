@@ -3360,7 +3360,7 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     typealias Output = Generation
 
     var detokenizer: NaiveStreamingDetokenizer
-    let toolCallProcessor: ToolCallProcessor
+    let toolCallProcessor: ToolCallProcessor?
     /// Optional `<think>...</think>` stripper pipelined BEFORE the tool-call
     /// processor. When `nil` every decoded chunk goes straight to the
     /// tool-call processor (matches upstream ml-explore/mlx-swift-lm
@@ -3384,7 +3384,10 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         stopStringMatcher: StopStringMatcher = StopStringMatcher(stopStrings: [])
     ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-        toolCallProcessor = ToolCallProcessor(format: format, tools: tools)
+        let activeTools = tools?.isEmpty == false ? tools : nil
+        toolCallProcessor = activeTools.map {
+            ToolCallProcessor(format: format, tools: $0)
+        }
         self.reasoningParser = reasoningParser
         self.stopStringMatcher = stopStringMatcher
     }

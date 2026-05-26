@@ -591,7 +591,10 @@ public actor BatchEngine {
 
         Task {
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-            let toolCallProcessor = ToolCallProcessor(format: toolCallFormat, tools: toolSchemas)
+            let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil
+            let toolCallProcessor = activeToolSchemas.map {
+                ToolCallProcessor(format: toolCallFormat, tools: $0)
+            }
             var reasoningParser = ReasoningParser.forPrompt(
                 stampName: reasoningParserName,
                 promptTail: promptTail)

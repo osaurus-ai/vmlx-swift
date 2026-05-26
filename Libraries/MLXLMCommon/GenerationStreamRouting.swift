@@ -8,8 +8,18 @@ public enum GenerationTextChannel {
 public func routeGenerationText(
     _ text: String,
     channel: GenerationTextChannel,
-    through toolCallProcessor: ToolCallProcessor
+    through toolCallProcessor: ToolCallProcessor?
 ) -> [Generation] {
+    guard let toolCallProcessor else {
+        guard !text.isEmpty else { return [] }
+        switch channel {
+        case .content:
+            return [.chunk(text)]
+        case .reasoning:
+            return [.reasoning(text)]
+        }
+    }
+
     var events: [Generation] = []
     if let visible = toolCallProcessor.processChunk(text) {
         switch channel {
@@ -32,8 +42,10 @@ public func drainToolCallEvents(from toolCallProcessor: ToolCallProcessor) -> [G
 
 public func flushGenerationText(
     channel: GenerationTextChannel,
-    through toolCallProcessor: ToolCallProcessor
+    through toolCallProcessor: ToolCallProcessor?
 ) -> [Generation] {
+    guard let toolCallProcessor else { return [] }
+
     var events: [Generation] = []
     if let visible = toolCallProcessor.processEOS() {
         switch channel {

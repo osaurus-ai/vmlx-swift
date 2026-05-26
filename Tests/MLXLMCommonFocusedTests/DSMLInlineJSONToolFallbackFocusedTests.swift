@@ -22,8 +22,34 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
         #expect(lmInput.contains("public let toolSchemas: [ToolSpec]?"))
         #expect(lmInput.contains("public func withToolSchemas"))
         #expect(batchEngine.contains("let toolSchemas = input.toolSchemas"))
-        #expect(batchEngine.contains("ToolCallProcessor(format: toolCallFormat, tools: toolSchemas)"))
-        #expect(evaluate.contains("toolCallProcessor = ToolCallProcessor(format: format, tools: tools)"))
+        #expect(batchEngine.contains("let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil"))
+        #expect(batchEngine.contains("ToolCallProcessor(format: toolCallFormat, tools: $0)"))
+        #expect(evaluate.contains("let activeTools = tools?.isEmpty == false ? tools : nil"))
+        #expect(evaluate.contains("ToolCallProcessor(format: format, tools: $0)"))
+    }
+
+    @Test("decode loop disables tool parser without active schemas")
+    func decodeLoopDisablesToolParserWithoutActiveSchemas() throws {
+        let routing = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/GenerationStreamRouting.swift",
+            encoding: .utf8)
+        let batchEngine = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+        let specDec = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/SpecDecStream.swift",
+            encoding: .utf8)
+
+        #expect(routing.contains("through toolCallProcessor: ToolCallProcessor?"))
+        #expect(routing.contains("guard let toolCallProcessor else"))
+        #expect(batchEngine.contains("let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil"))
+        #expect(evaluate.contains("let activeTools = tools?.isEmpty == false ? tools : nil"))
+        #expect(specDec.contains("let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil"))
+        #expect(!batchEngine.contains("ToolCallProcessor(format: toolCallFormat, tools: toolSchemas)"))
+        #expect(!evaluate.contains("toolCallProcessor = ToolCallProcessor(format: format, tools: tools)"))
     }
 
     @Test("registered top-level JSON tool fallback is parsed without visible leakage")

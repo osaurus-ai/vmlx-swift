@@ -53,9 +53,10 @@ public enum SpecDecStream {
                     let promptTokenCount = args.inputIds.dim(1)
                     var detokenizer = NaiveStreamingDetokenizer(
                         tokenizer: tokenizer)
-                    let toolCallProcessor = ToolCallProcessor(
-                        format: toolCallFormat,
-                        tools: toolSchemas)
+                    let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil
+                    let toolCallProcessor = activeToolSchemas.map {
+                        ToolCallProcessor(format: toolCallFormat, tools: $0)
+                    }
                     var reasoningParser = ReasoningParser
                         .fromCapabilityName(reasoningParserName)
 
@@ -115,9 +116,10 @@ public enum SpecDecStream {
                     let promptTokenCount = args.inputIds.dim(1)
                     var detokenizer = NaiveStreamingDetokenizer(
                         tokenizer: tokenizer)
-                    let toolCallProcessor = ToolCallProcessor(
-                        format: toolCallFormat,
-                        tools: toolSchemas)
+                    let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil
+                    let toolCallProcessor = activeToolSchemas.map {
+                        ToolCallProcessor(format: toolCallFormat, tools: $0)
+                    }
                     var reasoningParser = ReasoningParser
                         .fromCapabilityName(reasoningParserName)
 
@@ -224,9 +226,10 @@ public enum SpecDecStream {
                 let promptTokenCount = box.inputIds.dim(1)
                 var detokenizer = NaiveStreamingDetokenizer(
                     tokenizer: tokenizer)
-                let toolCallProcessor = ToolCallProcessor(
-                    format: toolCallFormat,
-                    tools: toolSchemas)
+                let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil
+                let toolCallProcessor = activeToolSchemas.map {
+                    ToolCallProcessor(format: toolCallFormat, tools: $0)
+                }
                 var reasoningParser = ReasoningParser
                     .forPrompt(
                         stampName: reasoningParserName,
@@ -308,7 +311,7 @@ public enum SpecDecStream {
     private static func pushBatch(
         tokens: [Int32],
         detokenizer: inout NaiveStreamingDetokenizer,
-        toolCallProcessor: ToolCallProcessor,
+        toolCallProcessor: ToolCallProcessor?,
         reasoningParser: inout ReasoningParser?,
         continuation: AsyncStream<Generation>.Continuation
     ) {
@@ -360,7 +363,7 @@ public enum SpecDecStream {
     /// `Evaluate.TextToolTokenLoopHandler.onGenerationEnd`.
     private static func flush(
         detokenizer: inout NaiveStreamingDetokenizer,
-        toolCallProcessor: ToolCallProcessor,
+        toolCallProcessor: ToolCallProcessor?,
         reasoningParser: inout ReasoningParser?,
         continuation: AsyncStream<Generation>.Continuation
     ) {
