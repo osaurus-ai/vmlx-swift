@@ -85,6 +85,15 @@ enum NemotronToolChoiceTemplateContext {
     private static let requiredToolDirective =
         "For this assistant turn, return exactly one <tool_call> XML function call for one available function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
 
+    private static func requiredToolDirective(targetName: String?) -> String {
+        guard let targetName,
+              !targetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return requiredToolDirective
+        }
+        return "For this assistant turn, return exactly one <tool_call> XML function call for the \(targetName) function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
+    }
+
     static func applies(to modelType: String?) -> Bool {
         guard let modelType else { return false }
         let normalized = modelType.lowercased()
@@ -103,17 +112,19 @@ enum NemotronToolChoiceTemplateContext {
         }
 
         var out = messages
+        let directive = requiredToolDirective(
+            targetName: additionalContext?["tool_choice_name"] as? String)
         if let index = out.firstIndex(where: { ($0["role"] as? String) == "system" }),
            let content = out[index]["content"] as? String
         {
             var system = out[index]
             let cleaned = removeExistingDirective(from: content)
             system["content"] = cleaned.isEmpty
-                ? requiredToolDirective
-                : "\(requiredToolDirective)\n\n\(cleaned)"
+                ? directive
+                : "\(directive)\n\n\(cleaned)"
             out[index] = system
         } else {
-            out.insert(["role": "system", "content": requiredToolDirective], at: 0)
+            out.insert(["role": "system", "content": directive], at: 0)
         }
         return out
     }
@@ -122,9 +133,12 @@ enum NemotronToolChoiceTemplateContext {
         content
             .split(separator: "\n", omittingEmptySubsequences: false)
             .filter { line in
-                String(line)
+                let normalized = String(line)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .lowercased() != requiredToolDirective.lowercased()
+                    .lowercased()
+                return normalized != requiredToolDirective.lowercased()
+                    && !normalized.hasPrefix(
+                        "for this assistant turn, return exactly one <tool_call> xml function call for the ")
             }
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)

@@ -907,14 +907,38 @@ struct NemotronToolChoiceTemplateFocusedTests {
         let out = NemotronToolChoiceTemplateContext.apply(
             to: messages,
             modelType: "nemotron_h",
-            additionalContext: ["tool_choice": "required"])
+            additionalContext: ["tool_choice": "required", "tool_choice_name": "line_count"])
 
         let system = out[0]["content"] as? String
         #expect(out[0]["role"] as? String == "system")
-        #expect(system?.contains("exactly one <tool_call> XML function call") == true)
+        #expect(system?.contains("for the line_count function") == true)
         #expect(system?.contains("Include every required <parameter=...>") == true)
         #expect(system?.hasSuffix("\n\nYou are concise.") == true)
         #expect(out[1]["content"] as? String == "Use line_count on red\ngreen\nblue.")
+    }
+
+    @Test("Nemotron named required tool contract replaces stale generic directive")
+    func requiredToolChoiceReplacesStaleGenericDirective() {
+        let messages: [Message] = [
+            [
+                "role": "system",
+                "content": """
+                    For this assistant turn, return exactly one <tool_call> XML function call for one available function and no prose before the tool result. Include every required <parameter=...> value exactly as requested.
+                    You are concise.
+                    """,
+            ],
+            ["role": "user", "content": "Use file_read on ./mandelbrot.py."],
+        ]
+
+        let out = NemotronToolChoiceTemplateContext.apply(
+            to: messages,
+            modelType: "nemotron_h",
+            additionalContext: ["tool_choice": "required", "tool_choice_name": "file_read"])
+
+        let system = out[0]["content"] as? String
+        #expect(system?.contains("for the file_read function") == true)
+        #expect(system?.contains("one available function") == false)
+        #expect(system?.contains("You are concise.") == true)
     }
 
     @Test("Nemotron required tool contract inserts system message")

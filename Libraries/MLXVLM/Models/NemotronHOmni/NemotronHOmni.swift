@@ -927,6 +927,33 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
     static let requiredToolChoiceInstruction =
         "For this assistant turn, return exactly one <tool_call> XML function call for one available function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
 
+    private static func requiredToolChoiceInstruction(
+        tools: [ToolSpec]?,
+        additionalContext: [String: any Sendable]?
+    ) -> String {
+        if let targetName = additionalContext?["tool_choice_name"] as? String,
+           !targetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return "For this assistant turn, return exactly one <tool_call> XML function call for the \(targetName) function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
+        }
+        if let tools, tools.count == 1,
+           let only = toolName(from: tools[0]),
+           !only.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return "For this assistant turn, return exactly one <tool_call> XML function call for the \(only) function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
+        }
+        return requiredToolChoiceInstruction
+    }
+
+    private static func toolName(from tool: ToolSpec) -> String? {
+        if let function = tool["function"] as? [String: any Sendable],
+           let name = function["name"] as? String
+        {
+            return name
+        }
+        return tool["name"] as? String
+    }
+
     static func addRequiredToolChoiceInstruction(
         to messages: inout [Message],
         tools: [ToolSpec]?,
@@ -937,7 +964,9 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         else {
             return
         }
-        addSystemInstruction(requiredToolChoiceInstruction, to: &messages)
+        addSystemInstruction(
+            requiredToolChoiceInstruction(tools: tools, additionalContext: additionalContext),
+            to: &messages)
     }
 
     private static func addSystemInstruction(
@@ -952,8 +981,13 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             let cleaned = existing
                 .split(separator: "\n", omittingEmptySubsequences: false)
                 .filter { line in
-                    String(line)
-                        .trimmingCharacters(in: .whitespacesAndNewlines) != instruction
+                    let normalized = String(line)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    return normalized != instruction
+                        && !normalized
+                            .lowercased()
+                            .hasPrefix(
+                                "for this assistant turn, return exactly one <tool_call> xml function call for the ")
                 }
                 .joined(separator: "\n")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
