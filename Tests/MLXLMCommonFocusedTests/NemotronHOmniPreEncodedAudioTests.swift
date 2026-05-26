@@ -287,12 +287,58 @@ struct NemotronHOmniPreEncodedAudioTests {
             tools: [lineCountTool()],
             additionalContext: ["tool_choice": "required"])
 
-        #expect(messages.count == 2)
+        #expect(messages.count == 3)
         #expect(messages[0]["role"] as? String == "system")
         let system = messages[0]["content"] as? String
         #expect(system?.contains("exactly one <tool_call> XML function call") == true)
         #expect(system?.contains("Include every required <parameter=...>") == true)
         #expect(messages[1]["content"] as? String == "Use line_count on red\ngreen\nblue.")
+        #expect(messages[2]["role"] as? String == "system")
+        #expect(messages[2]["content"] as? String == system)
+    }
+
+    @Test("required tool choice repeats at the current Nemotron Omni turn after no-tool history")
+    func requiredToolChoiceRepeatsAtCurrentNemotronOmniTurnAfterNoToolHistory() throws {
+        var messages: [Message] = [
+            ["role": "user", "content": "Use line_count on red\ngreen\nblue."],
+            [
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    [
+                        "id": "call_lines",
+                        "type": "function",
+                        "function": [
+                            "name": "line_count",
+                            "arguments": #"{"text":"red\ngreen\nblue"}"#,
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ],
+            ] as [String: any Sendable],
+            ["role": "tool", "tool_call_id": "call_lines", "content": #"{"lines":3}"#],
+            [
+                "role": "user",
+                "content": "How many lines were counted? Answer plainly. Do not call another tool.",
+            ],
+            ["role": "assistant", "content": "Three lines were counted."],
+            ["role": "user", "content": "Now use line_count on one\ntwo."],
+        ]
+
+        NemotronHOmniProcessor.addRequiredToolChoiceInstruction(
+            to: &messages,
+            tools: [lineCountTool()],
+            additionalContext: ["tool_choice": "required"])
+
+        let finalUserIndex = try #require(messages.lastIndex {
+            ($0["role"] as? String) == "user"
+                && (($0["content"] as? String)?.contains("one\ntwo") == true)
+        })
+        let tailInstructionIndex = try #require(messages.lastIndex {
+            ($0["role"] as? String) == "system"
+                && (($0["content"] as? String)?.contains(
+                    NemotronHOmniProcessor.requiredToolChoiceInstruction) == true)
+        })
+        #expect(tailInstructionIndex > finalUserIndex)
     }
 
     @Test("non-required tool choice leaves Nemotron Omni VLM messages unchanged")

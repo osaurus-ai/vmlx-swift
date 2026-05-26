@@ -944,9 +944,11 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         else {
             return
         }
-        addSystemInstruction(
-            requiredToolChoiceInstruction(tools: tools, additionalContext: additionalContext),
-            to: &messages)
+        let instruction = requiredToolChoiceInstruction(
+            tools: tools,
+            additionalContext: additionalContext)
+        addSystemInstruction(instruction, to: &messages)
+        addTailSystemInstruction(instruction, to: &messages)
     }
 
     private static func addSystemInstruction(
@@ -977,6 +979,20 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             return
         }
         messages.insert(["role": "system", "content": instruction], at: 0)
+    }
+
+    private static func addTailSystemInstruction(
+        _ instruction: String,
+        to messages: inout [Message]
+    ) {
+        if let last = messages.last,
+           (last["role"] as? String) == "system",
+           contentText(from: last["content"])
+               .trimmingCharacters(in: .whitespacesAndNewlines) == instruction
+        {
+            return
+        }
+        messages.append(["role": "system", "content": instruction])
     }
 
     private static func prependMedia(_ media: String, toLastUserIn messages: inout [Message]) {
