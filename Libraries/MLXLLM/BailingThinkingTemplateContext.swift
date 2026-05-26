@@ -74,3 +74,59 @@ enum BailingThinkingTemplateContext {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+
+/// Nemotron-H / Omni native tokenizer templates advertise XML function calls,
+/// but they do not consume the generic OpenAI `tool_choice=required` kwarg.
+/// Translate only that explicit API contract into the model's existing
+/// ChatML/system-message lane. This is deliberately separate from fallback
+/// template rails and does not alter sampler defaults, thinking mode, or
+/// parser visibility.
+enum NemotronToolChoiceTemplateContext {
+    private static let requiredToolDirective =
+        "For this assistant turn, return exactly one <tool_call> XML function call for one available function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
+
+    static func applies(to modelType: String?) -> Bool {
+        guard let modelType else { return false }
+        let normalized = modelType.lowercased()
+        return normalized == "nemotron" || normalized.hasPrefix("nemotron_")
+    }
+
+    static func apply(
+        to messages: [Message],
+        modelType: String?,
+        additionalContext: [String: any Sendable]?
+    ) -> [Message] {
+        guard applies(to: modelType),
+              additionalContext?["tool_choice"] as? String == "required"
+        else {
+            return messages
+        }
+
+        var out = messages
+        if let index = out.firstIndex(where: { ($0["role"] as? String) == "system" }),
+           let content = out[index]["content"] as? String
+        {
+            var system = out[index]
+            let cleaned = removeExistingDirective(from: content)
+            system["content"] = cleaned.isEmpty
+                ? requiredToolDirective
+                : "\(requiredToolDirective)\n\n\(cleaned)"
+            out[index] = system
+        } else {
+            out.insert(["role": "system", "content": requiredToolDirective], at: 0)
+        }
+        return out
+    }
+
+    private static func removeExistingDirective(from content: String) -> String {
+        content
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { line in
+                String(line)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased() != requiredToolDirective.lowercased()
+            }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}

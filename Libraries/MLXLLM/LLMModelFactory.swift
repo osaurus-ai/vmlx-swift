@@ -1047,8 +1047,13 @@ private struct LLMUserInputProcessor: UserInputProcessor {
 
     func prepare(input: UserInput) throws -> LMInput {
         let additionalContext = mergedAdditionalContext(input.additionalContext)
-        let messages = BailingThinkingTemplateContext.apply(
+        let bailingMessages = BailingThinkingTemplateContext.apply(
             to: messageGenerator.generate(from: input),
+            modelType: modelType,
+            additionalContext: additionalContext
+        )
+        let messages = NemotronToolChoiceTemplateContext.apply(
+            to: bailingMessages,
             modelType: modelType,
             additionalContext: additionalContext
         )

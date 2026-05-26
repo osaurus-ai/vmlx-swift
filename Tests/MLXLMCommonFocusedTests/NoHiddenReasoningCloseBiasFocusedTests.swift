@@ -895,6 +895,68 @@ struct BailingThinkingTemplateFocusedTests {
     }
 }
 
+@Suite("Nemotron tool-choice template focused contracts")
+struct NemotronToolChoiceTemplateFocusedTests {
+    @Test("tool_choice required prepends Nemotron XML tool contract")
+    func requiredToolChoicePrependsNemotronXMLDirective() {
+        let messages: [Message] = [
+            ["role": "system", "content": "You are concise."],
+            ["role": "user", "content": "Use line_count on red\ngreen\nblue."],
+        ]
+
+        let out = NemotronToolChoiceTemplateContext.apply(
+            to: messages,
+            modelType: "nemotron_h",
+            additionalContext: ["tool_choice": "required"])
+
+        let system = out[0]["content"] as? String
+        #expect(out[0]["role"] as? String == "system")
+        #expect(system?.contains("exactly one <tool_call> XML function call") == true)
+        #expect(system?.contains("Include every required <parameter=...>") == true)
+        #expect(system?.hasSuffix("\n\nYou are concise.") == true)
+        #expect(out[1]["content"] as? String == "Use line_count on red\ngreen\nblue.")
+    }
+
+    @Test("Nemotron required tool contract inserts system message")
+    func requiredToolChoiceInsertsSystemWhenMissing() {
+        let messages: [Message] = [
+            ["role": "user", "content": "Use line_count on one\ntwo."],
+        ]
+
+        let out = NemotronToolChoiceTemplateContext.apply(
+            to: messages,
+            modelType: "nemotron_h",
+            additionalContext: ["tool_choice": "required"])
+
+        #expect(out.count == 2)
+        #expect(out[0]["role"] as? String == "system")
+        #expect((out[0]["content"] as? String)?.contains("<tool_call> XML") == true)
+        #expect(out[1]["role"] as? String == "user")
+    }
+
+    @Test("non-required or non-Nemotron messages are unchanged")
+    func nonRequiredOrNonNemotronUnchanged() {
+        let messages: [Message] = [
+            ["role": "system", "content": "You are concise."],
+            ["role": "user", "content": "hello"],
+        ]
+
+        let auto = NemotronToolChoiceTemplateContext.apply(
+            to: messages,
+            modelType: "nemotron_h",
+            additionalContext: ["tool_choice": "auto"])
+        let qwen = NemotronToolChoiceTemplateContext.apply(
+            to: messages,
+            modelType: "qwen3_5_moe",
+            additionalContext: ["tool_choice": "required"])
+
+        #expect(auto[0]["content"] as? String == "You are concise.")
+        #expect(qwen[0]["content"] as? String == "You are concise.")
+        #expect(auto.count == messages.count)
+        #expect(qwen.count == messages.count)
+    }
+}
+
 @Suite("Direct capability parser alias focused contracts")
 struct DirectCapabilityParserAliasFocusedTests {
     @Test("direct Harmony capability aliases resolve without leaking control markers")
