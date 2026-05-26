@@ -97,6 +97,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         {
             return bareNameKeyValueCall
         }
+        if let actionJSONCall = parseActionJSONToolFallback(in: text, tools: tools) {
+            return actionJSONCall
+        }
         return parseInlineJSONToolFallback(in: text, tools: tools)
     }
 
@@ -127,6 +130,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             allowEOF: true)
         {
             return [bareNameKeyValueCall]
+        }
+        if let actionJSONCall = parseActionJSONToolFallback(in: buffer, tools: tools) {
+            return [actionJSONCall]
         }
         return parseInlineJSONToolFallback(in: buffer, tools: tools).map { [$0] } ?? []
     }
@@ -299,10 +305,51 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
 
         // Tool result envelopes can also carry a `"tool"` field. Those
         // are not new invocations, so leave them to the visible/text path.
-        guard object["ok"] == nil, object["result"] == nil else { return nil }
-
         let hasSchemaList = tools?.isEmpty == false
-        guard let name = fallbackToolName(in: object, allowBareName: hasSchemaList)
+        return parseInlineJSONObject(object, tools: tools, allowBareName: hasSchemaList)
+    }
+
+    /// Live DSV4 JANGTQ2 app rows can emit an agent-style action envelope,
+    /// for example `action:{"id":0,"name":"file_read","args":{...}}`.
+    /// Treat that as protocol, not assistant prose. If the action JSON is
+    /// malformed but still names a registered tool, quarantine it as an
+    /// invalid tool attempt so the visible stream stays clean.
+    private func parseActionJSONToolFallback(
+        in text: String,
+        tools: [[String: any Sendable]]?
+    ) -> ToolCall? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let payload = actionJSONPayload(in: trimmed) else { return nil }
+        let hasSchemaList = tools?.isEmpty == false
+        if let object = parseJSONObjectAllowingLiteralInvalidEscapes(payload) {
+            return parseInlineJSONObject(object, tools: tools, allowBareName: hasSchemaList)
+        }
+        guard let name = actionJSONToolName(in: payload, allowBareName: hasSchemaList)
+        else { return nil }
+        if let tools, !tools.isEmpty {
+            guard functionSpec(named: name, in: tools) != nil else { return nil }
+        } else if !Self.schemaLessFallbackToolNames.contains(name) {
+            return nil
+        }
+        return ToolCall(
+            function: .init(
+                name: name,
+                arguments: invalidInlineToolArguments(
+                    toolName: name,
+                    message: "malformed JSON action object",
+                    field: "arguments",
+                    expected: "valid JSON object")))
+    }
+
+    private func parseInlineJSONObject(
+        _ object: [String: Any],
+        tools: [[String: any Sendable]]?,
+        allowBareName: Bool
+    ) -> ToolCall? {
+        // Tool result envelopes can also carry a `"tool"` field. Those
+        // are not new invocations, so leave them to the visible/text path.
+        guard object["ok"] == nil, object["result"] == nil else { return nil }
+        guard let name = fallbackToolName(in: object, allowBareName: allowBareName)
         else { return nil }
         let argsObject: Any
         if let function = object["function"] as? [String: Any] {
@@ -317,8 +364,13 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             argsObject = arguments
         } else if let parameters = object["parameters"] {
             argsObject = parameters
+        } else if let args = object["args"] {
+            argsObject = args
         } else {
-            let reserved = Set(["tool", "tool_name", "name", "function", "arguments", "parameters", "type", "id"])
+            let reserved = Set([
+                "tool", "tool_name", "name", "function", "arguments", "parameters", "args",
+                "type", "id",
+            ])
             argsObject = object.filter { !reserved.contains($0.key) }
         }
 
@@ -334,6 +386,63 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             }
         }
         return ToolCall(function: .init(name: name, arguments: args))
+    }
+
+    private func actionJSONPayload(in text: String) -> String? {
+        let prefixes = ["action:", ":"]
+        for prefix in prefixes where text.hasPrefix(prefix) {
+            guard
+                let prefixEnd = text.index(
+                    text.startIndex,
+                    offsetBy: prefix.count,
+                    limitedBy: text.endIndex)
+            else { return nil }
+            var cursor = prefixEnd
+            while cursor < text.endIndex, isInlineFallbackWhitespace(text[cursor]) {
+                cursor = text.index(after: cursor)
+            }
+            if text[cursor...].lowercased().hasPrefix("json") {
+                guard let afterJSON = text.index(cursor, offsetBy: 4, limitedBy: text.endIndex)
+                else { return nil }
+                cursor = afterJSON
+                while cursor < text.endIndex, isInlineFallbackWhitespace(text[cursor]) {
+                    cursor = text.index(after: cursor)
+                }
+            }
+            guard cursor < text.endIndex, text[cursor] == "{" else { return nil }
+            return firstBalancedJSONObject(in: text[cursor...]) ?? String(text[cursor...])
+        }
+        return nil
+    }
+
+    private func actionJSONToolName(in text: String, allowBareName: Bool) -> String? {
+        for key in allowBareName ? ["tool", "tool_name", "name"] : ["tool", "tool_name"] {
+            if let value = firstJSONStringValue(for: key, in: text) {
+                return value
+            }
+        }
+        if let functionRange = text.range(of: #""function""#),
+            let value = firstJSONStringValue(for: "name", in: String(text[functionRange.upperBound...]))
+        {
+            return value
+        }
+        return nil
+    }
+
+    private func firstJSONStringValue(for key: String, in text: String) -> String? {
+        let pattern = #""# + NSRegularExpression.escapedPattern(for: key)
+            + #""\s*:\s*"((?:[^"\\]|\\.)*)""#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex ..< text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+            let valueRange = Range(match.range(at: 1), in: text)
+        else { return nil }
+        let raw = String(text[valueRange])
+        let literal = "\"\(raw)\""
+        guard let data = literal.data(using: .utf8),
+            let decoded = try? JSONDecoder().decode(String.self, from: data)
+        else { return raw }
+        return decoded
     }
 
     /// Some live DSV4 JANGTQ2 app rows try to invoke folder tools as a

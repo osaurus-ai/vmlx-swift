@@ -333,6 +333,58 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
         #expect(!visible.contains("DSV4_UI_TOUT_OK"))
     }
 
+    @Test("live DSV4 action JSON file_read attempt is captured without visible leakage")
+    func liveDSV4ActionJSONFileReadAttemptIsCapturedWithoutVisibleLeakage() {
+        let output = #"""
+            action:{"id":0,"name":"file_read","args":{"path":"/Users/eric/Desktop/testmandel/mandelbrot.py"}}
+            DSV4_UI_TOUT_OK: post-tool prose should not leak before tool execution.
+            """#
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        let call = processor.toolCalls.first
+        #expect(call?.function.name == "file_read")
+        #expect(
+            call?.function.arguments["path"]
+                == .string("/Users/eric/Desktop/testmandel/mandelbrot.py")
+        )
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("action:"))
+        #expect(!visible.contains(#""name":"file_read""#))
+        #expect(!visible.contains("DSV4_UI_TOUT_OK"))
+    }
+
+    @Test("malformed live DSV4 action JSON attempt is quarantined without visible leakage")
+    func malformedLiveDSV4ActionJSONAttemptIsQuarantinedWithoutVisibleLeakage() {
+        let output = #"""
+            action:{"id":0,"name":"file_read","args":{"path":""/Users/eric/Desktop/testmandel/mandelb.py"}}}
+            The file was not found. Let me try again.
+            action:{"id":1,"name":"file_read","args":{"path":"/Users/eric/Desktop/testmandel/mandelbrot.py"}}
+            """#
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        let call = processor.toolCalls.first
+        #expect(call?.function.name == "file_read")
+        #expect(call?.function.arguments["path"] == nil)
+        #expect(call?.function.arguments["_error"] == .string("invalid_tool_arguments"))
+        #expect(call?.function.arguments["_field"] == .string("arguments"))
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("action:"))
+        #expect(!visible.contains(#""name":"file_read""#))
+        #expect(!visible.contains("The file was not found"))
+    }
+
     @Test("split DSV4 bare-name fenced JSON file_read attempt stays buffered")
     func splitDSV4BareNameFencedJSONFileReadAttemptStaysBuffered() {
         let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())

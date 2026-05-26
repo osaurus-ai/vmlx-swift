@@ -48,6 +48,7 @@ public class ToolCallProcessor {
 
     private enum InlineToolCallKind {
         case json
+        case actionJSON
         case functionCall
         case bareNameJSON
         case bareNameKeyValue
@@ -172,6 +173,29 @@ public class ToolCallProcessor {
             let inlineText = leadingTextBeforeToolCall + chunk
             leadingTextBeforeToolCall = ""
 
+            if let callIndex = firstInlineActionJSONToolCallStart(in: inlineText) {
+                let leading = String(inlineText[..<callIndex])
+                inlineToolCallKind = .actionJSON
+                toolCallBuffer = String(inlineText[callIndex...])
+                state = .collectingInlineToolCall
+
+                if inlineToolCallComplete(toolCallBuffer),
+                    let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
+                {
+                    toolCalls.append(toolCall)
+                    toolCallBuffer = ""
+                    state = .normal
+                    suppressingTextAfterInlineToolCall = true
+                }
+                return leading.isEmpty ? nil : leading
+            }
+
+            if let pendingIndex = partialInlineActionJSONToolCallStart(in: inlineText) {
+                let visible = String(inlineText[..<pendingIndex])
+                leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
+                return visible.isEmpty ? nil : visible
+            }
+
             if let callIndex = firstInlineFunctionToolCallStart(in: inlineText) {
                 let leading = String(inlineText[..<callIndex])
                 inlineToolCallKind = .functionCall
@@ -270,14 +294,14 @@ public class ToolCallProcessor {
         case .potentialToolCall, .collectingToolCall, .collectingInlineToolCall:
             toolCallBuffer += chunk
 
-            if (inlineToolCallKind != .bareNameKeyValue
-                || bareNameKeyValueCallComplete(toolCallBuffer)),
+            if shouldAttemptInlineToolParse(toolCallBuffer),
                 let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
             {
                 toolCalls.append(toolCall)
                 toolCallBuffer = ""
                 state = .normal
-                if inlineToolCallKind == .functionCall
+                if inlineToolCallKind == .actionJSON
+                    || inlineToolCallKind == .functionCall
                     || inlineToolCallKind == .bareNameJSON
                     || inlineToolCallKind == .bareNameKeyValue
                 {
@@ -315,7 +339,7 @@ public class ToolCallProcessor {
 
     private func inlineToolCallComplete(_ text: String) -> Bool {
         switch inlineToolCallKind {
-        case .json:
+        case .json, .actionJSON:
             return jsonBracesBalanced(text)
         case .functionCall:
             return functionCallParenthesesBalanced(text)
@@ -323,6 +347,15 @@ public class ToolCallProcessor {
             return bareNameJSONCallBalanced(text)
         case .bareNameKeyValue:
             return bareNameKeyValueCallComplete(text)
+        }
+    }
+
+    private func shouldAttemptInlineToolParse(_ text: String) -> Bool {
+        switch inlineToolCallKind {
+        case .actionJSON, .bareNameKeyValue:
+            return inlineToolCallComplete(text)
+        case .json, .functionCall, .bareNameJSON:
+            return true
         }
     }
 
@@ -384,6 +417,16 @@ public class ToolCallProcessor {
                         && compact.contains(#""name":"\#(name)""#)
             }
         }
+        if compact.hasPrefix("action:{") || compact.hasPrefix("action:json{")
+            || compact.hasPrefix(":{")
+        {
+            return inlineFunctionToolNames().contains { name in
+                compact.contains(#""tool":"\#(name)""#)
+                    || compact.contains(#""tool_name":"\#(name)""#)
+                    || compact.contains(#""name":"\#(name)""#)
+                    || compact.contains(#""function":{"name":"\#(name)""#)
+            }
+        }
         return inlineFunctionToolNames().contains {
             compact.hasPrefix("\($0)(")
                 || compact.hasPrefix("\($0){")
@@ -425,6 +468,76 @@ public class ToolCallProcessor {
                 return nil
             }
             .min()
+    }
+
+    private func firstInlineActionJSONToolCallStart(in text: String) -> String.Index? {
+        var searchStart = text.startIndex
+        while let range = text.range(of: "action:", range: searchStart ..< text.endIndex) {
+            if isInlineFunctionBoundary(text, before: range.lowerBound),
+                inlineActionJSONTailStartsObject(in: text, afterPrefix: range.upperBound)
+            {
+                return range.lowerBound
+            }
+            searchStart = range.upperBound
+        }
+        return nil
+    }
+
+    private func partialInlineActionJSONToolCallStart(in text: String) -> String.Index? {
+        guard !text.isEmpty else { return nil }
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            if isInlineFunctionBoundary(text, before: cursor) {
+                let suffix = String(text[cursor...])
+                if "action:".hasPrefix(suffix) && suffix.count < "action:".count {
+                    return cursor
+                }
+                if suffix.hasPrefix("action:") {
+                    guard
+                        let afterPrefix = text.index(
+                            cursor,
+                            offsetBy: "action:".count,
+                            limitedBy: text.endIndex)
+                    else { return nil }
+                    let objectStart = inlineActionJSONTailObjectStart(
+                        in: text,
+                        afterPrefix: afterPrefix)
+                    if objectStart == text.endIndex {
+                        return cursor
+                    }
+                }
+            }
+            cursor = text.index(after: cursor)
+        }
+        return nil
+    }
+
+    private func inlineActionJSONTailStartsObject(
+        in text: String,
+        afterPrefix: String.Index
+    ) -> Bool {
+        let objectStart = inlineActionJSONTailObjectStart(in: text, afterPrefix: afterPrefix)
+        return objectStart < text.endIndex && text[objectStart] == "{"
+    }
+
+    private func inlineActionJSONTailObjectStart(
+        in text: String,
+        afterPrefix: String.Index
+    ) -> String.Index {
+        var cursor = afterPrefix
+        while cursor < text.endIndex, isInlineWhitespace(text[cursor]) {
+            cursor = text.index(after: cursor)
+        }
+        if text[cursor...].lowercased().hasPrefix("json") {
+            guard
+                let afterJSON = text.index(cursor, offsetBy: 4, limitedBy: text.endIndex)
+            else { return cursor }
+            cursor = afterJSON
+            while cursor < text.endIndex, isInlineWhitespace(text[cursor]) {
+                cursor = text.index(after: cursor)
+            }
+        }
+        return cursor
     }
 
     private func partialInlineFunctionToolCallStart(in text: String) -> String.Index? {
@@ -825,7 +938,9 @@ public class ToolCallProcessor {
                         return nil
                     }
                     if !leadingTextBeforeToolCall.isEmpty {
-                        if firstInlineFunctionToolCallStart(in: candidate) != nil
+                        if firstInlineActionJSONToolCallStart(in: candidate) != nil
+                            || partialInlineActionJSONToolCallStart(in: candidate) != nil
+                            || firstInlineFunctionToolCallStart(in: candidate) != nil
                             || partialInlineFunctionToolCallStart(in: candidate) != nil
                             || firstInlineBareNameJSONToolCallStart(in: candidate) != nil
                             || partialInlineBareNameJSONToolCallStart(in: candidate) != nil
@@ -844,6 +959,8 @@ public class ToolCallProcessor {
                     !leadingTextBeforeToolCall.isEmpty
                     && bareToolMarkerFragment(in: leadingTextBeforeToolCall) != nil
                 if (!leadingTextBeforeToolCall.isEmpty && !bufferedBareToolMarker)
+                    || firstInlineActionJSONToolCallStart(in: chunk) != nil
+                    || partialInlineActionJSONToolCallStart(in: chunk) != nil
                     || firstInlineFunctionToolCallStart(in: chunk) != nil
                     || partialInlineFunctionToolCallStart(in: chunk) != nil
                     || firstInlineBareNameJSONToolCallStart(in: chunk) != nil
