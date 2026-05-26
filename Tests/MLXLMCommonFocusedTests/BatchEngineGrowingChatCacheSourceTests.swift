@@ -180,6 +180,20 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(ssm.contains("try save(arrays: arrays, metadata: [\"format\": \"mlx\"], url: safetensorsURL)"))
     }
 
+    @Test("load-time stack materialization serializes with cache IO")
+    func loadTimeStackMaterializationSerializesWithCacheIO() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/LoadTimeStacking.swift",
+            encoding: .utf8)
+        let helper = try #require(source.range(of: "public func loadTimeMaterializedStacked"))
+        let helperSource = String(source[helper.lowerBound...])
+
+        #expect(helperSource.contains("MLXCacheIOLock.withSerializedMLXCacheIO"))
+        #expect(helperSource.contains("MLX.eval(result)"))
+        #expect(helperSource.contains("Stream.gpu.synchronize()"))
+        #expect(helperSource.contains("MLX.Memory.clearCache()"))
+    }
+
     @Test("SSM companion cache serializes in-memory MLX materialization")
     func ssmCompanionCacheSerializesInMemoryMLXMaterialization() throws {
         let source = try String(

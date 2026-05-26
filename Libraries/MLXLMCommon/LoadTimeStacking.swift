@@ -58,8 +58,11 @@ public func loadTimeMaterializedStacked(_ arrays: [MLXArray], axis: Int = 0) -> 
     guard loadTimeStackMaterializationEnabled() else {
         return result
     }
-    MLX.eval(result)
-    MLX.Memory.clearCache()
+    MLXCacheIOLock.withSerializedMLXCacheIO {
+        MLX.eval(result)
+        Stream.gpu.synchronize()
+        MLX.Memory.clearCache()
+    }
     return result
 }
 
