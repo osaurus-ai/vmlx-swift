@@ -546,8 +546,8 @@ struct ToolCallFormatCapabilityTests {
     }
 
     @Test func nemotronAlias() {
-        #expect(ToolCallFormat.fromCapabilityName("nemotron") == .xmlFunction)
-        #expect(ToolCallFormat.fromCapabilityName("nemotron_h") == .xmlFunction)
+        #expect(ToolCallFormat.fromCapabilityName("nemotron") == .nemotron)
+        #expect(ToolCallFormat.fromCapabilityName("nemotron_h") == .nemotron)
     }
 
     /// Locks in `laguna` model_type → `think_xml` reasoning stamp.

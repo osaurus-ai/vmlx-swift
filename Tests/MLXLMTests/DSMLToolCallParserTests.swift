@@ -175,4 +175,44 @@ struct DSMLToolCallParserTests {
         let parser = ToolCallFormat.dsml.createParser()
         #expect(parser is DSMLToolCallParser)
     }
+
+    @Test("Nemotron parser buffers DSML and recovers an explicit partial invoke at EOS")
+    func nemotronParserAcceptsLivePartialDSML() {
+        let tools: [[String: any Sendable]] = [[
+            "type": "function",
+            "function": [
+                "name": "line_count",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "path": ["type": "string"] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                    "required": ["path"],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]]
+        let output = """
+            At the start of the response, output your reasoning and then tool calls.
+
+            <\u{FF5C}DSML\u{FF5C}tool_calls>
+            <\u{FF5C}DSML\u{FF5C}invoke name="line_count">
+            <\u{FF5C}DSML\u{FF5C}parameter name="path" string="true">/Users/eric/Desktop/testmandel/mandelbrot.py
+            </\u{FF5C}DSMLｺ.
+            """
+
+        let processor = ToolCallProcessor(format: .nemotron, tools: tools)
+        var visible = ""
+        for chunk in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            visible += processor.processChunk(String(chunk) + "\n") ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls.first?.function.name == "line_count")
+        #expect(
+            processor.toolCalls.first?.function.arguments["path"]
+                == .string("/Users/eric/Desktop/testmandel/mandelbrot.py"))
+        #expect(!visible.contains("DSML"))
+        #expect(!visible.contains("line_count"))
+    }
 }

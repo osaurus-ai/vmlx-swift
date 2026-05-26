@@ -166,7 +166,7 @@ public struct JangCapabilities: Sendable {
     /// Tool-call format. Known values: `qwen`, `qwen3_coder` → `xml_function`;
     /// `minimax` → `minimax_m2`; `glm47`, `deepseek` → `glm4`; `deepseek_v4`
     /// → `dsml`; `gemma4` → `gemma4`; `hy3*` / `hunyuan*` → `hunyuan`;
-    /// `nemotron` → `xml_function`; plus any canonical `ToolCallFormat`
+    /// `nemotron` → `nemotron`; plus any canonical `ToolCallFormat`
     /// rawValue. `nil` means unknown.
     public let toolParser: String?
 

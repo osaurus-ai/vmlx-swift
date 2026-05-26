@@ -122,6 +122,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`
     case xmlFunction = "xml_function"
 
+    /// Nemotron-H / Omni tool format. Canonical templates advertise XML
+    /// function calls, but live Omni JANGTQ rows can emit DSML envelopes; this
+    /// format buffers and parses both protocols instead of leaking either one.
+    case nemotron
+
     /// GLM4 format with arg_key/arg_value tags.
     /// Example: `func<arg_key>k</arg_key><arg_value>v</arg_value>`
     case glm4
@@ -179,6 +184,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
                 startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
         case .xmlFunction:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        case .nemotron:
+            return NemotronToolCallParser()
         case .glm4:
             return GLM4ToolCallParser()
         case .gemma:
@@ -279,7 +286,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
 
         // Nemotron family (nemotron_h, etc.)
         if compact.hasPrefix("nemotron") {
-            return .xmlFunction
+            return .nemotron
         }
 
         // Qwen3.5 family (qwen3_5, qwen3_5_moe, etc.)
@@ -476,13 +483,12 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case "glm4", "glm47", "glm5", "glm4_moe", "deepseek",
             "laguna", "laguna_xs", "laguna_s":
             return .glm4
-        // Nemotron-H / Cascade — same XML-style envelope as Qwen3 Coder.
-        // Our `XMLFunctionParser` handles `<tool_call><function=name>…`
-        // which Nemotron's variant matches; if a future Nemotron release
-        // uses Hermes-style `<TOOLCALL>` tags, a dedicated enum case
-        // should be added here.
+        // Nemotron-H / Cascade — canonical templates use Qwen-style XML
+        // function calls, but live Omni/JANGTQ rows can emit DSML protocol
+        // markers. Route through the family parser so either protocol is
+        // treated as tool-call transport instead of visible content.
         case "nemotron", "nemotron_h":
-            return .xmlFunction
+            return .nemotron
         // Gemma — JANG stamps `gemma4`; the `gemma` short form maps to
         // legacy Gemma 3 format and is included for forward compatibility
         // with older stamps. Both produce `<|tool_call>…<tool_call|>`

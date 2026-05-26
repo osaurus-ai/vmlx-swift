@@ -417,10 +417,10 @@ struct ToolCallEdgeCasesTests {
         }
     }
 
-    @Test("fromCapabilityName maps Nemotron to xml_function")
+    @Test("fromCapabilityName maps Nemotron to family parser")
     func testJANGStampNemotron() {
-        #expect(ToolCallFormat.fromCapabilityName("nemotron") == .xmlFunction)
-        #expect(ToolCallFormat.fromCapabilityName("nemotron_h") == .xmlFunction)
+        #expect(ToolCallFormat.fromCapabilityName("nemotron") == .nemotron)
+        #expect(ToolCallFormat.fromCapabilityName("nemotron_h") == .nemotron)
     }
 
     @Test("fromCapabilityName maps Mistral family")

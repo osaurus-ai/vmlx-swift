@@ -112,7 +112,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         // internally by `<｜DSML｜invoke ...>` per call. Parse all
         // invokes in order.
         let buffer = strippedOuterToolTags(from: toolCallBuffer)
-        let calls = parseAllInvokes(in: buffer, tools: tools)
+        let calls = parseAllInvokes(in: buffer, tools: tools, allowPartialEOF: true)
         if !calls.isEmpty { return calls }
         if let pythonCall = parsePythonStyleToolFallback(in: buffer, tools: tools) {
             return [pythonCall]
@@ -155,7 +155,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
     /// converted through `JSONValue` so the emitted arguments match
     /// the tool schema's type contract.
     private func parseAllInvokes(
-        in text: String, tools: [[String: any Sendable]]?
+        in text: String,
+        tools: [[String: any Sendable]]?,
+        allowPartialEOF: Bool = false
     ) -> [ToolCall] {
         let invokeOpen = "\(Self.dsmlPrefix)invoke name="
         let invokeCloseTags = [
@@ -183,17 +185,24 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
                 continue
             }
 
-            // Find </｜DSML｜invoke>
-            guard let close = firstRange(
+            let body: String
+            let nextCursor: String.Index
+            if let close = firstRange(
                 of: invokeCloseTags, in: text, range: closeAngle.upperBound ..< text.endIndex)
-            else { break }
-
-            let body = String(text[closeAngle.upperBound ..< close.lowerBound])
+            {
+                body = String(text[closeAngle.upperBound ..< close.lowerBound])
+                nextCursor = close.upperBound
+            } else if allowPartialEOF {
+                body = String(text[closeAngle.upperBound ..< text.endIndex])
+                nextCursor = text.endIndex
+            } else {
+                break
+            }
             let paramConfig = parameterSchema(for: funcName, tools: tools)
-            let args = parseParameters(in: body, schema: paramConfig)
+            let args = parseParameters(in: body, schema: paramConfig, allowPartialEOF: allowPartialEOF)
             results.append(
                 ToolCall(function: .init(name: funcName, arguments: args)))
-            cursor = close.upperBound
+            cursor = nextCursor
         }
         return results
     }
@@ -240,7 +249,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
     ///                    JSON parse fails, so a malformed model
     ///                    output doesn't drop the whole tool call).
     private func parseParameters(
-        in body: String, schema: [String: any Sendable]?
+        in body: String,
+        schema: [String: any Sendable]?,
+        allowPartialEOF: Bool = false
     ) -> [String: any Sendable] {
         let paramOpen = "\(Self.dsmlPrefix)parameter name="
         let paramClose = "\(Self.dsmlPrefixClose)parameter>"
@@ -264,13 +275,27 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
                 continue
             }
 
-            // Body up to </｜DSML｜parameter>
-            guard
-                let paramEnd = body.range(
-                    of: paramClose, range: closeAngle.upperBound ..< body.endIndex)
-            else { break }
+            // Body up to </｜DSML｜parameter>. At EOS, live Omni/DSV4
+            // generations can length-stop after a clearly named parameter
+            // value but before a valid closing tag; keep the protocol hidden
+            // and recover the value up to the next DSML-like close marker.
+            let valueEnd: String.Index
+            let nextCursor: String.Index
+            if let paramEnd = body.range(
+                of: paramClose, range: closeAngle.upperBound ..< body.endIndex)
+            {
+                valueEnd = paramEnd.lowerBound
+                nextCursor = paramEnd.upperBound
+            } else if allowPartialEOF {
+                valueEnd = partialParameterValueEnd(
+                    in: body,
+                    range: closeAngle.upperBound ..< body.endIndex)
+                nextCursor = body.endIndex
+            } else {
+                break
+            }
 
-            var value = String(body[closeAngle.upperBound ..< paramEnd.lowerBound])
+            var value = String(body[closeAngle.upperBound ..< valueEnd])
             // Strip single leading / trailing newline (matches the
             // Python reference in `encoding_dsv4.py` which injects
             // newlines around multi-line values for readability).
@@ -284,9 +309,19 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
                 args[name] = decodeJSONValue(value, fallbackString: value)
             }
             _ = schema  // schema currently unused — DSML carries explicit `string=` flag so type hints aren't needed
-            cursor = paramEnd.upperBound
+            cursor = nextCursor
         }
         return args
+    }
+
+    private func partialParameterValueEnd(
+        in body: String,
+        range: Range<String.Index>
+    ) -> String.Index {
+        let markers = ["</", Self.dsmlPrefix, Self.dsmlPrefixClose]
+        return markers
+            .compactMap { body.range(of: $0, range: range)?.lowerBound }
+            .min() ?? range.upperBound
     }
 
     /// DSV4 live rows have occasionally fallen back from DSML to a top-level
