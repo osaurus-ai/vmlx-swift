@@ -80,20 +80,7 @@ private func debugDumpReasoningPrompt(
           !dir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     else { return }
 
-    let promptTokens = input.text.tokens
-    guard promptTokens.ndim >= 1 else { return }
-    let total = promptTokens.ndim == 1
-        ? promptTokens.dim(0)
-        : promptTokens.dim(promptTokens.ndim - 1)
-    guard total > 0 else { return }
-
-    let tokenArray: MLXArray
-    if promptTokens.ndim == 1 {
-        tokenArray = promptTokens[0 ..< total]
-    } else {
-        tokenArray = promptTokens[.ellipsis, 0 ..< total]
-    }
-    let tokenIds = tokenArray.asArray(Int32.self).map { Int($0) }
+    guard let tokenIds = input.text.tokenIds, !tokenIds.isEmpty else { return }
     let rendered = tokenizer.decode(tokenIds: tokenIds, skipSpecialTokens: false)
 
     let safeModel = modelName

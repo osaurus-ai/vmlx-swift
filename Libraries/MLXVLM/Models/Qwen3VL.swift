@@ -173,7 +173,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                 additionalContext: input.additionalContext,
                 promptTokens: promptTokens)
             return LMInput(
-                text: .init(tokens: promptArray, mask: mask),
+                text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
                 cachePrefixTokenCounts: cachePrefixTokenCounts)
         }
@@ -254,7 +254,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         let mask = ones(like: promptArray).asType(.int8)
 
         return LMInput(
-            text: .init(tokens: promptArray, mask: mask),
+            text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
             image: processedImage,
             video: processedVideo,
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))

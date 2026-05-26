@@ -3624,24 +3624,8 @@ internal func _decodePromptTail(
     tokenizer: any Tokenizer,
     tokens: Int
 ) -> String? {
-    let promptTokens = input.text.tokens
-    guard promptTokens.ndim >= 1 else { return nil }
-    let total = promptTokens.ndim == 1
-        ? promptTokens.dim(0)
-        : promptTokens.dim(promptTokens.ndim - 1)
-    guard total > 0 else { return nil }
-    let tailLen = min(tokens, total)
-    let startIdx = total - tailLen
-    let tailArray: MLXArray
-    if promptTokens.ndim == 1 {
-        tailArray = promptTokens[startIdx ..< total]
-    } else {
-        tailArray = promptTokens[.ellipsis, startIdx ..< total]
-    }
-    let tailInts = MLXCacheIOLock.withSerializedMLXCacheIO {
-        tailArray.asArray(Int32.self).map { Int($0) }
-    }
-    return tokenizer.decode(tokenIds: tailInts, skipSpecialTokens: false)
+    guard let tokenIds = input.text.tokenIds else { return nil }
+    return _decodePromptTail(tokenIds: tokenIds, tokenizer: tokenizer, tokens: tokens)
 }
 
 internal func _decodePromptTail(

@@ -1089,7 +1089,7 @@ public struct Gemma4Processor: UserInputProcessor {
 
         let pa = MLXArray(tokens).expandedDimensions(axis: 0)
         return LMInput(
-            text: .init(tokens: pa, mask: ones(like: pa).asType(.int8)),
+            text: .init(tokens: pa, mask: ones(like: pa).asType(.int8), tokenIds: tokens),
             image: processedImage,
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }

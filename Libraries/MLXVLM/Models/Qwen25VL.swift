@@ -727,6 +727,7 @@ public struct Qwen25VLProcessor: UserInputProcessor {
         if input.images.isEmpty, input.videos.isEmpty {
             return LMInput(
                 tokens: MLXArray(promptTokens),
+                tokenIds: promptTokens,
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         }
 
@@ -793,7 +794,7 @@ public struct Qwen25VLProcessor: UserInputProcessor {
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
         return LMInput(
-            text: .init(tokens: promptArray, mask: mask),
+            text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
             image: processedImage,
             video: processedVideo,
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))

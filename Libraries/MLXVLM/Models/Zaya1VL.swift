@@ -1718,6 +1718,7 @@ public struct Zaya1VLProcessor: UserInputProcessor {
         if input.images.isEmpty {
             return LMInput(
                 tokens: MLXArray(promptTokens),
+                tokenIds: promptTokens,
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         }
 
@@ -1735,7 +1736,7 @@ public struct Zaya1VLProcessor: UserInputProcessor {
         }
 
         return LMInput(
-            text: LMInput.Text(tokens: MLXArray(promptTokens)),
+            text: LMInput.Text(tokens: MLXArray(promptTokens), tokenIds: promptTokens),
             image: processedImage,
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }

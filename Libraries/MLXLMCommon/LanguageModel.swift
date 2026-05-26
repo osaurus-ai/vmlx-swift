@@ -82,9 +82,14 @@ public struct LMInput {
         /// optional mask array
         public let mask: MLXArray?
 
-        public init(tokens: MLXArray, mask: MLXArray? = nil) {
+        /// CPU-side token IDs used by parser/template helpers that need to
+        /// inspect prompt text without forcing a GPU readback.
+        public let tokenIds: [Int]?
+
+        public init(tokens: MLXArray, mask: MLXArray? = nil, tokenIds: [Int]? = nil) {
             self.tokens = tokens
             self.mask = mask
+            self.tokenIds = tokenIds
         }
 
         public subscript(
@@ -172,12 +177,13 @@ public struct LMInput {
     public init(
         tokens: MLXArray,
         mask: MLXArray? = nil,
+        tokenIds: [Int]? = nil,
         cacheScopeSalt: String? = nil,
         cachePrefixTokenCounts: [Int] = [],
         toolSchemas: [ToolSpec]? = nil
     ) {
         self.init(
-            text: .init(tokens: tokens, mask: mask),
+            text: .init(tokens: tokens, mask: mask, tokenIds: tokenIds),
             cacheScopeSalt: cacheScopeSalt,
             cachePrefixTokenCounts: cachePrefixTokenCounts,
             toolSchemas: toolSchemas)

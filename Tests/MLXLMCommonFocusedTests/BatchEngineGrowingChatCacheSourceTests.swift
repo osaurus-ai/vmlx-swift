@@ -174,8 +174,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(storeSource.contains("MLX.eval(materialized)"))
         #expect(storeSource.contains("Stream.gpu.synchronize()"))
         #expect(storeSource.contains("let disk: SSMCompanionDiskStore?"))
-        #expect(promptTailSource.contains("MLXCacheIOLock.withSerializedMLXCacheIO"))
-        #expect(promptTailSource.contains("tailArray.asArray(Int32.self)"))
+        #expect(promptTailSource.contains("input.text.tokenIds"))
+        #expect(!promptTailSource.contains("tailArray.asArray"))
 
         let materialize = try #require(storeSource.range(of: "MLX.eval(materialized)"))
         let lruLock = try #require(storeSource.range(of: "lock.lock()"))

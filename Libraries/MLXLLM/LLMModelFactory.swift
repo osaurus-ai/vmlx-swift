@@ -1063,6 +1063,7 @@ private struct LLMUserInputProcessor: UserInputProcessor {
 
             return LMInput(
                 tokens: MLXArray(promptTokens),
+                tokenIds: promptTokens,
                 cacheScopeSalt: cacheScopeSalt(from: additionalContext),
                 cachePrefixTokenCounts: cachePrefixTokenCounts)
         } catch TokenizerError.missingChatTemplate {
@@ -1076,6 +1077,7 @@ private struct LLMUserInputProcessor: UserInputProcessor {
             let promptTokens = tokenizer.encode(text: prompt)
             return LMInput(
                 tokens: MLXArray(promptTokens),
+                tokenIds: promptTokens,
                 cacheScopeSalt: cacheScopeSalt(from: additionalContext))
         }
     }

@@ -895,7 +895,7 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         let mask = ones(like: promptArray).asType(.int8)
 
         return LMInput(
-            text: .init(tokens: promptArray, mask: mask),
+            text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
             image: processedImage,
             video: processedVideo,
             audio: processedAudio,
