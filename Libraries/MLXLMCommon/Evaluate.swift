@@ -1837,6 +1837,13 @@ public struct TokenIterator: TokenIteratorProtocol {
             return trimmed
         }
 
+        if shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot) {
+            Self.logger.debug(
+                "TokenIterator: skipped history-boundary cache rederive after trim miss for disk-backed cache topology"
+            )
+            return nil
+        }
+
         if String(describing: Swift.type(of: model)).contains("Gemma3n") {
             Self.logger.debug(
                 "TokenIterator: skipped Gemma3n history-boundary cache rederive after trim miss"

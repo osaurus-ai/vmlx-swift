@@ -2236,6 +2236,13 @@ public actor BatchEngine {
                     return trimmed
                 }
 
+                if shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptCacheSnapshot) {
+                    Self.logger.debug(
+                        "Skipped history-boundary cache rederive after trim miss for slot \(slot.id.description, privacy: .public): disk-backed cache topology"
+                    )
+                    return nil
+                }
+
                 if String(describing: Swift.type(of: context.model)).contains("Gemma3n") {
                     Self.logger.debug(
                         "Skipped Gemma3n history-boundary cache rederive for slot \(slot.id.description, privacy: .public) after trim miss"

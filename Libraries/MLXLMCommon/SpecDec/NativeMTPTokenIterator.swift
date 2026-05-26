@@ -594,6 +594,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return trimmed
         }
 
+        if shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot) {
+            return nil
+        }
+
         if String(describing: Swift.type(of: model)).contains("Gemma3n") {
             return nil
         }

@@ -26,6 +26,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("let unsafeFullHit = remaining.isEmpty && hasPathDependentLayer"))
         #expect(source.contains("!slot.originalInput.requiresPostPrepareCacheKey"))
         #expect(source.contains("layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache"))
+        #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptCacheSnapshot)"))
+        #expect(source.contains("Skipped history-boundary cache rederive after trim miss for slot"))
         #expect(!source.contains("let unsafePartial = !remaining.isEmpty &&\n                        (hasMediaContent || hasSSMLayer)"))
     }
 
@@ -45,7 +47,19 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)"))
         #expect(source.contains("let unsafeFullHit = remainingTokens.isEmpty && hasPathDependentLayer"))
         #expect(source.contains("layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache"))
+        #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot)"))
+        #expect(source.contains("TokenIterator: skipped history-boundary cache rederive after trim miss"))
         #expect(!source.contains("let unsafePartial = !remainingTokens.isEmpty &&\n                        (hasMediaContent || hasSSMLayer)"))
+    }
+
+    @Test("native MTP iterator skips disk-backed history boundary rederive")
+    func nativeMTPIteratorSkipsDiskBackedHistoryBoundaryReDerive() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift",
+            encoding: .utf8)
+
+        #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot)"))
+        #expect(source.contains("return nil"))
     }
 
     @Test("token iterator drains MLX around cache store before completion info")
@@ -94,6 +108,30 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("let diskRestored = restoreFromDiskArrays(diskArrays, into: &self.cache)"))
         #expect(source.contains("MLX.eval(self.cache)"))
         #expect(source.contains("Cache \\(detail.rawValue) hit: restored \\(diskRestored) tokens from disk"))
+    }
+
+    @Test("history-boundary rederive skips disk-backed cache topologies after trim miss")
+    func historyBoundaryRederiveSkipsDiskBackedTopologiesAfterTrimMiss() throws {
+        let helpers = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Cache/CacheHelpers.swift",
+            encoding: .utf8)
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+        let batch = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let nativeMTP = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift",
+            encoding: .utf8)
+
+        #expect(helpers.contains("func shouldSkipHistoryBoundaryRederiveAfterTrimMiss"))
+        #expect(helpers.contains("cacheRequiresDiskBackedCoordinatorRestore(cache)"))
+
+        for source in [evaluate, batch, nativeMTP] {
+            #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss("))
+            #expect(source.contains("history-boundary cache rederive after trim miss"))
+        }
     }
 
     @Test("disk cache serializes MLX safetensors IO across model cache instances")

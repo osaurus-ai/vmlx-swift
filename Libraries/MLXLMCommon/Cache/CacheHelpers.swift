@@ -97,6 +97,21 @@ public func cacheRequiresDiskBackedCoordinatorRestore(_ cache: [any KVCache]) ->
     }
 }
 
+/// True when a failed trim should not fall back to a model re-derive while
+/// writing optional history-boundary cache entries.
+///
+/// Disk-backed topologies carry state that is more than ordinary append-only
+/// KV: rotating ring metadata, DSV4 hybrid-pool compressor/indexer state, or
+/// lossy/compressed cache payloads. If a prompt-boundary snapshot cannot be
+/// trimmed to the requested history boundary, re-entering model prepare/eval
+/// from the generation-completion path can race the just-finished decode and
+/// abort the host process. The history-boundary entry is only an optimization;
+/// the prompt-boundary and post-answer stores remain the authoritative cache
+/// entries for these families.
+func shouldSkipHistoryBoundaryRederiveAfterTrimMiss(_ cache: [any KVCache]) -> Bool {
+    cacheRequiresDiskBackedCoordinatorRestore(cache)
+}
+
 /// Extract per-layer KV tensors from a model's cache array.
 ///
 /// Returns per-layer `(keys, values)` tuples. SSM/MambaCache layers return `nil`.
