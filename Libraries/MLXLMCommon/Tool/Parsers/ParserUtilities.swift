@@ -204,9 +204,10 @@ func convertParameterValue(
 
     let type = paramType.lowercased()
 
-    // String types - return as-is
+    // String types - return as user text, while accepting the JSON-style
+    // escapes that XML tool templates commonly emit for multiline values.
     if ["string", "str", "text", "varchar", "char", "enum"].contains(type) {
-        return value
+        return unescapeJSONStringScalar(value)
     }
 
     // Integer types
@@ -240,6 +241,24 @@ func convertParameterValue(
     }
 
     return value
+}
+
+private func unescapeJSONStringScalar(_ value: String) -> String {
+    guard value.contains("\\") else { return value }
+    let quoted = "\""
+        + value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\\\\n", with: "\\n")
+            .replacingOccurrences(of: "\\\\r", with: "\\r")
+            .replacingOccurrences(of: "\\\\t", with: "\\t")
+        + "\""
+    guard let data = quoted.data(using: .utf8),
+          let decoded = try? JSONDecoder().decode(String.self, from: data)
+    else {
+        return value
+    }
+    return decoded
 }
 
 // MARK: - String Utilities

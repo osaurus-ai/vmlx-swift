@@ -942,6 +942,21 @@ struct NemotronToolChoiceTemplateFocusedTests {
         #expect(system?.contains("You are concise.") == true)
     }
 
+    @Test("Nemotron XML tool parser unescapes multiline string parameters")
+    func nemotronXMLParserUnescapesMultilineStringParameters() {
+        let output = #"""
+            <tool_call>
+            <function=line_count>
+            <parameter=text>red\ngreen\nblue</parameter>
+            </function>
+            </tool_call>
+            """#
+        let call = NemotronToolCallParser().parseEOS(output, tools: lineCountToolSchema()).first
+
+        #expect(call?.function.name == "line_count")
+        #expect(call?.function.arguments["text"] == .string("red\ngreen\nblue"))
+    }
+
     @Test("Nemotron required tool contract inserts system message")
     func requiredToolChoiceInsertsSystemWhenMissing() {
         let messages: [Message] = [
@@ -979,6 +994,26 @@ struct NemotronToolChoiceTemplateFocusedTests {
         #expect(qwen[0]["content"] as? String == "You are concise.")
         #expect(auto.count == messages.count)
         #expect(qwen.count == messages.count)
+    }
+
+    private func lineCountToolSchema() -> [[String: any Sendable]] {
+        let parameters: [String: any Sendable] = [
+            "type": "object",
+            "properties": [
+                "text": ["type": "string"] as [String: any Sendable],
+            ] as [String: any Sendable],
+            "required": ["text"],
+        ]
+        let function: [String: any Sendable] = [
+            "name": "line_count",
+            "parameters": parameters,
+        ]
+        return [
+            [
+                "type": "function",
+                "function": function,
+            ] as [String: any Sendable]
+        ]
     }
 }
 
