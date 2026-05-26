@@ -226,6 +226,19 @@ value_1
 
 <IMPORTANT>
 The current assistant response MUST be a tool call. Reply only with a `<tool_call>` block for one available tool and no prose before the tool result.
+Include every required parameter declared for the selected tool. Do not emit an empty `<function=...></function>` call.
+Use the available tool names and parameter names exactly:
+{%- for tool in tools %}
+  {%- set fn = tool['function'] if tool['function'] is defined else tool %}
+- {{ fn['name'] }} parameters:
+  {%- if fn['parameters'] is defined and fn['parameters']['properties'] is defined %}
+    {%- for param_name, param in fn['parameters']['properties'] | dictsort %}
+  <parameter={{ param_name }}>...</parameter>
+    {%- endfor %}
+  {%- else %}
+  no parameters
+  {%- endif %}
+{%- endfor %}
 </IMPORTANT>
 {%- endif %}
 {%- endif %}
