@@ -165,6 +165,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("MUST be a tool call"))
         #expect(rendered.contains("one available tool and no prose before the tool result"))
         #expect(rendered.contains("Include every required parameter"))
+        #expect(rendered.contains("real line breaks inside the `<parameter=...>` body"))
         #expect(rendered.contains("- line_count parameters:"))
         #expect(rendered.contains("<parameter=text>...</parameter>"))
         #expect(!rendered.contains("[AVAILABLE_TOOLS]"))
@@ -227,6 +228,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains(": 3 lines were counted."))
         #expect(rendered.contains("Now use line_count on one\ntwo."))
         #expect(rendered.contains("Include every required parameter"))
+        #expect(rendered.contains("real line breaks inside the `<parameter=...>` body"))
         #expect(rendered.contains("- line_count parameters:"))
         #expect(rendered.contains("<parameter=text>...</parameter>"))
         #expect(rendered.hasSuffix(
