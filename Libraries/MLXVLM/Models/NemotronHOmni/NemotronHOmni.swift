@@ -871,6 +871,10 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         // placeholder count from the encoded media embeddings.
         var messages = Self.textOnlyMessages(from: input)
         var templateContext = input.additionalContext
+        Self.addRequiredToolChoiceInstruction(
+            to: &messages,
+            tools: input.tools,
+            additionalContext: templateContext)
         if !media.isEmpty {
             if let index = Self.mediaTargetMessageIndex(in: input) {
                 Self.prependMedia(media, toMessageAt: index, in: &messages)
@@ -920,6 +924,47 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         }
     }
 
+    static let requiredToolChoiceInstruction =
+        "For this assistant turn, return exactly one <tool_call> XML function call for one available function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
+
+    static func addRequiredToolChoiceInstruction(
+        to messages: inout [Message],
+        tools: [ToolSpec]?,
+        additionalContext: [String: any Sendable]?
+    ) {
+        guard additionalContext?["tool_choice"] as? String == "required",
+              tools?.isEmpty == false
+        else {
+            return
+        }
+        addSystemInstruction(requiredToolChoiceInstruction, to: &messages)
+    }
+
+    private static func addSystemInstruction(
+        _ instruction: String,
+        to messages: inout [Message]
+    ) {
+        if let systemIndex = messages.firstIndex(where: {
+            ($0["role"] as? String) == "system"
+        }) {
+            let existing = contentText(from: messages[systemIndex]["content"])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleaned = existing
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .filter { line in
+                    String(line)
+                        .trimmingCharacters(in: .whitespacesAndNewlines) != instruction
+                }
+                .joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            messages[systemIndex]["content"] = cleaned.isEmpty
+                ? instruction
+                : instruction + "\n" + cleaned
+            return
+        }
+        messages.insert(["role": "system", "content": instruction], at: 0)
+    }
+
     private static func prependMedia(_ media: String, toLastUserIn messages: inout [Message]) {
         guard !messages.isEmpty else {
             messages = [["role": "user", "content": media]]
@@ -963,17 +1008,7 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         let instruction =
             "Answer directly with only the final visible response. " +
             "Do not include analysis, reasoning, scratchpad steps, or drafts."
-        if let systemIndex = messages.firstIndex(where: {
-            ($0["role"] as? String) == "system"
-        }) {
-            let existing = contentText(from: messages[systemIndex]["content"])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            messages[systemIndex]["content"] = existing.isEmpty
-                ? instruction
-                : instruction + "\n" + existing
-            return
-        }
-        messages.insert(["role": "system", "content": instruction], at: 0)
+        addSystemInstruction(instruction, to: &messages)
     }
 
     private static func videoTokensPerGroup(pixelValues: MLXArray) -> Int {

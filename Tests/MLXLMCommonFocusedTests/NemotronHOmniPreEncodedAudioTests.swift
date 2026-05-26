@@ -276,6 +276,58 @@ struct NemotronHOmniPreEncodedAudioTests {
         }
     }
 
+    @Test("required tool choice reaches Nemotron Omni VLM native template path")
+    func requiredToolChoiceReachesNemotronOmniVLMTemplatePath() {
+        var messages: [Message] = [
+            ["role": "user", "content": "Use line_count on red\ngreen\nblue."],
+        ]
+
+        NemotronHOmniProcessor.addRequiredToolChoiceInstruction(
+            to: &messages,
+            tools: [lineCountTool()],
+            additionalContext: ["tool_choice": "required"])
+
+        #expect(messages.count == 2)
+        #expect(messages[0]["role"] as? String == "system")
+        let system = messages[0]["content"] as? String
+        #expect(system?.contains("exactly one <tool_call> XML function call") == true)
+        #expect(system?.contains("Include every required <parameter=...>") == true)
+        #expect(messages[1]["content"] as? String == "Use line_count on red\ngreen\nblue.")
+    }
+
+    @Test("non-required tool choice leaves Nemotron Omni VLM messages unchanged")
+    func nonRequiredToolChoiceLeavesNemotronOmniVLMMessagesUnchanged() {
+        var messages: [Message] = [
+            ["role": "user", "content": "hello"],
+        ]
+
+        NemotronHOmniProcessor.addRequiredToolChoiceInstruction(
+            to: &messages,
+            tools: [lineCountTool()],
+            additionalContext: ["tool_choice": "none"])
+
+        #expect(messages.count == 1)
+        #expect(messages[0]["role"] as? String == "user")
+        #expect(messages[0]["content"] as? String == "hello")
+    }
+
+    private func lineCountTool() -> ToolSpec {
+        [
+            "type": "function",
+            "function": [
+                "name": "line_count",
+                "description": "Count newline-separated text lines.",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "text": ["type": "string"] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                    "required": ["text"],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+    }
+
     @Test("media no-thinking prompt carries explicit direct-answer instruction")
     func mediaNoThinkingPromptCarriesDirectAnswerInstruction() async throws {
         try await FocusedMLXTestSupport.withLock {
