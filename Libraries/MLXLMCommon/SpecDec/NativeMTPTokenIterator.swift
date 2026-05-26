@@ -595,6 +595,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         if shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot) {
+            if Self.traceEnabled {
+                let line =
+                    "[NativeMTPTrace] skipped history-boundary cache rederive after trim miss for disk-backed cache topology\n"
+                FileHandle.standardError.write(Data(line.utf8))
+            }
             return nil
         }
 
