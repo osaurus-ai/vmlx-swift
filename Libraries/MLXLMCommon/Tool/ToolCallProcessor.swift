@@ -387,6 +387,7 @@ public class ToolCallProcessor {
         return inlineFunctionToolNames().contains {
             compact.hasPrefix("\($0)(")
                 || compact.hasPrefix("\($0){")
+                || compact.hasPrefix("\($0):json{")
                 || compact.hasPrefix("\($0)```")
         } || firstInlineBareNameKeyValueToolCallStart(in: text) != nil
             || partialInlineBareNameKeyValueToolCallStart(in: text) != nil
@@ -724,6 +725,7 @@ public class ToolCallProcessor {
         while cursor < text.endIndex, isInlineWhitespace(text[cursor]) {
             cursor = text.index(after: cursor)
         }
+        cursor = consumeOptionalJSONLabel(in: text, at: cursor)
         guard cursor < text.endIndex else { return cursor }
         guard text[cursor...].hasPrefix("```") else { return cursor }
 
@@ -742,6 +744,30 @@ public class ToolCallProcessor {
             fenceCursor = text.index(after: fenceCursor)
         }
         return fenceCursor
+    }
+
+    private func consumeOptionalJSONLabel(in text: String, at cursor: String.Index) -> String.Index {
+        guard cursor < text.endIndex, text[cursor] == ":" else { return cursor }
+        var labelStart = text.index(after: cursor)
+        while labelStart < text.endIndex, isInlineWhitespace(text[labelStart]) {
+            labelStart = text.index(after: labelStart)
+        }
+        guard text[labelStart...].lowercased().hasPrefix("json") else { return cursor }
+        guard
+            let labelEnd = text.index(labelStart, offsetBy: 4, limitedBy: text.endIndex)
+        else { return cursor }
+        if labelEnd < text.endIndex,
+            !isInlineWhitespace(text[labelEnd]),
+            text[labelEnd] != "{",
+            !text[labelEnd...].hasPrefix("```")
+        {
+            return cursor
+        }
+        var next = labelEnd
+        while next < text.endIndex, isInlineWhitespace(text[next]) {
+            next = text.index(after: next)
+        }
+        return next
     }
 
     private func isInlineWhitespace(_ character: Character) -> Bool {
@@ -930,6 +956,24 @@ public class ToolCallProcessor {
     }
 
     private func shouldBufferPotentialBareToolMarker(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            for name in inlineFunctionToolNames() {
+                if name.hasPrefix(trimmed) { return true }
+                guard trimmed.hasPrefix(name) else { continue }
+                let afterName = String(trimmed.dropFirst(name.count))
+                if afterName.isEmpty { return true }
+                let compactTail = afterName.unicodeScalars.filter {
+                    !CharacterSet.whitespacesAndNewlines.contains($0)
+                }.map(String.init).joined().lowercased()
+                if compactTail.isEmpty { return true }
+                if ":json".hasPrefix(compactTail) { return true }
+                if compactTail.hasPrefix(":json") {
+                    let afterLabel = String(compactTail.dropFirst(5))
+                    return afterLabel.isEmpty
+                }
+            }
+        }
         guard let fragment = bareToolMarkerFragment(in: text) else { return false }
         return inlineFunctionToolNames().contains { name in
             name.hasPrefix(fragment) || fragment == name

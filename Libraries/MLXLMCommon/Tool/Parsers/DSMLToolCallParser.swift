@@ -83,7 +83,11 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         if let pythonCall = parsePythonStyleToolFallback(in: text, tools: tools) {
             return pythonCall
         }
-        if let bareNameJSONCall = parseBareNameJSONToolFallback(in: text, tools: tools) {
+        if let bareNameJSONCall = parseBareNameJSONToolFallback(
+            in: text,
+            tools: tools,
+            allowMalformedEOF: false)
+        {
             return bareNameJSONCall
         }
         if let bareNameKeyValueCall = parseBareNameKeyValueToolFallback(
@@ -110,7 +114,11 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         if let pythonCall = parsePythonStyleToolFallback(in: buffer, tools: tools) {
             return [pythonCall]
         }
-        if let bareNameJSONCall = parseBareNameJSONToolFallback(in: buffer, tools: tools) {
+        if let bareNameJSONCall = parseBareNameJSONToolFallback(
+            in: buffer,
+            tools: tools,
+            allowMalformedEOF: true)
+        {
             return [bareNameJSONCall]
         }
         if let bareNameKeyValueCall = parseBareNameKeyValueToolFallback(
@@ -368,7 +376,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
     /// leaks into the answer.
     private func parseBareNameJSONToolFallback(
         in text: String,
-        tools: [[String: any Sendable]]?
+        tools: [[String: any Sendable]]?,
+        allowMalformedEOF: Bool
     ) -> ToolCall? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !trimmed.hasPrefix("{") else { return nil }
@@ -384,11 +393,23 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             guard afterName == trimmed.endIndex
                 || isInlineFallbackWhitespace(trimmed[afterName])
                 || trimmed[afterName] == "{"
+                || trimmed[afterName] == ":"
             else { continue }
 
             let cursor = bareNameJSONTailObjectStart(in: trimmed, afterName: afterName)
             guard cursor < trimmed.endIndex, trimmed[cursor] == "{" else { continue }
             guard let jsonObject = firstBalancedJSONObject(in: trimmed[cursor...]) else {
+                if (allowMalformedEOF || jsonBracesBalanced(String(trimmed[cursor...]))),
+                    let tools, !tools.isEmpty,
+                    functionSpec(named: name, in: tools) != nil
+                {
+                    let invalidArgs = invalidInlineToolArguments(
+                        toolName: name,
+                        message: "malformed JSON argument object",
+                        field: "arguments",
+                        expected: "valid JSON object")
+                    return ToolCall(function: .init(name: name, arguments: invalidArgs))
+                }
                 continue
             }
             guard let object = parseJSONObjectAllowingLiteralInvalidEscapes(jsonObject) else {
@@ -420,6 +441,21 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             return ToolCall(function: .init(name: name, arguments: args))
         }
         return nil
+    }
+
+    private func jsonBracesBalanced(_ text: String) -> Bool {
+        var depth = 0
+        var sawOpen = false
+        for ch in text {
+            if ch == "{" {
+                sawOpen = true
+                depth += 1
+            } else if ch == "}" {
+                depth -= 1
+                if depth < 0 { return false }
+            }
+        }
+        return sawOpen && depth == 0
     }
 
     private func parseJSONObjectAllowingLiteralInvalidEscapes(_ jsonObject: String) -> [String: Any]? {
@@ -687,6 +723,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         while cursor < text.endIndex, isInlineFallbackWhitespace(text[cursor]) {
             cursor = text.index(after: cursor)
         }
+        cursor = consumeOptionalJSONLabel(in: text, at: cursor)
         guard cursor < text.endIndex else { return cursor }
         guard text[cursor...].hasPrefix("```") else { return cursor }
 
@@ -705,6 +742,30 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             fenceCursor = text.index(after: fenceCursor)
         }
         return fenceCursor
+    }
+
+    private func consumeOptionalJSONLabel(in text: String, at cursor: String.Index) -> String.Index {
+        guard cursor < text.endIndex, text[cursor] == ":" else { return cursor }
+        var labelStart = text.index(after: cursor)
+        while labelStart < text.endIndex, isInlineFallbackWhitespace(text[labelStart]) {
+            labelStart = text.index(after: labelStart)
+        }
+        guard text[labelStart...].lowercased().hasPrefix("json") else { return cursor }
+        guard
+            let labelEnd = text.index(labelStart, offsetBy: 4, limitedBy: text.endIndex)
+        else { return cursor }
+        if labelEnd < text.endIndex,
+            !isInlineFallbackWhitespace(text[labelEnd]),
+            text[labelEnd] != "{",
+            !text[labelEnd...].hasPrefix("```")
+        {
+            return cursor
+        }
+        var next = labelEnd
+        while next < text.endIndex, isInlineFallbackWhitespace(text[next]) {
+            next = text.index(after: next)
+        }
+        return next
     }
 
     private static let schemaLessFallbackToolNames: Set<String> = [

@@ -160,6 +160,57 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
         #expect(!visible.contains("DSV4_UI_TOUT_OK"))
     }
 
+    @Test("live DSV4 bare-name json label file_read attempt is captured")
+    func liveDSV4BareNameJSONLabelFileReadAttemptIsCaptured() {
+        let output = #"""
+            file_read:json{"path":"/Users/eric/Desktop/testmandel/mandelbrot.py","start_line":33,"end_line":39}
+            DSV4_UI_TOUT_OK: post-tool prose should not leak before tool execution.
+            """#
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        let call = processor.toolCalls.first
+        #expect(call?.function.name == "file_read")
+        #expect(
+            call?.function.arguments["path"]
+                == .string("/Users/eric/Desktop/testmandel/mandelbrot.py")
+        )
+        #expect(call?.function.arguments["start_line"] == .int(33))
+        #expect(call?.function.arguments["end_line"] == .int(39))
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("file_read"))
+        #expect(!visible.contains(":json"))
+        #expect(!visible.contains("DSV4_UI_TOUT_OK"))
+    }
+
+    @Test("malformed DSV4 bare-name json label attempt is quarantined as tool call")
+    func malformedDSV4BareNameJSONLabelAttemptIsQuarantinedAsToolCall() {
+        let output =
+            #"file_read:json{"{"error":"Invalid JSON structure: missing closing braces","type":"error":"Invalid JSON structure: missing closing braces","description":"Invalid JSON structure: missing closing braces","invalid":true}}false"#
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        let call = processor.toolCalls.first
+        #expect(call?.function.name == "file_read")
+        #expect(call?.function.arguments["path"] == nil)
+        #expect(call?.function.arguments["_error"] == .string("invalid_tool_arguments"))
+        #expect(call?.function.arguments["_field"] == .string("arguments"))
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("file_read"))
+        #expect(!visible.contains(":json"))
+        #expect(!visible.contains("Invalid JSON structure"))
+    }
+
     @Test("live DSV4 bare-name key-value file_read attempt is captured without visible leakage")
     func liveDSV4BareNameKeyValueFileReadAttemptIsCapturedWithoutVisibleLeakage() {
         let output = #"""
