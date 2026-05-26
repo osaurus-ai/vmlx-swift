@@ -147,6 +147,27 @@ struct DSMLToolCallParserFocusedTests {
         #expect(!visible.contains("line_count"))
     }
 
+    @Test("DSML processor accepts live bare-name JSON with malformed string escape")
+    func processorAcceptsLiveBareNameJSONWithMalformedStringEscape() {
+        let output = #"line_count{"text":"alpha\nbeta\gamma"}"#
+        let processor = ToolCallProcessor(format: .dsml, tools: lineCountToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls.first?.function.name == "line_count")
+        #expect(
+            processor.toolCalls.first?.function.arguments["text"]
+                == .string("alpha\nbeta\\gamma")
+        )
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("line_count"))
+        #expect(!visible.contains(#"{"text":"#))
+    }
+
     @Test("DSML processor routes Osaurus folder and git tools through live aliases")
     func processorRoutesOsaurusFolderAndGitToolsThroughLiveAliases() {
         let fixtures: [DSMLToolFixture] = [

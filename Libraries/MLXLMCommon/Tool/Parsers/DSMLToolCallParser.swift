@@ -391,10 +391,18 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             guard let jsonObject = firstBalancedJSONObject(in: trimmed[cursor...]) else {
                 continue
             }
-            guard
-                let data = jsonObject.data(using: .utf8),
-                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { continue }
+            guard let object = parseJSONObjectAllowingLiteralInvalidEscapes(jsonObject) else {
+                if let tools, !tools.isEmpty {
+                    guard functionSpec(named: name, in: tools) != nil else { return nil }
+                    let invalidArgs = invalidInlineToolArguments(
+                        toolName: name,
+                        message: "malformed JSON argument object",
+                        field: "arguments",
+                        expected: "valid JSON object")
+                    return ToolCall(function: .init(name: name, arguments: invalidArgs))
+                }
+                return nil
+            }
 
             let args = normalizeInlineArguments(object)
             if let tools, !tools.isEmpty {
@@ -412,6 +420,52 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             return ToolCall(function: .init(name: name, arguments: args))
         }
         return nil
+    }
+
+    private func parseJSONObjectAllowingLiteralInvalidEscapes(_ jsonObject: String) -> [String: Any]? {
+        if let object = parseJSONObject(jsonObject) {
+            return object
+        }
+        let repaired = jsonObjectWithInvalidStringEscapesMadeLiteral(jsonObject)
+        guard repaired != jsonObject else { return nil }
+        return parseJSONObject(repaired)
+    }
+
+    private func parseJSONObject(_ jsonObject: String) -> [String: Any]? {
+        guard let data = jsonObject.data(using: .utf8) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    private func jsonObjectWithInvalidStringEscapesMadeLiteral(_ jsonObject: String) -> String {
+        var output = ""
+        var inString = false
+        var escaped = false
+        let validEscapes = Set(["\"", "\\", "/", "b", "f", "n", "r", "t", "u"])
+
+        for ch in jsonObject {
+            if escaped {
+                let scalar = String(ch)
+                if !validEscapes.contains(scalar) {
+                    output.append("\\")
+                }
+                output.append(ch)
+                escaped = false
+                continue
+            }
+            if inString && ch == "\\" {
+                output.append(ch)
+                escaped = true
+                continue
+            }
+            if ch == "\"" {
+                inString.toggle()
+            }
+            output.append(ch)
+        }
+        if escaped {
+            output.append("\\")
+        }
+        return output
     }
 
     /// Live DSV4 JANGTQ2 UI rows can emit a bare tool name followed by

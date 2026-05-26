@@ -765,6 +765,15 @@ public class ToolCallProcessor {
                         return nil
                     }
                     if !leadingTextBeforeToolCall.isEmpty {
+                        if firstInlineFunctionToolCallStart(in: candidate) != nil
+                            || partialInlineFunctionToolCallStart(in: candidate) != nil
+                            || firstInlineBareNameJSONToolCallStart(in: candidate) != nil
+                            || partialInlineBareNameJSONToolCallStart(in: candidate) != nil
+                            || firstInlineBareNameKeyValueToolCallStart(in: candidate) != nil
+                            || partialInlineBareNameKeyValueToolCallStart(in: candidate) != nil
+                        {
+                            return processInlineChunk(chunk)
+                        }
                         let visible = leadingTextBeforeToolCall + chunk
                         leadingTextBeforeToolCall = ""
                         return visible
