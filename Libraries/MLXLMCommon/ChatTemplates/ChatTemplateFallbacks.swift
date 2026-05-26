@@ -222,10 +222,12 @@ value_1
 </parameter>
 </function>
 </tool_call>
+
+Every parameter listed in a function's `<required>` entry must be included as a `<parameter=name>` block. Empty function bodies are invalid tool calls.
 {%- if required_tool_choice %}
 
 <IMPORTANT>
-The current assistant response MUST be a tool call. Reply only with a `<tool_call>` block for one available tool and no prose before the tool result.
+The current assistant response MUST be a tool call. Reply only with a `<tool_call>` block for one available tool, include all required parameters from the user's request, and write no prose before the tool result.
 </IMPORTANT>
 {%- endif %}
 {%- endif %}

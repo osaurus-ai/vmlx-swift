@@ -369,6 +369,32 @@ struct ToolTests {
         #expect(toolCall.function.arguments.isEmpty)
     }
 
+    @Test("XML Function Parser marks missing required arguments invalid")
+    func testXMLFunctionParserMissingRequiredArgument() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "line_count",
+                    "parameters": [
+                        "properties": [
+                            "text": ["type": "string"] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                        "required": ["text"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content = "<tool_call>\n<function=line_count>\n</function>\n</tool_call>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.name == "line_count")
+        #expect(toolCall.function.arguments["text"] == nil)
+        #expect(toolCall.function.arguments["_error"] == .string("invalid_tool_arguments"))
+        #expect(toolCall.function.arguments["_field"] == .string("text"))
+    }
+
     // MARK: - GLM4 Format Tests
 
     @Test("Test GLM4 Tool Call Parser")

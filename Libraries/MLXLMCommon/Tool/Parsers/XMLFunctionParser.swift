@@ -67,6 +67,91 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             searchRange = paramEnd.upperBound ..< paramSection.endIndex
         }
 
+        if let invalidArguments = schemaValidationFailure(
+            toolName: funcName,
+            arguments: arguments,
+            tools: tools)
+        {
+            return ToolCall(function: .init(name: funcName, arguments: invalidArguments))
+        }
+
         return ToolCall(function: .init(name: funcName, arguments: arguments))
+    }
+
+    private func schemaValidationFailure(
+        toolName: String,
+        arguments: [String: any Sendable],
+        tools: [[String: any Sendable]]?
+    ) -> [String: any Sendable]? {
+        guard let tools,
+            let functionSpec = functionSpec(named: toolName, in: tools),
+            let parameters = sendableObject(functionSpec["parameters"])
+        else { return nil }
+
+        for required in sendableStringArray(parameters["required"]) {
+            if arguments[required] == nil {
+                return invalidToolArguments(
+                    toolName: toolName,
+                    message: "missing required argument: \(required)",
+                    field: required,
+                    expected: "required parameter")
+            }
+        }
+
+        return nil
+    }
+
+    private func functionSpec(
+        named name: String,
+        in tools: [[String: any Sendable]]
+    ) -> [String: any Sendable]? {
+        for tool in tools {
+            let function = (tool["function"] as? [String: any Sendable]) ?? tool
+            if function["name"] as? String == name {
+                return function
+            }
+        }
+        return nil
+    }
+
+    private func invalidToolArguments(
+        toolName: String,
+        message: String,
+        field: String,
+        expected: String
+    ) -> [String: any Sendable] {
+        [
+            "_error": "invalid_tool_arguments",
+            "_tool": toolName,
+            "_message": message,
+            "_field": field,
+            "_expected": expected,
+        ]
+    }
+
+    private func sendableObject(_ value: (any Sendable)?) -> [String: any Sendable]? {
+        if let object = value as? [String: any Sendable] {
+            return object
+        }
+        if case .object(let object)? = value as? JSONValue {
+            return object.mapValues { $0.sendableValue }
+        }
+        return nil
+    }
+
+    private func sendableStringArray(_ value: (any Sendable)?) -> [String] {
+        if let strings = value as? [String] {
+            return strings
+        }
+        if let values = value as? [any Sendable] {
+            return values.compactMap { $0 as? String }
+        }
+        if case .array(let values)? = value as? JSONValue {
+            return values.compactMap {
+                if case .string(let value) = $0 { return value }
+                return nil
+            }
+        }
+        return []
     }
 }
