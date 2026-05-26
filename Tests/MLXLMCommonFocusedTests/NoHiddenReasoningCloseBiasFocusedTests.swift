@@ -911,14 +911,15 @@ struct NemotronToolChoiceTemplateFocusedTests {
 
         let system = out[0]["content"] as? String
         #expect(out[0]["role"] as? String == "system")
-        #expect(system?.contains("for the line_count function") == true)
+        #expect(system?.contains("for one available function") == true)
+        #expect(system?.contains("for the line_count function") == false)
         #expect(system?.contains("Include every required <parameter=...>") == true)
         #expect(system?.hasSuffix("\n\nYou are concise.") == true)
         #expect(out[1]["content"] as? String == "Use line_count on red\ngreen\nblue.")
     }
 
-    @Test("Nemotron named required tool contract replaces stale generic directive")
-    func requiredToolChoiceReplacesStaleGenericDirective() {
+    @Test("Nemotron named required tool contract keeps proven generic directive")
+    func namedRequiredToolChoiceKeepsGenericDirective() {
         let messages: [Message] = [
             [
                 "role": "system",
@@ -936,8 +937,8 @@ struct NemotronToolChoiceTemplateFocusedTests {
             additionalContext: ["tool_choice": "required", "tool_choice_name": "file_read"])
 
         let system = out[0]["content"] as? String
-        #expect(system?.contains("for the file_read function") == true)
-        #expect(system?.contains("one available function") == false)
+        #expect(system?.contains("for one available function") == true)
+        #expect(system?.contains("for the file_read function") == false)
         #expect(system?.contains("You are concise.") == true)
     }
 

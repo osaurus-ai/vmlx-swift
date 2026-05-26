@@ -928,30 +928,10 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         "For this assistant turn, return exactly one <tool_call> XML function call for one available function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
 
     private static func requiredToolChoiceInstruction(
-        tools: [ToolSpec]?,
-        additionalContext: [String: any Sendable]?
+        tools _: [ToolSpec]?,
+        additionalContext _: [String: any Sendable]?
     ) -> String {
-        if let targetName = additionalContext?["tool_choice_name"] as? String,
-           !targetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            return "For this assistant turn, return exactly one <tool_call> XML function call for the \(targetName) function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
-        }
-        if let tools, tools.count == 1,
-           let only = toolName(from: tools[0]),
-           !only.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            return "For this assistant turn, return exactly one <tool_call> XML function call for the \(only) function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
-        }
         return requiredToolChoiceInstruction
-    }
-
-    private static func toolName(from tool: ToolSpec) -> String? {
-        if let function = tool["function"] as? [String: any Sendable],
-           let name = function["name"] as? String
-        {
-            return name
-        }
-        return tool["name"] as? String
     }
 
     static func addRequiredToolChoiceInstruction(

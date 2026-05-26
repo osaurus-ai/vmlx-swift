@@ -85,15 +85,6 @@ enum NemotronToolChoiceTemplateContext {
     private static let requiredToolDirective =
         "For this assistant turn, return exactly one <tool_call> XML function call for one available function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
 
-    private static func requiredToolDirective(targetName: String?) -> String {
-        guard let targetName,
-              !targetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else {
-            return requiredToolDirective
-        }
-        return "For this assistant turn, return exactly one <tool_call> XML function call for the \(targetName) function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
-    }
-
     static func applies(to modelType: String?) -> Bool {
         guard let modelType else { return false }
         let normalized = modelType.lowercased()
@@ -112,8 +103,7 @@ enum NemotronToolChoiceTemplateContext {
         }
 
         var out = messages
-        let directive = requiredToolDirective(
-            targetName: additionalContext?["tool_choice_name"] as? String)
+        let directive = requiredToolDirective
         if let index = out.firstIndex(where: { ($0["role"] as? String) == "system" }),
            let content = out[index]["content"] as? String
         {

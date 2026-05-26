@@ -225,11 +225,7 @@ value_1
 {%- if required_tool_choice %}
 
 <IMPORTANT>
-{%- if additionalContext is defined and additionalContext['tool_choice_name'] is defined %}
-The current assistant response MUST be a tool call. Reply only with a `<tool_call>` block for the {{ additionalContext['tool_choice_name'] }} function and no prose before the tool result.
-{%- else %}
 The current assistant response MUST be a tool call. Reply only with a `<tool_call>` block for one available tool and no prose before the tool result.
-{%- endif %}
 </IMPORTANT>
 {%- endif %}
 {%- endif %}
