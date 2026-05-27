@@ -845,6 +845,7 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
                 {%- endfor -%}
                 {{- '\n</function>\n</zyphra_tool_call>' -}}
                 {{- '\nReplace every VALUE_FOR_* placeholder with the actual argument value requested by the user.' -}}
+                {{- '\nFor string parameters, write the raw string value only. Do not wrap the parameter value in JSON quotes unless the requested value itself includes quote characters.' -}}
             {%- endif -%}
         {%- endfor -%}
     {%- endif -%}
@@ -911,7 +912,7 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
                 {%- set next_is_pure_tool_call = true -%}
             {%- endif -%}
         {%- endif -%}
-        {%- if not next_is_pure_tool_call -%}
+        {%- if (not required_tool_choice or loop.last) and not next_is_pure_tool_call -%}
         {{- '<|im_start|>user\n' -}}
         {{- render_content(message['content']) -}}
         {%- if required_tool_choice and loop.last -%}
@@ -923,7 +924,7 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
     {%- elif message['role'] == 'assistant' -%}
         {%- set has_tool_calls = message['tool_calls'] is defined and message['tool_calls'] is iterable and message['tool_calls'] | length > 0 -%}
         {%- set assistant_content = render_content(message['content']) -%}
-        {%- if not (required_tool_choice and has_tool_calls and not assistant_content) -%}
+        {%- if not required_tool_choice and not (required_tool_choice and has_tool_calls and not assistant_content) -%}
         {{- '<|im_start|>assistant\n' -}}
         {{- assistant_content -}}
         {%- if has_tool_calls and not required_tool_choice -%}

@@ -648,6 +648,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("<function=osaurus_probe_tool_0>"))
         #expect(rendered.contains("<parameter=query>\nVALUE_FOR_query\n</parameter>"))
         #expect(rendered.contains("Replace every VALUE_FOR_* placeholder"))
+        #expect(rendered.contains("Do not wrap the parameter value in JSON quotes"))
         #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
         #expect(!rendered.contains("<think>"))
         #expect(!rendered.contains("enable_thinking"))
@@ -717,13 +718,16 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             .compactMap { segment in
                 segment.split(separator: "\n", maxSplits: 1).first.map(String.init)
             }
-        #expect(turnRoles == ["system", "user", "assistant", "user", "assistant"])
+        #expect(turnRoles == ["system", "user", "assistant"])
         #expect(!rendered.contains("Use line_count on red\ngreen\nblue."))
+        #expect(!rendered.contains("How many lines? Do not call another tool."))
+        #expect(!rendered.contains("Three lines were counted."))
         #expect(!rendered.contains("Previous tool result available."))
         #expect(!rendered.contains("<zyphra_tool_response>\n{\"lines\":3}"))
         #expect(!rendered.contains("<function=line_count>\n<parameter=text>\nred\ngreen\nblue\n</parameter>\n</function>"))
         #expect(rendered.contains("Required call skeleton:\n<zyphra_tool_call>\n<function=line_count>"))
         #expect(rendered.contains("<parameter=text>\nVALUE_FOR_text\n</parameter>"))
+        #expect(rendered.contains("For string parameters, write the raw string value only."))
         #expect(rendered.hasSuffix(tail))
     }
 
