@@ -712,6 +712,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         let afterFinalUser = rendered[finalUserRange!.upperBound...]
         #expect(afterFinalUser.contains(currentReminder))
         #expect(!afterFinalUser.contains("<|im_start|>system\n" + currentReminder))
+        #expect(rendered.contains("Previous tool result available."))
+        #expect(!rendered.contains("<zyphra_tool_response>\n{\"lines\":3}"))
         #expect(rendered.contains("Required call skeleton:\n<zyphra_tool_call>\n<function=line_count>"))
         #expect(rendered.contains("<parameter=text>\nVALUE_FOR_text\n</parameter>"))
         #expect(rendered.hasSuffix(tail))

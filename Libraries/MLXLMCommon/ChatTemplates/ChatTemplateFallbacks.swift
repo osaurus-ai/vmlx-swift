@@ -919,9 +919,13 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
         {%- endif -%}
         {{- '<|im_end|>\n' -}}
     {%- elif message['role'] == 'tool' -%}
-        {{- '<|im_start|>user\n<zyphra_tool_response>\n' -}}
-        {{- render_content(message['content']) -}}
-        {{- '\n</zyphra_tool_response>\n<|im_end|>\n' -}}
+        {%- if required_tool_choice -%}
+            {{- '<|im_start|>user\nPrevious tool result available.\n<|im_end|>\n' -}}
+        {%- else -%}
+            {{- '<|im_start|>user\n<zyphra_tool_response>\n' -}}
+            {{- render_content(message['content']) -}}
+            {{- '\n</zyphra_tool_response>\n<|im_end|>\n' -}}
+        {%- endif -%}
     {%- elif message['role'] == 'system' -%}
         {{- '<|im_start|>system\n' -}}
         {{- render_content(message['content']) -}}
