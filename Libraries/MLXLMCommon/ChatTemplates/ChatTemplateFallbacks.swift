@@ -213,6 +213,31 @@ You have access to the following functions:
 {%- endfor %}
 </tools>
 
+{%- if required_tool_choice %}
+
+<IMPORTANT>
+The current assistant response MUST be a tool call. Reply only with a `<tool_call>` block for one available tool and no prose before the tool result. Use an exact function name from `<tools>`; never use placeholder or example function names.
+</IMPORTANT>
+Use this exact XML shape with real parameter values:
+{%- for tool in tools %}
+  {%- if loop.first %}
+    {%- set fn = tool['function'] if tool['function'] is defined else tool %}
+
+<tool_call>
+<function={{ fn['name'] }}>
+    {%- if fn['parameters'] is defined and fn['parameters']['properties'] is defined %}
+      {%- for param_name, param in fn['parameters']['properties'] | dictsort %}
+<parameter={{ param_name }}>
+value
+</parameter>
+      {%- endfor %}
+    {%- endif %}
+</function>
+</tool_call>
+  {%- endif %}
+{%- endfor %}
+{%- else %}
+
 If you choose to call a function ONLY reply in the following format with NO suffix:
 
 <tool_call>
@@ -222,11 +247,6 @@ value_1
 </parameter>
 </function>
 </tool_call>
-{%- if required_tool_choice %}
-
-<IMPORTANT>
-The current assistant response MUST be a tool call. Reply only with a `<tool_call>` block for one available tool and no prose before the tool result.
-</IMPORTANT>
 {%- endif %}
 {%- endif %}
 <|im_end|>
