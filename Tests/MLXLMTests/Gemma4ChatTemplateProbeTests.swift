@@ -362,6 +362,7 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             "messages": messages,
             "tools": tools,
             "add_generation_prompt": true,
+            "tool_choice": "required",
         ])
 
         XCTAssertTrue(out.contains("<|tool>declaration:get_weather"),
@@ -374,6 +375,10 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             "Assistant tool_call must render inline with Gemma's invoke syntax. Got: \(out)")
         XCTAssertTrue(out.contains("<|tool_response>response:get_weather{22°C, sunny}<tool_response|>"),
             "Tool response must render with Gemma's <|tool_response> wrapper. Got: \(out)")
+        XCTAssertTrue(out.contains("API tool_choice is required for the current assistant turn."),
+            "Required tool_choice must add a current-turn tool-call reminder. Got: \(out)")
+        XCTAssertTrue(out.contains("Required parameters for get_weather: location."),
+            "Required tool_choice reminder must name required parameters. Got: \(out)")
         XCTAssertTrue(out.hasSuffix("<|turn>model\n"),
             "Generation prompt must end with open model turn.")
     }

@@ -110,6 +110,12 @@ public enum ChatTemplateFallbacks {
         {{- arguments -}}
     {%- endif -%}
 {%- endmacro -%}
+{%- set required_tool_choice = false -%}
+{%- if tool_choice is defined and tool_choice == 'required' -%}
+    {%- set required_tool_choice = true -%}
+{%- elif additionalContext is defined and additionalContext['tool_choice'] == 'required' -%}
+    {%- set required_tool_choice = true -%}
+{%- endif -%}
 {%- if (tools or (messages[0]['role'] in ['system', 'developer'])) -%}
     {{- '<|turn>system\n' -}}
     {%- if messages[0]['role'] in ['system', 'developer'] -%}
@@ -188,6 +194,16 @@ public enum ChatTemplateFallbacks {
         {{- '<turn|>\n' -}}
     {%- endif -%}
 {%- endfor -%}
+{%- if required_tool_choice and tools -%}
+    {{- '<|turn>user\nAPI tool_choice is required for the current assistant turn. Reply with exactly one Gemma tool call and no prose. Include every required parameter declared for the chosen function. Native shape: <|tool_call>call:function_name{parameter_name:<|"|>value<|"|>}<tool_call|>.' -}}
+    {%- for tool in tools -%}
+        {%- set fn = tool['function'] if tool['function'] is defined else tool -%}
+        {%- if fn['parameters'] is defined and fn['parameters']['required'] is defined -%}
+            {{- '\nRequired parameters for ' + fn['name'] + ': ' + (fn['parameters']['required'] | join(', ')) + '.' -}}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- '<turn|>\n' -}}
+{%- endif -%}
 {%- if add_generation_prompt -%}
     {{- '<|turn>model\n' -}}
 {%- endif -%}
