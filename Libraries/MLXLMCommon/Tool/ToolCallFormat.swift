@@ -489,7 +489,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // which Nemotron's variant matches; if a future Nemotron release
         // uses Hermes-style `<TOOLCALL>` tags, a dedicated enum case
         // should be added here.
-        case "nemotron", "nemotron_h":
+        case "nemotron", "nemotron_h", "mimo_xml_tool_call":
             return .xmlFunction
         // Gemma — JANG stamps `gemma4`; the `gemma` short form maps to
         // legacy Gemma 3 format and is included for forward compatibility

@@ -627,6 +627,7 @@ struct ToolTests {
         // MiMo v2.5 JANG source bundles use XML-function tools.
         #expect(ToolCallFormat.infer(from: "mimo_v2") == .xmlFunction)
         #expect(ToolCallFormat.infer(from: "MIMO_V2") == .xmlFunction)
+        #expect(ToolCallFormat.fromCapabilityName("mimo_xml_tool_call") == .xmlFunction)
         #expect(ToolCallFormat.infer(from: "mimo_v2_flash") == nil)
 
         // Qwen3.5 models (prefix matching)
