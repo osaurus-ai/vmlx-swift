@@ -77,12 +77,6 @@
 {%- endif -%}
 
 {% endfor -%}
-{%- if required_tool_choice %}
-<extra_id_0>System
-<IMPORTANT>
-The current assistant response MUST be a tool call. Reply only with a `<tool_call>` block for one available tool and no prose before the tool result.
-</IMPORTANT>
-{%- endif %}
 {%- if add_generation_prompt %}
 <extra_id_1>Assistant
 {%- endif %}

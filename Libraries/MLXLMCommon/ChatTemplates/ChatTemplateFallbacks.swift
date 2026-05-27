@@ -302,13 +302,6 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
 {%- endif -%}
 
 {% endfor -%}
-{%- if required_tool_choice %}
-<|im_start|>system
-<IMPORTANT>
-The current assistant response MUST be a tool call. Reply only with a `<tool_call>` block for one available tool and no prose before the tool result.
-</IMPORTANT>
-<|im_end|>
-{%- endif %}
 {%- if add_generation_prompt %}
 <|im_start|>assistant
 {%- if enable_thinking %}

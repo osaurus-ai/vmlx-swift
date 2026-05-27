@@ -996,6 +996,16 @@ struct NemotronToolChoiceTemplateFocusedTests {
         #expect(out[1]["role"] as? String == "user")
     }
 
+    @Test("Nemotron required fallback does not append a late system turn")
+    func requiredFallbackDoesNotAppendLateSystemTurn() {
+        #expect(ChatTemplateFallbacks.nemotronMinimal.contains("<IMPORTANT>"))
+        #expect(!ChatTemplateFallbacks.nemotronMinimal.contains("""
+            {% endfor -%}
+            {%- if required_tool_choice %}
+            <|im_start|>system
+            """))
+    }
+
     @Test("non-required or non-Nemotron messages are unchanged")
     func nonRequiredOrNonNemotronUnchanged() {
         let messages: [Message] = [
