@@ -653,6 +653,67 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!rendered.contains("enable_thinking"))
     }
 
+    @Test("ZAYA1-VL required tool choice repeats at current turn after no-tool history")
+    func zayaVLRequiredToolChoiceRepeatsAfterNoToolHistory() throws {
+        let template = try Template(ChatTemplateFallbacks.zayaVLVisionToolMinimal)
+        let rendered = try template.renderDSV4([
+            "messages": [
+                ["role": "user", "content": "Use line_count on red\ngreen\nblue."],
+                [
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        [
+                            "id": "call_lines",
+                            "type": "function",
+                            "function": [
+                                "name": "line_count",
+                                "arguments": ["text": "red\ngreen\nblue"],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                    ],
+                ] as [String: any Sendable],
+                ["role": "tool", "tool_call_id": "call_lines", "content": #"{"lines":3}"#],
+                ["role": "user", "content": "How many lines? Do not call another tool."],
+                ["role": "assistant", "content": "Three lines were counted."],
+                ["role": "user", "content": "Now use line_count on one\ntwo."],
+            ],
+            "tools": [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "line_count",
+                        "description": "Count newline-separated lines in text.",
+                        "parameters": [
+                            "type": "object",
+                            "properties": [
+                                "text": ["type": "string"] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                            "required": ["text"],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ],
+            "bos_token": "<bos>",
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+            "tool_choice": "required",
+            "tool_choice_name": "line_count",
+        ])
+
+        let finalUser = "Now use line_count on one\ntwo."
+        let currentReminder = "The active API tool_choice is required for this assistant turn."
+        let tail = "<|im_start|>assistant\n"
+        let finalUserRange = rendered.range(of: finalUser)
+        let reminderRange = rendered.range(of: currentReminder, options: .backwards)
+        #expect(finalUserRange != nil)
+        #expect(reminderRange != nil)
+        #expect(finalUserRange!.lowerBound < reminderRange!.lowerBound)
+        #expect(rendered.contains("Required call skeleton:\n<zyphra_tool_call>\n<function=line_count>"))
+        #expect(rendered.contains("<parameter=text>\nVALUE_FOR_text\n</parameter>"))
+        #expect(rendered.hasSuffix(tail))
+    }
+
     @Test("ZAYA1-VL sidecar shim rewrites every loader-visible template source")
     func zayaVLSidecarShimRewritesTemplateSources() throws {
         let fm = FileManager.default
