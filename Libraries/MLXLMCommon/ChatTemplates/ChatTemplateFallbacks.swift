@@ -902,6 +902,16 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
 
 {%- for message in loop_messages -%}
     {%- if message['role'] == 'user' or message['role'] == 'question' -%}
+        {%- set next_is_pure_tool_call = false -%}
+        {%- if required_tool_choice and not loop.last -%}
+            {%- set next_message = loop_messages[loop.index0 + 1] -%}
+            {%- set next_has_tool_calls = next_message['tool_calls'] is defined and next_message['tool_calls'] is iterable and next_message['tool_calls'] | length > 0 -%}
+            {%- set next_assistant_content = render_content(next_message['content']) -%}
+            {%- if next_message['role'] == 'assistant' and next_has_tool_calls and not next_assistant_content -%}
+                {%- set next_is_pure_tool_call = true -%}
+            {%- endif -%}
+        {%- endif -%}
+        {%- if not next_is_pure_tool_call -%}
         {{- '<|im_start|>user\n' -}}
         {{- render_content(message['content']) -}}
         {%- if required_tool_choice and loop.last -%}
@@ -909,6 +919,7 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
             {{- render_required_tool_choice_instruction() -}}
         {%- endif -%}
         {{- '<|im_end|>\n' -}}
+        {%- endif -%}
     {%- elif message['role'] == 'assistant' -%}
         {%- set has_tool_calls = message['tool_calls'] is defined and message['tool_calls'] is iterable and message['tool_calls'] | length > 0 -%}
         {%- set assistant_content = render_content(message['content']) -%}
