@@ -1314,16 +1314,17 @@ public struct TokenIterator: TokenIteratorProtocol {
                     if cacheLookupUsesPostPrepareAlias {
                         self.promptTokenIds = cacheLookupTokenIds
                     }
-                    let hasPathDependentLayer = cacheContainsPathDependentState(self.cache)
+                    let requiresDiskBackedRestore =
+                        cacheRequiresDiskBackedCoordinatorRestore(self.cache)
                     let unsafePartial =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
-                    let unsafeFullHit = remainingTokens.isEmpty && hasPathDependentLayer
+                    let unsafeFullHit = remainingTokens.isEmpty && requiresDiskBackedRestore
                     if unsafePartial || unsafeFullHit {
                         let why: String
                         if unsafePartial {
                             why = "media placeholder tokens remain in cache-hit suffix"
                         } else if unsafeFullHit {
-                            why = "path-dependent full cache hit: re-feeding last token would double-count recurrent state"
+                            why = "disk-backed full cache hit: re-feeding last token can corrupt path-dependent or rotating state"
                         } else {
                             why = "cache hit can't be extended safely"
                         }
