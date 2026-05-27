@@ -40,7 +40,8 @@ struct MiMoV2FlashCacheTopologyTests {
       "v_head_dim": 4,
       "swa_head_dim": 4,
       "swa_v_head_dim": 4,
-      "partial_rotary_factor": 0.5
+      "partial_rotary_factor": 0.5,
+      "attention_value_scale": 0.707
     }
     """#
 
@@ -74,6 +75,45 @@ struct MiMoV2FlashCacheTopologyTests {
         #expect(!cache.contains { $0 is TurboQuantKVCache })
     }
 
+    @Test("configuration decodes MiMo V2.5 attention value scale")
+    func configurationDecodesAttentionValueScale() throws {
+        let config = try JSONDecoder.json5().decode(
+            MiMoV2FlashConfiguration.self,
+            from: Data(Self.minimalMiMoV25Config.utf8))
+
+        #expect(config.attentionValueScale == 0.707)
+    }
+
+    @Test("sanitize splits fused MiMo qkv projection by layer-specific KV shape")
+    func sanitizeSplitsFusedQKVProjection() throws {
+        let config = try JSONDecoder.json5().decode(
+            MiMoV2FlashConfiguration.self,
+            from: Data(Self.minimalMiMoV25Config.utf8))
+        let model = MiMoV2FlashModel(config)
+
+        let sanitized = model.sanitize(weights: [
+            "model.layers.0.self_attn.qkv_proj.weight": MLXArray.ones([64, 2]),
+            "model.layers.0.self_attn.qkv_proj.scales": MLXArray.ones([64, 1]),
+            "model.layers.0.self_attn.qkv_proj.biases": MLXArray.zeros([64, 1]),
+            "model.layers.1.self_attn.qkv_proj.weight": MLXArray.ones([96, 2]),
+            "model.layers.1.self_attn.qkv_proj.scales": MLXArray.ones([96, 1]),
+            "model.layers.1.self_attn.qkv_proj.biases": MLXArray.zeros([96, 1]),
+        ])
+
+        #expect(sanitized["model.layers.0.self_attn.qkv_proj.weight"] == nil)
+        #expect(sanitized["model.layers.0.self_attn.q_proj.weight"]?.shape == [32, 2])
+        #expect(sanitized["model.layers.0.self_attn.k_proj.weight"]?.shape == [16, 2])
+        #expect(sanitized["model.layers.0.self_attn.v_proj.weight"]?.shape == [16, 2])
+        #expect(sanitized["model.layers.0.self_attn.q_proj.scales"]?.shape == [32, 1])
+        #expect(sanitized["model.layers.0.self_attn.k_proj.biases"]?.shape == [16, 1])
+
+        #expect(sanitized["model.layers.1.self_attn.qkv_proj.weight"] == nil)
+        #expect(sanitized["model.layers.1.self_attn.q_proj.weight"]?.shape == [32, 2])
+        #expect(sanitized["model.layers.1.self_attn.k_proj.weight"]?.shape == [32, 2])
+        #expect(sanitized["model.layers.1.self_attn.v_proj.weight"]?.shape == [32, 2])
+        #expect(sanitized["model.layers.1.self_attn.v_proj.scales"]?.shape == [32, 1])
+    }
+
     @Test("TurboQuant KV only promotes full-attention cache layers")
     func turboQuantOnlyPromotesFullAttentionKVLayers() throws {
         let mlxTestLock = lockSerializedMLXTest()
@@ -102,6 +142,26 @@ struct MiMoV2FlashCacheTopologyTests {
         #expect(cache[1] is RotatingKVCache)
         #expect(cache[2] is RotatingKVCache)
         #expect(cache[3] is TurboQuantKVCache)
+    }
+
+    @Test("cache topology snapshot marks MiMo full/SWA KV as disk-backed rotating topology")
+    func cacheTopologySnapshotMarksMiMoHybridFullSWA() throws {
+        let config = try JSONDecoder.json5().decode(
+            MiMoV2FlashConfiguration.self,
+            from: Data(Self.minimalMiMoV25Config.utf8))
+        let model = MiMoV2FlashModel(config)
+
+        let snapshot = ModelCacheTopologySnapshot(cache: model.newCache(parameters: nil))
+
+        #expect(snapshot.layerCount == 4)
+        #expect(snapshot.kvLayerCount == 2)
+        #expect(snapshot.rotatingKVLayerCount == 2)
+        #expect(snapshot.requiresSSMCompanionState == false)
+        #expect(snapshot.requiresDiskBackedCoordinatorRestore)
+        #expect(snapshot.topologyTags.contains("kvLayers=2"))
+        #expect(snapshot.topologyTags.contains("rotatingLayers=2"))
+        #expect(snapshot.topologyTags.contains("restore=disk-backed"))
+        #expect(!snapshot.topologyTags.contains("companion=ssm"))
     }
 
     @Test("L2 disk round trip preserves hybrid full/SWA cache kinds")
@@ -134,6 +194,50 @@ struct MiMoV2FlashCacheTopologyTests {
         #expect((restored[1] as? RotatingKVCache)?.offset == 12)
         #expect((restored[2] as? RotatingKVCache)?.offset == 12)
         #expect(restored[3].state[0].dim(2) == 12)
+    }
+
+    @Test("L2 disk round trip preserves TurboQuant full layers plus rotating SWA")
+    func l2DiskRoundTripPreservesTurboQuantFullAndRotatingSWA() throws {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
+        let config = try JSONDecoder.json5().decode(
+            MiMoV2FlashConfiguration.self,
+            from: Data(Self.minimalMiMoV25Config.utf8))
+        let model = MiMoV2FlashModel(config)
+        var cache = model.newCache(parameters: GenerateParameters(
+            maxTokens: 8,
+            kvMode: .turboQuant(keyBits: 3, valueBits: 3)))
+        let tokenCount = 4
+            + TurboQuantKVCache.defaultResidualTokens
+            + TurboQuantKVCache.minimumCompressedTokens
+            + 8
+        Self.fill(cache: cache, tokenCount: tokenCount)
+
+        maybeQuantizeKVCache(
+            cache: &cache,
+            kvBits: nil,
+            quantizedKVStart: 0,
+            kvMode: .turboQuant(keyBits: 3, valueBits: 3))
+
+        let arrays = TQDiskSerializer.serialize(cache: cache)
+        #expect(TQDiskSerializer.formatVersion(of: arrays) == 2)
+        #expect(Self.layerKind(arrays, 0) == TQDiskSerializer.LayerKind.tq.rawValue)
+        #expect(Self.layerKind(arrays, 1) == TQDiskSerializer.LayerKind.rotating.rawValue)
+        #expect(Self.layerKind(arrays, 2) == TQDiskSerializer.LayerKind.rotating.rawValue)
+        #expect(Self.layerKind(arrays, 3) == TQDiskSerializer.LayerKind.tq.rawValue)
+
+        var restored = model.newCache(parameters: GenerateParameters(maxTokens: 8))
+        let restoredTokens = restoreFromDiskArrays(arrays, into: &restored)
+        #expect(restoredTokens == tokenCount)
+        #expect(restored[0] is TurboQuantKVCache)
+        #expect(restored[1] is RotatingKVCache)
+        #expect(restored[2] is RotatingKVCache)
+        #expect(restored[3] is TurboQuantKVCache)
+        #expect((restored[0] as? TurboQuantKVCache)?.offset == tokenCount)
+        #expect((restored[1] as? RotatingKVCache)?.offset == tokenCount)
+        #expect((restored[2] as? RotatingKVCache)?.offset == tokenCount)
+        #expect((restored[3] as? TurboQuantKVCache)?.offset == tokenCount)
     }
 
     private static func fill(cache: [any KVCache], tokenCount: Int) {
