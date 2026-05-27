@@ -872,6 +872,28 @@ struct BailingThinkingTemplateFocusedTests {
         #expect(replaced[0]["content"] as? String == "detailed thinking off\n\nYou are concise.")
     }
 
+    @Test("named required tool choice names the selected Bailing function")
+    func namedRequiredToolChoiceNamesSelectedBailingFunction() {
+        let messages: [Message] = [
+            ["role": "system", "content": "You are concise."],
+            ["role": "user", "content": "count lines"],
+        ]
+
+        let out = BailingThinkingTemplateContext.apply(
+            to: messages,
+            modelType: "bailing_hybrid",
+            additionalContext: [
+                "tool_choice": "required",
+                "tool_choice_name": "line_count",
+            ])
+
+        let system = out[0]["content"] as? String
+        #expect(out[0]["role"] as? String == "system")
+        #expect(system?.contains("one <tool_call> JSON object") == true)
+        #expect(system?.contains("Use the `line_count` function.") == true)
+        #expect(system?.hasSuffix("\n\nYou are concise.") == true)
+    }
+
     @Test("non-Bailing model and missing toggle are unchanged")
     func nonBailingOrMissingToggleUnchanged() {
         let messages: [Message] = [

@@ -39,6 +39,12 @@ enum BailingThinkingTemplateContext {
         }
         if additionalContext?["tool_choice"] as? String == "required" {
             directives.append(requiredToolDirective)
+            if let toolChoiceName = additionalContext?["tool_choice_name"] as? String {
+                let trimmedToolChoiceName = toolChoiceName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmedToolChoiceName.isEmpty {
+                    directives.append("Use the `\(trimmedToolChoiceName)` function.")
+                }
+            }
         }
         guard !directives.isEmpty else {
             return messages
@@ -69,6 +75,7 @@ enum BailingThinkingTemplateContext {
                 return normalized != thinkingOnDirective
                     && normalized != thinkingOffDirective
                     && normalized != requiredToolDirective.lowercased()
+                    && !(normalized.hasPrefix("use the `") && normalized.hasSuffix("` function."))
             }
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)

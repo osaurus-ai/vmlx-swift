@@ -106,6 +106,26 @@ final class BailingThinkingTemplateContextTests: XCTestCase {
         XCTAssertEqual(out[1]["role"] as? String, "user")
     }
 
+    func testNamedRequiredToolChoiceMentionsSelectedBailingFunction() {
+        let messages: [Message] = [
+            ["role": "system", "content": "You are concise."],
+            ["role": "user", "content": "count lines"]
+        ]
+
+        let out = BailingThinkingTemplateContext.apply(
+            to: messages,
+            modelType: "bailing_hybrid",
+            additionalContext: [
+                "tool_choice": "required",
+                "tool_choice_name": "line_count",
+            ]
+        )
+
+        XCTAssertEqual(out[0]["role"] as? String, "system")
+        XCTAssertTrue((out[0]["content"] as? String)?.contains("Use the `line_count` function.") == true)
+        XCTAssertTrue((out[0]["content"] as? String)?.contains("You are concise.") == true)
+    }
+
     func testThinkingAndRequiredToolChoiceShareOneSystemMessage() {
         let messages: [Message] = [
             ["role": "system", "content": "detailed thinking on\n\nYou are concise."],
