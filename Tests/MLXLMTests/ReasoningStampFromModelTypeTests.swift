@@ -106,6 +106,12 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
         }
     }
 
+    func testMiMoV2GetsThinkXml() {
+        XCTAssertEqual(reasoningStampFromModelType("mimo_v2"), "think_xml")
+        XCTAssertEqual(reasoningStampFromModelType("MIMO_V2"), "think_xml")
+        XCTAssertEqual(reasoningStampFromModelType("mimo_v2_flash"), "none")
+    }
+
     func testZayaGetsThinkXml() {
         for modelType in ["zaya", "zaya1", "zaya2"] {
             XCTAssertEqual(reasoningStampFromModelType(modelType), "think_xml")

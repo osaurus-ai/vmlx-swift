@@ -624,6 +624,11 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "nemotron_h") == .xmlFunction)
         #expect(ToolCallFormat.infer(from: "NEMOTRON_H") == .xmlFunction)
 
+        // MiMo v2.5 JANG source bundles use XML-function tools.
+        #expect(ToolCallFormat.infer(from: "mimo_v2") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "MIMO_V2") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "mimo_v2_flash") == nil)
+
         // Qwen3.5 models (prefix matching)
         #expect(ToolCallFormat.infer(from: "qwen3_5") == .xmlFunction)
         #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .xmlFunction)
