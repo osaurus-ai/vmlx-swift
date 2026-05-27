@@ -535,6 +535,11 @@ struct ToolCallFormatCapabilityTests {
         }
     }
 
+    @Test func mimoAliases() {
+        #expect(ToolCallFormat.fromCapabilityName("mimo_xml_tool_call") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "mimo_v2") == .xmlFunction)
+    }
+
     @Test func minimaxAlias() {
         #expect(ToolCallFormat.fromCapabilityName("minimax") == .minimaxM2)
     }
