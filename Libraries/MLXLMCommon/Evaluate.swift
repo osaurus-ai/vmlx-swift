@@ -1270,6 +1270,13 @@ public struct TokenIterator: TokenIteratorProtocol {
                     )
                 }
             }
+            if input.toolSchemas?.isEmpty == false,
+               cacheHasStandaloneRotatingWindowState(self.cache)
+            {
+                Self.logger.info(
+                    "TokenIterator: skipped disk-backed rotating cache fetch for active tool schema"
+                )
+            } else {
             let result = coordinator.fetch(
                 tokens: cacheLookupTokenIds, mediaSalt: mediaSalt)
             switch result {
@@ -1441,6 +1448,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                         )
                     }
                 }
+            }
             }
         } else if cacheCoordinator != nil,
                   !promptTokenIds.isEmpty,

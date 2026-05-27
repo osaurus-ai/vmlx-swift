@@ -136,6 +136,9 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(evaluate.contains("disk-backed full cache hit: re-feeding last token can corrupt path-dependent or rotating state"))
         #expect(batch.contains("cacheRequiresDiskBackedCoordinatorRestore(slot.cache)"))
         #expect(nativeMTP.contains("cacheRequiresDiskBackedCoordinatorRestore(self.cache)"))
+        #expect(helpers.contains("func cacheHasStandaloneRotatingWindowState"))
+        #expect(evaluate.contains("skipped disk-backed rotating cache fetch for active tool schema"))
+        #expect(batch.contains("skipped disk-backed rotating cache fetch for active tool schema"))
 
         for source in [evaluate, batch, nativeMTP] {
             #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss("))

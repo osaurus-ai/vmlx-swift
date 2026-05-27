@@ -97,6 +97,38 @@ public func cacheRequiresDiskBackedCoordinatorRestore(_ cache: [any KVCache]) ->
     }
 }
 
+/// True for Gemma/Mistral-style standalone sliding-window attention caches.
+///
+/// These caches are disk-backed because paged KV blocks cannot represent the
+/// rotating ring metadata. For active tool-call prompts, a stale or partial
+/// rotating restore can corrupt the model's next structured-argument emission.
+/// DSV4 hybrid-pool and recurrent SSM/CCA models are intentionally excluded:
+/// they have separate architecture-specific restore/companion-state contracts.
+public func cacheHasStandaloneRotatingWindowState(_ cache: [any KVCache]) -> Bool {
+    var hasRotating = false
+    var hasHybridPool = false
+
+    func visit(_ layer: any KVCache) {
+        if layer is HybridPoolCache {
+            hasHybridPool = true
+        }
+        if layer is RotatingKVCache || layer is RotatingKVCacheWrapper {
+            hasRotating = true
+        }
+        if let cacheList = layer as? CacheList {
+            for i in 0..<cacheList.count {
+                visit(cacheList[i])
+            }
+        }
+    }
+
+    for layer in cache {
+        visit(layer)
+    }
+
+    return hasRotating && !hasHybridPool && !cacheContainsPathDependentState(cache)
+}
+
 /// True when a failed trim should not fall back to a model re-derive while
 /// writing optional history-boundary cache entries.
 ///

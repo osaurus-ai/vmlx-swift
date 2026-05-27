@@ -1287,6 +1287,17 @@ public actor BatchEngine {
                 activeSlots[slotIndex] = slot
                 return stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare)
             }
+            if slot.originalInput.toolSchemas?.isEmpty == false,
+               cacheHasStandaloneRotatingWindowState(slot.cache)
+            {
+                Self.logger.info(
+                    "Slot \(slot.id.description, privacy: .public): skipped disk-backed rotating cache fetch for active tool schema"
+                )
+                activeSlots[slotIndex] = slot
+                return stepPrefillAfterCacheLookup(
+                    slotIndex: slotIndex,
+                    inputForPrepare: inputForPrepare)
+            }
             let result = coordinator.fetch(tokens: tokenIds, mediaSalt: slot.mediaSalt)
             if case .hit(_, let remaining, let detail, let blocks, let ssmStates, let diskArrays) = result {
                 var restored = false
