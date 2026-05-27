@@ -646,8 +646,10 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("Use the `osaurus_probe_tool_0` function."))
         #expect(rendered.contains("Required parameters for `osaurus_probe_tool_0`: query."))
         #expect(rendered.contains("<function=osaurus_probe_tool_0>"))
-        #expect(rendered.contains("<parameter=query>\nVALUE_FOR_query\n</parameter>"))
-        #expect(rendered.contains("Replace every VALUE_FOR_* placeholder"))
+        #expect(rendered.contains("<parameter=PARAMETER_NAME>\nACTUAL_ARGUMENT_VALUE\n</parameter>"))
+        #expect(rendered.contains("fill each parameter with the actual argument value"))
+        #expect(!rendered.contains("VALUE_FOR_query"))
+        #expect(!rendered.contains("VALUE_FOR_*"))
         #expect(rendered.contains("Do not wrap the parameter value in JSON quotes"))
         #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
         #expect(!rendered.contains("<think>"))
@@ -724,8 +726,9 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!rendered.contains("Previous tool result available."))
         #expect(!rendered.contains("<zyphra_tool_response>\n{\"lines\":3}"))
         #expect(!rendered.contains("<function=line_count>\n<parameter=text>\nred\ngreen\nblue\n</parameter>\n</function>"))
-        #expect(rendered.contains("Required call skeleton:\n<zyphra_tool_call>\n<function=line_count>"))
-        #expect(rendered.contains("<parameter=text>\nVALUE_FOR_text\n</parameter>"))
+        #expect(rendered.contains("Return the call in this form:\n<zyphra_tool_call>\n<function=line_count>"))
+        #expect(rendered.contains("<parameter=PARAMETER_NAME>\nACTUAL_ARGUMENT_VALUE\n</parameter>"))
+        #expect(!rendered.contains("VALUE_FOR_text"))
         #expect(rendered.contains("For string parameters, write the raw string value only."))
         #expect(rendered.hasSuffix(tail))
     }
@@ -761,6 +764,28 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         </function>
         </zyphra_tool_call>
         """#
+        let call = try #require(
+            ToolCallFormat.zayaXml.createParser().parse(
+                content: content,
+                tools: [lineCountToolSpec()]))
+
+        #expect(call.function.name == "line_count")
+        #expect(call.function.arguments["text"] == .string("red\ngreen\nblue"))
+    }
+
+    @Test("ZAYA XML parser unwraps accidental raw multiline quoted string parameters")
+    func zayaXMLParserUnwrapsRawMultilineQuotedStringParameters() throws {
+        let content = """
+        <zyphra_tool_call>
+        <function=line_count>
+        <parameter=text>
+        "red
+        green
+        blue"
+        </parameter>
+        </function>
+        </zyphra_tool_call>
+        """
         let call = try #require(
             ToolCallFormat.zayaXml.createParser().parse(
                 content: content,

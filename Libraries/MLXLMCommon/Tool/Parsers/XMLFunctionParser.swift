@@ -75,7 +75,7 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             }
             if unwrapJSONQuotedStringParameters,
                isStringType(funcName: funcName, argName: paramName, tools: tools),
-               let unwrapped = decodeJSONQuotedString(paramValue) {
+               let unwrapped = decodeQuotedStringParameter(paramValue) {
                 paramValue = unwrapped
             }
 
@@ -218,13 +218,21 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
     }
 }
 
-private func decodeJSONQuotedString(_ value: String) -> String? {
+private func decodeQuotedStringParameter(_ value: String) -> String? {
     let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard trimmed.hasPrefix("\""), trimmed.hasSuffix("\""),
-          let data = trimmed.data(using: .utf8),
-          let decoded = try? JSONDecoder().decode(String.self, from: data)
-    else {
+    guard trimmed.hasPrefix("\""), trimmed.hasSuffix("\"") else {
         return nil
     }
-    return decoded
+    if let data = trimmed.data(using: .utf8),
+       let decoded = try? JSONDecoder().decode(String.self, from: data) {
+        return decoded
+    }
+    let innerStart = trimmed.index(after: trimmed.startIndex)
+    let innerEnd = trimmed.index(before: trimmed.endIndex)
+    guard innerStart <= innerEnd else { return "" }
+    let inner = String(trimmed[innerStart..<innerEnd])
+    if inner.contains("\n") || inner.contains("\r") {
+        return inner
+    }
+    return nil
 }

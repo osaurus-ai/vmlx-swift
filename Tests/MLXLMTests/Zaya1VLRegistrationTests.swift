@@ -447,10 +447,12 @@ struct Zaya1VLRegistrationTests {
         #expect(decoded.contains("Required parameters for `line_count`: text."),
             "decoded prompt: \(decoded)")
         #expect(decoded.contains("<function=line_count>"), "decoded prompt: \(decoded)")
-        #expect(decoded.contains("<parameter=text>\nVALUE_FOR_text\n</parameter>"),
+        #expect(decoded.contains("<parameter=PARAMETER_NAME>\nACTUAL_ARGUMENT_VALUE\n</parameter>"),
             "decoded prompt: \(decoded)")
-        #expect(decoded.contains("Replace every VALUE_FOR_* placeholder"),
+        #expect(decoded.contains("fill each parameter with the actual argument value"),
             "decoded prompt: \(decoded)")
+        #expect(!decoded.contains("VALUE_FOR_text"), "decoded prompt: \(decoded)")
+        #expect(!decoded.contains("VALUE_FOR_*"), "decoded prompt: \(decoded)")
     }
 
     @Test("Real ZAYA1-VL processor expands sidecar-rendered image placeholders",
