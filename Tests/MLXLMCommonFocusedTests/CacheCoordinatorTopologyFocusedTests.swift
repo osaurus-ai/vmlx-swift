@@ -479,8 +479,8 @@ struct CacheCoordinatorTopologyFocusedTests {
                 modelKey: reasoningOn))
     }
 
-    @Test("cache scope salt includes only semantic reasoning keys")
-    func cacheScopeSaltIncludesOnlySemanticReasoningKeys() {
+    @Test("cache scope salt includes semantic reasoning and tool-choice keys")
+    func cacheScopeSaltIncludesSemanticReasoningAndToolChoiceKeys() {
         #expect(cacheScopeSalt(from: ["reasoning_effort": "high"]) == "effort=high")
         #expect(cacheScopeSalt(from: ["reasoning_effort": " No_Think "]) == "effort=no_think")
         #expect(cacheScopeSalt(from: [
@@ -492,6 +492,16 @@ struct CacheCoordinatorTopologyFocusedTests {
             "reasoning_effort": "max",
         ]) == "reasoning=off|effort=max")
         #expect(cacheScopeSalt(from: [
+            "tool_choice": "required",
+            "tool_choice_name": "Line_Count",
+        ]) == "tool=required|tool_name=line_count")
+        #expect(cacheScopeSalt(from: [
+            "enable_thinking": false,
+            "tool_choice": "required",
+            "tool_choice_name": "file_read",
+        ]) == "reasoning=off|tool=required|tool_name=file_read")
+        #expect(cacheScopeSalt(from: [
+            "tool_choice": "auto",
             "ui_panel": "visible",
             "temperature_source": "default",
         ]) == nil)

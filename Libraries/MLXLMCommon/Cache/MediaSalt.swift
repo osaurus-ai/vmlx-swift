@@ -124,7 +124,9 @@ private func hashMLXArray(_ array: MLXArray, into hasher: inout SHA256) {
 ///   - `"reasoning=off"` when `enable_thinking == false`
 ///   - `"reasoning=on"`  when `enable_thinking == true`
 ///   - `"effort=<value>"` when `reasoning_effort` is present
-///   - a `|`-joined composition when both keys are present
+///   - `"tool=required"` when `tool_choice == "required"`
+///   - `"tool_name=<value>"` when `tool_choice_name` is present
+///   - a `|`-joined composition when multiple keys are present
 ///   - `nil` when no recognized semantic key is present (so unrelated metadata
 ///     in `additionalContext` does not fragment cache keys)
 ///
@@ -141,6 +143,18 @@ public func cacheScopeSalt(from additionalContext: [String: any Sendable]?) -> S
         let normalized = effort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !normalized.isEmpty {
             parts.append("effort=\(normalized)")
+        }
+    }
+    if let toolChoice = additionalContext["tool_choice"] as? String {
+        let normalized = toolChoice.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized == "required" {
+            parts.append("tool=required")
+        }
+    }
+    if let toolChoiceName = additionalContext["tool_choice_name"] as? String {
+        let normalized = toolChoiceName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !normalized.isEmpty {
+            parts.append("tool_name=\(normalized)")
         }
     }
     return parts.isEmpty ? nil : parts.joined(separator: "|")
