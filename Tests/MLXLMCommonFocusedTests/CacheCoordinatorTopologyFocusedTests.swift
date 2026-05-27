@@ -323,8 +323,8 @@ struct CacheCoordinatorTopologyFocusedTests {
         }
     }
 
-    @Test("ZAYA CCA format-v2 disk payload is enough for hybrid cache hit")
-    func zayaCCADiskHitDoesNotRequireSeparateSSMCompanion() {
+    @Test("ZAYA CCA format-v2 disk payload is not reused without proven companion boundary")
+    func zayaCCADiskHitRequiresProvenCompanionBoundary() {
         FocusedMLXTestSupport.withLock {
         let tmp = makeTempDir("zaya-cca-disk")
         defer { try? FileManager.default.removeItem(at: tmp) }
@@ -352,15 +352,10 @@ struct CacheCoordinatorTopologyFocusedTests {
             cache: [cache])
 
         switch coordinator.fetch(tokens: tokens + [55]) {
-        case .hit(let matchedTokens, let remainingTokens, let detail, let blocks, _, let diskArrays):
-            #expect(matchedTokens == tokens.count)
-            #expect(remainingTokens == [55])
-            #expect(detail == .disk)
-            #expect(blocks.isEmpty)
-            #expect(diskArrays?["zaya_0_conv_state"] != nil)
-            #expect(diskArrays?["zaya_0_prev_hs"] != nil)
+        case .hit:
+            Issue.record("ZAYA CCA disk payload must not be promoted to a reusable prefix hit without a proven companion boundary")
         case .miss:
-            Issue.record("ZAYA CCA v2 disk payload already carries path-dependent state")
+            break
         }
         }
     }
