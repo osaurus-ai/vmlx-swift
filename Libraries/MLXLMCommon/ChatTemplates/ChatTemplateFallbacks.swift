@@ -846,7 +846,12 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
             {%- if selected_tool['name'] == required_tool_name and selected_tool['parameters'] is defined and selected_tool['parameters']['required'] is defined -%}
                 {{- '\nRequired parameters for `' ~ required_tool_name ~ '`: ' ~ (selected_tool['parameters']['required'] | join(', ')) ~ '.' -}}
                 {{- '\nReturn the call in this form:\n<zyphra_tool_call>\n<function=' ~ required_tool_name ~ '>\n<parameter=PARAMETER_NAME>\nACTUAL_ARGUMENT_VALUE\n</parameter>\n</function>\n</zyphra_tool_call>' -}}
+                {{- '\nFor this tool, include these required parameter block(s) exactly once:' -}}
+                {%- for required_param_name in selected_tool['parameters']['required'] -%}
+                    {{- '\n<parameter=' ~ required_param_name ~ '>\nACTUAL_ARGUMENT_VALUE\n</parameter>' -}}
+                {%- endfor -%}
                 {{- '\nUse the required parameter names exactly as listed above and fill each parameter with the actual argument value requested by the user.' -}}
+                {{- '\nDo not omit required parameters. If the latest user message asks to use the tool on exact text, copy that exact text into the string parameter body, preserving newlines.' -}}
                 {{- '\nFor string parameters, write the raw string value only. Do not wrap the parameter value in JSON quotes unless the requested value itself includes quote characters.' -}}
             {%- endif -%}
         {%- endfor -%}
