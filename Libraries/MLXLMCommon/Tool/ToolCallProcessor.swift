@@ -50,6 +50,7 @@ public class ToolCallProcessor {
         case json
         case actionJSON
         case functionCall
+        case requestToolXML
         case bareNameJSON
         case bareNameKeyValue
     }
@@ -217,6 +218,29 @@ public class ToolCallProcessor {
                 return visible.isEmpty ? nil : visible
             }
 
+            if let callIndex = firstInlineRequestToolXMLToolCallStart(in: inlineText) {
+                let leading = String(inlineText[..<callIndex])
+                inlineToolCallKind = .requestToolXML
+                toolCallBuffer = String(inlineText[callIndex...])
+                state = .collectingInlineToolCall
+
+                if requestToolXMLCallComplete(toolCallBuffer),
+                    let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
+                {
+                    toolCalls.append(toolCall)
+                    toolCallBuffer = ""
+                    state = .normal
+                    suppressingTextAfterInlineToolCall = true
+                }
+                return leading.isEmpty ? nil : leading
+            }
+
+            if let pendingIndex = partialInlineRequestToolXMLToolCallStart(in: inlineText) {
+                let visible = String(inlineText[..<pendingIndex])
+                leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
+                return visible.isEmpty ? nil : visible
+            }
+
             if let callIndex = firstInlineBareNameJSONToolCallStart(in: inlineText) {
                 let leading = String(inlineText[..<callIndex])
                 inlineToolCallKind = .bareNameJSON
@@ -343,6 +367,8 @@ public class ToolCallProcessor {
             return jsonBracesBalanced(text)
         case .functionCall:
             return functionCallParenthesesBalanced(text)
+        case .requestToolXML:
+            return requestToolXMLCallComplete(text)
         case .bareNameJSON:
             return bareNameJSONCallBalanced(text)
         case .bareNameKeyValue:
@@ -352,7 +378,7 @@ public class ToolCallProcessor {
 
     private func shouldAttemptInlineToolParse(_ text: String) -> Bool {
         switch inlineToolCallKind {
-        case .actionJSON, .bareNameKeyValue:
+        case .actionJSON, .requestToolXML, .bareNameKeyValue:
             return inlineToolCallComplete(text)
         case .json, .functionCall, .bareNameJSON:
             return true
@@ -432,7 +458,9 @@ public class ToolCallProcessor {
                 || compact.hasPrefix("\($0){")
                 || compact.hasPrefix("\($0):json{")
                 || compact.hasPrefix("\($0)```")
-        } || firstInlineBareNameKeyValueToolCallStart(in: text) != nil
+        } || firstInlineRequestToolXMLToolCallStart(in: text) != nil
+            || partialInlineRequestToolXMLToolCallStart(in: text) != nil
+            || firstInlineBareNameKeyValueToolCallStart(in: text) != nil
             || partialInlineBareNameKeyValueToolCallStart(in: text) != nil
     }
 
@@ -555,6 +583,35 @@ public class ToolCallProcessor {
             cursor = text.index(after: cursor)
         }
         return best
+    }
+
+    private func firstInlineRequestToolXMLToolCallStart(in text: String) -> String.Index? {
+        Self.requestToolXMLPrefixes
+            .compactMap { text.range(of: $0)?.lowerBound }
+            .min()
+    }
+
+    private func partialInlineRequestToolXMLToolCallStart(in text: String) -> String.Index? {
+        guard !text.isEmpty else { return nil }
+        var best: String.Index?
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            if isInlineFunctionBoundary(text, before: cursor) || text[cursor] == "_" {
+                let suffix = String(text[cursor...])
+                if Self.requestToolXMLPrefixes.contains(where: {
+                    $0.hasPrefix(suffix) && suffix.count < $0.count
+                }) {
+                    best = cursor
+                    break
+                }
+            }
+            cursor = text.index(after: cursor)
+        }
+        return best
+    }
+
+    private func requestToolXMLCallComplete(_ text: String) -> Bool {
+        text.contains("</invoke>")
     }
 
     private func firstInlineBareNameJSONToolCallStart(in text: String) -> String.Index? {
@@ -825,6 +882,11 @@ public class ToolCallProcessor {
         "recursive",
     ]
 
+    private static let requestToolXMLPrefixes = [
+        "_only:request_tool<invoke>",
+        "request_tool<invoke>",
+    ]
+
     private func bareNameJSONTailStartsObject(in text: String, afterName: String.Index) -> Bool {
         let cursor = bareNameJSONTailObjectStart(in: text, afterName: afterName)
         return cursor < text.endIndex && text[cursor] == "{"
@@ -942,6 +1004,8 @@ public class ToolCallProcessor {
                             || partialInlineActionJSONToolCallStart(in: candidate) != nil
                             || firstInlineFunctionToolCallStart(in: candidate) != nil
                             || partialInlineFunctionToolCallStart(in: candidate) != nil
+                            || firstInlineRequestToolXMLToolCallStart(in: candidate) != nil
+                            || partialInlineRequestToolXMLToolCallStart(in: candidate) != nil
                             || firstInlineBareNameJSONToolCallStart(in: candidate) != nil
                             || partialInlineBareNameJSONToolCallStart(in: candidate) != nil
                             || firstInlineBareNameKeyValueToolCallStart(in: candidate) != nil
@@ -963,6 +1027,8 @@ public class ToolCallProcessor {
                     || partialInlineActionJSONToolCallStart(in: chunk) != nil
                     || firstInlineFunctionToolCallStart(in: chunk) != nil
                     || partialInlineFunctionToolCallStart(in: chunk) != nil
+                    || firstInlineRequestToolXMLToolCallStart(in: chunk) != nil
+                    || partialInlineRequestToolXMLToolCallStart(in: chunk) != nil
                     || firstInlineBareNameJSONToolCallStart(in: chunk) != nil
                     || partialInlineBareNameJSONToolCallStart(in: chunk) != nil
                     || firstInlineBareNameKeyValueToolCallStart(in: chunk) != nil

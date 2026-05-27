@@ -145,10 +145,10 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
 
     private func trimBoundaryNewlines(_ value: String) -> String {
         var result = value
-        if result.hasPrefix("\n") {
+        while result.hasPrefix("\n") || result.hasPrefix("\r") {
             result = String(result.dropFirst())
         }
-        if result.hasSuffix("\n") {
+        while result.hasSuffix("\n") || result.hasSuffix("\r") {
             result = String(result.dropLast())
         }
         return result

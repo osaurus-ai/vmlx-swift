@@ -80,6 +80,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         if let firstCall = parseFirstInvoke(in: text, tools: tools) {
             return firstCall
         }
+        if let requestToolXMLCall = parseRequestToolXMLFallback(in: text, tools: tools) {
+            return requestToolXMLCall
+        }
         if let pythonCall = parsePythonStyleToolFallback(in: text, tools: tools) {
             return pythonCall
         }
@@ -117,6 +120,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         let buffer = strippedOuterToolTags(from: toolCallBuffer)
         let calls = parseAllInvokes(in: buffer, tools: tools, allowPartialEOF: true)
         if !calls.isEmpty { return calls }
+        if let requestToolXMLCall = parseRequestToolXMLFallback(in: buffer, tools: tools) {
+            return [requestToolXMLCall]
+        }
         if let pythonCall = parsePythonStyleToolFallback(in: buffer, tools: tools) {
             return [pythonCall]
         }
@@ -532,6 +538,52 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             return nil
         }
         return ToolCall(function: .init(name: candidate.name, arguments: args))
+    }
+
+    /// Live DSV4 JANGTQ2 can emit a structured request-tool rail after
+    /// multi-turn tool history, for example:
+    ///
+    /// `_only:request_tool<invoke><target_name>line_count</target><params><string>one\ntwo</string></params></invoke>`
+    ///
+    /// This is an alternate tool protocol, not visible assistant prose. Map the
+    /// target to the tool name and the single `<string>` param to the only
+    /// required string parameter declared by the selected tool schema.
+    private func parseRequestToolXMLFallback(
+        in text: String,
+        tools: [[String: any Sendable]]?
+    ) -> ToolCall? {
+        guard
+            let invokeStart = text.range(of: "<invoke>"),
+            let invokeEnd = text.range(of: "</invoke>", range: invokeStart.upperBound ..< text.endIndex)
+        else { return nil }
+
+        let body = String(text[invokeStart.upperBound ..< invokeEnd.lowerBound])
+        guard let name = firstXMLBody(in: body, tags: [("target_name", "target"), ("target", "target")]),
+            !name.isEmpty
+        else { return nil }
+
+        let args: [String: any Sendable]
+        if let stringValue = firstXMLBody(in: body, tags: [("string", "string")]) {
+            let decoded = decodeJSONStringLiteralIfPresent(stringValue)
+            let argumentName = singleRequiredStringArgumentName(for: name, tools: tools) ?? "text"
+            args = [argumentName: decoded]
+        } else {
+            args = [:]
+        }
+
+        if let tools, !tools.isEmpty {
+            guard let spec = functionSpec(named: name, in: tools) else { return nil }
+            if let invalidArgs = inlineSchemaValidationFailure(
+                toolName: name,
+                arguments: args,
+                functionSpec: spec)
+            {
+                return ToolCall(function: .init(name: name, arguments: invalidArgs))
+            }
+        } else if !Self.schemaLessFallbackToolNames.contains(name) {
+            return nil
+        }
+        return ToolCall(function: .init(name: name, arguments: args))
     }
 
     /// Live DSV4 JANGTQ2 app rows have also emitted a bare tool name followed
@@ -1149,6 +1201,57 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             }
         }
         return nil
+    }
+
+    private func singleRequiredStringArgumentName(
+        for toolName: String,
+        tools: [[String: any Sendable]]?
+    ) -> String? {
+        guard let tools, let spec = functionSpec(named: toolName, in: tools),
+            let parameters = sendableObject(spec["parameters"]),
+            let properties = sendableObject(parameters["properties"])
+        else { return nil }
+
+        let required = sendableStringArray(parameters["required"])
+        let candidates = required.isEmpty ? Array(properties.keys) : required
+        let stringNames = candidates.filter { name in
+            guard let property = sendableObject(properties[name]) else { return false }
+            return normalizedTypeStrings(from: property["type"]).contains("string")
+        }
+        return stringNames.count == 1 ? stringNames[0] : nil
+    }
+
+    private func firstXMLBody(in text: String, tags: [(open: String, close: String)]) -> String? {
+        for tag in tags {
+            let open = "<\(tag.open)>"
+            let close = "</\(tag.close)>"
+            guard let openRange = text.range(of: open),
+                let closeRange = text.range(of: close, range: openRange.upperBound ..< text.endIndex)
+            else { continue }
+            return String(text[openRange.upperBound ..< closeRange.lowerBound])
+        }
+        return nil
+    }
+
+    private func decodeJSONStringLiteralIfPresent(_ raw: String) -> String {
+        let literal = "\"\(raw)\""
+        guard let data = literal.data(using: .utf8),
+            let decoded = try? JSONDecoder().decode(String.self, from: data)
+        else { return raw }
+        return decoded
+    }
+
+    private func normalizedTypeStrings(from value: (any Sendable)?) -> Set<String> {
+        if let type = value as? String {
+            return [type.lowercased()]
+        }
+        if let types = value as? [String] {
+            return Set(types.map { $0.lowercased() })
+        }
+        if let types = value as? [any Sendable] {
+            return Set(types.compactMap { ($0 as? String)?.lowercased() })
+        }
+        return []
     }
 
     private func inlineSchemaValidationFailure(

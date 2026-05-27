@@ -611,6 +611,45 @@ struct ToolTests {
         #expect(toolCall.function.arguments["query"] == .string("ZAYA CCA cache"))
     }
 
+    @Test("ZAYA XML parser trims protocol-edge newlines from string parameters")
+    func testZayaXMLParserTrimsProtocolEdgeNewlines() throws {
+        let parameters: [String: any Sendable] = [
+            "type": "object",
+            "properties": [
+                "text": ["type": "string"] as [String: any Sendable],
+            ] as [String: any Sendable],
+            "required": ["text"],
+        ]
+        let function: [String: any Sendable] = [
+            "name": "line_count",
+            "parameters": parameters,
+        ]
+        let processor = ToolCallProcessor(format: .zayaXml, tools: [
+            [
+                "type": "function",
+                "function": function,
+            ] as [String: any Sendable]
+        ])
+        let content = """
+            <zyphra_tool_call>
+            <function=line_count>
+            <parameter=text>
+            one
+            two
+
+            </parameter>
+            </function>
+            </zyphra_tool_call>
+            """
+
+        _ = processor.processChunk(content)
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "line_count")
+        #expect(toolCall.function.arguments["text"] == .string("one\ntwo"))
+    }
+
     // MARK: - ToolCallFormat Serialization Tests
 
     @Test("Test ToolCallFormat Raw Values for Serialization")
