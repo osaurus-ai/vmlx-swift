@@ -163,7 +163,7 @@ class MiMoV2FlashAttention: Module {
 
         let queries = wq(x)
         let keys = wk(x)
-        let values = wv(x)
+        let values = wv(x) * MLXArray(args.attentionValueScale ?? 1.0, dtype: x.dtype)
 
         var q = queries.reshaped(B, L, numAttentionHeads, -1).transposed(0, 2, 1, 3)
         var k = keys.reshaped(B, L, numKeyValueHeads, -1).transposed(0, 2, 1, 3)
@@ -442,6 +442,28 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
         var sanitizedWeights = newWeights.isEmpty ? weights : newWeights
 
         for layerIndex in 0 ..< configuration.hiddenLayers {
+            let prefix = "model.layers.\(layerIndex).self_attn"
+            let isSliding = configuration.hybridLayerPattern[layerIndex] == 1
+            let qRows =
+                (isSliding ? configuration.swaAttentionHeads : configuration.attentionHeads)
+                * (isSliding ? configuration.swaHeadDim : configuration.headDim)
+            let kRows =
+                (isSliding ? configuration.swaKvHeads : configuration.kvHeads)
+                * (isSliding ? configuration.swaHeadDim : configuration.headDim)
+
+            for suffix in ["weight", "scales", "biases"] {
+                let fusedKey = "\(prefix).qkv_proj.\(suffix)"
+                guard let fused = sanitizedWeights.removeValue(forKey: fusedKey) else {
+                    continue
+                }
+                let qkv = split(fused, indices: [qRows, qRows + kRows], axis: 0)
+                sanitizedWeights["\(prefix).q_proj.\(suffix)"] = qkv[0]
+                sanitizedWeights["\(prefix).k_proj.\(suffix)"] = qkv[1]
+                sanitizedWeights["\(prefix).v_proj.\(suffix)"] = qkv[2]
+            }
+        }
+
+        for layerIndex in 0 ..< configuration.hiddenLayers {
             let prefix = "model.layers.\(layerIndex)"
             for (_, projName) in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")] {
                 for key in ["weight", "scales", "biases"] {
@@ -510,6 +532,7 @@ public struct MiMoV2FlashConfiguration: Codable, Sendable {
     var swaHeadDim: Int
     var swaVHeadDim: Int
     var partialRotaryFactor: Float
+    var attentionValueScale: Float?
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -545,6 +568,7 @@ public struct MiMoV2FlashConfiguration: Codable, Sendable {
         case swaHeadDim = "swa_head_dim"
         case swaVHeadDim = "swa_v_head_dim"
         case partialRotaryFactor = "partial_rotary_factor"
+        case attentionValueScale = "attention_value_scale"
     }
 }
 
