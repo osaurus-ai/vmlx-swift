@@ -8,11 +8,18 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
     public let startTag: String?
     public let endTag: String?
     public let decodesHTMLLineBreaks: Bool
+    public let unwrapJSONQuotedStringParameters: Bool
 
-    public init(startTag: String, endTag: String, decodesHTMLLineBreaks: Bool = false) {
+    public init(
+        startTag: String,
+        endTag: String,
+        decodesHTMLLineBreaks: Bool = false,
+        unwrapJSONQuotedStringParameters: Bool = false
+    ) {
         self.startTag = startTag
         self.endTag = endTag
         self.decodesHTMLLineBreaks = decodesHTMLLineBreaks
+        self.unwrapJSONQuotedStringParameters = unwrapJSONQuotedStringParameters
     }
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
@@ -65,6 +72,11 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             if decodesHTMLLineBreaks,
                isStringType(funcName: funcName, argName: paramName, tools: tools) {
                 paramValue = decodeHTMLLineBreaks(paramValue)
+            }
+            if unwrapJSONQuotedStringParameters,
+               isStringType(funcName: funcName, argName: paramName, tools: tools),
+               let unwrapped = decodeJSONQuotedString(paramValue) {
+                paramValue = unwrapped
             }
 
             // Convert value based on schema type
@@ -204,4 +216,15 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             with: "\n",
             options: [.regularExpression, .caseInsensitive])
     }
+}
+
+private func decodeJSONQuotedString(_ value: String) -> String? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.hasPrefix("\""), trimmed.hasSuffix("\""),
+          let data = trimmed.data(using: .utf8),
+          let decoded = try? JSONDecoder().decode(String.self, from: data)
+    else {
+        return nil
+    }
+    return decoded
 }

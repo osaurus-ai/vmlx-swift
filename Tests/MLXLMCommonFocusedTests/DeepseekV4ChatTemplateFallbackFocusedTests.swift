@@ -699,7 +699,6 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             "add_generation_prompt": true,
             "enable_thinking": false,
             "tool_choice": "required",
-            "tool_choice_name": "line_count",
         ])
 
         let finalUser = "Now use line_count on one\ntwo."
@@ -749,6 +748,26 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
 
         #expect(call.function.name == "line_count")
         #expect(call.function.arguments["text"] == .string("one\ntwo"))
+    }
+
+    @Test("ZAYA XML parser unwraps accidental JSON-quoted string parameters")
+    func zayaXMLParserUnwrapsJSONQuotedStringParameters() throws {
+        let content = #"""
+        <zyphra_tool_call>
+        <function=line_count>
+        <parameter=text>
+        "red\ngreen\nblue"
+        </parameter>
+        </function>
+        </zyphra_tool_call>
+        """#
+        let call = try #require(
+            ToolCallFormat.zayaXml.createParser().parse(
+                content: content,
+                tools: [lineCountToolSpec()]))
+
+        #expect(call.function.name == "line_count")
+        #expect(call.function.arguments["text"] == .string("red\ngreen\nblue"))
     }
 
     @Test("ZAYA1-VL sidecar shim rewrites every loader-visible template source")

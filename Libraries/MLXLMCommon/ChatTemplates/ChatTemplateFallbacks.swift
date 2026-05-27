@@ -799,6 +799,12 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
 {%- elif additionalContext is defined and additionalContext['tool_choice_name'] is defined -%}
     {%- set required_tool_name = additionalContext['tool_choice_name'] -%}
 {%- endif -%}
+{%- if required_tool_choice and not required_tool_name and tools is iterable and tools | length == 1 -%}
+    {%- set only_required_tool = tools[0]['function'] if tools[0]['function'] is defined else tools[0] -%}
+    {%- if only_required_tool['name'] is defined -%}
+        {%- set required_tool_name = only_required_tool['name'] -%}
+    {%- endif -%}
+{%- endif -%}
 
 {%- macro render_content(content) -%}
     {%- if content is string -%}
