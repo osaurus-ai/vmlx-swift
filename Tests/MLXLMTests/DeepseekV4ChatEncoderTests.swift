@@ -252,6 +252,18 @@ struct DeepseekV4ChatEncoderTests {
         #expect(prompt.hasSuffix(assistantTail), "Prompt: \(prompt)")
         #expect(prompt.contains("Use the `line_count` function."), "Prompt: \(prompt)")
         #expect(!prompt.contains(DeepseekV4Tokens.taskSPTokens["action"]!), "Prompt: \(prompt)")
+        #expect(
+            prompt.contains("<tool_result>{\"lines\":3}</tool_result>\n\n\(finalUser)"),
+            "Required DSV4 tool turns after a completed prose answer must compact back to tool_result + latest user. Prompt: \(prompt)"
+        )
+        #expect(
+            !prompt.contains("How many lines were counted? Do not call another tool."),
+            "Completed prose-only answer exchange should be dropped from this required tool prompt. Prompt: \(prompt)"
+        )
+        #expect(
+            !prompt.contains("Three lines were counted."),
+            "Completed prose-only assistant answer should not sit before the latest required DSML turn. Prompt: \(prompt)"
+        )
     }
 
     @Test("tool_call arguments with non-string values render string=\"false\" + JSON")

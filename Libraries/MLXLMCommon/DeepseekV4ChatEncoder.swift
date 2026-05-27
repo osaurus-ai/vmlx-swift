@@ -110,7 +110,10 @@ public struct DeepseekV4ChatEncoder: Sendable {
     ) -> String {
         // Preprocess: merge tool messages into user, sort tool_result
         // blocks by the order they were called in the prior assistant.
-        var processedMessages = Self.mergeToolMessages(messages)
+        let compactedMessages = toolChoiceRequired
+            ? Self.compactRequiredToolChoiceHistory(messages)
+            : messages
+        var processedMessages = Self.mergeToolMessages(compactedMessages)
         var processedContext = Self.mergeToolMessages(context)
         let merged = Self.sortToolResultsByCallOrder(processedContext + processedMessages)
         processedMessages = Array(merged[processedContext.count...])
@@ -608,6 +611,36 @@ public struct DeepseekV4ChatEncoder: Sendable {
             out.append(msg)
         }
         return out
+    }
+
+    /// DSV4's required-tool template is sensitive to an ordinary prose
+    /// assistant answer sitting between a previous tool result and the next
+    /// required tool turn: live rows showed it can terminate with a blank
+    /// assistant response instead of entering DSML. For required tool-choice
+    /// turns, collapse that completed prose exchange so the prior tool result
+    /// merges directly with the latest user request. This preserves the
+    /// actual tool result and latest user instruction; it does not synthesize
+    /// a tool call or alter sampler behavior.
+    static func compactRequiredToolChoiceHistory(_ messages: [Message]) -> [Message] {
+        guard
+            let finalUserIndex = messages.indices.last(where: {
+                messages[$0].role == .user || messages[$0].role == .developer
+            }),
+            finalUserIndex == messages.indices.last,
+            let lastToolIndex = messages[..<finalUserIndex].indices.last(where: {
+                messages[$0].role == .tool
+            }),
+            finalUserIndex > lastToolIndex + 1,
+            messages[(lastToolIndex + 1)..<finalUserIndex].contains(where: {
+                $0.role == .assistant && ($0.toolCalls?.isEmpty ?? true)
+            })
+        else {
+            return messages
+        }
+
+        var compacted = Array(messages[...lastToolIndex])
+        compacted.append(messages[finalUserIndex])
+        return compacted
     }
 
     static func findLastUserIndex(_ messages: [Message]) -> Int {
