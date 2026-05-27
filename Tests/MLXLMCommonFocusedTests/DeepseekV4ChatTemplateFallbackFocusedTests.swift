@@ -719,6 +719,26 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.hasSuffix(tail))
     }
 
+    @Test("ZAYA XML parser decodes live HTML line breaks in string parameters")
+    func zayaXMLParserDecodesLiveHTMLLineBreaksInStringParameters() throws {
+        let output = #"""
+            <zyphra_tool_call>
+            <function=line_count>
+            <parameter=text>one<br>two</parameter>
+            </function>
+            </zyphra_tool_call>
+            """#
+        let call = try #require(
+            ToolCallFormat.zayaXml.createParser().parse(
+                content: output,
+                tools: [lineCountToolSpec()]
+            )
+        )
+
+        #expect(call.function.name == "line_count")
+        #expect(call.function.arguments["text"] == .string("one\ntwo"))
+    }
+
     @Test("ZAYA1-VL sidecar shim rewrites every loader-visible template source")
     func zayaVLSidecarShimRewritesTemplateSources() throws {
         let fm = FileManager.default

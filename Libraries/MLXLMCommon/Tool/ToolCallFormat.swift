@@ -206,7 +206,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case .zayaXml:
             return XMLFunctionParser(
                 startTag: "<zyphra_tool_call>",
-                endTag: "</zyphra_tool_call>")
+                endTag: "</zyphra_tool_call>",
+                decodesHTMLLineBreaks: true)
         case .hunyuan:
             return HunyuanToolCallParser()
         }

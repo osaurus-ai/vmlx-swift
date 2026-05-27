@@ -7,10 +7,12 @@ import Foundation
 public struct XMLFunctionParser: ToolCallParser, Sendable {
     public let startTag: String?
     public let endTag: String?
+    public let decodesHTMLLineBreaks: Bool
 
-    public init(startTag: String, endTag: String) {
+    public init(startTag: String, endTag: String, decodesHTMLLineBreaks: Bool = false) {
         self.startTag = startTag
         self.endTag = endTag
+        self.decodesHTMLLineBreaks = decodesHTMLLineBreaks
     }
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
@@ -58,6 +60,11 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             }
             if paramValue.hasSuffix("\n") {
                 paramValue = String(paramValue.dropLast())
+            }
+
+            if decodesHTMLLineBreaks,
+               isStringType(funcName: funcName, argName: paramName, tools: tools) {
+                paramValue = decodeHTMLLineBreaks(paramValue)
             }
 
             // Convert value based on schema type
@@ -189,5 +196,12 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             }
         }
         return []
+    }
+
+    private func decodeHTMLLineBreaks(_ value: String) -> String {
+        value.replacingOccurrences(
+            of: #"<br\s*/?>"#,
+            with: "\n",
+            options: [.regularExpression, .caseInsensitive])
     }
 }
