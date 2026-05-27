@@ -10,6 +10,7 @@
 import Testing
 
 @testable import MLXLMCommon
+@testable import MLXVLM
 
 @Suite("Chat.Message tool-call plumbing")
 struct ChatMessageToolCallTests {
@@ -175,5 +176,27 @@ struct ChatMessageToolCallTests {
         let out = NoSystemMessageGenerator().generate(messages: messages)
         #expect(out.count == 1)
         #expect(out.first?["tool_calls"] != nil)
+    }
+
+    @Test("Qwen2VL generator preserves tool history while rendering media content arrays")
+    func qwen2VLGeneratorPreservesToolHistoryMetadata() {
+        let call = ToolCall(function: .init(
+            name: "line_count",
+            arguments: ["text": .string("one\ntwo")]
+        ))
+
+        let assistant = Qwen2VLMessageGenerator().generate(
+            message: .assistant("", toolCalls: [call])
+        )
+        #expect(assistant["role"] as? String == "assistant")
+        #expect(assistant["tool_calls"] != nil)
+        #expect(assistant["content"] as? [[String: String]] == [["type": "text", "text": ""]])
+
+        let tool = Qwen2VLMessageGenerator().generate(
+            message: .tool("2", toolCallId: "call_abc")
+        )
+        #expect(tool["role"] as? String == "tool")
+        #expect(tool["tool_call_id"] as? String == "call_abc")
+        #expect(tool["content"] as? [[String: String]] == [["type": "text", "text": "2"]])
     }
 }

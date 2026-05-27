@@ -912,9 +912,8 @@ public struct Qwen2VLMessageGenerator: MessageGenerator {
     public init() {}
 
     public func generate(message: Chat.Message) -> MLXLMCommon.Message {
-        [
-            "role": message.role.rawValue,
-            "content": [
+        var dict = defaultMessageDict(for: message)
+        dict["content"] = [
                 ["type": "text", "text": message.content]
             ]
                 // Messages format for Qwen 2 VL, Qwen 2.5 VL. May need to be adapted for other models.
@@ -923,7 +922,7 @@ public struct Qwen2VLMessageGenerator: MessageGenerator {
                 }
                 + message.videos.map { _ in
                     ["type": "video"]
-                },
-        ]
+                }
+        return dict
     }
 }
