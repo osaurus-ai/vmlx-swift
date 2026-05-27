@@ -702,13 +702,16 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         ])
 
         let finalUser = "Now use line_count on one\ntwo."
-        let currentReminder = "The active API tool_choice is required for this assistant turn."
+        let currentReminder = "The current assistant response MUST be a tool call."
         let tail = "<|im_start|>assistant\n"
         let finalUserRange = rendered.range(of: finalUser)
         let reminderRange = rendered.range(of: currentReminder, options: .backwards)
         #expect(finalUserRange != nil)
         #expect(reminderRange != nil)
         #expect(finalUserRange!.lowerBound < reminderRange!.lowerBound)
+        let afterFinalUser = rendered[finalUserRange!.upperBound...]
+        #expect(afterFinalUser.contains(currentReminder))
+        #expect(!afterFinalUser.contains("<|im_start|>system\n" + currentReminder))
         #expect(rendered.contains("Required call skeleton:\n<zyphra_tool_call>\n<function=line_count>"))
         #expect(rendered.contains("<parameter=text>\nVALUE_FOR_text\n</parameter>"))
         #expect(rendered.hasSuffix(tail))

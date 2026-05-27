@@ -831,6 +831,26 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
     {{- '</function>\n</zyphra_tool_call>\n' -}}
 {%- endmacro -%}
 
+{%- macro render_required_tool_choice_instruction() -%}
+    {{- '<IMPORTANT>\nThe current assistant response MUST be a tool call. Reply only with a `<zyphra_tool_call>` block for one available function and no prose before the tool result. Include every required `<parameter=...>` value exactly as requested.' -}}
+    {%- if required_tool_name -%}
+        {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
+        {%- for tool in tools -%}
+            {%- set selected_tool = tool['function'] if tool['function'] is defined else tool -%}
+            {%- if selected_tool['name'] == required_tool_name and selected_tool['parameters'] is defined and selected_tool['parameters']['required'] is defined -%}
+                {{- '\nRequired parameters for `' ~ required_tool_name ~ '`: ' ~ (selected_tool['parameters']['required'] | join(', ')) ~ '.' -}}
+                {{- '\nRequired call skeleton:\n<zyphra_tool_call>\n<function=' ~ required_tool_name ~ '>' -}}
+                {%- for param_name in selected_tool['parameters']['required'] -%}
+                    {{- '\n<parameter=' ~ param_name ~ '>\nVALUE_FOR_' ~ param_name ~ '\n</parameter>' -}}
+                {%- endfor -%}
+                {{- '\n</function>\n</zyphra_tool_call>' -}}
+                {{- '\nReplace every VALUE_FOR_* placeholder with the actual argument value requested by the user.' -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {{- '\n</IMPORTANT>' -}}
+{%- endmacro -%}
+
 {%- set loop_messages = messages -%}
 {%- set has_system = (messages | length > 0 and messages[0]['role'] == 'system') -%}
 {%- if has_system or (tools is iterable and tools | length > 0) -%}
@@ -873,23 +893,8 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
         {%- endfor -%}
         {{- '\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<zyphra_tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</zyphra_tool_call>' -}}
         {%- if required_tool_choice -%}
-            {{- '\n\n<IMPORTANT>\nThe current assistant response MUST be a tool call. Reply only with a `<zyphra_tool_call>` block for one available function and no prose before the tool result. Include every required `<parameter=...>` value exactly as requested.' -}}
-            {%- if required_tool_name -%}
-                {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
-                {%- for tool in tools -%}
-                    {%- set selected_tool = tool['function'] if tool['function'] is defined else tool -%}
-                    {%- if selected_tool['name'] == required_tool_name and selected_tool['parameters'] is defined and selected_tool['parameters']['required'] is defined -%}
-                        {{- '\nRequired parameters for `' ~ required_tool_name ~ '`: ' ~ (selected_tool['parameters']['required'] | join(', ')) ~ '.' -}}
-                        {{- '\nRequired call skeleton:\n<zyphra_tool_call>\n<function=' ~ required_tool_name ~ '>' -}}
-                        {%- for param_name in selected_tool['parameters']['required'] -%}
-                            {{- '\n<parameter=' ~ param_name ~ '>\nVALUE_FOR_' ~ param_name ~ '\n</parameter>' -}}
-                        {%- endfor -%}
-                        {{- '\n</function>\n</zyphra_tool_call>' -}}
-                        {{- '\nReplace every VALUE_FOR_* placeholder with the actual argument value requested by the user.' -}}
-                    {%- endif -%}
-                {%- endfor -%}
-            {%- endif -%}
-            {{- '\n</IMPORTANT>' -}}
+            {{- '\n\n' -}}
+            {{- render_required_tool_choice_instruction() -}}
         {%- endif -%}
     {%- endif -%}
     {{- '<|im_end|>\n' -}}
@@ -899,6 +904,10 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
     {%- if message['role'] == 'user' or message['role'] == 'question' -%}
         {{- '<|im_start|>user\n' -}}
         {{- render_content(message['content']) -}}
+        {%- if required_tool_choice and loop.last -%}
+            {{- '\n\n' -}}
+            {{- render_required_tool_choice_instruction() -}}
+        {%- endif -%}
         {{- '<|im_end|>\n' -}}
     {%- elif message['role'] == 'assistant' -%}
         {{- '<|im_start|>assistant\n' -}}
@@ -921,25 +930,6 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
 {%- endfor -%}
 
 {%- if add_generation_prompt -%}
-    {%- if required_tool_choice -%}
-        {{- '<|im_start|>system\nThe active API tool_choice is required for this assistant turn. Reply only with a `<zyphra_tool_call>` block for one available function and no prose before the tool result. Include every required `<parameter=...>` value exactly as requested.' -}}
-        {%- if required_tool_name -%}
-            {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
-            {%- for tool in tools -%}
-                {%- set selected_tool = tool['function'] if tool['function'] is defined else tool -%}
-                {%- if selected_tool['name'] == required_tool_name and selected_tool['parameters'] is defined and selected_tool['parameters']['required'] is defined -%}
-                    {{- '\nRequired parameters for `' ~ required_tool_name ~ '`: ' ~ (selected_tool['parameters']['required'] | join(', ')) ~ '.' -}}
-                    {{- '\nRequired call skeleton:\n<zyphra_tool_call>\n<function=' ~ required_tool_name ~ '>' -}}
-                    {%- for param_name in selected_tool['parameters']['required'] -%}
-                        {{- '\n<parameter=' ~ param_name ~ '>\nVALUE_FOR_' ~ param_name ~ '\n</parameter>' -}}
-                    {%- endfor -%}
-                    {{- '\n</function>\n</zyphra_tool_call>' -}}
-                    {{- '\nReplace every VALUE_FOR_* placeholder with the actual argument value requested by the user.' -}}
-                {%- endif -%}
-            {%- endfor -%}
-        {%- endif -%}
-        {{- '<|im_end|>\n' -}}
-    {%- endif -%}
     {{- '<|im_start|>assistant\n' -}}
 {%- endif -%}
 """#
