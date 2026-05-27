@@ -149,7 +149,10 @@ struct DSMLToolCallParserFocusedTests {
 
     @Test("DSV4 processor accepts live request_tool XML rail")
     func processorAcceptsLiveRequestToolXMLRail() {
-        let output = #"_only:request_tool<invoke><target_name>line_count</target><params><string>one\ntwo</string></params></invoke>"#
+        let output =
+            "_only:request_tool<invoke><target_name>line_count</target><params><string>\n"
+            + #"one\ntwo"#
+            + "\n</string></params></invoke>"
         let processor = ToolCallProcessor(format: .dsml, tools: lineCountToolSchema())
         var visible = ""
         for ch in output {

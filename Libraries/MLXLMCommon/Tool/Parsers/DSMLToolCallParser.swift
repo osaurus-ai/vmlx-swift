@@ -308,11 +308,10 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             }
 
             var value = String(body[closeAngle.upperBound ..< valueEnd])
-            // Strip single leading / trailing newline (matches the
-            // Python reference in `encoding_dsv4.py` which injects
-            // newlines around multi-line values for readability).
-            if value.hasPrefix("\n") { value = String(value.dropFirst()) }
-            if value.hasSuffix("\n") { value = String(value.dropLast()) }
+            // Strip protocol-edge newlines (matches the Python reference in
+            // `encoding_dsv4.py`, which injects newlines around multi-line
+            // values for readability).
+            value = trimBoundaryNewlines(value)
 
             if stringFlag == "true" {
                 args[name] = value
@@ -324,6 +323,17 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             cursor = nextCursor
         }
         return args
+    }
+
+    private func trimBoundaryNewlines(_ value: String) -> String {
+        var result = value
+        while result.hasPrefix("\n") || result.hasPrefix("\r") {
+            result = String(result.dropFirst())
+        }
+        while result.hasSuffix("\n") || result.hasSuffix("\r") {
+            result = String(result.dropLast())
+        }
+        return result
     }
 
     private func partialParameterValueEnd(
@@ -566,7 +576,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         if let stringValue = firstXMLBody(in: body, tags: [("string", "string")]) {
             let decoded = decodeJSONStringLiteralIfPresent(stringValue)
             let argumentName = singleRequiredStringArgumentName(for: name, tools: tools) ?? "text"
-            args = [argumentName: decoded]
+            args = [argumentName: trimBoundaryNewlines(decoded)]
         } else {
             args = [:]
         }
@@ -1234,7 +1244,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
     }
 
     private func decodeJSONStringLiteralIfPresent(_ raw: String) -> String {
-        let literal = "\"\(raw)\""
+        let trimmed = trimBoundaryNewlines(raw)
+        let literal = "\"\(trimmed)\""
         guard let data = literal.data(using: .utf8),
             let decoded = try? JSONDecoder().decode(String.self, from: data)
         else { return raw }
