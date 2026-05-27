@@ -398,7 +398,9 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
         self.configuration = config
         self.modelType = config.modelType
         self.vocabularySize = config.vocabularySize
-        self.kvHeads = Array(repeating: config.kvHeads, count: config.hiddenLayers)
+        self.kvHeads = config.hybridLayerPattern.map {
+            $0 == 1 ? config.swaKvHeads : config.kvHeads
+        }
         self.model = MiMoV2FlashModelInner(config)
         _lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
     }

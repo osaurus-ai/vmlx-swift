@@ -893,6 +893,14 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
         return "harmony"
     }
 
+    // MiMo v2.5 JANG source bundles use `model_type = "mimo_v2"` and
+    // a native `<think>...</think>` template. Keep this exact so the
+    // older `mimo` and upstream `mimo_v2_flash` aliases stay plain unless
+    // their bundle capabilities explicitly stamp a reasoning parser.
+    if normalized == "mimo_v2" {
+        return "think_xml"
+    }
+
     // ZAYA1-VL is a sibling multimodal architecture, not the text
     // `zaya` chat-template path. Its production template is selected via
     // the VL sidecar / JANG capability contract and does not open the text

@@ -277,6 +277,14 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .minimaxM2
         }
 
+        // MiMo v2.5 JANG source bundles stamp model_type `mimo_v2` and
+        // use the standard XML-function envelope. Do not broaden this to
+        // older `mimo` / `mimo_v2_flash` aliases without a matching source
+        // template proof.
+        if normalized == "mimo_v2" {
+            return .xmlFunction
+        }
+
         // Nemotron family (nemotron_h, etc.)
         if compact.hasPrefix("nemotron") {
             return .xmlFunction
