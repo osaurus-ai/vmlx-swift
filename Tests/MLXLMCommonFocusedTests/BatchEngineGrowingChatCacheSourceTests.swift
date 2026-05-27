@@ -293,6 +293,29 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(engine.contains("modelTypeName.contains(\"minimax\")"))
     }
 
+    @Test("MiMo V2 cache topology keeps TurboQuant limited to full-attention KV layers")
+    func mimoV2CacheTopologyLimitsTurboQuantToFullAttentionKVLayers() throws {
+        let model = try String(
+            contentsOfFile: "Libraries/MLXLLM/Models/MiMoV2Flash.swift",
+            encoding: .utf8)
+        let kvCache = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/KVCache.swift",
+            encoding: .utf8)
+
+        #expect(model.contains("modelType = try c.decodeIfPresent(String.self, forKey: .modelType) ?? \"mimo_v2_flash\""))
+        #expect(model.contains("public func newCache(parameters: GenerateParameters?) -> [KVCache]"))
+        #expect(model.contains("configuration.hybridLayerPattern.indices.map"))
+        #expect(model.contains("configuration.isSlidingLayer(layerIndex)"))
+        #expect(model.contains("RotatingKVCache(maxSize: configuration.slidingWindowSize)"))
+        #expect(model.contains("KVCacheSimple()"))
+        #expect(model.contains("if let quantizedKVCache = cache as? QuantizedKVCacheProtocol"))
+        #expect(model.contains("precondition(sinks == nil, \"Quantized SDPA does not support attention sinks.\")"))
+        #expect(kvCache.contains("Only converts `KVCacheSimple` layers. `RotatingKVCache`, `DeepseekV4Cache`,"))
+        #expect(kvCache.contains("if let simpleCache = cache[i] as? KVCacheSimple"))
+        #expect(kvCache.contains("TurboQuantKVCache.fromSimpleCache("))
+        #expect(kvCache.contains("// RotatingKVCache, DeepseekV4Cache, MambaCache, CacheList: skip"))
+    }
+
     @Test("Laguna stays off compiled decode until parity is proven")
     func lagunaCompiledDecodeIsDenied() throws {
         let evaluate = try String(
