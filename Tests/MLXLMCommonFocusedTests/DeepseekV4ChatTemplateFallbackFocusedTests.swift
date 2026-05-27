@@ -266,7 +266,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
                 ["role": "tool", "tool_call_id": "call_lines", "content": #"{"lines":3}"#],
                 ["role": "user", "content": "How many lines? Do not call another tool."],
                 ["role": "assistant", "content": "Three lines were counted."],
-                ["role": "user", "content": "Now use line_count on one\ntwo."],
+                ["role": "user", "content": "Now use line_count on this exact text: one\ntwo."],
             ],
             "tools": [
                 [
@@ -289,7 +289,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             "enable_thinking": false,
         ])
 
-        let finalUser = "Now use line_count on one\ntwo."
+        let finalUser = "Now use line_count on this exact text: one\ntwo."
         let tailDirective = "The current assistant response MUST be a tool call."
         let finalUserRange = try #require(rendered.range(of: finalUser))
         let tailDirectiveRange = try #require(
@@ -676,7 +676,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
                 ["role": "tool", "tool_call_id": "call_lines", "content": #"{"lines":3}"#],
                 ["role": "user", "content": "How many lines? Do not call another tool."],
                 ["role": "assistant", "content": "Three lines were counted."],
-                ["role": "user", "content": "Now use line_count on one\ntwo."],
+                ["role": "user", "content": "Now use line_count on this exact text: one\ntwo."],
             ],
             "tools": [
                 [
@@ -701,7 +701,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             "tool_choice_name": "line_count",
         ])
 
-        let finalUser = "Now use line_count on one\ntwo."
+        let finalUser = "Now use line_count on this exact text: one\ntwo."
         let currentReminder = "The current assistant response MUST be a tool call."
         let tail = "<|im_start|>assistant\n"
         let finalUserRange = rendered.range(of: finalUser)
@@ -714,6 +714,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!afterFinalUser.contains("<|im_start|>system\n" + currentReminder))
         #expect(rendered.contains("Previous tool result available."))
         #expect(!rendered.contains("<zyphra_tool_response>\n{\"lines\":3}"))
+        #expect(rendered.contains("Required parameter text is exactly:\none\ntwo."))
         #expect(rendered.contains("Required call skeleton:\n<zyphra_tool_call>\n<function=line_count>"))
         #expect(rendered.contains("<parameter=text>\nVALUE_FOR_text\n</parameter>"))
         #expect(rendered.hasSuffix(tail))
