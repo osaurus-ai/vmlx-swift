@@ -873,10 +873,10 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
             {%- set selected_tool = tool['function'] if tool['function'] is defined else tool -%}
             {%- if selected_tool['name'] == required_tool_name and selected_tool['parameters'] is defined and selected_tool['parameters']['required'] is defined -%}
                 {{- '\nRequired parameters for `' ~ required_tool_name ~ '`: ' ~ (selected_tool['parameters']['required'] | join(', ')) ~ '.' -}}
-                {{- '\nRequired call shape for the current request:\n<zyphra_tool_call>\n<function=' ~ required_tool_name ~ '>' -}}
-                {%- for param_name in selected_tool['parameters']['required'] -%}
-                    {%- set exact = namespace(value='') -%}
-                    {%- if latest_user_content is string -%}
+                {%- if latest_user_content is string and ('exact' in latest_user_content or 'preserving newlines:' in latest_user_content) -%}
+                    {{- '\nRequired call shape for the current request:\n<zyphra_tool_call>\n<function=' ~ required_tool_name ~ '>' -}}
+                    {%- for param_name in selected_tool['parameters']['required'] -%}
+                        {%- set exact = namespace(value='') -%}
                         {%- set exact_markers = [
                             'exact ' ~ param_name ~ ':',
                             'this exact ' ~ param_name ~ ':',
@@ -894,14 +894,14 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
                                 {%- set exact.value = latest_user_content.split(exact_marker)[1] | trim -%}
                             {%- endif -%}
                         {%- endfor -%}
-                    {%- endif -%}
-                    {{- '\n<parameter=' ~ param_name ~ '>\n' -}}
-                    {%- if exact.value -%}
-                        {{- exact.value -}}
-                    {%- endif -%}
-                    {{- '\n</parameter>' -}}
-                {%- endfor -%}
-                {{- '\n</function>\n</zyphra_tool_call>' -}}
+                        {{- '\n<parameter=' ~ param_name ~ '>\n' -}}
+                        {%- if exact.value -%}
+                            {{- exact.value -}}
+                        {%- endif -%}
+                        {{- '\n</parameter>' -}}
+                    {%- endfor -%}
+                    {{- '\n</function>\n</zyphra_tool_call>' -}}
+                {%- endif -%}
                 {{- '\nDo not omit required parameters. If the latest user message asks to use the tool on exact text, copy that exact text into the string parameter body, preserving newlines.' -}}
                 {{- '\nFor string parameters, write the raw string value only. Do not wrap the parameter value in JSON quotes unless the requested value itself includes quote characters.' -}}
             {%- endif -%}
