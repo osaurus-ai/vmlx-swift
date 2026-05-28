@@ -927,6 +927,7 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
 {%- endmacro -%}
 
 {%- macro render_required_tool_choice_instruction(latest_user_content='') -%}
+    {%- set latest_user_text = render_content(latest_user_content) -%}
     {{- '<IMPORTANT>\nThe current assistant response MUST be a tool call. Reply only with a `<zyphra_tool_call>` block for one available function and no prose before the tool result. Include every required `<parameter=...>` value exactly as requested.' -}}
     {%- if required_tool_name -%}
         {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
@@ -934,7 +935,7 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
             {%- set selected_tool = tool['function'] if tool['function'] is defined else tool -%}
             {%- if selected_tool['name'] == required_tool_name and selected_tool['parameters'] is defined and selected_tool['parameters']['required'] is defined -%}
                 {{- '\nRequired parameters for `' ~ required_tool_name ~ '`: ' ~ (selected_tool['parameters']['required'] | join(', ')) ~ '.' -}}
-                {%- if latest_user_content is string and ('exact' in latest_user_content or 'preserving newlines:' in latest_user_content) -%}
+                {%- if latest_user_text is string and ('exact' in latest_user_text or 'preserving newlines:' in latest_user_text) -%}
                     {{- '\nRequired call shape for the current request:\n<zyphra_tool_call>\n<function=' ~ required_tool_name ~ '>' -}}
                     {%- for param_name in selected_tool['parameters']['required'] -%}
                         {%- set exact = namespace(value='') -%}
@@ -957,8 +958,8 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
                             'preserving newlines:'
                         ] -%}
                         {%- for exact_marker in exact_markers -%}
-                            {%- if not exact.value and exact_marker in latest_user_content -%}
-                                {%- set exact.value = latest_user_content.split(exact_marker)[1] | trim -%}
+                            {%- if not exact.value and exact_marker in latest_user_text -%}
+                                {%- set exact.value = latest_user_text.split(exact_marker)[1] | trim -%}
                             {%- endif -%}
                         {%- endfor -%}
                         {{- '\n<parameter=' ~ param_name ~ '>\n' -}}
@@ -1017,7 +1018,11 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
             {%- endif -%}
             {{- '\n</function>' -}}
         {%- endfor -%}
-        {{- '\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<zyphra_tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</zyphra_tool_call>' -}}
+        {%- if required_tool_choice -%}
+            {{- '\n</tools>\n\nWhen the current assistant response is a function call, reply with one `<zyphra_tool_call>` block matching one listed function and no prose.' -}}
+        {%- else -%}
+            {{- '\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<zyphra_tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</zyphra_tool_call>' -}}
+        {%- endif -%}
         {%- if required_tool_choice -%}
             {{- '\n\n' -}}
             {{- render_required_tool_choice_instruction() -}}

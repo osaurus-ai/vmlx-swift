@@ -474,6 +474,64 @@ struct Zaya1VLRegistrationTests {
         #expect(!decoded.contains("PARAMETER_NAME"), "decoded prompt: \(decoded)")
         #expect(!decoded.contains("VALUE_FOR_text"), "decoded prompt: \(decoded)")
         #expect(!decoded.contains("VALUE_FOR_*"), "decoded prompt: \(decoded)")
+        #expect(!decoded.contains("value_1"), "decoded prompt: \(decoded)")
+    }
+
+    @Test("Real ZAYA1-VL tokenizer grounds required tool text from media messages",
+          .enabled(if: hasJANGTQ4TokenizerBundle))
+    func realTokenizerGroundsRequiredToolTextFromMediaMessages() async throws {
+        let dir = URL(fileURLWithPath: Self.bundlePath("ZAYA1-VL-8B-JANGTQ4"))
+        let tokenizerDir = JangLoader.resolveTokenizerClassSubstitution(
+            for: JangLoader.resolveChatTemplateSidecarSubstitution(
+                for: JangLoader.resolveTokenizerDirectory(for: dir)))
+        let tokenizer = try await #huggingFaceTokenizerLoader().load(from: tokenizerDir)
+        let messages: [[String: any Sendable]] = [
+            [
+                "role": "user",
+                "content": [
+                    ["type": "image"] as [String: any Sendable],
+                    [
+                        "type": "text",
+                        "text": "Call line_count on this exact text: alpha\nbeta\ngamma",
+                    ] as [String: any Sendable],
+                ] as [[String: any Sendable]],
+            ],
+        ]
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "line_count",
+                    "description": "Count newline-delimited lines.",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "text": [
+                                "type": "string",
+                                "description": "Text whose lines should be counted.",
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "required": ["text"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+        let tokens = try tokenizer.applyChatTemplate(
+            messages: messages,
+            tools: tools,
+            additionalContext: [
+                "enable_thinking": false,
+                "tool_choice": "required",
+                "tool_choice_name": "line_count",
+            ])
+        let decoded = tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
+
+        #expect(decoded.contains("<|vision_start|><image><|vision_end|>"),
+            "decoded prompt: \(decoded)")
+        #expect(decoded.contains("<function=line_count>"), "decoded prompt: \(decoded)")
+        #expect(decoded.contains("<parameter=text>\nalpha\nbeta\ngamma\n</parameter>"),
+            "decoded prompt: \(decoded)")
+        #expect(!decoded.contains("value_1"), "decoded prompt: \(decoded)")
     }
 
     @Test("Real ZAYA1-VL processor expands sidecar-rendered image placeholders",
