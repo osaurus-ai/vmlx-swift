@@ -276,8 +276,8 @@ struct NemotronHOmniPreEncodedAudioTests {
         }
     }
 
-    @Test("required tool choice reaches Nemotron Omni VLM native template path")
-    func requiredToolChoiceReachesNemotronOmniVLMTemplatePath() {
+    @Test("required tool choice does not inject Nemotron Omni VLM prompt directive")
+    func requiredToolChoiceDoesNotInjectNemotronOmniVLMPromptDirective() {
         var messages: [Message] = [
             ["role": "user", "content": "Use line_count on red\ngreen\nblue."],
         ]
@@ -287,18 +287,13 @@ struct NemotronHOmniPreEncodedAudioTests {
             tools: [lineCountTool()],
             additionalContext: ["tool_choice": "required"])
 
-        #expect(messages.count == 3)
-        #expect(messages[0]["role"] as? String == "system")
-        let system = messages[0]["content"] as? String
-        #expect(system?.contains("exactly one <tool_call> XML function call") == true)
-        #expect(system?.contains("Include every required <parameter=...>") == true)
-        #expect(messages[1]["content"] as? String == "Use line_count on red\ngreen\nblue.")
-        #expect(messages[2]["role"] as? String == "system")
-        #expect(messages[2]["content"] as? String == system)
+        #expect(messages.count == 1)
+        #expect(messages[0]["role"] as? String == "user")
+        #expect(messages[0]["content"] as? String == "Use line_count on red\ngreen\nblue.")
     }
 
-    @Test("required tool choice repeats at the current Nemotron Omni turn after no-tool history")
-    func requiredToolChoiceRepeatsAtCurrentNemotronOmniTurnAfterNoToolHistory() throws {
+    @Test("required tool choice leaves Nemotron Omni history unchanged")
+    func requiredToolChoiceLeavesNemotronOmniHistoryUnchanged() throws {
         var messages: [Message] = [
             ["role": "user", "content": "Use line_count on red\ngreen\nblue."],
             [
@@ -333,12 +328,11 @@ struct NemotronHOmniPreEncodedAudioTests {
             ($0["role"] as? String) == "user"
                 && (($0["content"] as? String)?.contains("one\ntwo") == true)
         })
-        let tailInstructionIndex = try #require(messages.lastIndex {
+        #expect(finalUserIndex == messages.count - 1)
+        #expect(!messages.contains {
             ($0["role"] as? String) == "system"
-                && (($0["content"] as? String)?.contains(
-                    NemotronHOmniProcessor.requiredToolChoiceInstruction) == true)
+                && (($0["content"] as? String)?.contains("return exactly one <tool_call>") == true)
         })
-        #expect(tailInstructionIndex > finalUserIndex)
     }
 
     @Test("non-required tool choice leaves Nemotron Omni VLM messages unchanged")

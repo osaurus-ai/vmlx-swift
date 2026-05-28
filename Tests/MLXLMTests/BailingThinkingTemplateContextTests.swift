@@ -87,7 +87,7 @@ final class BailingThinkingTemplateContextTests: XCTestCase {
         XCTAssertEqual(out[0]["role"] as? String, "user")
     }
 
-    func testRequiredToolChoiceInsertsBailingSystemDirective() {
+    func testRequiredToolChoiceDoesNotInsertBailingSystemDirective() {
         let messages: [Message] = [
             ["role": "user", "content": "count lines"]
         ]
@@ -98,15 +98,12 @@ final class BailingThinkingTemplateContextTests: XCTestCase {
             additionalContext: ["tool_choice": "required"]
         )
 
-        XCTAssertEqual(out[0]["role"] as? String, "system")
-        XCTAssertEqual(
-            out[0]["content"] as? String,
-            "For this assistant turn, return exactly one <tool_call> JSON object for one available function and no prose before the tool result."
-        )
-        XCTAssertEqual(out[1]["role"] as? String, "user")
+        XCTAssertEqual(out.count, messages.count)
+        XCTAssertEqual(out[0]["role"] as? String, "user")
+        XCTAssertEqual(out[0]["content"] as? String, "count lines")
     }
 
-    func testNamedRequiredToolChoiceMentionsSelectedBailingFunction() {
+    func testNamedRequiredToolChoiceDoesNotInjectBailingFunctionDirective() {
         let messages: [Message] = [
             ["role": "system", "content": "You are concise."],
             ["role": "user", "content": "count lines"]
@@ -121,12 +118,12 @@ final class BailingThinkingTemplateContextTests: XCTestCase {
             ]
         )
 
+        XCTAssertEqual(out.count, messages.count)
         XCTAssertEqual(out[0]["role"] as? String, "system")
-        XCTAssertTrue((out[0]["content"] as? String)?.contains("Use the `line_count` function.") == true)
-        XCTAssertTrue((out[0]["content"] as? String)?.contains("You are concise.") == true)
+        XCTAssertEqual(out[0]["content"] as? String, "You are concise.")
     }
 
-    func testThinkingAndRequiredToolChoiceShareOneSystemMessage() {
+    func testThinkingDirectiveIgnoresRequiredToolChoicePromptCoercion() {
         let messages: [Message] = [
             ["role": "system", "content": "detailed thinking on\n\nYou are concise."],
             ["role": "user", "content": "count lines"],
@@ -145,7 +142,6 @@ final class BailingThinkingTemplateContextTests: XCTestCase {
             out[0]["content"] as? String,
             """
             detailed thinking off
-            For this assistant turn, return exactly one <tool_call> JSON object for one available function and no prose before the tool result.
 
             You are concise.
             """

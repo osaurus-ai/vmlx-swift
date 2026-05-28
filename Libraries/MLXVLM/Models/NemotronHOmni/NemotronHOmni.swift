@@ -890,10 +890,6 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         // placeholder count from the encoded media embeddings.
         var messages = Self.textOnlyMessages(from: input)
         var templateContext = input.additionalContext
-        Self.addRequiredToolChoiceInstruction(
-            to: &messages,
-            tools: input.tools,
-            additionalContext: templateContext)
         if !media.isEmpty {
             if let index = Self.mediaTargetMessageIndex(in: input) {
                 Self.prependMedia(media, toMessageAt: index, in: &messages)
@@ -943,31 +939,17 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         }
     }
 
-    static let requiredToolChoiceInstruction =
-        "For this assistant turn, return exactly one <tool_call> XML function call for one available function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
-
-    private static func requiredToolChoiceInstruction(
-        tools _: [ToolSpec]?,
-        additionalContext _: [String: any Sendable]?
-    ) -> String {
-        return requiredToolChoiceInstruction
-    }
-
     static func addRequiredToolChoiceInstruction(
         to messages: inout [Message],
-        tools: [ToolSpec]?,
-        additionalContext: [String: any Sendable]?
+        tools _: [ToolSpec]?,
+        additionalContext _: [String: any Sendable]?
     ) {
-        guard additionalContext?["tool_choice"] as? String == "required",
-              tools?.isEmpty == false
-        else {
-            return
-        }
-        let instruction = requiredToolChoiceInstruction(
-            tools: tools,
-            additionalContext: additionalContext)
-        addSystemInstruction(instruction, to: &messages)
-        addTailSystemInstruction(instruction, to: &messages)
+        // `tool_choice=required` is forwarded through `additionalContext` and
+        // the tool schema. Do not synthesize an extra system/tail directive for
+        // Nemotron Omni: if the model/template cannot satisfy the required
+        // tool contract natively, the row must fail or remain partial instead
+        // of being made coherent with prompt coercion.
+        _ = messages
     }
 
     private static func addSystemInstruction(
@@ -979,39 +961,12 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         }) {
             let existing = contentText(from: messages[systemIndex]["content"])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            let cleaned = existing
-                .split(separator: "\n", omittingEmptySubsequences: false)
-                .filter { line in
-                    let normalized = String(line)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    return normalized != instruction
-                        && !normalized
-                            .lowercased()
-                            .hasPrefix(
-                                "for this assistant turn, return exactly one <tool_call> xml function call for the ")
-                }
-                .joined(separator: "\n")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            messages[systemIndex]["content"] = cleaned.isEmpty
+            messages[systemIndex]["content"] = existing.isEmpty
                 ? instruction
-                : instruction + "\n" + cleaned
+                : instruction + "\n" + existing
             return
         }
         messages.insert(["role": "system", "content": instruction], at: 0)
-    }
-
-    private static func addTailSystemInstruction(
-        _ instruction: String,
-        to messages: inout [Message]
-    ) {
-        if let last = messages.last,
-           (last["role"] as? String) == "system",
-           contentText(from: last["content"])
-               .trimmingCharacters(in: .whitespacesAndNewlines) == instruction
-        {
-            return
-        }
-        messages.append(["role": "system", "content": instruction])
     }
 
     private static func prependMedia(_ media: String, toLastUserIn messages: inout [Message]) {

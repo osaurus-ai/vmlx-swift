@@ -11,14 +11,9 @@ import MLXLMCommon
 /// disables it. Keep the translation in the model package so hosts can keep
 /// passing the standard `additionalContext["enable_thinking"]` knob.
 ///
-/// The same native template also ignores generic `tool_choice`. When callers
-/// explicitly request OpenAI-style `required`, surface that contract through
-/// the same system-message lane instead of adding sampler or decode coercion.
 enum BailingThinkingTemplateContext {
     private static let thinkingOnDirective = "detailed thinking on"
     private static let thinkingOffDirective = "detailed thinking off"
-    private static let requiredToolDirective =
-        "For this assistant turn, return exactly one <tool_call> JSON object for one available function and no prose before the tool result."
 
     static func applies(to modelType: String?) -> Bool {
         modelType?.lowercased().hasPrefix("bailing") == true
@@ -36,15 +31,6 @@ enum BailingThinkingTemplateContext {
         var directives: [String] = []
         if let enableThinking = additionalContext?["enable_thinking"] as? Bool {
             directives.append(enableThinking ? thinkingOnDirective : thinkingOffDirective)
-        }
-        if additionalContext?["tool_choice"] as? String == "required" {
-            directives.append(requiredToolDirective)
-            if let toolChoiceName = additionalContext?["tool_choice_name"] as? String {
-                let trimmedToolChoiceName = toolChoiceName.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmedToolChoiceName.isEmpty {
-                    directives.append("Use the `\(trimmedToolChoiceName)` function.")
-                }
-            }
         }
         guard !directives.isEmpty else {
             return messages
@@ -74,24 +60,17 @@ enum BailingThinkingTemplateContext {
                     .lowercased()
                 return normalized != thinkingOnDirective
                     && normalized != thinkingOffDirective
-                    && normalized != requiredToolDirective.lowercased()
-                    && !(normalized.hasPrefix("use the `") && normalized.hasSuffix("` function."))
             }
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
-/// Nemotron-H / Omni native tokenizer templates advertise XML function calls,
-/// but they do not consume the generic OpenAI `tool_choice=required` kwarg.
-/// Translate only that explicit API contract into the model's existing
-/// ChatML/system-message lane. This is deliberately separate from fallback
-/// template rails and does not alter sampler defaults, thinking mode, or
-/// parser visibility.
+/// Nemotron-H / Omni native tokenizer templates advertise XML function calls.
+/// Keep `tool_choice` in `additionalContext` and tool schemas, but do not add
+/// synthetic system prompt directives here. Required tool-choice rows must be
+/// proven by the model/template path itself rather than prompt coercion.
 enum NemotronToolChoiceTemplateContext {
-    private static let requiredToolDirective =
-        "For this assistant turn, return exactly one <tool_call> XML function call for one available function and no prose before the tool result. Include every required <parameter=...> value exactly as requested."
-
     static func applies(to modelType: String?) -> Bool {
         guard let modelType else { return false }
         let normalized = modelType.lowercased()
@@ -103,41 +82,8 @@ enum NemotronToolChoiceTemplateContext {
         modelType: String?,
         additionalContext: [String: any Sendable]?
     ) -> [Message] {
-        guard applies(to: modelType),
-              additionalContext?["tool_choice"] as? String == "required"
-        else {
-            return messages
-        }
-
-        var out = messages
-        let directive = requiredToolDirective
-        if let index = out.firstIndex(where: { ($0["role"] as? String) == "system" }),
-           let content = out[index]["content"] as? String
-        {
-            var system = out[index]
-            let cleaned = removeExistingDirective(from: content)
-            system["content"] = cleaned.isEmpty
-                ? directive
-                : "\(directive)\n\n\(cleaned)"
-            out[index] = system
-        } else {
-            out.insert(["role": "system", "content": directive], at: 0)
-        }
-        return out
-    }
-
-    private static func removeExistingDirective(from content: String) -> String {
-        content
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .filter { line in
-                let normalized = String(line)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .lowercased()
-                return normalized != requiredToolDirective.lowercased()
-                    && !normalized.hasPrefix(
-                        "for this assistant turn, return exactly one <tool_call> xml function call for the ")
-            }
-            .joined(separator: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = modelType
+        _ = additionalContext
+        return messages
     }
 }

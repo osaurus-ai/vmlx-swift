@@ -917,8 +917,8 @@ struct BailingThinkingTemplateFocusedTests {
         #expect(replaced[0]["content"] as? String == "detailed thinking off\n\nYou are concise.")
     }
 
-    @Test("named required tool choice names the selected Bailing function")
-    func namedRequiredToolChoiceNamesSelectedBailingFunction() {
+    @Test("named required tool choice does not inject a Bailing prompt directive")
+    func namedRequiredToolChoiceDoesNotInjectBailingPromptDirective() {
         let messages: [Message] = [
             ["role": "system", "content": "You are concise."],
             ["role": "user", "content": "count lines"],
@@ -934,9 +934,8 @@ struct BailingThinkingTemplateFocusedTests {
 
         let system = out[0]["content"] as? String
         #expect(out[0]["role"] as? String == "system")
-        #expect(system?.contains("one <tool_call> JSON object") == true)
-        #expect(system?.contains("Use the `line_count` function.") == true)
-        #expect(system?.hasSuffix("\n\nYou are concise.") == true)
+        #expect(system == "You are concise.")
+        #expect(out.count == messages.count)
     }
 
     @Test("non-Bailing model and missing toggle are unchanged")
@@ -964,8 +963,8 @@ struct BailingThinkingTemplateFocusedTests {
 
 @Suite("Nemotron tool-choice template focused contracts")
 struct NemotronToolChoiceTemplateFocusedTests {
-    @Test("tool_choice required prepends Nemotron XML tool contract")
-    func requiredToolChoicePrependsNemotronXMLDirective() {
+    @Test("tool_choice required does not prepend Nemotron XML prompt contract")
+    func requiredToolChoiceDoesNotPrependNemotronXMLDirective() {
         let messages: [Message] = [
             ["role": "system", "content": "You are concise."],
             ["role": "user", "content": "Use line_count on red\ngreen\nblue."],
@@ -978,20 +977,17 @@ struct NemotronToolChoiceTemplateFocusedTests {
 
         let system = out[0]["content"] as? String
         #expect(out[0]["role"] as? String == "system")
-        #expect(system?.contains("for one available function") == true)
-        #expect(system?.contains("for the line_count function") == false)
-        #expect(system?.contains("Include every required <parameter=...>") == true)
-        #expect(system?.hasSuffix("\n\nYou are concise.") == true)
+        #expect(system == "You are concise.")
         #expect(out[1]["content"] as? String == "Use line_count on red\ngreen\nblue.")
+        #expect(out.count == messages.count)
     }
 
-    @Test("Nemotron named required tool contract keeps proven generic directive")
-    func namedRequiredToolChoiceKeepsGenericDirective() {
+    @Test("Nemotron named required tool choice leaves existing messages unchanged")
+    func namedRequiredToolChoiceLeavesExistingMessagesUnchanged() {
         let messages: [Message] = [
             [
                 "role": "system",
                 "content": """
-                    For this assistant turn, return exactly one <tool_call> XML function call for one available function and no prose before the tool result. Include every required <parameter=...> value exactly as requested.
                     You are concise.
                     """,
             ],
@@ -1004,9 +1000,9 @@ struct NemotronToolChoiceTemplateFocusedTests {
             additionalContext: ["tool_choice": "required", "tool_choice_name": "file_read"])
 
         let system = out[0]["content"] as? String
-        #expect(system?.contains("for one available function") == true)
-        #expect(system?.contains("for the file_read function") == false)
         #expect(system?.contains("You are concise.") == true)
+        #expect(system?.contains("return exactly one <tool_call>") == false)
+        #expect(out.count == messages.count)
     }
 
     @Test("Nemotron XML tool parser unescapes multiline string parameters")
@@ -1024,8 +1020,8 @@ struct NemotronToolChoiceTemplateFocusedTests {
         #expect(call?.function.arguments["text"] == .string("red\ngreen\nblue"))
     }
 
-    @Test("Nemotron required tool contract inserts system message")
-    func requiredToolChoiceInsertsSystemWhenMissing() {
+    @Test("Nemotron required tool choice does not insert synthetic system message")
+    func requiredToolChoiceDoesNotInsertSystemWhenMissing() {
         let messages: [Message] = [
             ["role": "user", "content": "Use line_count on one\ntwo."],
         ]
@@ -1035,10 +1031,9 @@ struct NemotronToolChoiceTemplateFocusedTests {
             modelType: "nemotron_h",
             additionalContext: ["tool_choice": "required"])
 
-        #expect(out.count == 2)
-        #expect(out[0]["role"] as? String == "system")
-        #expect((out[0]["content"] as? String)?.contains("<tool_call> XML") == true)
-        #expect(out[1]["role"] as? String == "user")
+        #expect(out.count == messages.count)
+        #expect(out[0]["role"] as? String == "user")
+        #expect(out[0]["content"] as? String == "Use line_count on one\ntwo.")
     }
 
     @Test("Nemotron required fallback does not append a late system turn")
