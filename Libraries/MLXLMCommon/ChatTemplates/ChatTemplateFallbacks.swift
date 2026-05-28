@@ -911,6 +911,20 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
     {%- endif -%}
 {%- endmacro -%}
 
+{%- macro render_text_content(content) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- elif content is sequence and content is not mapping -%}
+        {%- for item in content -%}
+            {%- if item is mapping and item['type'] == 'text' -%}
+                {{- item['text'] -}}
+            {%- elif item is string -%}
+                {{- item -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+
 {%- macro render_tool_call(tool_call) -%}
     {%- if tool_call['function'] is defined -%}
         {%- set tool_call = tool_call['function'] -%}
@@ -927,7 +941,7 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
 {%- endmacro -%}
 
 {%- macro render_required_tool_choice_instruction(latest_user_content='') -%}
-    {%- set latest_user_text = render_content(latest_user_content) -%}
+    {%- set latest_user_text = render_text_content(latest_user_content) -%}
     {{- '<IMPORTANT>\nThe current assistant response MUST be a tool call. Reply only with a `<zyphra_tool_call>` block for one available function and no prose before the tool result. Include every required `<parameter=...>` value exactly as requested.' -}}
     {%- if required_tool_name -%}
         {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}

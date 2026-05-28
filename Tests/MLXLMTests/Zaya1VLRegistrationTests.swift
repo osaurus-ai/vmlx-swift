@@ -528,6 +528,9 @@ struct Zaya1VLRegistrationTests {
 
         #expect(decoded.contains("<|vision_start|><image><|vision_end|>"),
             "decoded prompt: \(decoded)")
+        #expect(
+            decoded.components(separatedBy: "<|vision_start|><image><|vision_end|>").count - 1 == 1,
+            "decoded prompt must render the single media image exactly once: \(decoded)")
         #expect(decoded.contains("<function=line_count>"), "decoded prompt: \(decoded)")
         #expect(decoded.contains("<parameter=text>\nalpha\nbeta\ngamma\n</parameter>"),
             "decoded prompt: \(decoded)")
