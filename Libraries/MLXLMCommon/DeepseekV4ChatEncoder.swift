@@ -305,9 +305,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
                 out += taskSP
             } else {
                 out += DeepseekV4Tokens.assistant
-                out += thinkingMode == .thinking
-                    ? DeepseekV4Tokens.thinkStart
-                    : DeepseekV4Tokens.thinkEnd
+                out += DeepseekV4Tokens.thinkStart
                 out += taskSP
             }
         } else if msg.role == .user || msg.role == .developer || msg.role == .latestReminder {

@@ -150,7 +150,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
 
         let action = "<\u{FF5C}action\u{FF5C}>"
         let reminder = "<\u{FF5C}latest_reminder\u{FF5C}>"
-        let tail = "<\u{FF5C}Assistant\u{FF5C}></think><\u{FF5C}action\u{FF5C}>"
+        let tail = "<\u{FF5C}Assistant\u{FF5C}><think><\u{FF5C}action\u{FF5C}>"
         let actionRange = rendered.range(of: action)
         let reminderRange = rendered.range(of: reminder)
         #expect(actionRange != nil)
@@ -186,7 +186,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
 
         let finalUser = "Now use line_count on one\ntwo."
         let reminder = "<\u{FF5C}latest_reminder\u{FF5C}>"
-        let tail = "<\u{FF5C}Assistant\u{FF5C}></think><\u{FF5C}action\u{FF5C}>"
+        let tail = "<\u{FF5C}Assistant\u{FF5C}><think><\u{FF5C}action\u{FF5C}>"
         let finalUserRange = rendered.range(of: finalUser)
         let reminderRange = rendered.range(of: reminder)
         #expect(finalUserRange != nil)
@@ -220,7 +220,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
 
         #expect(rendered.contains("<tool_result>{\"lines\":3}</tool_result>"))
         #expect(rendered.contains("The active API tool_choice is required"))
-        #expect(rendered.hasSuffix("<\u{FF5C}Assistant\u{FF5C}></think><\u{FF5C}action\u{FF5C}>"))
+        #expect(rendered.hasSuffix("<\u{FF5C}Assistant\u{FF5C}><think><\u{FF5C}action\u{FF5C}>"))
     }
 
     @Test("Nemotron required tool choice keeps native XML tool contract")
