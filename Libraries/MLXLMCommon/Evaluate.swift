@@ -1273,10 +1273,10 @@ public struct TokenIterator: TokenIteratorProtocol {
             }
             if (input.toolSchemas?.isEmpty == false
                 || input.cacheScopeSalt?.contains("tool=required") == true),
-               cacheHasStandaloneRotatingWindowState(self.cache)
+               cacheRequiresDiskBackedCoordinatorRestore(self.cache)
             {
                 Self.logger.info(
-                    "TokenIterator: skipped disk-backed rotating cache fetch for active tool request"
+                    "TokenIterator: skipped disk-backed path-dependent cache fetch for active tool request"
                 )
             } else {
             let result = coordinator.fetch(
