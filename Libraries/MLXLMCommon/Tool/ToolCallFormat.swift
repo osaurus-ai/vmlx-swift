@@ -276,6 +276,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         if compact.hasPrefix("gemma4") {
             return .gemma4
         }
+        if compact.hasPrefix("gemma3n") {
+            return nil
+        }
         if compact.hasPrefix("gemma3") || compact == "gemma" {
             return .gemma
         }

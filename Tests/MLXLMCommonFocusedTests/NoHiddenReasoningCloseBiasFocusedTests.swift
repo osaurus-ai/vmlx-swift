@@ -1190,6 +1190,21 @@ struct DirectCapabilityParserAliasFocusedTests {
         }
     }
 
+    @Test("Gemma3n model-type heuristic does not invent tool support")
+    func gemma3nModelTypeDoesNotInventToolSupport() {
+        for modelType in ["gemma3n", "gemma3n_text", "gemma-3n-e2b-it"] {
+            #expect(reasoningStampFromModelType(modelType) == "none")
+            #expect(ToolCallFormat.infer(from: modelType) == nil)
+
+            let (_, toolSource) = ParserResolution.toolCall(
+                capabilities: nil,
+                modelType: modelType)
+            #expect(toolSource == .none)
+        }
+
+        #expect(ToolCallFormat.infer(from: "gemma3_text") == .gemma)
+    }
+
     @Test("Parser aliases trim metadata whitespace without demoting known families")
     func parserAliasesTrimMetadataWhitespace() {
         for modelType in [" Ling-2.6-flash ", "\tgemma-4-text\n", " glm-5.1-flash "] {
