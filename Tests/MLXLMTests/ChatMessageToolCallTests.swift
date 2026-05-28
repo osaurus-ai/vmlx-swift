@@ -122,6 +122,49 @@ struct ChatMessageToolCallTests {
         #expect(dict["tool_call_id"] as? String == "call_abc")
     }
 
+    @Test("generator names tool replies from prior assistant tool call id")
+    func generatorNamesToolRepliesFromPriorAssistantToolCallID() {
+        let call = ToolCall(
+            id: "call_line",
+            function: .init(
+                name: "line_count",
+                arguments: ["text": .string("red\ngreen\nblue")]
+            )
+        )
+        let messages: [Chat.Message] = [
+            .assistant("", toolCalls: [call]),
+            .tool("{\"lines\":3}", toolCallId: "call_line"),
+        ]
+
+        let rendered = DefaultMessageGenerator().generate(messages: messages)
+        #expect(rendered.count == 2)
+        #expect(rendered[1]["role"] as? String == "tool")
+        #expect(rendered[1]["tool_call_id"] as? String == "call_line")
+        #expect(rendered[1]["name"] as? String == "line_count")
+    }
+
+    @Test("Qwen2VL generator names tool replies while preserving content arrays")
+    func qwen2VLGeneratorNamesToolRepliesFromPriorAssistantToolCallID() {
+        let call = ToolCall(
+            id: "call_line",
+            function: .init(
+                name: "line_count",
+                arguments: ["text": .string("one\ntwo")]
+            )
+        )
+        let messages: [Chat.Message] = [
+            .assistant("", toolCalls: [call]),
+            .tool("{\"lines\":2}", toolCallId: "call_line"),
+        ]
+
+        let rendered = Qwen2VLMessageGenerator().generate(messages: messages)
+        #expect(rendered.count == 2)
+        #expect(rendered[1]["role"] as? String == "tool")
+        #expect(rendered[1]["tool_call_id"] as? String == "call_line")
+        #expect(rendered[1]["name"] as? String == "line_count")
+        #expect(rendered[1]["content"] as? [[String: String]] == [["type": "text", "text": "{\"lines\":2}"]])
+    }
+
     @Test("tool reply without id omits tool_call_id field")
     func toolReplyNoIdOmitsKey() {
         let msg = Chat.Message.tool("legacy result")

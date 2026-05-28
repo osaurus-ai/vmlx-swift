@@ -169,9 +169,29 @@ extension MessageGenerator {
 
     public func generate(messages: [Chat.Message]) -> [Message] {
         var rawMessages: [Message] = []
+        var toolNamesById: [String: String] = [:]
 
         for message in messages {
-            let raw = generate(message: message)
+            var raw = generate(message: message)
+            if let calls = raw["tool_calls"] as? [[String: any Sendable]] {
+                for call in calls {
+                    guard let id = call["id"] as? String else { continue }
+                    if let name = call["name"] as? String {
+                        toolNamesById[id] = name
+                    } else if let function = call["function"] as? [String: any Sendable],
+                              let name = function["name"] as? String
+                    {
+                        toolNamesById[id] = name
+                    }
+                }
+            }
+            if raw["name"] == nil,
+               raw["role"] as? String == Chat.Message.Role.tool.rawValue,
+               let id = raw["tool_call_id"] as? String,
+               let name = toolNamesById[id]
+            {
+                raw["name"] = name
+            }
             rawMessages.append(raw)
         }
 

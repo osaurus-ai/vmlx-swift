@@ -1287,11 +1287,12 @@ public actor BatchEngine {
                 activeSlots[slotIndex] = slot
                 return stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare)
             }
-            if slot.originalInput.toolSchemas?.isEmpty == false,
+            if (slot.originalInput.toolSchemas?.isEmpty == false
+                || slot.originalInput.cacheScopeSalt?.contains("tool=required") == true),
                cacheHasStandaloneRotatingWindowState(slot.cache)
             {
                 Self.logger.info(
-                    "Slot \(slot.id.description, privacy: .public): skipped disk-backed rotating cache fetch for active tool schema"
+                    "Slot \(slot.id.description, privacy: .public): skipped disk-backed rotating cache fetch for active tool request"
                 )
                 activeSlots[slotIndex] = slot
                 return stepPrefillAfterCacheLookup(
