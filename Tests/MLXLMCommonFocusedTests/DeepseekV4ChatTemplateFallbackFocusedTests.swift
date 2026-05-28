@@ -105,10 +105,12 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
 
         let compiled = try Template(ChatTemplateFallbacks.dsv4Minimal).renderDSV4(context)
         assertRequiredToolChoiceDirective(compiled)
+        assertRequiredToolChoiceActionRail(compiled)
 
         let source = try repositoryFile("Libraries/MLXLMCommon/ChatTemplates/DSV4Minimal.jinja")
         let standalone = try Template(source).renderDSV4(context)
         assertRequiredToolChoiceDirective(standalone)
+        assertRequiredToolChoiceActionRail(standalone)
 
         let swiftRendered = DeepseekV4ChatEncoder().encode(
             messages: [
@@ -568,6 +570,10 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("The current assistant response MUST be a tool call"))
         #expect(rendered.contains("Start with a \"<\u{FF5C}DSML\u{FF5C}tool_calls>\" block"))
         #expect(rendered.contains("do not answer in prose before the tool result"))
+    }
+
+    private func assertRequiredToolChoiceActionRail(_ rendered: String) {
+        #expect(rendered.hasSuffix("<\u{FF5C}Assistant\u{FF5C}><think><\u{FF5C}action\u{FF5C}>"))
     }
 
     private func assertSystemSeparatedFromUser(_ rendered: String) {

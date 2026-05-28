@@ -389,6 +389,7 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
 {%- set asst_token = '<｜Assistant｜>' -%}
 {%- set think_open = '<think>' -%}
 {%- set think_close = '</think>' -%}
+{%- set action_token = '<｜action｜>' -%}
 {%- set dsml = '｜DSML｜' -%}
 {%- set ns = namespace(last_user_index=-1) -%}
 {%- for message in messages -%}
@@ -481,7 +482,9 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
 {%- set next_role = messages[loop.index0 + 1]['role'] if loop.index0 + 1 < messages|length else none -%}
 {%- if next_role == 'assistant' or loop.last and add_generation_prompt -%}
 {{- asst_token -}}
-{%- if enable_thinking and loop.index0 >= ns.last_user_index -%}
+{%- if tool_choice is defined and tool_choice == 'required' and loop.index0 >= ns.last_user_index -%}
+{{- think_open -}}{{- action_token -}}
+{%- elif enable_thinking and loop.index0 >= ns.last_user_index -%}
 {{- think_open -}}
 {%- else -%}
 {{- think_close -}}
@@ -507,7 +510,9 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
 {%- set next_role = messages[loop.index0 + 1]['role'] if loop.index0 + 1 < messages|length else none -%}
 {%- if next_role == 'assistant' or loop.last and add_generation_prompt -%}
 {{- asst_token -}}
-{%- if enable_thinking and loop.index0 >= ns.last_user_index -%}
+{%- if tool_choice is defined and tool_choice == 'required' and loop.index0 >= ns.last_user_index -%}
+{{- think_open -}}{{- action_token -}}
+{%- elif enable_thinking and loop.index0 >= ns.last_user_index -%}
 {{- think_open -}}
 {%- else -%}
 {{- think_close -}}
