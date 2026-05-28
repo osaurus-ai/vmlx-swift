@@ -53,6 +53,15 @@ struct ZayaThinkingAndRederiveContractTests {
             "LLMModelFactory.defaultContext must keep the supports_thinking=false closing branch for non-thinking models.")
     }
 
+    @Test("LLMModelFactory applies ZAYA chat-template substitution before tokenizer load")
+    func factoryAppliesZayaChatTemplateSubstitution() throws {
+        let source = try Self.source("Libraries/MLXLLM/LLMModelFactory.swift")
+
+        #expect(source.contains("let templateResolvedDir = JangLoader.resolveChatTemplateSidecarSubstitution("))
+        #expect(source.contains("for: jangResolvedDir)"))
+        #expect(source.contains("for: templateResolvedDir)"))
+    }
+
     // MARK: - ZayaCCACache rederive integration source coverage
 
     /// `ModelContainer.assignDefaultCacheCoordinator` must flip

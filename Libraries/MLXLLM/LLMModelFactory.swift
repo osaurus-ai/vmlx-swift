@@ -1669,11 +1669,13 @@ public final class LLMModelFactory: ModelFactory {
         // standard models.
         let jangResolvedDir = JangLoader.resolveTokenizerDirectory(
             for: configuration.tokenizerDirectory)
+        let templateResolvedDir = JangLoader.resolveChatTemplateSidecarSubstitution(
+            for: jangResolvedDir)
         // Then rewrite `tokenizer_class` if swift-transformers doesn't know
         // it (TokenizersBackend → Qwen2Tokenizer for Qwen VL). Returns
         // the input unchanged for already-supported classes.
         let tokenizerDirectory = JangLoader.resolveTokenizerClassSubstitution(
-            for: jangResolvedDir)
+            for: templateResolvedDir)
         async let tokenizerTask = tokenizerLoader.load(from: tokenizerDirectory)
 
         // When JANG, skip config.json's perLayerQuantization — JANG infers correct
