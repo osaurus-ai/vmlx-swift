@@ -1073,7 +1073,11 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
 {%- endfor -%}
 
 {%- if add_generation_prompt -%}
-    {{- '<|im_start|>assistant\n' -}}
+    {%- if enable_thinking is defined and enable_thinking == false -%}
+        {{- '<|im_start|>assistant\n<think>\n</think>\n\n' -}}
+    {%- else -%}
+        {{- '<|im_start|>assistant\n' -}}
+    {%- endif -%}
 {%- endif -%}
 """#
 

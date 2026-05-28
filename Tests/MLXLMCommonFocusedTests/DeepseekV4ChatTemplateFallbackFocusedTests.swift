@@ -655,8 +655,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!rendered.contains("VALUE_FOR_query"))
         #expect(!rendered.contains("VALUE_FOR_*"))
         #expect(rendered.contains("Do not wrap the parameter value in JSON quotes"))
-        #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
-        #expect(!rendered.contains("<think>"))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n<think>\n</think>\n\n"))
+        #expect(rendered.contains("<think>\n</think>\n\n"))
         #expect(!rendered.contains("enable_thinking"))
     }
 
