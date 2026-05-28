@@ -361,6 +361,8 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             "bos_token": "<bos>",
             "messages": messages,
             "tools": tools,
+            "tool_choice": "required",
+            "tool_choice_name": "get_weather",
             "add_generation_prompt": true,
         ])
 
@@ -374,6 +376,8 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             "Assistant tool_call must render inline with Gemma's invoke syntax. Got: \(out)")
         XCTAssertTrue(out.contains("<|tool_response>response:get_weather{22°C, sunny}<tool_response|>"),
             "Tool response must render with Gemma's <|tool_response> wrapper. Got: \(out)")
+        XCTAssertTrue(out.contains(#"Required tool choice: the current assistant response must be exactly one <|tool_call>call:get_weather{ARGUMENT_NAME:<|"|>ARGUMENT_VALUE<|"|>}<tool_call|> and no prose."#),
+            "Required tool_choice must be represented in Gemma-4 native tool grammar. Got: \(out)")
         XCTAssertTrue(out.hasSuffix("<|turn>model\n"),
             "Generation prompt must end with open model turn.")
     }

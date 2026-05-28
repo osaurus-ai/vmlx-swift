@@ -82,6 +82,15 @@
             {%- endif -%}
             {{- '}<tool|>' -}}
         {%- endfor -%}
+        {%- if tool_choice is defined and tool_choice == 'required' -%}
+            {{- 'Required tool choice: the current assistant response must be exactly one <|tool_call>call:' -}}
+            {%- if tool_choice_name is defined and tool_choice_name -%}
+                {{- tool_choice_name -}}
+            {%- else -%}
+                {{- 'FUNCTION_NAME' -}}
+            {%- endif -%}
+            {{- '{ARGUMENT_NAME:<|"|>ARGUMENT_VALUE<|"|>}<tool_call|> and no prose.' -}}
+        {%- endif -%}
     {%- endif -%}
     {{- '<turn|>\n' -}}
 {%- else -%}
