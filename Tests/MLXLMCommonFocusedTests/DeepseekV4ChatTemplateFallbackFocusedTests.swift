@@ -683,7 +683,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
                 ["role": "tool", "tool_call_id": "call_lines", "content": #"{"lines":3}"#],
                 ["role": "user", "content": "How many lines? Do not call another tool."],
                 ["role": "assistant", "content": "Three lines were counted."],
-                ["role": "user", "content": "Now use line_count on exactly this new text, preserving newlines:\none\ntwo"],
+                ["role": "user", "content": "Now use line_count on this exact text: one\ntwo"],
             ],
             "tools": [
                 [
@@ -707,7 +707,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             "tool_choice": "required",
         ])
 
-        let finalUser = "Now use line_count on exactly this new text, preserving newlines:\none\ntwo"
+        let finalUser = "Now use line_count on this exact text: one\ntwo"
         let currentReminder = "The current assistant response MUST be a tool call."
         let tail = "<|im_start|>assistant\n"
         let finalUserRange = rendered.range(of: finalUser)

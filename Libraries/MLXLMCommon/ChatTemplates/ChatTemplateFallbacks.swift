@@ -878,10 +878,16 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
                     {%- for param_name in selected_tool['parameters']['required'] -%}
                         {%- set exact = namespace(value='') -%}
                         {%- set exact_markers = [
+                            'on this exact ' ~ param_name ~ ':',
                             'exact ' ~ param_name ~ ':',
                             'this exact ' ~ param_name ~ ':',
                             'exactly this ' ~ param_name ~ ':',
                             'exactly ' ~ param_name ~ ':',
+                            'on this exact text:',
+                            'this exact text:',
+                            'exact text:',
+                            'on exactly this text:',
+                            'exactly this text:',
                             'exactly this new ' ~ param_name ~ ', preserving newlines:',
                             'exactly this ' ~ param_name ~ ', preserving newlines:',
                             'this new ' ~ param_name ~ ', preserving newlines:',
