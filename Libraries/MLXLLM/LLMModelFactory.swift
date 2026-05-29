@@ -1611,6 +1611,7 @@ public final class LLMModelFactory: ModelFactory {
         // `tool_parser` stamp disagreed with `model_type` were silently miscategorised.
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
+        let chatTemplate = Self.chatTemplateText(modelDirectory: modelDirectory)
         if mutableConfiguration.toolCallFormat == nil {
             // New DSV4-era stamp lives under `chat.tool_calling.parser`
             // (e.g. `"dsml"` for DeepSeek-V4-Flash). Keep the legacy
@@ -1623,7 +1624,7 @@ public final class LLMModelFactory: ModelFactory {
                 ParserResolution.toolCall(
                     capabilities: jangConfig?.capabilities,
                     modelType: baseConfig.modelType,
-                    chatTemplate: Self.chatTemplateText(modelDirectory: modelDirectory)
+                    chatTemplate: chatTemplate
                 ).format
             mutableConfiguration.toolCallFormat =
                 chatStamped
@@ -1654,8 +1655,16 @@ public final class LLMModelFactory: ModelFactory {
             if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
             } else {
+                let resolvedReasoning = ParserResolution.reasoning(
+                    capabilities: jangConfig?.capabilities,
+                    modelType: baseConfig.modelType,
+                    chatTemplate: chatTemplate)
                 mutableConfiguration.reasoningParserName =
-                    reasoningStampFromModelType(baseConfig.modelType)
+                    resolvedReasoning.parser == nil
+                    ? "none"
+                    : (resolvedReasoning.source == .chatTemplate
+                        ? "qwen3"
+                        : reasoningStampFromModelType(baseConfig.modelType))
             }
         }
 

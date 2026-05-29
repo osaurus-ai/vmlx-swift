@@ -312,7 +312,8 @@ public enum ParserResolution {
     ///   stream raw.
     public static func reasoning(
         capabilities: JangCapabilities?,
-        modelType: String?
+        modelType: String?,
+        chatTemplate: String? = nil
     ) -> (parser: ReasoningParser?, source: JangCapabilities.ResolutionSource) {
         if let cap = capabilities, cap.reasoningParser != nil {
             // Stamped — honour exactly. `nil` is a valid stamp meaning
@@ -320,6 +321,12 @@ public enum ParserResolution {
             return (
                 ReasoningParser.fromCapabilityName(cap.reasoningParser),
                 .jangStamped
+            )
+        }
+        if declaresLFM25ThinkingTemplate(modelType: modelType, chatTemplate: chatTemplate) {
+            return (
+                ReasoningParser.fromCapabilityName("qwen3"),
+                .chatTemplate
             )
         }
         // Heuristic: delegate to the canonical factory helper so this
@@ -338,6 +345,26 @@ public enum ParserResolution {
             ReasoningParser.fromCapabilityName(stamp),
             .modelTypeHeuristic
         )
+    }
+
+    private static func declaresLFM25ThinkingTemplate(
+        modelType: String?,
+        chatTemplate: String?
+    ) -> Bool {
+        guard let modelType, let chatTemplate else { return false }
+        let normalized = modelType
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: ".", with: "_")
+        let compact = normalized.replacingOccurrences(of: "_", with: "")
+        guard compact == "lfm2moe" || compact.hasPrefix("lfm25") else {
+            return false
+        }
+        return chatTemplate.contains("<think>")
+            && chatTemplate.contains("</think>")
+            && chatTemplate.contains("<|tool_call_start|>")
+            && chatTemplate.contains("<|tool_call_end|>")
     }
 
     /// Resolve a `ToolCallFormat` for a model.

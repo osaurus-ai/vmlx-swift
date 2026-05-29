@@ -72,6 +72,22 @@ private func create<C: Codable, M>(
     }
 }
 
+private func chatTemplateText(modelDirectory: URL) -> String? {
+    let templateURL = modelDirectory.appending(component: "chat_template.jinja")
+    if let template = try? String(contentsOf: templateURL, encoding: .utf8) {
+        return template
+    }
+    let tokenizerConfigURL = modelDirectory.appending(component: "tokenizer_config.json")
+    guard
+        let data = try? Data(contentsOf: tokenizerConfigURL),
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let template = object["chat_template"] as? String
+    else {
+        return nil
+    }
+    return template
+}
+
 private func create<C: Codable, P>(
     _ configurationType: C.Type,
     _ processorInit:
@@ -592,8 +608,16 @@ public final class VLMModelFactory: ModelFactory {
             if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
             } else {
+                let resolvedReasoning = ParserResolution.reasoning(
+                    capabilities: jangConfig?.capabilities,
+                    modelType: baseConfig.modelType,
+                    chatTemplate: chatTemplateText(modelDirectory: modelDirectory))
                 mutableConfiguration.reasoningParserName =
-                    reasoningStampFromModelType(baseConfig.modelType)
+                    resolvedReasoning.parser == nil
+                    ? "none"
+                    : (resolvedReasoning.source == .chatTemplate
+                        ? "qwen3"
+                        : reasoningStampFromModelType(baseConfig.modelType))
             }
         }
 

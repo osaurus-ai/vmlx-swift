@@ -61,6 +61,8 @@ struct ReasoningStampFamilyMatrixTests {
         "laguna", "laguna_xs", "laguna_s", "laguna_m",
         // ZAYA
         "zaya", "zaya1", "zaya2",
+        // MiMo
+        "mimo", "mimo_v2_flash",
     ])
     func thinkXmlFamilies(_ modelType: String) {
         #expect(reasoningStampFromModelType(modelType) == "think_xml",
@@ -87,11 +89,15 @@ struct ReasoningStampFamilyMatrixTests {
         "gemma", "gemma2", "gemma3", "gemma3_text", "gemma3n",
         "qwen2", "qwen2_vl", "qwen2_5_vl",
         "starcoder2", "cohere", "openelm", "internlm2",
-        "granite", "granitemoehybrid", "mimo", "mimo_v2_flash",
+        "granite", "granitemoehybrid",
         "bitnet", "falcon_h1",
         // VLM-only that don't route through think_xml
         "paligemma", "idefics3", "smolvlm", "fastvlm", "llava_qwen2",
         "pixtral", "lfm2_vl", "glm_ocr", "zaya1_vl",
+        // LFM2/LFM2-MoE remain no-reasoning by model_type alone. LFM2.5
+        // thinking is template-declared and covered by
+        // ReasoningStampFromModelTypeTests.
+        "lfm2", "lfm2_moe",
         // Empty/nil
         "", "unknown_model_type",
     ])

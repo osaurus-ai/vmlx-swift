@@ -32,6 +32,31 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
         XCTAssertEqual(reasoningStampFromModelType("lfm2_moe"), "none")
     }
 
+    func testLFM25TemplateDeclaresThinkingWithoutPromotingPlainLFM2MoE() {
+        let template = """
+        {%- macro render_tool_calls(tool_calls) -%}
+        {{- "<|tool_call_start|>[" + "line_count(text='a')" + "]<|tool_call_end|>" -}}
+        {%- endmacro -%}
+        {%- if message.thinking is defined -%}
+        {{- "<think>" + message.thinking + "</think>" -}}
+        {%- endif -%}
+        """
+
+        let plain = ParserResolution.reasoning(
+            capabilities: nil,
+            modelType: "lfm2_moe",
+            chatTemplate: nil)
+        XCTAssertNil(plain.parser)
+        XCTAssertEqual(plain.source, .modelTypeHeuristic)
+
+        let lfm25 = ParserResolution.reasoning(
+            capabilities: nil,
+            modelType: "lfm2_moe",
+            chatTemplate: template)
+        XCTAssertNotNil(lfm25.parser)
+        XCTAssertEqual(lfm25.source, .chatTemplate)
+    }
+
     func testPlainFamiliesGetNone() {
         // Every non-reasoning family vmlx supports must emit plain
         // .chunk, not .reasoning. Enumerate explicitly so a
@@ -41,7 +66,7 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
             "phi", "phi3", "phimoe",
             "gemma", "gemma2", "gemma3", "gemma3_text", "gemma3n",
             "starcoder2", "cohere", "openelm", "internlm2", "granite",
-            "granitemoehybrid", "mimo", "mimo_v2_flash",
+            "granitemoehybrid",
             "minicpm", "nanochat", "olmoe", "olmo2", "olmo3",
             "smollm3", "ernie4_5", "baichuan_m1",
             "exaone4", "lille-130m", "apertus", "jamba_3b",
@@ -108,6 +133,12 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
 
     func testZayaGetsThinkXml() {
         for modelType in ["zaya", "zaya1", "zaya2"] {
+            XCTAssertEqual(reasoningStampFromModelType(modelType), "think_xml")
+        }
+    }
+
+    func testMiMoFamilyGetsThinkXml() {
+        for modelType in ["mimo", "mimo_v2_flash"] {
             XCTAssertEqual(reasoningStampFromModelType(modelType), "think_xml")
         }
     }
