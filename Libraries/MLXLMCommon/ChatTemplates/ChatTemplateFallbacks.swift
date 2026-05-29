@@ -1183,7 +1183,7 @@ The current assistant response MUST be a tool call. This applies to the latest u
 {%- endmacro -%}
 
 {%- macro render_required_tool_choice_instruction(latest_user_content='') -%}
-    {{- 'The active API tool_choice is required for this assistant turn. Reply only with one native LFM tool call and no prose before the tool result:\n<|tool_call_start|>[FUNCTION_NAME(ARGUMENT_NAME=' ~ "'" ~ 'ARGUMENT_VALUE' ~ "'" ~ ')]<|tool_call_end|>' -}}
+    {{- 'The active API tool_choice is required for this assistant turn. Reply only with one native LFM tool call and no prose before the tool result.' -}}
     {%- if required_tool_name -%}
         {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
         {%- for tool in tools -%}
@@ -1216,9 +1216,11 @@ The current assistant response MUST be a tool call. This applies to the latest u
                         {{- '\nRequired call shape for the current request:\n<|tool_call_start|>[' ~ required_tool_name ~ '(' ~ param_name ~ '=' ~ "'" ~ exact.value ~ "'" ~ ')]<|tool_call_end|>' -}}
                     {%- endif -%}
                 {%- endfor -%}
-                {{- '\nDo not omit required parameters. If the latest user message asks to use exact text, copy that exact text into the string argument, preserving newlines.' -}}
+                {{- '\nDo not omit required parameters. If the latest user message asks to use exact text, copy that exact text into the string argument, preserving every newline and adding no spaces.' -}}
             {%- endif -%}
         {%- endfor -%}
+    {%- else -%}
+        {{- '\nUse exactly one of the listed function names and include every required argument.' -}}
     {%- endif -%}
 {%- endmacro -%}
 
