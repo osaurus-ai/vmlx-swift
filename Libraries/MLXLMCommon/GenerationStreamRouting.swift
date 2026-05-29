@@ -25,7 +25,13 @@ public func routeGenerationText(
 
     var events: [Generation] = []
     let toolCallCountBeforeChunk = toolCallProcessor.toolCalls.count
-    if let visible = toolCallProcessor.processChunk(text) {
+    let visibleChunk: String?
+    if channel == .reasoning, toolCallProcessor.usesTaggedOnlyReasoningExtraction {
+        visibleChunk = toolCallProcessor.processTaggedProtocolChunk(text)
+    } else {
+        visibleChunk = toolCallProcessor.processChunk(text)
+    }
+    if let visible = visibleChunk {
         let parsedToolCallInChunk = toolCallProcessor.toolCalls.count > toolCallCountBeforeChunk
         switch channel {
         case .content:

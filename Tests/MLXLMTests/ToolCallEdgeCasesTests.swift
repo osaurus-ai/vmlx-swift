@@ -203,8 +203,8 @@ struct ToolCallEdgeCasesTests {
             "User-visible text must carry the final answer.")
     }
 
-    @Test("LFM2 does not parse tool-call-looking deliberation as a tool call")
-    func testLFM2DoesNotParseToolCallLookingReasoning() throws {
+    @Test("LFM2 parses only native tagged calls from reasoning-routed output")
+    func testLFM2ParsesOnlyNativeTaggedCallsFromReasoningRoutedOutput() throws {
         let processor = ToolCallProcessor(format: .lfm2, tools: [lineCountToolSpec()])
         let reasoningEvents = routeGenerationText(
             "We need to call line_count() with the exact text first.",
@@ -214,13 +214,14 @@ struct ToolCallEdgeCasesTests {
         #expect(reasoningEvents.compactMap(\.toolCall).isEmpty)
         #expect(reasoningEvents.compactMap(\.reasoning).joined().contains("line_count()"))
 
-        let contentEvents = routeGenerationText(
+        let nativeCallEvents = routeGenerationText(
             #"<|tool_call_start|>[line_count(text="red\ngreen\nblue")]<|tool_call_end|>"#,
-            channel: .content,
+            channel: .reasoning,
             through: processor)
-        let call = try #require(contentEvents.compactMap(\.toolCall).first)
+        let call = try #require(nativeCallEvents.compactMap(\.toolCall).first)
         #expect(call.function.name == "line_count")
         #expect(call.function.arguments["text"] == .string("red\ngreen\nblue"))
+        #expect(nativeCallEvents.compactMap(\.reasoning).joined().isEmpty)
     }
 
     @Test("Gemma4 still parses tool calls from reasoning channel")

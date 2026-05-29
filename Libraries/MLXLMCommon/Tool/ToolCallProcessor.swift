@@ -29,6 +29,7 @@ public class ToolCallProcessor {
     private let parser: any ToolCallParser
     private let tools: [[String: any Sendable]]?
     public let parsesToolCallsFromReasoningChannel: Bool
+    public let usesTaggedOnlyReasoningExtraction: Bool
     private var state = State.normal
     private var toolCallBuffer = ""
     private var leadingTextBeforeToolCall = ""
@@ -72,6 +73,7 @@ public class ToolCallProcessor {
         self.parser = format.createParser()
         self.tools = tools
         self.parsesToolCallsFromReasoningChannel = format.parsesToolCallsFromReasoningChannel
+        self.usesTaggedOnlyReasoningExtraction = format.usesTaggedOnlyReasoningExtraction
     }
 
     // MARK: - Computed Properties
@@ -98,7 +100,14 @@ public class ToolCallProcessor {
         if isInlineFormat {
             return processInlineChunk(chunk)
         }
-        return processTaggedChunk(chunk)
+        return processTaggedChunk(chunk, allowInlineFallback: true)
+    }
+
+    /// Process a chunk using only the parser's explicit wrapper tags. This is
+    /// used for reasoning-channel extraction in formats whose prose can mention
+    /// bare function-looking text before the real native tool envelope.
+    public func processTaggedProtocolChunk(_ chunk: String) -> String? {
+        processTaggedChunk(chunk, allowInlineFallback: false)
     }
 
     /// Process end-of-sequence, parsing any buffered content as tool call(s).
@@ -1046,7 +1055,7 @@ public class ToolCallProcessor {
     }
 
     /// Process chunk for tagged formats.
-    private func processTaggedChunk(_ chunk: String) -> String? {
+    private func processTaggedChunk(_ chunk: String, allowInlineFallback: Bool) -> String? {
         let startTags = parser.startTagAliases
         let startTagPrefixes = parser.startTagPrefixes
         guard (!startTags.isEmpty || !startTagPrefixes.isEmpty),
@@ -1064,7 +1073,7 @@ public class ToolCallProcessor {
             return partialMatch(buffer: suffix, tags: startTags, prefixes: startTagPrefixes)
         }()
 
-        if parser.supportsInlineJSONToolFallback && !hasTaggedStartCandidate {
+        if allowInlineFallback && parser.supportsInlineJSONToolFallback && !hasTaggedStartCandidate {
             switch state {
             case .collectingInlineToolCall:
                 return processInlineChunk(chunk)
@@ -1214,7 +1223,9 @@ public class ToolCallProcessor {
                 if let trailingToken, let startChar = startTagFirstChar,
                     trailingToken.contains(startChar)
                 {
-                    let trailing = processChunk(trailingToken) ?? ""
+                    let trailing = processTaggedChunk(
+                        trailingToken,
+                        allowInlineFallback: allowInlineFallback) ?? ""
                     let visible = leading + trailing
                     return visible.isEmpty ? nil : visible
                 } else {

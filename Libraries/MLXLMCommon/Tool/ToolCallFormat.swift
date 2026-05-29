@@ -214,16 +214,23 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     }
 
     /// Whether this tool-call format should be extracted from the reasoning
-    /// channel. Most families can emit a real tool envelope immediately after
-    /// a reasoning close marker and therefore keep this enabled. LFM2 is an
-    /// exception in live Osaurus rows: it may mention `line_count()` while
-    /// deliberating, before the final native `<|tool_call_start|>...` call.
+    /// channel. Some bundles stamp a reasoning parser even when the template
+    /// does not prefill a thinking rail; parsing remains safe for tagged
+    /// formats because the parser only accepts explicit protocol envelopes.
     public var parsesToolCallsFromReasoningChannel: Bool {
+        true
+    }
+
+    /// Whether reasoning-channel extraction must ignore inline fallbacks and
+    /// accept only the format's explicit wrapper protocol. LFM2 may mention
+    /// `line_count()` while deliberating before emitting a real native
+    /// `<|tool_call_start|>...<|tool_call_end|>` envelope.
+    public var usesTaggedOnlyReasoningExtraction: Bool {
         switch self {
         case .lfm2:
-            return false
-        default:
             return true
+        default:
+            return false
         }
     }
 
