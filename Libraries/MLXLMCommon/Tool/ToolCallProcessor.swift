@@ -197,6 +197,27 @@ public class ToolCallProcessor {
                 return visible.isEmpty ? nil : visible
             }
 
+            if let callIndex = firstInlinePythonicCallListStart(in: inlineText) {
+                let leading = String(inlineText[..<callIndex])
+                inlineToolCallKind = .functionCall
+                toolCallBuffer = String(inlineText[callIndex...])
+                state = .collectingInlineToolCall
+
+                if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
+                    toolCalls.append(toolCall)
+                    toolCallBuffer = ""
+                    state = .normal
+                    suppressingTextAfterInlineToolCall = true
+                }
+                return leading.isEmpty ? nil : leading
+            }
+
+            if let pendingIndex = partialInlinePythonicCallListStart(in: inlineText) {
+                let visible = String(inlineText[..<pendingIndex])
+                leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
+                return visible.isEmpty ? nil : visible
+            }
+
             if let callIndex = firstInlineFunctionToolCallStart(in: inlineText) {
                 let leading = String(inlineText[..<callIndex])
                 inlineToolCallKind = .functionCall
@@ -455,6 +476,7 @@ public class ToolCallProcessor {
         }
         return inlineFunctionToolNames().contains {
             compact.hasPrefix("\($0)(")
+                || compact.hasPrefix("[\($0)(")
                 || compact.hasPrefix("\($0){")
                 || compact.hasPrefix("\($0):json{")
                 || compact.hasPrefix("\($0)```")
@@ -583,6 +605,49 @@ public class ToolCallProcessor {
             cursor = text.index(after: cursor)
         }
         return best
+    }
+
+    private func firstInlinePythonicCallListStart(in text: String) -> String.Index? {
+        var cursor = text.startIndex
+        while let bracket = text[cursor...].firstIndex(of: "[") {
+            let afterBracket = text.index(after: bracket)
+            var nameStart = afterBracket
+            while nameStart < text.endIndex, isInlineWhitespace(text[nameStart]) {
+                nameStart = text.index(after: nameStart)
+            }
+            for name in inlineFunctionToolNames() {
+                if text[nameStart...].hasPrefix("\(name)(") {
+                    return bracket
+                }
+            }
+            cursor = afterBracket
+        }
+        return nil
+    }
+
+    private func partialInlinePythonicCallListStart(in text: String) -> String.Index? {
+        guard !text.isEmpty else { return nil }
+        var cursor = text.startIndex
+        while let bracket = text[cursor...].firstIndex(of: "[") {
+            let suffix = String(text[bracket...])
+            if suffix.trimmingCharacters(in: .whitespacesAndNewlines) == "[" {
+                return bracket
+            }
+            let afterBracket = text.index(after: bracket)
+            var nameStart = afterBracket
+            while nameStart < text.endIndex, isInlineWhitespace(text[nameStart]) {
+                nameStart = text.index(after: nameStart)
+            }
+            let tail = String(text[nameStart...])
+            for name in inlineFunctionToolNames() {
+                let needle = "\(name)("
+                if needle.hasPrefix(tail) && tail.count < needle.count {
+                    return bracket
+                }
+            }
+            cursor = afterBracket
+        }
+        return nil
     }
 
     private func firstInlineRequestToolXMLToolCallStart(in text: String) -> String.Index? {
@@ -1013,6 +1078,8 @@ public class ToolCallProcessor {
                             || partialInlineActionJSONToolCallStart(in: candidate) != nil
                             || firstInlineFunctionToolCallStart(in: candidate) != nil
                             || partialInlineFunctionToolCallStart(in: candidate) != nil
+                            || firstInlinePythonicCallListStart(in: candidate) != nil
+                            || partialInlinePythonicCallListStart(in: candidate) != nil
                             || firstInlineRequestToolXMLToolCallStart(in: candidate) != nil
                             || partialInlineRequestToolXMLToolCallStart(in: candidate) != nil
                             || firstInlineBareNameJSONToolCallStart(in: candidate) != nil
@@ -1036,6 +1103,8 @@ public class ToolCallProcessor {
                     || partialInlineActionJSONToolCallStart(in: chunk) != nil
                     || firstInlineFunctionToolCallStart(in: chunk) != nil
                     || partialInlineFunctionToolCallStart(in: chunk) != nil
+                    || firstInlinePythonicCallListStart(in: chunk) != nil
+                    || partialInlinePythonicCallListStart(in: chunk) != nil
                     || firstInlineRequestToolXMLToolCallStart(in: chunk) != nil
                     || partialInlineRequestToolXMLToolCallStart(in: chunk) != nil
                     || firstInlineBareNameJSONToolCallStart(in: chunk) != nil

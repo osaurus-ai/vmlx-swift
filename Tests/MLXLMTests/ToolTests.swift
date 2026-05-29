@@ -237,6 +237,60 @@ struct ToolTests {
         #expect(toolCall.function.arguments["expression"] == .string("2+2"))
     }
 
+    @Test("LFM2 processor accepts bare native call list")
+    func lfm2ProcessorAcceptsBareNativeCallList() throws {
+        let tools: [ToolSpec] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "line_count",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "text": ["type": "string"] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "required": ["text"] as [String],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as ToolSpec
+        ]
+        let processor = ToolCallProcessor(format: .lfm2, tools: tools)
+        let visible = processor.processChunk(#"[line_count(text="red\ngreen\nblue")]"#)
+        _ = processor.processEOS()
+
+        #expect(visible == nil)
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "line_count")
+        #expect(toolCall.function.arguments["text"] == .string("red\ngreen\nblue"))
+    }
+
+    @Test("LFM2 parser maps one positional string to the required parameter")
+    func lfm2ParserMapsOnePositionalStringToRequiredParameter() throws {
+        let tools: [ToolSpec] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "line_count",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "text": ["type": "string"] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "required": ["text"] as [String],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as ToolSpec
+        ]
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let toolCall = try #require(
+            parser.parse(content: #"<|tool_call_start|>[line_count("red\ngreen\nblue")]<|tool_call_end|>"#, tools: tools))
+
+        #expect(toolCall.function.name == "line_count")
+        #expect(toolCall.function.arguments["text"] == .string("red\ngreen\nblue"))
+    }
+
     // MARK: - XML Function Format Tests (Qwen3 Coder)
 
     @Test("Test XML Function Parser - Qwen3 Coder Format")

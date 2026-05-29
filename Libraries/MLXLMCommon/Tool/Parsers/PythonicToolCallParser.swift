@@ -8,6 +8,7 @@ import Foundation
 public struct PythonicToolCallParser: ToolCallParser, Sendable {
     public let startTag: String?
     public let endTag: String?
+    public let supportsInlineJSONToolFallback = true
 
     public init(startTag: String? = nil, endTag: String? = nil) {
         self.startTag = startTag
@@ -154,6 +155,44 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
                 value, paramName: key, funcName: funcName, tools: tools)
         }
 
+        if arguments.isEmpty,
+            let positionalString = parseSinglePositionalString(argsString),
+            let firstRequiredParameter = requiredParameterNames(funcName: funcName, tools: tools).first
+        {
+            arguments[firstRequiredParameter] = convertParameterValue(
+                positionalString, paramName: firstRequiredParameter, funcName: funcName, tools: tools)
+        }
+
         return arguments
+    }
+
+    private func parseSinglePositionalString(_ argsString: String) -> String? {
+        let trimmed = argsString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return nil }
+
+        let quote = trimmed.first
+        guard (quote == "'" || quote == "\""), trimmed.last == quote else { return nil }
+
+        var value = String(trimmed.dropFirst().dropLast())
+        value = value.replacingOccurrences(of: "\\'", with: "'")
+        value = value.replacingOccurrences(of: "\\\"", with: "\"")
+        value = value.replacingOccurrences(of: "\\\\", with: "\\")
+        return value
+    }
+
+    private func requiredParameterNames(
+        funcName: String,
+        tools: [[String: any Sendable]]?
+    ) -> [String] {
+        guard let tools else { return [] }
+        for tool in tools {
+            guard let function = tool["function"] as? [String: any Sendable],
+                function["name"] as? String == funcName,
+                let parameters = function["parameters"] as? [String: any Sendable],
+                let required = parameters["required"] as? [String]
+            else { continue }
+            return required
+        }
+        return []
     }
 }
