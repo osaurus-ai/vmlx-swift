@@ -1652,7 +1652,21 @@ public final class LLMModelFactory: ModelFactory {
         // GLM 4/5, MiniMax M2+, Kimi K2.x, Nemotron-H). Every other
         // model_type falls through to `"none"` and emits plain `.chunk`.
         if mutableConfiguration.reasoningParserName == nil {
-            if let stamp = jangConfig?.capabilities?.reasoningParser {
+            if ParserResolution.shouldIgnoreReasoningStamp(
+                capabilities: jangConfig?.capabilities,
+                modelType: baseConfig.modelType)
+            {
+                let resolvedReasoning = ParserResolution.reasoning(
+                    capabilities: jangConfig?.capabilities,
+                    modelType: baseConfig.modelType,
+                    chatTemplate: chatTemplate)
+                mutableConfiguration.reasoningParserName =
+                    resolvedReasoning.parser == nil
+                    ? "none"
+                    : (resolvedReasoning.source == .chatTemplate
+                        ? "qwen3"
+                        : reasoningStampFromModelType(baseConfig.modelType))
+            } else if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
             } else {
                 let resolvedReasoning = ParserResolution.reasoning(

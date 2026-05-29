@@ -605,7 +605,21 @@ public final class VLMModelFactory: ModelFactory {
         // this is an explicit allowlist rather than a reverse-allowlist
         // default — shared helper in MLXLMCommon.
         if mutableConfiguration.reasoningParserName == nil {
-            if let stamp = jangConfig?.capabilities?.reasoningParser {
+            if ParserResolution.shouldIgnoreReasoningStamp(
+                capabilities: jangConfig?.capabilities,
+                modelType: baseConfig.modelType)
+            {
+                let resolvedReasoning = ParserResolution.reasoning(
+                    capabilities: jangConfig?.capabilities,
+                    modelType: baseConfig.modelType,
+                    chatTemplate: chatTemplateText(modelDirectory: modelDirectory))
+                mutableConfiguration.reasoningParserName =
+                    resolvedReasoning.parser == nil
+                    ? "none"
+                    : (resolvedReasoning.source == .chatTemplate
+                        ? "qwen3"
+                        : reasoningStampFromModelType(baseConfig.modelType))
+            } else if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
             } else {
                 let resolvedReasoning = ParserResolution.reasoning(

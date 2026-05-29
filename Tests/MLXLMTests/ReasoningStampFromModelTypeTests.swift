@@ -57,6 +57,28 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
         XCTAssertEqual(lfm25.source, .chatTemplate)
     }
 
+    func testLFM25JangStampWithoutThinkingTemplateDoesNotForceQwenReasoning() {
+        let capabilities = JangCapabilities(
+            reasoningParser: "qwen3",
+            toolParser: "lfm2",
+            thinkInTemplate: false,
+            supportsTools: true,
+            supportsThinking: true,
+            family: "lfm2_moe",
+            cacheType: "hybrid")
+
+        XCTAssertTrue(ParserResolution.shouldIgnoreReasoningStamp(
+            capabilities: capabilities,
+            modelType: "lfm2_moe"))
+
+        let resolved = ParserResolution.reasoning(
+            capabilities: capabilities,
+            modelType: "lfm2_moe",
+            chatTemplate: nil)
+        XCTAssertNil(resolved.parser)
+        XCTAssertEqual(resolved.source, .modelTypeHeuristic)
+    }
+
     func testPlainFamiliesGetNone() {
         // Every non-reasoning family vmlx supports must emit plain
         // .chunk, not .reasoning. Enumerate explicitly so a

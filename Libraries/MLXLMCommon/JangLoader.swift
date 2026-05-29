@@ -315,6 +315,20 @@ public enum ParserResolution {
         modelType: String?,
         chatTemplate: String? = nil
     ) -> (parser: ReasoningParser?, source: JangCapabilities.ResolutionSource) {
+        if shouldIgnoreReasoningStamp(capabilities: capabilities, modelType: modelType) {
+            if declaresLFM25ThinkingTemplate(modelType: modelType, chatTemplate: chatTemplate) {
+                return (
+                    ReasoningParser.fromCapabilityName("qwen3"),
+                    .chatTemplate
+                )
+            }
+            let stamp = reasoningStampFromModelType(modelType)
+            return (
+                stamp == "none" ? nil : ReasoningParser.fromCapabilityName(stamp),
+                modelType?.isEmpty == false ? .modelTypeHeuristic : .none
+            )
+        }
+
         if let cap = capabilities, cap.reasoningParser != nil {
             // Stamped — honour exactly. `nil` is a valid stamp meaning
             // "this model emits no reasoning".
@@ -345,6 +359,44 @@ public enum ParserResolution {
             ReasoningParser.fromCapabilityName(stamp),
             .modelTypeHeuristic
         )
+    }
+
+    public static func shouldIgnoreReasoningStamp(
+        capabilities: JangCapabilities?,
+        modelType: String?
+    ) -> Bool {
+        guard let capabilities,
+              let reasoningParser = capabilities.reasoningParser,
+              ReasoningParser.fromCapabilityName(reasoningParser) != nil,
+              capabilities.thinkInTemplate == false
+        else { return false }
+
+        let family = capabilities.family?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: ".", with: "_") ?? ""
+        let type = modelType?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: ".", with: "_") ?? ""
+        let compactType = type.replacingOccurrences(of: "_", with: "")
+        let toolParser = capabilities.toolParser?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+
+        // LFM2/LFM2.5 JANG bundles are Pythonic-tool models. Some early
+        // converted bundles stamped `reasoning_parser=qwen3` while also
+        // stamping `think_in_template=false`; trusting that routes normal
+        // assistant output into `.reasoning` and prevents tool extraction.
+        // Keep the tool parser stamp, but demote the impossible reasoning
+        // stamp back to the model-type/template resolver.
+        return family.hasPrefix("lfm2")
+            || family.contains("lfm")
+            || type.hasPrefix("lfm2")
+            || compactType.hasPrefix("lfm25")
+            || toolParser == "lfm2"
     }
 
     private static func declaresLFM25ThinkingTemplate(

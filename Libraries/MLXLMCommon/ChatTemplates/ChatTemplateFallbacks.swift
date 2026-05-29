@@ -1183,8 +1183,8 @@ The current assistant response MUST be a tool call. This applies to the latest u
 {%- endmacro -%}
 
 {%- macro render_required_tool_choice_instruction(latest_user_content='') -%}
-    {{- 'The active API tool_choice is required for this assistant turn. Reply only with one native LFM tool call and no prose before the tool result.' -}}
-    {{- '\nThe entire assistant message MUST be one Liquid/Python call list: it must begin with [ and end with ]. Do not think out loud, explain the format, output JSON, or use markdown.' -}}
+    {{- 'The active API tool_choice is required for this assistant turn. Reply only with one native LFM tool call and no prose.' -}}
+    {{- '\nThe entire assistant message MUST be exactly one bracketed call list in this syntax: [function_name(argument_name="argument value")]. Do not think out loud, explain the format, output JSON, or use markdown.' -}}
     {%- if required_tool_name -%}
         {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
         {%- for tool in tools -%}
@@ -1214,7 +1214,7 @@ The current assistant response MUST be a tool call. This applies to the latest u
                         {%- endif -%}
                     {%- endfor -%}
                     {%- if exact.value -%}
-                        {{- '\nRequired call shape for the current request:\n[' ~ required_tool_name ~ '(' ~ param_name ~ '=' ~ (exact.value | tojson) ~ ')]' -}}
+                        {{- '\nRequired assistant message for the current request:\n[' ~ required_tool_name ~ '(' ~ param_name ~ '=' ~ (exact.value | tojson) ~ ')]' -}}
                     {%- endif -%}
                 {%- endfor -%}
                 {{- '\nUse keyword arguments exactly as shown; do not use positional arguments. If the latest user message asks to use exact text, copy that exact text into the string argument, preserving every newline as \\n and adding no spaces.' -}}

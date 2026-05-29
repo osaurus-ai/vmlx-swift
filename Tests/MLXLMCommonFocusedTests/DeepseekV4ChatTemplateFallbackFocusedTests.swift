@@ -820,9 +820,11 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!rendered.contains("ARGUMENT_NAME"))
         #expect(rendered.contains("Use the `line_count` function."))
         #expect(rendered.contains("Required parameters for `line_count`: text."))
+        #expect(rendered.contains("Required assistant message for the current request:"))
         #expect(rendered.contains(#"[line_count(text="red\ngreen\nblue")]"#))
         #expect(rendered.contains("instead of replying with JSON"))
         #expect(rendered.contains("Do not think out loud"))
+        #expect(!rendered.contains("Liquid/Python call list"))
         #expect(rendered.contains("do not use positional arguments"))
         #expect(rendered.contains(#"preserving every newline as \n and adding no spaces"#))
         #expect(!rendered.contains("<think>"))
@@ -865,7 +867,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             encoding: .utf8)
         #expect(rewritten.contains("The active API tool_choice is required"))
         #expect(rewritten.contains("native LFM tool call"))
-        #expect(rewritten.contains("it must begin with [ and end with ]"))
+        #expect(rewritten.contains("exactly one bracketed call list"))
     }
 
     @Test("ZAYA XML parser decodes live HTML line breaks in string parameters")
