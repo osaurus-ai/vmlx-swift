@@ -1266,6 +1266,8 @@ The current assistant response MUST be a tool call. This applies to the latest u
 {%- endif -%}
 
 {%- for message in loop_messages -%}
+    {%- set compact_for_required_tool = required_tool_choice and loop.index0 < ns.last_user_index and message['role'] not in ['system', 'developer'] -%}
+    {%- if not compact_for_required_tool -%}
     {{- '<|im_start|>' + message['role'] + '\n' -}}
     {%- if message['role'] == 'assistant' -%}
         {%- if message['thinking'] is defined -%}
@@ -1290,6 +1292,7 @@ The current assistant response MUST be a tool call. This applies to the latest u
         {%- endif -%}
     {%- endif -%}
     {{- '<|im_end|>\n' -}}
+    {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
     {{- '<|im_start|>assistant\n' -}}

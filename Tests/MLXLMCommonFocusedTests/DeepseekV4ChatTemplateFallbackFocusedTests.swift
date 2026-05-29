@@ -875,6 +875,11 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         let finalUserRange = rendered.range(of: finalUser)
         #expect(finalUserRange != nil)
         let afterFinalUser = rendered[finalUserRange!.upperBound...]
+        #expect(!rendered.contains("Use the line_count tool on this exact text: red\ngreen\nblue"))
+        #expect(!rendered.contains(#"<|tool_call_start|>[line_count(text='red\ngreen\nblue')]"#))
+        #expect(!rendered.contains(#"{"lines":3}"#))
+        #expect(!rendered.contains("How many lines were counted? Answer plainly in one short sentence."))
+        #expect(!rendered.contains("There were 3 lines counted."))
         #expect(afterFinalUser.contains("The active API tool_choice is required"))
         #expect(afterFinalUser.contains(#"<|tool_call_start|>[line_count(text="one\ntwo")]<|tool_call_end|>"#))
         #expect(afterFinalUser.contains("Copy only that assistant message."))
