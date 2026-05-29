@@ -1184,13 +1184,17 @@ The current assistant response MUST be a tool call. This applies to the latest u
 
 {%- macro render_required_tool_choice_instruction(latest_user_content='') -%}
     {{- 'The active API tool_choice is required for this assistant turn. Reply only with one native LFM tool call and no prose.' -}}
-    {{- '\nThe entire assistant message MUST be exactly one bracketed call list in this syntax: [function_name(argument_name="argument value")]. Do not think out loud, explain the format, output JSON, or use markdown.' -}}
+    {{- '\nThe entire assistant message MUST be exactly one bracketed call list using the selected function name and real schema parameter names. Do not think out loud, explain the format, output JSON, or use markdown.' -}}
     {%- if required_tool_name -%}
         {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
         {%- for tool in tools -%}
             {%- set selected_tool = tool['function'] if tool['function'] is defined else tool -%}
             {%- if selected_tool['name'] == required_tool_name and selected_tool['parameters'] is defined and selected_tool['parameters']['required'] is defined -%}
                 {{- '\nRequired parameters for `' ~ required_tool_name ~ '`: ' ~ (selected_tool['parameters']['required'] | join(', ')) ~ '.' -}}
+                {%- if selected_tool['parameters']['required'] | length == 1 -%}
+                    {%- set sample_param = selected_tool['parameters']['required'][0] -%}
+                    {{- '\nCall syntax: [' ~ required_tool_name ~ '(' ~ sample_param ~ '="argument value")].' -}}
+                {%- endif -%}
                 {%- for param_name in selected_tool['parameters']['required'] -%}
                     {%- set exact = namespace(value='') -%}
                     {%- set latest_user_text = parse_content(latest_user_content) -%}
