@@ -1183,8 +1183,7 @@ The current assistant response MUST be a tool call. This applies to the latest u
 {%- endmacro -%}
 
 {%- macro render_required_tool_choice_instruction(latest_user_content='') -%}
-    {{- 'The active API tool_choice is required for this assistant turn. Reply only with one native LFM tool call and no prose.' -}}
-    {{- '\nThe entire assistant message MUST be exactly one bracketed call list using the selected function name and real schema parameter names. Do not think out loud, explain the format, output JSON, or use markdown.' -}}
+    {{- 'The active API tool_choice is required for this assistant turn.' -}}
     {%- if required_tool_name -%}
         {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
         {%- for tool in tools -%}
@@ -1230,12 +1229,14 @@ The current assistant response MUST be a tool call. This applies to the latest u
                         {%- endif -%}
                     {%- endfor -%}
                     {%- if exact.value -%}
+                        {{- '\nRequired assistant message for this current request:\n[' ~ required_tool_name ~ '(' ~ param_name ~ '=' ~ (exact.value | tojson) ~ ')]' -}}
                         {{- '\nCurrent exact value for `' ~ param_name ~ '`:\n' ~ exact.value -}}
-                        {{- '\nRequired assistant message for the current request:\n[' ~ required_tool_name ~ '(' ~ param_name ~ '=' ~ (exact.value | tojson) ~ ')]' -}}
-                        {{- '\nDo not replace this value with ellipsis, placeholders, summaries, or prior-turn text.' -}}
+                        {{- '\nReply with the required assistant message exactly. Do not output `' ~ required_tool_name ~ '()`. Do not omit `' ~ param_name ~ '`. Do not replace this value with ellipsis, placeholders, summaries, or prior-turn text.' -}}
+                    {%- else -%}
+                        {{- '\nReply only with one native LFM bracketed call list using real schema parameter names and values from the latest user request.' -}}
                     {%- endif -%}
                 {%- endfor -%}
-                {{- '\nUse keyword arguments exactly as shown; do not use positional arguments. If the latest user message asks to use exact text, copy that exact text into the string argument, preserving every newline as \\n and adding no spaces.' -}}
+                {{- '\nNo prose, no markdown, no JSON object, no reasoning text. Use keyword arguments exactly as shown; do not use positional arguments.' -}}
             {%- endif -%}
         {%- endfor -%}
     {%- else -%}
