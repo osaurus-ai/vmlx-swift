@@ -147,6 +147,8 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
                 // Unescape escaped quotes
                 value = value.replacingOccurrences(of: "\\'", with: "'")
                 value = value.replacingOccurrences(of: "\\\"", with: "\"")
+                value = value.replacingOccurrences(of: "\\n", with: "\n")
+                value = value.replacingOccurrences(of: "\\t", with: "\t")
                 value = value.replacingOccurrences(of: "\\\\", with: "\\")
             }
 
@@ -176,6 +178,8 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         var value = String(trimmed.dropFirst().dropLast())
         value = value.replacingOccurrences(of: "\\'", with: "'")
         value = value.replacingOccurrences(of: "\\\"", with: "\"")
+        value = value.replacingOccurrences(of: "\\n", with: "\n")
+        value = value.replacingOccurrences(of: "\\t", with: "\t")
         value = value.replacingOccurrences(of: "\\\\", with: "\\")
         return value
     }

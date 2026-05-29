@@ -1214,10 +1214,10 @@ The current assistant response MUST be a tool call. This applies to the latest u
                         {%- endif -%}
                     {%- endfor -%}
                     {%- if exact.value -%}
-                        {{- '\nRequired call shape for the current request:\n[' ~ required_tool_name ~ '(' ~ param_name ~ '=' ~ '"' ~ exact.value ~ '"' ~ ')]' -}}
+                        {{- '\nRequired call shape for the current request:\n[' ~ required_tool_name ~ '(' ~ param_name ~ '=' ~ (exact.value | tojson) ~ ')]' -}}
                     {%- endif -%}
                 {%- endfor -%}
-                {{- '\nUse keyword arguments exactly as shown; do not use positional arguments. If the latest user message asks to use exact text, copy that exact text into the string argument, preserving every newline and adding no spaces.' -}}
+                {{- '\nUse keyword arguments exactly as shown; do not use positional arguments. If the latest user message asks to use exact text, copy that exact text into the string argument, preserving every newline as \\n and adding no spaces.' -}}
             {%- endif -%}
         {%- endfor -%}
     {%- else -%}

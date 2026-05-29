@@ -291,6 +291,32 @@ struct ToolTests {
         #expect(toolCall.function.arguments["text"] == .string("red\ngreen\nblue"))
     }
 
+    @Test("LFM2 parser decodes escaped newlines in native strings")
+    func lfm2ParserDecodesEscapedNewlinesInNativeStrings() throws {
+        let tools: [ToolSpec] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "line_count",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "text": ["type": "string"] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "required": ["text"] as [String],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as ToolSpec
+        ]
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let toolCall = try #require(
+            parser.parse(content: #"<|tool_call_start|>[line_count(text="red\ngreen\nblue")]<|tool_call_end|>"#, tools: tools))
+
+        #expect(toolCall.function.name == "line_count")
+        #expect(toolCall.function.arguments["text"] == .string("red\ngreen\nblue"))
+    }
+
     // MARK: - XML Function Format Tests (Qwen3 Coder)
 
     @Test("Test XML Function Parser - Qwen3 Coder Format")
