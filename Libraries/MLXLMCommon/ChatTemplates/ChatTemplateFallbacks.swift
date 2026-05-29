@@ -1226,7 +1226,7 @@ The current assistant response MUST be a tool call. This applies to the latest u
                     {%- endfor -%}
                     {%- if exact.value -%}
                         {{- '\nRequired assistant message for this current request:\n<|tool_call_start|>[' ~ required_tool_name ~ '(' ~ param_name ~ '=' ~ (exact.value | tojson) ~ ')]<|tool_call_end|>' -}}
-                        {{- '\nCopy only that assistant message. Do not output `' ~ required_tool_name ~ '()`. Do not omit `' ~ param_name ~ '`. Do not invent placeholders, summaries, ellipsis, or prior-turn text.' -}}
+                        {{- '\nOutput exactly the native bracketed tool call above. Do not output an empty `' ~ required_tool_name ~ '()`. Do not omit `' ~ param_name ~ '`. Do not invent placeholders, summaries, ellipsis, or prior-turn text.' -}}
                     {%- else -%}
                         {{- '\nReply only with one native LFM bracketed call list using schema parameter names and values copied from the latest user request.' -}}
                     {%- endif -%}

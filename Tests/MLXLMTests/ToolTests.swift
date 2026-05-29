@@ -354,6 +354,54 @@ struct ToolTests {
         #expect(toolCall.function.arguments["text"] == .string("red\ngreen\nblue"))
     }
 
+    @Test("LFM2 parser accepts single-tool JSON argument object")
+    func lfm2ParserAcceptsSingleToolJSONArgumentObject() throws {
+        let tools: [ToolSpec] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "line_count",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "text": ["type": "string"] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "required": ["text"] as [String],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as ToolSpec
+        ]
+        let parser = PythonicToolCallParser()
+        let toolCall = try #require(
+            parser.parse(content: #"{"text":"red\ngreen\nblue"}"#, tools: tools))
+
+        #expect(toolCall.function.name == "line_count")
+        #expect(toolCall.function.arguments["text"] == .string("red\ngreen\nblue"))
+    }
+
+    @Test("LFM2 parser rejects single-tool JSON object missing required args")
+    func lfm2ParserRejectsSingleToolJSONObjectMissingRequiredArgs() throws {
+        let tools: [ToolSpec] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "line_count",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "text": ["type": "string"] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "required": ["text"] as [String],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as ToolSpec
+        ]
+        let parser = PythonicToolCallParser()
+        let toolCall = parser.parse(content: #"{"path":"/tmp/a"}"#, tools: tools)
+
+        #expect(toolCall == nil)
+    }
+
     @Test("LFM2 parser ignores unknown tool-keyed JSON envelopes")
     func lfm2ParserIgnoresUnknownToolKeyedJSONEnvelope() throws {
         let tools: [ToolSpec] = [

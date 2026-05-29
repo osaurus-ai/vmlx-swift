@@ -31,6 +31,9 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         if let jsonToolCall = parseToolKeyedJSONEnvelope(text, tools: tools) {
             return jsonToolCall
         }
+        if let jsonToolCall = parseSingleToolArgumentsJSON(text, tools: tools) {
+            return jsonToolCall
+        }
 
         let funcName: String
         let argsString: String
@@ -225,6 +228,33 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         return nil
     }
 
+    private func parseSingleToolArgumentsJSON(
+        _ text: String,
+        tools: [[String: any Sendable]]?
+    ) -> ToolCall? {
+        guard text.hasPrefix("{") else { return nil }
+        guard let object = parseJSONObjectWithOptionalEOFBrace(text) else { return nil }
+        guard let tool = singleToolSpec(tools: tools),
+            let name = tool.name,
+            let required = tool.required,
+            !required.isEmpty
+        else { return nil }
+
+        let registeredNames = Set(toolNames(tools: tools))
+        guard object.keys.allSatisfy({ !registeredNames.contains($0) }) else {
+            return nil
+        }
+        guard required.allSatisfy({ object[$0] != nil }) else {
+            return nil
+        }
+        if let properties = tool.properties, !properties.isEmpty {
+            guard object.keys.allSatisfy({ properties.contains($0) }) else {
+                return nil
+            }
+        }
+        return ToolCall(function: .init(name: name, arguments: object.mapValues(asSendable)))
+    }
+
     private func parseJSONObjectWithOptionalEOFBrace(_ text: String) -> [String: Any]? {
         if let object = parseJSONObject(text) {
             return object
@@ -262,5 +292,20 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
             guard let function = tool["function"] as? [String: any Sendable] else { return nil }
             return function["name"] as? String
         }
+    }
+
+    private func singleToolSpec(
+        tools: [[String: any Sendable]]?
+    ) -> (name: String?, required: [String]?, properties: Set<String>?)? {
+        guard let tools, tools.count == 1,
+            let function = tools[0]["function"] as? [String: any Sendable]
+        else { return nil }
+        let parameters = function["parameters"] as? [String: any Sendable]
+        let properties = parameters?["properties"] as? [String: any Sendable]
+        return (
+            function["name"] as? String,
+            parameters?["required"] as? [String],
+            properties.map { Set($0.keys) }
+        )
     }
 }
