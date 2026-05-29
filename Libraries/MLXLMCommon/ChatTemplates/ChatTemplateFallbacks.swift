@@ -1190,10 +1190,6 @@ The current assistant response MUST be a tool call. This applies to the latest u
             {%- set selected_tool = tool['function'] if tool['function'] is defined else tool -%}
             {%- if selected_tool['name'] == required_tool_name and selected_tool['parameters'] is defined and selected_tool['parameters']['required'] is defined -%}
                 {{- '\nRequired parameters for `' ~ required_tool_name ~ '`: ' ~ (selected_tool['parameters']['required'] | join(', ')) ~ '.' -}}
-                {%- if selected_tool['parameters']['required'] | length == 1 -%}
-                    {%- set sample_param = selected_tool['parameters']['required'][0] -%}
-                    {{- '\nCall syntax: <|tool_call_start|>[' ~ required_tool_name ~ '(' ~ sample_param ~ '=<real string value>)]<|tool_call_end|>.' -}}
-                {%- endif -%}
                 {%- for param_name in selected_tool['parameters']['required'] -%}
                     {%- set exact = namespace(value='') -%}
                     {%- set latest_user_text = parse_content(latest_user_content) -%}
@@ -1230,10 +1226,9 @@ The current assistant response MUST be a tool call. This applies to the latest u
                     {%- endfor -%}
                     {%- if exact.value -%}
                         {{- '\nRequired assistant message for this current request:\n<|tool_call_start|>[' ~ required_tool_name ~ '(' ~ param_name ~ '=' ~ (exact.value | tojson) ~ ')]<|tool_call_end|>' -}}
-                        {{- '\nCurrent exact value for `' ~ param_name ~ '`:\n' ~ exact.value -}}
-                        {{- '\nReply with the required assistant message exactly, including the <|tool_call_start|> and <|tool_call_end|> markers. Do not output `' ~ required_tool_name ~ '()`. Do not omit `' ~ param_name ~ '`. Do not replace this value with ellipsis, placeholders, summaries, or prior-turn text.' -}}
+                        {{- '\nCopy only that assistant message. Do not output `' ~ required_tool_name ~ '()`. Do not omit `' ~ param_name ~ '`. Do not invent placeholders, summaries, ellipsis, or prior-turn text.' -}}
                     {%- else -%}
-                        {{- '\nReply only with one native LFM bracketed call list using real schema parameter names and values from the latest user request.' -}}
+                        {{- '\nReply only with one native LFM bracketed call list using schema parameter names and values copied from the latest user request.' -}}
                     {%- endif -%}
                 {%- endfor -%}
                 {{- '\nNo prose, no markdown, no JSON object, no reasoning text. Use keyword arguments exactly as shown; do not use positional arguments.' -}}
