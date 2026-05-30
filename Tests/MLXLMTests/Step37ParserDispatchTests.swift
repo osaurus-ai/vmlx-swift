@@ -16,15 +16,15 @@ private extension Template {
 
 @Suite("Step 3.7 parser and capability dispatch")
 struct Step37ParserDispatchTests {
-    @Test("Step parser aliases resolve to XML function parser")
-    func stepParserAliasesResolveToXMLFunction() throws {
+    @Test("Step parser aliases resolve to Step parser")
+    func stepParserAliasesResolveToStepParser() throws {
         for stamp in ["step", "stepfun", "step3p5", "step3p7", "step3_5", "step3_7"] {
-            #expect(ToolCallFormat.fromCapabilityName(stamp) == .xmlFunction)
+            #expect(ToolCallFormat.fromCapabilityName(stamp) == .step)
         }
         for modelType in ["step3p5", "step3p7", "stepfun"] {
-            #expect(ToolCallFormat.infer(from: modelType) == .xmlFunction)
+            #expect(ToolCallFormat.infer(from: modelType) == .step)
         }
-        #expect(ToolCallFormat.xmlFunction.createParser() is XMLFunctionParser)
+        #expect(ToolCallFormat.step.createParser() is StepToolCallParser)
     }
 
     @Test("Step reasoning aliases resolve to Qwen-style think XML")
@@ -39,7 +39,7 @@ struct Step37ParserDispatchTests {
 
     @Test("Step XML function parser extracts multiline arguments without leaks")
     func stepXMLFunctionParserExtractsMultilineArguments() throws {
-        let processor = ToolCallProcessor(format: .xmlFunction)
+        let processor = ToolCallProcessor(format: .step)
         let stream = """
             <think>Need one tool call.</think>
             <tool_call><function=line_count><parameter=text>red
@@ -114,7 +114,7 @@ struct Step37ParserDispatchTests {
         #expect(cfg.capabilities?.thinkInTemplate == true)
         #expect(cfg.capabilities?.modality == "vision")
         #expect(cfg.capabilities?.cacheType == "kv")
-        #expect(ToolCallFormat.fromCapabilityName(cfg.capabilities?.toolParser) == .xmlFunction)
+        #expect(ToolCallFormat.fromCapabilityName(cfg.capabilities?.toolParser) == .step)
         #expect(ReasoningParser.fromCapabilityName(cfg.capabilities?.reasoningParser) != nil)
     }
 

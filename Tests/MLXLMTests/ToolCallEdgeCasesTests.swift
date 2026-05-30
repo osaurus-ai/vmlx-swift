@@ -459,6 +459,14 @@ struct ToolCallEdgeCasesTests {
         }
     }
 
+    @Test("fromCapabilityName maps Step stamps to Step parser")
+    func testJANGStampStepMapsToStepParser() {
+        for stamp in ["step", "stepfun", "step3p5", "step3p7", "step3_5", "step3_7"] {
+            #expect(ToolCallFormat.fromCapabilityName(stamp) == .step,
+                "JANG `\(stamp)` stamp must map to .step")
+        }
+    }
+
     @Test("fromCapabilityName maps JANG `minimax` stamp to minimaxM2")
     func testJANGStampMiniMaxMapsToMiniMaxM2() {
         for stamp in ["minimax", "minimax_m2", "minimax_m2_5"] {
@@ -625,6 +633,40 @@ struct ToolCallEdgeCasesTests {
         """#
 
         #expect(parser.parse(content: buffer, tools: [lineCountToolSpec()]) == nil)
+    }
+
+    @Test("Step parser extracts bare registered JSON function call from reasoning channel")
+    func testStepParserExtractsBareFunctionJSONFromReasoning() throws {
+        let direct = StepToolCallParser().parse(
+            content: #"line_count({"text":"red\ngreen\nblue"})"#,
+            tools: [lineCountToolSpec()])
+        #expect(direct?.function.name == "line_count")
+        #expect(direct?.function.arguments["text"] == .string("red\ngreen\nblue"))
+
+        let processor = ToolCallProcessor(format: .step, tools: [lineCountToolSpec()])
+        var events = routeGenerationText(
+            #"line_count({"text":"red\ngreen\nblue"})"#,
+            channel: .reasoning,
+            through: processor)
+        events.append(contentsOf: flushGenerationText(channel: .reasoning, through: processor))
+
+        let call = try #require(events.compactMap(\.toolCall).first)
+        #expect(call.function.name == "line_count")
+        #expect(call.function.arguments["text"] == .string("red\ngreen\nblue"))
+        #expect(events.compactMap(\.chunk).joined().isEmpty)
+        #expect(events.compactMap(\.reasoning).joined().isEmpty)
+    }
+
+    @Test("Step parser rejects bare JSON function call with unknown argument")
+    func testStepParserRejectsBareFunctionJSONUnknownArgument() {
+        let processor = ToolCallProcessor(format: .step, tools: [lineCountToolSpec()])
+        var events = routeGenerationText(
+            #"line_count({"text":"one\ntwo","path":"/tmp/a"})"#,
+            channel: .reasoning,
+            through: processor)
+        events.append(contentsOf: flushGenerationText(channel: .reasoning, through: processor))
+
+        #expect(events.compactMap(\.toolCall).isEmpty)
     }
 
     // MARK: - ToolCall.Function(name:arguments: JSONValue) upstream init
