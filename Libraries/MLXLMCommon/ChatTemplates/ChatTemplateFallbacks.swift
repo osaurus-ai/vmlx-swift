@@ -1138,9 +1138,9 @@ The current assistant response MUST be a tool call. This applies to the latest u
     {%- endif -%}
 {%- endif -%}
 
-{%- macro format_arg_value(arg_value) -%}
-    {%- if arg_value is string -%}
-        {{- "'" + arg_value + "'" -}}
+    {%- macro format_arg_value(arg_value) -%}
+        {%- if arg_value is string -%}
+        {{- "'" + (arg_value | replace("\\", "\\\\") | replace("'", "\\'")) + "'" -}}
     {%- elif arg_value is mapping or (arg_value is sequence and arg_value is not string) -%}
         {{- arg_value | tojson -}}
     {%- else -%}
@@ -1239,8 +1239,9 @@ The current assistant response MUST be a tool call. This applies to the latest u
                         {%- endif -%}
                     {%- endfor -%}
                     {%- if exact.value -%}
-                        {{- '\nRespond with exactly this one assistant message and nothing else:\n<|tool_call_start|>[' ~ required_tool_name ~ '(' ~ param_name ~ '=' ~ (exact.value | tojson) ~ ')]<|tool_call_end|>' -}}
-                        {{- '\nCopy the `' ~ param_name ~ '` value exactly from the current user request, including newlines and spacing. Do not add a trailing newline after the copied value. Do not output an empty `' ~ required_tool_name ~ '()`. Do not omit `' ~ param_name ~ '`. Do not invent placeholders, summaries, ellipsis, or prior-turn text.' -}}
+                        {%- set exact_escaped = exact.value | replace("\\", "\\\\") | replace("'", "\\'") -%}
+                        {{- '\nRespond with exactly this one assistant message and nothing else:\n<|tool_call_start|>[' ~ required_tool_name ~ '(' ~ param_name ~ "='" ~ exact_escaped ~ "'" ~ ')]<|tool_call_end|>' -}}
+                        {{- '\nCopy the `' ~ param_name ~ '` value exactly from the current user request, including newlines and spacing inside the quotes. Do not add a blank line, leading space, trailing newline, or any other character to the copied value. Do not output JSON, an empty `' ~ required_tool_name ~ '()`, or prose. Do not omit `' ~ param_name ~ '`. Do not invent placeholders, summaries, ellipsis, or prior-turn text.' -}}
                     {%- else -%}
                         {{- '\nReply only with one native LFM bracketed call list using argument names and values copied from the latest user request.' -}}
                     {%- endif -%}
@@ -1303,7 +1304,7 @@ The current assistant response MUST be a tool call. This applies to the latest u
     {%- elif message['role'] == 'user' -%}
         {{- parse_content(message['content']) -}}
     {%- elif message['role'] == 'tool' -%}
-        {{- parse_content(message['content']) -}}
+        {{- 'Tool result for previous assistant tool call: ' ~ parse_content(message['content']) -}}
     {%- else -%}
         {%- if message['content'] is defined -%}
             {{- parse_content(message['content']) -}}
