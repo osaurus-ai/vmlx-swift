@@ -731,6 +731,7 @@ let package = Package(
             path: "Tests/MLXLMCommonFocusedTests",
             sources: [
                 "DeepseekV4ChatTemplateFallbackFocusedTests.swift",
+                "DeepseekV4Step37RuntimeContractsTests.swift",
                 "DSMLInlineJSONToolFallbackFocusedTests.swift",
                 "DSMLToolCallParserFocusedTests.swift",
                 "FocusedMLXTestSupport.swift",

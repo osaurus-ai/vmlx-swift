@@ -53,6 +53,7 @@ public class ToolCallProcessor {
         case actionJSON
         case functionCall
         case requestToolXML
+        case embeddedAPIToolJSON
         case bareNameJSON
         case bareNameKeyValue
     }
@@ -203,6 +204,29 @@ public class ToolCallProcessor {
             }
 
             if let pendingIndex = partialInlineActionJSONToolCallStart(in: inlineText) {
+                let visible = String(inlineText[..<pendingIndex])
+                leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
+                return visible.isEmpty ? nil : visible
+            }
+
+            if let callIndex = firstInlineEmbeddedAPIToolJSONStart(in: inlineText) {
+                let leading = String(inlineText[..<callIndex])
+                inlineToolCallKind = .embeddedAPIToolJSON
+                toolCallBuffer = String(inlineText[callIndex...])
+                state = .collectingInlineToolCall
+
+                if inlineToolCallComplete(toolCallBuffer),
+                    let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
+                {
+                    toolCalls.append(toolCall)
+                    toolCallBuffer = ""
+                    state = .normal
+                    suppressingTextAfterInlineToolCall = true
+                }
+                return leading.isEmpty ? nil : leading
+            }
+
+            if let pendingIndex = partialInlineEmbeddedAPIToolJSONStart(in: inlineText) {
                 let visible = String(inlineText[..<pendingIndex])
                 leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
                 return visible.isEmpty ? nil : visible
@@ -397,6 +421,8 @@ public class ToolCallProcessor {
         switch inlineToolCallKind {
         case .json, .actionJSON:
             return jsonBracesBalanced(text)
+        case .embeddedAPIToolJSON:
+            return embeddedAPIToolJSONCallBalanced(text)
         case .functionCall:
             return functionCallParenthesesBalanced(text)
         case .requestToolXML:
@@ -410,7 +436,7 @@ public class ToolCallProcessor {
 
     private func shouldAttemptInlineToolParse(_ text: String) -> Bool {
         switch inlineToolCallKind {
-        case .actionJSON, .requestToolXML, .bareNameKeyValue:
+        case .actionJSON, .requestToolXML, .embeddedAPIToolJSON, .bareNameKeyValue:
             return inlineToolCallComplete(text)
         case .json, .functionCall, .bareNameJSON:
             return true
@@ -493,6 +519,8 @@ public class ToolCallProcessor {
                 || compact.hasPrefix("\($0)```")
         } || firstInlineRequestToolXMLToolCallStart(in: text) != nil
             || partialInlineRequestToolXMLToolCallStart(in: text) != nil
+            || firstInlineEmbeddedAPIToolJSONStart(in: text) != nil
+            || partialInlineEmbeddedAPIToolJSONStart(in: text) != nil
             || firstInlineBareNameKeyValueToolCallStart(in: text) != nil
             || partialInlineBareNameKeyValueToolCallStart(in: text) != nil
     }
@@ -599,6 +627,70 @@ public class ToolCallProcessor {
             }
         }
         return cursor
+    }
+
+    private func firstInlineEmbeddedAPIToolJSONStart(in text: String) -> String.Index? {
+        var searchStart = text.startIndex
+        while let range = text.range(
+            of: Self.embeddedAPIToolJSONPrefix,
+            range: searchStart ..< text.endIndex)
+        {
+            let objectStart = embeddedAPIToolJSONTailObjectStart(
+                in: text,
+                afterPrefix: range.upperBound)
+            if objectStart < text.endIndex, text[objectStart] == "{" {
+                return range.lowerBound
+            }
+            searchStart = range.upperBound
+        }
+        return nil
+    }
+
+    private func partialInlineEmbeddedAPIToolJSONStart(in text: String) -> String.Index? {
+        guard !text.isEmpty else { return nil }
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            if isInlineFunctionBoundary(text, before: cursor) || text[cursor] == "_" {
+                let suffix = String(text[cursor...])
+                if Self.embeddedAPIToolJSONPrefix.hasPrefix(suffix)
+                    && suffix.count < Self.embeddedAPIToolJSONPrefix.count
+                {
+                    return cursor
+                }
+                if suffix.hasPrefix(Self.embeddedAPIToolJSONPrefix) {
+                    guard
+                        let afterPrefix = text.index(
+                            cursor,
+                            offsetBy: Self.embeddedAPIToolJSONPrefix.count,
+                            limitedBy: text.endIndex)
+                    else { return nil }
+                    let objectStart = embeddedAPIToolJSONTailObjectStart(
+                        in: text,
+                        afterPrefix: afterPrefix)
+                    if objectStart == text.endIndex {
+                        return cursor
+                    }
+                }
+            }
+            cursor = text.index(after: cursor)
+        }
+        return nil
+    }
+
+    private func embeddedAPIToolJSONTailObjectStart(
+        in text: String,
+        afterPrefix: String.Index
+    ) -> String.Index {
+        var cursor = afterPrefix
+        while cursor < text.endIndex, isInlineWhitespace(text[cursor]) {
+            cursor = text.index(after: cursor)
+        }
+        return cursor
+    }
+
+    private func embeddedAPIToolJSONCallBalanced(_ text: String) -> Bool {
+        guard let open = text.firstIndex(of: "{") else { return false }
+        return jsonBracesBalanced(String(text[open...]))
     }
 
     private func partialInlineFunctionToolCallStart(in text: String) -> String.Index? {
@@ -963,6 +1055,8 @@ public class ToolCallProcessor {
         "request_tool<invoke>",
     ]
 
+    private static let embeddedAPIToolJSONPrefix = "_only_call_one_tools_without_parameters"
+
     private func bareNameJSONTailStartsObject(in text: String, afterName: String.Index) -> Bool {
         let cursor = bareNameJSONTailObjectStart(in: text, afterName: afterName)
         return cursor < text.endIndex && text[cursor] == "{"
@@ -1087,6 +1181,8 @@ public class ToolCallProcessor {
                     if !leadingTextBeforeToolCall.isEmpty {
                         if firstInlineActionJSONToolCallStart(in: candidate) != nil
                             || partialInlineActionJSONToolCallStart(in: candidate) != nil
+                            || firstInlineEmbeddedAPIToolJSONStart(in: candidate) != nil
+                            || partialInlineEmbeddedAPIToolJSONStart(in: candidate) != nil
                             || firstInlineFunctionToolCallStart(in: candidate) != nil
                             || partialInlineFunctionToolCallStart(in: candidate) != nil
                             || firstInlinePythonicCallListStart(in: candidate) != nil
@@ -1112,6 +1208,8 @@ public class ToolCallProcessor {
                 if (!leadingTextBeforeToolCall.isEmpty && !bufferedBareToolMarker)
                     || firstInlineActionJSONToolCallStart(in: chunk) != nil
                     || partialInlineActionJSONToolCallStart(in: chunk) != nil
+                    || firstInlineEmbeddedAPIToolJSONStart(in: chunk) != nil
+                    || partialInlineEmbeddedAPIToolJSONStart(in: chunk) != nil
                     || firstInlineFunctionToolCallStart(in: chunk) != nil
                     || partialInlineFunctionToolCallStart(in: chunk) != nil
                     || firstInlinePythonicCallListStart(in: chunk) != nil
