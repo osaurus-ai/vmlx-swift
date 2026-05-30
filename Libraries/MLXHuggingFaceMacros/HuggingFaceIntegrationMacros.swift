@@ -166,6 +166,29 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 tools: chatTemplateTools,
                                 additionalContext: additionalContext)
                         }
+                        let hasLFM2NativeToolSentinels =
+                            upstream.bosToken == "<|startoftext|>"
+                            && upstream.eosToken == "<|im_end|>"
+                            && upstream.convertTokenToId("<|tool_call_start|>") != nil
+                            && upstream.convertTokenToId("<|tool_call_end|>") != nil
+                        if !(tools?.isEmpty ?? true),
+                           hasLFM2NativeToolSentinels,
+                           (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
+                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                FileHandle.standardError.write(
+                                    "[vmlx] chat-template tools -> LFM2ToolMinimal fallback engaged\\n"
+                                        .data(using: .utf8)!)
+                            }
+                            return try upstream.applyChatTemplate(
+                                messages: messages,
+                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
+                                    MLXLMCommon.ChatTemplateFallbacks.lfm2ToolMinimal),
+                                addGenerationPrompt: true,
+                                truncation: false,
+                                maxLength: nil,
+                                tools: chatTemplateTools,
+                                additionalContext: additionalContext)
+                        }
                         // MiniMax-M2 native template auto-correction: every shipping
                         // MiniMax-M2 / M2.7 chat_template.jinja unconditionally prefills
                         // <think> at the assistant tail and ignores enable_thinking.
@@ -455,6 +478,29 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 messages: messages,
                                 chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
                                     MLXLMCommon.ChatTemplateFallbacks.lagunaMinimal),
+                                addGenerationPrompt: addGenerationPrompt,
+                                truncation: false,
+                                maxLength: nil,
+                                tools: chatTemplateTools,
+                                additionalContext: additionalContext)
+                        }
+                        let hasLFM2NativeToolSentinels =
+                            upstream.bosToken == "<|startoftext|>"
+                            && upstream.eosToken == "<|im_end|>"
+                            && upstream.convertTokenToId("<|tool_call_start|>") != nil
+                            && upstream.convertTokenToId("<|tool_call_end|>") != nil
+                        if !(tools?.isEmpty ?? true),
+                           hasLFM2NativeToolSentinels,
+                           (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
+                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                FileHandle.standardError.write(
+                                    "[vmlx] chat-template tools -> LFM2ToolMinimal fallback engaged\\n"
+                                        .data(using: .utf8)!)
+                            }
+                            return try upstream.applyChatTemplate(
+                                messages: messages,
+                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
+                                    MLXLMCommon.ChatTemplateFallbacks.lfm2ToolMinimal),
                                 addGenerationPrompt: addGenerationPrompt,
                                 truncation: false,
                                 maxLength: nil,

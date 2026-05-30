@@ -945,6 +945,20 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rewritten.contains("Do not output"))
     }
 
+    @Test("LFM2 tool fallback is tried before native bundled tool JSON template")
+    func lfm2ToolFallbackIsTriedBeforeNativeBundledToolJSONTemplate() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: "Libraries/MLXHuggingFaceMacros/HuggingFaceIntegrationMacros.swift"),
+            encoding: .utf8)
+
+        #expect(source.contains(#"upstream.bosToken == "<|startoftext|>""#))
+        #expect(source.contains(#"upstream.eosToken == "<|im_end|>""#))
+        #expect(source.contains(#"upstream.convertTokenToId("<|tool_call_start|>") != nil"#))
+        #expect(source.contains(#"upstream.convertTokenToId("<|tool_call_end|>") != nil"#))
+        #expect(source.contains("MLXLMCommon.ChatTemplateFallbacks.lfm2ToolMinimal"))
+        #expect(source.contains("[vmlx] chat-template tools -> LFM2ToolMinimal fallback engaged"))
+    }
+
     @Test("ZAYA XML parser decodes live HTML line breaks in string parameters")
     func zayaXMLParserDecodesLiveHTMLLineBreaksInStringParameters() throws {
         let output = #"""
