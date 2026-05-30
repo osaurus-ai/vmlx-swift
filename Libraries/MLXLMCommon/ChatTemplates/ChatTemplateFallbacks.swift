@@ -1239,9 +1239,9 @@ The current assistant response MUST be a tool call. This applies to the latest u
                         {%- endif -%}
                     {%- endfor -%}
                     {%- if exact.value -%}
-                        {%- set exact_escaped = exact.value | replace("\\", "\\\\") | replace("'", "\\'") -%}
+                        {%- set exact_escaped = exact.value | replace("\\", "\\\\") | replace("'", "\\'") | replace("\n", "\\n") -%}
                         {{- '\nRespond with exactly this one assistant message and nothing else:\n<|tool_call_start|>[' ~ required_tool_name ~ '(' ~ param_name ~ "='" ~ exact_escaped ~ "'" ~ ')]<|tool_call_end|>' -}}
-                        {{- '\nCopy the `' ~ param_name ~ '` value exactly from the current user request, including newlines and spacing inside the quotes. Do not add a blank line, leading space, trailing newline, or any other character to the copied value. Do not output JSON, an empty `' ~ required_tool_name ~ '()`, or prose. Do not omit `' ~ param_name ~ '`. Do not invent placeholders, summaries, ellipsis, or prior-turn text.' -}}
+                        {{- '\nCopy the `' ~ param_name ~ '` value exactly from the current user request, including newlines and spacing inside the quotes. Render newline characters inside the quoted argument as literal \\n escape sequences, not as physical line breaks. Do not add a blank line, leading space, trailing newline, or any other character to the copied value. Do not output JSON, an empty `' ~ required_tool_name ~ '()`, or prose. Do not omit `' ~ param_name ~ '`. Do not invent placeholders, summaries, ellipsis, or prior-turn text.' -}}
                     {%- else -%}
                         {{- '\nReply only with one native LFM bracketed call list using argument names and values copied from the latest user request.' -}}
                     {%- endif -%}
