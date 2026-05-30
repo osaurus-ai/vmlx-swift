@@ -74,7 +74,12 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
         let resolved = ParserResolution.reasoning(
             capabilities: capabilities,
             modelType: "lfm2_moe",
-            chatTemplate: nil)
+            chatTemplate: """
+            {%- if message.thinking is defined -%}
+            {{- "<think>" + message.thinking + "</think>" -}}
+            {%- endif -%}
+            {{- "<|tool_call_start|>[line_count(text='a')]<|tool_call_end|>" -}}
+            """)
         XCTAssertNil(resolved.parser)
         XCTAssertEqual(resolved.source, .modelTypeHeuristic)
     }
