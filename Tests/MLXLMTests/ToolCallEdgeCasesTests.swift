@@ -598,6 +598,35 @@ struct ToolCallEdgeCasesTests {
         #expect(calls[1].function.arguments["url"] == .string("https://x.io"))
     }
 
+    @Test("LFM2 parser accepts observed standard name arguments JSON object")
+    func testLFM2ParserAcceptsObservedNamedArgumentsJSON() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let buffer = #"""
+        {
+          "name": "line_count",
+          "arguments": {
+            "text": "red\ngreen\nblue"
+          }
+        }
+        """#
+
+        let call = try #require(parser.parse(content: buffer, tools: [lineCountToolSpec()]))
+        #expect(call.function.name == "line_count")
+        #expect(call.function.arguments["text"] == .string("red\ngreen\nblue"))
+    }
+
+    @Test("LFM2 parser rejects observed JSON object with unknown arguments")
+    func testLFM2ParserRejectsObservedNamedJSONWithUnknownArguments() {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let buffer = #"""
+        {"name":"line_count","arguments":{"text":"one\ntwo","path":"/tmp/a"}}
+        """#
+
+        #expect(parser.parse(content: buffer, tools: [lineCountToolSpec()]) == nil)
+    }
+
     // MARK: - ToolCall.Function(name:arguments: JSONValue) upstream init
 
     /// Upstream ship both `init(name:, arguments: [String: JSONValue])`

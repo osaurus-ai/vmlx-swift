@@ -31,6 +31,9 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         if let jsonToolCall = parseToolKeyedJSONEnvelope(text, tools: tools) {
             return jsonToolCall
         }
+        if let jsonToolCall = parseNamedArgumentsJSONEnvelope(text, tools: tools) {
+            return jsonToolCall
+        }
         if let jsonToolCall = parseSingleToolArgumentsJSON(text, tools: tools) {
             return jsonToolCall
         }
@@ -270,6 +273,34 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         return ToolCall(function: .init(name: name, arguments: object.mapValues(asSendable)))
     }
 
+    private func parseNamedArgumentsJSONEnvelope(
+        _ text: String,
+        tools: [[String: any Sendable]]?
+    ) -> ToolCall? {
+        guard text.hasPrefix("{") else { return nil }
+        guard let object = parseJSONObjectWithOptionalEOFBrace(text) else { return nil }
+        guard object.count == 2 || object.count == 3 else { return nil }
+        guard let name = object["name"] as? String,
+            toolNames(tools: tools).contains(name),
+            let rawArguments = object["arguments"],
+            let args = firstArgumentObject(from: rawArguments)
+        else { return nil }
+
+        let spec = toolSpec(named: name, tools: tools)
+        if let required = spec.required, !required.isEmpty {
+            guard required.allSatisfy({ args[$0] != nil }) else { return nil }
+        }
+        if let properties = spec.properties, !properties.isEmpty {
+            guard args.keys.allSatisfy({ properties.contains($0) }) else { return nil }
+        }
+        if let type = object["type"] as? String,
+            type != "function" && type != "tool_call"
+        {
+            return nil
+        }
+        return ToolCall(function: .init(name: name, arguments: args.mapValues(asSendable)))
+    }
+
     private func parseJSONObjectWithOptionalEOFBrace(_ text: String) -> [String: Any]? {
         if let object = parseJSONObject(text) {
             return object
@@ -322,5 +353,24 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
             parameters?["required"] as? [String],
             properties.map { Set($0.keys) }
         )
+    }
+
+    private func toolSpec(
+        named name: String,
+        tools: [[String: any Sendable]]?
+    ) -> (required: [String]?, properties: Set<String>?) {
+        guard let tools else { return (nil, nil) }
+        for tool in tools {
+            guard let function = tool["function"] as? [String: any Sendable],
+                function["name"] as? String == name
+            else { continue }
+            let parameters = function["parameters"] as? [String: any Sendable]
+            let properties = parameters?["properties"] as? [String: any Sendable]
+            return (
+                parameters?["required"] as? [String],
+                properties.map { Set($0.keys) }
+            )
+        }
+        return (nil, nil)
     }
 }
