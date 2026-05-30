@@ -357,7 +357,13 @@ enum JangPressRegressionBench {
         // -----------------------------------------------------------
         do {
             let thinkingOffMaxTokens = min(max(maxNewTokens, 48), 96)
-            let thinkingOnMaxTokens = min(max(maxNewTokens, 96), 160)
+            // Some reasoning-native families, including Step 3.7, spend
+            // more than 160 tokens inside a valid `<think>` block before
+            // closing and emitting visible content. Keep the direct-answer
+            // probe tight, but let the thinking-on probe use the caller's
+            // configured generation budget so the gate does not create a
+            // false reasoning-only failure.
+            let thinkingOnMaxTokens = min(max(maxNewTokens, 160), 512)
             let off = try await ask(engine, ctx: ctx,
                 chat: [.user("Answer in one short sentence: why is the sky blue?")],
                 maxNewTokens: thinkingOffMaxTokens,

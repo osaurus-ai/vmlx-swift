@@ -345,6 +345,16 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .xmlFunction
         }
 
+        // StepFun Step 3.5 / 3.7 templates use the same XML function
+        // envelope as Qwen/Nemotron:
+        // <tool_call><function=name><parameter=key>...</parameter></function></tool_call>.
+        if compact.hasPrefix("step3p5")
+            || compact.hasPrefix("step3p7")
+            || compact.hasPrefix("stepfun")
+        {
+            return .xmlFunction
+        }
+
         // Mistral3 family (mistral3, mistral3_text, etc.)
         if compact.hasPrefix("mistral3") {
             return .mistral
@@ -482,6 +492,13 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .xmlFunction
         }
 
+        if compact.hasPrefix("step3p5")
+            || compact.hasPrefix("step3p7")
+            || compact.hasPrefix("stepfun")
+        {
+            return .xmlFunction
+        }
+
         if normalized.hasPrefix("bailing")
             || normalized == "ling"
             || normalized.hasPrefix("ling_")
@@ -512,6 +529,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // (vLLM ecosystem name `qwen3_coder` aliased here).
         case "qwen", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
             "qwen3_coder", "mimo", "mimo_v2", "mimo_v2_flash":
+            return .xmlFunction
+        // StepFun Step 3.5 / 3.7 XML-function parser aliases. JANG
+        // Step 3.7 VLM bundles stamp `tool_parser = "step3p5"` because the
+        // text runtime/template is Step 3.5-compatible.
+        case "step", "stepfun", "step3p5", "step3p7", "step3_5", "step3_7":
             return .xmlFunction
         // MiniMax — JANG converter stamps `minimax`; older artifacts use
         // the canonical `minimax_m2`. Future M2.5 variants use

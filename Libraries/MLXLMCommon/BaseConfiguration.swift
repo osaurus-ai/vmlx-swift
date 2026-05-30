@@ -188,12 +188,40 @@ public struct BaseConfiguration: Codable, Sendable {
                         continue
                     } else {
                         perLayerQuantization[key.stringValue] = .quantize(
-                            try container.decode(Quantization.self, forKey: key))
+                            try Self.decodeLayerQuantization(
+                                from: container,
+                                key: key,
+                                defaultGroupSize: quantization.groupSize))
                     }
                 }
             }
             self.perLayerQuantization = PerLayerQuantization(
                 quantization: quantization, perLayerQuantization: perLayerQuantization)
+        }
+
+        private static func decodeLayerQuantization(
+            from container: KeyedDecodingContainer<_DictionaryCodingKey>,
+            key: _DictionaryCodingKey,
+            defaultGroupSize: Int
+        ) throws -> Quantization {
+            do {
+                return try container.decode(Quantization.self, forKey: key)
+            } catch DecodingError.keyNotFound(let missing, _)
+                where missing.stringValue == Quantization.CodingKeys.groupSize.rawValue
+            {
+                let nested = try container.nestedContainer(
+                    keyedBy: Quantization.CodingKeys.self,
+                    forKey: key)
+                let bits = try nested.decode(Int.self, forKey: .bits)
+                let mode = try nested.decodeIfPresent(String.self, forKey: ._mode)
+                    .flatMap { QuantizationMode(rawValue: $0.lowercased()) }
+                    ?? quantizationModeDefaultForLayerOverride()
+                return Quantization(groupSize: defaultGroupSize, bits: bits, mode: mode)
+            }
+        }
+
+        private static func quantizationModeDefaultForLayerOverride() -> QuantizationMode {
+            .affine
         }
 
         private static func isScalarMetadata(

@@ -651,6 +651,13 @@ extension ReasoningParser {
             return ReasoningParser(startInReasoning: true)
         }
 
+        if compact.hasPrefix("step3p5")
+            || compact.hasPrefix("step3p7")
+            || compact.hasPrefix("stepfun")
+        {
+            return ReasoningParser(startInReasoning: true)
+        }
+
         if normalized.hasPrefix("bailing")
             || normalized == "ling"
             || normalized.hasPrefix("ling_")
@@ -673,7 +680,8 @@ extension ReasoningParser {
             "kimi", "kimi_k2", "kimik2",
             "laguna", "laguna_xs", "laguna_s",
             "hy3", "hy_v3", "hy-v3", "hunyuan", "tencent",
-            "zaya", "zaya1", "zaya2":
+            "zaya", "zaya1", "zaya2",
+            "step", "stepfun", "step3p5", "step3p7", "step3_5", "step3_7":
             // Start inside the reasoning block — matches the Qwen 3.x
             // family's chat-template default (`enable_thinking=true`
             // prefills `<think>\n` at prompt tail).
@@ -941,6 +949,9 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
         "hyv3",         // `capabilities.reasoning_parser = "qwen3"`, but
                         // non-JANG/fallback paths should still pick think_xml.
         "mimo",         // MiMo-V2 templates use the same `<think>` envelope.
+        "step3p5",      // StepFun Step 3.5 text runtime / parser family.
+        "step3p7",      // Step 3.7 VLM wrapper uses Step 3.5 text template.
+        "stepfun",
     ]
     if thinkXmlPrefixes.contains(where: compact.hasPrefix) {
         return "think_xml"

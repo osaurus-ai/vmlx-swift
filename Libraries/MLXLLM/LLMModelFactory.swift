@@ -207,6 +207,9 @@ public enum LLMTypeRegistry {
             "bailing_hybrid": create(BailingHybridConfiguration.self, BailingHybridModel.init),
             "bailing_moe_v2_5": create(BailingHybridConfiguration.self, BailingHybridModel.init),
             "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
+            "step": dispatchStep3p5,
+            "step3p5": dispatchStep3p5,
+            "step3p7": dispatchStep3p5,
             "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
             "nemotron_h": dispatchNemotronH,
             "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
@@ -663,6 +666,42 @@ public enum LLMTypeRegistry {
         return DeepseekV3Model(config)
     }
 
+    private static func dispatchStep3p5(data: Data) throws -> any LanguageModel {
+        struct Probe: Codable {
+            let weightFormat: String?
+            let mxtqBits: Int?
+            let mxtqGateUpBits: Int?
+            let mxtqDownBits: Int?
+            let mxtqSeed: Int?
+            enum CodingKeys: String, CodingKey {
+                case weightFormat = "weight_format"
+                case mxtqBits = "mxtq_bits"
+                case mxtqGateUpBits = "mxtq_gate_up_bits"
+                case mxtqDownBits = "mxtq_down_bits"
+                case mxtqSeed = "mxtq_seed"
+            }
+        }
+        let probe = try? JSONDecoder.json5().decode(Probe.self, from: data)
+        let config = try JSONDecoder.json5().decode(Step3p5Configuration.self, from: data)
+        let isMxtq =
+            probe?.weightFormat?.lowercased() == "mxtq"
+            || probe?.mxtqBits != nil
+            || probe?.mxtqGateUpBits != nil
+            || probe?.mxtqDownBits != nil
+        let jangtq: Step3p5JANGTQContext?
+        if isMxtq {
+            let gateUpBits = probe?.mxtqGateUpBits ?? probe?.mxtqBits ?? 2
+            let downBits = probe?.mxtqDownBits ?? probe?.mxtqBits ?? gateUpBits
+            jangtq = Step3p5JANGTQContext(
+                gateUpBits: gateUpBits,
+                downBits: downBits,
+                seed: probe?.mxtqSeed ?? 42)
+        } else {
+            jangtq = nil
+        }
+        return Step3p5Model(config, jangtq: jangtq)
+    }
+
     /// Shared instance with default model types.
     public static let shared: ModelTypeRegistry = .init(
         creators: coreModels().merging(extendedModels()) { a, _ in a }
@@ -1074,7 +1113,8 @@ private struct LLMUserInputProcessor: UserInputProcessor {
                 tokens: MLXArray(promptTokens),
                 tokenIds: promptTokens,
                 cacheScopeSalt: cacheScopeSalt(from: additionalContext),
-                cachePrefixTokenCounts: cachePrefixTokenCounts)
+                cachePrefixTokenCounts: cachePrefixTokenCounts,
+                toolSchemas: input.tools)
         } catch TokenizerError.missingChatTemplate {
             print(
                 "No chat template was included or provided, so converting messages to simple text format. This is not optimal for model performance, so applications should provide a chat template if none is included with the model."
@@ -1087,7 +1127,8 @@ private struct LLMUserInputProcessor: UserInputProcessor {
             return LMInput(
                 tokens: MLXArray(promptTokens),
                 tokenIds: promptTokens,
-                cacheScopeSalt: cacheScopeSalt(from: additionalContext))
+                cacheScopeSalt: cacheScopeSalt(from: additionalContext),
+                toolSchemas: input.tools)
         }
     }
 
@@ -1319,6 +1360,17 @@ public final class LLMModelFactory: ModelFactory {
             var configDict = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
             let jangDict = (try? JSONSerialization.jsonObject(with: jangData)) as? [String: Any]
         {
+            let jangFormat = (jangDict["format"] as? String)?.lowercased()
+            let jangWeightFormat = (jangDict["weight_format"] as? String)?.lowercased()
+            let hasJANGTQSidecar = FileManager.default.fileExists(
+                atPath: modelDirectory.appending(component: "jangtq_runtime.safetensors").path)
+            let shouldMergeJANGTQMetadata =
+                hasJANGTQSidecar
+                || jangFormat?.contains("jangtq") == true
+                || jangWeightFormat == "mxtq"
+                || jangWeightFormat?.contains("jangtq") == true
+
+            if shouldMergeJANGTQMetadata {
             for key in ["weight_format", "mxtq_seed"] {
                 if configDict[key] == nil, let v = jangDict[key] {
                     configDict[key] = v
@@ -1498,6 +1550,7 @@ public final class LLMModelFactory: ModelFactory {
                     }
                 }
                 configDict["text_config"] = textConfig
+            }
             }
             if let merged = try? JSONSerialization.data(withJSONObject: configDict) {
                 configData = merged

@@ -187,6 +187,40 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 truncation: false,
                                 maxLength: nil,
                                 tools: chatTemplateTools,
+                                    additionalContext: additionalContext)
+                        }
+                        let step37Bos =
+                            "<" + String(UnicodeScalar(0xFF5C)!)
+                            + "begin" + String(UnicodeScalar(0x2581)!) + "of"
+                            + String(UnicodeScalar(0x2581)!) + "sentence"
+                            + String(UnicodeScalar(0xFF5C)!) + ">"
+                        let hasStep37Sentinels =
+                            upstream.bosToken == step37Bos
+                            && upstream.eosToken == "<|im_end|>"
+                            && upstream.convertTokenToId("<|im_start|>") != nil
+                            && upstream.convertTokenToId("<tool_call>") != nil
+                            && upstream.convertTokenToId("<im_patch>") != nil
+                        let step37NeedsFallback =
+                            hasStep37Sentinels
+                            && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
+                            && (
+                                !(tools?.isEmpty ?? true)
+                                || (additionalContext?["enable_thinking"] as? Bool) == false
+                            )
+                        if step37NeedsFallback {
+                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                FileHandle.standardError.write(
+                                    "[vmlx] chat-template auto-correction engaged: Step37Minimal\\n"
+                                        .data(using: .utf8)!)
+                            }
+                            return try upstream.applyChatTemplate(
+                                messages: messages,
+                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
+                                    MLXLMCommon.ChatTemplateFallbacks.step37Minimal),
+                                addGenerationPrompt: true,
+                                truncation: false,
+                                maxLength: nil,
+                                tools: chatTemplateTools,
                                 additionalContext: additionalContext)
                         }
                         // MiniMax-M2 native template auto-correction: every shipping
@@ -501,6 +535,40 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 messages: messages,
                                 chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
                                     MLXLMCommon.ChatTemplateFallbacks.lfm2ToolMinimal),
+                                addGenerationPrompt: addGenerationPrompt,
+                                truncation: false,
+                                maxLength: nil,
+                                tools: chatTemplateTools,
+                                    additionalContext: additionalContext)
+                        }
+                        let step37Bos =
+                            "<" + String(UnicodeScalar(0xFF5C)!)
+                            + "begin" + String(UnicodeScalar(0x2581)!) + "of"
+                            + String(UnicodeScalar(0x2581)!) + "sentence"
+                            + String(UnicodeScalar(0xFF5C)!) + ">"
+                        let hasStep37Sentinels =
+                            upstream.bosToken == step37Bos
+                            && upstream.eosToken == "<|im_end|>"
+                            && upstream.convertTokenToId("<|im_start|>") != nil
+                            && upstream.convertTokenToId("<tool_call>") != nil
+                            && upstream.convertTokenToId("<im_patch>") != nil
+                        let step37NeedsFallback =
+                            hasStep37Sentinels
+                            && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
+                            && (
+                                !(tools?.isEmpty ?? true)
+                                || (additionalContext?["enable_thinking"] as? Bool) == false
+                            )
+                        if step37NeedsFallback {
+                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                FileHandle.standardError.write(
+                                    "[vmlx] chat-template auto-correction engaged: Step37Minimal\\n"
+                                        .data(using: .utf8)!)
+                            }
+                            return try upstream.applyChatTemplate(
+                                messages: messages,
+                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
+                                    MLXLMCommon.ChatTemplateFallbacks.step37Minimal),
                                 addGenerationPrompt: addGenerationPrompt,
                                 truncation: false,
                                 maxLength: nil,

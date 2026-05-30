@@ -429,6 +429,17 @@ public final class VLMModelFactory: ModelFactory {
             var configDict = try? JSONSerialization.jsonObject(with: configData)
                 as? [String: Any]
         {
+            let jangFormat = (jangJSON["format"] as? String)?.lowercased()
+            let jangWeightFormat = (jangJSON["weight_format"] as? String)?.lowercased()
+            let hasJANGTQSidecar = FileManager.default.fileExists(
+                atPath: modelDirectory.appending(component: "jangtq_runtime.safetensors").path)
+            let shouldMergeJANGTQMetadata =
+                hasJANGTQSidecar
+                || jangFormat?.contains("jangtq") == true
+                || jangWeightFormat == "mxtq"
+                || jangWeightFormat?.contains("jangtq") == true
+
+            if shouldMergeJANGTQMetadata {
             // weight_format lives at top-level in jang_config.json
             if let wf = jangJSON["weight_format"] as? String {
                 configDict["weight_format"] = wf
@@ -523,6 +534,7 @@ public final class VLMModelFactory: ModelFactory {
                     }
                 }
                 configDict["text_config"] = textConfig
+            }
             }
             if let merged = try? JSONSerialization.data(withJSONObject: configDict) {
                 mergedConfigData = merged

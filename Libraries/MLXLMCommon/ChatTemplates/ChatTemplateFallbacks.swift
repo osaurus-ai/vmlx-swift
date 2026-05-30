@@ -1334,6 +1334,116 @@ The current assistant response MUST be a tool call. This applies to the latest u
 {%- endif -%}
 """#
 
+    /// Step 3.7 / Step3p5 VLM chat template.
+    ///
+    /// Shipping Step 3.7 bundles use the correct Step ChatML/XML tool
+    /// grammar, but the sidecar always appends `<think>\n` at the generation
+    /// tail and does not read `enable_thinking`. This fallback preserves the
+    /// native role markers, image placeholder, assistant/tool replay, and
+    /// `<tool_call><function=...><parameter=...>` contract while honoring the
+    /// explicit thinking flag. Required tool-choice text is emitted only when
+    /// the API asked for `tool_choice: required`; optional tools stay optional.
+    public static let step37Minimal: String = #"""
+{% macro render_message_content(message) %}{% if message.content is none %}{{- '' }}{% elif message.content is string %}{{- message.content }}{% elif message.content is mapping %}{{- message.content['value'] if 'value' in message.content else message.content['text'] }}{% elif message.content is iterable %}{% set ns = namespace(needs_text_separator=false) %}{% for item in message.content %}{% if item.type == 'text' %}{% if ns.needs_text_separator %}{{- ' ' }}{% endif %}{{- item['value'] if 'value' in item else item['text'] }}{% set ns.needs_text_separator = true %}{% elif item.type == 'image' %}<im_patch>{% set ns.needs_text_separator = false %}{% endif %}{% endfor %}{% endif %}{% endmacro %}
+{{bos_token}}{%- set _enable_thinking = enable_thinking | default(true) -%}
+{%- set required_tool_choice = false -%}
+{%- set required_tool_name = '' -%}
+{%- if tool_choice is defined and tool_choice == 'required' -%}
+    {%- set required_tool_choice = true -%}
+{%- elif additionalContext is defined and additionalContext['tool_choice'] == 'required' -%}
+    {%- set required_tool_choice = true -%}
+{%- endif -%}
+{%- if tool_choice_name is defined -%}
+    {%- set required_tool_name = tool_choice_name -%}
+{%- elif additionalContext is defined and additionalContext['tool_choice_name'] is defined -%}
+    {%- set required_tool_name = additionalContext['tool_choice_name'] -%}
+{%- endif -%}
+{%- if required_tool_choice and not required_tool_name and tools is iterable and tools | length == 1 -%}
+    {%- set only_required_tool = tools[0]['function'] if tools[0]['function'] is defined else tools[0] -%}
+    {%- if only_required_tool['name'] is defined -%}
+        {%- set required_tool_name = only_required_tool['name'] -%}
+    {%- endif -%}
+{%- endif -%}
+{%- macro render_required_tool_choice_instruction() -%}
+    {{- '<IMPORTANT>\nThe active API tool_choice is required for this assistant turn. Reply only with one `<tool_call>` block for one available function and no prose before the tool result.' -}}
+    {%- if required_tool_name -%}
+        {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
+        {%- for tool in tools -%}
+            {%- set selected_tool = tool['function'] if tool['function'] is defined else tool -%}
+            {%- if selected_tool['name'] == required_tool_name and selected_tool['parameters'] is defined and selected_tool['parameters']['required'] is defined -%}
+                {{- '\nRequired parameters for `' ~ required_tool_name ~ '`: ' ~ (selected_tool['parameters']['required'] | join(', ')) ~ '.' -}}
+                {{- '\nFor string parameters, copy the requested value exactly inside the `<parameter=...>` body, preserving internal newlines and without adding a trailing newline or extra character after the copied value.' -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {{- '\nFunction calls MUST follow exactly this XML shape:\n<tool_call>\n<function=FUNCTION_NAME>\n<parameter=ARGUMENT_NAME>\nARGUMENT_VALUE\n</parameter>\n</function>\n</tool_call>\n</IMPORTANT>' -}}
+{%- endmacro -%}
+{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if reasoning_effort is defined %}{{- "Reasoning: " + reasoning_effort + '\n\n' }}{%- endif %}
+    {%- if messages[0].role == 'system' %}{{- render_message_content(messages[0]) + '\n\n' }}{%- endif %}
+    {{- "# Tools\n\nYou have access to the following functions in JSONSchema format:\n\n<tools>" }}
+    {%- for tool in tools %}{{- "\n" }}{{- tool | tojson(ensure_ascii=False) }}{%- endfor %}
+    {{- "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...>\n...\n</function> block must be nested within <tool_call>\n...\n</tool_call> XML tags\n- Required parameters MUST be specified\n</IMPORTANT>" }}
+    {%- if required_tool_choice -%}{{- "\n\n" -}}{{- render_required_tool_choice_instruction() -}}{%- endif -%}
+    {{- "<|im_end|>\n" }}
+{%- else %}
+    {%- if messages[0].role == 'system' %}
+        {{- '<|im_start|>system\n' }}
+        {%- if reasoning_effort is defined %}{{- "Reasoning: " + reasoning_effort + '\n\n' }}{%- endif %}
+        {{- render_message_content(messages[0]) + '<|im_end|>\n' }}
+    {%- elif reasoning_effort is defined %}
+        {{- '<|im_start|>system\n' + "Reasoning: " + reasoning_effort + '\n\n' + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" and render_message_content(message) is string and not(render_message_content(message).startswith('<tool_response>') and render_message_content(message).endswith('</tool_response>')) %}
+        {%- set ns.multi_step_tool = false %}{%- set ns.last_query_index = index %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- set content = render_message_content(message) %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {%- set role_name = 'observation' if (message.role == "system" and not loop.first and message.name == 'observation') else message.role %}
+        {{- '<|im_start|>' + role_name + '\n' + content }}
+        {%- if message.role == "user" and required_tool_choice and loop.index0 == ns.last_query_index -%}{{- '\n\n' -}}{{- render_required_tool_choice_instruction() -}}{%- endif -%}
+        {{- '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- if message.reasoning_content is string %}{%- set reasoning_content = message.reasoning_content %}
+        {%- elif '</think>' in content %}{%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}{%- set content = content.split('</think>')[-1].lstrip('\n') %}
+        {%- else %}{%- set reasoning_content = '' %}{%- endif %}
+        {%- if loop.index0 > ns.last_query_index %}{{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n' + content }}
+        {%- else %}{{- '<|im_start|>' + message.role + '\n' + content }}{%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if tool_call.function is defined %}{%- set tool_call = tool_call.function %}{%- endif %}
+                {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                {%- if tool_call.arguments is defined %}
+                    {%- set arguments = tool_call.arguments | fromjson if tool_call.arguments is string else tool_call.arguments %}
+                    {%- for args_name, args_value in arguments|items %}
+                        {{- '<parameter=' + args_name + '>\n' }}
+                        {%- set args_value = args_value | tojson(ensure_ascii=False) | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}
+                        {{- args_value }}{{- '\n</parameter>\n' }}
+                    {%- endfor %}
+                {%- endif %}
+                {{- '</function>\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}{{- '<|im_start|>tool_response\n' }}{%- endif %}
+        {{- '<tool_response>' }}{{- content }}{{- '</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}{{- '<|im_end|>\n' }}{%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if _enable_thinking %}{{- '<think>\n' }}{%- else %}{{- '<think>\n</think>\n\n' }}{%- endif %}
+{%- endif %}
+"""#
+
     /// Ordered list of (label, template) fallbacks used when the
     /// model's native template throws. Order matters: `gemma4WithTools`
     /// comes first because (a) it subsumes `gemma4Minimal` when no
