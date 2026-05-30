@@ -1239,9 +1239,9 @@ The current assistant response MUST be a tool call. This applies to the latest u
                         {%- endif -%}
                     {%- endfor -%}
                     {%- if exact.value -%}
-                        {%- set exact_escaped = exact.value | replace("\\", "\\\\") | replace("'", "\\'") | replace("\n", "\\n") -%}
+                        {%- set exact_escaped = exact.value | replace("\\", "\\\\") | replace("'", "\\'") -%}
                         {{- '\nRespond with exactly this one assistant message and nothing else:\n<|tool_call_start|>[' ~ required_tool_name ~ '(' ~ param_name ~ "='" ~ exact_escaped ~ "'" ~ ')]<|tool_call_end|>' -}}
-                        {{- '\nCopy the `' ~ param_name ~ '` value exactly from the current user request, including newlines and spacing inside the quotes. Render newline characters inside the quoted argument as literal \\n escape sequences, not as physical line breaks. Do not add a blank line, leading space, trailing newline, or any other character to the copied value. Do not output JSON, an empty `' ~ required_tool_name ~ '()`, or prose. Do not omit `' ~ param_name ~ '`. Do not invent placeholders, summaries, ellipsis, or prior-turn text.' -}}
+                        {{- '\nCopy the `' ~ param_name ~ '` value exactly from the current user request, including newlines and spacing inside the quotes. Do not add a blank line, leading space, trailing newline, or any other character to the copied value. Do not output JSON, an empty `' ~ required_tool_name ~ '()`, or prose. Do not omit `' ~ param_name ~ '`. Do not invent placeholders, summaries, ellipsis, or prior-turn text.' -}}
                     {%- else -%}
                         {{- '\nReply only with one native LFM bracketed call list using argument names and values copied from the latest user request.' -}}
                     {%- endif -%}
@@ -1283,13 +1283,9 @@ The current assistant response MUST be a tool call. This applies to the latest u
 {%- endif -%}
 
 {%- for message in loop_messages -%}
+    {%- set is_required_latest_user = required_tool_choice and message['role'] == 'user' and loop.index0 == ns.last_user_index -%}
     {%- set compact_for_required_tool = required_tool_choice and loop.index0 < ns.last_user_index and message['role'] not in ['system', 'developer'] -%}
     {%- if not compact_for_required_tool -%}
-    {%- if required_tool_choice and message['role'] == 'user' and loop.index0 == ns.last_user_index -%}
-    {{- '<|im_start|>system\n' -}}
-    {{- render_required_tool_choice_instruction(message['content']) -}}
-    {{- '<|im_end|>\n' -}}
-    {%- endif -%}
     {{- '<|im_start|>' + message['role'] + '\n' -}}
     {%- if message['role'] == 'assistant' -%}
         {%- if message['thinking'] is defined -%}
@@ -1311,6 +1307,11 @@ The current assistant response MUST be a tool call. This applies to the latest u
         {%- endif -%}
     {%- endif -%}
     {{- '<|im_end|>\n' -}}
+    {%- if is_required_latest_user -%}
+    {{- '<|im_start|>system\n' -}}
+    {{- render_required_tool_choice_instruction(message['content']) -}}
+    {{- '<|im_end|>\n' -}}
+    {%- endif -%}
     {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
