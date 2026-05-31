@@ -184,8 +184,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case .json:
             return JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .lfm2:
-            return PythonicToolCallParser(
-                startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+            return LFM2ToolCallParser()
         case .xmlFunction:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .step:

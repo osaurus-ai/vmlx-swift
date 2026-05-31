@@ -3,6 +3,24 @@ import MLXLMCommon
 import Testing
 
 struct ToolTests {
+    private func lineCountTools() -> [ToolSpec] {
+        [
+            [
+                "type": "function",
+                "function": [
+                    "name": "line_count",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "text": ["type": "string"] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "required": ["text"] as [String],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as ToolSpec
+        ]
+    }
+
     @Test("Test Weather Tool Schema Generation")
     func testWeatherToolSchemaGeneration() throws {
         struct WeatherInput: Codable {
@@ -448,6 +466,68 @@ struct ToolTests {
         let toolCall = parser.parse(content: #"{"not_a_tool":[{"text":"red"}]}"#, tools: tools)
 
         #expect(toolCall == nil)
+    }
+
+    @Test("LFM2 processor accepts observed functionline required-tool output at EOS")
+    func lfm2ProcessorAcceptsObservedFunctionlineRequiredToolOutput() throws {
+        let tools = lineCountTools()
+        let processor = ToolCallProcessor(format: .lfm2, tools: tools)
+        let visible = processor.processChunk(
+            #"<functionline_count>line_count</function_line_count>text='red\ngreen\nblue'</function_line_count>"#)
+        let eosVisible = processor.processEOS()
+
+        #expect(visible == nil)
+        #expect(eosVisible == nil)
+        #expect(processor.toolCalls.count == 1)
+        let call = try #require(processor.toolCalls.first)
+        #expect(call.function.name == "line_count")
+        #expect(call.function.arguments["text"] == .string("red\ngreen\nblue"))
+    }
+
+    @Test("LFM2 processor accepts observed functionname arg tag output at EOS")
+    func lfm2ProcessorAcceptsObservedFunctionNameArgTagOutput() throws {
+        let tools = lineCountTools()
+        let parserCall = try #require(LFM2ToolCallParser().parse(
+            content: #"""
+            <functionname>line_count</functionname>
+            <argimiss name="text">one
+            two</argFunctionName>
+            """#,
+            tools: tools))
+        #expect(parserCall.function.arguments["text"] == .string("one\ntwo"))
+
+        let processor = ToolCallProcessor(format: .lfm2, tools: tools)
+        let visible = processor.processChunk(
+            #"""
+            <functionname>line_count</functionname>
+            <argimiss name="text">one
+            two</argFunctionName>
+            """#)
+        let eosVisible = processor.processEOS()
+
+        #expect(visible == nil)
+        #expect(eosVisible == nil)
+        #expect(processor.toolCalls.count == 1)
+        let call = try #require(processor.toolCalls.first)
+        #expect(call.function.name == "line_count")
+        #expect(call.function.arguments["text"] == .string("one\ntwo"))
+    }
+
+    @Test("LFM2 parser does not coerce plain code fence into a tool call")
+    func lfm2ParserDoesNotCoercePlainCodeFenceIntoToolCall() {
+        let processor = ToolCallProcessor(format: .lfm2, tools: lineCountTools())
+        let visible = processor.processChunk(
+            #"""
+            ```lfm
+            red
+            green
+            blue
+            ```
+            """#)
+        let eosVisible = processor.processEOS()
+
+        #expect(processor.toolCalls.isEmpty)
+        #expect((visible ?? "") + (eosVisible ?? "") != "")
     }
 
     // MARK: - XML Function Format Tests (Qwen3 Coder)
