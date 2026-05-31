@@ -847,9 +847,9 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("Do not omit `text`"))
         #expect(!rendered.contains("Liquid/Python call list"))
         #expect(rendered.contains("do not use positional arguments"))
-        #expect(!rendered.contains("<think>"))
+        #expect(rendered.contains("<think></think>"))
         #expect(!rendered.contains("enable_thinking"))
-        #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n<think></think>\n\n"))
     }
 
     @Test("LFM2 fallback repeats exact required tool value after history")
@@ -911,7 +911,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!afterFinalUser.contains("<real string value>"))
         #expect(!afterFinalUser.contains("argument value"))
         #expect(!afterFinalUser.contains("..."))
-        #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n<think></think>\n\n"))
     }
 
     @Test("LFM2 template shim only engages stamped LFM tool bundles")

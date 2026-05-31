@@ -1331,6 +1331,9 @@ The current assistant response MUST be a tool call. This applies to the latest u
 {%- endfor -%}
 {%- if add_generation_prompt -%}
     {{- '<|im_start|>assistant\n' -}}
+    {%- if required_tool_choice -%}
+        {{- '<think></think>\n\n' -}}
+    {%- endif -%}
 {%- endif -%}
 """#
 
