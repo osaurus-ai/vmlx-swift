@@ -847,9 +847,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("Do not omit `text`"))
         #expect(!rendered.contains("Liquid/Python call list"))
         #expect(rendered.contains("do not use positional arguments"))
-        #expect(!rendered.contains("<think>"))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n<think>\n</think>\n\n"))
         #expect(!rendered.contains("enable_thinking"))
-        #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
     }
 
     @Test("LFM2 fallback infers single required tool from OpenAI required choice")
@@ -873,9 +872,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!rendered.contains("Use the line_count tool on this exact text: red\ngreen\nblue"))
         #expect(rendered.contains(#"<|tool_call_start|>[line_count(text='red\ngreen\nblue')]<|tool_call_end|>"#))
         #expect(rendered.contains(#"the exact `text` value encoded with \n escapes is: red\ngreen\nblue"#))
-        #expect(!rendered.contains("<think>"))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n<think>\n</think>\n\n"))
         #expect(!rendered.contains("..."))
-        #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
     }
 
     @Test("LFM2 fallback repeats exact required tool value after history")
@@ -937,8 +935,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!afterFinalUser.contains("<real string value>"))
         #expect(!afterFinalUser.contains("argument value"))
         #expect(!afterFinalUser.contains("..."))
-        #expect(!rendered.contains("<think>"))
-        #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n<think>\n</think>\n\n"))
     }
 
     @Test("LFM2 template shim only engages stamped LFM tool bundles")
