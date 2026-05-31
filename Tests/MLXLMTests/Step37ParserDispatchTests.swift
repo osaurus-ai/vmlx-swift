@@ -234,6 +234,30 @@ struct Step37ParserDispatchTests {
         #expect(boundedTopology.requiresDiskBackedCoordinatorRestore)
     }
 
+    @Test("Step TurboQuant KV contract covers only full attention layers")
+    func stepTurboQuantKVContractCoversOnlyFullAttentionLayers() throws {
+        let batchQuantize = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchQuantize.swift",
+            encoding: .utf8)
+        #expect(batchQuantize.contains("Preserves `RotatingKVCache`, `DeepseekV4Cache`, `MambaCache`,"))
+        #expect(batchQuantize.contains("ordinary `KVCacheSimple` layers compress"))
+        #expect(batchQuantize.contains("maybeQuantizeKVCache("))
+
+        let topology = ModelCacheTopologySnapshot(cache: [
+            TurboQuantKVCache(),
+            RotatingKVCache(maxSize: 512),
+            TurboQuantKVCache(),
+            RotatingKVCache(maxSize: 512),
+        ])
+        #expect(topology.kvLayerCount == 0)
+        #expect(topology.turboQuantKVLayerCount == 2)
+        #expect(topology.rotatingKVLayerCount == 2)
+        #expect(topology.requiresDiskBackedCoordinatorRestore)
+        #expect(topology.topologyTags.contains("turboQuantKVLayers=2"))
+        #expect(topology.topologyTags.contains("rotatingLayers=2"))
+        #expect(topology.topologyTags.contains("restore=disk-backed"))
+    }
+
     @Test("Step JANGTQ per-layer quantization inherits top-level group size")
     func stepJANGTQPerLayerQuantizationInheritsTopLevelGroupSize() throws {
         let json = """
