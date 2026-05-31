@@ -494,10 +494,18 @@ public final class Step3p5Model: Module, LLMModel, KVCacheDimensionProvider {
         maxPositionEmbeddings: Int,
         parameters: GenerateParameters?
     ) -> [KVCache] {
+        let callerWantsTQ: Bool = {
+            guard let p = parameters else { return false }
+            if case .turboQuant = p.kvMode { return true }
+            return false
+        }()
         let fullKVSize = parameters?.maxKVSize ?? maxPositionEmbeddings
         return layerTypes.map { layerType in
             if layerType == "sliding_attention" {
                 return RotatingKVCache(maxSize: slidingWindow)
+            }
+            if callerWantsTQ {
+                return KVCacheSimple()
             }
             if parameters?.maxKVSize != nil {
                 return RotatingKVCache(maxSize: fullKVSize, keep: 4)

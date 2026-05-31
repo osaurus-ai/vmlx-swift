@@ -232,6 +232,22 @@ struct Step37ParserDispatchTests {
         #expect(boundedTopology.kvLayerCount == 0)
         #expect(boundedTopology.rotatingKVLayerCount == 4)
         #expect(boundedTopology.requiresDiskBackedCoordinatorRestore)
+
+        var tqParams = GenerateParameters(kvMode: .turboQuant(keyBits: 3, valueBits: 3))
+        tqParams.maxKVSize = 2048
+        let turboCache = Step3p5Model.makeCache(
+            layerTypes: cfg.layerTypes,
+            slidingWindow: cfg.slidingWindow,
+            maxPositionEmbeddings: cfg.maxPositionEmbeddings,
+            parameters: tqParams)
+        #expect(turboCache[0] is KVCacheSimple)
+        #expect(turboCache[1] is RotatingKVCache)
+        #expect(turboCache[2] is KVCacheSimple)
+        #expect(turboCache[3] is RotatingKVCache)
+        let turboTopology = ModelCacheTopologySnapshot(cache: turboCache)
+        #expect(turboTopology.kvLayerCount == 2)
+        #expect(turboTopology.rotatingKVLayerCount == 2)
+        #expect(turboTopology.requiresDiskBackedCoordinatorRestore)
     }
 
     @Test("Step TurboQuant KV contract covers only full attention layers")
