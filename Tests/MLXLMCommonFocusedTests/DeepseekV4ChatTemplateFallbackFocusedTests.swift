@@ -852,6 +852,32 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
     }
 
+    @Test("LFM2 fallback infers single required tool from OpenAI required choice")
+    func lfm2FallbackInfersSingleRequiredToolFromOpenAIRequiredChoice() throws {
+        let rendered = try Template(ChatTemplateFallbacks.lfm2ToolMinimal).renderDSV4([
+            "messages": [
+                ["role": "user", "content": "Use the line_count tool on this exact text: red\ngreen\nblue"],
+            ],
+            "tools": [lineCountToolSpec()],
+            "bos_token": "<|startoftext|>",
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+            "tool_choice": "required",
+        ])
+
+        #expect(rendered.contains("The API requires a tool call for the next assistant turn."))
+        #expect(rendered.contains("Function name: line_count"))
+        #expect(rendered.contains("Required arguments: text"))
+        #expect(rendered.contains("Respond with exactly this one assistant message and nothing else:"))
+        #expect(rendered.contains(#"Use the line_count tool on this exact text: red\ngreen\nblue"#))
+        #expect(!rendered.contains("Use the line_count tool on this exact text: red\ngreen\nblue"))
+        #expect(rendered.contains(#"<|tool_call_start|>[line_count(text='red\ngreen\nblue')]<|tool_call_end|>"#))
+        #expect(rendered.contains(#"the exact `text` value encoded with \n escapes is: red\ngreen\nblue"#))
+        #expect(!rendered.contains("<think>"))
+        #expect(!rendered.contains("..."))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
+    }
+
     @Test("LFM2 fallback repeats exact required tool value after history")
     func lfm2FallbackRepeatsExactRequiredToolValueAfterHistory() throws {
         let rendered = try Template(ChatTemplateFallbacks.lfm2ToolMinimal).renderDSV4([

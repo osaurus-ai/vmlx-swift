@@ -1239,8 +1239,12 @@ The current assistant response MUST be a tool call. This applies to the latest u
                         'Exactly this text:',
                         'use ' ~ required_tool_name ~ ' on this exact text:',
                         'Use ' ~ required_tool_name ~ ' on this exact text:',
+                        'use the ' ~ required_tool_name ~ ' tool on this exact text:',
+                        'Use the ' ~ required_tool_name ~ ' tool on this exact text:',
                         'now use ' ~ required_tool_name ~ ' on this exact text:',
-                        'Now use ' ~ required_tool_name ~ ' on this exact text:'
+                        'Now use ' ~ required_tool_name ~ ' on this exact text:',
+                        'now use the ' ~ required_tool_name ~ ' tool on this exact text:',
+                        'Now use the ' ~ required_tool_name ~ ' tool on this exact text:'
                     ] -%}
                     {%- for marker in exact_markers -%}
                         {%- if not exact.value and latest_user_text is string and marker in latest_user_text -%}
