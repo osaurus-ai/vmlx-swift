@@ -758,7 +758,11 @@ public actor BatchEngine {
                         promptTime: info.promptTime,
                         generationTime: info.generateTime,
                         stopReason: finalStop,
+                        turboQuantCompressions: info.turboQuantCompressions,
                         unclosedReasoning: unclosed)
+                    if info.turboQuantCompressions > 0 {
+                        turboQuantCompressionCount += info.turboQuantCompressions
+                    }
                     terminationState.markCompleted()
                     continuation.yield(.info(finalInfo))
                 }

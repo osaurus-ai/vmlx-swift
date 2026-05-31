@@ -881,6 +881,7 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var tokenCount: Int { get }
     var promptPrefillTime: TimeInterval { get }
     var promptTokenIds: [Int] { get }
+    var turboQuantCompressionCount: Int { get }
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool)
@@ -888,6 +889,7 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
 
 extension TokenIteratorProtocol {
     public var promptTokenIds: [Int] { [] }
+    public var turboQuantCompressionCount: Int { 0 }
 
     public mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
@@ -1045,6 +1047,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     public var tokenCount = 0
     public let maxTokens: Int?
+    public private(set) var turboQuantCompressionCount = 0
 
     // Cache quantization parameters
     let kvBits: Int?
@@ -1604,6 +1607,20 @@ public struct TokenIterator: TokenIteratorProtocol {
         return true
     }
 
+    mutating func maybeQuantizeCacheForStep() {
+        let hadTQ = cache.contains { $0 is TurboQuantKVCache }
+        maybeQuantizeKVCache(
+            cache: &cache,
+            kvBits: kvBits,
+            kvGroupSize: kvGroupSize,
+            quantizedKVStart: quantizedKVStart,
+            kvMode: kvMode)
+        let hasTQ = cache.contains { $0 is TurboQuantKVCache }
+        if !hadTQ && hasTQ {
+            turboQuantCompressionCount += 1
+        }
+    }
+
     mutating func setupCompiledDecode(maxCacheLength: Int) throws {
         guard HardwareInfo.isCompiledDecodeSupported else { return }
         // Compiled decode requires no auxiliary state — models with state (e.g. vision
@@ -1616,12 +1633,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         let promoted: [KVCache]
         switch kvMode {
         case .turboQuant:
-            maybeQuantizeKVCache(
-                cache: &cache,
-                kvBits: kvBits,
-                kvGroupSize: kvGroupSize,
-                quantizedKVStart: quantizedKVStart,
-                kvMode: kvMode)
+            maybeQuantizeCacheForStep()
             guard cache.allSatisfy({
                 ($0 as? TurboQuantKVCache)?.phase == .compressed
             }) else { return }
@@ -1679,10 +1691,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 self.state = nil
                 if shouldQuantizeAfterStep {
                     MLXPressGenerationProfile.time("decode.kv_quantize") {
-                        maybeQuantizeKVCache(
-                            cache: &cache, kvBits: kvBits,
-                            kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart,
-                            kvMode: kvMode)
+                        maybeQuantizeCacheForStep()
                     }
                 }
                 return MLXPressGenerationProfile.time("decode.sample") {
@@ -1705,13 +1714,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         if shouldQuantizeAfterStep {
             MLXPressGenerationProfile.time("decode.kv_quantize") {
-                maybeQuantizeKVCache(
-                    cache: &cache,
-                    kvBits: kvBits,
-                    kvGroupSize: kvGroupSize,
-                    quantizedKVStart: quantizedKVStart,
-                    kvMode: kvMode
-                )
+                maybeQuantizeCacheForStep()
             }
         }
 
@@ -3068,6 +3071,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 promptTime: promptTime + iterator.promptPrefillTime,
                 generationTime: generateTime,
                 stopReason: stopReason ?? .cancelled,
+                turboQuantCompressions: iterator.turboQuantCompressionCount,
                 unclosedReasoning: unclosedReasoning
             )
             // Multi-tier cache: drain the final async token eval before cache
@@ -3155,6 +3159,11 @@ public struct GenerateCompletionInfo: Sendable {
     /// Reason generation stopped.
     public let stopReason: GenerateStopReason
 
+    /// Number of KV cache transitions to TurboQuant compression observed
+    /// during this generation. Zero means this generation did not perform a
+    /// live KVCacheSimple -> TurboQuantKVCache transition.
+    public let turboQuantCompressions: Int
+
     /// True when the stream ended with the reasoning parser still in
     /// REASONING state — i.e. the model never emitted `</think>` (or
     /// the family-specific close tag) before EOS or `max_tokens`.
@@ -3192,6 +3201,7 @@ public struct GenerateCompletionInfo: Sendable {
         promptTime: TimeInterval,
         generationTime: TimeInterval,
         stopReason: GenerateStopReason = .stop,
+        turboQuantCompressions: Int = 0,
         unclosedReasoning: Bool = false
     ) {
         self.promptTokenCount = promptTokenCount
@@ -3199,6 +3209,7 @@ public struct GenerateCompletionInfo: Sendable {
         self.promptTime = promptTime
         self.generateTime = generationTime
         self.stopReason = stopReason
+        self.turboQuantCompressions = turboQuantCompressions
         self.unclosedReasoning = unclosedReasoning
     }
 
