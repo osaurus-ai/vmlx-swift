@@ -1368,7 +1368,7 @@ The current assistant response MUST be a tool call. This applies to the latest u
         {%- set required_tool_name = only_required_tool['name'] -%}
     {%- endif -%}
 {%- endif -%}
-{%- macro render_required_tool_choice_instruction() -%}
+{%- macro render_required_tool_choice_instruction(latest_user_content='') -%}
     {{- '<IMPORTANT>\nThe active API tool_choice is required for this assistant turn. Reply only with one `<tool_call>` block for one available function and no prose before the tool result.' -}}
     {%- if required_tool_name -%}
         {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
@@ -1376,7 +1376,52 @@ The current assistant response MUST be a tool call. This applies to the latest u
             {%- set selected_tool = tool['function'] if tool['function'] is defined else tool -%}
             {%- if selected_tool['name'] == required_tool_name and selected_tool['parameters'] is defined and selected_tool['parameters']['required'] is defined -%}
                 {{- '\nRequired parameters for `' ~ required_tool_name ~ '`: ' ~ (selected_tool['parameters']['required'] | join(', ')) ~ '.' -}}
-                {{- '\nFor string parameters, copy the requested value exactly inside the `<parameter=...>` body, preserving internal newlines and without adding a trailing newline or extra character after the copied value.' -}}
+                {%- for param_name in selected_tool['parameters']['required'] -%}
+                    {%- set exact = namespace(value='') -%}
+                    {%- set latest_user_text = render_message_content({'content': latest_user_content}) -%}
+                    {%- set exact_markers = [
+                        'on this exact ' ~ param_name ~ ':',
+                        'On this exact ' ~ param_name ~ ':',
+                        'this exact ' ~ param_name ~ ':',
+                        'This exact ' ~ param_name ~ ':',
+                        'exact ' ~ param_name ~ ':',
+                        'Exact ' ~ param_name ~ ':',
+                        'on exactly this ' ~ param_name ~ ':',
+                        'On exactly this ' ~ param_name ~ ':',
+                        'exactly this ' ~ param_name ~ ':',
+                        'Exactly this ' ~ param_name ~ ':',
+                        'on this exact text:',
+                        'On this exact text:',
+                        'this exact text:',
+                        'This exact text:',
+                        'exact text:',
+                        'Exact text:',
+                        'on exactly this text:',
+                        'On exactly this text:',
+                        'exactly this text:',
+                        'Exactly this text:',
+                        'use ' ~ required_tool_name ~ ' on this exact text:',
+                        'Use ' ~ required_tool_name ~ ' on this exact text:',
+                        'use the ' ~ required_tool_name ~ ' tool on this exact text:',
+                        'Use the ' ~ required_tool_name ~ ' tool on this exact text:',
+                        'now use ' ~ required_tool_name ~ ' on this exact text:',
+                        'Now use ' ~ required_tool_name ~ ' on this exact text:',
+                        'now use the ' ~ required_tool_name ~ ' tool on this exact text:',
+                        'Now use the ' ~ required_tool_name ~ ' tool on this exact text:'
+                    ] -%}
+                    {%- for marker in exact_markers -%}
+                        {%- if not exact.value and latest_user_text is string and marker in latest_user_text -%}
+                            {%- set exact.value = latest_user_text.split(marker)[1] | trim -%}
+                        {%- endif -%}
+                    {%- endfor -%}
+                    {%- if exact.value -%}
+                        {%- set newline_count = (exact.value.split('\n') | length) - 1 -%}
+                        {{- '\nCopy the `' ~ param_name ~ '` value exactly from the current user request. This value contains exactly ' ~ newline_count ~ ' line break(s). Do not add a blank line, leading space, trailing newline, or any other character to the copied value. Do not invent placeholders, summaries, ellipsis, or prior-turn text.' -}}
+                        {{- '\nRespond with exactly this one assistant message and nothing else:\n<tool_call>\n<function=' ~ required_tool_name ~ '>\n<parameter=' ~ param_name ~ '>\n' ~ exact.value ~ '\n</parameter>\n</function>\n</tool_call>' -}}
+                    {%- else -%}
+                        {{- '\nFor string parameters, copy the requested value exactly inside the `<parameter=...>` body, preserving internal newlines and without adding a trailing newline or extra character after the copied value.' -}}
+                    {%- endif -%}
+                {%- endfor -%}
             {%- endif -%}
         {%- endfor -%}
     {%- endif -%}
@@ -1412,7 +1457,7 @@ The current assistant response MUST be a tool call. This applies to the latest u
     {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
         {%- set role_name = 'observation' if (message.role == "system" and not loop.first and message.name == 'observation') else message.role %}
         {{- '<|im_start|>' + role_name + '\n' + content }}
-        {%- if message.role == "user" and required_tool_choice and loop.index0 == ns.last_query_index -%}{{- '\n\n' -}}{{- render_required_tool_choice_instruction() -}}{%- endif -%}
+        {%- if message.role == "user" and required_tool_choice and loop.index0 == ns.last_query_index -%}{{- '\n\n' -}}{{- render_required_tool_choice_instruction(content) -}}{%- endif -%}
         {{- '<|im_end|>' + '\n' }}
     {%- elif message.role == "assistant" %}
         {%- if message.reasoning_content is string %}{%- set reasoning_content = message.reasoning_content %}

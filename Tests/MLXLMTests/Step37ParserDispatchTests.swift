@@ -145,7 +145,7 @@ struct Step37ParserDispatchTests {
         let rendered = try template.renderStep37([
             "bos_token": "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>",
             "messages": [
-                ["role": "user", "content": "Use line_count on red\ngreen\nblue."],
+                ["role": "user", "content": "Use line_count on this exact text: red\ngreen\nblue"],
             ],
             "tools": [
                 [
@@ -170,6 +170,18 @@ struct Step37ParserDispatchTests {
         ])
         #expect(rendered.contains("The active API tool_choice is required"))
         #expect(rendered.contains("Use the `line_count` function."))
+        #expect(rendered.contains("Respond with exactly this one assistant message and nothing else:"))
+        #expect(rendered.contains("""
+<tool_call>
+<function=line_count>
+<parameter=text>
+red
+green
+blue
+</parameter>
+</function>
+</tool_call>
+"""))
         #expect(rendered.contains("<tool_call>\n<function=FUNCTION_NAME>"))
         #expect(rendered.contains("<function=example_function_name>"))
         #expect(rendered.contains("<parameter=ARGUMENT_NAME>"))
@@ -179,6 +191,80 @@ struct Step37ParserDispatchTests {
         )
         #expect(!rendered.contains("enable_thinking"))
         #expect(!rendered.contains("tool_choice_name"))
+    }
+
+    @Test("Step fallback repeats exact required tool value after history")
+    func stepFallbackRepeatsExactRequiredToolValueAfterHistory() throws {
+        let template = try Template(ChatTemplateFallbacks.step37Minimal)
+        let rendered = try template.renderStep37([
+            "bos_token": "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>",
+            "messages": [
+                ["role": "user", "content": "Use the line_count tool on this exact text: red\ngreen\nblue"],
+                [
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        [
+                            "id": "call_lines",
+                            "type": "function",
+                            "function": [
+                                "name": "line_count",
+                                "arguments": ["text": "red\ngreen\nblue"],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                    ],
+                ] as [String: any Sendable],
+                ["role": "tool", "tool_call_id": "call_lines", "content": #"{"lines":3}"#],
+                ["role": "user", "content": "How many lines were counted? Answer plainly in one short sentence. Do not call another tool."],
+                ["role": "assistant", "content": "\nThere were 3 lines counted."],
+                ["role": "user", "content": "Now use line_count on this exact text: one\ntwo"],
+            ],
+            "tools": [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "line_count",
+                        "description": "Count lines.",
+                        "parameters": [
+                            "type": "object",
+                            "properties": [
+                                "text": ["type": "string", "description": "Input text"] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                            "required": ["text"],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ],
+            "tool_choice": "required",
+            "tool_choice_name": "line_count",
+            "enable_thinking": false,
+            "add_generation_prompt": true,
+        ])
+
+        let finalUser = "Now use line_count on this exact text: one\ntwo"
+        let finalUserRange = rendered.range(of: finalUser)
+        #expect(finalUserRange != nil)
+        let afterFinalUser = rendered[finalUserRange!.upperBound...]
+        let beforeFinalUser = rendered[..<finalUserRange!.lowerBound]
+        #expect(!beforeFinalUser.contains("Respond with exactly this one assistant message and nothing else:"))
+        #expect(afterFinalUser.contains("The active API tool_choice is required"))
+        #expect(afterFinalUser.contains("Copy the `text` value exactly from the current user request."))
+        #expect(afterFinalUser.contains("This value contains exactly 1 line break(s)."))
+        #expect(afterFinalUser.contains("Do not add a blank line, leading space, trailing newline, or any other character"))
+        #expect(afterFinalUser.contains("""
+<tool_call>
+<function=line_count>
+<parameter=text>
+one
+two
+</parameter>
+</function>
+</tool_call>
+"""))
+        #expect(!afterFinalUser.contains("red\ngreen\nblue"))
+        #expect(!afterFinalUser.contains(#"{"lines":3}"#))
+        #expect(!afterFinalUser.contains("There were 3 lines counted."))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n<think>\n</think>\n\n"))
     }
 
     @Test("Step3p7 wrapper config decodes the Step3p5 text runtime shape")
