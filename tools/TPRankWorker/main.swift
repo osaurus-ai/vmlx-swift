@@ -66,6 +66,7 @@ struct TPRankWorker {
             ?? "/tmp/vmlx-tp-cache/\(sanitizedCacheComponent(modelPath))/rank\(rank)"
         let temperature = Float(env["TP_TEMPERATURE"] ?? "0") ?? 0
         let prefillStepSize = Int(env["TP_PREFILL_STEP_SIZE"] ?? "512") ?? 512
+        let preShardLoad = env["TP_PRESHARD_LOAD"] == "1"
 
         log("rank=\(rank) world_size=\(worldSize) backend=\(backend) strict=\(strict)")
         log("model_path=\(modelPath)")
@@ -77,6 +78,7 @@ struct TPRankWorker {
         log("kv_mode=\(describe(kvMode))")
         log("cache_coordinator=\(enableCacheCoordinator) l2_disk=\(enableDiskCache) cache_dir=\(cacheDir)")
         log("temperature=\(temperature) prefill_step_size=\(prefillStepSize)")
+        log("pre_shard_load=\(preShardLoad)")
         log("smoke=\(smokeMode)")
 
         if smokeMode {
@@ -120,9 +122,20 @@ struct TPRankWorker {
         let modelDir = URL(fileURLWithPath: modelPath)
         log("loading model from \(modelDir.path)")
         let context: ModelContext
+        var shardingAlreadyApplied = false
         do {
-            context = try await loadModel(
-                from: modelDir, using: #huggingFaceTokenizerLoader())
+            if preShardLoad {
+                let loaded = try await loadPreShardedMiMoModel(
+                    from: modelDir,
+                    group: group,
+                    tokenizerLoader: #huggingFaceTokenizerLoader())
+                context = loaded.context
+                shardingAlreadyApplied = loaded.replacedCount > 0
+                log("pre-shard load replaced \(loaded.replacedCount) Linears before loadWeights")
+            } else {
+                context = try await loadModel(
+                    from: modelDir, using: #huggingFaceTokenizerLoader())
+            }
         } catch {
             err("loadModel failed: \(error)")
             exit(3)
@@ -130,7 +143,7 @@ struct TPRankWorker {
         log("model loaded: \(type(of: context.model))")
 
         // 3. Apply sharding plan iff multi-rank.
-        if group.isMultiRank {
+        if group.isMultiRank && !shardingAlreadyApplied {
             let (planName, plan) = selectShardingPlan(for: context.model, requested: requestedPlan)
             log("applying ShardingPlan.\(planName) (world_size=\(group.size))")
             let replaced = plan.apply(to: context.model, group: group)
@@ -145,6 +158,8 @@ struct TPRankWorker {
                 }
             }
             MLX.eval(context.model)
+        } else if group.isMultiRank {
+            log("sharding plan already applied before loadWeights")
         } else {
             log("world_size=1 — sharding plan is a no-op (baseline mode)")
         }
@@ -310,6 +325,41 @@ struct TPRankWorker {
         log("wrote \(expectedBytes) bytes (\(count) Float32) to \(outputPath)")
         log("DONE rank=\(rank) — exiting 0")
     }
+}
+
+private func loadPreShardedMiMoModel(
+    from modelDir: URL,
+    group: Group,
+    tokenizerLoader: any TokenizerLoader
+) async throws -> (context: ModelContext, replacedCount: Int) {
+    let configURL = modelDir.appendingPathComponent("config.json")
+    let configData = try Data(contentsOf: configURL)
+    let config = try JSONDecoder.json5().decode(MiMoV2FlashConfiguration.self, from: configData)
+    let model = MiMoV2FlashModel(config)
+
+    var replacedCount = 0
+    if group.isMultiRank {
+        let replaced = ShardingPlan.mimoV2.apply(to: model, group: group)
+        replacedCount = replaced.count
+        if replaced.isEmpty {
+            throw NSError(
+                domain: "TPRankWorker",
+                code: 1001,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "TP_PRESHARD_LOAD=1 but ShardingPlan.mimoV2 replaced zero modules"
+                ])
+        }
+    }
+
+    try loadWeights(modelDirectory: modelDir, model: model)
+    let tokenizer = try await tokenizerLoader.load(from: modelDir)
+    let context = ModelContext(
+        configuration: ModelConfiguration(id: "tp-pre-sharded-mimo-v2"),
+        model: model,
+        processor: StandInUserInputProcessor(),
+        tokenizer: tokenizer)
+    return (context, replacedCount)
 }
 
 private struct RankZeroTokenSampler: LogitSampler {
