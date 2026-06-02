@@ -460,6 +460,7 @@ final class MiMoV2VisionAttention: Module {
 
     @ModuleInfo(key: "qkv") var qkv: Linear
     @ModuleInfo(key: "proj") var proj: Linear
+    @ParameterInfo(key: "sinks") var sinks: MLXArray?
 
     init(_ config: MiMoV2VisionConfiguration) {
         self.numHeads = config.numHeads
@@ -472,6 +473,7 @@ final class MiMoV2VisionAttention: Module {
 
         _qkv.wrappedValue = Linear(config.hiddenSize, qRows + kRows + vRows, bias: true)
         _proj.wrappedValue = Linear(numHeads * headDim, config.hiddenSize, bias: true)
+        _sinks.wrappedValue = nil
     }
 
     func callAsFunction(_ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode = .none)
@@ -498,7 +500,8 @@ final class MiMoV2VisionAttention: Module {
                 keys: k,
                 values: v,
                 scale: scale,
-                mask: mask
+                mask: mask,
+                sinks: sinks
             )
             .transposed(0, 2, 1, 3)
             .reshaped(sequenceLength, -1)

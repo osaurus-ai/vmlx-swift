@@ -198,6 +198,7 @@ struct MiMoV2FlashCacheTopologyTests {
         #expect(parameters["visual.patch_embed.proj.weight"]?.shape == [16, 2, 4, 4, 3])
         #expect(parameters["visual.blocks.0.attn.qkv.weight"]?.shape == [64, 16])
         #expect(parameters["visual.blocks.0.attn.proj.weight"]?.shape == [16, 32])
+        #expect(parameters["visual.blocks.0.attn.sinks"] == nil)
         #expect(parameters["visual.blocks.0.mlp.gate_proj.weight"]?.shape == [32, 16])
         #expect(parameters["visual.merger.ln_q.weight"]?.shape == [16])
         #expect(parameters["visual.merger.mlp.0.weight"]?.shape == [64, 64])
@@ -225,6 +226,7 @@ struct MiMoV2FlashCacheTopologyTests {
             "visual.patch_embed.proj.weight": sourcePatch,
             "visual.blocks.0.attn.qkv.weight": MLXArray.ones([64, 16]),
             "visual.blocks.0.attn.proj.weight": MLXArray.ones([16, 32]),
+            "visual.blocks.0.attn.sinks": MLXArray.zeros([4]),
             "audio_encoder.input_local_transformer.layers.0.self_attn.q_proj.weight":
                 MLXArray.ones([16, 16]),
             "speech_embeddings.0.weight": MLXArray.ones([1280, 16]),
@@ -234,6 +236,7 @@ struct MiMoV2FlashCacheTopologyTests {
         #expect(sanitized["visual.patch_embed.proj.weight"]?.shape == [16, 2, 4, 4, 3])
         #expect(sanitized["visual.blocks.0.attn.qkv.weight"]?.shape == [64, 16])
         #expect(sanitized["visual.blocks.0.attn.proj.weight"]?.shape == [16, 32])
+        #expect(sanitized["visual.blocks.0.attn.sinks"]?.shape == [4])
         #expect(sanitized["audio_encoder.input_local_transformer.layers.0.self_attn.q_proj.weight"]?.shape == [16, 16])
         #expect(sanitized["speech_embeddings.0.weight"]?.shape == [1280, 16])
         #expect(sanitized["model.mtp.0.embed_tokens.weight"] == nil)
