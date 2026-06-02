@@ -56,6 +56,9 @@ struct MiMoTPPlanProbe {
         let replaced = ShardingPlan.mimoV2.apply(to: model, group: group)
         print("MiMoTPPlanProbe replaced=\(replaced.count)")
 
+        try require(
+            !replaced.contains { $0.hasPrefix("audio_encoder.") || $0.hasPrefix("vision_model.") },
+            "MiMo TP plan must not shard non-text audio/vision modules")
         try require(replaced.contains("model.layers.0.self_attn.q_proj"), "missing full q_proj rewrite")
         try require(replaced.contains("model.layers.0.self_attn.o_proj"), "missing full o_proj rewrite")
         try require(
