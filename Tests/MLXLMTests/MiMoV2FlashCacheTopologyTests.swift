@@ -198,7 +198,7 @@ struct MiMoV2FlashCacheTopologyTests {
         #expect(parameters["visual.patch_embed.proj.weight"]?.shape == [16, 2, 4, 4, 3])
         #expect(parameters["visual.blocks.0.attn.qkv.weight"]?.shape == [64, 16])
         #expect(parameters["visual.blocks.0.attn.proj.weight"]?.shape == [16, 32])
-        #expect(parameters["visual.blocks.0.attn.sinks"] == nil)
+        #expect(parameters["visual.blocks.0.attn.sinks"]?.shape == [4])
         #expect(parameters["visual.blocks.0.mlp.gate_proj.weight"]?.shape == [32, 16])
         #expect(parameters["visual.merger.ln_q.weight"]?.shape == [16])
         #expect(parameters["visual.merger.mlp.0.weight"]?.shape == [64, 64])

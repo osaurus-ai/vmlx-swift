@@ -457,12 +457,13 @@ final class MiMoV2VisionAttention: Module {
     let kRows: Int
     let vRows: Int
     let scale: Float
+    let usesSinks: Bool
 
     @ModuleInfo(key: "qkv") var qkv: Linear
     @ModuleInfo(key: "proj") var proj: Linear
-    @ParameterInfo(key: "sinks") var sinks: MLXArray?
+    @ParameterInfo(key: "sinks") var sinks: MLXArray
 
-    init(_ config: MiMoV2VisionConfiguration) {
+    init(_ config: MiMoV2VisionConfiguration, usesSinks: Bool) {
         self.numHeads = config.numHeads
         self.numKeyValueHeads = config.numKeyValueHeads
         self.headDim = config.headDim
@@ -470,10 +471,11 @@ final class MiMoV2VisionAttention: Module {
         self.kRows = config.numKeyValueHeads * headDim
         self.vRows = config.numKeyValueHeads * headDim
         self.scale = pow(Float(headDim), -0.5)
+        self.usesSinks = usesSinks
 
         _qkv.wrappedValue = Linear(config.hiddenSize, qRows + kRows + vRows, bias: true)
         _proj.wrappedValue = Linear(numHeads * headDim, config.hiddenSize, bias: true)
-        _sinks.wrappedValue = nil
+        _sinks.wrappedValue = MLXArray.zeros([numHeads])
     }
 
     func callAsFunction(_ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode = .none)
@@ -501,11 +503,24 @@ final class MiMoV2VisionAttention: Module {
                 values: v,
                 scale: scale,
                 mask: mask,
-                sinks: sinks
+                sinks: usesSinks ? sinks : nil
             )
             .transposed(0, 2, 1, 3)
             .reshaped(sequenceLength, -1)
         )
+    }
+
+    override func updateMissing(
+        parameter: String,
+        verify: VerifyUpdate,
+        path: [String],
+        modulePath: [String]
+    ) throws {
+        if parameter == "sinks", !usesSinks {
+            return
+        }
+        try super.updateMissing(
+            parameter: parameter, verify: verify, path: path, modulePath: modulePath)
     }
 }
 
@@ -515,9 +530,10 @@ final class MiMoV2VisionBlock: Module, UnaryLayer {
     @ModuleInfo(key: "norm2") var norm2: RMSNorm
     @ModuleInfo(key: "mlp") var mlp: MiMoV2FlashMLP
 
-    init(_ config: MiMoV2VisionConfiguration) {
+    init(_ config: MiMoV2VisionConfiguration, layerIndex: Int) {
+        let usesSinks = config.useSink && !config.fullAttentionBlockIndexes.contains(layerIndex)
         _norm1.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.layernormEpsilon)
-        _attn.wrappedValue = MiMoV2VisionAttention(config)
+        _attn.wrappedValue = MiMoV2VisionAttention(config, usesSinks: usesSinks)
         _norm2.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.layernormEpsilon)
         _mlp.wrappedValue = MiMoV2FlashMLP(
             hiddenSize: config.hiddenSize,
@@ -562,7 +578,9 @@ final class MiMoV2VisionModel: Module, UnaryLayer {
 
     init(_ config: MiMoV2VisionConfiguration) {
         _patchEmbed.wrappedValue = MiMoV2VisionPatchEmbed(config)
-        _blocks.wrappedValue = (0 ..< config.depth).map { _ in MiMoV2VisionBlock(config) }
+        _blocks.wrappedValue = (0 ..< config.depth).map { index in
+            MiMoV2VisionBlock(config, layerIndex: index)
+        }
         _merger.wrappedValue = MiMoV2VisionMerger(config)
         self.fullAttentionBlockIndexes = Set(config.fullAttentionBlockIndexes)
         self.windowAttentionTypes = config.windowAttentionTypes
