@@ -830,19 +830,85 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         func dequant(weight: MLXArray, scaleInv: MLXArray) -> MLXArray {
-            let dtype = weight.dtype
             let bs = 128
             let (m, n) = (weight.shape[0], weight.shape[1])
             let padBottom = bs * scaleInv.dim(0) - m
             let padSide = bs * scaleInv.dim(1) - n
 
             var paddedWeight = padded(
-                weight, widths: [.init((0, padBottom)), .init((0, padSide))])
+                weight.asType(.float32), widths: [.init((0, padBottom)), .init((0, padSide))])
             paddedWeight = paddedWeight.reshaped(
                 [(m + padBottom) / bs, bs, (n + padSide) / bs, bs])
-            let scaled = paddedWeight * scaleInv[0..., .newAxis, 0..., .newAxis]
+            let scaled =
+                paddedWeight * scaleInv.asType(.float32)[0..., .newAxis, 0..., .newAxis]
             return scaled.reshaped([m + padBottom, n + padSide])[0 ..< m, 0 ..< n]
-                .asType(dtype)
+                .asType(.bfloat16)
+        }
+
+        func sourceQKVLayout(
+            key: String, weight: MLXArray, scaleInv: MLXArray
+        ) -> (tp: Int, qPer: Int, kPer: Int, vPer: Int, rankRows: Int, rankScaleRows: Int)? {
+            let prefix = "model.layers."
+            let suffix = ".self_attn.qkv_proj.weight"
+            guard key.hasPrefix(prefix), key.hasSuffix(suffix) else { return nil }
+            let remainder = key.dropFirst(prefix.count)
+            guard let dot = remainder.firstIndex(of: "."),
+                let layer = Int(remainder[..<dot])
+            else { return nil }
+
+            let isSliding = configuration.hybridLayerPattern[layer] == 1
+            let qRows =
+                (isSliding ? configuration.swaAttentionHeads : configuration.attentionHeads)
+                * (isSliding ? configuration.swaHeadDim : configuration.headDim)
+            let kRows =
+                (isSliding ? configuration.swaKvHeads : configuration.kvHeads)
+                * (isSliding ? configuration.swaHeadDim : configuration.headDim)
+            let vRows =
+                (isSliding ? configuration.swaKvHeads : configuration.kvHeads)
+                * (isSliding ? configuration.swaVHeadDim : configuration.vHeadDim)
+            guard qRows + kRows + vRows == weight.shape[0] else { return nil }
+
+            let tp = 4
+            guard qRows % tp == 0, kRows % tp == 0, vRows % tp == 0 else { return nil }
+            let qPer = qRows / tp
+            let kPer = kRows / tp
+            let vPer = vRows / tp
+            let rankRows = qPer + kPer + vPer
+            let rankScaleRows = (rankRows + 127) / 128
+            guard rankRows * tp == weight.shape[0],
+                rankScaleRows * tp == scaleInv.shape[0]
+            else {
+                return nil
+            }
+            return (tp, qPer, kPer, vPer, rankRows, rankScaleRows)
+        }
+
+        func dequantInterleavedSourceQKV(
+            key: String, weight: MLXArray, scaleInv: MLXArray
+        ) -> MLXArray? {
+            guard let layout = sourceQKVLayout(key: key, weight: weight, scaleInv: scaleInv)
+            else {
+                return nil
+            }
+
+            var qParts: [MLXArray] = []
+            var kParts: [MLXArray] = []
+            var vParts: [MLXArray] = []
+            for rank in 0 ..< layout.tp {
+                let wStart = rank * layout.rankRows
+                let sStart = rank * layout.rankScaleRows
+                let rankWeight = weight[wStart ..< (wStart + layout.rankRows), 0...]
+                let rankScale = scaleInv[sStart ..< (sStart + layout.rankScaleRows), 0...]
+                let rankOut = dequant(weight: rankWeight, scaleInv: rankScale)
+                let qkv = split(
+                    rankOut,
+                    indices: [layout.qPer, layout.qPer + layout.kPer],
+                    axis: 0)
+                qParts.append(qkv[0])
+                kParts.append(qkv[1])
+                vParts.append(qkv[2])
+            }
+            return concatenated(qParts + kParts + vParts, axis: 0)
         }
 
         var newWeights: [String: MLXArray] = [:]
@@ -850,7 +916,9 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
             if key.contains("weight_scale_inv") {
                 let weightKey = key.replacingOccurrences(of: "_scale_inv", with: "")
                 if let weight = weights[weightKey] {
-                    newWeights[weightKey] = dequant(weight: weight, scaleInv: value)
+                    newWeights[weightKey] =
+                        dequantInterleavedSourceQKV(key: weightKey, weight: weight, scaleInv: value)
+                        ?? dequant(weight: weight, scaleInv: value)
                 }
             } else if newWeights[key] == nil {
                 newWeights[key] = value

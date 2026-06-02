@@ -187,6 +187,46 @@ struct MiMoV2FlashCacheTopologyTests {
         #expect(sanitized["model.layers.1.self_attn.v_proj.scales"]?.shape == [32, 1])
     }
 
+    @Test("sanitize deinterleaves MiMo source TP4 qkv before q/k/v split")
+    func sanitizeDeinterleavesSourceTP4QKVBeforeSplit() throws {
+        let config = try JSONDecoder.json5().decode(
+            MiMoV2FlashConfiguration.self,
+            from: Data(Self.minimalMiMoV25Config.utf8))
+        let model = MiMoV2FlashModel(config)
+
+        var rows: [Float] = []
+        for rank in 0 ..< 4 {
+            let base = Float((rank + 1) * 100)
+            rows += (0 ..< 8).map { base + Float($0) }
+            rows += (0 ..< 4).map { base + 20 + Float($0) }
+            rows += (0 ..< 4).map { base + 40 + Float($0) }
+        }
+
+        let sanitized = model.sanitize(weights: [
+            "model.layers.0.self_attn.qkv_proj.weight": MLXArray(rows).reshaped([64, 1]),
+            "model.layers.0.self_attn.qkv_proj.weight_scale_inv":
+                MLXArray([Float(1), Float(10), Float(100), Float(1000)]).reshaped([4, 1]),
+        ])
+
+        let q = try #require(sanitized["model.layers.0.self_attn.q_proj.weight"])
+        let k = try #require(sanitized["model.layers.0.self_attn.k_proj.weight"])
+        let v = try #require(sanitized["model.layers.0.self_attn.v_proj.weight"])
+
+        #expect(q.shape == [32, 1])
+        #expect(k.shape == [16, 1])
+        #expect(v.shape == [16, 1])
+
+        let qValues = q.asType(.float32).asArray(Float.self)
+        let kValues = k.asType(.float32).asArray(Float.self)
+        let vValues = v.asType(.float32).asArray(Float.self)
+        #expect(Array(qValues.prefix(8)) == (0 ..< 8).map { Float(100 + $0) })
+        #expect(Array(qValues[8 ..< 16]) == (0 ..< 8).map { Float(200 + $0) * 10 })
+        #expect(Array(kValues.prefix(4)) == (0 ..< 4).map { Float(120 + $0) })
+        #expect(Array(kValues[4 ..< 8]) == (0 ..< 4).map { Float(220 + $0) * 10 })
+        #expect(Array(vValues.prefix(4)) == (0 ..< 4).map { Float(140 + $0) })
+        #expect(Array(vValues[4 ..< 8]) == (0 ..< 4).map { Float(240 + $0) * 10 })
+    }
+
     @Test("MiMo V2.5 registers shipped visual, audio, and speech weight namespaces")
     func registersMultimodalWeightNamespaces() throws {
         let config = try JSONDecoder.json5().decode(
