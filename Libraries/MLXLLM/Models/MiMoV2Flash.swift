@@ -29,8 +29,16 @@ private enum MiMoV2FlashTrace {
         enabled("VMLINUX_MIMO_LAYER_EVAL") || enabled("TP_MIMO_LAYER_EVAL")
     }
 
+    static var eagerLayerEval: Bool {
+        enabled("VMLINUX_MIMO_EAGER_LAYERS") || enabled("TP_MIMO_EAGER_LAYERS")
+    }
+
+    static var clearCacheAfterLayerEval: Bool {
+        enabled("VMLINUX_MIMO_LAYER_CLEAR_CACHE") || enabled("TP_MIMO_LAYER_CLEAR_CACHE")
+    }
+
     static func event(_ message: @autoclosure () -> String) {
-        guard layerTraceEnabled || forceLayerEval else { return }
+        guard layerTraceEnabled || forceLayerEval || eagerLayerEval else { return }
         let elapsed = ProcessInfo.processInfo.systemUptime
         let rank = ProcessInfo.processInfo.environment["MLX_RANK"] ?? "?"
         let line = String(
@@ -40,12 +48,16 @@ private enum MiMoV2FlashTrace {
     }
 
     static func eval(_ value: MLXArray, name: String) {
-        guard forceLayerEval else { return }
+        guard forceLayerEval || eagerLayerEval else { return }
         event("\(name) eval begin shape=\(value.shape)")
         let start = ProcessInfo.processInfo.systemUptime
         MLX.eval(value)
         let ms = (ProcessInfo.processInfo.systemUptime - start) * 1000
         event(String(format: "\(name) eval end %.1fms", ms))
+        if clearCacheAfterLayerEval {
+            Memory.clearCache()
+            event("\(name) cache clear")
+        }
     }
 }
 
