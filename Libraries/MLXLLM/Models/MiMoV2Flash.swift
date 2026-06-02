@@ -11,6 +11,44 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+private enum MiMoV2FlashTrace {
+    private static func enabled(_ key: String) -> Bool {
+        switch ProcessInfo.processInfo.environment[key]?.lowercased() {
+        case "1", "true", "yes", "on":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static var layerTraceEnabled: Bool {
+        enabled("VMLINUX_MIMO_LAYER_TRACE") || enabled("TP_MIMO_LAYER_TRACE")
+    }
+
+    static var forceLayerEval: Bool {
+        enabled("VMLINUX_MIMO_LAYER_EVAL") || enabled("TP_MIMO_LAYER_EVAL")
+    }
+
+    static func event(_ message: @autoclosure () -> String) {
+        guard layerTraceEnabled || forceLayerEval else { return }
+        let elapsed = ProcessInfo.processInfo.systemUptime
+        let rank = ProcessInfo.processInfo.environment["MLX_RANK"] ?? "?"
+        let line = String(
+            format: "[MiMoV2FlashTrace rank=%@ t=%.3f] %@\n",
+            rank, elapsed, message())
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
+    static func eval(_ value: MLXArray, name: String) {
+        guard forceLayerEval else { return }
+        event("\(name) eval begin shape=\(value.shape)")
+        let start = ProcessInfo.processInfo.systemUptime
+        MLX.eval(value)
+        let ms = (ProcessInfo.processInfo.systemUptime - start) * 1000
+        event(String(format: "\(name) eval end %.1fms", ms))
+    }
+}
+
 private func attentionWithCacheUpdateAndSinks(
     queries: MLXArray,
     keys: MLXArray,
@@ -341,12 +379,16 @@ class MiMoV2FlashMoE: Module, UnaryLayer {
 class MiMoV2FlashDecoderLayer: Module {
     @ModuleInfo(key: "self_attn") var selfAttn: MiMoV2FlashAttention
     @ModuleInfo(key: "mlp") var mlp: Module & UnaryLayer
+    let layerIdx: Int
+    let isMoe: Bool
     let isSlidingWindow: Bool
 
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
     init(_ config: MiMoV2FlashConfiguration, layerIdx: Int, isMoe: Bool, isSlidingWindow: Bool) {
+        self.layerIdx = layerIdx
+        self.isMoe = isMoe
         self.isSlidingWindow = isSlidingWindow
         _selfAttn.wrappedValue = MiMoV2FlashAttention(config, isSlidingWindow: isSlidingWindow)
         _mlp.wrappedValue = isMoe
@@ -361,8 +403,16 @@ class MiMoV2FlashDecoderLayer: Module {
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
+        MiMoV2FlashTrace.event(
+            "layer \(layerIdx) begin shape=\(x.shape) kind=\(isMoe ? "moe" : "mlp") window=\(isSlidingWindow ? "swa" : "full")")
         let residual = x + selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        return residual + mlp(postAttentionLayerNorm(residual))
+        MiMoV2FlashTrace.event("layer \(layerIdx) attention graph shape=\(residual.shape)")
+        MiMoV2FlashTrace.eval(residual, name: "layer \(layerIdx) attention")
+        let output = residual + mlp(postAttentionLayerNorm(residual))
+        MiMoV2FlashTrace.event("layer \(layerIdx) mlp graph shape=\(output.shape)")
+        MiMoV2FlashTrace.eval(output, name: "layer \(layerIdx) mlp")
+        MiMoV2FlashTrace.event("layer \(layerIdx) end")
+        return output
     }
 }
 
@@ -397,7 +447,10 @@ public class MiMoV2FlashModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        MiMoV2FlashTrace.event("model inner begin inputs=\(inputs.shape)")
         var h = embedTokens(inputs)
+        MiMoV2FlashTrace.event("embed graph shape=\(h.shape)")
+        MiMoV2FlashTrace.eval(h, name: "embed")
 
         let fullMask = createAttentionMask(h: h, cache: cache?[gaIdx])
         let swaMask = createAttentionMask(
@@ -405,10 +458,15 @@ public class MiMoV2FlashModelInner: Module {
 
         for (i, layer) in layers.enumerated() {
             let mask = hybridLayerPattern[i] == 1 ? swaMask : fullMask
+            MiMoV2FlashTrace.event("model layer \(i) dispatch")
             h = layer(h, mask: mask, cache: cache?[i])
         }
 
-        return norm(h)
+        let output = norm(h)
+        MiMoV2FlashTrace.event("norm graph shape=\(output.shape)")
+        MiMoV2FlashTrace.eval(output, name: "norm")
+        MiMoV2FlashTrace.event("model inner end")
+        return output
     }
 }
 
