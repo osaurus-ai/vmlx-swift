@@ -320,6 +320,7 @@ let package = Package(
         .executable(name: "ANEProbe", targets: ["ANEProbe"]),
         .executable(name: "OmniAudioLatencyBench", targets: ["OmniAudioLatencyBench"]),
         .executable(name: "OmniAudioChunkStabilityBench", targets: ["OmniAudioChunkStabilityBench"]),
+        .executable(name: "MiMoTPPlanProbe", targets: ["MiMoTPPlanProbe"]),
         .executable(name: "mlxpress", targets: ["MLXPressCLI"]),
         .executable(name: "mlxpress-selfcheck", targets: ["MLXPressSelfCheck"]),
     ],
@@ -544,6 +545,7 @@ let package = Package(
                 "CmlxDistributedShim",
                 "MLX",
                 "MLXNN",
+                "MLXLMCommon",
             ],
             path: "Libraries/MLXDistributedTP",
             exclude: ["README.md"]
@@ -687,6 +689,17 @@ let package = Package(
             ],
             path: "RunBench",
             exclude: ["coherency-matrix.sh", "test_slice.swift.bak"]
+        ),
+        .executableTarget(
+            name: "MiMoTPPlanProbe",
+            dependencies: [
+                "MLX",
+                "MLXNN",
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXDistributedTP",
+            ],
+            path: "tools/MiMoTPPlanProbe"
         ),
 
         .testTarget(

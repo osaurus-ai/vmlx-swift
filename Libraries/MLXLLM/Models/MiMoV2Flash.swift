@@ -165,12 +165,29 @@ class MiMoV2FlashAttention: Module {
         let keys = wk(x)
         let values = wv(x) * MLXArray(args.attentionValueScale ?? 1.0, dtype: x.dtype)
 
-        var q = queries.reshaped(B, L, numAttentionHeads, -1).transposed(0, 2, 1, 3)
-        var k = keys.reshaped(B, L, numKeyValueHeads, -1).transposed(0, 2, 1, 3)
-        let v = values.reshaped(B, L, numKeyValueHeads, -1).transposed(0, 2, 1, 3)
+        let localAttentionHeads = queries.dim(-1) / headDim
+        let localKeyValueHeads = keys.dim(-1) / headDim
+        let localValueHeads = values.dim(-1) / vHeadDim
+        precondition(
+            localKeyValueHeads == localValueHeads,
+            "MiMoV2FlashAttention TP head mismatch: k heads \(localKeyValueHeads), v heads \(localValueHeads)")
+
+        var q = queries.reshaped(B, L, localAttentionHeads, -1).transposed(0, 2, 1, 3)
+        var k = keys.reshaped(B, L, localKeyValueHeads, -1).transposed(0, 2, 1, 3)
+        let v = values.reshaped(B, L, localValueHeads, -1).transposed(0, 2, 1, 3)
 
         q = applyRotaryPosition(rope, to: q, cache: cache)
         k = applyRotaryPosition(rope, to: k, cache: cache)
+
+        let sinks: MLXArray?
+        if hasSinks {
+            precondition(
+                attentionSinkBias.dim(0) == localAttentionHeads,
+                "MiMoV2FlashAttention TP sink mismatch: sink dim \(attentionSinkBias.dim(0)), q heads \(localAttentionHeads)")
+            sinks = attentionSinkBias
+        } else {
+            sinks = nil
+        }
 
         let output = attentionWithCacheUpdateAndSinks(
             queries: q,
@@ -179,7 +196,7 @@ class MiMoV2FlashAttention: Module {
             cache: cache,
             scale: scale,
             mask: mask,
-            sinks: hasSinks ? attentionSinkBias : nil
+            sinks: sinks
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
@@ -314,7 +331,7 @@ class MiMoV2FlashMoE: Module, UnaryLayer {
 
 class MiMoV2FlashDecoderLayer: Module {
     @ModuleInfo(key: "self_attn") var selfAttn: MiMoV2FlashAttention
-    let mlp: UnaryLayer
+    @ModuleInfo(key: "mlp") var mlp: Module & UnaryLayer
     let isSlidingWindow: Bool
 
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
@@ -323,7 +340,9 @@ class MiMoV2FlashDecoderLayer: Module {
     init(_ config: MiMoV2FlashConfiguration, layerIdx: Int, isMoe: Bool, isSlidingWindow: Bool) {
         self.isSlidingWindow = isSlidingWindow
         _selfAttn.wrappedValue = MiMoV2FlashAttention(config, isSlidingWindow: isSlidingWindow)
-        self.mlp = isMoe ? MiMoV2FlashMoE(config, layerIdx: layerIdx) : MiMoV2FlashMLP(config)
+        _mlp.wrappedValue = isMoe
+            ? MiMoV2FlashMoE(config, layerIdx: layerIdx)
+            : MiMoV2FlashMLP(config)
         _inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.layernormEpsilon)
         _postAttentionLayerNorm.wrappedValue = RMSNorm(

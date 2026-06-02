@@ -172,7 +172,7 @@ extension BatchSlot {
         self.id = request.id
         self.continuation = request.continuation
         self.parameters = request.parameters
-        self.sampler = request.parameters.sampler()
+        self.sampler = request.samplerOverride?.sampler ?? request.parameters.sampler()
         self.processor = request.parameters.processor()
         self.stopTokenIDs = stopTokenIDs
         self.maxTokens = request.parameters.maxTokens

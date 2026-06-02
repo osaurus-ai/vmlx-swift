@@ -320,9 +320,9 @@ public class SwitchGLU: Module {
     }
 }
 
-public class SwitchLinear: Module, Quantizable {
-    @ModuleInfo(key: "weight") var weight: MLXArray
-    @ModuleInfo(key: "bias") var bias: MLXArray?
+open class SwitchLinear: Module, Quantizable {
+    @ModuleInfo(key: "weight") public var weight: MLXArray
+    @ModuleInfo(key: "bias") public var bias: MLXArray?
 
     let inputDims: Int
     let outputDims: Int
@@ -363,7 +363,7 @@ public class SwitchLinear: Module, Quantizable {
         self._bias.wrappedValue = bias
     }
 
-    public func callAsFunction(
+    open func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
         let weightT = self.weight.swappedAxes(-1, -2)

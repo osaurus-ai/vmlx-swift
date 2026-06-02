@@ -15,6 +15,8 @@ import MLX  // pulls Cmlx symbols into the link
 public struct Group: Sendable {
     /// Opaque mlx_distributed_group handle (just a void* ctx wrapper).
     public let handle: MLXDistributedGroupHandle
+    private let rankOverride: Int?
+    private let sizeOverride: Int?
 
     /// Initialise the global distributed group for this process.
     /// - Parameters:
@@ -32,16 +34,31 @@ public struct Group: Sendable {
         } else {
             self.handle = MLXDistributedGroupHandle(_mlx_distributed_init(strict, nil))
         }
+        self.rankOverride = nil
+        self.sizeOverride = nil
     }
 
     /// Number of ranks in this group.
     public var size: Int {
-        Int(_mlx_distributed_group_size(handle.raw))
+        if let sizeOverride { return sizeOverride }
+        return Int(_mlx_distributed_group_size(handle.raw))
     }
 
     /// Local rank within this group.
     public var rank: Int {
-        Int(_mlx_distributed_group_rank(handle.raw))
+        if let rankOverride { return rankOverride }
+        return Int(_mlx_distributed_group_rank(handle.raw))
+    }
+
+    /// Single-process test group for sharding transforms and shape checks.
+    /// Do not use this for collective correctness: there are no peer ranks.
+    public static func singleProcessTest(rank: Int, size: Int) -> Group {
+        precondition(size > 0, "test group size must be positive")
+        precondition(rank >= 0 && rank < size, "test group rank must be in [0, size)")
+        return Group(
+            handle: MLXDistributedGroupHandle(_MLXDistributedGroupRaw()),
+            rankOverride: rank,
+            sizeOverride: size)
     }
 
     /// Returns true if this group has more than one rank — i.e. real
@@ -61,6 +78,14 @@ public struct Group: Sendable {
 
     private init(handle: MLXDistributedGroupHandle) {
         self.handle = handle
+        self.rankOverride = nil
+        self.sizeOverride = nil
+    }
+
+    private init(handle: MLXDistributedGroupHandle, rankOverride: Int, sizeOverride: Int) {
+        self.handle = handle
+        self.rankOverride = rankOverride
+        self.sizeOverride = sizeOverride
     }
 }
 

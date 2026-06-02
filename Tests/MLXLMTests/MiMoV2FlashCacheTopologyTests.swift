@@ -1,7 +1,9 @@
 import Foundation
 import MLX
+import MLXDistributedTP
 import MLXLMCommon
 @testable import MLXLLM
+import MLXNN
 import Testing
 
 @Suite("MiMo V2.5 hybrid full/SWA cache topology")
@@ -238,6 +240,122 @@ struct MiMoV2FlashCacheTopologyTests {
         #expect((restored[1] as? RotatingKVCache)?.offset == tokenCount)
         #expect((restored[2] as? RotatingKVCache)?.offset == tokenCount)
         #expect((restored[3] as? TurboQuantKVCache)?.offset == tokenCount)
+    }
+
+    @Test("CacheCoordinator L2 prefix hit preserves MiMo full/SWA cache topology")
+    func cacheCoordinatorL2PrefixHitPreservesHybridFullSWA() throws {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-mimo-v25-l2-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let config = try JSONDecoder.json5().decode(
+            MiMoV2FlashConfiguration.self,
+            from: Data(Self.minimalMiMoV25Config.utf8))
+        let model = MiMoV2FlashModel(config)
+        let promptTokens = [701, 702, 703, 704, 705, 706]
+        let cache = model.newCache(parameters: GenerateParameters(maxTokens: 8))
+        Self.fill(cache: cache, tokenCount: promptTokens.count)
+
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: true,
+            enableDiskCache: true,
+            pagedBlockSize: 2,
+            maxCacheBlocks: 16,
+            diskCacheMaxGB: 1.0,
+            diskCacheDir: tmp,
+            modelKey: "mimo-v25-hybrid-full-swa"))
+        coordinator.setPagedIncompatible(cacheRequiresDiskBackedCoordinatorRestore(cache))
+        coordinator.storeAfterGeneration(
+            promptTokens: promptTokens,
+            perLayerData: extractLayerData(from: cache),
+            ssmStates: nil,
+            cache: cache)
+
+        #expect(coordinator.isPagedIncompatible)
+        #expect(coordinator.pagedCache?.stats.allocatedBlocks == 0)
+
+        switch coordinator.fetch(tokens: promptTokens + [707, 708]) {
+        case .hit(let matchedTokens, let remainingTokens, let detail, let blocks, _, let diskArrays):
+            #expect(matchedTokens == promptTokens.count)
+            #expect(remainingTokens == [707, 708])
+            #expect(detail == .disk)
+            #expect(blocks.isEmpty)
+            #expect(diskArrays != nil)
+            guard let diskArrays else {
+                Issue.record("MiMo disk-backed L2 hit must include serialized cache arrays")
+                return
+            }
+            #expect(TQDiskSerializer.formatVersion(of: diskArrays) == 2)
+            #expect(Self.layerKind(diskArrays, 0) == TQDiskSerializer.LayerKind.kv.rawValue)
+            #expect(Self.layerKind(diskArrays, 1) == TQDiskSerializer.LayerKind.rotating.rawValue)
+            #expect(Self.layerKind(diskArrays, 2) == TQDiskSerializer.LayerKind.rotating.rawValue)
+            #expect(Self.layerKind(diskArrays, 3) == TQDiskSerializer.LayerKind.kv.rawValue)
+
+            var restored = model.newCache(parameters: GenerateParameters(maxTokens: 8))
+            let restoredTokens = restoreFromDiskArrays(diskArrays, into: &restored)
+            #expect(restoredTokens == promptTokens.count)
+            #expect(restored[0] is KVCacheSimple)
+            #expect(restored[1] is RotatingKVCache)
+            #expect(restored[2] is RotatingKVCache)
+            #expect(restored[3] is KVCacheSimple)
+            #expect(restored[0].state[0].dim(2) == promptTokens.count)
+            #expect((restored[1] as? RotatingKVCache)?.offset == promptTokens.count)
+            #expect((restored[2] as? RotatingKVCache)?.offset == promptTokens.count)
+            #expect(restored[3].state[0].dim(2) == promptTokens.count)
+        case .miss:
+            Issue.record("MiMo hybrid full/SWA coordinator should hit L2 disk for stored prefix")
+        }
+    }
+
+    @Test("MiMo TP plan shards attention, SWA sinks, and SwitchGLU expert projections")
+    func mimoTPPlanShardsAttentionSinksAndSwitchGLU() throws {
+        let config = try JSONDecoder.json5().decode(
+            MiMoV2FlashConfiguration.self,
+            from: Data(Self.minimalMiMoV25Config.utf8))
+        let model = MiMoV2FlashModel(config)
+        let group = Group.singleProcessTest(rank: 2, size: 4)
+
+        let replaced = ShardingPlan.mimoV2.apply(to: model, group: group)
+
+        #expect(replaced.contains("model.layers.0.self_attn.q_proj"))
+        #expect(replaced.contains("model.layers.0.self_attn.o_proj"))
+        #expect(replaced.contains("model.layers.1.mlp.switch_mlp.gate_proj"))
+        #expect(replaced.contains("model.layers.1.mlp.switch_mlp.down_proj"))
+        #expect(replaced.count >= 24)
+
+        let leaves = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
+        let q0 = try #require(leaves["model.layers.0.self_attn.q_proj"] as? AllToShardedLinear)
+        let k0 = try #require(leaves["model.layers.0.self_attn.k_proj"] as? AllToShardedLinear)
+        let v0 = try #require(leaves["model.layers.0.self_attn.v_proj"] as? AllToShardedLinear)
+        let o0 = try #require(leaves["model.layers.0.self_attn.o_proj"] as? ShardedToAllLinear)
+        #expect(q0.weight.shape == [8, 32])
+        #expect(k0.weight.shape == [4, 32])
+        #expect(v0.weight.shape == [4, 32])
+        #expect(o0.weight.shape == [32, 8])
+
+        let q1 = try #require(leaves["model.layers.1.self_attn.q_proj"] as? AllToShardedLinear)
+        let k1 = try #require(leaves["model.layers.1.self_attn.k_proj"] as? AllToShardedLinear)
+        let v1 = try #require(leaves["model.layers.1.self_attn.v_proj"] as? AllToShardedLinear)
+        let o1 = try #require(leaves["model.layers.1.self_attn.o_proj"] as? ShardedToAllLinear)
+        #expect(q1.weight.shape == [8, 32])
+        #expect(k1.weight.shape == [8, 32])
+        #expect(v1.weight.shape == [8, 32])
+        #expect(o1.weight.shape == [32, 8])
+
+        let gate = try #require(leaves["model.layers.1.mlp.switch_mlp.gate_proj"] as? AllToShardedSwitchLinear)
+        let up = try #require(leaves["model.layers.1.mlp.switch_mlp.up_proj"] as? AllToShardedSwitchLinear)
+        let down = try #require(leaves["model.layers.1.mlp.switch_mlp.down_proj"] as? ShardedToAllSwitchLinear)
+        #expect(gate.weight.shape == [4, 4, 32])
+        #expect(up.weight.shape == [4, 4, 32])
+        #expect(down.weight.shape == [4, 32, 4])
+
+        let parameters = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+        #expect(parameters["model.layers.0.self_attn.attention_sink_bias"]?.shape == [2])
+        #expect(parameters["model.layers.1.self_attn.attention_sink_bias"]?.shape == [2])
     }
 
     private static func fill(cache: [any KVCache], tokenCount: Int) {

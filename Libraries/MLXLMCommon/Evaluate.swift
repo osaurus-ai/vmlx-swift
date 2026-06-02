@@ -1163,7 +1163,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     public init(
         input: LMInput, model: any LanguageModel, cache: [KVCache]? = nil,
         parameters: GenerateParameters,
-        cacheCoordinator: CacheCoordinator? = nil
+        cacheCoordinator: CacheCoordinator? = nil,
+        samplerOverride: LogitSampler? = nil
     ) throws {
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
@@ -1188,7 +1189,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         self.processor = effectiveParameters.processor()
-        self.sampler = effectiveParameters.sampler()
+        self.sampler = samplerOverride ?? effectiveParameters.sampler()
         self.maxTokens = effectiveParameters.maxTokens
 
         self.kvBits = effectiveParameters.kvBits
@@ -1821,6 +1822,41 @@ public struct TokenIterator: TokenIteratorProtocol {
         store(tokens: generatedBoundaryTokens, cache: cache, kvBits: kvBits, kvMode: kvMode)
     }
 
+    public func cacheDiagnostics() -> [String: Int] {
+        var result: [String: Int] = [
+            "layers": cache.count,
+            "max_offset": cache.map(\.offset).max() ?? 0,
+            "kv_simple": 0,
+            "rotating": 0,
+            "turboquant_fill": 0,
+            "turboquant_compressed": 0,
+            "quantized": 0,
+            "cache_list": 0,
+            "other": 0,
+        ]
+        for layer in cache {
+            if let tq = layer as? TurboQuantKVCache {
+                switch tq.phase {
+                case .fill:
+                    result["turboquant_fill", default: 0] += 1
+                case .compressed:
+                    result["turboquant_compressed", default: 0] += 1
+                }
+            } else if layer is RotatingKVCache {
+                result["rotating", default: 0] += 1
+            } else if layer is KVCacheSimple {
+                result["kv_simple", default: 0] += 1
+            } else if layer is QuantizedKVCache {
+                result["quantized", default: 0] += 1
+            } else if layer is CacheList {
+                result["cache_list", default: 0] += 1
+            } else {
+                result["other", default: 0] += 1
+            }
+        }
+        return result
+    }
+
     private func cacheSnapshotForBoundary(
         tokens: [Int],
         promptSnapshot: [KVCache]
@@ -1835,6 +1871,13 @@ public struct TokenIterator: TokenIteratorProtocol {
         {
             MLX.eval(trimmed)
             return trimmed
+        }
+
+        if String(describing: Swift.type(of: model)).contains("Gemma3n") {
+            Self.logger.debug(
+                "TokenIterator: skipped Gemma3n history-boundary cache rederive after trim miss"
+            )
+            return nil
         }
 
         do {
@@ -2754,6 +2797,49 @@ public func generateTask(
     )
 }
 
+private func debugGenerateTokenTraceEnabled() -> Bool {
+    let env = ProcessInfo.processInfo.environment
+    return env["VMLX_BATCH_TOKEN_TRACE"] == "1"
+        || env["VMLINUX_BATCH_TOKEN_TRACE"] == "1"
+}
+
+private func debugGenerateTokenTraceLimit() -> Int {
+    let env = ProcessInfo.processInfo.environment
+    return Int(env["VMLX_BATCH_TOKEN_TRACE_LIMIT"] ?? "")
+        ?? Int(env["VMLINUX_BATCH_TOKEN_TRACE_LIMIT"] ?? "")
+        ?? 64
+}
+
+private func debugGenerateTokenTraceDecodeEnabled() -> Bool {
+    let env = ProcessInfo.processInfo.environment
+    return env["VMLX_BATCH_TOKEN_TRACE_DECODE"] == "1"
+        || env["VMLINUX_BATCH_TOKEN_TRACE_DECODE"] == "1"
+}
+
+private func debugGenerateTokenTraceLine(
+    path: String,
+    modelName: String,
+    index: Int,
+    tokenID: Int,
+    tokenizer: Tokenizer
+) {
+    guard debugGenerateTokenTraceEnabled(), index <= debugGenerateTokenTraceLimit() else { return }
+    let decodedPart: String
+    if debugGenerateTokenTraceDecodeEnabled() {
+        let decoded = tokenizer.decode(tokenIds: [tokenID], skipSpecialTokens: false)
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+        decodedPart = " decoded=\"\(decoded)\""
+    } else {
+        decodedPart = ""
+    }
+    let line = "[vmlx] batchTokenTrace path=\(path) model=\(modelName) index=\(index) token=\(tokenID)\(decodedPart)\n"
+    if let data = line.data(using: .utf8) {
+        FileHandle.standardError.write(data)
+    }
+}
+
 /// Generates raw token IDs asynchronously using the provided language model input, parameters, and context.
 ///
 /// This is similar to `generate(input:cache:parameters:context:)`, but yields raw token IDs instead of decoded text/tool calls.
@@ -3006,6 +3092,12 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 }
 
                 tokenCount += 1
+                debugGenerateTokenTraceLine(
+                    path: "generateLoopTask.token",
+                    modelName: modelConfiguration.name,
+                    index: tokenCount,
+                    tokenID: token,
+                    tokenizer: tokenizer)
                 if !handler.onToken(token, emit: continuation.yield) {
                     // Distinguish "downstream consumer terminated the
                     // stream" from "library-internal stop-sequence

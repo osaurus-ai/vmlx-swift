@@ -127,6 +127,51 @@ private func debugDumpReasoningPrompt(
     }
 }
 
+private func debugBatchTokenTraceEnabled() -> Bool {
+    let env = ProcessInfo.processInfo.environment
+    return env["VMLX_BATCH_TOKEN_TRACE"] == "1"
+        || env["VMLINUX_BATCH_TOKEN_TRACE"] == "1"
+}
+
+private func debugBatchTokenTraceLimit() -> Int {
+    let env = ProcessInfo.processInfo.environment
+    return Int(env["VMLX_BATCH_TOKEN_TRACE_LIMIT"] ?? "")
+        ?? Int(env["VMLINUX_BATCH_TOKEN_TRACE_LIMIT"] ?? "")
+        ?? 64
+}
+
+private func debugBatchTokenTraceDecodeEnabled() -> Bool {
+    let env = ProcessInfo.processInfo.environment
+    return env["VMLX_BATCH_TOKEN_TRACE_DECODE"] == "1"
+        || env["VMLINUX_BATCH_TOKEN_TRACE_DECODE"] == "1"
+}
+
+private func debugBatchTokenTraceLine(
+    path: String,
+    modelName: String,
+    slotID: String?,
+    index: Int,
+    tokenID: Int,
+    tokenizer: any Tokenizer
+) {
+    guard debugBatchTokenTraceEnabled(), index <= debugBatchTokenTraceLimit() else { return }
+    let decodedPart: String
+    if debugBatchTokenTraceDecodeEnabled() {
+        let decoded = tokenizer.decode(tokenIds: [tokenID], skipSpecialTokens: false)
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+        decodedPart = " decoded=\"\(decoded)\""
+    } else {
+        decodedPart = ""
+    }
+    let slotPart = slotID.map { " slot=\($0)" } ?? ""
+    let line = "[vmlx] batchTokenTrace path=\(path) model=\(modelName)\(slotPart) index=\(index) token=\(tokenID)\(decodedPart)\n"
+    if let data = line.data(using: .utf8) {
+        FileHandle.standardError.write(data)
+    }
+}
+
 private final class BatchStreamTerminationState: @unchecked Sendable {
     private let lock = NSLock()
     private var completed = false
@@ -398,7 +443,8 @@ public actor BatchEngine {
     @discardableResult
     public func submit(
         input: consuming sending LMInput,
-        parameters: GenerateParameters
+        parameters: GenerateParameters,
+        samplerOverride: BatchSamplerOverride? = nil
     ) -> (id: BatchRequestID, stream: AsyncStream<BatchGeneration>) {
         guard !isShutdown else {
             return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
@@ -435,6 +481,7 @@ public actor BatchEngine {
         let request = BatchPendingRequest(
             input: input,
             parameters: parameters,
+            samplerOverride: samplerOverride,
             continuation: continuation
         )
         waitQueue.append(request)
@@ -725,6 +772,13 @@ public actor BatchEngine {
                 switch event {
                 case .token(let id):
                     generatedTokenCount += 1
+                    debugBatchTokenTraceLine(
+                        path: "BatchEngine.generate.consume",
+                        modelName: context.configuration.name,
+                        slotID: requestId.description,
+                        index: generatedTokenCount,
+                        tokenID: id,
+                        tokenizer: tokenizer)
                     detokenizer.append(token: id)
                     if let text = detokenizer.next() {
                         pump(text)
@@ -1556,6 +1610,13 @@ public actor BatchEngine {
         slot.phase = .decode
         slot.decodeStartTime = Date()
         slot.pendingTokens = MLXArray([Int32]()) // clear
+        debugBatchTokenTraceLine(
+            path: "BatchEngine.stepPrefill",
+            modelName: context.configuration.name,
+            slotID: slot.id.description,
+            index: slot.generatedTokenCount + 1,
+            tokenID: tokenID,
+            tokenizer: context.tokenizer)
 
         // Check EOS on first generated token before yielding
         if stopTokenIDs.contains(tokenID) {
@@ -1669,6 +1730,13 @@ public actor BatchEngine {
         let logits = result[0][0 ..< 1, 0, 0...]
         let token = slot.sampleToken(from: logits)
         let tokenID = token.item(Int.self)
+        debugBatchTokenTraceLine(
+            path: "BatchEngine.stepCompiledDecode",
+            modelName: context.configuration.name,
+            slotID: slot.id.description,
+            index: slot.generatedTokenCount + 1,
+            tokenID: tokenID,
+            tokenizer: context.tokenizer)
 
         // Stage 0: per-step KV-quant hook. For compile+TQ this is a no-op
         // because compile requires `.simple` family (TQ compression would
@@ -2052,6 +2120,13 @@ public actor BatchEngine {
             // of both the logits and the sampled tokens) — this wait
             // is much shorter than a synchronous eval + sample chain.
             let tokenID = token.item(Int.self)
+            debugBatchTokenTraceLine(
+                path: "BatchEngine.stepBatchDecode",
+                modelName: context.configuration.name,
+                slotID: slot.id.description,
+                index: slot.generatedTokenCount + 1,
+                tokenID: tokenID,
+                tokenizer: context.tokenizer)
 
             // Stage 0: per-step KV-quant compression hook. For slots with
             // short prompts that were below the TQ minimum threshold at
@@ -2234,6 +2309,13 @@ public actor BatchEngine {
                 {
                     MLX.eval(trimmed)
                     return trimmed
+                }
+
+                if String(describing: Swift.type(of: context.model)).contains("Gemma3n") {
+                    Self.logger.debug(
+                        "Skipped Gemma3n history-boundary cache rederive for slot \(slot.id.description, privacy: .public) after trim miss"
+                    )
+                    return nil
                 }
 
                 do {
