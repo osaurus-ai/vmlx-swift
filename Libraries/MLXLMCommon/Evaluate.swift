@@ -980,6 +980,47 @@ private enum MLXPressGenerationProfile {
     }
 }
 
+private enum TokenIteratorTrace {
+    private static var enabled: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return ["VMLINUX_TOKEN_ITERATOR_TRACE", "MLXPRESS_TOKEN_ITERATOR_TRACE", "TP_DECODE_TRACE"]
+            .contains { key in
+                switch env[key]?.lowercased() {
+                case "1", "true", "yes", "on":
+                    return true
+                default:
+                    return false
+                }
+            }
+    }
+
+    static func event(_ message: @autoclosure () -> String) {
+        guard enabled else { return }
+        let elapsed = ProcessInfo.processInfo.systemUptime
+        let rank = ProcessInfo.processInfo.environment["MLX_RANK"] ?? "?"
+        let line = String(
+            format: "[TokenIteratorTrace rank=%@ t=%.3f] %@\n",
+            rank, elapsed, message())
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
+    static func time<T>(_ name: String, _ body: () throws -> T) rethrows -> T {
+        guard enabled else { return try body() }
+        event("\(name) begin")
+        let start = ProcessInfo.processInfo.systemUptime
+        do {
+            let value = try body()
+            let ms = (ProcessInfo.processInfo.systemUptime - start) * 1000
+            event(String(format: "\(name) end %.1fms", ms))
+            return value
+        } catch {
+            let ms = (ProcessInfo.processInfo.systemUptime - start) * 1000
+            event(String(format: "\(name) throw %.1fms error=%@", ms, String(describing: error)))
+            throw error
+        }
+    }
+}
+
 /// Generator of tokens.
 ///
 /// This is typically used via a call to ``generate(input:cache:parameters:context:)`` returning `AsyncStream<Generation>`.
@@ -1166,6 +1207,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         cacheCoordinator: CacheCoordinator? = nil,
         samplerOverride: LogitSampler? = nil
     ) throws {
+        TokenIteratorTrace.event(
+            "init begin input_tokens=\(input.text.tokens.shape) model=\(String(describing: type(of: model)))")
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
         self.model = model
@@ -1182,6 +1225,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             effectiveParameters.maxKVSize = resolvedPolicy.maxKVSize
         }
         self.cache = cache ?? model.newCache(parameters: effectiveParameters)
+        TokenIteratorTrace.event(
+            "init cache_allocated layers=\(self.cache.count) kv_mode=\(String(describing: effectiveParameters.kvMode))")
         if let coordinator = cacheCoordinator,
            effectiveParameters.kvBits != nil || effectiveParameters.kvMode != .none
         {
@@ -1249,6 +1294,8 @@ public struct TokenIterator: TokenIteratorProtocol {
            !cacheLookupTokenIds.isEmpty,
            (!input.requiresPostPrepareCacheKey || cacheLookupUsesPostPrepareAlias)
         {
+            TokenIteratorTrace.event(
+                "cache_fetch begin lookup_tokens=\(cacheLookupTokenIds.count) media_salt=\(mediaSalt != nil)")
             if !coordinator.isHybrid {
                 if cacheContainsPathDependentState(self.cache) {
                     coordinator.setHybrid(true)
@@ -1376,6 +1423,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     }
                 }
             case .miss:
+                TokenIteratorTrace.event("cache_fetch miss lookup_tokens=\(cacheLookupTokenIds.count)")
                 let count = cacheLookupTokenIds.count
                 Self.logger.debug("Cache miss for \(count) prompt tokens")
 
@@ -1454,21 +1502,29 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         // Prefill: either full input (cache miss) or remaining tokens (cache hit).
-        self.promptPrefillTime = try measure {
-            try MLXPressGenerationProfile.time("prompt.prepare_total") {
-                try prepare(
-                    input: inputForPrepare,
-                    windowSize: effectivePrefillWindow(
-                        requested: effectiveParameters.prefillStepSize,
-                        input: inputForPrepare))
+        self.promptPrefillTime = try TokenIteratorTrace.time(
+            "init.prompt_prefill input_tokens=\(inputForPrepare.text.tokens.shape)"
+        ) {
+            try measure {
+                try MLXPressGenerationProfile.time("prompt.prepare_total") {
+                    try prepare(
+                        input: inputForPrepare,
+                        windowSize: effectivePrefillWindow(
+                            requested: effectiveParameters.prefillStepSize,
+                            input: inputForPrepare))
+                }
             }
         }
+        TokenIteratorTrace.event(
+            String(format: "init prompt_prefill_time=%.3fs cache_layers=%d",
+                   self.promptPrefillTime, self.cache.count))
         self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
 
         if effectiveParameters.enableCompiledDecode && !Self.compiledDecodeDenied(for: model) {
             try setupCompiledDecode(
                 maxCacheLength: effectiveParameters.compiledMaxCacheLength ?? 4096)
         }
+        TokenIteratorTrace.event("init end")
     }
 
     /// Initialize a `TokenIterator` with the given input and logit handling.
@@ -1521,22 +1577,32 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
-        let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
-            try model.prepare(input, cache: cache, windowSize: windowSize)
+        let prepared = try TokenIteratorTrace.time(
+            "prepare.model_prepare tokens=\(input.text.tokens.shape) window=\(windowSize ?? -1)"
+        ) {
+            try MLXPressGenerationProfile.time("prompt.model_prepare") {
+                try model.prepare(input, cache: cache, windowSize: windowSize)
+            }
         }
         switch prepared {
         case .tokens(let tokens):
+            TokenIteratorTrace.event("prepare returned tokens=\(tokens.tokens.shape)")
             processor?.prompt(input.text.tokens)
             y = tokens
 
             // evaluate the remainder of the prompt -- this primes the pump
+            TokenIteratorTrace.event("prepare.step previous=\(y.tokens.shape)")
             let token = step(previous: y)
+            TokenIteratorTrace.event("prepare.step produced=\(token.shape)")
             y = .init(tokens: token)
-            MLXPressGenerationProfile.time("prompt.async_eval_submit") {
-                asyncEval(y.tokens)
+            TokenIteratorTrace.time("prepare.async_eval_submit token=\(y.tokens.shape)") {
+                MLXPressGenerationProfile.time("prompt.async_eval_submit") {
+                    asyncEval(y.tokens)
+                }
             }
 
         case .logits(let result):
+            TokenIteratorTrace.event("prepare returned logits=\(result.logits.shape)")
             if let effectivePromptTokens = result.effectivePromptTokens {
                 promptTokenIds = effectivePromptTokens
                 if originalInput.requiresPostPrepareCacheKey {
@@ -1551,11 +1617,15 @@ public struct TokenIterator: TokenIteratorProtocol {
             } else {
                 processor?.prompt(input.text.tokens)
             }
-            y = .init(tokens: MLXPressGenerationProfile.time("prompt.sample") {
-                convertToToken(logits: result.logits)
+            y = .init(tokens: TokenIteratorTrace.time("prepare.sample logits=\(result.logits.shape)") {
+                MLXPressGenerationProfile.time("prompt.sample") {
+                    convertToToken(logits: result.logits)
+                }
             })
-            MLXPressGenerationProfile.time("prompt.async_eval_submit") {
-                asyncEval(y.tokens)
+            TokenIteratorTrace.time("prepare.async_eval_submit token=\(y.tokens.shape)") {
+                MLXPressGenerationProfile.time("prompt.async_eval_submit") {
+                    asyncEval(y.tokens)
+                }
             }
         }
 
@@ -1688,25 +1758,34 @@ public struct TokenIterator: TokenIteratorProtocol {
         // pure-LLM model paths (Llama, Mistral, Phi, etc).
         let stepInput: LMInput.Text =
             previous.tokens.ndim == 1 ? previous[text: .newAxis] : previous
-        let result = MLXPressGenerationProfile.time("decode.model_forward") {
-            model(stepInput, cache: cache.isEmpty ? nil : cache, state: state)
+        let result = TokenIteratorTrace.time(
+            "step.model_forward input=\(stepInput.tokens.shape) cache_layers=\(cache.count)"
+        ) {
+            MLXPressGenerationProfile.time("decode.model_forward") {
+                model(stepInput, cache: cache.isEmpty ? nil : cache, state: state)
+            }
         }
+        TokenIteratorTrace.event("step.model_forward logits=\(result.logits.shape)")
         self.state = result.state
 
         if shouldQuantizeAfterStep {
-            MLXPressGenerationProfile.time("decode.kv_quantize") {
-                maybeQuantizeKVCache(
-                    cache: &cache,
-                    kvBits: kvBits,
-                    kvGroupSize: kvGroupSize,
-                    quantizedKVStart: quantizedKVStart,
-                    kvMode: kvMode
-                )
+            TokenIteratorTrace.time("step.kv_quantize token_count=\(tokenCount)") {
+                MLXPressGenerationProfile.time("decode.kv_quantize") {
+                    maybeQuantizeKVCache(
+                        cache: &cache,
+                        kvBits: kvBits,
+                        kvGroupSize: kvGroupSize,
+                        quantizedKVStart: quantizedKVStart,
+                        kvMode: kvMode
+                    )
+                }
             }
         }
 
-        return MLXPressGenerationProfile.time("decode.sample") {
-            convertToToken(logits: result.logits)
+        return TokenIteratorTrace.time("step.sample logits=\(result.logits.shape)") {
+            MLXPressGenerationProfile.time("decode.sample") {
+                convertToToken(logits: result.logits)
+            }
         }
     }
 
@@ -1717,13 +1796,19 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         let previousY = y
 
-        let token = MLXPressGenerationProfile.time("decode.step_build") {
-            step(previous: previousY)
+        let token = TokenIteratorTrace.time(
+            "next.step_build previous=\(previousY.tokens.shape) token_count=\(tokenCount)"
+        ) {
+            MLXPressGenerationProfile.time("decode.step_build") {
+                step(previous: previousY)
+            }
         }
         y = .init(tokens: token)
 
-        MLXPressGenerationProfile.time("decode.async_eval_submit") {
-            asyncEval(token)
+        TokenIteratorTrace.time("next.async_eval_submit token=\(token.shape)") {
+            MLXPressGenerationProfile.time("decode.async_eval_submit") {
+                asyncEval(token)
+            }
         }
 
         tokenCount += 1
@@ -1732,8 +1817,10 @@ public struct TokenIterator: TokenIteratorProtocol {
             Memory.clearCache()
         }
 
-        return MLXPressGenerationProfile.time("decode.token_item_sync") {
-            previousY.tokens.item(Int.self)
+        return TokenIteratorTrace.time("next.token_item_sync previous=\(previousY.tokens.shape)") {
+            MLXPressGenerationProfile.time("decode.token_item_sync") {
+                previousY.tokens.item(Int.self)
+            }
         }
     }
 
