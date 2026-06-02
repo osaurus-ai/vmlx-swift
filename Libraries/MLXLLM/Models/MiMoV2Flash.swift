@@ -236,6 +236,15 @@ class MiMoV2FlashMLP: Module, UnaryLayer {
         _downProj.wrappedValue = Linear(self.intermediateSize, self.hiddenSize, bias: false)
     }
 
+    init(hiddenSize: Int, intermediateSize: Int, bias: Bool) {
+        self.hiddenSize = hiddenSize
+        self.intermediateSize = intermediateSize
+
+        _gateProj.wrappedValue = Linear(hiddenSize, intermediateSize, bias: bias)
+        _upProj.wrappedValue = Linear(hiddenSize, intermediateSize, bias: bias)
+        _downProj.wrappedValue = Linear(intermediateSize, hiddenSize, bias: bias)
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         downProj(silu(gateProj(x)) * upProj(x))
     }
@@ -403,6 +412,278 @@ public class MiMoV2FlashModelInner: Module {
     }
 }
 
+final class MiMoV2VisionPatchEmbed: Module, UnaryLayer {
+    @ModuleInfo(key: "proj") var proj: Conv3d
+
+    let patchSize: Int
+    let temporalPatchSize: Int
+    let inChannels: Int
+    let hiddenSize: Int
+
+    init(_ config: MiMoV2VisionConfiguration) {
+        self.patchSize = config.patchSize
+        self.temporalPatchSize = config.temporalPatchSize
+        self.inChannels = config.inChannels
+        self.hiddenSize = config.hiddenSize
+
+        let kernel = IntOrTriple([temporalPatchSize, patchSize, patchSize])
+        _proj.wrappedValue = Conv3d(
+            inputChannels: inChannels,
+            outputChannels: hiddenSize,
+            kernelSize: kernel,
+            stride: kernel,
+            bias: false
+        )
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var states = x.reshaped(
+            -1,
+            inChannels,
+            temporalPatchSize,
+            patchSize,
+            patchSize
+        ).movedAxis(source: 1, destination: 4)
+        states = proj(states)
+        return states.reshaped(-1, hiddenSize)
+    }
+}
+
+final class MiMoV2VisionAttention: Module {
+    let numHeads: Int
+    let numKeyValueHeads: Int
+    let headDim: Int
+    let qRows: Int
+    let kRows: Int
+    let vRows: Int
+    let scale: Float
+
+    @ModuleInfo(key: "qkv") var qkv: Linear
+    @ModuleInfo(key: "proj") var proj: Linear
+
+    init(_ config: MiMoV2VisionConfiguration) {
+        self.numHeads = config.numHeads
+        self.numKeyValueHeads = config.numKeyValueHeads
+        self.headDim = config.headDim
+        self.qRows = config.numHeads * headDim
+        self.kRows = config.numKeyValueHeads * headDim
+        self.vRows = config.numKeyValueHeads * headDim
+        self.scale = pow(Float(headDim), -0.5)
+
+        _qkv.wrappedValue = Linear(config.hiddenSize, qRows + kRows + vRows, bias: true)
+        _proj.wrappedValue = Linear(numHeads * headDim, config.hiddenSize, bias: true)
+    }
+
+    func callAsFunction(_ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode = .none)
+        -> MLXArray
+    {
+        let sequenceLength = x.dim(0)
+        let qkvStates = split(qkv(x), indices: [qRows, qRows + kRows], axis: -1)
+        let q = qkvStates[0].reshaped(1, sequenceLength, numHeads, headDim)
+            .transposed(0, 2, 1, 3)
+        var k = qkvStates[1].reshaped(1, sequenceLength, numKeyValueHeads, headDim)
+            .transposed(0, 2, 1, 3)
+        var v = qkvStates[2].reshaped(1, sequenceLength, numKeyValueHeads, headDim)
+            .transposed(0, 2, 1, 3)
+
+        if numHeads != numKeyValueHeads {
+            let repeats = numHeads / numKeyValueHeads
+            k = repeated(k, count: repeats, axis: 1)
+            v = repeated(v, count: repeats, axis: 1)
+        }
+
+        return proj(
+            MLXFast.scaledDotProductAttention(
+                queries: q,
+                keys: k,
+                values: v,
+                scale: scale,
+                mask: mask
+            )
+            .transposed(0, 2, 1, 3)
+            .reshaped(sequenceLength, -1)
+        )
+    }
+}
+
+final class MiMoV2VisionBlock: Module, UnaryLayer {
+    @ModuleInfo(key: "norm1") var norm1: RMSNorm
+    @ModuleInfo(key: "attn") var attn: MiMoV2VisionAttention
+    @ModuleInfo(key: "norm2") var norm2: RMSNorm
+    @ModuleInfo(key: "mlp") var mlp: MiMoV2FlashMLP
+
+    init(_ config: MiMoV2VisionConfiguration) {
+        _norm1.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.layernormEpsilon)
+        _attn.wrappedValue = MiMoV2VisionAttention(config)
+        _norm2.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.layernormEpsilon)
+        _mlp.wrappedValue = MiMoV2FlashMLP(
+            hiddenSize: config.hiddenSize,
+            intermediateSize: config.intermediateSize,
+            bias: true)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let residual = x + attn(norm1(x))
+        return residual + mlp(norm2(residual))
+    }
+}
+
+final class MiMoV2VisionMerger: Module, UnaryLayer {
+    let hiddenSize: Int
+    @ModuleInfo(key: "ln_q") var layerNormQ: RMSNorm
+    @ModuleInfo(key: "mlp") var mlp: (Linear, GELU, Linear)
+
+    init(_ config: MiMoV2VisionConfiguration) {
+        self.hiddenSize = config.hiddenSize * config.spatialMergeSize * config.spatialMergeSize
+        _layerNormQ.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.layernormEpsilon)
+        _mlp.wrappedValue = (
+            Linear(hiddenSize, hiddenSize),
+            GELU(),
+            Linear(hiddenSize, config.outHiddenSize)
+        )
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let merged = layerNormQ(x).reshaped(-1, hiddenSize)
+        return mlp.2(mlp.1(mlp.0(merged)))
+    }
+}
+
+final class MiMoV2VisionModel: Module, UnaryLayer {
+    @ModuleInfo(key: "patch_embed") var patchEmbed: MiMoV2VisionPatchEmbed
+    @ModuleInfo(key: "blocks") var blocks: [MiMoV2VisionBlock]
+    @ModuleInfo(key: "merger") var merger: MiMoV2VisionMerger
+
+    let fullAttentionBlockIndexes: Set<Int>
+    let windowAttentionTypes: [Int]
+
+    init(_ config: MiMoV2VisionConfiguration) {
+        _patchEmbed.wrappedValue = MiMoV2VisionPatchEmbed(config)
+        _blocks.wrappedValue = (0 ..< config.depth).map { _ in MiMoV2VisionBlock(config) }
+        _merger.wrappedValue = MiMoV2VisionMerger(config)
+        self.fullAttentionBlockIndexes = Set(config.fullAttentionBlockIndexes)
+        self.windowAttentionTypes = config.windowAttentionTypes
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var states = patchEmbed(x)
+        for block in blocks {
+            states = block(states)
+        }
+        return merger(states)
+    }
+}
+
+final class MiMoV2AudioAttention: Module {
+    let numHeads: Int
+    let headDim: Int
+    let scale: Float
+
+    @ModuleInfo(key: "q_proj") var qProj: Linear
+    @ModuleInfo(key: "k_proj") var kProj: Linear
+    @ModuleInfo(key: "v_proj") var vProj: Linear
+    @ModuleInfo(key: "o_proj") var oProj: Linear
+
+    init(_ config: MiMoV2AudioConfiguration) {
+        self.numHeads = config.inputLocalAttentionHeads
+        self.headDim = config.inputLocalHeadDim
+        self.scale = pow(Float(headDim), -0.5)
+        _qProj.wrappedValue = Linear(config.inputLocalDim, config.inputLocalDim, bias: true)
+        _kProj.wrappedValue = Linear(config.inputLocalDim, config.inputLocalDim, bias: true)
+        _vProj.wrappedValue = Linear(config.inputLocalDim, config.inputLocalDim, bias: true)
+        _oProj.wrappedValue = Linear(config.inputLocalDim, config.inputLocalDim, bias: false)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let (B, L) = (x.dim(0), x.dim(1))
+        let q = qProj(x).reshaped(B, L, numHeads, headDim).transposed(0, 2, 1, 3)
+        let k = kProj(x).reshaped(B, L, numHeads, headDim).transposed(0, 2, 1, 3)
+        let v = vProj(x).reshaped(B, L, numHeads, headDim).transposed(0, 2, 1, 3)
+        return oProj(
+            MLXFast.scaledDotProductAttention(
+                queries: q,
+                keys: k,
+                values: v,
+                scale: scale,
+                mask: .none
+            )
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
+        )
+    }
+}
+
+final class MiMoV2AudioLayer: Module, UnaryLayer {
+    @ModuleInfo(key: "self_attn") var selfAttn: MiMoV2AudioAttention
+    @ModuleInfo(key: "mlp") var mlp: MiMoV2FlashMLP
+    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
+    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
+
+    init(_ config: MiMoV2AudioConfiguration) {
+        _selfAttn.wrappedValue = MiMoV2AudioAttention(config)
+        _mlp.wrappedValue = MiMoV2FlashMLP(
+            hiddenSize: config.inputLocalDim,
+            intermediateSize: config.inputLocalIntermediateSize,
+            bias: false)
+        _inputLayerNorm.wrappedValue = RMSNorm(dimensions: config.inputLocalDim, eps: 1e-6)
+        _postAttentionLayerNorm.wrappedValue = RMSNorm(dimensions: config.inputLocalDim, eps: 1e-6)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let residual = x + selfAttn(inputLayerNorm(x))
+        return residual + mlp(postAttentionLayerNorm(residual))
+    }
+}
+
+final class MiMoV2AudioTransformer: Module, UnaryLayer {
+    @ModuleInfo(key: "layers") var layers: [MiMoV2AudioLayer]
+
+    init(_ config: MiMoV2AudioConfiguration) {
+        _layers.wrappedValue = (0 ..< config.inputLocalLayers).map { _ in
+            MiMoV2AudioLayer(config)
+        }
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var states = x
+        for layer in layers {
+            states = layer(states)
+        }
+        return states
+    }
+}
+
+final class MiMoV2AudioProjection: Module, UnaryLayer {
+    @ModuleInfo(key: "mlp") var mlp: (Linear, GELU, Linear)
+
+    init(_ config: MiMoV2AudioConfiguration, textHiddenSize: Int) {
+        let intermediateSize = textHiddenSize * 4
+        _mlp.wrappedValue = (
+            Linear(config.outHiddenSize, intermediateSize, bias: false),
+            GELU(),
+            Linear(intermediateSize, config.outHiddenSize, bias: false)
+        )
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        mlp.2(mlp.1(mlp.0(x)))
+    }
+}
+
+final class MiMoV2AudioEncoder: Module, UnaryLayer {
+    @ModuleInfo(key: "input_local_transformer") var inputLocalTransformer: MiMoV2AudioTransformer
+    @ModuleInfo(key: "projection") var projection: MiMoV2AudioProjection
+
+    init(_ config: MiMoV2AudioConfiguration, textHiddenSize: Int) {
+        _inputLocalTransformer.wrappedValue = MiMoV2AudioTransformer(config)
+        _projection.wrappedValue = MiMoV2AudioProjection(config, textHiddenSize: textHiddenSize)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        projection(inputLocalTransformer(x))
+    }
+}
+
 public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
     public let modelType: String
     public let vocabularySize: Int
@@ -411,6 +692,9 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
     public let model: MiMoV2FlashModelInner
     let configuration: MiMoV2FlashConfiguration
 
+    @ModuleInfo(key: "visual") var visual: MiMoV2VisionModel?
+    @ModuleInfo(key: "audio_encoder") var audioEncoder: MiMoV2AudioEncoder?
+    @ModuleInfo(key: "speech_embeddings") var speechEmbeddings: [Embedding]?
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
     public init(_ config: MiMoV2FlashConfiguration) {
@@ -421,6 +705,24 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
             $0 == 1 ? config.swaKvHeads : config.kvHeads
         }
         self.model = MiMoV2FlashModelInner(config)
+        if let visionConfig = config.visionConfig {
+            _visual.wrappedValue = MiMoV2VisionModel(visionConfig)
+        } else {
+            _visual.wrappedValue = nil
+        }
+        if let audioConfig = config.audioConfig {
+            _audioEncoder.wrappedValue = MiMoV2AudioEncoder(
+                audioConfig,
+                textHiddenSize: config.hiddenSize)
+            _speechEmbeddings.wrappedValue = (0 ..< audioConfig.audioChannels).map { _ in
+                Embedding(
+                    embeddingCount: audioConfig.speechVocabularySize,
+                    dimensions: audioConfig.inputLocalDim)
+            }
+        } else {
+            _audioEncoder.wrappedValue = nil
+            _speechEmbeddings.wrappedValue = nil
+        }
         _lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
     }
 
@@ -499,6 +801,18 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
 
+        if let visionConfig = configuration.visionConfig,
+            let patchWeight = sanitizedWeights["visual.patch_embed.proj.weight"],
+            patchWeight.shape.count == 5,
+            patchWeight.shape[1] == visionConfig.inChannels,
+            patchWeight.shape[2] == visionConfig.temporalPatchSize,
+            patchWeight.shape[3] == visionConfig.patchSize,
+            patchWeight.shape[4] == visionConfig.patchSize
+        {
+            sanitizedWeights["visual.patch_embed.proj.weight"] =
+                patchWeight.transposed(0, 2, 3, 4, 1)
+        }
+
         return sanitizedWeights.filter { key, _ in
             !key.hasPrefix("model.mtp")
         }
@@ -516,6 +830,133 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
 }
 
 // MARK: - Configuration
+
+public struct MiMoV2VisionConfiguration: Codable, Sendable {
+    var depth: Int
+    var hiddenSize: Int
+    var intermediateSize: Int
+    var numHeads: Int
+    var numKeyValueHeads: Int
+    var outHiddenSize: Int
+    var headDim: Int
+    var patchSize: Int
+    var temporalPatchSize: Int
+    var inChannels: Int
+    var spatialMergeSize: Int
+    var windowSize: Int
+    var visualTokenWindowSize: Int
+    var fullAttentionBlockIndexes: [Int]
+    var windowAttentionTypes: [Int]
+    var useSink: Bool
+    var layernormEpsilon: Float = 1e-6
+
+    enum CodingKeys: String, CodingKey {
+        case depth
+        case hiddenSize = "hidden_size"
+        case intermediateSize = "intermediate_size"
+        case numHeads = "num_heads"
+        case numKeyValueHeads = "num_key_value_heads"
+        case outHiddenSize = "out_hidden_size"
+        case headDim = "head_dim"
+        case patchSize = "patch_size"
+        case temporalPatchSize = "temporal_patch_size"
+        case inChannels = "in_channels"
+        case spatialMergeSize = "spatial_merge_size"
+        case windowSize = "window_size"
+        case visualTokenWindowSize = "visual_token_window_size"
+        case fullAttentionBlockIndexes = "fullatt_block_indexes"
+        case windowAttentionTypes = "vit_window_attn_types"
+        case useSink = "use_sink"
+        case layernormEpsilon = "layer_norm_eps"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.depth = try container.decode(Int.self, forKey: .depth)
+        self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        self.intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        self.numHeads = try container.decode(Int.self, forKey: .numHeads)
+        self.numKeyValueHeads = try container.decodeIfPresent(Int.self, forKey: .numKeyValueHeads)
+            ?? numHeads
+        self.outHiddenSize = try container.decode(Int.self, forKey: .outHiddenSize)
+        if let headDim = try container.decodeIfPresent(Int.self, forKey: .headDim) {
+            self.headDim = headDim
+        } else if hiddenSize == 1280, numHeads == 32, numKeyValueHeads == 8 {
+            self.headDim = 64
+        } else {
+            self.headDim = hiddenSize / numHeads
+        }
+        self.patchSize = try container.decode(Int.self, forKey: .patchSize)
+        self.temporalPatchSize = try container.decode(Int.self, forKey: .temporalPatchSize)
+        self.inChannels = try container.decodeIfPresent(Int.self, forKey: .inChannels) ?? 3
+        self.spatialMergeSize = try container.decode(Int.self, forKey: .spatialMergeSize)
+        self.windowSize = try container.decodeIfPresent(Int.self, forKey: .windowSize) ?? 0
+        self.visualTokenWindowSize =
+            try container.decodeIfPresent(Int.self, forKey: .visualTokenWindowSize) ?? 0
+        self.fullAttentionBlockIndexes =
+            try container.decodeIfPresent([Int].self, forKey: .fullAttentionBlockIndexes) ?? []
+        self.windowAttentionTypes =
+            try container.decodeIfPresent([Int].self, forKey: .windowAttentionTypes) ?? []
+        self.useSink = try container.decodeIfPresent(Bool.self, forKey: .useSink) ?? false
+        self.layernormEpsilon =
+            try container.decodeIfPresent(Float.self, forKey: .layernormEpsilon) ?? 1e-6
+    }
+}
+
+public struct MiMoV2AudioConfiguration: Codable, Sendable {
+    var audioChannels: Int
+    var speechVocabularySize: Int
+    var inputLocalLayers: Int
+    var inputLocalDim: Int
+    var inputLocalAttentionHeads: Int
+    var inputLocalHeadDim: Int
+    var inputLocalIntermediateSize: Int
+    var projectionLayers: Int
+    var outHiddenSize: Int
+    var ropeTheta: Float
+    var partialRotaryFactor: Float
+    var addPostNorm: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case audioChannels = "audio_channels"
+        case speechVocabularySize = "speech_vocab_size"
+        case inputLocalLayers = "input_local_layers"
+        case inputLocalDim = "input_local_dim"
+        case inputLocalAttentionHeads = "input_local_attn_heads"
+        case inputLocalHeadDim = "input_local_head_dim"
+        case inputLocalIntermediateSize = "input_local_intermediate_size"
+        case projectionLayers = "projection_layers"
+        case outHiddenSize = "out_hidden_size"
+        case ropeTheta = "rope_theta"
+        case partialRotaryFactor = "partial_rotary_factor"
+        case addPostNorm = "add_post_norm"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.audioChannels = try container.decode(Int.self, forKey: .audioChannels)
+        if let intValue = try? container.decode(Int.self, forKey: .speechVocabularySize) {
+            self.speechVocabularySize = intValue
+        } else {
+            let stringValue = try container.decode(String.self, forKey: .speechVocabularySize)
+            self.speechVocabularySize = Int(stringValue) ?? 1280
+        }
+        self.inputLocalLayers = try container.decode(Int.self, forKey: .inputLocalLayers)
+        self.inputLocalDim = try container.decode(Int.self, forKey: .inputLocalDim)
+        self.inputLocalAttentionHeads =
+            try container.decode(Int.self, forKey: .inputLocalAttentionHeads)
+        self.inputLocalHeadDim = try container.decode(Int.self, forKey: .inputLocalHeadDim)
+        self.inputLocalIntermediateSize =
+            try container.decode(Int.self, forKey: .inputLocalIntermediateSize)
+        self.projectionLayers = try container.decodeIfPresent(Int.self, forKey: .projectionLayers)
+            ?? 2
+        self.outHiddenSize = try container.decode(Int.self, forKey: .outHiddenSize)
+        self.ropeTheta = try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 640000
+        self.partialRotaryFactor =
+            try container.decodeIfPresent(Float.self, forKey: .partialRotaryFactor) ?? 1.0
+        self.addPostNorm = try container.decodeIfPresent(Bool.self, forKey: .addPostNorm) ?? true
+    }
+}
 
 public struct MiMoV2FlashConfiguration: Codable, Sendable {
     var modelType: String = "mimo_v2_flash"
@@ -552,6 +993,8 @@ public struct MiMoV2FlashConfiguration: Codable, Sendable {
     var swaVHeadDim: Int
     var partialRotaryFactor: Float
     var attentionValueScale: Float?
+    var visionConfig: MiMoV2VisionConfiguration?
+    var audioConfig: MiMoV2AudioConfiguration?
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -588,6 +1031,8 @@ public struct MiMoV2FlashConfiguration: Codable, Sendable {
         case swaVHeadDim = "swa_v_head_dim"
         case partialRotaryFactor = "partial_rotary_factor"
         case attentionValueScale = "attention_value_scale"
+        case visionConfig = "vision_config"
+        case audioConfig = "audio_config"
     }
 }
 

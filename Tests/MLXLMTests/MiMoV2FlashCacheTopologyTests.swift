@@ -47,6 +47,77 @@ struct MiMoV2FlashCacheTopologyTests {
     }
     """#
 
+    private static let multimodalMiMoV25Config = #"""
+    {
+      "model_type": "mimo_v2",
+      "num_experts_per_tok": 2,
+      "hybrid_layer_pattern": [0],
+      "moe_layer_freq": [0],
+      "add_swa_attention_sink_bias": true,
+      "add_full_attention_sink_bias": false,
+      "sliding_window_size": 128,
+      "vocab_size": 256,
+      "hidden_size": 32,
+      "intermediate_size": 64,
+      "moe_intermediate_size": 16,
+      "num_hidden_layers": 1,
+      "num_attention_heads": 8,
+      "num_key_value_heads": 4,
+      "n_shared_experts": 1,
+      "n_routed_experts": 4,
+      "routed_scaling_factor": 1.0,
+      "topk_method": "noaux_tc",
+      "scoring_func": "sigmoid",
+      "norm_topk_prob": true,
+      "n_group": 1,
+      "topk_group": 1,
+      "max_position_embeddings": 4096,
+      "layernorm_epsilon": 1e-6,
+      "rope_theta": 10000000,
+      "swa_rope_theta": 10000,
+      "swa_num_attention_heads": 8,
+      "swa_num_key_value_heads": 8,
+      "head_dim": 4,
+      "v_head_dim": 4,
+      "swa_head_dim": 4,
+      "swa_v_head_dim": 4,
+      "partial_rotary_factor": 0.5,
+      "attention_value_scale": 0.707,
+      "vision_config": {
+        "depth": 1,
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "out_hidden_size": 32,
+        "patch_size": 4,
+        "temporal_patch_size": 2,
+        "in_channels": 3,
+        "spatial_merge_size": 2,
+        "window_size": 8,
+        "visual_token_window_size": 4,
+        "fullatt_block_indexes": [0],
+        "vit_window_attn_types": [-1],
+        "use_sink": true
+      },
+      "audio_config": {
+        "audio_channels": 2,
+        "speech_vocab_size": "1280",
+        "input_local_layers": 1,
+        "input_local_dim": 16,
+        "input_local_attn_heads": 4,
+        "input_local_head_dim": 4,
+        "input_local_intermediate_size": 32,
+        "projection_layers": 2,
+        "out_hidden_size": 32,
+        "rope_theta": 640000,
+        "partial_rotary_factor": 1.0,
+        "add_post_norm": true
+      }
+    }
+    """#
+
     @Test("model_type=mimo_v2 dispatches to MiMoV2FlashModel")
     func modelTypeAliasDispatches() async throws {
         let model = try await LLMTypeRegistry.shared.createModel(
@@ -114,6 +185,58 @@ struct MiMoV2FlashCacheTopologyTests {
         #expect(sanitized["model.layers.1.self_attn.k_proj.weight"]?.shape == [32, 2])
         #expect(sanitized["model.layers.1.self_attn.v_proj.weight"]?.shape == [32, 2])
         #expect(sanitized["model.layers.1.self_attn.v_proj.scales"]?.shape == [32, 1])
+    }
+
+    @Test("MiMo V2.5 registers shipped visual, audio, and speech weight namespaces")
+    func registersMultimodalWeightNamespaces() throws {
+        let config = try JSONDecoder.json5().decode(
+            MiMoV2FlashConfiguration.self,
+            from: Data(Self.multimodalMiMoV25Config.utf8))
+        let model = MiMoV2FlashModel(config)
+        let parameters = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+
+        #expect(parameters["visual.patch_embed.proj.weight"]?.shape == [16, 2, 4, 4, 3])
+        #expect(parameters["visual.blocks.0.attn.qkv.weight"]?.shape == [64, 16])
+        #expect(parameters["visual.blocks.0.attn.proj.weight"]?.shape == [16, 32])
+        #expect(parameters["visual.blocks.0.mlp.gate_proj.weight"]?.shape == [32, 16])
+        #expect(parameters["visual.merger.ln_q.weight"]?.shape == [16])
+        #expect(parameters["visual.merger.mlp.0.weight"]?.shape == [64, 64])
+        #expect(parameters["visual.merger.mlp.2.weight"]?.shape == [32, 64])
+
+        #expect(parameters["audio_encoder.input_local_transformer.layers.0.self_attn.q_proj.weight"]?.shape == [16, 16])
+        #expect(parameters["audio_encoder.input_local_transformer.layers.0.self_attn.q_proj.bias"]?.shape == [16])
+        #expect(parameters["audio_encoder.input_local_transformer.layers.0.self_attn.o_proj.weight"]?.shape == [16, 16])
+        #expect(parameters["audio_encoder.input_local_transformer.layers.0.mlp.gate_proj.weight"]?.shape == [32, 16])
+        #expect(parameters["audio_encoder.projection.mlp.0.weight"]?.shape == [128, 32])
+        #expect(parameters["audio_encoder.projection.mlp.2.weight"]?.shape == [32, 128])
+        #expect(parameters["speech_embeddings.0.weight"]?.shape == [1280, 16])
+        #expect(parameters["speech_embeddings.1.weight"]?.shape == [1280, 16])
+    }
+
+    @Test("sanitize preserves MiMo multimodal namespaces and remaps Conv3d patch kernel")
+    func sanitizePreservesMultimodalNamespacesAndTransposesPatchEmbedKernel() throws {
+        let config = try JSONDecoder.json5().decode(
+            MiMoV2FlashConfiguration.self,
+            from: Data(Self.multimodalMiMoV25Config.utf8))
+        let model = MiMoV2FlashModel(config)
+
+        let sourcePatch = MLXArray.ones([16, 3, 2, 4, 4])
+        let sanitized = model.sanitize(weights: [
+            "visual.patch_embed.proj.weight": sourcePatch,
+            "visual.blocks.0.attn.qkv.weight": MLXArray.ones([64, 16]),
+            "visual.blocks.0.attn.proj.weight": MLXArray.ones([16, 32]),
+            "audio_encoder.input_local_transformer.layers.0.self_attn.q_proj.weight":
+                MLXArray.ones([16, 16]),
+            "speech_embeddings.0.weight": MLXArray.ones([1280, 16]),
+            "model.mtp.0.embed_tokens.weight": MLXArray.ones([2, 2]),
+        ])
+
+        #expect(sanitized["visual.patch_embed.proj.weight"]?.shape == [16, 2, 4, 4, 3])
+        #expect(sanitized["visual.blocks.0.attn.qkv.weight"]?.shape == [64, 16])
+        #expect(sanitized["visual.blocks.0.attn.proj.weight"]?.shape == [16, 32])
+        #expect(sanitized["audio_encoder.input_local_transformer.layers.0.self_attn.q_proj.weight"]?.shape == [16, 16])
+        #expect(sanitized["speech_embeddings.0.weight"]?.shape == [1280, 16])
+        #expect(sanitized["model.mtp.0.embed_tokens.weight"] == nil)
     }
 
     @Test("TurboQuant KV only promotes full-attention cache layers")
