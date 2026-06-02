@@ -90,6 +90,37 @@ struct Step37ParserDispatchTests {
         #expect(!visible.contains("<parameter=text>"))
     }
 
+    @Test("Step parser accepts observed bare XML function envelope after tool history")
+    func stepParserAcceptsBareXMLFunctionEnvelopeAfterHistory() throws {
+        let processor = ToolCallProcessor(format: .step, tools: [lineCountTool])
+        let stream = """
+            <function=line_count>
+            <parameter=text>
+            one
+            two
+            </parameter>
+            </function>
+            </tool_call>
+            """
+        var visible = ""
+
+        for scalar in stream {
+            if let chunk = processor.processChunk(String(scalar)) {
+                visible += chunk
+            }
+        }
+        if let tail = processor.processEOS() {
+            visible += tail
+        }
+
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls[0].function.name == "line_count")
+        #expect(processor.toolCalls[0].function.arguments["text"] == .string("one\ntwo"))
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("<function=line_count>"))
+        #expect(!visible.contains("</tool_call>"))
+    }
+
     @Test("Step JANG capabilities route tool and reasoning parsers")
     func stepJangCapabilitiesRouteParsers() throws {
         let cfg = try JangLoader.parseConfig(from: [
@@ -465,3 +496,21 @@ two
         }
         """
 }
+
+private let lineCountTool: [String: any Sendable] = [
+    "type": "function",
+    "function": [
+        "name": "line_count",
+        "description": "Count newline-separated text lines.",
+        "parameters": [
+            "type": "object",
+            "properties": [
+                "text": [
+                    "type": "string"
+                ] as [String: any Sendable]
+            ] as [String: any Sendable],
+            "required": ["text"],
+            "additionalProperties": false,
+        ] as [String: any Sendable],
+    ] as [String: any Sendable],
+]

@@ -22,7 +22,7 @@ public struct StepToolCallParser: ToolCallParser, Sendable {
 
     public var startTagAliases: [String] { xml.startTagAliases }
     public var endTagAliases: [String] { xml.endTagAliases }
-    public var startTagPrefixes: [String] { xml.startTagPrefixes }
+    public var startTagPrefixes: [String] { xml.startTagPrefixes + ["<function="] }
     public var endTagPrefixes: [String] { xml.endTagPrefixes }
 
     public init() {}
@@ -43,6 +43,15 @@ public struct StepToolCallParser: ToolCallParser, Sendable {
             return []
         }
         return [call]
+    }
+
+    public func isValidPartialContent(_ toolCallBuffer: String) -> Bool {
+        let trimmed = toolCallBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return true }
+        return trimmed.hasPrefix("<tool_call>")
+            || trimmed.hasPrefix("<function=")
+            || "<tool_call>".hasPrefix(trimmed)
+            || "<function=".hasPrefix(trimmed)
     }
 
     private func parseBareFunctionJSON(
