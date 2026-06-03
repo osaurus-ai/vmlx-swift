@@ -160,6 +160,27 @@ enum VLBench {
         var userInput = UserInput(prompt: prompt, images: [.ciImage(image)])
         userInput.additionalContext = ["enable_thinking": false]
         let lmInput = try await context.processor.prepare(input: userInput)
+        if (ProcessInfo.processInfo.environment["BENCH_VL_DEBUG_PROMPT"] ?? "0") == "1" {
+            let ids = lmInput.text.tokenIds ?? []
+            let imageId = context.tokenizer.convertTokenToId("<|image|>") ?? -1
+            let boiId = context.tokenizer.convertTokenToId("<|image>") ?? -1
+            let eoiId = context.tokenizer.convertTokenToId("<image|>") ?? -1
+            let imageCount = ids.filter { $0 == imageId }.count
+            let boiCount = ids.filter { $0 == boiId }.count
+            let eoiCount = ids.filter { $0 == eoiId }.count
+            let firstImage = ids.firstIndex(of: imageId) ?? ids.startIndex
+            let lo = max(ids.startIndex, firstImage - 12)
+            let hi = min(ids.endIndex, firstImage + 24)
+            let window = context.tokenizer.decode(
+                tokenIds: Array(ids[lo ..< hi]), skipSpecialTokens: false)
+            print("    debug prompt tokens=\(ids.count) imageId=\(imageId) imageCount=\(imageCount) boiCount=\(boiCount) eoiCount=\(eoiCount)")
+            print("    debug image pixels=\(lmInput.image?.pixels.shape.description ?? "nil") frames=\(lmInput.image?.frames?.map { "\($0.h)x\($0.w)" }.joined(separator: ",") ?? "nil")")
+            if let pixels = lmInput.image?.pixels {
+                let means = pixels.mean(axes: [0, 2, 3]).asArray(Float.self)
+                print("    debug image channel means=\(means)")
+            }
+            print("    debug prompt window: \(window.debugDescription)")
+        }
         nonisolated(unsafe) let sendable = lmInput
         let stream = await engine.generate(input: sendable, parameters: parameters)
 
@@ -1362,6 +1383,17 @@ enum VLBench {
     /// SHA256 salts diverge and the coordinator must isolate them.
     private static func synthesiseGradientImage(side: Int, invert: Bool = false) throws -> CIImage {
         var bytes = [UInt8](repeating: 0, count: side * side * 4)
+        if (ProcessInfo.processInfo.environment["BENCH_VL_SOLID_RED"] ?? "0") == "1" {
+            for y in 0..<side {
+                for x in 0..<side {
+                    let off = (y * side + x) * 4
+                    bytes[off + 0] = 255
+                    bytes[off + 1] = 0
+                    bytes[off + 2] = 0
+                    bytes[off + 3] = 255
+                }
+            }
+        } else {
         for y in 0..<side {
             let rawR = UInt8(255 - (255 * y) / max(side - 1, 1))
             let rawB = UInt8((255 * y) / max(side - 1, 1))
@@ -1374,6 +1406,7 @@ enum VLBench {
                 bytes[off + 2] = b
                 bytes[off + 3] = 255
             }
+        }
         }
         let data = Data(bytes)
         let cs = CGColorSpace(name: CGColorSpace.sRGB)!

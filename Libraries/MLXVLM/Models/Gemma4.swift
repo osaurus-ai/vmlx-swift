@@ -1,11 +1,11 @@
 // Copyright © 2024-2026 Jinho Jang (eric@jangq.ai)
 //
-// Gemma 4 VLM — vision-language model with:
-//   - Linear patch embedding with 2D position embeddings
-//   - 2D multidimensional RoPE for vision encoder
-//   - VisionPooler for downsampling patches
-//   - MultimodalEmbedder projecting vision features into text space
-//   - Full Gemma4 text decoder (MoE 26B or Dense 31B)
+// Gemma 4 VLM — supports both the earlier vision-tower variants and the
+// 2026 `gemma4_unified` 12B encoder-free image path:
+//   - unified: raw merged patches -> LN -> Dense -> LN -> +2D pos -> LN
+//     -> RMSNorm -> projection into text space
+//   - non-unified: vision tower + pooler + multimodal projection
+//   - full Gemma4 text decoder (dense 12B/31B or MoE 26B A4B)
 //
 // Python reference: mlx_vlm/models/gemma4/
 
@@ -600,7 +600,6 @@ private class UnifiedVisionEmbedder: Module {
         let pH = H / p
         let pW = W / p
         let nReal = min(pH * pW, cfg.defaultOutputLength)
-        let nPad = max(0, cfg.defaultOutputLength - nReal)
 
         var patches = pixels.reshaped(B, C, pH, p, pW, p)
             .transposed(0, 2, 4, 3, 5, 1)
@@ -623,14 +622,10 @@ private class UnifiedVisionEmbedder: Module {
         let pos = MLXArray(positions).reshaped(nReal, 2)
         let xPos = pos[0..., 0]
         let yPos = pos[0..., 1]
-        var posHidden = posEmbedding[xPos, 0] + posEmbedding[yPos, 1]
-        posHidden = posNorm(posHidden).expandedDimensions(axis: 0)
-        hidden = hidden + posHidden.asType(hidden.dtype)
+        let posHidden = (posEmbedding[xPos, 0] + posEmbedding[yPos, 1])
+            .expandedDimensions(axis: 0)
+        hidden = posNorm(hidden + posHidden.asType(hidden.dtype))
 
-        if nPad > 0 {
-            let pad = MLXArray.zeros([B, nPad, cfg.outputProjectionDimensions]).asType(hidden.dtype)
-            hidden = concatenated([hidden, pad], axis: 1)
-        }
         return hidden
     }
 }
@@ -959,7 +954,7 @@ private class G4LanguageModel: Module {
 private class MultimodalEmbedder: Module {
     @ModuleInfo(key: "embedding_projection") var proj: Linear
     init(embDim: Int, textDim: Int) { _proj.wrappedValue = Linear(embDim, textDim, bias: false); super.init() }
-    func callAsFunction(_ x: MLXArray) -> MLXArray { rmsNormNoScale(proj(x)) }
+    func callAsFunction(_ x: MLXArray) -> MLXArray { proj(rmsNormNoScale(x)) }
 }
 
 private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) throws -> MLXArray {
@@ -1024,19 +1019,12 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws -> PrepareResult {
-        // Media guard for the 2026 Gemma4 unified release. The text runtime is
-        // wired, but audio/video preprocessing is not implemented, and the
-        // early-fusion `vision_embedder.*` image path is not production-proven.
-        // Do not silently generate over missing or wrong media embeddings.
+        // Audio/video preprocessing is not implemented for the 2026 Gemma4
+        // unified release. Do not silently generate over missing embeddings.
         if input.audio != nil || input.video != nil {
             throw VLMError.processing(
                 "Gemma4 VLM does not implement audio/video inputs; LMInput.audio and LMInput.video must be nil. " +
                 "Audio/video-bearing Gemma4 bundles have no proven vMLX audio/video tower path yet.")
-        }
-        if input.image != nil && unifiedVisionEmbedder != nil {
-            throw VLMError.processing(
-                "Gemma4 unified image inputs are not production-supported yet; the released gemma4_unified early-fusion vision_embedder path is not live-proven in vMLX. " +
-                "Use text-only for this bundle until the unified media encoder is implemented and proven.")
         }
         var emb = languageModel.model.emb(input.text.tokens)
         emb = emb * MLXArray(sqrt(Float(config.textConfig.hiddenSize)), dtype: emb.dtype)
@@ -1189,12 +1177,7 @@ public struct Gemma4Processor: UserInputProcessor {
             throw VLMError.processing(
                 "Gemma4 processor currently supports image inputs only; audio/video lanes are explicit unsupported until implemented and proven.")
         }
-        if config.processorClass == "Gemma4UnifiedProcessor", !input.images.isEmpty {
-            throw VLMError.processing(
-                "Gemma4 unified image inputs are not production-supported yet; the released gemma4_unified early-fusion vision_embedder path is not live-proven in vMLX. " +
-                "Use text-only for this bundle until the unified media encoder is implemented and proven.")
-        }
-        var messages = Qwen2VLMessageGenerator().generate(from: input)
+        var messages = Gemma4MessageGenerator().generate(from: input)
         if Self.requiresToolChoice(input.additionalContext) {
             messages = Self.compactCompletedToolHistoryForRequiredChoice(messages)
         }
@@ -1203,6 +1186,7 @@ public struct Gemma4Processor: UserInputProcessor {
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {
             let ps = config.patchSize; let maxP = config.maxSoftTokens * config.poolingKernelSize * config.poolingKernelSize
+            var softTokenCounts: [Int] = []
             let arrays = try input.images.map { img -> MLXArray in
                 let ci = try img.asCIImage()
                 // Reject zero-area, infinite, and NaN extents explicitly. The
@@ -1217,6 +1201,12 @@ public struct Gemma4Processor: UserInputProcessor {
                 let sm = config.poolingKernelSize * ps
                 var tH = Int(floor(f * Float(h) / Float(sm))) * sm; var tW = Int(floor(f * Float(w) / Float(sm))) * sm
                 if tH == 0 { tH = sm }; if tW == 0 { tW = sm }
+                if config.processorClass == "Gemma4UnifiedProcessor" {
+                    let patchCount = (tH / ps) * (tW / ps)
+                    softTokenCounts.append(patchCount / (config.poolingKernelSize * config.poolingKernelSize))
+                } else {
+                    softTokenCounts.append(config.imageSeqLength)
+                }
                 let resized = MediaProcessing.resampleBicubic(ci, to: CGSize(width: tW, height: tH))
                 // Convert to sRGB tone curve — CIImage may be in linear space, but the
                 // vision tower was trained on sRGB images (PIL/Python default).
@@ -1240,9 +1230,14 @@ public struct Gemma4Processor: UserInputProcessor {
                 }
                 processedImage = LMInput.ProcessedImage(pixels: concatenated(stored), frames: imageSizes)
             }
-            // Chat template emits <|image|> which tokenizes to image_token_id (258880
-            // for shipped Gemma4 bundles). Expand each single image token into
-            // imageSeqLength copies for the vision features.
+            // Chat template emits <|image|>. The Gemma4 unified processor
+            // contract replaces that placeholder with:
+            //
+            //   <|image> + (<|image|> * imageSeqLength) + <image|>
+            //
+            // The begin/end sentinels remain normal text tokens. Only the
+            // repeated `<|image|>` positions are soft-token slots for
+            // maskedScatter, so their count must match the vision features.
             //
             // Use `convertTokenToId` rather than `encode("<|image|>").last` so the
             // lookup goes straight through the tokenizer's special-token map and
@@ -1253,7 +1248,20 @@ public struct Gemma4Processor: UserInputProcessor {
             // 258880 fallback covers tokenizers that don't expose `<|image|>` as
             // an addable special token.
             let imgId = tokenizer.convertTokenToId("<|image|>") ?? 258880
-            var exp = [Int](); for t in tokens { if t == imgId { exp.append(contentsOf: Array(repeating: imgId, count: config.imageSeqLength)) } else { exp.append(t) } }
+            let beginImageId = tokenizer.convertTokenToId("<|image>")
+            let endImageId = tokenizer.convertTokenToId("<image|>")
+            var softTokenIterator = softTokenCounts.makeIterator()
+            var exp = [Int]()
+            for t in tokens {
+                if t == imgId {
+                    let tokenCount = softTokenIterator.next() ?? config.imageSeqLength
+                    if let beginImageId { exp.append(beginImageId) }
+                    exp.append(contentsOf: Array(repeating: imgId, count: tokenCount))
+                    if let endImageId { exp.append(endImageId) }
+                } else {
+                    exp.append(t)
+                }
+            }
             tokens = exp
         }
 
@@ -1382,5 +1390,19 @@ public struct Gemma4Processor: UserInputProcessor {
             }.joined(separator: "\n")
         }
         return ""
+    }
+}
+
+private struct Gemma4MessageGenerator: MessageGenerator {
+    func generate(message: Chat.Message) -> MLXLMCommon.Message {
+        var dict = defaultMessageDict(for: message)
+        var content: [[String: String]] = []
+        content.append(contentsOf: message.images.map { _ in ["type": "image"] })
+        content.append(contentsOf: message.videos.map { _ in ["type": "video"] })
+        if !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            content.append(["type": "text", "text": message.content])
+        }
+        dict["content"] = content.isEmpty ? message.content : content
+        return dict
     }
 }

@@ -1679,7 +1679,7 @@ struct Gemma4VLMFocusedSourceContractsTests {
         #expect(overload.contains("addGenerationPrompt: addGenerationPrompt"))
     }
 
-    @Test("Gemma4 prepare rejects unsupported unified media explicitly")
+    @Test("Gemma4 prepare rejects audio/video but allows unified image path")
     func audioGuardIsPresent() throws {
         let source = try gemma4VLMSource()
 
@@ -1687,9 +1687,17 @@ struct Gemma4VLMFocusedSourceContractsTests {
         #expect(source.contains("throw VLMError.processing("))
         #expect(source.contains("LMInput.audio and LMInput.video must be nil"))
         #expect(source.contains("audio/video inputs"))
-        #expect(source.contains("if input.image != nil && unifiedVisionEmbedder != nil {"))
-        #expect(source.contains("Gemma4 unified image inputs are not production-supported yet"))
-        #expect(source.contains("vision_embedder path is not live-proven"))
+        #expect(!source.contains("Gemma4 unified image inputs are not production-supported yet"))
+        #expect(!source.contains("Use text-only for this bundle until the unified media encoder is implemented and proven."))
+        #expect(source.contains("featuresList.append(embedVision(unifiedVisionEmbedder(singleImage)))"))
+    }
+
+    @Test("Gemma4 multimodal projection normalizes before projection")
+    func multimodalProjectionNormalizesBeforeProjection() throws {
+        let source = try gemma4VLMSource()
+
+        #expect(source.contains("func callAsFunction(_ x: MLXArray) -> MLXArray { proj(rmsNormNoScale(x)) }"))
+        #expect(!source.contains("rmsNormNoScale(proj(x))"))
     }
 
     @Test("Gemma4 processor resolves image token without encode special-token drift")
@@ -1697,6 +1705,16 @@ struct Gemma4VLMFocusedSourceContractsTests {
         let source = try gemma4VLMSource()
 
         #expect(source.contains("tokenizer.convertTokenToId(\"<|image|>\")"))
+        #expect(source.contains("tokenizer.convertTokenToId(\"<|image>\")"))
+        #expect(source.contains("tokenizer.convertTokenToId(\"<image|>\")"))
+        #expect(source.contains("var softTokenCounts: [Int] = []"))
+        #expect(source.contains("softTokenCounts.append(patchCount / (config.poolingKernelSize * config.poolingKernelSize))"))
+        #expect(source.contains("let tokenCount = softTokenIterator.next() ?? config.imageSeqLength"))
+        #expect(source.contains("hidden = patchNorm2(hidden)"))
+        #expect(source.contains("hidden = posNorm(hidden + posHidden.asType(hidden.dtype))"))
+        #expect(!source.contains("BENCH_GEMMA4_UNIFIED_VISION_VARIANT"))
+        #expect(source.contains("if let beginImageId { exp.append(beginImageId) }"))
+        #expect(source.contains("if let endImageId { exp.append(endImageId) }"))
         #expect(!source.contains("tokenizer.encode(text: \"<|image|>\").last"))
         #expect(source.contains("?? 258880"))
     }
