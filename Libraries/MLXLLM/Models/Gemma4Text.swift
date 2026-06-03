@@ -262,11 +262,20 @@ class Gemma4Attention: Module {
         let ropeParams = config.ropeParameters[layerKey] ?? [:]
         let ropeTheta = ropeParams["rope_theta"]?.asFloat() ?? (isSliding ? 10000.0 : 1_000_000.0)
         let partialRotaryFactor = ropeParams["partial_rotary_factor"]?.asFloat() ?? (isSliding ? 1.0 : 0.25)
-        let ropeDims = max(1, Int(Float(headDim) * partialRotaryFactor))
+        let ropeType: String = {
+            if let typeValue = ropeParams["type"] ?? ropeParams["rope_type"],
+                case .string(let s) = typeValue
+            {
+                return s
+            }
+            return "default"
+        }()
+        let ropeDims =
+            ropeType == "proportional" ? headDim : max(1, Int(Float(headDim) * partialRotaryFactor))
 
         self.rope = initializeRope(
             dims: ropeDims, base: ropeTheta, traditional: config.ropeTraditional,
-            scalingConfig: nil, maxPositionEmbeddings: nil)
+            scalingConfig: ropeParams.isEmpty ? nil : ropeParams, maxPositionEmbeddings: nil)
 
         super.init()
     }
