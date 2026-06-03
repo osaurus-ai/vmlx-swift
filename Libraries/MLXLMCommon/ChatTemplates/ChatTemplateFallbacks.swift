@@ -150,6 +150,10 @@ public enum ChatTemplateFallbacks {
                             'exact text:',
                             'on exactly this text:',
                             'exactly this text:',
+                            'Use the ' ~ required_tool_name ~ ' tool on this exact text:',
+                            'use the ' ~ required_tool_name ~ ' tool on this exact text:',
+                            'Use ' ~ required_tool_name ~ ' on this exact text:',
+                            'Now use ' ~ required_tool_name ~ ' on this exact text:',
                             'now use ' ~ required_tool_name ~ ' on this exact text:',
                             'use ' ~ required_tool_name ~ ' on this exact text:'
                         ] -%}

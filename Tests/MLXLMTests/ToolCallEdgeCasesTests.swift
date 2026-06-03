@@ -428,6 +428,29 @@ struct ToolCallEdgeCasesTests {
         #expect(call.function.arguments["location"] == .string("Tokyo"))
     }
 
+    @Test("Gemma-4 parser unwraps redundant JSON quotes inside escaped string values")
+    func testGemma4ParserUnwrapsQuotedEscapedStringArgument() throws {
+        let parser = ToolCallFormat.gemma4.createParser()
+        let call = try #require(parser.parse(
+            content: #"<|tool_call>call:line_count{text:<|"|>"red\ngreen\nblue"<|"|>}<tool_call|>"#,
+            tools: [lineCountToolSpec()]
+        ))
+
+        #expect(call.function.name == "line_count")
+        #expect(call.function.arguments["text"] == .string("red\ngreen\nblue"))
+    }
+
+    @Test("Gemma-4 escaped string parser keeps literal booleans as strings")
+    func testGemma4EscapedStringParserKeepsLiteralBooleanString() throws {
+        let parser = ToolCallFormat.gemma4.createParser()
+        let call = try #require(parser.parse(
+            content: #"<|tool_call>call:label{value:<|"|>true<|"|>}<tool_call|>"#,
+            tools: nil
+        ))
+
+        #expect(call.function.arguments["value"] == .string("true"))
+    }
+
     @Test("Gemma-4 processor routes live 12B quoted native tool-call without visible leak")
     func testGemma4ProcessorRoutesLive12BQuotedNativeToolCallWithoutLeak() {
         let processor = ToolCallProcessor(format: .gemma4)

@@ -382,6 +382,48 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             "Generation prompt must end with open model turn.")
     }
 
+    func testGemma4WithToolsTemplateGroundsOsaurusRequiredLineCountText() throws {
+        let template = try Template(MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools)
+
+        let tools: [[String: Any]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "line_count",
+                    "description": "Count newline-separated text lines.",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "text": ["type": "string"] as [String: Any],
+                        ] as [String: Any],
+                        "required": ["text"],
+                        "additionalProperties": false,
+                    ] as [String: Any],
+                ] as [String: Any],
+            ] as [String: Any]
+        ]
+        let messages: [[String: Any]] = [
+            [
+                "role": "user",
+                "content": "Use the line_count tool on this exact text: red\ngreen\nblue",
+            ] as [String: Any],
+        ]
+
+        let out = try template.renderAny([
+            "bos_token": "<bos>",
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "required",
+            "add_generation_prompt": true,
+        ])
+
+        XCTAssertTrue(out.contains("Use the `line_count` function."),
+            "Single-tool required choice must infer the selected function. Got: \(out)")
+        XCTAssertTrue(out.contains(
+            "<|tool_call>call:line_count{text:<|\"|>red\ngreen\nblue<|\"|>}<tool_call|>"
+        ), "Required call shape must copy the exact multiline value. Got: \(out)")
+    }
+
     /// Iter 52: the system-message branch must handle multi-part content
     /// too. iter 50's version assumed `content` was always a string —
     /// would crash on a system turn whose content comes through as a

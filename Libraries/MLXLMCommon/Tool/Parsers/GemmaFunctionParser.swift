@@ -87,7 +87,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             guard let endEscape = text.range(of: escapeMarker) else { return nil }
             let value = String(text[..<endEscape.lowerBound])
             text = String(text[endEscape.upperBound...])
-            return value
+            return decodeEscapedStringValue(value)
         }
 
         if text.hasPrefix("[") {
@@ -161,5 +161,16 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             return json
         }
         return value
+    }
+
+    private func decodeEscapedStringValue(_ value: String) -> String {
+        guard value.hasPrefix("\""),
+            value.hasSuffix("\""),
+            let data = value.data(using: .utf8),
+            let decoded = try? JSONDecoder().decode(String.self, from: data)
+        else {
+            return value
+        }
+        return decoded
     }
 }
