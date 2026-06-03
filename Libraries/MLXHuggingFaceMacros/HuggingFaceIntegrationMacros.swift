@@ -189,9 +189,12 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 tools: chatTemplateTools,
                                     additionalContext: additionalContext)
                         }
+                        let hasGemma4NativeToolSentinels =
+                            upstream.convertTokenToId("<|tool_call>") != nil
+                            && upstream.convertTokenToId("<|turn>") != nil
                         let gemmaRequiredToolChoice =
-                            !(tools?.isEmpty ?? true)
-                            && upstream.bosToken == "<bos>"
+                            !(chatTemplateTools?.isEmpty ?? true)
+                            && (upstream.bosToken == "<bos>" || hasGemma4NativeToolSentinels)
                             && (additionalContext?["tool_choice"] as? String) == "required"
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
                         if gemmaRequiredToolChoice {
@@ -562,9 +565,12 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 tools: chatTemplateTools,
                                     additionalContext: additionalContext)
                         }
+                        let hasGemma4NativeToolSentinels =
+                            upstream.convertTokenToId("<|tool_call>") != nil
+                            && upstream.convertTokenToId("<|turn>") != nil
                         let gemmaRequiredToolChoice =
-                            !(tools?.isEmpty ?? true)
-                            && upstream.bosToken == "<bos>"
+                            !(chatTemplateTools?.isEmpty ?? true)
+                            && (upstream.bosToken == "<bos>" || hasGemma4NativeToolSentinels)
                             && (additionalContext?["tool_choice"] as? String) == "required"
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
                         if gemmaRequiredToolChoice {
