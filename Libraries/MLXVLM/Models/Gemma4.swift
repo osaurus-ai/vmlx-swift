@@ -673,7 +673,18 @@ private class TextAttn: Module {
         let rp = cfg.ropeParameters[lk] ?? [:]
         let rt = rp["rope_theta"]?.asFloat() ?? (isSliding ? 10000.0 : 1_000_000.0)
         let prf = rp["partial_rotary_factor"]?.asFloat() ?? (isSliding ? 1.0 : 0.25)
-        self.rope = initializeRope(dims: max(1, Int(Float(hD) * prf)), base: rt, traditional: cfg.ropeTraditional, scalingConfig: nil, maxPositionEmbeddings: nil)
+        let ropeType: String = {
+            if let typeValue = rp["type"] ?? rp["rope_type"],
+                case .string(let s) = typeValue
+            {
+                return s
+            }
+            return "default"
+        }()
+        let ropeDims = ropeType == "proportional" ? hD : max(1, Int(Float(hD) * prf))
+        self.rope = initializeRope(
+            dims: ropeDims, base: rt, traditional: cfg.ropeTraditional,
+            scalingConfig: rp.isEmpty ? nil : rp, maxPositionEmbeddings: nil)
         super.init()
     }
 

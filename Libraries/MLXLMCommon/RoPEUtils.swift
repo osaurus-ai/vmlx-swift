@@ -203,6 +203,111 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
 
 }
 
+public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
+    let dimensions: Int
+    let rotatedDimensions: Int
+    let traditional: Bool
+
+    private let _freqs: MLXArray?
+
+    public init(
+        dimensions: Int,
+        traditional: Bool = false,
+        base: Float = 10000,
+        scalingConfig: [String: StringOrNumber]? = nil
+    ) {
+        precondition(dimensions % 2 == 0, "Dimensions must be even")
+
+        self.dimensions = dimensions
+        self.traditional = traditional
+
+        let factor = scalingConfig?["factor"]?.asFloat() ?? 1.0
+        let partialRotaryFactor = scalingConfig?["partial_rotary_factor"]?.asFloat() ?? 1.0
+        let ropeAngles = Int(Float(dimensions) * partialRotaryFactor / 2.0)
+        self.rotatedDimensions = 2 * ropeAngles
+        precondition(rotatedDimensions <= dimensions, "Rotated dimensions must not exceed head dimension")
+
+        if rotatedDimensions > 0 {
+            let exponents =
+                MLXArray(stride(from: 0, to: rotatedDimensions, by: 2)).asType(.float32)
+                / Float(dimensions)
+            self._freqs = factor * MLX.pow(base, exponents)
+        } else {
+            self._freqs = nil
+        }
+
+        super.init()
+    }
+
+    public func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
+        guard rotatedDimensions > 0, let freqs = _freqs else {
+            return x
+        }
+        return apply(x, offset: offset, freqs: freqs)
+    }
+
+    public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        guard rotatedDimensions > 0, let freqs = _freqs else {
+            return x
+        }
+        return apply(x, offset: offset, freqs: freqs)
+    }
+
+    private func splitApplyAndMerge(
+        _ x: MLXArray,
+        applyRoPE: (MLXArray) -> MLXArray
+    ) -> MLXArray {
+        let head = x[.ellipsis, ..<dimensions]
+        let half = dimensions / 2
+        let rotatedHalf = rotatedDimensions / 2
+
+        let left = head[.ellipsis, ..<half]
+        let right = head[.ellipsis, half...]
+        let rotatedInput = concatenated(
+            [left[.ellipsis, ..<rotatedHalf], right[.ellipsis, ..<rotatedHalf]], axis: -1)
+        let rotated = applyRoPE(rotatedInput)
+
+        let mergedLeft = concatenated(
+            [rotated[.ellipsis, ..<rotatedHalf], left[.ellipsis, rotatedHalf...]], axis: -1)
+        let mergedRight = concatenated(
+            [rotated[.ellipsis, rotatedHalf...], right[.ellipsis, rotatedHalf...]], axis: -1)
+        let mergedHead = concatenated([mergedLeft, mergedRight], axis: -1)
+
+        guard (x.shape.last ?? dimensions) > dimensions else {
+            return mergedHead
+        }
+        return concatenated([mergedHead, x[.ellipsis, dimensions...]], axis: -1)
+    }
+
+    private func apply(_ x: MLXArray, offset: Int, freqs: MLXArray) -> MLXArray {
+        splitApplyAndMerge(x) { rotatedInput in
+            MLXFast.RoPE(
+                rotatedInput,
+                dimensions: rotatedDimensions,
+                traditional: traditional,
+                base: nil,
+                scale: 1.0,
+                offset: offset,
+                freqs: freqs
+            )
+        }
+    }
+
+    private func apply(_ x: MLXArray, offset: MLXArray, freqs: MLXArray) -> MLXArray {
+        splitApplyAndMerge(x) { rotatedInput in
+            MLXFast.RoPE(
+                rotatedInput,
+                dimensions: rotatedDimensions,
+                traditional: traditional,
+                base: nil,
+                scale: 1.0,
+                offset: offset,
+                freqs: freqs
+            )
+        }
+    }
+}
+
 private let yarnTypes: Set = ["yarn", "deepseek_yarn", "telechat3-yarn"]
 
 public typealias RoPELayer = OffsetLayer & ArrayOffsetLayer
@@ -232,6 +337,13 @@ public func initializeRope(
             scale = 1.0
         }
         return RoPE(dimensions: dims, traditional: traditional, base: base, scale: scale)
+    } else if ropeType == "proportional" {
+        return ProportionalRoPE(
+            dimensions: dims,
+            traditional: traditional,
+            base: base,
+            scalingConfig: scalingConfig
+        )
     } else if ropeType == "llama3" {
         return Llama3RoPE(
             dims: dims,
