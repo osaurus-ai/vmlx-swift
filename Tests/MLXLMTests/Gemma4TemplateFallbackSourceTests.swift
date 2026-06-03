@@ -73,6 +73,11 @@ struct Gemma4TemplateFallbackSourceTests {
         #expect(rendered.contains("represent each line break with the two characters \\n"))
         #expect(rendered.contains("Do not add or remove whitespace or spaces after newlines"))
         #expect(rendered.contains("<|tool_call>call:line_count{text:<|\"|>red\\ngreen\\nblue<|\"|>}<tool_call|>"))
+        #expect(rendered.contains("The two-character sequence \\n shown inside <|\"|> is how each requested line break must appear"))
+        #expect(rendered.contains("Do not replace \\n with a physical newline"))
+        #expect(rendered.contains("do not copy raw user prose"))
+        #expect(rendered.contains("<|turn>user\nRequired tool call request. Use the exact required call shape below; do not copy raw user prose."))
+        #expect(!rendered.contains("Use the line_count tool on this exact text: red\ngreen\nblue"))
         #expect(rendered.hasSuffix("<|turn>model\n"))
     }
 }

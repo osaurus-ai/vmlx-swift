@@ -164,7 +164,7 @@ public enum ChatTemplateFallbacks {
                         {%- endfor -%}
                         {%- if exact.value -%}
                             {%- set exact_escaped = exact.value | replace("\\", "\\\\") | replace("\n", "\\n") | replace("\t", "\\t") -%}
-                            {{- '\nRequired call shape for the current request:\n<|tool_call>call:' ~ required_tool_name ~ '{' ~ param_name ~ ':<|"|>' ~ exact_escaped ~ '<|"|>}<tool_call|>' -}}
+                            {{- '\nRequired call shape for the current request:\n<|tool_call>call:' ~ required_tool_name ~ '{' ~ param_name ~ ':<|"|>' ~ exact_escaped ~ '<|"|>}<tool_call|>\nEmit that call shape exactly. The two-character sequence \\n shown inside <|"|> is how each requested line break must appear in the native tool call; the parser decodes it back into real line breaks. Do not replace \\n with a physical newline, do not insert a space after it, and do not copy raw user prose.' -}}
                         {%- endif -%}
                     {%- endfor -%}
                 {%- endif -%}
@@ -237,7 +237,11 @@ public enum ChatTemplateFallbacks {
     {%- else -%}
         {{- '<|turn>' + role + '\n' -}}
         {%- if message['content'] -%}
-            {{- render_content(message['content']) -}}
+            {%- if message['role'] == 'user' and required_tool_choice and loop.last and message['content'] is string -%}
+                {{- 'Required tool call request. Use the exact required call shape below; do not copy raw user prose.' -}}
+            {%- else -%}
+                {{- render_content(message['content']) -}}
+            {%- endif -%}
         {%- endif -%}
         {%- if message['role'] == 'user' and required_tool_choice and loop.last -%}
             {%- set latest_required_user_content = message['content'] if message['content'] is string else '' -%}
