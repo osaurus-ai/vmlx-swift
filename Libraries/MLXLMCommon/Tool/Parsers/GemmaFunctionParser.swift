@@ -149,11 +149,14 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
     private func decodeRawValue(_ value: String) -> any Sendable {
         guard !value.isEmpty else { return "" }
         if value.hasPrefix("\""),
-            value.hasSuffix("\""),
-            let data = value.data(using: .utf8),
-            let decoded = try? JSONDecoder().decode(String.self, from: data)
+           value.hasSuffix("\"")
         {
-            return decoded
+            if let data = value.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode(String.self, from: data)
+            {
+                return decoded
+            }
+            return decodeQuotedStringLiteral(value)
         }
         if let data = value.data(using: .utf8),
             let json = deserializeJSON(data)
@@ -174,6 +177,16 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         {
             return decoded
         }
+        var inner = String(value.dropFirst().dropLast())
+        inner = inner.replacingOccurrences(of: #"\""#, with: #"""#)
+        inner = inner.replacingOccurrences(of: #"\\n"#, with: "\n")
+        inner = inner.replacingOccurrences(of: #"\\t"#, with: "\t")
+        inner = inner.replacingOccurrences(of: #"\\r"#, with: "\r")
+        inner = inner.replacingOccurrences(of: #"\\\\"#, with: #"\"#)
+        return inner
+    }
+
+    private func decodeQuotedStringLiteral(_ value: String) -> String {
         var inner = String(value.dropFirst().dropLast())
         inner = inner.replacingOccurrences(of: #"\""#, with: #"""#)
         inner = inner.replacingOccurrences(of: #"\\n"#, with: "\n")

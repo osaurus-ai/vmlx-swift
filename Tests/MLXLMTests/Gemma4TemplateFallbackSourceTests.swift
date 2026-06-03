@@ -69,6 +69,8 @@ struct Gemma4TemplateFallbackSourceTests {
         #expect(rendered.contains("Use the `line_count` function."))
         #expect(rendered.contains("Required parameters for `line_count`: text."))
         #expect(rendered.contains("<|tool_call>call:FUNCTION_NAME{ARGUMENT_NAME:<|\"|>ARGUMENT_VALUE<|\"|>}<tool_call|>"))
+        #expect(rendered.contains("Do not wrap the argument value in quote characters"))
+        #expect(rendered.contains("do not add or remove whitespace or spaces after newlines"))
         #expect(rendered.contains("<|tool_call>call:line_count{text:<|\"|>red\ngreen\nblue<|\"|>}<tool_call|>"))
         #expect(rendered.hasSuffix("<|turn>model\n"))
     }

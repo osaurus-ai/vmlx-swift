@@ -130,7 +130,7 @@ public enum ChatTemplateFallbacks {
 {%- endif -%}
 {%- macro render_required_tool_choice_instruction(latest_user_content='') -%}
     {%- if required_tool_choice -%}
-        {{- '\nThe current assistant response MUST be a function call. Reply only with one native Gemma function call and no prose before the tool result:\n<|tool_call>call:FUNCTION_NAME{ARGUMENT_NAME:<|"|>ARGUMENT_VALUE<|"|>}<tool_call|>' -}}
+        {{- '\nThe current assistant response MUST be a function call. Reply only with one native Gemma function call and no prose before the tool result:\n<|tool_call>call:FUNCTION_NAME{ARGUMENT_NAME:<|"|>ARGUMENT_VALUE<|"|>}<tool_call|>\nPlace string argument contents directly between <|"|> and <|"|>. Do not wrap the argument value in quote characters, and do not add or remove whitespace or spaces after newlines.' -}}
         {%- if required_tool_name -%}
             {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
             {%- for tool in tools -%}
