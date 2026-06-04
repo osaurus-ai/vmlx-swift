@@ -9,46 +9,84 @@ public func normalizedToolsForChatTemplate(_ tools: [ToolSpec]?) -> [ToolSpec]? 
 }
 
 public func normalizedToolForChatTemplate(_ tool: ToolSpec) -> ToolSpec {
-    normalizeChatTemplateValue(tool) as? ToolSpec ?? tool
+    normalizeChatTemplateValue(tool, inSchemaPosition: false) as? ToolSpec ?? tool
 }
 
-private func normalizeChatTemplateValue(_ value: any Sendable) -> any Sendable {
+private func normalizeChatTemplateValue(
+    _ value: any Sendable, inSchemaPosition: Bool
+) -> any Sendable {
     if var object = value as? [String: any Sendable] {
         for (key, child) in object {
-            object[key] = normalizeChatTemplateValue(child)
+            if key == "properties", let properties = child as? [String: any Sendable] {
+                var normalizedProperties: [String: any Sendable] = [:]
+                for (propertyName, propertySchema) in properties {
+                    normalizedProperties[propertyName] = normalizeChatTemplateValue(
+                        propertySchema, inSchemaPosition: true)
+                }
+                object[key] = normalizedProperties
+            } else if key == "parameters" || key == "items" || key == "additionalProperties"
+                || key == "response"
+            {
+                object[key] = normalizeChatTemplateValue(child, inSchemaPosition: true)
+            } else if key == "oneOf" || key == "anyOf" || key == "allOf" {
+                if let entries = child as? [any Sendable] {
+                    object[key] =
+                        entries.map { normalizeChatTemplateValue($0, inSchemaPosition: true) }
+                        as [any Sendable]
+                } else {
+                    object[key] = normalizeChatTemplateValue(child, inSchemaPosition: true)
+                }
+            } else {
+                object[key] = normalizeChatTemplateValue(
+                    child, inSchemaPosition: inSchemaPosition)
+            }
         }
-        normalizeNullableTypeUnion(&object)
+
+        if inSchemaPosition {
+            normalizeSchemaType(&object)
+        }
         normalizeNullableEnum(&object)
         return object
     }
 
     if let array = value as? [any Sendable] {
-        return array.map { normalizeChatTemplateValue($0) } as [any Sendable]
+        return array.map {
+            normalizeChatTemplateValue($0, inSchemaPosition: inSchemaPosition)
+        } as [any Sendable]
     }
 
     return value
 }
 
-private func normalizeNullableTypeUnion(_ object: inout [String: any Sendable]) {
-    guard let entries = stringTypeArray(object["type"]) else { return }
+private func normalizeSchemaType(_ object: inout [String: any Sendable]) {
+    if let type = object["type"] as? String, !type.isEmpty {
+        return
+    }
 
-    var hasNull = false
-    var scalar: String?
-    for entry in entries {
-        if entry == "null" {
-            hasNull = true
-        } else if scalar == nil {
-            scalar = entry
-        } else {
+    if let entries = stringTypeArray(object["type"]) {
+        let nonNull = entries.filter { $0 != "null" }
+        if entries.count != nonNull.count {
+            object["nullable"] = true
+        }
+        if let first = nonNull.first, !first.isEmpty {
+            object["type"] = first
             return
         }
-    }
-
-    guard let scalar else { return }
-    object["type"] = scalar
-    if hasNull {
+    } else if object["type"] is NSNull {
         object["nullable"] = true
     }
+
+    object["type"] = inferredSchemaType(from: object)
+}
+
+private func inferredSchemaType(from object: [String: any Sendable]) -> String {
+    if object["properties"] is [String: any Sendable] {
+        return "object"
+    }
+    if object["items"] != nil {
+        return "array"
+    }
+    return "string"
 }
 
 private func normalizeNullableEnum(_ object: inout [String: any Sendable]) {

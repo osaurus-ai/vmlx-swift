@@ -104,4 +104,77 @@ struct Gemma4ToolCallParserFocusedTests {
         #expect(!rendered.contains("upper filter requires string"))
         #expect(!rendered.contains("Cannot convert value of type Optional<Any> to Jinja Value"))
     }
+
+    @Test("Gemma4 tool template renders malformed schema types without crashing")
+    func gemma4ToolTemplateRendersMalformedSchemaTypesWithoutCrashing() throws {
+        let tool: ToolSpec = [
+            "type": "function",
+            "function": [
+                "name": "schema_probe",
+                "description": "Probe schema normalization for Gemma4 templates.",
+                "parameters": [
+                    "type": ["object", "null"] as [any Sendable],
+                    "properties": [
+                        "query": [
+                            "type": NSNull(),
+                            "description": "Search or URL query.",
+                        ] as [String: any Sendable],
+                        "format": [
+                            "type": ["string", "integer"] as [any Sendable],
+                            "description": "Preferred output format.",
+                        ] as [String: any Sendable],
+                        "nested": [
+                            "properties": [
+                                "type": [
+                                    "type": "string",
+                                    "description": "A literal property named type.",
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                    "required": ["query"],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+
+        let normalized = try #require(normalizedToolsForChatTemplate([tool])?.first)
+        let function = try #require(normalized["function"] as? [String: any Sendable])
+        let parameters = try #require(function["parameters"] as? [String: any Sendable])
+        #expect(parameters["type"] as? String == "object")
+        #expect(parameters["nullable"] as? Bool == true)
+
+        let properties = try #require(parameters["properties"] as? [String: any Sendable])
+        let query = try #require(properties["query"] as? [String: any Sendable])
+        let format = try #require(properties["format"] as? [String: any Sendable])
+        let nested = try #require(properties["nested"] as? [String: any Sendable])
+        let nestedProperties = try #require(nested["properties"] as? [String: any Sendable])
+        let literalTypeProperty = try #require(
+            nestedProperties["type"] as? [String: any Sendable])
+
+        #expect(query["type"] as? String == "string")
+        #expect(query["nullable"] as? Bool == true)
+        #expect(format["type"] as? String == "string")
+        #expect(nested["type"] as? String == "object")
+        #expect(literalTypeProperty["type"] as? String == "string")
+
+        let rendered = try renderGemma4([
+            "messages": [
+                [
+                    "role": "user",
+                    "content": "Can you download this youtube video?",
+                ] as [String: any Sendable],
+            ] as [any Sendable],
+            "tools": [normalized] as [any Sendable],
+            "tool_choice": "required",
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+            "bos_token": "<bos>",
+        ])
+
+        #expect(rendered.contains("declaration:schema_probe"))
+        #expect(rendered.contains("query"))
+        #expect(rendered.contains("nested"))
+        #expect(!rendered.contains("upper filter requires string"))
+        #expect(!rendered.contains("Cannot convert value of type Optional<Any> to Jinja Value"))
+    }
 }
