@@ -760,6 +760,11 @@ let package = Package(
                 "TokenizerAddedTokenRegexFocusedTests.swift",
             ]
         ),
+        .testTarget(
+            name: "MLXLMCommonToolParserFocusedTests",
+            dependencies: ["MLXLMCommon"],
+            path: "Tests/MLXLMCommonToolParserFocusedTests"
+        ),
 
         // ------
         // Example programs
