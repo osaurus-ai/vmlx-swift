@@ -1274,18 +1274,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                     )
                 }
             }
-            if (input.toolSchemas?.isEmpty == false
-                || input.cacheScopeSalt?.contains("tool=required") == true),
-               cacheRequiresDiskBackedCoordinatorRestore(self.cache)
-            {
-                self.cache = self.model.newCache(parameters: effectiveParameters)
-                inputForPrepare = input
-                Self.logger.info(
-                    "TokenIterator: reset path-dependent cache and skipped disk-backed fetch for active tool request"
-                )
-            } else {
+            let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(self.cache)
             let result = coordinator.fetch(
-                tokens: cacheLookupTokenIds, mediaSalt: mediaSalt)
+                tokens: cacheLookupTokenIds,
+                mediaSalt: mediaSalt,
+                skipExactDiskBoundary: requiresDiskBackedRestore)
             switch result {
             case .hit(_, let remainingTokens, let detail, let blocks, let ssmStates, let diskArrays):
                 var restored = false
@@ -1328,8 +1321,6 @@ public struct TokenIterator: TokenIteratorProtocol {
                     if cacheLookupUsesPostPrepareAlias {
                         self.promptTokenIds = cacheLookupTokenIds
                     }
-                    let requiresDiskBackedRestore =
-                        cacheRequiresDiskBackedCoordinatorRestore(self.cache)
                     let unsafePartial =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
                     let unsafeFullHit = remainingTokens.isEmpty && requiresDiskBackedRestore
@@ -1455,7 +1446,6 @@ public struct TokenIterator: TokenIteratorProtocol {
                         )
                     }
                 }
-            }
             }
         } else if cacheCoordinator != nil,
                   !promptTokenIds.isEmpty,
@@ -1812,6 +1802,20 @@ public struct TokenIterator: TokenIteratorProtocol {
                 kvMode: .none)
 
             if !originalInput.requiresPostPrepareCacheKey {
+                let requiresDiskBackedRestore =
+                    cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
+                if requiresDiskBackedRestore,
+                   promptTokenIds.count > 1,
+                   let boundarySnapshot = cacheSnapshotForBoundary(
+                        tokens: Array(promptTokenIds.dropLast()),
+                        promptSnapshot: promptCacheSnapshot)
+                {
+                    store(
+                        tokens: Array(promptTokenIds.dropLast()),
+                        cache: boundarySnapshot,
+                        kvBits: nil,
+                        kvMode: .none)
+                }
                 for boundary in Set(cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokenIds.count {
                     let boundaryTokens = Array(promptTokenIds.prefix(boundary))

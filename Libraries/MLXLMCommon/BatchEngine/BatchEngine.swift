@@ -1294,21 +1294,11 @@ public actor BatchEngine {
                 activeSlots[slotIndex] = slot
                 return stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare)
             }
-            if (slot.originalInput.toolSchemas?.isEmpty == false
-                || slot.originalInput.cacheScopeSalt?.contains("tool=required") == true),
-               cacheRequiresDiskBackedCoordinatorRestore(slot.cache)
-            {
-                slot.cache = context.model.newCache(parameters: slot.parameters)
-                inputForPrepare = slot.originalInput
-                Self.logger.info(
-                    "Slot \(slot.id.description, privacy: .public): reset path-dependent cache and skipped disk-backed fetch for active tool request"
-                )
-                activeSlots[slotIndex] = slot
-                return stepPrefillAfterCacheLookup(
-                    slotIndex: slotIndex,
-                    inputForPrepare: inputForPrepare)
-            }
-            let result = coordinator.fetch(tokens: tokenIds, mediaSalt: slot.mediaSalt)
+            let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(slot.cache)
+            let result = coordinator.fetch(
+                tokens: tokenIds,
+                mediaSalt: slot.mediaSalt,
+                skipExactDiskBoundary: requiresDiskBackedRestore)
             if case .hit(_, let remaining, let detail, let blocks, let ssmStates, let diskArrays) = result {
                 var restored = false
                 if !blocks.isEmpty {
@@ -1396,8 +1386,6 @@ public actor BatchEngine {
                     // remaining.nonEmpty case below.
                     let unsafePartial =
                         slot.originalInput.cacheHitSuffixContainsMediaPlaceholder(remaining)
-                    let requiresDiskBackedRestore =
-                        cacheRequiresDiskBackedCoordinatorRestore(slot.cache)
                     let unsafeFullHit = remaining.isEmpty && requiresDiskBackedRestore
                     if unsafePartial || unsafeFullHit {
                         let why: String
@@ -2307,6 +2295,17 @@ public actor BatchEngine {
                 label: "prompt-boundary")
 
             if !slot.cachePromptUsesPostPrepareKey {
+                let requiresDiskBackedRestore =
+                    cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
+                if requiresDiskBackedRestore,
+                   promptTokens.count > 1,
+                   let snapshot = boundarySnapshot(tokens: Array(promptTokens.dropLast()))
+                {
+                    storeCacheEntry(
+                        tokens: Array(promptTokens.dropLast()),
+                        snapshot: snapshot,
+                        label: "disk-backed-safe-prompt-boundary")
+                }
                 for boundary in Set(slot.originalInput.cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokens.count {
                     if let snapshot = boundarySnapshot(

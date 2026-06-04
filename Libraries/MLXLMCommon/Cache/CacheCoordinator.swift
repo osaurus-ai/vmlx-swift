@@ -318,7 +318,11 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///   - tokens: The full token sequence to look up.
     ///   - mediaSalt: Optional VLM media fingerprint; `nil` for text-only.
     /// - Returns: A ``CacheFetchResult`` describing the outcome.
-    public func fetch(tokens: [Int], mediaSalt: String? = nil) -> CacheFetchResult {
+    public func fetch(
+        tokens: [Int],
+        mediaSalt: String? = nil,
+        skipExactDiskBoundary: Bool = false
+    ) -> CacheFetchResult {
         func hasRequiredHybridSSM(
             _ states: [MLXArray]?,
             diskArrays: [String: MLXArray]? = nil
@@ -418,7 +422,9 @@ public final class CacheCoordinator: @unchecked Sendable {
             }
 
             var tried = Set<Int>()
-            let preferredBoundaries = [tokens.count, tokens.count - 1]
+            let preferredBoundaries = skipExactDiskBoundary
+                ? [tokens.count - 1]
+                : [tokens.count, tokens.count - 1]
             for boundary in preferredBoundaries where boundary > 0 {
                 tried.insert(boundary)
                 if let hit = diskHit(boundary: boundary) {
