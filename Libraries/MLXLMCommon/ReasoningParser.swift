@@ -357,8 +357,9 @@ public struct ReasoningParser: Sendable {
             }
 
             if final {
-                let emitted = stripIdentifierOnlyAtEnd
-                    && isHarmonyIdentifierChannelName(harmonyChannelNameBuffer)
+                let emitted = isHarmonyThoughtChannelName(harmonyChannelNameBuffer)
+                    || (stripIdentifierOnlyAtEnd
+                        && isHarmonyIdentifierChannelName(harmonyChannelNameBuffer))
                     ? ""
                     : harmonyChannelNameBuffer
                 harmonyChannelNameBuffer.removeAll(keepingCapacity: false)
@@ -383,6 +384,11 @@ public struct ReasoningParser: Sendable {
         return trimmed.unicodeScalars.allSatisfy {
             CharacterSet.alphanumerics.contains($0) || $0 == "_" || $0 == "-"
         }
+    }
+
+    private func isHarmonyThoughtChannelName(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return trimmed == "thought" || trimmed == "thinking"
     }
 
     private mutating func emitSafeHarmonyPrefix(
@@ -809,9 +815,15 @@ extension ReasoningParser {
             parser.insideReasoning = true
             if let lastOpener {
                 let promptChannelTail = String(promptTail[lastOpener.upperBound...])
-                if !promptChannelTail.contains("\n") {
+                if !promptChannelTail.contains("\n")
+                    || promptChannelTail
+                        .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+                        .first
+                        .map({ parser.isHarmonyThoughtChannelName(String($0)) }) == true
+                {
                     parser.harmonyChannelShouldStripName = true
-                    parser.harmonyChannelNameBuffer = promptChannelTail
+                    parser.harmonyChannelNameBuffer =
+                        promptChannelTail.contains("\n") ? "" : promptChannelTail
                 }
             }
         }
