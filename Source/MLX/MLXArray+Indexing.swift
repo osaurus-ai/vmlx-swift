@@ -678,6 +678,16 @@ func getItemND(
     var axis = 0
 
     for item in remainingIndices {
+        // `.newAxis` inserts a dimension and consumes no source axis; every other
+        // operation consumes one. Guard against an over-rank subscript (more
+        // index/slice dimensions than the source has) so it fails with a message
+        // naming the shape instead of trapping opaquely inside the Swift array
+        // bounds check on `starts`/`ends`/`strides` below.
+        if axis >= ndim, !item.isNewAxis {
+            preconditionFailure(
+                "MLXArray subscript has more index dimensions than the array rank: "
+                    + "\(remainingIndices.count) operations applied to shape \(src.shape) (ndim \(ndim))")
+        }
         switch item {
         case .newAxis:
             continue
