@@ -762,7 +762,7 @@ let package = Package(
         ),
         .testTarget(
             name: "MLXLMCommonToolParserFocusedTests",
-            dependencies: ["MLXLMCommon"],
+            dependencies: ["MLXLMCommon", "VMLXJinja"],
             path: "Tests/MLXLMCommonToolParserFocusedTests"
         ),
 

@@ -50,6 +50,8 @@ public enum Value: Sendable {
             self = .double(Double(float))
         case let bool as Bool:
             self = .boolean(bool)
+        case is NSNull:
+            self = .null
         case let array as [Any?]:
             let values = try array.map { try Value(any: $0) }
             self = .array(values)

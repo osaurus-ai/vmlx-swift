@@ -222,6 +222,7 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
                         "label": [
                             "type": ["string", "null"],
                             "description": "Optional label.",
+                            "enum": ["fast", "slow", NSNull()] as [any Sendable],
                         ] as [String: any Sendable],
                     ] as [String: any Sendable],
                     "required": ["label"],
@@ -244,9 +245,18 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
         XCTAssertThrowsError(try template.renderAny(context(rawTools)))
 
         let normalizedTools = try XCTUnwrap(normalizedToolsForChatTemplate(rawTools))
+        let normalizedFunction = try XCTUnwrap(normalizedTools.first?["function"] as? [String: any Sendable])
+        let normalizedParameters = try XCTUnwrap(normalizedFunction["parameters"] as? [String: any Sendable])
+        let normalizedProperties = try XCTUnwrap(normalizedParameters["properties"] as? [String: any Sendable])
+        let normalizedLabel = try XCTUnwrap(normalizedProperties["label"] as? [String: any Sendable])
+        let normalizedEnum = try XCTUnwrap(normalizedLabel["enum"] as? [any Sendable])
+        XCTAssertEqual(normalizedEnum.count, 2)
+        XCTAssertFalse(normalizedEnum.contains { $0 is NSNull })
+
         let rendered = try template.renderAny(context(normalizedTools))
         XCTAssertTrue(rendered.contains("nullable:true"))
         XCTAssertTrue(rendered.contains("type:<|\"|>STRING<|\"|>"))
+        XCTAssertTrue(rendered.contains("enum:[<|\"|>fast<|\"|>,<|\"|>slow<|\"|>]"))
     }
 
     /// Iter 52: the minimal template must emit image / video placeholder

@@ -18,6 +18,7 @@ private func normalizeChatTemplateValue(_ value: any Sendable) -> any Sendable {
             object[key] = normalizeChatTemplateValue(child)
         }
         normalizeNullableTypeUnion(&object)
+        normalizeNullableEnum(&object)
         return object
     }
 
@@ -48,6 +49,19 @@ private func normalizeNullableTypeUnion(_ object: inout [String: any Sendable]) 
     if hasNull {
         object["nullable"] = true
     }
+}
+
+private func normalizeNullableEnum(_ object: inout [String: any Sendable]) {
+    guard object["nullable"] as? Bool == true,
+          let entries = object["enum"] as? [any Sendable]
+    else { return }
+
+    let filtered = entries.filter { entry in
+        if entry is NSNull { return false }
+        if let string = entry as? String, string == "null" { return false }
+        return true
+    }
+    object["enum"] = filtered
 }
 
 private func stringTypeArray(_ value: (any Sendable)?) -> [String]? {
