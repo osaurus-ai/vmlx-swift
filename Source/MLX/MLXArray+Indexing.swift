@@ -508,8 +508,17 @@ func expandEllipsisOperations(shape: [Int32], operations: [MLXArrayIndexOperatio
     let suffix = operations.suffix(from: prefix.count + 1)
 
     // inject full range slices in place of the ellipsis
-    let expandRange =
-        countNonNewAxisOperations(prefix) ..< (shape.count - countNonNewAxisOperations(suffix))
+    let lower = countNonNewAxisOperations(prefix)
+    let upper = shape.count - countNonNewAxisOperations(suffix)
+    // An over-rank subscript (more index/slice dimensions around the ellipsis than
+    // the array has) makes `upper < lower`, which traps opaquely in the `..<` range
+    // precondition. Fail with a message naming the shape instead so the offending
+    // subscript is identifiable.
+    precondition(
+        lower <= upper,
+        "MLXArray ellipsis subscript has more index dimensions than the array rank: "
+            + "\(operations.count) operations applied to shape \(shape) (ndim \(shape.count))")
+    let expandRange = lower ..< upper
     let expand = expandRange.map {
         MLXArrayIndexOperation.slice(.init(start: 0, end: shape[$0], stride: 1))
     }
