@@ -162,8 +162,10 @@ public struct ReasoningParser: Sendable {
             var out = drainHarmonyChannel(allowPartialTagAtEnd: false)
             if !buffer.isEmpty {
                 let text = insideHarmonyChannel ? buffer : stripHarmonyControlText(buffer)
-                if !text.isEmpty {
-                    out.append(harmonyChannelIsReasoning ? .reasoning(text) : .content(text))
+                if insideHarmonyChannel {
+                    appendHarmonyChannelPayload(text, into: &out)
+                } else if !text.isEmpty {
+                    out.append(.content(text))
                 }
                 buffer.removeAll(keepingCapacity: false)
             }
@@ -374,6 +376,7 @@ public struct ReasoningParser: Sendable {
 
     private func appendHarmonyChannelPayload(_ text: String, into out: inout [ReasoningSegment]) {
         guard !text.isEmpty else { return }
+        guard !isHarmonyThoughtChannelName(text) else { return }
         out.append(harmonyChannelIsReasoning ? .reasoning(text) : .content(text))
     }
 

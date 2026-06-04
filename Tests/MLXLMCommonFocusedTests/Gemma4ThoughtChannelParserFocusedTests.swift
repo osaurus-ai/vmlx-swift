@@ -47,6 +47,30 @@ struct Gemma4ThoughtChannelParserFocusedTests {
         #expect(!reasoning.hasPrefix("thought"))
     }
 
+    @Test("prompt-tail open thought channel drops repeated empty thought header before visible content")
+    func promptTailOpenThoughtChannelDropsRepeatedEmptyThoughtHeaderBeforeVisibleContent() {
+        var parser = ReasoningParser.forPrompt(
+            stampName: "gemma4",
+            promptTail: "<start_of_turn>model\n<|channel>thought\n")
+        let segments = feed("thought\n<channel|>NO_IMAGE_VISIBLE", into: &parser, chunkSize: 4)
+
+        let (reasoning, content) = collect(segments)
+        #expect(reasoning.isEmpty)
+        #expect(content == "NO_IMAGE_VISIBLE")
+    }
+
+    @Test("prompt-tail open thought channel drops repeated empty thought header at stream end")
+    func promptTailOpenThoughtChannelDropsRepeatedEmptyThoughtHeaderAtStreamEnd() {
+        var parser = ReasoningParser.forPrompt(
+            stampName: "gemma4",
+            promptTail: "<start_of_turn>model\n<|channel>thought\n")
+        let segments = feed("thought\n", into: &parser, chunkSize: 4)
+
+        let (reasoning, content) = collect(segments)
+        #expect(reasoning.isEmpty)
+        #expect(content.isEmpty)
+    }
+
     private func feed(
         _ text: String,
         into parser: inout ReasoningParser?,
