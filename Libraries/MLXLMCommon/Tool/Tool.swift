@@ -27,6 +27,10 @@ private func normalizeChatTemplateValue(
             } else if key == "parameters" || key == "items" || key == "additionalProperties"
                 || key == "response"
             {
+                if key == "additionalProperties", child is Bool {
+                    object.removeValue(forKey: key)
+                    continue
+                }
                 object[key] = normalizeChatTemplateValue(child, inSchemaPosition: true)
             } else if key == "oneOf" || key == "anyOf" || key == "allOf" {
                 if let entries = child as? [any Sendable] {

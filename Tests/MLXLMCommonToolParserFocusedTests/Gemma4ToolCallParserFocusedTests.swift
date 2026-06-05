@@ -177,4 +177,71 @@ struct Gemma4ToolCallParserFocusedTests {
         #expect(!rendered.contains("upper filter requires string"))
         #expect(!rendered.contains("Cannot convert value of type Optional<Any> to Jinja Value"))
     }
+
+    @Test("Gemma4 tool template drops boolean additionalProperties in nested schemas")
+    func gemma4ToolTemplateDropsBooleanAdditionalPropertiesInNestedSchemas() throws {
+        let tool: ToolSpec = [
+            "type": "function",
+            "function": [
+                "name": "db_update",
+                "description": "Update rows in a local table.",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "where": [
+                            "type": "object",
+                            "description": "Filter object.",
+                            "additionalProperties": true,
+                        ] as [String: any Sendable],
+                        "set": [
+                            "type": "object",
+                            "description": "Update values.",
+                            "additionalProperties": false,
+                        ] as [String: any Sendable],
+                        "typed": [
+                            "type": "object",
+                            "additionalProperties": [
+                                "type": "string"
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                    "required": ["where", "set"],
+                    "additionalProperties": false,
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+
+        let normalized = try #require(normalizedToolsForChatTemplate([tool])?.first)
+        let function = try #require(normalized["function"] as? [String: any Sendable])
+        let parameters = try #require(function["parameters"] as? [String: any Sendable])
+        let properties = try #require(parameters["properties"] as? [String: any Sendable])
+        let whereSchema = try #require(properties["where"] as? [String: any Sendable])
+        let setSchema = try #require(properties["set"] as? [String: any Sendable])
+        let typedSchema = try #require(properties["typed"] as? [String: any Sendable])
+
+        #expect(parameters["additionalProperties"] == nil)
+        #expect(whereSchema["additionalProperties"] == nil)
+        #expect(setSchema["additionalProperties"] == nil)
+        #expect(typedSchema["additionalProperties"] is [String: any Sendable])
+
+        let rendered = try renderGemma4([
+            "messages": [
+                [
+                    "role": "user",
+                    "content": "Update the row where id is 1.",
+                ] as [String: any Sendable],
+            ] as [any Sendable],
+            "tools": [normalized] as [any Sendable],
+            "tool_choice": "required",
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+            "bos_token": "<bos>",
+        ])
+
+        #expect(rendered.contains("declaration:db_update"))
+        #expect(rendered.contains("where"))
+        #expect(rendered.contains("set"))
+        #expect(!rendered.contains("upper filter requires string"))
+        #expect(!rendered.contains("Cannot convert value of type Optional<Any> to Jinja Value"))
+    }
 }
