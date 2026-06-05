@@ -122,18 +122,91 @@ public class NemotronHTests: XCTestCase {
         XCTAssertEqual(config.hybridOverridePattern.filter { $0 == "M" }.count, 48)
         XCTAssertEqual(config.hybridOverridePattern.filter { $0 == "E" }.count, 48)
         XCTAssertEqual(config.hybridOverridePattern.filter { $0 == "*" }.count, 12)
+        XCTAssertEqual(Self.indices(of: "M", in: config.hybridOverridePattern), Self.ultraMambaIndices)
+        XCTAssertEqual(Self.indices(of: "E", in: config.hybridOverridePattern), Self.ultraMoEIndices)
+        XCTAssertEqual(Self.indices(of: "*", in: config.hybridOverridePattern), Self.ultraAttentionIndices)
         XCTAssertEqual(config.moeLatentSize, 2048)
         XCTAssertEqual(config.nRoutedExperts, 512)
+        XCTAssertEqual(config.numExpertsPerTok, 22)
+        XCTAssertEqual(config.nGroup, 1)
+        XCTAssertEqual(config.topkGroup, 1)
+        XCTAssertEqual(config.nGroups, 8)
+        XCTAssertEqual(config.mambaNumHeads * config.mambaHeadDim, 16_384)
+        XCTAssertEqual(16_384 + 2 * config.nGroups * config.ssmStateSize, 18_432)
 
-        let smallConfig = try decodeUltraStyleConfig()
-        let model = NemotronHModel(smallConfig)
-        let cache = model.newCache(parameters: nil)
-        XCTAssertEqual(cache.count, 60)
-        XCTAssertEqual(model.kvHeads.count, 60)
-        XCTAssertEqual(model.kvHeads.filter { $0 == 0 }.count, 48)
-        XCTAssertEqual(model.kvHeads.filter { $0 == 2 }.count, 12)
-        XCTAssertEqual(cache.filter { $0 is MambaCache }.count, 48)
-        XCTAssertEqual(cache.filter { $0 is KVCacheSimple }.count, 12)
+        try MLXMetalTestLock.withLock {
+            let smallConfig = try decodeUltraStyleConfig()
+            let model = NemotronHModel(smallConfig)
+            let cache = model.newCache(parameters: nil)
+            XCTAssertEqual(cache.count, 60)
+            XCTAssertEqual(model.kvHeads.count, 60)
+            XCTAssertEqual(model.kvHeads.filter { $0 == 0 }.count, 48)
+            XCTAssertEqual(model.kvHeads.filter { $0 == 2 }.count, 12)
+            XCTAssertEqual(cache.filter { $0 is MambaCache }.count, 48)
+            XCTAssertEqual(cache.filter { $0 is KVCacheSimple }.count, 12)
+        }
+    }
+
+    func testUltraJANGTQBundleMetadataMatchesRuntimeContract() throws {
+        let configData = try ultraStyleConfigData(
+            exactDimensions: true,
+            extra: [
+                "eos_token_id": 2,
+                "bos_token_id": 1,
+                "pad_token_id": 0,
+                "num_nextn_predict_layers": 0,
+                "mtp_layers_block_type": [],
+            ])
+        let config = try JSONSerialization.jsonObject(with: configData) as? [String: Any]
+        let layerTypes = try XCTUnwrap(config?["layers_block_type"] as? [String])
+
+        XCTAssertEqual(layerTypes.count, 108)
+        XCTAssertEqual(Self.indices(of: "mamba", in: layerTypes), Self.ultraMambaIndices)
+        XCTAssertEqual(Self.indices(of: "moe", in: layerTypes), Self.ultraMoEIndices)
+        XCTAssertEqual(Self.indices(of: "attention", in: layerTypes), Self.ultraAttentionIndices)
+        XCTAssertEqual(config?["num_nextn_predict_layers"] as? Int, 0)
+        XCTAssertEqual((config?["mtp_layers_block_type"] as? [String]) ?? ["unexpected"], [])
+        XCTAssertNil(config?["vision_config"])
+        XCTAssertNil(config?["audio_config"])
+
+        let generationConfig: [String: Any] = [
+            "eos_token_id": [2, 11],
+            "temperature": 1.0,
+            "top_p": 0.95,
+        ]
+        XCTAssertEqual(generationConfig["eos_token_id"] as? [Int], [2, 11])
+
+        let jangConfig: [String: Any] = [
+            "format": "jangtq",
+            "profile": "JANGTQ_1L",
+            "runtime": [
+                "keeps_mtp": false,
+                "keeps_attention_bf16": true,
+                "keeps_router_gates_source_precision": true,
+                "keeps_latent_moe_bf16": true,
+            ],
+            "capabilities": [
+                "family": "nemotron_h",
+                "modality": "text",
+                "cache_type": "hybrid",
+                "reasoning_parser": "deepseek_r1",
+                "tool_parser": "nemotron",
+                "think_in_template": true,
+                "supports_tools": true,
+                "supports_thinking": true,
+            ],
+        ]
+        let capabilities = try XCTUnwrap(jangConfig["capabilities"] as? [String: Any])
+
+        XCTAssertEqual(capabilities["family"] as? String, "nemotron_h")
+        XCTAssertEqual(capabilities["modality"] as? String, "text")
+        XCTAssertEqual(capabilities["cache_type"] as? String, "hybrid")
+        XCTAssertEqual(capabilities["reasoning_parser"] as? String, "deepseek_r1")
+        XCTAssertEqual(capabilities["tool_parser"] as? String, "nemotron")
+        XCTAssertEqual(capabilities["supports_tools"] as? Bool, true)
+        XCTAssertEqual(capabilities["supports_thinking"] as? Bool, true)
+        XCTAssertEqual(ToolCallFormat.fromCapabilityName(capabilities["tool_parser"] as? String), .nemotron)
+        XCTAssertNotNil(ReasoningParser.fromCapabilityName(capabilities["reasoning_parser"] as? String))
     }
 
     func testUltraNestedJANGTQBitsDispatchToOneBitNemotronH() async throws {
@@ -784,19 +857,40 @@ public class NemotronHTests: XCTestCase {
     }
 
     private static func ultraLayerTypes() -> [String] {
-        var layers: [String] = []
-        for index in 0..<108 {
-            if [7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84].contains(index) {
-                layers.append("attention")
-            } else if layers.filter({ $0 == "mamba" }).count < 48 {
-                layers.append("mamba")
-            } else {
-                layers.append("moe")
-            }
+        var layers = Array(repeating: "moe", count: 108)
+        for index in ultraMambaIndices {
+            layers[index] = "mamba"
         }
-        precondition(layers.filter { $0 == "mamba" }.count == 48)
-        precondition(layers.filter { $0 == "attention" }.count == 12)
-        precondition(layers.filter { $0 == "moe" }.count == 48)
+        for index in ultraAttentionIndices {
+            layers[index] = "attention"
+        }
+        precondition(indices(of: "mamba", in: layers) == ultraMambaIndices)
+        precondition(indices(of: "attention", in: layers) == ultraAttentionIndices)
+        precondition(indices(of: "moe", in: layers) == ultraMoEIndices)
         return layers
+    }
+
+    private static let ultraMambaIndices = [
+        0, 2, 4, 6, 9, 11, 13, 16, 18, 20, 22, 25, 27, 29, 31, 34,
+        36, 38, 41, 43, 45, 47, 50, 52, 54, 56, 59, 61, 63, 66, 68, 70,
+        72, 75, 77, 79, 81, 84, 86, 88, 91, 93, 95, 97, 100, 102, 104, 106,
+    ]
+
+    private static let ultraMoEIndices = [
+        1, 3, 5, 8, 10, 12, 15, 17, 19, 21, 24, 26, 28, 30, 33, 35,
+        37, 40, 42, 44, 46, 49, 51, 53, 55, 58, 60, 62, 65, 67, 69, 71,
+        74, 76, 78, 80, 83, 85, 87, 90, 92, 94, 96, 99, 101, 103, 105, 107,
+    ]
+
+    private static let ultraAttentionIndices = [
+        7, 14, 23, 32, 39, 48, 57, 64, 73, 82, 89, 98,
+    ]
+
+    private static func indices(of marker: Character, in pattern: String) -> [Int] {
+        pattern.enumerated().compactMap { $0.element == marker ? $0.offset : nil }
+    }
+
+    private static func indices(of marker: String, in layers: [String]) -> [Int] {
+        return layers.enumerated().compactMap { $0.element == marker ? $0.offset : nil }
     }
 }
