@@ -37,7 +37,7 @@ public func routeGenerationText(
         case .content:
             events.append(.chunk(visible))
         case .reasoning:
-            if !parsedToolCallInChunk {
+            if !parsedToolCallInChunk || toolCallProcessor.preservesReasoningTextAroundToolCalls {
                 events.append(.reasoning(visible))
             }
         }

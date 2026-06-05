@@ -30,6 +30,7 @@ public class ToolCallProcessor {
     private let tools: [[String: any Sendable]]?
     public let parsesToolCallsFromReasoningChannel: Bool
     public let usesTaggedOnlyReasoningExtraction: Bool
+    public let preservesReasoningTextAroundToolCalls: Bool
     private var state = State.normal
     private var toolCallBuffer = ""
     private var leadingTextBeforeToolCall = ""
@@ -75,6 +76,8 @@ public class ToolCallProcessor {
         self.tools = tools
         self.parsesToolCallsFromReasoningChannel = format.parsesToolCallsFromReasoningChannel
         self.usesTaggedOnlyReasoningExtraction = format.usesTaggedOnlyReasoningExtraction
+        self.preservesReasoningTextAroundToolCalls =
+            format.preservesReasoningTextAroundToolCalls
     }
 
     // MARK: - Computed Properties

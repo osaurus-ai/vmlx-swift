@@ -239,6 +239,20 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         }
     }
 
+    /// Whether non-tool prose returned while parsing a reasoning-channel tool
+    /// call should remain on the reasoning rail. MiniMax emits legitimate
+    /// natural-language deliberation around `<minimax:tool_call>...` envelopes;
+    /// channel-style families such as Gemma4 intentionally suppress wrapper
+    /// residue once a native tool call is extracted.
+    public var preservesReasoningTextAroundToolCalls: Bool {
+        switch self {
+        case .minimaxM2:
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Infer the tool call format based on model type from config.json.
     ///
     /// This method maps known model types to their corresponding tool call formats,
