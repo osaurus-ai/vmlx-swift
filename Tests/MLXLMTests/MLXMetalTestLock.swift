@@ -69,6 +69,13 @@ enum MLXMetalTestLock {
     /// the first MLX-backed assertion runs so tests exercise kernels instead
     /// of failing on a runner packaging detail.
     private static let metallibAliasPrepared: Void = {
+        let sourceDirectories = [
+            repoRoot.appendingPathComponent(".build/arm64-apple-macosx/debug"),
+            repoRoot.appendingPathComponent(".build/debug"),
+        ]
+        let sourceDirectory = sourceDirectories.first {
+            FileManager.default.fileExists(atPath: $0.appendingPathComponent("default.metallib").path)
+        }
         let fileManager = FileManager.default
         var candidates: [URL] = []
 
@@ -84,8 +91,14 @@ enum MLXMetalTestLock {
         candidates.append(repoRoot.appendingPathComponent(".build/arm64-apple-macosx/debug"))
         candidates.append(
             repoRoot.appendingPathComponent(
+                ".build/arm64-apple-macosx/debug/mlx-swiftPackageTests.xctest/Contents/MacOS"))
+        candidates.append(
+            repoRoot.appendingPathComponent(
                 ".build/arm64-apple-macosx/debug/vmlx-swift-lmPackageTests.xctest/Contents/MacOS"))
         candidates.append(repoRoot.appendingPathComponent(".build/debug"))
+        candidates.append(
+            repoRoot.appendingPathComponent(
+                ".build/debug/mlx-swiftPackageTests.xctest/Contents/MacOS"))
         candidates.append(
             repoRoot.appendingPathComponent(
                 ".build/debug/vmlx-swift-lmPackageTests.xctest/Contents/MacOS"))
@@ -96,16 +109,33 @@ enum MLXMetalTestLock {
             for _ in 0 ..< 4 {
                 let path = directory.path
                 if scanned.insert(path).inserted {
-                    let defaultURL = directory.appendingPathComponent("default.metallib")
-                    let aliasURL = directory.appendingPathComponent("mlx.metallib")
-                    if fileManager.fileExists(atPath: defaultURL.path),
-                       !fileManager.fileExists(atPath: aliasURL.path)
-                    {
-                        try? fileManager.copyItem(at: defaultURL, to: aliasURL)
+                    if let sourceDirectory {
+                        let source = sourceDirectory.appendingPathComponent("default.metallib")
+                        try? fileManager.copyMLXTestMetallibsIfMissing(from: source, into: directory)
+                    } else {
+                        let defaultURL = directory.appendingPathComponent("default.metallib")
+                        let aliasURL = directory.appendingPathComponent("mlx.metallib")
+                        if fileManager.fileExists(atPath: defaultURL.path),
+                           !fileManager.fileExists(atPath: aliasURL.path)
+                        {
+                            try? fileManager.copyItem(at: defaultURL, to: aliasURL)
+                        }
                     }
                 }
                 directory.deleteLastPathComponent()
             }
         }
     }()
+}
+
+private extension FileManager {
+    func copyMLXTestMetallibsIfMissing(from source: URL, into directory: URL) throws {
+        try createDirectory(at: directory, withIntermediateDirectories: true)
+        for name in ["default.metallib", "mlx.metallib"] {
+            let destination = directory.appendingPathComponent(name)
+            if !fileExists(atPath: destination.path) {
+                try copyItem(at: source, to: destination)
+            }
+        }
+    }
 }
