@@ -2,10 +2,96 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+@testable import MLXLLM
 @testable import MLXLMCommon
 import XCTest
 
 final class JANGTQStreamingExpertDescriptorTests: XCTestCase {
+    func testNemotronUltraLayersBlockTypeDecodesToHybridPattern() throws {
+        let json = """
+        {
+          "model_type": "nemotron_h",
+          "vocab_size": 131072,
+          "hidden_size": 8192,
+          "num_hidden_layers": 4,
+          "num_attention_heads": 64,
+          "num_key_value_heads": 2,
+          "mamba_num_heads": 256,
+          "mamba_head_dim": 64,
+          "ssm_state_size": 128,
+          "conv_kernel": 4,
+          "n_groups": 8,
+          "intermediate_size": 5120,
+          "moe_intermediate_size": 5120,
+          "moe_shared_expert_intermediate_size": 5120,
+          "n_routed_experts": 512,
+          "num_experts_per_tok": 22,
+          "layers_block_type": ["mamba", "attention", "mlp", "moe"],
+          "layer_norm_epsilon": 1e-5,
+          "n_group": 8,
+          "topk_group": 4
+        }
+        """
+
+        let config = try JSONDecoder().decode(
+            NemotronHConfiguration.self,
+            from: Data(json.utf8))
+
+        XCTAssertEqual(config.hybridOverridePattern, "M*-E")
+        XCTAssertEqual(config.numHiddenLayers, 4)
+        XCTAssertEqual(config.numExpertsPerTok, 22)
+    }
+
+    func testNemotronUltraStackedFc1AndFc2TensorsAreStreamable() throws {
+        let directory = try makeTemporaryModelDirectory()
+        try writeSafetensors(
+            at: directory.appendingPathComponent("model.safetensors"),
+            tensors: [
+                "backbone.layers.1.mixer.switch_mlp.fc1.tq_packed": TensorFixture(
+                    dtype: "U8", shape: [4, 2, 4], range: 0 ..< 32),
+                "backbone.layers.1.mixer.switch_mlp.fc1.tq_norms": TensorFixture(
+                    dtype: "F16", shape: [4, 2], range: 32 ..< 48),
+                "backbone.layers.1.mixer.switch_mlp.fc2.tq_packed": TensorFixture(
+                    dtype: "U8", shape: [4, 2, 4], range: 48 ..< 80),
+                "backbone.layers.1.mixer.switch_mlp.fc2.tq_norms": TensorFixture(
+                    dtype: "F16", shape: [4, 2], range: 80 ..< 96),
+            ])
+
+        XCTAssertTrue(
+            JANGTQStreamingExperts.isStreamableRoutedTensorKey(
+                "backbone.layers.1.mixer.switch_mlp.fc1.tq_packed"))
+        XCTAssertTrue(
+            JANGTQStreamingExperts.isStreamableRoutedTensorKey(
+                "backbone.layers.1.mixer.switch_mlp.fc2.tq_norms"))
+        XCTAssertTrue(JANGTQStreamingExperts.hasStreamableExperts(in: directory))
+
+        let up = JANGTQStreamingExperts.stackedOffsetDescriptor(
+            in: directory,
+            layerIdx: 1,
+            projectionName: "up_proj",
+            suffixName: "tq_packed")
+        let down = JANGTQStreamingExperts.stackedOffsetDescriptor(
+            in: directory,
+            layerIdx: 1,
+            projectionName: "down_proj",
+            suffixName: "tq_packed")
+
+        XCTAssertEqual(up?.storageLayout, "stacked-contiguous")
+        XCTAssertEqual(up?.expertCount, 4)
+        XCTAssertEqual(up?.spanByteCount, 32)
+        XCTAssertEqual(up?.expertByteCount, 8)
+        XCTAssertEqual(down?.storageLayout, "stacked-contiguous")
+        XCTAssertEqual(down?.expertCount, 4)
+    }
+
+    func testModuleUpdateArrayRecursionSkipsSparseNilEntries() throws {
+        let moduleSource = try String(
+            contentsOfFile: "Source/MLXNN/Module.swift",
+            encoding: .utf8)
+
+        XCTAssertTrue(moduleSource.contains("case (_, .none):\n                            continue"))
+    }
+
     func testDescriptorReportsContiguousStackedTensorLayout() throws {
         let directory = try makeTemporaryModelDirectory()
         try writeSafetensors(
