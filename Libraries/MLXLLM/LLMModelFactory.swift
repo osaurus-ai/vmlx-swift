@@ -363,14 +363,67 @@ public enum LLMTypeRegistry {
     }
 
     private static func dispatchNemotronH(data: Data) throws -> any LanguageModel {
-        struct Probe: Codable {
+        enum ProbeBits: Decodable {
+            case int(Int)
+            case routed(up: Int?, down: Int?)
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.singleValueContainer()
+                if let value = try? container.decode(Int.self) {
+                    self = .int(value)
+                    return
+                }
+                let keyed = try decoder.container(keyedBy: CodingKeys.self)
+                if let routed = try keyed.decodeIfPresent(
+                    RoutedExpert.self, forKey: .routedExpert)
+                {
+                    self = .routed(up: routed.upProj ?? routed.gateProj, down: routed.downProj)
+                } else {
+                    throw DecodingError.dataCorruptedError(
+                        in: container,
+                        debugDescription: "mxtq_bits must be an Int or contain routed_expert projection bits")
+                }
+            }
+
+            var uniformBits: Int? {
+                switch self {
+                case .int(let value):
+                    return value
+                case .routed(let up, let down):
+                    if let up, let down, up != down {
+                        return nil
+                    }
+                    return up ?? down
+                }
+            }
+
+            private enum CodingKeys: String, CodingKey {
+                case routedExpert = "routed_expert"
+            }
+
+            private struct RoutedExpert: Decodable {
+                let gateProj: Int?
+                let upProj: Int?
+                let downProj: Int?
+
+                enum CodingKeys: String, CodingKey {
+                    case gateProj = "gate_proj"
+                    case upProj = "up_proj"
+                    case downProj = "down_proj"
+                }
+            }
+        }
+
+        struct Probe: Decodable {
             let weightFormat: String?
-            let mxtqBits: Int?
+            let format: String?
+            let mxtqBits: ProbeBits?
             let routedExpertBits: Int?
             let mxtqSeed: Int?
 
             enum CodingKeys: String, CodingKey {
                 case weightFormat = "weight_format"
+                case format
                 case mxtqBits = "mxtq_bits"
                 case routedExpertBits = "routed_expert_bits"
                 case mxtqSeed = "mxtq_seed"
@@ -380,20 +433,30 @@ public enum LLMTypeRegistry {
         let config = try JSONDecoder.json5().decode(NemotronHConfiguration.self, from: data)
         let probe = try? JSONDecoder.json5().decode(Probe.self, from: data)
         let weightFormat = probe?.weightFormat?.lowercased()
+        let jangFormat = probe?.format?.lowercased()
+        let mxtqBits = probe?.mxtqBits?.uniformBits
         let isJANGTQ =
             weightFormat == "mxtq"
+            || jangFormat?.contains("jangtq") == true
             || weightFormat == "jangtq2"
             || weightFormat == "jangtq4"
-            || probe?.mxtqBits != nil
+            || mxtqBits != nil
             || probe?.routedExpertBits != nil
 
         guard isJANGTQ else {
             return NemotronHModel(config)
         }
 
+        guard let bits = mxtqBits ?? probe?.routedExpertBits else {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: [],
+                    debugDescription: "NemotronH JANGTQ requires uniform routed expert bits for fc1/fc2"))
+        }
+
         return NemotronHModel(
             jangtqContext: NemotronHJANGTQContext(
-                bits: probe?.mxtqBits ?? probe?.routedExpertBits ?? 2,
+                bits: bits,
                 mxtqSeed: probe?.mxtqSeed ?? 42),
             configuration: config)
     }

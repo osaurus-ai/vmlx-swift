@@ -660,6 +660,10 @@ extension ReasoningParser {
             return ReasoningParser(startInReasoning: true)
         }
 
+        if compact.hasPrefix("nemotron") {
+            return ReasoningParser(startInReasoning: true)
+        }
+
         if compact.hasPrefix("step3p5")
             || compact.hasPrefix("step3p7")
             || compact.hasPrefix("stepfun")
