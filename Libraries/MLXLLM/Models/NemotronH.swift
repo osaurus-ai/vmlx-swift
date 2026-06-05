@@ -794,6 +794,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
 
     @ModuleInfo(key: "backbone") private var backbone: NemotronHBackbone
     public let configuration: NemotronHConfiguration
+    public let jangtqContext: NemotronHJANGTQContext?
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -803,6 +804,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
 
     public init(_ args: NemotronHConfiguration) {
         self.configuration = args
+        self.jangtqContext = nil
         self.vocabularySize = args.vocabSize
 
         // kvHeads array: non-zero for attention layers, zero for others
@@ -829,6 +831,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     /// `jang_config.weight_format == "mxtq"` and dispatches here.
     public init(jangtqContext: NemotronHJANGTQContext, configuration args: NemotronHConfiguration) {
         self.configuration = args
+        self.jangtqContext = jangtqContext
         self.vocabularySize = args.vocabSize
         let pattern = Array(args.hybridOverridePattern)
         self.kvHeads = pattern.compactMap { char -> Int? in
@@ -1117,6 +1120,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
 
     private enum RawCodingKeys: String, CodingKey {
         case timeStepLimit = "time_step_limit"
+        case layersBlockType = "layers_block_type"
     }
 
     public init(from decoder: Decoder) throws {
@@ -1126,7 +1130,6 @@ public struct NemotronHConfiguration: Codable, Sendable {
         modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "nemotron_h"
         vocabSize = try container.decode(Int.self, forKey: .vocabSize)
         hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
-        numHiddenLayers = try container.decode(Int.self, forKey: .numHiddenLayers)
         numAttentionHeads = try container.decode(Int.self, forKey: .numAttentionHeads)
         numKeyValueHeads = try container.decode(Int.self, forKey: .numKeyValueHeads)
         attentionBias = try container.decodeIfPresent(Bool.self, forKey: .attentionBias) ?? false
@@ -1162,18 +1165,25 @@ public struct NemotronHConfiguration: Codable, Sendable {
         routedScalingFactor =
             try container.decodeIfPresent(Float.self, forKey: .routedScalingFactor) ?? 1.0
 
-        // Handle hybrid_override_pattern - can be string or array of strings
+        // Handle hybrid_override_pattern - can be string or array of strings.
+        // Nemotron 3 Ultra instead ships mlx-lm's `layers_block_type`
+        // string array: mamba / attention / moe / mlp.
         if let patternString = try? container.decode(String.self, forKey: .hybridOverridePattern) {
             hybridOverridePattern = patternString
         } else if let patternArray = try? container.decode(
             [String].self, forKey: .hybridOverridePattern)
         {
             hybridOverridePattern = patternArray.joined()
+        } else if let layerTypes = try? rawContainer.decode([String].self, forKey: .layersBlockType) {
+            hybridOverridePattern = try Self.pattern(fromLayerBlockTypes: layerTypes)
         } else {
             throw DecodingError.dataCorruptedError(
                 forKey: .hybridOverridePattern, in: container,
-                debugDescription: "hybrid_override_pattern must be string or array of strings")
+                debugDescription: "hybrid_override_pattern must be string/array, or layers_block_type must be present")
         }
+        numHiddenLayers =
+            try container.decodeIfPresent(Int.self, forKey: .numHiddenLayers)
+            ?? hybridOverridePattern.count
 
         // mlx-lm stores Nemotron-H as `time_step_limit: [min, max]`.
         // A lower bound of 0.0 is normalized to 0.001 upstream before the
@@ -1190,6 +1200,22 @@ public struct NemotronHConfiguration: Codable, Sendable {
                 try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMax)
                 ?? Float.infinity
         }
+    }
+
+    private static func pattern(fromLayerBlockTypes layerTypes: [String]) throws -> String {
+        try layerTypes.map { raw in
+            switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "mamba", "m": return "M"
+            case "attention", "attn", "*": return "*"
+            case "moe", "expert", "e": return "E"
+            case "mlp", "dense", "-": return "-"
+            default:
+                throw DecodingError.dataCorrupted(
+                    DecodingError.Context(
+                        codingPath: [],
+                        debugDescription: "Unknown NemotronH layers_block_type entry: \(raw)"))
+            }
+        }.joined()
     }
 
     /// Memberwise initializer for testing

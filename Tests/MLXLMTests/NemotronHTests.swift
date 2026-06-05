@@ -114,6 +114,74 @@ public class NemotronHTests: XCTestCase {
         XCTAssertEqual(config.hybridOverridePattern, "M*M-")
     }
 
+    func testConfigurationDecodingWithUltraLayersBlockType() throws {
+        let config = try decodeUltraStyleConfig(exactDimensions: true)
+
+        XCTAssertEqual(config.numHiddenLayers, 108)
+        XCTAssertEqual(config.hybridOverridePattern.count, 108)
+        XCTAssertEqual(config.hybridOverridePattern.filter { $0 == "M" }.count, 48)
+        XCTAssertEqual(config.hybridOverridePattern.filter { $0 == "E" }.count, 48)
+        XCTAssertEqual(config.hybridOverridePattern.filter { $0 == "*" }.count, 12)
+        XCTAssertEqual(config.moeLatentSize, 2048)
+        XCTAssertEqual(config.nRoutedExperts, 512)
+
+        let smallConfig = try decodeUltraStyleConfig()
+        let model = NemotronHModel(smallConfig)
+        let cache = model.newCache(parameters: nil)
+        XCTAssertEqual(cache.count, 60)
+        XCTAssertEqual(model.kvHeads.count, 60)
+        XCTAssertEqual(model.kvHeads.filter { $0 == 0 }.count, 48)
+        XCTAssertEqual(model.kvHeads.filter { $0 == 2 }.count, 12)
+        XCTAssertEqual(cache.filter { $0 is MambaCache }.count, 48)
+        XCTAssertEqual(cache.filter { $0 is KVCacheSimple }.count, 12)
+    }
+
+    func testUltraNestedJANGTQBitsDispatchToOneBitNemotronH() async throws {
+        let data = try ultraStyleConfigData(extra: [
+            "format": "jangtq",
+            "mxtq_seed": 42,
+            "mxtq_bits": [
+                "mamba_projection": 8,
+                "routed_expert": [
+                    "up_proj": 1,
+                    "down_proj": 1,
+                ],
+                "shared_expert": 8,
+            ],
+        ])
+
+        let model = try await LLMTypeRegistry.shared.createModel(
+            configuration: data, modelType: "nemotron_h")
+        let nemotron = try XCTUnwrap(model as? NemotronHModel)
+        XCTAssertEqual(nemotron.jangtqContext?.bits, 1)
+        XCTAssertEqual(nemotron.jangtqContext?.mxtqSeed, 42)
+        XCTAssertEqual(nemotron.newCache(parameters: nil).count, 60)
+    }
+
+    func testNemotronThreeParserAliasesResolveToBundleProtocol() throws {
+        XCTAssertEqual(ToolCallFormat.fromCapabilityName("nemotron"), .nemotron)
+        XCTAssertEqual(ToolCallFormat.fromCapabilityName("nemotron_h"), .nemotron)
+        XCTAssertEqual(ToolCallFormat.fromCapabilityName("nemotron_v3"), .nemotron)
+        XCTAssertEqual(ToolCallFormat.fromCapabilityName("nemotron_3"), .nemotron)
+        XCTAssertNotNil(ReasoningParser.fromCapabilityName("nemotron_v3"))
+        XCTAssertNotNil(ReasoningParser.fromCapabilityName("nemotron_3"))
+
+        let parser = ToolCallFormat.nemotron.createParser()
+        let calls = parser.parseEOS(
+            """
+            <tool_call>
+            <function=memory_search>
+            <parameter=query>
+            prefix cache
+            </parameter>
+            </function>
+            </tool_call>
+            """,
+            tools: nil)
+        XCTAssertEqual(calls.first?.function.name, "memory_search")
+        XCTAssertEqual(calls.count, 1)
+    }
+
     func testConfigurationDecodingWithTimeStepLimitArray() throws {
         // Canonical mlx-lm form: `time_step_limit: [min, max]` (single key holding
         // the pair). The test was originally authored against an early decoder
@@ -648,5 +716,87 @@ public class NemotronHTests: XCTestCase {
 
         // Only M and * contribute to kvHeads
         XCTAssertEqual(model.kvHeads, [0, 2])
+    }
+
+    private func decodeUltraStyleConfig(
+        exactDimensions: Bool = false, extra: [String: Any] = [:]
+    ) throws -> NemotronHConfiguration {
+        try JSONDecoder.json5().decode(
+            NemotronHConfiguration.self,
+            from: ultraStyleConfigData(exactDimensions: exactDimensions, extra: extra))
+    }
+
+    private func ultraStyleConfigData(
+        exactDimensions: Bool = false, extra: [String: Any] = [:]
+    ) throws -> Data {
+        var dict: [String: Any] = [
+            "model_type": "nemotron_h",
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "num_hidden_layers": 108,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "mamba_num_heads": 4,
+            "mamba_head_dim": 16,
+            "ssm_state_size": 16,
+            "conv_kernel": 4,
+            "n_groups": 2,
+            "intermediate_size": 128,
+            "moe_intermediate_size": 64,
+            "moe_latent_size": 32,
+            "moe_shared_expert_intermediate_size": 64,
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "n_group": 1,
+            "topk_group": 1,
+            "norm_topk_prob": true,
+            "routed_scaling_factor": 5.0,
+            "layer_norm_epsilon": 1e-5,
+            "time_step_limit": [0.0, 1e20],
+            "layers_block_type": Self.ultraLayerTypes(),
+        ]
+        if exactDimensions {
+            for (key, value) in [
+                "vocab_size": 131072,
+                "hidden_size": 8192,
+                "num_attention_heads": 64,
+                "head_dim": 128,
+                "mamba_num_heads": 256,
+                "mamba_head_dim": 64,
+                "ssm_state_size": 128,
+                "n_groups": 8,
+                "intermediate_size": 5120,
+                "moe_intermediate_size": 5120,
+                "moe_latent_size": 2048,
+                "moe_shared_expert_intermediate_size": 10240,
+                "n_routed_experts": 512,
+                "num_experts_per_tok": 22,
+            ] as [String: Any] {
+                dict[key] = value
+            }
+        }
+        for (key, value) in extra {
+            dict[key] = value
+        }
+        return try JSONSerialization.data(withJSONObject: dict)
+    }
+
+    private static func ultraLayerTypes() -> [String] {
+        var layers: [String] = []
+        for index in 0..<108 {
+            if [7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84].contains(index) {
+                layers.append("attention")
+            } else if layers.filter({ $0 == "mamba" }).count < 48 {
+                layers.append("mamba")
+            } else {
+                layers.append("moe")
+            }
+        }
+        precondition(layers.filter { $0 == "mamba" }.count == 48)
+        precondition(layers.filter { $0 == "attention" }.count == 12)
+        precondition(layers.filter { $0 == "moe" }.count == 48)
+        return layers
     }
 }

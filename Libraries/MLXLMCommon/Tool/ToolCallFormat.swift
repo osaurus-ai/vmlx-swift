@@ -518,6 +518,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .xmlFunction
         }
 
+        if compact.hasPrefix("nemotron") {
+            return .nemotron
+        }
+
         // Tencent Hunyuan / Hy3 parser aliases. Product capability stamps
         // may carry a suffix (`hy3-preview`, `hy_v3_preview`) rather than
         // the exact parser family name.
