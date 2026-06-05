@@ -1117,6 +1117,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
 
     private enum RawCodingKeys: String, CodingKey {
         case timeStepLimit = "time_step_limit"
+        case layersBlockType = "layers_block_type"
     }
 
     public init(from decoder: Decoder) throws {
@@ -1162,17 +1163,34 @@ public struct NemotronHConfiguration: Codable, Sendable {
         routedScalingFactor =
             try container.decodeIfPresent(Float.self, forKey: .routedScalingFactor) ?? 1.0
 
-        // Handle hybrid_override_pattern - can be string or array of strings
+        // Handle hybrid_override_pattern - can be string or array of strings.
+        // Nemotron-3 Ultra uses the newer mlx-lm `layers_block_type` array
+        // instead; map it back to this port's compact block letters.
         if let patternString = try? container.decode(String.self, forKey: .hybridOverridePattern) {
             hybridOverridePattern = patternString
         } else if let patternArray = try? container.decode(
             [String].self, forKey: .hybridOverridePattern)
         {
             hybridOverridePattern = patternArray.joined()
+        } else if let blockTypes = try? rawContainer.decode([String].self, forKey: .layersBlockType) {
+            let mapped = try blockTypes.map { block -> Character in
+                switch block.lowercased() {
+                case "mamba": return "M"
+                case "attention": return "*"
+                case "mlp": return "-"
+                case "moe": return "E"
+                default:
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .layersBlockType, in: rawContainer,
+                        debugDescription: "Unsupported NemotronH layer block type: \(block)")
+                }
+            }
+            hybridOverridePattern = String(mapped)
         } else {
             throw DecodingError.dataCorruptedError(
                 forKey: .hybridOverridePattern, in: container,
-                debugDescription: "hybrid_override_pattern must be string or array of strings")
+                debugDescription:
+                    "hybrid_override_pattern must be string/array, or layers_block_type must be present")
         }
 
         // mlx-lm stores Nemotron-H as `time_step_limit: [min, max]`.

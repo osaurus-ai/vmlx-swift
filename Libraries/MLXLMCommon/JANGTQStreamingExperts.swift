@@ -105,7 +105,7 @@ public enum JANGTQStreamingExperts {
             #"^(?:language_model\.)?model\.layers\.\d+\.(?:mlp|block_sparse_moe)\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(tq_packed|tq_norms)$"#,
             #"^(?:language_model\.)?model\.layers\.\d+\.(?:mlp\.)?zaya_block\.experts\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(tq_packed|tq_norms)$"#,
             #"^layers\.\d+\.ffn\.switch_mlp\.(w1|w2|w3)\.(tq_packed|tq_norms)$"#,
-            #"^backbone\.layers\.\d+\.mixer\.switch_mlp\.(up_proj|down_proj)\.(tq_packed|tq_norms)$"#,
+            #"^backbone\.layers\.\d+\.mixer\.switch_mlp\.(up_proj|down_proj|fc1|fc2)\.(tq_packed|tq_norms)$"#,
         ]
         return patterns.contains { pattern in
             key.range(of: pattern, options: .regularExpression) != nil
@@ -1883,10 +1883,12 @@ private final class JANGTQStreamingExpertIndex: @unchecked Sendable {
                 ]
             ),
             (
-                #"^backbone\.layers\.(\d+)\.mixer\.switch_mlp\.(up_proj|down_proj)\.(tq_packed|tq_norms)$"#,
+                #"^backbone\.layers\.(\d+)\.mixer\.switch_mlp\.(up_proj|down_proj|fc1|fc2)\.(tq_packed|tq_norms)$"#,
                 [
                     "up_proj": .up,
                     "down_proj": .down,
+                    "fc1": .up,
+                    "fc2": .down,
                 ]
             ),
         ]

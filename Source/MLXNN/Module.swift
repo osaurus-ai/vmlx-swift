@@ -707,6 +707,9 @@ open class Module {
                         case (.value(.module(let m)), .dictionary(let d)):
                             try m.update(modules: NestedDictionary(values: d), verify: verify)
 
+                        case (_, .none):
+                            continue
+
                         default:
                             throw UpdateError.mismatchedContainers(
                                 base: describeType(self), key: key)
