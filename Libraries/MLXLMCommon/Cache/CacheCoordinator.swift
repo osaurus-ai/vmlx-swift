@@ -334,14 +334,11 @@ public final class CacheCoordinator: @unchecked Sendable {
                 return true
             }
             // Format-v2 disk payloads carry first-class layer state for
-            // most path-dependent caches. ZAYA CCA is intentionally excluded
-            // until its disk-restore path has separate live proof: restoring
-            // a ZAYA prefix from disk without a proven companion boundary can
-            // corrupt follow-up required-tool arguments even when the XML
-            // wrapper still parses as a tool call. Prefer a full prefill over
-            // a false cache hit.
+            // path-dependent caches. For ZAYA CCA, LayerKind.zayaCCA stores
+            // KV plus conv/previous-hidden companion tensors in the same
+            // payload, so a separate recurrent SSM sidecar is not required.
             if let diskArrays, TQDiskSerializer.formatVersion(of: diskArrays) >= 2 {
-                return !Self.containsZayaCCADiskPayload(diskArrays)
+                return true
             }
             return false
         }
@@ -442,12 +439,6 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         // All tiers missed
         return .miss
-    }
-
-    private static func containsZayaCCADiskPayload(_ arrays: [String: MLXArray]) -> Bool {
-        arrays.keys.contains { key in
-            key.hasPrefix("zaya_") || key.contains("_zaya_")
-        }
     }
 
     /// Resolve SSM companion state for a disk-cache hit on a hybrid model.
