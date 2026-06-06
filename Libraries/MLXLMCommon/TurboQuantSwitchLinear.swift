@@ -45,7 +45,8 @@ public class TurboQuantSwitchLinear: Module {
 
     public init(
         inFeatures: Int, outFeatures: Int, numExperts: Int,
-        bits: Int = 2, seed: Int = 42
+        bits: Int = 2, seed: Int = 42,
+        useStreamingPlaceholders: Bool = false
     ) {
         self.inFeatures = inFeatures
         self.outFeatures = outFeatures
@@ -55,7 +56,7 @@ public class TurboQuantSwitchLinear: Module {
         let valsPerU32 = 32 / bits
         let packedCols = (inFeatures + valsPerU32 - 1) / valsPerU32
         // Initialize with zeros — the loader will overwrite with real data.
-        if JANGTQStreamingExperts.isEnabled {
+        if useStreamingPlaceholders || JANGTQStreamingExperts.isEnabled {
             self._packed.wrappedValue = MLXArray.zeros([1, 1, 1], dtype: .uint32)
             self._norms.wrappedValue  = MLXArray.zeros([1, 1], dtype: .float16)
         } else {
@@ -159,7 +160,8 @@ public class TurboQuantSwitchGLU: Module {
     public init(
         inputDims: Int, hiddenDims: Int, numExperts: Int,
         gateUpBits: Int, downBits: Int, seed: Int = 42,
-        swigluLimit: Float = 0.0
+        swigluLimit: Float = 0.0,
+        useStreamingPlaceholders: Bool = false
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
@@ -170,15 +172,18 @@ public class TurboQuantSwitchGLU: Module {
         self.swigluLimit = swigluLimit
         self._gateProj.wrappedValue = TurboQuantSwitchLinear(
             inFeatures: inputDims, outFeatures: hiddenDims,
-            numExperts: numExperts, bits: gateUpBits, seed: seed
+            numExperts: numExperts, bits: gateUpBits, seed: seed,
+            useStreamingPlaceholders: useStreamingPlaceholders
         )
         self._upProj.wrappedValue = TurboQuantSwitchLinear(
             inFeatures: inputDims, outFeatures: hiddenDims,
-            numExperts: numExperts, bits: gateUpBits, seed: seed
+            numExperts: numExperts, bits: gateUpBits, seed: seed,
+            useStreamingPlaceholders: useStreamingPlaceholders
         )
         self._downProj.wrappedValue = TurboQuantSwitchLinear(
             inFeatures: hiddenDims, outFeatures: inputDims,
-            numExperts: numExperts, bits: downBits, seed: seed
+            numExperts: numExperts, bits: downBits, seed: seed,
+            useStreamingPlaceholders: useStreamingPlaceholders
         )
         super.init()
     }

@@ -752,6 +752,7 @@ let package = Package(
                 "Gemma3nTextSanitizeFocusedTests.swift",
                 "MediaCachePlaceholderTests.swift",
                 "NemotronHOmniPreEncodedAudioTests.swift",
+                "NemotronHJANGTQDispatchFocusedTests.swift",
                 "MTPRuntimeFocusedTests.swift",
                 "MLXPressCLISourceContractsTests.swift",
                 "VMLXServerRuntimeSettingsTests.swift",
