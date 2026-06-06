@@ -178,6 +178,61 @@ Result:
 - `samplingSource=bundle-defaults`
 - coherent visible text, no loop, no parser marker leak
 
+Clean-main mmap DOT primitive histogram:
+
+```sh
+BENCH_MODEL=/Users/eric/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-JANGTQ_1L \
+BENCH_PERF=1 \
+BENCH_PERF_VARIANT=nemotron_mmap_graph_dot \
+BENCH_MAX_TOKENS=4 \
+BENCH_PERF_WARMUP=0 \
+BENCH_PERF_RUNS=1 \
+BENCH_PERF_USE_GENERATION_CONFIG=1 \
+BENCH_PERF_SEED=42 \
+BENCH_PERF_MMAP=1 \
+BENCH_GRAPH_STATS=1 \
+VMLINUX_GRAPH_DOT_PATH=/tmp/vmlx-nemotron-mmap-dot-20260606-051930.dot \
+.build/debug/RunBench
+```
+
+Artifact: `/tmp/vmlx-nemotron-mmap-dot-20260606-051930.log`
+
+Result:
+
+- `commit=ab207fa`
+- `tokps_median=5.0`
+- `peak_footprint_mib=1366`
+- `graphNodes=5711`
+- `asType=1152`
+- `samplingSource=bundle-defaults`
+- coherent visible text, no loop, no parser marker leak
+
+Top DOT primitive counts:
+
+| Primitive | Count |
+|---|---:|
+| `AsType` | 1152 |
+| `Broadcast` | 672 |
+| `Reshape` | 626 |
+| `Multiply` | 384 |
+| `Add` | 348 |
+| `Transpose` | 241 |
+| `Flatten` | 241 |
+| `CustomKernel` | 240 |
+| `Matmul` | 193 |
+| `QuantizedMatmul` | 192 |
+| `RMSNorm` | 157 |
+| `Sigmoid` | 144 |
+| `Maximum` | 144 |
+| `Sum` | 96 |
+| `Convolution` | 48 |
+| `ArgPartition` | 48 |
+| `ScaledDotProductAttention` | 12 |
+
+The histogram matches the 48-Mamba / 12-attention topology. The remaining mmap
+speed gap is dominated by Mamba and routed-MoE graph shape, not by
+generation-config, chat-template, tool parser, or reasoning parser behavior.
+
 Low-footprint JPREG row from the same worktree:
 
 Artifact: `/tmp/vmlx-nemotron-scored-weighted-jpreg-20260606-033442.log`
@@ -260,6 +315,10 @@ Still not complete:
   `1152` AsType nodes on the mmap path; closing the speed gap needs a real
   graph/kernel or resident-compute/reclaim improvement, not a template,
   sampler, or parser workaround.
+- The DOT histogram confirms the mmap graph is dominated by the expected
+  Nemotron-H topology: 48 recurrent Mamba layers plus 12 attention layers and
+  routed-MoE work. The next optimization target is Mamba / routed-MoE graph
+  reduction, not Osaurus wiring or generation defaults.
 - The resident `8.1 tok/s` row uses about `100 GB` physical footprint.
 - Thinking-on parser behavior is still partial in the short JPREG row because
   the model emitted reasoning but no visible answer within the token budget.
