@@ -123,6 +123,9 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
         let jangtqSource = try String(
             contentsOfFile: "Libraries/MLXLLM/Models/NemotronHJANGTQ.swift",
             encoding: .utf8)
+        let streamingSource = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/JANGTQStreamingExperts.swift",
+            encoding: .utf8)
 
         XCTAssertTrue(modelSource.contains("JANGTQ_DISABLE_NEMOTRON_ACTIVATION_BF16"))
         XCTAssertTrue(modelSource.contains("JANGTQ_DISABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH"))
@@ -131,6 +134,10 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
         XCTAssertTrue(modelSource.contains("out.asType(lmHead.weight.dtype)"))
         XCTAssertTrue(jangtqSource.contains("func weightedDecode(_ x: MLXArray, _ indices: MLXArray, scores: MLXArray) -> MLXArray?"))
         XCTAssertTrue(jangtqSource.contains("extension StreamingTurboQuantSwitchReLUSquaredMLP: NemotronHSwitchMLPLayer"))
+        XCTAssertTrue(jangtqSource.contains("reduced(x, indices: indices, scores: scores)"))
+        XCTAssertTrue(streamingSource.contains("public func reduced(_ x: MLXArray, indices: MLXArray, scores: MLXArray) -> MLXArray"))
+        XCTAssertTrue(streamingSource.contains("relu_reduce.call_chunk"))
+        XCTAssertTrue(streamingSource.contains("relu_reduce.score_sum_build"))
     }
 
     func testUltraHybridCacheTopologyIsFortyEightMambaPlusTwelveAttentionKV() throws {

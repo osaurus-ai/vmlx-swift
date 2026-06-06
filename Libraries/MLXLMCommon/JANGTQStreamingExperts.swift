@@ -2159,6 +2159,76 @@ public final class StreamingTurboQuantSwitchReLUSquaredMLP: Module {
         return joined.reshaped(outShape)
     }
 
+    public func reduced(_ x: MLXArray, indices: MLXArray, scores: MLXArray) -> MLXArray {
+        let totalTokens = x.size / inputDims
+        let kSlots = indices.dim(-1)
+        let xFlat = x.reshaped([totalTokens, inputDims])
+        let indicesFlat = indices.reshaped([totalTokens, kSlots])
+        let scoresFlat = stopGradient(scores.reshaped([totalTokens, kSlots]))
+        let requiredProjections: [StreamingProjection] = [.up, .down]
+        let useOffsetDispatch = JANGTQStreamingExpertStore.shared.canUseOffsetDispatch(
+            layerIdx: layerIdx,
+            requiredProjections: requiredProjections)
+        let shouldAutoFilterOffsetSpans =
+            useOffsetDispatch
+            && mlXPressStreamingOffsetActiveShardFilterOverride() == nil
+            && JANGTQStreamingExpertStore.shared.shouldAutoFilterOffsetSpans(
+                layerIdx: layerIdx,
+                requiredProjections: requiredProjections)
+        let shouldReadOffsetIndices = useOffsetDispatch
+            && (mlXPressStreamingOffsetActiveShardFilterEnabled()
+                || shouldAutoFilterOffsetSpans)
+        let allIndexValues: [Int]? = useOffsetDispatch && !shouldReadOffsetIndices
+            ? nil
+            : MLXPressStreamingProfile.time("router.indices_readback") {
+                indicesFlat.reshaped([-1]).asArray(Int32.self).map(Int.init)
+            }
+
+        func reduceChunk(start: Int, end: Int) -> MLXArray {
+            let tokenCount = end - start
+            let valueStart = start * kSlots
+            let valueEnd = end * kSlots
+            let indexValues = allIndexValues.map {
+                Array($0[valueStart ..< valueEnd])
+            }
+            let expertOutput = MLXPressStreamingProfile.time("relu_reduce.call_chunk") {
+                callChunk(
+                    xFlat: xFlat[start ..< end, 0...],
+                    indicesFlat: indicesFlat[start ..< end, 0...],
+                    indexValues: indexValues,
+                    tokenCount: tokenCount,
+                    kSlots: kSlots)
+            }
+            let reduced = MLXPressStreamingProfile.time("relu_reduce.score_sum_build") {
+                let scoreChunk = scoresFlat[start ..< end, 0...].asType(expertOutput.dtype)
+                return (expertOutput * scoreChunk[.ellipsis, .newAxis]).sum(axis: -2)
+            }
+            let materialized = stopGradient(reduced)
+            mlXPressStreamingMaterializeIfNeeded(
+                materialized,
+                force: evaluateEachLayer,
+                layerIdx: layerIdx,
+                phase: "relu_reduce_score_sum",
+                profileName: "relu_reduce.score_sum_eval")
+            return materialized
+        }
+
+        let chunkSize = max(1, tokenChunkSize)
+        if totalTokens <= chunkSize {
+            return reduceChunk(start: 0, end: totalTokens).reshaped(x.shape)
+        }
+
+        var chunks: [MLXArray] = []
+        chunks.reserveCapacity((totalTokens + chunkSize - 1) / chunkSize)
+        var start = 0
+        while start < totalTokens {
+            let end = min(start + chunkSize, totalTokens)
+            chunks.append(reduceChunk(start: start, end: end))
+            start = end
+        }
+        return concatenated(chunks, axis: 0).reshaped(x.shape)
+    }
+
     private func callChunk(
         xFlat: MLXArray,
         indicesFlat: MLXArray,
