@@ -230,7 +230,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         let template = try Template(ChatTemplateFallbacks.nemotronMinimal)
         let rendered = try template.renderDSV4([
             "messages": [
-                ["role": "user", "content": "Use line_count on alpha\nbeta."],
+                ["role": "user", "content": "Use the line_count tool on exactly this text, preserving newlines:\nalpha\nbeta\ngamma"],
             ],
             "tools": [
                 [
@@ -266,6 +266,11 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("one available tool and no prose before the tool result"))
         #expect(rendered.contains("<required>[\"text\"]</required>"))
         #expect(rendered.contains("Required parameters MUST be specified"))
+        #expect(rendered.contains("Use the `line_count` function."))
+        #expect(rendered.contains("Required parameters for `line_count`: text."))
+        #expect(rendered.contains("Respond with exactly this one assistant message and nothing else:"))
+        #expect(rendered.contains("<function=line_count>"))
+        #expect(rendered.contains("<parameter=text>\nalpha\nbeta\ngamma\n</parameter>"))
         #expect(!rendered.contains("[AVAILABLE_TOOLS]"))
         #expect(!rendered.contains("<extra_id_"))
         #expect(!rendered.contains("<｜DSML｜"))
@@ -274,7 +279,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         let source = try repositoryFile("Libraries/MLXLMCommon/ChatTemplates/NemotronMinimal.jinja")
         let standalone = try Template(source).renderDSV4([
             "messages": [
-                ["role": "user", "content": "Use line_count on alpha\nbeta."],
+                ["role": "user", "content": "Use the line_count tool on exactly this text, preserving newlines:\nalpha\nbeta\ngamma"],
             ],
             "tools": [
                 [
@@ -303,6 +308,11 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(standalone.contains("<tools>"))
         #expect(standalone.contains("<required>[\"text\"]</required>"))
         #expect(standalone.contains("Required parameters MUST be specified"))
+        #expect(standalone.contains("Use the `line_count` function."))
+        #expect(standalone.contains("Required parameters for `line_count`: text."))
+        #expect(standalone.contains("Respond with exactly this one assistant message and nothing else:"))
+        #expect(standalone.contains("<function=line_count>"))
+        #expect(standalone.contains("<parameter=text>\nalpha\nbeta\ngamma\n</parameter>"))
         #expect(!standalone.contains("[AVAILABLE_TOOLS]"))
         #expect(!standalone.contains("<extra_id_"))
         #expect(standalone.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(
@@ -334,7 +344,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
                 ["role": "tool", "tool_call_id": "call_lines", "content": #"{"lines":3}"#],
                 ["role": "user", "content": "How many lines? Do not call another tool."],
                 ["role": "assistant", "content": "Three lines were counted."],
-                ["role": "user", "content": "Now use line_count on one\ntwo."],
+                ["role": "user", "content": "Now use line_count on exactly this new text, preserving newlines:\none\ntwo"],
             ],
             "tools": [
                 [
@@ -357,7 +367,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             "enable_thinking": false,
         ])
 
-        let finalUser = "Now use line_count on one\ntwo."
+        let finalUser = "Now use line_count on exactly this new text, preserving newlines:\none\ntwo"
         let tailDirective = "The current assistant response MUST be a tool call."
         let finalUserRange = try #require(rendered.range(of: finalUser))
         let tailDirectiveRange = try #require(
@@ -368,6 +378,10 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!afterFinalUser.contains("<|im_start|>system\n" + tailDirective))
         #expect(rendered.contains("<parameter=text>\nred\ngreen\nblue\n</parameter>"))
         #expect(rendered.contains("<tool_response>\n{\"lines\":3}\n</tool_response>"))
+        #expect(afterFinalUser.contains("Use the `line_count` function."))
+        #expect(afterFinalUser.contains("Required parameters for `line_count`: text."))
+        #expect(afterFinalUser.contains("<function=line_count>"))
+        #expect(afterFinalUser.contains("<parameter=text>\none\ntwo\n</parameter>"))
         #expect(rendered.hasSuffix("<|im_start|>assistant\n<think></think>"))
     }
 
