@@ -407,3 +407,35 @@ Current root-cause target remains the same:
   `5711` graph nodes and `1152` `AsType` nodes. The next useful runtime work is
   a real Mamba/projection or JANGTQ kernel-family cleanup that preserves the
   fp32 router-selection floor and the existing JANGTQ math contract.
+
+## Follow-Up Trace - 2026-06-06 09:06 PDT
+
+The saved DOT histogram was rechecked against the local Ultra bundle headers.
+The high `AsType` count is not evidence that Osaurus, the chat template, or the
+JANGTQ routed-expert path is misrouting the model:
+
+- DOT primitive count: `QuantizedMatmul=192`, `AsType=1152`.
+- `192` quantized matmuls matches the expected affine-8 path:
+  - 96 Mamba projections: 48 `mixer.in_proj` + 48 `mixer.out_proj`.
+  - 96 shared-expert projections: 48 shared `up_proj` + 48 shared `down_proj`.
+- The local bundle headers for representative affine-8 tensors are consistent:
+  - `backbone.layers.0.mixer.in_proj.weight`: `U32`
+  - `backbone.layers.0.mixer.in_proj.scales` / `.biases`: `F16`
+  - `backbone.layers.0.mixer.out_proj.weight`: `U32`
+  - `backbone.layers.1.mixer.shared_experts.{up,down}_proj.weight`: `U32`
+  - shared/Mamba affine scales and biases: `F16`
+- Precision-critical control-plane tensors remain unquantized as intended:
+  - `backbone.layers.1.mixer.gate.weight`: `F32`
+  - `backbone.layers.1.mixer.fc1_latent_proj.weight`: `BF16`
+  - `backbone.layers.1.mixer.fc2_latent_proj.weight`: `BF16`
+
+Interpretation:
+
+- Do not "fix" this by demoting router/latent/control tensors or inventing
+  generation defaults.
+- Do not treat `QuantizedMatmul=192` as an accidental routed-expert fallback;
+  it is the expected Mamba/shared-expert affine-8 surface.
+- The remaining low-footprint speed gap is now narrowed to generic affine
+  quantized-matmul graph overhead / mmap residency behavior, or a future
+  resident-compute/reclaim mechanism that can keep Activity Monitor footprint
+  low without per-token mmap pressure.

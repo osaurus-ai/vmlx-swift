@@ -533,6 +533,8 @@ struct MLXPressLowRamPolicySourceTests {
         #expect(status.contains("JangPress: enabled=false"))
         #expect(status.contains("RouterAdvice: enabled=false"))
         #expect(status.contains("mmap tracked Metal buffers: `94.4 GB`"))
+        #expect(status.contains("DOT primitive count: `QuantizedMatmul=192`, `AsType=1152`."))
+        #expect(status.contains("it is the expected Mamba/shared-expert affine-8 surface"))
         #expect(
             status.contains(
                 """
