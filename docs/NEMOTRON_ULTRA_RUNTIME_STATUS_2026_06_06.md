@@ -439,3 +439,80 @@ Interpretation:
   quantized-matmul graph overhead / mmap residency behavior, or a future
   resident-compute/reclaim mechanism that can keep Activity Monitor footprint
   low without per-token mmap pressure.
+
+## Follow-Up Trace - 2026-06-06 09:56 PDT
+
+Ran the JANG-side no-load Ultra proof tools against the saved log bundle in
+`/Users/eric/jang/docs/runtime/logs` so this vMLX note stays aligned with the
+source-model handoff before any new heavy model run:
+
+```sh
+PYTHONPATH=/Users/eric/jang/jang-tools \
+  /Users/eric/jang/jang-tools/.venv/bin/python \
+  /Users/eric/jang/jang-tools/examples/nemotron_ultra/runtime_status_report.py \
+  --log-dir /Users/eric/jang/docs/runtime/logs
+
+PYTHONPATH=/Users/eric/jang/jang-tools \
+  /Users/eric/jang/jang-tools/.venv/bin/python \
+  /Users/eric/jang/jang-tools/examples/nemotron_ultra/speed_experiment_plan.py \
+  --log-dir /Users/eric/jang/docs/runtime/logs \
+  --out /tmp/nemotron-ultra-speed-experiment-plan-current.md
+
+PYTHONPATH=/Users/eric/jang/jang-tools \
+  /Users/eric/jang/jang-tools/.venv/bin/python \
+  /Users/eric/jang/jang-tools/examples/nemotron_ultra/runtime_speed_gate.py \
+  --log-dir /Users/eric/jang/docs/runtime/logs \
+  --out /tmp/nemotron-ultra-runtime-speed-gate-current.md
+
+PYTHONPATH=/Users/eric/jang/jang-tools \
+  /Users/eric/jang/jang-tools/.venv/bin/python \
+  /Users/eric/jang/jang-tools/examples/nemotron_ultra/validate_runtime_log_bundle.py \
+  --log-dir /Users/eric/jang/docs/runtime/logs
+```
+
+Results:
+
+- Log bundle validation: `FIXED`; all required saved logs are present.
+- Runtime speed gate: `PARTIAL`.
+- Best saved live speed: `8.335 tok/s`, which clears the resident
+  `8 tok/s` floor.
+- Manual synchronized decode: `143.237 ms/token`, implied `6.981 tok/s`.
+- MoE remains a major bucket: `65.773 ms` across 48 layers.
+- Mamba remains a major bucket: `64.157 ms` across 48 layers.
+- Attention and final head are not the first bottleneck:
+  attention `8.990 ms`, norm/lm_head `4.317 ms`.
+- Coherence remains partial in the JANG saved rows because visible
+  `</think>` leakage, repeated n-gram fractions, and one no-EOS row are still
+  recorded there. The Osaurus warm app/API row is separate and did not show
+  tool/reasoning marker leakage in visible output.
+
+Ranked next experiments from JANG's saved-log planner:
+
+1. MoE routed/shared scheduling or fused decode kernel.
+2. Mamba fused decode kernel / lower-overhead projection-state path.
+3. Joint MoE+Mamba scheduling path.
+4. Ahead-of-time warmup for startup/TTFT predictability, not steady tok/s.
+
+Negative controls confirmed by the planner:
+
+- Do not chase attention first.
+- Do not dequantize the 8-bit Mamba/shared projections; current probes say
+  quantized affine is faster.
+- Do not lower router top-k as the main fix; top-k 8 did not materially
+  improve decode.
+- Do not replace the normal generation loop with a manual Python-style argmax
+  loop.
+- Do not hide coherence/parser issues with prompt suffixes, forced tags, or
+  sampler tricks.
+
+Source interpretation:
+
+- Swift active-expert streaming for Nemotron Ultra remains explicit-only by
+  design. `JANGTQStreamingExperts.shouldAutoEnableNemotronUltra` returns
+  `false` unless the operator explicitly sets the streaming env override,
+  because prior live rows showed the stacked/offset backend could be slower
+  than the ordinary JANGTQ path.
+- The next aligned runtime work is not Osaurus wiring, generation defaults,
+  reasoning parser, or tool parser. It is a real MoE/Mamba graph or kernel
+  reduction that preserves the existing JANGTQ math contract and the fp32
+  router-selection floor.

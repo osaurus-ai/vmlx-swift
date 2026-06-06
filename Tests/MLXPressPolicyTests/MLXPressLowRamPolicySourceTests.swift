@@ -545,6 +545,12 @@ struct MLXPressLowRamPolicySourceTests {
         #expect(status.contains("mmap tracked Metal buffers: `94.4 GB`"))
         #expect(status.contains("DOT primitive count: `QuantizedMatmul=192`, `AsType=1152`."))
         #expect(status.contains("it is the expected Mamba/shared-expert affine-8 surface"))
+        #expect(status.contains("Runtime speed gate: `PARTIAL`."))
+        #expect(status.contains("Best saved live speed: `8.335 tok/s`"))
+        #expect(status.contains("MoE remains a major bucket: `65.773 ms` across 48 layers."))
+        #expect(status.contains("Mamba remains a major bucket: `64.157 ms` across 48 layers."))
+        #expect(status.contains("Swift active-expert streaming for Nemotron Ultra remains explicit-only"))
+        #expect(status.contains("The next aligned runtime work is not Osaurus wiring"))
         #expect(
             status.contains(
                 """
