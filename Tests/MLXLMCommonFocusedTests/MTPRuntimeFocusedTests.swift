@@ -1434,10 +1434,13 @@ struct MTPRuntimeFocusedTests {
 
     @Test("shape-walk honors role-level MXTQ metadata for dense JANGTQ roles")
     func shapeWalkHonorsRoleLevelMXTQMetadata() {
-        let base = "backbone.layers.0.mixer.in_proj"
+        let mambaBase = "backbone.layers.0.mixer.in_proj"
+        let sharedBase = "backbone.layers.1.mixer.shared_experts.up_proj"
         let weights: [String: MLXArray] = [
-            "\(base).weight": MLXArray.zeros([1, 128], dtype: .uint32),
-            "\(base).scales": MLXArray.zeros([1, 8], dtype: .float32),
+            "\(mambaBase).weight": MLXArray.zeros([1, 128], dtype: .uint32),
+            "\(mambaBase).scales": MLXArray.zeros([1, 8], dtype: .float32),
+            "\(sharedBase).weight": MLXArray.zeros([1, 128], dtype: .uint32),
+            "\(sharedBase).scales": MLXArray.zeros([1, 8], dtype: .float32),
         ]
 
         let inferred = JangLoader.inferPerLayerQuantization(
@@ -1451,11 +1454,17 @@ struct MTPRuntimeFocusedTests {
             declaredDefaultQuantization: BaseConfiguration.Quantization(
                 groupSize: 64, bits: 4))
 
-        if case .quantize(let override)? = inferred.perLayerQuantization[base] {
+        if case .quantize(let override)? = inferred.perLayerQuantization[mambaBase] {
             #expect(override.bits == 8)
             #expect(override.groupSize == 64)
         } else {
             Issue.record("Expected mamba projection override from role-level mxtq_bits")
+        }
+        if case .quantize(let override)? = inferred.perLayerQuantization[sharedBase] {
+            #expect(override.bits == 8)
+            #expect(override.groupSize == 64)
+        } else {
+            Issue.record("Expected shared expert override from role-level mxtq_bits")
         }
     }
 
