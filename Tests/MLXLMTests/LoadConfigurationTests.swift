@@ -211,7 +211,11 @@ struct LoadConfigurationTests {
 
         #expect(source.contains("let mmapSafetensorsActive = envFlag(\"MLX_SAFETENSORS_MMAP\")"))
         #expect(source.contains("let allowJANGTQMmapBFloat16 = envFlag(\"VMLINUX_JANGTQ_BF16_MMAP\")"))
+        #expect(source.contains("let autoJANGTQMmapBFloat16 = isNemotronHBundle(modelDirectory)"))
         #expect(source.contains("if !isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16"))
+        #expect(source.contains("|| autoJANGTQMmapBFloat16"))
+        #expect(source.contains("private func isNemotronHBundle(_ modelDirectory: URL) -> Bool"))
+        #expect(source.contains("modelType.lowercased() == \"nemotron_h\""))
         #expect(source.contains("shouldSkip: isJANGTQNative ? isJANGTQParameterKey"))
         #expect(source.contains("key.hasSuffix(\".tq_packed\") || key.hasSuffix(\".tq_norms\")"))
         #expect(!source.contains("if !isJANGTQNative {\n        convertToBFloat16(model: model)\n    }"))

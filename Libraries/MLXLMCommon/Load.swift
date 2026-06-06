@@ -667,15 +667,19 @@ public func loadWeights(
     //
     // For non-mmap JANGTQ loads, still convert non-TQ Mamba/attention/router
     // weights so resident decode avoids preventable fp16 AsType cascades. For
-    // mmap/JangPress loads, default to preserving file-backed tensor residency:
-    // converting a mapped tensor materializes a new array and can blow the low
-    // footprint gate. The mmap conversion path is left as an explicit diagnostic
-    // knob so it can be benchmarked without changing production memory policy.
+    // mmap/JangPress loads, default to preserving file-backed tensor residency
+    // unless the bundle is Nemotron-H: Ultra live rows show converting only
+    // non-TQ tensors keeps the low-footprint gate while removing avoidable
+    // decode AsType work. Other native JANGTQ families remain opt-in until
+    // they have their own mmap footprint/speed proof.
     let mmapSafetensorsActive = envFlag("MLX_SAFETENSORS_MMAP")
         || envFlag("VMLINUX_MMAP_SAFETENSORS")
     let allowJANGTQMmapBFloat16 = envFlag("VMLINUX_JANGTQ_BF16_MMAP")
         || envFlag("MLX_JANGTQ_BF16_MMAP")
-    if !isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16 {
+    let autoJANGTQMmapBFloat16 = isNemotronHBundle(modelDirectory)
+    if !isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16
+        || autoJANGTQMmapBFloat16
+    {
         convertToBFloat16(
             model: model,
             shouldSkip: isJANGTQNative ? isJANGTQParameterKey : { _ in false })
@@ -701,6 +705,18 @@ public func loadWeights(
 /// preserving the dtype contract.
 private func isJANGTQParameterKey(_ key: String) -> Bool {
     key.hasSuffix(".tq_packed") || key.hasSuffix(".tq_norms")
+}
+
+private func isNemotronHBundle(_ modelDirectory: URL) -> Bool {
+    let configURL = modelDirectory.appendingPathComponent("config.json")
+    guard
+        let data = try? Data(contentsOf: configURL),
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let modelType = object["model_type"] as? String
+    else {
+        return false
+    }
+    return modelType.lowercased() == "nemotron_h"
 }
 
 private func envFlag(_ key: String) -> Bool {
