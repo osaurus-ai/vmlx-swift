@@ -84,6 +84,7 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
             encoding: .utf8)
 
         XCTAssertTrue(source.contains("JANGTQStreamingExperts.isEnabled"))
+        XCTAssertTrue(source.contains("JANGTQStreamingExperts.shouldAutoEnableNemotronUltra("))
         XCTAssertTrue(source.contains("StreamingTurboQuantSwitchReLUSquaredMLP("))
         XCTAssertTrue(source.contains("NemotronHJANGTQSwitchMLP("))
         XCTAssertTrue(factorySource.contains("routedExpertBits"))
@@ -113,6 +114,23 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
         XCTAssertTrue(streamingSource.contains("(routedBits ?? 1) <= 1"))
         XCTAssertTrue(linearSource.contains("useStreamingPlaceholders: Bool = false"))
         XCTAssertTrue(linearSource.contains("if useStreamingPlaceholders || JANGTQStreamingExperts.isEnabled"))
+    }
+
+    func testUltraRuntimeFastPathControlsAreSourceWired() throws {
+        let modelSource = try String(
+            contentsOfFile: "Libraries/MLXLLM/Models/NemotronH.swift",
+            encoding: .utf8)
+        let jangtqSource = try String(
+            contentsOfFile: "Libraries/MLXLLM/Models/NemotronHJANGTQ.swift",
+            encoding: .utf8)
+
+        XCTAssertTrue(modelSource.contains("JANGTQ_DISABLE_NEMOTRON_ACTIVATION_BF16"))
+        XCTAssertTrue(modelSource.contains("JANGTQ_DISABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH"))
+        XCTAssertTrue(modelSource.contains("weightedDecode(expertInput, inds, scores: scores)"))
+        XCTAssertTrue(modelSource.contains("residual.asType(x.dtype)"))
+        XCTAssertTrue(modelSource.contains("out.asType(lmHead.weight.dtype)"))
+        XCTAssertTrue(jangtqSource.contains("func weightedDecode(_ x: MLXArray, _ indices: MLXArray, scores: MLXArray) -> MLXArray?"))
+        XCTAssertTrue(jangtqSource.contains("extension StreamingTurboQuantSwitchReLUSquaredMLP: NemotronHSwitchMLPLayer"))
     }
 
     func testUltraHybridCacheTopologyIsFortyEightMambaPlusTwelveAttentionKV() throws {

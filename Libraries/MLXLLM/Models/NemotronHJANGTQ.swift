@@ -133,9 +133,19 @@ internal final class NemotronHJANGTQSwitchMLP: Module, NemotronHSwitchMLPLayer {
         outShape.append(inputDims)                      // (B, T, K, hidden)
         return out.reshaped(outShape).asType(x.dtype)
     }
+
+    func weightedDecode(_ x: MLXArray, _ indices: MLXArray, scores: MLXArray) -> MLXArray? {
+        let y = callAsFunction(x, indices)
+        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+    }
 }
 
-extension StreamingTurboQuantSwitchReLUSquaredMLP: NemotronHSwitchMLPLayer {}
+extension StreamingTurboQuantSwitchReLUSquaredMLP: NemotronHSwitchMLPLayer {
+    func weightedDecode(_ x: MLXArray, _ indices: MLXArray, scores: MLXArray) -> MLXArray? {
+        let y = callAsFunction(x, indices)
+        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+    }
+}
 
 // MARK: - Public NemotronHJANGTQ helpers
 //

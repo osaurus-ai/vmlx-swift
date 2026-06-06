@@ -62,6 +62,26 @@ internal protocol NemotronHMixer: Module {
 /// as a generic `Module` and dispatch via this protocol at forward time.
 internal protocol NemotronHSwitchMLPLayer: Module {
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray
+    func weightedDecode(_ x: MLXArray, _ indices: MLXArray, scores: MLXArray) -> MLXArray?
+}
+
+extension NemotronHSwitchMLPLayer {
+    func weightedDecode(_ x: MLXArray, _ indices: MLXArray, scores: MLXArray) -> MLXArray? {
+        nil
+    }
+}
+
+private func nemotronHEnvFlag(_ name: String) -> Bool {
+    let raw = ProcessInfo.processInfo.environment[name]?.lowercased()
+    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+}
+
+private func nemotronHActivationBF16RetentionEnabled() -> Bool {
+    !nemotronHEnvFlag("JANGTQ_DISABLE_NEMOTRON_ACTIVATION_BF16")
+}
+
+private func nemotronHWeightedMoEFastPathEnabled() -> Bool {
+    !nemotronHEnvFlag("JANGTQ_DISABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH")
 }
 
 // MARK: - Activations
@@ -557,7 +577,13 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
                 latentSize, args.hiddenSize, bias: false)
         }
         if let jangtq {
-            if JANGTQStreamingExperts.isEnabled {
+            let streamJANGTQExperts =
+                JANGTQStreamingExperts.isEnabled
+                || JANGTQStreamingExperts.shouldAutoEnableNemotronUltra(
+                    nRoutedExperts: args.nRoutedExperts,
+                    numExpertsPerTok: args.numExpertsPerTok,
+                    routedBits: jangtq.bits)
+            if streamJANGTQExperts {
                 self._switchMLP.wrappedValue = StreamingTurboQuantSwitchReLUSquaredMLP(
                     inputDims: expertInputDims,
                     hiddenDims: args.moeIntermediateSize,
@@ -602,8 +628,15 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         guard let layer = switchMLP as? NemotronHSwitchMLPLayer else {
             fatalError("NemotronHMoE.switch_mlp must conform to NemotronHSwitchMLPLayer (got \(type(of: switchMLP)))")
         }
-        var y = layer(expertInput, inds)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        var y: MLXArray
+        if nemotronHWeightedMoEFastPathEnabled(),
+            let weighted = layer.weightedDecode(expertInput, inds, scores: scores)
+        {
+            y = weighted
+        } else {
+            y = layer(expertInput, inds)
+            y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        }
         if let fc2LatentProj {
             y = fc2LatentProj(y)
         }
@@ -676,7 +709,14 @@ internal class NemotronHBlock: Module {
         let mixerFunc = mixer as! NemotronHMixer
         let output = mixerFunc(hidden, attentionMask: attentionMask, ssmMask: ssmMask, cache: cache)
 
-        return x + output
+        let residual = x + output
+        if nemotronHActivationBF16RetentionEnabled(),
+            (x.dtype == .bfloat16 || x.dtype == .float16),
+            residual.dtype != x.dtype
+        {
+            return residual.asType(x.dtype)
+        }
+        return residual
     }
 }
 
@@ -850,6 +890,11 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var out = backbone(inputs, cache: cache)
         if let lmHead {
+            if nemotronHActivationBF16RetentionEnabled(),
+                out.dtype != lmHead.weight.dtype
+            {
+                out = out.asType(lmHead.weight.dtype)
+            }
             out = lmHead(out)
         } else {
             out = backbone.embeddings.asLinear(out)
@@ -867,6 +912,11 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     public func callAsFunction(inputsEmbeds: MLXArray, cache: [KVCache]?) -> MLXArray {
         var out = backbone.forwardFromEmbeddings(inputsEmbeds, cache: cache)
         if let lmHead {
+            if nemotronHActivationBF16RetentionEnabled(),
+                out.dtype != lmHead.weight.dtype
+            {
+                out = out.asType(lmHead.weight.dtype)
+            }
             out = lmHead(out)
         } else {
             out = backbone.embeddings.asLinear(out)
@@ -992,7 +1042,13 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                 guard sanitized[probe] != nil else { continue }
                 for kind in ["tq_packed", "tq_norms"] {
                     let target = "\(prefix).switch_mlp.\(fc).\(kind)"
-                    if JANGTQStreamingExperts.isEnabled {
+                    let streamJANGTQExperts =
+                        JANGTQStreamingExperts.isEnabled
+                        || JANGTQStreamingExperts.shouldAutoEnableNemotronUltra(
+                            nRoutedExperts: configuration.nRoutedExperts,
+                            numExpertsPerTok: configuration.numExpertsPerTok,
+                            routedBits: nil)
+                    if streamJANGTQExperts {
                         for e in 0 ..< configuration.nRoutedExperts {
                             sanitized.removeValue(
                                 forKey: "\(prefix).experts.\(e).\(proj).\(kind)")
