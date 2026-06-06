@@ -140,7 +140,7 @@ Still open before the Osaurus single-package PR:
   diagnostic.
 - VL/video/audio multi-turn media-salt behavior, including nil media salt on
   text-only turns and grounded output after media changes.
-- SSM/hybrid async re-derive with companion-cache proof.
+- SSM/hybrid prompt-boundary rederive with companion-cache proof.
 - The historical `Tests/MLXLMTests` directory is not wired into the current
   package test graph. Rows from those files are useful source/reference material
   only until they are moved into an active target or `Package.swift` is updated

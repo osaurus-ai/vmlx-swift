@@ -344,11 +344,11 @@ private func commonItems(
             state: family == .generic ? .missing : .partial,
             detail: "scripts/compare-cache-deviation.sh provides cache-off/cold/warm comparison with isolated disk L2; every family still needs a green row or an explicit skip-off rationale."),
         MLXPressReadinessItem(
-            gate: "async-rederive-warm-pass",
+            gate: "synchronous-prompt-boundary-rederive",
             state: family.hybridCompanionState == .notApplicable && !facts.isRouted
                 ? .notApplicable
                 : .partial,
-            detail: "Hybrid rows must prove SSMReDerive or companion capture/restoration; routed rows must prove async router/expert warm advice does not increase Activity Monitor footprint or change output."),
+            detail: "Hybrid rows must prove synchronous prompt-boundary SSMReDerive or companion capture/restoration; routed rows must separately prove router/expert warm advice does not increase Activity Monitor footprint or change output. Detached async SSM rederive is not a production path."),
         MLXPressReadinessItem(
             gate: "cache-stack-surfaces",
             state: cacheCompanionState,

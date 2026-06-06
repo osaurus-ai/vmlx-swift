@@ -313,9 +313,9 @@ status and user-facing docs should use MLXPress.
   `has_vision=false`. Those bundles now surface Qwen 2D/3D MRoPE vector gates
   and block on real media-cache proof instead of looking text-only.
 - `StreamOrDevice.stream(_:)` now preserves the caller-provided stream instead
-  of falling back to the default stream. That matters for future async rederive,
-  router readback isolation, and cache warm-pass diagnostics where a named
-  stream must actually be used.
+  of falling back to the default stream. That matters for future isolated
+  rederive diagnostics, router readback isolation, and cache warm-pass
+  diagnostics where a named stream must actually be used.
 - The readiness checklist now tracks attention architecture, Hadamard/TurboQuant
   matmul, RoPE/MRoPE position handling, cache block storage/encode, hybrid
   companion-state split, VL/vector media cache identity, parser autodetect,

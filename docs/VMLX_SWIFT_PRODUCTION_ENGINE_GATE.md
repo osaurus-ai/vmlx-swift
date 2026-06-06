@@ -259,7 +259,7 @@ These rows are now covered in this checkout with artifacts under
 | B2 | Environment/config isolation at engine start. | Model-family detection, loader config, cache config, JANGTQ/TurboQuant config, distributed config. | Poison parent shell with JANGTQ, DSV4, dense-lane, cache env vars; launch an engine probe through package API or RunBench; capture sanitized runtime config snapshot. |
 | B3 | Greedy and repetition-penalty behavior after guard removal. | `GenerateParameters`, reasoning/template policy, direct package generation, RunBench generation harness. | DSV4, MiniMax, and Ling prompts at greedy and rep=1.0; first 400 chars, stop reason, loop detector, think close status, token/s. |
 | B4 | Reasoning on/off/effort matrix. | `DeepseekV4ReasoningPolicy`, reasoning parser, `UserInput.additionalContext`, template kwargs, `--reasoning-effort`. | Matrix for DSV4, MiniMax, Qwen, GLM, Mistral, Kimi, GPT-OSS, Gemma where local; `max` must pass through instead of silent downgrade. |
-| B5 | SSM/hybrid async re-derive. | `SSMReDerive`, `SSMStateCache`, `SSMCompanionDiskStore`, `CacheCoordinator`, hybrid model input preparation. | Three-turn GatedDeltaNet/Qwen3.5-style run with prefix mismatch and partial overlap; companion hits/misses and coherent turn 3 output. |
+| B5 | SSM/hybrid prompt-boundary rederive and companion restore. | `SSMReDerive`, `SSMStateCache`, `SSMCompanionDiskStore`, `CacheCoordinator`, hybrid model input preparation. | Three-turn GatedDeltaNet/Qwen3.5-style run with prefix mismatch and partial overlap; companion hits/misses and coherent turn 3 output. |
 | B6 | VL multi-turn cache behavior. | `UserInput.images/videos/audios`, `MediaSalt`, VLM processors, placeholder suffix cache, `MLXVLM`. | Image+text, text-only same session, different image; media salt nil for text-only turn, resume path hit, grounded answer per image. |
 | B7 | DSV4 long-context regression and vector drift. | DSV4 cache, compressor, paged/disk state, finalizer budget, vector probe equivalents. | Long-context run on canonical DSV4 bundle; no 3k to 4k loop; paged+dsv4 cache detail; disk blocks; terminal restored; vector probe drift reported honestly. |
 | B8 | Tool-calling per family. | `ToolCallProcessor`, `ToolCallFormat`, model-family parsers, chat template tool injection. | One tool request and one tool-result follow-up per parser family supported in Swift; schema valid, no plaintext leak, replay order preserved. |
@@ -409,7 +409,7 @@ behavioral subset is:
 6. Greedy and rep=1.0 proof for DSV4, MiniMax, and Ling.
 7. Cache inverse proof for prefix, paged, disk L2, KV quantization, SSM companion,
    and media cache where applicable.
-8. SSM async re-derive proof on a hybrid model.
+8. SSM prompt-boundary rederive proof on a hybrid model.
 9. VL multi-turn proof on every local VL family.
 10. Tool-call parser proof for every supported family.
 11. DSV4 long-context and vector drift proof.

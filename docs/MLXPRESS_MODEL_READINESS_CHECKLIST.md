@@ -179,7 +179,7 @@ Current universal gate names include:
 - `parser-autodetect-stack`
 - `per-turn-ram-speed-artifact`
 - `cold-warm-deviation-proof`
-- `async-rederive-warm-pass`
+- `synchronous-prompt-boundary-rederive`
 
 The important low-level strings to look for are not cosmetic. For example:
 `mla-partial-rope-attention`, `randomized-hadamard-pow2-blocks`,

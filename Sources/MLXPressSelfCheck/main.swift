@@ -185,8 +185,8 @@ private func checkReadinessChecklist() throws {
         kimiReadiness.items.contains { $0.gate == "cold-warm-deviation-proof" && $0.state == .partial },
         "expected Kimi cold/warm deviation gate")
     try expect(
-        kimiReadiness.items.contains { $0.gate == "async-rederive-warm-pass" && $0.state == .partial },
-        "expected Kimi routed warm-pass gate")
+        kimiReadiness.items.contains { $0.gate == "synchronous-prompt-boundary-rederive" && $0.state == .partial },
+        "expected Kimi routed prompt-boundary rederive gate")
     try expect(
         kimiReadiness.requiredProofs.contains { $0.contains("longer Kimi MLXPress cache-stack decode") },
         "expected Kimi long decode proof requirement")

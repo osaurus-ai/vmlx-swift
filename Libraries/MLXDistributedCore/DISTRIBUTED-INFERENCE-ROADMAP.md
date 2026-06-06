@@ -32,7 +32,7 @@ cache format, model topology, and failure semantics differ by architecture.
 | --- | --- | --- |
 | Qwen, Gemma, Laguna, Nemotron text | Standard transformer KV/MoE | Paged prefix, disk L2, TurboQuant KV, and continuous batching can be shared only after exact model hash and tokenizer/template identity match. |
 | MiniMax M2/M2.7 | Standard KV/MoE transformer, not hybrid | Use normal KV cache, paged prefix, disk L2, TurboQuant KV, and batching. Do not route it through SSM/CCA/DSV4 hybrid rollback policy. |
-| Ling/Bailing | Recurrent linear-attention hybrid | ArraysCache plus recurrent state must move together. Prefix hits and async rederive need exact recurrent state restore; do not treat it as plain KV. |
+| Ling/Bailing | Recurrent linear-attention hybrid | ArraysCache plus recurrent state must move together. Prefix hits and prompt-boundary rederive need exact recurrent state restore; do not treat it as plain KV. |
 | ZAYA | CCA hybrid | `ZayaCCACache` contains KV, convolution state, and previous hidden state. Paged prefix remains disabled for this family until CCA block identity and restore semantics are proven. Disk L2 exact round-trip is the current supported persistence path. |
 | DSV4 Flash | CSA/HSA/SWA attention mix | Cache policy must preserve each attention class separately. Do not force TurboQuant KV over CSA/HSA/SWA compression paths until the DSV4 cache contract is encoded in the planner. |
 | Omni/VL families | Text KV plus media-derived context | Cache keys must include media salt and modality metadata. Image, audio, and video turns cannot share text-only prefix entries unless media state is identical. |

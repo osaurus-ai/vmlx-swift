@@ -16,8 +16,8 @@
 //      to .quiescing or .compressed (the failsafe state machine ticks).
 //      Cold routed bytes MUST be > 0 on routed bundles.
 //   5. Hybrid SSM models (NemotronH-Omni family) — second turn must
-//      complete without re-running prefill from scratch (proxy for the
-//      async SSM re-derive warm-pass landing correctly).
+//      complete without re-running prefill from scratch (proxy for
+//      prompt-boundary SSM companion restore landing correctly).
 //   6. TurboQuant cache encode/decode parity — for JANGTQ bundles,
 //      identical prompt twice with disk cache enabled. Both responses
 //      must be non-empty.

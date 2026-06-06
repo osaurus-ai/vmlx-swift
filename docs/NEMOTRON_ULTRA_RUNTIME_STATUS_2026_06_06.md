@@ -328,8 +328,9 @@ Still not complete:
 - The resident `8.1 tok/s` row uses about `100 GB` physical footprint.
 - Thinking-on parser behavior is still partial in the short JPREG row because
   the model emitted reasoning but no visible answer within the token budget.
-- Live async SSM rederive was not triggered in these cache rows:
+- Live prompt-boundary SSM rederive was not triggered in these cache rows:
   `reDerives=0`. The proven path is disk-backed SSM companion restore/hit.
+  Detached async SSM rederive is intentionally not a production path.
 - The vMLX rows above are harness rows. A separate Osaurus no-sign app/API pass
   was also run against the same model id and current vMLX pin:
   `/tmp/osaurus-bbd5d5ce-nemotron-ultra-tool-cache-warm-20260606-071921`.
