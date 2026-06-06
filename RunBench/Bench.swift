@@ -7266,9 +7266,18 @@ func runPerfBench(
             context = loaded.0
             jangPressRuntime = loaded.1
         } else {
-            context = try await MLXLMCommon.loadModel(
-                from: modelDir, using: #huggingFaceTokenizerLoader())
-            jangPressRuntime = nil
+            if useMmap {
+                let loaded = try await MLXLMCommon.loadModel(
+                    from: modelDir,
+                    using: #huggingFaceTokenizerLoader(),
+                    loadConfiguration: LoadConfiguration(useMmapSafetensors: true))
+                context = loaded.0
+                jangPressRuntime = loaded.1
+            } else {
+                context = try await MLXLMCommon.loadModel(
+                    from: modelDir, using: #huggingFaceTokenizerLoader())
+                jangPressRuntime = nil
+            }
         }
         let rssAfterLoad = currentRSSMiB()
         let footprintAfterLoad = currentPhysFootprintMiB()
