@@ -297,8 +297,9 @@ Release-safe wording:
   Nemotron Ultra JANGTQ_1L: `8.1 tok/s`, bundle generation defaults, coherent
   visible output, no loop, and no parser marker leak.
 - Do not describe the low-footprint mmap path as `8-10 tok/s`.
-  Current mmap rows are coherent and cache-correct, but they are still in the
-  `3.8-4.5 tok/s` class.
+  Current mmap rows are coherent and cache-correct, and the latest default
+  auto-BF16 mmap row is `5.3 tok/s`, but that is still below the `8-10 tok/s`
+  target.
 
 Fixed/proven:
 
@@ -306,18 +307,19 @@ Fixed/proven:
 - Current Swift resident decode confirms the documented `8 tok/s` class:
   `8.1 tok/s` with bundle generation defaults.
 - Current Swift low-footprint mmap decode is coherent and stays around
-  `1.35 GB` footprint in the perf rows. The saved JPREG row stays low-footprint
-  too, but its own artifact proves JangPress advisory state was disabled.
+  `1.35-2.1 GB` footprint in the perf rows. The latest default auto-BF16 mmap
+  row is `5.3 tok/s` with `1926 MiB` peak physical footprint. The saved JPREG
+  row stays low-footprint too, but its own artifact proves JangPress advisory
+  state was disabled.
 - Hybrid SSM disk-backed prefix cache hits are proven for exact replay and
   growing chat, including SSM companion-state hits and salt isolation.
 - The attempted scored-kernel optimization was proven slower and removed from
   the default path.
 - Loader dtype policy now preserves JANGTQ `tq_packed` / `tq_norms` raw while
-  allowing non-mmap JANGTQ loads to reuse the normal non-TQ bf16 conversion
-  path. Mmap/JangPress loads keep file-backed tensor residency by default; the
-  selective bf16-on-mmap path is diagnostic-only behind
-  `VMLINUX_JANGTQ_BF16_MMAP=1` / `MLX_JANGTQ_BF16_MMAP=1` until a live row
-  proves it does not violate the footprint gate.
+  allowing non-TQ tensors to promote out of fp16 AsType-heavy decode. This is
+  now automatic for mmap-loaded native Nemotron-H JANGTQ bundles only; other
+  native JANGTQ families remain env opt-in through
+  `VMLINUX_JANGTQ_BF16_MMAP` / `MLX_JANGTQ_BF16_MMAP`.
 - Role-level `mxtq_bits` now accepts both Nemotron Ultra Mamba projection
   spellings: `mamba_proj` and `mamba_projection`. Focused coverage proves the
   longer spelling still applies the 8-bit affine override to
@@ -326,13 +328,13 @@ Fixed/proven:
 
 Still not complete:
 
-- The release-friendly low-footprint mmap path is `3.8-3.9 tok/s`, not
+- The release-friendly low-footprint mmap path is `5.3 tok/s`, not
   `8-10 tok/s`.
 - The saved JPREG artifact is not proof that enabled JangPress router/expert
   advice is speed-neutral or production-ready; it reports
   `JangPress: enabled=false` and `RouterAdvice: enabled=false`.
-- A clean-main graph-stats probe still shows `5711` decode graph nodes and
-  `1152` AsType nodes on the mmap path; closing the speed gap needs a real
+- The latest auto-BF16 mmap graph-stats probe shows `4799` decode graph nodes
+  and `480` AsType nodes; closing the remaining speed gap still needs a real
   graph/kernel or resident-compute/reclaim improvement, not a template,
   sampler, or parser workaround.
 - The DOT histogram confirms the mmap graph is dominated by the expected
@@ -351,9 +353,9 @@ Still not complete:
   That warm relaunch row passed required-tool parsing, tool-history replay, no
   reasoning/tool marker leak, disk L2 hits, and SSM companion-state hits on the
   low-footprint mmap app path.
-- The selective non-TQ bf16 loader policy is source/test-proven only in this
-  update. A fresh live graph-stats row is still required before claiming it
-  reduces Nemotron Ultra `AsType` count or token/s.
+- The selective non-TQ bf16 loader policy is now source/test-proven and
+  live-proven for Nemotron-H JANGTQ mmap. It improves the mmap graph shape and
+  default token/s, but it does not complete the low-footprint speed target.
 
 ## Follow-Up Trace - 2026-06-06 08:40 PDT
 
@@ -523,8 +525,8 @@ Aligned Osaurus production load policy with the proven mmap harness boundary:
 
 - `LoadConfiguration.default` already uses mmap safetensors and 70% memory
   caps while keeping MLXPress/JangPress disabled unless explicitly requested.
-- The saved low-footprint vMLX rows above use that disabled-cold-tier mmap path
-  and decode in the `3.8-4.5 tok/s` class.
+- The saved low-footprint vMLX rows above use that disabled-cold-tier mmap path.
+  After the auto-BF16 default, the latest mmap row decodes at `5.3 tok/s`.
 - The Osaurus app proof used the `osaurusProduction` preset, which previously
   aliased `experimentalJangPressAuto`. On the 98 GB Nemotron Ultra routed
   bundle, that can auto-enable the experimental cold-tier because the bundle is
@@ -608,3 +610,57 @@ Interpretation:
 - The remaining low-footprint gap is still MoE/Mamba graph/kernel work or a
   resident-compute/reclaim mechanism, not Osaurus wiring or parser/default
   behavior.
+
+## Follow-Up Trace - 2026-06-06 15:55 PDT
+
+Merged the scoped auto-BF16 mmap load policy for Nemotron-H JANGTQ:
+
+- vMLX PR: `https://github.com/osaurus-ai/vmlx-swift/pull/28`
+- vMLX main revision: `9717a4562cd52a3b91156fb627389fdbc1911013`
+- Commit: `920e3e3 Auto BF16 mmap conversion for Nemotron JANGTQ`
+
+Change:
+
+- Mmap-loaded native Nemotron-H JANGTQ bundles automatically promote non-TQ
+  tensors out of fp16 AsType-heavy decode.
+- `.tq_packed` and `.tq_norms` stay raw.
+- Other native JANGTQ families remain opt-in through
+  `VMLINUX_JANGTQ_BF16_MMAP` / `MLX_JANGTQ_BF16_MMAP`.
+- No sampler, prompt, template, parser, or forced-output behavior changed.
+
+Focused checks:
+
+- `/tmp/vmlx-loadconfig-nemotron-auto-bf16-20260606-154840.log`
+  - `LoadConfigurationTests/jangtqLoadDoesNotSkipWholeModelBFloat16Conversion`
+    passed.
+- `/tmp/vmlx-nemotron-dispatch-focused-auto-bf16-20260606-155138.log`
+  - `NemotronHJANGTQDispatchFocusedTests`, 11 tests passed.
+
+Live low-footprint proof without BF16 env flags:
+
+- Artifact:
+  `/tmp/vmlx-nemotron-mmap-auto-bf16-64tok-sustained-20260606-155110.log`
+- Result:
+  - `tokps_median=5.3`
+  - `peak_footprint_mib=1926`
+  - `decodeNodes=4799`
+  - `asType=480`
+  - bundle generation defaults:
+    `temp=1.00 topP=0.95 topK=0 rep=nil`
+  - coherent visible text, no loop, no reasoning/tool leaks.
+
+Control:
+
+- `/tmp/vmlx-nemotron-mmap-streaming-explicit-16tok-control-20260606-154539.log`
+  showed the explicit MLXPress streaming-expert path remains diagnostic-only:
+  `tokps_median=0.3`, coherent but far too slow.
+
+Interpretation:
+
+- The low-footprint default is improved and still under 2 GB physical footprint
+  in the 64-token row.
+- The low-footprint speed gate remains PARTIAL: `5.3 tok/s` is not the
+  requested `8-10 tok/s`.
+- The next real speed lane is regular stacked Nemotron MoE/Mamba graph and
+  kernel work, not JangPress streaming, top-k reduction, prompt changes, or
+  sampler changes.

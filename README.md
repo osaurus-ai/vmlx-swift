@@ -60,15 +60,15 @@ cache topology, and parser state attached.
 | Model | Runtime path | Evidence | Status |
 |---|---|---:|---|
 | Nemotron Ultra 550B A55B `JANGTQ_1L` | resident Swift decode | 8.1 tok/s | Proven with bundle generation defaults, coherent output, and no parser leak |
-| Nemotron Ultra 550B A55B `JANGTQ_1L` | low-footprint mmap decode | 3.8-4.5 tok/s | Coherent and cache-correct, but speed-open |
+| Nemotron Ultra 550B A55B `JANGTQ_1L` | low-footprint mmap decode | 5.3 tok/s | Coherent and cache-correct with auto BF16 non-TQ tensors, but speed-open |
 
 The resident Nemotron Ultra row confirms the documented 8 tok/s Swift decode
 class. It uses about 100 GB physical footprint and is not the same claim as the
-low-footprint mmap/JangPress path. The mmap path currently decodes in the
-3.8-4.5 tok/s class while staying near 1.35-2.1 GB physical footprint in perf
-rows. It proves hybrid SSM disk-backed prefix-cache restore, including SSM
-companion hits and cache-salt isolation, but it does not yet reach the 8-10
-tok/s target. See
+low-footprint mmap/JangPress path. The mmap path currently decodes at
+5.3 tok/s while staying under 2 GB physical footprint in the latest 64-token
+perf row. It proves hybrid SSM disk-backed prefix-cache restore, including SSM
+companion hits and cache-salt isolation, but it does not yet reach the
+8-10 tok/s target. See
 [`docs/NEMOTRON_ULTRA_RUNTIME_STATUS_2026_06_06.md`](docs/NEMOTRON_ULTRA_RUNTIME_STATUS_2026_06_06.md)
 for the exact commands and artifacts.
 
