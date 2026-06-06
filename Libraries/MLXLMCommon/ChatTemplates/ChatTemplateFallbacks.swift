@@ -310,7 +310,7 @@ You have access to the following functions:
       </parameter>
       {%- endfor %}
       {%- if fn['parameters']['required'] is defined %}
-      <required>{{ fn['parameters']['required'] }}</required>
+      <required>{{ fn['parameters']['required'] | tojson }}</required>
       {%- endif %}
     </parameters>
     {%- endif %}
@@ -331,6 +331,7 @@ value_1
 
 <IMPORTANT>
 The current assistant response MUST be a tool call. Reply only with a `<tool_call>` block for one available tool and no prose before the tool result.
+Required parameters MUST be specified.
 </IMPORTANT>
 {%- endif %}
 {%- endif %}
@@ -343,6 +344,7 @@ The current assistant response MUST be a tool call. Reply only with a `<tool_cal
 
 <IMPORTANT>
 The current assistant response MUST be a tool call. This applies to the latest user request. Reply only with a `<tool_call>` block for one available tool and no prose before the tool result.
+Required parameters MUST be specified.
 </IMPORTANT>
 {%- endif %}
 <|im_end|>

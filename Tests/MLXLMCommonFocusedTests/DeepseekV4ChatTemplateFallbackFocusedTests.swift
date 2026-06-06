@@ -264,9 +264,49 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("<function=example_function_name>"))
         #expect(rendered.contains("MUST be a tool call"))
         #expect(rendered.contains("one available tool and no prose before the tool result"))
+        #expect(rendered.contains("<required>[\"text\"]</required>"))
+        #expect(rendered.contains("Required parameters MUST be specified"))
         #expect(!rendered.contains("[AVAILABLE_TOOLS]"))
+        #expect(!rendered.contains("<extra_id_"))
         #expect(!rendered.contains("<｜DSML｜"))
         #expect(rendered.hasSuffix("<|im_start|>assistant\n<think></think>"))
+
+        let source = try repositoryFile("Libraries/MLXLMCommon/ChatTemplates/NemotronMinimal.jinja")
+        let standalone = try Template(source).renderDSV4([
+            "messages": [
+                ["role": "user", "content": "Use line_count on alpha\nbeta."],
+            ],
+            "tools": [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "line_count",
+                        "description": "Count newline-separated lines in text.",
+                        "parameters": [
+                            "type": "object",
+                            "properties": [
+                                "text": [
+                                    "type": "string",
+                                    "description": "Text to count.",
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                            "required": ["text"],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ],
+            "tool_choice": "required",
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+        ])
+        #expect(standalone.contains("<|im_start|>system"))
+        #expect(standalone.contains("<tools>"))
+        #expect(standalone.contains("<required>[\"text\"]</required>"))
+        #expect(standalone.contains("Required parameters MUST be specified"))
+        #expect(!standalone.contains("[AVAILABLE_TOOLS]"))
+        #expect(!standalone.contains("<extra_id_"))
+        #expect(standalone.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(
+            "<|im_start|>assistant\n<think></think>"))
     }
 
     @Test("Nemotron required tool choice repeats contract after no-tool history")

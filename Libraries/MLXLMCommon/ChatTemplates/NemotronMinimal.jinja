@@ -1,60 +1,94 @@
 {#-
-  Minimal Nemotron-Cascade-2 chat template. The upstream Nemotron
-  template uses `for k in dict if k not in handled_keys` — a pattern
-  the swift-jinja runtime (johnmai-dev/Jinja 1.3.x) mis-iterates as
-  [key, value] ArrayValue tuples, which then breaks the `not in`
-  containment check against `ArrayValue + ArrayValue`. This drop-in
-  avoids dict filtering and keeps the prompt contract osaurus needs:
-  `<extra_id_1>` turn markers, `<think>` stripping in history, and a
-  `<tools>...</tools>` block before the first user turn when tools are
-  present. No function-definition formatting — the model's own prior
-  is relied on to call tools via the XML form it was trained on.
+  Minimal Nemotron-Cascade-2 chat template. The upstream template uses
+  `for k in dict if k not in handled_keys`, which older swift-jinja
+  runtimes can mis-handle. This drop-in avoids dict filtering while
+  preserving the source prompt contract: `<|im_start|>` turn markers,
+  required parameter metadata, XML function calls, and tool responses.
 -#}
 {%- set loop_messages = messages -%}
+{%- set enable_thinking = enable_thinking if enable_thinking is defined else false -%}
+{%- set required_tool_choice = false -%}
+{%- if tool_choice is defined and tool_choice == 'required' -%}
+    {%- set required_tool_choice = true -%}
+{%- elif additionalContext is defined and additionalContext['tool_choice'] == 'required' -%}
+    {%- set required_tool_choice = true -%}
+{%- endif -%}
 {%- if messages[0]['role'] == 'system' -%}
     {%- set system_message = messages[0]['content'] -%}
     {%- set loop_messages = messages[1:] -%}
 {%- else -%}
-    {%- set system_message = 'You are a helpful and harmless assistant.' -%}
+    {%- set system_message = '' -%}
 {%- endif -%}
-<extra_id_0>System
+<|im_start|>system
 {{ system_message }}
 {%- if tools %}
 
-<AVAILABLE_TOOLS>
+# Tools
+
+You have access to the following functions:
+
+<tools>
 {%- for tool in tools %}
-  {%- set fn = tool['function'] if tool.get('function') else tool -%}
-  <tool>
+  {%- set fn = tool['function'] if tool['function'] is defined else tool -%}
+  <function>
     <name>{{ fn['name'] }}</name>
-    {%- if fn.get('description') %}
+    {%- if fn['description'] is defined %}
     <description>{{ fn['description'] | trim }}</description>
     {%- endif %}
-    {%- if fn.get('parameters') and fn['parameters'].get('properties') %}
+    {%- if fn['parameters'] is defined and fn['parameters']['properties'] is defined %}
     <parameters>
       {%- for param_name, param in fn['parameters']['properties'] | dictsort %}
       <parameter>
         <name>{{ param_name }}</name>
-        {%- if param.get('type') %}<type>{{ param['type'] }}</type>{%- endif %}
-        {%- if param.get('description') %}<description>{{ param['description'] | trim }}</description>{%- endif %}
+        {%- if param['type'] is defined %}<type>{{ param['type'] }}</type>{%- endif %}
+        {%- if param['description'] is defined %}<description>{{ param['description'] | trim }}</description>{%- endif %}
       </parameter>
       {%- endfor %}
+      {%- if fn['parameters']['required'] is defined %}
+      <required>{{ fn['parameters']['required'] | tojson }}</required>
+      {%- endif %}
     </parameters>
     {%- endif %}
-  </tool>
+  </function>
 {%- endfor %}
-</AVAILABLE_TOOLS>
-{%- endif %}
+</tools>
 
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+</function>
+</tool_call>
+{%- if required_tool_choice %}
+
+<IMPORTANT>
+The current assistant response MUST be a tool call. Reply only with a `<tool_call>` block for one available tool and no prose before the tool result.
+Required parameters MUST be specified.
+</IMPORTANT>
+{%- endif %}
+{%- endif %}
+<|im_end|>
 {% for message in loop_messages -%}
 {%- if message['role'] == 'user' -%}
-<extra_id_1>User
+<|im_start|>user
 {{ message['content'] }}
+{%- if required_tool_choice and loop.last %}
+
+<IMPORTANT>
+The current assistant response MUST be a tool call. This applies to the latest user request. Reply only with a `<tool_call>` block for one available tool and no prose before the tool result.
+Required parameters MUST be specified.
+</IMPORTANT>
+{%- endif %}
+<|im_end|>
 {%- elif message['role'] == 'assistant' -%}
-<extra_id_1>Assistant
-{%- if message.get('content') -%}
+<|im_start|>assistant
+{%- if message['content'] -%}
 {{ message['content'] }}
 {%- endif %}
-{%- if message.get('tool_calls') %}
+{%- if message['tool_calls'] is defined and message['tool_calls'] %}
 {%- for tc in message['tool_calls'] %}
 <tool_call>
 <function={{ tc['function']['name'] }}>
@@ -71,12 +105,21 @@
 </tool_call>
 {%- endfor %}
 {%- endif %}
+<|im_end|>
 {%- elif message['role'] == 'tool' -%}
-<extra_id_1>Tool
+<|im_start|>user
+<tool_response>
 {{ message['content'] }}
+</tool_response>
+<|im_end|>
 {%- endif -%}
 
 {% endfor -%}
 {%- if add_generation_prompt %}
-<extra_id_1>Assistant
+<|im_start|>assistant
+{%- if enable_thinking %}
+<think>
+{%- else %}
+<think></think>
+{%- endif %}
 {%- endif %}
