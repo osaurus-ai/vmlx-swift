@@ -549,9 +549,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
 
         switch n {
         // Qwen 3.5 / 3.6 family — XML-style <tool_call>…</tool_call>
-        // (vLLM ecosystem name `qwen3_coder` aliased here).
+        // (vLLM ecosystem names `qwen3_coder` / `qwen3_coder_xml` aliased here).
         case "qwen", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
-            "qwen3_coder", "mimo", "mimo_v2", "mimo_v2_flash":
+            "qwen3_coder", "qwen3_coder_xml", "mimo", "mimo_v2", "mimo_v2_flash":
             return .xmlFunction
         // StepFun Step 3.5 / 3.7 parser aliases. JANG
         // Step 3.7 VLM bundles stamp `tool_parser = "step3p5"` because the

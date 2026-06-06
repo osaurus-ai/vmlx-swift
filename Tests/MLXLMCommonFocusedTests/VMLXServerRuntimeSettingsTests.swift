@@ -758,6 +758,7 @@ struct VMLXServerRuntimeSettingsTests {
             ("deepseek_v4_flash", .dsml, "think_xml"),
             ("gemma4", .gemma4, "harmony"),
             ("hy3", .hunyuan, "think_xml"),
+            ("nemotron_h", .nemotron, "think_xml"),
         ]
         let settings = VMLXServerRuntimeSettings()
         let config = settings.cacheCoordinatorConfig(

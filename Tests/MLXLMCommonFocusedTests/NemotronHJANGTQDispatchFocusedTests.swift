@@ -158,7 +158,10 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
     func testUltraCapabilityParsersAndGenerationDefaultsStayBundleDriven() throws {
         XCTAssertEqual(ToolCallFormat.fromCapabilityName("nemotron"), .nemotron)
         XCTAssertEqual(ToolCallFormat.infer(from: "nemotron_h"), .nemotron)
+        XCTAssertEqual(ToolCallFormat.fromCapabilityName("qwen3_coder_xml"), .xmlFunction)
         XCTAssertNotNil(ReasoningParser.fromCapabilityName("deepseek_r1"))
+        XCTAssertNotNil(ReasoningParser.fromCapabilityName("nemotron_v3"))
+        XCTAssertNotNil(ReasoningParser.fromCapabilityName("nemotron_3"))
 
         var parser = try XCTUnwrap(
             ReasoningParser.forPrompt(
