@@ -192,6 +192,25 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         let hasGemma4NativeToolSentinels =
                             upstream.convertTokenToId("<|tool_call>") != nil
                             && upstream.convertTokenToId("<|turn>") != nil
+                        if !(tools?.isEmpty ?? true),
+                           upstream.bosToken == "<s>",
+                           upstream.convertTokenToId("<|im_end|>") != nil,
+                           (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
+                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                FileHandle.standardError.write(
+                                    "[vmlx] chat-template tools -> NemotronMinimal fallback engaged\n"
+                                        .data(using: .utf8)!)
+                            }
+                            return try upstream.applyChatTemplate(
+                                messages: messages,
+                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
+                                    MLXLMCommon.ChatTemplateFallbacks.nemotronMinimal),
+                                addGenerationPrompt: true,
+                                truncation: false,
+                                maxLength: nil,
+                                tools: chatTemplateTools,
+                                additionalContext: additionalContext)
+                        }
                         let gemmaRequiredToolChoice =
                             !(chatTemplateTools?.isEmpty ?? true)
                             && (upstream.bosToken == "<bos>" || hasGemma4NativeToolSentinels)
@@ -568,6 +587,20 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         let hasGemma4NativeToolSentinels =
                             upstream.convertTokenToId("<|tool_call>") != nil
                             && upstream.convertTokenToId("<|turn>") != nil
+                        if !(tools?.isEmpty ?? true),
+                           upstream.bosToken == "<s>",
+                           upstream.convertTokenToId("<|im_end|>") != nil,
+                           (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
+                            return try upstream.applyChatTemplate(
+                                messages: messages,
+                                chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
+                                    MLXLMCommon.ChatTemplateFallbacks.nemotronMinimal),
+                                addGenerationPrompt: addGenerationPrompt,
+                                truncation: false,
+                                maxLength: nil,
+                                tools: chatTemplateTools,
+                                additionalContext: additionalContext)
+                        }
                         let gemmaRequiredToolChoice =
                             !(chatTemplateTools?.isEmpty ?? true)
                             && (upstream.bosToken == "<bos>" || hasGemma4NativeToolSentinels)
