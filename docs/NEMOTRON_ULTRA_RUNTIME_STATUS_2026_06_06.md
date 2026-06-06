@@ -539,3 +539,72 @@ This change does not alter sampler defaults, prompt templates, reasoning/tool
 parsers, quantized matmul math, JANGTQ kernels, or SSM cache semantics. It keeps
 the Osaurus default on the proven mmap + memory-cap behavior instead of
 silently selecting an experimental cold-tier path for large routed bundles.
+
+## Follow-Up Trace - 2026-06-06 14:52 PDT
+
+Added a narrow Nemotron-H decode-only depthwise-conv fast path:
+
+- Scope: Mamba `conv1d` only when `seqLen == 1`, the rolling Mamba conv state is
+  available or initialized, and the bundle has a conv bias. Prefill and no-bias
+  variants still use generic `Conv1d`.
+- Math contract: the kernel computes the same depthwise convolution over
+  `[previous_state, current_token]`, applies the same SiLU, and emits the next
+  rolling conv state. It does not change SSM recurrence, MoE routing, JANGTQ
+  kernels, generation defaults, templates, reasoning parsers, or tool parsers.
+- Diagnostic opt-out:
+  `VMLINUX_DISABLE_NEMOTRON_MAMBA_CONV_FASTPATH=1`.
+
+Focused validation:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun swift test --filter NemotronHJANGTQDispatchFocusedTests \
+  --jobs 1 --no-parallel
+```
+
+Artifact:
+`/tmp/vmlx-nemotron-depthwise-conv-focused-rerun2-20260606-144944.log`
+
+Result: passed, 11 tests. The new numerical parity test compares the custom
+decode kernel against generic `conv1d + bias + SiLU` and verifies the emitted
+rolling state.
+
+Fresh mmap speed row:
+
+- Artifact:
+  `/tmp/vmlx-nemotron-mmap-depthwise-conv-fastpath-20260606-145009.log`
+- Result: `tokps_median=4.1`, `peak_footprint_mib=1360`, bundle generation
+  defaults, coherent visible output, no reasoning/tool leaks.
+
+Disabled fast-path control:
+
+- Artifact:
+  `/tmp/vmlx-nemotron-mmap-depthwise-conv-disabled-control-20260606-145034.log`
+- Result: `tokps_median=4.0`, `peak_footprint_mib=1362`, same visible output.
+
+Resident control:
+
+- Artifact:
+  `/tmp/vmlx-nemotron-resident-depthwise-conv-fastpath-20260606-145051.log`
+- Result: `tokps_median=8.8`, `peak_footprint_mib=101573`, coherent visible
+  output, no reasoning/tool leaks.
+
+Graph-stats row:
+
+- Artifact:
+  `/tmp/vmlx-nemotron-mmap-depthwise-conv-graphstats-20260606-145155.log`
+- DOT:
+  `/tmp/vmlx-nemotron-mmap-depthwise-conv-dot-20260606-145155.dot`
+- Result: `decodeNodes=5375`, `asType=1056`, `tokps_median=5.0` for the
+  4-token graph probe.
+
+Interpretation:
+
+- This is a real graph reduction versus the prior clean-main graph row
+  (`5711` decode nodes, `1152` `AsType` nodes), and it preserves the low
+  footprint and coherency envelope.
+- It is not the final low-footprint speed fix. The fresh 16-token mmap row is
+  still about `4 tok/s`, not `8-10 tok/s`.
+- The remaining low-footprint gap is still MoE/Mamba graph/kernel work or a
+  resident-compute/reclaim mechanism, not Osaurus wiring or parser/default
+  behavior.

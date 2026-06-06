@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+import MLX
 @testable import MLXLLM
 @testable import MLXLMCommon
 import XCTest
@@ -158,6 +159,50 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
         XCTAssertFalse(kernelSource.contains("public static func gatherTQTopKScored("))
     }
 
+    func testNemotronMambaDecodeDepthwiseConvFastPathMatchesGenericConv1d() throws {
+        try FocusedMLXTestSupport.withLock {
+            let batch = 2
+            let channels = 3
+            let kernelSize = 4
+
+            let input = MLXArray([
+                Float(0.25), -0.5, 0.75,
+                -1.0, 1.25, 0.5,
+            ], [batch, 1, channels])
+            let state = MLXArray([
+                Float(0.1), 0.2, 0.3,
+                0.4, 0.5, 0.6,
+                0.7, 0.8, 0.9,
+                -0.1, -0.2, -0.3,
+                -0.4, -0.5, -0.6,
+                -0.7, -0.8, -0.9,
+            ], [batch, kernelSize - 1, channels])
+            let weight = MLXArray([
+                Float(0.5), -0.25, 0.75, 1.0,
+                -0.5, 0.25, 0.125, -0.75,
+                0.625, -0.375, 0.875, -0.125,
+            ], [channels, kernelSize, 1])
+            let bias = MLXArray([Float(0.1), -0.2, 0.3])
+
+            let padded = concatenated([state, input], axis: 1)
+            let expectedRaw = conv1d(padded, weight, groups: channels) + bias
+            let expected = expectedRaw * sigmoid(expectedRaw)
+            let expectedState = padded[0..., 1..., 0...]
+
+            let (actual, actualState) = try XCTUnwrap(
+                nemotronHMambaDepthwiseDecodeConv(
+                    input: input,
+                    state: state,
+                    weight: weight,
+                    bias: bias,
+                    channels: channels,
+                    kernelSize: kernelSize))
+
+            Self.assertClose(actual, expected, tolerance: 1e-5)
+            Self.assertClose(actualState, expectedState, tolerance: 1e-5)
+        }
+    }
+
     func testUltraHybridCacheTopologyIsFortyEightMambaPlusTwelveAttentionKV() throws {
         let pattern = Self.ultraLayerBlockTypes
         XCTAssertEqual(pattern.count, 108)
@@ -277,5 +322,16 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
         "moe", "mamba", "attention", "moe", "mamba", "moe", "mamba",
         "moe", "mamba", "moe", "mamba", "moe",
     ]
+
+    private static func assertClose(_ actual: MLXArray, _ expected: MLXArray, tolerance: Float) {
+        MLX.eval(actual, expected)
+        let actualValues = actual.asArray(Float.self)
+        let expectedValues = expected.asArray(Float.self)
+        XCTAssertEqual(actualValues.count, expectedValues.count)
+        let maxDiff = zip(actualValues, expectedValues)
+            .map { abs($0 - $1) }
+            .max() ?? 0
+        XCTAssertLessThanOrEqual(maxDiff, tolerance, "maxDiff=\(maxDiff)")
+    }
 
 }

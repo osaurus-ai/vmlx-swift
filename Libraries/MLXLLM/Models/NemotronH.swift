@@ -132,6 +132,101 @@ internal class NemotronHRMSNormGated: Module {
     }
 }
 
+private func nemotronHMambaConvFastPathDisabled() -> Bool {
+    nemotronHEnvFlag("VMLINUX_DISABLE_NEMOTRON_MAMBA_CONV_FASTPATH")
+}
+
+private func makeNemotronHMambaDepthwiseDecodeConvKernel() -> MLXFast.MLXFastKernel? {
+    let source = """
+            auto c = thread_position_in_grid.x;
+            auto b = thread_position_in_grid.y;
+
+            if (c >= C || b >= Bsz) {
+                return;
+            }
+
+            float acc = 0.0;
+            auto state_base = (b * (K - 1)) * C + c;
+            auto weight_base = c * K;
+
+            for (int k = 0; k < K - 1; ++k) {
+                acc += static_cast<float>(state[state_base + k * C])
+                    * static_cast<float>(weight[weight_base + k]);
+            }
+            acc += static_cast<float>(input[b * C + c])
+                * static_cast<float>(weight[weight_base + K - 1]);
+            acc += static_cast<float>(bias[c]);
+
+            auto sigmoid = 1.0f / (1.0f + fast::exp(-acc));
+            out[b * C + c] = static_cast<T>(acc * sigmoid);
+
+            auto next_base = (b * (K - 1)) * C + c;
+            for (int k = 0; k < K - 2; ++k) {
+                next_state[next_base + k * C] = state[state_base + (k + 1) * C];
+            }
+            if (K > 1) {
+                next_state[next_base + (K - 2) * C] = input[b * C + c];
+            }
+        """
+
+    return MLXFast.metalKernel(
+        name: "nemotron_h_mamba_depthwise_decode_conv",
+        inputNames: ["input", "state", "weight", "bias"],
+        outputNames: ["out", "next_state"],
+        source: source
+    )
+}
+
+private final class NemotronHMambaConvKernelManager: Sendable {
+    static let shared = NemotronHMambaConvKernelManager()
+
+    let decodeKernel: MLXFast.MLXFastKernel?
+
+    private init() {
+        decodeKernel = makeNemotronHMambaDepthwiseDecodeConvKernel()
+    }
+}
+
+internal func nemotronHMambaDepthwiseDecodeConv(
+    input: MLXArray,
+    state: MLXArray,
+    weight: MLXArray,
+    bias: MLXArray,
+    channels: Int,
+    kernelSize: Int
+) -> (MLXArray, MLXArray)? {
+    guard !nemotronHMambaConvFastPathDisabled(),
+        input.dim(1) == 1,
+        state.dim(1) == kernelSize - 1,
+        state.dim(2) == channels,
+        weight.dim(0) == channels,
+        weight.dim(1) == kernelSize,
+        weight.dim(2) == 1,
+        bias.dim(0) == channels,
+        let kernel = NemotronHMambaConvKernelManager.shared.decodeKernel
+    else {
+        return nil
+    }
+
+    let batch = input.dim(0)
+    let outputDType = input.dtype
+    let outputs = kernel(
+        [input, state, weight, bias],
+        template: [
+            ("T", outputDType),
+            ("Bsz", batch),
+            ("C", channels),
+            ("K", kernelSize),
+        ],
+        grid: (channels, batch, 1),
+        threadGroup: (min(256, channels), 1, 1),
+        outputShapes: [[batch, 1, channels], [batch, kernelSize - 1, channels]],
+        outputDTypes: [outputDType, outputDType]
+    )
+
+    return (outputs[0], outputs[1])
+}
+
 // MARK: - Mamba2Mixer
 
 internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
@@ -216,6 +311,22 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
             } else {
                 convState = MLXArray.zeros([batch, 0, convDim], dtype: dtype)
             }
+        }
+
+        if convInput.dim(1) == 1,
+            let bias = conv1d.bias,
+            let (convOutput, nextState) = nemotronHMambaDepthwiseDecodeConv(
+                input: convInput,
+                state: convState!,
+                weight: conv1d.weight,
+                bias: bias,
+                channels: convDim,
+                kernelSize: convKernelSize)
+        {
+            if let cache {
+                cache[0] = nextState
+            }
+            return convOutput
         }
 
         let padded = concatenated([convState!, convInput], axis: 1)
