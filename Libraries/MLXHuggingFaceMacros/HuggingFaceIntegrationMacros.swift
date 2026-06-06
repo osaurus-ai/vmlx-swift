@@ -198,7 +198,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
                                 FileHandle.standardError.write(
-                                    "[vmlx] chat-template tools -> NemotronMinimal fallback engaged\n"
+                                    "[vmlx] chat-template tools -> NemotronMinimal fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
                             return try upstream.applyChatTemplate(
