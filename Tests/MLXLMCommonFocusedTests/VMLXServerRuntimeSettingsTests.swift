@@ -33,12 +33,29 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.mtp.acceptedTokensOnlyEnterBaseCache)
     }
 
-    @Test("Osaurus production preset enables MLXPress auto while preserving MTP resolution")
-    func osaurusProductionPresetEnablesMLXPressAutoWhilePreservingMTPResolution() {
+    @Test("Osaurus production preset keeps MLXPress opt-in while preserving MTP resolution")
+    func osaurusProductionPresetKeepsMLXPressOptInWhilePreservingMTPResolution() {
         let settings = VMLXServerRuntimeSettings()
 
         let resolved = settings.resolvedLoadConfiguration(
             base: .osaurusProduction,
+            configData: nil,
+            jangConfig: nil,
+            status: nil)
+
+        #expect(resolved.jangPress == .disabled)
+        #expect(resolved.maxResidentBytes == .default)
+        #expect(resolved.memoryLimit == .default)
+        #expect(resolved.useMmapSafetensors)
+        #expect(!resolved.nativeMTP)
+    }
+
+    @Test("experimental MLXPress preset remains available for explicit host opt-in")
+    func experimentalMLXPressPresetRemainsAvailableForExplicitHostOptIn() {
+        let settings = VMLXServerRuntimeSettings()
+
+        let resolved = settings.resolvedLoadConfiguration(
+            base: .experimentalJangPressAuto,
             configData: nil,
             jangConfig: nil,
             status: nil)

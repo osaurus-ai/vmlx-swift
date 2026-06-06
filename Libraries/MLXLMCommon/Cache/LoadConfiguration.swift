@@ -181,12 +181,13 @@ public struct LoadConfiguration: Sendable, Equatable {
 
     /// Production host preset for Osaurus/vMLX server integrations.
     ///
-    /// This keeps the conservative load-time memory caps and mmap
-    /// safetensors path from ``default``, while opting validated hosts
-    /// into MLXPress auto-detection for routed bundles that exceed half
-    /// of physical RAM. Native MTP remains a separate per-bundle
-    /// decision resolved by ``VMLXServerRuntimeSettings``.
-    public static let osaurusProduction = experimentalJangPressAuto
+    /// Keep the conservative load-time memory caps and mmap safetensors
+    /// path from ``default`` without automatically engaging the
+    /// experimental routed-expert cold tier. Hosts that have validated
+    /// MLXPress for a specific bundle family should pass
+    /// ``experimentalJangPressAuto`` or an explicit
+    /// ``JangPressPolicy/enabled(coldFraction:)`` policy from settings.
+    public static let osaurusProduction = LoadConfiguration.default
 
     /// Everything off — strict byte-compat with pre-iter-23 behavior.
     /// MLXPress disabled, no caps, no mmap loader.

@@ -396,11 +396,10 @@ struct Bench {
 
         // BENCH_JPREG=1 (2026-05-03): per-bundle regression sweep that
         // exercises the new typed `LoadConfiguration` path end-to-end.
-        // Loads with `LoadConfiguration.default` (auto JangPress + 70%
-        // resident cap), runs 3-turn coherency, samples RSS at four
-        // checkpoints, verifies the JangPress controller advances past
-        // .armed during a 6s quiesce window, plus hybrid-SSM warm-pass
-        // and TurboQuant disk round-trip checks where applicable.
+        // Loads with `LoadConfiguration.default` (JangPress disabled +
+        // 70% caps + mmap), runs 3-turn coherency, samples RSS at four
+        // checkpoints, and exercises hybrid-SSM warm-pass plus
+        // TurboQuant disk round-trip checks where applicable.
         // Designed to be invoked once per bundle from a shell loop so
         // each model gets a fresh process.
         if (env["BENCH_JPREG"] ?? "0") == "1" {

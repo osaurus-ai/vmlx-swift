@@ -516,3 +516,26 @@ Source interpretation:
   reasoning parser, or tool parser. It is a real MoE/Mamba graph or kernel
   reduction that preserves the existing JANGTQ math contract and the fp32
   router-selection floor.
+
+## Follow-Up Trace - 2026-06-06 13:45 PDT
+
+Aligned Osaurus production load policy with the proven mmap harness boundary:
+
+- `LoadConfiguration.default` already uses mmap safetensors and 70% memory
+  caps while keeping MLXPress/JangPress disabled unless explicitly requested.
+- The saved low-footprint vMLX rows above use that disabled-cold-tier mmap path
+  and decode in the `3.8-4.5 tok/s` class.
+- The Osaurus app proof used the `osaurusProduction` preset, which previously
+  aliased `experimentalJangPressAuto`. On the 98 GB Nemotron Ultra routed
+  bundle, that can auto-enable the experimental cold-tier because the bundle is
+  larger than half of physical RAM.
+- Since the current enabled-cold-tier path is not speed-proven for Nemotron
+  Ultra and prior active-streaming rows were slower, `osaurusProduction` now
+  aliases `LoadConfiguration.default`.
+- `experimentalJangPressAuto` remains available for explicit host/settings
+  opt-in after a bundle family has live proof.
+
+This change does not alter sampler defaults, prompt templates, reasoning/tool
+parsers, quantized matmul math, JANGTQ kernels, or SSM cache semantics. It keeps
+the Osaurus default on the proven mmap + memory-cap behavior instead of
+silently selecting an experimental cold-tier path for large routed bundles.

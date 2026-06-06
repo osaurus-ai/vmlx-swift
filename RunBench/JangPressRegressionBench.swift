@@ -6,9 +6,9 @@
 //
 // What each row checks:
 //   1. Load via the new `loadModel(from:using:loadConfiguration:)`
-//      overload (LoadConfiguration.default → auto JangPress + 70%
-//      resident cap). Verify status reports `enabled=true` for routed
-//      bundles and `enabled=false` for dense ones.
+//      overload (LoadConfiguration.default → JangPress disabled + 70%
+//      resident cap + mmap safetensors). Force mode can still verify
+//      explicit JangPress behavior for routed bundles.
 //   2. RSS sample at: pre-load, post-load, post-warm, post-quiesce.
 //   3. 3-turn coherency on a fixed prompt set. Looping detector flags
 //      runs that emit ≥3 identical 16-char windows back-to-back.
@@ -82,7 +82,8 @@ enum JangPressRegressionBench {
     /// the compression path on bundles that the auto threshold would
     /// otherwise leave disabled (i.e. bundles ≤ 50% of physical RAM).
     /// Default false — production-default `LoadConfiguration.default`
-    /// path.
+    /// path, which keeps JangPress opt-in while preserving mmap and
+    /// memory caps.
     private static let forceJangPress: Bool = {
         ProcessInfo.processInfo.environment["BENCH_JPREG_FORCE"] == "1"
     }()
