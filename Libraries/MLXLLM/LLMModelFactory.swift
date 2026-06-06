@@ -1651,6 +1651,10 @@ public final class LLMModelFactory: ModelFactory {
             configData = try NativeMTPActivation.scrubInactiveMTPConfig(configData)
         }
 
+        if JANGTQStreamingExperts.shouldAutoEnableNemotronUltra(modelDirectory: modelDirectory) {
+            JANGTQStreamingExperts.configureModelDirectory(modelDirectory)
+        }
+
         // Determine effective model type for the LLM factory.
         // VLM configs may wrap a different text decoder (e.g., mistral3 VLM wraps mistral4 text).
         // If text_config.model_type exists and differs from the top-level, prefer it when

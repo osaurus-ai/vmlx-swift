@@ -194,7 +194,10 @@ public func loadWeights(
         var skippedStreamingSourceTensors = 0
         var skippedPreservedMTPTensors = 0
         var skippedPreservedMTPShards = 0
-        let streamingRoutedExperts = JANGTQStreamingExperts.isEnabled
+        let streamingRoutedExperts =
+            JANGTQStreamingExperts.isEnabled
+            || JANGTQStreamingExperts.shouldAutoEnableNemotronUltra(
+                modelDirectory: modelDirectory)
         if streamingRoutedExperts {
             JANGTQStreamingExperts.configureModelDirectory(modelDirectory)
         }

@@ -583,6 +583,7 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
                     nRoutedExperts: args.nRoutedExperts,
                     numExpertsPerTok: args.numExpertsPerTok,
                     routedBits: jangtq.bits)
+                    && JANGTQStreamingExperts.canUseNemotronUltraStreaming(layerIdx: layerIdx)
             if streamJANGTQExperts {
                 self._switchMLP.wrappedValue = StreamingTurboQuantSwitchReLUSquaredMLP(
                     inputDims: expertInputDims,

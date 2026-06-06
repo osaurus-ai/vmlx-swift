@@ -100,7 +100,7 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
         XCTAssertTrue(source.contains("if let jangtq"))
     }
 
-    func testUltraOneBitJANGTQAutoSelectsStreamingExpertsSourceContract() throws {
+    func testUltraOneBitJANGTQStreamingStaysExplicitUntilLiveFastPathIsProven() throws {
         let streamingSource = try String(
             contentsOfFile: "Libraries/MLXLMCommon/JANGTQStreamingExperts.swift",
             encoding: .utf8)
@@ -109,9 +109,9 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
             encoding: .utf8)
 
         XCTAssertTrue(streamingSource.contains("shouldAutoEnableNemotronUltra("))
-        XCTAssertTrue(streamingSource.contains("nRoutedExperts >= 512"))
-        XCTAssertTrue(streamingSource.contains("numExpertsPerTok >= 16"))
-        XCTAssertTrue(streamingSource.contains("(routedBits ?? 1) <= 1"))
+        XCTAssertTrue(streamingSource.contains("return false"))
+        XCTAssertTrue(streamingSource.contains("canUseNemotronUltraStreaming(layerIdx: Int)"))
+        XCTAssertTrue(streamingSource.contains("diagnostic-only"))
         XCTAssertTrue(linearSource.contains("useStreamingPlaceholders: Bool = false"))
         XCTAssertTrue(linearSource.contains("if useStreamingPlaceholders || JANGTQStreamingExperts.isEnabled"))
     }

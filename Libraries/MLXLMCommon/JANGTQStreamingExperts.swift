@@ -39,9 +39,23 @@ public enum JANGTQStreamingExperts {
         if let explicit = explicitStreamingEnabled {
             return explicit
         }
-        return nRoutedExperts >= 512
-            && numExpertsPerTok >= 16
-            && (routedBits ?? 1) <= 1
+        // The stacked Nemotron Ultra offset backend is still diagnostic-only:
+        // live rows showed it can be slower than the regular JANGTQ path.
+        // Keep production auto on the proven bundle-weight path unless the
+        // operator explicitly enables streaming.
+        _ = (nRoutedExperts, numExpertsPerTok, routedBits)
+        return false
+    }
+
+    public static func canUseNemotronUltraStreaming(layerIdx: Int) -> Bool {
+        let requiredProjections: [StreamingProjection] = [.up, .down]
+        let store = JANGTQStreamingExpertStore.shared
+        return store.canUseOffsetDispatch(
+            layerIdx: layerIdx,
+            requiredProjections: requiredProjections)
+            || store.canUseDirectStacked(
+                layerIdx: layerIdx,
+                requiredProjections: requiredProjections)
     }
 
     public static func shouldAutoEnableNemotronUltra(modelDirectory: URL) -> Bool {
