@@ -51,6 +51,26 @@ package with reproducible remote pins, no local package paths, and a documented
 runtime coverage matrix for deciding when Osaurus can safely consume this repo
 as its only MLX dependency.
 
+## Current validation snapshot
+
+The current Swift runtime proof is intentionally split by runtime path. A
+single token/s number is not enough without the load mode, memory footprint,
+cache topology, and parser state attached.
+
+| Model | Runtime path | Evidence | Status |
+|---|---|---:|---|
+| Nemotron Ultra 550B A55B `JANGTQ_1L` | resident Swift decode | 8.1 tok/s | Proven with bundle generation defaults, coherent output, and no parser leak |
+| Nemotron Ultra 550B A55B `JANGTQ_1L` | low-footprint mmap decode | 3.9-4.5 tok/s | Coherent and cache-correct, but speed-open |
+
+The resident Nemotron Ultra row confirms the documented 8 tok/s Swift decode
+class. It uses about 100 GB physical footprint and is not the same claim as the
+low-footprint mmap/JangPress path. The mmap path currently stays near 1.35-2.1
+GB physical footprint and proves hybrid SSM disk-backed prefix-cache restore,
+including SSM companion hits and cache-salt isolation, but it does not yet reach
+the 8-10 tok/s target. See
+[`docs/NEMOTRON_ULTRA_RUNTIME_STATUS_2026_06_06.md`](docs/NEMOTRON_ULTRA_RUNTIME_STATUS_2026_06_06.md)
+for the exact commands and artifacts.
+
 ## Install
 
 Use a revision pin for production apps:

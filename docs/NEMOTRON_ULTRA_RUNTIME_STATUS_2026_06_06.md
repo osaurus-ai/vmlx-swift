@@ -81,6 +81,23 @@ Artifact:
 
 Result: passed.
 
+Clean-main cache topology source coverage:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun swift test --filter CacheCoordinatorTopologyFocusedTests \
+  --jobs 1 --no-parallel
+```
+
+Artifact:
+`/tmp/vmlx-nemotron-cache-topology-main-20260606-050752.log`
+
+Result: passed, 31 tests across 5 suites.
+
+Coverage includes hybrid companion-state requirements, partial companion-state
+rejection, disk-tier longest-prefix restore, path-dependent disk-backed restore,
+and reasoning/tool-choice/KV-policy cache-salt isolation.
+
 ## Live Rows
 
 Resident Swift speed row:
@@ -131,6 +148,34 @@ Result:
 - `peak_footprint_mib=1353`
 - `samplingSource=bundle-defaults`
 - `temp=1.00 topP=0.95 topK=0 rep=nil`
+- coherent visible text, no loop, no parser marker leak
+
+Clean-main mmap graph-stats probe:
+
+```sh
+BENCH_MODEL=/Users/eric/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-JANGTQ_1L \
+BENCH_PERF=1 \
+BENCH_PERF_VARIANT=nemotron_mmap_graphstats_main \
+BENCH_MAX_TOKENS=4 \
+BENCH_PERF_WARMUP=0 \
+BENCH_PERF_RUNS=1 \
+BENCH_PERF_USE_GENERATION_CONFIG=1 \
+BENCH_PERF_SEED=42 \
+BENCH_PERF_MMAP=1 \
+BENCH_GRAPH_STATS=1 \
+.build/debug/RunBench
+```
+
+Artifact: `/tmp/vmlx-nemotron-mmap-graphstats-main-20260606-051005.log`
+
+Result:
+
+- `commit=4ccceed`
+- `tokps_median=4.4`
+- `peak_footprint_mib=1366`
+- `graphNodes=5711`
+- `asType=1152`
+- `samplingSource=bundle-defaults`
 - coherent visible text, no loop, no parser marker leak
 
 Low-footprint JPREG row from the same worktree:
@@ -186,6 +231,15 @@ Result:
 
 PARTIAL.
 
+Release-safe wording:
+
+- Current Swift resident decode reaches the documented `8 tok/s` class on
+  Nemotron Ultra JANGTQ_1L: `8.1 tok/s`, bundle generation defaults, coherent
+  visible output, no loop, and no parser marker leak.
+- Do not describe the low-footprint mmap/JangPress path as `8-10 tok/s`.
+  Current mmap rows are coherent and cache-correct, but they are still in the
+  `3.8-4.5 tok/s` class.
+
 Fixed/proven:
 
 - The perf harness now distinguishes the resident and mmap load paths.
@@ -202,6 +256,10 @@ Still not complete:
 
 - The release-friendly low-footprint mmap path is `3.8-3.9 tok/s`, not
   `8-10 tok/s`.
+- A clean-main graph-stats probe still shows `5711` decode graph nodes and
+  `1152` AsType nodes on the mmap path; closing the speed gap needs a real
+  graph/kernel or resident-compute/reclaim improvement, not a template,
+  sampler, or parser workaround.
 - The resident `8.1 tok/s` row uses about `100 GB` physical footprint.
 - Thinking-on parser behavior is still partial in the short JPREG row because
   the model emitted reasoning but no visible answer within the token budget.
