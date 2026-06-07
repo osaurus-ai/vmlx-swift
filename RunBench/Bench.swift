@@ -1028,6 +1028,14 @@ final class NullTokenizerLoader: TokenizerLoader, @unchecked Sendable {
     }
 }
 
+private func loadBenchModelContext(from modelDir: URL) async throws -> ModelContext {
+    let loaded = try await MLXLMCommon.loadModel(
+        from: modelDir,
+        using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .osaurusProduction)
+    return loaded.0
+}
+
 // MARK: - BatchEngine multi-turn chat (iter 26)
 
 /// TRUE BatchEngine multi-turn verification. Unlike
@@ -1043,8 +1051,7 @@ func runBatchEngineMultiTurn(modelPath: String, maxNew: Int) async throws {
     print("\n=== BatchEngine multi-turn chat (iter 26, simplified iter 27) ===")
     print("Loading with real HuggingFace tokenizer...")
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader())
+    let context = try await loadBenchModelContext(from: modelDir)
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
 
@@ -1153,8 +1160,7 @@ func runBatchEngineToolCall(modelPath: String, maxNew: Int) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     print("\n=== BatchEngine tool-call pipeline (iter 66) ===")
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader())
+    let context = try await loadBenchModelContext(from: modelDir)
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
     print("Tool format: \(context.configuration.toolCallFormat.map { "\($0)" } ?? "json (default)")")
@@ -1968,8 +1974,7 @@ func runBatchEngineCacheHit(modelPath: String, maxNew: Int) async throws {
     print("\n=== BatchEngine cache-hit verification (iter 34) ===")
     print("Loading with real HuggingFace tokenizer...")
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader())
+    let context = try await loadBenchModelContext(from: modelDir)
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
 
@@ -1982,8 +1987,9 @@ func runBatchEngineCacheHit(modelPath: String, maxNew: Int) async throws {
     cfg.modelKey = modelDir.lastPathComponent
     let coordinator = CacheCoordinator(config: cfg)
 
-    let params = GenerateParameters(
+    var params = GenerateParameters(
         maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
+    params.extraStopStrings = ["<END>"]
 
     nonisolated(unsafe) let ctx = context
     let engine = BatchEngine(
@@ -2002,10 +2008,15 @@ func runBatchEngineCacheHit(modelPath: String, maxNew: Int) async throws {
     // least 2 full blocks stored on turn 1 so there's something to hit
     // on turn 2. 200+ tokens at blockSize=64 gives ≥3 blocks cached.
     let turn1Prompt = String(repeating: """
-        Facts for this cache test: the sky is blue; grass is green; roses are \
-        red; lemons are yellow; snow is white. Use only these facts. Do not \
-        explain the policy or repeat the prompt.
-        """, count: 4) + "\nQuestion: What colour is the sky?\nAnswer:"
+        Cache proof context: the sky has the color blue; grass has the color \
+        green; roses have the color red; lemons have the color yellow; snow \
+        has the color white. This paragraph is filler for prefix-cache block \
+        coverage and is not a dialogue or a list of tasks.
+        """, count: 4) + """
+
+        Task: answer with exactly the single word for the sky color, then write <END>.
+        Answer:
+        """
     let turn1Tokens = context.tokenizer.encode(
         text: turn1Prompt, addSpecialTokens: true)
     let turn1TokensArr = MLXArray(turn1Tokens.map { Int32($0) })[.newAxis, .ellipsis]
@@ -2014,7 +2025,11 @@ func runBatchEngineCacheHit(modelPath: String, maxNew: Int) async throws {
     // hard-coded token ids: the same integers are not portable across Qwen,
     // MiniMax, Gemma, etc., and can turn a cache test into a garbage-prompt
     // test for non-Qwen tokenizers.
-    let followupText = "\n\nQuestion: What colour is grass?\nAnswer:"
+    let followupText = """
+
+        Task: answer with exactly the single word for the grass color, then write <END>.
+        Answer:
+        """
     let followup = context.tokenizer.encode(
         text: followupText, addSpecialTokens: false)
     if followup.isEmpty {
@@ -2030,28 +2045,34 @@ func runBatchEngineCacheHit(modelPath: String, maxNew: Int) async throws {
     {
         let tokenCount = input.text.tokens.size
         let t0 = CFAbsoluteTimeGetCurrent()
-        let (_, stream) = await engine.submit(input: input, parameters: params)
+        let stream = await engine.generate(input: input, parameters: params)
         var promptTime: Double = 0
-        var tokenIds: [Int] = []
+        var text = ""
+        var reasoning = ""
+        var toolCalls = 0
         var completionInfo: GenerateCompletionInfo?
         for await event in stream {
             switch event {
-            case .token(let id):
-                tokenIds.append(id)
+            case .chunk(let chunk):
+                text += chunk
+            case .reasoning(let chunk):
+                reasoning += chunk
+            case .toolCall:
+                toolCalls += 1
             case .info(let info):
                 completionInfo = info
                 promptTime = info.promptTime
             }
         }
         let wall = CFAbsoluteTimeGetCurrent() - t0
-        let decoded = context.tokenizer.decode(tokenIds: tokenIds)
         print(String(format:
-            "  %@ : prompt=%d tokens, promptTime=%.3fs, genTokens=%d, wall=%.2fs",
-            label, tokenCount, promptTime, tokenIds.count, wall))
+            "  %@ : prompt=%d tokens, promptTime=%.3fs, genTokens=%d, wall=%.2fs, reasoning=%d, tools=%d",
+            label, tokenCount, promptTime, completionInfo?.generationTokenCount ?? 0, wall,
+            reasoning.count, toolCalls))
         printDecodedOutput(
             label: "CacheHit \(label)",
-            text: decoded)
-        return (promptTime, tokenCount, completionInfo, decoded)
+            text: text)
+        return (promptTime, tokenCount, completionInfo, text)
     }
 
     nonisolated(unsafe) let turn1Send = turn1Input
@@ -2158,8 +2179,7 @@ func runBatchEngineDiskRestore(modelPath: String, maxNew: Int) async throws {
     print("\n=== BatchEngine disk-restore verification (iter 35) ===")
     print("Loading with real HuggingFace tokenizer...")
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader())
+    let context = try await loadBenchModelContext(from: modelDir)
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
 
@@ -3555,8 +3575,7 @@ func runBatchEngineLongContext(
     let modelDir = URL(fileURLWithPath: modelPath)
     print("\n=== BatchEngine long-context prefill (iter 42, prompt \(promptLen) tokens) ===")
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader())
+    let context = try await loadBenchModelContext(from: modelDir)
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
 
@@ -8298,8 +8317,7 @@ func runOfficialMultiTurn(modelPath: String, maxNew: Int) async throws {
     let rssBefore = currentRSSMiB()
     print(String(format: "RSS before load: %.0f MiB", rssBefore))
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader())
+    let context = try await loadBenchModelContext(from: modelDir)
     let loadSec = CFAbsoluteTimeGetCurrent() - loadStart
     let rssAfterLoad = currentRSSMiB()
     print(String(format: "Load: %.2fs  Model: %@  RSS +%.0f MiB -> %.0f MiB",
@@ -8401,16 +8419,18 @@ func runOfficialMultiTurn(modelPath: String, maxNew: Int) async throws {
         return (false, "answer not found")
     }
 
-    // S2: Same prompt — verifies cache hit + reproducibility.
+    // S2: Same prompt — verifies repeat-turn reproducibility. Hybrid cache
+    // topology is validated separately by runBatchEngineCacheHit so this matrix
+    // does not overclaim cache reuse from timing alone.
     try await runTurn(
-        label: "S2 reasoning=ON  math 7+8-11 (cache hit)",
+        label: "S2 reasoning=ON  math 7+8-11 (repeat prompt)",
         prompt: "Compute 7 + 8 - 11. Respond with just the number.",
         thinking: true
     ) { text, reasoning, _ in
         if text.contains("4") {
             return (true, "")
         }
-        return (false, "answer not found on cache hit")
+        return (false, "answer not found on repeat prompt")
     }
 
     // S3: thinking=OFF — should produce mostly .chunk events, minimal

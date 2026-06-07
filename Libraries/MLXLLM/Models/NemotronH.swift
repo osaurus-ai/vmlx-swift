@@ -94,7 +94,8 @@ private func nemotronHWeightedMoEFastPathEnabled() -> Bool {
 }
 
 private func nemotronHLayerProfileEnabled() -> Bool {
-    nemotronHEnvFlag("VMLINUX_NEMOTRON_LAYER_PROFILE")
+    nemotronHEnvFlag("VMLX_NEMOTRON_LAYER_PROFILE")
+        || nemotronHEnvFlag("VMLINUX_NEMOTRON_LAYER_PROFILE")
 }
 
 private final class NemotronHLayerProfiler: @unchecked Sendable {
