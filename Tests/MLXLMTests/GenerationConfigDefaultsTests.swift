@@ -18,7 +18,8 @@ final class GenerationConfigDefaultsTests: XCTestCase {
           "top_k": 40,
           "min_p": 0.05,
           "repetition_penalty": 1.05,
-          "do_sample": true
+          "do_sample": true,
+          "suppress_tokens": [258883, 258882]
         }
         """
 
@@ -33,6 +34,7 @@ final class GenerationConfigDefaultsTests: XCTestCase {
         XCTAssertEqual(config.minP, 0.05)
         XCTAssertEqual(config.repetitionPenalty, 1.05)
         XCTAssertEqual(config.doSample, true)
+        XCTAssertEqual(config.suppressTokens, [258883, 258882])
     }
 
     func testGenerateParametersApplyConfigDefaultsAndPreserveRuntimeControls() {
@@ -68,7 +70,8 @@ final class GenerationConfigDefaultsTests: XCTestCase {
             topK: 50,
             minP: 0.02,
             repetitionPenalty: 1.1,
-            doSample: true)
+            doSample: true,
+            suppressTokens: [258883, 258882])
 
         let params = GenerateParameters(generationConfig: config, fallback: fallback)
 
@@ -78,6 +81,7 @@ final class GenerationConfigDefaultsTests: XCTestCase {
         XCTAssertEqual(params.topK, 50)
         XCTAssertEqual(params.minP, 0.02)
         XCTAssertEqual(params.repetitionPenalty, 1.1)
+        XCTAssertEqual(params.suppressTokens, [258883, 258882])
 
         XCTAssertEqual(params.maxKVSize, 2048)
         XCTAssertEqual(params.kvBits, 4)
@@ -93,6 +97,21 @@ final class GenerationConfigDefaultsTests: XCTestCase {
         XCTAssertEqual(params.frequencyPenalty, 0.2)
         XCTAssertEqual(params.prefillStepSize, 256)
         XCTAssertEqual(params.extraStopStrings, ["END"])
+    }
+
+    func testSuppressTokensProcessorMasksConfiguredLogits() {
+        let params = GenerateParameters(suppressTokens: [1, 3, 99])
+        let processor = params.processor()
+
+        var logits = MLXArray.zeros([1, 5], type: Float32.self)
+        logits = processor?.process(logits: logits) ?? logits
+        let values = logits.asArray(Float.self)
+
+        XCTAssertEqual(values[0], 0)
+        XCTAssertTrue(values[1].isInfinite && values[1] < 0)
+        XCTAssertEqual(values[2], 0)
+        XCTAssertTrue(values[3].isInfinite && values[3] < 0)
+        XCTAssertEqual(values[4], 0)
     }
 
     func testDoSampleFalseForcesGreedyEvenWhenTemperaturePresent() {

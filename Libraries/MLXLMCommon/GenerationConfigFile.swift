@@ -16,6 +16,7 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
     public var minP: Float?
     public var repetitionPenalty: Float?
     public var doSample: Bool?
+    public var suppressTokens: [Int]?
 
     public init(
         eosTokenIds: IntOrIntArray? = nil,
@@ -25,7 +26,8 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         topK: Int? = nil,
         minP: Float? = nil,
         repetitionPenalty: Float? = nil,
-        doSample: Bool? = nil
+        doSample: Bool? = nil,
+        suppressTokens: [Int]? = nil
     ) {
         self.eosTokenIds = eosTokenIds
         self.maxNewTokens = maxNewTokens
@@ -35,6 +37,7 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         self.minP = minP
         self.repetitionPenalty = repetitionPenalty
         self.doSample = doSample
+        self.suppressTokens = suppressTokens
     }
 
     enum CodingKeys: String, CodingKey {
@@ -46,5 +49,6 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         case minP = "min_p"
         case repetitionPenalty = "repetition_penalty"
         case doSample = "do_sample"
+        case suppressTokens = "suppress_tokens"
     }
 }

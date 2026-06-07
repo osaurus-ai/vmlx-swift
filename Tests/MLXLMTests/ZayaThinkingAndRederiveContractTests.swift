@@ -64,14 +64,17 @@ struct ZayaThinkingAndRederiveContractTests {
 
     // MARK: - ZayaCCACache rederive integration source coverage
 
-    /// `ModelContainer.assignDefaultCacheCoordinator` must flip
-    /// `isHybrid=true` for ZAYA so the SSM state cache fires.
+    /// `ModelContainer.enableCachingAsync` must flip `isHybrid=true` for
+    /// ZAYA through the shared topology snapshot so the companion cache fires.
     @Test("ModelContainer hybrid auto-detection includes ZayaCCACache")
     func modelContainerDetectsZaya() throws {
         let source = try Self.source("Libraries/MLXLMCommon/ModelContainer.swift")
         #expect(
-            source.contains("$0 is MambaCache || $0 is ArraysCache || $0 is ZayaCCACache"),
-            "ModelContainer.assignDefaultCacheCoordinator must include ZayaCCACache in the hybrid auto-detect — Zaya CCA conv_state + prev_hs are path-dependent.")
+            source.contains("let topology = await cacheTopologySnapshot()"),
+            "ModelContainer.enableCachingAsync must derive cache policy from the live cache topology.")
+        #expect(
+            source.contains("let isHybrid = topology.requiresSSMCompanionState"),
+            "ModelContainer.enableCachingAsync must include ZayaCCACache through ModelCacheTopologySnapshot.requiresSSMCompanionState.")
     }
 
     /// `BatchEngine.finishSlot`'s post-prefill SSM snapshot must include

@@ -1387,17 +1387,46 @@ public actor BatchEngine {
                     let unsafePartial =
                         slot.originalInput.cacheHitSuffixContainsMediaPlaceholder(remaining)
                     let unsafeFullHit = remaining.isEmpty && requiresDiskBackedRestore
-                    if unsafePartial || unsafeFullHit {
-                        let why: String
-                        if unsafePartial { why = "media placeholder tokens remain in cache-hit suffix" }
-                        else if unsafeFullHit { why = "disk-backed full cache hit: re-feeding last token can corrupt path-dependent or rotating state" }
-                        else                { why = "path-dependent cache hit can't be extended safely" }
+                    if unsafePartial {
                         let slotIDStr = slot.id.description
                         Self.logger.info(
-                            "Slot \(slotIDStr, privacy: .public): cache hit — rolling back to full prefill (\(why))"
+                            "Slot \(slotIDStr, privacy: .public): cache hit — rolling back to full prefill (media placeholder tokens remain in cache-hit suffix)"
                         )
                         slot.cache = context.model.newCache(parameters: slot.parameters)
                         inputForPrepare = slot.originalInput
+                    } else if unsafeFullHit {
+                        let promptLen = tokenIds.count
+                        let seedBoundary = promptLen - 1
+                        if seedBoundary > 0,
+                           let last = tokenIds.last,
+                           let seedSSM = coordinator.ssmStateCache.fetch(
+                            tokens: tokenIds,
+                            boundary: seedBoundary,
+                            mediaSalt: slot.mediaSalt)
+                        {
+                            let cacheOffset = slot.cache.first?.offset ?? promptLen
+                            let trimNeeded = cacheOffset - seedBoundary
+                            if trimNeeded > 0 {
+                                for layer in slot.cache where layer.isTrimmable {
+                                    _ = layer.trim(trimNeeded)
+                                }
+                                MLX.eval(slot.cache)
+                            }
+                            restoreSSMStates(seedSSM, into: slot.cache)
+                            MLX.eval(slot.cache)
+                            let lastToken = MLXArray([Int32(last)])
+                                .expandedDimensions(axis: 0)
+                            inputForPrepare = LMInput(
+                                text: LMInput.Text(tokens: lastToken),
+                                image: nil, video: nil)
+                        } else {
+                            let slotIDStr = slot.id.description
+                            Self.logger.info(
+                                "Slot \(slotIDStr, privacy: .public): cache hit — rolling back to full prefill (path-dependent full cache hit missing seed-boundary SSM state)"
+                            )
+                            slot.cache = context.model.newCache(parameters: slot.parameters)
+                            inputForPrepare = slot.originalInput
+                        }
                     } else if remaining.isEmpty, let last = tokenIds.last {
                         // Full cache hit — feed last token to seed decode.
                         // Tensor must be 2D `[1, 1]`: the Qwen3_5 VLM
