@@ -85,17 +85,26 @@ private func nemotronHEnvFlag(_ name: String) -> Bool {
     return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
 }
 
-private func nemotronHActivationBF16RetentionEnabled() -> Bool {
+private let nemotronHActivationBF16RetentionFlag =
     !nemotronHEnvFlag("JANGTQ_DISABLE_NEMOTRON_ACTIVATION_BF16")
+private let nemotronHWeightedMoEFastPathFlag =
+    !nemotronHEnvFlag("JANGTQ_DISABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH")
+private let nemotronHLayerProfileFlag =
+    nemotronHEnvFlag("VMLX_NEMOTRON_LAYER_PROFILE")
+    || nemotronHEnvFlag("VMLINUX_NEMOTRON_LAYER_PROFILE")
+private let nemotronHMambaConvFastPathDisabledFlag =
+    nemotronHEnvFlag("VMLINUX_DISABLE_NEMOTRON_MAMBA_CONV_FASTPATH")
+
+private func nemotronHActivationBF16RetentionEnabled() -> Bool {
+    nemotronHActivationBF16RetentionFlag
 }
 
 private func nemotronHWeightedMoEFastPathEnabled() -> Bool {
-    !nemotronHEnvFlag("JANGTQ_DISABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH")
+    nemotronHWeightedMoEFastPathFlag
 }
 
 private func nemotronHLayerProfileEnabled() -> Bool {
-    nemotronHEnvFlag("VMLX_NEMOTRON_LAYER_PROFILE")
-        || nemotronHEnvFlag("VMLINUX_NEMOTRON_LAYER_PROFILE")
+    nemotronHLayerProfileFlag
 }
 
 private final class NemotronHLayerProfiler: @unchecked Sendable {
@@ -178,7 +187,7 @@ internal class NemotronHRMSNormGated: Module {
 }
 
 private func nemotronHMambaConvFastPathDisabled() -> Bool {
-    nemotronHEnvFlag("VMLINUX_DISABLE_NEMOTRON_MAMBA_CONV_FASTPATH")
+    nemotronHMambaConvFastPathDisabledFlag
 }
 
 private func makeNemotronHMambaDepthwiseDecodeConvKernel() -> MLXFast.MLXFastKernel? {
