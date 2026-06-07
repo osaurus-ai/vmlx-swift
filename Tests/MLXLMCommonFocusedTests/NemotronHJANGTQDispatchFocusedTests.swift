@@ -133,6 +133,8 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
 
         XCTAssertTrue(modelSource.contains("JANGTQ_DISABLE_NEMOTRON_ACTIVATION_BF16"))
         XCTAssertTrue(modelSource.contains("JANGTQ_DISABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH"))
+        XCTAssertTrue(modelSource.contains("VMLINUX_NEMOTRON_LAYER_PROFILE"))
+        XCTAssertTrue(modelSource.contains("NEMOTRON_LAYER_PROFILE label=%@"))
         XCTAssertTrue(modelSource.contains("weightedDecode(expertInput, inds, scores: scores)"))
         XCTAssertTrue(modelSource.contains("residual.asType(x.dtype)"))
         XCTAssertTrue(modelSource.contains("out.asType(lmHead.weight.dtype)"))

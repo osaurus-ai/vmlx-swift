@@ -42,6 +42,15 @@ internal enum NemotronHBlockType {
         default: fatalError("Unknown NemotronH block type: \(char)")
         }
     }
+
+    var profileName: String {
+        switch self {
+        case .mamba: return "mamba"
+        case .attention: return "attention"
+        case .mlp: return "mlp"
+        case .moe: return "moe"
+        }
+    }
 }
 
 // MARK: - Mixer Protocol
@@ -82,6 +91,41 @@ private func nemotronHActivationBF16RetentionEnabled() -> Bool {
 
 private func nemotronHWeightedMoEFastPathEnabled() -> Bool {
     !nemotronHEnvFlag("JANGTQ_DISABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH")
+}
+
+private func nemotronHLayerProfileEnabled() -> Bool {
+    nemotronHEnvFlag("VMLINUX_NEMOTRON_LAYER_PROFILE")
+}
+
+private final class NemotronHLayerProfiler: @unchecked Sendable {
+    static let shared = NemotronHLayerProfiler()
+
+    private let lock = NSLock()
+    private var rows: [String: (count: Int, totalMs: Double)] = [:]
+
+    func record(_ label: String, seconds: Double) {
+        lock.lock()
+        let current = rows[label] ?? (0, 0)
+        rows[label] = (current.count + 1, current.totalMs + seconds * 1000)
+        lock.unlock()
+    }
+
+    func printSummary() {
+        lock.lock()
+        let snapshot = rows
+        rows.removeAll()
+        lock.unlock()
+
+        for key in snapshot.keys.sorted() {
+            guard let value = snapshot[key], value.count > 0 else { continue }
+            let avg = value.totalMs / Double(value.count)
+            FileHandle.standardError.write(Data(
+                String(
+                    format: "NEMOTRON_LAYER_PROFILE label=%@ count=%d total_ms=%.3f avg_ms=%.3f\n",
+                    key, value.count, value.totalMs, avg
+                ).utf8))
+        }
+    }
 }
 
 // MARK: - Activations
@@ -731,9 +775,21 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let profile = nemotronHLayerProfileEnabled()
+
+        let gateStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         let (inds, scores) = gate(x)
+        if profile {
+            MLX.eval(inds, scores)
+            NemotronHLayerProfiler.shared.record("moe.gate", seconds: CFAbsoluteTimeGetCurrent() - gateStart)
+        }
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
+        let fc1Start = profile ? CFAbsoluteTimeGetCurrent() : 0
         let expertInput = fc1LatentProj.map { $0(x) } ?? x
+        if profile {
+            MLX.eval(expertInput)
+            NemotronHLayerProfiler.shared.record("moe.fc1_latent", seconds: CFAbsoluteTimeGetCurrent() - fc1Start)
+        }
         // Dispatch through the type-erased protocol — both
         // `NemotronHSwitchMLP` (affine) and `NemotronHJANGTQSwitchMLP`
         // (TurboQuant) implement `callAsFunction(_:_:)`.
@@ -741,6 +797,7 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
             fatalError("NemotronHMoE.switch_mlp must conform to NemotronHSwitchMLPLayer (got \(type(of: switchMLP)))")
         }
         var y: MLXArray
+        let switchStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         if nemotronHWeightedMoEFastPathEnabled(),
             let weighted = layer.weightedDecode(expertInput, inds, scores: scores)
         {
@@ -749,12 +806,26 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
             y = layer(expertInput, inds)
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
+        if profile {
+            MLX.eval(y)
+            NemotronHLayerProfiler.shared.record("moe.switch_mlp", seconds: CFAbsoluteTimeGetCurrent() - switchStart)
+        }
         if let fc2LatentProj {
+            let fc2Start = profile ? CFAbsoluteTimeGetCurrent() : 0
             y = fc2LatentProj(y)
+            if profile {
+                MLX.eval(y)
+                NemotronHLayerProfiler.shared.record("moe.fc2_latent", seconds: CFAbsoluteTimeGetCurrent() - fc2Start)
+            }
         }
 
         if let sharedExperts {
+            let sharedStart = profile ? CFAbsoluteTimeGetCurrent() : 0
             y = y + sharedExperts(x)
+            if profile {
+                MLX.eval(y)
+                NemotronHLayerProfiler.shared.record("moe.shared", seconds: CFAbsoluteTimeGetCurrent() - sharedStart)
+            }
         }
 
         return y
@@ -815,18 +886,41 @@ internal class NemotronHBlock: Module {
         ssmMask: MLXArray?,
         cache: KVCache?
     ) -> MLXArray {
+        let profile = nemotronHLayerProfileEnabled()
+        let label = blockType.profileName
+
+        let normStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         let hidden = norm(x)
+        if profile {
+            MLX.eval(hidden)
+            NemotronHLayerProfiler.shared.record("\(label).norm", seconds: CFAbsoluteTimeGetCurrent() - normStart)
+        }
 
         // Cast to protocol and call - all mixer types conform to NemotronHMixer
         let mixerFunc = mixer as! NemotronHMixer
+        let mixerStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         let output = mixerFunc(hidden, attentionMask: attentionMask, ssmMask: ssmMask, cache: cache)
+        if profile {
+            MLX.eval(output)
+            NemotronHLayerProfiler.shared.record("\(label).mixer", seconds: CFAbsoluteTimeGetCurrent() - mixerStart)
+        }
 
+        let residualStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         let residual = x + output
         if nemotronHActivationBF16RetentionEnabled(),
             (x.dtype == .bfloat16 || x.dtype == .float16),
             residual.dtype != x.dtype
         {
-            return residual.asType(x.dtype)
+            let casted = residual.asType(x.dtype)
+            if profile {
+                MLX.eval(casted)
+                NemotronHLayerProfiler.shared.record("\(label).residual", seconds: CFAbsoluteTimeGetCurrent() - residualStart)
+            }
+            return casted
+        }
+        if profile {
+            MLX.eval(residual)
+            NemotronHLayerProfiler.shared.record("\(label).residual", seconds: CFAbsoluteTimeGetCurrent() - residualStart)
         }
         return residual
     }
@@ -1011,6 +1105,10 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         } else {
             out = backbone.embeddings.asLinear(out)
         }
+        if nemotronHLayerProfileEnabled() {
+            MLX.eval(out)
+            NemotronHLayerProfiler.shared.printSummary()
+        }
         return out
     }
 
@@ -1032,6 +1130,10 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             out = lmHead(out)
         } else {
             out = backbone.embeddings.asLinear(out)
+        }
+        if nemotronHLayerProfileEnabled() {
+            MLX.eval(out)
+            NemotronHLayerProfiler.shared.printSummary()
         }
         return out
     }

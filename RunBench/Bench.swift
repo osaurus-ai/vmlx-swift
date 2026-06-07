@@ -7383,6 +7383,16 @@ func runPerfBench(
                 genSec > 0 ? Double(genTokens) / genSec : 0
             }
 
+            var firstDecodeSecEstimate: Double {
+                max(0, ttftSec - promptSec)
+            }
+
+            var tailTokpsEstimate: Double {
+                guard genTokens > 1 else { return 0 }
+                let tailSec = genSec - firstDecodeSecEstimate
+                return tailSec > 0 ? Double(genTokens - 1) / tailSec : 0
+            }
+
             func promptTokensPerSecond(promptTokenCount: Int) -> Double {
                 promptSec > 0 ? Double(promptTokenCount) / promptSec : 0
             }
@@ -7613,12 +7623,14 @@ func runPerfBench(
                 let leaks = markerLeaks(in: result.text).joined(separator: ",")
                 let loop = lagunaLoopHeuristic(visible)
                 print(String(format:
-                    "  PERF_RUN label=%@ samplingSource=%@ seed=%@ ttft_ms=%.0f prompt_ms=%.0f prompt_tps=%.0f genTokens=%d genSec=%.3f tokps=%.1f rss_mib=%.0f footprint_mib=%.0f temp=%.2f topP=%.2f topK=%d minP=%.2f rep=%@ stop=%@ unclosedReasoning=%@ textChars=%d reasoningChars=%d toolCalls=%d loop=%@ leaks=%@",
+                    "  PERF_RUN label=%@ samplingSource=%@ seed=%@ ttft_ms=%.0f prompt_ms=%.0f prompt_tps=%.0f first_decode_ms=%.0f genTokens=%d genSec=%.3f tokps=%.1f tail_tokps_est=%.1f rss_mib=%.0f footprint_mib=%.0f temp=%.2f topP=%.2f topK=%d minP=%.2f rep=%@ stop=%@ unclosedReasoning=%@ textChars=%d reasoningChars=%d toolCalls=%d loop=%@ leaks=%@",
                     label, samplingSource, perfSeedLabel,
                     result.ttftSec * 1000,
                     result.promptSec * 1000,
                     result.promptTokensPerSecond(promptTokenCount: promptTokens.count),
+                    result.firstDecodeSecEstimate * 1000,
                     result.genTokens, result.genSec, result.tokps,
+                    result.tailTokpsEstimate,
                     result.rssMiB, result.footprintMiB,
                     Double(params.temperature), Double(params.topP),
                     params.topK, Double(params.minP),

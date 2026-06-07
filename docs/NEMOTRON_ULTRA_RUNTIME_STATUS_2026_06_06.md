@@ -664,3 +664,93 @@ Interpretation:
 - The next real speed lane is regular stacked Nemotron MoE/Mamba graph and
   kernel work, not JangPress streaming, top-k reduction, prompt changes, or
   sampler changes.
+
+## Follow-Up Trace - 2026-06-06 19:35 PDT
+
+Rechecked current `vmlx-origin/main` after the scoped Nemotron merges and
+rejected two more non-fixes:
+
+- Compiled SwitchMLP reduced the graph only under an unsafe compile lane and
+  did not move default decode enough:
+  - control `/tmp/vmlx-nemotron-ultra-compiled-switch-control-20260606-185207.log`:
+    `6.9 tok/s`
+  - candidate `/tmp/vmlx-nemotron-ultra-compiled-switch-candidate-20260606-185231.log`:
+    `6.9 tok/s`
+  - unsafe diagnostic `/tmp/vmlx-nemotron-ultra-compiled-switch-unsafe-20260606-185308.log`:
+    `7.1 tok/s`
+- Explicit JangPress/streaming-expert mode is still rejected for the production
+  default:
+  `/tmp/vmlx-nemotron-ultra-explicit-streaming-diagnostic-20260606-185920.log`
+  reports about `0.7 tok/s`.
+- A scored-offset down-projection candidate was coherent but slower and was
+  reverted:
+  `/tmp/vmlx-nemotron-ultra-scored-offset-capital-20260606-191817.log`
+  reports `4.4 tok/s`.
+
+Fresh current-main low-footprint rows after the revert:
+
+- `/tmp/vmlx-nemotron-ultra-reverted-tq33-capital-20260606-192246.log`
+  - `tokps_median=7.0`
+  - `tail_tokps_est=9.9`
+  - `first_decode_ms=761`
+  - `peak_footprint_mib=1932`
+  - bundle defaults, coherent visible answer, no parser leak, no loop
+- `/tmp/vmlx-nemotron-ultra-reverted-graphstats-capital-20260606-192305.log`
+  - `decodeNodes=4799`
+  - `asType=480`
+  - `tokps_median=6.6`
+  - `tail_tokps_est=19.8`
+  - visible answer: `Tokyo is the capital of Japan.`
+- `/tmp/vmlx-nemotron-ultra-warmup-tq33-capital-20260606-192411.log`
+  - warmup did not remove the first-decode cost:
+    `tokps_median=7.0`, `tail_tokps_est=9.9`, `first_decode_ms=765`
+- `/tmp/vmlx-nemotron-ultra-batch-tq33-capital-20260606-192442.log`
+  - BatchEngine path matches the iterator path:
+    `tokps_median=7.0`, `tail_tokps_est=9.8`, `first_decode_ms=759`
+
+Python comparison from the same local model:
+
+- `/tmp/nemotron-ultra-python-live-short-20260606-190521.json`
+  - math: `8.808 tok/s` excluding first decode
+  - capital: `8.684 tok/s` excluding first decode
+
+Interpretation:
+
+- Swift low-footprint sustained/tail decode is now in the same `8-10 tok/s`
+  class as the Python documentation when compared on the same exclude-first
+  basis.
+- Full-run short prompts remain around `7 tok/s` because the first decode step
+  costs about `760 ms`.
+- Osaurus path selection is not the speed gap; BatchEngine and direct iterator
+  rows are equivalent.
+- The remaining work is model-forward dispatch in Nemotron-H MoE/Mamba, not
+  sampler, template, tool parser, reasoning parser, top-k reduction, attention,
+  or JangPress streaming.
+
+Added current diagnostic instrumentation:
+
+- `RunBench` now prints `first_decode_ms` and `tail_tokps_est` in `PERF_RUN`
+  rows so the resident/mmap/Python comparison is not hidden by the first-decode
+  cost.
+- `VMLINUX_NEMOTRON_LAYER_PROFILE=1` enables an explicit diagnostic profiler
+  for Nemotron-H block and MoE subcomponent timings. The flag is default-off and
+  inserts synchronization only when enabled.
+
+Diagnostic profiler rows:
+
+- `/tmp/vmlx-nemotron-ultra-layer-profile-20260606-192922.log`
+  shows decode-token work dominated by Mamba and MoE mixers, with attention
+  around `9-10 ms`.
+- `/tmp/vmlx-nemotron-ultra-moe-subprofile-20260606-193036.log`
+  shows MoE work split mainly across `moe.switch_mlp`, `moe.shared`, gate, and
+  latent projections.
+
+Focused verification:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun swift test --filter NemotronHJANGTQDispatchFocusedTests \
+  --jobs 1 --no-parallel
+```
+
+Result: passed, 11 tests.
