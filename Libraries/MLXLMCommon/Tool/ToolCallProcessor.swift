@@ -1344,6 +1344,13 @@ public class ToolCallProcessor {
 
     private func shouldBufferPotentialBareToolMarker(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty,
+            Self.requestToolXMLPrefixes.contains(where: {
+                $0.hasPrefix(trimmed) && trimmed.count < $0.count
+            })
+        {
+            return true
+        }
         if !trimmed.isEmpty {
             for name in inlineFunctionToolNames() {
                 if name.hasPrefix(trimmed) { return true }

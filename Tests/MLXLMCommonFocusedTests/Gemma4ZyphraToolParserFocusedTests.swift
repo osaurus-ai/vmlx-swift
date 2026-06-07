@@ -107,7 +107,7 @@ struct Gemma4ZyphraToolParserFocusedTests {
         )
 
         #expect(call.function.name == "line_count")
-        #expect(call.function.arguments["text"] == .string("one\\ntwo"))
+        #expect(call.function.arguments["text"] == .string("one\ntwo"))
     }
 
     private func lineCountToolSpec() -> [String: any Sendable] {
