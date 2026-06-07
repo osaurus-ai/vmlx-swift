@@ -192,6 +192,10 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
+    /// Token ids that must never be sampled. Mirrors Hugging Face
+    /// `generation_config.json`'s `suppress_tokens` field.
+    public var suppressTokens: [Int]
+
     /// Speculative-decoding strategy (opt-in). `nil` preserves the existing
     /// autoregressive decode path byte-for-byte — callers who don't set this
     /// see no behaviour change.
@@ -248,7 +252,8 @@ public struct GenerateParameters: Sendable {
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
         prefillStepSize: Int = 512,
-        extraStopStrings: [String] = []
+        extraStopStrings: [String] = [],
+        suppressTokens: [Int] = []
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -273,6 +278,7 @@ public struct GenerateParameters: Sendable {
         self.presenceContextSize = presenceContextSize
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
+        self.suppressTokens = suppressTokens
         self.prefillStepSize = prefillStepSize
         self.extraStopStrings = extraStopStrings
     }
@@ -304,6 +310,9 @@ public struct GenerateParameters: Sendable {
         }
         if generationConfig.doSample == false {
             self.temperature = 0
+        }
+        if let suppressTokens = generationConfig.suppressTokens {
+            self.suppressTokens = suppressTokens
         }
     }
 
@@ -367,14 +376,20 @@ public struct GenerateParameters: Sendable {
             frequencyContext = nil
         }
 
-        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil {
+        let suppressContext =
+            suppressTokens.isEmpty ? nil : SuppressTokensProcessor(tokens: suppressTokens)
+
+        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil
+            && suppressContext == nil
+        {
             return nil
         }
 
         return PenaltyProcessor(
             repetitionContext: repetitionContext,
             presenceContext: presenceContext,
-            frequencyContext: frequencyContext
+            frequencyContext: frequencyContext,
+            suppressContext: suppressContext
         )
     }
 
@@ -838,26 +853,52 @@ public struct FrequencyPenaltyContext: LogitProcessor {
     }
 }
 
-/// Processor that composes penalty processors in Python mlx-lm order.
+/// Processor that masks configured token ids out of the next-token distribution.
+public struct SuppressTokensProcessor: LogitProcessor {
+    private let tokens: [Int]
+    private let negInf = MLXArray(-Float.infinity)
+
+    public init(tokens: [Int]) {
+        self.tokens = Array(Set(tokens)).sorted()
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {}
+
+    public func process(logits: MLXArray) -> MLXArray {
+        let vocabSize = logits.dim(-1)
+        let valid = tokens.filter { $0 >= 0 && $0 < vocabSize }
+        guard !valid.isEmpty else { return logits }
+        logits[0..., MLXArray(valid.map(Int32.init)).asType(.uint32)] = negInf
+        return logits
+    }
+
+    mutating public func didSample(token: MLXArray) {}
+}
+
+/// Processor that composes generation-config logits processors.
 public struct PenaltyProcessor: LogitProcessor {
     var repetitionContext: RepetitionContext?
     var presenceContext: PresencePenaltyContext?
     var frequencyContext: FrequencyPenaltyContext?
+    var suppressContext: SuppressTokensProcessor?
 
     public init(
         repetitionContext: RepetitionContext?,
         presenceContext: PresencePenaltyContext?,
-        frequencyContext: FrequencyPenaltyContext?
+        frequencyContext: FrequencyPenaltyContext?,
+        suppressContext: SuppressTokensProcessor? = nil
     ) {
         self.repetitionContext = repetitionContext
         self.presenceContext = presenceContext
         self.frequencyContext = frequencyContext
+        self.suppressContext = suppressContext
     }
 
     mutating public func prompt(_ prompt: MLXArray) {
         repetitionContext?.prompt(prompt)
         presenceContext?.prompt(prompt)
         frequencyContext?.prompt(prompt)
+        suppressContext?.prompt(prompt)
     }
 
     public func process(logits: MLXArray) -> MLXArray {
@@ -865,6 +906,7 @@ public struct PenaltyProcessor: LogitProcessor {
         logits = repetitionContext?.process(logits: logits) ?? logits
         logits = presenceContext?.process(logits: logits) ?? logits
         logits = frequencyContext?.process(logits: logits) ?? logits
+        logits = suppressContext?.process(logits: logits) ?? logits
         return logits
     }
 
@@ -872,6 +914,7 @@ public struct PenaltyProcessor: LogitProcessor {
         repetitionContext?.didSample(token: token)
         presenceContext?.didSample(token: token)
         frequencyContext?.didSample(token: token)
+        suppressContext?.didSample(token: token)
     }
 }
 
@@ -1324,20 +1367,43 @@ public struct TokenIterator: TokenIteratorProtocol {
                     let unsafePartial =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
                     let unsafeFullHit = remainingTokens.isEmpty && requiresDiskBackedRestore
-                    if unsafePartial || unsafeFullHit {
-                        let why: String
-                        if unsafePartial {
-                            why = "media placeholder tokens remain in cache-hit suffix"
-                        } else if unsafeFullHit {
-                            why = "disk-backed full cache hit: re-feeding last token can corrupt path-dependent or rotating state"
-                        } else {
-                            why = "cache hit can't be extended safely"
-                        }
+                    if unsafePartial {
                         Self.logger.info(
-                            "TokenIterator: cache hit rolling back to full prefill (\(why))"
+                            "TokenIterator: cache hit rolling back to full prefill (media placeholder tokens remain in cache-hit suffix)"
                         )
                         self.cache = self.model.newCache(parameters: effectiveParameters)
                         inputForPrepare = input
+                    } else if unsafeFullHit {
+                        let promptLen = cacheLookupTokenIds.count
+                        let seedBoundary = promptLen - 1
+                        if seedBoundary > 0,
+                           let last = cacheLookupTokenIds.last,
+                           let seedSSM = coordinator.ssmStateCache.fetch(
+                                tokens: cacheLookupTokenIds,
+                                boundary: seedBoundary,
+                                mediaSalt: mediaSalt)
+                        {
+                            let cacheOffset = self.cache.first?.offset ?? promptLen
+                            let trimNeeded = cacheOffset - seedBoundary
+                            if trimNeeded > 0 {
+                                for layer in self.cache where layer.isTrimmable {
+                                    _ = layer.trim(trimNeeded)
+                                }
+                            }
+                            restoreSSMStates(seedSSM, into: self.cache)
+                            MLX.eval(self.cache)
+                            let lastToken = MLXArray([Int32(last)])
+                                .expandedDimensions(axis: 0)
+                            inputForPrepare = LMInput(
+                                text: LMInput.Text(tokens: lastToken),
+                                image: nil, video: nil)
+                        } else {
+                            Self.logger.info(
+                                "TokenIterator: cache hit rolling back to full prefill (path-dependent full cache hit missing seed-boundary SSM state)"
+                            )
+                            self.cache = self.model.newCache(parameters: effectiveParameters)
+                            inputForPrepare = input
+                        }
                     } else {
                         // Rebuild inputForPrepare with tokens shaped as `[1, T]`
                         // (2D batch-first). Some model forward paths — notably

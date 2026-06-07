@@ -381,6 +381,9 @@ public func reDeriveAndStoreSSMStatesForPromptBoundaries(
 
     var boundaries = Set<Int>()
     boundaries.insert(promptTokenIds.count)
+    if promptTokenIds.count > 1 {
+        boundaries.insert(promptTokenIds.count - 1)
+    }
 
     if coordinator.pagedCache != nil, !coordinator.isPagedIncompatible {
         let blockSize = max(1, coordinator.config.pagedBlockSize)

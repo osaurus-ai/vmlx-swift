@@ -75,16 +75,36 @@ final class LocalChatTemplateFamilySnapshotTests: XCTestCase {
             candidatePaths: [
                 "models/dealign.ai/Qwen3.6-27B-JANG_4M-CRACK/chat_template.jinja",
                 "models/dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK/chat_template.jinja",
+                "models/dealign.ai/Qwen3.6-35B-A3B-MXFP4-CRACK-MTP/chat_template.jinja",
+                "models/dealign.ai/Qwen3.6-35B-A3B-MXFP8-CRACK-MTP/chat_template.jinja",
+                ".mlxstudio/models/dealignai/Qwen3.6-35B-A3B-JANGTQ-CRACK/chat_template.jinja",
             ],
             expectedFragments: [
                 "<|im_start|>user\nSay ping.<|im_end|>",
                 "<|im_start|>assistant\n<think>\n\n</think>",
             ]),
         TemplateCase(
+            name: "gemma4",
+            candidatePaths: [
+                "models/OsaurusAI/gemma-4-12B-it-MXFP8/chat_template.jinja",
+                "models/OsaurusAI/gemma-4-12B-it-MXFP4/chat_template.jinja",
+                "models/JANGQ-AI/gemma-4-12B-it-JANG_4M/chat_template.jinja",
+                "models/dealign.ai/Gemma-4-12B-it-MXFP8-CRACK/chat_template.jinja",
+                "models/dealign.ai/Gemma-4-12B-it-MXFP4-CRACK/chat_template.jinja",
+                "models/dealign.ai/Gemma-4-12B-it-JANG_4M-CRACK/chat_template.jinja",
+                "models/dealign.ai/Gemma-4-26B-A4B-it-JANG_4M-CRACK/chat_template.jinja",
+                ".mlxstudio/models/dealignai/Gemma-4-26B-A4B-it-JANG_4M-CRACK/chat_template.jinja",
+            ],
+            expectedFragments: [
+                "<|turn>user\nSay ping.<turn|>",
+                "<|turn>model\n",
+            ]),
+        TemplateCase(
             name: "ling-bailing-hybrid",
             candidatePaths: [
                 "models/JANGQ/Ling-2.6-flash-JANGTQ/chat_template.jinja",
                 "models/dealign.ai/Ling-2.6-flash-MXFP4-CRACK/chat_template.jinja",
+                ".mlxstudio/models/dealignai/Ling-2.6-flash-JANGTQ2-CRACK/chat_template.jinja",
             ],
             expectedFragments: [
                 "<role>HUMAN</role>Say ping.<|role_end|>",
@@ -95,11 +115,15 @@ final class LocalChatTemplateFamilySnapshotTests: XCTestCase {
             candidatePaths: [
                 ".mlxstudio/models/Nemotron-Cascade-2-30B-A3B-JANG_2L/chat_template.jinja",
                 ".mlxstudio/models/Nemotron-3-Super-120B-A12B-JANG_2L/chat_template.jinja",
+                "models/NVIDIA-Nemotron-3-Ultra-550B-A55B-JANGTQ_1L/chat_template.jinja",
                 "models/dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK/chat_template.jinja",
+                "models/dealign.ai/Nemotron-Omni-Nano-JANGTQ4-CRACK/chat_template.jinja",
+                "models/dealign.ai/Nemotron-Omni-Nano-MXFP4-CRACK/chat_template.jinja",
+                ".mlxstudio/models/dealignai/Nemotron-Omni-Nano-JANGTQ-CRACK/chat_template.jinja",
             ],
             expectedFragments: [
                 "<|im_start|>user\nSay ping.",
-                "{thinking token budget: 0}<|im_end|>",
+                "<think></think>",
                 "<|im_start|>assistant",
             ]),
         TemplateCase(
