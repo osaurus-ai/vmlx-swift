@@ -20,8 +20,9 @@
 //   <cacheDir>/ssm-<sha>.safetensors    — N MLX arrays keyed `state_0`…`state_N-1`
 //   <cacheDir>/ssm-<sha>.json           — metadata { is_complete, num_states, model_key }
 //
-// Cache key derivation matches the in-memory `SSMStateCache`:
-//   key = SHA-256( modelKey + ":" + tokens[..<boundary].joined(",") )
+// Cache key derivation delegates to the in-memory `SSMStateCache.makeKey`
+// implementation so model key and media salt isolation cannot drift between
+// memory and disk companion caches.
 //
 // Concurrency: store/fetch/clear are serialized with an
 // `OSAllocatedUnfairLock`, and MLX safetensors IO also takes

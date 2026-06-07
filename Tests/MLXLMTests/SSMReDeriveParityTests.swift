@@ -119,6 +119,50 @@ final class SSMReDeriveParityTests: XCTestCase {
         XCTAssertEqual(coordinator.ssmStateCache.reDerives, 1)
     }
 
+    func testLegacyMaybeRederiveWrapperStoresPagedBlockAndExactBoundaries() throws {
+        let model = TinyHybridSSMModel()
+        let promptOnly = [3, 5, 7, 11, 13]
+        let generationPrompt = [101, 102]
+        let fullPrompt = promptOnly + generationPrompt
+
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: true,
+            enableDiskCache: false,
+            pagedBlockSize: 2,
+            modelKey: "tiny-hybrid|legacy-wrapper"))
+        coordinator.setHybrid(true)
+
+        maybeReDeriveSSMState(
+            coordinator: coordinator,
+            model: model,
+            promptTokenIds: fullPrompt,
+            genPromptLen: generationPrompt.count,
+            enableSSMReDerive: true)
+
+        let blockBoundary = 4
+        let blockStates = try XCTUnwrap(
+            coordinator.ssmStateCache.fetch(
+                tokens: promptOnly,
+                boundary: blockBoundary))
+        let exactStates = try XCTUnwrap(
+            coordinator.ssmStateCache.fetch(
+                tokens: promptOnly,
+                boundary: promptOnly.count))
+
+        let warmBlock = try warmPassStates(
+            model: model,
+            tokens: Array(promptOnly.prefix(blockBoundary)),
+            prefillStepSize: 2)
+        let warmExact = try warmPassStates(
+            model: model,
+            tokens: promptOnly,
+            prefillStepSize: 2)
+
+        assertStatesEqual(blockStates, warmBlock)
+        assertStatesEqual(exactStates, warmExact)
+        XCTAssertEqual(coordinator.ssmStateCache.reDerives, 1)
+    }
+
     func testExactSnapshotSSMStatesAvoidReDeriveWhenNoIntermediateBoundaryIsNeeded() throws {
         let model = TinyHybridSSMModel()
         let tokens = [3, 4, 5, 6, 7]

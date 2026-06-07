@@ -754,3 +754,50 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 ```
 
 Result: passed, 11 tests.
+
+## Follow-Up Trace - 2026-06-06 21:12 PDT
+
+Added a narrow hybrid SSM cache correctness fix from the clean main branch:
+
+- `maybeReDeriveSSMState` now delegates to
+  `reDeriveAndStoreSSMStatesForPromptBoundaries`, so the legacy wrapper stores
+  both paged-block and exact prompt SSM companion boundaries instead of only
+  relying on the exact-boundary path.
+- Removed the dead single-boundary helper that always returned `nil`.
+- Updated the SSM companion disk-cache comment to reflect the real
+  `SSMStateCache.makeKey` key path with model-key and media-salt isolation.
+- Added focused coverage that rejects legacy hybrid KV-only L2 payloads without
+  complete SSM companion state, proves disk and memory SSM companion keys stay
+  identical, and proves the legacy wrapper stores paged-block plus exact SSM
+  boundaries.
+
+No sampler, template, parser, reasoning, generation-config, quantized matmul,
+JANGTQ kernel, Gemma4, Qwen, Mistral, MiniMax, DSV4, or VLM runtime behavior was
+changed.
+
+Focused verification from `/private/tmp/vmlx-nemotron-ultra-clean-pr`:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun swift test \
+  --filter 'SSMReDeriveParityTests|CacheCoordinatorTopologyFocusedTests|NemotronHJANGTQDispatchFocusedTests|Gemma4VLMFocusedSourceContractsTests|MTPRuntimeFocusedTests|VMLXServerRuntimeSettingsTests/automaticRuntimeCachePolicyCoversDownloadedArchitectureFamilies' \
+  --jobs 1 --no-parallel
+```
+
+Result:
+
+- Build passed.
+- `git diff --check` passed.
+- `99` selected tests passed.
+- Coverage included:
+  - hybrid SSM paged/disk companion-state rejection and restore boundaries
+  - DSV4 disk-backed CSA/HSA pool restore
+  - ZAYA CCA companion-state disk restore and salt isolation
+  - Gemma4 mixed/full rotating cache topology and Gemma4 VLM source wiring
+  - Qwen MTP / Qwen3.5 recurrent-prefix runtime metadata
+  - Nemotron Ultra JANGTQ dispatch, parser/default source guards, and
+    48-Mamba / 12-attention cache topology
+  - downloaded-family automatic cache policy source coverage
+
+Current verdict is unchanged: this closes a cache-wrapper correctness gap, but
+does not claim a new heavy live model row or a new low-footprint speed result.
