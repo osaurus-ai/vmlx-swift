@@ -120,10 +120,16 @@ require_text "$ZAYA_DISK" 'readCCA\(\)\.conv' "ZAYA CCA conv state round-trip co
 require_text "$ZAYA_DISK" 'readCCA\(\)\.prev' "ZAYA CCA previous-state round-trip covered"
 require_text "$ZAYA_DISK" 'Mixed per-layer round-trip: KVCacheSimple \+ ZayaCCACache \+ RotatingKVCache' \
   "ZAYA mixed per-layer cache round-trip covered"
-require_text "$TOPO" 'ZAYA CCA format-v2 disk payload is not reused without proven companion boundary' \
-  "ZAYA topology guard rejects unproven CCA v2 reusable prefix hit"
-require_text "$TOPO" 'ZAYA CCA disk payload must not be promoted to a reusable prefix hit without a proven companion boundary' \
-  "ZAYA topology guard documents path-dependent CCA state boundary"
+require_text "$TOPO" 'ZAYA CCA format-v2 disk payload restores growing prompt boundary' \
+  "ZAYA topology guard restores only complete CCA v2 disk payloads"
+require_text "$TOPO" 'zaya_0_conv_state' \
+  "ZAYA topology guard requires CCA conv_state in disk payload"
+require_text "$TOPO" 'zaya_0_prev_hs' \
+  "ZAYA topology guard requires CCA prev_hs in disk payload"
+require_text "$TOPO" 'ZAYA CCA state is not duplicated into SSM companion cache' \
+  "ZAYA topology guard keeps CCA state out of SSM companion cache"
+require_text "$TOPO" 'ZAYA CCA topology advertises CCA companion, not recurrent SSM' \
+  "ZAYA topology guard advertises CCA companion instead of SSM"
 
 require_text "$TOPO" 'hybridPagedHitRequiresSSMCompanion' \
   "hybrid SSM paged hit requires companion state"
