@@ -564,11 +564,12 @@ struct MLXPressLowRamPolicySourceTests {
         let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
 
         #expect(readme.contains("resident Swift decode | 8.1 tok/s"))
-        #expect(readme.contains("low-footprint mmap decode | 3.8-4.5 tok/s"))
+        #expect(readme.contains("low-footprint mmap decode | 7.0 tok/s full-run, 9.8-9.9 tok/s tail"))
         #expect(readme.contains("The current Swift runtime proof is intentionally split by runtime path"))
         #expect(readme.contains("It uses about 100 GB physical footprint"))
-        #expect(readme.contains("but it does not yet reach the 8-10\ntok/s target"))
-        #expect(readme.contains("hybrid SSM disk-backed prefix-cache restore"))
+        #expect(readme.contains("first-decode cost remains the open low-footprint speed gap"))
+        #expect(readme.contains("hybrid SSM disk-backed prefix-cache"))
+        #expect(readme.contains("SSM companion hits and cache-salt isolation"))
     }
 
     @Test("Nemotron-H JANGTQ docs do not regress to obsolete wrapper-blocked status")
