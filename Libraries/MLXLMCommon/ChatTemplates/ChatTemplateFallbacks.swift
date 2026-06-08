@@ -599,9 +599,7 @@ value_1
 {%- set next_role = messages[loop.index0 + 1]['role'] if loop.index0 + 1 < messages|length else none -%}
 {%- if next_role == 'assistant' or loop.last and add_generation_prompt -%}
 {{- asst_token -}}
-{%- if tool_choice is defined and tool_choice == 'required' and loop.index0 >= ns.last_user_index -%}
-{{- think_open -}}{{- action_token -}}
-{%- elif enable_thinking and loop.index0 >= ns.last_user_index -%}
+{%- if enable_thinking and loop.index0 >= ns.last_user_index -%}
 {{- think_open -}}
 {%- else -%}
 {{- think_close -}}
@@ -627,9 +625,7 @@ value_1
 {%- set next_role = messages[loop.index0 + 1]['role'] if loop.index0 + 1 < messages|length else none -%}
 {%- if next_role == 'assistant' or loop.last and add_generation_prompt -%}
 {{- asst_token -}}
-{%- if tool_choice is defined and tool_choice == 'required' and loop.index0 >= ns.last_user_index -%}
-{{- think_open -}}{{- action_token -}}
-{%- elif enable_thinking and loop.index0 >= ns.last_user_index -%}
+{%- if enable_thinking and loop.index0 >= ns.last_user_index -%}
 {{- think_open -}}
 {%- else -%}
 {{- think_close -}}

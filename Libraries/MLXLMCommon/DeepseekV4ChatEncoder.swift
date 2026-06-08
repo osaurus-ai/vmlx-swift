@@ -152,13 +152,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
             if let tailIndex = finalRendered.lastIndex(where: {
                 $0.role == .user || $0.role == .developer
             }), tailIndex >= contextLen {
-                if finalRendered[tailIndex].task == nil {
-                    finalRendered[tailIndex].task = "action"
-                }
-                let insertionIndex = finalRendered[tailIndex].task == nil
-                    ? finalRendered.index(after: tailIndex)
-                    : tailIndex
-                finalRendered.insert(reminder, at: insertionIndex)
+                finalRendered.insert(reminder, at: finalRendered.index(after: tailIndex))
             } else {
                 finalRendered.append(reminder)
             }
@@ -620,9 +614,11 @@ public struct DeepseekV4ChatEncoder: Sendable {
     /// assistant response instead of entering DSML. For required tool-choice
     /// turns, collapse that completed prose exchange so the prior tool result
     /// merges directly with the latest user request. The final required turn
-    /// is then rendered on DSV4's native `action` rail above. This preserves
-    /// the actual tool result and latest user instruction; it does not
-    /// synthesize a tool call or alter sampler behavior.
+    /// keeps the ordinary assistant chat tail; opening DSV4's internal action
+    /// task rail here can leak `<｜action｜>` as visible text after tool-result
+    /// history. This preserves the actual tool result and latest user
+    /// instruction; it does not synthesize a tool call or alter sampler
+    /// behavior.
     static func compactRequiredToolChoiceHistory(_ messages: [Message]) -> [Message] {
         guard
             let finalUserIndex = messages.indices.last(where: {

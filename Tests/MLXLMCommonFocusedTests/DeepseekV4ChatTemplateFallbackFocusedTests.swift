@@ -188,7 +188,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
 
         let finalUser = "Now use line_count on one\ntwo."
         let reminder = "<\u{FF5C}latest_reminder\u{FF5C}>"
-        let tail = "<\u{FF5C}Assistant\u{FF5C}><think><\u{FF5C}action\u{FF5C}>"
+        let tail = "<\u{FF5C}Assistant\u{FF5C}></think>"
         let finalUserRange = rendered.range(of: finalUser)
         let reminderRange = rendered.range(of: reminder)
         #expect(finalUserRange != nil)
@@ -199,8 +199,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.hasSuffix(tail))
     }
 
-    @Test("Swift DSV4 required tool choice uses action rail after tool-result history")
-    func swiftDSV4RequiredToolChoiceUsesActionRailAfterToolResultHistory() {
+    @Test("Swift DSV4 required tool choice keeps ordinary assistant tail after tool-result history")
+    func swiftDSV4RequiredToolChoiceKeepsOrdinaryAssistantTailAfterToolResultHistory() {
         let rendered = DeepseekV4ChatEncoder().encode(
             messages: [
                 .init(role: .system, content: "", tools: [lineCountToolSpec()]),
@@ -222,7 +222,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
 
         #expect(rendered.contains("<tool_result>{\"lines\":3}</tool_result>"))
         #expect(rendered.contains("The active API tool_choice is required"))
-        #expect(rendered.hasSuffix("<\u{FF5C}Assistant\u{FF5C}><think><\u{FF5C}action\u{FF5C}>"))
+        #expect(rendered.hasSuffix("<\u{FF5C}Assistant\u{FF5C}></think>"))
+        #expect(!rendered.contains("<\u{FF5C}action\u{FF5C}>"))
     }
 
     @Test("Nemotron required tool choice keeps native XML tool contract")
@@ -630,7 +631,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
     }
 
     private func assertRequiredToolChoiceActionRail(_ rendered: String) {
-        #expect(rendered.hasSuffix("<\u{FF5C}Assistant\u{FF5C}><think><\u{FF5C}action\u{FF5C}>"))
+        #expect(rendered.hasSuffix("<\u{FF5C}Assistant\u{FF5C}></think>"))
+        #expect(!rendered.contains("<\u{FF5C}action\u{FF5C}>"))
     }
 
     private func assertSystemSeparatedFromUser(_ rendered: String) {

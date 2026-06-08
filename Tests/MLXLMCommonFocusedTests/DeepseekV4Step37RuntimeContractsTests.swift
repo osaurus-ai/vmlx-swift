@@ -37,8 +37,8 @@ struct DeepseekV4Step37RuntimeContractsTests {
         #expect(!coordinator.contains("if config.defaultKVMode"))
     }
 
-    @Test("DSV4 required tools use action rail and schema-aware parser fallbacks")
-    func dsv4RequiredToolsUseActionRailAndSchemaAwareParserFallbacks() {
+    @Test("DSV4 required tools keep ordinary assistant tail and schema-aware parser fallbacks")
+    func dsv4RequiredToolsKeepOrdinaryAssistantTailAndSchemaAwareParserFallbacks() {
         let rendered = DeepseekV4ChatEncoder().encode(
             messages: [
                 .init(role: .system, content: "", tools: [Self.lineCountToolSpec()]),
@@ -63,7 +63,8 @@ struct DeepseekV4Step37RuntimeContractsTests {
         #expect(rendered.contains("The active API tool_choice is required"))
         #expect(rendered.contains("Use the `line_count` function."))
         #expect(rendered.contains("<\u{FF5C}latest_reminder\u{FF5C}>"))
-        #expect(rendered.hasSuffix("<\u{FF5C}Assistant\u{FF5C}><think><\u{FF5C}action\u{FF5C}>"))
+        #expect(rendered.hasSuffix("<\u{FF5C}Assistant\u{FF5C}></think>"))
+        #expect(!rendered.contains("<\u{FF5C}action\u{FF5C}>"))
 
         let processor = ToolCallProcessor(format: .dsml, tools: [Self.lineCountToolSpec()])
         let output = #"line_count("text": "one\ntwo") extra prose that must not leak"#
