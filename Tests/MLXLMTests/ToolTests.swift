@@ -525,6 +525,24 @@ struct ToolTests {
         #expect(call.function.arguments["text"] == .string("one\ntwo"))
     }
 
+    @Test("LFM2 parser rejects native pythonic calls outside supplied tool schema")
+    func lfm2ParserRejectsNativePythonicCallsOutsideSuppliedToolSchema() {
+        let tools = lineCountTools()
+        let parser = LFM2ToolCallParser()
+
+        #expect(parser.parse(
+            content: #"<|tool_call_start|>[break()]<|tool_call_end|>"#,
+            tools: tools) == nil)
+        #expect(parser.parseEOS(
+            #"<|tool_call_start|>[break()]<|tool_call_end|>"#,
+            tools: tools).isEmpty)
+
+        let processor = ToolCallProcessor(format: .lfm2, tools: tools)
+        #expect(processor.processChunk(#"<|tool_call_start|>[break()]<|tool_call_end|>"#) == nil)
+        #expect(processor.processEOS() == nil)
+        #expect(processor.toolCalls.isEmpty)
+    }
+
     @Test("LFM2 parser does not coerce plain code fence into a tool call")
     func lfm2ParserDoesNotCoercePlainCodeFenceIntoToolCall() {
         let processor = ToolCallProcessor(format: .lfm2, tools: lineCountTools())

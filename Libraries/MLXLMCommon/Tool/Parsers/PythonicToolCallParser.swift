@@ -75,6 +75,9 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         }
 
         let arguments = parseArguments(argsString, funcName: funcName, tools: tools)
+        guard acceptsToolCall(name: funcName, arguments: arguments, tools: tools) else {
+            return nil
+        }
         return ToolCall(function: .init(name: funcName, arguments: arguments))
     }
 
@@ -134,6 +137,9 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
             let funcName = String(text[nameRange])
             let argsString = String(text[argsRange])
             let arguments = parseArguments(argsString, funcName: funcName, tools: tools)
+            guard acceptsToolCall(name: funcName, arguments: arguments, tools: tools) else {
+                continue
+            }
             results.append(ToolCall(function: .init(name: funcName, arguments: arguments)))
         }
         return results
@@ -225,6 +231,24 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
             return required
         }
         return []
+    }
+
+    private func acceptsToolCall(
+        name: String,
+        arguments: [String: any Sendable],
+        tools: [[String: any Sendable]]?
+    ) -> Bool {
+        guard let tools, !tools.isEmpty else { return true }
+        guard toolNames(tools: tools).contains(name) else { return false }
+
+        let spec = toolSpec(named: name, tools: tools)
+        if let required = spec.required, !required.isEmpty {
+            guard required.allSatisfy({ arguments[$0] != nil }) else { return false }
+        }
+        if let properties = spec.properties, !properties.isEmpty {
+            guard arguments.keys.allSatisfy({ properties.contains($0) }) else { return false }
+        }
+        return true
     }
 
     private func parseToolKeyedJSONEnvelope(

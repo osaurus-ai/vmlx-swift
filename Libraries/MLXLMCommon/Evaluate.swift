@@ -1103,6 +1103,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     // Multi-tier cache coordinator (skeleton integration)
     let cacheCoordinator: CacheCoordinator?
 
+    /// Caller-proven policy gate for required-tool rows whose disk-backed
+    /// warm restore can pollute prompt boundaries before tool selection.
+    let disableDiskBackedRequiredToolRestore: Bool
+
     /// Prompt token IDs captured at init for cache store after generation.
     public private(set) var promptTokenIds: [Int]
 
@@ -1176,6 +1180,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvMode = parameters.kvMode
 
         self.cacheCoordinator = nil
+        self.disableDiskBackedRequiredToolRestore = false
         self.promptTokenIds = []
         self.cachePrefixTokenCounts = []
         self.originalInput = LMInput(text: y)
@@ -1210,13 +1215,15 @@ public struct TokenIterator: TokenIteratorProtocol {
     public init(
         input: LMInput, model: any LanguageModel, cache: [KVCache]? = nil,
         parameters: GenerateParameters,
-        cacheCoordinator: CacheCoordinator? = nil
+        cacheCoordinator: CacheCoordinator? = nil,
+        disableDiskBackedRequiredToolRestore: Bool = false
     ) throws {
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
         self.model = model
         self.y = input.text
         self.cacheCoordinator = cacheCoordinator
+        self.disableDiskBackedRequiredToolRestore = disableDiskBackedRequiredToolRestore
         let promptTokenCount = input.text.tokens.size
         var effectiveParameters = parameters
         if let coordinator = cacheCoordinator {
@@ -1318,12 +1325,17 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(self.cache)
-            let result = coordinator.fetch(
-                tokens: cacheLookupTokenIds,
-                mediaSalt: mediaSalt,
-                skipExactDiskBoundary: requiresDiskBackedRestore)
-            switch result {
-            case .hit(_, let remainingTokens, let detail, let blocks, let ssmStates, let diskArrays):
+            if requiresDiskBackedRestore && disableDiskBackedRequiredToolRestore {
+                Self.logger.info(
+                    "TokenIterator: skipped disk-backed required-tool cache restore; warm restore is not proven safe for this topology"
+                )
+            } else {
+                let result = coordinator.fetch(
+                    tokens: cacheLookupTokenIds,
+                    mediaSalt: mediaSalt,
+                    skipExactDiskBoundary: requiresDiskBackedRestore)
+                switch result {
+                case .hit(_, let remainingTokens, let detail, let blocks, let ssmStates, let diskArrays):
                 var restored = false
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
@@ -1444,9 +1456,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                         }
                     }
                 }
-            case .miss:
-                let count = cacheLookupTokenIds.count
-                Self.logger.debug("Cache miss for \(count) prompt tokens")
+                case .miss:
+                    let count = cacheLookupTokenIds.count
+                    Self.logger.debug("Cache miss for \(count) prompt tokens")
 
                 // 2026-05-05 (Ling-2.6-flash multi-turn fix): coordinator
                 // missed but the cache may already hold a previous turn's
@@ -1512,6 +1524,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                         )
                     }
                 }
+                }
             }
         } else if cacheCoordinator != nil,
                   !promptTokenIds.isEmpty,
@@ -1570,6 +1583,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvMode = .none
 
         self.cacheCoordinator = nil
+        self.disableDiskBackedRequiredToolRestore = false
         self.promptTokenIds = []
         self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
         self.originalInput = input
