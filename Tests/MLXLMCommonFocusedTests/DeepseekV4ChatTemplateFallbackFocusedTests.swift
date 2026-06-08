@@ -885,8 +885,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("Required arguments: text"))
         #expect(!rendered.contains("<real string value>"))
         #expect(rendered.contains("Respond with exactly this one assistant message and nothing else:"))
-        #expect(rendered.contains(#"Use the line_count tool on this exact text: red\ngreen\nblue"#))
-        #expect(!rendered.contains("Use the line_count tool on this exact text: red\ngreen\nblue"))
+        #expect(!rendered.contains(#"Use the line_count tool on this exact text: red\ngreen\nblue"#))
+        #expect(rendered.contains("Use the line_count tool on this exact text: red\ngreen\nblue"))
         #expect(rendered.contains(#"<|tool_call_start|>["line_count", {"text":"red\ngreen\nblue"}]<|tool_call_end|>"#))
         #expect(rendered.contains("This value contains exactly 2 line break(s)."))
         #expect(rendered.contains(#"In the native LFM tagged JSON call, each line break is represented by the two characters \n"#))
@@ -925,8 +925,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("Function name: line_count"))
         #expect(rendered.contains("Required arguments: text"))
         #expect(rendered.contains("Respond with exactly this one assistant message and nothing else:"))
-        #expect(rendered.contains(#"Use the line_count tool on this exact text: red\ngreen\nblue"#))
-        #expect(!rendered.contains("Use the line_count tool on this exact text: red\ngreen\nblue"))
+        #expect(!rendered.contains(#"Use the line_count tool on this exact text: red\ngreen\nblue"#))
+        #expect(rendered.contains("Use the line_count tool on this exact text: red\ngreen\nblue"))
         #expect(rendered.contains(#"<|tool_call_start|>["line_count", {"text":"red\ngreen\nblue"}]<|tool_call_end|>"#))
         #expect(rendered.contains(#"the exact `text` value encoded with \n escapes is: red\ngreen\nblue"#))
         #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
@@ -1020,7 +1020,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             "tool_choice_name": "line_count",
         ])
 
-        let finalUser = #"Now use line_count on this exact text: one\ntwo"#
+        let finalUser = "Now use line_count on this exact text: one\ntwo"
         let finalUserRange = rendered.range(of: finalUser)
         #expect(finalUserRange != nil)
         let afterFinalUser = rendered[finalUserRange!.upperBound...]
@@ -1030,17 +1030,17 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!rendered.contains(#"{"lines":3}"#))
         #expect(!rendered.contains("How many lines were counted? Answer plainly in one short sentence."))
         #expect(!rendered.contains("There were 3 lines counted."))
-        #expect(!beforeFinalUser.contains("The API requires a tool call for the next assistant turn."))
-        #expect(afterFinalUser.contains("The API requires a tool call for the next assistant turn."))
-        #expect(afterFinalUser.contains(#"<|tool_call_start|>["line_count", {"text":"one\ntwo"}]<|tool_call_end|>"#))
-        #expect(afterFinalUser.contains("Respond with exactly this one assistant message and nothing else:"))
-        #expect(afterFinalUser.contains("Copy the `text` value exactly from the current user request."))
-        #expect(afterFinalUser.contains("This value contains exactly 1 line break(s)."))
-        #expect(afterFinalUser.contains(#"In the native LFM tagged JSON call, each line break is represented by the two characters \n"#))
-        #expect(afterFinalUser.contains(#"the exact `text` value encoded with \n escapes is: one\ntwo"#))
-        #expect(afterFinalUser.contains("Do not double any line break."))
-        #expect(afterFinalUser.contains("Do not add a blank line, leading space, trailing newline, or any other character to the copied value."))
-        #expect(afterFinalUser.contains("Do not invent placeholders, summaries, ellipsis, or prior-turn text."))
+        #expect(beforeFinalUser.contains("The API requires a tool call for the next assistant turn."))
+        #expect(!afterFinalUser.contains("The API requires a tool call for the next assistant turn."))
+        #expect(beforeFinalUser.contains(#"<|tool_call_start|>["line_count", {"text":"one\ntwo"}]<|tool_call_end|>"#))
+        #expect(beforeFinalUser.contains("Respond with exactly this one assistant message and nothing else:"))
+        #expect(beforeFinalUser.contains("Copy the `text` value exactly from the current user request."))
+        #expect(beforeFinalUser.contains("This value contains exactly 1 line break(s)."))
+        #expect(beforeFinalUser.contains(#"In the native LFM tagged JSON call, each line break is represented by the two characters \n"#))
+        #expect(beforeFinalUser.contains(#"the exact `text` value encoded with \n escapes is: one\ntwo"#))
+        #expect(beforeFinalUser.contains("Do not double any line break."))
+        #expect(beforeFinalUser.contains("Do not add a blank line, leading space, trailing newline, or any other character to the copied value."))
+        #expect(beforeFinalUser.contains("Do not invent placeholders, summaries, ellipsis, or prior-turn text."))
         #expect(!beforeFinalUser.contains("List of tools:"))
         #expect(!beforeFinalUser.contains("<tools>"))
         #expect(!beforeFinalUser.contains("<|tool_call_start|>[line_count(text='red\\ngreen\\nblue')]<|tool_call_end|>"))
@@ -1092,18 +1092,20 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             "tool_choice_name": "line_count",
         ])
 
-        let finalUser = #"Now use line_count on exactly this new text, preserving newlines:\none\ntwo"#
+        let finalUser = "Now use line_count on exactly this new text, preserving newlines:\none\ntwo"
         let finalUserRange = rendered.range(of: finalUser)
         #expect(finalUserRange != nil)
         let afterFinalUser = rendered[finalUserRange!.upperBound...]
+        let beforeFinalUser = rendered[..<finalUserRange!.lowerBound]
 
         #expect(!rendered.contains("Use the line_count tool on exactly this text, preserving newlines:\nalpha\nbeta\ngamma"))
         #expect(!rendered.contains(#"{"lines":3}"#))
         #expect(!rendered.contains("There were three lines counted."))
-        #expect(afterFinalUser.contains(#"<|tool_call_start|>["line_count", {"text":"one\ntwo"}]<|tool_call_end|>"#))
-        #expect(afterFinalUser.contains(#"the exact `text` value encoded with \n escapes is: one\ntwo"#))
-        #expect(afterFinalUser.contains("This value contains exactly 1 line break(s)."))
-        #expect(afterFinalUser.contains("Do not omit `text`"))
+        #expect(beforeFinalUser.contains(#"<|tool_call_start|>["line_count", {"text":"one\ntwo"}]<|tool_call_end|>"#))
+        #expect(beforeFinalUser.contains(#"the exact `text` value encoded with \n escapes is: one\ntwo"#))
+        #expect(beforeFinalUser.contains("This value contains exactly 1 line break(s)."))
+        #expect(beforeFinalUser.contains("Do not omit `text`"))
+        #expect(!afterFinalUser.contains("The API requires a tool call for the next assistant turn."))
         #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
     }
 

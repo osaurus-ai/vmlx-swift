@@ -1402,7 +1402,7 @@ value_1
     {%- endif -%}
 {%- endmacro -%}
 
-{%- set ns = namespace(system_prompt='', last_user_index=-1) -%}
+{%- set ns = namespace(system_prompt='', last_user_index=-1, latest_required_user_content='') -%}
 {%- set loop_messages = messages -%}
 {%- if messages and messages[0]['role'] == 'system' -%}
     {%- if messages[0]['content'] is defined -%}
@@ -1413,6 +1413,7 @@ value_1
 {%- for message in loop_messages -%}
     {%- if message['role'] == 'user' -%}
         {%- set ns.last_user_index = loop.index0 -%}
+        {%- set ns.latest_required_user_content = message['content'] -%}
     {%- endif -%}
 {%- endfor -%}
 {%- if ns.system_prompt or (tools is iterable and tools | length > 0) -%}
@@ -1424,7 +1425,8 @@ value_1
         {%- if ns.system_prompt -%}{{- '\n\n' -}}{%- endif -%}
         {{- render_tool_summary() -}}
         {%- if required_tool_choice -%}
-            {{- '\nWhen a tool call is required, use only the exact native LFM tagged call from the current-turn instruction.' -}}
+            {{- '\n' -}}
+            {{- render_required_tool_choice_instruction(ns.latest_required_user_content) -}}
         {%- endif -%}
     {%- endif -%}
     {{- '<|im_end|>\n' -}}
@@ -1446,11 +1448,7 @@ value_1
             {{- render_tool_calls(message['tool_calls']) -}}
         {%- endif -%}
     {%- elif message['role'] == 'user' -%}
-        {%- if is_required_latest_user -%}
-            {{- parse_content_json_linebreaks(message['content']) -}}
-        {%- else -%}
-            {{- parse_content(message['content']) -}}
-        {%- endif -%}
+        {{- parse_content(message['content']) -}}
     {%- elif message['role'] == 'tool' -%}
         {{- 'Tool result for previous assistant tool call: ' ~ parse_content(message['content']) -}}
     {%- else -%}
@@ -1459,11 +1457,6 @@ value_1
         {%- endif -%}
     {%- endif -%}
     {{- '<|im_end|>\n' -}}
-    {%- if is_required_latest_user -%}
-    {{- '<|im_start|>system\n' -}}
-    {{- render_required_tool_choice_instruction(message['content']) -}}
-    {{- '<|im_end|>\n' -}}
-    {%- endif -%}
     {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
