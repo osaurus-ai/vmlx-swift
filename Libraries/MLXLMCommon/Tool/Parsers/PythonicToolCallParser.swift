@@ -31,6 +31,9 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         if let jsonToolCall = parseToolKeyedJSONEnvelope(text, tools: tools) {
             return jsonToolCall
         }
+        if let jsonToolCall = parseOpenAIToolCallJSONEnvelope(text, tools: tools) {
+            return jsonToolCall
+        }
         if let jsonToolCall = parseNamedArgumentsJSONEnvelope(text, tools: tools) {
             return jsonToolCall
         }
@@ -81,18 +84,26 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
     /// surfaces the first. Byte-compatible with upstream
     /// ml-explore/mlx-swift-lm so `LFM2` streams behave identically.
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
-        if let toolCall = parse(content: toolCallBuffer, tools: tools) {
-            return [toolCall]
-        }
         if let startTag {
-            return
+            let calls =
                 toolCallBuffer
                 .components(separatedBy: startTag)
                 .filter { !$0.isEmpty }
                 .flatMap { parseMultiple(content: $0, tools: tools) }
+            if !calls.isEmpty {
+                return calls
+            }
         } else {
-            return parseMultiple(content: toolCallBuffer, tools: tools)
+            let calls = parseMultiple(content: toolCallBuffer, tools: tools)
+            if !calls.isEmpty {
+                return calls
+            }
         }
+
+        if let toolCall = parse(content: toolCallBuffer, tools: tools) {
+            return [toolCall]
+        }
+        return []
     }
 
     private func parseMultiple(content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
@@ -232,6 +243,37 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
             }
         }
         return nil
+    }
+
+    private func parseOpenAIToolCallJSONEnvelope(
+        _ text: String,
+        tools: [[String: any Sendable]]?
+    ) -> ToolCall? {
+        guard text.hasPrefix("{") else { return nil }
+        guard let object = parseJSONObjectWithOptionalEOFBrace(text) else { return nil }
+        guard object.count == 1 else { return nil }
+
+        let rawCall = object["tool_call"] ?? object["toolCall"]
+        guard let callObject = rawCall as? [String: Any],
+            let name = callObject["name"] as? String,
+            toolNames(tools: tools).contains(name),
+            let rawArguments = callObject["arguments"],
+            let args = firstArgumentObject(from: rawArguments)
+        else { return nil }
+
+        let spec = toolSpec(named: name, tools: tools)
+        if let required = spec.required, !required.isEmpty {
+            guard required.allSatisfy({ args[$0] != nil }) else { return nil }
+        }
+        if let properties = spec.properties, !properties.isEmpty {
+            guard args.keys.allSatisfy({ properties.contains($0) }) else { return nil }
+        }
+        if let type = callObject["type"] as? String,
+            type != "function" && type != "tool_call"
+        {
+            return nil
+        }
+        return ToolCall(function: .init(name: name, arguments: args.mapValues(asSendable)))
     }
 
     private func parseSingleToolArgumentsJSON(

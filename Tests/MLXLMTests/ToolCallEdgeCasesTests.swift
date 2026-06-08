@@ -715,6 +715,32 @@ struct ToolCallEdgeCasesTests {
         #expect(call.function.arguments["text"] == .string("red\ngreen\nblue"))
     }
 
+    @Test("LFM2 processor accepts observed OpenAI tool_call JSON envelope")
+    func testLFM2ProcessorAcceptsObservedOpenAIToolCallJSONEnvelope() throws {
+        let processor = ToolCallProcessor(format: .lfm2, tools: [lineCountToolSpec()])
+        let output = #"""
+
+        {
+          "tool_call": {
+            "id": "tool_call_1",
+            "name": "line_count",
+            "arguments": {
+              "text": "red\ngreen\nblue"
+            }
+          }
+        }
+        """#
+
+        let visible = processor.processChunk(output) ?? ""
+        let eosVisible = processor.processEOS() ?? ""
+        let call = try #require(processor.toolCalls.first)
+
+        #expect(visible.isEmpty)
+        #expect(eosVisible.isEmpty)
+        #expect(call.function.name == "line_count")
+        #expect(call.function.arguments["text"] == .string("red\ngreen\nblue"))
+    }
+
     @Test("LFM2 parser rejects observed JSON object with unknown arguments")
     func testLFM2ParserRejectsObservedNamedJSONWithUnknownArguments() {
         let parser = PythonicToolCallParser(

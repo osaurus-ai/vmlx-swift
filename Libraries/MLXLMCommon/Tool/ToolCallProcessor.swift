@@ -203,7 +203,7 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return leading.isEmpty ? nil : leading
+                return visibleInlineLeading(leading)
             }
 
             if let pendingIndex = partialInlineActionJSONToolCallStart(in: inlineText) {
@@ -226,7 +226,7 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return leading.isEmpty ? nil : leading
+                return visibleInlineLeading(leading)
             }
 
             if let pendingIndex = partialInlineEmbeddedAPIToolJSONStart(in: inlineText) {
@@ -247,7 +247,7 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return leading.isEmpty ? nil : leading
+                return visibleInlineLeading(leading)
             }
 
             if let pendingIndex = partialInlinePythonicCallListStart(in: inlineText) {
@@ -268,7 +268,7 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return leading.isEmpty ? nil : leading
+                return visibleInlineLeading(leading)
             }
 
             if let pendingIndex = partialInlineFunctionToolCallStart(in: inlineText) {
@@ -291,7 +291,7 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return leading.isEmpty ? nil : leading
+                return visibleInlineLeading(leading)
             }
 
             if let pendingIndex = partialInlineRequestToolXMLToolCallStart(in: inlineText) {
@@ -312,7 +312,7 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return leading.isEmpty ? nil : leading
+                return visibleInlineLeading(leading)
             }
 
             if let pendingIndex = partialInlineBareNameJSONToolCallStart(in: inlineText) {
@@ -335,7 +335,7 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return leading.isEmpty ? nil : leading
+                return visibleInlineLeading(leading)
             }
 
             if let pendingIndex = partialInlineBareNameKeyValueToolCallStart(in: inlineText) {
@@ -356,7 +356,7 @@ public class ToolCallProcessor {
                     toolCalls.append(toolCall)
                     toolCallBuffer = ""
                     state = .normal
-                    return leading.isEmpty ? nil : leading
+                    return visibleInlineLeading(leading)
                 }
 
                 // Still collecting — check if braces are balanced (would mean parse
@@ -368,7 +368,7 @@ public class ToolCallProcessor {
                     return leading + buffer
                 }
 
-                return leading.isEmpty ? nil : leading
+                return visibleInlineLeading(leading)
             }
 
             // No brace seen — pass through as regular text
@@ -1149,6 +1149,10 @@ public class ToolCallProcessor {
             "git_diff",
             "git_commit",
         ]
+    }
+
+    private func visibleInlineLeading(_ leading: String) -> String? {
+        leading.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : leading
     }
 
     /// Process chunk for tagged formats.
