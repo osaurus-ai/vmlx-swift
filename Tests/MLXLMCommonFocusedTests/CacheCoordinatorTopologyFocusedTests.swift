@@ -600,6 +600,8 @@ struct CacheCoordinatorTopologyFocusedTests {
         #expect(source.contains(#"modelName.contains("gemma-4")"#))
         #expect(source.contains(#"modelName.contains("mxfp4")"#))
         #expect(source.contains("!shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)"))
+        #expect(source.contains("shouldDisableDiskBackedRequiredToolRestore"))
+        #expect(source.contains("Skipped disk-backed required-tool cache restore"))
         #expect(source.contains("Skipped disk-backed tool prompt seed boundary"))
     }
 

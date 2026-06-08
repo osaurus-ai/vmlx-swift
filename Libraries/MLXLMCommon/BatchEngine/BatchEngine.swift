@@ -821,6 +821,12 @@ public actor BatchEngine {
         return false
     }
 
+    private func shouldDisableDiskBackedRequiredToolRestore(for slot: BatchSlot) -> Bool {
+        guard slot.disablesGeneratedCacheBoundary else { return false }
+        let modelName = context.configuration.name.lowercased()
+        return modelName.contains("lfm2.5") && modelName.contains("mxfp8")
+    }
+
     private func startSoloFastPath(
         input: consuming sending LMInput,
         parameters: GenerateParameters,
@@ -1307,211 +1313,219 @@ public actor BatchEngine {
                 return stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare)
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(slot.cache)
-            let result = coordinator.fetch(
-                tokens: tokenIds,
-                mediaSalt: slot.mediaSalt,
-                skipExactDiskBoundary: requiresDiskBackedRestore)
-            if case .hit(_, let remaining, let detail, let blocks, let ssmStates, let diskArrays) = result {
-                var restored = false
-                if !blocks.isEmpty {
-                    let restoredTokens = restoreLayerData(from: blocks, into: slot.cache)
-                    coordinator.release(blocks: blocks)
-                    if restoredTokens > 0 {
-                        if let ssm = ssmStates {
-                            restoreSSMStates(ssm, into: slot.cache)
+            if requiresDiskBackedRestore,
+               shouldDisableDiskBackedRequiredToolRestore(for: slot)
+            {
+                Self.logger.info(
+                    "Skipped disk-backed required-tool cache restore for \(self.context.configuration.name, privacy: .public): warm restore is not proven safe for this topology"
+                )
+            } else {
+                let result = coordinator.fetch(
+                    tokens: tokenIds,
+                    mediaSalt: slot.mediaSalt,
+                    skipExactDiskBoundary: requiresDiskBackedRestore)
+                if case .hit(_, let remaining, let detail, let blocks, let ssmStates, let diskArrays) = result {
+                    var restored = false
+                    if !blocks.isEmpty {
+                        let restoredTokens = restoreLayerData(from: blocks, into: slot.cache)
+                        coordinator.release(blocks: blocks)
+                        if restoredTokens > 0 {
+                            if let ssm = ssmStates {
+                                restoreSSMStates(ssm, into: slot.cache)
+                            }
+                            restored = true
+                            Self.logger.info(
+                                "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(restoredTokens) tokens, prefilling \(remaining.count) remaining"
+                            )
                         }
-                        restored = true
-                        Self.logger.info(
-                            "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(restoredTokens) tokens, prefilling \(remaining.count) remaining"
-                        )
                     }
-                }
 
-                // Disk cache restore (blocks are empty, arrays are present)
-                if let diskArrays, !restored {
-                    let diskRestored = restoreFromDiskArrays(diskArrays, into: &slot.cache)
-                    if diskRestored > 0 {
-                        if let ssm = ssmStates,
-                           TQDiskSerializer.formatVersion(of: diskArrays) < 2
-                        {
-                            restoreSSMStates(ssm, into: slot.cache)
+                    // Disk cache restore (blocks are empty, arrays are present)
+                    if let diskArrays, !restored {
+                        let diskRestored = restoreFromDiskArrays(diskArrays, into: &slot.cache)
+                        if diskRestored > 0 {
+                            if let ssm = ssmStates,
+                               TQDiskSerializer.formatVersion(of: diskArrays) < 2
+                            {
+                                restoreSSMStates(ssm, into: slot.cache)
+                            }
+                            // 2026-04-27 fix: materialize restored cache state
+                            // in its own command buffer BEFORE prefill builds
+                            // its forward graph. Disk restore produces lazy
+                            // MLXArrays (asType conversions, TQ component
+                            // deserialization, mamba state copies). Without
+                            // an explicit eval here, the next prefill forward
+                            // builds a single command buffer containing both
+                            // the cache materialization AND the model's
+                            // custom kernel dispatches — combined allocation
+                            // pressure can trigger `mlx::core::metal::Device::
+                            // clear_library` mid-encode, evicting a kernel
+                            // pipeline that's still referenced by the
+                            // in-flight buffer →
+                            // `notifyExternalReferencesNonZeroOnDealloc`
+                            // assertion (osaurus repro 2026-04-27 on Qwen-3.6
+                            // 35B A3B MXFP4 with warm disk-tier KV cache).
+                            // Eager eval forces the cache state into GPU
+                            // memory in a SEPARATE command buffer that
+                            // commits before prefill encoding starts.
+                            MLX.eval(slot.cache)
+                            restored = true
+                            Self.logger.info(
+                                "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(diskRestored) tokens from disk, prefilling \(remaining.count) remaining"
+                            )
                         }
-                        // 2026-04-27 fix: materialize restored cache state
-                        // in its own command buffer BEFORE prefill builds
-                        // its forward graph. Disk restore produces lazy
-                        // MLXArrays (asType conversions, TQ component
-                        // deserialization, mamba state copies). Without
-                        // an explicit eval here, the next prefill forward
-                        // builds a single command buffer containing both
-                        // the cache materialization AND the model's
-                        // custom kernel dispatches — combined allocation
-                        // pressure can trigger `mlx::core::metal::Device::
-                        // clear_library` mid-encode, evicting a kernel
-                        // pipeline that's still referenced by the
-                        // in-flight buffer →
-                        // `notifyExternalReferencesNonZeroOnDealloc`
-                        // assertion (osaurus repro 2026-04-27 on Qwen-3.6
-                        // 35B A3B MXFP4 with warm disk-tier KV cache).
-                        // Eager eval forces the cache state into GPU
-                        // memory in a SEPARATE command buffer that
-                        // commits before prefill encoding starts.
-                        MLX.eval(slot.cache)
-                        restored = true
-                        Self.logger.info(
-                            "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(diskRestored) tokens from disk, prefilling \(remaining.count) remaining"
-                        )
                     }
-                }
 
-                if restored {
-                    if usesPostPrepareAlias {
-                        slot.cachePromptTokenIds = tokenIds
-                        slot.cachePromptUsesPostPrepareKey = true
-                    }
-                    // Two classes of partial-restore that must roll back to
-                    // full prefill rather than feed "remaining" tokens into
-                    // model.prepare — correctness over speed in both cases:
-                    //
-                    // 1. Media content: model-side media splice code aligns
-                    //    placeholder token spans against image/video/audio
-                    //    embedding tensors. Splitting that region across a
-                    //    cache boundary can make the splice path crash or
-                    //    attach the wrong media state.
-                    //
-                    // 2. Exact full hits on hybrid SSM: the restored SSM
-                    //    state already includes the last token's recurrence
-                    //    contribution. The remaining.isEmpty path has to
-                    //    re-feed the last token to seed logits, which would
-                    //    double-count that recurrence. Partial disk hits are
-                    //    different: a complete state at boundary N plus
-                    //    prefill over [N...M] is the intended Markov resume
-                    //    path for MambaCache, ArraysCache, and ZayaCCACache.
-                    // Full disk hit on hybrid-SSM is ALSO unsafe: the
-                    // restored SSM state already includes the last
-                    // token's recurrence contribution, so the
-                    // remaining.isEmpty branch's "trim KV by 1 and
-                    // re-feed last token" recipe double-counts the
-                    // last token's SSM update. Result: logits sample
-                    // EOS first, decode emits zero tokens (StabilityBench
-                    // S2 reproducer on Qwen3.6-35B-A3B-JANGTQ4 2026-05-01).
-                    // Same SSM-state path-dependence rationale as the
-                    // remaining.nonEmpty case below.
-                    let unsafePartial =
-                        slot.originalInput.cacheHitSuffixContainsMediaPlaceholder(remaining)
-                    let unsafeFullHit = remaining.isEmpty && requiresDiskBackedRestore
-                    if unsafePartial {
-                        let slotIDStr = slot.id.description
-                        Self.logger.info(
-                            "Slot \(slotIDStr, privacy: .public): cache hit — rolling back to full prefill (media placeholder tokens remain in cache-hit suffix)"
-                        )
-                        slot.cache = context.model.newCache(parameters: slot.parameters)
-                        inputForPrepare = slot.originalInput
-                    } else if unsafeFullHit {
-                        let promptLen = tokenIds.count
-                        let seedBoundary = promptLen - 1
-                        if seedBoundary > 0,
-                           let last = tokenIds.last,
-                           let seedSSM = coordinator.ssmStateCache.fetch(
-                            tokens: tokenIds,
-                            boundary: seedBoundary,
-                            mediaSalt: slot.mediaSalt)
-                        {
+                    if restored {
+                        if usesPostPrepareAlias {
+                            slot.cachePromptTokenIds = tokenIds
+                            slot.cachePromptUsesPostPrepareKey = true
+                        }
+                        // Two classes of partial-restore that must roll back to
+                        // full prefill rather than feed "remaining" tokens into
+                        // model.prepare — correctness over speed in both cases:
+                        //
+                        // 1. Media content: model-side media splice code aligns
+                        //    placeholder token spans against image/video/audio
+                        //    embedding tensors. Splitting that region across a
+                        //    cache boundary can make the splice path crash or
+                        //    attach the wrong media state.
+                        //
+                        // 2. Exact full hits on hybrid SSM: the restored SSM
+                        //    state already includes the last token's recurrence
+                        //    contribution. The remaining.isEmpty path has to
+                        //    re-feed the last token to seed logits, which would
+                        //    double-count that recurrence. Partial disk hits are
+                        //    different: a complete state at boundary N plus
+                        //    prefill over [N...M] is the intended Markov resume
+                        //    path for MambaCache, ArraysCache, and ZayaCCACache.
+                        // Full disk hit on hybrid-SSM is ALSO unsafe: the
+                        // restored SSM state already includes the last
+                        // token's recurrence contribution, so the
+                        // remaining.isEmpty branch's "trim KV by 1 and
+                        // re-feed last token" recipe double-counts the
+                        // last token's SSM update. Result: logits sample
+                        // EOS first, decode emits zero tokens (StabilityBench
+                        // S2 reproducer on Qwen3.6-35B-A3B-JANGTQ4 2026-05-01).
+                        // Same SSM-state path-dependence rationale as the
+                        // remaining.nonEmpty case below.
+                        let unsafePartial =
+                            slot.originalInput.cacheHitSuffixContainsMediaPlaceholder(remaining)
+                        let unsafeFullHit = remaining.isEmpty && requiresDiskBackedRestore
+                        if unsafePartial {
+                            let slotIDStr = slot.id.description
+                            Self.logger.info(
+                                "Slot \(slotIDStr, privacy: .public): cache hit — rolling back to full prefill (media placeholder tokens remain in cache-hit suffix)"
+                            )
+                            slot.cache = context.model.newCache(parameters: slot.parameters)
+                            inputForPrepare = slot.originalInput
+                        } else if unsafeFullHit {
+                            let promptLen = tokenIds.count
+                            let seedBoundary = promptLen - 1
+                            if seedBoundary > 0,
+                               let last = tokenIds.last,
+                               let seedSSM = coordinator.ssmStateCache.fetch(
+                                tokens: tokenIds,
+                                boundary: seedBoundary,
+                                mediaSalt: slot.mediaSalt)
+                            {
+                                let cacheOffset = slot.cache.first?.offset ?? promptLen
+                                let trimNeeded = cacheOffset - seedBoundary
+                                if trimNeeded > 0 {
+                                    for layer in slot.cache where layer.isTrimmable {
+                                        _ = layer.trim(trimNeeded)
+                                    }
+                                    MLX.eval(slot.cache)
+                                }
+                                restoreSSMStates(seedSSM, into: slot.cache)
+                                MLX.eval(slot.cache)
+                                let lastToken = MLXArray([Int32(last)])
+                                    .expandedDimensions(axis: 0)
+                                inputForPrepare = LMInput(
+                                    text: LMInput.Text(tokens: lastToken),
+                                    image: nil, video: nil)
+                            } else {
+                                let slotIDStr = slot.id.description
+                                Self.logger.info(
+                                    "Slot \(slotIDStr, privacy: .public): cache hit — rolling back to full prefill (path-dependent full cache hit missing seed-boundary SSM state)"
+                                )
+                                slot.cache = context.model.newCache(parameters: slot.parameters)
+                                inputForPrepare = slot.originalInput
+                            }
+                        } else if remaining.isEmpty, let last = tokenIds.last {
+                            // Full cache hit — feed last token to seed decode.
+                            // Tensor must be 2D `[1, 1]`: the Qwen3_5 VLM
+                            // `Qwen35Language.LanguageModel` reads
+                            // `inputs.dim(1)` during position-id compute and
+                            // crashes MLX with `SmallVector out of range`
+                            // (array.cpp:335) on a 1D input. All other
+                            // model forwards either broadcast 2D already
+                            // or tolerate the extra leading axis — matches
+                            // the sibling `Evaluate.swift:825` fix.
+                            //
+                            // Trim cache offset back to (promptLen - 1) before
+                            // re-feeding the last token. Disk-tier hits restore
+                            // KV for `promptLen + previousDecodeLen` entries
+                            // (storage runs at finishSlot AFTER decode), so
+                            // without trimming the model would re-feed the
+                            // last prompt token at position `promptLen +
+                            // previousDecodeLen` — RoPE then rotates by the
+                            // wrong angle and the resulting logits typically
+                            // sample EOS first-token, yielding 0 generated
+                            // tokens (BENCH_BATCH_DISK_RESTORE 2026-04-24).
+                            // Trim is a no-op for paged-tier hits because
+                            // their `remaining.isEmpty == true` branch is
+                            // only reached when the matched count already
+                            // equals promptLen and offset already equals
+                            // promptLen.
+                            let promptLen = tokenIds.count
                             let cacheOffset = slot.cache.first?.offset ?? promptLen
-                            let trimNeeded = cacheOffset - seedBoundary
+                            let trimNeeded = cacheOffset - (promptLen - 1)
                             if trimNeeded > 0 {
                                 for layer in slot.cache where layer.isTrimmable {
                                     _ = layer.trim(trimNeeded)
                                 }
+                                // 2026-05-01: force materialization of trim mutations
+                                // before the prefill seed-forward consumes the cache.
+                                // Trim is lazy; without this MLX call, trim's pending
+                                // state changes get folded into the SAME command
+                                // buffer that dispatches the JANGTQ kernels for the
+                                // seed forward. The buffer's allocation pressure
+                                // mid-encode can trigger Metal's library-cache
+                                // eviction while the kernel pipeline is still
+                                // referenced by the in-flight buffer →
+                                // `notifyExternalReferencesNonZeroOnDealloc` crash
+                                // inside `Device::clear_library`. Reproducer: 2nd
+                                // request whose prompt is FULLY in disk-tier cache
+                                // (so this remaining.isEmpty branch fires, trim
+                                // runs, and a one-token forward immediately follows).
+                                //
+                                // Sibling to the disk-restore materialization at line
+                                // 778 — that closes the `remaining.nonEmpty` paths;
+                                // this one closes the `remaining.isEmpty + trim`
+                                // path the prior fix missed.
                                 MLX.eval(slot.cache)
                             }
-                            restoreSSMStates(seedSSM, into: slot.cache)
-                            MLX.eval(slot.cache)
                             let lastToken = MLXArray([Int32(last)])
                                 .expandedDimensions(axis: 0)
                             inputForPrepare = LMInput(
                                 text: LMInput.Text(tokens: lastToken),
                                 image: nil, video: nil)
-                        } else {
-                            let slotIDStr = slot.id.description
-                            Self.logger.info(
-                                "Slot \(slotIDStr, privacy: .public): cache hit — rolling back to full prefill (path-dependent full cache hit missing seed-boundary SSM state)"
-                            )
+                        } else if remaining.isEmpty {
+                            // Defensive fallback: no last token → roll back.
                             slot.cache = context.model.newCache(parameters: slot.parameters)
                             inputForPrepare = slot.originalInput
+                            Self.logger.error(
+                                "Slot \(slot.id.description, privacy: .public): cache .hit returned empty tokenIds — rolling back to full prefill"
+                            )
+                        } else {
+                            // Remaining tokens path — same 2D shape contract.
+                            let remainingArray = MLXArray(remaining.map { Int32($0) })
+                                .expandedDimensions(axis: 0)
+                            inputForPrepare = LMInput(
+                                text: LMInput.Text(tokens: remainingArray),
+                                image: nil, video: nil)
                         }
-                    } else if remaining.isEmpty, let last = tokenIds.last {
-                        // Full cache hit — feed last token to seed decode.
-                        // Tensor must be 2D `[1, 1]`: the Qwen3_5 VLM
-                        // `Qwen35Language.LanguageModel` reads
-                        // `inputs.dim(1)` during position-id compute and
-                        // crashes MLX with `SmallVector out of range`
-                        // (array.cpp:335) on a 1D input. All other
-                        // model forwards either broadcast 2D already
-                        // or tolerate the extra leading axis — matches
-                        // the sibling `Evaluate.swift:825` fix.
-                        //
-                        // Trim cache offset back to (promptLen - 1) before
-                        // re-feeding the last token. Disk-tier hits restore
-                        // KV for `promptLen + previousDecodeLen` entries
-                        // (storage runs at finishSlot AFTER decode), so
-                        // without trimming the model would re-feed the
-                        // last prompt token at position `promptLen +
-                        // previousDecodeLen` — RoPE then rotates by the
-                        // wrong angle and the resulting logits typically
-                        // sample EOS first-token, yielding 0 generated
-                        // tokens (BENCH_BATCH_DISK_RESTORE 2026-04-24).
-                        // Trim is a no-op for paged-tier hits because
-                        // their `remaining.isEmpty == true` branch is
-                        // only reached when the matched count already
-                        // equals promptLen and offset already equals
-                        // promptLen.
-                        let promptLen = tokenIds.count
-                        let cacheOffset = slot.cache.first?.offset ?? promptLen
-                        let trimNeeded = cacheOffset - (promptLen - 1)
-                        if trimNeeded > 0 {
-                            for layer in slot.cache where layer.isTrimmable {
-                                _ = layer.trim(trimNeeded)
-                            }
-                            // 2026-05-01: force materialization of trim mutations
-                            // before the prefill seed-forward consumes the cache.
-                            // Trim is lazy; without this MLX call, trim's pending
-                            // state changes get folded into the SAME command
-                            // buffer that dispatches the JANGTQ kernels for the
-                            // seed forward. The buffer's allocation pressure
-                            // mid-encode can trigger Metal's library-cache
-                            // eviction while the kernel pipeline is still
-                            // referenced by the in-flight buffer →
-                            // `notifyExternalReferencesNonZeroOnDealloc` crash
-                            // inside `Device::clear_library`. Reproducer: 2nd
-                            // request whose prompt is FULLY in disk-tier cache
-                            // (so this remaining.isEmpty branch fires, trim
-                            // runs, and a one-token forward immediately follows).
-                            //
-                            // Sibling to the disk-restore materialization at line
-                            // 778 — that closes the `remaining.nonEmpty` paths;
-                            // this one closes the `remaining.isEmpty + trim`
-                            // path the prior fix missed.
-                            MLX.eval(slot.cache)
-                        }
-                        let lastToken = MLXArray([Int32(last)])
-                            .expandedDimensions(axis: 0)
-                        inputForPrepare = LMInput(
-                            text: LMInput.Text(tokens: lastToken),
-                            image: nil, video: nil)
-                    } else if remaining.isEmpty {
-                        // Defensive fallback: no last token → roll back.
-                        slot.cache = context.model.newCache(parameters: slot.parameters)
-                        inputForPrepare = slot.originalInput
-                        Self.logger.error(
-                            "Slot \(slot.id.description, privacy: .public): cache .hit returned empty tokenIds — rolling back to full prefill"
-                        )
-                    } else {
-                        // Remaining tokens path — same 2D shape contract.
-                        let remainingArray = MLXArray(remaining.map { Int32($0) })
-                            .expandedDimensions(axis: 0)
-                        inputForPrepare = LMInput(
-                            text: LMInput.Text(tokens: remainingArray),
-                            image: nil, video: nil)
                     }
                 }
             }
