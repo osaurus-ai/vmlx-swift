@@ -292,6 +292,47 @@ final class JangTokenizerFallbackTests: XCTestCase {
         assertSamePath(resolved, dir)
     }
 
+    func testZayaTaggedButNonChoiceAwareTemplateGetsProductionShim() throws {
+        let dir = tmpRoot.appendingPathComponent("zaya-stale-template")
+        try writeFile(at: dir.appendingPathComponent("tokenizer.json"))
+        try writeFile(
+            at: dir.appendingPathComponent("tokenizer_config.json"),
+            contents: #"{"tokenizer_class":"Qwen2Tokenizer","chat_template":"{{ bos_token }}<zyphra_tool_call>{{ messages[-1]['content'] }}</zyphra_tool_call>"}"#)
+        try writeFile(
+            at: dir.appendingPathComponent("jang_config.json"),
+            contents: #"""
+            {
+              "format": "JANG",
+              "format_version": 2,
+              "source_model": {"name": "ZAYA1-8B", "org": "Zyphra"},
+              "capabilities": {
+                "family": "zaya",
+                "tool_parser": "zaya_xml",
+                "reasoning_parser": "qwen3",
+                "think_in_template": false,
+                "supports_tools": true,
+                "supports_thinking": true,
+                "modality": "text",
+                "cache_type": "hybrid"
+              }
+            }
+            """#)
+
+        let resolved = JangLoader.resolveChatTemplateSidecarSubstitution(for: dir)
+        XCTAssertNotEqual(
+            resolved.resolvingSymlinksInPath().path,
+            dir.resolvingSymlinksInPath().path,
+            "A ZAYA template with Zyphra tags but no tool_choice/current-turn contract must be replaced.")
+
+        let data = try Data(contentsOf: resolved.appendingPathComponent("tokenizer_config.json"))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let template = try XCTUnwrap(json["chat_template"] as? String)
+        XCTAssertTrue(template.contains("required_tool_choice"))
+        XCTAssertTrue(template.contains("The current assistant response MUST be a tool call."))
+        XCTAssertTrue(template.contains("Required call shape for the current request:"))
+        XCTAssertTrue(template.contains("Do not omit required parameters."))
+    }
+
     // MARK: - resolveTokenizerDirectory — defensive fallbacks
 
     func testResolveReturnsSelfWhenSourceModelMissingOrg() throws {
