@@ -587,6 +587,20 @@ struct CacheCoordinatorTopologyFocusedTests {
                 parameters: GenerateParameters()))
     }
 
+    @Test("LFM2.5 MXFP8 required-tool rows skip disk-backed prompt seed boundary")
+    func lfm25MXFP8RequiredToolRowsSkipDiskBackedPromptSeedBoundary() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+
+        #expect(source.contains("shouldSkipDiskBackedToolPromptSeedBoundary"))
+        #expect(source.contains("slot.disablesGeneratedCacheBoundary"))
+        #expect(source.contains(#"modelName.contains("lfm2.5")"#))
+        #expect(source.contains(#"modelName.contains("mxfp8")"#))
+        #expect(source.contains("!shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)"))
+        #expect(source.contains("Skipped disk-backed tool prompt seed boundary"))
+    }
+
     @Test("KV policy changes dynamic cache salt")
     func kvPolicyChangesDynamicCacheSalt() {
         let tokenArray = MLXArray([Int32(801), Int32(802), Int32(803)])

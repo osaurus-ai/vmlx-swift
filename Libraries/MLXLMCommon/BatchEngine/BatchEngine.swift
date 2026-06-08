@@ -809,6 +809,13 @@ public actor BatchEngine {
             !isShutdown
     }
 
+    private func shouldSkipDiskBackedToolPromptSeedBoundary(for slot: BatchSlot) -> Bool {
+        guard slot.disablesGeneratedCacheBoundary else { return false }
+        let modelName = context.configuration.name.lowercased()
+        return modelName.contains("lfm2.5")
+            && modelName.contains("mxfp8")
+    }
+
     private func startSoloFastPath(
         input: consuming sending LMInput,
         parameters: GenerateParameters,
@@ -2331,6 +2338,7 @@ public actor BatchEngine {
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
                 if requiresDiskBackedRestore,
+                   !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot),
                    promptTokens.count > 1,
                    let snapshot = boundarySnapshot(tokens: Array(promptTokens.dropLast()))
                 {
@@ -2338,6 +2346,12 @@ public actor BatchEngine {
                         tokens: Array(promptTokens.dropLast()),
                         snapshot: snapshot,
                         label: "disk-backed-safe-prompt-boundary")
+                } else if requiresDiskBackedRestore,
+                          shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)
+                {
+                    Self.logger.debug(
+                        "Skipped disk-backed tool prompt seed boundary for \(self.context.configuration.name, privacy: .public): required-tool restore is not proven safe for this topology"
+                    )
                 }
                 for boundary in Set(slot.originalInput.cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokens.count {
