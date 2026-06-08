@@ -829,3 +829,20 @@ experiment was removed from source after measurement. The remaining speed gap is
 still in model-forward dispatch cost, with the next useful target likely a real
 ReLU²-specific TQ kernel fusion or more granular Mamba subcomponent proof, not
 Swift `MLX.compile` around the existing kernel calls.
+
+Rejected a first-projection `gatherTQTopKRelu2` kernel fusion experiment.
+
+- Hypothesis: fusing Nemotron's `maximum(h, 0) * maximum(h, 0)` into the first
+  routed TQ gather would remove two MLX dispatches per MoE layer and improve
+  decode without changing math.
+- Focused parity test passed before the live row:
+  `JANGTQHadamardShuffleTests/testGatherTopKRelu2MatchesSeparateActivation`
+  matched separate `gatherTQTopK` + ReLU² at `1e-5`.
+- Sustained log:
+  `/tmp/vmlx-nemotron-relu2-fused-128tok-20260607-223310.log`
+  produced coherent 128-token output with bundle defaults, no loop/leak, and
+  low footprint, but regressed to `3.2 tok/s` with `tail_tokps_est=3.3`.
+
+Result: the fused ReLU² gather was removed from source after measurement. The
+likely cost is inside the new kernel variant itself rather than the two MLX
+activation dispatches, so this is not a release path.
