@@ -440,6 +440,7 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
         if let cache {
             cache[1] = nextState
+            cache.offset += y.dim(1)
         }
 
         let flattenedY = y.flattened(start: 2)
