@@ -1019,6 +1019,62 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!rendered.contains("<think>"))
     }
 
+    @Test("LFM2 fallback repeats preserving-newlines required tool value after history")
+    func lfm2FallbackRepeatsPreservingNewlinesRequiredToolValueAfterHistory() throws {
+        let rendered = try Template(ChatTemplateFallbacks.lfm2ToolMinimal).renderDSV4([
+            "messages": [
+                [
+                    "role": "user",
+                    "content": "Use the line_count tool on exactly this text, preserving newlines:\nalpha\nbeta\ngamma",
+                ],
+                [
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        [
+                            "id": "call_lines",
+                            "type": "function",
+                            "function": [
+                                "name": "line_count",
+                                "arguments": ["text": "alpha\nbeta\ngamma"],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                    ],
+                ] as [String: any Sendable],
+                ["role": "tool", "tool_call_id": "call_lines", "content": #"{"lines":3}"#],
+                [
+                    "role": "user",
+                    "content": "Answer visibly in one short sentence: how many lines were counted? Do not call a tool.",
+                ],
+                ["role": "assistant", "content": "\nThere were three lines counted."],
+                [
+                    "role": "user",
+                    "content": "Now use line_count on exactly this new text, preserving newlines:\none\ntwo",
+                ],
+            ],
+            "tools": [lineCountToolSpec()],
+            "bos_token": "<|startoftext|>",
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+            "tool_choice": "required",
+            "tool_choice_name": "line_count",
+        ])
+
+        let finalUser = #"Now use line_count on exactly this new text, preserving newlines:\none\ntwo"#
+        let finalUserRange = rendered.range(of: finalUser)
+        #expect(finalUserRange != nil)
+        let afterFinalUser = rendered[finalUserRange!.upperBound...]
+
+        #expect(!rendered.contains("Use the line_count tool on exactly this text, preserving newlines:\nalpha\nbeta\ngamma"))
+        #expect(!rendered.contains(#"{"lines":3}"#))
+        #expect(!rendered.contains("There were three lines counted."))
+        #expect(afterFinalUser.contains(#"<|tool_call_start|>["line_count", {"text":"one\ntwo"}]<|tool_call_end|>"#))
+        #expect(afterFinalUser.contains(#"the exact `text` value encoded with \n escapes is: one\ntwo"#))
+        #expect(afterFinalUser.contains("This value contains exactly 1 line break(s)."))
+        #expect(afterFinalUser.contains("Do not omit `text`"))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
+    }
+
     @Test("LFM2 template shim only engages stamped LFM tool bundles")
     func lfm2TemplateShimOnlyEngagesStampedToolBundles() throws {
         let fm = FileManager.default
