@@ -589,20 +589,27 @@ struct CacheCoordinatorTopologyFocusedTests {
 
     @Test("Known unsafe required-tool rows skip disk-backed prompt seed boundary")
     func knownUnsafeRequiredToolRowsSkipDiskBackedPromptSeedBoundary() throws {
-        let source = try String(
+        let batchSource = try String(
             contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
             encoding: .utf8)
+        let evaluateSource = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
 
-        #expect(source.contains("shouldSkipDiskBackedToolPromptSeedBoundary"))
-        #expect(source.contains("slot.disablesGeneratedCacheBoundary"))
-        #expect(source.contains(#"modelName.contains("lfm2.5")"#))
-        #expect(source.contains(#"modelName.contains("mxfp8")"#))
-        #expect(source.contains(#"modelName.contains("gemma-4")"#))
-        #expect(source.contains(#"modelName.contains("mxfp4")"#))
-        #expect(source.contains("!shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)"))
-        #expect(source.contains("shouldDisableDiskBackedRequiredToolRestore"))
-        #expect(source.contains("Skipped disk-backed required-tool cache restore"))
-        #expect(source.contains("Skipped disk-backed tool prompt seed boundary"))
+        #expect(batchSource.contains("shouldSkipDiskBackedToolPromptSeedBoundary"))
+        #expect(batchSource.contains("slot.disablesGeneratedCacheBoundary"))
+        #expect(batchSource.contains(#"modelName.contains("lfm2.5")"#))
+        #expect(batchSource.contains(#"modelName.contains("mxfp8")"#))
+        #expect(batchSource.contains(#"modelName.contains("gemma-4")"#))
+        #expect(batchSource.contains(#"modelName.contains("mxfp4")"#))
+        #expect(batchSource.contains("!shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)"))
+        #expect(batchSource.contains("shouldDisableDiskBackedRequiredToolRestore"))
+        #expect(batchSource.contains("disableDiskBackedRequiredToolRestore: disableDiskBackedRequiredToolRestore"))
+        #expect(batchSource.contains("Skipped disk-backed required-tool cache restore"))
+        #expect(batchSource.contains("Skipped disk-backed tool prompt seed boundary"))
+        #expect(evaluateSource.contains("disableDiskBackedRequiredToolRestore"))
+        #expect(evaluateSource.contains("TokenIterator: skipped disk-backed required-tool cache restore"))
+        #expect(evaluateSource.contains("requiresDiskBackedRestore && disableDiskBackedRequiredToolRestore"))
     }
 
     @Test("KV policy changes dynamic cache salt")

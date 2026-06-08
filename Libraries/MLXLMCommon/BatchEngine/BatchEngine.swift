@@ -810,7 +810,18 @@ public actor BatchEngine {
     }
 
     private func shouldSkipDiskBackedToolPromptSeedBoundary(for slot: BatchSlot) -> Bool {
-        guard slot.disablesGeneratedCacheBoundary else { return false }
+        shouldSkipDiskBackedToolPromptSeedBoundary(
+            toolSchemas: slot.originalInput.toolSchemas,
+            disablesGeneratedCacheBoundary: slot.disablesGeneratedCacheBoundary)
+    }
+
+    private func shouldSkipDiskBackedToolPromptSeedBoundary(
+        toolSchemas: [ToolSpec]?,
+        disablesGeneratedCacheBoundary: Bool
+    ) -> Bool {
+        guard disablesGeneratedCacheBoundary || toolSchemas?.isEmpty == false else {
+            return false
+        }
         let modelName = context.configuration.name.lowercased()
         if modelName.contains("lfm2.5") && modelName.contains("mxfp8") {
             return true
@@ -822,7 +833,18 @@ public actor BatchEngine {
     }
 
     private func shouldDisableDiskBackedRequiredToolRestore(for slot: BatchSlot) -> Bool {
-        guard slot.disablesGeneratedCacheBoundary else { return false }
+        shouldDisableDiskBackedRequiredToolRestore(
+            toolSchemas: slot.originalInput.toolSchemas,
+            disablesGeneratedCacheBoundary: slot.disablesGeneratedCacheBoundary)
+    }
+
+    private func shouldDisableDiskBackedRequiredToolRestore(
+        toolSchemas: [ToolSpec]?,
+        disablesGeneratedCacheBoundary: Bool
+    ) -> Bool {
+        guard disablesGeneratedCacheBoundary || toolSchemas?.isEmpty == false else {
+            return false
+        }
         let modelName = context.configuration.name.lowercased()
         return modelName.contains("lfm2.5") && modelName.contains("mxfp8")
     }
@@ -834,6 +856,9 @@ public actor BatchEngine {
     ) -> AsyncStream<Generation> {
         let promptTokenCount = input.text.tokens.size
         let toolSchemas = input.toolSchemas
+        let disableDiskBackedRequiredToolRestore = shouldDisableDiskBackedRequiredToolRestore(
+            toolSchemas: toolSchemas,
+            disablesGeneratedCacheBoundary: false)
         let fastPathID = UUID()
         var soloParameters = parameters
         soloParameters.extraStopStrings = mergeStopStrings(
@@ -885,7 +910,8 @@ public actor BatchEngine {
                     model: context.model,
                     cache: nil,
                     parameters: soloParameters,
-                    cacheCoordinator: cacheCoordinator)
+                    cacheCoordinator: cacheCoordinator,
+                    disableDiskBackedRequiredToolRestore: disableDiskBackedRequiredToolRestore)
                 (sourceStream, generationTask) = generateTask(
                     promptTokenCount: promptTokenCount,
                     modelConfiguration: context.configuration,
