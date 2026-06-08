@@ -984,10 +984,16 @@ public struct JangLoader: Sendable {
     private static func templateAlreadyMatchesZayaVLToolAware(_ template: String) -> Bool {
         isVisionChatTemplate(template)
             && template.contains("zyphra_tool_call")
+            && template.contains("required_tool_choice")
+            && template.contains("tool_choice")
+            && template.contains("The current assistant response MUST be a tool call.")
     }
 
     private static func templateAlreadyMatchesZayaToolAware(_ template: String) -> Bool {
         template.contains("zyphra_tool_call")
+            && template.contains("required_tool_choice")
+            && template.contains("tool_choice")
+            && template.contains("The current assistant response MUST be a tool call.")
     }
 
     private static func templateAlreadyMatchesLFM2ToolAware(_ template: String) -> Bool {

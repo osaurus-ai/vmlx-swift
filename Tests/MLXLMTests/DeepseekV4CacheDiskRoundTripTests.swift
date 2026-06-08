@@ -142,4 +142,64 @@ struct DeepseekV4CacheDiskRoundTripTests {
         #expect(wrapper?.rotating === v4.local,
             "wrapper.rotating must return the exact inner RotatingKVCache")
     }
+
+    @Test("Gemma-style mixed rotating/simple cache disk round-trips tensor state")
+    func gemmaStyleMixedRotatingSimpleRoundTripPreservesTensorState() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
+        let sliding = RotatingKVCache(maxSize: 16, keep: 0)
+        Self.fillRotating(sliding)
+
+        let full = KVCacheSimple()
+        let fullKeys = MLXArray.ones([1, 1, 5, 8]) * 5.0
+        let fullValues = MLXArray.ones([1, 1, 5, 8]) * 6.0
+        full.state = [fullKeys, fullValues]
+
+        let sink = RotatingKVCache(maxSize: 32, keep: 4)
+        Self.fillRotating(sink)
+
+        let caches: [any KVCache] = [sliding, full, sink]
+        eval(caches.flatMap(\.state))
+        let encoded = TQDiskSerializer.serialize(cache: caches)
+
+        var restored: [any KVCache] = [
+            RotatingKVCache(maxSize: 16, keep: 0),
+            KVCacheSimple(),
+            RotatingKVCache(maxSize: 32, keep: 4),
+        ]
+        let restoredTokens = restoreFromDiskArrays(encoded, into: &restored)
+        eval(restored.flatMap(\.state))
+        #expect(restoredTokens == sliding.offset)
+
+        guard let restoredSliding = restored[0] as? RotatingKVCache,
+              let restoredFull = restored[1] as? KVCacheSimple,
+              let restoredSink = restored[2] as? RotatingKVCache
+        else {
+            Issue.record("Restored cache types changed unexpectedly")
+            return
+        }
+
+        assertStateEqual(restoredSliding.state, sliding.state, label: "sliding")
+        #expect(restoredSliding.metaState == sliding.metaState)
+        assertStateEqual(restoredFull.state, full.state, label: "full")
+        assertStateEqual(restoredSink.state, sink.state, label: "sink")
+        #expect(restoredSink.metaState == sink.metaState)
+    }
+
+    private func assertStateEqual(
+        _ actual: [MLXArray],
+        _ expected: [MLXArray],
+        label: String,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) {
+        #expect(actual.count == expected.count, "\(label) state array count", sourceLocation: sourceLocation)
+        guard actual.count == expected.count else { return }
+        for (index, pair) in zip(actual, expected).enumerated() {
+            #expect(pair.0.shape == pair.1.shape,
+                "\(label) state \(index) shape", sourceLocation: sourceLocation)
+            #expect(allClose(pair.0, pair.1).item(Bool.self),
+                "\(label) state \(index) values", sourceLocation: sourceLocation)
+        }
+    }
 }

@@ -69,4 +69,45 @@ final class LagunaChatTemplateFallbackTests: XCTestCase {
         XCTAssertTrue(rendered.contains("<user>\nagain\n</user>\n"), rendered.debugDescription)
         XCTAssertTrue(rendered.hasSuffix("<assistant>\n</think>\n"), rendered.debugDescription)
     }
+
+    func testLagunaRequiredToolChoiceRendersFunctionCallOnlyContract() throws {
+        let template = try Template(ChatTemplateFallbacks.lagunaMinimal)
+        let rendered = try template.renderLaguna([
+            "messages": [
+                [
+                    "role": "user",
+                    "content": "Use the line_count tool on this exact text: red\ngreen\nblue",
+                ]
+            ],
+            "tools": [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "line_count",
+                        "description": "Count newline-separated text lines.",
+                        "parameters": [
+                            "type": "object",
+                            "properties": ["text": ["type": "string"]],
+                            "required": ["text"],
+                        ],
+                    ],
+                ]
+            ],
+            "tool_choice": "required",
+            "tool_choice_name": "line_count",
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+        ])
+
+        XCTAssertTrue(rendered.contains("<available_tools>"), rendered.debugDescription)
+        XCTAssertTrue(rendered.contains("\"name\":\"line_count\""), rendered.debugDescription)
+        XCTAssertTrue(rendered.contains("<tool_call>function-name"), rendered.debugDescription)
+        XCTAssertTrue(rendered.contains("<arg_key>argument-key</arg_key>"), rendered.debugDescription)
+        XCTAssertTrue(rendered.contains("<arg_value>value-of-argument-key</arg_value>"), rendered.debugDescription)
+        XCTAssertTrue(rendered.contains("The current assistant response MUST be a function call."), rendered.debugDescription)
+        XCTAssertTrue(rendered.contains("Use the `line_count` function."), rendered.debugDescription)
+        XCTAssertTrue(rendered.contains("Include every required argument exactly as requested"), rendered.debugDescription)
+        XCTAssertFalse(rendered.contains("Reply with prose"), rendered.debugDescription)
+        XCTAssertTrue(rendered.hasSuffix("<assistant>\n</think>\n"), rendered.debugDescription)
+    }
 }

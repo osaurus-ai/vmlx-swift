@@ -538,7 +538,7 @@ run_batch_stack() {
   if qwen_tool_probe_applicable "$dir"; then
     run_runbench "${name}.qwen_multiturn_tool" \
       BENCH_MODEL="$dir" BENCH_QWEN_MULTITURN_TOOL=1 \
-      BENCH_MAX_TOKENS="$max_tokens" || true
+      BENCH_MAX_TOKENS="$(matrix_prod_max_tokens)" || true
   fi
   run_runbench "${name}.batch_disk_restore" \
     BENCH_MODEL="$dir" BENCH_BATCH_DISK_RESTORE=1 \

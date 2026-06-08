@@ -660,6 +660,88 @@ private let kGatherTQOffsetsScoredSource = """
     }
 """
 
+private let kGatherTQScoredSource = """
+    uint global_x = thread_position_in_grid.x;
+    uint token_idx = thread_position_in_grid.y;
+
+    uint out_group = global_x / 32u;
+    uint lane = global_x % 32u;
+    uint out_idx_0 = out_group * 20u;
+
+    uint K = meta[0];
+    uint in_features = meta[1];
+    uint out_features = meta[2];
+    uint packed_cols = meta[3];
+    uint bits = meta[4];
+
+    if (out_idx_0 >= out_features) return;
+
+    uint vals_per_u32 = 32u / bits;
+    uint mask = (1u << bits) - 1u;
+
+    float acc[20];
+    #pragma unroll
+    for (uint o = 0; o < 20; o++) acc[o] = 0.0f;
+
+    uint n_outs = 20u;
+    if (out_idx_0 + 20u > out_features) n_outs = out_features - out_idx_0;
+
+    for (uint k_idx = 0u; k_idx < K; k_idx++) {
+        uint row_idx = token_idx * K + k_idx;
+        uint expert = rhs_indices[row_idx];
+        uint packed_base = expert * out_features * packed_cols;
+        uint norm_base = expert * out_features;
+
+        float part[20];
+        #pragma unroll
+        for (uint o = 0; o < 20; o++) part[o] = 0.0f;
+
+        uint x_offset = row_idx * in_features;
+        for (uint pack_idx = lane; pack_idx < packed_cols; pack_idx += 32u) {
+            uint i_base = pack_idx * vals_per_u32;
+            uint pv[20];
+            #pragma unroll
+            for (uint o = 0; o < 20; o++) {
+                pv[o] = (o < n_outs)
+                    ? packed[packed_base + (out_idx_0 + o) * packed_cols + pack_idx]
+                    : 0u;
+            }
+            for (uint k = 0; k < vals_per_u32; k++) {
+                uint i = i_base + k;
+                if (i >= in_features) break;
+                float xv = static_cast<float>(x_rot[x_offset + i]);
+                uint shift = k * bits;
+                #pragma unroll
+                for (uint o = 0; o < 20; o++) {
+                    float w = codebook[(pv[o] >> shift) & mask];
+                    part[o] += xv * w;
+                }
+            }
+        }
+
+        #pragma unroll
+        for (uint o = 0; o < 20; o++) {
+            part[o] = simd_sum(part[o]);
+        }
+
+        if (lane == 0) {
+            float score = static_cast<float>(scores[row_idx]);
+            for (uint o = 0; o < n_outs; o++) {
+                uint oi = out_idx_0 + o;
+                float n_v = static_cast<float>(norms[norm_base + oi]);
+                acc[o] += part[o] * n_v * score;
+            }
+        }
+    }
+
+    if (lane == 0) {
+        uint base_off = token_idx * out_features;
+        for (uint o = 0; o < n_outs; o++) {
+            out[base_off + out_idx_0 + o] = acc[o];
+        }
+    }
+"""
+
 private let kFusedSwiGLUSlots8Source = """
     #define SLOT8_U32(slot, a0, a1, a2, a3, a4, a5, a6, a7, idx) \\
         ((slot) == 0u ? (a0)[idx] : \\
@@ -934,6 +1016,16 @@ public enum JANGTQKernelLibrary {
         ],
         outputNames: ["out"],
         source: kGatherTQOffsetsScoredSource
+    )
+
+    public static let gatherTQScored: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "jangtq_gather_tq_scored_matmul",
+        inputNames: [
+            "x_rot", "packed", "norms",
+            "codebook", "rhs_indices", "scores", "meta",
+        ],
+        outputNames: ["out"],
+        source: kGatherTQScoredSource
     )
 
     public static let fusedGateUpSwiGLUSlots8: MLXFast.MLXFastKernel = MLXFast.metalKernel(
@@ -1475,6 +1567,38 @@ public enum JANGTQKernels {
             grid: (gridX, nDispatches, 1),
             threadGroup: (tgX, 1, 1),
             outputShapes: [[nDispatches, outFeatures]],
+            outputDTypes: [.float32]
+        )
+        return arr[0]
+    }
+
+    /// Gather TQ matmul in top-k mode with router-score reduction fused into
+    /// the kernel. `xRot` has one row per selected slot while the output is
+    /// reduced to `(batchTokens, outFeatures)`.
+    public static func gatherTQTopKScored(
+        xRot: MLXArray,
+        packed: MLXArray, norms: MLXArray,
+        codebook: MLXArray, rhsIndices: MLXArray,
+        scores: MLXArray,
+        batchTokens: Int, K: Int,
+        inFeatures: Int, outFeatures: Int, bits: Int = 2
+    ) -> MLXArray {
+        let valsPerU32 = 32 / bits
+        let packedCols = (inFeatures + valsPerU32 - 1) / valsPerU32
+        let meta = cachedJANGTQMeta(kind: "gatherTQTopKScored", values: [
+            UInt32(K), UInt32(inFeatures), UInt32(outFeatures),
+            UInt32(packedCols), UInt32(bits),
+        ])
+        let opt = 20
+        let outGroups = (outFeatures + opt - 1) / opt
+        let gridX = outGroups * 32
+        let tgX = min(gridX, 256)
+        let arr = JANGTQKernelLibrary.gatherTQScored(
+            [xRot, packed, norms, codebook, rhsIndices, scores, meta],
+            template: nil,
+            grid: (gridX, batchTokens, 1),
+            threadGroup: (tgX, 1, 1),
+            outputShapes: [[batchTokens, outFeatures]],
             outputDTypes: [.float32]
         )
         return arr[0]

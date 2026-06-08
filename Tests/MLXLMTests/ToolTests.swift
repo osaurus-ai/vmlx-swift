@@ -335,6 +335,18 @@ struct ToolTests {
         #expect(toolCall.function.arguments["text"] == .string("red\ngreen\nblue"))
     }
 
+    @Test("LFM2 parser accepts observed bracketed name and JSON arguments array")
+    func lfm2ParserAcceptsObservedBracketedNameAndJSONArgumentsArray() throws {
+        let tools = lineCountTools()
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let toolCall = try #require(
+            parser.parse(content: #"[ "line_count", { "text": "alpha\nbeta\ngamma" } ]"#, tools: tools))
+
+        #expect(toolCall.function.name == "line_count")
+        #expect(toolCall.function.arguments["text"] == .string("alpha\nbeta\ngamma"))
+    }
+
     @Test("LFM2 processor accepts tool-keyed JSON object envelope at EOS")
     func lfm2ProcessorAcceptsToolKeyedJSONObjectEnvelopeAtEOS() throws {
         let tools: [ToolSpec] = [
@@ -819,7 +831,7 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "gemma4_text") == .gemma4)
         #expect(ToolCallFormat.infer(from: "gemma3") == .gemma)
         #expect(ToolCallFormat.infer(from: "gemma3_text") == .gemma)
-        #expect(ToolCallFormat.infer(from: "gemma3n") == .gemma)
+        #expect(ToolCallFormat.infer(from: "gemma3n") == nil)
     }
 
     // MARK: - Kimi K2 Format Tests

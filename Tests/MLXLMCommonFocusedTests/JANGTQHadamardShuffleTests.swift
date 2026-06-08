@@ -403,6 +403,70 @@ final class JANGTQHadamardShuffleTests: XCTestCase {
         }
     }
 
+    func testStackedGatherScoredMatchesStackedGatherScoreSum() {
+        MLX.Device.withDefaultDevice(.gpu) {
+            let bits = 2
+            let inFeatures = 8
+            let outFeatures = 3
+            let batchTokens = 2
+            let k = 2
+            let packedRows: [[UInt32]] = [
+                [0, 1, 2, 3, 0, 1, 2, 3],
+                [3, 2, 1, 0, 3, 2, 1, 0],
+                [1, 1, 2, 2, 3, 3, 0, 0],
+                [2, 0, 2, 0, 2, 0, 2, 0],
+                [0, 3, 0, 3, 1, 2, 1, 2],
+                [3, 3, 2, 2, 1, 1, 0, 0],
+            ].map { [packJANGTQCodes($0, bits: bits)] }
+            let packedStack = MLXArray(packedRows.flatMap { $0 })
+                .reshaped([2, outFeatures, 1])
+            let normsStack = MLXArray([
+                Float(0.5), Float(1.0), Float(1.5),
+                Float(1.25), Float(0.75), Float(0.25),
+            ]).reshaped([2, outFeatures])
+            let xRot = MLXArray([
+                Float(1), Float(2), Float(-1), Float(0.5),
+                Float(3), Float(-2), Float(0.25), Float(1.5),
+                Float(-1.5), Float(0.75), Float(2.5), Float(-0.5),
+                Float(1.25), Float(0.0), Float(-2.25), Float(3.5),
+                Float(0.5), Float(-1.25), Float(1.75), Float(2.25),
+                Float(-3), Float(0.5), Float(1.0), Float(-0.75),
+                Float(2.0), Float(1.25), Float(-0.25), Float(-1.0),
+                Float(0.0), Float(1.5), Float(-2.0), Float(0.25),
+            ]).reshaped([batchTokens * k, inFeatures])
+            let codebook = MLXArray([Float(-1.0), Float(-0.25), Float(0.5), Float(1.75)])
+            let rhsIndices = MLXArray([UInt32(1), UInt32(0), UInt32(0), UInt32(1)])
+            let scores = MLXArray([Float(0.75), Float(0.25), Float(0.4), Float(0.6)])
+                .reshaped([batchTokens, k])
+
+            let gathered = JANGTQKernels.gatherTQ(
+                xRot: xRot,
+                packed: packedStack,
+                norms: normsStack,
+                codebook: codebook,
+                rhsIndices: rhsIndices,
+                nRows: batchTokens * k,
+                inFeatures: inFeatures,
+                outFeatures: outFeatures,
+                bits: bits)
+                .reshaped([batchTokens, k, outFeatures])
+            let expected = (gathered * scores[.ellipsis, .newAxis]).sum(axis: -2)
+            let actual = JANGTQKernels.gatherTQTopKScored(
+                xRot: xRot,
+                packed: packedStack,
+                norms: normsStack,
+                codebook: codebook,
+                rhsIndices: rhsIndices,
+                scores: scores.reshaped([-1]),
+                batchTokens: batchTokens,
+                K: k,
+                inFeatures: inFeatures,
+                outFeatures: outFeatures,
+                bits: bits)
+            assertClose(actual, expected, tolerance: 1e-5)
+        }
+    }
+
     func testSlots8GatherScoredMatchesStackedGatherForDecodeToken() {
         MLX.Device.withDefaultDevice(.gpu) {
             let bits = 2

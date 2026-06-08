@@ -135,8 +135,52 @@ internal final class NemotronHJANGTQSwitchMLP: Module, NemotronHSwitchMLPLayer {
     }
 
     func weightedDecode(_ x: MLXArray, _ indices: MLXArray, scores: MLXArray) -> MLXArray? {
-        let y = callAsFunction(x, indices)
-        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        guard let signsIn = JANGTQRuntimeCache.shared.signs(
+            inFeatures: inputDims, seed: fc1.mxtqSeed)
+        else { fatalError("JANGTQ sidecar missing signs.\(inputDims).\(fc1.mxtqSeed)") }
+        guard let signsInter = JANGTQRuntimeCache.shared.signs(
+            inFeatures: hiddenDims, seed: fc2.mxtqSeed)
+        else { fatalError("JANGTQ sidecar missing signs.\(hiddenDims).\(fc2.mxtqSeed)") }
+        guard let cbIn = JANGTQRuntimeCache.shared.codebook(
+            inFeatures: inputDims, bits: fc1.bits)
+        else { fatalError("JANGTQ sidecar missing codebook.\(inputDims).\(fc1.bits)") }
+        guard let cbInter = JANGTQRuntimeCache.shared.codebook(
+            inFeatures: hiddenDims, bits: fc2.bits)
+        else { fatalError("JANGTQ sidecar missing codebook.\(hiddenDims).\(fc2.bits)") }
+
+        let totalTokens = x.size / inputDims
+        let kSlots = indices.dim(-1)
+        guard totalTokens > 0, kSlots > 0 else {
+            return callAsFunction(x, indices)
+                .asType(x.dtype)
+        }
+
+        let xPerToken = x.reshaped([totalTokens, inputDims])
+        let idxFlat = indices.reshaped([-1]).asType(.uint32)
+        let scoreFlat = stopGradient(scores.reshaped([-1]))
+
+        let xRot1 = JANGTQKernels.hadamardRotate(
+            xPerToken, signs: signsIn, dim: inputDims)
+        var h = JANGTQKernels.gatherTQTopK(
+            xRot: xRot1, packed: fc1.packed, norms: fc1.norms,
+            codebook: cbIn, rhsIndices: idxFlat,
+            batchTokens: totalTokens, K: kSlots,
+            inFeatures: inputDims, outFeatures: hiddenDims, bits: fc1.bits)
+
+        let relu = MLX.maximum(h, MLXArray(0, dtype: h.dtype))
+        h = relu * relu
+
+        let xRot2 = JANGTQKernels.hadamardRotate(
+            h, signs: signsInter, dim: hiddenDims)
+        let reduced = JANGTQKernels.gatherTQTopKScored(
+            xRot: xRot2, packed: fc2.packed, norms: fc2.norms,
+            codebook: cbInter, rhsIndices: idxFlat, scores: scoreFlat,
+            batchTokens: totalTokens, K: kSlots,
+            inFeatures: hiddenDims, outFeatures: inputDims, bits: fc2.bits)
+
+        var outShape = Array(indices.shape.dropLast())
+        outShape.append(inputDims)
+        return reduced.reshaped(outShape).asType(x.dtype)
     }
 }
 

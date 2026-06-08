@@ -801,3 +801,207 @@ Result:
 
 Current verdict is unchanged: this closes a cache-wrapper correctness gap, but
 does not claim a new heavy live model row or a new low-footprint speed result.
+
+## Follow-Up Trace - 2026-06-07 22:25 PDT
+
+Rejected a Swift `MLX.compile` micrograph experiment for Nemotron JANGTQ
+`SwitchMLP`.
+
+- Hypothesis: Python's compiled `fc1 -> relu² -> fc2` SwitchMLP closure might
+  explain the remaining Swift/Python decode gap.
+- Swift implementation tested: opt-in `JANGTQ_ENABLE_NEMOTRON_SWITCHMLP_COMPILE`
+  path that compiled the same Hadamard -> `gatherTQTopK` -> ReLU² -> Hadamard
+  -> `gatherTQ` graph for decode-shape `totalTokens == 1`.
+- Smoke log:
+  `/tmp/vmlx-nemotron-switchmlp-compile-smoke-20260607-222317.log`
+  produced coherent text at `7.4 tok/s`, but the row was only 8 tokens and
+  included compile/startup effects.
+- Sustained log:
+  `/tmp/vmlx-nemotron-switchmlp-compile-128tok-20260607-222513.log`
+  produced coherent 128-token output with bundle defaults, no loop/leak, and
+  low footprint, but measured only `6.4 tok/s` with `tail_tokps_est=6.6`.
+- Baseline `cee099d` sustained row remains faster:
+  `/tmp/vmlx-nemotron-cee099d-sustained-128tok-20260607-221127.log`
+  measured `6.7 tok/s` with `tail_tokps_est=6.9`.
+
+Result: do not add a compiled SwitchMLP flag or make this path default. The
+experiment was removed from source after measurement. The remaining speed gap is
+still in model-forward dispatch cost, with the next useful target likely a real
+ReLU²-specific TQ kernel fusion or more granular Mamba subcomponent proof, not
+Swift `MLX.compile` around the existing kernel calls.
+
+Rejected a first-projection `gatherTQTopKRelu2` kernel fusion experiment.
+
+- Hypothesis: fusing Nemotron's `maximum(h, 0) * maximum(h, 0)` into the first
+  routed TQ gather would remove two MLX dispatches per MoE layer and improve
+  decode without changing math.
+- Focused parity test passed before the live row:
+  `JANGTQHadamardShuffleTests/testGatherTopKRelu2MatchesSeparateActivation`
+  matched separate `gatherTQTopK` + ReLU² at `1e-5`.
+- Sustained log:
+  `/tmp/vmlx-nemotron-relu2-fused-128tok-20260607-223310.log`
+  produced coherent 128-token output with bundle defaults, no loop/leak, and
+  low footprint, but regressed to `3.2 tok/s` with `tail_tokps_est=3.3`.
+
+Result: the fused ReLU² gather was removed from source after measurement. The
+likely cost is inside the new kernel variant itself rather than the two MLX
+activation dispatches, so this is not a release path.
+
+## Follow-Up Trace - 2026-06-07 22:44 PDT
+
+Kept a default-off Mamba subcomponent profiler for the next Nemotron speed
+trace. This does not change normal runtime behavior; it only adds synchronized
+timing when `VMLINUX_NEMOTRON_LAYER_PROFILE=1` or
+`VMLINUX_NEMOTRON_LAYER_PROFILE=1` is set.
+
+Focused verification:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun swift test \
+  --filter NemotronHJANGTQDispatchFocusedTests/testUltraRuntimeFastPathControlsAreSourceWired \
+  --jobs 1 --no-parallel
+```
+
+Result: passed, 1 selected test.
+
+Live diagnostic row:
+
+- `/tmp/vmlx-nemotron-mamba-subprofile-20260607-224427.log`
+- Model:
+  `/Users/eric/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-JANGTQ_1L`
+- Bundle defaults were used:
+  `samplingSource=bundle-defaults temp=1.00 topP=0.95 topK=0 rep=nil`
+- Output was coherent for the short row:
+  `"The ocean waves are"`
+- `stop=length`, `unclosedReasoning=NO`, `loop=NO`, `leaks=none`
+- Profiling overhead made this a diagnostic-only row:
+  `genTokens=4 genSec=0.802 tokps=5.0`
+
+Steady decode profile after the first profiled token:
+
+- `moe.mixer`: about `115-120 ms/token`, with `moe.switch_mlp` about
+  `53-56 ms/token` and `moe.shared` about `26-28 ms/token`.
+- `mamba.mixer`: about `98-99 ms/token`, with `mamba.in_proj` about
+  `35-36 ms/token`, `mamba.out_proj` about `22 ms/token`,
+  `mamba.norm` about `21-22 ms/token`, and `mamba.ssm_update` about
+  `15-16 ms/token`.
+- `attention.mixer`: about `9-10 ms/token`.
+
+Verdict: the remaining Nemotron Ultra decode ceiling is not a sampler,
+template, parser, generation-config, or cache-hit issue in this row. The
+measured cost is still model-forward work split across MoE/SwitchMLP and Mamba
+projection/SSM/norm. The accepted release state remains the measured
+`cee099d` baseline plus the hybrid SSM companion-cache fix; this profiler is
+only there to make the next speed patch measurable.
+
+## Current-Head Recheck - 2026-06-07 23:46 PDT
+
+Rechecked the current PR head after the default-off weighted-MoE experiments and
+Mamba subprofile diagnostics.
+
+- Worktree: `/private/tmp/vmlx-nemo-ultra-runtime`
+- Commit: `ef15137a47fa5cda7329c840366ecc02e345d7ed`
+- Model:
+  `/Users/eric/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-JANGTQ_1L`
+
+Low-footprint mmap speed row:
+
+```sh
+BENCH_MODEL=/Users/eric/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-JANGTQ_1L \
+BENCH_PERF=1 \
+BENCH_PERF_VARIANT=current_head_mmap_bundle_defaults \
+BENCH_MAX_TOKENS=32 \
+BENCH_PERF_WARMUP=0 \
+BENCH_PERF_RUNS=1 \
+BENCH_PERF_USE_GENERATION_CONFIG=1 \
+BENCH_PERF_SEED=42 \
+BENCH_PERF_MMAP=1 \
+.build/release/RunBench
+```
+
+Artifact:
+`/tmp/vmlx-nemotron-current-mmap-perf-ef15137-20260607-234536.log`
+
+Result:
+
+- `tokps_median=6.7`
+- `tail_tokps_est=7.7`
+- `peak_footprint_mib=1924`
+- `samplingSource=bundle-defaults`
+- `temp=1.00 topP=0.95 topK=0 rep=nil`
+- `stop=length`, `unclosedReasoning=NO`, `loop=NO`, `leaks=none`
+
+Hybrid SSM growing-chat cache row:
+
+```sh
+BENCH_MODEL=/Users/eric/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-JANGTQ_1L \
+BENCH_GROWING_CHAT_CACHE=1 \
+BENCH_GROWING_MMAP=1 \
+BENCH_GROWING_BUNDLE_DEFAULTS=1 \
+BENCH_GROWING_SEED=42 \
+BENCH_MAX_TOKENS=48 \
+BENCH_GROWING_CACHE_DIR=/tmp/vmlx-nemotron-current-growing-cache-ef15137-20260607-234607 \
+BENCH_KEEP_GROWING_CACHE=1 \
+.build/release/RunBench
+```
+
+Artifact:
+`/tmp/vmlx-nemotron-current-growing-mmap-cache-ef15137-20260607-234607.log`
+
+Result:
+
+- Load mode: `mmap`
+- Tool format: `nemotron`
+- Reasoning stamp: `deepseek_r1`
+- Sampling: `bundle-defaults`, `temp=1.000 topP=0.950 topK=0 rep=nil`
+- Cache topology:
+  `layers=60,kvLayers=12,mambaLayers=48,companion=ssm,restore=disk-backed`
+- Prompt-boundary salted probe hit: `matched=30/31`
+- Post-answer salted probe hit: `matched=35/36`
+- Nil-salt probes missed, proving cache-salt isolation.
+- Before turn 2:
+  `disk{hits=2,misses=8,stores=2}` and
+  `ssm{hits=2,misses=0,reDerives=0}`
+- After turn 2:
+  `disk{hits=4,misses=11,stores=4}` and
+  `ssm{hits=4,misses=0,reDerives=0}`
+- Turn 2 answered from the previous assistant history with
+  `vmlx-cache-green`; no raw role marker leak.
+
+Resident speed row:
+
+```sh
+BENCH_MODEL=/Users/eric/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-JANGTQ_1L \
+BENCH_PERF=1 \
+BENCH_PERF_VARIANT=current_head_resident_bundle_defaults \
+BENCH_MAX_TOKENS=32 \
+BENCH_PERF_WARMUP=0 \
+BENCH_PERF_RUNS=1 \
+BENCH_PERF_USE_GENERATION_CONFIG=1 \
+BENCH_PERF_SEED=42 \
+BENCH_PERF_MMAP=0 \
+.build/release/RunBench
+```
+
+Artifact:
+`/tmp/vmlx-nemotron-current-resident-perf-ef15137-20260607-234626.log`
+
+Result:
+
+- `tokps_median=9.8`
+- `tail_tokps_est=11.5`
+- `peak_footprint_mib=101574`
+- `samplingSource=bundle-defaults`
+- `temp=1.00 topP=0.95 topK=0 rep=nil`
+- `stop=length`, `unclosedReasoning=NO`, `loop=NO`, `leaks=none`
+
+Verdict:
+
+- Resident current-head Swift decode clears the 8-10 tok/s class.
+- Low-footprint mmap current-head decode is coherent and cache-correct but still
+  below the 8-10 tok/s release target. Do not describe mmap/JangPress as fixed
+  to 8-10 tok/s from this row.
+- Generation config, reasoning parser, tool format, hybrid SSM companion cache,
+  disk L2 restore, and cache-salt isolation are not the remaining blocker in
+  these rows. The remaining low-footprint gap is model-forward speed.

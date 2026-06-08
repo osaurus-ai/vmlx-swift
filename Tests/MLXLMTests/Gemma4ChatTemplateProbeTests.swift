@@ -386,14 +386,31 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             "Assistant tool_call must render inline with Gemma's invoke syntax. Got: \(out)")
         XCTAssertTrue(out.contains("<|tool_response>response:get_weather{22°C, sunny}<tool_response|>"),
             "Tool response must render with Gemma's <|tool_response> wrapper. Got: \(out)")
-        XCTAssertTrue(out.contains(#"Required tool choice: the current assistant response must be exactly one <|tool_call>call:get_weather{ARGUMENT_NAME:<|"|>ARGUMENT_VALUE<|"|>}<tool_call|> and no prose."#),
+        XCTAssertTrue(out.contains("The current assistant response MUST be a function call."),
             "Required tool_choice must be represented in Gemma-4 native tool grammar. Got: \(out)")
+        XCTAssertTrue(out.contains(#"<|tool_call>call:FUNCTION_NAME{ARGUMENT_NAME:<|"|>ARGUMENT_VALUE<|"|>}<tool_call|>"#),
+            "Required tool_choice must show Gemma's native call shape. Got: \(out)")
+        XCTAssertFalse(out.contains("Required tool choice: the current assistant response must be exactly one"),
+            "File-backed Gemma template must not regress to the old generic required-tool sentence. Got: \(out)")
         XCTAssertTrue(out.hasSuffix("<|turn>model\n"),
             "Generation prompt must end with open model turn.")
     }
 
     func testGemma4WithToolsTemplateGroundsOsaurusRequiredLineCountText() throws {
-        let template = try Template(MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools)
+        var searchPath = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        var found: URL? = nil
+        for _ in 0..<6 {
+            let candidate = searchPath
+                .appendingPathComponent("Libraries/MLXLMCommon/ChatTemplates/Gemma4WithTools.jinja")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                found = candidate; break
+            }
+            searchPath = searchPath.deletingLastPathComponent()
+        }
+        guard let templateURL = found else {
+            throw XCTSkip("Gemma4WithTools.jinja not found.")
+        }
+        let template = try Template(String(contentsOf: templateURL, encoding: .utf8))
 
         let tools: [[String: Any]] = [
             [
@@ -429,9 +446,15 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
 
         XCTAssertTrue(out.contains("Use the `line_count` function."),
             "Single-tool required choice must infer the selected function. Got: \(out)")
+        XCTAssertTrue(out.contains("Do not add or remove whitespace or spaces after newlines"),
+            "Required line-count guidance must reject live space-mutated multiline args. Got: \(out)")
         XCTAssertTrue(out.contains(
-            "<|tool_call>call:line_count{text:<|\"|>red\ngreen\nblue<|\"|>}<tool_call|>"
-        ), "Required call shape must copy the exact multiline value. Got: \(out)")
+            "<|tool_call>call:line_count{text:<|\"|>red\\ngreen\\nblue<|\"|>}<tool_call|>"
+        ), "Required call shape must copy the exact multiline value with escaped newlines. Got: \(out)")
+        XCTAssertTrue(out.contains("Do not replace \\n with a physical newline"),
+            "Required line-count guidance must preserve native escaped-newline syntax. Got: \(out)")
+        XCTAssertFalse(out.contains("Use the line_count tool on this exact text: red\ngreen\nblue"),
+            "Required-tool turn should replace raw user prose with the exact native call shape. Got: \(out)")
     }
 
     /// Iter 52: the system-message branch must handle multi-part content

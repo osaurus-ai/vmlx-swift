@@ -30,6 +30,12 @@ struct Bench {
             .path
     }
 
+    private static func benchFailureExitCode(for error: Error) -> Int32 {
+        let code = (error as NSError).code
+        guard code > 0, code < 126 else { return 1 }
+        return Int32(code)
+    }
+
     static func main() async throws {
         setvbuf(stdout, nil, _IONBF, 0)
         FileHandle.standardError.write("[STDERR] Bench main() started\n".data(using: .utf8)!)
@@ -428,7 +434,7 @@ struct Bench {
                 try await runGrowingChatCacheReuse(modelPath: modelPath, maxNew: maxNew)
             } catch {
                 print("[BENCH_GROWING_CHAT_CACHE] error: \(String(reflecting: error))")
-                throw error
+                exit(benchFailureExitCode(for: error))
             }
             return
         }
@@ -615,7 +621,12 @@ struct Bench {
             return
         }
         if (env["BENCH_GROWING_CHAT_CACHE"] ?? "0") == "1" {
-            try await runGrowingChatCacheReuse(modelPath: modelPath, maxNew: maxNew)
+            do {
+                try await runGrowingChatCacheReuse(modelPath: modelPath, maxNew: maxNew)
+            } catch {
+                print("[BENCH_GROWING_CHAT_CACHE] error: \(String(reflecting: error))")
+                exit(benchFailureExitCode(for: error))
+            }
             return
         }
 
@@ -7082,7 +7093,7 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
     // prompt spends the whole token cap in the reasoning channel.
     let turns: [(
         label: String,
-        messages: [[String: any Sendable]],
+        messages: [Chat.Message],
         tools: [[String: any Sendable]]?,
         enableThinking: Bool,
         requiresToolCall: Bool
@@ -7090,7 +7101,7 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
         (
             "Turn 1 — thinking visible answer",
             [
-                ["role": "user", "content": "What is 7+8-11? Reply with just the number."]
+                .user("What is 7+8-11? Reply with just the number.")
             ],
             nil,
             true,
@@ -7099,8 +7110,7 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
         (
             "Turn 2 — structured tool call",
             [
-                ["role": "user", "content":
-                    "Call get_weather for location Tokyo. Emit only the tool call."]
+                .user("Call get_weather for location Tokyo. Emit only the tool call.")
             ],
             [weatherTool],
             false,
@@ -7109,7 +7119,7 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
         (
             "Turn 3 — thinking off visible answer",
             [
-                ["role": "user", "content": "Reply with exactly qwen-visible-ok."]
+                .user("Reply with exactly qwen-visible-ok.")
             ],
             nil,
             false,
@@ -7121,20 +7131,17 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
     var anyLeak = false
 
     for (idx, turn) in turns.enumerated() {
-        let promptTokens: [Int]
-        do {
-            promptTokens = try context.tokenizer.applyChatTemplate(
-                messages: turn.messages,
-                tools: turn.tools,
-                additionalContext: ["enable_thinking": turn.enableThinking])
-        } catch {
-            promptTokens = try context.tokenizer.applyChatTemplate(
-                messages: turn.messages,
-                tools: turn.tools)
+        let prepared = try await context.processor.prepare(input: UserInput(
+            chat: turn.messages,
+            tools: turn.tools,
+            additionalContext: ["enable_thinking": turn.enableThinking]))
+        let input = prepared.withToolSchemas(turn.tools)
+        let promptTokens = input.text.tokenIds ?? []
+        let promptTokenCount = promptTokens.isEmpty ? input.text.tokens.size : promptTokens.count
+        if turn.requiresToolCall && input.toolSchemas?.isEmpty != false {
+            fputs("\nFAIL: tool-required turn \(idx + 1) lost prepared tool schemas before decode\n", stderr)
+            exit(4)
         }
-        let promptIds = MLXArray(promptTokens.map { Int32($0) })
-            .reshaped(1, promptTokens.count)
-        let input = LMInput(text: LMInput.Text(tokens: promptIds))
         nonisolated(unsafe) let ctxSendable = context
         nonisolated(unsafe) let sendable = input
 
@@ -7182,7 +7189,7 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
         let r = TurnResult(
             idx: idx + 1,
             requiresToolCall: turn.requiresToolCall,
-            promptTokens: promptTokens.count,
+            promptTokens: promptTokenCount,
             chunks: chunkCount,
             reasoningDeltas: reasoningCount,
             toolCalls: toolCallCount,
@@ -7192,7 +7199,7 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
             leakedThink: leaked,
             emptyVisible: emptyVisible)
         results.append(r)
-        print("\n[\(turn.label)] promptTokens=\(promptTokens.count)")
+        print("\n[\(turn.label)] promptTokens=\(promptTokenCount)")
         print(String(format:
             "  chunks=%d reasoning=%d toolCalls=%d tokps=%.1f leakedThinkMarkers=%@ emptyVisible=%@",
             chunkCount, reasoningCount, toolCallCount, tokps,

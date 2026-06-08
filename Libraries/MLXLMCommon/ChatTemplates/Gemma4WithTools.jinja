@@ -31,6 +31,76 @@
         {{- arguments -}}
     {%- endif -%}
 {%- endmacro -%}
+{%- set required_tool_choice = false -%}
+{%- set required_tool_name = '' -%}
+{%- if tool_choice is defined and tool_choice == 'required' -%}
+    {%- set required_tool_choice = true -%}
+{%- elif additionalContext is defined and additionalContext['tool_choice'] == 'required' -%}
+    {%- set required_tool_choice = true -%}
+{%- endif -%}
+{%- if tool_choice_name is defined -%}
+    {%- set required_tool_name = tool_choice_name -%}
+{%- elif additionalContext is defined and additionalContext['tool_choice_name'] is defined -%}
+    {%- set required_tool_name = additionalContext['tool_choice_name'] -%}
+{%- endif -%}
+{%- if required_tool_choice and not required_tool_name and tools is iterable and tools | length == 1 -%}
+    {%- set only_required_tool = tools[0]['function'] if tools[0]['function'] is defined else tools[0] -%}
+    {%- if only_required_tool['name'] is defined -%}
+        {%- set required_tool_name = only_required_tool['name'] -%}
+    {%- endif -%}
+{%- endif -%}
+{%- macro render_required_tool_choice_instruction(latest_user_content='') -%}
+    {%- if required_tool_choice -%}
+        {{- '\nThe current assistant response MUST be a function call. Reply only with one native Gemma function call and no prose before the tool result:\n<|tool_call>call:FUNCTION_NAME{ARGUMENT_NAME:<|"|>ARGUMENT_VALUE<|"|>}<tool_call|>\nPlace string argument contents directly between <|"|> and <|"|>. Do not wrap the argument value in quote characters. For multiline string values, represent each line break with the two characters \\n; the parser decodes those back into real line breaks. Do not add or remove whitespace or spaces after newlines.' -}}
+        {%- if required_tool_name -%}
+            {{- '\nUse the `' ~ required_tool_name ~ '` function.' -}}
+            {%- for tool in tools -%}
+                {%- set selected_tool = tool['function'] if tool['function'] is defined else tool -%}
+                {%- if selected_tool['name'] == required_tool_name and selected_tool['parameters'] is defined and selected_tool['parameters']['required'] is defined -%}
+                    {{- '\nRequired parameters for `' ~ required_tool_name ~ '`: ' ~ (selected_tool['parameters']['required'] | join(', ')) ~ '.' -}}
+                    {%- for param_name in selected_tool['parameters']['required'] -%}
+                        {%- set exact = namespace(value='') -%}
+                        {%- set exact_markers = [
+                            'on this exact ' ~ param_name ~ ':',
+                            'this exact ' ~ param_name ~ ':',
+                            'exact ' ~ param_name ~ ':',
+                            'on exactly this ' ~ param_name ~ ':',
+                            'exactly this ' ~ param_name ~ ':',
+                            'on this exact text:',
+                            'this exact text:',
+                            'exact text:',
+                            'on exactly this text:',
+                            'exactly this text:',
+                            'Use the ' ~ required_tool_name ~ ' tool on this exact text:',
+                            'use the ' ~ required_tool_name ~ ' tool on this exact text:',
+                            'Use ' ~ required_tool_name ~ ' on this exact text:',
+                            'Now use ' ~ required_tool_name ~ ' on this exact text:',
+                            'now use ' ~ required_tool_name ~ ' on this exact text:',
+                            'use ' ~ required_tool_name ~ ' on this exact text:',
+                            'Use ' ~ required_tool_name ~ ' on exactly this text, preserving newlines:',
+                            'use ' ~ required_tool_name ~ ' on exactly this text, preserving newlines:',
+                            'Use the ' ~ required_tool_name ~ ' tool on exactly this text, preserving newlines:',
+                            'use the ' ~ required_tool_name ~ ' tool on exactly this text, preserving newlines:',
+                            'Now use ' ~ required_tool_name ~ ' on exactly this new text, preserving newlines:',
+                            'now use ' ~ required_tool_name ~ ' on exactly this new text, preserving newlines:',
+                            'Now use the ' ~ required_tool_name ~ ' tool on exactly this new text, preserving newlines:',
+                            'now use the ' ~ required_tool_name ~ ' tool on exactly this new text, preserving newlines:'
+                        ] -%}
+                        {%- for marker in exact_markers -%}
+                            {%- if not exact.value and latest_user_content is string and marker in latest_user_content -%}
+                                {%- set exact.value = latest_user_content.split(marker)[1] | trim -%}
+                            {%- endif -%}
+                        {%- endfor -%}
+                        {%- if exact.value -%}
+                            {%- set exact_escaped = exact.value | replace("\\", "\\\\") | replace("\n", "\\n") | replace("\t", "\\t") -%}
+                            {{- '\nRequired call shape for the current request:\n<|tool_call>call:' ~ required_tool_name ~ '{' ~ param_name ~ ':<|"|>' ~ exact_escaped ~ '<|"|>}<tool_call|>\nEmit that call shape exactly. The two-character sequence \\n shown inside <|"|> is how each requested line break must appear in the native tool call; the parser decodes it back into real line breaks. Do not replace \\n with a physical newline, do not insert a space after it, and do not copy raw user prose.' -}}
+                        {%- endif -%}
+                    {%- endfor -%}
+                {%- endif -%}
+            {%- endfor -%}
+        {%- endif -%}
+    {%- endif -%}
+{%- endmacro -%}
 {%- if (tools or (messages[0]['role'] in ['system', 'developer'])) -%}
     {{- '<|turn>system\n' -}}
     {%- if messages[0]['role'] in ['system', 'developer'] -%}
@@ -82,15 +152,7 @@
             {%- endif -%}
             {{- '}<tool|>' -}}
         {%- endfor -%}
-        {%- if tool_choice is defined and tool_choice == 'required' -%}
-            {{- 'Required tool choice: the current assistant response must be exactly one <|tool_call>call:' -}}
-            {%- if tool_choice_name is defined and tool_choice_name -%}
-                {{- tool_choice_name -}}
-            {%- else -%}
-                {{- 'FUNCTION_NAME' -}}
-            {%- endif -%}
-            {{- '{ARGUMENT_NAME:<|"|>ARGUMENT_VALUE<|"|>}<tool_call|> and no prose.' -}}
-        {%- endif -%}
+        {{- render_required_tool_choice_instruction() -}}
     {%- endif -%}
     {{- '<turn|>\n' -}}
 {%- else -%}
@@ -106,7 +168,15 @@
     {%- else -%}
         {{- '<|turn>' + role + '\n' -}}
         {%- if message['content'] -%}
-            {{- render_content(message['content']) -}}
+            {%- if message['role'] == 'user' and required_tool_choice and loop.last and message['content'] is string -%}
+                {{- 'Required tool call request. Use the exact required call shape below; do not copy raw user prose.' -}}
+            {%- else -%}
+                {{- render_content(message['content']) -}}
+            {%- endif -%}
+        {%- endif -%}
+        {%- if message['role'] == 'user' and required_tool_choice and loop.last -%}
+            {%- set latest_required_user_content = message['content'] if message['content'] is string else '' -%}
+            {{- render_required_tool_choice_instruction(latest_required_user_content) -}}
         {%- endif -%}
         {%- if message['tool_calls'] -%}
             {%- for tool_call in message['tool_calls'] -%}

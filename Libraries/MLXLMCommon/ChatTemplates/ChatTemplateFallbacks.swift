@@ -155,7 +155,15 @@ public enum ChatTemplateFallbacks {
                             'Use ' ~ required_tool_name ~ ' on this exact text:',
                             'Now use ' ~ required_tool_name ~ ' on this exact text:',
                             'now use ' ~ required_tool_name ~ ' on this exact text:',
-                            'use ' ~ required_tool_name ~ ' on this exact text:'
+                            'use ' ~ required_tool_name ~ ' on this exact text:',
+                            'Use ' ~ required_tool_name ~ ' on exactly this text, preserving newlines:',
+                            'use ' ~ required_tool_name ~ ' on exactly this text, preserving newlines:',
+                            'Use the ' ~ required_tool_name ~ ' tool on exactly this text, preserving newlines:',
+                            'use the ' ~ required_tool_name ~ ' tool on exactly this text, preserving newlines:',
+                            'Now use ' ~ required_tool_name ~ ' on exactly this new text, preserving newlines:',
+                            'now use ' ~ required_tool_name ~ ' on exactly this new text, preserving newlines:',
+                            'Now use the ' ~ required_tool_name ~ ' tool on exactly this new text, preserving newlines:',
+                            'now use the ' ~ required_tool_name ~ ' tool on exactly this new text, preserving newlines:'
                         ] -%}
                         {%- for marker in exact_markers -%}
                             {%- if not exact.value and latest_user_content is string and marker in latest_user_content -%}
@@ -599,9 +607,7 @@ value_1
 {%- set next_role = messages[loop.index0 + 1]['role'] if loop.index0 + 1 < messages|length else none -%}
 {%- if next_role == 'assistant' or loop.last and add_generation_prompt -%}
 {{- asst_token -}}
-{%- if tool_choice is defined and tool_choice == 'required' and loop.index0 >= ns.last_user_index -%}
-{{- think_open -}}{{- action_token -}}
-{%- elif enable_thinking and loop.index0 >= ns.last_user_index -%}
+{%- if enable_thinking and loop.index0 >= ns.last_user_index -%}
 {{- think_open -}}
 {%- else -%}
 {{- think_close -}}
@@ -627,9 +633,7 @@ value_1
 {%- set next_role = messages[loop.index0 + 1]['role'] if loop.index0 + 1 < messages|length else none -%}
 {%- if next_role == 'assistant' or loop.last and add_generation_prompt -%}
 {{- asst_token -}}
-{%- if tool_choice is defined and tool_choice == 'required' and loop.index0 >= ns.last_user_index -%}
-{{- think_open -}}{{- action_token -}}
-{%- elif enable_thinking and loop.index0 >= ns.last_user_index -%}
+{%- if enable_thinking and loop.index0 >= ns.last_user_index -%}
 {{- think_open -}}
 {%- else -%}
 {{- think_close -}}
@@ -670,6 +674,15 @@ value_1
       {{- tool | tojson -}}{{- "\n" -}}
     {%- endfor -%}
     {{- "</available_tools>\n" -}}
+    {{- "\nFor each function call, reply only with an XML object in this format:\n" -}}
+    {{- "<tool_call>function-name\n<arg_key>argument-key</arg_key>\n<arg_value>value-of-argument-key</arg_value>\n</tool_call>\n" -}}
+    {%- if tool_choice is defined and tool_choice == "required" -%}
+      {{- "\nThe current assistant response MUST be a function call. Do not answer in prose before the tool result." -}}
+      {%- if tool_choice_name is defined and tool_choice_name -%}
+        {{- " Use the `" ~ tool_choice_name ~ "` function." -}}
+      {%- endif -%}
+      {{- " Include every required argument exactly as requested by the current user turn.\n" -}}
+    {%- endif -%}
   {%- endif -%}
   {{- "\n</system>\n" -}}
 {%- endif -%}
@@ -1352,6 +1365,14 @@ value_1
                         'Use ' ~ required_tool_name ~ ' on this exact text:',
                         'use the ' ~ required_tool_name ~ ' tool on this exact text:',
                         'Use the ' ~ required_tool_name ~ ' tool on this exact text:',
+                        'use ' ~ required_tool_name ~ ' on exactly this text, preserving newlines:',
+                        'Use ' ~ required_tool_name ~ ' on exactly this text, preserving newlines:',
+                        'use the ' ~ required_tool_name ~ ' tool on exactly this text, preserving newlines:',
+                        'Use the ' ~ required_tool_name ~ ' tool on exactly this text, preserving newlines:',
+                        'now use ' ~ required_tool_name ~ ' on exactly this new text, preserving newlines:',
+                        'Now use ' ~ required_tool_name ~ ' on exactly this new text, preserving newlines:',
+                        'now use the ' ~ required_tool_name ~ ' tool on exactly this new text, preserving newlines:',
+                        'Now use the ' ~ required_tool_name ~ ' tool on exactly this new text, preserving newlines:',
                         'now use ' ~ required_tool_name ~ ' on this exact text:',
                         'Now use ' ~ required_tool_name ~ ' on this exact text:',
                         'now use the ' ~ required_tool_name ~ ' tool on this exact text:',
@@ -1364,10 +1385,11 @@ value_1
                     {%- endfor -%}
                     {%- if exact.value -%}
                         {%- set exact_escaped = exact.value | replace("\\", "\\\\") | replace("\n", "\\n") | replace("\t", "\\t") | replace("'", "\\'") -%}
+                        {%- set exact_json_escaped = exact.value | replace("\\", "\\\\") | replace("\"", "\\\"") | replace("\n", "\\n") | replace("\t", "\\t") -%}
                         {%- set newline_count = (exact.value.split('\n') | length) - 1 -%}
-                        {{- '\nCopy the `' ~ param_name ~ '` value exactly from the current user request. This value contains exactly ' ~ newline_count ~ ' line break(s) and 0 blank lines. In the native LFM call, each line break is represented by the two characters \\n; the parser decodes those back into real line breaks. Do not double any line break. Do not add a blank line, leading space, trailing newline, or any other character to the copied value. Do not omit `' ~ param_name ~ '`. Do not invent placeholders, summaries, ellipsis, or prior-turn text.' -}}
+                        {{- '\nCopy the `' ~ param_name ~ '` value exactly from the current user request. This value contains exactly ' ~ newline_count ~ ' line break(s). In the native LFM tagged JSON call, each line break is represented by the two characters \\n; the parser decodes those back into real line breaks. Do not double any line break. Do not add a blank line, leading space, trailing newline, or any other character to the copied value. Do not omit `' ~ param_name ~ '`. Do not invent placeholders, summaries, ellipsis, or prior-turn text.' -}}
                         {{- '\nFor the current tool call, the exact `' ~ param_name ~ '` value encoded with \\n escapes is: ' ~ exact_escaped -}}
-                        {{- '\nRespond with exactly this one assistant message and nothing else:\n<|tool_call_start|>[' ~ required_tool_name ~ '(' ~ param_name ~ "='" ~ exact_escaped ~ "'" ~ ')]<|tool_call_end|>' -}}
+                        {{- '\nRespond with exactly this one assistant message and nothing else:\n<|tool_call_start|>["' ~ required_tool_name ~ '", {"' ~ param_name ~ '":"' ~ exact_json_escaped ~ '"}]<|tool_call_end|>' -}}
                     {%- else -%}
                         {{- '\nReply only with one native LFM bracketed call list using argument names and values copied from the latest user request.' -}}
                     {%- endif -%}
@@ -1380,7 +1402,7 @@ value_1
     {%- endif -%}
 {%- endmacro -%}
 
-{%- set ns = namespace(system_prompt='', last_user_index=-1) -%}
+{%- set ns = namespace(system_prompt='', last_user_index=-1, latest_required_user_content='') -%}
 {%- set loop_messages = messages -%}
 {%- if messages and messages[0]['role'] == 'system' -%}
     {%- if messages[0]['content'] is defined -%}
@@ -1391,6 +1413,7 @@ value_1
 {%- for message in loop_messages -%}
     {%- if message['role'] == 'user' -%}
         {%- set ns.last_user_index = loop.index0 -%}
+        {%- set ns.latest_required_user_content = message['content'] -%}
     {%- endif -%}
 {%- endfor -%}
 {%- if ns.system_prompt or (tools is iterable and tools | length > 0) -%}
@@ -1402,7 +1425,8 @@ value_1
         {%- if ns.system_prompt -%}{{- '\n\n' -}}{%- endif -%}
         {{- render_tool_summary() -}}
         {%- if required_tool_choice -%}
-            {{- '\nWhen a tool call is required, use only the exact native LFM tagged call from the current-turn instruction.' -}}
+            {{- '\n' -}}
+            {{- render_required_tool_choice_instruction(ns.latest_required_user_content) -}}
         {%- endif -%}
     {%- endif -%}
     {{- '<|im_end|>\n' -}}
@@ -1424,11 +1448,7 @@ value_1
             {{- render_tool_calls(message['tool_calls']) -}}
         {%- endif -%}
     {%- elif message['role'] == 'user' -%}
-        {%- if is_required_latest_user -%}
-            {{- parse_content_json_linebreaks(message['content']) -}}
-        {%- else -%}
-            {{- parse_content(message['content']) -}}
-        {%- endif -%}
+        {{- parse_content(message['content']) -}}
     {%- elif message['role'] == 'tool' -%}
         {{- 'Tool result for previous assistant tool call: ' ~ parse_content(message['content']) -}}
     {%- else -%}
@@ -1437,11 +1457,6 @@ value_1
         {%- endif -%}
     {%- endif -%}
     {{- '<|im_end|>\n' -}}
-    {%- if is_required_latest_user -%}
-    {{- '<|im_start|>system\n' -}}
-    {{- render_required_tool_choice_instruction(message['content']) -}}
-    {{- '<|im_end|>\n' -}}
-    {%- endif -%}
     {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}

@@ -222,6 +222,26 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(evaluate.contains("model.prepare("))
     }
 
+    @Test("growing chat verifier failures exit instead of crashing async main")
+    func growingChatVerifierFailuresExitInsteadOfCrashingAsyncMain() throws {
+        let bench = try String(
+            contentsOfFile: "RunBench/Bench.swift",
+            encoding: .utf8)
+        guard let envCheck = bench.range(
+            of: "if (env[\"BENCH_GROWING_CHAT_CACHE\"] ?? \"0\") == \"1\""),
+              let nextCheck = bench.range(
+                of: "if (env[\"BENCH_BATCH_TQ_B2\"] ?? \"0\") == \"1\"",
+                range: envCheck.upperBound..<bench.endIndex)
+        else {
+            Issue.record("Could not locate BENCH_GROWING_CHAT_CACHE dispatch block")
+            return
+        }
+
+        let block = String(bench[envCheck.lowerBound..<nextCheck.lowerBound])
+        #expect(block.contains("exit(benchFailureExitCode(for: error))"))
+        #expect(!block.contains("throw error"))
+    }
+
     @Test("history-boundary rederive feeds remaining tokens batch-first")
     func historyBoundaryRederiveUsesBatchFirstRemainingTokens() throws {
         let engine = try String(
@@ -540,6 +560,40 @@ struct HarmonyParserFocusedTests {
         #expect(function.body.contains("$0.requiresToolCall && $0.toolCalls == 0"))
         #expect(function.body.contains("tool-required turn"))
         #expect(function.body.contains("structured .toolCall event"))
+    }
+
+    @Test("Qwen multi-turn tool probe keeps prepared tool schemas")
+    func qwenMultiturnToolProbeKeepsPreparedToolSchemas() throws {
+        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let function = try #require(
+            Self.extractFunction(named: "runQwenMultiturnToolCheck", from: bench),
+            "runQwenMultiturnToolCheck not found"
+        )
+
+        #expect(function.body.contains("context.processor.prepare(input: UserInput("))
+        #expect(function.body.contains("tools: turn.tools"))
+        #expect(function.body.contains("input.toolSchemas"))
+        #expect(!function.body.contains("LMInput(text: LMInput.Text(tokens: promptIds))"))
+    }
+
+    @Test("Qwen multi-turn tool matrix uses production token budget")
+    func qwenMultiturnToolMatrixUsesProductionTokenBudget() throws {
+        let script = try String(
+            contentsOfFile: "scripts/vmlx-live-model-matrix.sh",
+            encoding: .utf8)
+        guard let row = script.range(of: "\"${name}.qwen_multiturn_tool\""),
+              let nextRow = script.range(
+                of: "\"${name}.batch_disk_restore\"",
+                range: row.upperBound..<script.endIndex)
+        else {
+            Issue.record("Could not locate qwen_multiturn_tool matrix row")
+            return
+        }
+
+        let block = String(script[row.lowerBound..<nextRow.lowerBound])
+        #expect(block.contains("BENCH_QWEN_MULTITURN_TOOL=1"))
+        #expect(block.contains("BENCH_MAX_TOKENS=\"$(matrix_prod_max_tokens)\""))
+        #expect(!block.contains("BENCH_MAX_TOKENS=\"$max_tokens\""))
     }
 
     @Test("DSV4 coherence gate honors bundle defaults")

@@ -86,9 +86,11 @@ private func nemotronHEnvFlag(_ name: String) -> Bool {
 }
 
 private let nemotronHActivationBF16RetentionFlag =
-    !nemotronHEnvFlag("JANGTQ_DISABLE_NEMOTRON_ACTIVATION_BF16")
+    nemotronHEnvFlag("VMLINUX_ENABLE_NEMOTRON_ACTIVATION_BF16")
+    && !nemotronHEnvFlag("JANGTQ_DISABLE_NEMOTRON_ACTIVATION_BF16")
 private let nemotronHWeightedMoEFastPathFlag =
-    !nemotronHEnvFlag("JANGTQ_DISABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH")
+    nemotronHEnvFlag("JANGTQ_ENABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH")
+    && !nemotronHEnvFlag("JANGTQ_DISABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH")
 private let nemotronHLayerProfileFlag =
     nemotronHEnvFlag("VMLX_NEMOTRON_LAYER_PROFILE")
     || nemotronHEnvFlag("VMLINUX_NEMOTRON_LAYER_PROFILE")
@@ -400,14 +402,33 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
         mask: MLXArray?,
         cache: MambaCache?
     ) -> MLXArray {
+        let profile = nemotronHLayerProfileEnabled()
+        let inProjStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         let projected = inProj(hiddenStates)
+        if profile {
+            MLX.eval(projected)
+            NemotronHLayerProfiler.shared.record("mamba.in_proj", seconds: CFAbsoluteTimeGetCurrent() - inProjStart)
+        }
+
+        let splitStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         let splits = split(
             projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = splits[0]
         let convInput = splits[1]
         let dt = splits[2]
+        if profile {
+            MLX.eval(gate, convInput, dt)
+            NemotronHLayerProfiler.shared.record("mamba.split", seconds: CFAbsoluteTimeGetCurrent() - splitStart)
+        }
 
+        let convStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         let convOutput = applyConv(convInput, mask: mask, cache: cache)
+        if profile {
+            MLX.eval(convOutput)
+            NemotronHLayerProfiler.shared.record("mamba.conv", seconds: CFAbsoluteTimeGetCurrent() - convStart)
+        }
+
+        let convSplitStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         let convSplits = split(
             convOutput,
             indices: [intermediateSize, intermediateSize + numGroups * ssmStateSize],
@@ -423,27 +444,50 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
         C = C.reshaped([C.dim(0), C.dim(1), numGroups, ssmStateSize])
 
         let dtArray = dt.reshaped([dt.dim(0), dt.dim(1), numHeads])
+        if profile {
+            MLX.eval(hidden, B, C, dtArray)
+            NemotronHLayerProfiler.shared.record("mamba.conv_split", seconds: CFAbsoluteTimeGetCurrent() - convSplitStart)
+        }
 
         let previousState = cache?[1]
+        let ssmStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         let (y, nextState) = ssmUpdate(
             hiddenStates: hidden,
             ALog: aLog,
             B: B,
             C: C,
-            D: D,
+            D: D.asType(hidden.dtype),
             dt: dtArray,
             dtBias: dtBias,
             state: previousState,
             timeStepLimit: timeStepLimit,
             mask: mask
         )
+        if profile {
+            MLX.eval(y, nextState)
+            NemotronHLayerProfiler.shared.record("mamba.ssm_update", seconds: CFAbsoluteTimeGetCurrent() - ssmStart)
+        }
 
         if let cache {
             cache[1] = nextState
+            cache.offset += y.dim(1)
         }
 
         let flattenedY = y.flattened(start: 2)
-        return outProj(norm(flattenedY, gate: gate))
+        let normStart = profile ? CFAbsoluteTimeGetCurrent() : 0
+        let normalized = norm(flattenedY, gate: gate)
+        if profile {
+            MLX.eval(normalized)
+            NemotronHLayerProfiler.shared.record("mamba.norm", seconds: CFAbsoluteTimeGetCurrent() - normStart)
+        }
+
+        let outProjStart = profile ? CFAbsoluteTimeGetCurrent() : 0
+        let output = outProj(normalized)
+        if profile {
+            MLX.eval(output)
+            NemotronHLayerProfiler.shared.record("mamba.out_proj", seconds: CFAbsoluteTimeGetCurrent() - outProjStart)
+        }
+        return output
     }
 
     // Protocol conformance
