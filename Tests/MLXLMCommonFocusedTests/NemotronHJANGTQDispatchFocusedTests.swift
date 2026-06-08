@@ -145,6 +145,7 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
         XCTAssertTrue(modelSource.contains("private func nemotronHLayerProfileEnabled() -> Bool {\n    nemotronHLayerProfileFlag\n}"))
         XCTAssertTrue(modelSource.contains("weightedDecode(expertInput, inds, scores: scores)"))
         XCTAssertTrue(modelSource.contains("cache.offset += y.dim(1)"))
+        XCTAssertTrue(modelSource.contains("D.asType(hidden.dtype)"))
         XCTAssertTrue(modelSource.contains("residual.asType(x.dtype)"))
         XCTAssertTrue(modelSource.contains("out.asType(lmHead.weight.dtype)"))
         XCTAssertTrue(jangtqSource.contains("func weightedDecode(_ x: MLXArray, _ indices: MLXArray, scores: MLXArray) -> MLXArray?"))

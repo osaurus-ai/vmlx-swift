@@ -430,7 +430,7 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
             ALog: aLog,
             B: B,
             C: C,
-            D: D,
+            D: D.asType(hidden.dtype),
             dt: dtArray,
             dtBias: dtBias,
             state: previousState,
