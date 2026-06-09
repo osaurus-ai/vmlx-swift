@@ -935,6 +935,20 @@ private class TextModel: Module {
         return (p + pli) * pow(Float(2.0), Float(-0.5))
     }
 
+    private func splitPerLayerInputs(_ perLayerInputs: MLXArray) -> [MLXArray?] {
+        let layerCount = layers.count
+        guard layerCount > 0 else { return [] }
+        let boundaries = layerCount > 1 ? Array(1 ..< layerCount) : []
+        let splitInputs = perLayerInputs.split(indices: boundaries, axis: 2).map {
+            $0.squeezed(axis: 2) as MLXArray?
+        }
+        if splitInputs.count == layerCount {
+            return splitInputs
+        }
+        preconditionFailure(
+            "Gemma4 per-layer input split produced \(splitInputs.count) chunks for \(layerCount) layers")
+    }
+
     func callAsFunction(_ inputs: MLXArray?, inputEmbedding: MLXArray? = nil, cache: [KVCache?]? = nil) -> MLXArray {
         // Ensure batch dimension — callers may pass 1D tokens [N] on cache-reuse turns
         let inputs = inputs.map { $0.ndim == 1 ? $0.expandedDimensions(axis: 0) : $0 }
@@ -949,9 +963,7 @@ private class TextModel: Module {
         if cfg.hiddenSizePerLayerInput > 0 {
             let raw = inputs.flatMap { getPerLayerInputs($0) }
             if let final = projectPerLayerInputs(h, pli: raw) {
-                pliList = final.split(parts: layers.count, axis: 2).map {
-                    $0.squeezed(axis: 2)
-                }
+                pliList = splitPerLayerInputs(final)
             } else { pliList = Array(repeating: nil, count: layers.count) }
         } else { pliList = Array(repeating: nil, count: layers.count) }
 

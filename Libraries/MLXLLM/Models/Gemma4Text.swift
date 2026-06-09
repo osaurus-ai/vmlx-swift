@@ -719,6 +719,20 @@ public class Gemma4Model: Module {
         return (proj + perLayerInputs) * pow(Float(2.0), Float(-0.5))
     }
 
+    private func splitPerLayerInputs(_ perLayerInputs: MLXArray) -> [MLXArray?] {
+        let layerCount = layers.count
+        guard layerCount > 0 else { return [] }
+        let boundaries = layerCount > 1 ? Array(1 ..< layerCount) : []
+        let splitInputs = perLayerInputs.split(indices: boundaries, axis: 2).map {
+            $0.squeezed(axis: 2) as MLXArray?
+        }
+        if splitInputs.count == layerCount {
+            return splitInputs
+        }
+        preconditionFailure(
+            "Gemma4 per-layer input split produced \(splitInputs.count) chunks for \(layerCount) layers")
+    }
+
     func callAsFunction(
         _ inputs: MLXArray, cache: [KVCache?]? = nil
     ) -> MLXArray {
@@ -732,9 +746,7 @@ public class Gemma4Model: Module {
         if config.hiddenSizePerLayerInput > 0 {
             let rawPLI = getPerLayerInputs(inputs)
             if let finalPLI = projectPerLayerInputs(h, perLayerInputs: rawPLI) {
-                perLayerInputsList = finalPLI.split(parts: layers.count, axis: 2).map {
-                    $0.squeezed(axis: 2)
-                }
+                perLayerInputsList = splitPerLayerInputs(finalPLI)
             } else {
                 perLayerInputsList = Array(repeating: nil, count: layers.count)
             }
