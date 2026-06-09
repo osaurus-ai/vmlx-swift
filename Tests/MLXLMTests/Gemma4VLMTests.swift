@@ -293,10 +293,15 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) ->
 
         let rotatedQuery = rope(query, offset: 0)
         let rotatedKey = rope(key, offset: 0)
-        eval(rotatedQuery, rotatedKey)
+        let dynamicOffset = MLXArray([Int32(0)])
+        let dynamicQuery = rope(query, offset: dynamicOffset)
+        let dynamicKey = rope(key, offset: dynamicOffset)
+        eval(rotatedQuery, rotatedKey, dynamicQuery, dynamicKey)
 
         #expect(rotatedQuery.shape == query.shape)
         #expect(rotatedKey.shape == key.shape)
+        #expect(dynamicQuery.shape == query.shape)
+        #expect(dynamicKey.shape == key.shape)
     }
 }
 

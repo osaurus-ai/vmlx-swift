@@ -268,27 +268,42 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
             return x
         }
 
-        let head = x[.ellipsis, ..<evenDimensions]
+        let head: MLXArray
+        let tail: MLXArray?
+        if actualDimensions > evenDimensions {
+            let pieces = x.split(indices: [evenDimensions], axis: -1)
+            head = pieces[0]
+            tail = pieces[1]
+        } else {
+            head = x
+            tail = nil
+        }
         let half = evenDimensions / 2
         let rotatedHalf = evenRotatedDimensions / 2
         let effectiveFreqs = evenRotatedDimensions == rotatedDimensions ? freqs : freqs[..<rotatedHalf]
 
-        let left = head[.ellipsis, ..<half]
-        let right = head[.ellipsis, half...]
+        let halves = head.split(indices: [half], axis: -1)
+        let left = halves[0]
+        let right = halves[1]
+        let leftPieces = rotatedHalf < half ? left.split(indices: [rotatedHalf], axis: -1) : [left]
+        let rightPieces = rotatedHalf < half ? right.split(indices: [rotatedHalf], axis: -1) : [right]
         let rotatedInput = concatenated(
-            [left[.ellipsis, ..<rotatedHalf], right[.ellipsis, ..<rotatedHalf]], axis: -1)
+            [leftPieces[0], rightPieces[0]], axis: -1)
         let rotated = applyRoPE(rotatedInput, evenRotatedDimensions, effectiveFreqs)
+        let rotatedPieces = rotated.split(indices: [rotatedHalf], axis: -1)
 
-        let mergedLeft = concatenated(
-            [rotated[.ellipsis, ..<rotatedHalf], left[.ellipsis, rotatedHalf...]], axis: -1)
-        let mergedRight = concatenated(
-            [rotated[.ellipsis, rotatedHalf...], right[.ellipsis, rotatedHalf...]], axis: -1)
+        let mergedLeft =
+            rotatedHalf < half
+            ? concatenated([rotatedPieces[0], leftPieces[1]], axis: -1)
+            : rotatedPieces[0]
+        let mergedRight =
+            rotatedHalf < half
+            ? concatenated([rotatedPieces[1], rightPieces[1]], axis: -1)
+            : rotatedPieces[1]
         let mergedHead = concatenated([mergedLeft, mergedRight], axis: -1)
 
-        guard actualDimensions > evenDimensions else {
-            return mergedHead
-        }
-        return concatenated([mergedHead, x[.ellipsis, evenDimensions...]], axis: -1)
+        guard let tail else { return mergedHead }
+        return concatenated([mergedHead, tail], axis: -1)
     }
 
     private func apply(_ x: MLXArray, offset: Int, freqs: MLXArray) -> MLXArray {
