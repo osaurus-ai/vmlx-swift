@@ -678,12 +678,36 @@ public struct JangChatConfig: Sendable, Equatable {
     }
 }
 
+public struct JangRoutedExpertBitPlan: Sendable, Equatable {
+    public let defaultBits: [String: Int]
+    public let layerOverrides: [Int: [String: Int]]
+
+    public init(
+        defaultBits: [String: Int] = [:],
+        layerOverrides: [Int: [String: Int]] = [:]
+    ) {
+        self.defaultBits = defaultBits
+        self.layerOverrides = layerOverrides
+    }
+
+    public func bits(layerIndex: Int, projection: String) -> Int? {
+        layerOverrides[layerIndex]?[projection]
+            ?? defaultBits[projection]
+            ?? defaultBits[projection.replacingOccurrences(of: "_proj", with: "")]
+    }
+
+    public var allBitWidths: [Int] {
+        Array(Set(defaultBits.values + layerOverrides.values.flatMap(\.values))).sorted()
+    }
+}
+
 public struct JangConfig: Sendable {
     public let format: String
     public let formatVersion: String
     public var isV2: Bool { formatVersion.hasPrefix("2") }
     public let quantization: JangQuantization
     public let mxtqBits: [String: Int]
+    public let routedExpertBitPlan: JangRoutedExpertBitPlan?
     public let sourceModel: JangSourceModel
     public let architecture: JangArchitecture
     public let runtime: JangRuntime
@@ -710,6 +734,7 @@ public struct JangConfig: Sendable {
         formatVersion: String = "2.0",
         quantization: JangQuantization = JangQuantization(),
         mxtqBits: [String: Int] = [:],
+        routedExpertBitPlan: JangRoutedExpertBitPlan? = nil,
         sourceModel: JangSourceModel = JangSourceModel(),
         architecture: JangArchitecture = JangArchitecture(),
         runtime: JangRuntime = JangRuntime(),
@@ -721,6 +746,7 @@ public struct JangConfig: Sendable {
         self.formatVersion = formatVersion
         self.quantization = quantization
         self.mxtqBits = mxtqBits
+        self.routedExpertBitPlan = routedExpertBitPlan
         self.sourceModel = sourceModel
         self.architecture = architecture
         self.runtime = runtime
@@ -1244,6 +1270,17 @@ public struct JangLoader: Sendable {
         let format = json["format"] as? String ?? "jang"
         let formatVersion = json["format_version"] as? String ?? "2.0"
 
+        let mxtqBits = parseMXTQBits(json["mxtq_bits"])
+        let routedExpertBits = parseMXTQBits(json["routed_expert_bits"])
+        let routedExpertBitPlan = parseRoutedExpertBitPlan(
+            json["routed_expert_bit_plan"],
+            fallbackDefault: routedExpertBits.isEmpty ? mxtqBits : routedExpertBits)
+        let topLevelRoutedGroupSize = json["routed_expert_group_size"] as? Int
+        let topLevelBitWidths = Array(Set(
+            Array(mxtqBits.values)
+                + Array(routedExpertBits.values)
+                + (routedExpertBitPlan?.allBitWidths ?? []))).sorted()
+
         let quantization: JangQuantization
         if let qDict = json["quantization"] as? [String: Any] {
             quantization = JangQuantization(
@@ -1251,16 +1288,19 @@ public struct JangLoader: Sendable {
                 profile: qDict["profile"] as? String ?? "JANG_2S",
                 targetBits: floatValue(qDict["target_bits"]) ?? 2.5,
                 actualBits: floatValue(qDict["actual_bits"]) ?? 2.5,
-                blockSize: (qDict["block_size"] as? Int) ?? (qDict["group_size"] as? Int) ?? 64,
-                bitWidthsUsed: qDict["bit_widths_used"] as? [Int] ?? [],
+                blockSize: (qDict["block_size"] as? Int) ?? (qDict["group_size"] as? Int)
+                    ?? topLevelRoutedGroupSize ?? 64,
+                bitWidthsUsed: Array(Set(
+                    (qDict["bit_widths_used"] as? [Int] ?? []) + topLevelBitWidths
+                )).sorted(),
                 quantizationScheme: qDict["quantization_scheme"] as? String ?? "asymmetric",
                 quantizationBackend: qDict["quantization_backend"] as? String ?? "mx.quantize"
             )
         } else {
-            quantization = JangQuantization()
+            quantization = JangQuantization(
+                blockSize: topLevelRoutedGroupSize ?? 64,
+                bitWidthsUsed: topLevelBitWidths)
         }
-
-        let mxtqBits = parseMXTQBits(json["mxtq_bits"])
 
         let sourceModel = parseSourceModel(json["source_model"])
 
@@ -1388,6 +1428,7 @@ public struct JangLoader: Sendable {
             formatVersion: formatVersion,
             quantization: quantization,
             mxtqBits: mxtqBits,
+            routedExpertBitPlan: routedExpertBitPlan,
             sourceModel: sourceModel,
             architecture: architecture,
             runtime: runtime,
@@ -1412,6 +1453,66 @@ public struct JangLoader: Sendable {
                         out["\(role).\(projection)"] = bits
                     }
                 }
+            }
+        }
+        return out
+    }
+
+    private static func parseRoutedExpertBitPlan(
+        _ value: Any?,
+        fallbackDefault: [String: Int]
+    ) -> JangRoutedExpertBitPlan? {
+        guard let dict = value as? [String: Any] else {
+            return fallbackDefault.isEmpty
+                ? nil
+                : JangRoutedExpertBitPlan(defaultBits: normalizedProjectionBits(fallbackDefault))
+        }
+
+        let defaultBits = normalizedProjectionBits(
+            parseMXTQBits(dict["default"]).isEmpty
+                ? fallbackDefault
+                : parseMXTQBits(dict["default"]))
+
+        var layerOverrides: [Int: [String: Int]] = [:]
+        if let overrides = dict["layer_overrides"] as? [String: Any] {
+            for (layer, rawPlan) in overrides {
+                guard let layerIndex = Int(layer) else { continue }
+                let bits = normalizedProjectionBits(parseMXTQBits(rawPlan))
+                if !bits.isEmpty {
+                    layerOverrides[layerIndex] = bits
+                }
+            }
+        } else if let overrides = dict["layerOverrides"] as? [String: Any] {
+            for (layer, rawPlan) in overrides {
+                guard let layerIndex = Int(layer) else { continue }
+                let bits = normalizedProjectionBits(parseMXTQBits(rawPlan))
+                if !bits.isEmpty {
+                    layerOverrides[layerIndex] = bits
+                }
+            }
+        }
+
+        guard !defaultBits.isEmpty || !layerOverrides.isEmpty else { return nil }
+        return JangRoutedExpertBitPlan(
+            defaultBits: defaultBits,
+            layerOverrides: layerOverrides)
+    }
+
+    private static func normalizedProjectionBits(_ bits: [String: Int]) -> [String: Int] {
+        var out = bits
+        for (key, value) in bits {
+            let normalized = key
+                .replacingOccurrences(of: "routed_expert.", with: "")
+                .replacingOccurrences(of: "routed_experts.", with: "")
+            if out[normalized] == nil {
+                out[normalized] = value
+            }
+            if normalized == "gate" && out["gate_proj"] == nil {
+                out["gate_proj"] = value
+            } else if normalized == "up" && out["up_proj"] == nil {
+                out["up_proj"] = value
+            } else if normalized == "down" && out["down_proj"] == nil {
+                out["down_proj"] = value
             }
         }
         return out
@@ -1606,6 +1707,36 @@ public struct JangLoader: Sendable {
 
         func declaredMXTQRoleBits(for basePath: String) -> Int? {
             let roles = jangConfig.mxtqBits
+            let layerIndex = layerIndexFromQuantizedBasePath(basePath)
+            if basePath.contains(".switch_mlp.")
+                || basePath.contains(".switch_glu.")
+            {
+                if basePath.hasSuffix(".gate_proj") {
+                    return layerIndex.flatMap {
+                        jangConfig.routedExpertBitPlan?.bits(
+                            layerIndex: $0, projection: "gate_proj")
+                    }
+                        ?? roles["routed_expert.gate_proj"] ?? roles["gate_proj"]
+                        ?? roles["routed_expert"]
+                }
+                if basePath.hasSuffix(".up_proj") {
+                    return layerIndex.flatMap {
+                        jangConfig.routedExpertBitPlan?.bits(
+                            layerIndex: $0, projection: "up_proj")
+                    }
+                        ?? roles["routed_expert.up_proj"] ?? roles["up_proj"]
+                        ?? roles["routed_expert"]
+                }
+                if basePath.hasSuffix(".down_proj") {
+                    return layerIndex.flatMap {
+                        jangConfig.routedExpertBitPlan?.bits(
+                            layerIndex: $0, projection: "down_proj")
+                    }
+                        ?? roles["routed_expert.down_proj"] ?? roles["down_proj"]
+                        ?? roles["routed_expert"]
+                }
+            }
+
             guard !roles.isEmpty else { return nil }
 
             if basePath.hasSuffix("lm_head") {
@@ -1702,6 +1833,23 @@ public struct JangLoader: Sendable {
             }
             return declaredPerLayerQuantization?.quantization
                 ?? declaredDefaultQuantization
+        }
+
+        func layerIndexFromQuantizedBasePath(_ basePath: String) -> Int? {
+            guard let range = basePath.range(
+                of: #"(?:^|\.)(?:model\.)?layers\.(\d+)\."#,
+                options: .regularExpression)
+            else {
+                return nil
+            }
+            let match = String(basePath[range])
+            guard let digitsRange = match.range(
+                of: #"\d+"#,
+                options: .regularExpression)
+            else {
+                return nil
+            }
+            return Int(match[digitsRange])
         }
 
         var disagreementCount = 0

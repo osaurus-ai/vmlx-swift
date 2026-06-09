@@ -1583,6 +1583,108 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
+    @Test("JANG config parses MiMo top-level routed affine bit plan")
+    func jangConfigParsesMiMoTopLevelRoutedAffineBitPlan() throws {
+        let json: [String: Any] = [
+            "format": "jang",
+            "family": "mimo_v2",
+            "routed_expert_group_size": 128,
+            "mxtq_bits": [
+                "gate_proj": 3,
+                "up_proj": 2,
+                "down_proj": 2,
+            ],
+            "routed_expert_bit_plan": [
+                "default": [
+                    "gate_proj": 3,
+                    "up_proj": 2,
+                    "down_proj": 2,
+                ],
+                "layer_overrides": [
+                    "1": [
+                        "gate_proj": 3,
+                        "up_proj": 2,
+                        "down_proj": 3,
+                    ],
+                ],
+            ],
+        ]
+
+        let config = try JangLoader.parseConfig(from: json)
+        #expect(config.quantization.blockSize == 128)
+        #expect(config.quantization.bitWidthsUsed == [2, 3])
+        #expect(config.routedExpertBitPlan?.bits(layerIndex: 1, projection: "gate_proj") == 3)
+        #expect(config.routedExpertBitPlan?.bits(layerIndex: 1, projection: "up_proj") == 2)
+        #expect(config.routedExpertBitPlan?.bits(layerIndex: 1, projection: "down_proj") == 3)
+        #expect(config.routedExpertBitPlan?.bits(layerIndex: 17, projection: "down_proj") == 2)
+    }
+
+    @Test("shape-walk honors MiMo routed affine bit plan down projection override")
+    func shapeWalkHonorsMiMoRoutedAffineBitPlanDownProjectionOverride() {
+        let gate = "model.layers.1.mlp.switch_mlp.gate_proj"
+        let up = "model.layers.1.mlp.switch_mlp.up_proj"
+        let down = "model.layers.1.mlp.switch_mlp.down_proj"
+        let weights: [String: MLXArray] = [
+            "\(gate).weight": MLXArray.zeros([256, 4096, 384], dtype: .uint32),
+            "\(gate).scales": MLXArray.zeros([256, 4096, 32], dtype: .float32),
+            "\(gate).biases": MLXArray.zeros([256, 4096, 32], dtype: .float32),
+            "\(up).weight": MLXArray.zeros([256, 4096, 256], dtype: .uint32),
+            "\(up).scales": MLXArray.zeros([256, 4096, 32], dtype: .float32),
+            "\(up).biases": MLXArray.zeros([256, 4096, 32], dtype: .float32),
+            "\(down).weight": MLXArray.zeros([256, 4096, 384], dtype: .uint32),
+            "\(down).scales": MLXArray.zeros([256, 4096, 32], dtype: .float32),
+            "\(down).biases": MLXArray.zeros([256, 4096, 32], dtype: .float32),
+        ]
+
+        let inferred = JangLoader.inferPerLayerQuantization(
+            weights: weights,
+            jangConfig: JangConfig(
+                quantization: JangQuantization(
+                    blockSize: 128,
+                    bitWidthsUsed: [2, 3]),
+                mxtqBits: [
+                    "gate_proj": 3,
+                    "up_proj": 2,
+                    "down_proj": 2,
+                ],
+                routedExpertBitPlan: JangRoutedExpertBitPlan(
+                    defaultBits: [
+                        "gate_proj": 3,
+                        "up_proj": 2,
+                        "down_proj": 2,
+                    ],
+                    layerOverrides: [
+                        1: [
+                            "gate_proj": 3,
+                            "up_proj": 2,
+                            "down_proj": 3,
+                        ],
+                    ])),
+            hiddenSizeHint: 4096,
+            expertIntermediateSizeHint: 4096,
+            validInDims: [4096],
+            declaredDefaultQuantization: nil)
+
+        if case .quantize(let override)? = inferred.perLayerQuantization[gate] {
+            #expect(override.bits == 3)
+            #expect(override.groupSize == 128)
+        } else {
+            Issue.record("Expected MiMo routed gate projection to use 3-bit group-128 metadata")
+        }
+        if case .quantize(let override)? = inferred.perLayerQuantization[up] {
+            #expect(override.bits == 2)
+            #expect(override.groupSize == 128)
+        } else {
+            Issue.record("Expected MiMo routed up projection to use 2-bit group-128 metadata")
+        }
+        if case .quantize(let override)? = inferred.perLayerQuantization[down] {
+            #expect(override.bits == 3)
+            #expect(override.groupSize == 128)
+        } else {
+            Issue.record("Expected MiMo routed down projection to use layer override")
+        }
+    }
+
     @Test("shape-walk quantization resolves Nex N2 JANG_1L hybrid SSM tensors")
     func shapeWalkQuantizationResolvesNexN2Jang1LHybridSSMTensors() {
         let linearOut = "model.layers.0.linear_attn.out_proj"
