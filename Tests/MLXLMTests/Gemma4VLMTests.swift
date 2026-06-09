@@ -318,6 +318,14 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) ->
 
         #expect(e4bRotatedQuery.shape == e4bQuery.shape)
         #expect(e4bRotatedKey.shape == e4bKey.shape)
+
+        let e4bGlobalKey = MLXArray.ones([1, 1, 96, 512])
+        let e4bGlobalKeyOffset = e4bGlobalRope(e4bGlobalKey, offset: 0)
+        let e4bGlobalKeyDynamicOffset = e4bGlobalRope(e4bGlobalKey, offset: dynamicOffset)
+        eval(e4bGlobalKeyOffset, e4bGlobalKeyDynamicOffset)
+
+        #expect(e4bGlobalKeyOffset.shape == e4bGlobalKey.shape)
+        #expect(e4bGlobalKeyDynamicOffset.shape == e4bGlobalKey.shape)
     }
 }
 

@@ -1407,6 +1407,44 @@ struct MTPRuntimeFocusedTests {
         #expect(inferred?.perLayerQuantization["language_model.model.embed_tokens"] == nil)
     }
 
+    @Test("shape-walk quantization uses Gemma4 PLE input width")
+    func shapeWalkQuantizationUsesGemma4PLEInputWidth() {
+        let projection = "language_model.model.layers.0.per_layer_projection"
+        let gate = "language_model.model.layers.0.per_layer_input_gate"
+        let modelProjection = "language_model.model.per_layer_model_projection"
+        let embedding = "language_model.model.embed_tokens_per_layer"
+        let weights: [String: MLXArray] = [
+            "\(projection).weight": MLXArray.zeros([2_560, 32], dtype: .uint32),
+            "\(projection).scales": MLXArray.zeros([2_560, 8], dtype: .uint8),
+            "\(gate).weight": MLXArray.zeros([256, 320], dtype: .uint32),
+            "\(gate).scales": MLXArray.zeros([256, 80], dtype: .uint8),
+            "\(modelProjection).weight": MLXArray.zeros([10_752, 320], dtype: .uint32),
+            "\(modelProjection).scales": MLXArray.zeros([10_752, 80], dtype: .uint8),
+            "\(embedding).weight": MLXArray.zeros([262_144, 1_344], dtype: .uint32),
+            "\(embedding).scales": MLXArray.zeros([262_144, 336], dtype: .uint8),
+        ]
+
+        let inferred = JangLoader.inferPerLayerQuantization(
+            weights: weights,
+            jangConfig: JangConfig(
+                quantization: JangQuantization(
+                    blockSize: 64,
+                    bitWidthsUsed: [2, 4])),
+            hiddenSizeHint: 2_560,
+            validInDims: [256, 2_560, 10_752],
+            declaredDefaultQuantization: BaseConfiguration.Quantization(
+                groupSize: 32, bits: 4, mode: .mxfp4))
+
+        for base in [projection, gate, modelProjection, embedding] {
+            if case .quantize(let override)? = inferred.perLayerQuantization[base] {
+                #expect(override.bits == 4, "\(base) should remain 4-bit")
+                #expect(override.groupSize == 32, "\(base) should remain group-32")
+            } else {
+                Issue.record("Expected Gemma4 PLE override for \(base)")
+            }
+        }
+    }
+
     @Test("shape-walk quantization uses hidden size for JANG_2K routed expert inputs")
     func shapeWalkQuantizationUsesHiddenSizeForJang2KRoutedExpertInputs() {
         let base = "model.layers.0.mlp.switch_mlp.gate_proj"

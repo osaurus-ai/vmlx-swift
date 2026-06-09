@@ -898,11 +898,19 @@ private func readValidInDims(at modelDirectory: URL) -> Set<Int> {
     add(config["moe_intermediate_size"])
     add(config["expert_intermediate_size"])
     add(config["shared_expert_intermediate_size"])
+    add(config["hidden_size_per_layer_input"])
     add(config["q_lora_rank"])
     add(config["kv_lora_rank"])
     add(config["v_head_dim"])
     add(config["qk_nope_head_dim"])
     add(config["qk_rope_head_dim"])
+
+    if let numLayers = config["num_hidden_layers"] as? Int,
+       let perLayerInput = config["hidden_size_per_layer_input"] as? Int,
+       numLayers > 0, perLayerInput > 0
+    {
+        dims.insert(numLayers * perLayerInput)
+    }
 
     let headDims = [
         config["head_dim"],
