@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Process-wide gate to serialize MLX Metal work across test suites.
 ///
@@ -12,11 +13,13 @@ import Foundation
 /// independent of `@Suite(.serialized)` (which only protects within a
 /// single suite).
 ///
-/// Implementation: a serial `DispatchQueue` enforces single-tenant access.
-/// The async overload keeps that queue occupied until the async body finishes;
-/// a plain actor method would be reentrant at `await` points and would not
-/// protect Metal submissions that happen after suspension.
+/// Implementation: a named POSIX semaphore enforces single-tenant access even
+/// across SwiftPM test targets. The async overload keeps a serial queue
+/// occupied until the async body finishes; a plain actor method would be
+/// reentrant at `await` points and would not protect Metal submissions that
+/// happen after suspension.
 enum MLXMetalTestLock {
+    private static let semaphore = ProcessWideMLXTestSemaphore()
     private static let repoRoot: URL = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()
         .deletingLastPathComponent()
@@ -24,7 +27,9 @@ enum MLXMetalTestLock {
 
     static func withLock<T>(_ body: () throws -> T) rethrows -> T {
         _ = metallibAliasPrepared
-        return try mlxTestSerializationQueue.sync(execute: body)
+        semaphore.wait()
+        defer { semaphore.signal() }
+        return try body()
     }
 
     static func withLock<T: Sendable>(
@@ -34,6 +39,8 @@ enum MLXMetalTestLock {
         return try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<T, Error>) in
             mlxTestSerializationQueue.async {
+                semaphore.wait()
+                defer { semaphore.signal() }
                 let done = DispatchSemaphore(value: 0)
                 // `nonisolated(unsafe)` is required because Swift 6 strict
                 // concurrency cannot prove the cross-isolation transfer is
@@ -126,6 +133,36 @@ enum MLXMetalTestLock {
             }
         }
     }()
+}
+
+private final class ProcessWideMLXTestSemaphore: @unchecked Sendable {
+    private let pointer: UnsafeMutablePointer<sem_t>
+
+    init() {
+        let name = "/vmlx_mlx_lock"
+        guard let sem = sem_open(name, O_CREAT, 0o600, 1), sem != SEM_FAILED else {
+            fatalError("Unable to create MLX Metal test semaphore")
+        }
+        pointer = sem
+    }
+
+    deinit {
+        sem_close(pointer)
+    }
+
+    func wait() {
+        while sem_wait(pointer) == -1 {
+            if errno != EINTR {
+                fatalError("Unable to wait on MLX Metal test semaphore")
+            }
+        }
+    }
+
+    func signal() {
+        if sem_post(pointer) == -1 {
+            fatalError("Unable to signal MLX Metal test semaphore")
+        }
+    }
 }
 
 private extension FileManager {

@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+import Darwin
 
 enum FocusedMLXTestSupport {
     private static let queue = DispatchQueue(label: "ai.osaurus.vmlx.focused-mlx-tests")
+    private static let semaphore = ProcessWideMLXTestSemaphore()
 
     static func withLock<T>(_ body: () throws -> T) rethrows -> T {
         _ = metallibPrepared
-        return try queue.sync(execute: body)
+        semaphore.wait()
+        defer { semaphore.signal() }
+        return try body()
     }
 
     static func withLock<T: Sendable>(
@@ -18,6 +22,8 @@ enum FocusedMLXTestSupport {
         return try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<T, Error>) in
             queue.async {
+                semaphore.wait()
+                defer { semaphore.signal() }
                 let done = DispatchSemaphore(value: 0)
                 nonisolated(unsafe) var output: Result<T, Error>?
                 Task { @Sendable in
@@ -91,6 +97,36 @@ enum FocusedMLXTestSupport {
             }
         }
     }()
+}
+
+private final class ProcessWideMLXTestSemaphore: @unchecked Sendable {
+    private let pointer: UnsafeMutablePointer<sem_t>
+
+    init() {
+        let name = "/vmlx_mlx_lock"
+        guard let sem = sem_open(name, O_CREAT, 0o600, 1), sem != SEM_FAILED else {
+            fatalError("Unable to create MLX Metal test semaphore")
+        }
+        pointer = sem
+    }
+
+    deinit {
+        sem_close(pointer)
+    }
+
+    func wait() {
+        while sem_wait(pointer) == -1 {
+            if errno != EINTR {
+                fatalError("Unable to wait on MLX Metal test semaphore")
+            }
+        }
+    }
+
+    func signal() {
+        if sem_post(pointer) == -1 {
+            fatalError("Unable to signal MLX Metal test semaphore")
+        }
+    }
 }
 
 private extension FileManager {
