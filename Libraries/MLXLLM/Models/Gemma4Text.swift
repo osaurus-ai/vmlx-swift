@@ -386,17 +386,26 @@ class Gemma4MLP: Module {
 /// Linear layer with fixed output scaling (not a learnable parameter).
 /// Python: (x @ self.weight.T) * scalar
 class Gemma4ScaledLinear: Module {
-    let weight: MLXArray
+    @ParameterInfo(key: "weight") var weight: MLXArray
+    @ParameterInfo(key: "scales") var scales: MLXArray?
+    @ParameterInfo(key: "biases") var biases: MLXArray?
     let scalar: Float
 
     init(inputDims: Int, outputDims: Int, scalar: Float) {
-        self.weight = MLXArray.zeros([outputDims, inputDims])
+        self._weight.wrappedValue = MLXArray.zeros([outputDims, inputDims])
         self.scalar = scalar
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        matmul(x, weight.T) * scalar
+        if let scales {
+            let inferred = JangLoader.inferBitWidthAndGroupSize(
+                weight: weight, scales: scales, knownGroupSize: 32)
+            return quantizedMM(
+                x, weight, scales: scales, biases: biases, transpose: true,
+                groupSize: inferred.groupSize, bits: inferred.bits, mode: .mxfp4) * scalar
+        }
+        return matmul(x, weight.T) * scalar
     }
 }
 

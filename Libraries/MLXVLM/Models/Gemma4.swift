@@ -663,11 +663,25 @@ private class UnifiedVisionEmbedder: Module {
 // MARK: - ScaledLinear (for per-layer model projection)
 
 private class G4ScaledLinear: Module {
-    let weight: MLXArray; let scalar: Float
+    @ParameterInfo(key: "weight") var weight: MLXArray
+    @ParameterInfo(key: "scales") var scales: MLXArray?
+    @ParameterInfo(key: "biases") var biases: MLXArray?
+    let scalar: Float
     init(inputDims: Int, outputDims: Int, scalar: Float) {
-        self.weight = MLXArray.zeros([outputDims, inputDims]); self.scalar = scalar; super.init()
+        self._weight.wrappedValue = MLXArray.zeros([outputDims, inputDims])
+        self.scalar = scalar
+        super.init()
     }
-    func callAsFunction(_ x: MLXArray) -> MLXArray { matmul(x, weight.T) * scalar }
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let scales {
+            let inferred = JangLoader.inferBitWidthAndGroupSize(
+                weight: weight, scales: scales, knownGroupSize: 32)
+            return quantizedMM(
+                x, weight, scales: scales, biases: biases, transpose: true,
+                groupSize: inferred.groupSize, bits: inferred.bits, mode: .mxfp4) * scalar
+        }
+        return matmul(x, weight.T) * scalar
+    }
 }
 
 // MARK: - Text Model Components (inline for VLM — MLXVLM can't import MLXLLM)

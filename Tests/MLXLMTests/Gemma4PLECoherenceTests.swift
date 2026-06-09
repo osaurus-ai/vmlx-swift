@@ -125,4 +125,43 @@ struct Gemma4PLECoherenceTests {
             source.contains("decodedVocabSizePerLayerInput == 0"),
             "Gemma4.swift (VLM) must still reject hidden>0/vocab=0.")
     }
+
+    @Test("Gemma4 E-series scaled projection accepts quantized checkpoint scales")
+    func eSeriesScaledProjectionAcceptsQuantizedScales() throws {
+        let candidateRoots = [
+            "/Volumes/EricsLLMDrive/hf-stage/gemma4-qat-mxfp4/OsaurusAI/gemma-4-E2B-it-qat-MXFP4",
+            "/Volumes/eric/models/JANGQ-AI/gemma-4-E2B-it-qat-MXFP4",
+            "/Users/eric/osaurus_models/finished/gemma-4-e2b-it-4bit",
+        ]
+        guard let modelRoot = candidateRoots.first(where: {
+            FileManager.default.fileExists(atPath: "\($0)/model.safetensors.index.json")
+        }) else {
+            print("SKIP: Gemma4 E2B model index not local")
+            return
+        }
+
+        let indexURL = URL(fileURLWithPath: modelRoot)
+            .appendingPathComponent("model.safetensors.index.json")
+        let index = try String(contentsOf: indexURL, encoding: .utf8)
+        #expect(index.contains("language_model.model.per_layer_model_projection.weight"))
+        #expect(index.contains("language_model.model.per_layer_model_projection.scales"))
+
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let textSource = try String(
+            contentsOf: repo.appendingPathComponent("Libraries/MLXLLM/Models/Gemma4Text.swift"),
+            encoding: .utf8)
+        let vlmSource = try String(
+            contentsOf: repo.appendingPathComponent("Libraries/MLXVLM/Models/Gemma4.swift"),
+            encoding: .utf8)
+
+        for source in [textSource, vlmSource] {
+            #expect(source.contains(#"@ParameterInfo(key: "scales") var scales: MLXArray?"#))
+            #expect(source.contains("JangLoader.inferBitWidthAndGroupSize"))
+            #expect(source.contains("quantizedMM("))
+            #expect(source.contains("mode: .mxfp4"))
+        }
+    }
 }
