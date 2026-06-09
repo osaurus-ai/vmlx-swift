@@ -1846,6 +1846,13 @@ public struct TokenIterator: TokenIteratorProtocol {
                 : extractLayerData(from: snapshot)
             let ssmCapture: [MLXArray]? = {
                 guard coordinator.isHybrid else { return nil }
+                if let exact = exactBoundarySSMStatesFromSnapshotIfSufficient(
+                    coordinator: coordinator,
+                    snapshot: snapshot,
+                    tokenCount: tokens.count)
+                {
+                    return exact
+                }
                 guard coordinator.config.enableSSMReDerive,
                     !originalInput.hasMediaContent
                 else {
@@ -1856,10 +1863,6 @@ public struct TokenIterator: TokenIteratorProtocol {
                     model: model,
                     promptTokenIds: tokens,
                     mediaSalt: mediaSalt)
-                    ?? exactBoundarySSMStatesFromSnapshotIfSufficient(
-                        coordinator: coordinator,
-                        snapshot: snapshot,
-                        tokenCount: tokens.count)
             }()
             let diskStoreCache = makeDiskStoreCache(
                 fromPromptBoundary: snapshot,

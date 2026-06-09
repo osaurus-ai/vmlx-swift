@@ -2274,6 +2274,13 @@ public actor BatchEngine {
                     : extractLayerData(from: snapshot)
                 let ssmStates: [MLXArray]? = {
                     guard coordinator.isHybrid else { return nil }
+                    if let exact = exactBoundarySSMStatesFromSnapshotIfSufficient(
+                        coordinator: coordinator,
+                        snapshot: snapshot,
+                        tokenCount: tokens.count)
+                    {
+                        return exact
+                    }
                     if coordinator.config.enableSSMReDerive &&
                         !slot.originalInput.hasMediaContent
                     {
@@ -2283,10 +2290,6 @@ public actor BatchEngine {
                             promptTokenIds: tokens,
                             mediaSalt: slot.mediaSalt,
                             prefillStepSize: slot.parameters.prefillStepSize)
-                            ?? exactBoundarySSMStatesFromSnapshotIfSufficient(
-                                coordinator: coordinator,
-                                snapshot: snapshot,
-                                tokenCount: tokens.count)
                     }
                     return extractSSMStates(from: snapshot)
                 }()
