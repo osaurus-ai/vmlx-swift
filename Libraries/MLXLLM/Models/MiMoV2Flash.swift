@@ -426,14 +426,17 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         func dequant(weight: MLXArray, scaleInv: MLXArray) -> MLXArray {
-            let dtype = weight.dtype
+            let decodedWeight = weight.dtype == .uint8
+                ? MLX.fromFP8(weight, dtype: .float32)
+                : weight
+            let dtype = decodedWeight.dtype
             let bs = 128
-            let (m, n) = (weight.shape[0], weight.shape[1])
+            let (m, n) = (decodedWeight.shape[0], decodedWeight.shape[1])
             let padBottom = bs * scaleInv.dim(0) - m
             let padSide = bs * scaleInv.dim(1) - n
 
             var paddedWeight = padded(
-                weight, widths: [.init((0, padBottom)), .init((0, padSide))])
+                decodedWeight, widths: [.init((0, padBottom)), .init((0, padSide))])
             paddedWeight = paddedWeight.reshaped(
                 [(m + padBottom) / bs, bs, (n + padSide) / bs, bs])
             let scaled = paddedWeight * scaleInv[0..., .newAxis, 0..., .newAxis]

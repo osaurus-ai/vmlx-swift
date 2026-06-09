@@ -1,5 +1,6 @@
 import Testing
 
+import MLX
 @testable import MLXLMCommon
 
 private struct PromptTailTestTokenizer: Tokenizer {
@@ -81,5 +82,36 @@ struct PromptTailDecodeTests {
         }
 
         #expect(reasoning.contains("hidden thought"))
+    }
+
+    @Test("input token array tail with nil tokenIds keeps closed think content-visible")
+    func inputTokenArrayTailWithNilTokenIdsKeepsClosedThinkContentVisible() {
+        let tokenizer = PromptTailTestTokenizer(pieces: [
+            1: "<|im_start|>assistant\n",
+            2: "<think></think>",
+        ])
+        let input = LMInput(tokens: MLXArray([1, 2]))
+        let tail = _decodePromptTail(input: input, tokenizer: tokenizer, tokens: 64)
+
+        var parser = ReasoningParser.forPrompt(stampName: "mimo", promptTail: tail)
+        #expect(parser != nil)
+
+        var content = ""
+        var reasoning = ""
+        for segment in parser!.feed("Blue.") {
+            switch segment {
+            case .content(let text): content += text
+            case .reasoning(let text): reasoning += text
+            }
+        }
+        for segment in parser!.flush() {
+            switch segment {
+            case .content(let text): content += text
+            case .reasoning(let text): reasoning += text
+            }
+        }
+
+        #expect(content == "Blue.")
+        #expect(reasoning.isEmpty)
     }
 }

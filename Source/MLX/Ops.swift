@@ -1164,6 +1164,21 @@ public func dequantized(
     return MLXArray(result)
 }
 
+/// Decode E4M3 FP8 payload bytes to a floating-point array.
+///
+/// Casting a `uint8` FP8 tensor to float interprets each byte as an integer.
+/// This op preserves the FP8 value semantics used by bundles that store
+/// `.weight` plus `.weight_scale_inv` tensors.
+public func fromFP8(
+    _ x: MLXArray,
+    dtype: DType = .bfloat16,
+    stream: StreamOrDevice = .default
+) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_from_fp8(&result, x.ctx, dtype.cmlxDtype, stream.ctx)
+    return MLXArray(result)
+}
+
 /// Element-wise division.
 ///
 /// Divide two arrays with <doc:broadcasting>.

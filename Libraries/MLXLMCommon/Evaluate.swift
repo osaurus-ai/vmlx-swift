@@ -3759,7 +3759,8 @@ internal func _decodePromptTail(
     tokenizer: any Tokenizer,
     tokens: Int
 ) -> String? {
-    guard let tokenIds = input.text.tokenIds else { return nil }
+    let tokenIds = input.text.tokenIds
+        ?? input.text.tokens.reshaped(-1).asArray(Int.self)
     return _decodePromptTail(tokenIds: tokenIds, tokenizer: tokenizer, tokens: tokens)
 }
 

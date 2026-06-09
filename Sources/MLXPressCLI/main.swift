@@ -1132,8 +1132,8 @@ private struct Options {
 
     static let usage = """
     Usage:
-      mlxpress <model-dir> <prompt> [--max-tokens N] [--prefill-step-size N] [--temp T] [--top-p P] [--thinking on|off] [--reasoning-effort VALUE] [--mlxpress off|auto|N] [--ephemeral-prestack on|off] [--compiled-decode on|off] [--compiled-max-cache-length N] [--allow-minimax-compiled-decode] [--active-expert-streaming on|off] [--active-expert-trace] [--cache-stack on|off] [--disk-cache on|off] [--disk-cache-dir PATH] [--kv-cache none|turboquant] [--router-advice] [--print-memory] [--activity-gate PCT] [--activity-gate-report-only] [--file-read-gate-mb-per-token N] [--file-read-gate-report-only] [--metrics-jsonl PATH] [--min-visible-chars N] [--min-generation-tokens N] [--fail-on-length-stop]
-      mlxpress <model-dir> --turn TEXT --turn TEXT [--expect TEXT --expect TEXT] [--max-tokens N] [--prefill-step-size N] [--thinking on|off] [--reasoning-effort VALUE] [--mlxpress off|auto|N] [--ephemeral-prestack on|off] [--compiled-decode on|off] [--compiled-max-cache-length N] [--allow-minimax-compiled-decode] [--active-expert-streaming on|off] [--active-expert-trace] [--cache-stack on|off] [--disk-cache on|off] [--disk-cache-dir PATH] [--kv-cache none|turboquant] [--print-memory] [--activity-gate PCT] [--activity-gate-report-only] [--file-read-gate-mb-per-token N] [--file-read-gate-report-only] [--metrics-jsonl PATH] [--min-visible-chars N] [--min-generation-tokens N] [--fail-on-length-stop]
+      mlxpress <model-dir> <prompt> [--max-tokens N] [--prefill-step-size N] [--temp T] [--top-p P] [--thinking on|off] [--reasoning-effort VALUE] [--mlxpress off|auto|N] [--resident-load on|off] [--ephemeral-prestack on|off] [--compiled-decode on|off] [--compiled-max-cache-length N] [--allow-minimax-compiled-decode] [--active-expert-streaming on|off] [--active-expert-trace] [--cache-stack on|off] [--disk-cache on|off] [--disk-cache-dir PATH] [--kv-cache none|turboquant] [--router-advice] [--print-memory] [--activity-gate PCT] [--activity-gate-report-only] [--file-read-gate-mb-per-token N] [--file-read-gate-report-only] [--metrics-jsonl PATH] [--min-visible-chars N] [--min-generation-tokens N] [--fail-on-length-stop]
+      mlxpress <model-dir> --turn TEXT --turn TEXT [--expect TEXT --expect TEXT] [--max-tokens N] [--prefill-step-size N] [--thinking on|off] [--reasoning-effort VALUE] [--mlxpress off|auto|N] [--resident-load on|off] [--ephemeral-prestack on|off] [--compiled-decode on|off] [--compiled-max-cache-length N] [--allow-minimax-compiled-decode] [--active-expert-streaming on|off] [--active-expert-trace] [--cache-stack on|off] [--disk-cache on|off] [--disk-cache-dir PATH] [--kv-cache none|turboquant] [--print-memory] [--activity-gate PCT] [--activity-gate-report-only] [--file-read-gate-mb-per-token N] [--file-read-gate-report-only] [--metrics-jsonl PATH] [--min-visible-chars N] [--min-generation-tokens N] [--fail-on-length-stop]
       mlxpress <model-dir> --inspect [--print-memory] [--json]
       mlxpress --runtime-check [--json]
 
@@ -1142,6 +1142,7 @@ private struct Options {
       --prefill-step-size N bounds prompt prefill activation peaks; default is \(MLXPressDefaultPrefillStepSize).
       --turn may be repeated to run a multi-turn chat in one loaded session.
       --expect may be repeated to require visible generated text to contain each expected answer.
+      --resident-load on disables safetensors mmap for this run and loads model weights into RAM.
       --thinking is tri-state: omitted leaves the model's template default untouched; on/off explicitly sets enable_thinking.
       --reasoning-effort passes the model-family chat-template effort knob (for example no_think, low, high, max).
       For strict thinking-on validation, thinking-on validation prompts must ask for a visible final answer.
@@ -1178,6 +1179,7 @@ private struct Options {
         var temperature: Float?
         var topP: Float?
         var compression: MLXPressCompressionPolicy = .auto(envFallback: true)
+        var useMmapSafetensors = true
         var prestack: MLXPressPrestackPolicy = .disabled
         var enableCompiledDecode = false
         var compiledMaxCacheLength: Int?
@@ -1277,6 +1279,14 @@ private struct Options {
                 index += 1
                 guard index < args.count else { throw CLIError.badValue("--mlxpress") }
                 compression = try Self.parseCompression(args[index])
+            case "--resident-load":
+                index += 1
+                guard index < args.count else { throw CLIError.badValue("--resident-load") }
+                useMmapSafetensors = !(try Self.parseBool(args[index], option: "--resident-load"))
+            case "--enable-resident-load":
+                useMmapSafetensors = false
+            case "--disable-resident-load":
+                useMmapSafetensors = true
             case "--ephemeral-prestack":
                 index += 1
                 guard index < args.count else { throw CLIError.badValue("--ephemeral-prestack") }
@@ -1438,6 +1448,7 @@ private struct Options {
         self.loadConfiguration = MLXPressLoadConfiguration(
             compression: compression,
             memoryLimit: .default,
+            useMmapSafetensors: useMmapSafetensors,
             enableRouterAdvice: routerAdvice,
             enableActiveExpertStreaming: enableActiveExpertStreaming,
             prestack: prestack,

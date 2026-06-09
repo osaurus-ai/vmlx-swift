@@ -31,6 +31,18 @@ struct MLXPressCLISourceContractsTests {
         #expect(source.contains("--min-visible-chars"))
         #expect(source.contains("--fail-on-length-stop"))
     }
+
+    @Test("resident load flag disables safetensors mmap explicitly")
+    func residentLoadFlagDisablesSafetensorsMmapExplicitly() throws {
+        let source = try repositoryFile("Sources/MLXPressCLI/main.swift")
+
+        #expect(source.contains("var useMmapSafetensors = true"))
+        #expect(source.contains(#"case "--resident-load":"#))
+        #expect(source.contains(#"useMmapSafetensors = !(try Self.parseBool(args[index], option: "--resident-load"))"#))
+        #expect(source.contains(#"case "--enable-resident-load":"#))
+        #expect(source.contains("useMmapSafetensors: useMmapSafetensors"))
+        #expect(source.contains("--resident-load on disables safetensors mmap"))
+    }
 }
 
 private func repositoryFile(_ relativePath: String) throws -> String {
