@@ -942,7 +942,8 @@ private class TextModel: Module {
         guard layerCount > 0 else { return [] }
         let width = cfg.hiddenSizePerLayerInput
         let boundaries = layerCount > 1 ? (1 ..< layerCount).map { $0 * width } : []
-        let splitInputs = perLayerInputs.split(indices: boundaries, axis: -1).map { $0 as MLXArray? }
+        let splitAxis = perLayerInputs.ndim - 1
+        let splitInputs = perLayerInputs.split(indices: boundaries, axis: splitAxis).map { $0 as MLXArray? }
         if splitInputs.count == layerCount {
             return splitInputs
         }
