@@ -924,13 +924,15 @@ private class TextModel: Module {
     private func getPerLayerInputs(_ ids: MLXArray) -> MLXArray? {
         guard let embPL else { return nil }
         let r = embPL(ids) * pow(Float(cfg.hiddenSizePerLayerInput), 0.5)
-        return r.reshaped(Array(ids.shape) + [cfg.numHiddenLayers, cfg.hiddenSizePerLayerInput])
+        return r
     }
 
     private func projectPerLayerInputs(_ h: MLXArray, pli: MLXArray?) -> MLXArray? {
         guard let plProj, let plNorm else { return nil }
-        var p = plProj(h).reshaped(Array(h.shape.dropLast()) + [cfg.numHiddenLayers, cfg.hiddenSizePerLayerInput])
-        p = plNorm(p)
+        let layerShape = Array(h.shape.dropLast()) + [cfg.numHiddenLayers, cfg.hiddenSizePerLayerInput]
+        var p = plProj(h)
+        p = plNorm(p.reshaped(layerShape))
+            .reshaped(Array(h.shape.dropLast()) + [cfg.numHiddenLayers * cfg.hiddenSizePerLayerInput])
         guard let pli else { return p }
         return (p + pli) * pow(Float(2.0), Float(-0.5))
     }
@@ -938,10 +940,9 @@ private class TextModel: Module {
     private func splitPerLayerInputs(_ perLayerInputs: MLXArray) -> [MLXArray?] {
         let layerCount = layers.count
         guard layerCount > 0 else { return [] }
-        let boundaries = layerCount > 1 ? Array(1 ..< layerCount) : []
-        let splitInputs = perLayerInputs.split(indices: boundaries, axis: 2).map {
-            $0.squeezed(axis: 2) as MLXArray?
-        }
+        let width = cfg.hiddenSizePerLayerInput
+        let boundaries = layerCount > 1 ? (1 ..< layerCount).map { $0 * width } : []
+        let splitInputs = perLayerInputs.split(indices: boundaries, axis: -1).map { $0 as MLXArray? }
         if splitInputs.count == layerCount {
             return splitInputs
         }

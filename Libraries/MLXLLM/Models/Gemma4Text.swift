@@ -696,11 +696,7 @@ public class Gemma4Model: Module {
         var result = embedTokensPerLayer(inputIds)
         let scale = pow(Float(config.hiddenSizePerLayerInput), 0.5)
         result = result * scale
-        // Reshape from [B, L, numLayers * hiddenPerLayer] → [B, L, numLayers, hiddenPerLayer]
-        let shape = Array(inputIds.shape) + [
-            config.numHiddenLayers, config.hiddenSizePerLayerInput,
-        ]
-        return result.reshaped(shape)
+        return result
     }
 
     private func projectPerLayerInputs(
@@ -708,12 +704,13 @@ public class Gemma4Model: Module {
     ) -> MLXArray? {
         guard let perLayerModelProjection, let perLayerProjectionNorm else { return nil }
         var proj = perLayerModelProjection(inputEmbeds)
-        let shape =
-            Array(inputEmbeds.shape.dropLast()) + [
-                config.numHiddenLayers, config.hiddenSizePerLayerInput,
-            ]
-        proj = proj.reshaped(shape)
-        proj = perLayerProjectionNorm(proj)
+        let layerShape = Array(inputEmbeds.shape.dropLast()) + [
+            config.numHiddenLayers, config.hiddenSizePerLayerInput,
+        ]
+        proj = perLayerProjectionNorm(proj.reshaped(layerShape))
+            .reshaped(Array(inputEmbeds.shape.dropLast()) + [
+                config.numHiddenLayers * config.hiddenSizePerLayerInput,
+            ])
 
         guard let perLayerInputs else { return proj }
         return (proj + perLayerInputs) * pow(Float(2.0), Float(-0.5))
@@ -722,10 +719,9 @@ public class Gemma4Model: Module {
     private func splitPerLayerInputs(_ perLayerInputs: MLXArray) -> [MLXArray?] {
         let layerCount = layers.count
         guard layerCount > 0 else { return [] }
-        let boundaries = layerCount > 1 ? Array(1 ..< layerCount) : []
-        let splitInputs = perLayerInputs.split(indices: boundaries, axis: 2).map {
-            $0.squeezed(axis: 2) as MLXArray?
-        }
+        let width = config.hiddenSizePerLayerInput
+        let boundaries = layerCount > 1 ? (1 ..< layerCount).map { $0 * width } : []
+        let splitInputs = perLayerInputs.split(indices: boundaries, axis: -1).map { $0 as MLXArray? }
         if splitInputs.count == layerCount {
             return splitInputs
         }

@@ -201,9 +201,10 @@ struct Gemma4PLECoherenceTests {
 
         for source in [textSource, vlmSource] {
             #expect(source.contains("splitPerLayerInputs"))
-            #expect(source.contains("split(indices: boundaries, axis: 2)"))
-            #expect(source.contains("squeezed(axis: 2)"))
+            #expect(source.contains("split(indices: boundaries, axis: -1)"))
+            #expect(source.contains("hiddenSizePerLayerInput"))
             #expect(!source.contains("split(parts: layers.count, axis: 2)"))
+            #expect(!source.contains("squeezed(axis: 2)"))
             #expect(!source.contains("[0..., 0..., i, 0...]"))
             #expect(!source.contains("[0..., 0..., $0, 0...]"))
         }
