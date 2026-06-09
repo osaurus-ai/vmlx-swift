@@ -452,6 +452,18 @@ struct ToolCallEdgeCasesTests {
         #expect(call.function.arguments["text"] == .string("red\ngreen\nblue"))
     }
 
+    @Test("Gemma-4 parser decodes double-escaped native newline string values")
+    func testGemma4ParserDecodesDoubleEscapedNativeNewlineStringArgument() throws {
+        let parser = ToolCallFormat.gemma4.createParser()
+        let call = try #require(parser.parse(
+            content: #"<|tool_call>call:line_count{text:<|"|>red\\ngreen\\nblue<|"|>}<tool_call|>"#,
+            tools: [lineCountToolSpec()]
+        ))
+
+        #expect(call.function.name == "line_count")
+        #expect(call.function.arguments["text"] == .string("red\ngreen\nblue"))
+    }
+
     @Test("Gemma-4 parser unwraps redundant quotes around literal-newline escaped values")
     func testGemma4ParserUnwrapsQuotedLiteralNewlineStringArgument() throws {
         let parser = ToolCallFormat.gemma4.createParser()

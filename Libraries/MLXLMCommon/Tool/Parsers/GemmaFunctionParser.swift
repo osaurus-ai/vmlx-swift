@@ -228,6 +228,9 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
     private func decodeBackslashEscapedString(_ value: String) -> String {
         var inner = value
+        inner = inner.replacingOccurrences(of: #"\\n"#, with: #"\n"#)
+        inner = inner.replacingOccurrences(of: #"\\t"#, with: #"\t"#)
+        inner = inner.replacingOccurrences(of: #"\\r"#, with: #"\r"#)
         inner = inner.replacingOccurrences(of: #"\""#, with: #"""#)
         inner = inner.replacingOccurrences(of: #"\n"#, with: "\n")
         inner = inner.replacingOccurrences(of: #"\t"#, with: "\t")

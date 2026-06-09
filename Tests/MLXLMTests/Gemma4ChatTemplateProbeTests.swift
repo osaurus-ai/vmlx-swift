@@ -386,10 +386,10 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             "Assistant tool_call must render inline with Gemma's invoke syntax. Got: \(out)")
         XCTAssertTrue(out.contains("<|tool_response>response:get_weather{22°C, sunny}<tool_response|>"),
             "Tool response must render with Gemma's <|tool_response> wrapper. Got: \(out)")
-        XCTAssertTrue(out.contains("The current assistant response MUST be a function call."),
-            "Required tool_choice must be represented in Gemma-4 native tool grammar. Got: \(out)")
-        XCTAssertTrue(out.contains(#"<|tool_call>call:FUNCTION_NAME{ARGUMENT_NAME:<|"|>ARGUMENT_VALUE<|"|>}<tool_call|>"#),
-            "Required tool_choice must show Gemma's native call shape. Got: \(out)")
+        XCTAssertFalse(out.contains("The current assistant response MUST be a function call."),
+            "Required tool_choice must not inject a synthetic prompt directive. Got: \(out)")
+        XCTAssertFalse(out.contains(#"<|tool_call>call:FUNCTION_NAME{ARGUMENT_NAME:<|"|>ARGUMENT_VALUE<|"|>}<tool_call|>"#),
+            "Required tool_choice must not inject placeholder call-shape prose. Got: \(out)")
         XCTAssertFalse(out.contains("Required tool choice: the current assistant response must be exactly one"),
             "File-backed Gemma template must not regress to the old generic required-tool sentence. Got: \(out)")
         XCTAssertTrue(out.hasSuffix("<|turn>model\n"),
@@ -444,17 +444,17 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             "add_generation_prompt": true,
         ])
 
-        XCTAssertTrue(out.contains("Use the `line_count` function."),
-            "Single-tool required choice must infer the selected function. Got: \(out)")
-        XCTAssertTrue(out.contains("Do not add or remove whitespace or spaces after newlines"),
-            "Required line-count guidance must reject live space-mutated multiline args. Got: \(out)")
-        XCTAssertTrue(out.contains(
+        XCTAssertFalse(out.contains("Use the `line_count` function."),
+            "Single-tool required choice must not inject synthetic function-selection prose. Got: \(out)")
+        XCTAssertFalse(out.contains("Do not add or remove whitespace or spaces after newlines"),
+            "Required line-count handling must not add synthetic argument-shaping guidance. Got: \(out)")
+        XCTAssertFalse(out.contains(
             "<|tool_call>call:line_count{text:<|\"|>red\\ngreen\\nblue<|\"|>}<tool_call|>"
-        ), "Required call shape must copy the exact multiline value with escaped newlines. Got: \(out)")
-        XCTAssertTrue(out.contains("Do not replace \\n with a physical newline"),
-            "Required line-count guidance must preserve native escaped-newline syntax. Got: \(out)")
-        XCTAssertFalse(out.contains("Use the line_count tool on this exact text: red\ngreen\nblue"),
-            "Required-tool turn should replace raw user prose with the exact native call shape. Got: \(out)")
+        ), "Required-tool turn must not inject an exact native call shape. Got: \(out)")
+        XCTAssertFalse(out.contains("Do not replace \\n with a physical newline"),
+            "Required line-count handling must not add synthetic escaped-newline guidance. Got: \(out)")
+        XCTAssertTrue(out.contains("Use the line_count tool on this exact text: red\ngreen\nblue"),
+            "Required-tool turn should preserve raw user prose and the real tool schema. Got: \(out)")
     }
 
     /// Iter 52: the system-message branch must handle multi-part content

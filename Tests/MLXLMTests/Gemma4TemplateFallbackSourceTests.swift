@@ -33,7 +33,7 @@ struct Gemma4TemplateFallbackSourceTests {
     }
 
     @Test
-    func gemmaRequiredToolFallbackEmitsExactTextNativeCallShape() throws {
+    func gemmaRequiredToolFallbackKeepsUserTurnContract() throws {
         let template = try Template(ChatTemplateFallbacks.gemma4WithTools)
         let rendered = try template.renderGemma4([
             "messages": [
@@ -65,19 +65,11 @@ struct Gemma4TemplateFallbackSourceTests {
         ])
 
         #expect(rendered.contains("<|tool>declaration:line_count"))
-        #expect(rendered.contains("The current assistant response MUST be a function call."))
-        #expect(rendered.contains("Use the `line_count` function."))
-        #expect(rendered.contains("Required parameters for `line_count`: text."))
-        #expect(rendered.contains("<|tool_call>call:FUNCTION_NAME{ARGUMENT_NAME:<|\"|>ARGUMENT_VALUE<|\"|>}<tool_call|>"))
-        #expect(rendered.contains("Do not wrap the argument value in quote characters"))
-        #expect(rendered.contains("represent each line break with the two characters \\n"))
-        #expect(rendered.contains("Do not add or remove whitespace or spaces after newlines"))
-        #expect(rendered.contains("<|tool_call>call:line_count{text:<|\"|>red\\ngreen\\nblue<|\"|>}<tool_call|>"))
-        #expect(rendered.contains("The two-character sequence \\n shown inside <|\"|> is how each requested line break must appear"))
-        #expect(rendered.contains("Do not replace \\n with a physical newline"))
-        #expect(rendered.contains("do not copy raw user prose"))
-        #expect(rendered.contains("<|turn>user\nRequired tool call request. Use the exact required call shape below; do not copy raw user prose."))
-        #expect(!rendered.contains("Use the line_count tool on this exact text: red\ngreen\nblue"))
+        #expect(!rendered.contains("The current assistant response MUST be a function call."))
+        #expect(!rendered.contains("<|tool_call>call:FUNCTION_NAME{ARGUMENT_NAME:<|\"|>ARGUMENT_VALUE<|\"|>}<tool_call|>"))
+        #expect(!rendered.contains("Required call shape for the current request"))
+        #expect(!rendered.contains("Required tool call request."))
+        #expect(rendered.contains("Use the line_count tool on this exact text: red\ngreen\nblue"))
         #expect(rendered.hasSuffix("<|turn>model\n"))
     }
 }
