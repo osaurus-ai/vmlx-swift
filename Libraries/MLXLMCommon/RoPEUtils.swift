@@ -268,12 +268,15 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
             return x
         }
 
+        let rank = x.shape.count
+        precondition(rank > 0, "ProportionalRoPE requires a ranked input tensor, got shape \(x.shape)")
+
         func sliceLastAxis(_ array: MLXArray, from start: Int, to end: Int) -> MLXArray {
             precondition(
                 start <= end,
                 "Invalid ProportionalRoPE last-axis slice \(start)..<\(end) for shape \(array.shape)")
-            var indices: [any MLXArrayIndex] = Array(repeating: MLXSlice(), count: array.ndim)
-            indices[array.ndim - 1] = MLXSlice(start: Int32(start), end: Int32(end), stride: 1)
+            var indices: [any MLXArrayIndex] = Array(repeating: MLXSlice(), count: rank)
+            indices[rank - 1] = MLXSlice(start: Int32(start), end: Int32(end), stride: 1)
             return array[indices]
         }
 
@@ -290,10 +293,8 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
         let rotatedHalf = evenRotatedDimensions / 2
         let effectiveFreqs = evenRotatedDimensions == rotatedDimensions ? freqs : freqs[..<rotatedHalf]
 
-        let left = sliceLastAxis(head, from: 0, to: half)
-        let right = sliceLastAxis(head, from: half, to: evenDimensions)
-        let leftRotary = rotatedHalf < half ? sliceLastAxis(left, from: 0, to: rotatedHalf) : left
-        let rightRotary = rotatedHalf < half ? sliceLastAxis(right, from: 0, to: rotatedHalf) : right
+        let leftRotary = sliceLastAxis(head, from: 0, to: rotatedHalf)
+        let rightRotary = sliceLastAxis(head, from: half, to: half + rotatedHalf)
         let rotatedInput = concatenated([leftRotary, rightRotary], axis: -1).contiguous()
         let rotated = applyRoPE(rotatedInput, evenRotatedDimensions, effectiveFreqs)
         let rotatedLeft = sliceLastAxis(rotated, from: 0, to: rotatedHalf)
@@ -301,11 +302,11 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
 
         let mergedLeft =
             rotatedHalf < half
-            ? concatenated([rotatedLeft, sliceLastAxis(left, from: rotatedHalf, to: half)], axis: -1)
+            ? concatenated([rotatedLeft, sliceLastAxis(head, from: rotatedHalf, to: half)], axis: -1)
             : rotatedLeft
         let mergedRight =
             rotatedHalf < half
-            ? concatenated([rotatedRight, sliceLastAxis(right, from: rotatedHalf, to: half)], axis: -1)
+            ? concatenated([rotatedRight, sliceLastAxis(head, from: half + rotatedHalf, to: evenDimensions)], axis: -1)
             : rotatedRight
         let mergedHead = concatenated([mergedLeft, mergedRight], axis: -1)
 
