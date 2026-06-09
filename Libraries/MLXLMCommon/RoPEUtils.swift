@@ -255,17 +255,29 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
 
     private func splitApplyAndMerge(
         _ x: MLXArray,
-        applyRoPE: (MLXArray) -> MLXArray
+        freqs: MLXArray,
+        applyRoPE: (MLXArray, Int, MLXArray) -> MLXArray
     ) -> MLXArray {
-        let head = x[.ellipsis, ..<dimensions]
-        let half = dimensions / 2
-        let rotatedHalf = rotatedDimensions / 2
+        let actualDimensions = x.shape.last ?? dimensions
+        let effectiveDimensions = min(dimensions, actualDimensions)
+        let evenDimensions = effectiveDimensions - (effectiveDimensions % 2)
+        let effectiveRotatedDimensions = min(rotatedDimensions, evenDimensions)
+        let evenRotatedDimensions = effectiveRotatedDimensions - (effectiveRotatedDimensions % 2)
+
+        guard evenDimensions > 0, evenRotatedDimensions > 0 else {
+            return x
+        }
+
+        let head = x[.ellipsis, ..<evenDimensions]
+        let half = evenDimensions / 2
+        let rotatedHalf = evenRotatedDimensions / 2
+        let effectiveFreqs = evenRotatedDimensions == rotatedDimensions ? freqs : freqs[..<rotatedHalf]
 
         let left = head[.ellipsis, ..<half]
         let right = head[.ellipsis, half...]
         let rotatedInput = concatenated(
             [left[.ellipsis, ..<rotatedHalf], right[.ellipsis, ..<rotatedHalf]], axis: -1)
-        let rotated = applyRoPE(rotatedInput)
+        let rotated = applyRoPE(rotatedInput, evenRotatedDimensions, effectiveFreqs)
 
         let mergedLeft = concatenated(
             [rotated[.ellipsis, ..<rotatedHalf], left[.ellipsis, rotatedHalf...]], axis: -1)
@@ -273,36 +285,36 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
             [rotated[.ellipsis, rotatedHalf...], right[.ellipsis, rotatedHalf...]], axis: -1)
         let mergedHead = concatenated([mergedLeft, mergedRight], axis: -1)
 
-        guard (x.shape.last ?? dimensions) > dimensions else {
+        guard actualDimensions > evenDimensions else {
             return mergedHead
         }
-        return concatenated([mergedHead, x[.ellipsis, dimensions...]], axis: -1)
+        return concatenated([mergedHead, x[.ellipsis, evenDimensions...]], axis: -1)
     }
 
     private func apply(_ x: MLXArray, offset: Int, freqs: MLXArray) -> MLXArray {
-        splitApplyAndMerge(x) { rotatedInput in
+        splitApplyAndMerge(x, freqs: freqs) { rotatedInput, effectiveRotatedDimensions, effectiveFreqs in
             MLXFast.RoPE(
                 rotatedInput,
-                dimensions: rotatedDimensions,
+                dimensions: effectiveRotatedDimensions,
                 traditional: traditional,
                 base: nil,
                 scale: 1.0,
                 offset: offset,
-                freqs: freqs
+                freqs: effectiveFreqs
             )
         }
     }
 
     private func apply(_ x: MLXArray, offset: MLXArray, freqs: MLXArray) -> MLXArray {
-        splitApplyAndMerge(x) { rotatedInput in
+        splitApplyAndMerge(x, freqs: freqs) { rotatedInput, effectiveRotatedDimensions, effectiveFreqs in
             MLXFast.RoPE(
                 rotatedInput,
-                dimensions: rotatedDimensions,
+                dimensions: effectiveRotatedDimensions,
                 traditional: traditional,
                 base: nil,
                 scale: 1.0,
                 offset: offset,
-                freqs: freqs
+                freqs: effectiveFreqs
             )
         }
     }

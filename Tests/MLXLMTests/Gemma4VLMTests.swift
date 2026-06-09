@@ -278,6 +278,28 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) ->
     #expect(config.visionConfig.defaultOutputLength == 280)
 }
 
+@Test func gemma4ProportionalRoPEHandlesAsymmetricGlobalKeyWidth() {
+    MLXMetalTestLock.withLock {
+        let rope = ProportionalRoPE(
+            dimensions: 512,
+            base: 1_000_000,
+            scalingConfig: [
+                "rope_type": .string("proportional"),
+                "partial_rotary_factor": .float(0.5),
+            ])
+
+        let query = MLXArray.ones([1, 8, 4, 512])
+        let key = MLXArray.ones([1, 2, 4, 256])
+
+        let rotatedQuery = rope(query, offset: 0)
+        let rotatedKey = rope(key, offset: 0)
+        eval(rotatedQuery, rotatedKey)
+
+        #expect(rotatedQuery.shape == query.shape)
+        #expect(rotatedKey.shape == key.shape)
+    }
+}
+
 @Test func gemma4Unified12BAudioConfigDecode() throws {
     let data = Data(#"""
     {
