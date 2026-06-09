@@ -185,4 +185,25 @@ struct Gemma4PLECoherenceTests {
             #expect(source.contains("self._biases.wrappedValue = MLXArray.mlxNone"))
         }
     }
+
+    @Test("Gemma4 PLE layer tensors split without advanced indexing")
+    func eSeriesPerLayerInputsAvoidAdvancedIndexingTrap() throws {
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let textSource = try String(
+            contentsOf: repo.appendingPathComponent("Libraries/MLXLLM/Models/Gemma4Text.swift"),
+            encoding: .utf8)
+        let vlmSource = try String(
+            contentsOf: repo.appendingPathComponent("Libraries/MLXVLM/Models/Gemma4.swift"),
+            encoding: .utf8)
+
+        for source in [textSource, vlmSource] {
+            #expect(source.contains("split(parts: layers.count, axis: 2)"))
+            #expect(source.contains("squeezed(axis: 2)"))
+            #expect(!source.contains("[0..., 0..., i, 0...]"))
+            #expect(!source.contains("[0..., 0..., $0, 0...]"))
+        }
+    }
 }

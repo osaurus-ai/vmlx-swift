@@ -949,7 +949,9 @@ private class TextModel: Module {
         if cfg.hiddenSizePerLayerInput > 0 {
             let raw = inputs.flatMap { getPerLayerInputs($0) }
             if let final = projectPerLayerInputs(h, pli: raw) {
-                pliList = (0 ..< layers.count).map { final[0..., 0..., $0, 0...] }
+                pliList = final.split(parts: layers.count, axis: 2).map {
+                    $0.squeezed(axis: 2)
+                }
             } else { pliList = Array(repeating: nil, count: layers.count) }
         } else { pliList = Array(repeating: nil, count: layers.count) }
 

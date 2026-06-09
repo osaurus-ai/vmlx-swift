@@ -732,8 +732,8 @@ public class Gemma4Model: Module {
         if config.hiddenSizePerLayerInput > 0 {
             let rawPLI = getPerLayerInputs(inputs)
             if let finalPLI = projectPerLayerInputs(h, perLayerInputs: rawPLI) {
-                perLayerInputsList = (0 ..< layers.count).map { i in
-                    finalPLI[0..., 0..., i, 0...]
+                perLayerInputsList = finalPLI.split(parts: layers.count, axis: 2).map {
+                    $0.squeezed(axis: 2)
                 }
             } else {
                 perLayerInputsList = Array(repeating: nil, count: layers.count)
