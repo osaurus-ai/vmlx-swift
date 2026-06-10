@@ -165,13 +165,13 @@
         {{- '}<tool_response|>\n' -}}
     {%- else -%}
         {{- '<|turn>' + role + '\n' -}}
+        {%- if message['content'] -%}
+            {{- render_content(message['content']) -}}
+        {%- endif -%}
         {%- if message['role'] == 'user' and required_tool_choice and loop.last -%}
             {%- set latest_required_user_content = message['content'] if message['content'] is string else '' -%}
             {{- render_required_tool_choice_instruction(latest_required_user_content) -}}
             {{- '\n' -}}
-        {%- endif -%}
-        {%- if message['content'] -%}
-            {{- render_content(message['content']) -}}
         {%- endif -%}
         {%- if message['tool_calls'] -%}
             {%- for tool_call in message['tool_calls'] -%}

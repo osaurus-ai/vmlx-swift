@@ -74,7 +74,7 @@ struct Gemma4TemplateFallbackSourceTests {
         #expect(rendered.contains(#"blue<|"|>}<tool_call|>"#))
         let currentShapeRange = try #require(rendered.range(of: "Required call shape for the current request"))
         let userContentRange = try #require(rendered.range(of: "Use the line_count tool on this exact text: red\ngreen\nblue"))
-        #expect(currentShapeRange.lowerBound < userContentRange.lowerBound)
+        #expect(userContentRange.lowerBound < currentShapeRange.lowerBound)
         #expect(!rendered.contains("FUNCTION_NAME"))
         #expect(!rendered.contains("ARGUMENT_NAME"))
         #expect(!rendered.contains("VALUE_FOR_text"))
