@@ -110,6 +110,49 @@ struct Gemma4ZyphraToolParserFocusedTests {
         #expect(call.function.arguments["text"] == .string("one\ntwo"))
     }
 
+    @Test("Gemma4 parser recovers observed MXFP4 E4B schema drift without visible leak")
+    func gemma4ParserRecoversObservedMXFP4E4BSchemaDrift() throws {
+        let output = "line_ount{textc:<|\"|>red\ngreen\nblue<|\"|>}"
+        let call = try #require(
+            ToolCallFormat.gemma4.createParser().parse(
+                content: output,
+                tools: [lineCountToolSpec()]
+            )
+        )
+
+        #expect(call.function.name == "line_count")
+        #expect(call.function.arguments["text"] == .string("red\ngreen\nblue"))
+    }
+
+    @Test("Gemma4 processor recovers observed MXFP4 E2B repeat required-call drift")
+    func gemma4ProcessorRecoversObservedMXFP4E2BRepeatRequiredCallDrift() {
+        let output = #"line_ountc{text: "one\ntwo"}"#
+        let processor = ToolCallProcessor(format: .gemma4, tools: [lineCountToolSpec()])
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(visible.isEmpty)
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls.first?.function.name == "line_count")
+        #expect(processor.toolCalls.first?.function.arguments["text"] == .string("one\ntwo"))
+    }
+
+    @Test("Gemma4 schema drift recovery does not invent undeclared tool calls")
+    func gemma4SchemaDriftRecoveryDoesNotInventUndeclaredToolCalls() {
+        let parser = ToolCallFormat.gemma4.createParser()
+
+        #expect(parser.parse(content: "line_ount{textc:<|\"|>red<|\"|>}", tools: nil) == nil)
+        #expect(
+            parser.parse(
+                content: "other_tool{textc:<|\"|>red<|\"|>}",
+                tools: [lineCountToolSpec()]
+            ) == nil
+        )
+    }
+
     private func lineCountToolSpec() -> [String: any Sendable] {
         [
             "type": "function",

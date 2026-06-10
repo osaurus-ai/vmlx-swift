@@ -839,20 +839,23 @@ public class ToolCallProcessor {
     }
 
     private func firstInlineBareNameJSONToolCallStart(in text: String) -> String.Index? {
-        inlineFunctionToolNames()
-            .compactMap { name -> String.Index? in
-                var searchStart = text.startIndex
-                while let range = text.range(of: name, range: searchStart ..< text.endIndex) {
-                    if isInlineFunctionBoundary(text, before: range.lowerBound)
-                        && bareNameJSONTailStartsObject(in: text, afterName: range.upperBound)
-                    {
-                        return range.lowerBound
-                    }
-                    searchStart = range.upperBound
+        var best: String.Index?
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            if isInlineFunctionBoundary(text, before: cursor) {
+                let (candidate, afterName) = inlineIdentifier(in: text, at: cursor)
+                if !candidate.isEmpty,
+                    inlineFunctionToolNames().contains(where: {
+                        resolvesInlineFunctionName(candidate, to: $0)
+                    }),
+                    bareNameJSONTailStartsObject(in: text, afterName: afterName)
+                {
+                    best = minIndex(best, cursor)
                 }
-                return nil
             }
-            .min()
+            cursor = text.index(after: cursor)
+        }
+        return best
     }
 
     private func partialInlineBareNameJSONToolCallStart(in text: String) -> String.Index? {
@@ -863,15 +866,13 @@ public class ToolCallProcessor {
             if isInlineFunctionBoundary(text, before: cursor) {
                 let suffix = String(text[cursor...])
                 for name in inlineFunctionToolNames() {
-                    if name.hasPrefix(suffix) && suffix.count < name.count {
+                    if inlineFunctionNamePrefix(suffix, matches: name) && suffix.count < name.count {
                         best = cursor
                         break
                     }
-                    guard suffix.hasPrefix(name),
-                        let afterName = text.index(
-                            cursor,
-                            offsetBy: name.count,
-                            limitedBy: text.endIndex)
+                    let (candidate, afterName) = inlineIdentifier(in: text, at: cursor)
+                    guard !candidate.isEmpty,
+                        resolvesInlineFunctionName(candidate, to: name)
                     else { continue }
                     let tailCursor = bareNameJSONTailObjectStart(in: text, afterName: afterName)
                     if tailCursor == text.endIndex {
@@ -886,6 +887,67 @@ public class ToolCallProcessor {
             cursor = text.index(after: cursor)
         }
         return best
+    }
+
+    private func inlineIdentifier(
+        in text: String,
+        at start: String.Index
+    ) -> (String, String.Index) {
+        var cursor = start
+        while cursor < text.endIndex, isInlineKeyValueIdentifierCharacter(text[cursor]) {
+            cursor = text.index(after: cursor)
+        }
+        return (String(text[start..<cursor]), cursor)
+    }
+
+    private func minIndex(_ lhs: String.Index?, _ rhs: String.Index) -> String.Index {
+        guard let lhs else { return rhs }
+        return rhs < lhs ? rhs : lhs
+    }
+
+    private func inlineFunctionNamePrefix(_ suffix: String, matches expected: String) -> Bool {
+        if expected.hasPrefix(suffix) { return true }
+        return expected.replacingOccurrences(of: "c", with: "")
+            .hasPrefix(suffix.replacingOccurrences(of: "c", with: ""))
+    }
+
+    private func resolvesInlineFunctionName(_ raw: String, to expected: String) -> Bool {
+        if raw == expected { return true }
+        if raw.replacingOccurrences(of: "c", with: "")
+            == expected.replacingOccurrences(of: "c", with: "")
+        {
+            return true
+        }
+        return editDistanceAtMostOne(raw, expected)
+    }
+
+    private func editDistanceAtMostOne(_ lhs: String, _ rhs: String) -> Bool {
+        let left = Array(lhs)
+        let right = Array(rhs)
+        if abs(left.count - right.count) > 1 { return false }
+
+        var i = 0
+        var j = 0
+        var edits = 0
+        while i < left.count && j < right.count {
+            if left[i] == right[j] {
+                i += 1
+                j += 1
+                continue
+            }
+            edits += 1
+            if edits > 1 { return false }
+            if left.count > right.count {
+                i += 1
+            } else if right.count > left.count {
+                j += 1
+            } else {
+                i += 1
+                j += 1
+            }
+        }
+        if i < left.count || j < right.count { edits += 1 }
+        return edits <= 1
     }
 
     private func firstInlineBareNameKeyValueToolCallStart(in text: String) -> String.Index? {
@@ -1231,8 +1293,32 @@ public class ToolCallProcessor {
             switch state {
             case .collectingInlineToolCall where inlineToolCallKind == .bareCall:
                 return processInlineChunk(chunk)
+            case .collectingInlineToolCall where inlineToolCallKind == .bareNameJSON:
+                return processInlineChunk(chunk)
             case .normal:
                 let candidate = leadingTextBeforeToolCall + chunk
+                if let callIndex = firstInlineBareNameJSONToolCallStart(in: candidate) {
+                    let leading = String(candidate[..<callIndex])
+                    inlineToolCallKind = .bareNameJSON
+                    toolCallBuffer = String(candidate[callIndex...])
+                    leadingTextBeforeToolCall = ""
+                    state = .collectingInlineToolCall
+
+                    if shouldAttemptInlineToolParse(toolCallBuffer),
+                       let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
+                    {
+                        toolCalls.append(toolCall)
+                        toolCallBuffer = ""
+                        state = .normal
+                        suppressingTextAfterInlineToolCall = true
+                    }
+                    return visibleInlineLeading(leading)
+                }
+                if let fragmentIndex = partialInlineBareNameJSONToolCallStart(in: candidate) {
+                    let leading = String(candidate[..<fragmentIndex])
+                    leadingTextBeforeToolCall = String(candidate[fragmentIndex...])
+                    return visibleInlineLeading(leading)
+                }
                 if let callIndex = firstBareCallToolCallStart(in: candidate) {
                     let leading = String(candidate[..<callIndex])
                     inlineToolCallKind = .bareCall
