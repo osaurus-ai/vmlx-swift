@@ -163,9 +163,11 @@ struct Gemma4PLECoherenceTests {
             #expect(source.contains("MLXArray.mlxNone"))
             #expect(source.contains("!scales.shape.isEmpty"))
             #expect(source.contains("JangLoader.inferBitWidthAndGroupSize"))
+            #expect(source.contains("let mode: QuantizationMode = biases == nil ? .mxfp4 : .affine"))
             #expect(source.contains("quantizedMM("))
-            #expect(source.contains("projected.reshaped(Array(x.shape.dropLast()) + [outputDims])"))
-            #expect(source.contains("mode: .mxfp4"))
+            #expect(source.contains("mode: mode"))
+            #expect(source.contains("func callAsFunction(_ x: MLXArray, prefixShape: [Int]? = nil)"))
+            #expect(source.contains("let flatInput = x.reshaped([leadingShape.reduce(1, *)] + [inputDims])"))
         }
     }
 
@@ -202,8 +204,10 @@ struct Gemma4PLECoherenceTests {
 
         for source in [textSource, vlmSource] {
             #expect(source.contains("splitPerLayerInputs"))
-            #expect(source.contains("prefixRank: max(h.ndim - 1, 0)"))
-            #expect(source.contains("let flatShape = Array"))
+            #expect(source.contains("prefixShape:"))
+            #expect(source.contains("prefixRank:"))
+            #expect(source.contains(".count"))
+            #expect(source.contains("flatShape = prefixShape"))
             #expect(source.contains("reshaped(flatShape)"))
             #expect(source.contains(".split(parts: layerCount, axis: prefixRank)"))
             #expect(source.contains("precondition(width > 0"))

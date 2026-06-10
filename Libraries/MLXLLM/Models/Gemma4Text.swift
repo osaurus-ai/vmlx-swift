@@ -390,6 +390,7 @@ class Gemma4ScaledLinear: Module {
     @ParameterInfo(key: "scales") var scales: MLXArray
     @ParameterInfo(key: "biases") var biases: MLXArray?
     let scalar: Float
+    let inputDims: Int
     let outputDims: Int
 
     init(inputDims: Int, outputDims: Int, scalar: Float) {
@@ -397,20 +398,26 @@ class Gemma4ScaledLinear: Module {
         self._scales.wrappedValue = MLXArray.mlxNone
         self._biases.wrappedValue = MLXArray.mlxNone
         self.scalar = scalar
+        self.inputDims = inputDims
         self.outputDims = outputDims
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    func callAsFunction(_ x: MLXArray, prefixShape: [Int]? = nil) -> MLXArray {
+        let leadingShape = prefixShape ?? Array(x.shape.dropLast())
+        let flatInput = x.reshaped([leadingShape.reduce(1, *)] + [inputDims])
+        let outputShape = leadingShape + [outputDims]
+
         if !scales.shape.isEmpty {
             let inferred = JangLoader.inferBitWidthAndGroupSize(
                 weight: weight, scales: scales, knownGroupSize: 32)
+            let mode: QuantizationMode = biases == nil ? .mxfp4 : .affine
             let projected = quantizedMM(
-                x, weight, scales: scales, biases: biases, transpose: true,
-                groupSize: inferred.groupSize, bits: inferred.bits, mode: .mxfp4)
-            return projected.reshaped(Array(x.shape.dropLast()) + [outputDims]) * scalar
+                flatInput, weight, scales: scales, biases: biases, transpose: true,
+                groupSize: inferred.groupSize, bits: inferred.bits, mode: mode)
+            return projected.reshaped(outputShape) * scalar
         }
-        return matmul(x, weight.T) * scalar
+        return matmul(flatInput, weight.T).reshaped(outputShape) * scalar
     }
 }
 
@@ -703,18 +710,20 @@ public class Gemma4Model: Module {
     }
 
     private func projectPerLayerInputs(
-        _ inputEmbeds: MLXArray, perLayerInputs: MLXArray?
+        _ inputEmbeds: MLXArray, prefixShape: [Int], perLayerInputs: MLXArray?
     ) -> MLXArray? {
         guard let perLayerModelProjection, let perLayerProjectionNorm else { return nil }
-        var proj = perLayerModelProjection(inputEmbeds)
-        let layerShape = Array(inputEmbeds.shape.dropLast()) + [
+        var proj = perLayerModelProjection(inputEmbeds, prefixShape: prefixShape)
+        let layerShape = prefixShape + [
             config.numHiddenLayers, config.hiddenSizePerLayerInput,
         ]
-        let flatShape = Array(inputEmbeds.shape.dropLast()) + [
+        let flatShape = prefixShape + [
             config.numHiddenLayers * config.hiddenSizePerLayerInput,
         ]
+        eval(proj)
         proj = perLayerProjectionNorm(proj.reshaped(layerShape))
-            .reshaped(flatShape)
+        eval(proj)
+        proj = proj.reshaped(flatShape)
 
         guard let perLayerInputs else { return proj }
         return ((proj + perLayerInputs) * pow(Float(2.0), Float(-0.5))).reshaped(flatShape)
@@ -743,8 +752,11 @@ public class Gemma4Model: Module {
         var perLayerInputsList: [MLXArray?]
         if config.hiddenSizePerLayerInput > 0 {
             let rawPLI = getPerLayerInputs(inputs)
-            if let finalPLI = projectPerLayerInputs(h, perLayerInputs: rawPLI) {
-                perLayerInputsList = splitPerLayerInputs(finalPLI, prefixRank: max(h.ndim - 1, 0))
+            let prefixShape = inputs.shape
+            if let finalPLI = projectPerLayerInputs(
+                h, prefixShape: prefixShape, perLayerInputs: rawPLI)
+            {
+                perLayerInputsList = splitPerLayerInputs(finalPLI, prefixRank: prefixShape.count)
             } else {
                 perLayerInputsList = Array(repeating: nil, count: layers.count)
             }

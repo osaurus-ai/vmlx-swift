@@ -670,25 +670,32 @@ private class G4ScaledLinear: Module {
     @ParameterInfo(key: "scales") var scales: MLXArray
     @ParameterInfo(key: "biases") var biases: MLXArray?
     let scalar: Float
+    let inputDims: Int
     let outputDims: Int
     init(inputDims: Int, outputDims: Int, scalar: Float) {
         self._weight.wrappedValue = MLXArray.zeros([outputDims, inputDims])
         self._scales.wrappedValue = MLXArray.mlxNone
         self._biases.wrappedValue = MLXArray.mlxNone
         self.scalar = scalar
+        self.inputDims = inputDims
         self.outputDims = outputDims
         super.init()
     }
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    func callAsFunction(_ x: MLXArray, prefixShape: [Int]? = nil) -> MLXArray {
+        let leadingShape = prefixShape ?? Array(x.shape.dropLast())
+        let flatInput = x.reshaped([leadingShape.reduce(1, *)] + [inputDims])
+        let outputShape = leadingShape + [outputDims]
+
         if !scales.shape.isEmpty {
             let inferred = JangLoader.inferBitWidthAndGroupSize(
                 weight: weight, scales: scales, knownGroupSize: 32)
+            let mode: QuantizationMode = biases == nil ? .mxfp4 : .affine
             let projected = quantizedMM(
-                x, weight, scales: scales, biases: biases, transpose: true,
-                groupSize: inferred.groupSize, bits: inferred.bits, mode: .mxfp4)
-            return projected.reshaped(Array(x.shape.dropLast()) + [outputDims]) * scalar
+                flatInput, weight, scales: scales, biases: biases, transpose: true,
+                groupSize: inferred.groupSize, bits: inferred.bits, mode: mode)
+            return projected.reshaped(outputShape) * scalar
         }
-        return matmul(x, weight.T) * scalar
+        return matmul(flatInput, weight.T).reshaped(outputShape) * scalar
     }
 }
 
@@ -930,29 +937,40 @@ private class TextModel: Module {
         return r
     }
 
-    private func projectPerLayerInputs(_ h: MLXArray, pli: MLXArray?) -> MLXArray? {
+    private func projectPerLayerInputs(_ h: MLXArray, prefixShape: [Int], pli: MLXArray?) -> MLXArray? {
         guard let plProj, let plNorm else { return nil }
-        let layerShape = Array(h.shape.dropLast()) + [cfg.numHiddenLayers, cfg.hiddenSizePerLayerInput]
-        let flatShape = Array(h.shape.dropLast()) + [cfg.numHiddenLayers * cfg.hiddenSizePerLayerInput]
-        var p = plProj(h)
+        let layerShape = prefixShape + [cfg.numHiddenLayers, cfg.hiddenSizePerLayerInput]
+        let flatShape = prefixShape + [cfg.numHiddenLayers * cfg.hiddenSizePerLayerInput]
+        var p = plProj(h, prefixShape: prefixShape)
+        eval(p)
         p = plNorm(p.reshaped(layerShape))
-            .reshaped(flatShape)
+        eval(p)
+        p = p.reshaped(flatShape)
         guard let pli else { return p }
         return ((p + pli) * pow(Float(2.0), Float(-0.5))).reshaped(flatShape)
     }
 
-    private func splitPerLayerInputs(_ perLayerInputs: MLXArray, prefixRank: Int) -> [MLXArray?] {
+    private func splitPerLayerInputs(
+        _ perLayerInputs: MLXArray, prefixRank: Int, prefixShape: [Int]
+    ) -> [MLXArray?] {
         let layerCount = layers.count
         guard layerCount > 0 else { return [] }
         let width = cfg.hiddenSizePerLayerInput
         precondition(width > 0, "Gemma4 per-layer input width must be positive")
 
-        return perLayerInputs
+        let splitInputs = perLayerInputs
             .split(parts: layerCount, axis: prefixRank)
             .map { $0 as MLXArray? }
+        precondition(
+            splitInputs.count == layerCount,
+            "Gemma4 PLE split produced \(splitInputs.count) parts for \(layerCount) layers, prefixRank=\(prefixRank), prefixShape=\(prefixShape), shape=\(perLayerInputs.shape)")
+        return splitInputs
     }
 
-    func callAsFunction(_ inputs: MLXArray?, inputEmbedding: MLXArray? = nil, cache: [KVCache?]? = nil) -> MLXArray {
+    func callAsFunction(
+        _ inputs: MLXArray?, inputEmbedding: MLXArray? = nil, cache: [KVCache?]? = nil,
+        prefixShape: [Int]? = nil
+    ) -> MLXArray {
         // Ensure batch dimension — callers may pass 1D tokens [N] on cache-reuse turns
         let inputs = inputs.map { $0.ndim == 1 ? $0.expandedDimensions(axis: 0) : $0 }
         var h: MLXArray
@@ -965,8 +983,10 @@ private class TextModel: Module {
         var pliList: [MLXArray?]
         if cfg.hiddenSizePerLayerInput > 0 {
             let raw = inputs.flatMap { getPerLayerInputs($0) }
-            if let final = projectPerLayerInputs(h, pli: raw) {
-                pliList = splitPerLayerInputs(final, prefixRank: max(h.ndim - 1, 0))
+            let effectivePrefixShape = prefixShape ?? inputs?.shape ?? Array(h.shape.dropLast())
+            if let final = projectPerLayerInputs(h, prefixShape: effectivePrefixShape, pli: raw) {
+                pliList = splitPerLayerInputs(
+                    final, prefixRank: effectivePrefixShape.count, prefixShape: effectivePrefixShape)
             } else { pliList = Array(repeating: nil, count: layers.count) }
         } else { pliList = Array(repeating: nil, count: layers.count) }
 
@@ -977,6 +997,13 @@ private class TextModel: Module {
         let gc: KVCache? = cache.flatMap { gIdx < $0.count ? $0[gIdx] : nil }
         let sc: KVCache? = cache.flatMap { sIdx < $0.count ? $0[sIdx] : nil }
         let gm = createAttentionMask(h: h, cache: gc); let sm = createAttentionMask(h: h, cache: sc, windowSize: cfg.slidingWindow)
+
+        precondition(
+            pliList.count == layers.count,
+            "Gemma4 PLE list count \(pliList.count) does not match layer count \(layers.count)")
+        precondition(
+            previousKVs.count == layers.count,
+            "Gemma4 previousKV count \(previousKVs.count) does not match layer count \(layers.count)")
 
         var intermediates: [(keys: MLXArray, values: MLXArray, offset: Int, offsetArray: MLXArray?)?] = Array(repeating: nil, count: layers.count)
         for (i, l) in layers.enumerated() {
@@ -1010,8 +1037,11 @@ private class G4LanguageModel: Module {
         if !cfg.tieWordEmbeddings { _lmHead.wrappedValue = Linear(cfg.hiddenSize, cfg.vocabSize, bias: false) }
         super.init()
     }
-    func callAsFunction(_ inputs: MLXArray?, inputEmbedding: MLXArray? = nil, cache: [KVCache?]? = nil) -> MLXArray {
-        var o = model(inputs, inputEmbedding: inputEmbedding, cache: cache)
+    func callAsFunction(
+        _ inputs: MLXArray?, inputEmbedding: MLXArray? = nil, cache: [KVCache?]? = nil,
+        prefixShape: [Int]? = nil
+    ) -> MLXArray {
+        var o = model(inputs, inputEmbedding: inputEmbedding, cache: cache, prefixShape: prefixShape)
         if let lh = lmHead { o = lh(o) } else { o = model.emb.asLinear(o) }
         if let cap = cfg.finalLogitSoftcapping, cap > 0 { o = compiledLogitSoftcap(o, MLXArray(cap)) }
         return o
@@ -1163,7 +1193,8 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         }
 
         let paddedCache = padCache(cache)
-        let out = languageModel(llmTokens, inputEmbedding: emb, cache: paddedCache)
+        let out = languageModel(
+            llmTokens, inputEmbedding: emb, cache: paddedCache, prefixShape: input.text.tokens.shape)
         return .logits(.init(logits: out))
     }
 
