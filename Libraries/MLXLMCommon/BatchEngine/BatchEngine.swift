@@ -666,6 +666,9 @@ public actor BatchEngine {
             }
 
             func flush() {
+                if let text = detokenizer.flush() {
+                    pump(text)
+                }
                 if var parser = reasoningParser {
                     for segment in parser.flush() {
                         switch segment {

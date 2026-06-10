@@ -3603,6 +3603,10 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     mutating func onGenerationEnd(
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) {
+        if let chunk = detokenizer.flush(), !dispatch(chunk, emit: emit) {
+            return
+        }
+
         // Flush the reasoning parser — any buffered tail becomes content
         // (or a trailing `.reasoning` segment if the model stopped mid-
         // think block) per ReasoningParser.flush contract. The tool-call

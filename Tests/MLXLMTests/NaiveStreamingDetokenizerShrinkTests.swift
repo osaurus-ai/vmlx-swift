@@ -64,6 +64,7 @@ final class NaiveStreamingDetokenizerShrinkTests: XCTestCase {
             d.append(token: t)
             if let s = d.next() { out += s }
         }
+        if let s = d.flush() { out += s }
         XCTAssertEqual(out, "Hello")
     }
 
@@ -151,6 +152,7 @@ final class NaiveStreamingDetokenizerShrinkTests: XCTestCase {
         _ = d.next()  // shrink — returns nil, reconciles baseline
         d.append(token: 3)
         if let s = d.next() { emitted += s }
+        if let s = d.flush() { emitted += s }
 
         // The exact content depends on where the baseline landed, but
         // we require the detokenizer (a) never crashed, (b) emits
@@ -158,6 +160,31 @@ final class NaiveStreamingDetokenizerShrinkTests: XCTestCase {
         // swallowing forever.
         XCTAssertFalse(emitted.isEmpty,
             "Detokenizer must resume emission after a shrink (got \"\(emitted)\")")
+    }
+
+    /// Gemma 4 regression: visible app streaming showed impossible strings
+    /// like "I am an cOsaurus hat agent." even though final decode should be
+    /// "I am an Osaurus chat agent.". The broken path emitted a short unstable
+    /// prefix ("I am an c") before a later decode reinterpreted the same token
+    /// boundary. Streaming plus final flush must equal final decode exactly.
+    func testStreamingPlusFlushMatchesFinalDecodeWhenPrefixIsReinterpreted() {
+        let final = "I am an Osaurus chat agent."
+        let tok = ScriptedDecodeTokenizer(outputs: [
+            "I am an c",
+            "I am an Osaurus c",
+            final,
+        ])
+        var d = NaiveStreamingDetokenizer(tokenizer: tok)
+        var emitted = ""
+        for t in [1, 2, 3] {
+            d.append(token: t)
+            if let s = d.next() { emitted += s }
+        }
+        if let s = d.flush() { emitted += s }
+
+        XCTAssertEqual(emitted, final)
+        XCTAssertFalse(emitted.contains("cOsaurus"))
+        XCTAssertFalse(emitted.contains("Osaurus hat"))
     }
 }
 
