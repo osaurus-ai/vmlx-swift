@@ -159,7 +159,16 @@ public enum ChatTemplateFallbacks {
                         'on exactly this text:',
                         'On exactly this text:',
                         'exactly this text:',
-                        'Exactly this text:'
+                        'Exactly this text:',
+                        'use ' ~ required_tool_name ~ ' on exactly this text, preserving newlines:',
+                        'Use ' ~ required_tool_name ~ ' on exactly this text, preserving newlines:',
+                        'use the ' ~ required_tool_name ~ ' tool on exactly this text, preserving newlines:',
+                        'Use the ' ~ required_tool_name ~ ' tool on exactly this text, preserving newlines:',
+                        'now use ' ~ required_tool_name ~ ' on exactly this new text, preserving newlines:',
+                        'Now use ' ~ required_tool_name ~ ' on exactly this new text, preserving newlines:',
+                        'now use the ' ~ required_tool_name ~ ' tool on exactly this new text, preserving newlines:',
+                        'Now use the ' ~ required_tool_name ~ ' tool on exactly this new text, preserving newlines:',
+                        'preserving newlines:'
                     ] -%}
                     {%- for marker in exact_markers -%}
                         {%- if not exact.value and latest_user_text is string and marker in latest_user_text -%}
@@ -167,7 +176,9 @@ public enum ChatTemplateFallbacks {
                         {%- endif -%}
                     {%- endfor -%}
                     {%- if exact.value -%}
-                        {{- '\nRequired call shape for the current request:\n<|tool_call>call:' + required_tool_name + '{' + param_name + ':<|"|>' + exact.value + '<|"|>}<tool_call|>' -}}
+                        {%- set exact_escaped = exact.value | replace("\\", "\\\\") | replace("\n", "\\n") | replace("\t", "\\t") -%}
+                        {{- '\nRequired call shape for the current request:\n<|tool_call>call:' + required_tool_name + '{' + param_name + ':<|"|>' + exact_escaped + '<|"|>}<tool_call|>' -}}
+                        {{- '\nDo not replace \\n with a physical newline, do not insert a space after it, and do not insert the function name inside the argument value.' -}}
                     {%- else -%}
                         {{- '\nCopy the `' + param_name + '` value exactly from the current user request. Do not invent placeholders, summaries, or prior-turn text.' -}}
                     {%- endif -%}
@@ -229,9 +240,6 @@ public enum ChatTemplateFallbacks {
             {%- endif -%}
             {{- '}<tool|>' -}}
         {%- endfor -%}
-        {%- if required_tool_choice -%}
-            {{- render_required_tool_choice_instruction() -}}
-        {%- endif -%}
     {%- endif -%}
     {{- '<turn|>\n' -}}
 {%- else -%}
