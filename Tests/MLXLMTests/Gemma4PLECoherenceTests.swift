@@ -247,7 +247,7 @@ struct Gemma4PLECoherenceTests {
         }
     }
 
-    @Test("Gemma4 PLE layer tensors split without advanced indexing")
+    @Test("Gemma4 PLE layer tensors split with validated positive axis")
     func eSeriesPerLayerInputsAvoidAdvancedIndexingTrap() throws {
         let repo = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -272,17 +272,19 @@ struct Gemma4PLECoherenceTests {
             #expect(source.contains("perLayerInputs.dim(prefixRank) == combinedWidth"))
             #expect(source.contains("perLayerInputs.shape.lastIndex(of: combinedWidth)"))
             #expect(source.contains("guard width > 0, perLayerInputs.ndim > 0 else"))
-            #expect(source.contains("indices[splitAxis] = MLXSlice.stride(from: start, to: start + width)"))
-            #expect(source.contains("return perLayerInputs[indices] as MLXArray?"))
+            #expect(source.contains("split(indices: boundaries, axis: splitAxis)"))
+            #expect(source.contains("guard splitInputs.count == layerCount else"))
+            #expect(source.contains("return splitInputs.map { $0 as MLXArray? }"))
             #expect(source.contains("return Array(repeating: nil, count: layerCount)"))
             #expect(!source.contains("precondition(width > 0"))
             #expect(!source.contains("preconditionFailure("))
             #expect(!source.contains("switch perLayerInputs.ndim"))
             #expect(!source.contains("perLayerInputs[0..., 0..., start ..< end]"))
+            #expect(!source.contains("indices[splitAxis] = MLXSlice.stride(from: start, to: start + width)"))
+            #expect(!source.contains("return perLayerInputs[indices] as MLXArray?"))
             #expect(!source.contains("let lastDim = perLayerInputs.shape.last ?? 0"))
             #expect(!source.contains("lastDim == layerCount * width"))
             #expect(source.contains("hiddenSizePerLayerInput"))
-            #expect(!source.contains(".split(indices:"))
             #expect(!source.contains(".split(parts:"))
             #expect(!source.contains("perLayerInputs.dim(-1)"))
             #expect(!source.contains("squeezed(axis: 2)"))
