@@ -748,6 +748,9 @@ private func convertToBFloat16(
             guard !shouldSkip(key) else {
                 return nil
             }
+            guard array.ctx.ctx != nil else {
+                return nil
+            }
             guard array.dtype == .float16 || array.dtype == .float32 else {
                 return nil
             }
@@ -774,6 +777,7 @@ private func convertToBFloat16(
                 }
 
                 guard let array = current[entry.key],
+                    array.ctx.ctx != nil,
                     array.dtype == DType.float16 || array.dtype == DType.float32
                 else {
                     index += 1
