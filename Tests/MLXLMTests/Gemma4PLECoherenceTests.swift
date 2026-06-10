@@ -204,6 +204,8 @@ struct Gemma4PLECoherenceTests {
             #expect(source.contains("splitPerLayerInputs"))
             #expect(source.contains("perLayerInputs[0..., 0..., start ..< end]"))
             #expect(source.contains("precondition(width > 0"))
+            #expect(source.contains("if perLayerInputs.ndim == 0"))
+            #expect(source.contains("perLayerInputs.eval()"))
             #expect(!source.contains("let lastDim = perLayerInputs.shape.last ?? 0"))
             #expect(!source.contains("lastDim == layerCount * width"))
             #expect(source.contains("hiddenSizePerLayerInput"))

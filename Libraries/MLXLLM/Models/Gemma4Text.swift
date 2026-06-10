@@ -724,6 +724,9 @@ public class Gemma4Model: Module {
         guard layerCount > 0 else { return [] }
         let width = config.hiddenSizePerLayerInput
         precondition(width > 0, "Gemma4 per-layer input width must be positive")
+        if perLayerInputs.ndim == 0 {
+            perLayerInputs.eval()
+        }
 
         var splitInputs: [MLXArray?] = []
         splitInputs.reserveCapacity(layerCount)
