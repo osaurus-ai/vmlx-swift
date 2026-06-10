@@ -70,8 +70,12 @@ struct Gemma4TemplateFallbackSourceTests {
         #expect(rendered.contains("Required arguments: text"))
         #expect(rendered.contains("Required call shape for the current request"))
         #expect(rendered.components(separatedBy: "Tool use is REQUIRED for this assistant turn.").count == 2)
-        #expect(rendered.contains(#"<|tool_call>call:line_count{text:<|"|>red\ngreen\nblue<|"|>}<tool_call|>"#))
-        #expect(rendered.contains(#"Do not replace \n with a physical newline"#))
+        #expect(rendered.contains("""
+            <|tool_call>call:line_count{text:<|"|>red
+            green
+            blue<|"|>}<tool_call|>
+            """))
+        #expect(!rendered.contains(#"Do not replace \n with a physical newline"#))
         let currentShapeRange = try #require(rendered.range(of: "Required call shape for the current request"))
         let userContentRange = try #require(rendered.range(of: "Use the line_count tool on this exact text: red\ngreen\nblue"))
         #expect(userContentRange.lowerBound < currentShapeRange.lowerBound)

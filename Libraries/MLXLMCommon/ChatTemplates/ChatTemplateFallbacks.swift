@@ -176,9 +176,8 @@ public enum ChatTemplateFallbacks {
                         {%- endif -%}
                     {%- endfor -%}
                     {%- if exact.value -%}
-                        {%- set exact_escaped = exact.value | replace("\\", "\\\\") | replace("\n", "\\n") | replace("\t", "\\t") -%}
+                        {%- set exact_escaped = exact.value | replace("\\", "\\\\") | replace("\t", "\\t") -%}
                         {{- '\nRequired call shape for the current request:\n<|tool_call>call:' + required_tool_name + '{' + param_name + ':<|"|>' + exact_escaped + '<|"|>}<tool_call|>' -}}
-                        {{- '\nDo not replace \\n with a physical newline, do not insert a space after it, and do not insert the function name inside the argument value.' -}}
                     {%- else -%}
                         {{- '\nCopy the `' + param_name + '` value exactly from the current user request. Do not invent placeholders, summaries, or prior-turn text.' -}}
                     {%- endif -%}
