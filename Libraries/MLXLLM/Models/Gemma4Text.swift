@@ -411,7 +411,8 @@ class Gemma4ScaledLinear: Module {
         if !scales.shape.isEmpty {
             let inferred = JangLoader.inferBitWidthAndGroupSize(
                 weight: weight, scales: scales, knownGroupSize: 32)
-            let mode: QuantizationMode = biases == nil ? .mxfp4 : .affine
+            let hasAffineBiases = biases?.shape.isEmpty == false
+            let mode: QuantizationMode = hasAffineBiases ? .affine : .mxfp4
             let projected = quantizedMM(
                 flatInput, weight, scales: scales, biases: biases, transpose: true,
                 groupSize: inferred.groupSize, bits: inferred.bits, mode: mode)
