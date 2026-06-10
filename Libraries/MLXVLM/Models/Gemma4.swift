@@ -956,21 +956,30 @@ private class TextModel: Module {
         let layerCount = layers.count
         guard layerCount > 0 else { return [] }
         let width = cfg.hiddenSizePerLayerInput
+        let combinedWidth = layerCount * width
         precondition(width > 0, "Gemma4 per-layer input width must be positive")
         precondition(
-            prefixRank >= 0 && prefixRank < perLayerInputs.ndim,
-            "Gemma4 PLE prefix rank \(prefixRank) is outside shape \(perLayerInputs.shape)")
-        precondition(
-            perLayerInputs.dim(prefixRank) == layerCount * width,
-            "Gemma4 PLE axis width \(perLayerInputs.dim(prefixRank)) does not match \(layerCount) layers * \(width), prefixRank=\(prefixRank), prefixShape=\(prefixShape), shape=\(perLayerInputs.shape)")
+            perLayerInputs.ndim > 0,
+            "Gemma4 PLE tensor must have rank > 0, prefixRank=\(prefixRank), prefixShape=\(prefixShape)")
+        let splitAxis: Int
+        if prefixRank >= 0 && prefixRank < perLayerInputs.ndim
+            && perLayerInputs.dim(prefixRank) == combinedWidth
+        {
+            splitAxis = prefixRank
+        } else if let axis = perLayerInputs.shape.lastIndex(of: combinedWidth) {
+            splitAxis = axis
+        } else {
+            preconditionFailure(
+                "Gemma4 PLE could not find axis width \(combinedWidth), prefixRank=\(prefixRank), prefixShape=\(prefixShape), shape=\(perLayerInputs.shape)")
+        }
 
         let boundaries = layerCount > 1 ? (1 ..< layerCount).map { $0 * width } : []
         let splitInputs = perLayerInputs
-            .split(indices: boundaries, axis: prefixRank)
+            .split(indices: boundaries, axis: splitAxis)
             .map { $0 as MLXArray? }
         precondition(
             splitInputs.count == layerCount,
-            "Gemma4 PLE split produced \(splitInputs.count) parts for \(layerCount) layers, prefixRank=\(prefixRank), prefixShape=\(prefixShape), shape=\(perLayerInputs.shape)")
+            "Gemma4 PLE split produced \(splitInputs.count) parts for \(layerCount) layers, splitAxis=\(splitAxis), prefixRank=\(prefixRank), prefixShape=\(prefixShape), shape=\(perLayerInputs.shape)")
         return splitInputs
     }
 

@@ -18,6 +18,8 @@
 // Source-coverage style — no MLX runtime needed.
 
 import Foundation
+import MLX
+import MLXLMCommon
 @testable import MLXLLM
 import Testing
 
@@ -171,6 +173,59 @@ struct Gemma4PLECoherenceTests {
         }
     }
 
+    @Test("Gemma4 E2B MXFP4 PLE projection has production split shape")
+    func e2bMXFP4PLEProjectionHasProductionSplitShape() throws {
+        let modelRoot = URL(
+            fileURLWithPath: "/Volumes/EricsLLMDrive/hf-stage/gemma4-qat-mxfp4/OsaurusAI/gemma-4-E2B-it-qat-MXFP4")
+        let indexURL = modelRoot.appendingPathComponent("model.safetensors.index.json")
+        guard FileManager.default.fileExists(atPath: indexURL.path) else {
+            print("SKIP: Gemma4 E2B MXFP4 model index not local")
+            return
+        }
+
+        let configData = try Data(contentsOf: modelRoot.appendingPathComponent("config.json"))
+        let configJSON = try #require(
+            JSONSerialization.jsonObject(with: configData) as? [String: Any])
+        let textConfig = try #require(configJSON["text_config"] as? [String: Any])
+        let hiddenSize = try #require(textConfig["hidden_size"] as? Int)
+        let layerCount = try #require(textConfig["num_hidden_layers"] as? Int)
+        let width = try #require(textConfig["hidden_size_per_layer_input"] as? Int)
+        let outputDims = layerCount * width
+
+        let indexData = try Data(contentsOf: indexURL)
+        let indexJSON = try #require(
+            JSONSerialization.jsonObject(with: indexData) as? [String: Any])
+        let weightMap = try #require(indexJSON["weight_map"] as? [String: String])
+        let weightKey = "language_model.model.per_layer_model_projection.weight"
+        let scalesKey = "language_model.model.per_layer_model_projection.scales"
+        let tensorFile = try #require(weightMap[weightKey])
+        #expect(weightMap[scalesKey] == tensorFile)
+
+        let arrays = try MLX.loadArrays(url: modelRoot.appendingPathComponent(tensorFile))
+        let weight = try #require(arrays[weightKey])
+        let scales = try #require(arrays[scalesKey])
+        #expect(weight.shape == [outputDims, hiddenSize / 8])
+        #expect(scales.shape == [outputDims, hiddenSize / 32])
+
+        let inferred = JangLoader.inferBitWidthAndGroupSize(
+            weight: weight, scales: scales, knownGroupSize: 32)
+        #expect(inferred.bits == 4)
+        #expect(inferred.groupSize == 32)
+
+        let tokenCount = 2
+        let flatInput = MLXArray.zeros([tokenCount, hiddenSize])
+        let projected = quantizedMM(
+            flatInput, weight, scales: scales, biases: nil, transpose: true,
+            groupSize: inferred.groupSize, bits: inferred.bits, mode: .mxfp4)
+        eval(projected)
+        #expect(projected.shape == [tokenCount, outputDims])
+
+        let final = projected.reshaped([1, tokenCount, outputDims])
+        let split = final.split(indices: (1 ..< layerCount).map { $0 * width }, axis: 2)
+        #expect(split.count == layerCount)
+        #expect(split.allSatisfy { $0.shape == [1, tokenCount, width] })
+    }
+
     @Test("Gemma4 E-series scaled projection initializes JANG affine biases slot")
     func eSeriesScaledProjectionInitializesAffineBiasSlot() throws {
         let repo = URL(fileURLWithPath: #filePath)
@@ -209,9 +264,12 @@ struct Gemma4PLECoherenceTests {
             #expect(source.contains(".count"))
             #expect(source.contains("flatShape = prefixShape"))
             #expect(source.contains("reshaped(flatShape)"))
-            #expect(source.contains("perLayerInputs.dim(prefixRank) == layerCount * width"))
+            #expect(source.contains("let combinedWidth = layerCount * width"))
+            #expect(source.contains("let splitAxis: Int"))
+            #expect(source.contains("perLayerInputs.dim(prefixRank) == combinedWidth"))
+            #expect(source.contains("perLayerInputs.shape.lastIndex(of: combinedWidth)"))
             #expect(source.contains("let boundaries = layerCount > 1 ? (1 ..< layerCount).map { $0 * width } : []"))
-            #expect(source.contains(".split(indices: boundaries, axis: prefixRank)"))
+            #expect(source.contains(".split(indices: boundaries, axis: splitAxis)"))
             #expect(source.contains("precondition(width > 0"))
             #expect(!source.contains("switch perLayerInputs.ndim"))
             #expect(!source.contains("perLayerInputs[0..., 0..., start ..< end]"))

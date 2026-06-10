@@ -733,17 +733,26 @@ public class Gemma4Model: Module {
         let layerCount = layers.count
         guard layerCount > 0 else { return [] }
         let width = config.hiddenSizePerLayerInput
+        let combinedWidth = layerCount * width
         precondition(width > 0, "Gemma4 per-layer input width must be positive")
         precondition(
-            prefixRank >= 0 && prefixRank < perLayerInputs.ndim,
-            "Gemma4 PLE prefix rank \(prefixRank) is outside shape \(perLayerInputs.shape)")
-        precondition(
-            perLayerInputs.dim(prefixRank) == layerCount * width,
-            "Gemma4 PLE axis width \(perLayerInputs.dim(prefixRank)) does not match \(layerCount) layers * \(width), prefixRank=\(prefixRank), shape=\(perLayerInputs.shape)")
+            perLayerInputs.ndim > 0,
+            "Gemma4 PLE tensor must have rank > 0, prefixRank=\(prefixRank)")
+        let splitAxis: Int
+        if prefixRank >= 0 && prefixRank < perLayerInputs.ndim
+            && perLayerInputs.dim(prefixRank) == combinedWidth
+        {
+            splitAxis = prefixRank
+        } else if let axis = perLayerInputs.shape.lastIndex(of: combinedWidth) {
+            splitAxis = axis
+        } else {
+            preconditionFailure(
+                "Gemma4 PLE could not find axis width \(combinedWidth), prefixRank=\(prefixRank), shape=\(perLayerInputs.shape)")
+        }
 
         let boundaries = layerCount > 1 ? (1 ..< layerCount).map { $0 * width } : []
         return perLayerInputs
-            .split(indices: boundaries, axis: prefixRank)
+            .split(indices: boundaries, axis: splitAxis)
             .map { $0 as MLXArray? }
     }
 
