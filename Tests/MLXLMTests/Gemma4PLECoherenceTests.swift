@@ -165,7 +165,7 @@ struct Gemma4PLECoherenceTests {
             #expect(source.contains("MLXArray.mlxNone"))
             #expect(source.contains("!scales.shape.isEmpty"))
             #expect(source.contains("JangLoader.inferBitWidthAndGroupSize"))
-            #expect(source.contains("let hasAffineBiases = biases?.shape.isEmpty == false"))
+            #expect(source.contains("let hasAffineBiases = biases?.ctx.ctx != nil"))
             #expect(source.contains("let mode: QuantizationMode = hasAffineBiases ? .affine : .mxfp4"))
             #expect(source.contains("quantizedMM("))
             #expect(source.contains("mode: mode"))
