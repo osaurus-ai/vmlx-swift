@@ -945,10 +945,6 @@ private class TextModel: Module {
         guard layerCount > 0 else { return [] }
         let width = cfg.hiddenSizePerLayerInput
         precondition(width > 0, "Gemma4 per-layer input width must be positive")
-        let lastDim = perLayerInputs.shape.last ?? 0
-        precondition(
-            lastDim == layerCount * width,
-            "Gemma4 per-layer input width \(lastDim) does not match \(layerCount) * \(width)")
 
         var splitInputs: [MLXArray?] = []
         splitInputs.reserveCapacity(layerCount)
