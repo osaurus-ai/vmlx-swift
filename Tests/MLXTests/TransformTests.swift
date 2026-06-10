@@ -33,6 +33,14 @@ class TransformTests: XCTestCase {
         eval(a, b, c, d, e)
     }
 
+    func testEvalSkipsNoneSentinelArrays() {
+        let a = MLXArray(0)
+
+        eval(MLXArray.mlxNone)
+        eval([MLXArray.mlxNone, a])
+        eval((MLXArray.mlxNone, a))
+    }
+
     func testGrad() {
         func fn(_ x: MLXArray) -> MLXArray {
             x.square()

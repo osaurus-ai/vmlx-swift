@@ -14,7 +14,7 @@ let evalLock = NSRecursiveLock()
 /// ### See Also
 /// - <doc:lazy-evaluation>
 public func eval(_ arrays: MLXArray...) {
-    let vector_array = new_mlx_vector_array(arrays)
+    let vector_array = new_mlx_vector_array(arrays.filter(\.hasBackingArray))
     mlx_eval(vector_array)
     mlx_vector_array_free(vector_array)
 }
@@ -24,7 +24,7 @@ public func eval(_ arrays: MLXArray...) {
 /// ### See Also
 /// - <doc:lazy-evaluation>
 public func eval(_ arrays: some Collection<MLXArray>) {
-    let vector_array = new_mlx_vector_array(arrays)
+    let vector_array = new_mlx_vector_array(arrays.filter(\.hasBackingArray))
     mlx_eval(vector_array)
     mlx_vector_array_free(vector_array)
 }
@@ -35,7 +35,7 @@ public func eval(_ arrays: some Collection<MLXArray>) {
 /// - <doc:lazy-evaluation>
 /// - ``asyncEval(_:)-(Collection<MLXArray>)``
 public func asyncEval(_ arrays: some Collection<MLXArray>) {
-    let vector_array = new_mlx_vector_array(arrays)
+    let vector_array = new_mlx_vector_array(arrays.filter(\.hasBackingArray))
     mlx_async_eval(vector_array)
     mlx_vector_array_free(vector_array)
 }
@@ -202,5 +202,11 @@ private func collect(_ item: Any, into arrays: inout [MLXArray]) {
         break
     default:
         fatalError("Unable to extract MLXArray from \(item)")
+    }
+}
+
+private extension MLXArray {
+    var hasBackingArray: Bool {
+        ctx.ctx != nil
     }
 }
