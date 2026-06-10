@@ -186,6 +186,30 @@ final class NaiveStreamingDetokenizerShrinkTests: XCTestCase {
         XCTAssertFalse(emitted.contains("cOsaurus"))
         XCTAssertFalse(emitted.contains("Osaurus hat"))
     }
+
+    /// Gemma 4 regression follow-up: holding back the unstable tail must not
+    /// combine with newline compaction and drop text between chunks. The live
+    /// app symptom was a stream like "\n\nto use this information?" where the
+    /// held text "How would you like me " disappeared.
+    func testHeldBackNewlineTailIsNotDroppedBeforeFlush() {
+        let stablePrefix = "12345678901234567890\n"
+        let heldTail = "abcdefghijklmnopqrstuvwx"
+        let final = stablePrefix + heldTail + "YZ"
+        let tok = ScriptedDecodeTokenizer(outputs: [
+            stablePrefix + heldTail,
+            final,
+        ])
+        var d = NaiveStreamingDetokenizer(tokenizer: tok)
+        var emitted = ""
+        for t in [1, 2] {
+            d.append(token: t)
+            if let s = d.next() { emitted += s }
+        }
+        if let s = d.flush() { emitted += s }
+
+        XCTAssertEqual(emitted, final)
+        XCTAssertTrue(emitted.contains(heldTail))
+    }
 }
 
 /// Defensive regression suite for `ReasoningParser.drain`'s holdback

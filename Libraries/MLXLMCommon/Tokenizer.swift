@@ -195,7 +195,7 @@ public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
             }
         }
 
-        if new.hasSuffix("\n") {
+        if !holdBackTail && new.hasSuffix("\n") {
             startNewSegment()
         } else {
             self.segment = newSegment
