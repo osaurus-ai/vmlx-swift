@@ -27,8 +27,11 @@ struct JangPressSafetensorsAlignmentTests {
         try Data("{}".utf8).write(to: bundle.appendingPathComponent("config.json"))
 
         let priorCache = getenv("JANGPRESS_ALIGN_CACHE_DIR").map { String(cString: $0) }
+        let priorAlign = getenv("JANGPRESS_ALIGN_SAFETENSORS").map { String(cString: $0) }
         setenv("JANGPRESS_ALIGN_CACHE_DIR", cache.path, 1)
+        setenv("JANGPRESS_ALIGN_SAFETENSORS", "1", 1)
         defer { Self.restoreEnv("JANGPRESS_ALIGN_CACHE_DIR", priorCache) }
+        defer { Self.restoreEnv("JANGPRESS_ALIGN_SAFETENSORS", priorAlign) }
 
         let prepared = try JangPressPrestacker.prepareBundleIfNeeded(
             originalURL: bundle,
@@ -68,6 +71,31 @@ struct JangPressSafetensorsAlignmentTests {
         let priorCache = getenv("JANGPRESS_ALIGN_CACHE_DIR").map { String(cString: $0) }
         setenv("JANGPRESS_ALIGN_CACHE_DIR", cache.path, 1)
         defer { Self.restoreEnv("JANGPRESS_ALIGN_CACHE_DIR", priorCache) }
+
+        let prepared = try JangPressPrestacker.prepareBundleIfNeeded(
+            originalURL: bundle,
+            enabled: true)
+        #expect(prepared.path == bundle.resolvingSymlinksInPath().path)
+    }
+
+    @Test("alignment overlay is opt-in when env is unset")
+    func alignmentOverlayIsOffByDefault() throws {
+        let bundle = try Self.makeBundleDir()
+        let cache = try Self.makeBundleDir(prefix: "jpress-align-cache")
+        defer {
+            try? FileManager.default.removeItem(at: bundle)
+            try? FileManager.default.removeItem(at: cache)
+        }
+        try Self.writeSafetensors(
+            at: bundle.appendingPathComponent("model.safetensors"),
+            tensorName: "model.layers.0.mlp.experts.0.gate_proj.weight")
+
+        let priorCache = getenv("JANGPRESS_ALIGN_CACHE_DIR").map { String(cString: $0) }
+        let priorAlign = getenv("JANGPRESS_ALIGN_SAFETENSORS").map { String(cString: $0) }
+        setenv("JANGPRESS_ALIGN_CACHE_DIR", cache.path, 1)
+        unsetenv("JANGPRESS_ALIGN_SAFETENSORS")
+        defer { Self.restoreEnv("JANGPRESS_ALIGN_CACHE_DIR", priorCache) }
+        defer { Self.restoreEnv("JANGPRESS_ALIGN_SAFETENSORS", priorAlign) }
 
         let prepared = try JangPressPrestacker.prepareBundleIfNeeded(
             originalURL: bundle,

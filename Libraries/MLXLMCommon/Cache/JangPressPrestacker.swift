@@ -55,9 +55,10 @@ public enum JangPressPrestacker {
         let prestackDisabled = !prestackExplicitlyEnabled
         let alignSafetensors = env["MLXPRESS_ALIGN_SAFETENSORS"]
             ?? env["JANGPRESS_ALIGN_SAFETENSORS"]
+        let alignExplicitlyEnabled = isEnabledFlag(alignSafetensors)
         let prestackStrict = env["MLXPRESS_PRESTACK_STRICT"]
             ?? env["JANGPRESS_PRESTACK_STRICT"]
-        if prestackDisabled && alignSafetensors == "0" {
+        if prestackDisabled && !alignExplicitlyEnabled {
             return originalURL
         }
 
@@ -556,7 +557,7 @@ public enum JangPressPrestacker {
     ) throws -> URL {
         let alignSafetensors = env["MLXPRESS_ALIGN_SAFETENSORS"]
             ?? env["JANGPRESS_ALIGN_SAFETENSORS"]
-        guard alignSafetensors != "0" else {
+        guard isEnabledFlag(alignSafetensors) else {
             return directory
         }
         // JANGTQ bundles already use the prestack overlay path. Rewriting
