@@ -35,6 +35,17 @@ private func loadSafetensorsHeaderNamesForBaseLoad(_ url: URL) throws -> [String
     return header.keys.filter { $0 != "__metadata__" }
 }
 
+private func modelIndexContainsPreservedMTPWeight(at modelDirectory: URL) -> Bool? {
+    let indexURL = modelDirectory.appendingPathComponent("model.safetensors.index.json")
+    guard let data = try? Data(contentsOf: indexURL),
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let weightMap = json["weight_map"] as? [String: Any]
+    else {
+        return nil
+    }
+    return weightMap.keys.contains(where: isPreservedMTPWeightKey)
+}
+
 private func loadJangConfigSanitizeMetadata(at modelDirectory: URL) -> [String: String] {
     guard let url = JangLoader.findConfigPath(at: modelDirectory),
         let data = try? Data(contentsOf: url),
@@ -194,6 +205,8 @@ public func loadWeights(
         var skippedStreamingSourceTensors = 0
         var skippedPreservedMTPTensors = 0
         var skippedPreservedMTPShards = 0
+        let shouldFilterPreservedMTP =
+            !loadPreservedMTP && (modelIndexContainsPreservedMTPWeight(at: modelDirectory) ?? true)
         let streamingRoutedExperts =
             JANGTQStreamingExperts.isEnabled
             || JANGTQStreamingExperts.shouldAutoEnableNemotronUltra(
@@ -204,7 +217,7 @@ public func loadWeights(
             JANGTQStreamingExperts.configureModelDirectory(modelDirectory)
         }
         for url in allShardURLs {
-            if !loadPreservedMTP,
+            if shouldFilterPreservedMTP,
                 let headerNames = try? loadSafetensorsHeaderNamesForBaseLoad(url),
                 !headerNames.isEmpty,
                 headerNames.allSatisfy(isPreservedMTPWeightKey)
@@ -216,7 +229,7 @@ public func loadWeights(
             let (w, m) = try loadArraysAndMetadata(url: url)
             let isPrestackedShard = url.lastPathComponent == "jangpress-prestacked.safetensors"
             for (key, value) in w {
-                if !loadPreservedMTP, isPreservedMTPWeightKey(key) {
+                if shouldFilterPreservedMTP, isPreservedMTPWeightKey(key) {
                     skippedPreservedMTPTensors += 1
                     continue
                 }

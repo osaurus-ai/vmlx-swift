@@ -23,6 +23,26 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
+    @Test("preserved MTP filtering is index gated before shard header scan")
+    func preservedMTPFilteringIsIndexGatedBeforeShardHeaderScan() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let repoRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repoRoot
+                .appendingPathComponent("Libraries/MLXLMCommon/Load.swift"),
+            encoding: .utf8)
+
+        #expect(source.contains("modelIndexContainsPreservedMTPWeight"))
+        #expect(source.contains("model.safetensors.index.json"))
+        #expect(source.contains("let shouldFilterPreservedMTP"))
+        #expect(source.contains("modelIndexContainsPreservedMTPWeight(at: modelDirectory) ?? true"))
+        #expect(source.contains("if shouldFilterPreservedMTP,"))
+        #expect(!source.contains("if !loadPreservedMTP,\n                let headerNames"))
+    }
+
     @Test("cached multi-token verifier mask carries cache offset")
     func cachedMultiTokenVerifierMaskCarriesCacheOffset() {
         FocusedMLXTestSupport.withLock {
