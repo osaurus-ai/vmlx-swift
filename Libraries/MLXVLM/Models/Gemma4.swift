@@ -1342,7 +1342,12 @@ public struct Gemma4Processor: UserInputProcessor {
         if Self.requiresToolChoice(input.additionalContext) {
             messages = Self.compactCompletedToolHistoryForRequiredChoice(messages)
         }
-        var tokens = try tokenizer.applyChatTemplate(messages: messages, tools: input.tools, additionalContext: input.additionalContext)
+        let chatTemplateTools = MLXLMCommon.normalizedToolsForChatTemplate(input.tools)
+        var tokens = try tokenizer.applyChatTemplate(
+            messages: messages,
+            tools: chatTemplateTools,
+            additionalContext: input.additionalContext
+        )
 
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {

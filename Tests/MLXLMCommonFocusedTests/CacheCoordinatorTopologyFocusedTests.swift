@@ -681,6 +681,18 @@ struct CacheCoordinatorTopologyFocusedTests {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
+
+    @Test("Gemma4 processor normalizes tool schemas before applying chat template")
+    func gemma4ProcessorNormalizesToolSchemasBeforeChatTemplate() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Libraries/MLXVLM/Models/Gemma4.swift")
+        let source = try String(contentsOf: sourceURL)
+        #expect(source.contains("normalizedToolsForChatTemplate(input.tools)"))
+        #expect(source.contains("tools: chatTemplateTools"))
+    }
 }
 
 @Suite("BatchArraysCache focused contracts", .serialized)
