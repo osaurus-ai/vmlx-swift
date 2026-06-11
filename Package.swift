@@ -791,6 +791,7 @@ let package = Package(
                 "MTPRuntimeFocusedTests.swift",
                 "MLXPressCLISourceContractsTests.swift",
                 "VMLXServerRuntimeSettingsTests.swift",
+                "VMLXMemorySafetySettingsTests.swift",
                 "DSV4AgenticToolSourceTests.swift",
                 "NoHiddenReasoningCloseBiasFocusedTests.swift",
                 "TokenizerAddedTokenRegexFocusedTests.swift",

@@ -19,6 +19,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     public var tools: VMLXServerToolSettings
     public var multimodal: VMLXServerMultimodalSettings
     public var mtp: VMLXServerMTPSettings
+    public var memorySafety: VMLXMemorySafetySettings
 
     public init(
         network: VMLXServerNetworkSettings = .init(),
@@ -28,7 +29,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         generation: VMLXServerGenerationDefaults = .init(),
         tools: VMLXServerToolSettings = .init(),
         multimodal: VMLXServerMultimodalSettings = .init(),
-        mtp: VMLXServerMTPSettings = .init()
+        mtp: VMLXServerMTPSettings = .init(),
+        memorySafety: VMLXMemorySafetySettings = .init()
     ) {
         self.network = network
         self.concurrency = concurrency
@@ -38,6 +40,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         self.tools = tools
         self.multimodal = multimodal
         self.mtp = mtp
+        self.memorySafety = memorySafety
     }
 
     public func validationIssues(
@@ -274,6 +277,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                     message: "MTP force-on was requested without a bundle status snapshot."))
             }
         }
+        issues.append(contentsOf: memorySafety.validationIssues())
 
         return issues
     }
@@ -425,6 +429,122 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             jangConfig: jangConfig,
             status: status).launchMode == .speculative
         return resolved
+    }
+
+    /// Resolve the single memory-safety slider into concrete engine knobs.
+    ///
+    /// This helper is intentionally policy-only. It does not inspect Activity
+    /// Monitor free memory, does not alter generation defaults, and does not
+    /// hide runtime bugs with sampler/template changes. Strict modes may return
+    /// typed blocking issues before load/request execution; non-strict modes
+    /// return warnings so hosts can show the risk while still allowing an
+    /// explicit user launch.
+    public func resolvedMemorySafetyPlan(
+        baseLoadConfiguration: LoadConfiguration = .default,
+        bundleFacts: LoadBundleFacts? = nil,
+        host: MemoryStatus? = nil,
+        request: VMLXMemoryRequestEstimate? = nil
+    ) -> VMLXResolvedMemorySafetyPlan {
+        let profile = memorySafety.profile
+        let physicalMemory = host?.physicalMemory
+            ?? bundleFacts?.physicalMemory
+            ?? ProcessInfo.processInfo.physicalMemory
+        let requestedFraction = memorySafety.customPhysicalMemoryFraction
+            ?? profile.loadFraction
+        let loadCap = ResidentCap.fraction(requestedFraction)
+        let allocatorCap = memorySafety.customAllocatorCacheBytes.map(ResidentCap.absolute)
+            ?? profile.allocatorCap
+
+        var loadConfiguration = baseLoadConfiguration
+        loadConfiguration.memoryLimit = loadCap
+        loadConfiguration.maxResidentBytes = allocatorCap
+        loadConfiguration.useMmapSafetensors = true
+        loadConfiguration.jangPress = resolvedMemorySafetyJangPress(
+            base: baseLoadConfiguration.jangPress,
+            facts: bundleFacts)
+
+        var resolvedConcurrency = concurrency
+        resolvedConcurrency.maxConcurrentSequences =
+            memorySafety.customMaxConcurrentSequences
+            ?? resolvedConcurrency.maxConcurrentSequences
+            ?? profile.maxConcurrentSequences
+
+        var resolvedCache = cache
+        resolvedCache.prefix.enabled = true
+        resolvedCache.pagedKV.enabled = true
+        resolvedCache.blockDisk.enabled = true
+        resolvedCache.legacyDisk.enabled = false
+        if resolvedCache.prefix.memoryLimitMB == nil {
+            resolvedCache.prefix.memoryLimitMB = profile.prefixMemoryLimitMB
+        }
+        if resolvedCache.prefix.memoryPercent == nil {
+            resolvedCache.prefix.memoryPercent = profile.prefixMemoryPercent
+        }
+        resolvedCache.defaultMaxKVSize =
+            memorySafety.customDefaultMaxKVSize
+            ?? resolvedCache.defaultMaxKVSize
+            ?? profile.defaultMaxKVSize
+
+        var warnings = profile.warnings
+        var blockingIssues: [VMLXServerSettingsIssue] = []
+
+        if case .diagnosticDangerous = memorySafety.mode {
+            warnings.append("Diagnostic memory mode uses caller-supplied limits and may exceed the host working set.")
+        }
+        if !memorySafety.allowExperimentalMLXPress,
+           baseLoadConfiguration.jangPress != .disabled {
+            warnings.append("MLXPress/JangPress was not selected by the memory slider. It remains disabled unless the host enables a proven routed-bundle lane explicitly.")
+        }
+
+        let resolvedBudgetBytes = loadCap.resolve(physicalMemory: physicalMemory)
+        if let estimate = request {
+            if estimate.workingSetBytes == nil,
+               memorySafety.failClosedWhenEstimateUnknown || profile.failClosedWhenEstimateUnknown {
+                blockingIssues.append(.error(
+                    field: "memorySafety.requestEstimate",
+                    message: "Strict memory safety requires a request working-set estimate before launch."))
+            }
+            if let budget = resolvedBudgetBytes,
+               let estimateBytes = estimate.workingSetBytes,
+               estimateBytes > budget {
+                let message = "Estimated request working set \(estimateBytes) bytes exceeds resolved memory budget \(budget) bytes."
+                if profile.blocksOverBudget {
+                    blockingIssues.append(.error(
+                        field: "memorySafety.requestEstimate",
+                        message: message))
+                } else {
+                    warnings.append(message)
+                }
+            }
+        }
+
+        let displaySummary = "mode=\(memorySafety.mode.rawValue) slider=\(memorySafety.slider) load_cap=\(requestedFraction) allocator_cap=\(allocatorCap.displayValue) max_concurrent=\(resolvedConcurrency.maxConcurrentSequences ?? 0) kv_cap=\(resolvedCache.defaultMaxKVSize ?? 0)"
+
+        return VMLXResolvedMemorySafetyPlan(
+            loadConfiguration: loadConfiguration,
+            cache: resolvedCache,
+            concurrency: resolvedConcurrency,
+            resolvedPhysicalMemoryBytes: physicalMemory,
+            resolvedLoadBudgetBytes: resolvedBudgetBytes,
+            warnings: warnings,
+            blockingIssues: blockingIssues,
+            displaySummary: displaySummary)
+    }
+
+    private func resolvedMemorySafetyJangPress(
+        base: JangPressPolicy,
+        facts: LoadBundleFacts?
+    ) -> JangPressPolicy {
+        guard memorySafety.allowExperimentalMLXPress else {
+            return .disabled
+        }
+        guard let facts,
+              facts.isRouted,
+              facts.hasJangConfig || facts.hasJangTQRuntime
+        else {
+            return .disabled
+        }
+        return base
     }
 
     /// Apply explicit server-panel parser overrides to a model configuration.
@@ -985,6 +1105,199 @@ public struct VMLXResolvedMTPLaunch: Codable, Sendable, Equatable {
     }
 }
 
+public enum VMLXMemorySafetyMode: String, Codable, Sendable, Equatable, CaseIterable {
+    case performance
+    case balanced
+    case safeAuto = "safe_auto"
+    case strict
+    case diagnosticDangerous = "diagnostic_dangerous"
+}
+
+public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
+    public var mode: VMLXMemorySafetyMode
+    public var slider: Int
+    public var allowExperimentalMLXPress: Bool
+    public var failClosedWhenEstimateUnknown: Bool
+    public var customPhysicalMemoryFraction: Double?
+    public var customAllocatorCacheBytes: UInt64?
+    public var customDefaultMaxKVSize: Int?
+    public var customMaxConcurrentSequences: Int?
+
+    public init(
+        mode: VMLXMemorySafetyMode = .safeAuto,
+        slider: Int = 2,
+        allowExperimentalMLXPress: Bool = false,
+        failClosedWhenEstimateUnknown: Bool = false,
+        customPhysicalMemoryFraction: Double? = nil,
+        customAllocatorCacheBytes: UInt64? = nil,
+        customDefaultMaxKVSize: Int? = nil,
+        customMaxConcurrentSequences: Int? = nil
+    ) {
+        self.mode = mode
+        self.slider = slider
+        self.allowExperimentalMLXPress = allowExperimentalMLXPress
+        self.failClosedWhenEstimateUnknown = failClosedWhenEstimateUnknown
+        self.customPhysicalMemoryFraction = customPhysicalMemoryFraction
+        self.customAllocatorCacheBytes = customAllocatorCacheBytes
+        self.customDefaultMaxKVSize = customDefaultMaxKVSize
+        self.customMaxConcurrentSequences = customMaxConcurrentSequences
+    }
+
+    public func validationIssues() -> [VMLXServerSettingsIssue] {
+        var issues: [VMLXServerSettingsIssue] = []
+        if !(0...4).contains(slider) {
+            issues.append(.error(
+                field: "memorySafety.slider",
+                message: "Memory safety slider must be between 0 and 4."))
+        }
+        if let fraction = customPhysicalMemoryFraction,
+           fraction <= 0 || fraction > 1 {
+            issues.append(.error(
+                field: "memorySafety.customPhysicalMemoryFraction",
+                message: "Custom physical-memory fraction must be greater than 0 and at most 1."))
+        }
+        if let bytes = customAllocatorCacheBytes, bytes == 0 {
+            issues.append(.error(
+                field: "memorySafety.customAllocatorCacheBytes",
+                message: "Custom allocator cache bytes must be positive."))
+        }
+        if let kv = customDefaultMaxKVSize, kv <= 0 {
+            issues.append(.error(
+                field: "memorySafety.customDefaultMaxKVSize",
+                message: "Custom max KV size must be positive."))
+        }
+        if let maxConcurrent = customMaxConcurrentSequences, maxConcurrent <= 0 {
+            issues.append(.error(
+                field: "memorySafety.customMaxConcurrentSequences",
+                message: "Custom max concurrent sequences must be positive."))
+        }
+        return issues
+    }
+
+    fileprivate var profile: VMLXMemorySafetyProfile {
+        switch mode {
+        case .performance:
+            return .init(
+                loadFraction: customPhysicalMemoryFraction ?? 0.90,
+                allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute) ?? .unlimited,
+                maxConcurrentSequences: customMaxConcurrentSequences ?? 2,
+                prefixMemoryLimitMB: nil,
+                prefixMemoryPercent: 20,
+                defaultMaxKVSize: customDefaultMaxKVSize,
+                failClosedWhenEstimateUnknown: false,
+                blocksOverBudget: false,
+                warnings: ["Performance memory mode may allow macOS compression or swap before refusing a request."])
+        case .balanced:
+            return .init(
+                loadFraction: customPhysicalMemoryFraction ?? 0.75,
+                allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute) ?? .absolute(1 << 30),
+                maxConcurrentSequences: customMaxConcurrentSequences ?? 2,
+                prefixMemoryLimitMB: 512,
+                prefixMemoryPercent: 15,
+                defaultMaxKVSize: customDefaultMaxKVSize ?? 8192,
+                failClosedWhenEstimateUnknown: false,
+                blocksOverBudget: false,
+                warnings: [])
+        case .safeAuto:
+            return .init(
+                loadFraction: customPhysicalMemoryFraction ?? 0.70,
+                allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute) ?? .absolute(128 << 20),
+                maxConcurrentSequences: customMaxConcurrentSequences ?? 1,
+                prefixMemoryLimitMB: 128,
+                prefixMemoryPercent: 15,
+                defaultMaxKVSize: customDefaultMaxKVSize ?? 8192,
+                failClosedWhenEstimateUnknown: false,
+                blocksOverBudget: false,
+                warnings: [])
+        case .strict:
+            return .init(
+                loadFraction: customPhysicalMemoryFraction ?? 0.60,
+                allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute) ?? .absolute(128 << 20),
+                maxConcurrentSequences: customMaxConcurrentSequences ?? 1,
+                prefixMemoryLimitMB: 128,
+                prefixMemoryPercent: 10,
+                defaultMaxKVSize: customDefaultMaxKVSize ?? 4096,
+                failClosedWhenEstimateUnknown: true,
+                blocksOverBudget: true,
+                warnings: [])
+        case .diagnosticDangerous:
+            return .init(
+                loadFraction: customPhysicalMemoryFraction ?? 1.0,
+                allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute) ?? .unlimited,
+                maxConcurrentSequences: customMaxConcurrentSequences ?? 1,
+                prefixMemoryLimitMB: nil,
+                prefixMemoryPercent: nil,
+                defaultMaxKVSize: customDefaultMaxKVSize,
+                failClosedWhenEstimateUnknown: failClosedWhenEstimateUnknown,
+                blocksOverBudget: false,
+                warnings: [])
+        }
+    }
+}
+
+fileprivate struct VMLXMemorySafetyProfile: Sendable, Equatable {
+    var loadFraction: Double
+    var allocatorCap: ResidentCap
+    var maxConcurrentSequences: Int
+    var prefixMemoryLimitMB: Int?
+    var prefixMemoryPercent: Double?
+    var defaultMaxKVSize: Int?
+    var failClosedWhenEstimateUnknown: Bool
+    var blocksOverBudget: Bool
+    var warnings: [String]
+}
+
+public struct VMLXMemoryRequestEstimate: Sendable, Equatable {
+    public var workingSetBytes: UInt64?
+    public var promptTokens: Int?
+    public var maxNewTokens: Int?
+
+    public init(
+        workingSetBytes: UInt64? = nil,
+        promptTokens: Int? = nil,
+        maxNewTokens: Int? = nil
+    ) {
+        self.workingSetBytes = workingSetBytes
+        self.promptTokens = promptTokens
+        self.maxNewTokens = maxNewTokens
+    }
+}
+
+public struct VMLXResolvedMemorySafetyPlan: Sendable, Equatable {
+    public var loadConfiguration: LoadConfiguration
+    public var cache: VMLXServerCacheSettings
+    public var concurrency: VMLXServerConcurrencySettings
+    public var resolvedPhysicalMemoryBytes: UInt64
+    public var resolvedLoadBudgetBytes: UInt64?
+    public var warnings: [String]
+    public var blockingIssues: [VMLXServerSettingsIssue]
+    public var displaySummary: String
+
+    public init(
+        loadConfiguration: LoadConfiguration,
+        cache: VMLXServerCacheSettings,
+        concurrency: VMLXServerConcurrencySettings,
+        resolvedPhysicalMemoryBytes: UInt64,
+        resolvedLoadBudgetBytes: UInt64?,
+        warnings: [String],
+        blockingIssues: [VMLXServerSettingsIssue],
+        displaySummary: String
+    ) {
+        self.loadConfiguration = loadConfiguration
+        self.cache = cache
+        self.concurrency = concurrency
+        self.resolvedPhysicalMemoryBytes = resolvedPhysicalMemoryBytes
+        self.resolvedLoadBudgetBytes = resolvedLoadBudgetBytes
+        self.warnings = warnings
+        self.blockingIssues = blockingIssues
+        self.displaySummary = displaySummary
+    }
+
+    public var allowed: Bool {
+        blockingIssues.isEmpty
+    }
+}
+
 public struct VMLXServerSettingsIssue: Codable, Sendable, Equatable {
     public enum Severity: String, Codable, Sendable, Equatable {
         case warning
@@ -1007,5 +1320,18 @@ public struct VMLXServerSettingsIssue: Codable, Sendable, Equatable {
 
     public static func error(field: String, message: String) -> VMLXServerSettingsIssue {
         .init(severity: .error, field: field, message: message)
+    }
+}
+
+private extension ResidentCap {
+    var displayValue: String {
+        switch self {
+        case .unlimited:
+            return "unlimited"
+        case .fraction(let value):
+            return "fraction(\(value))"
+        case .absolute(let bytes):
+            return "absolute(\(bytes))"
+        }
     }
 }
