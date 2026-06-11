@@ -26,10 +26,49 @@ struct Gemma4TemplateFallbackSourceTests {
             !source.contains("if isGemma {\n                                throw error\n                            }"),
             "Gemma native Jinja runtime errors must not bypass built-in Gemma fallbacks."
         )
-        #expect(source.contains("let gemmaRequiredToolChoice"))
-        #expect(source.contains("chat-template required tools -> Gemma4WithTools fallback engaged"))
+        #expect(source.contains("let gemmaToolSchemasPresent"))
+        #expect(source.contains("chat-template tools -> Gemma4WithTools fallback engaged"))
         #expect(source.contains(#""Gemma4WithTools", MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools"#))
         #expect(source.contains(#""Gemma4Minimal",   MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal"#))
+    }
+
+    @Test
+    func gemmaToolFallbackCoversAutoToolChoiceWithoutRequiredInstruction() throws {
+        let template = try Template(ChatTemplateFallbacks.gemma4WithTools)
+        let rendered = try template.renderGemma4([
+            "messages": [
+                [
+                    "role": "user",
+                    "content": "Answer plainly in one short sentence: what color is grass?",
+                ],
+            ],
+            "tools": [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "line_count",
+                        "description": "Count lines in text.",
+                        "parameters": [
+                            "type": "object",
+                            "properties": [
+                                "text": [
+                                    "type": "string",
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                            "required": ["text"],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ],
+            "tool_choice": "auto",
+            "add_generation_prompt": true,
+        ])
+
+        #expect(rendered.contains("<|tool>declaration:line_count"))
+        #expect(!rendered.contains("Tool use is REQUIRED for this assistant turn."))
+        #expect(!rendered.contains("Required call shape for the current request"))
+        #expect(rendered.contains("Answer plainly in one short sentence: what color is grass?"))
+        #expect(rendered.hasSuffix("<|turn>model\n"))
     }
 
     @Test

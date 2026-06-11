@@ -211,15 +211,14 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 tools: chatTemplateTools,
                                 additionalContext: additionalContext)
                         }
-                        let gemmaRequiredToolChoice =
+                        let gemmaToolSchemasPresent =
                             !(chatTemplateTools?.isEmpty ?? true)
                             && (upstream.bosToken == "<bos>" || hasGemma4NativeToolSentinels)
-                            && (additionalContext?["tool_choice"] as? String) == "required"
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
-                        if gemmaRequiredToolChoice {
+                        if gemmaToolSchemasPresent {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
                                 FileHandle.standardError.write(
-                                    "[vmlx] chat-template required tools -> Gemma4WithTools fallback engaged\\n"
+                                    "[vmlx] chat-template tools -> Gemma4WithTools fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
                             return try upstream.applyChatTemplate(
@@ -601,15 +600,14 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 tools: chatTemplateTools,
                                 additionalContext: additionalContext)
                         }
-                        let gemmaRequiredToolChoice =
+                        let gemmaToolSchemasPresent =
                             !(chatTemplateTools?.isEmpty ?? true)
                             && (upstream.bosToken == "<bos>" || hasGemma4NativeToolSentinels)
-                            && (additionalContext?["tool_choice"] as? String) == "required"
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
-                        if gemmaRequiredToolChoice {
+                        if gemmaToolSchemasPresent {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
                                 FileHandle.standardError.write(
-                                    "[vmlx] chat-template required tools -> Gemma4WithTools fallback engaged\\n"
+                                    "[vmlx] chat-template tools -> Gemma4WithTools fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
                             return try upstream.applyChatTemplate(
