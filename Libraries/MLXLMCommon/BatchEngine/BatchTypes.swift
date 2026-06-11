@@ -42,6 +42,9 @@ public enum BatchGeneration: Sendable {
     /// A single generated token ID.
     case token(Int)
 
+    /// Prompt-processing progress before the first decoded token.
+    case prefillProgress(PrefillProgress)
+
     /// Completion information with metrics. This is the final event before
     /// the stream closes.
     case info(GenerateCompletionInfo)

@@ -200,6 +200,9 @@ enum VLBench {
                 text += chunk
                 chunkCount += 1
                 if chunkCount > maxNew * 2 { break }
+            case .prefillProgress:
+
+                break
             case .info(let info):
                 generationTokens = info.generationTokenCount
                 promptTokensPerSecond = info.promptTokensPerSecond
@@ -403,7 +406,7 @@ enum VLBench {
                     chunkCount += 1
                 case .reasoning:
                     reasoningCount += 1
-                case .info, .toolCall:
+                case .prefillProgress, .info, .toolCall:
                     break
                 }
             }
@@ -546,7 +549,7 @@ enum VLBench {
             case .reasoning(let r):
                 if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
                 reasoningText += r; reasoningDeltas += 1; sawAnyEvent = true
-            case .info, .toolCall:
+            case .prefillProgress, .info, .toolCall:
                 break
             }
         }
@@ -815,6 +818,9 @@ enum VLBench {
             case .token(let id):
                 engineTokens.append(id)
                 if engineTokens.count >= maxNewTokens { break }
+            case .prefillProgress:
+
+                break
             case .info: break
             }
             if engineTokens.count >= maxNewTokens { break }
@@ -899,6 +905,9 @@ enum VLBench {
         for await event in streamA {
             switch event {
             case .token: turn1Gen += 1
+            case .prefillProgress:
+
+                break
             case .info(let info): turn1PromptTime = info.promptTime
             }
         }
@@ -946,6 +955,9 @@ enum VLBench {
         for await event in streamB {
             switch event {
             case .token: turn2Gen += 1
+            case .prefillProgress:
+
+                break
             case .info(let info): turn2PromptTime = info.promptTime
             }
         }
@@ -1179,6 +1191,9 @@ enum VLBench {
             case .token(let id):
                 if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
                 tokenIds.append(id)
+            case .prefillProgress:
+
+                break
             case .info(let info):
                 promptTime = info.promptTime
             }
@@ -1213,6 +1228,9 @@ enum VLBench {
                 text += chunk
             case .reasoning(let chunk):
                 reasoning += chunk
+            case .prefillProgress:
+
+                break
             case .info(let info):
                 promptTime = info.promptTime
                 tokenCount = info.generationTokenCount
@@ -1309,6 +1327,9 @@ enum VLBench {
                 if ttftMs == nil { ttftMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000 }
                 tokens.append(id)
                 if tokens.count >= maxNewTokens { break }
+            case .prefillProgress:
+
+                break
             case .info: break
             }
             if tokens.count >= maxNewTokens { break }

@@ -3,6 +3,27 @@
 See `~/AGENTS.md` for the global Codex environment, wiki protocol, hard rules,
 machine context, and useful commands.
 
+## Active Focus: Gemma Cache Defaults + Harness Proof
+
+Until this lane is merged, focus only on the Gemma cache-default and harness
+compatibility PR:
+
+- Default model loading must not enable the paged RAM KV cache. Paged RAM cache
+  may still be exercised by explicit benchmark or regression-test settings, but
+  ordinary single-batch chat/server loads should start with it off.
+- Gemma JANG and MXFP bundles must use real TurboQuant KV cache by default when
+  loaded through Osaurus chat or Osaurus server settings. Prove this through the
+  server runtime settings contract and runtime cache telemetry; do not use
+  prompts, sampler tweaks, or parser masking as a substitute.
+- Compare Gemma BF16/source bundles against the QAT/MXFP/JANG quantized bundles
+  in the Osaurus harness compatibility lane. Record pass/fail counts, token/s
+  where generation occurs, cache topology, and every failure cause.
+- Add real prefill progress telemetry so Osaurus can show prompt-processing
+  percentage during long first-token waits. Progress must come from runtime
+  prefill/cache/media stages, not from a UI timer guess.
+- Keep progress and remaining proof in the repo docs before claiming the PR is
+  merge-ready. This branch is not a broad model-runtime cleanup lane.
+
 ## MLXPress Non-Negotiables
 
 For any MLXPress, JANGTQ, cache-stack, model-runtime, or Osaurus-facing work,

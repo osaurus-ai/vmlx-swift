@@ -70,8 +70,13 @@ class BatchEngineEOSFirstTokenTests: XCTestCase {
         var stopReason: GenerateStopReason?
         for await event in stream {
             switch event {
+            case .prefillProgress:
+                break
             case .token:
                 tokenCount += 1
+            case .prefillProgress:
+
+                break
             case .info(let info):
                 stopReason = info.stopReason
             }

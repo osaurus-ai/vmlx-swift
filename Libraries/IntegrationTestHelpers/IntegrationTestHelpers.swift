@@ -234,6 +234,9 @@ public enum ChatSessionTests {
                 break
             case .toolCall(let toolCall):
                 toolCalls.append(toolCall)
+            case .prefillProgress:
+
+                break
             case .info(let completionInfo):
                 info = completionInfo
             }
@@ -670,7 +673,10 @@ public enum BatchEngineIntegrationTests {
             case .chunk(let text):
                 print(text, terminator: "")
                 result += text
-            case .info, .toolCall, .reasoning:
+            case .prefillProgress:
+
+                break
+            case .info, .prefillProgress, .toolCall, .reasoning:
                 break
             }
         }
@@ -904,7 +910,7 @@ public enum ToolCallTests {
                     text += chunk
                 case .toolCall(let toolCall):
                     toolCalls.append(toolCall)
-                case .reasoning, .info:
+                case .reasoning, .prefillProgress, .info:
                     break
                 }
             }

@@ -15,7 +15,7 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.network.host == "127.0.0.1")
         #expect(settings.concurrency.continuousBatching)
         #expect(settings.cache.prefix.enabled)
-        #expect(settings.cache.pagedKV.enabled)
+        #expect(!settings.cache.pagedKV.enabled)
         #expect(settings.cache.blockDisk.enabled)
         #expect(settings.cache.legacyDisk.enabled == false)
         #expect(settings.cache.liveKVCodec == .engineSelected)
@@ -788,7 +788,7 @@ struct VMLXServerRuntimeSettingsTests {
             promptTokenCount: 32_768)
 
         #expect(settings.concurrency.continuousBatching)
-        #expect(config.usePagedCache)
+        #expect(!config.usePagedCache)
         #expect(config.enableDiskCache)
         #expect(config.enableSSMReDerive)
         #expect(config.modelKey == "matrix|reasoning=auto|tools=auto")
@@ -818,6 +818,17 @@ struct VMLXServerRuntimeSettingsTests {
 
         #expect(!config.usePagedCache)
         #expect(!config.enableDiskCache)
+    }
+
+    @Test("explicit paged cache opt-in still enables coordinator paged tier")
+    func explicitPagedCacheOptInStillEnablesCoordinatorPagedTier() {
+        var settings = VMLXServerRuntimeSettings()
+        settings.cache.pagedKV.enabled = true
+
+        let config = settings.cacheCoordinatorConfig()
+
+        #expect(config.usePagedCache)
+        #expect(config.enableDiskCache)
     }
 
     @Test("parser overrides validate known aliases")

@@ -200,6 +200,8 @@ struct MLXPressCLI {
                         fflush(stdout)
                     case .reasoning(let text):
                         reasoningText += text
+                    case .prefillProgress:
+                        break
                     case .toolCall:
                         break
                     case .info(let info):
@@ -1148,7 +1150,7 @@ private struct Options {
       For strict thinking-on validation, thinking-on validation prompts must ask for a visible final answer.
       Do not use prompts that ask the model to think privately; pair thinking-on proof rows with
       --min-visible-chars and --fail-on-length-stop so reasoning-only length stops remain failures.
-      --cache-stack defaults to on: paged cache, disk L2, TurboQuant KV defaulting, and long-prompt KV cap are enabled.
+      --cache-stack defaults to on: disk L2, TurboQuant KV defaulting, and long-prompt KV cap are enabled; paged RAM cache is opt-in.
       --disk-cache-dir isolates disk L2 state for cold/warm validation runs.
       --ephemeral-prestack builds a temporary routed JANGTQ overlay under the system temp directory, uses the mmap loader, and removes the overlay after mmap load with a process-exit fallback. It is a MiniMax-class resident-compute diagnostic, not a permanent prestack cache.
       --compiled-decode is diagnostic opt-in for the single-sequence compiled decode path. MiniMax remains blocked unless --allow-minimax-compiled-decode is also set, because older compiled traces diverged.

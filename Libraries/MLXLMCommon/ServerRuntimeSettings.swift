@@ -471,7 +471,6 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
 
         var resolvedCache = cache
         if resolvedCache.prefix.enabled {
-            resolvedCache.pagedKV.enabled = true
             resolvedCache.blockDisk.enabled = true
             resolvedCache.legacyDisk.enabled = false
             if resolvedCache.prefix.memoryLimitMB == nil {
@@ -693,6 +692,10 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         let diskDirectory: String?
         if reuseEnabled, cache.pagedKV.enabled {
             diskEnabled = cache.blockDisk.enabled
+            diskMaxSizeGB = cache.blockDisk.maxSizeGB
+            diskDirectory = cache.blockDisk.directory
+        } else if reuseEnabled, cache.blockDisk.enabled {
+            diskEnabled = true
             diskMaxSizeGB = cache.blockDisk.maxSizeGB
             diskDirectory = cache.blockDisk.directory
         } else if reuseEnabled {
@@ -917,7 +920,7 @@ public struct VMLXPagedKVCacheSettings: Codable, Sendable, Equatable {
     public var blockSize: Int?
     public var maxBlocks: Int?
 
-    public init(enabled: Bool = true, blockSize: Int? = nil, maxBlocks: Int? = nil) {
+    public init(enabled: Bool = false, blockSize: Int? = nil, maxBlocks: Int? = nil) {
         self.enabled = enabled
         self.blockSize = blockSize
         self.maxBlocks = maxBlocks

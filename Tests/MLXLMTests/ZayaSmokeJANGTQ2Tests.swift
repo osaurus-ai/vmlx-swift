@@ -270,12 +270,17 @@ struct ZayaSmokeJANGTQ2Tests {
         var unclosedReasoning = false
         for await event in stream {
             switch event {
+            case .prefillProgress:
+                break
             case .chunk(let chunk):
                 text += chunk
             case .reasoning(let chunk):
                 reasoning += chunk
             case .toolCall:
                 toolCalls += 1
+            case .prefillProgress:
+
+                break
             case .info(let info):
                 unclosedReasoning = info.unclosedReasoning
             }

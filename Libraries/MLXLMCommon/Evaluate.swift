@@ -3315,6 +3315,49 @@ public struct GenerateCompletionInfo: Sendable {
     }
 }
 
+/// Runtime progress for the prompt-processing phase before the first decoded token.
+///
+/// Progress is measured in real runtime work units. For text-only generation
+/// that means prompt tokens restored from cache or consumed by prefill. Model
+/// families whose `prepare()` implementation hides internal media/chunk work
+/// may emit only stage boundary events until that deeper implementation exposes
+/// per-chunk callbacks.
+public struct PrefillProgress: Sendable, Equatable {
+    public enum Stage: String, Sendable {
+        case queued
+        case cacheLookup
+        case cacheRestore
+        case prefill
+        case complete
+    }
+
+    public let stage: Stage
+    public let completedUnitCount: Int
+    public let totalUnitCount: Int
+    public let detail: String?
+
+    public var fractionCompleted: Double {
+        guard totalUnitCount > 0 else { return 0 }
+        return min(1, max(0, Double(completedUnitCount) / Double(totalUnitCount)))
+    }
+
+    public var percentCompleted: Double {
+        fractionCompleted * 100
+    }
+
+    public init(
+        stage: Stage,
+        completedUnitCount: Int,
+        totalUnitCount: Int,
+        detail: String? = nil
+    ) {
+        self.stage = stage
+        self.completedUnitCount = max(0, completedUnitCount)
+        self.totalUnitCount = max(0, totalUnitCount)
+        self.detail = detail
+    }
+}
+
 /// Represents the different stages or outputs of the token generation process.
 ///
 /// This enum distinguishes between the following:
@@ -3322,6 +3365,7 @@ public struct GenerateCompletionInfo: Sendable {
 /// - `.reasoning`: A streaming chain-of-thought chunk (content between `<think>` /
 ///   `</think>` tags, or the family-specific equivalent). Emitted only when the
 ///   runtime has an active `ReasoningParser` stamped on the model configuration.
+/// - `.prefillProgress`: Real prompt-processing progress before first token.
 /// - `.toolCall`: A tool call parsed from the generated output.
 /// - `.info`: Metadata and performance statistics about the generation process.
 public enum Generation: Sendable {
@@ -3349,6 +3393,9 @@ public enum Generation: Sendable {
     /// Completion information summarizing token counts and performance metrics.
     case info(GenerateCompletionInfo)
 
+    /// Prompt-processing progress before the first decoded token.
+    case prefillProgress(PrefillProgress)
+
     /// A tool call from the language model.
     case toolCall(ToolCall)
 
@@ -3358,6 +3405,7 @@ public enum Generation: Sendable {
         case .chunk(let string): string
         case .reasoning: nil
         case .info: nil
+        case .prefillProgress: nil
         case .toolCall: nil
         }
     }
@@ -3368,6 +3416,7 @@ public enum Generation: Sendable {
         case .chunk: nil
         case .reasoning(let string): string
         case .info: nil
+        case .prefillProgress: nil
         case .toolCall: nil
         }
     }
@@ -3378,6 +3427,18 @@ public enum Generation: Sendable {
         case .chunk: nil
         case .reasoning: nil
         case .info(let info): info
+        case .prefillProgress: nil
+        case .toolCall: nil
+        }
+    }
+
+    /// Prefill progress or nil
+    public var prefillProgress: PrefillProgress? {
+        switch self {
+        case .chunk: nil
+        case .reasoning: nil
+        case .info: nil
+        case .prefillProgress(let progress): progress
         case .toolCall: nil
         }
     }
@@ -3388,6 +3449,7 @@ public enum Generation: Sendable {
         case .chunk: nil
         case .reasoning: nil
         case .info: nil
+        case .prefillProgress: nil
         case .toolCall(let toolCall): toolCall
         }
     }
@@ -3409,11 +3471,15 @@ public enum TokenGeneration: Sendable {
     /// Completion information summarizing token counts and performance metrics.
     case info(GenerateCompletionInfo)
 
+    /// Prompt-processing progress before the first decoded token.
+    case prefillProgress(PrefillProgress)
+
     /// Token ID or nil
     public var token: Int? {
         switch self {
         case .token(let token): token
         case .info: nil
+        case .prefillProgress: nil
         }
     }
 
@@ -3422,6 +3488,16 @@ public enum TokenGeneration: Sendable {
         switch self {
         case .token: nil
         case .info(let info): info
+        case .prefillProgress: nil
+        }
+    }
+
+    /// Prefill progress or nil
+    public var prefillProgress: PrefillProgress? {
+        switch self {
+        case .token: nil
+        case .info: nil
+        case .prefillProgress(let progress): progress
         }
     }
 
@@ -3674,7 +3750,7 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
                 return false
             }
             return !stopSequenceHit
-        case .reasoning, .toolCall, .info:
+        case .reasoning, .prefillProgress, .toolCall, .info:
             if case .toolCall = event {
                 emittedToolCall = true
             }

@@ -55,8 +55,13 @@ class BatchEngineCompileWiringTests: XCTestCase {
         var info: GenerateCompletionInfo?
         for await event in stream {
             switch event {
+            case .prefillProgress:
+                break
             case .token(let id):
                 tokens.append(id)
+            case .prefillProgress:
+
+                break
             case .info(let i):
                 info = i
             }

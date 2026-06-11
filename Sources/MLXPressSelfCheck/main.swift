@@ -322,7 +322,7 @@ private func checkLoadConfigurationDefaults() throws {
     try expect(defaultConfiguration.disableDecodeFusedGateUp, "expected fused gate/up disabled")
     try expect(!defaultConfiguration.enableActiveExpertStreaming, "expected active streaming default-off")
     try expect(defaultConfiguration.cache.enabled, "expected cache stack default-on")
-    try expect(defaultConfiguration.cache.usePagedCache, "expected paged cache default-on")
+    try expect(!defaultConfiguration.cache.usePagedCache, "expected paged cache default-off")
     try expect(defaultConfiguration.cache.enableDiskCache, "expected disk cache default-on")
     try expect(defaultConfiguration.cache.defaultKVMode == .turboQuant(keyBits: 3, valueBits: 3), "expected TurboQuant KV default")
 

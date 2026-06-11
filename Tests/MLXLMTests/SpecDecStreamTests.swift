@@ -146,8 +146,11 @@ struct SpecDecStreamTests {
         for await ev in stream {
             switch ev {
             case .chunk(let c): chunks.append(c)
+            case .prefillProgress:
+
+                break
             case .info: infoCount += 1
-            case .reasoning, .toolCall: break
+            case .reasoning, .prefillProgress, .toolCall: break
             @unknown default: break
             }
         }
@@ -198,8 +201,11 @@ struct SpecDecStreamTests {
         for await ev in stream {
             switch ev {
             case .chunk(let c): chunks.append(c)
+            case .prefillProgress:
+
+                break
             case .info: infoCount += 1
-            case .reasoning, .toolCall: break
+            case .reasoning, .prefillProgress, .toolCall: break
             @unknown default: break
             }
         }

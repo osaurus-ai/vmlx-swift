@@ -45,7 +45,7 @@ struct VMLXMemorySafetySettingsTests {
         #expect(plan.loadConfiguration.useMmapSafetensors)
         #expect(plan.loadConfiguration.jangPress == .disabled)
         #expect(plan.cache.prefix.enabled)
-        #expect(plan.cache.pagedKV.enabled)
+        #expect(!plan.cache.pagedKV.enabled)
         #expect(plan.cache.blockDisk.enabled)
         #expect(!plan.cache.legacyDisk.enabled)
         #expect(plan.cache.defaultMaxKVSize == 8192)
@@ -208,7 +208,7 @@ struct VMLXMemorySafetySettingsTests {
 
         #expect(plan.cache.liveKVCodec == .engineSelected)
         #expect(plan.cache.enableSSMReDerive)
-        #expect(coordinator.usePagedCache)
+        #expect(!coordinator.usePagedCache)
         #expect(coordinator.enableDiskCache)
         #expect(coordinator.enableSSMReDerive)
         #expect(coordinator.ssmMaxEntries == 96)

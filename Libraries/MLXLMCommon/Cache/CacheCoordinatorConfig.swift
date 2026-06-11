@@ -101,7 +101,7 @@ public struct CacheCoordinatorConfig: Sendable {
     public var longPromptMultiplier: Double
 
     public init(
-        usePagedCache: Bool = true,
+        usePagedCache: Bool = false,
         enableDiskCache: Bool = false,
         pagedBlockSize: Int = 64,
         maxCacheBlocks: Int = 1000,

@@ -1244,6 +1244,8 @@ enum OmniBench {
                 events += 1
             case .info(let generationInfo):
                 info = generationInfo
+            case .prefillProgress:
+                break
             case .toolCall:
                 break
             }

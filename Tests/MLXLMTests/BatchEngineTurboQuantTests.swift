@@ -374,6 +374,32 @@ struct BatchQuantizeHookTests {
             #expect(!cache.contains { $0 is TurboQuantKVCache })
         }
     }
+
+    @Test("Gemma SWA contract keeps full attention TQ-eligible and sliding disk-backed")
+    func testGemmaSWATopologyContract() throws {
+        let gemmaSource = try String(
+            contentsOfFile: "Libraries/MLXLLM/Models/Gemma4Text.swift",
+            encoding: .utf8)
+        let batchQuantizeSource = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchQuantize.swift",
+            encoding: .utf8)
+
+        #expect(gemmaSource.contains(#"if layerType == "full_attention""#))
+        #expect(gemmaSource.contains("return KVCacheSimple()"))
+        #expect(gemmaSource.contains(#"return RotatingKVCache(maxSize: config.slidingWindow, keep: 0)"#))
+        #expect(batchQuantizeSource.contains("ordinary `KVCacheSimple` layers compress"))
+        #expect(batchQuantizeSource.contains("Preserves `RotatingKVCache`, `DeepseekV4Cache`, `MambaCache`,"))
+
+        let topology = ModelCacheTopologySnapshot(cache: [
+            TurboQuantKVCache(),
+            RotatingKVCache(maxSize: 1024, keep: 0),
+            RotatingKVCache(maxSize: 1024, keep: 0),
+            TurboQuantKVCache(),
+        ])
+        #expect(topology.turboQuantKVLayerCount == 2)
+        #expect(topology.rotatingKVLayerCount == 2)
+        #expect(topology.requiresDiskBackedCoordinatorRestore)
+    }
 }
 
 // MARK: - Integration Tests: BatchEngine + TurboQuant
@@ -412,6 +438,8 @@ class BatchEngineTurboQuantIntegrationTests: XCTestCase {
         var info: GenerateCompletionInfo?
         for await event in stream {
             switch event {
+            case .prefillProgress:
+                break
             case .token(let id):
                 tokens.append(id)
             case .info(let i):
@@ -665,6 +693,8 @@ class BatchEngineMultiTurnTests: XCTestCase {
         var info: GenerateCompletionInfo?
         for await event in stream {
             switch event {
+            case .prefillProgress:
+                break
             case .token(let id):
                 tokens.append(id)
             case .info(let i):

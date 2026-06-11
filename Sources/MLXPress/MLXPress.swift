@@ -108,7 +108,7 @@ public struct MLXPressCacheConfiguration: Sendable, Equatable {
 
     public init(
         enabled: Bool = true,
-        usePagedCache: Bool = true,
+        usePagedCache: Bool = false,
         enableDiskCache: Bool = true,
         maxCacheBlocks: Int = 2_000,
         diskCacheMaxGB: Float = 10.0,

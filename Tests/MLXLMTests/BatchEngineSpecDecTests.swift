@@ -77,9 +77,14 @@ struct BatchEngineSpecDecTests {
         var chunks = 0, toolCalls = 0, infoCount = 0
         for await ev in stream {
             switch ev {
+            case .prefillProgress:
+                break
             case .chunk: chunks += 1
             case .reasoning: break
             case .toolCall: toolCalls += 1
+            case .prefillProgress:
+
+                break
             case .info: infoCount += 1
             @unknown default: break
             }

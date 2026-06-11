@@ -16,6 +16,14 @@ import Testing
 @Suite("CacheCoordinator KV policy")
 struct CacheCoordinatorKVPolicyTests {
 
+    @Test("coordinator defaults keep paged RAM cache off")
+    func coordinatorDefaultsKeepPagedRAMCacheOff() {
+        let config = CacheCoordinatorConfig()
+
+        #expect(!config.usePagedCache)
+        #expect(!config.enableDiskCache)
+    }
+
     // MARK: - defaultKVMode
 
     @Test("explicit request kvMode wins over coordinator default")

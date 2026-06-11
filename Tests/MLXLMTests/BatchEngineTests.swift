@@ -523,15 +523,20 @@ class BatchEngineIntegrationTests: XCTestCase {
         let stream = await engine.generate(input: input, parameters: params)
         for await generation in stream {
             switch generation {
+            case .prefillProgress:
+                break
             case .chunk(let text):
                 XCTAssertFalse(text.isEmpty, "Chunk should not be empty")
                 tokenCount += 1
+            case .prefillProgress:
+
+                break
             case .info(let info):
                 gotInfo = true
                 XCTAssertEqual(info.promptTokenCount, 5)
                 XCTAssertGreaterThan(info.generationTokenCount, 0)
                 XCTAssertEqual(info.stopReason, .length)
-            case .reasoning, .toolCall:
+            case .reasoning, .prefillProgress, .toolCall:
                 break
             @unknown default:
                 break
@@ -874,11 +879,16 @@ class BatchEngineIntegrationTests: XCTestCase {
             var info: GenerateCompletionInfo?
             for await event in stream {
                 switch event {
-                case .chunk(let text):
+                case .prefillProgress:
+                break
+            case .chunk(let text):
                     chunks.append(text)
+                case .prefillProgress:
+
+                    break
                 case .info(let i):
                     info = i
-                case .reasoning, .toolCall:
+                case .reasoning, .prefillProgress, .toolCall:
                     break
                 @unknown default:
                     break
@@ -1088,8 +1098,13 @@ class BatchEngineIntegrationTests: XCTestCase {
         var info: GenerateCompletionInfo?
         for await event in stream {
             switch event {
+            case .prefillProgress:
+                break
             case .token(let id):
                 tokens.append(id)
+            case .prefillProgress:
+
+                break
             case .info(let i):
                 info = i
             }
@@ -1104,11 +1119,16 @@ class BatchEngineIntegrationTests: XCTestCase {
         var info: GenerateCompletionInfo?
         for await event in stream {
             switch event {
+            case .prefillProgress:
+                break
             case .chunk(let text):
                 chunks.append(text)
+            case .prefillProgress:
+
+                break
             case .info(let i):
                 info = i
-            case .reasoning, .toolCall:
+            case .reasoning, .prefillProgress, .toolCall:
                 break
             @unknown default:
                 break
