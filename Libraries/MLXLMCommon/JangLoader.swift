@@ -1672,6 +1672,7 @@ public struct JangLoader: Sendable {
         weights: [String: MLXArray],
         jangConfig: JangConfig,
         hiddenSizeHint: Int? = nil,
+        hiddenSizePerLayerInputHint: Int? = nil,
         linearAttnValueDimHint: Int? = nil,
         expertIntermediateSizeHint: Int? = nil,
         validInDims: Set<Int> = [],
@@ -1904,6 +1905,10 @@ public struct JangLoader: Sendable {
                 || basePath.hasSuffix(".mixer.o_proj")
             let isZayaCCAOutputProjection =
                 basePath.hasSuffix(".sub.o_proj")
+            let isPerLayerProjection =
+                basePath.hasSuffix(".per_layer_projection")
+            let isPerLayerModelProjection =
+                basePath.hasSuffix(".per_layer_model_projection")
             let isExpertDownProjection =
                 basePath.hasSuffix("switch_mlp.down_proj")
                 || basePath.hasSuffix("switch_glu.down_proj")
@@ -2009,6 +2014,25 @@ public struct JangLoader: Sendable {
                     knownGroupSize: groupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: ccaOutputDim)
+            } else if isPerLayerProjection,
+                      let perLayerInputDim = hiddenSizePerLayerInputHint,
+                      perLayerInputDim > 0
+            {
+                (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
+                    packedDim: packedDim,
+                    numGroups: numGroups,
+                    knownGroupSize: groupSize,
+                    bitWidthsUsed: bitWidthsUsed,
+                    expectedInDim: perLayerInputDim)
+            } else if isPerLayerModelProjection,
+                      let hiddenSize = hiddenSizeHint, hiddenSize > 0
+            {
+                (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
+                    packedDim: packedDim,
+                    numGroups: numGroups,
+                    knownGroupSize: groupSize,
+                    bitWidthsUsed: bitWidthsUsed,
+                    expectedInDim: hiddenSize)
             } else if isExpertDownProjection,
                       let expertIntermediateSize = expertIntermediateSizeHint,
                       expertIntermediateSize > 0

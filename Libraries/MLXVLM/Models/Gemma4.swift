@@ -663,43 +663,6 @@ private class UnifiedVisionEmbedder: Module {
     }
 }
 
-// MARK: - ScaledLinear (for per-layer model projection)
-
-private class G4ScaledLinear: Module {
-    @ParameterInfo(key: "weight") var weight: MLXArray
-    @ParameterInfo(key: "scales") var scales: MLXArray
-    @ParameterInfo(key: "biases") var biases: MLXArray?
-    let scalar: Float
-    let inputDims: Int
-    let outputDims: Int
-    init(inputDims: Int, outputDims: Int, scalar: Float) {
-        self._weight.wrappedValue = MLXArray.zeros([outputDims, inputDims])
-        self._scales.wrappedValue = MLXArray.mlxNone
-        self._biases.wrappedValue = MLXArray.mlxNone
-        self.scalar = scalar
-        self.inputDims = inputDims
-        self.outputDims = outputDims
-        super.init()
-    }
-    func callAsFunction(_ x: MLXArray, prefixShape: [Int]? = nil) -> MLXArray {
-        let leadingShape = prefixShape ?? Array(x.shape.dropLast())
-        let flatInput = x.reshaped([leadingShape.reduce(1, *)] + [inputDims])
-        let outputShape = leadingShape + [outputDims]
-
-        if !scales.shape.isEmpty {
-            let inferred = JangLoader.inferBitWidthAndGroupSize(
-                weight: weight, scales: scales, knownGroupSize: 32)
-            let hasAffineBiases = biases?.ctx.ctx != nil
-            let mode: QuantizationMode = hasAffineBiases ? .affine : .mxfp4
-            let projected = quantizedMM(
-                flatInput, weight, scales: scales, biases: biases, transpose: true,
-                groupSize: inferred.groupSize, bits: inferred.bits, mode: mode)
-            return projected.reshaped(outputShape) * scalar
-        }
-        return matmul(flatInput, weight.T).reshaped(outputShape) * scalar
-    }
-}
-
 // MARK: - Text Model Components (inline for VLM — MLXVLM can't import MLXLLM)
 
 // Text Attention, MLP, Router, Experts, DecoderLayer, Model — same as Gemma4Text.swift
@@ -904,9 +867,10 @@ private class TextLayer: Module {
 private class TextModel: Module {
     @ModuleInfo(key: "embed_tokens") var emb: Embedding; @ModuleInfo var layers: [TextLayer]; @ModuleInfo var norm: G4RMSNorm
     @ModuleInfo(key: "embed_tokens_per_layer") var embPL: Embedding?
-    @ModuleInfo(key: "per_layer_model_projection") var plProj: G4ScaledLinear?
+    @ModuleInfo(key: "per_layer_model_projection") var plProj: Linear?
     @ModuleInfo(key: "per_layer_projection_norm") var plNorm: G4RMSNorm?
     let cfg: G4TextConfig
+    let perLayerProjectionScale: Float
     let previousKVs: [Int]
 
     init(_ cfg: G4TextConfig) {
@@ -914,12 +878,16 @@ private class TextModel: Module {
         _layers.wrappedValue = (0 ..< cfg.numHiddenLayers).map { TextLayer(cfg, i: $0) }
         self.norm = G4RMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
         if cfg.hiddenSizePerLayerInput > 0 {
+            self.perLayerProjectionScale = pow(Float(cfg.hiddenSize), -0.5)
             _embPL.wrappedValue = Embedding(embeddingCount: cfg.vocabSizePerLayerInput,
                 dimensions: cfg.numHiddenLayers * cfg.hiddenSizePerLayerInput)
-            _plProj.wrappedValue = G4ScaledLinear(inputDims: cfg.hiddenSize,
-                outputDims: cfg.numHiddenLayers * cfg.hiddenSizePerLayerInput,
-                scalar: pow(Float(cfg.hiddenSize), -0.5))
+            _plProj.wrappedValue = Linear(
+                cfg.hiddenSize,
+                cfg.numHiddenLayers * cfg.hiddenSizePerLayerInput,
+                bias: false)
             _plNorm.wrappedValue = G4RMSNorm(dimensions: cfg.hiddenSizePerLayerInput, eps: cfg.rmsNormEps)
+        } else {
+            self.perLayerProjectionScale = 1.0
         }
         let lt = cfg.layerTypes.isEmpty ? Array(repeating: "sliding_attention", count: cfg.numHiddenLayers) : cfg.layerTypes
         var pkvs = Array(0 ..< cfg.numHiddenLayers)
@@ -942,7 +910,7 @@ private class TextModel: Module {
         guard let plProj, let plNorm else { return nil }
         let layerShape = prefixShape + [cfg.numHiddenLayers, cfg.hiddenSizePerLayerInput]
         let flatShape = prefixShape + [cfg.numHiddenLayers * cfg.hiddenSizePerLayerInput]
-        var p = plProj(h, prefixShape: prefixShape)
+        var p = plProj(h) * perLayerProjectionScale
         eval(p)
         p = plNorm(p.reshaped(layerShape))
         eval(p)

@@ -357,6 +357,7 @@ public func loadWeights(
         // `(gs=32, bits=8)` for layers actually packed at `(gs=64,
         // bits=4)`) and would re-introduce the wrong values.
         let hiddenHint = readHiddenSizeHint(at: modelDirectory)
+        let hiddenSizePerLayerInputHint = readHiddenSizePerLayerInputHint(at: modelDirectory)
         let linearAttnValueDimHint = readLinearAttnValueDimHint(at: modelDirectory)
         let expertIntermediateSizeHint = readExpertIntermediateSizeHint(at: modelDirectory)
         let validInDims = readValidInDims(at: modelDirectory)
@@ -365,6 +366,7 @@ public func loadWeights(
         let inferred = JangLoader.inferPerLayerQuantization(
             weights: weights, jangConfig: jangConfig,
             hiddenSizeHint: hiddenHint,
+            hiddenSizePerLayerInputHint: hiddenSizePerLayerInputHint,
             linearAttnValueDimHint: linearAttnValueDimHint,
             expertIntermediateSizeHint: expertIntermediateSizeHint,
             validInDims: validInDims,
@@ -864,6 +866,18 @@ private func readHiddenSizeHint(at modelDirectory: URL) -> Int? {
     }
     if let hiddenSize = top["hidden_size"] as? Int, hiddenSize > 0 {
         return hiddenSize
+    }
+    return nil
+}
+
+private func readHiddenSizePerLayerInputHint(at modelDirectory: URL) -> Int? {
+    let configURL = modelDirectory.appendingPathComponent("config.json")
+    guard let data = try? Data(contentsOf: configURL),
+          let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    let config = (top["text_config"] as? [String: Any]) ?? top
+    if let value = config["hidden_size_per_layer_input"] as? Int, value > 0 {
+        return value
     }
     return nil
 }

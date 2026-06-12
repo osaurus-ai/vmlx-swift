@@ -381,47 +381,6 @@ class Gemma4MLP: Module {
     }
 }
 
-// MARK: - ScaledLinear (for per-layer model projection)
-
-/// Linear layer with fixed output scaling (not a learnable parameter).
-/// Python: (x @ self.weight.T) * scalar
-class Gemma4ScaledLinear: Module {
-    @ParameterInfo(key: "weight") var weight: MLXArray
-    @ParameterInfo(key: "scales") var scales: MLXArray
-    @ParameterInfo(key: "biases") var biases: MLXArray?
-    let scalar: Float
-    let inputDims: Int
-    let outputDims: Int
-
-    init(inputDims: Int, outputDims: Int, scalar: Float) {
-        self._weight.wrappedValue = MLXArray.zeros([outputDims, inputDims])
-        self._scales.wrappedValue = MLXArray.mlxNone
-        self._biases.wrappedValue = MLXArray.mlxNone
-        self.scalar = scalar
-        self.inputDims = inputDims
-        self.outputDims = outputDims
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray, prefixShape: [Int]? = nil) -> MLXArray {
-        let leadingShape = prefixShape ?? Array(x.shape.dropLast())
-        let flatInput = x.reshaped([leadingShape.reduce(1, *)] + [inputDims])
-        let outputShape = leadingShape + [outputDims]
-
-        if !scales.shape.isEmpty {
-            let inferred = JangLoader.inferBitWidthAndGroupSize(
-                weight: weight, scales: scales, knownGroupSize: 32)
-            let hasAffineBiases = biases?.ctx.ctx != nil
-            let mode: QuantizationMode = hasAffineBiases ? .affine : .mxfp4
-            let projected = quantizedMM(
-                flatInput, weight, scales: scales, biases: biases, transpose: true,
-                groupSize: inferred.groupSize, bits: inferred.bits, mode: mode)
-            return projected.reshaped(outputShape) * scalar
-        }
-        return matmul(flatInput, weight.T).reshaped(outputShape) * scalar
-    }
-}
-
 // MARK: - Router (Softmax, with RMSNormNoScale pre-norm)
 
 class Gemma4Router: Module {
@@ -648,10 +607,11 @@ public class Gemma4Model: Module {
     // Per-layer embeddings (E2B/E4B models, nil for 26B/31B)
     @ModuleInfo(key: "embed_tokens_per_layer") var embedTokensPerLayer: Embedding?
     @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection:
-        Gemma4ScaledLinear?
+        Linear?
     @ModuleInfo(key: "per_layer_projection_norm") var perLayerProjectionNorm: Gemma4RMSNorm?
 
     let config: Gemma4TextConfiguration
+    let perLayerProjectionScale: Float
 
     // KV sharing: maps layer index → source layer index for shared KVs
     let previousKVs: [Int]
@@ -667,15 +627,18 @@ public class Gemma4Model: Module {
 
         // Per-layer embeddings (E2B/E4B)
         if config.hiddenSizePerLayerInput > 0 {
+            self.perLayerProjectionScale = pow(Float(config.hiddenSize), -0.5)
             self._embedTokensPerLayer.wrappedValue = Embedding(
                 embeddingCount: config.vocabSizePerLayerInput,
                 dimensions: config.numHiddenLayers * config.hiddenSizePerLayerInput)
-            self._perLayerModelProjection.wrappedValue = Gemma4ScaledLinear(
-                inputDims: config.hiddenSize,
-                outputDims: config.numHiddenLayers * config.hiddenSizePerLayerInput,
-                scalar: pow(Float(config.hiddenSize), -0.5))
+            self._perLayerModelProjection.wrappedValue = Linear(
+                config.hiddenSize,
+                config.numHiddenLayers * config.hiddenSizePerLayerInput,
+                bias: false)
             self._perLayerProjectionNorm.wrappedValue = Gemma4RMSNorm(
                 dimensions: config.hiddenSizePerLayerInput, eps: config.rmsNormEps)
+        } else {
+            self.perLayerProjectionScale = 1.0
         }
 
         // KV sharing map
@@ -714,7 +677,7 @@ public class Gemma4Model: Module {
         _ inputEmbeds: MLXArray, prefixShape: [Int], perLayerInputs: MLXArray?
     ) -> MLXArray? {
         guard let perLayerModelProjection, let perLayerProjectionNorm else { return nil }
-        var proj = perLayerModelProjection(inputEmbeds, prefixShape: prefixShape)
+        var proj = perLayerModelProjection(inputEmbeds) * perLayerProjectionScale
         let layerShape = prefixShape + [
             config.numHiddenLayers, config.hiddenSizePerLayerInput,
         ]

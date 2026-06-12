@@ -14,7 +14,7 @@ let evalLock = NSRecursiveLock()
 /// ### See Also
 /// - <doc:lazy-evaluation>
 public func eval(_ arrays: MLXArray...) {
-    let vector_array = new_mlx_vector_array(arrays.filter(\.hasBackingArray))
+    let vector_array = newEvalVectorArray(arrays)
     mlx_eval(vector_array)
     mlx_vector_array_free(vector_array)
 }
@@ -24,7 +24,7 @@ public func eval(_ arrays: MLXArray...) {
 /// ### See Also
 /// - <doc:lazy-evaluation>
 public func eval(_ arrays: some Collection<MLXArray>) {
-    let vector_array = new_mlx_vector_array(arrays.filter(\.hasBackingArray))
+    let vector_array = newEvalVectorArray(arrays)
     mlx_eval(vector_array)
     mlx_vector_array_free(vector_array)
 }
@@ -35,7 +35,7 @@ public func eval(_ arrays: some Collection<MLXArray>) {
 /// - <doc:lazy-evaluation>
 /// - ``asyncEval(_:)-(Collection<MLXArray>)``
 public func asyncEval(_ arrays: some Collection<MLXArray>) {
-    let vector_array = new_mlx_vector_array(arrays.filter(\.hasBackingArray))
+    let vector_array = newEvalVectorArray(arrays)
     mlx_async_eval(vector_array)
     mlx_vector_array_free(vector_array)
 }
@@ -209,4 +209,12 @@ private extension MLXArray {
     var hasBackingArray: Bool {
         ctx.ctx != nil
     }
+}
+
+@inline(__always)
+private func newEvalVectorArray(_ arrays: some Collection<MLXArray>) -> mlx_vector_array {
+    if arrays.contains(where: { !$0.hasBackingArray }) {
+        return new_mlx_vector_array(arrays.filter(\.hasBackingArray))
+    }
+    return new_mlx_vector_array(arrays)
 }
