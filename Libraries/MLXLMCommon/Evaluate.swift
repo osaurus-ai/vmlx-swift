@@ -97,6 +97,14 @@ public struct GenerateParameters: Sendable {
     /// When set, uses ``RotatingKVCache`` instead of ``KVCacheSimple``
     public var maxKVSize: Int?
 
+    /// Block-diffusion speed/quality control: caps the denoising steps per
+    /// canvas for ``BlockDiffusionModel`` generation, overriding the
+    /// bundle's `generation_config.json` value. Lower is faster, higher is
+    /// better quality. Measured on diffusiongemma-26B-A4B MXFP4 (M5 Max):
+    /// 48 (bundle default) ≈ 37 tok/s, 16 ≈ 74 tok/s still coherent,
+    /// 8 breaks coherency. Ignored by autoregressive models.
+    public var diffusionMaxDenoisingSteps: Int?
+
     /// Number of bits to use for KV cache quantization. nil implies no cache quantization.
     public var kvBits: Int?
 
@@ -2690,6 +2698,7 @@ public func generate(
     if let diffusionModel = context.model as? any BlockDiffusionModel {
         let options = diffusionModel.blockDiffusionDefaults
             .resolving(generationConfig: context.configuration.generationDefaults)
+            .overriding(parameters: parameters)
         let iterator = try BlockDiffusionTokenIterator(
             input: input,
             model: diffusionModel,

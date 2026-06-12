@@ -96,6 +96,28 @@ higher-precision logits converge in fewer denoising steps (68 vs 98
 forwards for the same essay). Output was a coherent, factually grounded
 multi-paragraph essay on both quants.
 
+Per-step profile (instrumented): the 256-wide decoder forward is 91% of
+denoise time (178 ms/forward MXFP4, 254 ms MXFP8); the sampler pipeline
+(softmax/entropy/sort over the 262k vocab) is 9%. The engine is
+forward-bound — throughput is governed by the model's convergence rate.
+
+### Speed/quality control (`GenerateParameters.diffusionMaxDenoisingSteps`)
+
+Per-request override of the bundle's denoising budget — the hook for an
+app-level Quality ⟷ Speed slider. Swept on MXFP4, same essay prompt:
+
+| max_denoising_steps | Wall tok/s | TTFT | Coherency |
+|---|---|---|---|
+| 48 (bundle default) | 36.9 | 6.7 s | clean |
+| 24 | 57.9 | 4.2 s | clean |
+| 16 | 73.8 | 3.4 s | clean (essay + 3-turn recall verified) |
+| 8 | 140.5 | 1.8 s | BREAKS (word-salad spans) |
+
+Raising `entropy_bound` (0.1 → 0.4 at 48 steps) does not help: 37.9
+tok/s — the step budget is the lever. Recommended app slider range
+16–48, default 48 (quality). The override is clamped to ≥ 1 and ignored
+by autoregressive models.
+
 ### Tool calls (BENCH_BATCH_TOOLCALL, BatchEngine solo path)
 
 Both quants: structured `get_weather({"location":"Tokyo"})` extracted

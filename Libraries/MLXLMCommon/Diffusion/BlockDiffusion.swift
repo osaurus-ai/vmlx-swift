@@ -75,6 +75,16 @@ public struct BlockDiffusionParameters: Sendable {
         if let v = generationConfig.padTokenId { resolved.padTokenId = v }
         return resolved
     }
+
+    /// Apply explicit per-request overrides (e.g. an app-level speed/quality
+    /// slider). Clamped to at least 1 step.
+    public func overriding(parameters: GenerateParameters) -> BlockDiffusionParameters {
+        var resolved = self
+        if let steps = parameters.diffusionMaxDenoisingSteps {
+            resolved.maxDenoisingSteps = Swift.max(1, steps)
+        }
+        return resolved
+    }
 }
 
 /// A language model that generates via block diffusion instead of

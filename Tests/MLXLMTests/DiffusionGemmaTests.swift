@@ -467,6 +467,15 @@ func testGenerationConfigFileDecodesDiffusionFields() throws {
         .resolving(generationConfig: config)
     #expect(defaults.canvasLength == 256)
     #expect(defaults.maxDenoisingSteps == 48)
+
+    // Per-request speed/quality override (app slider path).
+    var fast = GenerateParameters()
+    fast.diffusionMaxDenoisingSteps = 16
+    #expect(defaults.overriding(parameters: fast).maxDenoisingSteps == 16)
+    var clamped = GenerateParameters()
+    clamped.diffusionMaxDenoisingSteps = 0
+    #expect(defaults.overriding(parameters: clamped).maxDenoisingSteps == 1)
+    #expect(defaults.overriding(parameters: GenerateParameters()).maxDenoisingSteps == 48)
     #expect(defaults.entropyBound == 0.1)
     #expect(defaults.eosTokenIds == Set([1, 106, 50]))
     #expect(defaults.padTokenId == 0)

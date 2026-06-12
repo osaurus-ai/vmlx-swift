@@ -904,6 +904,7 @@ public actor BatchEngine {
             if let diffusionModel = context.model as? any BlockDiffusionModel {
                 let options = diffusionModel.blockDiffusionDefaults
                     .resolving(generationConfig: context.configuration.generationDefaults)
+                    .overriding(parameters: soloParameters)
                 let iterator = try BlockDiffusionTokenIterator(
                     input: input,
                     model: diffusionModel,

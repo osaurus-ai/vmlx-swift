@@ -440,6 +440,7 @@ public final class ChatSession {
                             let options = diffusionModel.blockDiffusionDefaults
                                 .resolving(
                                     generationConfig: modelConfiguration.generationDefaults)
+                                .overriding(parameters: generateParameters)
                             let iterator = try BlockDiffusionTokenIterator(
                                 input: input, model: diffusionModel, cache: kvCache,
                                 parameters: generateParameters,

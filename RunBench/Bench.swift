@@ -2225,8 +2225,16 @@ func runSoloLongform(modelPath: String, maxNew: Int) async throws {
 
     let prompt = ProcessInfo.processInfo.environment["BENCH_PROMPT"]
         ?? "Write a detailed multi-paragraph essay (at least 500 words) about the history of the Internet, from ARPANET to the modern web. Include specific milestones and dates."
-    let params = GenerateParameters(
+    var params = GenerateParameters(
         maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
+    // Speed/quality slider probe: override the bundle's denoising budget
+    // per request, the same way an app-level setting would.
+    if let stepsRaw = ProcessInfo.processInfo.environment["BENCH_DIFFUSION_STEPS"],
+        let steps = Int(stepsRaw)
+    {
+        params.diffusionMaxDenoisingSteps = steps
+        print("  diffusionMaxDenoisingSteps override: \(steps)")
+    }
 
     let input = try await context.processor.prepare(input: UserInput(prompt: prompt))
     let promptTokens = input.text.tokens.size
