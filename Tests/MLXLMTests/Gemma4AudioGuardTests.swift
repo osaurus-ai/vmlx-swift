@@ -53,24 +53,44 @@ struct Gemma4AudioGuardTests {
         #expect(source.contains("if input.video != nil {"),
             "Gemma4.prepare must reject unsupported video before proceeding.")
         #expect(!source.contains("if input.audio != nil || input.video != nil {"),
-            "Gemma4.prepare must not reject the pre-encoded audio lane.")
+            "Gemma4.prepare must not reject the audio lane.")
 
         #expect(source.contains("throw VLMError.processing("),
             "Unsupported media must surface as VLMError.processing, not fatalError or silent fallthrough.")
         #expect(source.contains("@ModuleInfo(key: \"embed_audio\") private var embedAudio"),
             "Gemma4 must keep the audio projection module.")
-        #expect(source.contains("if nk.hasPrefix(\"audio_tower.\") { continue }"),
-            "Gemma4 should reject raw audio tower weights until the encoder is implemented.")
         #expect(!source.contains("nk.hasPrefix(\"embed_audio.\")"),
             "Gemma4 must not drop embed_audio projection weights.")
         #expect(source.contains("audioFeatures.dim(-1) == config.audioEmbedDim"),
-            "Gemma4 must validate pre-encoded audio feature width before projection.")
+            "Gemma4 must validate audio feature width before projection.")
         #expect(source.contains("let projectedAudio = embedAudio(audioFeatures).asType(emb.dtype)"),
-            "Gemma4 must project pre-encoded audio into the text embedding dimension.")
+            "Gemma4 must project audio features into the text embedding dimension.")
         #expect(!source.contains("pre-encoded 640-dim"),
             "Gemma4 raw/pre-encoded audio errors must not hard-code 640; E-series bundles use a different configured width.")
-        #expect(source.contains("Gemma4 raw audio feature extraction is not implemented"),
-            "Raw audio must fail with a clear typed unsupported message.")
+    }
+
+    /// Pins the unified raw-waveform chunking contract
+    /// (Gemma4UnifiedAudioFeatureExtractor parity).
+    @Test("Gemma4Processor chunks raw waveforms for unified bundles and gates the mel/tower pipeline")
+    func unifiedRawAudioChunkingContract() throws {
+        let source = try Self.gemma4Source()
+
+        // The unified extractor is encoder-free: raw 16 kHz frames of
+        // `audio_samples_per_token` samples are the soft-token features.
+        #expect(source.contains("unifiedWaveformFeatures"),
+            "Gemma4Processor must implement unified raw-waveform chunking.")
+        #expect(source.contains("Gemma4UnifiedAudioFeatureExtractor"),
+            "Unified chunking must be gated on the bundle's feature_extractor_type.")
+        #expect(source.contains("audio_samples_per_token"),
+            "Frame width must come from processor_config.json feature_extractor, not a hard-coded constant.")
+        #expect(source.contains("tokens > config.audioSeqLength"),
+            "Unified chunking must cap soft tokens at audio_seq_length like the upstream extractor.")
+        #expect(source.contains("linearResamplePCM"),
+            "Raw PCM at non-16kHz rates must be resampled, not rejected or misinterpreted.")
+        // Mel + conformer audio_tower bundles (E-series) stay typed-refused
+        // until that pipeline is wired; refusal must name the real pipeline.
+        #expect(source.contains("mel + audio_tower pipeline"),
+            "Non-unified raw audio must fail with a typed message naming the missing mel/audio_tower pipeline.")
     }
 
     /// Pins the image-token-id resolution path in `Gemma4Processor.prepare`.

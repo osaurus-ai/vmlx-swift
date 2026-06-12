@@ -1161,8 +1161,9 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         if let audio = input.audio {
             guard let audioFeatures = audio.preEncodedEmbedding else {
                 throw VLMError.processing(
-                    "Gemma4 audio requires pre-encoded features matching this bundle's configured audio embedding width. " +
-                    "Raw waveform feature extraction is not implemented for Gemma4 yet.")
+                    "Gemma4 audio reached prepare() without extracted features. " +
+                    "Gemma4Processor extracts unified raw-waveform frames (or accepts pre-encoded features) before prepare; " +
+                    "LMInput.audio.preEncodedEmbedding must be populated.")
             }
             guard audioFeatures.dim(-1) == config.audioEmbedDim else {
                 throw VLMError.processing(
@@ -1271,6 +1272,16 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
     public let poolingKernelSize: Int
     public let imageSeqLength: Int
     public let audioSeqLength: Int
+    /// `feature_extractor.feature_extractor_type` from `processor_config.json`.
+    /// `Gemma4UnifiedAudioFeatureExtractor` = encoder-free raw-waveform chunking
+    /// (12B unified bundles); `Gemma4AudioFeatureExtractor` = 128-mel + conformer
+    /// `audio_tower` (E-series bundles).
+    public let audioFeatureExtractorType: String?
+    /// Raw 16 kHz samples per audio soft token for the unified extractor
+    /// (`feature_extractor.audio_samples_per_token`, 640 = 40 ms).
+    public let audioSamplesPerToken: Int
+    /// `feature_extractor.sampling_rate`; both extractor families use 16 kHz.
+    public let audioSamplingRate: Int
 
     enum CodingKeys: String, CodingKey {
         case processorClass = "processor_class"
@@ -1281,6 +1292,14 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
         case audioSeqLength = "audio_seq_length"
         case imageProcessor = "image_processor"
         case videoProcessor = "video_processor"
+        case featureExtractor = "feature_extractor"
+    }
+
+    enum FeatureExtractorKeys: String, CodingKey {
+        case featureExtractorType = "feature_extractor_type"
+        case audioSamplesPerToken = "audio_samples_per_token"
+        case featureSize = "feature_size"
+        case samplingRate = "sampling_rate"
     }
 
     public init(from decoder: Decoder) throws {
@@ -1301,6 +1320,25 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
             ?? 3
         imageSeqLength = try c.decodeIfPresent(Int.self, forKey: .imageSeqLength) ?? 280
         audioSeqLength = try c.decodeIfPresent(Int.self, forKey: .audioSeqLength) ?? 750
+        if let fe = try? c.nestedContainer(keyedBy: FeatureExtractorKeys.self, forKey: .featureExtractor) {
+            audioFeatureExtractorType = try fe.decodeIfPresent(String.self, forKey: .featureExtractorType)
+            // The unified extractor's frame width is `audio_samples_per_token`;
+            // `feature_size` mirrors it in shipped configs. For the mel extractor
+            // `feature_size` is the mel-bin count (128), which is NOT a chunk
+            // width, so only fall back to it for the unified extractor type.
+            let parsedSamplesPerToken = try fe.decodeIfPresent(Int.self, forKey: .audioSamplesPerToken)
+            let parsedFeatureSize = try fe.decodeIfPresent(Int.self, forKey: .featureSize)
+            if audioFeatureExtractorType == "Gemma4UnifiedAudioFeatureExtractor" {
+                audioSamplesPerToken = parsedSamplesPerToken ?? parsedFeatureSize ?? 640
+            } else {
+                audioSamplesPerToken = parsedSamplesPerToken ?? 640
+            }
+            audioSamplingRate = try fe.decodeIfPresent(Int.self, forKey: .samplingRate) ?? 16_000
+        } else {
+            audioFeatureExtractorType = nil
+            audioSamplesPerToken = 640
+            audioSamplingRate = 16_000
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -1311,6 +1349,10 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
         try c.encode(poolingKernelSize, forKey: .poolingKernelSize)
         try c.encode(imageSeqLength, forKey: .imageSeqLength)
         try c.encode(audioSeqLength, forKey: .audioSeqLength)
+        var fe = c.nestedContainer(keyedBy: FeatureExtractorKeys.self, forKey: .featureExtractor)
+        try fe.encodeIfPresent(audioFeatureExtractorType, forKey: .featureExtractorType)
+        try fe.encode(audioSamplesPerToken, forKey: .audioSamplesPerToken)
+        try fe.encode(audioSamplingRate, forKey: .samplingRate)
     }
 }
 
@@ -1422,7 +1464,7 @@ public struct Gemma4Processor: UserInputProcessor {
 
         var processedAudio: LMInput.ProcessedAudio?
         if !input.audios.isEmpty {
-            let prepared = try Self.preEncodedAudio(from: input.audios)
+            let prepared = try Self.processedAudio(from: input.audios, config: config)
             processedAudio = prepared.audio
 
             let audioId = tokenizer.convertTokenToId("<|audio|>") ?? 258881
@@ -1452,13 +1494,13 @@ public struct Gemma4Processor: UserInputProcessor {
             toolSchemas: input.tools)
     }
 
-    private static func preEncodedAudio(
-        from audios: [UserInput.Audio]
+    private static func processedAudio(
+        from audios: [UserInput.Audio], config: Gemma4ProcessorConfiguration
     ) throws -> (audio: LMInput.ProcessedAudio, tokenCounts: [Int]) {
         var embeddings = [MLXArray]()
         var tokenCounts = [Int]()
         var waveforms = [MLXArray]()
-        var sampleRate = 16_000
+        var sampleRate = config.audioSamplingRate
 
         for audio in audios {
             switch audio {
@@ -1472,9 +1514,12 @@ public struct Gemma4Processor: UserInputProcessor {
                 waveforms.append(MLXArray(samples).reshaped(1, samples.count))
                 sampleRate = sr
             case .url, .samples, .array:
-                throw VLMError.processing(
-                    "Gemma4 raw audio feature extraction is not implemented. " +
-                    "Provide UserInput.Audio.preEncoded with configured-width Gemma4 audio features.")
+                let pcm = try rawWaveform(from: audio, targetSampleRate: config.audioSamplingRate)
+                let features = try unifiedWaveformFeatures(pcm, config: config)
+                embeddings.append(features)
+                tokenCounts.append(features.dim(0))
+                waveforms.append(MLXArray(pcm).reshaped(1, pcm.count))
+                sampleRate = config.audioSamplingRate
             }
         }
 
@@ -1488,6 +1533,67 @@ public struct Gemma4Processor: UserInputProcessor {
                 preEncodedEmbedding: embedding),
             tokenCounts
         )
+    }
+
+    /// Decode and resample a raw `UserInput.Audio` resource to mono PCM at
+    /// `targetSampleRate` (16 kHz for all shipped Gemma4 bundles).
+    private static func rawWaveform(
+        from audio: UserInput.Audio, targetSampleRate: Int
+    ) throws -> [Float] {
+        switch audio {
+        case .url(let url):
+            return try nemotronOmniLoadAudioFile(url, targetSampleRate: targetSampleRate)
+        case .samples(let pcm, let sr):
+            return sr == targetSampleRate
+                ? pcm : linearResamplePCM(pcm, fromRate: sr, toRate: targetSampleRate)
+        case .array(let arr, let sr):
+            let pcm = arr.reshaped([-1]).asType(.float32).asArray(Float.self)
+            return sr == targetSampleRate
+                ? pcm : linearResamplePCM(pcm, fromRate: sr, toRate: targetSampleRate)
+        case .preEncoded(let pcm, let sr, _):
+            return sr == targetSampleRate
+                ? pcm : linearResamplePCM(pcm, fromRate: sr, toRate: targetSampleRate)
+        }
+    }
+
+    /// Gemma4UnifiedAudioFeatureExtractor parity: chunk a raw 16 kHz mono
+    /// waveform into `[tokens, audioSamplesPerToken]` frames. Each frame of
+    /// `audio_samples_per_token` (640 = 40 ms) raw samples IS one audio soft
+    /// token's feature vector — the unified 12B checkpoint is encoder-free and
+    /// `embed_audio.embedding_projection` consumes the frames directly. The
+    /// waveform is zero-padded to a whole number of frames and capped at
+    /// `audio_seq_length` (750 tokens = 30 s) like the upstream extractor.
+    ///
+    /// E-series (E2B/E4B) bundles use the mel-spectrogram
+    /// `Gemma4AudioFeatureExtractor` plus a conformer `audio_tower`; that
+    /// pipeline is separate and gated on `audioFeatureExtractorType`.
+    private static func unifiedWaveformFeatures(
+        _ pcm: [Float], config: Gemma4ProcessorConfiguration
+    ) throws -> MLXArray {
+        guard config.audioFeatureExtractorType == "Gemma4UnifiedAudioFeatureExtractor"
+            || config.processorClass == "Gemma4UnifiedProcessor"
+        else {
+            throw VLMError.processing(
+                "Gemma4 raw audio for this bundle requires the \(config.audioFeatureExtractorType ?? "Gemma4AudioFeatureExtractor") " +
+                "mel + audio_tower pipeline, which is not wired in Swift yet. " +
+                "Unified bundles (Gemma4UnifiedAudioFeatureExtractor) decode raw audio natively.")
+        }
+        guard !pcm.isEmpty else {
+            throw VLMError.processing("Gemma4 audio input decoded to an empty waveform.")
+        }
+        let samplesPerToken = config.audioSamplesPerToken
+        var padded = pcm
+        let remainder = padded.count % samplesPerToken
+        if remainder != 0 {
+            padded.append(contentsOf: [Float](repeating: 0, count: samplesPerToken - remainder))
+        }
+        var tokens = padded.count / samplesPerToken
+        if tokens > config.audioSeqLength {
+            // Upstream truncates to `audio_seq_length` soft tokens per segment.
+            tokens = config.audioSeqLength
+            padded = Array(padded.prefix(tokens * samplesPerToken))
+        }
+        return MLXArray(padded).reshaped(tokens, samplesPerToken)
     }
 
     private static func requiresToolChoice(_ context: [String: any Sendable]?) -> Bool {
