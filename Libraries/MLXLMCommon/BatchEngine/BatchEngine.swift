@@ -1665,7 +1665,7 @@ public actor BatchEngine {
                 continuation: slot.continuation,
                 completedBeforePrefill: completedBeforePrefill,
                 totalPromptUnits: totalPromptUnits)
-            prepareResult = try PrefillProgressReporter.$current.withValue({
+            prepareResult = try PrefillProgressReporter.withHandler({
                 progressAccumulator.report(completedInPrepare: $0)
             }) {
                 try context.model.prepare(

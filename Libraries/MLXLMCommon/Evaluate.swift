@@ -1596,7 +1596,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
         self.promptPrefillTime = try measure {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
-                try PrefillProgressReporter.$current.withValue(modelPrepareProgressHandler) {
+                try PrefillProgressReporter.withHandler(modelPrepareProgressHandler) {
                     try prepare(
                         input: inputForPrepare,
                         windowSize: effectivePrefillWindow(
