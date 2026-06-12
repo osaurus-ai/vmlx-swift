@@ -151,13 +151,50 @@ Run actual conversion with the JANG MLX venv:
   --replace
 ```
 
-The current `/Users/eric/models` volume has about 19 GiB free after the BF16
-source download. That is enough for metadata and smoke tests, but not enough to
-reliably hold the full MXFP8 output and may be too tight for a complete MXFP4
-artifact plus temporary write pressure. Free space or a different output volume
-is required before the full conversion should be launched.
+Actual conversion proof with the JANG MLX venv:
 
-Synthetic conversion proof passed with the JANG MLX venv:
+- MXFP4 output:
+  `/Users/eric/models/OsaurusAI/diffusiongemma-26B-A4B-it-MXFP4`
+- MXFP4 log: `/tmp/diffusiongemma-mxfp4-convert-20260612T191053Z.log`
+- MXFP4 result: 1,047/1,047 source tensors processed, 295 quantized tensors,
+  752 passthrough tensors, 0 skipped tensors, 1,342 indexed output tensors,
+  15 shards, 15 GB on disk, `total_size=15944852880`
+- MXFP4 timing: 74.38 seconds wall, 14,044,954,624-byte max RSS, 0 swaps
+- MXFP8 output:
+  `/Users/eric/models/OsaurusAI/diffusiongemma-26B-A4B-it-MXFP8`
+- MXFP8 log: `/tmp/diffusiongemma-mxfp8-convert-20260612T191232Z.log`
+- MXFP8 result: 1,047/1,047 source tensors processed, 295 quantized tensors,
+  752 passthrough tensors, 0 skipped tensors, 1,342 indexed output tensors,
+  23 shards, 26 GB on disk, `total_size=27918936056`
+- MXFP8 timing: 65.80 seconds wall, 14,894,694,400-byte max RSS, 0 swaps
+
+Final bundle verification passed for both MXFP4 and MXFP8:
+
+- `config.json`, `jang_config.json`, `model.safetensors.index.json`, and
+  `diffusiongemma_mxfp_manifest.json` agree on `weight_format`, quant mode,
+  quant bits, `group_size=32`, shard count, indexed tensor count, and total
+  size.
+- Every index entry resolves to an existing shard and every indexed tensor key
+  is present in its safetensors shard.
+- Modality metadata remains `image=true`, `video=true`, `audio=false`.
+- Sampled tensor layout:
+  - MXFP4 attention: `q_proj.weight (4096, 352) uint32`,
+    `q_proj.scales (4096, 88) uint8`
+  - MXFP4 dense MLP override:
+    `mlp.down_proj.weight (2816, 528) uint32`,
+    `mlp.down_proj.scales (2816, 66) uint8`
+  - MXFP4 experts: `experts.down_proj.weight (128, 2816, 88) uint32`,
+    `experts.down_proj.scales (128, 2816, 22) uint8`
+  - MXFP8 attention: `q_proj.weight (4096, 704) uint32`,
+    `q_proj.scales (4096, 88) uint8`
+  - MXFP8 dense MLP: `mlp.down_proj.weight (2816, 528) uint32`,
+    `mlp.down_proj.scales (2816, 66) uint8`
+  - MXFP8 experts: `experts.down_proj.weight (128, 2816, 176) uint32`,
+    `experts.down_proj.scales (128, 2816, 22) uint8`
+  - Embeddings stay passthrough:
+    `model.decoder.embed_tokens.weight (262144, 2816) float16`
+
+Synthetic conversion proof also passed with the JANG MLX venv:
 
 - output `weight_format=mxfp4`
 - attention/expert tensors emitted `weight` + `scales`
