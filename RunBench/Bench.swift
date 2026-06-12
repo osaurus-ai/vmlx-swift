@@ -630,6 +630,17 @@ struct Bench {
             try await runSoloDiskRestore(modelPath: modelPath, maxNew: maxNew)
             return
         }
+
+        // BENCH_SOLO_LONGFORM=1: single long-form generation through
+        // `BatchEngine.generate` (solo path) with the real chat template.
+        // For block-diffusion models the [BlockDiffusion] stderr line
+        // reports canvases / denoising forwards / tokens-per-forward —
+        // the honest long-form throughput metric. BENCH_PROMPT overrides
+        // the default essay prompt.
+        if (env["BENCH_SOLO_LONGFORM"] ?? "0") == "1" {
+            try await runSoloLongform(modelPath: modelPath, maxNew: maxNew)
+            return
+        }
         if (env["BENCH_GROWING_CHAT_CACHE"] ?? "0") == "1" {
             do {
                 try await runGrowingChatCacheReuse(modelPath: modelPath, maxNew: maxNew)
@@ -2200,6 +2211,58 @@ func runBatchEngineCacheHit(modelPath: String, maxNew: Int) async throws {
 /// Session 1 generates and stores at the prompt boundary; the coordinator
 /// is dropped and a FRESH one is built on the same disk dir; the probe
 /// must hit the disk tier and session 2 must generate normally.
+/// Single long-form generation through the BatchEngine solo path with the
+/// real chat template. Reports wall/decode tok/s from the stream timing;
+/// block-diffusion models additionally print their [BlockDiffusion] stats
+/// line (canvases, denoising forwards, tokens-per-forward) on stderr.
+func runSoloLongform(modelPath: String, maxNew: Int) async throws {
+    let modelDir = URL(fileURLWithPath: modelPath)
+    print("\n=== Solo long-form generation ===")
+    let loadStart = CFAbsoluteTimeGetCurrent()
+    let context = try await loadBenchModelContext(from: modelDir)
+    print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
+    print("Model: \(type(of: context.model))")
+
+    let prompt = ProcessInfo.processInfo.environment["BENCH_PROMPT"]
+        ?? "Write a detailed multi-paragraph essay (at least 500 words) about the history of the Internet, from ARPANET to the modern web. Include specific milestones and dates."
+    let params = GenerateParameters(
+        maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
+
+    let input = try await context.processor.prepare(input: UserInput(prompt: prompt))
+    let promptTokens = input.text.tokens.size
+    nonisolated(unsafe) let ctx = context
+    let engine = BatchEngine(context: ctx, maxBatchSize: 1)
+    nonisolated(unsafe) let sendable = input
+
+    var text = ""
+    var generationTokens = 0
+    var firstChunkAt: Double? = nil
+    let t0 = CFAbsoluteTimeGetCurrent()
+    let stream = await engine.generate(input: sendable, parameters: params)
+    for await event in stream {
+        switch event {
+        case .chunk(let chunk):
+            if firstChunkAt == nil { firstChunkAt = CFAbsoluteTimeGetCurrent() - t0 }
+            text += chunk
+        case .info(let info):
+            generationTokens = info.generationTokenCount
+        default:
+            break
+        }
+    }
+    let wall = CFAbsoluteTimeGetCurrent() - t0
+    await engine.shutdown()
+
+    let charCount = text.count
+    print(String(format:
+        "  prompt=%d genTokens=%d wall=%.2fs TTFT=%.2fs wallTokPerSec=%.1f chars=%d",
+        promptTokens, generationTokens, wall, firstChunkAt ?? 0,
+        Double(generationTokens) / max(wall, 0.001), charCount))
+    let preview = text.count > 700 ? String(text.prefix(700)) + "…" : text
+    print("  TEXT:\n\(preview)")
+    print("\n=== Solo long-form done ===")
+}
+
 func runSoloDiskRestore(modelPath: String, maxNew: Int) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     print("\n=== Solo-path disk-restore verification ===")
