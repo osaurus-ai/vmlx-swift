@@ -65,6 +65,7 @@ extension LLMModel {
             MLX.eval(cache)
             flatTokens = flatTokens[prefillStepSize...]
             if let m = flatMask { flatMask = m[prefillStepSize...] }
+            PrefillProgressReporter.reportCompletedUnits(input.text.tokens.size - flatTokens.size)
             Memory.clearCache()
         }
 

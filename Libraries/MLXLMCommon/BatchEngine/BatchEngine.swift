@@ -52,6 +52,43 @@ private func cancelledGenerationStream(
     return stream
 }
 
+private final class PrefillProgressAccumulator: @unchecked Sendable {
+    private let continuation: AsyncStream<BatchGeneration>.Continuation
+    private let completedBeforePrefill: Int
+    private let totalPromptUnits: Int
+    private let lock = NSLock()
+    private var lastReportedCompleted: Int
+
+    init(
+        continuation: AsyncStream<BatchGeneration>.Continuation,
+        completedBeforePrefill: Int,
+        totalPromptUnits: Int
+    ) {
+        self.continuation = continuation
+        self.completedBeforePrefill = completedBeforePrefill
+        self.totalPromptUnits = totalPromptUnits
+        self.lastReportedCompleted = completedBeforePrefill
+    }
+
+    func report(completedInPrepare: Int) {
+        let completed = min(
+            totalPromptUnits,
+            completedBeforePrefill + max(0, completedInPrepare))
+        lock.lock()
+        guard completed > lastReportedCompleted else {
+            lock.unlock()
+            return
+        }
+        lastReportedCompleted = completed
+        lock.unlock()
+        continuation.yield(.prefillProgress(PrefillProgress(
+            stage: .prefill,
+            completedUnitCount: completed,
+            totalUnitCount: totalPromptUnits,
+            detail: "chunk")))
+    }
+}
+
 private func debugLogReasoningPromptTail(
     modelName: String,
     promptTail: String?,
@@ -1606,13 +1643,22 @@ public actor BatchEngine {
         // Prefill: either full input (cache miss) or remaining tokens (cache hit).
         let prepareResult: PrepareResult
         do {
-            prepareResult = try context.model.prepare(
-                inputForPrepare,
-                cache: slot.cache,
-                windowSize: effectivePrefillWindow(
-                    requested: slot.prefillStepSize,
-                    input: inputForPrepare,
-                    cache: slot.cache))
+            let completedBeforePrefill = max(0, totalPromptUnits - remainingPromptUnits)
+            let progressAccumulator = PrefillProgressAccumulator(
+                continuation: slot.continuation,
+                completedBeforePrefill: completedBeforePrefill,
+                totalPromptUnits: totalPromptUnits)
+            prepareResult = try PrefillProgressReporter.$current.withValue({
+                progressAccumulator.report(completedInPrepare: $0)
+            }) {
+                try context.model.prepare(
+                    inputForPrepare,
+                    cache: slot.cache,
+                    windowSize: effectivePrefillWindow(
+                        requested: slot.prefillStepSize,
+                        input: inputForPrepare,
+                        cache: slot.cache))
+            }
         } catch {
             // Prefill failed (e.g., invalid input) — finish with cancellation
             finishSlot(slot, reason: .cancelled)

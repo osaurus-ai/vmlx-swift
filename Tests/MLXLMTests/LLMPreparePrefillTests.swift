@@ -28,6 +28,22 @@ import XCTest
 /// extension is shared. These tests pin the behaviour with a tiny random
 /// Llama so regressions surface under `swift test` without any model files.
 final class LLMPreparePrefillTests: XCTestCase {
+    private final class ProgressRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [Int] = []
+
+        func append(_ value: Int) {
+            lock.lock()
+            values.append(value)
+            lock.unlock()
+        }
+
+        func snapshot() -> [Int] {
+            lock.lock()
+            defer { lock.unlock() }
+            return values
+        }
+    }
 
     /// Small random-init Llama that exercises the default `LLMModel.prepare`.
     private func makeModel(vocab: Int = 64) -> LlamaModel {
@@ -97,6 +113,20 @@ final class LLMPreparePrefillTests: XCTestCase {
         XCTAssertEqual(
             remainder.tokens.ndim, 1,
             "prepare must return a 1D tokens remainder even for 2D input")
+    }
+
+    func testChunkedPrefillReportsCompletedUnitsAfterEachChunk() throws {
+        let model = makeModel()
+        let cache = model.newCache(parameters: nil)
+        let recorder = ProgressRecorder()
+
+        let tokens = MLXArray((0..<totalLen).map { Int32($0 % 64) })[.newAxis, 0...]
+        let input = LMInput(text: .init(tokens: tokens))
+        _ = try PrefillProgressReporter.$current.withValue({ recorder.append($0) }) {
+            try model.prepare(input, cache: cache, windowSize: step)
+        }
+
+        XCTAssertEqual(recorder.snapshot(), [step, step * 2])
     }
 
     // MARK: - Short input (no chunking)

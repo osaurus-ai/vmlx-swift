@@ -65,6 +65,7 @@ public func chunkedPrefillEmbedding<Result>(
         _ = step(chunk)
         MLX.eval(cache)
         offset = end
+        PrefillProgressReporter.reportCompletedUnits(offset)
         MLX.Memory.clearCache()
     }
 
