@@ -1566,13 +1566,15 @@ public actor BatchEngine {
                         // remaining.nonEmpty case below.
                         let unsafePartial =
                             slot.originalInput.cacheHitSuffixContainsMediaPlaceholder(remaining)
-                        // Only path-dependent caches (Mamba/CCA/ArraysCache) need the
-                        // SSM-seed full-hit recovery; rotating/SWA + TQ/Quantized KV
-                        // restore exactly and use the standard trim+re-feed fast path.
-                        // Gating on the broad requiresDiskBackedRestore threw away
-                        // perfect Gemma SWA hits and re-prefilled every turn.
+                        // Only standalone rotating / sliding-window caches (Gemma,
+                        // Mistral SWA) are proven to restore exactly and take the
+                        // standard trim+re-feed fast path on a full hit. Keep the
+                        // conservative full-prefill rollback for every other
+                        // disk-backed topology — path-dependent recurrent, TurboQuant/
+                        // Quantized, HybridPool — whose exact-restore is unverified.
                         let unsafeFullHit =
-                            remaining.isEmpty && cacheContainsPathDependentState(slot.cache)
+                            remaining.isEmpty && requiresDiskBackedRestore
+                            && !cacheHasStandaloneRotatingWindowState(slot.cache)
                         if unsafePartial {
                             let slotIDStr = slot.id.description
                             Self.logger.info(

@@ -1424,15 +1424,18 @@ public struct TokenIterator: TokenIteratorProtocol {
                     }
                     let unsafePartial =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
-                    // A full exact hit only needs the SSM-seed recovery path for
-                    // PATH-DEPENDENT caches (Mamba/CCA/ArraysCache), whose restored
-                    // recurrent state already folds in the last token. Plain
-                    // rotating/SWA (and TurboQuant/Quantized) KV caches restore
-                    // exactly and take the standard trim-last-token + re-feed fast
-                    // path below; gating on the broad requiresDiskBackedRestore
-                    // discarded perfect Gemma SWA hits and re-prefilled every turn.
+                    // Only standalone rotating / sliding-window caches (Gemma,
+                    // Mistral SWA) are PROVEN to restore exactly and take the
+                    // standard trim-last-token + re-feed fast path on a full hit
+                    // (single-turn warm output is bit-exact vs no-cache). Keep the
+                    // conservative full-prefill rollback for every other disk-backed
+                    // topology — path-dependent recurrent (Mamba/CCA/ArraysCache),
+                    // TurboQuant/Quantized, and HybridPool — whose exact-restore is
+                    // not yet verified. (Gating only on path-dependent would have
+                    // enabled an unverified fast path for TQ/Quantized/HybridPool.)
                     let unsafeFullHit =
-                        remainingTokens.isEmpty && cacheContainsPathDependentState(self.cache)
+                        remainingTokens.isEmpty && requiresDiskBackedRestore
+                        && !cacheHasStandaloneRotatingWindowState(self.cache)
                     if unsafePartial {
                         Self.logger.info(
                             "TokenIterator: cache hit rolling back to full prefill (media placeholder tokens remain in cache-hit suffix)"
