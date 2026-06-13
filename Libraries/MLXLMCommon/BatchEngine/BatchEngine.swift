@@ -1566,7 +1566,13 @@ public actor BatchEngine {
                         // remaining.nonEmpty case below.
                         let unsafePartial =
                             slot.originalInput.cacheHitSuffixContainsMediaPlaceholder(remaining)
-                        let unsafeFullHit = remaining.isEmpty && requiresDiskBackedRestore
+                        // Only path-dependent caches (Mamba/CCA/ArraysCache) need the
+                        // SSM-seed full-hit recovery; rotating/SWA + TQ/Quantized KV
+                        // restore exactly and use the standard trim+re-feed fast path.
+                        // Gating on the broad requiresDiskBackedRestore threw away
+                        // perfect Gemma SWA hits and re-prefilled every turn.
+                        let unsafeFullHit =
+                            remaining.isEmpty && cacheContainsPathDependentState(slot.cache)
                         if unsafePartial {
                             let slotIDStr = slot.id.description
                             Self.logger.info(
