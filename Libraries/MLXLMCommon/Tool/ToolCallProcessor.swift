@@ -1292,7 +1292,11 @@ public class ToolCallProcessor {
     }
 
     private func visibleInlineLeading(_ leading: String) -> String? {
-        leading.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : leading
+        // Emit leading text verbatim. Returning nil only for *empty* leading
+        // (never for whitespace-only) keeps ordinary prose byte-exact: a chunk
+        // like " {" must not lose its leading space when the brace triggers a
+        // (possibly false) inline tool-call probe.
+        leading.isEmpty ? nil : leading
     }
 
     /// Process chunk for tagged formats.
