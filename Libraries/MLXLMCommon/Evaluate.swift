@@ -1424,7 +1424,15 @@ public struct TokenIterator: TokenIteratorProtocol {
                     }
                     let unsafePartial =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
-                    let unsafeFullHit = remainingTokens.isEmpty && requiresDiskBackedRestore
+                    // A full exact hit only needs the SSM-seed recovery path for
+                    // PATH-DEPENDENT caches (Mamba/CCA/ArraysCache), whose restored
+                    // recurrent state already folds in the last token. Plain
+                    // rotating/SWA (and TurboQuant/Quantized) KV caches restore
+                    // exactly and take the standard trim-last-token + re-feed fast
+                    // path below; gating on the broad requiresDiskBackedRestore
+                    // discarded perfect Gemma SWA hits and re-prefilled every turn.
+                    let unsafeFullHit =
+                        remainingTokens.isEmpty && cacheContainsPathDependentState(self.cache)
                     if unsafePartial {
                         Self.logger.info(
                             "TokenIterator: cache hit rolling back to full prefill (media placeholder tokens remain in cache-hit suffix)"
