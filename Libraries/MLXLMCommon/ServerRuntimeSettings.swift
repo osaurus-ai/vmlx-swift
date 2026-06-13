@@ -531,7 +531,12 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             if let budget = resolvedBudgetBytes,
                let estimateBytes = estimate.workingSetBytes,
                estimateBytes > budget {
-                let message = "Estimated request working set \(estimateBytes) bytes exceeds resolved memory budget \(budget) bytes."
+                var message = "Estimated request working set \(estimateBytes) bytes exceeds resolved memory budget \(budget) bytes."
+                if cache.liveKVCodec != .turboQuant {
+                    message += " To fit without truncating context, enable TurboQuant KV cache (3-bit, ~5\u{00D7} smaller KV) in the cache settings, or reduce the context length / lower the memory-safety slider."
+                } else {
+                    message += " TurboQuant KV is already enabled; reduce the context length or lower the memory-safety slider to fit."
+                }
                 if profile.blocksOverBudget {
                     blockingIssues.append(.error(
                         field: "memorySafety.requestEstimate",
@@ -1275,7 +1280,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
                 maxConcurrentSequences: customMaxConcurrentSequences ?? 2,
                 prefixMemoryLimitMB: nil,
                 prefixMemoryPercent: 20,
-                defaultMaxKVSize: customDefaultMaxKVSize,
+                defaultMaxKVSize: customDefaultMaxKVSize ?? 131072,
                 failClosedWhenEstimateUnknown: false,
                 blocksOverBudget: false,
                 warnings: ["Performance memory mode may allow macOS compression or swap before refusing a request."])
@@ -1286,7 +1291,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
                 maxConcurrentSequences: customMaxConcurrentSequences ?? 2,
                 prefixMemoryLimitMB: 512,
                 prefixMemoryPercent: 15,
-                defaultMaxKVSize: customDefaultMaxKVSize ?? 8192,
+                defaultMaxKVSize: customDefaultMaxKVSize ?? 65536,
                 failClosedWhenEstimateUnknown: false,
                 blocksOverBudget: false,
                 warnings: [])
@@ -1297,7 +1302,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
                 maxConcurrentSequences: customMaxConcurrentSequences ?? 1,
                 prefixMemoryLimitMB: 128,
                 prefixMemoryPercent: 15,
-                defaultMaxKVSize: customDefaultMaxKVSize ?? 8192,
+                defaultMaxKVSize: customDefaultMaxKVSize ?? 65536,
                 failClosedWhenEstimateUnknown: false,
                 blocksOverBudget: false,
                 warnings: [])
@@ -1308,7 +1313,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
                 maxConcurrentSequences: customMaxConcurrentSequences ?? 1,
                 prefixMemoryLimitMB: 128,
                 prefixMemoryPercent: 10,
-                defaultMaxKVSize: customDefaultMaxKVSize ?? 4096,
+                defaultMaxKVSize: customDefaultMaxKVSize ?? 16384,
                 failClosedWhenEstimateUnknown: true,
                 blocksOverBudget: true,
                 warnings: [])
