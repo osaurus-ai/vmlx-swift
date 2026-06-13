@@ -1003,21 +1003,40 @@ public actor BatchEngine {
                     promptTail: promptTail,
                     toolSchemas: toolSchemas)
             } else {
-                let iterator = try TokenIterator(
-                    input: input,
-                    model: context.model,
-                    cache: nil,
-                    parameters: soloParameters,
-                    cacheCoordinator: cacheCoordinator,
-                    disableDiskBackedRequiredToolRestore: disableDiskBackedRequiredToolRestore,
-                    prefillProgressHandler: { progress in
-                        continuation.yield(.prefillProgress(progress))
-                    })
-                (sourceStream, generationTask) = generateTask(
+                // Defer TokenIterator construction (and therefore the prompt
+                // prefill) into the streaming task so the consumer can observe
+                // `.prefillProgress` frames live as prefill proceeds, rather
+                // than as one burst after the (already-prefilled) iterator is
+                // returned. The prefill itself is unchanged — `prepare` is
+                // still invoked exactly once with the full input — so model
+                // output and token/s are bit-identical; only the timing of
+                // when progress frames reach the consumer changes.
+                let promptTokenIdsForTail = input.text.tokens.reshaped(-1).asArray(Int.self)
+                let deferredParameters = soloParameters
+                let deferredDisableRestore = disableDiskBackedRequiredToolRestore
+                let deferredInputs = SendableBox(
+                    (input, context.model, cacheCoordinator))
+                let deferredContinuation = continuation
+                let makeIterator: @Sendable () throws -> any TokenIteratorProtocol = {
+                    let (deferredInput, deferredModel, deferredCoordinator) =
+                        deferredInputs.consume()
+                    return try TokenIterator(
+                        input: deferredInput,
+                        model: deferredModel,
+                        cache: nil,
+                        parameters: deferredParameters,
+                        cacheCoordinator: deferredCoordinator,
+                        disableDiskBackedRequiredToolRestore: deferredDisableRestore,
+                        prefillProgressHandler: { progress in
+                            deferredContinuation.yield(.prefillProgress(progress))
+                        })
+                }
+                (sourceStream, generationTask) = generateTaskDeferred(
                     promptTokenCount: promptTokenCount,
                     modelConfiguration: context.configuration,
                     tokenizer: context.tokenizer,
-                    iterator: iterator,
+                    promptTokenIds: promptTokenIdsForTail,
+                    makeIterator: makeIterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
                     toolSchemas: toolSchemas)

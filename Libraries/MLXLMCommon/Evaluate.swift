@@ -2914,11 +2914,12 @@ public func generate(
         resolveStopSequences(
             modelConfiguration: context.configuration,
             tokenizer: context.tokenizer).textStopStrings)
+    let iteratorBox = SendableBox(iterator)
     let (stream, _) = generateLoopTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
-        iterator: iterator,
+        makeIterator: { iteratorBox.consume() },
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
@@ -2988,11 +2989,62 @@ public func generateTask(
             modelConfiguration: modelConfiguration,
             tokenizer: tokenizer).textStopStrings)
 
+    // Existing callers pass an already-constructed iterator (prefill ran at
+    // construction time). Wrap it in a one-shot factory so it crosses into the
+    // loop task unchanged; behavior for these callers is identical.
+    let iteratorBox = SendableBox(iterator)
     return generateLoopTask(
         promptTokenCount: promptTokenCount,
         modelConfiguration: modelConfiguration,
         tokenizer: tokenizer,
-        iterator: iterator,
+        makeIterator: { iteratorBox.consume() },
+        wiredMemoryTicket: wiredMemoryTicket,
+        handler: TextToolTokenLoopHandler(
+            tokenizer: tokenizer,
+            format: modelConfiguration.toolCallFormat ?? .json,
+            tools: toolSchemas,
+            reasoningParser: ReasoningParser.forPrompt(
+                stampName: modelConfiguration.reasoningParserName,
+                promptTail: effectivePromptTail),
+            stopStringMatcher: StopStringMatcher(stopStrings: effectiveStopStrings)
+        )
+    )
+}
+
+/// Like ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:...)``
+/// but defers iterator construction (and therefore prompt prefill) into the
+/// streaming task. Use this for the solo fast path so the consumer can observe
+/// `.prefillProgress` frames live as the prompt is prefilled, rather than as a
+/// single burst once the (already-prefilled) iterator is returned.
+///
+/// `promptTokenIds` is supplied explicitly because the iterator does not exist
+/// yet when the prompt tail is computed for the reasoning-parser stamp.
+public func generateTaskDeferred(
+    promptTokenCount: Int,
+    modelConfiguration: ModelConfiguration,
+    tokenizer: Tokenizer,
+    promptTokenIds: [Int],
+    makeIterator: @escaping @Sendable () throws -> any TokenIteratorProtocol,
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    extraStopStrings: [String] = [],
+    promptTail: String? = nil,
+    toolSchemas: [ToolSpec]? = nil
+) -> (AsyncStream<Generation>, Task<Void, Never>) {
+    let effectivePromptTail =
+        promptTail
+        ?? _decodePromptTail(
+            tokenIds: promptTokenIds, tokenizer: tokenizer, tokens: 64)
+    let effectiveStopStrings = mergeStopStrings(
+        extraStopStrings,
+        resolveStopSequences(
+            modelConfiguration: modelConfiguration,
+            tokenizer: tokenizer).textStopStrings)
+
+    return generateLoopTask(
+        promptTokenCount: promptTokenCount,
+        modelConfiguration: modelConfiguration,
+        tokenizer: tokenizer,
+        makeIterator: makeIterator,
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
@@ -3088,11 +3140,12 @@ public func generateTokens(
         parameters: parameters,
         numDraftTokens: numDraftTokens
     )
+    let iteratorBox = SendableBox(iterator)
     let (stream, _) = generateLoopTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
-        iterator: iterator,
+        makeIterator: { iteratorBox.consume() },
         wiredMemoryTicket: wiredMemoryTicket,
         handler: RawTokenLoopHandler()
     )
@@ -3188,11 +3241,12 @@ public func generateTokenTask(
     includeStopToken: Bool = false,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
+    let iteratorBox = SendableBox(iterator)
     return generateLoopTask(
         promptTokenCount: promptTokenCount,
         modelConfiguration: modelConfiguration,
         tokenizer: tokenizer,
-        iterator: iterator,
+        makeIterator: { iteratorBox.consume() },
         wiredMemoryTicket: wiredMemoryTicket,
         includeStopToken: includeStopToken,
         handler: RawTokenLoopHandler()
@@ -3203,7 +3257,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     promptTokenCount: Int,
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
-    iterator: consuming any TokenIteratorProtocol,
+    makeIterator: @escaping @Sendable () throws -> any TokenIteratorProtocol,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     includeStopToken: Bool = false,
     handler: consuming Handler
@@ -3211,14 +3265,38 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
     let (stream, continuation) = AsyncStream<Handler.Output>.makeStream()
 
-    let iterator = SendableBox(iterator)
+    let makeIterator = SendableBox(makeIterator)
     let handler = SendableBox(handler)
 
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
         let performIteration = {
-            var iterator = iterator.consume()
             var handler = handler.consume()
+
+            // Construct the iterator *inside* the streaming task so any
+            // prefill work (cache fetch + prompt prepare) runs here rather
+            // than synchronously at call time. This lets the consumer drain
+            // `.prefillProgress` frames live as prefill proceeds, instead of
+            // receiving them in one burst after the stream has already been
+            // returned (which happens when the iterator — and therefore the
+            // whole prompt prefill — is built eagerly before the loop task).
+            var iterator: any TokenIteratorProtocol
+            do {
+                iterator = try makeIterator.consume()()
+            } catch {
+                Logger(subsystem: "vmlx", category: "generateLoopTask").error(
+                    "Iterator construction failed: \(error.localizedDescription, privacy: .public)")
+                handler.onGenerationEnd(emit: continuation.yield)
+                _ = continuation.yield(handler.infoEvent(GenerateCompletionInfo(
+                    promptTokenCount: promptTokenCount,
+                    generationTokenCount: 0,
+                    promptTime: 0,
+                    generationTime: 0,
+                    stopReason: .cancelled
+                )))
+                continuation.finish()
+                return
+            }
 
             var start = Date.timeIntervalSinceReferenceDate
             var promptTime: TimeInterval = 0
