@@ -782,7 +782,22 @@ public class DiffusionGemmaModel: Module, LLMModel {
         if let logits = selfConditioningLogits {
             // Soft embeddings from the previous step's logits.
             let probs = softmax(logits.asType(.float32), axis: -1, precise: true)
-            let soft = probs.asType(embeds.dtype).matmul(model.decoder.embedTokens.weight)
+            // The tied embedding head ships quantized in many bundles (e.g.
+            // Gemma 4 QAT q6). Its packed `.weight` is grouped along the hidden
+            // axis, so the soft-embedding contraction over the vocab axis is not
+            // a valid quantized matmul and collapses the signal to a 0-D scalar
+            // (crashing the MoE router on denoising step >= 2). Dequantize the
+            // embedding table for this `probs @ W` soft-embedding; dense bundles
+            // keep using the plain weight.
+            let embedTable: MLXArray
+            if let qEmbed = model.decoder.embedTokens as? QuantizedEmbedding {
+                embedTable = dequantized(
+                    qEmbed.weight, scales: qEmbed.scales, biases: qEmbed.biases,
+                    groupSize: qEmbed.groupSize, bits: qEmbed.bits, mode: qEmbed.mode)
+            } else {
+                embedTable = model.decoder.embedTokens.weight
+            }
+            let soft = probs.asType(embeds.dtype).matmul(embedTable.asType(embeds.dtype))
             signal = soft * model.decoder.embedScale(embeds.dtype)
         } else {
             signal = MLXArray.zeros(embeds.shape, dtype: embeds.dtype)
