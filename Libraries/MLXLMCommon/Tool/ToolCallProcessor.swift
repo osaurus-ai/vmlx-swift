@@ -1342,7 +1342,7 @@ public class ToolCallProcessor {
                 if let fragmentIndex = partialInlineBareNameJSONToolCallStart(in: candidate) {
                     let leading = String(candidate[..<fragmentIndex])
                     leadingTextBeforeToolCall = String(candidate[fragmentIndex...])
-                    return visibleInlineLeading(leading)
+                    return leading.isEmpty ? nil : leading
                 }
                 if let callIndex = firstBareCallToolCallStart(in: candidate) {
                     let leading = String(candidate[..<callIndex])
@@ -1364,7 +1364,18 @@ public class ToolCallProcessor {
                 if let fragmentIndex = partialBareCallToolCallStart(in: candidate) {
                     let leading = String(candidate[..<fragmentIndex])
                     leadingTextBeforeToolCall = String(candidate[fragmentIndex...])
-                    return visibleInlineLeading(leading)
+                    return leading.isEmpty ? nil : leading
+                }
+                // A previously buffered bare-call fragment (a trailing "c"/
+                // "ca"/"cal"/"call" that looked like the start of `call:`) did
+                // not continue into a tool call. Flush the held text together
+                // with this chunk, in order, so ordinary prose is never dropped
+                // or reordered. Gemma is the only family with bare-call
+                // fallback and it never enables inline-JSON fallback, so no
+                // later stage would otherwise consume this candidate.
+                if !leadingTextBeforeToolCall.isEmpty {
+                    leadingTextBeforeToolCall = ""
+                    return candidate.isEmpty ? nil : candidate
                 }
             case .collectingInlineToolCall:
                 break
