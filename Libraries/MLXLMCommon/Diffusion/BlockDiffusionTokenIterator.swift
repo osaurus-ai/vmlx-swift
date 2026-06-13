@@ -163,8 +163,30 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             }
         }
 
-        // ---- Chunked encoder prefill ------------------------------------
+        // ---- Encoder prefill ---------------------------------------------
         let prefillStart = Date.timeIntervalSinceReferenceDate
+
+        // Multimodal prompts prefill single-shot from spliced embeddings:
+        // image blocks attend bidirectionally inside the prompt, which a
+        // chunk boundary through an image span would break (mirrors the
+        // reference encoder's chunked-prefill policy). The prefix cache is
+        // already skipped for media above.
+        if input.hasMediaContent,
+            let spliced = try model.encoderPromptEmbeddings(for: input)
+        {
+            model.encoderForward(
+                embeddings: spliced.embeddings,
+                cache: self.cache,
+                visionBlockIds: spliced.visionBlockIds)
+            encoderForwardCount += 1
+            MLX.eval(self.cache)
+            self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
+            if cacheCoordinator != nil {
+                self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
+            }
+            return
+        }
+
         let stepSize = Swift.max(parameters.prefillStepSize, 1)
         var remaining = tokensToEncode[...]
         while !remaining.isEmpty {

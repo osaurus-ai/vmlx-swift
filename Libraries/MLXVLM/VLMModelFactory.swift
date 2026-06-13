@@ -116,6 +116,11 @@ public enum VLMTypeRegistry {
 
     nonisolated(unsafe) private static let _creators: [String: (Data) throws -> any LanguageModel] = [
         "paligemma": create(PaliGemmaConfiguration.self, PaliGemma.init),
+        // Block-diffusion Gemma: the MLXLLM engine with the Gemma4 vision
+        // tower installed. Generation runs via BlockDiffusionTokenIterator;
+        // the throwing prepare() guard keeps AR routes loud.
+        "diffusion_gemma": create(
+            DiffusionGemmaVLMConfiguration.self, makeDiffusionGemmaVLM),
         "qwen2_vl": create(Qwen2VLConfiguration.self, Qwen2VL.init),
         "qwen2_5_vl": create(Qwen25VLConfiguration.self, Qwen25VL.init),
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),

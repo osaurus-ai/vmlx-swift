@@ -129,6 +129,9 @@ public struct DiffusionGemmaConfiguration: Codable, Sendable {
     public let imageTokenId: Int?
     let textConfig: DiffusionGemmaTextConfiguration
 
+    /// Text hidden size, exposed for the MLXVLM vision wiring.
+    public var textHiddenSize: Int { textConfig.hiddenSize }
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case canvasLength = "canvas_length"
@@ -522,6 +525,13 @@ class DiffusionGemmaEncoderScalarStack: Module {
 class DiffusionGemmaEncoderModule: Module {
     @ModuleInfo(key: "language_model") var languageModel: DiffusionGemmaEncoderScalarStack
 
+    /// Vision attachment points. The concrete tower/embedder classes live in
+    /// MLXVLM (which depends on this module, not vice versa), so they are
+    /// installed post-init as opaque `Module`s purely for weight loading;
+    /// the compute path is injected as a closure on the top-level model.
+    @ModuleInfo(key: "vision_tower") var visionTower: Module?
+    @ModuleInfo(key: "embed_vision") var embedVision: Module?
+
     init(layerCount: Int) {
         self._languageModel.wrappedValue = DiffusionGemmaEncoderScalarStack(count: layerCount)
         super.init()
@@ -637,20 +647,44 @@ public class DiffusionGemmaModel: Module, LLMModel {
 
     func encoderForwardInternal(_ tokens: MLXArray, cache: [KVCache]) {
         let tokens = tokens.ndim == 1 ? tokens.expandedDimensions(axis: 0) : tokens
-        var h = model.decoder.embedTokens(tokens)
-        h = h * model.decoder.embedScale(h.dtype)
+        let h = embedPromptTokens(tokens)
+        runEncoderLayers(h, cache: cache, visionBlockIds: nil)
+    }
 
-        let (globalMask, slidingMask) = {
-            let m = masks(h: h, cache: cache)
-            return (m.global, m.sliding)
-        }()
+    /// Encoder forward over precomputed embeddings (multimodal prefill).
+    ///
+    /// `visionBlockIds` carries per-position contiguous image-block ids
+    /// (−1 for text positions). Image positions attend bidirectionally
+    /// within their block on top of the causal/sliding mask — the
+    /// `use_bidirectional_attention == "vision"` contract from the
+    /// reference encoder.
+    func encoderForwardInternal(
+        embeddings: MLXArray, cache: [KVCache], visionBlockIds: MLXArray?
+    ) {
+        let h = embeddings.ndim == 2 ? embeddings.expandedDimensions(axis: 0) : embeddings
+        runEncoderLayers(h, cache: cache, visionBlockIds: visionBlockIds)
+    }
+
+    private func runEncoderLayers(
+        _ embeddings: MLXArray, cache: [KVCache], visionBlockIds: MLXArray?
+    ) {
+        var h = embeddings
+        let masks: (
+            global: MLXFast.ScaledDotProductAttentionMaskMode,
+            sliding: MLXFast.ScaledDotProductAttentionMaskMode
+        )
+        if let visionBlockIds {
+            masks = visionOverlayMasks(h: h, cache: cache, visionBlockIds: visionBlockIds)
+        } else {
+            masks = self.masks(h: h, cache: cache)
+        }
 
         let layerTypes = textConfig.layerTypes
         for (i, layer) in model.decoder.layers.enumerated() {
             let isGlobal = i < layerTypes.count && layerTypes[i] == "full_attention"
             h = layer(
                 h,
-                mask: isGlobal ? globalMask : slidingMask,
+                mask: isGlobal ? masks.global : masks.sliding,
                 cache: i < cache.count ? cache[i] : nil,
                 mode: .encoder,
                 scalarOverride: model.encoder.languageModel.layers[i].layerScalar)
@@ -658,6 +692,85 @@ public class DiffusionGemmaModel: Module, LLMModel {
         // Encoder hidden states are unused — only the KV cache side effect
         // matters, so the final norm / logits are skipped.
     }
+
+    /// Causal (+ sliding-window) masks OR'd with bidirectional attention
+    /// inside each contiguous image block. Only used for media prefill,
+    /// which runs single-shot from an empty cache.
+    private func visionOverlayMasks(
+        h: MLXArray, cache: [KVCache], visionBlockIds: MLXArray?
+    ) -> (
+        global: MLXFast.ScaledDotProductAttentionMaskMode,
+        sliding: MLXFast.ScaledDotProductAttentionMaskMode
+    ) {
+        let n = h.dim(1)
+        let offset = cache.first?.offset ?? 0
+        let positions = MLXArray(Int32(offset) ..< Int32(offset + n))
+        let queryPositions = expandedDimensions(positions, axis: -1)
+        let keyPositions = expandedDimensions(positions, axis: 0)
+        let causal = greaterEqual(queryPositions, keyPositions)
+        var overlay = MLXArray.zeros([n, n], dtype: .bool)
+        if let blockIds = visionBlockIds {
+            let ids = blockIds.reshaped(-1)
+            let q = expandedDimensions(ids, axis: -1)
+            let k = expandedDimensions(ids, axis: 0)
+            overlay = logicalAnd(
+                greaterEqual(q, MLXArray(Int32(0))), equal(q, k))
+        }
+        let globalMask = logicalOr(causal, overlay)
+        let window = textConfig.slidingWindow
+        let withinWindow = less(
+            queryPositions, keyPositions + MLXArray(Int32(window)))
+        let slidingMask = logicalOr(logicalAnd(causal, withinWindow), overlay)
+        return (
+            global: .array(globalMask),
+            sliding: .array(slidingMask)
+        )
+    }
+
+    // MARK: Vision attachment (installed by the VLM factory)
+
+    /// Compute closure injected by MLXVLM: builds the full spliced prompt
+    /// embeddings (text embeds + image features scattered over the image
+    /// placeholder positions) for a media-bearing `LMInput`. `nil` (or a
+    /// closure returning `nil`) means text-only operation.
+    public var visionPromptEmbedder:
+        ((LMInput, DiffusionGemmaModel) throws -> (embeddings: MLXArray, visionBlockIds: MLXArray)?)?
+
+    /// Install the vision tower + multimodal embedder modules (for weight
+    /// loading) and the prompt-embedding compute closure. Called by the
+    /// VLM factory before weights load; text-only loads never call this.
+    public func installVision(
+        tower: Module,
+        embedder: Module,
+        promptEmbedder:
+            @escaping (LMInput, DiffusionGemmaModel) throws
+                -> (embeddings: MLXArray, visionBlockIds: MLXArray)?
+    ) {
+        model.encoder.visionTower = tower
+        model.encoder.embedVision = embedder
+        visionPromptEmbedder = promptEmbedder
+    }
+
+    /// Prompt token embedding with image placeholders mapped to pad before
+    /// embedding — the reference encoder always does this, with or without
+    /// pixels. Without it, history turns that re-render `<|image|>`
+    /// placeholders (but carry no pixels) would inject the raw image-token
+    /// embedding 280× and derail the model into immediate EOS.
+    public func embedPromptTokens(_ tokens: MLXArray) -> MLXArray {
+        var tokens = tokens.ndim == 1 ? tokens.expandedDimensions(axis: 0) : tokens
+        if let imageToken = config.imageTokenId {
+            tokens = MLX.where(
+                MLX.equal(tokens, MLXArray(Int32(imageToken))),
+                MLXArray(Int32(textConfig.padTokenId)),
+                tokens)
+        }
+        let h = model.decoder.embedTokens(tokens)
+        return h * model.decoder.embedScale(h.dtype)
+    }
+
+    public var visionTowerModule: Module? { model.encoder.visionTower }
+    public var visionEmbedderModule: Module? { model.encoder.embedVision }
+    public var imageTokenId: Int? { config.imageTokenId }
 
     func decoderForwardInternal(
         canvas: MLXArray, cache: [KVCache], selfConditioningLogits: MLXArray?
@@ -703,11 +816,15 @@ public class DiffusionGemmaModel: Module, LLMModel {
         processed.reserveCapacity(weights.count)
 
         for (key, value) in weights {
-            // Vision tower / multimodal embedder are not part of the text
-            // engine (fp16 passthrough tensors in the bundle).
+            // Vision tower / multimodal embedder: kept (with the checkpoint's
+            // ClippableLinear `.linear.` nesting stripped) when the VLM
+            // factory installed vision modules; dropped for text-only loads.
             if key.hasPrefix("model.encoder.vision_tower.")
                 || key.hasPrefix("model.encoder.embed_vision.")
             {
+                if model.encoder.visionTower != nil {
+                    processed[key.replacingOccurrences(of: ".linear.", with: ".")] = value
+                }
                 continue
             }
             if key.hasPrefix("model.encoder.language_model.") {
@@ -777,6 +894,19 @@ extension DiffusionGemmaModel: BlockDiffusionModel {
     ) -> MLXArray {
         decoderForwardInternal(
             canvas: canvas, cache: cache, selfConditioningLogits: selfConditioningLogits)
+    }
+
+    public func encoderPromptEmbeddings(
+        for input: LMInput
+    ) throws -> (embeddings: MLXArray, visionBlockIds: MLXArray)? {
+        try visionPromptEmbedder?(input, self)
+    }
+
+    public func encoderForward(
+        embeddings: MLXArray, cache: [KVCache], visionBlockIds: MLXArray?
+    ) {
+        encoderForwardInternal(
+            embeddings: embeddings, cache: cache, visionBlockIds: visionBlockIds)
     }
 }
 

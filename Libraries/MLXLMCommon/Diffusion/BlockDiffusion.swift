@@ -118,6 +118,33 @@ public protocol BlockDiffusionModel: LanguageModel {
     func decoderForward(
         canvas: MLXArray, cache: [KVCache], selfConditioningLogits: MLXArray?
     ) -> MLXArray
+
+    /// Multimodal prefill hook: the full spliced prompt embeddings (text
+    /// embeds + image features over the placeholder positions) plus
+    /// per-position contiguous image-block ids (−1 for text). Returns `nil`
+    /// for text-only models/inputs; the iterator then uses the token path.
+    func encoderPromptEmbeddings(
+        for input: LMInput
+    ) throws -> (embeddings: MLXArray, visionBlockIds: MLXArray)?
+
+    /// Causal forward over precomputed `embeddings` [1, T]; writes KV into
+    /// `cache`. `visionBlockIds` enables bidirectional attention inside
+    /// each image block.
+    func encoderForward(
+        embeddings: MLXArray, cache: [KVCache], visionBlockIds: MLXArray?)
+}
+
+extension BlockDiffusionModel {
+    public func encoderPromptEmbeddings(
+        for input: LMInput
+    ) throws -> (embeddings: MLXArray, visionBlockIds: MLXArray)? { nil }
+
+    public func encoderForward(
+        embeddings: MLXArray, cache: [KVCache], visionBlockIds: MLXArray?
+    ) {
+        fatalError(
+            "\(Self.self) does not implement embeddings-based encoder prefill")
+    }
 }
 
 public enum BlockDiffusionModelError: Error, CustomStringConvertible {

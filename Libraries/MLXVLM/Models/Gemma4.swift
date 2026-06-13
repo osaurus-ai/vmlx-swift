@@ -1099,6 +1099,35 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) th
     return inputFlat.reshaped(inputShape)
 }
 
+// MARK: - Vision reuse facade (DiffusionGemma)
+
+/// Opaque handles for sibling VLM wirings (the block-diffusion Gemma) that
+/// reuse this file's private vision tower / multimodal embedder without
+/// widening their access. The returned `module` goes into the consumer's
+/// module tree for weight loading; `compute` is the forward pass.
+struct Gemma4VisionReuse {
+    let module: Module
+    let compute: (MLXArray) -> MLXArray
+}
+
+func makeGemma4VisionTower(_ config: Gemma4VisionConfig) -> Gemma4VisionReuse {
+    let tower = VisionTower(config)
+    return Gemma4VisionReuse(module: tower, compute: { tower($0) })
+}
+
+func makeGemma4MultimodalEmbedder(embDim: Int, textDim: Int) -> Gemma4VisionReuse {
+    let embedder = MultimodalEmbedder(embDim: embDim, textDim: textDim)
+    return Gemma4VisionReuse(module: embedder, compute: { embedder($0) })
+}
+
+/// Scatter `source` features over `mask` positions of `input` — internal
+/// re-export of this file's private maskedScatter for sibling wirings.
+func gemma4MaskedScatter(
+    input: MLXArray, mask: MLXArray, source: MLXArray
+) throws -> MLXArray {
+    try maskedScatter(input: input, mask: mask, source: source)
+}
+
 // MARK: - Gemma4 VLM
 
 public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
