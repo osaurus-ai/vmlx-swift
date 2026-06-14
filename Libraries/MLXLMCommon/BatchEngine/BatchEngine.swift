@@ -921,6 +921,28 @@ public actor BatchEngine {
         return modelName.contains("lfm2.5") && modelName.contains("mxfp8")
     }
 
+    /// Clamps prefill-progress frames so the reported completed count never
+    /// decreases within a single request. A progress counter must be monotonic;
+    /// partial / diverging-prefix cache restores can otherwise emit a frame
+    /// whose `completedBeforePrefill` boundary is below an already-shown value,
+    /// which the UI would render as the %% briefly ticking backward.
+    private final class PrefillMonotonicGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var maxCompleted = 0
+        func clamp(_ progress: PrefillProgress) -> PrefillProgress {
+            lock.lock()
+            let bumped = Swift.max(progress.completedUnitCount, maxCompleted)
+            maxCompleted = bumped
+            lock.unlock()
+            if bumped == progress.completedUnitCount { return progress }
+            return PrefillProgress(
+                stage: progress.stage,
+                completedUnitCount: bumped,
+                totalUnitCount: progress.totalUnitCount,
+                detail: progress.detail)
+        }
+    }
+
     private func startSoloFastPath(
         input: consuming sending LMInput,
         parameters: GenerateParameters,
@@ -952,11 +974,17 @@ public actor BatchEngine {
             input.text.tokens.reshaped(-1).asArray(Int.self))
 
         let (outStream, continuation) = AsyncStream<Generation>.makeStream()
-        continuation.yield(.prefillProgress(PrefillProgress(
+        // Monotonic gate: a prompt-processing counter must never tick backward.
+        // Partial / diverging-prefix cache restores (e.g. reasoning-strip
+        // templates that shorten history) can compute a `completedBeforePrefill`
+        // boundary below an already-emitted frame; clamp every emitted frame's
+        // completed count to a running max so the UI %% only ever advances.
+        let prefillGate = PrefillMonotonicGate()
+        continuation.yield(.prefillProgress(prefillGate.clamp(PrefillProgress(
             stage: .queued,
             completedUnitCount: 0,
             totalUnitCount: promptTokenCount,
-            detail: "solo")))
+            detail: "solo"))))
 
         let sourceStream: AsyncStream<Generation>
         let generationTask: Task<Void, Never>
@@ -1028,7 +1056,7 @@ public actor BatchEngine {
                         cacheCoordinator: deferredCoordinator,
                         disableDiskBackedRequiredToolRestore: deferredDisableRestore,
                         prefillProgressHandler: { progress in
-                            deferredContinuation.yield(.prefillProgress(progress))
+                            deferredContinuation.yield(.prefillProgress(prefillGate.clamp(progress)))
                         })
                 }
                 (sourceStream, generationTask) = generateTaskDeferred(
