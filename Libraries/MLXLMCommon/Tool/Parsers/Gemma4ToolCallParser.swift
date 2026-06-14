@@ -33,7 +33,14 @@ public struct Gemma4ToolCallParser: ToolCallParser, Sendable {
     public var supportsBareCallToolFallback: Bool { true }
 
     public var startTagAliases: [String] {
-        native.startTagAliases + zyphra.startTagAliases
+        // Live JANG/CRACK rows occasionally drift the native `<|tool_call>` open
+        // delimiter to `<|tool_call|>` (an extra pipe mirroring the `<tool_call|>`
+        // close) and wrap the arguments in parens, e.g.
+        // `<|tool_call|>call:name({"k":"v"})<tool_call|>`. Recognize the drifted
+        // open tag so the streaming processor buffers the envelope instead of
+        // leaking the raw markup as visible content. The close `<tool_call|>` is
+        // unchanged, so it still pairs through `endTagAliases`.
+        ["<|tool_call|>"] + native.startTagAliases + zyphra.startTagAliases
     }
 
     public var endTagAliases: [String] {

@@ -45,9 +45,14 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
         let remaining = String(text[callRange.upperBound...])
 
-        // Extract function name (word characters until {)
+        // Extract function name. Native format is `call:name{...}`; live rows
+        // can drift to a paren-wrapped form `call:name({...})`. Stop the name
+        // at the first `{` (native) or `(` (drift) so the trailing paren never
+        // becomes part of the function name. The argument span below still
+        // reads the inner `{...}`, so JSON-in-parens parses identically.
         guard let braceStart = remaining.firstIndex(of: "{") else { return nil }
-        let funcName = String(remaining[..<braceStart])
+        let nameEnd = remaining.firstIndex(where: { $0 == "{" || $0 == "(" }) ?? braceStart
+        let funcName = String(remaining[..<nameEnd])
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !funcName.isEmpty else { return nil }
