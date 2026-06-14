@@ -54,9 +54,13 @@ public enum SpecDecStream {
                     var detokenizer = NaiveStreamingDetokenizer(
                         tokenizer: tokenizer)
                     let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil
-                    let toolCallProcessor = activeToolSchemas.map {
-                        ToolCallProcessor(format: toolCallFormat, tools: $0)
-                    }
+                    // No tools offered: still strip tagged tool-call markers so a
+                    // model that emits an envelope anyway cannot leak raw markup.
+                    let toolCallProcessor: ToolCallProcessor? =
+                        activeToolSchemas.map { ToolCallProcessor(format: toolCallFormat, tools: $0) }
+                        ?? (toolCallFormat.hasTaggedToolMarkers
+                            ? ToolCallProcessor(format: toolCallFormat, tools: nil, stripOnly: true)
+                            : nil)
                     var reasoningParser = ReasoningParser
                         .fromCapabilityName(reasoningParserName)
 
@@ -117,9 +121,13 @@ public enum SpecDecStream {
                     var detokenizer = NaiveStreamingDetokenizer(
                         tokenizer: tokenizer)
                     let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil
-                    let toolCallProcessor = activeToolSchemas.map {
-                        ToolCallProcessor(format: toolCallFormat, tools: $0)
-                    }
+                    // No tools offered: still strip tagged tool-call markers so a
+                    // model that emits an envelope anyway cannot leak raw markup.
+                    let toolCallProcessor: ToolCallProcessor? =
+                        activeToolSchemas.map { ToolCallProcessor(format: toolCallFormat, tools: $0) }
+                        ?? (toolCallFormat.hasTaggedToolMarkers
+                            ? ToolCallProcessor(format: toolCallFormat, tools: nil, stripOnly: true)
+                            : nil)
                     var reasoningParser = ReasoningParser
                         .fromCapabilityName(reasoningParserName)
 
@@ -227,9 +235,13 @@ public enum SpecDecStream {
                 var detokenizer = NaiveStreamingDetokenizer(
                     tokenizer: tokenizer)
                 let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil
-                let toolCallProcessor = activeToolSchemas.map {
-                    ToolCallProcessor(format: toolCallFormat, tools: $0)
-                }
+                // No tools offered: still strip tagged tool-call markers so a
+                // model that emits an envelope anyway cannot leak raw markup.
+                let toolCallProcessor: ToolCallProcessor? =
+                    activeToolSchemas.map { ToolCallProcessor(format: toolCallFormat, tools: $0) }
+                    ?? (toolCallFormat.hasTaggedToolMarkers
+                        ? ToolCallProcessor(format: toolCallFormat, tools: nil, stripOnly: true)
+                        : nil)
                 var reasoningParser = ReasoningParser
                     .forPrompt(
                         stampName: reasoningParserName,

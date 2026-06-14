@@ -3796,8 +3796,18 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
         let activeTools = tools?.isEmpty == false ? tools : nil
-        toolCallProcessor = activeTools.map {
-            ToolCallProcessor(format: format, tools: $0)
+        // When tools ARE offered, parse + emit calls. When NONE are offered we
+        // must still strip tagged tool-call control markers (strip-only mode):
+        // a model can emit a tool-call envelope anyway — e.g. an agent loop
+        // whose tool schema rides in the system prompt sends an empty `tools`
+        // field — and without a processor the raw `<|tool_call>…<tool_call|>`
+        // envelope leaks verbatim into visible text. Mirrors BatchEngine.
+        if let activeTools {
+            toolCallProcessor = ToolCallProcessor(format: format, tools: activeTools)
+        } else if format.hasTaggedToolMarkers {
+            toolCallProcessor = ToolCallProcessor(format: format, tools: nil, stripOnly: true)
+        } else {
+            toolCallProcessor = nil
         }
         self.reasoningParser = reasoningParser
         self.stopStringMatcher = stopStringMatcher
