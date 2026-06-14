@@ -52,12 +52,41 @@ public class ToolCallProcessor {
     /// itself is discarded because no tools were offered).
     private func recordToolCall(_ call: ToolCall) {
         guard !stripOnly else { return }
-        toolCalls.append(call)
+        toolCalls.append(canonicalizedToolName(call))
     }
 
     private func recordToolCalls(_ calls: [ToolCall]) {
         guard !stripOnly else { return }
-        toolCalls.append(contentsOf: calls)
+        toolCalls.append(contentsOf: calls.map(canonicalizedToolName))
+    }
+
+    /// Registered tool names from the request's tool schemas.
+    private func registeredToolNames() -> [String] {
+        guard let tools else { return [] }
+        return tools.compactMap { tool in
+            let function = (tool["function"] as? [String: any Sendable]) ?? tool
+            return function["name"] as? String
+        }
+    }
+
+    /// Canonicalize a parsed tool-call name to the exact registered spelling
+    /// when it differs only by case. Models (e.g. some Gemma quantizations)
+    /// occasionally emit `Get_weather` for a tool registered as `get_weather`;
+    /// downstream dispatch (`ToolCall.execute`, OpenAI clients) matches names
+    /// case-sensitively, so an un-canonicalized name fails to invoke the tool.
+    /// Conservative: only rewrites on a case-insensitive EXACT match to a
+    /// registered name, so it never invents or guesses a different tool.
+    private func canonicalizedToolName(_ call: ToolCall) -> ToolCall {
+        let registered = registeredToolNames()
+        guard !registered.isEmpty else { return call }
+        let name = call.function.name
+        if registered.contains(name) { return call }
+        guard let canonical = registered.first(where: {
+            $0.compare(name, options: .caseInsensitive) == .orderedSame
+        }) else { return call }
+        return ToolCall(
+            id: call.id,
+            function: .init(name: canonical, arguments: call.function.arguments))
     }
 
     // MARK: - State Enum
