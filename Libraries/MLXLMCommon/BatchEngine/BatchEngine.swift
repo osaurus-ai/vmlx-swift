@@ -993,18 +993,39 @@ public actor BatchEngine {
                 let options = diffusionModel.blockDiffusionDefaults
                     .resolving(generationConfig: context.configuration.generationDefaults)
                     .overriding(parameters: soloParameters)
-                let iterator = try BlockDiffusionTokenIterator(
-                    input: input,
-                    model: diffusionModel,
-                    cache: nil,
-                    parameters: soloParameters,
-                    options: options,
-                    cacheCoordinator: cacheCoordinator)
-                (sourceStream, generationTask) = generateTask(
+                // Defer iterator construction (and therefore the encoder
+                // prefill) into the streaming task — like the AR path below —
+                // so `.prefillProgress` frames emitted by the block-diffusion
+                // encoder loop reach the consumer LIVE instead of bursting
+                // after the (already-prefilled) iterator is returned. The
+                // prefill itself is unchanged; only frame timing changes.
+                let promptTokenIdsForTail = input.text.tokens.reshaped(-1).asArray(Int.self)
+                let deferredParameters = soloParameters
+                let deferredOptions = options
+                let deferredInputs = SendableBox(
+                    (input, diffusionModel, cacheCoordinator))
+                let deferredContinuation = continuation
+                let makeIterator: @Sendable () throws -> any TokenIteratorProtocol = {
+                    let (deferredInput, deferredModel, deferredCoordinator) =
+                        deferredInputs.consume()
+                    return try BlockDiffusionTokenIterator(
+                        input: deferredInput,
+                        model: deferredModel,
+                        cache: nil,
+                        parameters: deferredParameters,
+                        options: deferredOptions,
+                        cacheCoordinator: deferredCoordinator,
+                        prefillProgressHandler: { progress in
+                            deferredContinuation.yield(
+                                .prefillProgress(prefillGate.clamp(progress)))
+                        })
+                }
+                (sourceStream, generationTask) = generateTaskDeferred(
                     promptTokenCount: promptTokenCount,
                     modelConfiguration: context.configuration,
                     tokenizer: context.tokenizer,
-                    iterator: iterator,
+                    promptTokenIds: promptTokenIdsForTail,
+                    makeIterator: makeIterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
                     toolSchemas: toolSchemas)

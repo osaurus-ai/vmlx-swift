@@ -80,12 +80,24 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
         cache: [KVCache]? = nil,
         parameters: GenerateParameters,
         options: BlockDiffusionParameters,
-        cacheCoordinator: CacheCoordinator? = nil
+        cacheCoordinator: CacheCoordinator? = nil,
+        prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil
     ) throws {
         let promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
         guard !promptTokenIds.isEmpty else {
             throw BlockDiffusionModelError.emptyPrompt
         }
+        let totalPromptTokens = promptTokenIds.count
+        // The block-diffusion encoder prefill does not flow through the
+        // autoregressive `prepare(...)` path that emits `.prefillProgress`
+        // frames, so we emit them here directly. Without this the UI counter
+        // sits frozen at `0/N` for the entire (potentially many-second) 26B
+        // encoder prefill, which reads as "stuck". Frames are clamped to the
+        // prompt length and reported monotonically by the caller's gate.
+        prefillProgressHandler?(
+            PrefillProgress(
+                stage: .prefill, completedUnitCount: 0,
+                totalUnitCount: totalPromptTokens, detail: "diffusion"))
 
         self.model = model
         self.options = options
@@ -154,6 +166,14 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
                 {
                     tokensToEncode = remainingTokens
                     prefixCacheRestoredTokens = matchedTokens
+                    if matchedTokens > 0 {
+                        prefillProgressHandler?(
+                            PrefillProgress(
+                                stage: .cacheRestore,
+                                completedUnitCount: matchedTokens,
+                                totalUnitCount: totalPromptTokens,
+                                detail: "diffusion"))
+                    }
                 } else if restored {
                     self.cache = model.newCache(parameters: parameters)
                     tokensToEncode = promptTokenIds
@@ -181,6 +201,12 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             encoderForwardCount += 1
             MLX.eval(self.cache)
             self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
+            // Media prefill is single-shot (one bidirectional encoder pass),
+            // so there is no incremental progress to report — jump to complete.
+            prefillProgressHandler?(
+                PrefillProgress(
+                    stage: .complete, completedUnitCount: totalPromptTokens,
+                    totalUnitCount: totalPromptTokens, detail: "diffusion"))
             if cacheCoordinator != nil {
                 self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
             }
@@ -189,6 +215,7 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
 
         let stepSize = Swift.max(parameters.prefillStepSize, 1)
         var remaining = tokensToEncode[...]
+        var encodedTokens = prefixCacheRestoredTokens
         while !remaining.isEmpty {
             let chunk = Array(remaining.prefix(stepSize))
             remaining = remaining.dropFirst(stepSize)
@@ -196,11 +223,25 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             model.encoderForward(chunkTokens, cache: self.cache)
             encoderForwardCount += 1
             MLX.eval(self.cache)
+            encodedTokens += chunk.count
+            prefillProgressHandler?(
+                PrefillProgress(
+                    stage: remaining.isEmpty ? .complete : .prefill,
+                    completedUnitCount: encodedTokens,
+                    totalUnitCount: totalPromptTokens, detail: "diffusion"))
             if !remaining.isEmpty {
                 Memory.clearCache()
             }
         }
         self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
+        // Emit a terminal complete frame even when there was nothing to encode
+        // (full prefix-cache hit: tokensToEncode empty) so the counter lands at N/N.
+        if tokensToEncode.isEmpty {
+            prefillProgressHandler?(
+                PrefillProgress(
+                    stage: .complete, completedUnitCount: totalPromptTokens,
+                    totalUnitCount: totalPromptTokens, detail: "diffusion"))
+        }
 
         if cacheCoordinator != nil {
             self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
