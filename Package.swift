@@ -467,7 +467,21 @@ let package = Package(
             name: "MLXLMCommon",
             dependencies: ["MLX", "MLXNN", "MLXOptimizers", "MLXRandom"],
             path: "Libraries/MLXLMCommon",
-            exclude: mlxLMCommonExcludedFiles
+            exclude: mlxLMCommonExcludedFiles,
+            // Compile this target in the Swift 5 language mode. The package is
+            // otherwise built in Swift 6 mode (the tools-version 6.1 default,
+            // which the vendored Jinja target needs for bare-slash regex
+            // literals). But the batch engine's actor code triggers region-
+            // based-isolation errors ("Sending 'slot'/'inputForPrepare' risks
+            // causing data races") on the struct read/mutate/write-back locals
+            // in `stepPrefill` on some Swift 6.0/6.1 compilers — a known
+            // region-isolation over-report that current toolchains (6.2+) no
+            // longer emit. Compiling just this target in v5 keeps those
+            // diagnostics as warnings so the package builds on the full
+            // tools-version-6.1 toolchain range, while every other target
+            // (incl. Jinja) stays in Swift 6 mode. No real data race exists:
+            // MLXLMCommon compiles cleanly in Swift 6 mode on current compilers.
+            swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .target(
             name: "MLXLLM",
