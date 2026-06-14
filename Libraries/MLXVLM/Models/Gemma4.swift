@@ -756,15 +756,29 @@ private class TextAttn: Module {
         // vision-tower fp32 upcast when the activation dtype is fp16.
         // Critical for sliding-window layers since the windowed key set
         // concentrates softmax mass on fewer entries.
+        //
+        // bf16 does not overflow (it shares fp32's exponent range), but the
+        // GLOBAL full-attention layers (head_dim 512, attention over ALL
+        // positions) are routed to the unfused Metal SDPA fallback because
+        // head_dim 512 is not in the fused set {64, 80, 128}. That fallback
+        // reduces the softmax in the activation dtype, and bf16's 8-bit
+        // mantissa loses enough precision in the reduction over N keys that
+        // past ~26k positions the global-layer logits collapse — every
+        // sampled token becomes <pad> (reproducible cold, content-independent,
+        // already at the first generated token). Upcast those layers to fp32
+        // as well. Sliding layers stay bf16: their key set is capped at the
+        // window (≤1024) so the reduction is precise, and upcasting all 40
+        // sliding prefill layers would multiply attention memory at long ctx.
         let origDType = q.dtype
         var qF = q, kF = cK, vF = cV
-        if origDType == .float16 {
+        let needsUpcast = origDType == .float16 || (origDType == .bfloat16 && !isSliding)
+        if needsUpcast {
             qF = qF.asType(.float32)
             kF = kF.asType(.float32)
             vF = vF.asType(.float32)
         }
         var sdpa = MLXFast.scaledDotProductAttention(queries: qF, keys: kF, values: vF, scale: scale, mask: mask)
-        if origDType == .float16 { sdpa = sdpa.asType(.float16) }
+        if needsUpcast { sdpa = sdpa.asType(origDType) }
         let out = sdpa.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         return (oP(out), cK, cV, off)
     }
