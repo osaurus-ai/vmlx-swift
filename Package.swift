@@ -326,6 +326,7 @@ let package = Package(
         .executable(name: "Gemma4AudioSmoke", targets: ["Gemma4AudioSmoke"]),
         .executable(name: "OmniAudioLatencyBench", targets: ["OmniAudioLatencyBench"]),
         .executable(name: "OmniAudioChunkStabilityBench", targets: ["OmniAudioChunkStabilityBench"]),
+        .executable(name: "Qwen35TPProofRunner", targets: ["Qwen35TPProofRunner"]),
         .executable(name: "mlxpress", targets: ["MLXPressCLI"]),
         .executable(name: "mlxpress-selfcheck", targets: ["MLXPressSelfCheck"]),
     ],
@@ -672,6 +673,19 @@ let package = Package(
             name: "DistributedReplicaSmoke",
             dependencies: ["MLXDistributedCore"],
             path: "tools/DistributedReplicaSmoke"
+        ),
+        .executableTarget(
+            name: "Qwen35TPProofRunner",
+            dependencies: [
+                "MLX",
+                "MLXNN",
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXHuggingFace",
+                "MLXDistributedTP",
+                "VMLXTokenizers",
+            ],
+            path: "tools/Qwen35TPProofRunner"
         ),
         .executableTarget(
             name: "ANEProbe",
