@@ -847,6 +847,18 @@ let package = Package(
             sources: ["CustomFunctionExampleSimple.swift"]
         ),
     ],
+    // Pin the package to the Swift 5 language mode. This is the configuration
+    // consumers actually build and ship in (Osaurus's xcodebuild assigns
+    // SWIFT_VERSION=5 to unpinned package targets), so the code is validated
+    // against v5 data-isolation semantics. Without this pin, `swift build`
+    // (and SPM integrations that honor the tools-version 6.1 default) compile
+    // the high-level LM targets in the Swift 6 language mode, where region-
+    // based-isolation diagnostics ("Sending 'x' risks causing data races") on
+    // benign struct read/mutate/write-back locals in the batch engine are hard
+    // errors on some compiler versions — breaking the build on toolchains the
+    // shipping configuration never exercises. Pinning v5 makes every build
+    // path compile these targets identically to how they ship.
+    swiftLanguageModes: [.v5],
     cxxLanguageStandard: .gnucxx20
 )
 
