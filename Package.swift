@@ -316,6 +316,12 @@ let package = Package(
         .library(name: "MLXDistributedTP", targets: ["MLXDistributedTP"]),
         .library(name: "MLXPress", targets: ["MLXPress"]),
         .library(name: "VMLX", targets: ["VMLX"]),
+        // Native mFLUX image/video generation (vendored from jjang-ai/vmlx-flux).
+        .library(name: "vMLXFluxKit", targets: ["vMLXFluxKit"]),
+        .library(name: "vMLXFluxModels", targets: ["vMLXFluxModels"]),
+        .library(name: "vMLXFluxVideo", targets: ["vMLXFluxVideo"]),
+        .library(name: "vMLXFlux", targets: ["vMLXFlux"]),
+        .executable(name: "vmlxflux-probe", targets: ["vMLXFluxProbe"]),
         .executable(name: "RunBench", targets: ["RunBench"]),
         .executable(name: "TPRankWorker", targets: ["TPRankWorker"]),
         .executable(name: "DistributedProbe", targets: ["DistributedProbe"]),
@@ -827,6 +833,37 @@ let package = Package(
             name: "MLXLMCommonToolParserFocusedTests",
             dependencies: ["MLXLMCommon", "VMLXJinja"],
             path: "Tests/MLXLMCommonToolParserFocusedTests"
+        ),
+
+        // ------
+        // Native mFLUX image/video generation
+        // Vendored from jjang-ai/vmlx-flux. Shares the in-tree MLX runtime,
+        // MLXLMCommon (JangLoader reuse) and VMLXTokenizers so the whole vMLX
+        // stack uses one MLX binary. Umbrella import: `import vMLXFlux`.
+        .target(
+            name: "vMLXFluxKit",
+            dependencies: ["MLX", "MLXNN", "MLXRandom", "MLXLMCommon"],
+            path: "Libraries/vMLXFluxKit"
+        ),
+        .target(
+            name: "vMLXFluxModels",
+            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXRandom", "VMLXTokenizers"],
+            path: "Libraries/vMLXFluxModels"
+        ),
+        .target(
+            name: "vMLXFluxVideo",
+            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXRandom"],
+            path: "Libraries/vMLXFluxVideo"
+        ),
+        .target(
+            name: "vMLXFlux",
+            dependencies: ["vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo"],
+            path: "Libraries/vMLXFlux"
+        ),
+        .executableTarget(
+            name: "vMLXFluxProbe",
+            dependencies: ["vMLXFlux", "vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo"],
+            path: "tools/vMLXFluxProbe"
         ),
 
         // ------
