@@ -70,6 +70,42 @@ final class RegistryTests: XCTestCase {
         }
     }
 
+    func testQwenImageEditLoadRejectsBundleMissingVisionTowerKeys() throws {
+        let model = try makeTemporaryQwenImageEditBundle()
+
+        XCTAssertThrowsError(try QwenImageEdit(modelPath: model, quantize: 4)) { error in
+            guard case FluxError.localModelIncomplete(let url, let reasons) = error else {
+                return XCTFail("wrong error: \(error)")
+            }
+            XCTAssertEqual(url.lastPathComponent, model.lastPathComponent)
+            XCTAssertTrue(reasons.contains {
+                $0.contains("missing text_encoder weight encoder.visual.patch_embed.proj.weight")
+            })
+        }
+    }
+
+    func testQwenImageEditManifestValidationAcceptsRequiredEditKeys() throws {
+        let model = try makeTemporaryQwenImageEditBundle(includeEditKeys: true)
+
+        let edit = try QwenImageEdit(modelPath: model, quantize: 4)
+
+        XCTAssertEqual(edit.modelPath.lastPathComponent, model.lastPathComponent)
+        XCTAssertEqual(edit.quantize, 4)
+    }
+
+    func testQwenImageEditLoadRejectsIndexWithMissingShard() throws {
+        let model = try makeTemporaryQwenImageEditBundle(includeEditKeys: true)
+        let shard = model.appendingPathComponent("text_encoder/0.safetensors")
+        try FileManager.default.removeItem(at: shard)
+
+        XCTAssertThrowsError(try QwenImageEdit(modelPath: model, quantize: 4)) { error in
+            guard case FluxError.weightsNotFound(let url) = error else {
+                return XCTFail("wrong error: \(error)")
+            }
+            XCTAssertEqual(url.lastPathComponent, shard.lastPathComponent)
+        }
+    }
+
     func testEngineGenerateRequiresLoad() async {
         let engine = FluxEngine()
         let request = ImageGenRequest(
@@ -85,5 +121,71 @@ final class RegistryTests: XCTestCase {
         } catch {
             XCTFail("wrong error: \(error)")
         }
+    }
+
+    private func makeTemporaryQwenImageEditBundle(includeEditKeys: Bool = false) throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-flux-registry-tests-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: root)
+        }
+        let model = root.appendingPathComponent("Qwen-Image-Edit-mflux-q4", isDirectory: true)
+        let fm = FileManager.default
+        for component in ["tokenizer", "text_encoder", "transformer", "vae"] {
+            try fm.createDirectory(
+                at: model.appendingPathComponent(component, isDirectory: true),
+                withIntermediateDirectories: true)
+        }
+        try Data("{}".utf8).write(to: model.appendingPathComponent("tokenizer/tokenizer.json"))
+        try Data("{}".utf8).write(to: model.appendingPathComponent("tokenizer/tokenizer_config.json"))
+        try writeWeightIndex(
+            keys: includeEditKeys
+                ? [
+                    "encoder.embed_tokens.weight",
+                    "encoder.layers.0.self_attn.q_proj.weight",
+                    "encoder.norm.weight",
+                    "encoder.visual.patch_embed.proj.weight",
+                    "encoder.visual.blocks.0.attn.qkv.weight",
+                    "encoder.visual.blocks.31.attn.qkv.weight",
+                    "encoder.visual.merger.mlp_1.weight",
+                ]
+                : [
+                    "encoder.embed_tokens.weight",
+                    "encoder.layers.0.self_attn.q_proj.weight",
+                    "encoder.norm.weight",
+                ],
+            to: model.appendingPathComponent("text_encoder/model.safetensors.index.json"))
+        try writeWeightIndex(
+            keys: [
+                "img_in.weight",
+                "txt_in.weight",
+                "time_text_embed.timestep_embedder.linear_1.weight",
+                "transformer_blocks.0.attn.add_q_proj.weight",
+                "transformer_blocks.59.img_ff.mlp_out.weight",
+                "proj_out.weight",
+            ],
+            to: model.appendingPathComponent("transformer/model.safetensors.index.json"))
+        try writeWeightIndex(
+            keys: [
+                "encoder.conv_in.conv3d.weight",
+                "encoder.down_blocks.0.resnets.0.conv1.conv3d.weight",
+                "quant_conv.conv3d.weight",
+                "post_quant_conv.conv3d.weight",
+                "decoder.conv_in.conv3d.weight",
+                "decoder.conv_out.conv3d.weight",
+            ],
+            to: model.appendingPathComponent("vae/model.safetensors.index.json"))
+        return model
+    }
+
+    private func writeWeightIndex(keys: [String], to url: URL) throws {
+        let weightMap = Dictionary(uniqueKeysWithValues: keys.map { ($0, "0.safetensors") })
+        let object: [String: Any] = ["weight_map": weightMap]
+        let data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url)
+        try Data([0]).write(
+            to: url.deletingLastPathComponent().appendingPathComponent("0.safetensors"))
     }
 }

@@ -43,6 +43,27 @@ public struct LoadedWeights: Sendable {
 
 public enum WeightLoader {
 
+    public static func indexedWeightKeys(in directory: URL, component: String) throws -> Set<String> {
+        let componentURL = component == "root"
+            ? directory
+            : directory.appendingPathComponent(component, isDirectory: true)
+        guard let indexURL = firstIndexURL(in: componentURL) else { return [] }
+        let data = try Data(contentsOf: indexURL)
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let weightMap = obj["weight_map"] as? [String: String]
+        else {
+            throw FluxError.invalidRequest("invalid safetensors index at \(indexURL.path)")
+        }
+        let fm = FileManager.default
+        for shardName in Set(weightMap.values) {
+            let shardURL = componentURL.appendingPathComponent(shardName)
+            guard fm.fileExists(atPath: shardURL.path) else {
+                throw FluxError.weightsNotFound(shardURL)
+            }
+        }
+        return Set(weightMap.keys)
+    }
+
     /// Load all safetensors shards from a model directory and return a
     /// merged dict. If the directory contains `jang_config.json`, the
     /// parsed config is returned alongside so the caller can apply
@@ -105,20 +126,25 @@ public enum WeightLoader {
         return groups
     }
 
+    private static let indexCandidateNames = [
+        "model.safetensors.index.json",
+        "diffusion_pytorch_model.safetensors.index.json",
+    ]
+
+    private static func firstIndexURL(in directory: URL) -> URL? {
+        let fm = FileManager.default
+        return indexCandidateNames
+            .map { directory.appendingPathComponent($0) }
+            .first(where: { fm.fileExists(atPath: $0.path) })
+    }
+
     private static func enumerateShards(in directory: URL) throws -> [URL] {
         let fm = FileManager.default
         var isDirectory: ObjCBool = false
         guard fm.fileExists(atPath: directory.path, isDirectory: &isDirectory),
               isDirectory.boolValue
         else { return [] }
-        let indexCandidates = [
-            "model.safetensors.index.json",
-            "diffusion_pytorch_model.safetensors.index.json",
-        ]
-        if let indexURL = indexCandidates
-            .map({ directory.appendingPathComponent($0) })
-            .first(where: { fm.fileExists(atPath: $0.path) })
-        {
+        if let indexURL = firstIndexURL(in: directory) {
             // Parse the index to get the unique set of shards.
             let data = try Data(contentsOf: indexURL)
             if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

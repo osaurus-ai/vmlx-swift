@@ -865,6 +865,11 @@ let package = Package(
             dependencies: ["vMLXFlux", "vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo"],
             path: "tools/vMLXFluxProbe"
         ),
+        .testTarget(
+            name: "vMLXFluxTests",
+            dependencies: ["vMLXFlux", "vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo"],
+            path: "Tests/vMLXFluxTests"
+        ),
 
         // ------
         // Example programs

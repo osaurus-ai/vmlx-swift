@@ -1,15 +1,23 @@
 # Qwen-Image / Qwen-Image-Edit native port plan (vMLXFlux)
 
-**Purpose:** a concrete, executable plan to take `qwen-image` and `qwen-image-edit`
-from `notImplemented` to a proven native pipeline, using the **already-proven
-`ZImageNative.swift`** as the reference template. For osaurus teammates + future
-porting sessions.
+**Purpose:** a concrete, executable port record for `qwen-image` and
+`qwen-image-edit`, using the **already-proven `ZImageNative.swift`** as the
+reference template. For osaurus teammates + future porting sessions.
 
-**Status (2026-06-15):** registered, scans/loads as a local mflux bundle, but
-`generate`/`edit` throw `FluxError.notImplemented`. The `qwen-image-mflux-4bit`
-(25 GB) bundle is NOT currently on disk — staging it onto the internal SSD
-(`~/.mlxstudio/models/image/`, per the GPU-watchdog rule) is **step 0** and is
-required before any live proof.
+**Status (2026-06-16):** `qwen-image` text-to-image is implemented in
+`Common/QwenImageNative.swift` and live-proven for the local 4-bit mflux bundle
+with same-seed determinism, prompt sensitivity, and visual inspection. In the
+Osaurus monorepo worktree, `qwen-image-mflux-4bit` also has fresh load proof at
+`docs/local/vmlx-flux-probes/2026-06-16-osaurus-qwen-image-q4-load-final/qwen-image-mflux-4bit-load.json`.
+`qwen-image-edit` is still `PARTIAL`: q4 load, prompt-image token expansion,
+Qwen2.5-VL image encode, VAE conditioning, first edit transformer velocity, and
+ImageEditor scheduler/decode/PNG plumbing are live-proven, but the viewed edit
+outputs are noise-like. Do not expose it as a normal user model until coherent
+edited-image proof exists.
+
+The sections below are the grounded port notes and transcription record. Older
+"next" checkboxes may describe the sequence that produced the current native
+txt2img implementation; the live status above is the source of truth.
 
 > Do NOT mark this done without a live same-seed/different-prompt proof (the HARD
 > RULE). The Z-Image proof in `OSAURUS_VMLX_FLUX_INTEGRATION_SPEC.md` §11 is the bar.
@@ -110,6 +118,153 @@ image conditioning for `-edit`.
 - **Shared payoff:** the T5-XXL encoder needed for `flux1-*`/`flux2-klein` is a
   separate port; Qwen-Image does NOT need T5 (it uses Qwen2.5-VL), so Qwen-Image is
   the better *next* target than the Flux family.
+
+## GROUNDED mflux source structure (/tmp/mflux-ref/src/mflux/models/qwen, 2026-06-15)
+Qwen is BIGGER than flux — 3 heavy components:
+1. **Text encoder = Qwen2.5-VL** (`qwen_text_encoder/`): a full decoder LM
+   (`qwen_text_encoder.py`, `qwen_encoder_layer.py`, `qwen_attention.py`, `qwen_mlp.py`,
+   `qwen_rms_norm.py`, `qwen_rope.py`) PLUS a vision transformer
+   (`qwen_vision_*.py`, patch_embed/patch_merger/vision_block/vision_attention/
+   vision_rotary). For **txt2img** only the LM path is needed (`qwen_prompt_encoder.py`);
+   for **EDIT** the vision tower encodes the input image too
+   (`qwen_vision_language_prompt_encoder.py`). The LM is Qwen2.5-style (RMSNorm, GQA,
+   RoPE, SwiGLU) — reuse the MFluxStore + the z-image Qwen-style attention pattern as a start.
+2. **VAE = 3D causal VAE** (`qwen_vae/`): `qwen_image_decoder_3d`, `causal_conv_3d`,
+   `res_block_3d`, `mid_block_3d`, `up_block_3d`, `attention_block_3d`, `resample_3d`,
+   `rms_norm`. Like the Wan video VAE (vMLXFluxVideo/WanVAE3D has a CausalConv3d shim to reuse).
+3. **Transformer = QwenTransformer** MMDiT (`qwen_transformer.py`) — double-stream like flux,
+   reuse FluxJoint/Single block patterns adapted to qwen keys/dims.
+
+Flow (txt2img `variants/txt2img/qwen_image.py`): text_encoder(prompt)→embeds; loop
+transformer(t, latents, embeds)→scheduler; VAE.decode. Edit adds image→vision→embeds + img latents.
+
+**Sequencing:** (1) qwen txt2img first (LM encoder only, simpler) → prove; (2) then edit
+(add vision tower + image conditioning). Download: fcreait/Qwen-Image-Edit-mflux (staging).
+Biggest new pieces: Qwen2.5 LM encoder + 3D VAE. Est. 3-5 iterations.
+
+## GROUNDED checkpoint keys (carsenk/qwen-image-mflux-4bit, 24GB, staged, has tokenizer.json)
+Components: text_encoder, transformer, vae, tokenizer.
+- **text_encoder = Qwen2.5 LM (NOT quantized, bf16)** — keys: `encoder.embed_tokens.weight`,
+  `encoder.layers.{0..27}.{input_layernorm, post_attention_layernorm}.weight`,
+  `...self_attn.{q,k,v}_proj.{weight,bias}` (q/k/v HAVE bias), `...self_attn.o_proj.weight` (no bias),
+  `...self_attn.rotary_emb.inv_freq`, `...mlp.{gate,up,down}_proj.weight`, `encoder.norm.weight`.
+  28 layers. **This is the SAME arch as z-image's working ZImageTextEncoder** (Qwen2.5: RMSNorm,
+  GQA attn with q/k/v bias, RoPE from inv_freq, SwiGLU). REUSE that pattern — biggest shortcut.
+  Output: per-token hidden states = the transformer conditioning. (Need to find hidden dims/head
+  counts from config.json + the qwen-image prompt template/system prompt from mflux qwen_prompt_encoder.)
+- **transformer = MMDiT (quantized 4bit, weight/scales/biases)** — `img_in`, `time_text_embed.
+  timestep_embedder.linear_{1,2}`, `transformer_blocks.N.*` (double-stream, like flux —
+  reuse FluxJoint patterns adapted to qwen keys), `norm_out.linear`, `proj_out`. No context_embedder
+  (text enters differently — check qwen_transformer.py). Use MFluxStore.
+- **vae = 3D causal VAE (NOT quantized)** — `decoder.conv_in.conv3d`, `decoder.mid_block.{resnets.N.
+  {conv1,conv2}.conv3d, norm1/norm2, attentions.N.{norm, to_qkv, proj}}`, `decoder.up_block{0..N}.
+  resnets.N.conv{1,2}.conv3d` (+ upsamplers), `decoder.norm_out`, `decoder.conv_out.conv3d`. conv3d
+  (causal) + RMSNorm. REUSE vMLXFluxVideo/WanVAE3D's CausalConv3d shim (collapse T into batch → Conv2d).
+  Qwen VAE: latent_channels 16, temporal compression. For txt2img the temporal dim = 1.
+
+## NEXT (this is the port-write sequence)
+1. Read config.json (text_encoder hidden/heads/kv_heads/head_dim/layers, transformer dims, vae scale/shift).
+2. Read mflux qwen_image.py (txt2img flow) + qwen_prompt_encoder.py (prompt template) +
+   qwen_transformer.py (block structure + how text conditioning enters) + qwen_vae.py (decode + scale/shift).
+3. Write Common/QwenImageNative.swift: QwenTextEncoder (reuse z-image Qwen pattern on MFluxStore),
+   QwenTransformer (MMDiT), Qwen3DVAEDecoder (CausalConv3d). Pipeline + wire QwenImage.generate.
+4. De-risk stderr finite stats → live-prove coherent. Then qwen-image-edit (add vision tower).
+
+## GROUNDED qwen text-encoder dims + gotchas (mflux source, 2026-06-15)
+**QwenTextEncoder = Qwen2.5-VL LM (txt2img uses LM only, no vision tower):**
+- hidden 3584, 28 layers, 28 attn heads, 4 KV heads (GQA, 7 groups), head_dim 128,
+  intermediate 18944, RMSNorm eps 1e-6, rope_theta 1e6, SwiGLU MLP (gate/up/down).
+- Attn: q_proj(3584→3584,bias), k_proj(3584→512,bias), v_proj(3584→512,bias),
+  o_proj(3584→3584,NO bias). Keys: `encoder.layers.N.self_attn.{q,k,v}_proj.{weight,bias}`,
+  `o_proj.weight`, `input_layernorm`/`post_attention_layernorm`.weight, `mlp.{gate,up,down}_proj.weight`,
+  `encoder.embed_tokens.weight`, `encoder.norm.weight`. NOT quantized (bf16).
+- **mRoPE** (rope_scaling mrope_section [16,24,24]) — Qwen2.5-VL multimodal RoPE; for pure TEXT
+  all 3 position sections use the text position (so effectively standard RoPE over head_dim with
+  theta 1e6 split [16,24,24]*2=128). Verify against qwen_rope.py.
+- **GOTCHA drop_idx=34**: output drops the FIRST 34 tokens (the qwen-image system-prompt template)
+  from hidden states → those become prompt_embeds. So tokenization MUST use qwen-image's chat template
+  (a ~34-token system prefix). Get template from mflux qwen_vision_language_tokenizer / tokenizer_config.
+  Also produces an attention MASK (valid-token mask) used by the transformer.
+- **CFG**: qwen-image uses guidance (default 4.0) — TWO transformer passes/step (pos+neg prompt),
+  guided = neg + guidance*(pos-neg). negative_prompt default " ". More steps than turbo (read default).
+
+**Transformer** = MMDiT (quantized): `img_in`, `time_text_embed.timestep_embedder.linear_{1,2}`,
+`transformer_blocks.N.*`, `norm_out.linear`, `proj_out`. Text enters as encoder_hidden_states+mask
+(read qwen_transformer.py for block structure + how mask/text used — likely double-stream like flux).
+**VAE** = 3D causal conv (conv3d), txt2img temporal dim=1; reuse WanVAE3D CausalConv3d.
+
+PROGRESS:
+- [x] `Common/QwenImageNative.swift` QwenTextEncoder COMPILES — Qwen2.5 LM (embed_tokens, 28×QwenLMLayer
+  {RMSNorm→GQA attn(q/k/v bias, o no bias, repeat_kv 7×, standard RoPE theta1e6, causal mask)→ +res,
+  RMSNorm→SwiGLU→ +res}, encoder.norm, drop first 34 tokens). On MFluxStore (text_encoder bf16, not quant).
+- [ ] tokenizer wrapper with qwen-image CHAT TEMPLATE (the ~34-token system prefix that drop_idx=34 removes
+  — get from mflux qwen_vision_language_tokenizer.py / qwen_image_processor; tokenizer_config chat_template empty).
+- [ ] QwenTransformer (MMDiT — read qwen_transformer/qwen_transformer.py: img_in, time_text_embed, blocks,
+  norm_out, proj_out, how encoder_hidden_states+mask enter; reuse FluxJoint patterns on MFluxStore quant).
+- [ ] Qwen3DVAEDecoder (conv3d causal — read qwen_vae/qwen_vae.py for scale/shift + structure; reuse WanVAE3D
+  CausalConv3d shim; txt2img temporal=1).
+- [ ] pipeline + CFG (guidance 4.0, pos+neg, 2 transformer passes/step) + wire QwenImage.generate.
+- [ ] de-risk stderr finite, live-prove. Default steps/guidance from ModelConfig.qwen_image.
+GROUNDED transformer (qwen_transformer.py): MMDiT, in_ch 64, out_ch 16, **60 layers**, 24 heads × 128 =
+inner 3072, joint_attention_dim 3584 (text), patch 2. img_in Linear(64→3072), txt_norm RMSNorm(3584),
+txt_in Linear(3584→3072), time_text_embed = QwenTimeTextEmbed (timestep-ONLY: QwenTimesteps sinusoidal
+proj256 scale1000 → QwenTimestepEmbedding 256→3072; NO pooled text). pos_embed = QwenEmbedRopeMLX(theta
+10000, axes_dim [16,56,56], scale_rope=True) → separate img_rotary + txt_rotary. norm_out =
+AdaLayerNormContinuous(3072). proj_out Linear(3072→2*2*16=64).
+QwenTransformerBlock (×60): img_mod_linear/txt_mod_linear (3072→6*3072), split into mod1,mod2 (each 3*3072
+= shift,scale,gate). img_norm1/2, txt_norm1/2 = LayerNorm affine=false. _modulate(x,mod)=x*(1+scale)+shift,
+returns (mod_x, gate). Flow: modulate img+txt w/ mod1 → QwenAttention(img,txt,mask,rope) → gate1 residual
+on both; modulate w/ mod2 → img_ff/txt_ff (QwenFeedForward) → gate2 residual. Returns (encoder, hidden).
+STILL TO READ next iter: qwen_attention.py (joint attn: how img+txt concat, rope applied, mask), qwen_feed_forward.py,
+qwen_rope.py QwenEmbedRopeMLX (3-axis scale_rope img/txt split), qwen_vae.py (+3d blocks, scale/shift),
+chat template (qwen_vision_language_tokenizer), ModelConfig.qwen_image (default steps≈? guidance 4.0).
+Then write QwenTransformer + Qwen3DVAEDecoder + tokenizer + pipeline+CFG into QwenImageNative.swift, wire
+QwenImage.generate, de-risk finite, live-prove. (60-layer transformer + 3D VAE = big; ~2-3 more iterations.)
+
+GROUNDED (all transformer internals — ready to transcribe):
+- **QwenAttention** (joint): to_q/k/v + add_q/k/v_proj (all Linear dim→dim, bias), norm_q/k/added_q/added_k
+  = RMSNorm(head_dim=128, eps1e-6). Reshape q/k/v to (b, seq, heads24, 128) — KEEP (b,s,h,d) for rope.
+  Apply RMSNorm on q/k (img: norm_q/norm_k; txt: norm_added_q/norm_added_k). Apply RoPE (complex-pair, see
+  below) to img q/k with img_cos/sin, txt q/k with txt_cos/sin. concat [txt, img] on axis=1 (seq).
+  _compute_attention: transpose to (b,h,s,d), SDPA scale 1/sqrt(128), mask (additive from text mask),
+  transpose back, reshape (b,s,3072). Split [: seq_txt]=txt, [seq_txt:]=img. img→attn_to_out[0], txt→to_add_out.
+  RoPE apply (complex): x→(...,−1,2) real/imag; cos/sin (seq,64)→[None,:,None,:]; out_real=r*cos−i*sin,
+  out_imag=r*sin+i*cos; stack→reshape back.
+- **QwenFeedForward**: mlp_in(dim→4*dim,bias)→gelu_approx→mlp_out(4*dim→dim,bias).
+- **QwenTimeTextEmbed**: QwenTimesteps(sinusoidal half128, max_period 1e4, ×scale 1000, flip sin/cos halves)
+  → (1,256); QwenTimestepEmbedding linear_1(256→3072,bias)→silu→linear_2(3072→3072,bias). = text_embeddings (timestep-only).
+- **QwenEmbedRopeMLX** (theta 1e4, axes_dim [16,56,56], scale_rope=true): precompute pos_freqs/neg_freqs
+  (np): for each axis dim, scales=arange(0,dim,2)/dim, omega=1/theta^scales, freqs=outer(index,omega),
+  stack[cos,sin]. pos_index=0..4095, neg_index reversed negative. _compute_video_freqs(frame=1,h//16,w//16):
+  axes_splits=[8,28,28]; split pos/neg freqs by cumsum; frame axis from pos[0][idx:idx+frame] bc to (f,h,w);
+  height axis: scale_rope→concat[neg[1][-(h-h//2):], pos[1][:h//2]] bc; width axis similarly; concat on axis −2
+  → (seq, 64, 2). img_cos/sin = (seq,64). txt_cos/sin = pos_freqs[max_vid_index : +max_len] (max_vid_index =
+  max(h//2,w//2)). Implement in Swift by precomputing the freq tables.
+- **norm_out** = AdaLayerNormContinuous (REUSE flux FluxAdaNormContinuous — scale then shift, no-bias linear 3072→6144).
+- **Pipeline**: latents packed like flux (1,(h//16)(w//16),64? — qwen in_channels 64, check QwenLatentCreator pack);
+  loop: noise_pos=transformer(t,latents,prompt_embeds,mask); noise_neg=transformer(t,latents,neg_embeds,neg_mask);
+  guided = neg + guidance*(pos−neg); FlowMatch step; unpack; VAE decode. CFG guidance 4.0.
+GROUNDED VAE (qwen 3D causal-conv decoder, 106 decoder keys, conv keys end `.conv3d.{weight,bias}`):
+- **De-norm is PER-CHANNEL** (not scalar): latents(1,16,1,h/8,w/8) * LATENTS_STD[16] + LATENTS_MEAN[16]
+  (values in qwen_vae.py — hardcode the two 16-vectors). Then post_quant_conv (CausalConv3D 16→16 k1) → decoder.
+  Latent packing = SAME as flux (unpack → (1,16,h/8,w/8) → reshape to 5D (1,16,1,h/8,w/8)).
+- **QwenImageDecoder3D**: conv_in CausalConv3D(16→384,k3); mid_block MidBlock3D(384, 1 layer = 2 resnets +
+  1 attention); up_block0 UpBlock3D(384→384, 2 res, upsample3d); up_block1(192→384?, 2 res, upsample3d, has
+  skip_conv); up_block2(192→192, 2 res, upsample2d); up_block3(96→96, 2 res, no upsample); norm_out RMSNorm(96);
+  conv_out CausalConv3D(96→3,k3); silu before conv_out. Channel flow 384→384→192→192→96→96→3.
+  Keys: decoder.{conv_in.conv3d, mid_block.{resnets.{0,1}.{conv1,conv2}.conv3d + norm1/norm2, attentions.0.
+  {norm, to_qkv, proj}}, up_block{0..3}.{resnets.{0,1,2}.{conv1,conv2}.conv3d + norm1/norm2 (+skip_conv.conv3d
+  on channel-change blocks), upsamplers.0.{resample_conv, time_conv.conv3d}}, norm_out, conv_out.conv3d}.
+  VAE is NOT quantized (weight/bias only). RMSNorm here = QwenImageRMSNorm (spatial, images=False).
+- For txt2img temporal dim=1: CausalConv3D can reuse vMLXFluxVideo WanVAE3D's CausalConv3d shim (collapse T
+  into batch → Conv2d) since T=1. upsample3d temporal upsample is a no-op at T=1 (just spatial 2x); upsample2d
+  = spatial 2x; the time_conv/resample_conv handle it.
+NEXT: read /tmp/mflux-ref/.../qwen_vae/{qwen_image_causal_conv_3d, qwen_image_res_block_3d, qwen_image_up_block_3d,
+qwen_image_attention_block_3d, qwen_image_mid_block_3d, qwen_image_resample_3d, qwen_image_rms_norm}.py + compare
+to vMLXFluxVideo/WanVAE3D.swift (reuse its 3D blocks). Also chat template (qwen tokenizer applies a system prompt —
+the drop_idx=34; get exact template from qwen_vision_language_tokenizer.py / qwen_image_processor) + qwen-image
+default steps (ModelConfig qwen-image line 484+). Write Qwen3DVAEDecoder + tokenizer + QwenImagePipeline (CFG
+guid4.0 pos+neg, FlowMatch) + wire QwenImage.generate. Compile, de-risk finite, live-prove.
 
 ## Reference files
 - Template: `Libraries/vMLXFluxModels/ZImage/ZImageNative.swift` (proven).

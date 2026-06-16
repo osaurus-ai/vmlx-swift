@@ -10,9 +10,13 @@ determinate progress bar so users always see "step N / M" and never a stuck spin
 field below maps to an engine request/event — see the mapping notes. This is the
 contract osaurus implements server-side and the UI builds against.
 
-> Status: the engine is real and `z-image-turbo` is live-proven (text→image, CFG,
-> seeds, 256²–1024²). The HTTP surface below is the **proposed contract** for the
-> osaurus team to expose; design it once, wire all models through it.
+> Status: the engine is real. `z-image-turbo` and `flux1-schnell` are
+> live-proven for 4-bit and 8-bit text-to-image; `qwen-image` is live-proven for
+> 4-bit text-to-image. `qwen-image-edit` has q4 load/edit-loop/PNG plumbing
+> proof, but viewed outputs are noise-like, so expose it only as partial or
+> internal/diagnostic until coherent edited-image proof exists. The HTTP surface
+> below is the **proposed contract** for the osaurus team to expose; design it
+> once, wire all models through it.
 
 ---
 
@@ -69,6 +73,9 @@ The UI should NOT hard-code model names or limits — fetch them. Response:
 Notes for UI:
 - `ready:false` → show the model greyed with a "Download required" CTA (no silent
   downloads — the user must stage weights first).
+- `native_runtime_status != native_pipeline_implemented` → disable normal user
+  actions and show the blocker text. `native_pipeline_partial` is an internal
+  diagnostic state, not a release-ready user model.
 - Use `capabilities` to show/hide fields. e.g. `negative_prompt:false` → hide the
   negative box; `mask:false` → no mask tool.
 - Pre-fill `steps`/`guidance` from `defaults`; clamp sliders with `limits`.

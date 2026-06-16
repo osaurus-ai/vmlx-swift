@@ -16,6 +16,112 @@ import CoreImage
 // that range are clamped.
 
 public enum ImageIO {
+    public enum RGBNormalization: Sendable {
+        case zeroToOne
+        case minusOneToOne
+        case openAIClip
+    }
+
+    public static func dimensions(of url: URL) throws -> (width: Int, height: Int) {
+        #if canImport(AppKit)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int
+        else {
+            throw FluxError.invalidRequest("failed to read image dimensions at \(url.path)")
+        }
+        return (width, height)
+        #else
+        throw FluxError.notImplemented("ImageIO.dimensions requires AppKit")
+        #endif
+    }
+
+    public static func readRGBValues(
+        _ url: URL,
+        width: Int,
+        height: Int,
+        normalization: RGBNormalization
+    ) throws -> [Float] {
+        #if canImport(AppKit)
+        guard width > 0, height > 0 else {
+            throw FluxError.invalidRequest("image read dimensions must be positive")
+        }
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        else {
+            throw FluxError.invalidRequest("failed to read image at \(url.path)")
+        }
+
+        let bytesPerRow = width * 4
+        var rgba = [UInt8](repeating: 0, count: height * bytesPerRow)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+            | CGBitmapInfo.byteOrder32Big.rawValue
+        let rendered = rgba.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo)
+            else { return false }
+            context.interpolationQuality = .high
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard rendered else {
+            throw FluxError.invalidRequest("failed to render image at \(url.path)")
+        }
+
+        let plane = width * height
+        var values = [Float](repeating: 0, count: plane * 3)
+        for y in 0 ..< height {
+            for x in 0 ..< width {
+                let pixelOffset = y * bytesPerRow + x * 4
+                let outputOffset = y * width + x
+                let r = Float(rgba[pixelOffset]) / 255
+                let g = Float(rgba[pixelOffset + 1]) / 255
+                let b = Float(rgba[pixelOffset + 2]) / 255
+                values[outputOffset] = normalize(r, channel: 0, normalization: normalization)
+                values[plane + outputOffset] = normalize(g, channel: 1, normalization: normalization)
+                values[plane * 2 + outputOffset] = normalize(b, channel: 2, normalization: normalization)
+            }
+        }
+        return values
+        #else
+        throw FluxError.notImplemented("ImageIO.readRGBValues requires AppKit")
+        #endif
+    }
+
+    public static func readRGBTensor(
+        _ url: URL,
+        width: Int,
+        height: Int,
+        normalization: RGBNormalization
+    ) throws -> MLXArray {
+        let values = try readRGBValues(url, width: width, height: height, normalization: normalization)
+        return MLXArray(values, [1, 3, height, width]).asType(.float32)
+    }
+
+    private static func normalize(
+        _ value: Float,
+        channel: Int,
+        normalization: RGBNormalization
+    ) -> Float {
+        switch normalization {
+        case .zeroToOne:
+            return value
+        case .minusOneToOne:
+            return value * 2 - 1
+        case .openAIClip:
+            let mean: [Float] = [0.48145466, 0.4578275, 0.40821073]
+            let std: [Float] = [0.26862954, 0.26130258, 0.27577711]
+            return (value - mean[channel]) / std[channel]
+        }
+    }
 
     /// Save an image tensor to `dir/<prefix>-<uuid>.png`.
     /// Returns the URL of the written file.

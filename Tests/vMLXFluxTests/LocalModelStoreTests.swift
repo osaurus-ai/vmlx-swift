@@ -46,6 +46,27 @@ final class LocalModelStoreTests: XCTestCase {
         XCTAssertEqual(byDirectory?.canonicalName, "qwen-image")
     }
 
+    func testScanExpandsNestedQuantVariantBundles() throws {
+        let root = try makeTemporaryImageModelRoot()
+        let model = root.appendingPathComponent("Qwen-Image-Edit-mflux", isDirectory: true)
+        let q4 = model.appendingPathComponent("q4", isDirectory: true)
+        try makeComponentLayout(at: q4)
+
+        let scanned = try MLXStudioModelStore(root: root).scan()
+        let variant = try XCTUnwrap(scanned.first {
+            $0.directoryName == "Qwen-Image-Edit-mflux-q4"
+        })
+
+        XCTAssertEqual(variant.directory.lastPathComponent, "q4")
+        XCTAssertEqual(variant.canonicalName, "qwen-image-edit")
+        XCTAssertEqual(variant.quantizationBits, 4)
+        XCTAssertEqual(variant.readiness, .loadableScaffold)
+        XCTAssertTrue(variant.components.contains(.tokenizer))
+        XCTAssertTrue(variant.components.contains(.transformer))
+        XCTAssertTrue(variant.components.contains(.textEncoder))
+        XCTAssertTrue(variant.components.contains(.vae))
+    }
+
     func testEngineLoadFromStoreRejectsIncompleteLocalBundleBeforeWeightLoad() async throws {
         let root = try makeTemporaryImageModelRoot()
         let model = root.appendingPathComponent("Z-Image-Turbo-mflux-4bit", isDirectory: true)

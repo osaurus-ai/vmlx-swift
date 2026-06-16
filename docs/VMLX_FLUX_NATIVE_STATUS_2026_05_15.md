@@ -1,5 +1,12 @@
 # vMLX Flux Native Status - 2026-05-15
 
+> Superseded status note, 2026-06-16: this file is historical. Current native
+> image status lives in `MFLUX_HANDOFF.md` and
+> `OSAURUS_VMLX_FLUX_INTEGRATION_SPEC.md`. Since this May snapshot,
+> z-image-turbo and flux1-schnell are live-proven for 4-bit and 8-bit,
+> qwen-image is live-proven for 4-bit, and qwen-image-edit has q4 native
+> plumbing but remains `PARTIAL` because coherent edited-image proof is missing.
+
 This records the current state of native MFlux/Flux-family image support in
 the consolidated `vmlx-swift` package. It is based on source inspection plus
 live probes against local bundles under `~/.mlxstudio/models/image`.

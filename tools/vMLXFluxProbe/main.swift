@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import ImageIO
+@preconcurrency import MLX
 import vMLXFlux
 import vMLXFluxKit
 
@@ -144,9 +145,17 @@ struct VMLXFluxProbe {
             "model": modelJSON(local),
             "started_at": isoTimestamp(startedAt),
             "generate_requested": options.generate,
+            "edit_requested": options.edit,
+            "qwen_edit_prompt_requested": options.qwenEditPrompt,
+            "qwen_edit_conditioning_requested": options.qwenEditConditioning,
+            "qwen_edit_vision_requested": options.qwenEditVision,
+            "qwen_edit_denoise_requested": options.qwenEditDenoise,
             "turns": options.turns,
             "width": options.width,
             "height": options.height,
+            "width_explicit": options.widthExplicit,
+            "height_explicit": options.heightExplicit,
+            "source_image": options.sourceImage?.path ?? NSNull(),
             "steps": options.steps,
             "seed": options.seed.map { $0 as Any } ?? NSNull(),
         ]
@@ -222,6 +231,242 @@ struct VMLXFluxProbe {
                     turnRecords.append(record)
                 }
                 payload["generation_turns"] = turnRecords
+            }
+
+            if options.edit {
+                guard let sourceImage = options.sourceImage else {
+                    throw ProbeError("--edit requires --source-image")
+                }
+                var turnRecords: [[String: Any]] = []
+                for (index, prompt) in options.turns.enumerated() {
+                    let request = ImageEditRequest(
+                        prompt: prompt,
+                        sourceImage: sourceImage,
+                        mask: nil,
+                        strength: options.strength,
+                        width: options.widthExplicit ? options.width : nil,
+                        height: options.heightExplicit ? options.height : nil,
+                        steps: options.steps,
+                        guidance: options.guidance ?? 4.0,
+                        seed: options.seed ?? UInt64(index + 1),
+                        outputDir: options.outputDirectory)
+                    let turnStart = Date()
+                    var record: [String: Any] = [
+                        "turn": index + 1,
+                        "prompt": prompt,
+                        "source_image": sourceImage.path,
+                        "started_at": isoTimestamp(turnStart),
+                    ]
+                    do {
+                        let stream = await engine.edit(request)
+                        var steps: [[String: Any]] = []
+                        var completedURL: String?
+                        for try await event in stream {
+                            switch event {
+                            case .step(let step, let total, let eta):
+                                steps.append([
+                                    "step": step,
+                                    "total": total,
+                                    "eta_seconds": eta.map { $0 as Any } ?? NSNull(),
+                                ])
+                            case .preview(let data, let step):
+                                steps.append([
+                                    "preview_step": step,
+                                    "preview_bytes": data.count,
+                                ])
+                            case .completed(let url, let seed):
+                                completedURL = url.path
+                                record["seed"] = seed
+                            case .failed(let message, let hfAuth):
+                                record["status"] = "failed_event"
+                                record["message"] = message
+                                record["hf_auth"] = hfAuth
+                            case .cancelled:
+                                record["status"] = "cancelled"
+                            }
+                        }
+                        record["steps"] = steps
+                        if let completedURL {
+                            record["status"] = "completed"
+                            record["output"] = completedURL
+                            record["image_diagnostics"] = imageDiagnostics(
+                                for: URL(fileURLWithPath: completedURL))
+                        } else if record["status"] == nil {
+                            record["status"] = "no_completed_event"
+                        }
+                    } catch {
+                        record["status"] = "threw"
+                        record["error"] = String(describing: error)
+                    }
+                    record["elapsed_seconds"] = Date().timeIntervalSince(turnStart)
+                    turnRecords.append(record)
+                }
+                payload["edit_turns"] = turnRecords
+            }
+
+            if options.qwenEditConditioning {
+                guard let sourceImage = options.sourceImage else {
+                    throw ProbeError("--qwen-edit-conditioning requires --source-image")
+                }
+                guard local.canonicalName == "qwen-image-edit" else {
+                    throw ProbeError("--qwen-edit-conditioning requires a qwen-image-edit model")
+                }
+                let plan = try QwenImageEditPreprocessPlan(
+                    sourceImage: sourceImage,
+                    requestedWidth: options.widthExplicit ? options.width : nil,
+                    requestedHeight: options.heightExplicit ? options.height : nil,
+                    steps: options.steps,
+                    guidance: options.guidance ?? 4.0)
+                let conditioningStart = Date()
+                let conditioning = try QwenImageEditConditioner.encode(
+                    modelPath: local.directory,
+                    sourceImage: sourceImage,
+                    plan: plan)
+                payload["qwen_edit_conditioning"] = [
+                    "status": "encoded",
+                    "elapsed_seconds": Date().timeIntervalSince(conditioningStart),
+                    "output_width": plan.outputWidth,
+                    "output_height": plan.outputHeight,
+                    "vae_width": plan.vaeWidth,
+                    "vae_height": plan.vaeHeight,
+                    "patch_rows": conditioning.patchRows,
+                    "patch_columns": conditioning.patchColumns,
+                    "latents_shape": conditioning.latents.shape,
+                    "image_ids_shape": conditioning.imageIDs.shape,
+                    "latents_stats": mlxStats(conditioning.latents),
+                    "image_ids_stats": mlxStats(conditioning.imageIDs),
+                ]
+            }
+
+            if options.qwenEditPrompt {
+                guard let sourceImage = options.sourceImage else {
+                    throw ProbeError("--qwen-edit-prompt requires --source-image")
+                }
+                guard local.canonicalName == "qwen-image-edit" else {
+                    throw ProbeError("--qwen-edit-prompt requires a qwen-image-edit model")
+                }
+                let plan = try QwenImageEditPreprocessPlan(
+                    sourceImage: sourceImage,
+                    requestedWidth: options.widthExplicit ? options.width : nil,
+                    requestedHeight: options.heightExplicit ? options.height : nil,
+                    steps: options.steps,
+                    guidance: options.guidance ?? 4.0)
+                let visionInput = try QwenImageEditPreprocessor.visionInput(
+                    sourceImage: sourceImage,
+                    plan: plan)
+                let tokenizer = try await QwenImageEditPromptTokenizer(modelPath: local.directory)
+                var promptRecords: [[String: Any]] = []
+                for prompt in options.turns {
+                    let promptInput = try QwenImageEditPreprocessor.visionLanguagePrompt(
+                        prompt: prompt,
+                        imageTokenCounts: [visionInput.imageTokenCount])
+                    let tokens = tokenizer.tokenize(promptInput)
+                    guard tokens.imageTokenCount == visionInput.imageTokenCount else {
+                        throw ProbeError(
+                            "qwen edit prompt image token count mismatch: got \(tokens.imageTokenCount), expected \(visionInput.imageTokenCount)")
+                    }
+                    promptRecords.append([
+                        "status": "tokenized",
+                        "prompt": prompt,
+                        "sequence_length": tokens.sequenceLength,
+                        "input_ids_shape": tokens.inputIDs.shape,
+                        "attention_mask_shape": tokens.attentionMask.shape,
+                        "image_token_id": QwenImageEditPreprocessor.imageTokenID,
+                        "image_token_count": tokens.imageTokenCount,
+                        "expected_image_token_count": visionInput.imageTokenCount,
+                        "template_drop_index": tokens.templateDropIndex,
+                        "image_grid_thw": visionInput.imageGridTHW,
+                    ])
+                }
+                payload["qwen_edit_prompt_tokens"] = promptRecords
+            }
+
+            if options.qwenEditVision {
+                guard let sourceImage = options.sourceImage else {
+                    throw ProbeError("--qwen-edit-vision requires --source-image")
+                }
+                guard local.canonicalName == "qwen-image-edit" else {
+                    throw ProbeError("--qwen-edit-vision requires a qwen-image-edit model")
+                }
+                let plan = try QwenImageEditPreprocessPlan(
+                    sourceImage: sourceImage,
+                    requestedWidth: options.widthExplicit ? options.width : nil,
+                    requestedHeight: options.heightExplicit ? options.height : nil,
+                    steps: options.steps,
+                    guidance: options.guidance ?? 4.0)
+                var encodingRecords: [[String: Any]] = []
+                for prompt in options.turns {
+                    let visionStart = Date()
+                    let encoding = try await QwenImageEditPromptImageEncoder.encode(
+                        modelPath: local.directory,
+                        sourceImage: sourceImage,
+                        prompt: prompt,
+                        plan: plan)
+                    encodingRecords.append([
+                        "status": "encoded",
+                        "elapsed_seconds": Date().timeIntervalSince(visionStart),
+                        "prompt": prompt,
+                        "image_grid_thw": encoding.features.imageGridTHW,
+                        "feature_shape": encoding.features.imageFeatures.shape,
+                        "feature_stats": mlxStats(encoding.features.imageFeatures),
+                        "image_token_count": encoding.features.imageTokenCount,
+                        "token_sequence_length": encoding.tokens.sequenceLength,
+                        "token_image_count": encoding.tokens.imageTokenCount,
+                        "template_drop_index": encoding.tokens.templateDropIndex,
+                        "prompt_embeds_shape": encoding.promptEmbeddings.promptEmbeds.shape,
+                        "prompt_mask_shape": encoding.promptEmbeddings.attentionMask.shape,
+                        "prompt_embeds_stats": mlxStats(encoding.promptEmbeddings.promptEmbeds),
+                        "prompt_mask_stats": mlxStats(encoding.promptEmbeddings.attentionMask),
+                        "matches_features": encoding.tokens.imageTokenCount == encoding.features.imageTokenCount,
+                    ])
+                }
+                payload["qwen_edit_vision_language"] = encodingRecords
+            }
+
+            if options.qwenEditDenoise {
+                guard let sourceImage = options.sourceImage else {
+                    throw ProbeError("--qwen-edit-denoise requires --source-image")
+                }
+                guard local.canonicalName == "qwen-image-edit" else {
+                    throw ProbeError("--qwen-edit-denoise requires a qwen-image-edit model")
+                }
+                let plan = try QwenImageEditPreprocessPlan(
+                    sourceImage: sourceImage,
+                    requestedWidth: options.widthExplicit ? options.width : nil,
+                    requestedHeight: options.heightExplicit ? options.height : nil,
+                    steps: options.steps,
+                    guidance: options.guidance ?? 4.0)
+                var denoiseRecords: [[String: Any]] = []
+                for (index, prompt) in options.turns.enumerated() {
+                    let seed = options.seed ?? UInt64(index + 1)
+                    let denoiseStart = Date()
+                    let result = try await QwenImageEditDenoiseProbe.predictVelocity(
+                        modelPath: local.directory,
+                        sourceImage: sourceImage,
+                        prompt: prompt,
+                        plan: plan,
+                        seed: seed)
+                    denoiseRecords.append([
+                        "status": "predicted",
+                        "elapsed_seconds": Date().timeIntervalSince(denoiseStart),
+                        "prompt": prompt,
+                        "seed": seed,
+                        "output_width": plan.outputWidth,
+                        "output_height": plan.outputHeight,
+                        "vae_width": plan.vaeWidth,
+                        "vae_height": plan.vaeHeight,
+                        "steps": plan.steps,
+                        "guidance": plan.guidance,
+                        "target_latent_count": result.targetLatentCount,
+                        "conditioning_latent_count": result.conditioningLatentCount,
+                        "image_shapes": result.imageShapes.map { [$0.frame, $0.height, $0.width] },
+                        "combined_velocity_shape": result.combinedVelocity.shape,
+                        "target_velocity_shape": result.targetVelocity.shape,
+                        "combined_velocity_stats": mlxStats(result.combinedVelocity),
+                        "target_velocity_stats": mlxStats(result.targetVelocity),
+                    ])
+                }
+                payload["qwen_edit_denoise"] = denoiseRecords
             }
         } catch {
             payload["load_status"] = "failed"
@@ -346,10 +591,12 @@ struct VMLXFluxProbe {
 
     private static func runtimeStatus(for canonicalName: String?) -> String {
         switch canonicalName {
-        case "z-image-turbo":
+        case "z-image-turbo", "flux1-schnell", "qwen-image":
             return "native_pipeline_implemented"
-        case "flux1-schnell", "flux1-dev", "flux1-kontext", "flux1-fill",
-             "flux2-klein", "flux2-klein-edit", "qwen-image", "qwen-image-edit",
+        case "qwen-image-edit":
+            return "native_pipeline_partial"
+        case "flux1-dev", "flux1-kontext", "flux1-fill",
+             "flux2-klein", "flux2-klein-edit",
              "fibo", "seedvr2":
             return "not_implemented"
         case "wan-2.1", "wan-2.2":
@@ -363,13 +610,18 @@ struct VMLXFluxProbe {
 
     private static func runtimeBlockers(for canonicalName: String?) -> [String] {
         switch canonicalName {
-        case "z-image-turbo":
+        case "z-image-turbo", "flux1-schnell", "qwen-image":
             return [
                 "requires live same-seed prompt-sensitivity and multi-turn matrix before production promotion",
             ]
-        case "flux1-schnell", "flux1-dev", "flux1-kontext", "flux1-fill",
-             "flux2-klein", "flux2-klein-edit", "qwen-image", "qwen-image-edit",
-             "fibo", "seedvr2":
+        case "qwen-image-edit":
+            return [
+                "ImageEditor loop completes and writes PNGs, but q4 live outputs are still noise-like",
+                "prompt-image fidelity/edit quality root cause remains open",
+                "live coherent edited-image proof is missing",
+            ]
+        case "flux1-dev", "flux1-kontext", "flux1-fill",
+             "flux2-klein", "flux2-klein-edit", "fibo", "seedvr2":
             return [
                 "model generate/edit/upscale body throws FluxError.notImplemented",
                 "text encoder ports are missing",
@@ -409,6 +661,21 @@ struct VMLXFluxProbe {
         }
     }
 
+    private static func mlxStats(_ array: MLXArray) -> [String: Any] {
+        eval(array)
+        let f = array.asType(.float32)
+        let meanValue = mean(f).item(Float.self)
+        let maxValue = MLX.max(f).item(Float.self)
+        let minValue = (-MLX.max(-f)).item(Float.self)
+        return [
+            "shape": array.shape,
+            "mean": meanValue,
+            "min": minValue,
+            "max": maxValue,
+            "finite": meanValue.isFinite && minValue.isFinite && maxValue.isFinite,
+        ]
+    }
+
     private static func isoTimestamp(_ date: Date = Date()) -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -432,13 +699,22 @@ struct ProbeOptions {
     var matrix = false
     var load = false
     var generate = false
+    var edit = false
+    var qwenEditPrompt = false
+    var qwenEditConditioning = false
+    var qwenEditVision = false
+    var qwenEditDenoise = false
     var json = false
     var width = 256
     var height = 256
+    var widthExplicit = false
+    var heightExplicit = false
     var steps = 1
     var seed: UInt64?
     var guidance: Float?
     var negativePrompt: String?
+    var sourceImage: URL?
+    var strength: Float = 0.75
     var turns = Self.defaultTurns
 
     init(arguments: [String]) throws {
@@ -463,6 +739,21 @@ struct ProbeOptions {
             case "--generate":
                 generate = true
                 load = true
+            case "--edit":
+                edit = true
+                load = true
+            case "--qwen-edit-prompt":
+                qwenEditPrompt = true
+                load = true
+            case "--qwen-edit-conditioning":
+                qwenEditConditioning = true
+                load = true
+            case "--qwen-edit-vision":
+                qwenEditVision = true
+                load = true
+            case "--qwen-edit-denoise":
+                qwenEditDenoise = true
+                load = true
             case "--no-generate":
                 generate = false
             case "--json":
@@ -471,10 +762,12 @@ struct ProbeOptions {
                 let value = try Self.value(after: arg, in: arguments, index: &index)
                 guard let parsed = Int(value) else { throw ProbeError("invalid --width") }
                 width = parsed
+                widthExplicit = true
             case "--height":
                 let value = try Self.value(after: arg, in: arguments, index: &index)
                 guard let parsed = Int(value) else { throw ProbeError("invalid --height") }
                 height = parsed
+                heightExplicit = true
             case "--steps":
                 let value = try Self.value(after: arg, in: arguments, index: &index)
                 guard let parsed = Int(value) else { throw ProbeError("invalid --steps") }
@@ -489,6 +782,12 @@ struct ProbeOptions {
                 guidance = parsed
             case "--negative":
                 negativePrompt = try Self.value(after: arg, in: arguments, index: &index)
+            case "--source-image":
+                sourceImage = URL(fileURLWithPath: try Self.value(after: arg, in: arguments, index: &index))
+            case "--strength":
+                let value = try Self.value(after: arg, in: arguments, index: &index)
+                guard let parsed = Float(value) else { throw ProbeError("invalid --strength") }
+                strength = parsed
             case "--turn":
                 let turn = try Self.value(after: arg, in: arguments, index: &index)
                 if turns == Self.defaultTurns {
