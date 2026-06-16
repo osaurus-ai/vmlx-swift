@@ -60,6 +60,10 @@ contract osaurus implements server-side and the UI builds against.
 > `docs/local/vmlx-flux-outputs/2026-06-16-qwen-edit-multi-image-contact-sheet.png`.
 > The HTTP surface below is the **proposed contract** for the osaurus team to
 > expose; design it once, wire all models through it.
+> Machine-readable companion for UI/server wiring:
+> `docs/OSAURUS_IMAGE_UI_MANIFEST.json`. Treat that JSON as the current
+> dropdown/control/exposure/proof manifest; this prose spec explains the HTTP
+> contract and field semantics.
 
 ---
 

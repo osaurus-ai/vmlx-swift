@@ -64,6 +64,9 @@
   Official `ideogram-ai/*` downloads remain approval-gated for the current
   account (`hf download ... --dry-run` returned access denied for fp8 and nf4
   on 2026-06-16).
+  UI/server teams should consume `docs/OSAURUS_IMAGE_UI_MANIFEST.json` as the
+  machine-readable model/control/exposure/proof manifest; this integration spec
+  remains the source for Swift engine semantics and concurrency requirements.
   See §6 and §7b.
 
 ---
