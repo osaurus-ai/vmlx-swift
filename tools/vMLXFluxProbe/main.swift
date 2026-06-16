@@ -642,7 +642,7 @@ struct VMLXFluxProbe {
         switch model.canonicalName {
         case "z-image-turbo", "flux1-schnell":
             return [
-                "current 3305ed2f main 4/8-bit live probes completed three turns with same-seed repeated-prompt SHA match, different-prompt SHA change, finite diagnostics where emitted, and viewed coherent apple/mountain images on 2026-06-16",
+                "current bb4cfaf4 main 4/8-bit live probes completed three turns with same-seed repeated-prompt SHA match, different-prompt SHA change, finite diagnostics where emitted, and viewed coherent apple/mountain images on 2026-06-16",
                 "run a broader Osaurus-side production matrix before release promotion",
             ]
         case "qwen-image":
@@ -650,7 +650,7 @@ struct VMLXFluxProbe {
                 && model.readiness == .loadableScaffold
             {
                 return [
-                    "current 3305ed2f main qwen-image 4-bit text-to-image path completed a 20-step three-turn live probe with same-seed prompt sensitivity, deterministic repeat, finite diagnostics, and viewed coherent apple/mountain images on 2026-06-16",
+                    "current bb4cfaf4 main qwen-image 4-bit text-to-image path completed a 20-step three-turn live probe with same-seed prompt sensitivity, deterministic repeat, finite diagnostics, and viewed coherent apple/mountain images on 2026-06-16",
                     "public mflux 8-bit bundle was not found in current HF search",
                     "run a broader Osaurus-side production matrix before release promotion",
                 ]
@@ -659,13 +659,13 @@ struct VMLXFluxProbe {
                 && model.readiness == .loadableScaffold
             {
                 return [
-                    "current 03a68ad7 main qwen-image 6-bit text-to-image path completed a 20-step three-turn live probe with same-seed prompt sensitivity, deterministic repeat, finite diagnostics, and viewed coherent apple/mountain images on 2026-06-16",
+                    "current bb4cfaf4 main qwen-image 6-bit text-to-image path completed a 20-step three-turn live probe with same-seed prompt sensitivity, deterministic repeat, finite diagnostics, and viewed coherent apple/mountain images on 2026-06-16",
                     "public mflux 8-bit bundle was not found in current HF search",
                     "run a broader Osaurus-side production matrix before release promotion",
                 ]
             }
             return [
-                "qwen-image 4-bit has current-3305 live proof and 6-bit has current-03a live proof; this quant variant has not completed live generation",
+                "qwen-image 4-bit and 6-bit have current-bb4 live proof; this quant variant has not completed live generation",
                 "live coherent text-to-image proof is missing for this quant variant",
             ]
         case "qwen-image-edit":
@@ -673,8 +673,8 @@ struct VMLXFluxProbe {
                 && model.readiness == .loadableScaffold
             {
                 return [
-                    "current 3305ed2f main qwen-image-edit q5 text-image edit path completed a 20-step three-turn live probe with same-seed deterministic repeat and prompt-sensitive SHA changes on 2026-06-16",
-                    "visual boundary: q5 cleanly edits blue apple and green pear; q4 has current-03a proof but remains noisier/weaker on shape-changing green-pear prompts",
+                    "current bb4cfaf4 main qwen-image-edit q5 text-image edit path completed a 20-step three-turn live probe with same-seed deterministic repeat and prompt-sensitive SHA changes on 2026-06-16",
+                    "visual boundary: q5 cleanly edits blue apple and green pear; q4 has current-bb4 proof but remains noisier/weaker on shape-changing green-pear prompts",
                     "mask/inpaint edit fields are not wired yet",
                     "q3 and q6 variants require complete local bundles before UI promotion",
                     "run a broader Osaurus-side production matrix before release promotion",
@@ -684,7 +684,7 @@ struct VMLXFluxProbe {
                 && model.readiness == .loadableScaffold
             {
                 return [
-                    "current 03a68ad7 main qwen-image-edit q4 text-image edit path completed a 20-step three-turn live probe with same-seed deterministic repeat and prompt-sensitive SHA changes on 2026-06-16",
+                    "current bb4cfaf4 main qwen-image-edit q4 text-image edit path completed a 20-step three-turn live probe with same-seed deterministic repeat and prompt-sensitive SHA changes on 2026-06-16",
                     "visual boundary: q4 changes color and shape but remains noisier/weaker on shape-changing green-pear prompts; q5 is the cleaner current-head edit row",
                     "mask/inpaint edit fields are not wired yet",
                     "q3 and q6 variants require complete local bundles before UI promotion",
@@ -694,12 +694,12 @@ struct VMLXFluxProbe {
             if model.readiness != .loadableScaffold {
                 return [
                     "local qwen-image-edit bundle is incomplete and cannot enter the native load path",
-                    "qwen-image-edit q5 has current-3305 live proof and q4 has current-03a live proof; this quant variant has not completed live generation",
+                    "qwen-image-edit q4 and q5 have current-bb4 live proof; this quant variant has not completed live generation",
                     "mask/inpaint edit fields are not wired yet",
                 ]
             }
             return [
-                "qwen-image-edit q5 has current-3305 live proof and q4 has current-03a live proof; this quant variant has not been generated and visually checked",
+                "qwen-image-edit q4 and q5 have current-bb4 live proof; this quant variant has not been generated and visually checked",
                 "mask/inpaint edit fields are not wired yet",
                 "live coherent edited-image proof is missing for this quant variant",
             ]
@@ -715,8 +715,8 @@ struct VMLXFluxProbe {
                 if model.directoryName.localizedCaseInsensitiveContains("nf4") {
                     return [
                         "Ideogram NF4 source path is wired through Qwen3 text encoder, conditional/unconditional 34-layer DiT, bitsandbytes NF4 linear dequantization, VAE decode, and PNG output",
-                        "current 3305ed2f NF4 strict 512px object-icon probe completed three 20-step turns; apple and mountain prompts were coherent, prompt-sensitive, and repeated apple had identical SHA",
-                        "NF4 proof artifact: docs/local/vmlx-flux-probes/2026-06-16-current-3305-ideogram-nf4-object-strict/ideogram-4-nf4-load.json",
+                        "current bb4cfaf4 NF4 strict 512px object-icon probe completed three 20-step turns; apple and mountain prompts were coherent, prompt-sensitive, and repeated apple had identical SHA",
+                        "NF4 proof artifact: docs/local/vmlx-flux-probes/2026-06-16-current-bb4-ideogram-nf4-object-strict/ideogram-4-nf4-load.json",
                         "visual boundary: a broader fp8 a188 no-text apple prompt hallucinated text, so expose Ideogram as staged/testable with prompt-pattern caveats rather than a general clean object renderer",
                         "official ideogram-ai/ideogram-4-fp8 and ideogram-ai/ideogram-4-nf4 dry-runs still return access denied for the current HF account; current NF4 live proof uses the staged cocktailpeanut/ideogram-4-nf4 mirror",
                         "run a broader Osaurus-side production matrix before release promotion",
@@ -725,10 +725,10 @@ struct VMLXFluxProbe {
                 return [
                     "Ideogram fp8 source path is wired through Qwen3 text encoder, conditional/unconditional 34-layer DiT, VAE decode, and PNG output",
                     "live 20-step fp8 typography probe completed after the rotary-half correction; HELLO/BANANA outputs were prompt-sensitive and repeated HELLO had identical SHA",
-                    "current 03a68ad7 main strict 512px object-icon probe completed three turns; apple and mountain prompts were coherent, prompt-sensitive, and repeated apple had identical SHA",
+                    "current bb4cfaf4 main strict 512px object-icon probe completed three turns; apple and mountain prompts were coherent, prompt-sensitive, and repeated apple had identical SHA",
                     "visual boundary: a broader a188 no-text apple prompt hallucinated text, so expose Ideogram fp8 as staged/testable with prompt-pattern caveats rather than a general clean object renderer",
                     "official ideogram-ai/ideogram-4-fp8 and ideogram-ai/ideogram-4-nf4 dry-runs still return access denied for the current HF account; fp8 live proof uses the staged cocktailpeanut/ideogram-4-fp8 mirror",
-                    "NF4 support has current 3305 staged mirror proof; run a broader Osaurus-side production matrix before release promotion",
+                    "NF4 support has current-bb4 staged mirror proof; run a broader Osaurus-side production matrix before release promotion",
                 ]
             }
             return [
