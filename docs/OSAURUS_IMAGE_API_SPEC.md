@@ -12,40 +12,42 @@ contract osaurus implements server-side and the UI builds against.
 
 > Status: the engine is real on Osaurus `vmlx-origin/main`. Current scanner/load
 > proof exists for all local image rows at
-> `docs/local/vmlx-flux-probes/2026-06-16-current-bb4-load-matrix/compatibility-matrix.json`
+> `docs/local/vmlx-flux-probes/2026-06-16-current-103be-load-matrix/compatibility-matrix.json`
 > (12 scanned, 10 loaded, qwen-edit q3/q6 blocked before load with explicit
 > missing-shard/component reasons).
-> Current bb4 live generation/edit proof exists for `z-image-turbo` 4/8-bit,
+> Current 103be live generation/edit proof exists for `z-image-turbo` 4/8-bit,
 > `flux1-schnell` 4/8-bit, `qwen-image` 4/6-bit, `qwen-image-edit` q4/q5, and
 > staged `ideogram-4-fp8`/`ideogram-4-nf4`:
-> `docs/local/vmlx-flux-probes/2026-06-16-current-bb4-zimage-4bit-gen/`,
-> `2026-06-16-current-bb4-zimage-8bit-gen/`,
-> `2026-06-16-current-bb4-flux-schnell-4bit-gen/`,
-> `2026-06-16-current-bb4-flux-schnell-8bit-gen/`,
-> `2026-06-16-current-bb4-qwen-image-4bit-gen20/`,
-> `2026-06-16-current-bb4-qwen-image-6bit-gen20/`,
-> `2026-06-16-current-bb4-qwen-edit-q4-gen20/`,
-> `2026-06-16-current-bb4-qwen-edit-q5-gen20/`,
-> `2026-06-16-current-bb4-ideogram-fp8-object-strict/`, and
-> `2026-06-16-current-bb4-ideogram-nf4-object-strict/`.
+> `docs/local/vmlx-flux-probes/2026-06-16-current-103be-zimage-4bit-gen/`,
+> `2026-06-16-current-103be-zimage-8bit-gen/`,
+> `2026-06-16-current-103be-flux-schnell-4bit-gen/`,
+> `2026-06-16-current-103be-flux-schnell-8bit-gen/`,
+> `2026-06-16-current-103be-qwen-image-4bit-gen20/`,
+> `2026-06-16-current-103be-qwen-image-6bit-gen20/`,
+> `2026-06-16-current-103be-qwen-edit-q4-gen20/`,
+> `2026-06-16-current-103be-qwen-edit-q5-gen20/`,
+> `2026-06-16-current-103be-ideogram-fp8-bb4-exact/`, and
+> `2026-06-16-current-103be-ideogram-nf4-bb4-exact/`.
 > Viewed contact sheet:
-> `docs/local/vmlx-flux-outputs/2026-06-16-current-bb4-contact-sheet.png`.
+> `docs/local/vmlx-flux-outputs/2026-06-16-current-103be-contact-sheet.png`.
 > Expose only proven local variants for normal testing. Keep qwen-edit q3
 > blocked because its text-encoder index references missing
 > `text_encoder/3.safetensors`; keep q6 blocked until its local bundle is
 > complete; hide qwen mask/inpaint controls because the mflux qwen-edit
 > reference exposes no qwen mask path. qwen-edit q5 is cleanest; q4 is
-> current-bb4 deterministic and color-prompt-sensitive but visibly noisy/weaker
+> current-103be deterministic and color-prompt-sensitive but visibly noisy/weaker
 > on shape-changing edits.
 > Ideogram fp8 is implemented/testable for the staged mirror with typography
-> and current-bb4 strict clean object-icon proof. Ideogram NF4 is implemented/testable for
+> and current-103be strict clean object-icon proof. Ideogram NF4 is implemented/testable for
 > the staged `cocktailpeanut/ideogram-4-nf4` mirror with strict 512px
 > object-icon proof: apple/repeat SHA
 > `76cd995b90d4ad85140418ae1d3a8a44bc688d03840041ff93ff2cd006e748df`,
 > mountains SHA
 > `302ffe06596c718df6a118a56bcc0e8ec7437edee1dc9ba1656d0cd5d2052425`.
-> Boundary: a broader a188 fp8 "no text" apple prompt hallucinated
-> text, so do not present Ideogram as a general clean object renderer yet.
+> Boundary: current 103be seed/order variants with adjacent repeated prompts
+> generated safety-filter-like text cards for fp8 and NF4, and a broader a188
+> fp8 "no text" apple prompt hallucinated text, so do not present Ideogram as a
+> general clean object renderer yet.
 > Official `ideogram-ai/*` downloads still require approval for the current
 > account (`hf download ... --dry-run` returned access denied for both fp8 and
 > nf4 on 2026-06-16).

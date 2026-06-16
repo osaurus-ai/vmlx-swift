@@ -3,13 +3,13 @@
 **For:** the next engineer/agent continuing the native mFLUX image-generation port.
 **Date:** 2026-06-16. **Owner:** Eric. **Status:** Osaurus
 `vmlx-origin/main` runtime-proof baseline
-`bb4cfaf4be81dfbd7287bdad9faa107db24cf98e` has current live generation/edit
+`103be4375d88f7f8249b39853feedcf390d41465` has current live generation/edit
 proof for z-image-turbo 4/8-bit, flux-schnell 4/8-bit, qwen-image 4/6-bit,
 qwen-image-edit q4/q5, and staged Ideogram fp8/NF4. The current status/load
 matrix is
-`docs/local/vmlx-flux-probes/2026-06-16-current-bb4-load-matrix/compatibility-matrix.json`
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-load-matrix/compatibility-matrix.json`
 and the viewed current output sheet is
-`docs/local/vmlx-flux-outputs/2026-06-16-current-bb4-contact-sheet.png`.
+`docs/local/vmlx-flux-outputs/2026-06-16-current-103be-contact-sheet.png`.
 Qwen-edit q3 is incomplete (`text_encoder/3.safetensors` missing from its
 index), q6 is incomplete on disk, qwen masks are unsupported by the current
 mflux qwen-edit reference, and official `ideogram-ai/*` access is still
@@ -18,39 +18,39 @@ ideogram-ai/ideogram-4-fp8 --dry-run` and `hf download
 ideogram-ai/ideogram-4-nf4 --dry-run` both returned `Access denied. This
 repository requires approval.` on 2026-06-16).
 
-**2026-06-16 current bb4 main generation refresh:** `/Users/eric/vmlx-swift-fluxwt`
+**2026-06-16 current 103be main generation refresh:** `/Users/eric/vmlx-swift-fluxwt`
 was rebuilt on `vmlx-origin/main`
-`bb4cfaf4be81dfbd7287bdad9faa107db24cf98e`; `vmlxflux-probe` completed these
+`103be4375d88f7f8249b39853feedcf390d41465`; `vmlxflux-probe` completed these
 live three-turn generation/edit rows and the outputs were visually inspected in
-`docs/local/vmlx-flux-outputs/2026-06-16-current-bb4-contact-sheet.png`:
-`docs/local/vmlx-flux-probes/2026-06-16-current-bb4-zimage-4bit-gen/Z-Image-Turbo-mflux-4bit-load.json`
-(apple/repeat `62a4401a9135e3fdc6a59167eb71b9310757084204c48585de4deed94f103d2f`,
-mountains `6b7e17c2c9fc56825f099f6a3fd3dc85b7835d60493454c5220412d7f97d6741`),
-`docs/local/vmlx-flux-probes/2026-06-16-current-bb4-zimage-8bit-gen/Z-Image-Turbo-mflux-8bit-load.json`
-(apple/repeat `8a57d4cc15827e047c9d8e38e063272914597fe5957696bef3abb1869efd3cbd`,
-mountains `be5415e642d463751eae82d5644c570d8e81d96928699cdefb0bde5753150ad7`),
-`docs/local/vmlx-flux-probes/2026-06-16-current-bb4-flux-schnell-4bit-gen/FLUX.1-schnell-mflux-4bit-load.json`
-(apple/repeat `2fae822906710482052587006a69cb6081c3a0ddebfed1edd6cb0912361d4192`,
-mountains `1fbb3d06f468192648e77df4e40004cd100db8c432545c8dc1a0d6b8001e89ab`),
-`docs/local/vmlx-flux-probes/2026-06-16-current-bb4-flux-schnell-8bit-gen/FLUX.1-schnell-mflux-8bit-load.json`
-(apple/repeat `cb34f25a543ed69ad2449006f0d6d8280bb6d657d5e3c6be58baa1ac8ffc1552`,
-mountains `d019893c21939e77ccf71a36b228f398ff9e7874648454cd61c9318be482dbd2`),
-`docs/local/vmlx-flux-probes/2026-06-16-current-bb4-qwen-image-4bit-gen20/qwen-image-mflux-4bit-load.json`
-(apple/repeat `7ff3c32fb65597dbd7fb36d82aaf0ce7f52a9268ad27dfe0b5d15b57fe67be0b`,
-mountains `931aba2e4c44505738624edd7140bc3df79f243833d96bff904f3b221f42d0f1`),
-`docs/local/vmlx-flux-probes/2026-06-16-current-bb4-qwen-image-6bit-gen20/Qwen-Image-mflux-6bit-load.json`
-(apple/repeat `a70e21834f4fb2757cf1cea9fe2c09b30874fc2e2cf3bf53cd6b0dfd8f90e575`,
-mountains `27e52c4e7dddebd259e1a0962f16d1641d50ecaa0eb551e6165ae942926eda02`),
-`docs/local/vmlx-flux-probes/2026-06-16-current-bb4-qwen-edit-q5-gen20/Qwen-Image-Edit-mflux-q5-load.json`
-(blue apple/repeat `64bc519b0aad6fcd920ac75095d339b53f910f0e28ee4ddabebef9acb3974ef9`,
-green pear `4eac702102a2790e6466dd6b777ce2d22a671be277005733d33579d73b764957`),
-`docs/local/vmlx-flux-probes/2026-06-16-current-bb4-qwen-edit-q4-gen20/Qwen-Image-Edit-mflux-q4-load.json`
-(blue apple/repeat `c6c7aa2985983bbee73b78984ffb12a117922b4fcf94cf0d94d2f03844656aa8`,
-green pear `f1955d0f31a88cee2d9530c5b488cfcd8186bfb1dcfdb4c674941f13c6df4280`),
-`docs/local/vmlx-flux-probes/2026-06-16-current-bb4-ideogram-fp8-object-strict/ideogram-4-fp8-load.json`
+`docs/local/vmlx-flux-outputs/2026-06-16-current-103be-contact-sheet.png`:
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-zimage-4bit-gen/Z-Image-Turbo-mflux-4bit-load.json`
+(apple/repeat `5a05e19c3af197b6bdc7dd396311bd09c4b5cd99506fd0650fbbcb700c14ca09`,
+mountains `86b0ba7c1be426ec6d5fadf8c8a626af6a3aba20dd59e7d2d611d9e9e3c288c5`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-zimage-8bit-gen/Z-Image-Turbo-mflux-8bit-load.json`
+(apple/repeat `c3a59a9768efa034863ec6eb3a9df4d50fe7b4b40a607739bde83b388afefdc7`,
+mountains `2ea29580f7c50aaa155a3e16f19282512fc355b9c1633cad6165c7c8efb7986f`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-flux-schnell-4bit-gen/FLUX.1-schnell-mflux-4bit-load.json`
+(apple/repeat `74f57cc0f4fd80a66c8c7f12b653840c27a30207e2a2d735d359a585a7eac86a`,
+mountains `d38fc11f0aee4afe3531968b1d0097ce2b4ae58442338667ae427e9bbe0036b2`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-flux-schnell-8bit-gen/FLUX.1-schnell-mflux-8bit-load.json`
+(apple/repeat `c499e34fd9b4fb7b3b1c41dcf72bf703924d8fbdba212294f4a39fe712f43f8d`,
+mountains `6039e36a34f7b79d4385edb06421162c5abfc36b3a8de2b41d2d75c3204250a4`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-qwen-image-4bit-gen20/qwen-image-mflux-4bit-load.json`
+(apple/repeat `d4f536e4ea65bb979a8e812f60f3a5a9799f7eb702adc5c031a4827be9e9103a`,
+mountains `e7471663bc360ff796428550c73caa18668838b4daccbb02566d1024a5e21192`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-qwen-image-6bit-gen20/Qwen-Image-mflux-6bit-load.json`
+(apple/repeat `dbe3755ae644663da7cd42737e411022b8cc5211fea2173ad7782a291ed5a73f`,
+mountains `8a355fdfcb61112a40a0b1ce39f2b571b2be05226d36ab85148c27caccb3bbd5`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-qwen-edit-q5-gen20/Qwen-Image-Edit-mflux-q5-load.json`
+(blue apple/repeat `67b48f966f598552db85d21284bf0a3607af9bf58451a2efac698adf7723f835`,
+green pear `f98b8f78e283dc347513cac1521313f88b6be833a223aa48d14419f5110ee839`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-qwen-edit-q4-gen20/Qwen-Image-Edit-mflux-q4-load.json`
+(blue apple/repeat `894b3f9d6fbe607a3f1704c178d3780e605fd1e4e14b1b8b5b140f80fa9a3438`,
+green pear `f009a7e9181fa7d08606c160be315ed4a49a000870edbea1b2ff7748676c331f`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-ideogram-fp8-bb4-exact/ideogram-4-fp8-load.json`
 (apple/repeat `deab6d605047add88657c645e1a3747c00ec85a7493dbc10ee0a09941f0f3bb3`,
 mountains `782e6be1d3250fbe85cae555a0aeba3a6e11e5213c4b895608acde693183930d`), and
-`docs/local/vmlx-flux-probes/2026-06-16-current-bb4-ideogram-nf4-object-strict/ideogram-4-nf4-load.json`
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-ideogram-nf4-bb4-exact/ideogram-4-nf4-load.json`
 (apple/repeat `76cd995b90d4ad85140418ae1d3a8a44bc688d03840041ff93ff2cd006e748df`,
 mountains `302ffe06596c718df6a118a56bcc0e8ec7437edee1dc9ba1656d0cd5d2052425`).
 All repeated prompts were byte-identical and different prompts changed SHA.
@@ -59,10 +59,17 @@ z-image, flux, qwen-image, and Ideogram produced apple and mountains/sun icons.
 qwen-edit q5 produced a cleaner blue apple and green pear from the current
 qwen-image apple source; qwen-edit q4 was deterministic and prompt-sensitive
 but visibly noisier/weaker on the green-pear shape-change prompt.
+Ideogram boundary probes on the same current 103be source generated
+safety-filter-like text cards when adjacent repeated prompts changed the
+seed/order shape; keep Ideogram exposure scoped to typography and the exact
+strict object-icon prompt pattern until broader rows pass. Boundary artifacts:
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-ideogram-fp8-object-strict/ideogram-4-fp8-load.json`,
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-ideogram-nf4-object-strict/ideogram-4-nf4-load.json`, and
+`docs/local/vmlx-flux-outputs/2026-06-16-current-103be-ideogram-exact-and-boundary-sheet.png`.
 
-**2026-06-16 current bb4 status/load refresh:** `.build/arm64-apple-macosx/debug/vmlxflux-probe --matrix --no-generate`
+**2026-06-16 current 103be status/load refresh:** `.build/arm64-apple-macosx/debug/vmlxflux-probe --matrix --no-generate`
 wrote
-`docs/local/vmlx-flux-probes/2026-06-16-current-bb4-load-matrix/compatibility-matrix.json`.
+`docs/local/vmlx-flux-probes/2026-06-16-current-103be-load-matrix/compatibility-matrix.json`.
 It scanned 12 local image models, loaded 10, and blocked qwen-edit q3/q6 before
 load. q3 is missing indexed shard `text_encoder/3.safetensors`; q6 is missing
 `transformer`, `vae`, `text_encoder/3.safetensors`, and
@@ -287,7 +294,7 @@ boundary artifact:
 `005ee15c584e37351672fb4ae40910348d05bf608705ee74c2aebe017682f072`);
 viewed output contains an apple icon plus extra hallucinated text. This boundary
 failure is superseded for strict clean icon prompts by the a188 fp8 object proof
-and current bb4 NF4 object proof listed above, but keep it as a regression case
+and current 103be NF4 object proof listed above, but keep it as a regression case
 for broader Ideogram prompting.
 Official `hf download --dry-run` for `ideogram-ai/ideogram-4-fp8` still returned
 `Access denied. This repository requires approval.` on 2026-06-16.
@@ -355,9 +362,9 @@ This is the single starting doc. Read it top to bottom, then the per-model port 
 | ideogram (4) | ✅ NF4 staged mirror proven for strict clean object icons | ✅ fp8 staged mirror proven for typography + strict clean object icons; broader no-text apple prompt can hallucinate text | — | `Libraries/vMLXFluxModels/Ideogram4/Ideogram4.swift`, `Libraries/vMLXFluxModels/Ideogram4/Ideogram4Native.swift` |
 | flux1-dev/kontext/fill, flux2-klein, fibo, seedvr2, wan | ⬜ scaffold | — | — | registered, throw `notImplemented` |
 
-"Proven" = live-generated a coherent, prompt-accurate image that is **deterministic** (same seed+prompt -> byte-identical) and **prompt-sensitive** (different prompt same seed -> different coherent image). Per Eric's HARD RULE: *do not trust/claim a model works until you've generated and visually checked a real image.* Current bb4 proof covers z-image 4/8, flux-schnell 4/8, qwen-image 4/6-bit, qwen-image-edit q4/q5, and Ideogram fp8/NF4; artifact roots and SHA pairs are listed in the current bb4 refresh near the top of this file.
+"Proven" = live-generated a coherent, prompt-accurate image that is **deterministic** (same seed+prompt -> byte-identical) and **prompt-sensitive** (different prompt same seed -> different coherent image). Per Eric's HARD RULE: *do not trust/claim a model works until you've generated and visually checked a real image.* Current 103be proof covers z-image 4/8, flux-schnell 4/8, qwen-image 4/6-bit, qwen-image-edit q4/q5, and Ideogram fp8/NF4; artifact roots and SHA pairs are listed in the current 103be refresh near the top of this file.
 
-Qwen-image-edit q4/q5 are live-proven after fixing the source-image conditioning grid to match mflux. Source trace: mflux `qwen_image_edit.py` passes `vl_width/vl_height` into `QwenEditUtil.create_image_conditioning_latents`, and `qwen_edit_util.py` uses those VL dimensions for the source-image VAE encode when present. Swift now mirrors that in `QwenImageEditSupport.swift`: square source images encode conditioning at 384x384, pack 24x24=576 static latents, and denoise with 1024 target latents + 576 conditioning latents. Current q4 single-image proof is `docs/local/vmlx-flux-probes/2026-06-16-current-bb4-qwen-edit-q4-gen20/Qwen-Image-Edit-mflux-q4-load.json`; current q5 single-image proof is `docs/local/vmlx-flux-probes/2026-06-16-current-bb4-qwen-edit-q5-gen20/Qwen-Image-Edit-mflux-q5-load.json`. Viewed q5 is cleaner for the green-pear shape-change prompt; q4 remains deterministic and color/shape-sensitive but visibly noisier. Boundary artifacts remain useful: `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-prompt-live/Qwen-Image-Edit-mflux-q4-load.json`, `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-vl-encode-live/Qwen-Image-Edit-mflux-q4-load.json`, `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-conditioning-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`, and `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-denoise-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`.
+Qwen-image-edit q4/q5 are live-proven after fixing the source-image conditioning grid to match mflux. Source trace: mflux `qwen_image_edit.py` passes `vl_width/vl_height` into `QwenEditUtil.create_image_conditioning_latents`, and `qwen_edit_util.py` uses those VL dimensions for the source-image VAE encode when present. Swift now mirrors that in `QwenImageEditSupport.swift`: square source images encode conditioning at 384x384, pack 24x24=576 static latents, and denoise with 1024 target latents + 576 conditioning latents. Current q4 single-image proof is `docs/local/vmlx-flux-probes/2026-06-16-current-103be-qwen-edit-q4-gen20/Qwen-Image-Edit-mflux-q4-load.json`; current q5 single-image proof is `docs/local/vmlx-flux-probes/2026-06-16-current-103be-qwen-edit-q5-gen20/Qwen-Image-Edit-mflux-q5-load.json`. Viewed q5 is cleaner for the green-pear shape-change prompt; q4 remains deterministic and color/shape-sensitive but visibly noisier. Boundary artifacts remain useful: `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-prompt-live/Qwen-Image-Edit-mflux-q4-load.json`, `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-vl-encode-live/Qwen-Image-Edit-mflux-q4-load.json`, `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-conditioning-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`, and `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-denoise-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`.
 
 Qwen-image-edit multi-image is also live-proven on q4 and q5. Source trace:
 mflux qwen-edit accepts `image_paths: list[str]`, sizes from `image_paths[-1]`,
@@ -392,11 +399,12 @@ multi-reference text-image edit, not qwen mask/inpaint support.
 1. **Ideogram 4 follow-through** — staged `cocktailpeanut/ideogram-4-fp8` is
    live-proven for typography and strict clean object-icon prompts, and staged
    `cocktailpeanut/ideogram-4-nf4` is live-proven for strict clean object-icon
-   prompts on the Osaurus runtime-proof baseline. The current bb4 fp8 strict
-   object proof is clean, but a broader a188 "no text" apple prompt still
-   hallucinated text on fp8, so do not advertise Ideogram as a general clean
-   object renderer yet. Official `ideogram-ai/*` approval is still needed for
-   canonical official bundles.
+   prompts on the Osaurus runtime-proof baseline. The current 103be exact strict
+   object proof is clean, but 103be seed/order boundary probes with adjacent
+   repeated prompts generated safety-filter-like text cards, and a broader a188
+   "no text" apple prompt still hallucinated text on fp8. Do not advertise
+   Ideogram as a general clean object renderer yet. Official `ideogram-ai/*`
+   approval is still needed for canonical official bundles.
 2. **qwen-image-edit follow-through** — q4/q5 single-image and ordered
    multi-image text-image edit paths are implemented/testable. q5 is cleaner;
    current q4 proof changes color but is weaker on shape-changing green-pear
@@ -408,7 +416,7 @@ multi-reference text-image edit, not qwen mask/inpaint support.
 4. Osaurus app/server wiring: implement the `/v1/images/*` bridge from the
    specs below, wrap every image request in the required `MetalGate` exclusion,
    expose only proven variants, and pin Osaurus to `vmlx-origin/main`
-   `bb4cfaf4be81dfbd7287bdad9faa107db24cf98e` or a later verified main SHA.
+   `103be4375d88f7f8249b39853feedcf390d41465` or a later verified main SHA.
 
 ---
 
@@ -416,7 +424,7 @@ multi-reference text-image edit, not qwen mask/inpaint support.
 
 - **vmlx-swift integration worktree:** `/Users/eric/vmlx-swift-fluxwt` — clean
   Osaurus monorepo worktree for this lane. The current runtime-proof baseline is
-  `vmlx-origin/main` `5c7cf42caa7e010e68828c277dc9e67bd3404650`; later commits
+  `vmlx-origin/main` `103be4375d88f7f8249b39853feedcf390d41465`; later commits
   in this lane must be source/test checked before pinning.
 - **Dirty local dev tree:** `/Users/eric/vmlx-swift` — branch
   `codex/mimo-v25-cache-contract` carries unrelated MLXPress/MiMo/Gemma/JANG
@@ -616,7 +624,7 @@ Full per-model transcription specs are in `docs/FLUX_SCHNELL_PORT_PLAN.md` and `
 ## 9. How to continue (concrete next steps)
 1. **qwen-image-edit:** the q4/q5 single-image and ordered multi-image text-image edit paths are live-proven. Source-image conditioning now follows mflux's VL-size path (`vlWidth/vlHeight`) instead of the 1024-area VAE target grid, and multi-image uses mflux's ordered `image_paths` semantics. Current proof artifacts: `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-determinism-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`, `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q5-determinism/Qwen-Image-Edit-mflux-q5-load.json`, `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-conditioning-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json` (`latents_shape=1x576x64`, `image_ids_shape=1x576x3`), `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-denoise-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json` (`combined_velocity_shape=1x1600x64`), `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-multi-image-live/Qwen-Image-Edit-mflux-q4-load.json`, and `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q5-multi-image-live/Qwen-Image-Edit-mflux-q5-load.json`. Current non-null qwen masks are rejected before pipeline load; keep qwen masks hidden unless upstream mflux adds a real qwen mask path or a separate fill/inpaint model is wired.
    - Current staged bundle is already present at `~/.mlxstudio/models/image/Qwen-Image-Edit-mflux`; use `Qwen-Image-Edit-mflux-q4` or `Qwen-Image-Edit-mflux-q5` for current Osaurus wiring. Keep q3/q6 hidden/blocked until their indexed shards/components are complete.
-2. **Ideogram 4:** `cocktailpeanut/ideogram-4-fp8` and `cocktailpeanut/ideogram-4-nf4` are staged locally, scan complete, load-validate required sentinel keys, and run native generation. fp8 typography proof exists at `docs/local/vmlx-flux-probes/2026-06-16-ideogram-fp8-native-gen20-current-source/ideogram-4-fp8-load.json`; current bb4 fp8 strict object-icon proof exists at `docs/local/vmlx-flux-probes/2026-06-16-current-bb4-ideogram-fp8-object-strict/ideogram-4-fp8-load.json` (apple/repeat SHA `deab6d605047add88657c645e1a3747c00ec85a7493dbc10ee0a09941f0f3bb3`, mountains SHA `782e6be1d3250fbe85cae555a0aeba3a6e11e5213c4b895608acde693183930d`, viewed clean). Current bb4 NF4 strict object-icon proof exists at `docs/local/vmlx-flux-probes/2026-06-16-current-bb4-ideogram-nf4-object-strict/ideogram-4-nf4-load.json` (apple/repeat SHA `76cd995b90d4ad85140418ae1d3a8a44bc688d03840041ff93ff2cd006e748df`, mountains SHA `302ffe06596c718df6a118a56bcc0e8ec7437edee1dc9ba1656d0cd5d2052425`, viewed clean). Boundary: `docs/local/vmlx-flux-probes/2026-06-16-current-a188-ideogram-fp8-object-determinism/ideogram-4-fp8-load.json` hallucinated text on a broader "no text" apple prompt, so keep normal UI/API wording scoped to typography and strict object-icon test coverage. Official `ideogram-ai/*` access remains approval-gated. Ref: `/tmp/mflux-ref/src/mflux/models/ideogram4/`.
+2. **Ideogram 4:** `cocktailpeanut/ideogram-4-fp8` and `cocktailpeanut/ideogram-4-nf4` are staged locally, scan complete, load-validate required sentinel keys, and run native generation. fp8 typography proof exists at `docs/local/vmlx-flux-probes/2026-06-16-ideogram-fp8-native-gen20-current-source/ideogram-4-fp8-load.json`; current 103be fp8 strict object-icon proof exists at `docs/local/vmlx-flux-probes/2026-06-16-current-103be-ideogram-fp8-bb4-exact/ideogram-4-fp8-load.json` (apple/repeat SHA `deab6d605047add88657c645e1a3747c00ec85a7493dbc10ee0a09941f0f3bb3`, mountains SHA `782e6be1d3250fbe85cae555a0aeba3a6e11e5213c4b895608acde693183930d`, viewed clean). Current 103be NF4 strict object-icon proof exists at `docs/local/vmlx-flux-probes/2026-06-16-current-103be-ideogram-nf4-bb4-exact/ideogram-4-nf4-load.json` (apple/repeat SHA `76cd995b90d4ad85140418ae1d3a8a44bc688d03840041ff93ff2cd006e748df`, mountains SHA `302ffe06596c718df6a118a56bcc0e8ec7437edee1dc9ba1656d0cd5d2052425`, viewed clean). Boundary: 103be seed/order variants with adjacent repeated prompts generated safety-filter-like text cards in `docs/local/vmlx-flux-probes/2026-06-16-current-103be-ideogram-fp8-object-strict/ideogram-4-fp8-load.json` and `docs/local/vmlx-flux-probes/2026-06-16-current-103be-ideogram-nf4-object-strict/ideogram-4-nf4-load.json`; the older `docs/local/vmlx-flux-probes/2026-06-16-current-a188-ideogram-fp8-object-determinism/ideogram-4-fp8-load.json` also hallucinated text on a broader "no text" apple prompt. Keep normal UI/API wording scoped to typography and strict object-icon test coverage. Official `ideogram-ai/*` access remains approval-gated. Ref: `/tmp/mflux-ref/src/mflux/models/ideogram4/`.
 3. **Full precision** flux/z-image: download, run the probe, and promote only
    after load/generation proof on the current main SHA. Existing pipelines use
    `MFluxLinear` for non-quant weights, but full precision is not staged/proven.
@@ -625,7 +633,7 @@ Full per-model transcription specs are in `docs/FLUX_SCHNELL_PORT_PLAN.md` and `
    bridge, model list/capability mapping, progress SSE, output file policy, and
    `MetalGate` exclusion. Pin Osaurus to current `vmlx-origin/main` after this
    docs/probe refresh; the minimum runtime-proof baseline is
-   `bb4cfaf4be81dfbd7287bdad9faa107db24cf98e`.
+   `103be4375d88f7f8249b39853feedcf390d41465`.
 
 **Reference:** the mflux Python source (the source of truth for every arch + weight key) is at `/tmp/mflux-ref` (clone of `github.com/filipstrand/mflux`). Re-clone if gone.
 
@@ -653,14 +661,17 @@ Full per-model transcription specs are in `docs/FLUX_SCHNELL_PORT_PLAN.md` and `
 - `osaurus-ai/vmlx-swift` main commit **`3305ed2f`** — previous generation-proof
   baseline for z-image 4/8-bit, flux-schnell 4/8-bit, qwen-image 4-bit,
   qwen-edit q5, and Ideogram NF4.
-- `osaurus-ai/vmlx-swift` main commit **`bb4cfaf4`** — current generation-proof
+- `osaurus-ai/vmlx-swift` main commit **`103be437`** — current generation-proof
+  baseline for z-image 4/8-bit, flux-schnell 4/8-bit, qwen-image 4/6-bit,
+  qwen-edit q4/q5, and Ideogram fp8/NF4.
+- `osaurus-ai/vmlx-swift` main commit **`bb4cfaf4`** — previous generation-proof
   baseline for z-image 4/8-bit, flux-schnell 4/8-bit, qwen-image 4/6-bit,
   qwen-edit q4/q5, and Ideogram fp8/NF4.
 - `osaurus-ai/vmlx-swift` main commit **`e7c5deef`** — first pushed docs and
   probe-status refresh recording the bb4 proof baseline; later doc-only commits
   may update this handoff without changing the runtime proof baseline.
 - `jjang-ai/vmlx-flux` branch **`native-zimage-proven`** from commit
-  **`4e277e4`** forward mirrors the bb4 image source/docs status and root
+  **`4e277e4`** forward mirrors the image source/docs status and root
   Osaurus image API spec.
 - Wiki note (private `jjang-ai/wiki`): `notes/2026-06-15-vmlx-flux-native-z-image-proven-fork-lockstep.md`.
 - Per-project memory: `~/.claude/projects/-Users-eric-vmlx-swift/memory/vmlx-flux-native-zimage-integration.md`.
