@@ -9,24 +9,31 @@ reference template. For osaurus teammates + future porting sessions.
 with same-seed determinism, prompt sensitivity, and visual inspection. In the
 Osaurus monorepo worktree, `qwen-image-mflux-4bit` also has fresh load proof at
 `docs/local/vmlx-flux-probes/2026-06-16-osaurus-qwen-image-q4-load-final/qwen-image-mflux-4bit-load.json`.
-`qwen-image-edit` q4 is live-proven for text-image edit after the VL-grid
+`qwen-image-edit` q4 and q5 are live-proven for text-image edit after the VL-grid
 conditioning fix. Source trace: mflux passes `vl_width/vl_height` into
 `QwenEditUtil.create_image_conditioning_latents`, and that utility uses those
 dimensions for source-image VAE conditioning when present. Swift now mirrors
 that path in `QwenImageEditSupport.swift`: square source conditioning is
 384x384 -> 24x24 -> 576 static tokens, not 1024x1024 -> 64x64 -> 4096 tokens.
-Live proof:
+q4 live proof:
 `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-determinism-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`
 has a coherent same-prompt deterministic repeat (blue edit SHA
 `005ab8baddfe9b7a94aa83f8ddd22d192e7e5a0275c556dcf2ead76a565e474a` for turns
 1 and 3) and a different coherent green-pear edit (SHA
 `815711be73a9e89599b3e97f9f15196115875103f9407d7b1b61bab33de8e3b4`).
+q5 live proof:
+`docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q5-determinism/Qwen-Image-Edit-mflux-q5-load.json`
+has a coherent same-prompt deterministic repeat (blue edit SHA
+`5cd5d9197bd659bd8b59b4a2f2bca413266146ad4e08249289d5fa6a8025fa4e` for turns
+1 and 3) and a different coherent green-pear edit (SHA
+`d2c6c4eb4a19dcf48122b5216fc15ac37b9f5aa49c15f596acd1276a4df57034`).
 Shape proof:
 `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-conditioning-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`
 (`latents_shape=1x576x64`) and
 `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-denoise-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`
-(`combined_velocity_shape=1x1600x64`). Do not expose q3/q5 until separately
-live-proven, q6 is incomplete on disk, and masks/inpaint are not wired yet.
+(`combined_velocity_shape=1x1600x64`). Do not expose q3 because its
+text-encoder index references missing `text_encoder/3.safetensors`; keep q6
+blocked until its local bundle is complete, and masks/inpaint are not wired yet.
 
 The sections below are the grounded port notes and transcription record. Older
 "next" checkboxes may describe the sequence that produced the current native

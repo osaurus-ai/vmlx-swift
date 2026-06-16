@@ -119,7 +119,8 @@ public struct MLXStudioModelStore: Sendable {
         let hasModelIndex = FileManager.default.fileExists(
             atPath: directory.appendingPathComponent("model_index.json").path
         )
-        let reasons = blockedReasons(
+        let reasons = try blockedReasons(
+            directory: directory,
             canonicalName: canonical,
             components: components,
             safetensorCount: safetensors.count
@@ -307,11 +308,64 @@ public struct MLXStudioModelStore: Sendable {
         return (count, bytes)
     }
 
+    private static func missingIndexedSafetensorFiles(in directory: URL) throws -> [String] {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        var missing: [String] = []
+        var seen: Set<String> = []
+        for case let indexURL as URL in enumerator
+            where indexURL.lastPathComponent.hasSuffix(".safetensors.index.json")
+        {
+            let data = try Data(contentsOf: indexURL)
+            guard
+                let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let weightMap = json["weight_map"] as? [String: String]
+            else { continue }
+            let base = indexURL.deletingLastPathComponent()
+            for fileName in Set(weightMap.values).sorted() {
+                let shard = base.appendingPathComponent(fileName)
+                guard !fm.fileExists(atPath: shard.path) else { continue }
+                let relative = relativePath(for: shard, under: directory)
+                if seen.insert(relative).inserted {
+                    missing.append("missing indexed shard \(relative)")
+                }
+            }
+        }
+        return missing.sorted()
+    }
+
+    private static func relativePath(for child: URL, under directory: URL) -> String {
+        let candidates = [
+            (directory.path, child.path),
+            (directory.standardizedFileURL.path, child.standardizedFileURL.path),
+            (directory.resolvingSymlinksInPath().path, child.resolvingSymlinksInPath().path),
+        ]
+        for (rootPath, childPath) in candidates {
+            let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+            if childPath.hasPrefix(prefix) {
+                return String(childPath.dropFirst(prefix.count))
+            }
+        }
+        let rootName = directory.lastPathComponent
+        let components = child.pathComponents
+        if let rootIndex = components.lastIndex(of: rootName),
+           rootIndex + 1 < components.endIndex
+        {
+            return components[(rootIndex + 1)...].joined(separator: "/")
+        }
+        return child.lastPathComponent
+    }
+
     private static func blockedReasons(
+        directory: URL,
         canonicalName: String?,
         components: Set<LocalFluxComponent>,
         safetensorCount: Int
-    ) -> [String] {
+    ) throws -> [String] {
         guard canonicalName != nil else {
             return safetensorCount == 0 ? ["no safetensors found"] : ["unknown flux-family model"]
         }
@@ -333,6 +387,7 @@ public struct MLXStudioModelStore: Sendable {
                 reasons.append("missing \(component.rawValue)")
             }
         }
+        reasons.append(contentsOf: try missingIndexedSafetensorFiles(in: directory))
         return reasons
     }
 

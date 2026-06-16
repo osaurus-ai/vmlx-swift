@@ -88,6 +88,25 @@ final class LocalModelStoreTests: XCTestCase {
         XCTAssertTrue(complete.components.contains(.unconditionalTransformer))
     }
 
+    func testInspectRejectsMissingIndexedSafetensorShard() throws {
+        let root = try makeTemporaryImageModelRoot()
+        let model = root.appendingPathComponent("Qwen-Image-Edit-mflux-q3", isDirectory: true)
+        try makeComponentLayout(at: model)
+        let index = """
+        {"weight_map":{"model.embed_tokens.weight":"3.safetensors"}}
+        """
+        try Data(index.utf8).write(
+            to: model.appendingPathComponent("text_encoder/model.safetensors.index.json"))
+
+        let inspected = try MLXStudioModelStore.inspect(directory: model)
+
+        XCTAssertEqual(inspected.canonicalName, "qwen-image-edit")
+        XCTAssertEqual(inspected.readiness, .incomplete)
+        XCTAssertTrue(
+            inspected.blockedReasons.contains("missing indexed shard text_encoder/3.safetensors"),
+            "blocked reasons: \(inspected.blockedReasons)")
+    }
+
     func testEngineLoadFromStoreRejectsIncompleteLocalBundleBeforeWeightLoad() async throws {
         let root = try makeTemporaryImageModelRoot()
         let model = root.appendingPathComponent("Z-Image-Turbo-mflux-4bit", isDirectory: true)

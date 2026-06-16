@@ -12,10 +12,11 @@ contract osaurus implements server-side and the UI builds against.
 
 > Status: the engine is real. `z-image-turbo` and `flux1-schnell` are
 > live-proven for 4-bit and 8-bit text-to-image; `qwen-image` is live-proven for
-> 4-bit text-to-image. `qwen-image-edit` q4 is live-proven for text-image edit
-> after the VL-grid conditioning fix; expose only the proven q4 path for normal
-> testing, keep q3/q5 internal until separately live-proven, keep q6 blocked
-> until its local bundle is complete, and hide mask/inpaint controls until wired.
+> 4-bit text-to-image. `qwen-image-edit` q4 and q5 are live-proven for
+> text-image edit after the VL-grid conditioning fix; expose only the proven
+> q4/q5 paths for normal testing, keep q3 blocked because its text-encoder index
+> references missing `text_encoder/3.safetensors`, keep q6 blocked until its
+> local bundle is complete, and hide mask/inpaint controls until wired.
 > Ideogram is metadata-visible on HF but not downloadable for the current account
 > yet (`Access denied. This repository requires approval.`), so keep it disabled
 > until a local bundle exists and live load/generation proof is captured.
@@ -80,8 +81,9 @@ Notes for UI:
 - `native_runtime_status != native_pipeline_implemented` → disable normal user
   actions and show the blocker text. `native_pipeline_partial` is an internal
   diagnostic state, not a release-ready user model. For qwen-image-edit, the
-  status is variant-specific: `Qwen-Image-Edit-mflux-q4` is implemented/testable;
-  q3/q5/q6 remain partial or blocked until separately proven.
+  status is variant-specific: `Qwen-Image-Edit-mflux-q4` and
+  `Qwen-Image-Edit-mflux-q5` are implemented/testable; q3/q6 remain partial or
+  blocked until complete local bundles are staged and proven.
 - Use `capabilities` to show/hide fields. e.g. `negative_prompt:false` → hide the
   negative box; `mask:false` → no mask tool.
 - Pre-fill `steps`/`guidance` from `defaults`; clamp sliders with `limits`.
@@ -156,8 +158,9 @@ Notes for UI:
 ```
 Maps to `ImageEditRequest` (`sourceImage`, `mask`, `strength`, ...). Only models
 with `capabilities.image_edit:true` accept this; else 400 `wrong model kind`.
-Current live-proven target is `Qwen-Image-Edit-mflux-q4` without masks; reject a
-non-null `mask` with 501 or hide the control until mask/inpaint wiring lands.
+Current live-proven targets are `Qwen-Image-Edit-mflux-q4` and
+`Qwen-Image-Edit-mflux-q5` without masks; reject a non-null `mask` with 501 or
+hide the control until mask/inpaint wiring lands.
 
 ---
 
