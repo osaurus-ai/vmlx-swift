@@ -516,18 +516,19 @@ multi-reference text-image edit, not qwen mask/inpaint support.
    promote only after load/generation proof on the current main SHA).
 4. Osaurus app/server wiring: implement the `/v1/images/*` bridge from the
    specs below, wrap every image request in the required `MetalGate` exclusion,
-   expose only proven variants, and pin Osaurus to `vmlx-origin/main`
-   `5eda194e194fd8ebea6fd5dc4f528fe5b9959d25` or a later verified main SHA.
+   expose only proven variants, and pin Osaurus to the current verified
+   `vmlx-origin/main` head after `git ls-remote vmlx-origin refs/heads/main`.
+   Do not pin below runtime source baseline `ee9fa928354d4d39c600731ac8d34c4998545cb3`.
 
 ---
 
 ## 1. Where the code lives
 
 - **vmlx-swift integration worktree:** `/Users/eric/vmlx-swift-fluxwt` — clean
-  Osaurus monorepo worktree for this lane. The current runtime-proof baseline is
-  `vmlx-origin/main` `5eda194e194fd8ebea6fd5dc4f528fe5b9959d25`; later commits
-  in this lane must be source/test checked before pinning. Docs-only commits
-  after that SHA do not change the native image runtime source.
+  Osaurus monorepo worktree for this lane. The current runtime source proof
+  baseline is `vmlx-origin/main` `ee9fa928354d4d39c600731ac8d34c4998545cb3`;
+  later image-lane commits add docs/proof-runner/checker wiring and must still
+  be source/test checked before pinning Osaurus to the current main head.
 - **Dirty local dev tree:** `/Users/eric/vmlx-swift` — branch
   `codex/mimo-v25-cache-contract` carries unrelated MLXPress/MiMo/Gemma/JANG
   WIP; do not commit the image-gen integration from that dirty checkout.
@@ -744,9 +745,10 @@ Full per-model transcription specs are in `docs/FLUX_SCHNELL_PORT_PLAN.md` and `
    bridge, model list/capability mapping, progress SSE, output file policy, and
    `MetalGate` exclusion. Use `docs/OSAURUS_IMAGE_OPENAPI.json` for route/schema
    wiring and `docs/OSAURUS_IMAGE_UI_MANIFEST.json` for dropdown/control exposure.
-   Pin Osaurus to current `vmlx-origin/main` after this docs/probe refresh; the
-   minimum current runtime-proof baseline is
-   `5eda194e194fd8ebea6fd5dc4f528fe5b9959d25`.
+   Pin Osaurus to current `vmlx-origin/main` after this docs/probe refresh and
+   source/test verification. The runtime source proof baseline remains
+   `ee9fa928354d4d39c600731ac8d34c4998545cb3`; later image-lane commits only add
+   docs/proof-runner/checker wiring.
 
 **Reference:** the mflux Python source (the source of truth for every arch + weight key) is at `/tmp/mflux-ref` (clone of `github.com/filipstrand/mflux`). Re-clone if gone.
 
