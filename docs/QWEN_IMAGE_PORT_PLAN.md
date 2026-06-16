@@ -5,7 +5,7 @@
 reference template. For osaurus teammates + future porting sessions.
 
 **Status (2026-06-16):** `qwen-image` text-to-image is implemented in
-`Common/QwenImageNative.swift` and live-proven for the local 4-bit and 6-bit
+`Common/QwenImageNative.swift` and live-proven for the local 4-bit, 6-bit, and 8-bit
 mflux bundles with same-seed determinism, prompt sensitivity, and visual
 inspection. In the Osaurus monorepo worktree, `qwen-image-mflux-4bit` also has
 fresh load proof at
@@ -19,8 +19,17 @@ blue watercolor mountain prompt has SHA
 `44069312716932d6d72181a808625a33777ed29af7723eea8f76b0ac5ba96a52`. The 6-bit
 bundle uses Diffusers-style nested modulation keys
 `img_norm1.mod_linear` / `txt_norm1.mod_linear`; the native loader accepts both
-that layout and the 4-bit `img_mod_linear` / `txt_mod_linear` layout. Current HF
-search did not find a public qwen-image mflux 8-bit bundle.
+that layout and the 4-bit `img_mod_linear` / `txt_mod_linear` layout.
+`qwen-image-mflux-8bit` is staged locally from `AbstractFramework/qwen-image-8bit`
+(repo SHA `c92c2b346b705f797897a29c4a7b5334cb501f44`; index metadata
+`quantization_level=8`, `mflux_version=0.18.2`) and live-proven at
+`docs/local/vmlx-flux-probes/2026-06-16-qwen-image-8bit-gen20/qwen-image-mflux-8bit-load.json`;
+turns 1 and 3 share apple SHA
+`1611715920c71fbb40c02011035ff616c93745386e2708570c595f439b15cae3`, while the
+blue mountain/sun watercolor prompt has SHA
+`67a9f6195777c06a70e81230756015718110472df38ef5688608516637862c70`. The 8-bit
+bundle quantizes text-encoder embeddings/linears too; Swift loads those through
+the shared `MFluxEmbedding`/`MFluxLinear` group-quant paths.
 `qwen-image-edit` q4 and q5 are live-proven for text-image edit after the VL-grid
 conditioning fix. Source trace: mflux passes `vl_width/vl_height` into
 `QwenEditUtil.create_image_conditioning_latents`, and that utility uses those

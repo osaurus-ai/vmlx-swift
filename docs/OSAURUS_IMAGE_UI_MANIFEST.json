@@ -3,7 +3,7 @@
   "generated_for": "osaurus image UI and server wiring",
   "status": {
     "overall": "PARTIAL",
-    "reason": "vMLX native image pipelines have source and probe evidence for the listed local variants; qwen-image-edit q6/q8 are now staged and live-proven, q3 loads but remains hidden because visual edit output is high-noise, and the Osaurus /v1/images/* bridge and UI are not implemented or live-proven here.",
+    "reason": "vMLX native image pipelines have source and probe evidence for the listed local variants; qwen-image 8-bit and qwen-image-edit q6/q8 are now staged and live-proven, qwen-edit q3 loads but remains hidden because visual edit output is high-noise, and the Osaurus /v1/images/* bridge and UI are not implemented or live-proven here.",
     "normal_ui_policy": "show only entries with ui_exposure=show_for_testing; hide blocked variants and unsupported controls."
   },
   "source_trace": {
@@ -16,7 +16,7 @@
     "api_spec": "docs/OSAURUS_IMAGE_API_SPEC.md"
   },
   "runtime_evidence": {
-    "status_load_matrix": "docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q6q8-status-refresh-load-matrix/compatibility-matrix.json",
+    "status_load_matrix": "docs/local/vmlx-flux-probes/2026-06-16-qwen-image-8bit-status-refresh-load-matrix/compatibility-matrix.json",
     "visual_contact_sheet": "docs/local/vmlx-flux-outputs/2026-06-16-current-103be-contact-sheet.png",
     "runtime_generation_baseline": "103be4375d88f7f8249b39853feedcf390d41465",
     "runtime_generation_baseline_scope": [
@@ -26,6 +26,7 @@
       "flux1-schnell 8-bit",
       "qwen-image 4-bit",
       "qwen-image 6-bit",
+      "qwen-image 8-bit",
       "qwen-image-edit q4",
       "qwen-image-edit q5",
       "ideogram fp8",
@@ -38,7 +39,11 @@
     "qwen_edit_q3_boundary_artifact": "docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q3-after-shard-gen20/Qwen-Image-Edit-mflux-q3-load.json",
     "qwen_edit_q6_live_artifact": "docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q6-after-download-gen20/Qwen-Image-Edit-mflux-q6-load.json",
     "qwen_edit_q8_live_artifact": "docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q8-after-download-gen20/Qwen-Image-Edit-mflux-q8-load.json",
-    "qwen_edit_latest_source_commit": "ed84bac6cb256cac6ebbb39bc564acd16e8ea717"
+    "qwen_edit_latest_source_commit": "ed84bac6cb256cac6ebbb39bc564acd16e8ea717",
+    "qwen_image_8bit_live_artifact": "docs/local/vmlx-flux-probes/2026-06-16-qwen-image-8bit-gen20/qwen-image-mflux-8bit-load.json",
+    "qwen_image_8bit_latest_source_commit": "da782e8b47c428c2ce178daa3ec8cfdd4ab2deb1",
+    "qwen_image_8bit_source_repo": "AbstractFramework/qwen-image-8bit",
+    "qwen_image_8bit_source_repo_sha": "c92c2b346b705f797897a29c4a7b5334cb501f44"
   },
   "engine_contract": {
     "swift_import": "import vMLXFlux",
@@ -286,17 +291,27 @@
             "apple_repeat": "dbe3755ae644663da7cd42737e411022b8cc5211fea2173ad7782a291ed5a73f",
             "mountains": "8a355fdfcb61112a40a0b1ce39f2b571b2be05226d36ab85148c27caccb3bbd5"
           }
+        },
+        {
+          "model_id": "qwen-image-mflux-8bit",
+          "quantization_bits": 8,
+          "local_load_status": "loaded",
+          "proof_status": "live_proven_current_da782",
+          "proof_artifact": "docs/local/vmlx-flux-probes/2026-06-16-qwen-image-8bit-gen20/qwen-image-mflux-8bit-load.json",
+          "sha256": {
+            "apple_repeat": "1611715920c71fbb40c02011035ff616c93745386e2708570c595f439b15cae3",
+            "mountains": "67a9f6195777c06a70e81230756015718110472df38ef5688608516637862c70"
+          }
         }
       ],
       "blocked_variants": [
         {
-          "variant": "8bit",
-          "reason": "public mflux 8-bit bundle not found/staged"
-        },
-        {
           "variant": "full",
           "reason": "full precision weights are not staged/proven locally"
         }
+      ],
+      "notes": [
+        "qwen-image 8-bit is staged from AbstractFramework/qwen-image-8bit and live-proven on da782e8b with 20-step deterministic/prompt-sensitive 512px output."
       ]
     },
     {

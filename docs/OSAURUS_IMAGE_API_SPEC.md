@@ -12,18 +12,19 @@ contract osaurus implements server-side and the UI builds against.
 
 > Status: the engine is real on Osaurus `vmlx-origin/main`. Current scanner/load
 > proof exists for all local image rows at
-> `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q6q8-status-refresh-load-matrix/compatibility-matrix.json`
-> (13 scanned, 13 loaded after staging qwen-edit q3/q6/q8).
+> `docs/local/vmlx-flux-probes/2026-06-16-qwen-image-8bit-status-refresh-load-matrix/compatibility-matrix.json`
+> (14 scanned, 14 loaded after staging qwen-edit q3/q6/q8 and qwen-image 8-bit).
 > Current 103be live generation/edit proof exists for `z-image-turbo` 4/8-bit,
 > `flux1-schnell` 4/8-bit, `qwen-image` 4/6-bit, qwen-edit q4/q5, and staged
 > `ideogram-4-fp8`/`ideogram-4-nf4`; current ed84 follow-up proof adds clean
-> qwen-edit q6/q8 rows:
+> qwen-edit q6/q8 rows, and current da782 follow-up proof adds qwen-image 8-bit:
 > `docs/local/vmlx-flux-probes/2026-06-16-current-103be-zimage-4bit-gen/`,
 > `2026-06-16-current-103be-zimage-8bit-gen/`,
 > `2026-06-16-current-103be-flux-schnell-4bit-gen/`,
 > `2026-06-16-current-103be-flux-schnell-8bit-gen/`,
 > `2026-06-16-current-103be-qwen-image-4bit-gen20/`,
 > `2026-06-16-current-103be-qwen-image-6bit-gen20/`,
+> `docs/local/vmlx-flux-probes/2026-06-16-qwen-image-8bit-gen20/`,
 > `2026-06-16-current-103be-qwen-edit-q4-gen20/`,
 > `2026-06-16-current-103be-qwen-edit-q5-gen20/`,
 > `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q6-after-download-gen20/`,

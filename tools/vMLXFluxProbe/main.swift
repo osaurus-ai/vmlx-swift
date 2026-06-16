@@ -651,7 +651,7 @@ struct VMLXFluxProbe {
             {
                 return [
                     "current 103be437 main qwen-image 4-bit text-to-image path completed a 20-step three-turn live probe with same-seed prompt sensitivity, deterministic repeat, finite diagnostics, and viewed coherent apple/mountain images on 2026-06-16",
-                    "public mflux 8-bit bundle was not found in current HF search",
+                    "current da782e8b main qwen-image 8-bit text-to-image path completed a 20-step three-turn live probe with same-seed prompt sensitivity, deterministic repeat, finite diagnostics, and viewed coherent apple/mountain images on 2026-06-16",
                     "run a broader Osaurus-side production matrix before release promotion",
                 ]
             }
@@ -660,12 +660,21 @@ struct VMLXFluxProbe {
             {
                 return [
                     "current 103be437 main qwen-image 6-bit text-to-image path completed a 20-step three-turn live probe with same-seed prompt sensitivity, deterministic repeat, finite diagnostics, and viewed coherent apple/mountain images on 2026-06-16",
-                    "public mflux 8-bit bundle was not found in current HF search",
+                    "current da782e8b main qwen-image 8-bit text-to-image path completed a 20-step three-turn live probe with same-seed prompt sensitivity, deterministic repeat, finite diagnostics, and viewed coherent apple/mountain images on 2026-06-16",
+                    "run a broader Osaurus-side production matrix before release promotion",
+                ]
+            }
+            if model.quantizationBits == 8
+                && model.readiness == .loadableScaffold
+            {
+                return [
+                    "current da782e8b main qwen-image 8-bit text-to-image path completed a 20-step three-turn live probe with same-seed prompt sensitivity, deterministic repeat, finite diagnostics, and viewed coherent apple/mountain images on 2026-06-16",
+                    "source bundle: AbstractFramework/qwen-image-8bit, 29.5GB dry-run, staged as qwen-image-mflux-8bit with quantization_level=8 index metadata",
                     "run a broader Osaurus-side production matrix before release promotion",
                 ]
             }
             return [
-                "qwen-image 4-bit and 6-bit have current-103be live proof; this quant variant has not completed live generation",
+                "qwen-image 4-bit and 6-bit have current-103be live proof and qwen-image 8-bit has current-da782 live proof; this quant variant has not completed live generation",
                 "live coherent text-to-image proof is missing for this quant variant",
             ]
         case "qwen-image-edit":
