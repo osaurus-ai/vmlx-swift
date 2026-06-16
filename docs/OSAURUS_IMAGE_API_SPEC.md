@@ -16,6 +16,9 @@ contract osaurus implements server-side and the UI builds against.
 > after the VL-grid conditioning fix; expose only the proven q4 path for normal
 > testing, keep q3/q5 internal until separately live-proven, keep q6 blocked
 > until its local bundle is complete, and hide mask/inpaint controls until wired.
+> Ideogram is metadata-visible on HF but not downloadable for the current account
+> yet (`Access denied. This repository requires approval.`), so keep it disabled
+> until a local bundle exists and live load/generation proof is captured.
 > The HTTP surface below is the **proposed contract** for the osaurus team to
 > expose; design it once, wire all models through it.
 

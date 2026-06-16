@@ -651,8 +651,8 @@ struct VMLXFluxProbe {
         case "ideogram":
             return [
                 "Ideogram4.generate body throws FluxError.notImplemented",
-                "local Ideogram bundle is not staged on the current proof machine",
-                "Qwen3 text encoder, 34-layer DiT key mapping, VAE, and fp8/nf4 quant path are missing",
+                "local Ideogram bundle is not staged on the current proof machine; hf download dry-runs for ideogram-ai/ideogram-4-nf4 and ideogram-ai/ideogram-4-fp8 returned approval-gated access denied on 2026-06-16",
+                "Qwen3 text encoder, 34-layer DiT key mapping, unconditional transformer, VAE, and fp8/nf4 quant path are missing",
             ]
         case "wan-2.1", "wan-2.2":
             return [

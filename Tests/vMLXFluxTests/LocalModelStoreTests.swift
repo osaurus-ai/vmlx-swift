@@ -67,6 +67,27 @@ final class LocalModelStoreTests: XCTestCase {
         XCTAssertTrue(variant.components.contains(.vae))
     }
 
+    func testIdeogramRequiresUnconditionalTransformerComponent() throws {
+        let root = try makeTemporaryImageModelRoot()
+        let model = root.appendingPathComponent("ideogram-4-nf4", isDirectory: true)
+        try makeComponentLayout(at: model)
+
+        let incomplete = try MLXStudioModelStore.inspect(directory: model)
+
+        XCTAssertEqual(incomplete.canonicalName, "ideogram")
+        XCTAssertEqual(incomplete.readiness, .incomplete)
+        XCTAssertTrue(incomplete.blockedReasons.contains("missing unconditionalTransformer"))
+
+        let unconditional = model.appendingPathComponent("unconditional_transformer", isDirectory: true)
+        try FileManager.default.createDirectory(at: unconditional, withIntermediateDirectories: true)
+        try Data([3]).write(to: unconditional.appendingPathComponent("0.safetensors"))
+
+        let complete = try MLXStudioModelStore.inspect(directory: model)
+
+        XCTAssertEqual(complete.readiness, .loadableScaffold)
+        XCTAssertTrue(complete.components.contains(.unconditionalTransformer))
+    }
+
     func testEngineLoadFromStoreRejectsIncompleteLocalBundleBeforeWeightLoad() async throws {
         let root = try makeTemporaryImageModelRoot()
         let model = root.appendingPathComponent("Z-Image-Turbo-mflux-4bit", isDirectory: true)

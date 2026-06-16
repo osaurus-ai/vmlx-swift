@@ -4,6 +4,7 @@ public enum LocalFluxComponent: String, CaseIterable, Codable, Sendable {
     case root
     case tokenizer
     case transformer
+    case unconditionalTransformer
     case scheduler
     case textEncoder
     case vae
@@ -250,6 +251,7 @@ public struct MLXStudioModelStore: Sendable {
         let componentDirs: [(LocalFluxComponent, String)] = [
             (.tokenizer, "tokenizer"),
             (.transformer, "transformer"),
+            (.unconditionalTransformer, "unconditional_transformer"),
             (.scheduler, "scheduler"),
             (.textEncoder, "text_encoder"),
             (.vae, "vae"),
@@ -317,7 +319,16 @@ public struct MLXStudioModelStore: Sendable {
         if safetensorCount == 0 {
             reasons.append("no safetensors found")
         }
-        for component in [LocalFluxComponent.transformer, .textEncoder, .vae, .tokenizer] {
+        var requiredComponents: [LocalFluxComponent] = [
+            .transformer,
+            .textEncoder,
+            .vae,
+            .tokenizer,
+        ]
+        if canonicalName == "ideogram" {
+            requiredComponents.append(.unconditionalTransformer)
+        }
+        for component in requiredComponents {
             if !components.contains(component) {
                 reasons.append("missing \(component.rawValue)")
             }

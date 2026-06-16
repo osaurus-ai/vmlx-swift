@@ -35,7 +35,10 @@
   edit proof after the VL-grid source-conditioning fix: same prompt+seed repeats
   byte-identically, a different edit prompt changes the image coherently, and
   the q4 shape probes match mflux. q3/q5 are local but not visually proven, q6
-  is incomplete, and mask/inpaint editing is not wired. See §6 and §7b.
+  is incomplete, and mask/inpaint editing is not wired. Ideogram repos are
+  visible through HF metadata, but downloads are approval-gated for the current
+  account, and the local dry-run skeletons are incomplete asset/cache dirs only,
+  so there is no local Ideogram load proof. See §6 and §7b.
 
 ---
 
@@ -193,7 +196,7 @@ both map to `z-image-turbo` but resolve to their own dirs).
 `scan()` → `[LocalFluxModel]` with:
 - `directory`, `directoryName`, `canonicalName?`, `displayName`, `kind?`
 - `quantizationBits?` (parsed from `-Nbit` / mflux dir naming)
-- `components: Set<{root,tokenizer,transformer,scheduler,textEncoder,vae,assets}>`
+- `components: Set<{root,tokenizer,transformer,unconditionalTransformer,scheduler,textEncoder,vae,assets}>`
 - `safetensorCount`, `totalBytes`, `hasModelIndex`
 - `readiness: {loadableScaffold, incomplete, unknown}`, `blockedReasons`
 - `canEnterNativeLoadPath` (== `readiness == .loadableScaffold`)
@@ -265,7 +268,7 @@ their 4-bit linears through scale tensors at load time inside the model.
 | flux2-klein / flux2-klein-edit | `not_implemented` | Bundle scans + loads; `FluxDiTConfig.flux2Klein` preset exists. | T5 (single-encoder) port + weight key-map + 3-axis RoPE. |
 | **flux1-schnell** | `native_pipeline_implemented` | Full native pipeline `Flux1Native.swift`: T5-XXL + CLIP-L encoders, full DiT (19 joint + 38 single blocks, 24h×128, 3-axis RoPE), AutoencoderKL VAE, mflux decode. Fresh 2026-06-16 proof: 4-bit + 8-bit live load, 3 completed turns, same-prompt SHA match, different-prompt SHA change, viewed coherent apple/mountain images. | tokenizer.json must be staged (mflux ships slow tokenizers — convert; see port plan). Full precision pending. |
 | flux1-dev/kontext/fill | `not_implemented` | dev = schnell + guidance embedder (small add); kontext/fill = edit variants. | wire guidance + edit conditioning on the working schnell pipeline. |
-| **ideogram** (Ideogram 4) | `not_implemented` (scaffold registered) | Strong text/typography renderer. mflux-compatible weights: `ideogram-ai/ideogram-4-fp8` or `ideogram-ai/ideogram-4-nf4` (4-bit). The current proof machine has no staged Ideogram bundle in the local image-model roots, so there is no live load/generation evidence. | Stage a local bundle, then port Qwen3 text encoder (reuse Qwen LM pattern) + 34-layer DiT (emb 4608, 18 heads, llm_features 4096×13 multi-layer, rope 5e6) + VAE. **Needs an fp8/nf4 quant path** (mflux fp8_linear for the canonical fp8 bundle) — different from the MLX group-quant the others use. |
+| **ideogram** (Ideogram 4) | `not_implemented` (scaffold registered) | Strong text/typography renderer. mflux-compatible weights: `ideogram-ai/ideogram-4-fp8` or `ideogram-ai/ideogram-4-nf4` (4-bit). HF metadata is reachable, and scanner readiness now requires Ideogram's `unconditional_transformer` component in addition to tokenizer/text_encoder/transformer/vae. Current proof machine has only incomplete asset/cache skeleton dirs from failed dry-runs (`ideogram-4-nf4`, `ideogram-4-fp8`); `hf download --dry-run` for both Ideogram repos returned `Access denied. This repository requires approval.` on 2026-06-16, so there is no live load/generation evidence. | Get HF approval, stage a complete local bundle, then port Qwen3 text encoder (reuse Qwen LM pattern) + 34-layer DiT (emb 4608, 18 heads, llm_features 4096×13 multi-layer, rope 5e6) + unconditional transformer + VAE. **Needs an fp8/nf4 quant path** (mflux fp8_linear for the canonical fp8 bundle) — different from the MLX group-quant the others use. |
 | seedvr2 | scaffold | registered | upscale arch (different family). |
 | wan-2.1 / wan-2.2 | scaffold | full pipeline scaffolded (WanVAE3D + WanDiT + MP4 writer) with random weights. | real weight key-map, real Conv3d (currently a Conv2d shim), windowed attention for >3-4s clips. |
 
