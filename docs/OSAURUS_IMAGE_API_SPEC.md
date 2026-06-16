@@ -11,12 +11,18 @@ field below maps to an engine request/event — see the mapping notes. This is t
 contract osaurus implements server-side and the UI builds against.
 
 > Status: the engine is real on Osaurus `vmlx-origin/main` runtime-proof
-> baseline `5c7cf42caa7e010e68828c277dc9e67bd3404650`. Current-head load proof
+> baseline `03a68ad70bfc3cff5363ef263cf773eab3aa34a8`. Current-head load proof
 > exists for all local loadable image rows at
-> `docs/local/vmlx-flux-probes/2026-06-16-current-5c7-load-matrix/compatibility-matrix.json`.
-> Current-head live generation/edit proof exists for `z-image-turbo` 4/8-bit,
+> `docs/local/vmlx-flux-probes/2026-06-16-current-03a-load-matrix/compatibility-matrix.json`.
+> Current 03a live generation/edit proof exists for `qwen-image` 6-bit,
+> `qwen-image-edit` q4, and staged `ideogram-4-fp8`:
+> `docs/local/vmlx-flux-probes/2026-06-16-current-03a-qwen-image-6bit-gen20/`,
+> `2026-06-16-current-03a-qwen-edit-q4-gen20/`, and
+> `2026-06-16-current-03a-ideogram-fp8-object-strict/`.
+> Current 5c7 generation/edit proof still covers `z-image-turbo` 4/8-bit,
 > `flux1-schnell` 4/8-bit, `qwen-image` 4-bit, `qwen-image-edit` q5, and staged
-> `ideogram-4-nf4`. Current 5c7 generation/edit artifact roots:
+> `ideogram-4-nf4`; commits after 5c7 only changed docs/probe status text, not
+> those native runtime paths. Current 5c7 artifact roots:
 > `docs/local/vmlx-flux-probes/2026-06-16-current-5c7-zimage-4bit-gen/`,
 > `2026-06-16-current-5c7-zimage-8bit-gen/`,
 > `2026-06-16-current-5c7-flux-schnell-4bit-gen/`,
@@ -24,20 +30,15 @@ contract osaurus implements server-side and the UI builds against.
 > `2026-06-16-current-5c7-qwen-image-4bit-gen20/`,
 > `2026-06-16-current-5c7-qwen-edit-q5-gen20/`, and
 > `2026-06-16-ideogram-nf4-strict-object/`.
-> Older a188 generation proof still covers `qwen-image` 6-bit,
-> `qwen-image-edit` q4, and staged `ideogram-4-fp8` until those rows are rerun
-> on 5c7:
-> `2026-06-16-current-a188-qwen-image-6bit-gen20/`,
-> `2026-06-16-current-a188-qwen-edit-q4-gen20/`, and
-> `2026-06-16-current-a188-ideogram-fp8-object-strict/`.
 > Expose only proven local variants for normal testing. Keep qwen-edit q3
 > blocked because its text-encoder index references missing
 > `text_encoder/3.safetensors`; keep q6 blocked until its local bundle is
 > complete; hide qwen mask/inpaint controls because the mflux qwen-edit
 > reference exposes no qwen mask path. qwen-edit q5 is cleanest; q4 is
-> deterministic and color-prompt-sensitive but weaker on shape-changing edits.
+> current-03a deterministic and color-prompt-sensitive but visibly noisy/weaker
+> on shape-changing edits.
 > Ideogram fp8 is implemented/testable for the staged mirror with typography
-> and strict clean object-icon proof. Ideogram NF4 is implemented/testable for
+> and current-03a strict clean object-icon proof. Ideogram NF4 is implemented/testable for
 > the staged `cocktailpeanut/ideogram-4-nf4` mirror with strict 512px
 > object-icon proof: apple/repeat SHA
 > `76cd995b90d4ad85140418ae1d3a8a44bc688d03840041ff93ff2cd006e748df`,
