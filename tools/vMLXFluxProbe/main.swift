@@ -643,7 +643,7 @@ struct VMLXFluxProbe {
         switch model.canonicalName {
         case "z-image-turbo", "flux1-schnell":
             return [
-                "current e0f main 4/8-bit live probes completed three turns with same-seed repeated-prompt SHA match, different-prompt SHA change, and viewed coherent apple/mountain images on 2026-06-16",
+                "current a188 main 4/8-bit live probes completed three turns with same-seed repeated-prompt SHA match, different-prompt SHA change, finite diagnostics where emitted, and viewed coherent apple/mountain images on 2026-06-16",
                 "run a broader Osaurus-side production matrix before release promotion",
             ]
         case "qwen-image":
@@ -651,7 +651,7 @@ struct VMLXFluxProbe {
                 && model.readiness == .loadableScaffold
             {
                 return [
-                    "current e0f main qwen-image 4-bit and 6-bit text-to-image paths completed 20-step three-turn live probes with same-seed prompt sensitivity, deterministic repeat, finite diagnostics, and viewed coherent apple/mountain images on 2026-06-16",
+                    "current a188 main qwen-image 4-bit and 6-bit text-to-image paths completed 20-step three-turn live probes with same-seed prompt sensitivity, deterministic repeat, finite diagnostics, and viewed coherent apple/mountain images on 2026-06-16",
                     "public mflux 8-bit bundle was not found in current HF search",
                     "run a broader Osaurus-side production matrix before release promotion",
                 ]
@@ -665,8 +665,8 @@ struct VMLXFluxProbe {
                 && model.readiness == .loadableScaffold
             {
                 return [
-                    "current e0f main qwen-image-edit q4 and q5 text-image edit paths completed 20-step three-turn live probes with same-seed deterministic repeat and prompt-sensitive SHA changes on 2026-06-16",
-                    "visual boundary: q5 cleanly edits blue apple and green pear; q4 changes color but remains weaker on shape-changing green-pear prompts",
+                    "current a188 main qwen-image-edit q4 and q5 text-image edit paths completed 20-step three-turn live probes with same-seed deterministic repeat and prompt-sensitive SHA changes on 2026-06-16",
+                    "visual boundary: q5 cleanly edits blue apple and green pear; q4 changes color and shape but remains noisier/weaker on shape-changing green-pear prompts",
                     "mask/inpaint edit fields are not wired yet",
                     "q3 and q6 variants require complete local bundles before UI promotion",
                     "run a broader Osaurus-side production matrix before release promotion",
@@ -696,7 +696,8 @@ struct VMLXFluxProbe {
                 return [
                     "Ideogram fp8 source path is wired through Qwen3 text encoder, conditional/unconditional 34-layer DiT, VAE decode, and PNG output",
                     "live 20-step fp8 typography probe completed after the rotary-half correction; HELLO/BANANA outputs were prompt-sensitive and repeated HELLO had identical SHA",
-                    "current e0f main 512px object-icon probe completed three turns; apple and mountain prompts were coherent, prompt-sensitive, and repeated apple had identical SHA",
+                    "current a188 main strict 512px object-icon probe completed three turns; apple and mountain prompts were coherent, prompt-sensitive, and repeated apple had identical SHA",
+                    "visual boundary: a broader current a188 no-text apple prompt hallucinated text, so expose Ideogram fp8 as staged/testable with prompt-pattern caveats rather than a general clean object renderer",
                     "official ideogram-ai/ideogram-4-fp8 and ideogram-ai/ideogram-4-nf4 dry-runs still return access denied for the current HF account; current live proof uses the staged cocktailpeanut/ideogram-4-fp8 mirror",
                     "nf4 support remains incomplete until a complete local nf4 bundle is staged and load/generation proof passes",
                 ]
