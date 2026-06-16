@@ -419,8 +419,8 @@ Full per-model transcription specs are in `docs/FLUX_SCHNELL_PORT_PLAN.md` and `
   **`codex/qwen-edit-multi-image`** — qwen-edit ordered multi-image
   source/docs work, pending merge.
 - `jjang-ai/vmlx-flux` branch **`native-zimage-proven`** — standalone mirror of
-  the native work. Current pushed checkpoint includes Ideogram fp8 load
-  validation (`6d7901d01b19f76b9d4a0754188eff1dba80b10c`).
+  the native work. Current branch head includes the qwen-edit ordered
+  multi-image source/docs mirror and root Osaurus image API spec.
 - Wiki note (private `jjang-ai/wiki`): `notes/2026-06-15-vmlx-flux-native-z-image-proven-fork-lockstep.md`.
 - Per-project memory: `~/.claude/projects/-Users-eric-vmlx-swift/memory/vmlx-flux-native-zimage-integration.md`.
 - Proof artifacts (gitignored): `docs/local/vmlx-flux-{outputs,probes}/` (PROOF-*, FLUX-proof, QWEN-proof, Q8b-*).
