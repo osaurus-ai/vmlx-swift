@@ -28,7 +28,7 @@
   command buffer exactly like the Model2Vec embedder did. osaurus MUST route
   image generation through the same `MetalGate` exclusion it already uses for
   embeddings (see §7). This is the single most important wiring correctness note.
-- **Per-model status:** current Osaurus `vmlx-origin/main`
+- **Per-model status:** Osaurus `vmlx-origin/main` runtime-proof baseline
   `e0f3ccff7ae78a6b3e8ccc4989825f582d1b7ee5` has fresh live proof for
   `z-image-turbo` 4/8-bit, `flux1-schnell` 4/8-bit, `qwen-image` 4/6-bit,
   `qwen-image-edit` q4/q5, and staged `ideogram-4-fp8`. Load matrix:

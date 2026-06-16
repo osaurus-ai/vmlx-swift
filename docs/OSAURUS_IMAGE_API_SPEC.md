@@ -10,9 +10,9 @@ determinate progress bar so users always see "step N / M" and never a stuck spin
 field below maps to an engine request/event — see the mapping notes. This is the
 contract osaurus implements server-side and the UI builds against.
 
-> Status: the engine is real on current Osaurus `vmlx-origin/main`
-> `e0f3ccff7ae78a6b3e8ccc4989825f582d1b7ee5`. Fresh live proof exists for
-> `z-image-turbo` 4/8-bit, `flux1-schnell` 4/8-bit, `qwen-image` 4/6-bit,
+> Status: the engine is real on Osaurus `vmlx-origin/main` runtime-proof
+> baseline `e0f3ccff7ae78a6b3e8ccc4989825f582d1b7ee5`. Fresh live proof exists
+> for `z-image-turbo` 4/8-bit, `flux1-schnell` 4/8-bit, `qwen-image` 4/6-bit,
 > `qwen-image-edit` q4/q5, and staged `ideogram-4-fp8`. Load matrix:
 > `docs/local/vmlx-flux-probes/2026-06-16-current-e0f-load-matrix/compatibility-matrix.json`.
 > Generation/edit artifact roots:

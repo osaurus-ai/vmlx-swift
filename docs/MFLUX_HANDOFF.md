@@ -1,9 +1,10 @@
 # vMLX-Flux (native mFLUX image gen) — HANDOFF
 
 **For:** the next engineer/agent continuing the native mFLUX image-generation port.
-**Date:** 2026-06-16. **Owner:** Eric. **Status:** current Osaurus
-`vmlx-origin/main` `e0f3ccff7ae78a6b3e8ccc4989825f582d1b7ee5` has fresh live
-proof for z-image-turbo 4/8-bit, flux-schnell 4/8-bit, qwen-image 4/6-bit,
+**Date:** 2026-06-16. **Owner:** Eric. **Status:** Osaurus
+`vmlx-origin/main` runtime-proof baseline
+`e0f3ccff7ae78a6b3e8ccc4989825f582d1b7ee5` has fresh live proof for
+z-image-turbo 4/8-bit, flux-schnell 4/8-bit, qwen-image 4/6-bit,
 qwen-image-edit q4/q5, and staged Ideogram fp8. Qwen-edit q3 is incomplete
 (`text_encoder/3.safetensors` missing from its index), q6 is incomplete on
 disk, qwen masks are unsupported by the current mflux qwen-edit reference,
@@ -235,7 +236,8 @@ multi-reference text-image edit, not qwen mask/inpaint support.
 
 **Next work, in priority order:**
 1. **Ideogram 4 follow-through** — staged `cocktailpeanut/ideogram-4-fp8` is now
-   live-proven for typography and clean object icons on current Osaurus main.
+   live-proven for typography and clean object icons on the Osaurus runtime-proof
+   baseline.
    Official `ideogram-ai/*` approval is still needed for canonical official
    bundles, and nf4 requires a complete local bundle plus load/generation proof
    before exposure.
@@ -459,8 +461,9 @@ Full per-model transcription specs are in `docs/FLUX_SCHNELL_PORT_PLAN.md` and `
 4. **Osaurus app/server bridge:** the consolidated vMLX work is already on
    `osaurus-ai/vmlx-swift` main. Next osaurus-side work is the `/v1/images/*`
    bridge, model list/capability mapping, progress SSE, output file policy, and
-   `MetalGate` exclusion. Pin Osaurus to `vmlx-origin/main`
-   `e0f3ccff7ae78a6b3e8ccc4989825f582d1b7ee5` or a later verified main SHA.
+   `MetalGate` exclusion. Pin Osaurus to current `vmlx-origin/main` after this
+   docs/probe refresh; the minimum runtime-proof baseline is
+   `e0f3ccff7ae78a6b3e8ccc4989825f582d1b7ee5`.
 
 **Reference:** the mflux Python source (the source of truth for every arch + weight key) is at `/tmp/mflux-ref` (clone of `github.com/filipstrand/mflux`). Re-clone if gone.
 
