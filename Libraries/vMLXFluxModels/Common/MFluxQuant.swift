@@ -70,6 +70,25 @@ final class MFluxStore {
             name: "\(component).\(prefix)")
     }
 
+    func linear(
+        _ component: String,
+        prefixes: [String],
+        inputDimensions: Int,
+        outputDimensions: Int,
+        bias: Bool = false
+    ) throws -> MFluxLinear {
+        for prefix in prefixes where hasKey(component, "\(prefix).weight") {
+            return try linear(
+                component,
+                prefix,
+                inputDimensions: inputDimensions,
+                outputDimensions: outputDimensions,
+                bias: bias)
+        }
+        let names = prefixes.map { "\(component).\($0).weight" }.joined(separator: ", ")
+        throw FluxError.invalidRequest("missing any of weights [\(names)]")
+    }
+
     func embedding(
         _ component: String,
         _ prefix: String,

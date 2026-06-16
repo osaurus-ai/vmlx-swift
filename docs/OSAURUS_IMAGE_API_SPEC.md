@@ -12,7 +12,7 @@ contract osaurus implements server-side and the UI builds against.
 
 > Status: the engine is real. `z-image-turbo` and `flux1-schnell` are
 > live-proven for 4-bit and 8-bit text-to-image; `qwen-image` is live-proven for
-> 4-bit text-to-image. `qwen-image-edit` q4 and q5 are live-proven for
+> 4-bit and 6-bit text-to-image (public mflux 8-bit not found). `qwen-image-edit` q4 and q5 are live-proven for
 > text-image edit after the VL-grid conditioning fix; expose only the proven
 > q4/q5 paths for normal testing, keep q3 blocked because its text-encoder index
 > references missing `text_encoder/3.safetensors`, keep q6 blocked until its

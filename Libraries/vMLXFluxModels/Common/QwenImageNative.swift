@@ -406,8 +406,18 @@ private final class QwenBlock {
     private let imgFF: QwenFF, txtFF: QwenFF
     init(store: MFluxStore, component: String, index: Int) throws {
         let p = "transformer_blocks.\(index)"
-        imgMod = try store.linear(component, "\(p).img_mod_linear", inputDimensions: 3072, outputDimensions: 18432, bias: true)
-        txtMod = try store.linear(component, "\(p).txt_mod_linear", inputDimensions: 3072, outputDimensions: 18432, bias: true)
+        imgMod = try store.linear(
+            component,
+            prefixes: ["\(p).img_mod_linear", "\(p).img_norm1.mod_linear"],
+            inputDimensions: 3072,
+            outputDimensions: 18432,
+            bias: true)
+        txtMod = try store.linear(
+            component,
+            prefixes: ["\(p).txt_mod_linear", "\(p).txt_norm1.mod_linear"],
+            inputDimensions: 3072,
+            outputDimensions: 18432,
+            bias: true)
         attn = try QwenAttn(store: store, component: component, p: p)
         imgFF = try QwenFF(store: store, component: component, prefix: "\(p).img_ff")
         txtFF = try QwenFF(store: store, component: component, prefix: "\(p).txt_ff")

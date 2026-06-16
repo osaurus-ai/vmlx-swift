@@ -619,9 +619,23 @@ struct VMLXFluxProbe {
 
     private static func runtimeBlockers(for model: LocalFluxModel) -> [String] {
         switch model.canonicalName {
-        case "z-image-turbo", "flux1-schnell", "qwen-image":
+        case "z-image-turbo", "flux1-schnell":
             return [
                 "requires live same-seed prompt-sensitivity and multi-turn matrix before production promotion",
+            ]
+        case "qwen-image":
+            if [4, 6].contains(model.quantizationBits ?? -1)
+                && model.readiness == .loadableScaffold
+            {
+                return [
+                    "qwen-image q4 and q6 text-to-image paths are live-proven for same-seed prompt sensitivity and deterministic repeat on 2026-06-16",
+                    "public mflux 8-bit bundle was not found in current HF search",
+                    "run a broader Osaurus-side production matrix before release promotion",
+                ]
+            }
+            return [
+                "qwen-image q4 and q6 are live-proven; this quant variant has not completed live generation",
+                "live coherent text-to-image proof is missing for this quant variant",
             ]
         case "qwen-image-edit":
             if [4, 5].contains(model.quantizationBits ?? -1)

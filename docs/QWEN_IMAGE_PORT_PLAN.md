@@ -5,10 +5,22 @@
 reference template. For osaurus teammates + future porting sessions.
 
 **Status (2026-06-16):** `qwen-image` text-to-image is implemented in
-`Common/QwenImageNative.swift` and live-proven for the local 4-bit mflux bundle
-with same-seed determinism, prompt sensitivity, and visual inspection. In the
-Osaurus monorepo worktree, `qwen-image-mflux-4bit` also has fresh load proof at
+`Common/QwenImageNative.swift` and live-proven for the local 4-bit and 6-bit
+mflux bundles with same-seed determinism, prompt sensitivity, and visual
+inspection. In the Osaurus monorepo worktree, `qwen-image-mflux-4bit` also has
+fresh load proof at
 `docs/local/vmlx-flux-probes/2026-06-16-osaurus-qwen-image-q4-load-final/qwen-image-mflux-4bit-load.json`.
+`Qwen-Image-mflux-6bit` is staged locally from `filipstrand/Qwen-Image-mflux-6bit`
+and live-proven at
+`docs/local/vmlx-flux-probes/2026-06-16-qwen-image-6bit-gen20-after-key-fix/Qwen-Image-mflux-6bit-load.json`;
+turns 1 and 3 share apple SHA
+`66e8187e887087e8a8e9227a99f16236c5ba15717a5e31e08a5772868b3a456a`, while the
+blue watercolor mountain prompt has SHA
+`44069312716932d6d72181a808625a33777ed29af7723eea8f76b0ac5ba96a52`. The 6-bit
+bundle uses Diffusers-style nested modulation keys
+`img_norm1.mod_linear` / `txt_norm1.mod_linear`; the native loader accepts both
+that layout and the 4-bit `img_mod_linear` / `txt_mod_linear` layout. Current HF
+search did not find a public qwen-image mflux 8-bit bundle.
 `qwen-image-edit` q4 and q5 are live-proven for text-image edit after the VL-grid
 conditioning fix. Source trace: mflux passes `vl_width/vl_height` into
 `QwenEditUtil.create_image_conditioning_latents`, and that utility uses those

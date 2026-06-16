@@ -2,7 +2,7 @@
 
 **For:** the next engineer/agent continuing the native mFLUX image-generation port.
 **Date:** 2026-06-16. **Owner:** Eric. **Status:** z-image-turbo and flux-schnell
-are live-proven for 4/8-bit; qwen-image 4-bit is live-proven; qwen-image-edit
+are live-proven for 4/8-bit; qwen-image 4-bit and 6-bit are live-proven; qwen-image-edit
 q4/q5 are live-proven for text-image edit after the conditioning-grid fix. qwen-edit
 q3 is incomplete (`text_encoder/3.safetensors` missing from its index), q6 is incomplete on disk, masks are
 not wired, and Ideogram has no complete staged local bundle/proof because the
@@ -58,6 +58,17 @@ skeleton directories only; the scanner reports them as incomplete Ideogram rows.
 Ideogram has no live load/generation evidence on this machine. `hf download`
 dry-runs for both `ideogram-ai/ideogram-4-nf4` and `ideogram-ai/ideogram-4-fp8`
 returned `Access denied. This repository requires approval.` on 2026-06-16.
+Qwen-Image 6-bit was staged from `filipstrand/Qwen-Image-mflux-6bit` on
+2026-06-16; its slow tokenizer was converted to `tokenizer.json`, and the
+Diffusers-style mod-linear key layout (`img_norm1.mod_linear` /
+`txt_norm1.mod_linear`) is handled by the Qwen native loader fallback. Live proof:
+`docs/local/vmlx-flux-probes/2026-06-16-qwen-image-6bit-gen20-after-key-fix/Qwen-Image-mflux-6bit-load.json`
+(`load_status=loaded`; turn 1 and 3 apple prompt SHA
+`66e8187e887087e8a8e9227a99f16236c5ba15717a5e31e08a5772868b3a456a`;
+turn 2 blue watercolor mountain SHA
+`44069312716932d6d72181a808625a33777ed29af7723eea8f76b0ac5ba96a52`).
+Viewed outputs are coherent and prompt-sensitive. Current HF search did not find
+a public Qwen-Image mflux 8-bit bundle.
 
 This is the single starting doc. Read it top to bottom, then the per-model port plans.
 
@@ -69,12 +80,12 @@ This is the single starting doc. Read it top to bottom, then the per-model port 
 |---|---|---|---|---|
 | **z-image-turbo** | ✅ proven | ✅ proven | ⬜ (weights gone) | `Libraries/vMLXFluxModels/ZImage/ZImageNative.swift` |
 | **flux-schnell** | ✅ proven | ✅ proven | ⬜ (not staged) | `Libraries/vMLXFluxModels/Flux1/Flux1Native.swift` |
-| **qwen-image** (txt2img) | ✅ proven | ⬜ | ⬜ | `Libraries/vMLXFluxModels/Common/QwenImageNative.swift` |
+| **qwen-image** (txt2img) | ✅ proven; ✅ 6-bit also proven | ⬜ (public mflux 8-bit not found) | ⬜ | `Libraries/vMLXFluxModels/Common/QwenImageNative.swift` |
 | qwen-image-edit | ✅ q4/q5 text-image edit proven; q3/q6 incomplete | — | — | `Libraries/vMLXFluxModels/QwenImage/QwenImageEditSupport.swift`; masks/inpaint pending |
 | ideogram (4) | ⬜ scaffold, no local bundle staged/proven | — | — | `Libraries/vMLXFluxModels/Ideogram4/Ideogram4.swift` (fp8/nf4 path missing) |
 | flux1-dev/kontext/fill, flux2-klein, fibo, seedvr2, wan | ⬜ scaffold | — | — | registered, throw `notImplemented` |
 
-"Proven" = live-generated a coherent, prompt-accurate image that is **deterministic** (same seed+prompt -> byte-identical) and **prompt-sensitive** (different prompt same seed -> different coherent image). Per Eric's HARD RULE: *do not trust/claim a model works until you have generated and visually checked a real image.* 2026-06-16 rerun: z-image 4/8 and flux-schnell 4/8 passed live load + three-turn generate + SHA determinism/prompt-sensitivity + visual inspection. Qwen-image 4-bit now also passed live load + 20-step generation + three-turn SHA determinism/prompt-sensitivity + visual inspection after the mflux guidance rescale fix; turn 1/3 apple SHA `2f1c27c68993fe9a537bca2cc019ac3d32d59818b92c606c00726104661bcea7`, turn 2 mountain SHA `2bf77ce59c8ed99c1b1aa5fb8940c9d35948b1763fbd360e14f577032b62f060`, artifact `docs/local/vmlx-flux-probes/2026-06-16-qwen-image-q4-guidance-proof/qwen-image-mflux-4bit-load.json`.
+"Proven" = live-generated a coherent, prompt-accurate image that is **deterministic** (same seed+prompt -> byte-identical) and **prompt-sensitive** (different prompt same seed -> different coherent image). Per Eric's HARD RULE: *do not trust/claim a model works until you have generated and visually checked a real image.* 2026-06-16 rerun: z-image 4/8 and flux-schnell 4/8 passed live load + three-turn generate + SHA determinism/prompt-sensitivity + visual inspection. Qwen-image 4-bit also passed live load + 20-step generation + three-turn SHA determinism/prompt-sensitivity + visual inspection after the mflux guidance rescale fix; turn 1/3 apple SHA `2f1c27c68993fe9a537bca2cc019ac3d32d59818b92c606c00726104661bcea7`, turn 2 mountain SHA `2bf77ce59c8ed99c1b1aa5fb8940c9d35948b1763fbd360e14f577032b62f060`, artifact `docs/local/vmlx-flux-probes/2026-06-16-qwen-image-q4-guidance-proof/qwen-image-mflux-4bit-load.json`. Qwen-image 6-bit also passed live load + 20-step three-turn SHA determinism/prompt-sensitivity + visual inspection; turn 1/3 apple SHA `66e8187e887087e8a8e9227a99f16236c5ba15717a5e31e08a5772868b3a456a`, turn 2 mountain SHA `44069312716932d6d72181a808625a33777ed29af7723eea8f76b0ac5ba96a52`, artifact `docs/local/vmlx-flux-probes/2026-06-16-qwen-image-6bit-gen20-after-key-fix/Qwen-Image-mflux-6bit-load.json`.
 
 Qwen-image-edit q4/q5 are live-proven after fixing the source-image conditioning grid to match mflux. Source trace: mflux `qwen_image_edit.py` passes `vl_width/vl_height` into `QwenEditUtil.create_image_conditioning_latents`, and `qwen_edit_util.py` uses those VL dimensions for the source-image VAE encode when present. Swift now mirrors that in `QwenImageEditSupport.swift`: square source images encode conditioning at 384x384, pack 24x24=576 static latents, and denoise with 1024 target latents + 576 conditioning latents. q4 live proof artifact: `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-determinism-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json` (blue prompt SHA `005ab8baddfe9b7a94aa83f8ddd22d192e7e5a0275c556dcf2ead76a565e474a`, green-pear prompt SHA `815711be73a9e89599b3e97f9f15196115875103f9407d7b1b61bab33de8e3b4`, repeated blue prompt same SHA). q5 live proof artifact: `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q5-determinism/Qwen-Image-Edit-mflux-q5-load.json` (blue prompt SHA `5cd5d9197bd659bd8b59b4a2f2bca413266146ad4e08249289d5fa6a8025fa4e`, green-pear prompt SHA `d2c6c4eb4a19dcf48122b5216fc15ac37b9f5aa49c15f596acd1276a4df57034`, repeated blue prompt same SHA). Viewed q4/q5 outputs are coherent and prompt-sensitive. Boundary artifacts remain useful: `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-prompt-live/Qwen-Image-Edit-mflux-q4-load.json`, `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-vl-encode-live/Qwen-Image-Edit-mflux-q4-load.json`, `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-conditioning-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`, and `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-denoise-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`.
 
@@ -126,7 +137,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter vML
 ## 3. Models on disk (staged at `~/.mlxstudio/models/image/`)
 - `Z-Image-Turbo-mflux-4bit` (5.5GB), `Z-Image-Turbo-mflux-8bit` (10GB)
 - `FLUX.1-schnell-mflux-4bit` (9GB), `FLUX.1-schnell-mflux-8bit` (12GB)
-- `qwen-image-mflux-4bit` (24GB)
+- `qwen-image-mflux-4bit` (24GB), `Qwen-Image-mflux-6bit` (21GB)
 - `Qwen-Image-Edit-mflux` (89GB) with nested `q3`, `q4`, `q5`, `q6` variants.
   The scanner now expands these as `Qwen-Image-Edit-mflux-q3/q4/q5/q6`; q4 and
   q5 have complete tokenizer/text_encoder/transformer/vae bundles and are
@@ -161,7 +172,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter vML
 **Downloadable mflux-compatible weights (HF):**
 - flux: `dhairyashil/FLUX.1-schnell-mflux-{4,8}bit`; full = `black-forest-labs/FLUX.1-schnell` (GATED).
 - z-image: `Tongyi-MAI/Z-Image-Turbo` (full), `carsenk/z-image-turbo-mflux-8bit`, `filipstrand/Z-Image-Turbo-mflux-4bit`.
-- qwen: `carsenk/qwen-image-mflux-4bit` (txt2img), `fcreait/Qwen-Image-Edit-mflux` (87GB full edit model).
+- qwen: `carsenk/qwen-image-mflux-4bit` (txt2img), `filipstrand/Qwen-Image-mflux-6bit` (txt2img), `fcreait/Qwen-Image-Edit-mflux` (87GB full edit model). Current HF search did not find a public qwen-image mflux 8-bit bundle.
 - ideogram: `ideogram-ai/ideogram-4-fp8` (the mflux canonical), `ideogram-ai/ideogram-4-nf4` (4-bit).
   Current account state: both repos are visible through `hf models info`, but
   `hf download --dry-run` is approval-gated (`Access denied. This repository
