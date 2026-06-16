@@ -9,8 +9,9 @@
 //  group-quantized, bits inferred from shapes), plus Ideogram fp8 Linear
 //  weights (`weight` + `weight_scale`). The proven Z-Image native pipeline uses
 //  an equivalent private store; this is the reusable extraction so flux/qwen/
-//  ideogram don't re-implement quant handling. Plain (non-quantized) params
-//  (layer norms, conv bias) are loaded as-is.
+//  ideogram don't re-implement quant handling. Ideogram NF4 Diffusers mirrors
+//  use bitsandbytes metadata (`weight.absmax` + `weight.quant_map`) for Linears.
+//  Plain (non-quantized) params (layer norms, conv bias) are loaded as-is.
 //
 
 import Foundation
@@ -67,6 +68,9 @@ final class MFluxStore {
             scales: optionalTensor(component, "\(prefix).scales"),
             biases: optionalTensor(component, "\(prefix).biases"),
             weightScale: optionalTensor(component, "\(prefix).weight_scale"),
+            nf4Absmax: optionalTensor(component, "\(prefix).weight.absmax"),
+            nf4QuantMap: optionalTensor(component, "\(prefix).weight.quant_map"),
+            nf4QuantState: optionalTensor(component, "\(prefix).weight.quant_state.bitsandbytes__nf4"),
             bias: bias ? optionalTensor(component, "\(prefix).bias") : nil,
             inputDimensions: inputDimensions,
             outputDimensions: outputDimensions,
@@ -135,15 +139,44 @@ final class MFluxStore {
 
 // MARK: - Layers
 
+private enum MFluxBNBNF4 {
+    static let blockSize = 64
+
+    static func dequantizedMatrix(
+        weight: MLXArray,
+        absmax: MLXArray,
+        quantMap: MLXArray,
+        outputDimensions: Int,
+        inputDimensions: Int
+    ) -> MLXArray {
+        let elementCount = outputDimensions * inputDimensions
+        let packed = weight.reshaped([-1]).asType(.uint8)
+        let high = rightShift(packed, UInt8(4))
+        let low = bitwiseAnd(packed, UInt8(0x0f))
+        let codes = stacked([high, low], axis: 1)
+            .reshaped([elementCount])
+            .asType(.int32)
+        let values = take(quantMap.asType(.float32), codes)
+        let scaleIndices = floorDivide(arange(elementCount, dtype: .int32), Int32(blockSize))
+        let scales = take(absmax.asType(.float32), scaleIndices)
+        return (values * scales).reshaped([outputDimensions, inputDimensions])
+    }
+}
+
 /// Linear that runs group-quantized matmul when `scales` is present, fp8 decode
-/// when `weight_scale` is present, else dense matmul. Bits + group size are
-/// inferred from the packed `weight`/`scales` shapes.
+/// when `weight_scale` is present, bitsandbytes NF4 decode when `weight.absmax`
+/// and `weight.quant_map` are present, else dense matmul. MLX group bits + group
+/// size are inferred from the packed `weight`/`scales` shapes.
 final class MFluxLinear {
     private let weight: MLXArray
     private let scales: MLXArray?
     private let biases: MLXArray?
     private let weightScale: MLXArray?
+    private let nf4Absmax: MLXArray?
+    private let nf4QuantMap: MLXArray?
     private let bias: MLXArray?
+    private let inputDimensions: Int
+    private let outputDimensions: Int
     private let groupSize: Int
     private let bits: Int
 
@@ -152,51 +185,83 @@ final class MFluxLinear {
         scales: MLXArray?,
         biases: MLXArray?,
         weightScale: MLXArray?,
+        nf4Absmax: MLXArray?,
+        nf4QuantMap: MLXArray?,
+        nf4QuantState: MLXArray?,
         bias: MLXArray?,
         inputDimensions: Int,
         outputDimensions: Int,
         name: String
     ) throws {
-        guard weight.dim(0) == outputDimensions else {
-            throw FluxError.invalidRequest("\(name) output mismatch: weight=\(weight.shape), expected output \(outputDimensions)")
-        }
-        if scales != nil, weightScale != nil {
-            throw FluxError.invalidRequest("\(name) has both group quant scales and fp8 weight_scale")
+        let hasGroupQuant = scales != nil
+        let hasFp8 = weightScale != nil
+        let hasNF4 = nf4Absmax != nil || nf4QuantMap != nil || nf4QuantState != nil
+        let quantKinds = [hasGroupQuant, hasFp8, hasNF4].filter { $0 }.count
+        if quantKinds > 1 {
+            throw FluxError.invalidRequest("\(name) mixes incompatible quantization metadata")
         }
         self.weight = weight
         self.scales = scales
         self.biases = biases
         self.weightScale = weightScale
+        self.nf4Absmax = nf4Absmax
+        self.nf4QuantMap = nf4QuantMap
         self.bias = bias
-        if let weightScale {
-            guard weight.dim(1) == inputDimensions else {
-                throw FluxError.invalidRequest("\(name) fp8 input mismatch: weight=\(weight.shape), expected input \(inputDimensions)")
+        self.inputDimensions = inputDimensions
+        self.outputDimensions = outputDimensions
+        if hasNF4 {
+            guard let nf4Absmax, let nf4QuantMap, nf4QuantState != nil else {
+                throw FluxError.invalidRequest("\(name) has incomplete bitsandbytes NF4 metadata")
             }
-            guard weightScale.shape == [outputDimensions] else {
-                throw FluxError.invalidRequest("\(name) invalid fp8 weight_scale \(weightScale.shape), expected [\(outputDimensions)]")
+            let elementCount = inputDimensions * outputDimensions
+            guard weight.size * 2 == elementCount else {
+                throw FluxError.invalidRequest("\(name) NF4 packed size mismatch: weight=\(weight.shape), expected \(elementCount / 2) packed bytes")
             }
-            self.bits = 0
-            self.groupSize = 0
-        } else if scales != nil {
-            var inferred: Int?
-            for candidate in [2, 3, 4, 5, 6, 8] where weight.dim(1) * 32 / candidate == inputDimensions {
-                inferred = candidate; break
+            guard nf4Absmax.size * MFluxBNBNF4.blockSize == elementCount else {
+                throw FluxError.invalidRequest("\(name) invalid NF4 absmax \(nf4Absmax.shape), expected \(elementCount / MFluxBNBNF4.blockSize) blocks")
             }
-            guard let inferred else {
-                throw FluxError.invalidRequest("\(name) quantized input mismatch: weight=\(weight.shape), expected input \(inputDimensions)")
+            guard nf4QuantMap.size == 16 else {
+                throw FluxError.invalidRequest("\(name) invalid NF4 quant_map \(nf4QuantMap.shape), expected 16 values")
             }
-            let scaleColumns = scales?.dim(1) ?? 0
-            guard scaleColumns > 0, inputDimensions % scaleColumns == 0 else {
-                throw FluxError.invalidRequest("\(name) invalid quantization scales \(scales?.shape ?? [])")
-            }
-            self.bits = inferred
-            self.groupSize = inputDimensions / scaleColumns
+            self.bits = 4
+            self.groupSize = MFluxBNBNF4.blockSize
         } else {
-            guard weight.dim(1) == inputDimensions else {
-                throw FluxError.invalidRequest("\(name) input mismatch: weight=\(weight.shape), expected input \(inputDimensions)")
+            guard weight.dim(0) == outputDimensions else {
+                throw FluxError.invalidRequest("\(name) output mismatch: weight=\(weight.shape), expected output \(outputDimensions)")
             }
-            self.bits = 0
-            self.groupSize = 0
+            if biases != nil, scales == nil {
+                throw FluxError.invalidRequest("\(name) has group quant biases without scales")
+            }
+            if let weightScale {
+                guard weight.dim(1) == inputDimensions else {
+                    throw FluxError.invalidRequest("\(name) fp8 input mismatch: weight=\(weight.shape), expected input \(inputDimensions)")
+                }
+                guard weightScale.shape == [outputDimensions] else {
+                    throw FluxError.invalidRequest("\(name) invalid fp8 weight_scale \(weightScale.shape), expected [\(outputDimensions)]")
+                }
+                self.bits = 0
+                self.groupSize = 0
+            } else if scales != nil {
+                var inferred: Int?
+                for candidate in [2, 3, 4, 5, 6, 8] where weight.dim(1) * 32 / candidate == inputDimensions {
+                    inferred = candidate; break
+                }
+                guard let inferred else {
+                    throw FluxError.invalidRequest("\(name) quantized input mismatch: weight=\(weight.shape), expected input \(inputDimensions)")
+                }
+                let scaleColumns = scales?.dim(1) ?? 0
+                guard scaleColumns > 0, inputDimensions % scaleColumns == 0 else {
+                    throw FluxError.invalidRequest("\(name) invalid quantization scales \(scales?.shape ?? [])")
+                }
+                self.bits = inferred
+                self.groupSize = inputDimensions / scaleColumns
+            } else {
+                guard weight.dim(1) == inputDimensions else {
+                    throw FluxError.invalidRequest("\(name) input mismatch: weight=\(weight.shape), expected input \(inputDimensions)")
+                }
+                self.bits = 0
+                self.groupSize = 0
+            }
         }
     }
 
@@ -206,7 +271,15 @@ final class MFluxLinear {
             y = quantizedMM(x, weight, scales: scales, biases: biases,
                             transpose: true, groupSize: groupSize, bits: bits, mode: .affine)
         } else if let weightScale {
-            let decoded = MLX.fromFP8(weight, dtype: .float32) * weightScale.asType(.float32)[0..., .newAxis]
+            let decoded = mfluxFromFP8(weight, dtype: .float32) * weightScale.asType(.float32)[0..., .newAxis]
+            y = matmul(x.asType(.float32), decoded.T)
+        } else if let nf4Absmax, let nf4QuantMap {
+            let decoded = MFluxBNBNF4.dequantizedMatrix(
+                weight: weight,
+                absmax: nf4Absmax,
+                quantMap: nf4QuantMap,
+                outputDimensions: outputDimensions,
+                inputDimensions: inputDimensions)
             y = matmul(x.asType(.float32), decoded.T)
         } else {
             y = matmul(x, weight.T)

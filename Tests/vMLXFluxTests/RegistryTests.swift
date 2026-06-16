@@ -132,6 +132,15 @@ final class RegistryTests: XCTestCase {
         try await engine.load(name: "ideogram", modelPath: model)
     }
 
+    func testIdeogramLoadAcceptsRequiredNF4Components() async throws {
+        let model = try makeTemporaryIdeogramBundle(
+            includeUnconditionalTransformer: true,
+            useNF4Quantization: true)
+        let engine = FluxEngine()
+
+        try await engine.load(name: "ideogram", modelPath: model)
+    }
+
     func testEngineGenerateRequiresLoad() async {
         let engine = FluxEngine()
         let request = ImageGenRequest(
@@ -215,13 +224,18 @@ final class RegistryTests: XCTestCase {
             to: url.deletingLastPathComponent().appendingPathComponent("0.safetensors"))
     }
 
-    private func makeTemporaryIdeogramBundle(includeUnconditionalTransformer: Bool) throws -> URL {
+    private func makeTemporaryIdeogramBundle(
+        includeUnconditionalTransformer: Bool,
+        useNF4Quantization: Bool = false
+    ) throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("vmlx-flux-ideogram-tests-\(UUID().uuidString)", isDirectory: true)
         addTeardownBlock {
             try? FileManager.default.removeItem(at: root)
         }
-        let model = root.appendingPathComponent("ideogram-4-fp8", isDirectory: true)
+        let model = root.appendingPathComponent(
+            useNF4Quantization ? "ideogram-4-nf4" : "ideogram-4-fp8",
+            isDirectory: true)
         let fm = FileManager.default
         try fm.createDirectory(
             at: model.appendingPathComponent("tokenizer", isDirectory: true),
@@ -237,26 +251,20 @@ final class RegistryTests: XCTestCase {
             ],
             component: "text_encoder",
             model: model)
+        let transformerPrefixes = [
+            "input_proj",
+            "llm_cond_proj",
+            "layers.0.attention.qkv",
+            "layers.33.feed_forward.w3",
+            "final_layer.linear",
+        ]
         try writeSafetensor(
-            keys: [
-                "input_proj.weight",
-                "input_proj.weight_scale",
-                "llm_cond_proj.weight",
-                "layers.0.attention.qkv.weight",
-                "layers.33.feed_forward.w3.weight",
-                "final_layer.linear.weight",
-            ],
+            keys: ideogramLinearKeys(prefixes: transformerPrefixes, useNF4Quantization: useNF4Quantization),
             component: "transformer",
             model: model)
         if includeUnconditionalTransformer {
             try writeSafetensor(
-                keys: [
-                    "input_proj.weight",
-                    "input_proj.weight_scale",
-                    "layers.0.attention.qkv.weight",
-                    "layers.33.feed_forward.w3.weight",
-                    "final_layer.linear.weight",
-                ],
+                keys: ideogramLinearKeys(prefixes: transformerPrefixes, useNF4Quantization: useNF4Quantization),
                 component: "unconditional_transformer",
                 model: model)
         }
@@ -269,6 +277,23 @@ final class RegistryTests: XCTestCase {
             component: "vae",
             model: model)
         return model
+    }
+
+    private func ideogramLinearKeys(prefixes: [String], useNF4Quantization: Bool) -> [String] {
+        prefixes.flatMap { prefix -> [String] in
+            if useNF4Quantization {
+                return [
+                    "\(prefix).weight",
+                    "\(prefix).weight.absmax",
+                    "\(prefix).weight.quant_map",
+                    "\(prefix).weight.quant_state.bitsandbytes__nf4",
+                ]
+            }
+            return [
+                "\(prefix).weight",
+                "\(prefix).weight_scale",
+            ]
+        }
     }
 
     private func writeSafetensor(keys: [String], component: String, model: URL) throws {

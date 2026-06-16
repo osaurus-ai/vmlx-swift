@@ -13,7 +13,8 @@ contract osaurus implements server-side and the UI builds against.
 > Status: the engine is real on Osaurus `vmlx-origin/main` runtime-proof
 > baseline `a188a2ccecc92c8a5993506acc83df16f83c7420`. Fresh live proof exists
 > for `z-image-turbo` 4/8-bit, `flux1-schnell` 4/8-bit, `qwen-image` 4/6-bit,
-> `qwen-image-edit` q4/q5, and staged `ideogram-4-fp8`. Load matrix:
+> `qwen-image-edit` q4/q5, staged `ideogram-4-fp8`, and staged
+> `ideogram-4-nf4`. Load matrix:
 > `docs/local/vmlx-flux-probes/2026-06-16-current-a188-load-matrix/compatibility-matrix.json`.
 > Generation/edit artifact roots:
 > `docs/local/vmlx-flux-probes/2026-06-16-current-a188-zimage-4bit-gen/`,
@@ -25,6 +26,8 @@ contract osaurus implements server-side and the UI builds against.
 > `2026-06-16-current-a188-qwen-edit-q4-gen20/`,
 > `2026-06-16-current-a188-qwen-edit-q5-gen20/`, and
 > `2026-06-16-current-a188-ideogram-fp8-object-strict/`.
+> NF4 follow-up artifact:
+> `docs/local/vmlx-flux-probes/2026-06-16-ideogram-nf4-strict-object/`.
 > Expose only proven local variants for normal testing. Keep qwen-edit q3
 > blocked because its text-encoder index references missing
 > `text_encoder/3.safetensors`; keep q6 blocked until its local bundle is
@@ -32,11 +35,17 @@ contract osaurus implements server-side and the UI builds against.
 > reference exposes no qwen mask path. qwen-edit q5 is cleanest; q4 is
 > deterministic and color-prompt-sensitive but weaker on shape-changing edits.
 > Ideogram fp8 is implemented/testable for the staged mirror with typography
-> and strict clean object-icon proof. Boundary: a broader current-a188 "no text"
-> apple prompt hallucinated text, so do not present it as a general clean object
-> renderer yet. Official `ideogram-ai/*` downloads still require approval for
-> the current account (`hf download ... --dry-run` returned access denied for
-> both fp8 and nf4 on 2026-06-16), and nf4 is not staged/proven.
+> and strict clean object-icon proof. Ideogram NF4 is implemented/testable for
+> the staged `cocktailpeanut/ideogram-4-nf4` mirror with strict 512px
+> object-icon proof: apple/repeat SHA
+> `76cd995b90d4ad85140418ae1d3a8a44bc688d03840041ff93ff2cd006e748df`,
+> mountains SHA
+> `302ffe06596c718df6a118a56bcc0e8ec7437edee1dc9ba1656d0cd5d2052425`.
+> Boundary: a broader current-a188 fp8 "no text" apple prompt hallucinated
+> text, so do not present Ideogram as a general clean object renderer yet.
+> Official `ideogram-ai/*` downloads still require approval for the current
+> account (`hf download ... --dry-run` returned access denied for both fp8 and
+> nf4 on 2026-06-16).
 > Multi-image qwen-edit proof: vMLX source includes ordered
 > `ImageEditRequest.sourceImages`. q4 artifact:
 > `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-multi-image-live/Qwen-Image-Edit-mflux-q4-load.json`;

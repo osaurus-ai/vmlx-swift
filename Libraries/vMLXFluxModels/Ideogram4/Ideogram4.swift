@@ -1,4 +1,5 @@
 import Foundation
+@preconcurrency import MLX
 import vMLXFluxKit
 
 // Ideogram 4 — open-weights text-to-image (strong typography/text rendering).
@@ -11,11 +12,10 @@ import vMLXFluxKit
 // intermediate 12288, in_channels 128, llm_features_dim 4096*13 = multi-layer
 // Qwen3 hidden states, rope_theta 5e6, adaLN_dim 512), and a VAE.
 //
-// NOTE: ideogram-4 uses **fp8 quantization** (mflux fp8_linear) for the
-// transformer — a DIFFERENT quant path than the MLX group-quant (weight/
-// scales/biases) that flux/qwen/z-image use via MFluxStore. The fp8 path is
-// source-wired for the staged mirror bundle. Typography has current live proof;
-// broader UI/API promotion still requires coherent object-scene proof.
+// NOTE: ideogram-4 uses fp8 or bitsandbytes NF4 quantization for transformer
+// linears — different paths than the MLX group-quant (weight/scales/biases)
+// that flux/qwen/z-image use via MFluxStore. Typography has current fp8 live
+// proof; strict object-icon prompts have current fp8 and NF4 live proof.
 
 public final class Ideogram4: ImageGenerator, @unchecked Sendable {
     public static let _register: Void = {
@@ -103,7 +103,6 @@ enum Ideogram4BundleValidator {
         ],
         "transformer": [
             "input_proj.weight",
-            "input_proj.weight_scale",
             "llm_cond_proj.weight",
             "layers.0.attention.qkv.weight",
             "layers.33.feed_forward.w3.weight",
@@ -111,7 +110,7 @@ enum Ideogram4BundleValidator {
         ],
         "unconditional_transformer": [
             "input_proj.weight",
-            "input_proj.weight_scale",
+            "llm_cond_proj.weight",
             "layers.0.attention.qkv.weight",
             "layers.33.feed_forward.w3.weight",
             "final_layer.linear.weight",
@@ -120,6 +119,23 @@ enum Ideogram4BundleValidator {
             "decoder.conv_in.weight",
             "decoder.conv_out.weight",
             "post_quant_conv.weight",
+        ],
+    ]
+
+    private static let requiredQuantizedLinearsByComponent: [String: [String]] = [
+        "transformer": [
+            "input_proj",
+            "llm_cond_proj",
+            "layers.0.attention.qkv",
+            "layers.33.feed_forward.w3",
+            "final_layer.linear",
+        ],
+        "unconditional_transformer": [
+            "input_proj",
+            "llm_cond_proj",
+            "layers.0.attention.qkv",
+            "layers.33.feed_forward.w3",
+            "final_layer.linear",
         ],
     ]
 
@@ -141,10 +157,26 @@ enum Ideogram4BundleValidator {
             for key in requiredWeightsByComponent[component, default: []] where weights[key] == nil {
                 reasons.append("missing \(component) weight \(key)")
             }
+            for prefix in requiredQuantizedLinearsByComponent[component, default: []] {
+                if hasFp8Linear(prefix, in: weights) || hasNF4Linear(prefix, in: weights) {
+                    continue
+                }
+                reasons.append("missing \(component) quant metadata for \(prefix) (fp8 weight_scale or bitsandbytes NF4 absmax/quant_map/state)")
+            }
         }
 
         if !reasons.isEmpty {
             throw FluxError.localModelIncomplete(modelPath, reasons: reasons)
         }
+    }
+
+    private static func hasFp8Linear(_ prefix: String, in weights: [String: MLXArray]) -> Bool {
+        weights["\(prefix).weight_scale"] != nil
+    }
+
+    private static func hasNF4Linear(_ prefix: String, in weights: [String: MLXArray]) -> Bool {
+        weights["\(prefix).weight.absmax"] != nil &&
+            weights["\(prefix).weight.quant_map"] != nil &&
+            weights["\(prefix).weight.quant_state.bitsandbytes__nf4"] != nil
     }
 }
