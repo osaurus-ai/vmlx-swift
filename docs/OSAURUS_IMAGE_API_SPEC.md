@@ -10,26 +10,26 @@ determinate progress bar so users always see "step N / M" and never a stuck spin
 field below maps to an engine request/event — see the mapping notes. This is the
 contract osaurus implements server-side and the UI builds against.
 
-> Status: the engine is real on Osaurus `vmlx-origin/main` runtime-proof
-> baseline `03a68ad70bfc3cff5363ef263cf773eab3aa34a8`. Current-head load proof
-> exists for all local loadable image rows at
-> `docs/local/vmlx-flux-probes/2026-06-16-current-03a-load-matrix/compatibility-matrix.json`.
+> Status: the engine is real on Osaurus `vmlx-origin/main`. Current scanner/load
+> proof exists for all local image rows at
+> `docs/local/vmlx-flux-probes/2026-06-16-current-post3305-status-load-matrix/compatibility-matrix.json`
+> (12 scanned, 10 loaded, qwen-edit q3/q6 blocked before load with explicit
+> missing-shard/component reasons).
+> Current 3305 live generation/edit proof exists for `z-image-turbo` 4/8-bit,
+> `flux1-schnell` 4/8-bit, `qwen-image` 4-bit, `qwen-image-edit` q5, and
+> staged `ideogram-4-nf4`:
+> `docs/local/vmlx-flux-probes/2026-06-16-current-3305-zimage-4bit-gen/`,
+> `2026-06-16-current-3305-zimage-8bit-gen/`,
+> `2026-06-16-current-3305-flux-schnell-4bit-gen/`,
+> `2026-06-16-current-3305-flux-schnell-8bit-gen/`,
+> `2026-06-16-current-3305-qwen-image-4bit-gen20/`,
+> `2026-06-16-current-3305-qwen-edit-q5-gen20/`, and
+> `2026-06-16-current-3305-ideogram-nf4-object-strict/`.
 > Current 03a live generation/edit proof exists for `qwen-image` 6-bit,
 > `qwen-image-edit` q4, and staged `ideogram-4-fp8`:
 > `docs/local/vmlx-flux-probes/2026-06-16-current-03a-qwen-image-6bit-gen20/`,
 > `2026-06-16-current-03a-qwen-edit-q4-gen20/`, and
 > `2026-06-16-current-03a-ideogram-fp8-object-strict/`.
-> Current 5c7 generation/edit proof still covers `z-image-turbo` 4/8-bit,
-> `flux1-schnell` 4/8-bit, `qwen-image` 4-bit, `qwen-image-edit` q5, and staged
-> `ideogram-4-nf4`; commits after 5c7 only changed docs/probe status text, not
-> those native runtime paths. Current 5c7 artifact roots:
-> `docs/local/vmlx-flux-probes/2026-06-16-current-5c7-zimage-4bit-gen/`,
-> `2026-06-16-current-5c7-zimage-8bit-gen/`,
-> `2026-06-16-current-5c7-flux-schnell-4bit-gen/`,
-> `2026-06-16-current-5c7-flux-schnell-8bit-gen/`,
-> `2026-06-16-current-5c7-qwen-image-4bit-gen20/`,
-> `2026-06-16-current-5c7-qwen-edit-q5-gen20/`, and
-> `2026-06-16-ideogram-nf4-strict-object/`.
 > Expose only proven local variants for normal testing. Keep qwen-edit q3
 > blocked because its text-encoder index references missing
 > `text_encoder/3.safetensors`; keep q6 blocked until its local bundle is
