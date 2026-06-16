@@ -329,11 +329,26 @@ eval hot path).
 | qwen-image-edit | ✅ q4 text-image edit proven; q3 incomplete | ✅ q5 text-image edit proven; q6 incomplete | (not staged) | (not staged) |
 Proven rows are deterministic (same seed+prompt -> identical), prompt-sensitive,
 and coherent. z-image-turbo and flux1-schnell 8-bit and 4-bit produce visibly
-distinct images (genuine quant), ~3-4s/512px/4-step. qwen-image q4/q6 are
-live-proven text-to-image rows; qwen-image 8-bit remains unproven because no
-public mflux 8-bit bundle was found in the current HF search. qwen-image-edit
-q4/q5 are live-proven text-image edit rows after the VL-grid conditioning fix;
-q3/q6 and masks remain unpromoted as above.
+distinct images (genuine quant), ~3-4s/512px/4-step. qwen-image 4-bit and
+6-bit are live-proven text-to-image rows; qwen-image 8-bit remains unproven
+because no public mflux 8-bit bundle was found in the current HF search.
+qwen-image-edit q4/q5 are live-proven text-image edit rows after the VL-grid
+conditioning fix; q3/q6 and masks remain unpromoted as above.
+
+Current-main refresh after PR #67: `vmlx-origin/main`
+`9f1faea11aee78f17041c5bed6da039e70c11d05` was rebuilt and live-probed from
+`/Users/eric/vmlx-swift-fluxwt`. `swift test --filter vMLXFluxTests` passed 48
+tests with 0 failures. Fresh artifacts:
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-zimage-4bit/`,
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-zimage-8bit/`,
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-flux-schnell-4bit/`,
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-flux-schnell-8bit/`,
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-qwen-image-4bit/`,
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-qwen-image-6bit/`,
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-qwen-edit-q4/`, and
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-qwen-edit-q5/`. Viewed
+contact sheet:
+`docs/local/vmlx-flux-outputs/2026-06-16-current-main-contact-sheet.png`.
 
 **Model-resolution bug fixed:** `MLXStudioModelStore.resolve(name:)` normalized away the
 `-Nbit` suffix, so requesting `...-8bit` collapsed onto a co-installed `...-4bit` dir
@@ -475,15 +490,17 @@ seeds, and the CFG path. z-image-turbo is **production-compatible** — the May-
 
 ## 12. Open work / follow-ups (prioritized)
 
-1. Land + commit the vendored engine in vmlx-swift (local-only fork — never pushed)
-   and push the ahead-of-repo native work (ZImageNative, LocalModelStore, probe,
-   loader edits) back to `jjang-ai/vmlx-flux`.
-2. Prove z-image-turbo prompt-sensitivity live (§11); promote to production-compatible.
-3. Port the shared T5-XXL + CLIP-L encoders → unblocks Flux1/Flux2/Qwen at once.
-4. Qwen-Image-Edit follow-through: q4/q5 text-image edit is live-proven after
+1. Wire the osaurus app/server bridge: `/v1/images/models`,
+   `/v1/images/generations`, `/v1/images/edits`, progress SSE, output path
+   policy, exact directory-name resolution, and the required `MetalGate`
+   exclusion around the full stream drain.
+2. Ideogram 4 native generation: Qwen3 encoder, 34-layer DiT,
+   unconditional transformer execution, VAE decode, then live image proof.
+3. Qwen-Image-Edit follow-through: q4/q5 text-image edit is live-proven after
    the VL-grid conditioning fix. Keep q3/q6 hidden/blocked until the local
    bundles are complete, and wire masks/inpaint semantics before exposing masked
    editing.
+4. Full-precision z-image/flux-schnell: stage weights, run the same current-main
+   probe matrix, and visually inspect outputs before promotion.
 5. LoRA loader hook (`supportsLoRA`), img2img/controlnet conditioning.
 6. `numImages > 1` batching; webp/jpeg writers; preview-decode cadence.
-7. Wire MetalGate exclusion in the osaurus bridge (§7) before shipping.
