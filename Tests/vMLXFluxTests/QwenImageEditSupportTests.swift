@@ -320,6 +320,47 @@ final class QwenImageEditSupportTests: XCTestCase {
         XCTAssertFalse(message.contains("notImplemented"))
     }
 
+    func testQwenImageEditRejectsMaskBeforePipelineLoad() async throws {
+        let model = try makeTemporaryQwenImageEditBundle()
+        let source = try makePNG(width: 64, height: 64)
+        let mask = try makePNG(width: 64, height: 64)
+        let outputDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-edit-output-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: outputDir)
+        }
+
+        let editor = try QwenImageEdit(modelPath: model, quantize: 4)
+        let request = ImageEditRequest(
+            prompt: "make the apple blue",
+            sourceImage: source,
+            mask: mask,
+            width: nil,
+            height: nil,
+            steps: 4,
+            guidance: 4.0,
+            outputDir: outputDir)
+
+        var failedMessage: String?
+        var emittedNonFailureEvent = false
+        do {
+            for try await event in editor.edit(request) {
+                switch event {
+                case .failed(let message, _):
+                    failedMessage = message
+                default:
+                    emittedNonFailureEvent = true
+                }
+            }
+        } catch {
+            XCTFail("edit stream should report unsupported masks as failed events, got throw: \(error)")
+        }
+
+        let message = try XCTUnwrap(failedMessage)
+        XCTAssertTrue(message.contains("QwenImageEdit masks are not wired yet"))
+        XCTAssertFalse(emittedNonFailureEvent)
+    }
+
     private func makePNG(
         width: Int,
         height: Int,

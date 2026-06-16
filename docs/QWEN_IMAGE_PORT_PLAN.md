@@ -34,6 +34,8 @@ Shape proof:
 (`combined_velocity_shape=1x1600x64`). Do not expose q3 because its
 text-encoder index references missing `text_encoder/3.safetensors`; keep q6
 blocked until its local bundle is complete, and masks/inpaint are not wired yet.
+Current Qwen edit rejects non-null `mask` before the pipeline loads; keep the UI
+mask control hidden until real mask conditioning lands.
 
 The sections below are the grounded port notes and transcription record. Older
 "next" checkboxes may describe the sequence that produced the current native

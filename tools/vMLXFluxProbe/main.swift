@@ -156,6 +156,7 @@ struct VMLXFluxProbe {
             "width_explicit": options.widthExplicit,
             "height_explicit": options.heightExplicit,
             "source_image": options.sourceImage?.path ?? NSNull(),
+            "mask_image": options.maskImage?.path ?? NSNull(),
             "steps": options.steps,
             "seed": options.seed.map { $0 as Any } ?? NSNull(),
         ]
@@ -242,7 +243,7 @@ struct VMLXFluxProbe {
                     let request = ImageEditRequest(
                         prompt: prompt,
                         sourceImage: sourceImage,
-                        mask: nil,
+                        mask: options.maskImage,
                         strength: options.strength,
                         width: options.widthExplicit ? options.width : nil,
                         height: options.heightExplicit ? options.height : nil,
@@ -255,6 +256,7 @@ struct VMLXFluxProbe {
                         "turn": index + 1,
                         "prompt": prompt,
                         "source_image": sourceImage.path,
+                        "mask_image": options.maskImage?.path ?? NSNull(),
                         "started_at": isoTimestamp(turnStart),
                     ]
                     do {
@@ -744,6 +746,7 @@ struct ProbeOptions {
     var guidance: Float?
     var negativePrompt: String?
     var sourceImage: URL?
+    var maskImage: URL?
     var strength: Float = 0.75
     var turns = Self.defaultTurns
 
@@ -814,6 +817,8 @@ struct ProbeOptions {
                 negativePrompt = try Self.value(after: arg, in: arguments, index: &index)
             case "--source-image":
                 sourceImage = URL(fileURLWithPath: try Self.value(after: arg, in: arguments, index: &index))
+            case "--mask-image":
+                maskImage = URL(fileURLWithPath: try Self.value(after: arg, in: arguments, index: &index))
             case "--strength":
                 let value = try Self.value(after: arg, in: arguments, index: &index)
                 guard let parsed = Float(value) else { throw ProbeError("invalid --strength") }

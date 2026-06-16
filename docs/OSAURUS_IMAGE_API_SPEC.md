@@ -160,7 +160,11 @@ Maps to `ImageEditRequest` (`sourceImage`, `mask`, `strength`, ...). Only models
 with `capabilities.image_edit:true` accept this; else 400 `wrong model kind`.
 Current live-proven targets are `Qwen-Image-Edit-mflux-q4` and
 `Qwen-Image-Edit-mflux-q5` without masks; reject a non-null `mask` with 501 or
-hide the control until mask/inpaint wiring lands.
+hide the control until mask/inpaint wiring lands. The engine currently enforces
+this for Qwen edit by emitting a failed event before the edit pipeline loads;
+`QwenImageEditSupportTests.testQwenImageEditRejectsMaskBeforePipelineLoad`
+covers that contract, and `vmlxflux-probe --edit --mask-image <png>` records the
+same failed-event behavior against staged local bundles.
 
 ---
 
