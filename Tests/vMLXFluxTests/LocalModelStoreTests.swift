@@ -1,3 +1,4 @@
+import MLX
 import XCTest
 @testable import vMLXFlux
 @testable import vMLXFluxKit
@@ -127,6 +128,22 @@ final class LocalModelStoreTests: XCTestCase {
         } catch {
             XCTFail("wrong error: \(error)")
         }
+    }
+
+    func testWeightLoaderIncludesIdeogramUnconditionalTransformerComponent() throws {
+        let root = try makeTemporaryImageModelRoot()
+        let model = root.appendingPathComponent("ideogram-4-fp8", isDirectory: true)
+        for component in ["transformer", "text_encoder", "vae", "unconditional_transformer"] {
+            let directory = model.appendingPathComponent(component, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try MLX.save(
+                arrays: ["input_proj.weight": MLXArray([1, 2], [1, 2]).asType(.float32)],
+                url: directory.appendingPathComponent("diffusion_pytorch_model.safetensors"))
+        }
+
+        let loaded = try WeightLoader.load(from: model)
+
+        XCTAssertNotNil(loaded.componentWeights["unconditional_transformer"]?["input_proj.weight"])
     }
 
     private func makeTemporaryImageModelRoot() throws -> URL {

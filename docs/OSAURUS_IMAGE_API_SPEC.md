@@ -19,7 +19,9 @@ contract osaurus implements server-side and the UI builds against.
 > local bundle is complete, and hide mask/inpaint controls until wired.
 > Ideogram has a complete local fp8 mirror bundle staged from
 > `cocktailpeanut/ideogram-4-fp8`, and the scanner reports it as loadable
-> scaffold. Keep it disabled because the native `Ideogram4.generate` body still
+> scaffold. The shared source can now load Ideogram's
+> `unconditional_transformer` component and decode fp8 linear `weight_scale`
+> rows. Keep it disabled because the native `Ideogram4.generate` body still
 > throws `FluxError.notImplemented`, and no live generation proof exists.
 > Official `ideogram-ai/*` downloads still require approval for the current
 > account.

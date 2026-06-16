@@ -13,8 +13,10 @@ import vMLXFluxKit
 //
 // NOTE: ideogram-4 uses **fp8 quantization** (mflux fp8_linear) for the
 // transformer — a DIFFERENT quant path than the MLX group-quant (weight/
-// scales/biases) that flux/qwen/z-image use via MFluxStore. The port needs an
-// fp8 dequant/matmul path. STATUS: scaffold — generate throws notImplemented.
+// scales/biases) that flux/qwen/z-image use via MFluxStore. MFluxStore now has
+// fp8 `weight_scale` Linear support; STATUS: scaffold — generate throws
+// notImplemented until the Qwen3 encoder, DiT, unconditional transformer, and
+// VAE execution path are ported.
 
 public final class Ideogram4: ImageGenerator, @unchecked Sendable {
     public static let _register: Void = {
@@ -48,7 +50,7 @@ public final class Ideogram4: ImageGenerator, @unchecked Sendable {
         AsyncThrowingStream { continuation in
             continuation.finish(throwing: FluxError.notImplemented(
                 "Ideogram4.generate — port from mflux/models/ideogram4 "
-                    + "(Qwen3 encoder + 34-layer fp8 DiT). Needs an fp8 quant path."))
+                    + "(Qwen3 encoder + 34-layer fp8 DiT + unconditional transformer + VAE)."))
         }
     }
 }

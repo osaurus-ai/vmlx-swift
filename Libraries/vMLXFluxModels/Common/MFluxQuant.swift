@@ -2,12 +2,14 @@
 //  MFluxQuant.swift
 //  vMLXFluxModels
 //
-//  Shared building blocks for native mFLUX model ports (flux1, flux2, qwen).
+//  Shared building blocks for native mFLUX model ports (flux1, flux2, qwen,
+//  ideogram).
 //  These mirror the MLX group-quantization format that mflux's `*-mflux-{4,8}bit`
 //  bundles use for every Linear/Embedding (`weight` + `scales` + `biases`,
-//  group-quantized, bits inferred from shapes). The proven Z-Image native
-//  pipeline uses an equivalent private store; this is the reusable extraction so
-//  flux/qwen don't re-implement quant handling. Plain (non-quantized) params
+//  group-quantized, bits inferred from shapes), plus Ideogram fp8 Linear
+//  weights (`weight` + `weight_scale`). The proven Z-Image native pipeline uses
+//  an equivalent private store; this is the reusable extraction so flux/qwen/
+//  ideogram don't re-implement quant handling. Plain (non-quantized) params
 //  (layer norms, conv bias) are loaded as-is.
 //
 
@@ -64,6 +66,7 @@ final class MFluxStore {
             weight: tensor(component, "\(prefix).weight"),
             scales: optionalTensor(component, "\(prefix).scales"),
             biases: optionalTensor(component, "\(prefix).biases"),
+            weightScale: optionalTensor(component, "\(prefix).weight_scale"),
             bias: bias ? optionalTensor(component, "\(prefix).bias") : nil,
             inputDimensions: inputDimensions,
             outputDimensions: outputDimensions,
@@ -132,12 +135,14 @@ final class MFluxStore {
 
 // MARK: - Layers
 
-/// Linear that runs quantized matmul when `scales` is present, else dense matmul.
-/// Bits + group size are inferred from the packed `weight`/`scales` shapes.
+/// Linear that runs group-quantized matmul when `scales` is present, fp8 decode
+/// when `weight_scale` is present, else dense matmul. Bits + group size are
+/// inferred from the packed `weight`/`scales` shapes.
 final class MFluxLinear {
     private let weight: MLXArray
     private let scales: MLXArray?
     private let biases: MLXArray?
+    private let weightScale: MLXArray?
     private let bias: MLXArray?
     private let groupSize: Int
     private let bits: Int
@@ -146,6 +151,7 @@ final class MFluxLinear {
         weight: MLXArray,
         scales: MLXArray?,
         biases: MLXArray?,
+        weightScale: MLXArray?,
         bias: MLXArray?,
         inputDimensions: Int,
         outputDimensions: Int,
@@ -154,11 +160,24 @@ final class MFluxLinear {
         guard weight.dim(0) == outputDimensions else {
             throw FluxError.invalidRequest("\(name) output mismatch: weight=\(weight.shape), expected output \(outputDimensions)")
         }
+        if scales != nil, weightScale != nil {
+            throw FluxError.invalidRequest("\(name) has both group quant scales and fp8 weight_scale")
+        }
         self.weight = weight
         self.scales = scales
         self.biases = biases
+        self.weightScale = weightScale
         self.bias = bias
-        if scales != nil {
+        if let weightScale {
+            guard weight.dim(1) == inputDimensions else {
+                throw FluxError.invalidRequest("\(name) fp8 input mismatch: weight=\(weight.shape), expected input \(inputDimensions)")
+            }
+            guard weightScale.shape == [outputDimensions] else {
+                throw FluxError.invalidRequest("\(name) invalid fp8 weight_scale \(weightScale.shape), expected [\(outputDimensions)]")
+            }
+            self.bits = 0
+            self.groupSize = 0
+        } else if scales != nil {
             var inferred: Int?
             for candidate in [2, 3, 4, 5, 6, 8] where weight.dim(1) * 32 / candidate == inputDimensions {
                 inferred = candidate; break
@@ -186,6 +205,9 @@ final class MFluxLinear {
         if let scales {
             y = quantizedMM(x, weight, scales: scales, biases: biases,
                             transpose: true, groupSize: groupSize, bits: bits, mode: .affine)
+        } else if let weightScale {
+            let decoded = MLX.fromFP8(weight, dtype: .float32) * weightScale.asType(.float32)[0..., .newAxis]
+            y = matmul(x.asType(.float32), decoded.T)
         } else {
             y = matmul(x, weight.T)
         }
