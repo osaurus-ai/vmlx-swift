@@ -156,8 +156,6 @@ public class Olmo3ModelInner: Module {
     let gaIdx: Int
 
     init(_ args: Olmo3Configuration) {
-        precondition(args.vocabularySize > 0)
-
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -297,6 +295,8 @@ public struct Olmo3Configuration: Codable, Sendable {
             self.attentionBias = attentionBias
         }
 
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+
         // Decode layer_types or generate default
         if let layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes) {
             self.layerTypes = layerTypes
@@ -314,6 +314,85 @@ public struct Olmo3Configuration: Codable, Sendable {
             Bool.self, forKey: .tieWordEmbeddings)
         {
             self.tieWordEmbeddings = tieWordEmbeddings
+        }
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try Self.validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+        try Self.validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try Self.validatePositive(slidingWindow, key: .slidingWindow, in: container)
+        try Self.validatePositive(ropeTheta, key: .ropeTheta, in: container)
+
+        if let headDimensions {
+            try Self.validatePositive(headDimensions, key: .headDimensions, in: container)
+        }
+
+        guard hiddenSize == attentionHeads * _headDimensions else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "Olmo3 hidden_size must equal num_attention_heads * head_dim.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription: "Olmo3 num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard layerTypes.count == hiddenLayers else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layerTypes,
+                in: container,
+                debugDescription: "Olmo3 layer_types count must equal num_hidden_layers.")
+        }
+        guard layerTypes.allSatisfy({ $0 == "full_attention" || $0 == "sliding_attention" }) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layerTypes,
+                in: container,
+                debugDescription:
+                    "Olmo3 layer_types entries must be full_attention or sliding_attention.")
+        }
+        if let factor = ropeScaling?["factor"]?.asFloat() {
+            guard factor.isFinite, factor > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling,
+                    in: container,
+                    debugDescription: "Olmo3 rope_scaling.factor must be finite and > 0.")
+            }
+        }
+    }
+
+    private static func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Olmo3 \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private static func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Olmo3 \(key.rawValue) must be finite and > 0.")
         }
     }
 }

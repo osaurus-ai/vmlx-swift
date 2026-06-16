@@ -55,6 +55,7 @@ require_tracked() {
 
 is_allowed_push_path() {
   case "$1" in
+    .gitignore) return 0 ;;
     AGENTS.md) return 0 ;;
     Libraries/MLXLMCommon/ReasoningParser.swift) return 0 ;;
     Tests/MLXLMCommonFocusedTests/Gemma4ThoughtChannelParserFocusedTests.swift) return 0 ;;
@@ -63,12 +64,19 @@ is_allowed_push_path() {
     scripts/vmlx-push-readiness-scope-check.sh) return 0 ;;
     scripts/vmlx-osaurus-release-readiness-audit.sh) return 0 ;;
     scripts/vmlx-release-dirty-scope-classifier.sh) return 0 ;;
+    scripts/vmlx-family-matrix-coverage-check.sh) return 0 ;;
+    scripts/vmlx-downloaded-model-inventory-check.sh) return 0 ;;
+    scripts/vmlx-ram-footprint-proof-boundary-check.sh) return 0 ;;
+    scripts/vmlx-reasoning-visible-boundary-check.sh) return 0 ;;
     .agents/vmlx-osaurus/codex/PROGRESS.md) return 0 ;;
     .agents/vmlx-osaurus/codex/TEST-RESULTS.md) return 0 ;;
     .agents/vmlx-osaurus/codex/MATRIX-LEDGER.md) return 0 ;;
     .agents/vmlx-osaurus/codex/PR-READINESS.md) return 0 ;;
-    .agents/vmlx-osaurus/codex/2026-05-24-*.md) return 0 ;;
-    .agents/vmlx-osaurus/codex/outbox/2026-05-24-*.md) return 0 ;;
+    .agents/vmlx-osaurus/codex/PR-COMMENT-CURRENT.md) return 0 ;;
+    .agents/vmlx-osaurus/codex/PR-PROOF-CHECKLIST.md) return 0 ;;
+    .agents/vmlx-osaurus/codex/RELEASE-READINESS.md) return 0 ;;
+    .agents/vmlx-osaurus/codex/2026-05-*.md) return 0 ;;
+    .agents/vmlx-osaurus/codex/outbox/2026-05-*.md) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -105,7 +113,7 @@ require_text "$ROOT/Tests/MLXLMCommonFocusedTests/Gemma4ThoughtChannelParserFocu
 
 echo "--- proof artifacts ---"
 QWEN_DIR="${VMLX_QWEN_PROOF_DIR:-/tmp/vmlx-qwen35-jangtq-turnmatrix-post-vlfix-20260524-1545}"
-GEMMA_DIR="${VMLX_GEMMA_PROOF_DIR:-/tmp/vmlx-gemma4-turnmatrix-post-thoughtfix-20260524}"
+GEMMA_DIR="${VMLX_GEMMA_PROOF_DIR:-/tmp/vmlx-gemma4-turnmatrix-current-20260524-1516}"
 require_file "$QWEN_DIR/REPORT.md" "Qwen proof REPORT"
 require_file "$GEMMA_DIR/REPORT.md" "Gemma proof REPORT"
 require_clean_status "$QWEN_DIR" "Qwen proof"

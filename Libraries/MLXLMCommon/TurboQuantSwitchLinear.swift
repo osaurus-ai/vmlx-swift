@@ -45,7 +45,8 @@ public class TurboQuantSwitchLinear: Module {
 
     public init(
         inFeatures: Int, outFeatures: Int, numExperts: Int,
-        bits: Int = 2, seed: Int = 42
+        bits: Int = 2, seed: Int = 42,
+        useStreamingPlaceholders: Bool = false
     ) {
         self.inFeatures = inFeatures
         self.outFeatures = outFeatures
@@ -55,7 +56,7 @@ public class TurboQuantSwitchLinear: Module {
         let valsPerU32 = 32 / bits
         let packedCols = (inFeatures + valsPerU32 - 1) / valsPerU32
         // Initialize with zeros — the loader will overwrite with real data.
-        if JANGTQStreamingExperts.isEnabled {
+        if useStreamingPlaceholders || JANGTQStreamingExperts.isEnabled {
             self._packed.wrappedValue = MLXArray.zeros([1, 1, 1], dtype: .uint32)
             self._norms.wrappedValue  = MLXArray.zeros([1, 1], dtype: .float16)
         } else {
@@ -69,15 +70,11 @@ public class TurboQuantSwitchLinear: Module {
     /// fused gate+up+SwiGLU + down path, use `TurboQuantSwitchGLU` which
     /// dispatches the two specialized kernels in one chain.
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
-        // Look up signs + codebook from the runtime cache.
-        guard let signs = JANGTQRuntimeCache.shared.signs(inFeatures: inFeatures, seed: mxtqSeed)
-        else {
-            fatalError("JANGTQ runtime sidecar not loaded for inFeatures=\(inFeatures), seed=\(mxtqSeed)")
-        }
-        guard let codebook = JANGTQRuntimeCache.shared.codebook(inFeatures: inFeatures, bits: bits)
-        else {
-            fatalError("JANGTQ codebook missing for inFeatures=\(inFeatures), bits=\(bits)")
-        }
+        // Look up or deterministically materialize signs + codebook from the runtime cache.
+        let signs = JANGTQRuntimeCache.shared.requiredSigns(
+            inFeatures: inFeatures, seed: mxtqSeed)
+        let codebook = JANGTQRuntimeCache.shared.requiredCodebook(
+            inFeatures: inFeatures, bits: bits)
 
         // Hadamard rotate input — accepts shape (..., in_features), returns fp32.
         let xRot = JANGTQKernels.hadamardRotate(x, signs: signs, dim: inFeatures)
@@ -159,7 +156,8 @@ public class TurboQuantSwitchGLU: Module {
     public init(
         inputDims: Int, hiddenDims: Int, numExperts: Int,
         gateUpBits: Int, downBits: Int, seed: Int = 42,
-        swigluLimit: Float = 0.0
+        swigluLimit: Float = 0.0,
+        useStreamingPlaceholders: Bool = false
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
@@ -170,15 +168,18 @@ public class TurboQuantSwitchGLU: Module {
         self.swigluLimit = swigluLimit
         self._gateProj.wrappedValue = TurboQuantSwitchLinear(
             inFeatures: inputDims, outFeatures: hiddenDims,
-            numExperts: numExperts, bits: gateUpBits, seed: seed
+            numExperts: numExperts, bits: gateUpBits, seed: seed,
+            useStreamingPlaceholders: useStreamingPlaceholders
         )
         self._upProj.wrappedValue = TurboQuantSwitchLinear(
             inFeatures: inputDims, outFeatures: hiddenDims,
-            numExperts: numExperts, bits: gateUpBits, seed: seed
+            numExperts: numExperts, bits: gateUpBits, seed: seed,
+            useStreamingPlaceholders: useStreamingPlaceholders
         )
         self._downProj.wrappedValue = TurboQuantSwitchLinear(
             inFeatures: hiddenDims, outFeatures: inputDims,
-            numExperts: numExperts, bits: downBits, seed: seed
+            numExperts: numExperts, bits: downBits, seed: seed,
+            useStreamingPlaceholders: useStreamingPlaceholders
         )
         super.init()
     }
@@ -221,21 +222,14 @@ public class TurboQuantSwitchGLU: Module {
         // (gate=2 / up=2 / down=4) loads the right table for each
         // dispatch. Uniform-bit bundles fall through with
         // gateUpBits == downBits, matching the legacy single-bits path.
-        let signsIn = JANGTQRuntimeCache.shared.signs(inFeatures: inputDims, seed: mxtqSeed)
-        let signsDn = JANGTQRuntimeCache.shared.signs(inFeatures: hiddenDims, seed: mxtqSeed)
-        let cbGate = JANGTQRuntimeCache.shared.codebook(inFeatures: inputDims, bits: gateUpBits)
-        let cbDown = JANGTQRuntimeCache.shared.codebook(inFeatures: hiddenDims, bits: downBits)
-        guard let signsIn, let signsDn, let cbGate, let cbDown else {
-            let missing = [
-                signsIn == nil ? "signs.\(inputDims).\(mxtqSeed)" : nil,
-                signsDn == nil ? "signs.\(hiddenDims).\(mxtqSeed)" : nil,
-                cbGate == nil ? "codebook.\(inputDims).\(gateUpBits)" : nil,
-                cbDown == nil ? "codebook.\(hiddenDims).\(downBits)" : nil,
-            ].compactMap { $0 }.joined(separator: ", ")
-            fatalError(
-                "JANGTQ runtime sidecar is missing required array(s): \(missing). "
-                + "Confirm mxtq_gate_up_bits/mxtq_down_bits match the bundle sidecar.")
-        }
+        let signsIn = JANGTQRuntimeCache.shared.requiredSigns(
+            inFeatures: inputDims, seed: mxtqSeed)
+        let signsDn = JANGTQRuntimeCache.shared.requiredSigns(
+            inFeatures: hiddenDims, seed: mxtqSeed)
+        let cbGate = JANGTQRuntimeCache.shared.requiredCodebook(
+            inFeatures: inputDims, bits: gateUpBits)
+        let cbDown = JANGTQRuntimeCache.shared.requiredCodebook(
+            inFeatures: hiddenDims, bits: downBits)
 
         // The decode broadcast pattern: x has shape (batch, seq, hidden),
         // indices has shape (batch, seq, K). Each token uses K experts.
@@ -349,3 +343,5 @@ public class TurboQuantSwitchGLU: Module {
         return y.reshaped(outShape).asType(x.dtype)
     }
 }
+
+extension TurboQuantSwitchGLU: SwitchGLULayer {}

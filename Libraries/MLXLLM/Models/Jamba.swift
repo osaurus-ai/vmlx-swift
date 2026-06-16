@@ -93,18 +93,157 @@ public struct JambaConfiguration: Codable, Sendable {
         self.tieWordEmbeddings =
             try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? true
 
-        // Post-initialization logic
+        try validateDecodedFields(container: container)
 
-        // If mambaDtRank is nil, calculate it
         if self.mambaDtRank == nil {
             self.mambaDtRank = Int((Double(self.hiddenSize) / 16.0).rounded(.up))
         }
 
-        // If layersBlockType is nil, generate it based on layer configuration
         if self.layersBlockType == nil {
             self.layersBlockType = (0 ..< self.numHiddenLayers).map { i in
                 (i % self.attnLayerPeriod == self.attnLayerOffset) ? "attention" : "mamba"
             }
+        }
+
+        try validateDerivedFields(container: container)
+    }
+
+    private func validateDecodedFields(
+        container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(numHiddenLayers, key: .numHiddenLayers, in: container)
+        try validatePositive(numAttentionHeads, key: .numAttentionHeads, in: container)
+        try validatePositive(numKeyValueHeads, key: .numKeyValueHeads, in: container)
+        try validatePositive(mambaDConv, key: .mambaDConv, in: container)
+        try validatePositive(mambaDState, key: .mambaDState, in: container)
+        try validatePositive(mambaExpand, key: .mambaExpand, in: container)
+        try validatePositive(numExperts, key: .numExperts, in: container)
+        try validatePositive(numExpertsPerTok, key: .numExpertsPerTok, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try validatePositive(vocabSize, key: .vocabSize, in: container)
+
+        if attnLayerPeriod <= 0 || expertLayerPeriod <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .attnLayerPeriod,
+                in: container,
+                debugDescription: "Jamba attn_layer_period and expert_layer_period must be positive."
+            )
+        }
+
+        if attnLayerOffset < 0 || attnLayerOffset >= attnLayerPeriod {
+            throw DecodingError.dataCorruptedError(
+                forKey: .attnLayerOffset,
+                in: container,
+                debugDescription: "Jamba attn_layer_offset must be >= 0 and less than attn_layer_period."
+            )
+        }
+
+        if expertLayerOffset < 0 || expertLayerOffset >= expertLayerPeriod {
+            throw DecodingError.dataCorruptedError(
+                forKey: .expertLayerOffset,
+                in: container,
+                debugDescription: "Jamba expert_layer_offset must be >= 0 and less than expert_layer_period."
+            )
+        }
+
+        if hiddenSize % numAttentionHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "Jamba hidden_size must be divisible by num_attention_heads."
+            )
+        }
+
+        if numAttentionHeads % numKeyValueHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numKeyValueHeads,
+                in: container,
+                debugDescription: "Jamba num_attention_heads must be divisible by num_key_value_heads."
+            )
+        }
+
+        if numExpertsPerTok > numExperts {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numExpertsPerTok,
+                in: container,
+                debugDescription: "Jamba num_experts_per_tok must be <= num_experts."
+            )
+        }
+    }
+
+    private func validateDerivedFields(
+        container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard let mambaDtRank, mambaDtRank > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .mambaDtRank,
+                in: container,
+                debugDescription: "Jamba mamba_dt_rank must be positive."
+            )
+        }
+
+        guard let layersBlockType else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layersBlockType,
+                in: container,
+                debugDescription: "Jamba layers_block_type must be present after config derivation."
+            )
+        }
+
+        if layersBlockType.count != numHiddenLayers {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layersBlockType,
+                in: container,
+                debugDescription: "Jamba layers_block_type count must equal num_hidden_layers."
+            )
+        }
+
+        if !layersBlockType.allSatisfy({ $0 == "attention" || $0 == "mamba" }) {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layersBlockType,
+                in: container,
+                debugDescription: "Jamba layers_block_type entries must be attention or mamba."
+            )
+        }
+
+        if !layersBlockType.contains("attention") || !layersBlockType.contains("mamba") {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layersBlockType,
+                in: container,
+                debugDescription:
+                    "Jamba layers_block_type must include at least one attention and one mamba layer."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Jamba \(key.rawValue) must be > 0."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if !value.isFinite || value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Jamba \(key.rawValue) must be finite and > 0."
+            )
         }
     }
 }
@@ -434,8 +573,6 @@ public class JambaModelInner: Module {
     let ssmIdx: Int
 
     public init(_ config: JambaConfiguration) {
-        precondition(config.vocabSize > 0)
-
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
 

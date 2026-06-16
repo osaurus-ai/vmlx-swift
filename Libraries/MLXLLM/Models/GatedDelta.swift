@@ -16,17 +16,16 @@ import MLXNN
 /// Matches Python's @mx.compile(shapeless=True) def compute_g().
 /// Called per GatedDeltaNet layer per token (~12 SSM layers in Qwen 3.5).
 ///
-/// Always compiled, regardless of `HardwareInfo.isCompiledDecodeSupported`. The broad
-/// disable of compile() targeted shape-variable prefill graphs that caused trace-cache
-/// misses; compute_g operates on tiny [numVHeads] tensors with stable shapes across
-/// every decode step, so the trace cache hits 100% of the time and there is no prefill
-/// stall to worry about. Python's mlx_lm reference compiles this exact function and
-/// gets ~17 tok/s more on Qwen 3.5-35B vs Swift's eager path.
-private let _compiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
-    compile(shapeless: true) { (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
+/// Guarded by `HardwareInfo.isCompiledDecodeSupported` because production
+/// Osaurus crash `APPLE-MACOS-54` reached `CustomKernel::eval_gpu` during
+/// Qwen3-Next prepare before the lower GatedDelta Metal kernel boundary.
+private let _compiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = { (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
         let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
         return decay.asType(a.dtype)
     }
+    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
 
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
     _compiledComputeG(aLog, a, dtBias)
@@ -190,8 +189,10 @@ func gatedDeltaKernel(
             roundStateEachStep: roundStateEachStep)
     }
 
-    guard let kernel = selectedKernel else {
-        fatalError("Gated delta kernel not available")
+    guard let kernel = selectedKernel, Dk >= 32, Dk % 32 == 0 else {
+        return gatedDeltaOps(
+            q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask,
+            roundStateEachStep: roundStateEachStep)
     }
 
     let outputs = kernel(
@@ -239,13 +240,15 @@ private func _rawStepOps(
 /// Compiled GatedDelta step — fuses ~10 ops (decay, kv_mem, delta, state update, output)
 /// into one Metal dispatch. Matches Python's @mx.compile _gated_delta_step_ops.
 /// Called per SSM layer per token (~30 layers). Without compile: 300 extra kernel launches/token.
-private let _compiledStepOps: @Sendable ([MLXArray]) -> [MLXArray] =
-    compile { (args: [MLXArray]) -> [MLXArray] in
+private let _compiledStepOps: @Sendable ([MLXArray]) -> [MLXArray] = {
+    let body: @Sendable ([MLXArray]) -> [MLXArray] = { (args: [MLXArray]) -> [MLXArray] in
         let (y, state) = _rawStepOps(
             q: args[0], k: args[1], v: args[2],
             g: args[3], beta: args[4], state: args[5])
         return [y, state]
     }
+    return HardwareInfo.isCompiledDecodeSupported ? compile(body) : body
+}()
 
 private func gatedDeltaStepOps(
     q: MLXArray,

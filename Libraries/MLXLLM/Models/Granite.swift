@@ -138,8 +138,6 @@ public class GraniteModelInner: Module {
     let embeddingMultiplier: Float
 
     public init(_ args: GraniteConfiguration) {
-        precondition(args.vocabularySize > 0)
-
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
         self.layers = (0 ..< args.hiddenLayers)
@@ -261,6 +259,81 @@ public struct GraniteConfiguration: Codable, Sendable {
         self.ropeScaling = try container.decodeIfPresent(
             [String: StringOrNumber].self, forKey: .ropeScaling)
         self.tieWordEmbeddings = try container.decode(Bool.self, forKey: .tieWordEmbeddings)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(
+        container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(logitsScaling, key: .logitsScaling, in: container)
+        try validatePositive(attentionMultiplier, key: .attentionMultiplier, in: container)
+        try validatePositive(embeddingMultiplier, key: .embeddingMultiplier, in: container)
+        try validatePositive(residualMultiplier, key: .residualMultiplier, in: container)
+        try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+
+        if hiddenSize % attentionHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "Granite hidden_size must be divisible by num_attention_heads."
+            )
+        }
+
+        if attentionHeads % kvHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "Granite num_attention_heads must be divisible by num_key_value_heads."
+            )
+        }
+
+        if let factor = ropeScaling?["factor"]?.asFloat() {
+            if !factor.isFinite || factor <= 0 {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling,
+                    in: container,
+                    debugDescription: "Granite rope_scaling.factor must be finite and > 0."
+                )
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Granite \(key.rawValue) must be > 0."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if !value.isFinite || value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Granite \(key.rawValue) must be finite and > 0."
+            )
+        }
     }
 }
 

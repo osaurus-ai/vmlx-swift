@@ -32,7 +32,33 @@ private func attentionWithCacheUpdateAndSinks(
     }
 
     if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
-        precondition(sinks == nil, "Quantized SDPA does not support attention sinks.")
+        if let sinks {
+            if let quantizedCache = cache as? QuantizedKVCache {
+                let floatCache = quantizedCache.toUnquantized()
+                let (cachedKeys, cachedValues) = floatCache.update(keys: keys, values: values)
+                let refreshed = floatCache.toQuantized(
+                    groupSize: quantizedCache.groupSize, bits: quantizedCache.bits)
+                quantizedCache.state = refreshed.state
+                quantizedCache.metaState = refreshed.metaState
+                return MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: cachedKeys,
+                    values: cachedValues,
+                    scale: scale,
+                    mask: mask,
+                    sinks: sinks
+                )
+            }
+            let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+            return MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: cachedKeys,
+                values: cachedValues,
+                scale: scale,
+                mask: mask,
+                sinks: sinks
+            )
+        }
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
         return quantizedScaledDotProductAttention(
@@ -165,12 +191,23 @@ class MiMoV2FlashAttention: Module {
         let keys = wk(x)
         let values = wv(x) * MLXArray(args.attentionValueScale ?? 1.0, dtype: x.dtype)
 
-        var q = queries.reshaped(B, L, numAttentionHeads, -1).transposed(0, 2, 1, 3)
-        var k = keys.reshaped(B, L, numKeyValueHeads, -1).transposed(0, 2, 1, 3)
-        let v = values.reshaped(B, L, numKeyValueHeads, -1).transposed(0, 2, 1, 3)
+        let localAttentionHeads = queries.dim(-1) / headDim
+        let localKeyValueHeads = keys.dim(-1) / headDim
+        let localValueHeads = values.dim(-1) / vHeadDim
+
+        var q = queries.reshaped(B, L, localAttentionHeads, -1).transposed(0, 2, 1, 3)
+        var k = keys.reshaped(B, L, localKeyValueHeads, -1).transposed(0, 2, 1, 3)
+        let v = values.reshaped(B, L, localValueHeads, -1).transposed(0, 2, 1, 3)
 
         q = applyRotaryPosition(rope, to: q, cache: cache)
         k = applyRotaryPosition(rope, to: k, cache: cache)
+
+        let sinks: MLXArray?
+        if hasSinks {
+            sinks = attentionSinkBias
+        } else {
+            sinks = nil
+        }
 
         let output = attentionWithCacheUpdateAndSinks(
             queries: q,
@@ -179,7 +216,7 @@ class MiMoV2FlashAttention: Module {
             cache: cache,
             scale: scale,
             mask: mask,
-            sinks: hasSinks ? attentionSinkBias : nil
+            sinks: sinks
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
@@ -236,11 +273,8 @@ class MiMoV2FlashMoEGate: Module {
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
 
     init(_ config: MiMoV2FlashConfiguration) {
-        guard let nRoutedExperts = config.nRoutedExperts else {
-            fatalError("MiMoV2FlashMoEGate requires nRoutedExperts.")
-        }
+        let nRoutedExperts = config.nRoutedExperts
 
-        precondition(config.topkMethod == "noaux_tc", "Unsupported topk method.")
 
         self.topK = config.numExpertsPerTok
         self.normTopkProb = config.normTopkProb
@@ -273,23 +307,34 @@ class MiMoV2FlashMoE: Module, UnaryLayer {
     let numExpertsPerTok: Int
     let gate: MiMoV2FlashMoEGate
 
-    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    @ModuleInfo(key: "switch_mlp") var switchMLP: Module & SwitchGLULayer
     @ModuleInfo(key: "shared_experts") var sharedExperts: MiMoV2FlashMLP?
 
     init(_ config: MiMoV2FlashConfiguration, layerIdx: Int) {
-        guard let nRoutedExperts = config.nRoutedExperts else {
-            fatalError("MiMoV2FlashMoE requires nRoutedExperts.")
-        }
+        let nRoutedExperts = config.nRoutedExperts
 
         self.layerIdx = layerIdx
         self.numExpertsPerTok = config.numExpertsPerTok
         self.gate = MiMoV2FlashMoEGate(config)
 
-        _switchMLP.wrappedValue = SwitchGLU(
-            inputDims: config.hiddenSize,
-            hiddenDims: config.moeIntermediateSize,
-            numExperts: nRoutedExperts
-        )
+        if config.usesTurboQuantRoutedExperts {
+            let gate = config.routedExpertQuantization(layerIndex: layerIdx, projection: "gate_proj")
+            let down = config.routedExpertQuantization(layerIndex: layerIdx, projection: "down_proj")
+            _switchMLP.wrappedValue = TurboQuantSwitchGLU(
+                inputDims: config.hiddenSize,
+                hiddenDims: config.moeIntermediateSize,
+                numExperts: nRoutedExperts,
+                gateUpBits: gate.bits,
+                downBits: down.bits,
+                seed: config.mxtqSeed
+            )
+        } else {
+            _switchMLP.wrappedValue = SwitchGLU(
+                inputDims: config.hiddenSize,
+                hiddenDims: config.moeIntermediateSize,
+                numExperts: nRoutedExperts
+            )
+        }
 
         if let shared = config.nSharedExperts {
             let intermediateSize = config.moeIntermediateSize * shared
@@ -314,7 +359,7 @@ class MiMoV2FlashMoE: Module, UnaryLayer {
 
 class MiMoV2FlashDecoderLayer: Module {
     @ModuleInfo(key: "self_attn") var selfAttn: MiMoV2FlashAttention
-    let mlp: UnaryLayer
+    @ModuleInfo(key: "mlp") var mlp: Module & UnaryLayer
     let isSlidingWindow: Bool
 
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
@@ -323,7 +368,9 @@ class MiMoV2FlashDecoderLayer: Module {
     init(_ config: MiMoV2FlashConfiguration, layerIdx: Int, isMoe: Bool, isSlidingWindow: Bool) {
         self.isSlidingWindow = isSlidingWindow
         _selfAttn.wrappedValue = MiMoV2FlashAttention(config, isSlidingWindow: isSlidingWindow)
-        self.mlp = isMoe ? MiMoV2FlashMoE(config, layerIdx: layerIdx) : MiMoV2FlashMLP(config)
+        _mlp.wrappedValue = isMoe
+            ? MiMoV2FlashMoE(config, layerIdx: layerIdx)
+            : MiMoV2FlashMLP(config)
         _inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.layernormEpsilon)
         _postAttentionLayerNorm.wrappedValue = RMSNorm(
@@ -411,15 +458,39 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        func expertPrefix(layer: Int, expert: Int, proj: String) -> String {
+            "model.layers.\(layer).mlp.experts.\(expert).\(proj)"
+        }
+
+        func isRoutedExpertScaleKey(_ key: String) -> Bool {
+            key.contains(".mlp.experts.") && key.hasSuffix(".weight_scale_inv")
+        }
+
+        func hasCompleteExpertSet(layer: Int, proj: String, suffixes: [String]) -> Bool {
+            for expert in 0 ..< configuration.nRoutedExperts {
+                for suffix in suffixes {
+                    let key = "\(expertPrefix(layer: layer, expert: expert, proj: proj)).\(suffix)"
+                    if sanitizedWeights[key] == nil {
+                        return false
+                    }
+                }
+            }
+            return true
+        }
+
         func dequant(weight: MLXArray, scaleInv: MLXArray) -> MLXArray {
-            let dtype = weight.dtype
+            // MiMo source weights are FP8 E4M3 bytes, not integer uint8 values.
+            let decodedWeight = weight.dtype == .uint8
+                ? MLX.fromFP8(weight, dtype: .float32)
+                : weight
+            let dtype = decodedWeight.dtype
             let bs = 128
-            let (m, n) = (weight.shape[0], weight.shape[1])
+            let (m, n) = (decodedWeight.shape[0], decodedWeight.shape[1])
             let padBottom = bs * scaleInv.dim(0) - m
             let padSide = bs * scaleInv.dim(1) - n
 
             var paddedWeight = padded(
-                weight, widths: [.init((0, padBottom)), .init((0, padSide))])
+                decodedWeight, widths: [.init((0, padBottom)), .init((0, padSide))])
             paddedWeight = paddedWeight.reshaped(
                 [(m + padBottom) / bs, bs, (n + padSide) / bs, bs])
             let scaled = paddedWeight * scaleInv[0..., .newAxis, 0..., .newAxis]
@@ -430,6 +501,10 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
         var newWeights: [String: MLXArray] = [:]
         for (key, value) in weights {
             if key.contains("weight_scale_inv") {
+                if isRoutedExpertScaleKey(key) {
+                    newWeights[key] = value
+                    continue
+                }
                 let weightKey = key.replacingOccurrences(of: "_scale_inv", with: "")
                 if let weight = weights[weightKey] {
                     newWeights[weightKey] = dequant(weight: weight, scaleInv: value)
@@ -440,6 +515,18 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         var sanitizedWeights = newWeights.isEmpty ? weights : newWeights
+
+        for key in Array(sanitizedWeights.keys) where key.hasSuffix(".tq_bits") {
+            sanitizedWeights.removeValue(forKey: key)
+        }
+        for key in Array(sanitizedWeights.keys)
+            where key.hasPrefix("audio_encoder.")
+                || key.hasPrefix("encoder.")
+                || key.hasPrefix("speech_embeddings.")
+                || key.hasPrefix("visual.")
+        {
+            sanitizedWeights.removeValue(forKey: key)
+        }
 
         for layerIndex in 0 ..< configuration.hiddenLayers {
             let prefix = "model.layers.\(layerIndex).self_attn"
@@ -466,12 +553,62 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
         for layerIndex in 0 ..< configuration.hiddenLayers {
             let prefix = "model.layers.\(layerIndex)"
             for (_, projName) in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")] {
+                let firstPrefix = expertPrefix(layer: layerIndex, expert: 0, proj: projName)
+                let firstScaleInvKey = "\(firstPrefix).weight_scale_inv"
+                if sanitizedWeights["\(firstPrefix).weight"] != nil,
+                   sanitizedWeights[firstScaleInvKey] != nil {
+                    let quant = configuration.routedExpertQuantization(
+                        layerIndex: layerIndex, projection: projName)
+                    var weightParts: [MLXArray] = []
+                    var scaleParts: [MLXArray] = []
+                    var biasParts: [MLXArray] = []
+                    guard hasCompleteExpertSet(
+                        layer: layerIndex, proj: projName,
+                        suffixes: ["weight", "weight_scale_inv"])
+                    else {
+                        continue
+                    }
+
+                    for expert in 0 ..< configuration.nRoutedExperts {
+                        let expertBase = expertPrefix(layer: layerIndex, expert: expert, proj: projName)
+                        let weightKey = "\(expertBase).weight"
+                        let scaleInvKey = "\(expertBase).weight_scale_inv"
+                        let weight = sanitizedWeights.removeValue(forKey: weightKey)!
+                        let scaleInv = sanitizedWeights.removeValue(forKey: scaleInvKey)!
+                        let dense = dequant(weight: weight, scaleInv: scaleInv).asType(.float32)
+                        let (qWeight, scales, biases) = MLX.quantized(
+                            dense, groupSize: quant.groupSize, bits: quant.bits, mode: .affine)
+                        guard let biases else { continue }
+                        weightParts.append(qWeight)
+                        scaleParts.append(scales)
+                        biasParts.append(biases)
+                    }
+                    guard weightParts.count == configuration.nRoutedExperts,
+                        scaleParts.count == configuration.nRoutedExperts,
+                        biasParts.count == configuration.nRoutedExperts
+                    else {
+                        continue
+                    }
+                    sanitizedWeights["\(prefix).mlp.switch_mlp.\(projName).weight"] =
+                        MLX.stacked(weightParts)
+                    sanitizedWeights["\(prefix).mlp.switch_mlp.\(projName).scales"] =
+                        MLX.stacked(scaleParts)
+                    sanitizedWeights["\(prefix).mlp.switch_mlp.\(projName).biases"] =
+                        MLX.stacked(biasParts)
+                    continue
+                }
+
                 for key in ["weight", "scales", "biases"] {
-                    let firstKey = "\(prefix).mlp.experts.0.\(projName).\(key)"
+                    let firstKey = "\(firstPrefix).\(key)"
                     if sanitizedWeights[firstKey] != nil {
-                        let toJoin = (0 ..< (configuration.nRoutedExperts ?? 1)).map {
+                        guard hasCompleteExpertSet(
+                            layer: layerIndex, proj: projName, suffixes: [key])
+                        else {
+                            continue
+                        }
+                        let toJoin = (0 ..< configuration.nRoutedExperts).map {
                             sanitizedWeights.removeValue(
-                                forKey: "\(prefix).mlp.experts.\($0).\(projName).\(key)")!
+                                forKey: "\(expertPrefix(layer: layerIndex, expert: $0, proj: projName)).\(key)")!
                         }
                         sanitizedWeights["\(prefix).mlp.switch_mlp.\(projName).\(key)"] =
                             MLX.stacked(toJoin)
@@ -498,6 +635,62 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
 
 // MARK: - Configuration
 
+struct MiMoRoutedExpertBits: Codable, Sendable {
+    let projections: [String: Int]
+
+    init(scalar: Int) {
+        self.projections = [
+            "gate_proj": scalar,
+            "up_proj": scalar,
+            "down_proj": scalar,
+        ]
+    }
+
+    init(projections: [String: Int]) {
+        self.projections = projections
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let scalar = try? container.decode(Int.self) {
+            self.init(scalar: scalar)
+        } else {
+        if let projections = try? container.decode([String: Int].self) {
+            self.init(projections: projections)
+        } else {
+            let nested = try container.decode([String: [String: Int]].self)
+            if let routed = nested["routed_expert"] ?? nested["routed_experts"] {
+                self.init(projections: routed)
+            } else if let first = nested.values.first {
+                self.init(projections: first)
+            } else {
+                self.init(projections: [:])
+            }
+        }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(projections)
+    }
+
+    func bits(for projection: String) -> Int? {
+        projections[projection]
+            ?? projections[projection.replacingOccurrences(of: "_proj", with: "")]
+    }
+}
+
+struct MiMoRoutedExpertBitPlan: Codable, Sendable {
+    var defaultBits: MiMoRoutedExpertBits?
+    var layerOverrides: [String: MiMoRoutedExpertBits]?
+
+    enum CodingKeys: String, CodingKey {
+        case defaultBits = "default"
+        case layerOverrides = "layer_overrides"
+    }
+}
+
 public struct MiMoV2FlashConfiguration: Codable, Sendable {
     var modelType: String = "mimo_v2_flash"
     var numExpertsPerTok: Int
@@ -514,7 +707,7 @@ public struct MiMoV2FlashConfiguration: Codable, Sendable {
     var attentionHeads: Int
     var kvHeads: Int
     var nSharedExperts: Int?
-    var nRoutedExperts: Int?
+    var nRoutedExperts: Int
     var routedScalingFactor: Float?
     var topkMethod: String
     var scoringFunc: String
@@ -533,6 +726,202 @@ public struct MiMoV2FlashConfiguration: Codable, Sendable {
     var swaVHeadDim: Int
     var partialRotaryFactor: Float
     var attentionValueScale: Float?
+    var routedExpertBits: MiMoRoutedExpertBits?
+    var mxtqBits: MiMoRoutedExpertBits?
+    var routedExpertBitPlan: MiMoRoutedExpertBitPlan?
+    var routedExpertGroupSize: Int?
+    var weightFormat: String?
+    var mxtqSeed: Int
+
+    var usesTurboQuantRoutedExperts: Bool {
+        weightFormat?.lowercased() == "mxtq"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.modelType = try container.decodeIfPresent(String.self, forKey: .modelType)
+            ?? "mimo_v2_flash"
+        self.numExpertsPerTok = try container.decode(Int.self, forKey: .numExpertsPerTok)
+        self.hybridLayerPattern = try container.decode([Int].self, forKey: .hybridLayerPattern)
+        self.moeLayerFreq = try container.decode([Int].self, forKey: .moeLayerFreq)
+        self.addSwaAttentionSinkBias = try container.decode(
+            Bool.self, forKey: .addSwaAttentionSinkBias)
+        self.addFullAttentionSinkBias = try container.decode(
+            Bool.self, forKey: .addFullAttentionSinkBias)
+        self.slidingWindowSize = try container.decode(Int.self, forKey: .slidingWindowSize)
+        self.vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+        self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        self.intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        self.moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)
+        self.hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+        self.attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+        self.kvHeads = try container.decode(Int.self, forKey: .kvHeads)
+        self.nSharedExperts = try container.decodeIfPresent(Int.self, forKey: .nSharedExperts)
+        self.nRoutedExperts = try container.decode(Int.self, forKey: .nRoutedExperts)
+        self.routedScalingFactor = try container.decodeIfPresent(
+            Float.self, forKey: .routedScalingFactor)
+        self.topkMethod = try container.decode(String.self, forKey: .topkMethod)
+        self.scoringFunc = try container.decode(String.self, forKey: .scoringFunc)
+        self.normTopkProb = try container.decode(Bool.self, forKey: .normTopkProb)
+        self.nGroup = try container.decode(Int.self, forKey: .nGroup)
+        self.topkGroup = try container.decode(Int.self, forKey: .topkGroup)
+        self.maxPositionEmbeddings = try container.decode(Int.self, forKey: .maxPositionEmbeddings)
+        self.layernormEpsilon = try container.decode(Float.self, forKey: .layernormEpsilon)
+        self.ropeTheta = try container.decode(Float.self, forKey: .ropeTheta)
+        self.swaRopeTheta = try container.decode(Float.self, forKey: .swaRopeTheta)
+        self.swaAttentionHeads = try container.decode(Int.self, forKey: .swaAttentionHeads)
+        self.swaKvHeads = try container.decode(Int.self, forKey: .swaKvHeads)
+        self.headDim = try container.decode(Int.self, forKey: .headDim)
+        self.vHeadDim = try container.decode(Int.self, forKey: .vHeadDim)
+        self.swaHeadDim = try container.decode(Int.self, forKey: .swaHeadDim)
+        self.swaVHeadDim = try container.decode(Int.self, forKey: .swaVHeadDim)
+        self.partialRotaryFactor = try container.decode(Float.self, forKey: .partialRotaryFactor)
+        self.attentionValueScale = try container.decodeIfPresent(
+            Float.self, forKey: .attentionValueScale)
+        self.routedExpertBits = try container.decodeIfPresent(
+            MiMoRoutedExpertBits.self, forKey: .routedExpertBits)
+        self.mxtqBits = try container.decodeIfPresent(MiMoRoutedExpertBits.self, forKey: .mxtqBits)
+        self.routedExpertBitPlan = try container.decodeIfPresent(
+            MiMoRoutedExpertBitPlan.self, forKey: .routedExpertBitPlan)
+        self.routedExpertGroupSize = try container.decodeIfPresent(
+            Int.self, forKey: .routedExpertGroupSize)
+        self.weightFormat = try container.decodeIfPresent(String.self, forKey: .weightFormat)
+        self.mxtqSeed = try container.decodeIfPresent(Int.self, forKey: .mxtqSeed) ?? 42
+
+        try Self.validatePositive(numExpertsPerTok, key: .numExpertsPerTok, in: container)
+        try Self.validatePositive(slidingWindowSize, key: .slidingWindowSize, in: container)
+        try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try Self.validatePositive(moeIntermediateSize, key: .moeIntermediateSize, in: container)
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+        try Self.validatePositive(nRoutedExperts, key: .nRoutedExperts, in: container)
+        if let nSharedExperts {
+            try Self.validateNonNegative(nSharedExperts, key: .nSharedExperts, in: container)
+        }
+        if let routedScalingFactor {
+            try Self.validatePositive(routedScalingFactor, key: .routedScalingFactor, in: container)
+        }
+        try Self.validatePositive(nGroup, key: .nGroup, in: container)
+        try Self.validatePositive(topkGroup, key: .topkGroup, in: container)
+        try Self.validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try Self.validatePositive(layernormEpsilon, key: .layernormEpsilon, in: container)
+        try Self.validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try Self.validatePositive(swaRopeTheta, key: .swaRopeTheta, in: container)
+        try Self.validatePositive(swaAttentionHeads, key: .swaAttentionHeads, in: container)
+        try Self.validatePositive(swaKvHeads, key: .swaKvHeads, in: container)
+        try Self.validatePositive(headDim, key: .headDim, in: container)
+        try Self.validatePositive(vHeadDim, key: .vHeadDim, in: container)
+        try Self.validatePositive(swaHeadDim, key: .swaHeadDim, in: container)
+        try Self.validatePositive(swaVHeadDim, key: .swaVHeadDim, in: container)
+        try Self.validatePositive(partialRotaryFactor, key: .partialRotaryFactor, in: container)
+        if let attentionValueScale {
+            try Self.validatePositive(attentionValueScale, key: .attentionValueScale, in: container)
+        }
+        if let routedExpertGroupSize {
+            try Self.validatePositive(
+                routedExpertGroupSize, key: .routedExpertGroupSize, in: container)
+        }
+        try Self.validateRoutedExpertBits(routedExpertBits, key: .routedExpertBits, in: container)
+        try Self.validateRoutedExpertBits(mxtqBits, key: .mxtqBits, in: container)
+        try Self.validateRoutedExpertBitPlan(routedExpertBitPlan, key: .routedExpertBitPlan, in: container)
+        try Self.validateNonNegative(mxtqSeed, key: .mxtqSeed, in: container)
+
+        guard !modelType.isEmpty else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .modelType,
+                in: container,
+                debugDescription: "MiMoV2Flash model_type must not be empty.")
+        }
+        if let weightFormat, !weightFormat.isEmpty, weightFormat.lowercased() != "mxtq" {
+            throw DecodingError.dataCorruptedError(
+                forKey: .weightFormat,
+                in: container,
+                debugDescription: "MiMoV2Flash weight_format must be mxtq when present.")
+        }
+        if weightFormat?.lowercased() == "mxtq" {
+            for layerIndex in 0 ..< hiddenLayers where moeLayerFreq[layerIndex] == 1 {
+                let gate = routedExpertQuantization(layerIndex: layerIndex, projection: "gate_proj")
+                let up = routedExpertQuantization(layerIndex: layerIndex, projection: "up_proj")
+                guard gate.bits == up.bits else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .mxtqBits,
+                        in: container,
+                        debugDescription:
+                            "MiMoV2Flash JANGTQ gate_proj and up_proj bits must match.")
+                }
+            }
+        }
+        guard hybridLayerPattern.count == hiddenLayers, moeLayerFreq.count == hiddenLayers else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hybridLayerPattern,
+                in: container,
+                debugDescription:
+                    "MiMoV2Flash hybrid_layer_pattern and moe_layer_freq must match num_hidden_layers.")
+        }
+        guard hybridLayerPattern.allSatisfy({ $0 == 0 || $0 == 1 }),
+            moeLayerFreq.allSatisfy({ $0 == 0 || $0 == 1 })
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hybridLayerPattern,
+                in: container,
+                debugDescription:
+                    "MiMoV2Flash hybrid_layer_pattern and moe_layer_freq values must be 0 or 1.")
+        }
+        guard topkMethod == "noaux_tc" else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .topkMethod,
+                in: container,
+                debugDescription: "MiMoV2Flash topk_method must be noaux_tc.")
+        }
+        guard scoringFunc == "sigmoid" else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .scoringFunc,
+                in: container,
+                debugDescription: "MiMoV2Flash scoring_func must be sigmoid.")
+        }
+        guard attentionHeads % kvHeads == 0, swaAttentionHeads % swaKvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "MiMoV2Flash attention heads must be divisible by KV heads.")
+        }
+        guard nRoutedExperts % nGroup == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .nGroup,
+                in: container,
+                debugDescription:
+                    "MiMoV2Flash n_routed_experts must be divisible by n_group.")
+        }
+        guard topkGroup <= nGroup else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .topkGroup,
+                in: container,
+                debugDescription:
+                    "MiMoV2Flash topk_group must be less than or equal to n_group.")
+        }
+        guard numExpertsPerTok <= nRoutedExperts else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numExpertsPerTok,
+                in: container,
+                debugDescription:
+                    "MiMoV2Flash num_experts_per_tok must be less than or equal to n_routed_experts.")
+        }
+        let rotaryDim = Int(Float(headDim) * partialRotaryFactor)
+        let swaRotaryDim = Int(Float(swaHeadDim) * partialRotaryFactor)
+        guard rotaryDim > 0, rotaryDim <= headDim, swaRotaryDim > 0,
+            swaRotaryDim <= swaHeadDim
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .partialRotaryFactor,
+                in: container,
+                debugDescription:
+                    "MiMoV2Flash rotary dimensions must be positive and no larger than the head dimensions.")
+        }
+    }
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -569,6 +958,108 @@ public struct MiMoV2FlashConfiguration: Codable, Sendable {
         case swaVHeadDim = "swa_v_head_dim"
         case partialRotaryFactor = "partial_rotary_factor"
         case attentionValueScale = "attention_value_scale"
+        case routedExpertBits = "routed_expert_bits"
+        case mxtqBits = "mxtq_bits"
+        case routedExpertBitPlan = "routed_expert_bit_plan"
+        case routedExpertGroupSize = "routed_expert_group_size"
+        case weightFormat = "weight_format"
+        case mxtqSeed = "mxtq_seed"
+    }
+
+    func routedExpertQuantization(layerIndex: Int, projection: String) -> (bits: Int, groupSize: Int) {
+        let env = ProcessInfo.processInfo.environment
+        let groupSize = Int(env["TP_MIMO_ROUTED_EXPERT_GROUP_SIZE"] ?? "")
+            ?? routedExpertGroupSize
+            ?? 128
+        let layerEnv = env["TP_MIMO_ROUTED_EXPERT_BITS_LAYER_\(layerIndex)"]
+        let envBits = Self.bits(from: layerEnv, projection: projection)
+            ?? Self.bits(from: env["TP_MIMO_ROUTED_EXPERT_BITS"], projection: projection)
+        let plannedBits = routedExpertBitPlan?.layerOverrides?["\(layerIndex)"]?.bits(for: projection)
+            ?? routedExpertBitPlan?.defaultBits?.bits(for: projection)
+        let configBits = usesTurboQuantRoutedExperts
+            ? (mxtqBits?.bits(for: projection) ?? routedExpertBits?.bits(for: projection))
+            : (routedExpertBits?.bits(for: projection) ?? mxtqBits?.bits(for: projection))
+        let bits = envBits ?? plannedBits ?? configBits ?? 4
+        return (bits, groupSize)
+    }
+
+    private static func bits(from raw: String?, projection: String) -> Int? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+        if let scalar = Int(raw) {
+            return scalar
+        }
+        for part in raw.split(separator: ",") {
+            let pair = part.split(whereSeparator: { $0 == "=" || $0 == ":" })
+            guard pair.count == 2 else { continue }
+            let key = pair[0].trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = pair[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            if key == projection || key == projection.replacingOccurrences(of: "_proj", with: "") {
+                return Int(value)
+            }
+        }
+        return nil
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be greater than zero.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be finite and greater than zero.")
+        }
+    }
+
+    private static func validateNonNegative<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be non-negative.")
+        }
+    }
+
+    private static func validateRoutedExpertBits<K: CodingKey>(
+        _ value: MiMoRoutedExpertBits?, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard let value else { return }
+        for (projection, bits) in value.projections {
+            guard ["gate_proj", "up_proj", "down_proj", "gate", "up", "down"].contains(projection),
+                [2, 3, 4, 5, 6, 8].contains(bits)
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription:
+                        "MiMoV2Flash routed expert bits must use supported projections and bit widths.")
+            }
+        }
+    }
+
+    private static func validateRoutedExpertBitPlan<K: CodingKey>(
+        _ value: MiMoRoutedExpertBitPlan?, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard let value else { return }
+        try validateRoutedExpertBits(value.defaultBits, key: key, in: container)
+        for (_, bits) in value.layerOverrides ?? [:] {
+            try validateRoutedExpertBits(bits, key: key, in: container)
+        }
     }
 }
 

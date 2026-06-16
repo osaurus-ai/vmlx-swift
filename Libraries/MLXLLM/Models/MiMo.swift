@@ -129,8 +129,6 @@ public class MiMoModelInner: Module {
     let numNextnPredictLayers: Int
 
     public init(_ args: MiMoConfiguration) {
-        precondition(args.vocabularySize > 0)
-
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -250,6 +248,84 @@ public struct MiMoConfiguration: Codable, Sendable {
             try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
         self.numNextnPredictLayers =
             try container.decodeIfPresent(Int.self, forKey: .numNextnPredictLayers) ?? 2
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(
+        container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+
+        if hiddenSize % attentionHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "MiMo hidden_size must be divisible by num_attention_heads."
+            )
+        }
+
+        if attentionHeads % kvHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription: "MiMo num_attention_heads must be divisible by num_key_value_heads."
+            )
+        }
+
+        if numNextnPredictLayers < 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numNextnPredictLayers,
+                in: container,
+                debugDescription: "MiMo num_nextn_predict_layers must be >= 0."
+            )
+        }
+
+        if let factor = ropeScaling?["factor"]?.asFloat() {
+            if !factor.isFinite || factor <= 0 {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling,
+                    in: container,
+                    debugDescription: "MiMo rope_scaling.factor must be finite and > 0."
+                )
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "MiMo \(key.rawValue) must be > 0."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if !value.isFinite || value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "MiMo \(key.rawValue) must be finite and > 0."
+            )
+        }
     }
 }
 

@@ -259,6 +259,73 @@ public struct BitnetConfiguration: Codable, Sendable {
         )
         tieWordEmbeddings =
             try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? true
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(resolvedKvHeads, key: .kvHeads, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+
+        if let headDimensions {
+            try validatePositive(headDimensions, key: .headDimensions, in: container)
+        }
+        if let maxPositionEmbeddings {
+            try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        }
+
+        guard hiddenSize == attentionHeads * resolvedHeadDimensions else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "Bitnet hidden_size must equal num_attention_heads * head_dim.")
+        }
+        guard attentionHeads % resolvedKvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription: "Bitnet num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        if let factor = ropeScaling?["factor"]?.asFloat() {
+            guard factor.isFinite, factor > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling,
+                    in: container,
+                    debugDescription: "Bitnet rope_scaling.factor must be finite and > 0.")
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Bitnet \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Bitnet \(key.rawValue) must be finite and > 0.")
+        }
     }
 }
 
@@ -405,8 +472,6 @@ public class BitnetModelInner: Module {
     var norm: RMSNorm
 
     init(_ args: BitnetConfiguration) {
-        precondition(args.vocabularySize > 0)
-
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize
         )

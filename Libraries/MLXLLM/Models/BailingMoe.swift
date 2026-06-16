@@ -73,6 +73,201 @@ public struct BailingMoeConfiguration: Codable, Sendable {
         case topkGroup = "topk_group"
         case moeSharedExpertIntermediateSize = "moe_shared_expert_intermediate_size"
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        modelType = try container.decode(String.self, forKey: .modelType)
+        hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        maxPositionEmbeddings = try container.decodeIfPresent(
+            Int.self, forKey: .maxPositionEmbeddings)
+        moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)
+        numExperts = try container.decode(Int.self, forKey: .numExperts)
+        numSharedExperts = try container.decode(Int.self, forKey: .numSharedExperts)
+        normTopkProb = try container.decode(Bool.self, forKey: .normTopkProb)
+        attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+        numExpertsPerToken = try container.decode(Int.self, forKey: .numExpertsPerToken)
+        hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+        kvHeads = try container.decode(Int.self, forKey: .kvHeads)
+        rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
+        ropeTheta = try container.decode(Float.self, forKey: .ropeTheta)
+        vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+        firstKDenseReplace = try container.decode(Int.self, forKey: .firstKDenseReplace)
+        ropeScaling = try container.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: .ropeScaling)
+        useBias = try container.decodeIfPresent(Bool.self, forKey: .useBias) ?? false
+        useQKVBias = try container.decodeIfPresent(Bool.self, forKey: .useQKVBias) ?? false
+        useQKNorm = try container.decodeIfPresent(Bool.self, forKey: .useQKNorm) ?? false
+        tieWordEmbeddings =
+            try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
+        partialRotaryFactor =
+            try container.decodeIfPresent(Float.self, forKey: .partialRotaryFactor) ?? 1.0
+        moeRouterEnableExpertBias =
+            try container.decodeIfPresent(Bool.self, forKey: .moeRouterEnableExpertBias) ?? false
+        routedScalingFactor =
+            try container.decodeIfPresent(Float.self, forKey: .routedScalingFactor) ?? 1.0
+        scoreFunction =
+            try container.decodeIfPresent(String.self, forKey: .scoreFunction) ?? "softmax"
+        nGroup = try container.decodeIfPresent(Int.self, forKey: .nGroup) ?? 1
+        topkGroup = try container.decodeIfPresent(Int.self, forKey: .topkGroup) ?? nGroup
+        moeSharedExpertIntermediateSize =
+            try container.decodeIfPresent(Int.self, forKey: .moeSharedExpertIntermediateSize)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(moeIntermediateSize, key: .moeIntermediateSize, in: container)
+        try validatePositive(numExperts, key: .numExperts, in: container)
+        try validateNonNegative(numSharedExperts, key: .numSharedExperts, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(numExpertsPerToken, key: .numExpertsPerToken, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validateNonNegative(firstKDenseReplace, key: .firstKDenseReplace, in: container)
+        try validatePositive(partialRotaryFactor, key: .partialRotaryFactor, in: container)
+        try validatePositive(routedScalingFactor, key: .routedScalingFactor, in: container)
+        try validatePositive(nGroup, key: .nGroup, in: container)
+        try validatePositive(topkGroup, key: .topkGroup, in: container)
+
+        if let maxPositionEmbeddings {
+            try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        }
+        if let moeSharedExpertIntermediateSize {
+            try validatePositive(
+                moeSharedExpertIntermediateSize,
+                key: .moeSharedExpertIntermediateSize,
+                in: container)
+        }
+
+        if hiddenSize % attentionHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription:
+                    "BailingMoe hidden_size must be divisible by num_attention_heads."
+            )
+        }
+
+        if attentionHeads % kvHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "BailingMoe num_attention_heads must be divisible by num_key_value_heads."
+            )
+        }
+
+        let headDim = hiddenSize / attentionHeads
+        let ropeDim = Int(Float(headDim) * partialRotaryFactor)
+        if ropeDim <= 0 || ropeDim > headDim {
+            throw DecodingError.dataCorruptedError(
+                forKey: .partialRotaryFactor,
+                in: container,
+                debugDescription:
+                    "BailingMoe rotary dimension must be positive and no larger than head_dim."
+            )
+        }
+
+        if numExpertsPerToken > numExperts {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numExpertsPerToken,
+                in: container,
+                debugDescription: "BailingMoe num_experts_per_tok must be <= num_experts."
+            )
+        }
+
+        if numExperts % nGroup != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .nGroup,
+                in: container,
+                debugDescription: "BailingMoe num_experts must be divisible by n_group."
+            )
+        }
+
+        if topkGroup > nGroup {
+            throw DecodingError.dataCorruptedError(
+                forKey: .topkGroup,
+                in: container,
+                debugDescription: "BailingMoe topk_group must be > 0 and <= n_group."
+            )
+        }
+
+        if firstKDenseReplace > hiddenLayers {
+            throw DecodingError.dataCorruptedError(
+                forKey: .firstKDenseReplace,
+                in: container,
+                debugDescription:
+                    "BailingMoe first_k_dense_replace must be <= num_hidden_layers."
+            )
+        }
+
+        if scoreFunction != "softmax" && scoreFunction != "sigmoid" {
+            throw DecodingError.dataCorruptedError(
+                forKey: .scoreFunction,
+                in: container,
+                debugDescription: "BailingMoe score_function must be softmax or sigmoid."
+            )
+        }
+
+        if let factor = ropeScaling?["factor"]?.asFloat() {
+            if !factor.isFinite || factor <= 0 {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling,
+                    in: container,
+                    debugDescription: "BailingMoe rope_scaling.factor must be finite and > 0."
+                )
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "BailingMoe \(key.rawValue) must be > 0."
+            )
+        }
+    }
+
+    private func validateNonNegative(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value < 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "BailingMoe \(key.rawValue) must be >= 0."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if !value.isFinite || value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "BailingMoe \(key.rawValue) must be finite and > 0."
+            )
+        }
+    }
 }
 
 class BailingMoeAttention: Module {
@@ -223,12 +418,18 @@ class BailingMoeGate: Module, UnaryLayer {
         let groupScores = scoresForChoice.reshaped(bsz, seqLen, self.nGroup, -1)
 
         let topKGroup = top(groupScores, k: 2, axis: -1).sum(axis: -1, keepDims: true)
-        var k = nGroup - topkGroup
-        let groupIdx = argPartition(topKGroup, kth: k - 1, axis: -2)[.ellipsis, ..<k, 0...]
-        scores = putAlong(groupScores, groupIdx, values: MLXArray(0.0, dtype: groupScores.dtype), axis: -2)
-        scores = flattened(scores, start: -2, end: -1)
+        let droppedGroups = nGroup - topkGroup
+        if droppedGroups > 0 {
+            let groupIdx = argPartition(topKGroup, kth: droppedGroups - 1, axis: -2)[
+                .ellipsis, ..<droppedGroups, 0...]
+            scores = putAlong(
+                groupScores, groupIdx, values: MLXArray(0.0, dtype: groupScores.dtype), axis: -2)
+            scores = flattened(scores, start: -2, end: -1)
+        } else {
+            scores = flattened(groupScores, start: -2, end: -1)
+        }
 
-        k = topK
+        let k = topK
         let inds = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
         scores = takeAlong(scores, inds, axis: -1)
         if topK > 1, normTopkProb {
@@ -320,7 +521,6 @@ public class BailingMoeModelInner: Module {
     let norm: RMSNorm
 
     init(_ args: BailingMoeConfiguration) {
-        precondition(args.vocabularySize > 0)
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
         self.layers = (0 ..< args.hiddenLayers).map {

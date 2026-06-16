@@ -60,16 +60,14 @@ public struct UserInput {
             *, deprecated,
             message: "Use MediaProcessing.asProcessedSequence() with the Video directly"
         )
-        public func asAVAsset() -> AVAsset {
+        public func asAVAsset() throws -> AVAsset {
             switch self {
             case .avAsset(let asset):
                 return asset
             case .url(let url):
                 return AVAsset(url: url)
             case .frames:
-                fatalError(
-                    "calling asAVAsset() on Video Input with VideoFames provided is unsupported and deprecated - please use MediaProcessing.asProcessedSequence() instead"
-                )
+                throw UserInputError.unsupportedVideoFramesAsAVAsset
             }
         }
     }
@@ -396,6 +394,7 @@ internal enum UserInputError: LocalizedError {
     case notImplemented
     case unableToLoad(URL)
     case arrayError(String)
+    case unsupportedVideoFramesAsAVAsset
 
     var errorDescription: String? {
         switch self {
@@ -405,6 +404,8 @@ internal enum UserInputError: LocalizedError {
             return String(localized: "Unable to load image from URL: \(url.path).")
         case .arrayError(let message):
             return String(localized: "Error processing image array: \(message).")
+        case .unsupportedVideoFramesAsAVAsset:
+            return String(localized: "Frame-backed video input cannot be converted to AVAsset. Use MediaProcessing.asProcessedSequence() with the Video directly.")
         }
     }
 }

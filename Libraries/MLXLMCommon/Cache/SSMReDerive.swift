@@ -143,75 +143,15 @@ public func maybeReDeriveSSMState(
     let stripped = Array(promptTokenIds.prefix(promptTokenIds.count - genPromptLen))
     guard !stripped.isEmpty else { log("skip/empty-stripped"); return }
 
-    do {
-        let blockBoundary = hybridBlockDiskBoundary(
-            coordinator: coordinator,
-            strippedTokenCount: stripped.count)
-
-        if let blockBoundary {
-            let statesByBoundary = try reDeriveSSMStatesAtBoundaries(
-                model: model,
-                tokens: stripped,
-                boundaries: [blockBoundary, stripped.count])
-            guard let exactStates = statesByBoundary[stripped.count],
-                  !exactStates.isEmpty
-            else { log("skip/no-ssm-states"); return }
-            var storedBlockBoundary = false
-            if let blockStates = statesByBoundary[blockBoundary],
-               !blockStates.isEmpty
-            {
-                coordinator.ssmStateCache.store(
-                    ssmStates: blockStates,
-                    tokens: stripped,
-                    boundary: blockBoundary
-                )
-                storedBlockBoundary = true
-            }
-            coordinator.ssmStateCache.store(
-                ssmStates: exactStates,
-                tokens: stripped,
-                boundary: stripped.count
-            )
-            log("ok/stored stateCount=\(exactStates.count) blockBoundary=\(blockBoundary) blockStored=\(storedBlockBoundary)")
-        } else {
-            guard let states = try reDeriveSSMStates(
-                model: model, tokens: stripped
-            ) else { log("skip/no-ssm-states"); return }
-            coordinator.ssmStateCache.store(
-                ssmStates: states,
-                tokens: stripped,
-                boundary: stripped.count
-            )
-            log("ok/stored stateCount=\(states.count)")
-        }
-        // Surface the re-derive event as a stats counter so
-        // users watching the CachePanel can see "hybrid SSM helper
-        // watcher" activity instead of wondering whether it ever ran.
-        coordinator.ssmStateCache.markReDeriveFired()
-    } catch {
-        // Best-effort. A failed re-derive just means the next turn
-        // re-prefills normally — no worse than the pre-2026-04-14
-        // contamination-skip behavior. Log the specific error so
-        // operators can see if this is a recurring failure mode on
-        // their platform/model combo.
-        log("fail/\(error)")
+    let states = reDeriveAndStoreSSMStatesForPromptBoundaries(
+        coordinator: coordinator,
+        model: model,
+        promptTokenIds: stripped)
+    guard let states, !states.isEmpty else {
+        log("skip/no-ssm-states")
+        return
     }
-}
-
-/// Largest BlockDisk boundary that can actually be restored on a later
-/// partial-prefix hit. BlockDisk persists full paged blocks only; hybrid SSM
-/// must have a companion snapshot at the same boundary or the KV restore is
-/// rejected for correctness.
-private func hybridBlockDiskBoundary(
-    coordinator: CacheCoordinator,
-    strippedTokenCount: Int
-) -> Int? {
-    // Block-level disk cache is not wired in this package yet. Keep the
-    // helper as the single integration point so the re-derive path can
-    // add block-boundary snapshots when that tier lands.
-    _ = coordinator
-    _ = strippedTokenCount
-    return nil
+    log("ok/stored stateCount=\(states.count) boundaryMode=prompt-and-paged-blocks")
 }
 
 /// §440 — capture-during-prefill (Python #109 native port). When the
@@ -412,6 +352,9 @@ public func reDeriveAndStoreSSMStatesForPromptBoundaries(
 
     var boundaries = Set<Int>()
     boundaries.insert(promptTokenIds.count)
+    if promptTokenIds.count > 1 {
+        boundaries.insert(promptTokenIds.count - 1)
+    }
 
     if coordinator.pagedCache != nil, !coordinator.isPagedIncompatible {
         let blockSize = max(1, coordinator.config.pagedBlockSize)

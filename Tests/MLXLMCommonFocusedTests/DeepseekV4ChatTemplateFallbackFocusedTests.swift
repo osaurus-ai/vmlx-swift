@@ -125,6 +125,19 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         assertRequiredToolChoiceDirective(swiftRendered)
     }
 
+    @Test("Nemotron fallback renders required tool-choice directive")
+    func nemotronRequiredToolChoiceReachesFallbackPrompt() throws {
+        var context = noSystemToolProbeContext()
+        context["tool_choice"] = "required"
+
+        let compiled = try Template(ChatTemplateFallbacks.nemotronMinimal).renderDSV4(context)
+        assertNemotronRequiredToolChoiceDirective(compiled)
+
+        let source = try repositoryFile("Libraries/MLXLMCommon/ChatTemplates/NemotronMinimal.jinja")
+        let standalone = try Template(source).renderDSV4(context)
+        assertNemotronRequiredToolChoiceDirective(standalone)
+    }
+
     @Test("compiled DSV4 fallback renders assistant DSML tool history and tool results")
     func compiledDSV4FallbackRendersAssistantToolHistory() throws {
         let template = try Template(ChatTemplateFallbacks.dsv4Minimal)
@@ -254,6 +267,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
                             "properties": [
                                 "query": ["type": "string"] as [String: any Sendable],
                             ] as [String: any Sendable],
+                            "required": ["query"],
                         ] as [String: any Sendable],
                     ] as [String: any Sendable],
                 ] as [String: any Sendable],
@@ -350,6 +364,24 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("do not answer in prose before the tool result"))
     }
 
+    private func assertNemotronRequiredToolChoiceDirective(_ rendered: String) {
+        #expect(rendered.contains("osaurus_no_system_probe"))
+        #expect(rendered.contains("<|im_start|>system"))
+        #expect(rendered.contains("<|im_start|>user"))
+        #expect(rendered.contains("<tools>"))
+        #expect(rendered.contains("</tools>"))
+        #expect(rendered.contains("<function>"))
+        #expect(rendered.contains("<parameter>"))
+        #expect(rendered.contains("<required>[\"query\"]</required>"))
+        #expect(rendered.contains("<function=example_function_name>"))
+        #expect(rendered.contains("<parameter=example_parameter_1>"))
+        #expect(rendered.contains("Required parameters MUST be specified"))
+        #expect(rendered.contains("The current assistant response MUST be a tool call"))
+        #expect(rendered.contains("Start with a <tool_call> block"))
+        #expect(rendered.contains("do not answer in prose before the tool result"))
+        #expect(!rendered.contains("<extra_id_"))
+    }
+
     private func assertSystemSeparatedFromUser(_ rendered: String) {
         let separated = "You are concise.\n\(DeepseekV4Tokens.user)Remember sapphire-42."
         let glued = "You are concise.\(DeepseekV4Tokens.user)Remember sapphire-42."
@@ -441,9 +473,53 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("Describe the image"))
         #expect(rendered.contains("<name>osaurus_probe_tool_0</name>"))
         #expect(rendered.contains("<zyphra_tool_call>"))
+        #expect(!rendered.contains("The current assistant response MUST be a function call."))
+        #expect(!rendered.contains("Use the `osaurus_probe_tool_0` function."))
         #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
         #expect(!rendered.contains("<think>"))
         #expect(!rendered.contains("enable_thinking"))
+    }
+
+    @Test("ZAYA1-VL fallback honors required named tool choice")
+    func zayaVLFallbackHonorsRequiredNamedToolChoice() throws {
+        let template = try Template(ChatTemplateFallbacks.zayaVLVisionToolMinimal)
+        let rendered = try template.renderDSV4([
+            "messages": [
+                [
+                    "role": "user",
+                    "content": "Use line_count on this exact text: one\ntwo",
+                ] as [String: any Sendable],
+            ],
+            "tools": [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "line_count",
+                        "description": "Count newline-separated text lines.",
+                        "parameters": [
+                            "type": "object",
+                            "properties": [
+                                "text": ["type": "string"] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                            "required": ["text"],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ],
+            "bos_token": "<bos>",
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+            "tool_choice": "required",
+            "tool_choice_name": "line_count",
+        ])
+
+        #expect(rendered.contains("The current assistant response MUST be a function call."))
+        #expect(rendered.contains("Use the `line_count` function."))
+        #expect(rendered.contains("<zyphra_tool_call>"))
+        #expect(rendered.contains("<function=line_count>") == false)
+        #expect(!rendered.contains("<think>"))
+        #expect(!rendered.contains("enable_thinking"))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
     }
 
     @Test("ZAYA1-VL sidecar shim rewrites every loader-visible template source")

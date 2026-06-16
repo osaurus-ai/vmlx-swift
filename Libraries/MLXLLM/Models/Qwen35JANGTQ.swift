@@ -275,6 +275,109 @@ public struct Qwen35JANGTQTextConfiguration: Codable, Sendable {
         if self.headDim == nil {
             self.headDim = self.hiddenSize / self.attentionHeads
         }
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+        try Self.validatePositive(linearNumValueHeads, key: .linearNumValueHeads, in: container)
+        try Self.validatePositive(linearNumKeyHeads, key: .linearNumKeyHeads, in: container)
+        try Self.validatePositive(linearKeyHeadDim, key: .linearKeyHeadDim, in: container)
+        try Self.validatePositive(linearValueHeadDim, key: .linearValueHeadDim, in: container)
+        try Self.validatePositive(linearConvKernelDim, key: .linearConvKernelDim, in: container)
+        try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try Self.validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try Self.validatePositive(fullAttentionInterval, key: .fullAttentionInterval, in: container)
+        try Self.validatePositive(decoderSparseStep, key: .decoderSparseStep, in: container)
+        try Self.validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try Self.validatePositive(partialRotaryFactor, key: .partialRotaryFactor, in: container)
+        try Self.validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try Self.validateNonNegative(mxtqSeed, key: .mxtqSeed, in: container)
+        if let headDim {
+            try Self.validatePositive(headDim, key: .headDim, in: container)
+        }
+
+        guard hiddenSize % attentionHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription:
+                    "Qwen35JANGTQ hidden_size must be divisible by num_attention_heads.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "Qwen35JANGTQ num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard linearNumValueHeads % linearNumKeyHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .linearNumKeyHeads,
+                in: container,
+                debugDescription:
+                    "Qwen35JANGTQ linear_num_value_heads must be divisible by linear_num_key_heads.")
+        }
+        guard mxtqBits == 2 || mxtqBits == 4 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .mxtqBits,
+                in: container,
+                debugDescription: "Qwen35JANGTQ mxtq_bits must be 2 or 4.")
+        }
+        if numExpertsPerTok > 0 {
+            guard numExperts > 0, numExpertsPerTok <= numExperts else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .numExpertsPerTok,
+                    in: container,
+                    debugDescription:
+                        "Qwen35JANGTQ MoE config incoherent: num_experts_per_tok must be in 1...num_experts when enabled.")
+            }
+            try Self.validatePositive(moeIntermediateSize, key: .moeIntermediateSize, in: container)
+        }
+        if numExperts > 0 {
+            try Self.validatePositive(sharedExpertIntermediateSize, key: .sharedExpertIntermediateSize, in: container)
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription:
+                    "Qwen35JANGTQ config \(key.stringValue) must be greater than zero.")
+        }
+    }
+
+    private static func validateNonNegative<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription:
+                    "Qwen35JANGTQ config \(key.stringValue) must be nonnegative.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value.isFinite && value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription:
+                    "Qwen35JANGTQ config \(key.stringValue) must be finite and greater than zero.")
+        }
     }
 
     /// Project this JANGTQ config into the affine-side representation
@@ -282,22 +385,14 @@ public struct Qwen35JANGTQTextConfiguration: Codable, Sendable {
     /// `Qwen3NextMLP` initialisers expect. They take a
     /// `Qwen35TextConfiguration` (no JANGTQ fields), so we fabricate
     /// one by re-encoding through JSON.
-    fileprivate func asAffine() -> Qwen35TextConfiguration {
+    fileprivate func asAffine() throws -> Qwen35TextConfiguration {
         // The affine config has the same on-wire shape minus the three
         // JANGTQ fields. Round-trip via JSON to populate it without
         // re-implementing every field default.
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()
-        do {
-            let data = try encoder.encode(JANGTQAffineProjection(self))
-            return try decoder.decode(Qwen35TextConfiguration.self, from: data)
-        } catch {
-            // The encoder shape is exactly what Qwen35TextConfiguration
-            // accepts; an exception here is a programming error, not
-            // an input-data issue.
-            fatalError(
-                "Qwen35JANGTQTextConfiguration.asAffine encode/decode failed: \(error)")
-        }
+        let data = try encoder.encode(JANGTQAffineProjection(self))
+        return try decoder.decode(Qwen35TextConfiguration.self, from: data)
     }
 }
 
@@ -542,14 +637,14 @@ final class Qwen35JANGTQDecoderLayer: Module {
 
     @ModuleInfo(key: "mlp") var mlp: Module
 
-    init(_ args: Qwen35JANGTQTextConfiguration, layerIdx: Int) {
+    init(_ args: Qwen35JANGTQTextConfiguration, layerIdx: Int) throws {
         self.isLinear = (layerIdx + 1) % args.fullAttentionInterval != 0
 
         // The internal Qwen35GatedDeltaNet / Qwen35Attention live in
         // the same module and accept Qwen35TextConfiguration. We
         // project our JANGTQ config down to that shape via JSON
         // round-trip — see Qwen35JANGTQTextConfiguration.asAffine().
-        let affine = args.asAffine()
+        let affine = try args.asAffine()
         if isLinear {
             _linearAttn.wrappedValue = Qwen35GatedDeltaNet(affine)
         } else {
@@ -601,15 +696,13 @@ public class Qwen35JANGTQTextModelInner: Module {
     let ssmIdx: Int
     let faIdx: Int
 
-    init(_ args: Qwen35JANGTQTextConfiguration) {
-        precondition(args.vocabularySize > 0)
-
+    init(_ args: Qwen35JANGTQTextConfiguration) throws {
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize,
             dimensions: args.hiddenSize
         )
-        self.layers = (0 ..< args.hiddenLayers).map { layerIdx in
-            Qwen35JANGTQDecoderLayer(args, layerIdx: layerIdx)
+        self.layers = try (0 ..< args.hiddenLayers).map { layerIdx in
+            try Qwen35JANGTQDecoderLayer(args, layerIdx: layerIdx)
         }
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
@@ -657,11 +750,11 @@ public class Qwen35JANGTQTextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
-    public init(_ args: Qwen35JANGTQTextConfiguration) {
+    public init(_ args: Qwen35JANGTQTextConfiguration) throws {
         self.configuration = args
         self.vocabularySize = args.vocabularySize
         self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
-        self.model = Qwen35JANGTQTextModelInner(args)
+        self.model = try Qwen35JANGTQTextModelInner(args)
 
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
@@ -806,8 +899,8 @@ public class Qwen35JANGTQModel: Module, LLMModel, KVCacheDimensionProvider {
 
     @ModuleInfo(key: "language_model") var languageModel: Qwen35JANGTQTextModel
 
-    public init(_ args: Qwen35JANGTQConfiguration) {
-        let textModel = Qwen35JANGTQTextModel(args.textConfig)
+    public init(_ args: Qwen35JANGTQConfiguration) throws {
+        let textModel = try Qwen35JANGTQTextModel(args.textConfig)
         self.vocabularySize = textModel.vocabularySize
         self.kvHeads = textModel.kvHeads
         _languageModel.wrappedValue = textModel

@@ -93,6 +93,10 @@ enum OmniBench {
             exit(1)
         }
 
+        if (ProcessInfo.processInfo.environment["BENCH_OMNI_MALFORMED_MEDIA"] ?? "0") == "1" {
+            try await runMalformedMediaGuardProbe(context: context, omni: omni)
+            return
+        }
 
         var results: [RowResult] = []
 
@@ -217,7 +221,7 @@ enum OmniBench {
                 temporalPatchDim: 2,
                 mean: CLIP_NORM_MEAN, std: CLIP_NORM_STD)
             let t0 = CFAbsoluteTimeGetCurrent()
-            let videoEmbeds = omni.extractImageEmbeds(
+            let videoEmbeds = try omni.extractImageEmbeds(
                 pixelValues: pixelValues, video: true)
             MLX.eval(videoEmbeds)
             let secs = CFAbsoluteTimeGetCurrent() - t0
@@ -748,6 +752,66 @@ enum OmniBench {
         let hitMaxTokens: Bool
     }
 
+    private static func runMalformedMediaGuardProbe(
+        context: ModelContext,
+        omni: NemotronHOmni
+    ) async throws {
+        print("\n=== BENCH_OMNI_MALFORMED_MEDIA: RADIO pixel guard probe ===")
+        let img = try synthesiseGradient(side: 224)
+        let prepared = try await context.processor.prepare(input: UserInput(
+            prompt: "Describe this image briefly.",
+            images: [.ciImage(img)]))
+
+        func expectProcessingError(
+            _ label: String,
+            pixels: MLXArray,
+            expectedDiagnostic: String
+        ) throws {
+            let malformed = LMInput(
+                text: prepared.text,
+                image: .init(pixels: pixels, frames: prepared.image?.frames),
+                video: nil,
+                audio: nil,
+                mediaTokenIds: prepared.mediaTokenIds,
+                cacheScopeSalt: prepared.cacheScopeSalt)
+            do {
+                _ = try omni.prepare(
+                    malformed,
+                    cache: omni.newCache(parameters: .init()),
+                    windowSize: nil)
+                throw NSError(
+                    domain: "OmniBench", code: 130,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "\(label) unexpectedly reached prepare without RADIO pixel guard error"])
+            } catch let error as VLMError {
+                let message = String(describing: error)
+                guard message.contains("NemotronHOmni")
+                    && message.contains(expectedDiagnostic)
+                else {
+                    throw NSError(
+                        domain: "OmniBench", code: 131,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "\(label) threw VLMError, but not the RADIO pixel guard: \(message)"])
+                }
+                print("PASS \(label): \(message)")
+            }
+        }
+
+        try expectProcessingError(
+            "rank-3 image",
+            pixels: MLXArray.zeros([3, 224, 224]),
+            expectedDiagnostic: "rank 4 [N,C,H,W]")
+        try expectProcessingError(
+            "wrong-channel image",
+            pixels: MLXArray.zeros([1, 4, 224, 224]),
+            expectedDiagnostic: "expected 3 channels")
+        try expectProcessingError(
+            "oversized-grid image",
+            pixels: MLXArray.zeros([1, 3, 20000, 20000]),
+            expectedDiagnostic: "exceeds RADIO max grid")
+        print("=== BENCH_OMNI_MALFORMED_MEDIA: passed ===")
+    }
+
     private static func makeOmniParameters(
         context: ModelContext,
         maxNewTokens: Int
@@ -1256,7 +1320,7 @@ enum OmniBench {
         }
         let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return (
-            visible.isEmpty ? reasoning.trimmingCharacters(in: .whitespacesAndNewlines) : visible,
+            visible,
             reasoning,
             info?.generationTokenCount ?? events,
             info)

@@ -84,18 +84,14 @@ internal final class NemotronHJANGTQSwitchMLP: Module, NemotronHSwitchMLPLayer {
     /// directly lets us EXPAND the input to per-(token, expert) layout
     /// up-front, which is what the kernel actually expects.
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
-        guard let signsIn = JANGTQRuntimeCache.shared.signs(
+        let signsIn = JANGTQRuntimeCache.shared.requiredSigns(
             inFeatures: inputDims, seed: fc1.mxtqSeed)
-        else { fatalError("JANGTQ sidecar missing signs.\(inputDims).\(fc1.mxtqSeed)") }
-        guard let signsInter = JANGTQRuntimeCache.shared.signs(
+        let signsInter = JANGTQRuntimeCache.shared.requiredSigns(
             inFeatures: hiddenDims, seed: fc2.mxtqSeed)
-        else { fatalError("JANGTQ sidecar missing signs.\(hiddenDims).\(fc2.mxtqSeed)") }
-        guard let cbIn = JANGTQRuntimeCache.shared.codebook(
+        let cbIn = JANGTQRuntimeCache.shared.requiredCodebook(
             inFeatures: inputDims, bits: fc1.bits)
-        else { fatalError("JANGTQ sidecar missing codebook.\(inputDims).\(fc1.bits)") }
-        guard let cbInter = JANGTQRuntimeCache.shared.codebook(
+        let cbInter = JANGTQRuntimeCache.shared.requiredCodebook(
             inFeatures: hiddenDims, bits: fc2.bits)
-        else { fatalError("JANGTQ sidecar missing codebook.\(hiddenDims).\(fc2.bits)") }
 
         // x: (B, T, hidden). Rotate once per token for fc1; the gather
         // kernel reuses each rotated row across the K selected experts.
@@ -133,9 +129,11 @@ internal final class NemotronHJANGTQSwitchMLP: Module, NemotronHSwitchMLPLayer {
         outShape.append(inputDims)                      // (B, T, K, hidden)
         return out.reshaped(outShape).asType(x.dtype)
     }
+
 }
 
-extension StreamingTurboQuantSwitchReLUSquaredMLP: NemotronHSwitchMLPLayer {}
+extension StreamingTurboQuantSwitchReLUSquaredMLP: NemotronHSwitchMLPLayer,
+    NemotronHReducedSwitchMLPLayer {}
 
 // MARK: - Public NemotronHJANGTQ helpers
 //

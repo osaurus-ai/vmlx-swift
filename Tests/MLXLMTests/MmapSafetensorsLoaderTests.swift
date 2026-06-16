@@ -133,6 +133,14 @@ struct MmapSafetensorsLoaderTests {
         }
     }
 
+    @Test("non-file URL throws instead of trapping")
+    func nonFileURLThrows() {
+        let url = URL(string: "https://example.invalid/model.safetensors")!
+        #expect(throws: MmapSafetensorsError.self) {
+            try MmapSafetensorsLoader.loadArraysAndMetadata(url: url)
+        }
+    }
+
     @Test("file too short throws headerTooShort")
     func tooShortThrows() throws {
         let url = FileManager.default.temporaryDirectory

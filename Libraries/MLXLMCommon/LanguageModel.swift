@@ -107,12 +107,16 @@ public struct LMInput {
         public let pixels: MLXArray
         /// Time, height, and width of the images
         public let frames: [THW]?
+        /// Optional per-patch image position ids for models whose processor
+        /// emits patch vectors instead of raw BCHW image tensors.
+        public let positionIds: MLXArray?
 
         public init(
-            pixels: MLXArray, frames: [THW]? = nil
+            pixels: MLXArray, frames: [THW]? = nil, positionIds: MLXArray? = nil
         ) {
             self.pixels = pixels
             self.frames = frames
+            self.positionIds = positionIds
         }
     }
 

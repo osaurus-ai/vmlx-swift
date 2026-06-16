@@ -616,7 +616,9 @@ class BatchEngineTurboQuantIntegrationTests: XCTestCase {
 /// - L2 disk (`TQDiskSerializer v2`) restore on fresh engine — requires
 ///   on-disk fixtures.
 /// - VLM multi-turn with image mediaSalt — requires a VLM fixture model.
-/// - Async SSM re-derive — pending `SSMReDeriver` port (spec §11.3).
+/// - Detached async SSM re-derive — the Swift production path intentionally
+///   uses synchronous prompt-boundary rederive/capture after the old detached
+///   helper was reverted for Metal command-encoder safety.
 class BatchEngineMultiTurnTests: XCTestCase {
 
     /// Build an engine that has a paged cache coordinator attached. No disk

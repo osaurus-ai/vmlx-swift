@@ -139,7 +139,6 @@ public final class Lille130mModelInner: Module {
     let norm: RMSNorm
 
     init(_ args: Lille130mConfiguration) {
-        precondition(args.vocabularySize > 0)
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
         self.layers = (0 ..< args.hiddenLayers).map { _ in Lille130mBlock(args) }
@@ -232,6 +231,65 @@ public struct Lille130mConfiguration: Codable, Sendable {
             Float.self, forKey: Lille130mConfiguration.CodingKeys.ropeTheta)
         self.vocabularySize = try container.decode(
             Int.self, forKey: Lille130mConfiguration.CodingKeys.vocabularySize)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(
+        container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        try validatePositive(blockSize, key: .blockSize, in: container)
+        try validatePositive(layerNormEps, key: .layerNormEps, in: container)
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+
+        if hiddenSize % attentionHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "Lille130m hidden_size must be divisible by n_head."
+            )
+        }
+
+        if attentionHeads % kvHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription: "Lille130m n_head must be divisible by n_kv_heads."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Lille130m \(key.rawValue) must be > 0."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if !value.isFinite || value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Lille130m \(key.rawValue) must be finite and > 0."
+            )
+        }
     }
 }
 

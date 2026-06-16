@@ -197,8 +197,6 @@ public class Mistral3TextModelInner: Module {
         self.layerTypes = args.layerTypes
         self.slidingWindow = args.slidingWindow
 
-        precondition(args.vocabularySize > 0)
-
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -455,6 +453,113 @@ public struct Mistral3TextConfiguration: Codable, Sendable {
         }
 
         slidingWindow = try container.decodeIfPresent(Int.self, forKey: .slidingWindow)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+
+        if let headDimensions {
+            try validatePositive(headDimensions, key: .headDimensions, in: container)
+        }
+        if let maxPositionEmbeddings {
+            try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        }
+        if let slidingWindow {
+            try validatePositive(slidingWindow, key: .slidingWindow, in: container)
+        }
+
+        let resolvedHeadDimensions = headDimensions ?? (hiddenSize / attentionHeads)
+        guard hiddenSize == attentionHeads * resolvedHeadDimensions else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "Mistral3Text hidden_size must equal num_attention_heads * head_dim.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription: "Mistral3Text num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard layerTypes.count == hiddenLayers else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layerTypes,
+                in: container,
+                debugDescription: "Mistral3Text layer_types count must match num_hidden_layers.")
+        }
+        let allowedLayerTypes = Set(["full_attention", "sliding_attention"])
+        guard layerTypes.allSatisfy({ allowedLayerTypes.contains($0) }) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layerTypes,
+                in: container,
+                debugDescription: "Mistral3Text layer_types entries must be full_attention or sliding_attention.")
+        }
+        if layerTypes.contains("sliding_attention"), slidingWindow == nil {
+            throw DecodingError.dataCorruptedError(
+                forKey: .slidingWindow,
+                in: container,
+                debugDescription: "Mistral3Text sliding_attention layers require sliding_window.")
+        }
+
+        if let ropeTheta = ropeParameters?["rope_theta"]?.asFloat() {
+            guard ropeTheta.isFinite, ropeTheta > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeParameters,
+                    in: container,
+                    debugDescription: "Mistral3Text rope_parameters.rope_theta must be finite and > 0.")
+            }
+        }
+        if let llama4ScalingBeta = ropeParameters?["llama_4_scaling_beta"]?.asFloat() {
+            guard llama4ScalingBeta.isFinite else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeParameters,
+                    in: container,
+                    debugDescription: "Mistral3Text rope_parameters.llama_4_scaling_beta must be finite.")
+            }
+        }
+        if let originalMaxPositionEmbeddings = ropeParameters?["original_max_position_embeddings"]?.asInt() {
+            guard originalMaxPositionEmbeddings > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeParameters,
+                    in: container,
+                    debugDescription: "Mistral3Text rope_parameters.original_max_position_embeddings must be > 0.")
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Mistral3Text \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Mistral3Text \(key.rawValue) must be finite and > 0.")
+        }
     }
 
     public init(

@@ -80,25 +80,12 @@ class Internlm2Attention: Module {
             dim, (self.heads + 2 * self.kvHeads) * self.headDim, bias: args.bias)
         self._wo.wrappedValue = Linear(self.heads * self.headDim, dim, bias: args.bias)
 
-        let ropeScale: Float
-        if let ropeScaling = args.ropeScaling, ropeScaling["type"] == .string("linear"),
-            let factor = ropeScaling["factor"]
-        {
-            if let v = factor.asFloat() {
-                ropeScale = 1 / v
-            } else {
-                fatalError("ropeScaling.factor must be a float")
-            }
-        } else {
-            ropeScale = 1
-        }
-
         self.rope = Internlm2DynamicNTKScalingRoPE(
             dims: self.headDim,
             maxPositionEmbeddings: args.maxPositionEmbeddings,
             traditional: args.ropeTraditional,
             base: args.ropeTheta,
-            scale: ropeScale
+            scale: args.ropeScale
         )
     }
 
@@ -187,8 +174,6 @@ public class InternLM2ModelInner: Module {
     let norm: RMSNorm
 
     init(_ args: InternLM2Configuration) {
-        precondition(args.vocabularySize > 0)
-
         self._tokEmbeddings.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -268,6 +253,15 @@ public struct InternLM2Configuration: Codable, Sendable {
         attentionHeads / kvHeads
     }
 
+    var ropeScale: Float {
+        guard let ropeScaling, ropeScaling["type"] == .string("linear"),
+            let factor = ropeScaling["factor"]?.asFloat()
+        else {
+            return 1
+        }
+        return 1 / factor
+    }
+
     enum CodingKeys: String, CodingKey {
         case hiddenSize = "hidden_size"
         case hiddenLayers = "num_hidden_layers"
@@ -331,6 +325,57 @@ public struct InternLM2Configuration: Codable, Sendable {
                         "rope_scaling 'type' currently only supports 'linear' or 'dynamic'"
                 )
             }
+            guard let factor = ropeScaling["factor"]?.asFloat(), factor.isFinite, factor > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling, in: container,
+                    debugDescription: "InternLM2 rope_scaling.factor must be a positive float.")
+            }
+        }
+
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try Self.validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+        try Self.validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try Self.validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        guard hiddenSize % attentionHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription:
+                    "InternLM2 hidden_size must be divisible by num_attention_heads.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "InternLM2 num_attention_heads must be divisible by num_key_value_heads.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be greater than zero.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be finite and greater than zero.")
         }
     }
 }

@@ -79,6 +79,58 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(ssm.contains("try save(arrays: arrays, metadata: [\"format\": \"mlx\"], url: safetensorsURL)"))
     }
 
+    @Test("SSM rederive is synchronous prompt-boundary path, not detached helper")
+    func ssmRederiveUsesSynchronousPromptBoundaryPath() throws {
+        let rederive = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Cache/SSMReDerive.swift",
+            encoding: .utf8)
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+        let engine = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let nativeMTP = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift",
+            encoding: .utf8)
+
+        #expect(rederive.contains("Swift parity: detached async re-derive is not active"))
+        #expect(rederive.contains("reDeriveAndStoreSSMStatesForPromptBoundaries"))
+        #expect(rederive.contains("captureCleanSSMStateInline"))
+        #expect(rederive.contains("boundaryMode=prompt-and-paged-blocks"))
+        #expect(!rederive.contains("hybridBlockDiskBoundary"))
+        #expect(!rederive.contains("Task.detached"))
+        #expect(evaluate.contains("reDeriveAndStoreSSMStatesForPromptBoundaries"))
+        #expect(engine.contains("reDeriveAndStoreSSMStatesForPromptBoundaries"))
+        #expect(!engine.contains("!requiresDiskBackedRestore &&\n                        !slot.originalInput.hasMediaContent"))
+        #expect(!evaluate.contains("!requiresDiskBackedRestore &&\n                !originalInput.hasMediaContent"))
+        #expect(!nativeMTP.contains("!requiresDiskBackedRestore &&\n                    !originalInput.hasMediaContent"))
+    }
+
+    @Test("hybrid full cache hits use seed-boundary SSM instead of unconditional rollback")
+    func hybridFullCacheHitsUseSeedBoundarySSM() throws {
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+        let engine = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let rederive = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Cache/SSMReDerive.swift",
+            encoding: .utf8)
+
+        #expect(rederive.contains("boundaries.insert(promptTokenIds.count - 1)"))
+        for source in [evaluate, engine] {
+            #expect(source.contains("let seedBoundary = promptLen - 1"))
+            #expect(source.contains("coordinator.ssmStateCache.fetch("))
+            #expect(source.contains("boundary: seedBoundary"))
+            #expect(source.contains("restoreSSMStates(seedSSM"))
+            #expect(source.contains("missing seed-boundary SSM state"))
+            #expect(!source.contains("path-dependent full disk hit: re-feeding last token would double-count recurrent state"))
+            #expect(!source.contains("path-dependent full cache hit: re-feeding last token would double-count recurrent state"))
+        }
+    }
+
     @Test("token iterator trims full cache hits before one-token seed prefill")
     func tokenIteratorTrimsFullCacheHitBeforeSeedPrefill() throws {
         let source = try String(
@@ -124,6 +176,46 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(engine.contains("debugLogReasoningPromptTail"))
         #expect(engine.contains("path: \"BatchEngine.generate\""))
         #expect(engine.contains("path: \"BatchEngine.submit\""))
+    }
+
+    @Test("batch token trace is env-gated diagnostic only")
+    func batchTokenTraceIsEnvGatedDiagnosticOnly() throws {
+        let engine = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+
+        #expect(engine.contains("VMLINUX_BATCH_TOKEN_TRACE"))
+        #expect(engine.contains("VMLX_BATCH_TOKEN_TRACE"))
+        #expect(engine.contains("VMLINUX_BATCH_TOKEN_TRACE_LIMIT"))
+        #expect(engine.contains("VMLX_BATCH_TOKEN_TRACE_LIMIT"))
+        #expect(engine.contains("VMLINUX_BATCH_TOKEN_TRACE_DECODE"))
+        #expect(engine.contains("VMLX_BATCH_TOKEN_TRACE_DECODE"))
+        #expect(engine.contains("debugBatchTokenTraceLine"))
+        #expect(engine.contains("debugBatchTokenTraceDecodeEnabled"))
+        #expect(engine.contains("if debugBatchTokenTraceDecodeEnabled()"))
+        #expect(engine.contains("decodedPart = \"\""))
+        #expect(engine.contains("token=\\(tokenID)\\(decodedPart)"))
+        #expect(engine.contains("path: \"BatchEngine.generate.consume\""))
+        #expect(engine.contains("path: \"BatchEngine.stepPrefill\""))
+        #expect(engine.contains("path: \"BatchEngine.stepBatchDecode\""))
+        #expect(engine.contains("path: \"BatchEngine.stepCompiledDecode\""))
+        #expect(evaluate.contains("VMLINUX_BATCH_TOKEN_TRACE"))
+        #expect(evaluate.contains("VMLX_BATCH_TOKEN_TRACE"))
+        #expect(evaluate.contains("VMLINUX_BATCH_TOKEN_TRACE_DECODE"))
+        #expect(evaluate.contains("VMLX_BATCH_TOKEN_TRACE_DECODE"))
+        #expect(evaluate.contains("debugGenerateTokenTraceLine"))
+        #expect(evaluate.contains("debugGenerateTokenTraceDecodeEnabled"))
+        #expect(evaluate.contains("if debugGenerateTokenTraceDecodeEnabled()"))
+        #expect(evaluate.contains("decodedPart = \"\""))
+        #expect(evaluate.contains("token=\\(tokenID)\\(decodedPart)"))
+        #expect(evaluate.contains("path: \"generateLoopTask.token\""))
+        #expect(!engine.contains("ReasoningCloseBiasProcessor"))
+        #expect(!engine.contains("parametersWithAutomaticReasoningCloseBias"))
+        #expect(!evaluate.contains("ReasoningCloseBiasProcessor"))
+        #expect(!evaluate.contains("parametersWithAutomaticReasoningCloseBias"))
     }
 
     @Test("MiniMax stays off compiled decode until parity is proven")

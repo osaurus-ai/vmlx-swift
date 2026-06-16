@@ -198,8 +198,6 @@ public class Mistral3TextJANGTQModelInner: Module {
         self.layerTypes = args.layerTypes
         self.slidingWindow = args.slidingWindow
 
-        precondition(args.vocabularySize > 0)
-
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 

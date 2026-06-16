@@ -33,13 +33,13 @@ internal enum NemotronHBlockType {
     case mlp  // "-"
     case moe  // "E"
 
-    init(from char: Character) {
+    static func decode(_ char: Character) -> NemotronHBlockType? {
         switch char {
-        case "M": self = .mamba
-        case "*": self = .attention
-        case "-": self = .mlp
-        case "E": self = .moe
-        default: fatalError("Unknown NemotronH block type: \(char)")
+        case "M": return .mamba
+        case "*": return .attention
+        case "-": return .mlp
+        case "E": return .moe
+        default: return nil
         }
     }
 }
@@ -62,6 +62,10 @@ internal protocol NemotronHMixer: Module {
 /// as a generic `Module` and dispatch via this protocol at forward time.
 internal protocol NemotronHSwitchMLPLayer: Module {
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray
+}
+
+internal protocol NemotronHReducedSwitchMLPLayer: Module {
+    func reduced(_ x: MLXArray, indices: MLXArray, scores: MLXArray) -> MLXArray
 }
 
 // MARK: - Activations
@@ -557,7 +561,13 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
                 latentSize, args.hiddenSize, bias: false)
         }
         if let jangtq {
-            if JANGTQStreamingExperts.isEnabled {
+            let streamJANGTQExperts =
+                JANGTQStreamingExperts.isEnabled
+                || JANGTQStreamingExperts.shouldAutoEnableNemotronUltra(
+                    nRoutedExperts: args.nRoutedExperts,
+                    numExpertsPerTok: args.numExpertsPerTok,
+                    routedBits: jangtq.bits)
+            if streamJANGTQExperts {
                 self._switchMLP.wrappedValue = StreamingTurboQuantSwitchReLUSquaredMLP(
                     inputDims: expertInputDims,
                     hiddenDims: args.moeIntermediateSize,
@@ -602,8 +612,13 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         guard let layer = switchMLP as? NemotronHSwitchMLPLayer else {
             fatalError("NemotronHMoE.switch_mlp must conform to NemotronHSwitchMLPLayer (got \(type(of: switchMLP)))")
         }
-        var y = layer(expertInput, inds)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        var y: MLXArray
+        if let reducedLayer = switchMLP as? NemotronHReducedSwitchMLPLayer {
+            y = reducedLayer.reduced(expertInput, indices: inds, scores: scores)
+        } else {
+            y = layer(expertInput, inds)
+            y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        }
         if let fc2LatentProj {
             y = fc2LatentProj(y)
         }
@@ -640,10 +655,10 @@ internal class NemotronHBlock: Module {
     init(
         _ args: NemotronHConfiguration,
         layerIdx: Int,
-        blockType: Character,
+        blockType: NemotronHBlockType,
         jangtq: NemotronHJANGTQContext? = nil
     ) {
-        self.blockType = NemotronHBlockType(from: blockType)
+        self.blockType = blockType
 
         self._norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
 
@@ -676,7 +691,7 @@ internal class NemotronHBlock: Module {
         let mixerFunc = mixer as! NemotronHMixer
         let output = mixerFunc(hidden, attentionMask: attentionMask, ssmMask: ssmMask, cache: cache)
 
-        return x + output
+        return (x + output).asType(x.dtype)
     }
 }
 
@@ -697,12 +712,11 @@ internal class NemotronHBackbone: Module {
 
     init(_ args: NemotronHConfiguration, jangtq: NemotronHJANGTQContext? = nil) {
         self.args = args
-        precondition(args.vocabSize > 0)
 
         self._embeddings.wrappedValue = Embedding(
             embeddingCount: args.vocabSize, dimensions: args.hiddenSize)
 
-        let pattern = Array(args.hybridOverridePattern)
+        let pattern = args.blockTypes
         self._layers.wrappedValue = pattern.enumerated().map { layerIdx, blockType in
             NemotronHBlock(args, layerIdx: layerIdx, blockType: blockType, jangtq: jangtq)
         }
@@ -713,11 +727,11 @@ internal class NemotronHBackbone: Module {
         // fa_idx: count Mamba layers (M) before the first Attention layer (*)
         var faIdx: Int? = nil
         var mambaCount = 0
-        for char in pattern {
-            if char == "*" {
+        for blockType in pattern {
+            if blockType == .attention {
                 faIdx = mambaCount
                 break
-            } else if char == "M" {
+            } else if blockType == .mamba {
                 mambaCount += 1
             }
         }
@@ -726,11 +740,11 @@ internal class NemotronHBackbone: Module {
         // ssm_idx: count Attention layers (*) before the first Mamba layer (M)
         var ssmIdx: Int? = nil
         var attnCount = 0
-        for char in pattern {
-            if char == "M" {
+        for blockType in pattern {
+            if blockType == .mamba {
                 ssmIdx = attnCount
                 break
-            } else if char == "*" {
+            } else if blockType == .attention {
                 attnCount += 1
             }
         }
@@ -806,9 +820,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         self.vocabularySize = args.vocabSize
 
         // kvHeads array: non-zero for attention layers, zero for others
-        let pattern = Array(args.hybridOverridePattern)
-        self.kvHeads = pattern.compactMap { char -> Int? in
-            let blockType = NemotronHBlockType(from: char)
+        self.kvHeads = args.blockTypes.compactMap { blockType -> Int? in
             if blockType == .mamba || blockType == .attention {
                 return blockType == .attention ? args.numKeyValueHeads : 0
             }
@@ -830,9 +842,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     public init(jangtqContext: NemotronHJANGTQContext, configuration args: NemotronHConfiguration) {
         self.configuration = args
         self.vocabularySize = args.vocabSize
-        let pattern = Array(args.hybridOverridePattern)
-        self.kvHeads = pattern.compactMap { char -> Int? in
-            let blockType = NemotronHBlockType(from: char)
+        self.kvHeads = args.blockTypes.compactMap { blockType -> Int? in
             if blockType == .mamba || blockType == .attention {
                 return blockType == .attention ? args.numKeyValueHeads : 0
             }
@@ -846,6 +856,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var out = backbone(inputs, cache: cache)
+        out = out.asType(backbone.embeddings.weight.dtype)
         if let lmHead {
             out = lmHead(out)
         } else {
@@ -863,6 +874,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     /// Returns logits in the same shape as ``callAsFunction(_:cache:)``.
     public func callAsFunction(inputsEmbeds: MLXArray, cache: [KVCache]?) -> MLXArray {
         var out = backbone.forwardFromEmbeddings(inputsEmbeds, cache: cache)
+        out = out.asType(backbone.embeddings.weight.dtype)
         if let lmHead {
             out = lmHead(out)
         } else {
@@ -877,9 +889,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         // CacheCoordinator's `defaultMaxKVSize` contract a silent no-op
         // for the Cascade-2 / Nemotron-Omni hybrid family. Mamba layers
         // ignore the bound by design (their hidden state is fixed-size).
-        let pattern = Array(configuration.hybridOverridePattern)
-        return pattern.compactMap { char -> KVCache? in
-            let blockType = NemotronHBlockType(from: char)
+        return configuration.blockTypes.compactMap { blockType -> KVCache? in
             switch blockType {
             case .mamba:
                 return MambaCache()
@@ -989,7 +999,13 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                 guard sanitized[probe] != nil else { continue }
                 for kind in ["tq_packed", "tq_norms"] {
                     let target = "\(prefix).switch_mlp.\(fc).\(kind)"
-                    if JANGTQStreamingExperts.isEnabled {
+                    let streamJANGTQExperts =
+                        JANGTQStreamingExperts.isEnabled
+                        || JANGTQStreamingExperts.shouldAutoEnableNemotronUltra(
+                            nRoutedExperts: configuration.nRoutedExperts,
+                            numExpertsPerTok: configuration.numExpertsPerTok,
+                            routedBits: nil)
+                    if streamJANGTQExperts {
                         for e in 0 ..< configuration.nRoutedExperts {
                             sanitized.removeValue(
                                 forKey: "\(prefix).experts.\(e).\(proj).\(kind)")
@@ -1077,6 +1093,10 @@ public struct NemotronHConfiguration: Codable, Sendable {
     public var routedScalingFactor: Float
     public var timeStepLimitMin: Float
     public var timeStepLimitMax: Float
+
+    internal var blockTypes: [NemotronHBlockType] {
+        Array(hybridOverridePattern).compactMap(NemotronHBlockType.decode)
+    }
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -1207,6 +1227,123 @@ public struct NemotronHConfiguration: Codable, Sendable {
             timeStepLimitMax =
                 try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMax)
                 ?? Float.infinity
+        }
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(vocabSize, key: .vocabSize, in: container)
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(numHiddenLayers, key: .numHiddenLayers, in: container)
+        try validatePositive(numAttentionHeads, key: .numAttentionHeads, in: container)
+        try validatePositive(numKeyValueHeads, key: .numKeyValueHeads, in: container)
+        try validatePositive(mambaNumHeads, key: .mambaNumHeads, in: container)
+        try validatePositive(mambaHeadDim, key: .mambaHeadDim, in: container)
+        try validatePositive(ssmStateSize, key: .ssmStateSize, in: container)
+        try validatePositive(convKernel, key: .convKernel, in: container)
+        try validatePositive(nGroups, key: .nGroups, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(moeIntermediateSize, key: .moeIntermediateSize, in: container)
+        try validatePositive(moeSharedExpertIntermediateSize, key: .moeSharedExpertIntermediateSize, in: container)
+        try validatePositive(nRoutedExperts, key: .nRoutedExperts, in: container)
+        try validatePositive(numExpertsPerTok, key: .numExpertsPerTok, in: container)
+        try validatePositive(layerNormEpsilon, key: .layerNormEpsilon, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try validatePositive(nGroup, key: .nGroup, in: container)
+        try validatePositive(topkGroup, key: .topkGroup, in: container)
+        try validatePositive(routedScalingFactor, key: .routedScalingFactor, in: container)
+        if let headDim {
+            try validatePositive(headDim, key: .headDim, in: container)
+        }
+        if let moeLatentSize {
+            try validatePositive(moeLatentSize, key: .moeLatentSize, in: container)
+        }
+        if let nSharedExperts, nSharedExperts < 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .nSharedExperts, in: container,
+                debugDescription: "NemotronH config n_shared_experts must be >= 0.")
+        }
+
+        guard hiddenSize % numAttentionHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize, in: container,
+                debugDescription: "NemotronH config hidden_size must be divisible by num_attention_heads.")
+        }
+        guard numAttentionHeads % numKeyValueHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numKeyValueHeads, in: container,
+                debugDescription: "NemotronH config num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard mambaNumHeads % nGroups == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .nGroups, in: container,
+                debugDescription: "NemotronH config mamba_num_heads must be divisible by n_groups.")
+        }
+        guard (mambaNumHeads * mambaHeadDim) % nGroups == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .nGroups, in: container,
+                debugDescription: "NemotronH config mamba_num_heads * mamba_head_dim must be divisible by n_groups.")
+        }
+        guard nRoutedExperts % nGroup == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .nGroup, in: container,
+                debugDescription: "NemotronH config n_routed_experts must be divisible by n_group.")
+        }
+        guard topkGroup <= nGroup else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .topkGroup, in: container,
+                debugDescription: "NemotronH config topk_group must not exceed n_group.")
+        }
+        guard numExpertsPerTok <= nRoutedExperts else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numExpertsPerTok, in: container,
+                debugDescription: "NemotronH config num_experts_per_tok must not exceed n_routed_experts.")
+        }
+        if timeStepLimitMax.isFinite {
+            guard timeStepLimitMax >= timeStepLimitMin else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .timeStepLimitMax, in: container,
+                    debugDescription: "NemotronH config time_step_limit max must be >= min.")
+            }
+        }
+
+        let pattern = Array(hybridOverridePattern)
+        guard pattern.count == numHiddenLayers else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hybridOverridePattern, in: container,
+                debugDescription: "NemotronH config hybrid_override_pattern length must equal num_hidden_layers.")
+        }
+        for char in pattern {
+            guard NemotronHBlockType.decode(char) != nil else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hybridOverridePattern, in: container,
+                    debugDescription: "NemotronH config hybrid_override_pattern must contain only M, *, -, or E.")
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "NemotronH config \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "NemotronH config \(key.rawValue) must be finite and > 0.")
         }
     }
 

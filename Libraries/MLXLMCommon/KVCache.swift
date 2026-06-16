@@ -1471,7 +1471,14 @@ public func loadPromptCache(
             throw KVCacheError(message: "Unknown cache class: \(className)")
         }
 
-        cache.state = cacheData[i]
+        try validatePromptCacheState(
+            className: className,
+            state: cacheData[i],
+            metaState: i < cacheInfo.count ? cacheInfo[i] : []
+        )
+        if !cacheData[i].isEmpty {
+            cache.state = cacheData[i]
+        }
         if i < cacheInfo.count {
             cache.metaState = cacheInfo[i]
         }
@@ -1479,6 +1486,87 @@ public func loadPromptCache(
     }
 
     return (caches, userMetadata)
+}
+
+private func validatePromptCacheState(
+    className: String,
+    state: [MLXArray],
+    metaState: [String]
+) throws {
+    func validateDecodedKVState(_ expectedClass: String) throws {
+        guard state.count == 0 || state.count == 2 else {
+            throw KVCacheError(
+                message: "\(expectedClass) prompt cache state must have 0 or 2 arrays; got \(state.count)")
+        }
+        guard state.isEmpty || promptCacheDecodedKVStateIsValid(state[0], state[1]) else {
+            throw KVCacheError(message: "\(expectedClass) prompt cache state has incompatible key/value tensors")
+        }
+    }
+
+    switch className {
+    case "KVCache", "KVCacheSimple":
+        try validateDecodedKVState("KVCacheSimple")
+        try validateBasePromptCacheMetaState(metaState, className: className)
+    case "RotatingKVCache":
+        try validateDecodedKVState("RotatingKVCache")
+        guard metaState.count == 5 else {
+            throw KVCacheError(message: "RotatingKVCache prompt cache metaState must have 5 values")
+        }
+        guard metaState[1] != "None" else {
+            throw KVCacheError(message: "RotatingKVCache prompt cache metaState must have non-nil maxSize")
+        }
+        guard let maxSize = Int(metaState[1]), maxSize > 0,
+              Int(metaState[0]) != nil,
+              Int(metaState[2]) != nil,
+              let offset = Int(metaState[3]), offset >= 0,
+              let idx = Int(metaState[4]), idx >= 0 && idx < maxSize
+        else {
+            throw KVCacheError(message: "RotatingKVCache prompt cache metaState contains invalid values")
+        }
+    case "QuantizedKVCache":
+        guard state.count == 0 || state.count == 4 || state.count == 6 else {
+            throw KVCacheError(
+                message: "QuantizedKVCache prompt cache state must have 0, 4, or 6 arrays; got \(state.count)")
+        }
+        guard metaState.count == 4 else {
+            throw KVCacheError(message: "QuantizedKVCache prompt cache metaState must have 4 values")
+        }
+        guard Int(metaState[1]) != nil else {
+            throw KVCacheError(message: "QuantizedKVCache prompt cache offset metaState is invalid")
+        }
+    case "ChunkedKVCache":
+        try validateDecodedKVState("ChunkedKVCache")
+        guard metaState.count == 2 else {
+            throw KVCacheError(message: "ChunkedKVCache prompt cache metaState must have 2 values")
+        }
+        guard metaState[0] == "None" || Int(metaState[0]) != nil,
+              Int(metaState[1]) != nil
+        else {
+            throw KVCacheError(message: "ChunkedKVCache prompt cache metaState contains invalid values")
+        }
+    case "MambaCache", "ArraysCache":
+        try validateBasePromptCacheMetaState(metaState, className: className)
+    case "CacheList":
+        guard state.isEmpty else {
+            throw KVCacheError(message: "CacheList prompt cache loading only supports empty state")
+        }
+        try validateBasePromptCacheMetaState(metaState, className: className)
+    default:
+        return
+    }
+}
+
+private func promptCacheDecodedKVStateIsValid(_ keys: MLXArray, _ values: MLXArray) -> Bool {
+    keys.shape.count >= 3 && values.shape.count >= 3 && keys.shape == values.shape
+}
+
+private func validateBasePromptCacheMetaState(
+    _ metaState: [String],
+    className: String
+) throws {
+    guard metaState.count == 1 && metaState[0].isEmpty else {
+        throw KVCacheError(message: "\(className) prompt cache metaState must be a single empty value")
+    }
 }
 
 /// Unflatten arrays from tree_flatten format (e.g., "0.1", "1.0") to nested structure

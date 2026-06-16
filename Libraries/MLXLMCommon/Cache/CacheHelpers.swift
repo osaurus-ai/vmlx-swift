@@ -208,9 +208,15 @@ public func restoreLayerData(from blocks: [CacheBlock], into cache: [any KVCache
         }
 
         guard !keySlices.isEmpty else { continue }
+        guard keySlices.allSatisfy({ $0.shape.count >= 3 }),
+              valueSlices.allSatisfy({ $0.shape.count >= 3 })
+        else { return 0 }
 
         var restoredKeys = keySlices.count == 1 ? keySlices[0] : concatenated(keySlices, axis: 2)
         var restoredValues = valueSlices.count == 1 ? valueSlices[0] : concatenated(valueSlices, axis: 2)
+        guard isCompatibleDecodedKVState(keys: restoredKeys, values: restoredValues) else {
+            return 0
+        }
 
         // Ensure restored KV matches bfloat16 (prevents dtype mismatch from stale
         // disk cache entries created before the universal bfloat16 conversion)
@@ -355,7 +361,9 @@ public func restoreSSMStates(_ states: [MLXArray], into cache: [any KVCache]) {
             if stateIdx + 2 <= states.count {
                 let conv = states[stateIdx][.ellipsis]
                 let prev = states[stateIdx + 1][.ellipsis]
-                zaya.writeCCA(conv: conv, prev: prev)
+                guard restoreZayaCCACompanionState(conv: conv, prev: prev, into: zaya) else {
+                    return
+                }
                 stateIdx += 2
             }
         } else if let cacheList = layer as? CacheList {
@@ -374,10 +382,30 @@ public func restoreSSMStates(_ states: [MLXArray], into cache: [any KVCache]) {
                             .map { $0[.ellipsis] }
                         stateIdx += existingCount
                     }
+                } else if let zaya = cacheList[i] as? ZayaCCACache {
+                    if stateIdx + 2 <= states.count {
+                        let conv = states[stateIdx][.ellipsis]
+                        let prev = states[stateIdx + 1][.ellipsis]
+                        guard restoreZayaCCACompanionState(conv: conv, prev: prev, into: zaya) else {
+                            return
+                        }
+                        stateIdx += 2
+                    }
                 }
             }
         }
     }
+}
+
+private func restoreZayaCCACompanionState(
+    conv: MLXArray,
+    prev: MLXArray,
+    into zaya: ZayaCCACache
+) -> Bool {
+    guard conv.shape == [zaya.batchSize, zaya.convChannels, 2] else { return false }
+    guard prev.shape == [zaya.batchSize, zaya.hiddenSize] else { return false }
+    zaya.writeCCA(conv: conv, prev: prev)
+    return true
 }
 
 // MARK: - Disk Cache KV Restoration
@@ -498,7 +526,7 @@ private func restoreFromV2Arrays(
             // SLIDING-1 (2026-04-15): closes the central skip in
             // CacheCoordinator.swift that previously dropped Gemma4 SWA,
             // Mistral4-with-maxKVSize, MiMoV2Flash, BaichuanM1.
-            restoreRotatingLayer(comp, into: cache[i])
+            guard restoreRotatingLayer(comp, into: cache[i]) else { continue }
             if totalTokens == 0 {
                 totalTokens = comp.offset
             }
@@ -510,7 +538,7 @@ private func restoreFromV2Arrays(
             // so multi-turn /v1/chat/completions prefix-cache reuse
             // doesn't have to re-derive the long-context summary from
             // prompt tokens every turn.
-            restoreDeepseekV4Layer(comp, into: cache[i])
+            guard restoreDeepseekV4Layer(comp, into: cache[i]) else { continue }
             if totalTokens == 0 {
                 totalTokens = comp.offset
             }
@@ -520,7 +548,7 @@ private func restoreFromV2Arrays(
             // Restore the four-array state (keys, values, conv_state,
             // prev_hs) as one unit. KV-only restore would be a false hit
             // because conv_state and prev_hs are path-dependent.
-            restoreZayaCCALayer(comp, into: cache[i])
+            guard restoreZayaCCALayer(comp, into: cache[i]) else { continue }
             if totalTokens == 0 {
                 totalTokens = comp.offset
             }
@@ -558,7 +586,7 @@ private func restoreFromV2Arrays(
                     restoreMambaLayer(comp, into: cache[i])
 
                 case .rotating(let comp):
-                    restoreRotatingLayer(comp, into: cache[i])
+                    guard restoreRotatingLayer(comp, into: cache[i]) else { continue }
                     if totalTokens == 0 {
                         totalTokens = comp.offset
                     }
@@ -673,6 +701,10 @@ private func restoreFromLegacyArrays(
             restoredValues = restoredValues.asType(.bfloat16)
         }
 
+        guard isCompatibleDecodedKVState(keys: restoredKeys, values: restoredValues) else {
+            return 0
+        }
+
         if totalTokens == 0 {
             totalTokens = restoredKeys.dim(2)
         }
@@ -740,6 +772,12 @@ private func restoreKVLayer(
     }
 }
 
+private func isCompatibleDecodedKVState(keys: MLXArray, values: MLXArray) -> Bool {
+    guard keys.shape.count >= 3 && values.shape.count >= 3 else { return false }
+    guard keys.shape == values.shape else { return false }
+    return true
+}
+
 /// Helper: restore quantized-KV state into a `QuantizedKVCache` layer.
 /// Verifies group size + bit width match the runtime cache before
 /// touching state — a mismatch means the model was reconfigured since the
@@ -749,16 +787,22 @@ private func restoreQKVLayer(
     _ comp: TQDiskSerializer.QKVLayerComponents,
     into layer: inout any KVCache
 ) -> Bool {
+    guard isValidQKVStateArrayCount(comp.stateArrays.count) else { return false }
+    let stateArrays = comp.stateArrays
+
+    func restoreQuantizedState(_ qkv: QuantizedKVCache) {
+        qkv.state = stateArrays
+        qkv.offset = comp.offset
+    }
+
     if let qkv = layer as? QuantizedKVCache {
         guard qkv.groupSize == comp.groupSize, qkv.bits == comp.bits else { return false }
-        qkv.state = comp.stateArrays
-        qkv.offset = comp.offset
+        restoreQuantizedState(qkv)
         return true
     }
     if layer is KVCacheSimple {
         let qkv = QuantizedKVCache(groupSize: comp.groupSize, bits: comp.bits)
-        qkv.state = comp.stateArrays
-        qkv.offset = comp.offset
+        restoreQuantizedState(qkv)
         layer = qkv
         return true
     }
@@ -768,20 +812,22 @@ private func restoreQKVLayer(
                 guard qkv.groupSize == comp.groupSize, qkv.bits == comp.bits else {
                     return false
                 }
-                qkv.state = comp.stateArrays
-                qkv.offset = comp.offset
+                restoreQuantizedState(qkv)
                 return true
             }
             if cacheList[i] is KVCacheSimple {
                 let qkv = QuantizedKVCache(groupSize: comp.groupSize, bits: comp.bits)
-                qkv.state = comp.stateArrays
-                qkv.offset = comp.offset
+                restoreQuantizedState(qkv)
                 cacheList.caches[i] = qkv
                 return true
             }
         }
     }
     return false
+}
+
+private func isValidQKVStateArrayCount(_ count: Int) -> Bool {
+    count == 4 || count == 6
 }
 
 /// Helper: restore TQ-compressed state into a `TurboQuantKVCache` layer
@@ -862,7 +908,9 @@ private func makeTurboQuantLayer(
 private func restoreRotatingLayer(
     _ comp: TQDiskSerializer.RotatingLayerComponents,
     into layer: any KVCache
-) {
+) -> Bool {
+    guard isCompatibleRotatingState(comp) else { return false }
+
     func apply(_ rot: RotatingKVCache) {
         rot.state = [comp.keys, comp.values]
         rot.metaState = [
@@ -875,27 +923,39 @@ private func restoreRotatingLayer(
     }
     if let rot = layer as? RotatingKVCache {
         apply(rot)
-        return
+        return true
     }
     // Composite cache that wraps a RotatingKVCache (e.g. DeepseekV4Cache).
     // Restores the inner rotating state; the wrapper's ephemeral buffer
     // state is cleared and will be repopulated on the next prefill.
     if let wrapper = layer as? RotatingKVCacheWrapper {
         apply(wrapper.rotating)
-        return
+        return true
     }
     if let cacheList = layer as? CacheList {
         for i in 0..<cacheList.count {
             if let rot = cacheList[i] as? RotatingKVCache {
                 apply(rot)
-                return
+                return true
             }
             if let wrapper = cacheList[i] as? RotatingKVCacheWrapper {
                 apply(wrapper.rotating)
-                return
+                return true
             }
         }
     }
+    return false
+}
+
+private func isCompatibleRotatingState(
+    _ comp: TQDiskSerializer.RotatingLayerComponents
+) -> Bool {
+    guard comp.keys.shape.count >= 3 && comp.values.shape.count >= 3 else { return false }
+    guard comp.keys.shape == comp.values.shape else { return false }
+    guard comp.maxSize > 0 else { return false }
+    guard comp.offset >= 0 else { return false }
+    guard comp.idx >= 0 && comp.idx < comp.maxSize else { return false }
+    return true
 }
 
 /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
@@ -905,7 +965,7 @@ private func restoreRotatingLayer(
 private func restoreDeepseekV4Layer(
     _ comp: TQDiskSerializer.DeepseekV4LayerComponents,
     into layer: any KVCache
-) {
+) -> Bool {
     func apply(_ hybrid: HybridPoolCache) {
         hybrid.rotating.state = [comp.keys, comp.values]
         hybrid.rotating.metaState = [
@@ -924,11 +984,24 @@ private func restoreDeepseekV4Layer(
             branch: .indexer,
             kv: comp.bufIdxKV, gate: comp.bufIdxGate)
     }
-    if let hybrid = layer as? HybridPoolCache {
-        apply(hybrid)
-        return
-    }
-    // Type mismatch — caller will fall back to fresh prefill.
+    guard let hybrid = layer as? HybridPoolCache else { return false }
+    guard isCompatibleDeepseekV4State(comp, with: hybrid) else { return false }
+    apply(hybrid)
+    return true
+}
+
+private func isCompatibleDeepseekV4State(
+    _ comp: TQDiskSerializer.DeepseekV4LayerComponents,
+    with hybrid: HybridPoolCache
+) -> Bool {
+    guard comp.compressRatio == hybrid.compressRatio,
+          comp.slidingWindow == hybrid.slidingWindow
+    else { return false }
+    guard comp.keys.shape.count >= 3 && comp.values.shape.count >= 3 else { return false }
+    guard comp.keys.shape == comp.values.shape else { return false }
+    guard comp.offset >= 0, comp.maxSize > 0 else { return false }
+    guard comp.idx >= 0 && comp.idx < comp.maxSize else { return false }
+    return true
 }
 
 /// 2026-05-06 (ZAYA1 CCA-attention port):
@@ -940,9 +1013,27 @@ private func restoreDeepseekV4Layer(
 private func restoreZayaCCALayer(
     _ comp: TQDiskSerializer.ZayaCCALayerComponents,
     into layer: any KVCache
-) {
-    guard let zaya = layer as? ZayaCCACache else { return }
+) -> Bool {
+    guard let zaya = layer as? ZayaCCACache else { return false }
+    guard isCompatibleZayaCCAState(comp, with: zaya) else { return false }
     zaya.state = [comp.keys, comp.values, comp.convState, comp.prevHS]
+    return true
+}
+
+private func isCompatibleZayaCCAState(
+    _ comp: TQDiskSerializer.ZayaCCALayerComponents,
+    with zaya: ZayaCCACache
+) -> Bool {
+    guard comp.batchSize == zaya.batchSize,
+          comp.convChannels == zaya.convChannels,
+          comp.hiddenSize == zaya.hiddenSize
+    else { return false }
+    guard comp.keys.shape.count >= 3 && comp.values.shape.count >= 3 else { return false }
+    guard comp.keys.shape == comp.values.shape else { return false }
+    guard comp.keys.shape[0] == zaya.batchSize else { return false }
+    guard comp.convState.shape == [zaya.batchSize, zaya.convChannels, 2] else { return false }
+    guard comp.prevHS.shape == [zaya.batchSize, zaya.hiddenSize] else { return false }
+    return true
 }
 
 /// Helper: restore Mamba SSM state into a `MambaCache` layer (or a

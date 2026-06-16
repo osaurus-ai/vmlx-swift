@@ -40,6 +40,70 @@ public struct PixtralVisionConfiguration: Codable, Sendable {
         case _headDim = "head_dim"
         case _ropeTheta = "rope_theta"
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        modelType = try container.decode(String.self, forKey: .modelType)
+        hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        numHiddenLayers = try container.decode(Int.self, forKey: .numHiddenLayers)
+        numAttentionHeads = try container.decode(Int.self, forKey: .numAttentionHeads)
+        intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        patchSize = try container.decode(Int.self, forKey: .patchSize)
+        imageSize = try container.decode(Int.self, forKey: .imageSize)
+        _numChannels = try container.decodeIfPresent(Int.self, forKey: ._numChannels)
+        _rmsNormEps = try container.decodeIfPresent(Float.self, forKey: ._rmsNormEps)
+        _headDim = try container.decodeIfPresent(Int.self, forKey: ._headDim)
+        _ropeTheta = try container.decodeIfPresent(Float.self, forKey: ._ropeTheta)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(numHiddenLayers, key: .numHiddenLayers, in: container)
+        try validatePositive(numAttentionHeads, key: .numAttentionHeads, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(patchSize, key: .patchSize, in: container)
+        try validatePositive(imageSize, key: .imageSize, in: container)
+        try validatePositive(numChannels, key: ._numChannels, in: container)
+        try validatePositive(rmsNormEps, key: ._rmsNormEps, in: container)
+        try validatePositive(headDim, key: ._headDim, in: container)
+        try validatePositive(ropeTheta, key: ._ropeTheta, in: container)
+        guard hiddenSize == numAttentionHeads * headDim else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize, in: container,
+                debugDescription: "Pixtral vision config hidden_size must equal num_attention_heads * head_dim.")
+        }
+        guard imageSize % patchSize == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .patchSize, in: container,
+                debugDescription: "Pixtral vision config image_size must be divisible by patch_size.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Pixtral vision config \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Pixtral vision config \(key.rawValue) must be finite and > 0.")
+        }
+    }
 }
 
 // MARK: - Text Configuration (for Pixtral)
@@ -88,6 +152,76 @@ public struct PixtralTextConfiguration: Codable, Sendable {
         case _tieWordEmbeddings = "tie_word_embeddings"
         case _useQkNorm = "use_qk_norm"
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        modelType = try container.decode(String.self, forKey: .modelType)
+        hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        numHiddenLayers = try container.decode(Int.self, forKey: .numHiddenLayers)
+        intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        numAttentionHeads = try container.decode(Int.self, forKey: .numAttentionHeads)
+        rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
+        vocabSize = try container.decode(Int.self, forKey: .vocabSize)
+        _headDim = try container.decodeIfPresent(Int.self, forKey: ._headDim)
+        _maxPositionEmbeddings = try container.decodeIfPresent(Int.self, forKey: ._maxPositionEmbeddings)
+        _numKeyValueHeads = try container.decodeIfPresent(Int.self, forKey: ._numKeyValueHeads)
+        _ropeTheta = try container.decodeIfPresent(Float.self, forKey: ._ropeTheta)
+        _ropeTraditional = try container.decodeIfPresent(Bool.self, forKey: ._ropeTraditional)
+        _ropeScaling = try container.decodeIfPresent([String: StringOrNumber].self, forKey: ._ropeScaling)
+        _tieWordEmbeddings = try container.decodeIfPresent(Bool.self, forKey: ._tieWordEmbeddings)
+        _useQkNorm = try container.decodeIfPresent(Bool.self, forKey: ._useQkNorm)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(numHiddenLayers, key: .numHiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(numAttentionHeads, key: .numAttentionHeads, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabSize, key: .vocabSize, in: container)
+        try validatePositive(headDim, key: ._headDim, in: container)
+        if let maxPositionEmbeddings {
+            try validatePositive(maxPositionEmbeddings, key: ._maxPositionEmbeddings, in: container)
+        }
+        try validatePositive(numKeyValueHeads, key: ._numKeyValueHeads, in: container)
+        try validatePositive(ropeTheta, key: ._ropeTheta, in: container)
+        guard hiddenSize == numAttentionHeads * headDim else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize, in: container,
+                debugDescription: "Pixtral text config hidden_size must equal num_attention_heads * head_dim.")
+        }
+        guard numAttentionHeads % numKeyValueHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._numKeyValueHeads, in: container,
+                debugDescription: "Pixtral text config num_attention_heads must be divisible by num_key_value_heads.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Pixtral text config \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Pixtral text config \(key.rawValue) must be finite and > 0.")
+        }
+    }
 }
 
 // MARK: - Model Configuration
@@ -120,6 +254,55 @@ public struct PixtralConfiguration: Codable, Sendable {
         case _visionFeatureSelectStrategy = "vision_feature_select_strategy"
         case _visionFeatureLayer = "vision_feature_layer"
         case _vocabSize = "vocab_size"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        textConfig = try container.decode(PixtralTextConfiguration.self, forKey: .textConfig)
+        visionConfig = try container.decode(PixtralVisionConfiguration.self, forKey: .visionConfig)
+        modelType = try container.decode(String.self, forKey: .modelType)
+        _ignoreIndex = try container.decodeIfPresent(Int.self, forKey: ._ignoreIndex)
+        _imageTokenIndex = try container.decodeIfPresent(Int.self, forKey: ._imageTokenIndex)
+        _imageTokenId = try container.decodeIfPresent(Int.self, forKey: ._imageTokenId)
+        _visionFeatureSelectStrategy = try container.decodeIfPresent(String.self, forKey: ._visionFeatureSelectStrategy)
+        _visionFeatureLayer = try container.decodeIfPresent(Int.self, forKey: ._visionFeatureLayer)
+        _vocabSize = try container.decodeIfPresent(Int.self, forKey: ._vocabSize)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(vocabSize, key: ._vocabSize, in: container)
+        guard imageTokenIndex >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._imageTokenIndex, in: container,
+                debugDescription: "Pixtral config image_token_index must be >= 0.")
+        }
+        guard imageTokenIndex < vocabSize else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._imageTokenIndex, in: container,
+                debugDescription: "Pixtral config image_token_index must be less than vocab_size.")
+        }
+        guard visionFeatureLayer == -1
+                || (visionFeatureLayer >= 0 && visionFeatureLayer < visionConfig.numHiddenLayers)
+                || (visionFeatureLayer < -1 && visionConfig.numHiddenLayers + visionFeatureLayer >= 0)
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._visionFeatureLayer, in: container,
+                debugDescription: "Pixtral config vision_feature_layer is outside vision num_hidden_layers.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Pixtral config \(key.rawValue) must be > 0.")
+        }
     }
 }
 
@@ -778,16 +961,16 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
     private func getInputEmbeddings(
         inputIds: MLXArray?,
         pixelValues: MLXArray?
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         guard let pixelValues else {
             guard let inputIds else {
-                fatalError("Either inputIds or pixelValues must be provided")
+                throw VLMError.processing("Pixtral inputIds required when no pixelValues are provided.")
             }
             return languageModel.model.embedTokens(inputIds)
         }
 
         guard let inputIds else {
-            fatalError("inputIds required when pixelValues provided")
+            throw VLMError.processing("Pixtral inputIds required when pixelValues are provided.")
         }
 
         let inputsEmbeds = languageModel.model.embedTokens(inputIds)
@@ -800,7 +983,7 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
 
         // Select features from specified layer
         guard let hiddenStates else {
-            fatalError("Vision model must return hidden states")
+            throw VLMError.processing("Pixtral vision tower returned nil hidden states; bundle may be missing vision weights.")
         }
 
         let layerIndex =
@@ -813,7 +996,7 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
         let imageFeatures = multiModalProjector(selectedFeatures)
 
         // Merge embeddings
-        return mergeInputIdsWithImageFeatures(
+        return try mergeInputIdsWithImageFeatures(
             imageTokenIndex: config.imageTokenIndex,
             imageFeatures: imageFeatures,
             inputsEmbeds: inputsEmbeds,
@@ -826,7 +1009,7 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
         imageFeatures: MLXArray,
         inputsEmbeds: MLXArray,
         inputIds: MLXArray
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         let (_, numImagePatches, _) = (
             imageFeatures.dim(0),
             imageFeatures.dim(1),
@@ -837,6 +1020,10 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
         let inputIdArray: [Int32] = inputIds[0].asArray(Int32.self)
         let imagePositions = inputIdArray.enumerated().compactMap {
             $1 == Int32(imageTokenIndex) ? $0 : nil
+        }
+        guard imagePositions.count == numImagePatches else {
+            throw VLMError.processing(
+                "Pixtral image token count \(imagePositions.count) does not match image feature patches \(numImagePatches).")
         }
 
         // Build text segments - text before each image token
@@ -874,7 +1061,7 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
         let inputIds = input.text.tokens
         let pixelValues = input.image?.pixels
 
-        let embeddings = getInputEmbeddings(
+        let embeddings = try getInputEmbeddings(
             inputIds: inputIds,
             pixelValues: pixelValues
         )
@@ -993,6 +1180,66 @@ public struct PixtralProcessorConfiguration: Codable, Sendable {
             case doRescale = "do_rescale"
             case doResize = "do_resize"
             case rescaleFactor = "rescale_factor"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            imageMean = try container.decode([CGFloat].self, forKey: .imageMean)
+            imageStd = try container.decode([CGFloat].self, forKey: .imageStd)
+            size = try container.decode(ProcessorSize.self, forKey: .size)
+            patchSize = try container.decode(Int.self, forKey: .patchSize)
+            doNormalize = try container.decodeIfPresent(Bool.self, forKey: .doNormalize)
+            doRescale = try container.decodeIfPresent(Bool.self, forKey: .doRescale)
+            doResize = try container.decodeIfPresent(Bool.self, forKey: .doResize)
+            rescaleFactor = try container.decodeIfPresent(Float.self, forKey: .rescaleFactor)
+
+            try validateDecodedFields(container: container)
+        }
+
+        private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+            try validateRGBTuple(imageMean, key: .imageMean, in: container)
+            try validateRGBTuple(imageStd, key: .imageStd, in: container)
+            try validatePositive(patchSize, key: .patchSize, in: container)
+            if let width = size.width {
+                try validatePositive(width, key: .size, in: container)
+            }
+            if let height = size.height {
+                try validatePositive(height, key: .size, in: container)
+            }
+            if let longestEdge = size.longestEdge {
+                try validatePositive(longestEdge, key: .size, in: container)
+            }
+            if let rescaleFactor {
+                guard rescaleFactor.isFinite, rescaleFactor > 0 else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .rescaleFactor, in: container,
+                        debugDescription: "Pixtral processor config rescale_factor must be finite and > 0.")
+                }
+            }
+        }
+
+        private func validateRGBTuple(
+            _ values: [CGFloat],
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard values.count == 3 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "Pixtral processor config \(key.rawValue) must contain exactly 3 RGB values.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Int,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "Pixtral processor config \(key.rawValue) values must be > 0.")
+            }
         }
     }
 

@@ -193,9 +193,150 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         self.indexHeadDim = req(.indexHeadDim, 128)
         self.indexTopk = req(.indexTopk, 512)
         self.useAttnSink = req(.useAttnSink, true)
+
+        try validateDecodedFields(container: c)
     }
 
     public init() {}
+
+    private func validateDecodedFields(container c: KeyedDecodingContainer<CodingKeys>) throws {
+        try Self.validatePositive(vocabSize, key: .vocabSize, in: c)
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: c)
+        try Self.validatePositive(numHiddenLayers, key: .numHiddenLayers, in: c)
+        try Self.validatePositive(numAttentionHeads, key: .numAttentionHeads, in: c)
+        try Self.validatePositive(numKeyValueHeads, key: .numKeyValueHeads, in: c)
+        try Self.validatePositive(headDim, key: .headDim, in: c)
+        try Self.validatePositive(qkRopeHeadDim, key: .qkRopeHeadDim, in: c)
+        try Self.validatePositive(qLoraRank, key: .qLoraRank, in: c)
+        try Self.validatePositive(rmsNormEps, key: .rmsNormEps, in: c)
+        try Self.validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: c)
+        try Self.validatePositive(oGroups, key: .oGroups, in: c)
+        try Self.validatePositive(oLoraRank, key: .oLoraRank, in: c)
+        try Self.validatePositive(nRoutedExperts, key: .nRoutedExperts, in: c)
+        try Self.validateNonNegative(nSharedExperts, key: .nSharedExperts, in: c)
+        try Self.validatePositive(numExpertsPerTok, key: .numExpertsPerTok, in: c)
+        try Self.validatePositive(moeIntermediateSize, key: .moeIntermediateSize, in: c)
+        try Self.validateNonNegative(numHashLayers, key: .numHashLayers, in: c)
+        try Self.validatePositive(routedScalingFactor, key: .routedScalingFactor, in: c)
+        try Self.validatePositive(swigluLimit, key: .swigluLimit, in: c)
+        try Self.validatePositive(hcMult, key: .hcMult, in: c)
+        try Self.validatePositive(hcSinkhornIters, key: .hcSinkhornIters, in: c)
+        try Self.validatePositive(hcEps, key: .hcEps, in: c)
+        try Self.validatePositive(ropeTheta, key: .ropeTheta, in: c)
+        try Self.validatePositive(compressRopeTheta, key: .compressRopeTheta, in: c)
+        try Self.validatePositive(slidingWindow, key: .slidingWindow, in: c)
+        try Self.validatePositive(indexNHeads, key: .indexNHeads, in: c)
+        try Self.validatePositive(indexHeadDim, key: .indexHeadDim, in: c)
+        try Self.validatePositive(indexTopk, key: .indexTopk, in: c)
+
+        guard qkRopeHeadDim <= headDim else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .qkRopeHeadDim,
+                in: c,
+                debugDescription: "DeepseekV4 qk_rope_head_dim must be in 1...head_dim.")
+        }
+        guard hiddenSize % numAttentionHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: c,
+                debugDescription:
+                    "DeepseekV4 hidden_size must be divisible by num_attention_heads.")
+        }
+        guard numAttentionHeads % numKeyValueHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numKeyValueHeads,
+                in: c,
+                debugDescription:
+                    "DeepseekV4 num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard numExpertsPerTok <= nRoutedExperts else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numExpertsPerTok,
+                in: c,
+                debugDescription:
+                    "DeepseekV4 num_experts_per_tok must be in 1...n_routed_experts.")
+        }
+        guard numHashLayers <= numHiddenLayers else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numHashLayers,
+                in: c,
+                debugDescription:
+                    "DeepseekV4 num_hash_layers must be in 0...num_hidden_layers.")
+        }
+        if !compressRatios.isEmpty {
+            guard compressRatios.count == numHiddenLayers else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .compressRatios,
+                    in: c,
+                    debugDescription:
+                        "DeepseekV4 compress_ratios count must match num_hidden_layers when provided.")
+            }
+            for ratio in compressRatios where ratio != 0 && ratio != 4 && ratio != 128 {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .compressRatios,
+                    in: c,
+                    debugDescription:
+                        "DeepseekV4 compress_ratios entries must be one of 0, 4, or 128.")
+            }
+        }
+        try Self.validateRoutedExpertBits(routedExpertDefaultBits, key: .routedExpertBits, in: c)
+        for (layer, bits) in routedExpertLayerBits {
+            guard layer >= 0 && layer < numHiddenLayers else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .routedExpertBitPlan,
+                    in: c,
+                    debugDescription:
+                        "DeepseekV4 routed expert bit plan layers must be in 0..<num_hidden_layers.")
+            }
+            try Self.validateRoutedExpertBits(bits, key: .routedExpertBitPlan, in: c)
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription:
+                    "DeepseekV4 config \(key.stringValue) must be greater than zero.")
+        }
+    }
+
+    private static func validateNonNegative<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "DeepseekV4 config \(key.stringValue) must be nonnegative.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value.isFinite && value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription:
+                    "DeepseekV4 config \(key.stringValue) must be finite and greater than zero.")
+        }
+    }
+
+    private static func validateRoutedExpertBits<K: CodingKey>(
+        _ bits: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard bits == 2 || bits == 4 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "DeepseekV4 routed expert bits must be 2 or 4.")
+        }
+    }
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)

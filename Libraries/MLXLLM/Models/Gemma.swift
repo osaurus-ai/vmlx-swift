@@ -138,8 +138,6 @@ public class GemmaModelInner: Module {
     fileprivate let norm: Gemma.RMSNorm
 
     public init(_ args: GemmaConfiguration) {
-        precondition(args.vocabularySize > 0)
-
         self.args = args
         self.vocabularySize = args.vocabularySize
         self.numHiddenLayers = args.hiddenLayers
@@ -219,6 +217,77 @@ public struct GemmaConfiguration: Codable, Sendable {
         case kvHeads = "num_key_value_heads"
         case _ropeTheta = "rope_theta"
         case _ropeTraditional = "rope_traditional"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        modelType = try container.decode(String.self, forKey: .modelType)
+        hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+        intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+        headDimensions = try container.decode(Int.self, forKey: .headDimensions)
+        rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
+        vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+        kvHeads = try container.decode(Int.self, forKey: .kvHeads)
+        _ropeTheta = try container.decodeIfPresent(Float.self, forKey: ._ropeTheta)
+        _ropeTraditional = try container.decodeIfPresent(Bool.self, forKey: ._ropeTraditional)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(headDimensions, key: .headDimensions, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        if let _ropeTheta {
+            try validatePositive(_ropeTheta, key: ._ropeTheta, in: container)
+        }
+
+        guard hiddenSize == attentionHeads * headDimensions else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "Gemma hidden_size must equal num_attention_heads * head_dim.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription: "Gemma num_attention_heads must be divisible by num_key_value_heads.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Gemma \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Gemma \(key.rawValue) must be finite and > 0.")
+        }
     }
 }
 

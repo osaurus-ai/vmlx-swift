@@ -10,8 +10,8 @@
 //    `ZayaCCACache.conv_state` + `prev_hs` are path-dependent (per Zyphra
 //    runtime contract) — same multi-turn contamination problem as Mamba
 //    SSM state. Pinned:
-//      - `ModelContainer.assignDefaultCacheCoordinator` flips `isHybrid`
-//        for Zaya (new detection clause).
+//      - `ModelContainer` topology snapshots count Zaya CCA layers as
+//        requiring SSM companion state and use that to flip `isHybrid`.
 //      - `BatchEngine.finishSlot`'s post-prefill `hasSSM` snapshot path
 //        includes ZayaCCACache.
 //      - `reDeriveSSMStates` / `reDeriveSSMStatesAtBoundaries` recognize
@@ -55,14 +55,17 @@ struct ZayaThinkingAndRederiveContractTests {
 
     // MARK: - ZayaCCACache rederive integration source coverage
 
-    /// `ModelContainer.assignDefaultCacheCoordinator` must flip
-    /// `isHybrid=true` for ZAYA so the SSM state cache fires.
+    /// `ModelContainer` must flip `isHybrid=true` for ZAYA so the SSM
+    /// state cache fires. Current code does this through topology
+    /// snapshots rather than a direct class-name predicate at the call site.
     @Test("ModelContainer hybrid auto-detection includes ZayaCCACache")
     func modelContainerDetectsZaya() throws {
         let source = try Self.source("Libraries/MLXLMCommon/ModelContainer.swift")
-        #expect(
-            source.contains("$0 is MambaCache || $0 is ArraysCache || $0 is ZayaCCACache"),
-            "ModelContainer.assignDefaultCacheCoordinator must include ZayaCCACache in the hybrid auto-detect — Zaya CCA conv_state + prev_hs are path-dependent.")
+        #expect(source.contains("case is ZayaCCACache:"))
+        #expect(source.contains("zayaCCALayerCount += 1"))
+        #expect(source.contains("mambaLayerCount > 0 || arraysLayerCount > 0 || zayaCCALayerCount > 0"))
+        #expect(source.contains("let isHybrid = topology.requiresSSMCompanionState"))
+        #expect(source.contains("coordinator.setHybrid(isHybrid)"))
     }
 
     /// `BatchEngine.finishSlot`'s post-prefill SSM snapshot must include

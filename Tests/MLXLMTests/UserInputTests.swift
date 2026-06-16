@@ -63,6 +63,19 @@ public class UserInputTests: XCTestCase {
         XCTAssertEqual(expected, messages as? [[String: String]])
     }
 
+    public func testFrameBackedVideoAsAVAssetThrows() throws {
+        let video = UserInput.Video.frames([])
+
+        do {
+            _ = try video.asAVAsset()
+            XCTFail("Expected frame-backed video asAVAsset conversion to throw")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Frame-backed video input cannot be converted to AVAsset. Use MediaProcessing.asProcessedSequence() with the Video directly.")
+        }
+    }
+
     public func testQwen2ConversionText() {
         let chat: [Chat.Message] = [
             .system("You are a useful agent."),

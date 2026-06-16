@@ -126,6 +126,15 @@ public enum ChatTemplateFallbacks {
             {%- endif -%}
             {{- '<tool|>' -}}
         {%- endfor -%}
+        {%- if tool_choice is defined and (tool_choice == 'required' or tool_choice_name is defined) -%}
+            {{- 'Tool use is REQUIRED for this turn: ' -}}
+            {%- if tool_choice_name is defined and tool_choice_name -%}
+                {{- 'call `' + tool_choice_name + '` exactly once. ' -}}
+            {%- else -%}
+                {{- 'call exactly one declared tool. ' -}}
+            {%- endif -%}
+            {{- 'Output only <|tool_call>call:name{args}<tool_call|>; do not answer in prose.' -}}
+        {%- endif -%}
     {%- endif -%}
     {{- '<turn|>\n' -}}
 {%- else -%}
@@ -161,12 +170,9 @@ public enum ChatTemplateFallbacks {
     /// Nemotron-Cascade-2 minimal. Avoids the `for k in dict if k not
     /// in handled_keys` construct that trips swift-jinja's runtime.
     /// Uses the ChatML-style `<|im_start|>role` / `<|im_end|>` turn
-    /// markers Nemotron was actually trained on (the first attempt
-    /// incorrectly used `<extra_id_*>`; see tokenizer special-token
-    /// inspection — `<|im_start|>` + `[AVAILABLE_TOOLS]` are the real
-    /// markers). Tool declarations use the `[AVAILABLE_TOOLS]` /
-    /// `[/AVAILABLE_TOOLS]` block and assistant tool calls use the
-    /// `<tool_call><function=name></function></tool_call>` XML form.
+    /// markers Nemotron was actually trained on. Tool declarations mirror
+    /// the source Nemotron template's `<tools>` block, including required
+    /// parameter metadata and the XML tool-call protocol reminder.
     public static let nemotronMinimal: String = #"""
 {%- set loop_messages = messages -%}
 {%- if messages[0]['role'] == 'system' -%}
@@ -179,28 +185,64 @@ public enum ChatTemplateFallbacks {
 {{ system_message }}
 {%- if tools %}
 
-[AVAILABLE_TOOLS]
+# Tools
+
+You have access to the following functions:
+
+<tools>
 {%- for tool in tools %}
   {%- set fn = tool['function'] if tool['function'] is defined else tool -%}
-  <tool>
-    <name>{{ fn['name'] }}</name>
-    {%- if fn['description'] is defined %}
-    <description>{{ fn['description'] | trim }}</description>
-    {%- endif %}
-    {%- if fn['parameters'] is defined and fn['parameters']['properties'] is defined %}
-    <parameters>
-      {%- for param_name, param in fn['parameters']['properties'] | dictsort %}
-      <parameter>
-        <name>{{ param_name }}</name>
-        {%- if param['type'] is defined %}<type>{{ param['type'] }}</type>{%- endif %}
-        {%- if param['description'] is defined %}<description>{{ param['description'] | trim }}</description>{%- endif %}
-      </parameter>
-      {%- endfor %}
-    </parameters>
-    {%- endif %}
-  </tool>
+<function>
+<name>{{ fn['name'] }}</name>
+{%- if fn['description'] is defined %}
+<description>{{ fn['description'] | trim }}</description>
+{%- endif %}
+{%- if fn['parameters'] is defined and fn['parameters']['properties'] is defined %}
+<parameters>
+{%- for param_name, param in fn['parameters']['properties'] | dictsort %}
+<parameter>
+<name>{{ param_name }}</name>
+{%- if param['type'] is defined %}
+<type>{{ param['type'] }}</type>
+{%- endif %}
+{%- if param['description'] is defined %}
+<description>{{ param['description'] | trim }}</description>
+{%- endif %}
+</parameter>
 {%- endfor %}
-[/AVAILABLE_TOOLS]
+{%- if fn['parameters']['required'] is defined %}
+<required>{{ fn['parameters']['required'] | tojson }}</required>
+{%- endif %}
+</parameters>
+{%- endif %}
+</function>
+{%- endfor %}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with no prefix or suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+value_2
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format.
+- Required parameters MUST be specified.
+- Only call one function at a time.
+- Put the entire function call reply on its own.
+</IMPORTANT>
+{%- if tool_choice is defined and tool_choice == 'required' %}
+
+The current assistant response MUST be a tool call. Start with a <tool_call> block and do not answer in prose before the tool result.
+{%- endif %}
 {%- endif %}
 <|im_end|>
 {% for message in loop_messages -%}
@@ -240,6 +282,11 @@ public enum ChatTemplateFallbacks {
 {% endfor -%}
 {%- if add_generation_prompt %}
 <|im_start|>assistant
+{%- if enable_thinking is defined and not enable_thinking %}
+<think></think>
+{%- else %}
+<think>
+{%- endif %}
 {%- endif %}
 """#
 
@@ -803,6 +850,12 @@ public enum ChatTemplateFallbacks {
             {{- '\n</function>' -}}
         {%- endfor -%}
         {{- '\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<zyphra_tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</zyphra_tool_call>' -}}
+        {%- if tool_choice is defined and tool_choice == 'required' -%}
+            {{- '\n\nThe current assistant response MUST be a function call. Do not answer in prose before the tool result.' -}}
+            {%- if tool_choice_name is defined and tool_choice_name -%}
+                {{- ' Use the `' ~ tool_choice_name ~ '` function.' -}}
+            {%- endif -%}
+        {%- endif -%}
     {%- endif -%}
     {{- '<|im_end|>\n' -}}
 {%- endif -%}

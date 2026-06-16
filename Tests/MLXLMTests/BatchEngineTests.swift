@@ -8,7 +8,7 @@ import XCTest
 
 // MARK: - BatchKVCache Unit Tests
 
-@Suite("BatchKVCache")
+@Suite("BatchKVCache", .serialized)
 struct BatchKVCacheTests {
 
     @Test("update splits and pads correctly for 2 sequences at different offsets")
@@ -128,7 +128,7 @@ struct BatchKVCacheTests {
     }
 }
 
-@Suite("BatchArraysCache")
+@Suite("BatchArraysCache", .serialized)
 struct BatchArraysCacheTests {
     @Test("preserves per-slot offsets for one-slot ArraysCache")
     func preservesOneSlotOffsets() {
@@ -159,7 +159,7 @@ struct BatchArraysCacheTests {
 
 // MARK: - Batch Causal Mask Tests
 
-@Suite("BatchCausalMask")
+@Suite("BatchCausalMask", .serialized)
 struct BatchCausalMaskTests {
 
     @Test("two sequences at different offsets, decode step")
@@ -681,6 +681,14 @@ class BatchEngineIntegrationTests: XCTestCase {
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
+
+        let currentMaxBatchSize = await engine.maxBatchSize
+        XCTAssertEqual(currentMaxBatchSize, 1)
+    }
+
+    /// Test: invalid construction maxBatchSize cannot abort the process.
+    func testConstructionNormalizesInvalidMaxBatchSize() async throws {
+        let engine = makeEngine(maxBatchSize: 0)
 
         let currentMaxBatchSize = await engine.maxBatchSize
         XCTAssertEqual(currentMaxBatchSize, 1)

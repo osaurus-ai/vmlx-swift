@@ -75,6 +75,10 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 
 // MARK: - SwitchGLU
 
+public protocol SwitchGLULayer: Module {
+    func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray
+}
+
 public class SwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear
@@ -320,9 +324,11 @@ public class SwitchGLU: Module {
     }
 }
 
-public class SwitchLinear: Module, Quantizable {
-    @ModuleInfo(key: "weight") var weight: MLXArray
-    @ModuleInfo(key: "bias") var bias: MLXArray?
+extension SwitchGLU: SwitchGLULayer {}
+
+open class SwitchLinear: Module, Quantizable {
+    @ModuleInfo(key: "weight") public var weight: MLXArray
+    @ModuleInfo(key: "bias") public var bias: MLXArray?
 
     let inputDims: Int
     let outputDims: Int
@@ -363,7 +369,7 @@ public class SwitchLinear: Module, Quantizable {
         self._bias.wrappedValue = bias
     }
 
-    public func callAsFunction(
+    open func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
         let weightT = self.weight.swappedAxes(-1, -2)
@@ -381,9 +387,9 @@ public class SwitchLinear: Module, Quantizable {
     }
 }
 
-public class QuantizedSwitchLinear: SwitchLinear, Quantized {
-    @ParameterInfo(key: "scales") var scales: MLXArray
-    @ParameterInfo(key: "biases") var biases: MLXArray?
+open class QuantizedSwitchLinear: SwitchLinear, Quantized {
+    @ParameterInfo(key: "scales") public var scales: MLXArray
+    @ParameterInfo(key: "biases") public var biases: MLXArray?
 
     public let groupSize: Int
     public let bits: Int
@@ -442,7 +448,7 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         self.freeze()
     }
 
-    override public func callAsFunction(
+    override open func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
         var result = MLX.gatherQuantizedMM(

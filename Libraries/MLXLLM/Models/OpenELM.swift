@@ -152,8 +152,6 @@ public class OpenELMModelInner: Module {
     fileprivate let norm: RMSNorm
 
     public init(_ args: OpenElmConfiguration) {
-        precondition(args.vocabularySize > 0)
-
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.modelDim)
 
@@ -238,6 +236,11 @@ public struct OpenElmConfiguration: Codable, Sendable {
         case ffnWithGlu = "ffn_with_glu"
         case normalizeQkProjections = "normalize_qk_projections"
         case shareInputOutputLayers = "share_input_output_layers"
+        case rmsNormEps = "rms_norm_eps"
+        case ropeTheta = "rope_theta"
+        case ropeTraditional = "rope_traditional"
+        case numGqaGroups = "num_gqa_groups"
+        case qkvMultiplier = "qkv_multipliers"
     }
 
     public init(from decoder: Decoder) throws {
@@ -259,6 +262,22 @@ public struct OpenElmConfiguration: Codable, Sendable {
             Int.self, forKey: OpenElmConfiguration.CodingKeys.vocabularySize)
         self.ffnDimDivisor = try container.decode(
             Int.self, forKey: OpenElmConfiguration.CodingKeys.ffnDimDivisor)
+        self.ffnMultipliers =
+            try container.decodeIfPresent([Float].self, forKey: .ffnMultipliers)
+            ?? [0.5, 4.0]
+        self.rmsNormEps =
+            try container.decodeIfPresent(Float.self, forKey: .rmsNormEps) ?? 1e-6
+        self.ropeTheta =
+            try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 10_000
+        self.ropeTraditional =
+            try container.decodeIfPresent(Bool.self, forKey: .ropeTraditional) ?? false
+        self.numGqaGroups =
+            try container.decodeIfPresent(Int.self, forKey: .numGqaGroups) ?? 4
+        self.qkvMultiplier =
+            try container.decodeIfPresent([Float].self, forKey: .qkvMultiplier)
+            ?? [0.5, 1.0]
+
+        try validateBaseFields(container: container)
 
         let qkvMultipliers = stride(
             from: qkvMultiplier[0], through: qkvMultiplier[1],
@@ -271,12 +290,34 @@ public struct OpenElmConfiguration: Codable, Sendable {
             makeDivisible(Float(self.modelDim) * a, divisor: self.headDimensions * headMultipleOf)
         }
 
+        guard queryDims.count == numTransformerLayers else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numTransformerLayers,
+                in: container,
+                debugDescription: "OpenELM derived query head count must match num_transformer_layers.")
+        }
+        for queryDim in queryDims {
+            guard queryDim > 0, queryDim % headDimensions == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .headDimensions,
+                    in: container,
+                    debugDescription: "OpenELM derived query dimensions must be positive and divisible by head_dim.")
+            }
+        }
+
         self.numQueryHeads = queryDims.map { qDim in
             Int(computeHeads(modelDim: qDim, headDim: self.headDimensions))
         }
 
         self.kvHeads = self.numQueryHeads.map { qHeads in
             qHeads / numGqaGroups
+        }
+
+        guard kvHeads.allSatisfy({ $0 > 0 }) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .headDimensions,
+                in: container,
+                debugDescription: "OpenELM derived num_key_value_heads entries must be positive.")
         }
 
         self.ffnMultipliers = stride(
@@ -294,6 +335,79 @@ public struct OpenElmConfiguration: Codable, Sendable {
         self.shareInputOutputLayers =
             try container.decodeIfPresent(
                 Bool.self, forKey: OpenElmConfiguration.CodingKeys.shareInputOutputLayers) ?? true
+    }
+
+    private func validateBaseFields(
+        container: KeyedDecodingContainer<OpenElmConfiguration.CodingKeys>
+    ) throws {
+        try validatePositive(headDimensions, key: .headDimensions, in: container)
+        try validatePositive(numTransformerLayers, key: .numTransformerLayers, in: container)
+        try validatePositive(modelDim, key: .modelDim, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(ffnDimDivisor, key: .ffnDimDivisor, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+
+        guard numTransformerLayers > 1 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numTransformerLayers,
+                in: container,
+                debugDescription: "OpenELM num_transformer_layers must be greater than 1.")
+        }
+        guard modelDim % headDimensions == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .modelDim,
+                in: container,
+                debugDescription: "OpenELM model_dim must be divisible by head_dim.")
+        }
+        guard numGqaGroups > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .headDimensions,
+                in: container,
+                debugDescription: "OpenELM num_gqa_groups must be positive.")
+        }
+        guard ffnMultipliers.count == 2,
+            ffnMultipliers.allSatisfy({ $0.isFinite && $0 > 0 })
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .ffnMultipliers,
+                in: container,
+                debugDescription: "OpenELM ffn_multipliers must contain two positive finite values.")
+        }
+        guard qkvMultiplier.count == 2,
+            qkvMultiplier.allSatisfy({ $0.isFinite && $0 > 0 })
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .headDimensions,
+                in: container,
+                debugDescription: "OpenELM qkv multipliers must contain two positive finite values.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "OpenELM \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "OpenELM \(key.rawValue) must be finite and > 0.")
+        }
     }
 }
 

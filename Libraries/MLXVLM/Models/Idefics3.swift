@@ -47,6 +47,68 @@ public struct Idefics3Configuration: Codable, Sendable {
             case _ropeTraditional = "rope_traditional"
             case _tieWordEmbeddings = "tie_word_embeddings"
         }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            modelType = try container.decode(String.self, forKey: .modelType)
+            hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+            _numHiddenLayers = try container.decodeIfPresent(Int.self, forKey: ._numHiddenLayers)
+            intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+            numAttentionHeads = try container.decode(Int.self, forKey: .numAttentionHeads)
+            rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
+            vocabSize = try container.decode(Int.self, forKey: .vocabSize)
+            numKeyValueHeads = try container.decode(Int.self, forKey: .numKeyValueHeads)
+            ropeTheta = try container.decode(Float.self, forKey: .ropeTheta)
+            _ropeTraditional = try container.decodeIfPresent(Bool.self, forKey: ._ropeTraditional)
+            _tieWordEmbeddings = try container.decodeIfPresent(Bool.self, forKey: ._tieWordEmbeddings)
+
+            try validateDecodedFields(container: container)
+        }
+
+        private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+            try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try validatePositive(numHiddenLayers, key: ._numHiddenLayers, in: container)
+            try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+            try validatePositive(numAttentionHeads, key: .numAttentionHeads, in: container)
+            try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+            try validatePositive(vocabSize, key: .vocabSize, in: container)
+            try validatePositive(numKeyValueHeads, key: .numKeyValueHeads, in: container)
+            try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+            guard hiddenSize % numAttentionHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize, in: container,
+                    debugDescription: "Idefics3 text config hidden_size must be divisible by num_attention_heads.")
+            }
+            guard numAttentionHeads % numKeyValueHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .numKeyValueHeads, in: container,
+                    debugDescription: "Idefics3 text config num_attention_heads must be divisible by num_key_value_heads.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Int,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "Idefics3 text config \(key.rawValue) must be > 0.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Float,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value.isFinite, value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "Idefics3 text config \(key.rawValue) must be finite and > 0.")
+            }
+        }
     }
 
     public struct VisionConfiguration: Codable, Sendable {
@@ -75,6 +137,66 @@ public struct Idefics3Configuration: Codable, Sendable {
             case imageSize = "image_size"
             case _numChannels = "num_channels"
             case _layerNormEps = "layer_norm_eps"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            modelType = try container.decode(String.self, forKey: .modelType)
+            _numHiddenLayers = try container.decodeIfPresent(Int.self, forKey: ._numHiddenLayers)
+            hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+            _intermediateSize = try container.decodeIfPresent(Int.self, forKey: ._intermediateSize)
+            numAttentionHeads = try container.decode(Int.self, forKey: .numAttentionHeads)
+            patchSize = try container.decode(Int.self, forKey: .patchSize)
+            imageSize = try container.decode(Int.self, forKey: .imageSize)
+            _numChannels = try container.decodeIfPresent(Int.self, forKey: ._numChannels)
+            _layerNormEps = try container.decodeIfPresent(Float.self, forKey: ._layerNormEps)
+
+            try validateDecodedFields(container: container)
+        }
+
+        private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+            try validatePositive(numHiddenLayers, key: ._numHiddenLayers, in: container)
+            try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try validatePositive(intermediateSize, key: ._intermediateSize, in: container)
+            try validatePositive(numAttentionHeads, key: .numAttentionHeads, in: container)
+            try validatePositive(patchSize, key: .patchSize, in: container)
+            try validatePositive(imageSize, key: .imageSize, in: container)
+            try validatePositive(numChannels, key: ._numChannels, in: container)
+            try validatePositive(layerNormEps, key: ._layerNormEps, in: container)
+            guard hiddenSize % numAttentionHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize, in: container,
+                    debugDescription: "Idefics3 vision config hidden_size must be divisible by num_attention_heads.")
+            }
+            guard imageSize % patchSize == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .patchSize, in: container,
+                    debugDescription: "Idefics3 vision config image_size must be divisible by patch_size.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Int,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "Idefics3 vision config \(key.rawValue) must be > 0.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Float,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value.isFinite, value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "Idefics3 vision config \(key.rawValue) must be finite and > 0.")
+            }
         }
     }
 
@@ -114,6 +236,40 @@ public struct Idefics3Configuration: Codable, Sendable {
         self.imageTokenId = (try? container.decode(Int.self, forKey: .imageTokenId)) ?? 49153
         self.imageTokenIndex =
             (try? container.decode(Int.self, forKey: .imageTokenIndex)) ?? self.imageTokenId
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(vocabSize, key: .vocabSize, in: container)
+        try validatePositive(scaleFactor, key: .scaleFactor, in: container)
+        guard imageTokenId >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .imageTokenId, in: container,
+                debugDescription: "Idefics3 config image_token_id must be >= 0.")
+        }
+        guard imageTokenIndex >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .imageTokenIndex, in: container,
+                debugDescription: "Idefics3 config image_token_index must be >= 0.")
+        }
+        guard imageTokenIndex < vocabSize else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .imageTokenIndex, in: container,
+                debugDescription: "Idefics3 config image_token_index must be less than vocab_size.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Idefics3 config \(key.rawValue) must be > 0.")
+        }
     }
 }
 
@@ -646,17 +802,17 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
         self._connector.wrappedValue = Idefics3Connector(config)
     }
 
-    private func getInputEmbeddings(inputIds: MLXArray?, pixelValues: MLXArray?) -> MLXArray {
+    private func getInputEmbeddings(inputIds: MLXArray?, pixelValues: MLXArray?) throws -> MLXArray {
         if pixelValues == nil {
             guard let inputIds = inputIds else {
-                fatalError("inputIds required if no pixelValues")
+                throw VLMError.processing("Idefics3 inputIds required when no pixelValues are provided.")
             }
             let inputs_embeds = languageModel.getEmbeddings(for: inputIds)
             return inputs_embeds
         }
 
         guard let inputIds = inputIds, let pixelValues = pixelValues else {
-            fatalError("inputIds and pixelValues required")
+            throw VLMError.processing("Idefics3 inputIds and pixelValues are required for multimodal prepare.")
         }
 
         let inputs_embeds = languageModel.getEmbeddings(for: inputIds)
@@ -669,7 +825,7 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
             pooler_output.asType(inputs_embeds.dtype)
         )
 
-        let final = prepareInputsForMultimodal(
+        let final = try prepareInputsForMultimodal(
             imageFeatures: image_features,
             inputs_embeds: inputs_embeds,
             inputIds: inputIds
@@ -680,7 +836,7 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
     // inputs_merger
     private func prepareInputsForMultimodal(
         imageFeatures: MLXArray, inputs_embeds: MLXArray, inputIds: MLXArray
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         // Assumes bs == 1
         // inputIds shape: (1, seq_len)
         // asArray(Int.self) -> [[Int]], take [0] to get [Int]
@@ -697,7 +853,18 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
         var start_idx = 0
 
         let chunkSize = imageFeatures.shape[1]  // 64
+        guard chunkSize > 0 else {
+            throw VLMError.processing("Idefics3 image features must have a positive chunk size.")
+        }
+        guard imagePositions.count % chunkSize == 0 else {
+            throw VLMError.processing(
+                "Idefics3 image token count \(imagePositions.count) is not divisible by feature chunk size \(chunkSize).")
+        }
         let chunkCount = imagePositions.count / chunkSize  // Should be imageFeatures.shape[0]
+        guard chunkCount == imageFeatures.dim(0) else {
+            throw VLMError.processing(
+                "Idefics3 image feature chunk count \(imageFeatures.dim(0)) does not match image token chunks \(chunkCount).")
+        }
         let chunks = (0 ..< chunkCount).map { startIndex in
             let start = startIndex * chunkSize
             let end = start + chunkSize
@@ -729,7 +896,7 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
     {
         let inputIds = input.text.tokens
         let pixelValues = input.image?.pixels
-        let embeddings = getInputEmbeddings(
+        let embeddings = try getInputEmbeddings(
             inputIds: inputIds,
             pixelValues: pixelValues
         )
@@ -800,6 +967,49 @@ public struct Idefics3ProcessorConfiguration: Codable, Sendable {
         case imageStd = "image_std"
         case size
         case imageSequenceLength = "image_seq_len"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        imageMean = try container.decode([CGFloat].self, forKey: .imageMean)
+        imageStd = try container.decode([CGFloat].self, forKey: .imageStd)
+        size = try container.decode(Size.self, forKey: .size)
+        imageSequenceLength = try container.decodeIfPresent(Int.self, forKey: .imageSequenceLength)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validateRGBTuple(imageMean, key: .imageMean, in: container)
+        try validateRGBTuple(imageStd, key: .imageStd, in: container)
+        try validatePositive(size.longestEdge, key: .size, in: container)
+        if let imageSequenceLength {
+            try validatePositive(imageSequenceLength, key: .imageSequenceLength, in: container)
+        }
+    }
+
+    private func validateRGBTuple(
+        _ values: [CGFloat],
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard values.count == 3 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Idefics3 processor config \(key.rawValue) must contain exactly 3 RGB values.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Idefics3 processor config \(key.rawValue) must be > 0.")
+        }
     }
 }
 

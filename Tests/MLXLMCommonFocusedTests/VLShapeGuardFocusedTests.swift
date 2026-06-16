@@ -74,6 +74,16 @@ struct VLShapeGuardFocusedTests {
         #expect(source.contains("Need >= 3D. Falling back to fresh prefill."))
     }
 
+    @Test("VL mixed and video benches fail when requested media is not attached")
+    func vlBenchesFailWhenRequestedMediaIsNotAttached() throws {
+        let source = try Self.source("RunBench/VLBench.swift")
+
+        #expect(source.contains("requested image but processor.prepare produced LMInput.image=nil"))
+        #expect(source.contains("requested video but processor.prepare produced LMInput.video=nil"))
+        #expect(source.contains("requested video but processor does not implement video input"))
+        #expect(!source.contains("not applicable: processor video input is not implemented for this model"))
+    }
+
     @Test("Qwen3.6 VLM native MTP verifier reuses MRoPE continuation state")
     func qwen35VLMNativeMTPVerifierUsesMRoPEContinuationState() throws {
         let source = try Self.source("Libraries/MLXVLM/Models/Qwen35.swift")

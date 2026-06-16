@@ -123,6 +123,80 @@ public struct ApertusConfiguration: Codable, Sendable {
                     debugDescription: "rope_scaling must contain either 'type' or 'rope_type'")
             }
         }
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(
+        container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(numHiddenLayers, key: .numHiddenLayers, in: container)
+        try validatePositive(numAttentionHeads, key: .numAttentionHeads, in: container)
+        try validatePositive(numKeyValueHeads, key: .numKeyValueHeads, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabSize, key: .vocabSize, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+
+        if let maxPositionEmbeddings {
+            try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        }
+
+        if hiddenSize % numAttentionHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "Apertus hidden_size must be divisible by num_attention_heads."
+            )
+        }
+
+        if numAttentionHeads % numKeyValueHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numKeyValueHeads,
+                in: container,
+                debugDescription:
+                    "Apertus num_attention_heads must be divisible by num_key_value_heads."
+            )
+        }
+
+        if let factor = ropeScaling?["factor"]?.asFloat() {
+            if !factor.isFinite || factor <= 0 {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling,
+                    in: container,
+                    debugDescription: "Apertus rope_scaling.factor must be finite and > 0."
+                )
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Apertus \(key.rawValue) must be > 0."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if !value.isFinite || value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Apertus \(key.rawValue) must be finite and > 0."
+            )
+        }
     }
 }
 
@@ -302,8 +376,6 @@ private class ApertusModelInner: Module {
     let norm: RMSNorm
 
     public init(_ args: ApertusConfiguration) {
-        precondition(args.vocabSize > 0)
-
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabSize,
             dimensions: args.hiddenSize

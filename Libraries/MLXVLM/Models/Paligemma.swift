@@ -134,8 +134,6 @@ private enum Language {
         let hiddenScale: Float
 
         public init(_ args: PaliGemmaConfiguration.TextConfiguration) {
-            precondition(args.vocabularySize > 0)
-
             self._embedTokens.wrappedValue = Embedding(
                 embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -212,8 +210,6 @@ private enum Vision {
         @ModuleInfo(key: "out_proj") var wo: Linear
 
         public init(dims: Int, numHeads: Int, bias: Bool = true) {
-            precondition(dims % numHeads == 0, "Dimensions must be divisible by numHeads")
-
             self.numHeads = numHeads
             let headDim = dims / numHeads
             self.scale = pow(Float(headDim), -0.5)
@@ -379,9 +375,6 @@ private enum Vision {
         @ModuleInfo(key: "vision_model") var visionModel: SigLipVisionModel
 
         public init(_ config: PaliGemmaConfiguration.VisionConfiguration) {
-            precondition(
-                config.modelType == "siglip_vision_model",
-                "Unsupported modelType: \(config.modelType)")
             self._visionModel.wrappedValue = SigLipVisionModel(config)
         }
 
@@ -657,6 +650,72 @@ public struct PaliGemmaConfiguration: Codable, Sendable {
             case _ropeTheta = "rope_theta"
             case _ropeTraditional = "rope_traditional"
         }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            modelType = try container.decode(String.self, forKey: .modelType)
+            hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+            hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+            intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+            attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+            kvHeads = try container.decode(Int.self, forKey: .kvHeads)
+            vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+            _rmsNormEps = try container.decodeIfPresent(Float.self, forKey: ._rmsNormEps)
+            _ropeTheta = try container.decodeIfPresent(Float.self, forKey: ._ropeTheta)
+            _ropeTraditional = try container.decodeIfPresent(Bool.self, forKey: ._ropeTraditional)
+
+            try validateDecodedFields(container: container)
+        }
+
+        private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+            guard modelType == "siglip_vision_model" else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .modelType, in: container,
+                    debugDescription: "PaliGemma vision config model_type must be siglip_vision_model.")
+            }
+            try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+            try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+            try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+            try validatePositive(kvHeads, key: .kvHeads, in: container)
+            try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+            try validatePositive(rmsNormEps, key: ._rmsNormEps, in: container)
+            try validatePositive(ropeTheta, key: ._ropeTheta, in: container)
+            guard hiddenSize % attentionHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize, in: container,
+                    debugDescription: "PaliGemma text config hidden_size must be divisible by num_attention_heads.")
+            }
+            guard attentionHeads % kvHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .kvHeads, in: container,
+                    debugDescription: "PaliGemma text config num_attention_heads must be divisible by num_key_value_heads.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Int,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "PaliGemma text config \(key.rawValue) must be > 0.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Float,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value.isFinite, value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "PaliGemma text config \(key.rawValue) must be finite and > 0.")
+            }
+        }
     }
 
     public struct VisionConfiguration: Codable, Sendable {
@@ -685,6 +744,68 @@ public struct PaliGemmaConfiguration: Codable, Sendable {
             case _channels = "num_channels"
             case _layerNormEps = "layer_norm_eps"
         }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            modelType = try container.decode(String.self, forKey: .modelType)
+            hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+            hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+            intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+            attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+            patchSize = try container.decode(Int.self, forKey: .patchSize)
+            projectionDimensions = try container.decode(Int.self, forKey: .projectionDimensions)
+            imageSize = try container.decode(Int.self, forKey: .imageSize)
+            _channels = try container.decodeIfPresent(Int.self, forKey: ._channels)
+            _layerNormEps = try container.decodeIfPresent(Float.self, forKey: ._layerNormEps)
+
+            try validateDecodedFields(container: container)
+        }
+
+        private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+            try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+            try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+            try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+            try validatePositive(patchSize, key: .patchSize, in: container)
+            try validatePositive(projectionDimensions, key: .projectionDimensions, in: container)
+            try validatePositive(imageSize, key: .imageSize, in: container)
+            try validatePositive(channels, key: ._channels, in: container)
+            try validatePositive(layerNormEps, key: ._layerNormEps, in: container)
+            guard hiddenSize % attentionHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize, in: container,
+                    debugDescription: "PaliGemma vision config hidden_size must be divisible by num_attention_heads.")
+            }
+            guard imageSize % patchSize == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .patchSize, in: container,
+                    debugDescription: "PaliGemma vision config image_size must be divisible by patch_size.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Int,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "PaliGemma vision config \(key.rawValue) must be > 0.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Float,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value.isFinite, value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "PaliGemma vision config \(key.rawValue) must be finite and > 0.")
+            }
+        }
     }
 
     public let textConfiguration: TextConfiguration
@@ -705,6 +826,57 @@ public struct PaliGemmaConfiguration: Codable, Sendable {
         case imageTokenIndex = "image_token_index"
         case hiddenSize = "hidden_size"
         case padTokenId = "pad_token_id"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        textConfiguration = try container.decode(TextConfiguration.self, forKey: .textConfiguration)
+        visionConfiguration = try container.decode(VisionConfiguration.self, forKey: .visionConfiguration)
+        modelType = try container.decode(String.self, forKey: .modelType)
+        vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+        ignoreIndex = try container.decode(Int.self, forKey: .ignoreIndex)
+        imageTokenIndex = try container.decode(Int.self, forKey: .imageTokenIndex)
+        hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        padTokenId = try container.decode(Int.self, forKey: .padTokenId)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        guard padTokenId >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .padTokenId, in: container,
+                debugDescription: "PaliGemma config pad_token_id must be >= 0.")
+        }
+        guard imageTokenIndex >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .imageTokenIndex, in: container,
+                debugDescription: "PaliGemma config image_token_index must be >= 0.")
+        }
+        guard imageTokenIndex < vocabularySize else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .imageTokenIndex, in: container,
+                debugDescription: "PaliGemma config image_token_index must be less than vocab_size.")
+        }
+        guard hiddenSize == textConfiguration.hiddenSize else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize, in: container,
+                debugDescription: "PaliGemma config hidden_size must match text_config.hidden_size.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "PaliGemma config \(key.rawValue) must be > 0.")
+        }
     }
 }
 
@@ -735,5 +907,47 @@ public struct PaliGemmaProcessorConfiguration: Codable, Sendable {
         case imageStd = "image_std"
         case size
         case imageSequenceLength = "image_seq_length"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        imageMean = try container.decode([CGFloat].self, forKey: .imageMean)
+        imageStd = try container.decode([CGFloat].self, forKey: .imageStd)
+        size = try container.decode(Size.self, forKey: .size)
+        imageSequenceLength = try container.decode(Int.self, forKey: .imageSequenceLength)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validateRGBTuple(imageMean, key: .imageMean, in: container)
+        try validateRGBTuple(imageStd, key: .imageStd, in: container)
+        try validatePositive(size.width, key: .size, in: container)
+        try validatePositive(size.height, key: .size, in: container)
+        try validatePositive(imageSequenceLength, key: .imageSequenceLength, in: container)
+    }
+
+    private func validateRGBTuple(
+        _ values: [CGFloat],
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard values.count == 3 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "PaliGemma processor config \(key.rawValue) must contain exactly 3 RGB values.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "PaliGemma processor config \(key.rawValue) must be > 0.")
+        }
     }
 }

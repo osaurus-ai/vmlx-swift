@@ -170,6 +170,78 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         if self.headDim == nil {
             self.headDim = self.hiddenSize / self.attentionHeads
         }
+
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+        try Self.validatePositive(linearNumValueHeads, key: .linearNumValueHeads, in: container)
+        try Self.validatePositive(linearNumKeyHeads, key: .linearNumKeyHeads, in: container)
+        try Self.validatePositive(linearKeyHeadDim, key: .linearKeyHeadDim, in: container)
+        try Self.validatePositive(linearValueHeadDim, key: .linearValueHeadDim, in: container)
+        try Self.validatePositive(linearConvKernelDim, key: .linearConvKernelDim, in: container)
+        try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try Self.validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try Self.validatePositive(fullAttentionInterval, key: .fullAttentionInterval, in: container)
+        try Self.validateNonNegative(mtpNumHiddenLayers, key: .mtpNumHiddenLayers, in: container)
+        try Self.validatePositive(decoderSparseStep, key: .decoderSparseStep, in: container)
+        if let headDim {
+            try Self.validatePositive(headDim, key: .headDim, in: container)
+        }
+        guard hiddenSize % attentionHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription:
+                    "Qwen35 hidden_size must be divisible by num_attention_heads.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "Qwen35 num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard linearNumValueHeads % linearNumKeyHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .linearNumKeyHeads,
+                in: container,
+                debugDescription:
+                    "Qwen35 linear_num_value_heads must be divisible by linear_num_key_heads.")
+        }
+        if numExpertsPerTok > 0 {
+            guard numExperts > 0, numExpertsPerTok <= numExperts else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .numExpertsPerTok,
+                    in: container,
+                    debugDescription:
+                        "Qwen35 MoE config incoherent: num_experts_per_tok must be in 1...num_experts when enabled.")
+            }
+            try Self.validatePositive(moeIntermediateSize, key: .moeIntermediateSize, in: container)
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Qwen35 config \(key.stringValue) must be greater than zero.")
+        }
+    }
+
+    private static func validateNonNegative<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Qwen35 config \(key.stringValue) must be non-negative.")
+        }
     }
 }
 
@@ -216,11 +288,6 @@ final class Qwen35GatedDeltaNet: Module {
         self.valueDim = headVDim * numVHeads
         self.convKernelSize = args.linearConvKernelDim
         self.convDim = keyDim * 2 + valueDim
-
-        precondition(
-            numVHeads % numKHeads == 0,
-            "num_v_heads (\(numVHeads)) must be divisible by num_k_heads (\(numKHeads))"
-        )
 
         _conv1d.wrappedValue = Conv1d(
             inputChannels: convDim,
@@ -740,8 +807,6 @@ public class Qwen35TextModelInner: Module {
     let faIdx: Int
 
     init(_ args: Qwen35TextConfiguration) {
-        precondition(args.vocabularySize > 0)
-
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize,
             dimensions: args.hiddenSize
@@ -1030,7 +1095,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
             || (!explicitNormConvention
                 && (hasUnsanitizedConv1d || Self.baseNormWeightsNeedShift(weights)))
         let shouldShiftMTPNormWeights = loadNativeMTP
-            && (shouldShiftNormWeights || Self.mtpNormWeightsNeedShift(weights))
+            && (shouldShiftNormWeights
+                || (!explicitNormConvention && Self.mtpNormWeightsNeedShift(weights)))
 
         if configuration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
@@ -1068,20 +1134,16 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
     }
 
     private static func mtpNormWeightsNeedShift(_ weights: [String: MLXArray]) -> Bool {
-        let probeSuffixes = [
-            "mtp.layers.0.input_layernorm.weight",
-            "mtp.pre_fc_norm_hidden.weight",
-            "mtp.pre_fc_norm_embedding.weight",
-        ]
-        for suffix in probeSuffixes {
-            for (key, value) in weights where value.ndim == 1 {
-                guard Self.isMTPWeightKey(key), key.hasSuffix(suffix) else {
-                    continue
-                }
-                return value.asType(.float32).mean().item(Float.self) < 0.5
-            }
+        // Do not sample MTP norm tensor values during sanitize. Scalar extraction
+        // forces MLX eval while weights are still loading. Preserved Qwen3.5 MTP
+        // sidecars use the raw plus-one norm convention unless bundle metadata
+        // explicitly says otherwise.
+        weights.contains { key, value in
+            value.ndim == 1
+                && Self.isMTPWeightKey(key)
+                && key.hasSuffix(".weight")
+                && (key.contains("norm") || key.contains("q_norm") || key.contains("k_norm"))
         }
-        return false
     }
 
     private static func normConvention(_ metadata: [String: String]) -> String? {
@@ -1103,19 +1165,11 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
     }
 
     private static func baseNormWeightsNeedShift(_ weights: [String: MLXArray]) -> Bool {
-        let probeSuffixes = [
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-        ]
-        for (key, value) in weights where value.ndim == 1 {
-            guard !Self.isMTPWeightKey(key),
-                  probeSuffixes.contains(where: { key.hasSuffix($0) }) else {
-                continue
-            }
-            let mean = value.asType(.float32).mean().item(Float.self)
-            if mean < 0.5 { return true }
-            if mean > 0.5 { return false }
-        }
+        // Do not sample norm tensor values during sanitize. Scalar extraction forces
+        // MLX eval while weights are still loading and Sentry has caught this
+        // path inside Metal command-buffer crashes. Qwen3.5/Qwen3.6 bundles
+        // must carry `norm_convention` metadata when conv layout alone is not
+        // enough to prove the plus-one convention.
         return false
     }
 }

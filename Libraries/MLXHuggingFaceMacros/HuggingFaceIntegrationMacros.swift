@@ -360,8 +360,9 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 ]
                             } else if isGemma {
                                 ordered = [
-                                    ("Gemma4WithTools", MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools),
-                                    ("Gemma4Minimal",   MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal),
+                                    (tools?.isEmpty ?? true)
+                                        ? ("Gemma4Minimal", MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal)
+                                        : ("Gemma4WithTools", MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools),
                                 ]
                             } else if hasNemotronSentinel {
                                 ordered = [
@@ -564,8 +565,9 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 ]
                             } else if isGemma {
                                 ordered = [
-                                    ("Gemma4WithTools", MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools),
-                                    ("Gemma4Minimal",   MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal),
+                                    (tools?.isEmpty ?? true)
+                                        ? ("Gemma4Minimal", MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal)
+                                        : ("Gemma4WithTools", MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools),
                                 ]
                             } else if hasNemotronSentinel {
                                 ordered = [

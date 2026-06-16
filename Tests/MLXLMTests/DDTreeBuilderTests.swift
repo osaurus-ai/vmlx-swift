@@ -178,6 +178,28 @@ struct DDTreeBuilderTests {
         #expect(bonus == 99)
     }
 
+    @Test("followVerifiedTree rejects empty posterior tokens")
+    func testFollowVerifiedTreeRejectsEmptyPosteriorTokens() throws {
+        do {
+            _ = try TreeBuilder.followVerifiedTree(
+                childMaps: [[10: 1], [:]], posteriorTokens: [])
+            Issue.record("Expected empty posterior tokens to throw")
+        } catch let error as SpecDecError {
+            #expect(String(describing: error).contains("posteriorTokens"))
+        }
+    }
+
+    @Test("followVerifiedTree rejects child map indexes out of range")
+    func testFollowVerifiedTreeRejectsOutOfRangeChildMapIndex() throws {
+        do {
+            _ = try TreeBuilder.followVerifiedTree(
+                childMaps: [[10: 3], [:]], posteriorTokens: [10, 0])
+            Issue.record("Expected out-of-range child map index to throw")
+        } catch let error as SpecDecError {
+            #expect(String(describing: error).contains("child map index out of range"))
+        }
+    }
+
     // MARK: - computeDfsOrder
 
     @Test("computeDfsOrder matches hand-drawn branching tree")

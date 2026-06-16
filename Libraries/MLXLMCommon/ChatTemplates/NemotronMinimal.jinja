@@ -1,14 +1,9 @@
 {#-
-  Minimal Nemotron-Cascade-2 chat template. The upstream Nemotron
-  template uses `for k in dict if k not in handled_keys` — a pattern
-  the swift-jinja runtime (johnmai-dev/Jinja 1.3.x) mis-iterates as
-  [key, value] ArrayValue tuples, which then breaks the `not in`
-  containment check against `ArrayValue + ArrayValue`. This drop-in
-  avoids dict filtering and keeps the prompt contract osaurus needs:
-  `<extra_id_1>` turn markers, `<think>` stripping in history, and a
-  `<tools>...</tools>` block before the first user turn when tools are
-  present. No function-definition formatting — the model's own prior
-  is relied on to call tools via the XML form it was trained on.
+  Minimal Nemotron-Cascade-2 chat template. The upstream template uses
+  `for k in dict if k not in handled_keys`, which older swift-jinja
+  runtimes can mis-handle. This drop-in avoids dict filtering while
+  preserving the source prompt contract: `<|im_start|>` turn markers,
+  required parameter metadata, and the XML function-call reminder.
 -#}
 {%- set loop_messages = messages -%}
 {%- if messages[0]['role'] == 'system' -%}
@@ -17,44 +12,82 @@
 {%- else -%}
     {%- set system_message = 'You are a helpful and harmless assistant.' -%}
 {%- endif -%}
-<extra_id_0>System
+<|im_start|>system
 {{ system_message }}
 {%- if tools %}
 
-<AVAILABLE_TOOLS>
+# Tools
+
+You have access to the following functions:
+
+<tools>
 {%- for tool in tools %}
-  {%- set fn = tool['function'] if tool.get('function') else tool -%}
-  <tool>
-    <name>{{ fn['name'] }}</name>
-    {%- if fn.get('description') %}
-    <description>{{ fn['description'] | trim }}</description>
-    {%- endif %}
-    {%- if fn.get('parameters') and fn['parameters'].get('properties') %}
-    <parameters>
-      {%- for param_name, param in fn['parameters']['properties'] | dictsort %}
-      <parameter>
-        <name>{{ param_name }}</name>
-        {%- if param.get('type') %}<type>{{ param['type'] }}</type>{%- endif %}
-        {%- if param.get('description') %}<description>{{ param['description'] | trim }}</description>{%- endif %}
-      </parameter>
-      {%- endfor %}
-    </parameters>
-    {%- endif %}
-  </tool>
-{%- endfor %}
-</AVAILABLE_TOOLS>
+  {%- set fn = tool['function'] if tool['function'] is defined else tool -%}
+<function>
+<name>{{ fn['name'] }}</name>
+{%- if fn['description'] is defined %}
+<description>{{ fn['description'] | trim }}</description>
 {%- endif %}
+{%- if fn['parameters'] is defined and fn['parameters']['properties'] is defined %}
+<parameters>
+{%- for param_name, param in fn['parameters']['properties'] | dictsort %}
+<parameter>
+<name>{{ param_name }}</name>
+{%- if param['type'] is defined %}
+<type>{{ param['type'] }}</type>
+{%- endif %}
+{%- if param['description'] is defined %}
+<description>{{ param['description'] | trim }}</description>
+{%- endif %}
+</parameter>
+{%- endfor %}
+{%- if fn['parameters']['required'] is defined %}
+<required>{{ fn['parameters']['required'] | tojson }}</required>
+{%- endif %}
+</parameters>
+{%- endif %}
+</function>
+{%- endfor %}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with no prefix or suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+value_2
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format.
+- Required parameters MUST be specified.
+- Only call one function at a time.
+- Put the entire function call reply on its own.
+</IMPORTANT>
+{%- if tool_choice is defined and tool_choice == 'required' %}
+
+The current assistant response MUST be a tool call. Start with a <tool_call> block and do not answer in prose before the tool result.
+{%- endif %}
+{%- endif %}
+<|im_end|>
 
 {% for message in loop_messages -%}
 {%- if message['role'] == 'user' -%}
-<extra_id_1>User
+<|im_start|>user
 {{ message['content'] }}
+<|im_end|>
 {%- elif message['role'] == 'assistant' -%}
-<extra_id_1>Assistant
-{%- if message.get('content') -%}
+<|im_start|>assistant
+{%- if message['content'] -%}
 {{ message['content'] }}
 {%- endif %}
-{%- if message.get('tool_calls') %}
+{%- if message['tool_calls'] is defined and message['tool_calls'] %}
 {%- for tc in message['tool_calls'] %}
 <tool_call>
 <function={{ tc['function']['name'] }}>
@@ -71,12 +104,19 @@
 </tool_call>
 {%- endfor %}
 {%- endif %}
+<|im_end|>
 {%- elif message['role'] == 'tool' -%}
-<extra_id_1>Tool
+<|im_start|>tool
 {{ message['content'] }}
+<|im_end|>
 {%- endif -%}
 
 {% endfor -%}
 {%- if add_generation_prompt %}
-<extra_id_1>Assistant
+<|im_start|>assistant
+{%- if enable_thinking is defined and not enable_thinking %}
+<think></think>
+{%- else %}
+<think>
+{%- endif %}
 {%- endif %}

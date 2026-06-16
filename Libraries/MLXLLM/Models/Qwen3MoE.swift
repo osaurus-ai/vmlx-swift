@@ -44,22 +44,9 @@ class Qwen3MoEAttention: Module {
         _qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
         _kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
 
-        let ropeScale: Float
-        if let ropeScaling = args.ropeScaling, ropeScaling["type"] == .string("linear"),
-            let factor = ropeScaling["factor"]
-        {
-            if let v = factor.asFloat() {
-                ropeScale = 1 / v
-            } else {
-                fatalError("ropeScaling.factor must be a float")
-            }
-        } else {
-            ropeScale = 1
-        }
-
         self.rope = RoPE(
             dimensions: headDim, traditional: false, base: args.ropeTheta,
-            scale: ropeScale)
+            scale: args.ropeScale)
     }
 
     public func callAsFunction(
@@ -201,7 +188,6 @@ public class Qwen3MoEModelInner: Module {
 
     init(_ args: Qwen3MoEConfiguration) {
         self.args = args
-        precondition(args.vocabularySize > 0)
 
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
@@ -305,6 +291,15 @@ public struct Qwen3MoEConfiguration: Codable, Sendable {
     var normTopkProb: Bool = false
     var ropeScaling: [String: StringOrNumber]? = nil
 
+    var ropeScale: Float {
+        guard let ropeScaling, ropeScaling["type"] == .string("linear"),
+            let factor = ropeScaling["factor"]?.asFloat()
+        else {
+            return 1
+        }
+        return 1 / factor
+    }
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case hiddenSize = "hidden_size"
@@ -356,6 +351,87 @@ public struct Qwen3MoEConfiguration: Codable, Sendable {
         self.normTopkProb = try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? false
         self.ropeScaling = try container.decodeIfPresent(
             [String: StringOrNumber].self, forKey: .ropeScaling)
+
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try Self.validatePositive(numExperts, key: .numExperts, in: container)
+        try Self.validatePositive(numExpertsPerToken, key: .numExpertsPerToken, in: container)
+        try Self.validatePositive(decoderSparseStep, key: .decoderSparseStep, in: container)
+        try Self.validatePositive(moeIntermediateSize, key: .moeIntermediateSize, in: container)
+        try Self.validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+        try Self.validatePositive(headDim, key: .headDim, in: container)
+        try Self.validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try Self.validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        guard hiddenSize == attentionHeads * headDim else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription:
+                    "Qwen3MoE hidden_size must equal num_attention_heads * head_dim.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "Qwen3MoE num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard numExpertsPerToken <= numExperts else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numExpertsPerToken,
+                in: container,
+                debugDescription:
+                    "Qwen3MoE num_experts_per_tok must be less than or equal to num_experts.")
+        }
+        guard mlpOnlyLayers.allSatisfy({ $0 >= 0 && $0 < hiddenLayers }) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .mlpOnlyLayers,
+                in: container,
+                debugDescription:
+                    "Qwen3MoE mlp_only_layers entries must be valid layer indexes.")
+        }
+        try Self.validateRopeScaling(ropeScaling, key: .ropeScaling, in: container)
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be greater than zero.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be finite and greater than zero.")
+        }
+    }
+
+    private static func validateRopeScaling<K: CodingKey>(
+        _ value: [String: StringOrNumber]?, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard let value else { return }
+        if let type = value["type"], type != .string("linear") {
+            return
+        }
+        guard let factor = value["factor"]?.asFloat(), factor.isFinite, factor > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Qwen3MoE rope_scaling.factor must be a positive float.")
+        }
     }
 }
 

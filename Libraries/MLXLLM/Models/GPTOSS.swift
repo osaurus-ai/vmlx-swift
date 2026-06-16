@@ -67,6 +67,111 @@ public struct GPTOSSConfiguration: Codable, Sendable {
         self.ropeScaling = try container.decodeIfPresent(
             [String: StringOrNumber].self, forKey: .ropeScaling)
         self.layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes)
+
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try Self.validatePositive(localExperts, key: .localExperts, in: container)
+        try Self.validatePositive(expertsPerToken, key: .expertsPerToken, in: container)
+        try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try Self.validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try Self.validatePositive(headDim, key: .headDim, in: container)
+        try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+        try Self.validatePositive(slidingWindow, key: .slidingWindow, in: container)
+        try Self.validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "GPTOSS num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard expertsPerToken <= localExperts else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .expertsPerToken,
+                in: container,
+                debugDescription:
+                    "GPTOSS num_experts_per_tok must be less than or equal to num_local_experts.")
+        }
+        if let layerTypes {
+            guard layerTypes.count == hiddenLayers else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .layerTypes,
+                    in: container,
+                    debugDescription:
+                        "GPTOSS layer_types count must match num_hidden_layers.")
+            }
+            let allowedLayerTypes = Set(["sliding_attention", "full_attention"])
+            guard layerTypes.allSatisfy({ allowedLayerTypes.contains($0) }) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .layerTypes,
+                    in: container,
+                    debugDescription:
+                        "GPTOSS layer_types entries must be sliding_attention or full_attention.")
+            }
+        }
+        if let ropeScaling {
+            try Self.validateRopeScaling(ropeScaling, key: .ropeScaling, in: container)
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be greater than zero.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be finite and greater than zero.")
+        }
+    }
+
+    private static func validateRopeScaling<K: CodingKey>(
+        _ ropeScaling: [String: StringOrNumber],
+        key: K,
+        in container: KeyedDecodingContainer<K>
+    ) throws {
+        if ropeScaling["factor"] != nil {
+            guard let factor = ropeScaling["factor"]?.asFloat(), factor.isFinite, factor > 0
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "GPTOSS rope_scaling.factor must be a positive float.")
+            }
+        }
+        if ropeScaling["original_max_position_embeddings"] != nil {
+            guard let originalMax = ropeScaling["original_max_position_embeddings"]?.asInt(),
+                  originalMax > 0
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription:
+                        "GPTOSS rope_scaling.original_max_position_embeddings must be positive.")
+            }
+        }
+        for betaKey in ["beta_fast", "beta_slow"] {
+            guard ropeScaling[betaKey] != nil else { continue }
+            guard let beta = ropeScaling[betaKey]?.asFloat(), beta.isFinite, beta > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "GPTOSS rope_scaling.\(betaKey) must be positive.")
+            }
+        }
     }
 }
 
@@ -231,7 +336,26 @@ class AttentionBlock: Module {
         // Quantized cache path
         if let qcache = cache as? QuantizedKVCacheProtocol {
             if sinksActive {
-                fatalError("Quantized attention does not support non-zero sinks.")
+                if let quantizedCache = cache as? QuantizedKVCache {
+                    let floatCache = quantizedCache.toUnquantized()
+                    q = applyRotaryPosition(rope, to: q, cache: floatCache)
+                    k = applyRotaryPosition(rope, to: k, cache: floatCache)
+                    let (cachedKeys, cachedValues) = floatCache.update(keys: k, values: v)
+                    let refreshed = floatCache.toQuantized(
+                        groupSize: quantizedCache.groupSize, bits: quantizedCache.bits)
+                    quantizedCache.state = refreshed.state
+                    quantizedCache.metaState = refreshed.metaState
+                    let vHat = MLXFast.scaledDotProductAttention(
+                        queries: q,
+                        keys: cachedKeys,
+                        values: cachedValues,
+                        scale: smScale,
+                        mask: mask,
+                        sinks: sinks)
+                    return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
+                }
+                fatalError(
+                    "GPTOSS non-zero sinks require concrete QuantizedKVCache fallback support.")
             }
             q = applyRotaryPosition(rope, to: q, cache: cache)
             k = applyRotaryPosition(rope, to: k, cache: cache)
@@ -417,11 +541,10 @@ public class GPTOSSModelInner: Module {
     }
 }
 
-private func convertMoePackedTensors(blocks: MLXArray, scales: MLXArray) -> MLXArray {
-    precondition(
-        blocks.shape.dropLast() == scales.shape,
-        "blocks.shape=\(blocks.shape) does not match scales.shape=\(scales.shape)"
-    )
+private func convertMoePackedTensors(blocks: MLXArray, scales: MLXArray) -> MLXArray? {
+    guard blocks.shape.dropLast() == scales.shape else {
+        return nil
+    }
 
     var scales = scales.asType(.int32) - 127
     let lut = MLXArray([
@@ -439,7 +562,7 @@ private func convertMoePackedTensors(blocks: MLXArray, scales: MLXArray) -> MLXA
 
     var out = stacked([lut[idxLo], lut[idxHi]], axis: -1).flattened(start: -2)
     out = (2.0 ** scales) * out
-    out = out.reshaped(prefixShape.count, G * B * 2)
+    out = out.reshaped(prefixShape + [G * B * 2])
     return out.asType(.bfloat16)
 }
 
@@ -480,9 +603,10 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
                 } else if k.hasSuffix("_blocks") {
                     let scaleKey = k.replacingOccurrences(of: "_blocks", with: "_scales")
                     if let scales = weights[scaleKey] {
-                        let newV = convertMoePackedTensors(blocks: v, scales: scales)
-                        let newK = k.replacingOccurrences(of: "_blocks", with: "")
-                        newWeights[newK] = newV
+                        if let newV = convertMoePackedTensors(blocks: v, scales: scales) {
+                            let newK = k.replacingOccurrences(of: "_blocks", with: "")
+                            newWeights[newK] = newV
+                        }
                     }
                 } else {
                     newWeights[k] = v

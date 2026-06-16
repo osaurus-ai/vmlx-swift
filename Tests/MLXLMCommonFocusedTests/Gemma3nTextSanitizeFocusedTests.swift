@@ -65,6 +65,34 @@ struct Gemma3nTextSanitizeFocusedTests {
         #expect(prodSource.contains("missing expected UTF-8 words in visible output"))
     }
 
+    @Test("template smoke marks native no-tool templates unsupported instead of forcing a fallback")
+    func templateSmokeMarksNativeNoToolTemplatesUnsupported() throws {
+        let source = try String(contentsOfFile: Self.repoFile("RunBench/Bench.swift"))
+        let templateSource = Self.templateSmokeSource(from: source)
+
+        #expect(templateSource.contains("nativeTemplateMentionsTools"))
+        #expect(templateSource.contains("toolsUnsupportedByNativeTemplate"))
+        #expect(templateSource.contains("status=\\(ok ? (toolsUnsupportedByNativeTemplate ? \"UNSUPPORTED\" : \"PASS\") : \"FAIL\")"))
+        #expect(templateSource.contains("tool schema/name missing despite native tool-capable template"))
+        #expect(!templateSource.contains("ChatTemplateFallbacks.gemma4WithTools"))
+        #expect(!templateSource.contains("ChatTemplateFallbacks.gemma4Minimal"))
+    }
+
+    @Test("Gemma3n cache store skips unsafe history-boundary rederive after trim miss")
+    func cacheStoreSkipsUnsafeHistoryBoundaryRederiveAfterTrimMiss() throws {
+        let evaluate = try String(contentsOfFile: Self.repoFile("Libraries/MLXLMCommon/Evaluate.swift"))
+        let batch = try String(contentsOfFile: Self.repoFile("Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"))
+        let nativeMTP = try String(contentsOfFile: Self.repoFile("Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift"))
+
+        for source in [evaluate, batch, nativeMTP] {
+            #expect(source.contains("String(describing: Swift.type(of:"))
+            #expect(source.contains("contains(\"Gemma3n\")"))
+            #expect(!source.contains("Gemma3n") || !source.contains("forced </think>"))
+        }
+        #expect(evaluate.contains("TokenIterator: skipped Gemma3n history-boundary cache rederive after trim miss"))
+        #expect(batch.contains("Skipped Gemma3n history-boundary cache rederive"))
+    }
+
     @Test("text-only config keeps the LM text embedding path")
     func textOnlyConfigKeepsLMTextEmbeddingPath() throws {
         let config = try Self.makeConfig(vocabSize: 4, architectures: nil)
@@ -155,5 +183,9 @@ struct Gemma3nTextSanitizeFocusedTests {
 
     private static func productionMatrixSource(from source: String) -> String {
         source.components(separatedBy: "func runProdMatrix").dropFirst().joined(separator: "func runProdMatrix")
+    }
+
+    private static func templateSmokeSource(from source: String) -> String {
+        source.components(separatedBy: "func runTemplateSmoke").dropFirst().joined(separator: "func runTemplateSmoke")
     }
 }

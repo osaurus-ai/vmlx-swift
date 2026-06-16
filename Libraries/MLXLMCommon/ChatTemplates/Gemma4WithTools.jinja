@@ -47,6 +47,15 @@
             {%- endif -%}
             {{- '<tool|>' -}}
         {%- endfor -%}
+        {%- if tool_choice is defined and (tool_choice == 'required' or tool_choice_name is defined) -%}
+            {{- 'Tool use is REQUIRED for this turn: ' -}}
+            {%- if tool_choice_name is defined and tool_choice_name -%}
+                {{- 'call `' + tool_choice_name + '` exactly once. ' -}}
+            {%- else -%}
+                {{- 'call exactly one declared tool. ' -}}
+            {%- endif -%}
+            {{- 'Output only <|tool_call>call:name{args}<tool_call|>; do not answer in prose.' -}}
+        {%- endif -%}
     {%- endif -%}
     {{- '<turn|>\n' -}}
 {%- else -%}

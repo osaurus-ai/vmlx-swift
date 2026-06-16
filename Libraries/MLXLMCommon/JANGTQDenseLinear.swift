@@ -90,20 +90,10 @@ public class JANGTQDenseLinear: Module {
     /// The kernel's per-row mode reduces the gather to a plain
     /// codebook-indexed matmul under that configuration.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        guard let signs = JANGTQRuntimeCache.shared.signs(
+        let signs = JANGTQRuntimeCache.shared.requiredSigns(
             inFeatures: inFeatures, seed: mxtqSeed)
-        else {
-            fatalError(
-                "JANGTQ runtime sidecar not loaded for inFeatures=\(inFeatures), "
-                + "seed=\(mxtqSeed). Call `JANGTQRuntimeCache.shared.loadSidecar(...)` "
-                + "before the first forward pass.")
-        }
-        guard let codebook = JANGTQRuntimeCache.shared.codebook(
+        let codebook = JANGTQRuntimeCache.shared.requiredCodebook(
             inFeatures: inFeatures, bits: bits)
-        else {
-            fatalError(
-                "JANGTQ codebook missing for inFeatures=\(inFeatures), bits=\(bits)")
-        }
 
         // Hadamard rotate input — accepts shape (..., in_features), returns fp32.
         let xRot = JANGTQKernels.hadamardRotate(x, signs: signs, dim: inFeatures)

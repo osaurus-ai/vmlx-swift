@@ -64,20 +64,7 @@ private enum Language {
             self._wv.wrappedValue = Linear(dim, kvHeads * headDim, bias: true)
             self._wo.wrappedValue = Linear(heads * headDim, dim, bias: false)
 
-            if let v = args.ropeScaling?["mrope_section"], let array = v.asInts() {
-                // mrope_section = np.cumsum(mrope_section * 2)[:-1].tolist()
-                self.mropeSection = sequence(state: (0, array.makeIterator())) { state in
-                    if let v = state.1.next() {
-                        // note the *2
-                        state.0 += v * 2
-                        return state.0
-                    } else {
-                        return nil
-                    }
-                }.dropLast()
-            } else {
-                fatalError("rope_scaling['mrope_section'] must be an array of integers")
-            }
+            self.mropeSection = args.mropeSection
 
             self._rotaryEmbedding.wrappedValue = RoPE(
                 dimensions: headDim, traditional: args.ropeTraditional, base: args.ropeTheta)
@@ -167,8 +154,6 @@ private enum Language {
         fileprivate let norm: RMSNorm
 
         public init(_ args: Qwen25VLConfiguration.TextConfiguration) {
-            precondition(args.vocabularySize > 0)
-
             self._embedTokens.wrappedValue = Embedding(
                 embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -179,17 +164,23 @@ private enum Language {
             self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
         }
 
-        public func callAsFunction(
-            _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil
-        ) -> MLXArray {
-            var h: MLXArray
-            if let inputEmbedding {
-                h = inputEmbedding
-            } else if let inputs {
-                h = embedTokens(inputs)
-            } else {
-                fatalError("one of inputs or inputEmbedding must be non-nil")
+        public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+            forward(hiddenStates: embedTokens(inputs), cache: cache)
+        }
+
+        func embeddingsForward(_ inputEmbedding: MLXArray?, cache: [KVCache]? = nil) throws
+            -> MLXArray
+        {
+            guard let inputEmbedding else {
+                throw VLMError.processing(
+                    "Qwen2.5-VL prepare requires input ids or input embeddings.")
             }
+            return forward(hiddenStates: inputEmbedding, cache: cache)
+        }
+
+        private func forward(hiddenStates: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+            var h: MLXArray
+            h = hiddenStates
 
             let mask = createAttentionMask(h: h, cache: cache?.first)
 
@@ -218,9 +209,21 @@ private enum Language {
         }
 
         public func callAsFunction(
-            _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil
+            _ inputs: MLXArray, cache: [KVCache]? = nil
         ) -> LMOutput {
-            var out = model(inputs, cache: cache, inputEmbedding: inputEmbedding)
+            var out = model(inputs, cache: cache)
+            if let lmHead {
+                out = lmHead(out)
+            } else {
+                out = model.embedTokens.asLinear(out)
+            }
+            return LMOutput(logits: out)
+        }
+
+        func embeddingsForward(_ inputEmbedding: MLXArray?, cache: [KVCache]? = nil) throws
+            -> LMOutput
+        {
+            var out = try model.embeddingsForward(inputEmbedding, cache: cache)
             if let lmHead {
                 out = lmHead(out)
             } else {
@@ -876,7 +879,7 @@ public class Qwen25VL: Module, VLMModel, KVCacheDimensionProvider {
             inputIds: input.text.tokens, pixelValues: allPixels,
             frames: allFrames.isEmpty ? nil : allFrames)
 
-        let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings)
+        let result = try languageModel.embeddingsForward(inputEmbeddings, cache: cache)
 
         return .logits(result)
     }
@@ -935,6 +938,20 @@ public struct Qwen25VLConfiguration: Codable, Sendable {
         public var slidingWindow: Int { _slidingWindow ?? 32768 }
         private let _useSlidingWindow: Bool?
         public var useSlidingWindow: Bool { _useSlidingWindow ?? false }
+        public var mropeSection: [Int] {
+            guard let array = ropeScaling?["mrope_section"]?.asInts() else {
+                return []
+            }
+            // mrope_section = np.cumsum(mrope_section * 2)[:-1].tolist()
+            return sequence(state: (0, array.makeIterator())) { state in
+                if let v = state.1.next() {
+                    state.0 += v * 2
+                    return state.0
+                } else {
+                    return nil
+                }
+            }.dropLast()
+        }
 
         enum CodingKeys: String, CodingKey {
             case modelType = "model_type"
@@ -952,6 +969,73 @@ public struct Qwen25VLConfiguration: Codable, Sendable {
             case _tieWordEmbeddings = "tie_word_embeddings"
             case _slidingWindow = "sliding_window"
             case _useSlidingWindow = "use_sliding_window"
+        }
+
+        public init(from decoder: any Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.modelType = try container.decode(String.self, forKey: .modelType)
+            self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+            self.hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+            self.intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+            self.attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+            self._rmsNormEps = try container.decodeIfPresent(Float.self, forKey: ._rmsNormEps)
+            self.vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+            self.kvHeads = try container.decode(Int.self, forKey: .kvHeads)
+            self._maxPositionEmbeddings = try container.decodeIfPresent(
+                Int.self, forKey: ._maxPositionEmbeddings)
+            self._ropeTheta = try container.decodeIfPresent(Float.self, forKey: ._ropeTheta)
+            self._ropeTraditional = try container.decodeIfPresent(
+                Bool.self, forKey: ._ropeTraditional)
+            self.ropeScaling = try container.decodeIfPresent(
+                [String: StringOrNumber].self, forKey: .ropeScaling)
+            self._tieWordEmbeddings = try container.decodeIfPresent(
+                Bool.self, forKey: ._tieWordEmbeddings)
+            self._slidingWindow = try container.decodeIfPresent(Int.self, forKey: ._slidingWindow)
+            self._useSlidingWindow = try container.decodeIfPresent(
+                Bool.self, forKey: ._useSlidingWindow)
+
+            try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+            try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+            try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+            try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+            try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+            try Self.validatePositive(slidingWindow, key: ._slidingWindow, in: container)
+            guard hiddenSize % attentionHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize,
+                    in: container,
+                    debugDescription:
+                        "Qwen2.5-VL hidden_size must be divisible by num_attention_heads.")
+            }
+            guard attentionHeads % kvHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .kvHeads,
+                    in: container,
+                    debugDescription:
+                        "Qwen2.5-VL num_attention_heads must be divisible by num_key_value_heads.")
+            }
+            guard let mropeSection = ropeScaling?["mrope_section"]?.asInts(),
+                mropeSection.count >= 2,
+                mropeSection.allSatisfy({ $0 > 0 })
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling,
+                    in: container,
+                    debugDescription:
+                        "Qwen2.5-VL rope_scaling.mrope_section must be an array of positive integers.")
+            }
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be greater than zero.")
+            }
         }
     }
 
@@ -995,6 +1079,72 @@ public struct Qwen25VLConfiguration: Codable, Sendable {
             case _skipVision = "skip_vision"
             case _hiddenAct = "hidden_act"
         }
+
+        public init(from decoder: any Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.depth = try container.decode(Int.self, forKey: .depth)
+            self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+            self.intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+            self.outHiddenSize = try container.decode(Int.self, forKey: .outHiddenSize)
+            self.numHeads = try container.decode(Int.self, forKey: .numHeads)
+            self.patchSize = try container.decode(Int.self, forKey: .patchSize)
+            self._inChans = try container.decodeIfPresent(Int.self, forKey: ._inChans)
+            self._layerNormEps = try container.decodeIfPresent(Float.self, forKey: ._layerNormEps)
+            self.spatialPatchSize = try container.decode(Int.self, forKey: .spatialPatchSize)
+            self.spatialMergeSize = try container.decode(Int.self, forKey: .spatialMergeSize)
+            self.temporalPatchSize = try container.decode(Int.self, forKey: .temporalPatchSize)
+            self.windowSize = try container.decode(Int.self, forKey: .windowSize)
+            self.fullattBlockIndexes = try container.decode(
+                [Int].self, forKey: .fullattBlockIndexes)
+            self.tokensPerSecond = try container.decode(Int.self, forKey: .tokensPerSecond)
+            self._skipVision = try container.decodeIfPresent(Bool.self, forKey: ._skipVision)
+            self._hiddenAct = try container.decodeIfPresent(String.self, forKey: ._hiddenAct)
+
+            try Self.validatePositive(depth, key: .depth, in: container)
+            try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+            try Self.validatePositive(outHiddenSize, key: .outHiddenSize, in: container)
+            try Self.validatePositive(numHeads, key: .numHeads, in: container)
+            try Self.validatePositive(patchSize, key: .patchSize, in: container)
+            try Self.validatePositive(inChannels, key: ._inChans, in: container)
+            try Self.validatePositive(spatialPatchSize, key: .spatialPatchSize, in: container)
+            try Self.validatePositive(spatialMergeSize, key: .spatialMergeSize, in: container)
+            try Self.validatePositive(temporalPatchSize, key: .temporalPatchSize, in: container)
+            try Self.validatePositive(windowSize, key: .windowSize, in: container)
+            try Self.validatePositive(tokensPerSecond, key: .tokensPerSecond, in: container)
+            guard hiddenSize % numHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize,
+                    in: container,
+                    debugDescription:
+                        "Qwen2.5-VL vision hidden_size must be divisible by num_heads.")
+            }
+            guard patchSize % spatialMergeSize == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .spatialMergeSize,
+                    in: container,
+                    debugDescription:
+                        "Qwen2.5-VL patch_size must be divisible by spatial_merge_size.")
+            }
+            guard fullattBlockIndexes.allSatisfy({ $0 >= 0 && $0 < depth }) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .fullattBlockIndexes,
+                    in: container,
+                    debugDescription:
+                        "Qwen2.5-VL fullatt_block_indexes must be within the vision layer range.")
+            }
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be greater than zero.")
+            }
+        }
     }
 
     public struct BaseConfiguration: Codable, Sendable {
@@ -1031,6 +1181,66 @@ public struct Qwen25VLConfiguration: Codable, Sendable {
             case useSlidingWindow = "use_sliding_window"
             case maxWindowLayers = "max_window_layers"
         }
+
+        public init(from decoder: any Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.modelType = try container.decode(String.self, forKey: .modelType)
+            self.vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+            self.imageTokenId = try container.decode(Int.self, forKey: .imageTokenId)
+            self.videoTokenId = try container.decode(Int.self, forKey: .videoTokenId)
+            self.visionStartTokenId = try container.decode(Int.self, forKey: .visionStartTokenId)
+            self.visionEndTokenId = try container.decode(Int.self, forKey: .visionEndTokenId)
+            self.visionTokenId = try container.decode(Int.self, forKey: .visionTokenId)
+            self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+            self.numAttentionHeads = try container.decode(Int.self, forKey: .numAttentionHeads)
+            self.numHiddenLayers = try container.decode(Int.self, forKey: .numHiddenLayers)
+            self.intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+            self.numKeyValueHeads = try container.decode(Int.self, forKey: .numKeyValueHeads)
+            self.slidingWindow = try container.decode(Int.self, forKey: .slidingWindow)
+            self.useSlidingWindow = try container.decode(Bool.self, forKey: .useSlidingWindow)
+            self.maxWindowLayers = try container.decode(Int.self, forKey: .maxWindowLayers)
+
+            try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+            try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try Self.validatePositive(numAttentionHeads, key: .numAttentionHeads, in: container)
+            try Self.validatePositive(numHiddenLayers, key: .numHiddenLayers, in: container)
+            try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+            try Self.validatePositive(numKeyValueHeads, key: .numKeyValueHeads, in: container)
+            try Self.validatePositive(slidingWindow, key: .slidingWindow, in: container)
+            try Self.validatePositive(maxWindowLayers, key: .maxWindowLayers, in: container)
+            guard hiddenSize % numAttentionHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize,
+                    in: container,
+                    debugDescription:
+                        "Qwen2.5-VL base hidden_size must be divisible by num_attention_heads.")
+            }
+            guard numAttentionHeads % numKeyValueHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .numKeyValueHeads,
+                    in: container,
+                    debugDescription:
+                        "Qwen2.5-VL base num_attention_heads must be divisible by num_key_value_heads.")
+            }
+            guard maxWindowLayers <= numHiddenLayers else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .maxWindowLayers,
+                    in: container,
+                    debugDescription:
+                        "Qwen2.5-VL max_window_layers must not exceed num_hidden_layers.")
+            }
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be greater than zero.")
+            }
+        }
     }
 
     public let textConfiguration: TextConfiguration
@@ -1064,6 +1274,38 @@ public struct Qwen25VLProcessorConfiguration: Codable, Sendable {
             case maxPixels = "max_pixels"
             case minPixels = "min_pixels"
         }
+
+        public init(maxPixels: Int, minPixels: Int) {
+            self.maxPixels = maxPixels
+            self.minPixels = minPixels
+        }
+
+        public init(from decoder: any Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.maxPixels = try container.decode(Int.self, forKey: .maxPixels)
+            self.minPixels = try container.decode(Int.self, forKey: .minPixels)
+
+            try Self.validatePositive(maxPixels, key: .maxPixels, in: container)
+            try Self.validatePositive(minPixels, key: .minPixels, in: container)
+            guard maxPixels >= minPixels else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .maxPixels,
+                    in: container,
+                    debugDescription:
+                        "Qwen2.5-VL processor size.max_pixels must be greater than or equal to min_pixels.")
+            }
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be greater than zero.")
+            }
+        }
     }
 
     public let imageMean: [CGFloat]
@@ -1095,5 +1337,67 @@ public struct Qwen25VLProcessorConfiguration: Codable, Sendable {
         case patchSize = "patch_size"
         case temporalPatchSize = "temporal_patch_size"
         case imageProcessorType = "image_processor_type"
+    }
+
+    public init(from decoder: any Swift.Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.imageMean = try container.decode([CGFloat].self, forKey: .imageMean)
+        self.imageStd = try container.decode([CGFloat].self, forKey: .imageStd)
+        self.minPixels = try container.decode(Int.self, forKey: .minPixels)
+        self.maxPixels = try container.decode(Int.self, forKey: .maxPixels)
+        self.mergeSize = try container.decode(Int.self, forKey: .mergeSize)
+        self.patchSize = try container.decode(Int.self, forKey: .patchSize)
+        self.temporalPatchSize = try container.decode(Int.self, forKey: .temporalPatchSize)
+        self.imageProcessorType = try container.decode(String.self, forKey: .imageProcessorType)
+
+        try Self.validateRGBTriplet(imageMean, key: .imageMean, in: container)
+        try Self.validateRGBTriplet(imageStd, key: .imageStd, in: container)
+        try Self.validatePositive(minPixels, key: .minPixels, in: container)
+        try Self.validatePositive(maxPixels, key: .maxPixels, in: container)
+        try Self.validatePositive(mergeSize, key: .mergeSize, in: container)
+        try Self.validatePositive(patchSize, key: .patchSize, in: container)
+        try Self.validatePositive(temporalPatchSize, key: .temporalPatchSize, in: container)
+        guard maxPixels >= minPixels else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .maxPixels,
+                in: container,
+                debugDescription:
+                    "Qwen2.5-VL processor max_pixels must be greater than or equal to min_pixels.")
+        }
+        guard patchSize % mergeSize == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .mergeSize,
+                in: container,
+                debugDescription:
+                    "Qwen2.5-VL processor patch_size must be divisible by merge_size.")
+        }
+        guard !imageProcessorType.isEmpty else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .imageProcessorType,
+                in: container,
+                debugDescription: "Qwen2.5-VL image_processor_type must not be empty.")
+        }
+    }
+
+    private static func validateRGBTriplet<K: CodingKey>(
+        _ values: [CGFloat], key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard values.count == 3 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must contain exactly three RGB values.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be greater than zero.")
+        }
     }
 }

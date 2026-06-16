@@ -226,11 +226,7 @@ public struct ReasoningParser: Sendable {
                 }
 
                 let before = String(buffer[..<range.lowerBound])
-                appendHarmonyChannelText(
-                    before,
-                    into: &out,
-                    final: true,
-                    stripIdentifierOnlyAtEnd: false)
+                appendHarmonyChannelText(before, into: &out, final: true)
                 buffer.removeSubrange(buffer.startIndex..<range.upperBound)
                 insideHarmonyChannel = false
                 harmonyChannelIsReasoning = false

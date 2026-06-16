@@ -4,12 +4,16 @@ import Foundation
 
 enum LoRADataError: LocalizedError {
     case fileNotFound(URL, String)
+    case unsupportedFileType(URL)
 
     var errorDescription: String? {
         switch self {
         case .fileNotFound(let directory, let name):
             return String(
                 localized: "Could not find data file '\(name)' in directory '\(directory.path())'.")
+        case .unsupportedFileType(let url):
+            return String(
+                localized: "Unsupported LoRA data file type for '\(url.lastPathComponent)'. Use a .jsonl or .txt file.")
         }
     }
 }
@@ -41,7 +45,7 @@ public func loadLoRAData(url: URL) throws -> [String] {
         return try loadLines(url: url)
 
     default:
-        fatalError("Unable to load data file, unknown type: \(url)")
+        throw LoRADataError.unsupportedFileType(url)
 
     }
 }

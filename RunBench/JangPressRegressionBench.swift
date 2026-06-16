@@ -6,9 +6,9 @@
 //
 // What each row checks:
 //   1. Load via the new `loadModel(from:using:loadConfiguration:)`
-//      overload (LoadConfiguration.default → auto JangPress + 70%
-//      resident cap). Verify status reports `enabled=true` for routed
-//      bundles and `enabled=false` for dense ones.
+//      overload. Verify the reported JangPress/MLXPress status matches the
+//      selected runtime mode; diagnostic low-footprint streaming paths must be
+//      explicitly enabled until they have model-family speed/coherency proof.
 //   2. RSS sample at: pre-load, post-load, post-warm, post-quiesce.
 //   3. 3-turn coherency on a fixed prompt set. Looping detector flags
 //      runs that emit ≥3 identical 16-char windows back-to-back.
@@ -285,7 +285,7 @@ enum JangPressRegressionBench {
             do {
                 let out = try await ask(engine, ctx: ctx, chat: transcript,
                     maxNewTokens: maxNewTokens)
-                let visible = out.visibleText
+                let visible = out.text
                 turnTexts.append(visible)
                 turnSecs.append(CFAbsoluteTimeGetCurrent() - tT)
                 if let info = out.info {
@@ -370,13 +370,10 @@ enum JangPressRegressionBench {
             r.reasoningOnChars = on.reasoning.count
             let offAnswer = off.text.trimmingCharacters(in: .whitespacesAndNewlines)
             let onAnswer = on.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let offVisible = off.visibleText
-            let onVisible = on.visibleText
             r.reasoningProbePassed =
                 !offAnswer.isEmpty && !onAnswer.isEmpty
-                && !offVisible.isEmpty && !onVisible.isEmpty
-                && !detectLooping(in: offVisible)
-                && !detectLooping(in: onVisible)
+                && !detectLooping(in: offAnswer)
+                && !detectLooping(in: onAnswer)
             print("  Thinking probe: off(reasoning=\(off.reasoning.count)c answer=\(off.text.count)c) on(reasoning=\(on.reasoning.count)c answer=\(on.text.count)c) pass=\(r.reasoningProbePassed == true ? "yes" : "NO")")
             printBlock("THINKING_OFF_ANSWER", off.text)
             if !off.reasoning.isEmpty {
@@ -400,9 +397,11 @@ enum JangPressRegressionBench {
                     prompt: "Name a single bird in one word.", maxNewTokens: 16)
                 let r2 = try await ask(engine, ctx: ctx,
                     prompt: "Name a single bird in one word.", maxNewTokens: 16)
-                r.tqRoundTripPassed = !r1.visibleText.isEmpty && !r2.visibleText.isEmpty
-                printBlock("TQ_ROUNDTRIP_1", r1.visibleText)
-                printBlock("TQ_ROUNDTRIP_2", r2.visibleText)
+                r.tqRoundTripPassed =
+                    !r1.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !r2.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                printBlock("TQ_ROUNDTRIP_1", r1.text)
+                printBlock("TQ_ROUNDTRIP_2", r2.text)
             } catch {
                 r.tqRoundTripPassed = false
                 print("  TQ round-trip FAIL: \(error)")
@@ -471,9 +470,6 @@ enum JangPressRegressionBench {
         var reasoning: String
         var info: GenerateCompletionInfo?
 
-        var visibleText: String {
-            text.isEmpty ? reasoning : text
-        }
     }
 
     private static func ask(
@@ -485,15 +481,15 @@ enum JangPressRegressionBench {
         ui.additionalContext = ["enable_thinking": enableThinking]
         let lm = try await ctx.processor.prepare(input: ui)
         nonisolated(unsafe) let sendable = lm
-        var p = GenerateParameters(maxTokens: maxNewTokens, temperature: 0)
+        let fallback = GenerateParameters(maxTokens: maxNewTokens)
+        var p = GenerateParameters(
+            generationConfig: ctx.configuration.generationDefaults,
+            fallback: fallback)
+        p.maxTokens = maxNewTokens
         p.prefillStepSize = 512
         let stream = await engine.generate(input: sendable, parameters: p)
-        // Collect BOTH .chunk and .reasoning — MiniMax / Qwen3 thinking
-        // models emit visible content inside <think>...</think> which
-        // the ReasoningParser routes to `.reasoning`, leaving `.chunk`
-        // empty. Coherency is "did the model say anything coherent",
-        // so prefer `.chunk` when non-empty, else fall back to
-        // `.reasoning`.
+        // Collect BOTH .chunk and .reasoning, but keep them separate:
+        // reasoning-only output is not a visible-answer pass.
         var text = ""
         var reasoning = ""
         var info: GenerateCompletionInfo?

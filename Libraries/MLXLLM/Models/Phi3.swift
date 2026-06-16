@@ -153,7 +153,6 @@ public class Phi3ModelInner: Module {
     let args: Phi3Configuration
 
     public init(_ args: Phi3Configuration) {
-        precondition(args.vocabularySize > 0)
         self.args = args
 
         self._embedTokens.wrappedValue = Embedding(
@@ -229,6 +228,46 @@ struct RopeScalingWithFactorArrays: Codable {
         case longMScale = "long_mscale"
         case shortMScale = "short_mscale"
     }
+
+    func validate<K: CodingKey>(
+        key: K, in container: KeyedDecodingContainer<K>, headDim: Int
+    ) throws {
+        if let type, type == "linear" {
+            guard let factor, factor.isFinite, factor > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "Phi3 rope_scaling.factor must be a positive float.")
+            }
+        }
+        if let type, type == "su" || type == "longrope" {
+            guard let shortFactor, let longFactor,
+                !shortFactor.isEmpty,
+                !longFactor.isEmpty,
+                shortFactor.allSatisfy({ $0.isFinite && $0 > 0 }),
+                longFactor.allSatisfy({ $0.isFinite && $0 > 0 })
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription:
+                        "Phi3 longrope/su rope_scaling must include positive short_factor and long_factor arrays.")
+            }
+            guard shortFactor.count == headDim / 2, longFactor.count == headDim / 2 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription:
+                        "Phi3 longrope/su factor arrays must match half the attention head dimension.")
+            }
+        }
+        if let type, !["linear", "su", "longrope"].contains(type) {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Phi3 rope_scaling.type must be linear, su, or longrope.")
+        }
+    }
 }
 
 public struct Phi3Configuration: Codable, Sendable {
@@ -298,6 +337,65 @@ public struct Phi3Configuration: Codable, Sendable {
         tieWordEmbeddings =
             try container.decodeIfPresent(
                 Bool.self, forKey: .tieWordEmbeddings) ?? false
+
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try Self.validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+        try Self.validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try Self.validatePositive(partialRotaryFactor, key: .partialRotaryFactor, in: container)
+        try Self.validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try Self.validatePositive(
+            originalMaxPositionEmbeddings, key: .originalMaxPositionEmbeddings, in: container)
+        guard hiddenSize % attentionHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription:
+                    "Phi3 hidden_size must be divisible by num_attention_heads.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "Phi3 num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        let headDim = hiddenSize / attentionHeads
+        let rotaryDim = Int(Float(headDim) * partialRotaryFactor)
+        guard rotaryDim > 0, rotaryDim <= headDim else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .partialRotaryFactor,
+                in: container,
+                debugDescription:
+                    "Phi3 rotary dimension must be positive and no larger than head_dim.")
+        }
+        try ropeScaling?.validate(key: .ropeScaling, in: container, headDim: headDim)
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be greater than zero.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be finite and greater than zero.")
+        }
     }
 }
 

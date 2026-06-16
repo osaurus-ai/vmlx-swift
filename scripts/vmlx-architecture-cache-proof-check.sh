@@ -63,6 +63,7 @@ TOPO="$ROOT/Tests/MLXLMCommonFocusedTests/CacheCoordinatorTopologyFocusedTests.s
 MEDIA="$ROOT/Tests/MLXLMTests/CacheCoordinatorMediaSaltTests.swift"
 TQ_PROBE="$ROOT/Tests/MLXLMTests/TurboQuantCompileProbeTests.swift"
 TQ_LIST="$ROOT/Tests/MLXLMTests/CompilableCacheListTests.swift"
+MIMO_TOPO="$ROOT/Tests/MLXLMTests/MiMoV2FlashCacheTopologyTests.swift"
 NOHIDDEN="$ROOT/Tests/MLXLMCommonFocusedTests/NoHiddenReasoningCloseBiasFocusedTests.swift"
 GEMMA_PARSER="$ROOT/Tests/MLXLMCommonFocusedTests/Gemma4ThoughtChannelParserFocusedTests.swift"
 SETTINGS_TESTS="$ROOT/Tests/MLXLMCommonFocusedTests/VMLXServerRuntimeSettingsTests.swift"
@@ -71,7 +72,7 @@ QG_PROOF="$ROOT/scripts/vmlx-qwen-gemma-proof-check.sh"
 
 for file in \
   "$MATRIX" "$DSV4_DISK" "$DSV4_SMOKE" "$ZAYA_DISK" "$TOPO" "$MEDIA" \
-  "$TQ_PROBE" "$TQ_LIST" "$NOHIDDEN" "$GEMMA_PARSER" "$SETTINGS_TESTS" "$PARSER" "$QG_PROOF"; do
+  "$TQ_PROBE" "$TQ_LIST" "$MIMO_TOPO" "$NOHIDDEN" "$GEMMA_PARSER" "$SETTINGS_TESTS" "$PARSER" "$QG_PROOF"; do
   require_file "$file"
 done
 
@@ -84,6 +85,8 @@ require_text "$MATRIX" 'CCA/HY3 style models need companion' "matrix names CCA/H
 require_text "$MATRIX" 'cache/pooling proof' "matrix requires CCA/HY3 cache/pooling proof"
 require_text "$MATRIX" 'DeepSeek-V4 needs CSA/HSA/SWA pool restore proof' \
   "matrix requires DSV4 CSA/HSA/SWA pool proof"
+require_text "$MATRIX" 'MiMo v2.5 needs full-attention KV plus rotating SWA L2 proof' \
+  "matrix requires MiMo v2.5 full/SWA KV proof"
 require_text "$MATRIX" 'VL/video models need media payload' \
   "matrix requires VL/video media cache proof"
 require_fixed "$MATRIX" "n-a:deepseek-v4-uses-swa-csa-hsa-hybrid-pool-cache-not-turboquant-kv" \
@@ -152,8 +155,27 @@ require_text "$GEMMA_PARSER" 'empty thought channel without newline does not sur
   "Gemma4 no-newline thought regression covered"
 require_text "$GEMMA_PARSER" 'pre<\|channel>thought<channel\|>answer' \
   "Gemma4 no-newline thought fixture covered"
-require_text "$PARSER" 'stripIdentifierOnlyAtEnd: true\)' \
-  "Gemma4 parser source fix guarded"
+require_fixed "$PARSER" 'channelName == "thought" || channelName == "thinking"' \
+  "Gemma4 bare thought-channel source fix guarded"
+require_fixed "$PARSER" 'harmonyChannelShouldStripName = false' \
+  "Gemma4 empty thought-channel source fix guarded"
+
+require_text "$MIMO_TOPO" 'MiMo V2.5 hybrid full/SWA cache topology' \
+  "MiMo v2.5 topology suite exists"
+require_text "$MIMO_TOPO" 'per-layer KV heads and cache classes match full/SWA layer pattern' \
+  "MiMo v2.5 per-layer full/SWA cache classes covered"
+require_text "$MIMO_TOPO" 'TurboQuant KV only promotes full-attention cache layers' \
+  "MiMo v2.5 TurboQuant KV full-layer-only promotion covered"
+require_text "$MIMO_TOPO" 'cache topology snapshot marks MiMo full/SWA KV as disk-backed rotating topology' \
+  "MiMo v2.5 topology snapshot marks rotating restore boundary"
+require_text "$MIMO_TOPO" 'L2 disk round trip preserves hybrid full/SWA cache kinds' \
+  "MiMo v2.5 L2 disk native full/SWA round-trip covered"
+require_text "$MIMO_TOPO" 'L2 disk round trip preserves TurboQuant full layers plus rotating SWA' \
+  "MiMo v2.5 L2 disk TurboQuant plus rotating SWA round-trip covered"
+require_text "$MIMO_TOPO" 'CacheCoordinator L2 prefix hit preserves MiMo full/SWA cache topology' \
+  "MiMo v2.5 coordinator L2 prefix hit covered"
+require_text "$SETTINGS_TESTS" '\("mimo_v2", \.xmlFunction, "think_xml"\)' \
+  "server runtime family policy includes MiMo v2.5 reasoning/tool autodetect"
 
 require_text "$MEDIA" 'mediaSalt is not folded into the paged block hash chain' \
   "media salt paged-prefix isolation covered"

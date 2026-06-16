@@ -64,8 +64,9 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
             // Find the key (everything before :)
             guard let colonIdx = argsStr.firstIndex(of: ":") else { break }
-            let key = String(argsStr[..<colonIdx])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let key = normalizeArgumentKey(
+                String(argsStr[..<colonIdx])
+                    .trimmingCharacters(in: .whitespacesAndNewlines))
             argsStr = String(argsStr[argsStr.index(after: colonIdx)...])
 
             guard let value = parseValue(from: &argsStr) else { break }
@@ -153,6 +154,31 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         {
             return json
         }
+        if let decoded = decodeJSONStringLiteral(value) {
+            return decoded
+        }
         return value
+    }
+
+    private func normalizeArgumentKey(_ key: String) -> String {
+        guard key.count >= 2 else { return key }
+        if let decoded = decodeJSONStringLiteral(key) {
+            return decoded
+        }
+        if (key.hasPrefix("\"") && key.hasSuffix("\""))
+            || (key.hasPrefix("'") && key.hasSuffix("'"))
+        {
+            return String(key.dropFirst().dropLast())
+        }
+        return key
+    }
+
+    private func decodeJSONStringLiteral(_ value: String) -> String? {
+        guard value.hasPrefix("\""), value.hasSuffix("\""),
+            let data = value.data(using: .utf8),
+            let decoded = try? JSONSerialization.jsonObject(
+                with: data, options: [.fragmentsAllowed]) as? String
+        else { return nil }
+        return decoded
     }
 }

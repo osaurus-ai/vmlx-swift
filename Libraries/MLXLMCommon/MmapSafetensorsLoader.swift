@@ -78,6 +78,7 @@ import MLX
 import Darwin
 
 public enum MmapSafetensorsError: LocalizedError {
+    case nonFileURL(URL)
     case openFailed(String, errno: Int32)
     case statFailed(String, errno: Int32)
     case mmapFailed(String, errno: Int32)
@@ -90,6 +91,8 @@ public enum MmapSafetensorsError: LocalizedError {
 
     public var errorDescription: String? {
         switch self {
+        case .nonFileURL(let url):
+            return "MmapSafetensorsLoader: expected a file URL, got \(url.absoluteString)"
         case .openFailed(let path, let e):
             return "MmapSafetensorsLoader: open(\(path)) failed: errno=\(e) (\(String(cString: strerror(e))))"
         case .statFailed(let path, let e):
@@ -146,7 +149,9 @@ public enum MmapSafetensorsLoader {
     public static func loadArraysAndMetadata(url: URL) throws -> (
         [String: MLXArray], [String: String]
     ) {
-        precondition(url.isFileURL)
+        guard url.isFileURL else {
+            throw MmapSafetensorsError.nonFileURL(url)
+        }
         let path = url.path(percentEncoded: false)
 
         // 1. open + stat
@@ -290,6 +295,7 @@ public enum MmapSafetensorsLoader {
 #else  // !canImport(Darwin)
 
 public enum MmapSafetensorsError: Error {
+    case nonFileURL(URL)
     case unsupportedPlatform
 }
 
@@ -297,6 +303,9 @@ public enum MmapSafetensorsLoader {
     public static func loadArraysAndMetadata(url: URL) throws -> (
         [String: MLXArray], [String: String]
     ) {
+        guard url.isFileURL else {
+            throw MmapSafetensorsError.nonFileURL(url)
+        }
         throw MmapSafetensorsError.unsupportedPlatform
     }
 }

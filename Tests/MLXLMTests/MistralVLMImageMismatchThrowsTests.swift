@@ -16,6 +16,7 @@
 // Metal runner / loaded model.
 
 import Foundation
+@testable import MLXVLM
 import Testing
 
 @Suite("Mistral-family VLM image-mismatch throwing-contract source coverage")
@@ -111,5 +112,52 @@ struct MistralVLMImageMismatchThrowsTests {
         #expect(
             !source.contains(#"fatalError("Image token count"#),
             "Mistral4VLM must not reintroduce fatalError on count mismatch.")
+    }
+
+    @Test("Mistral4VLM projector bridge preserves required Mistral3 rope parameters")
+    func mistral4ProjectorBridgePreservesRopeParameters() throws {
+        let json = """
+        {
+          "model_type": "mistral4",
+          "vocab_size": 64,
+          "text_config": {
+            "model_type": "mistral4",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 64,
+            "head_dim": 4,
+            "rope_parameters": { "rope_theta": 10000.0 },
+            "kv_lora_rank": 4,
+            "q_lora_rank": 4,
+            "qk_rope_head_dim": 2,
+            "v_head_dim": 4,
+            "qk_nope_head_dim": 2,
+            "n_routed_experts": 1,
+            "num_experts_per_tok": 1,
+            "n_shared_experts": 1,
+            "moe_intermediate_size": 16
+          },
+          "vision_config": {
+            "model_type": "pixtral",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "intermediate_size": 16,
+            "patch_size": 4,
+            "image_size": 8,
+            "num_channels": 3,
+            "head_dim": 4,
+            "rope_theta": 10000.0
+          }
+        }
+        """
+        let data = try #require(json.data(using: .utf8))
+        let config = try JSONDecoder().decode(Mistral4VLMConfiguration.self, from: data)
+
+        _ = try Mistral4VLM(config)
     }
 }

@@ -251,8 +251,14 @@ public enum TreeBuilder {
         childMaps: [[Int32: Int32]],
         posteriorTokens: [Int32]
     ) throws -> (acceptedIndices: [Int32], bonusToken: Int32) {
-        precondition(!posteriorTokens.isEmpty,
-            "followVerifiedTree: posteriorTokens must have at least one entry")
+        guard !posteriorTokens.isEmpty else {
+            throw SpecDecError.invalidRequest(
+                "DDTree posteriorTokens must have at least one entry")
+        }
+        guard !childMaps.isEmpty else {
+            throw SpecDecError.invalidRequest(
+                "DDTree child map index out of range at node 0")
+        }
 
         var acceptedIndices: [Int32] = [0]
         var currentIndex = 0
@@ -260,6 +266,10 @@ public enum TreeBuilder {
 
         while let childIdx = childMaps[currentIndex][nextToken] {
             currentIndex = Int(childIdx)
+            guard currentIndex >= 0 && currentIndex < childMaps.count else {
+                throw SpecDecError.invalidRequest(
+                    "DDTree child map index out of range at node \(currentIndex)")
+            }
             acceptedIndices.append(childIdx)
             if currentIndex >= posteriorTokens.count { break }
             nextToken = posteriorTokens[currentIndex]

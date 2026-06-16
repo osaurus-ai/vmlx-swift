@@ -75,6 +75,15 @@ require_text() {
   fi
 }
 
+require_fixed_text() {
+  local file="$1" pattern="$2" label="$3"
+  if rg -Fq "$pattern" "$file"; then
+    pass "$label"
+  else
+    fail_msg "missing evidence for $label in $file"
+  fi
+}
+
 reject_text() {
   local dir="$1" pattern="$2" label="$3"
   if rg -n -i "$pattern" "$dir"; then
@@ -216,8 +225,9 @@ check_osaurus_vmlx_pin_reproducible() {
     fail_msg "vMLX parser fix/regression files have uncommitted diffs; Osaurus pin $pin cannot reproduce local parser proof"
   fi
 
-  if git -C "$REPO_ROOT" show "HEAD:Libraries/MLXLMCommon/ReasoningParser.swift" \
-      | rg -q 'stripIdentifierOnlyAtEnd: true\)'; then
+  pinned_parser="$(git -C "$REPO_ROOT" show "HEAD:Libraries/MLXLMCommon/ReasoningParser.swift" 2>/dev/null || true)"
+  if rg -Fq 'channelName == "thought" || channelName == "thinking"' <<<"$pinned_parser" \
+      && rg -Fq 'harmonyChannelShouldStripName = false' <<<"$pinned_parser"; then
     pass "pinned vMLX HEAD contains Gemma empty thought-channel parser fix"
   else
     fail_msg "pinned vMLX HEAD lacks Gemma empty thought-channel parser fix"
@@ -261,7 +271,8 @@ check_vmlx_gemma_parser_source() {
   require_file "$tool_parser" "vMLX GemmaFunctionParser.swift"
   require_file "$tests" "vMLX Gemma parser focused tests"
   require_file "$tool_tests" "vMLX Gemma tool parser edge-case tests"
-  require_text "$parser" 'stripIdentifierOnlyAtEnd: true\)' "vMLX Gemma empty thought-channel source fix"
+  require_fixed_text "$parser" 'channelName == "thought" || channelName == "thinking"' "vMLX Gemma bare thought-channel source fix"
+  require_fixed_text "$parser" 'harmonyChannelShouldStripName = false' "vMLX Gemma empty thought-channel source fix"
   require_text "$tests" 'empty thought channel without newline does not surface thought' "vMLX Gemma no-newline thought regression"
   require_text "$tests" 'pre<\|channel>thought<channel\|>answer' "vMLX Gemma no-newline thought fixture"
   require_text "$REPO_ROOT/Package.swift" 'Gemma4ThoughtChannelParserFocusedTests\.swift' "vMLX Gemma parser regression target wiring"

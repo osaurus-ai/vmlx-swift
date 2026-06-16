@@ -874,20 +874,20 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
             let kPacked = kW.dim(kW.ndim - 1)
             let vPacked = vW.dim(vW.ndim - 1)
             if qPacked != kPacked || kPacked != vPacked {
-                fatalError(
+                FileHandle.standardError.write(Data(
                     """
-                    [Laguna sanitize] layer \(layer) self_attn has mismatched \
+                    [Laguna sanitize warning] layer \(layer) self_attn has mismatched \
                     bit widths across q/k/v projections (q packed_in=\(qPacked), \
-                    k=\(kPacked), v=\(vPacked)). QKV fusion requires identical \
-                    bit widths.
-                    """
-                )
+                    k=\(kPacked), v=\(vPacked)). Leaving source q/k/v keys intact \
+                    so load verification fails.
+                    """.utf8))
+                continue
             }
 
             out["\(fusedKey).weight"] = concatenated([qW, kW, vW], axis: 0)
-            out.removeValue(forKey: "\(qKey).weight")
-            out.removeValue(forKey: "\(kKey).weight")
-            out.removeValue(forKey: "\(vKey).weight")
+            out["\(qKey).weight"] = nil
+            out["\(kKey).weight"] = nil
+            out["\(vKey).weight"] = nil
 
             for suffix in ["scales", "biases", "bias"] {
                 let qS = out["\(qKey).\(suffix)"]
@@ -895,9 +895,9 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
                 let vS = out["\(vKey).\(suffix)"]
                 guard let qS, let kS, let vS else { continue }
                 out["\(fusedKey).\(suffix)"] = concatenated([qS, kS, vS], axis: 0)
-                out.removeValue(forKey: "\(qKey).\(suffix)")
-                out.removeValue(forKey: "\(kKey).\(suffix)")
-                out.removeValue(forKey: "\(vKey).\(suffix)")
+                out["\(qKey).\(suffix)"] = nil
+                out["\(kKey).\(suffix)"] = nil
+                out["\(vKey).\(suffix)"] = nil
             }
         }
         return out

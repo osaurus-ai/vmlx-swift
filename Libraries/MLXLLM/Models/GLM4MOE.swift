@@ -123,11 +123,7 @@ class GLM4MoEGate: Module {
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
 
     init(_ config: GLM4MoEConfiguration) {
-        guard let nRoutedExperts = config.nRoutedExperts else {
-            fatalError("GLM4MoEGate requires nRoutedExperts")
-        }
-
-        precondition(config.topkMethod == "noaux_tc", "Unsupported topk method.")
+        let nRoutedExperts = config.nRoutedExperts
 
         self.topK = config.numExpertsPerTok
         self.normTopkProb = config.normTopkProb
@@ -188,9 +184,7 @@ class GLM4MoE: Module, UnaryLayer {
     @ModuleInfo(key: "shared_experts") var sharedExperts: GLM4MoEMLP?
 
     init(_ config: GLM4MoEConfiguration, layerIdx: Int) {
-        guard let nRoutedExperts = config.nRoutedExperts else {
-            fatalError("GLM4MoE requires nRoutedExperts")
-        }
+        let nRoutedExperts = config.nRoutedExperts
 
         self.layerIdx = layerIdx
         self.numExpertsPerTok = config.numExpertsPerTok
@@ -234,7 +228,7 @@ class GLM4MoEDecoderLayer: Module {
     init(_ args: GLM4MoEConfiguration, layerIdx: Int) {
         _attention.wrappedValue = GLM4MoEAttention(args)
 
-        if args.nRoutedExperts != nil && layerIdx >= args.firstKDenseReplace {
+        if layerIdx >= args.firstKDenseReplace {
             self.mlp = GLM4MoE(args, layerIdx: layerIdx)
         } else {
             self.mlp = GLM4MoEMLP(args)
@@ -263,8 +257,6 @@ public class GLM4MoEModelInner: Module {
     let norm: RMSNorm
 
     init(_ args: GLM4MoEConfiguration) {
-        precondition(args.vocabularySize > 0)
-
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -328,7 +320,8 @@ public class GLM4MoEModel: Module, LLMModel, KVCacheDimensionProvider {
             for n in ["gate_proj", "down_proj", "up_proj"] {
                 for k in ["weight", "scales", "biases"] {
                     let key = "\(prefix).mlp.experts.0.\(n).\(k)"
-                    if sanitized[key] != nil, let nRoutedExperts = configuration.nRoutedExperts {
+                    if sanitized[key] != nil {
+                        let nRoutedExperts = configuration.nRoutedExperts
                         let toJoin = (0 ..< nRoutedExperts).map { e in
                             sanitized.removeValue(
                                 forKey: "\(prefix).mlp.experts.\(e).\(n).\(k)")!
@@ -359,7 +352,7 @@ public struct GLM4MoEConfiguration: Codable, Sendable {
     var headDim: Int
     var topkGroup: Int
     var nSharedExperts: Int?
-    var nRoutedExperts: Int?
+    var nRoutedExperts: Int
     var routedScalingFactor: Float
     var numExpertsPerTok: Int
     var firstKDenseReplace: Int
@@ -421,7 +414,7 @@ public struct GLM4MoEConfiguration: Codable, Sendable {
         self.headDim = try container.decode(Int.self, forKey: .headDim)
         self.topkGroup = try container.decode(Int.self, forKey: .topkGroup)
         self.nSharedExperts = try container.decodeIfPresent(Int.self, forKey: .nSharedExperts)
-        self.nRoutedExperts = try container.decodeIfPresent(Int.self, forKey: .nRoutedExperts)
+        self.nRoutedExperts = try container.decode(Int.self, forKey: .nRoutedExperts)
         self.routedScalingFactor = try container.decode(Float.self, forKey: .routedScalingFactor)
         self.numExpertsPerTok = try container.decode(Int.self, forKey: .numExpertsPerTok)
         self.firstKDenseReplace = try container.decode(Int.self, forKey: .firstKDenseReplace)
@@ -439,6 +432,123 @@ public struct GLM4MoEConfiguration: Codable, Sendable {
             try container.decodeIfPresent(String.self, forKey: .scoringFunc) ?? "sigmoid"
         self.topkMethod =
             try container.decodeIfPresent(String.self, forKey: .topkMethod) ?? "noaux_tc"
+
+        try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try Self.validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try Self.validatePositive(moeIntermediateSize, key: .moeIntermediateSize, in: container)
+        try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try Self.validatePositive(nGroup, key: .nGroup, in: container)
+        try Self.validatePositive(headDim, key: .headDim, in: container)
+        try Self.validatePositive(topkGroup, key: .topkGroup, in: container)
+        try Self.validatePositive(nRoutedExperts, key: .nRoutedExperts, in: container)
+        if let nSharedExperts {
+            try Self.validateNonNegative(nSharedExperts, key: .nSharedExperts, in: container)
+        }
+        try Self.validatePositive(routedScalingFactor, key: .routedScalingFactor, in: container)
+        try Self.validatePositive(numExpertsPerTok, key: .numExpertsPerTok, in: container)
+        try Self.validateNonNegative(firstKDenseReplace, key: .firstKDenseReplace, in: container)
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+        try Self.validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try Self.validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try Self.validatePositive(partialRotaryFactor, key: .partialRotaryFactor, in: container)
+
+        guard topkMethod == "noaux_tc" else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .topkMethod,
+                in: container,
+                debugDescription: "GLM4MoE topk_method must be noaux_tc.")
+        }
+        guard scoringFunc == "sigmoid" || scoringFunc == "softmax" else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .scoringFunc,
+                in: container,
+                debugDescription: "GLM4MoE scoring_func must be sigmoid or softmax.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "GLM4MoE num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard hiddenSize == attentionHeads * headDim else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription:
+                    "GLM4MoE hidden_size must equal num_attention_heads * head_dim.")
+        }
+        guard nRoutedExperts % nGroup == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .nGroup,
+                in: container,
+                debugDescription:
+                    "GLM4MoE n_routed_experts must be divisible by n_group.")
+        }
+        guard topkGroup <= nGroup else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .topkGroup,
+                in: container,
+                debugDescription: "GLM4MoE topk_group must be less than or equal to n_group.")
+        }
+        guard numExpertsPerTok <= nRoutedExperts else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numExpertsPerTok,
+                in: container,
+                debugDescription:
+                    "GLM4MoE num_experts_per_tok must be less than or equal to n_routed_experts.")
+        }
+        guard firstKDenseReplace < hiddenLayers else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .firstKDenseReplace,
+                in: container,
+                debugDescription:
+                    "GLM4MoE first_k_dense_replace must be less than num_hidden_layers.")
+        }
+        let rotaryDim = Int(Float(headDim) * partialRotaryFactor)
+        guard rotaryDim > 0, rotaryDim <= headDim else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .partialRotaryFactor,
+                in: container,
+                debugDescription:
+                    "GLM4MoE rotary dimension must be positive and no larger than head_dim.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be greater than zero.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be finite and greater than zero.")
+        }
+    }
+
+    private static func validateNonNegative<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be non-negative.")
+        }
     }
 }
 

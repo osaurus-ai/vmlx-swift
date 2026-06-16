@@ -102,6 +102,18 @@ public struct DFlashDrafterConfiguration: Codable, Sendable {
         self.hiddenAct = try c.decodeIfPresent(String.self, forKey: .hiddenAct) ?? "silu"
         self.blockSize = try c.decode(Int.self, forKey: .blockSize)
         self.dflashConfig = try c.decode(DFlashInnerConfig.self, forKey: .dflashConfig)
+        guard !self.dflashConfig.targetLayerIds.isEmpty else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .dflashConfig,
+                in: c,
+                debugDescription: "DFlash dflash_config.target_layer_ids must be non-empty")
+        }
+        guard self.dflashConfig.targetLayerIds.allSatisfy({ $0 >= 0 }) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .dflashConfig,
+                in: c,
+                debugDescription: "DFlash dflash_config.target_layer_ids must be nonnegative")
+        }
         self.modelType = try c.decodeIfPresent(String.self, forKey: .modelType)
         self.dtype = try c.decodeIfPresent(String.self, forKey: .dtype)
     }

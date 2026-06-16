@@ -1383,7 +1383,9 @@ public struct JangLoader: Sendable {
         jangConfig: JangConfig,
         hiddenSizeHint: Int? = nil,
         linearAttnValueDimHint: Int? = nil,
+        expertIntermediateSizeHint: Int? = nil,
         validInDims: Set<Int> = [],
+        attentionOutputDimHints: Set<Int> = [],
         declaredDefaultQuantization: BaseConfiguration.Quantization? = nil,
         declaredPerLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
     ) -> BaseConfiguration.PerLayerQuantization {
@@ -1559,6 +1561,10 @@ public struct JangLoader: Sendable {
                 || basePath.hasSuffix("mtp.fc")
             let isLinearAttnOutputProjection =
                 basePath.hasSuffix(".linear_attn.out_proj")
+            let isAttentionOutputProjection =
+                basePath.hasSuffix(".self_attn.o_proj")
+                || basePath.hasSuffix(".attn.o_proj")
+                || basePath.hasSuffix(".mixer.o_proj")
             let isZayaCCAOutputProjection =
                 basePath.hasSuffix(".sub.o_proj")
             let isExpertDownProjection =
@@ -1624,6 +1630,33 @@ public struct JangLoader: Sendable {
                     knownGroupSize: groupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: valueDim)
+            } else if isAttentionOutputProjection,
+                      !attentionOutputDimHints.isEmpty
+            {
+                let candidates = attentionOutputDimHints.sorted()
+                var picked: (bits: Int, groupSize: Int)? = nil
+                for dim in candidates where dim > 0 {
+                    let inferred = inferBitWidthAndGroupSize(
+                        packedDim: packedDim,
+                        numGroups: numGroups,
+                        knownGroupSize: groupSize,
+                        bitWidthsUsed: bitWidthsUsed,
+                        expectedInDim: dim)
+                    let inputDim = (packedDim * 32) / inferred.bits
+                    if inputDim == dim {
+                        picked = inferred
+                        break
+                    }
+                }
+                if let picked {
+                    (bits, inferredGroupSize) = picked
+                } else {
+                    (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
+                        weight: weightArray,
+                        scales: scalesArray,
+                        knownGroupSize: groupSize,
+                        bitWidthsUsed: bitWidthsUsed)
+                }
             } else if isZayaCCAOutputProjection,
                       let hiddenSize = hiddenSizeHint, hiddenSize > 1
             {
@@ -1641,6 +1674,16 @@ public struct JangLoader: Sendable {
                     expectedInDim: ccaOutputDim)
             } else if let picked = inferFromUniqueValidInDim() {
                 (bits, inferredGroupSize) = picked
+            } else if isExpertDownProjection,
+                      let expertIntermediateSize = expertIntermediateSizeHint,
+                      expertIntermediateSize > 0
+            {
+                (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
+                    packedDim: packedDim,
+                    numGroups: numGroups,
+                    knownGroupSize: groupSize,
+                    bitWidthsUsed: bitWidthsUsed,
+                    expectedInDim: expertIntermediateSize)
             } else if isExpertDownProjection && !validInDims.isEmpty {
                 let preferred: [(Int, Int)] = [
                     (8, 32), (8, 64), (8, 128),

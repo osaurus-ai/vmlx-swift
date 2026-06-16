@@ -401,87 +401,88 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
-        if let coordinator = cacheCoordinator,
-           !promptTokenIds.isEmpty,
-           let promptCacheSnapshot
-        {
-            func store(tokens: [Int], snapshot: [KVCache], label _: String) {
-                guard !tokens.isEmpty else { return }
-                let cacheSnapshot = snapshot.map { $0.copy() }
-                MLX.eval(cacheSnapshot)
-                let requiresDiskBackedRestore =
-                    cacheRequiresDiskBackedCoordinatorRestore(cacheSnapshot)
-                let perLayerData = requiresDiskBackedRestore
-                    ? []
-                    : extractLayerData(from: cacheSnapshot)
-                let ssmCapture: [MLXArray]? = coordinator.isHybrid &&
-                    coordinator.config.enableSSMReDerive &&
-                    !requiresDiskBackedRestore &&
-                    !originalInput.hasMediaContent
-                    ? reDeriveAndStoreSSMStatesForPromptBoundaries(
-                        coordinator: coordinator,
-                        model: model,
-                        promptTokenIds: tokens,
-                        mediaSalt: mediaSalt,
-                        prefillStepSize: cacheInitParameters.prefillStepSize)
-                    : (coordinator.isHybrid ? extractSSMStates(from: cacheSnapshot) : nil)
-                let diskStoreCache = makeDiskStoreCache(
-                    fromPromptBoundary: cacheSnapshot,
-                    parameters: cacheInitParameters)
-                coordinator.storeAfterGeneration(
-                    promptTokens: tokens,
-                    perLayerData: perLayerData,
-                    ssmStates: ssmCapture,
-                    cache: diskStoreCache,
-                    mediaSalt: mediaSalt)
-            }
+        withMLXDiskCacheIOLock {
+            if let coordinator = cacheCoordinator,
+               !promptTokenIds.isEmpty,
+               let promptCacheSnapshot
+            {
+                func store(tokens: [Int], snapshot: [KVCache], label _: String) {
+                    guard !tokens.isEmpty else { return }
+                    let cacheSnapshot = snapshot.map { $0.copy() }
+                    MLX.eval(cacheSnapshot)
+                    let requiresDiskBackedRestore =
+                        cacheRequiresDiskBackedCoordinatorRestore(cacheSnapshot)
+                    let perLayerData = requiresDiskBackedRestore
+                        ? []
+                        : extractLayerData(from: cacheSnapshot)
+                    let ssmCapture: [MLXArray]? = coordinator.isHybrid &&
+                        coordinator.config.enableSSMReDerive &&
+                        !originalInput.hasMediaContent
+                        ? reDeriveAndStoreSSMStatesForPromptBoundaries(
+                            coordinator: coordinator,
+                            model: model,
+                            promptTokenIds: tokens,
+                            mediaSalt: mediaSalt,
+                            prefillStepSize: cacheInitParameters.prefillStepSize)
+                        : (coordinator.isHybrid ? extractSSMStates(from: cacheSnapshot) : nil)
+                    let diskStoreCache = makeDiskStoreCache(
+                        fromPromptBoundary: cacheSnapshot,
+                        parameters: cacheInitParameters)
+                    coordinator.storeAfterGeneration(
+                        promptTokens: tokens,
+                        perLayerData: perLayerData,
+                        ssmStates: ssmCapture,
+                        cache: diskStoreCache,
+                        mediaSalt: mediaSalt)
+                }
 
-            store(
-                tokens: promptTokenIds,
-                snapshot: promptCacheSnapshot,
-                label: "prompt-boundary")
+                store(
+                    tokens: promptTokenIds,
+                    snapshot: promptCacheSnapshot,
+                    label: "prompt-boundary")
 
-            if !originalInput.requiresPostPrepareCacheKey {
-                for boundary in Set(cachePrefixTokenCounts).sorted()
-                where boundary > 0 && boundary < promptTokenIds.count {
-                    let boundaryTokens = Array(promptTokenIds.prefix(boundary))
-                    if let boundarySnapshot = cacheSnapshotForBoundary(
-                        tokens: boundaryTokens,
-                        promptSnapshot: promptCacheSnapshot)
-                    {
-                        store(
+                if !originalInput.requiresPostPrepareCacheKey {
+                    for boundary in Set(cachePrefixTokenCounts).sorted()
+                    where boundary > 0 && boundary < promptTokenIds.count {
+                        let boundaryTokens = Array(promptTokenIds.prefix(boundary))
+                        if let boundarySnapshot = cacheSnapshotForBoundary(
                             tokens: boundaryTokens,
-                            snapshot: boundarySnapshot,
-                            label: "history-boundary")
+                            promptSnapshot: promptCacheSnapshot)
+                        {
+                            store(
+                                tokens: boundaryTokens,
+                                snapshot: boundarySnapshot,
+                                label: "history-boundary")
+                        }
                     }
                 }
-            }
 
-            if includeGeneratedBoundary,
-               !generatedTokenIds.isEmpty,
-               !cache.isEmpty
-            {
-                let postAnswerTokens = promptTokenIds + generatedTokenIds
-                let postAnswerSnapshot = cache.map { $0.copy() }
-                let offsets = postAnswerSnapshot.map(\.offset)
-                if let offset = offsets.first,
-                   offsets.allSatisfy({ $0 == offset })
+                if includeGeneratedBoundary,
+                   !generatedTokenIds.isEmpty,
+                   !cache.isEmpty
                 {
-                    if offset == postAnswerTokens.count {
-                        store(
-                            tokens: postAnswerTokens,
-                            snapshot: postAnswerSnapshot,
-                            label: "post-answer")
-                    } else if offset > postAnswerTokens.count {
-                        let trimCount = offset - postAnswerTokens.count
-                        if canTrimPromptCache(postAnswerSnapshot),
-                           trimPromptCache(postAnswerSnapshot, numTokens: trimCount) == trimCount
-                        {
-                            MLX.eval(postAnswerSnapshot)
+                    let postAnswerTokens = promptTokenIds + generatedTokenIds
+                    let postAnswerSnapshot = cache.map { $0.copy() }
+                    let offsets = postAnswerSnapshot.map(\.offset)
+                    if let offset = offsets.first,
+                       offsets.allSatisfy({ $0 == offset })
+                    {
+                        if offset == postAnswerTokens.count {
                             store(
                                 tokens: postAnswerTokens,
                                 snapshot: postAnswerSnapshot,
                                 label: "post-answer")
+                        } else if offset > postAnswerTokens.count {
+                            let trimCount = offset - postAnswerTokens.count
+                            if canTrimPromptCache(postAnswerSnapshot),
+                               trimPromptCache(postAnswerSnapshot, numTokens: trimCount) == trimCount
+                            {
+                                MLX.eval(postAnswerSnapshot)
+                                store(
+                                    tokens: postAnswerTokens,
+                                    snapshot: postAnswerSnapshot,
+                                    label: "post-answer")
+                            }
                         }
                     }
                 }
@@ -592,6 +593,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         {
             MLX.eval(trimmed)
             return trimmed
+        }
+
+        if String(describing: Swift.type(of: model)).contains("Gemma3n") {
+            return nil
         }
 
         do {

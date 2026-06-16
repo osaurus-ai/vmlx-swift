@@ -470,15 +470,20 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             ?? profile.maxConcurrentSequences
 
         var resolvedCache = cache
-        resolvedCache.prefix.enabled = true
-        resolvedCache.pagedKV.enabled = true
-        resolvedCache.blockDisk.enabled = true
-        resolvedCache.legacyDisk.enabled = false
-        if resolvedCache.prefix.memoryLimitMB == nil {
-            resolvedCache.prefix.memoryLimitMB = profile.prefixMemoryLimitMB
-        }
-        if resolvedCache.prefix.memoryPercent == nil {
-            resolvedCache.prefix.memoryPercent = profile.prefixMemoryPercent
+        if resolvedCache.prefix.enabled {
+            resolvedCache.pagedKV.enabled = true
+            resolvedCache.blockDisk.enabled = true
+            resolvedCache.legacyDisk.enabled = false
+            if resolvedCache.prefix.memoryLimitMB == nil {
+                resolvedCache.prefix.memoryLimitMB = profile.prefixMemoryLimitMB
+            }
+            if resolvedCache.prefix.memoryPercent == nil {
+                resolvedCache.prefix.memoryPercent = profile.prefixMemoryPercent
+            }
+        } else {
+            resolvedCache.pagedKV.enabled = false
+            resolvedCache.blockDisk.enabled = false
+            resolvedCache.legacyDisk.enabled = false
         }
         resolvedCache.defaultMaxKVSize =
             memorySafety.customDefaultMaxKVSize

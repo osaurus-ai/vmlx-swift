@@ -598,8 +598,12 @@ public func loadModel(
     configuration: ModelConfiguration,
     loadConfiguration: LoadConfiguration
 ) async throws -> (ModelContext, JangPressRuntime) {
+    try Task.checkCancellation()
+
     // 1. Inspect bundle once.
     let facts = LoadBundleFacts.inspect(bundleURL: directory)
+    try Task.checkCancellation()
+
     if let reason = facts.productionBlockReason {
         let raw = ProcessInfo.processInfo.environment[
             "VMLINUX_ALLOW_EXPERIMENTAL_DSV4_AFFINE_JANG"
@@ -609,9 +613,11 @@ public func loadModel(
             throw ModelFactoryError.unsupportedModelType(reason)
         }
     }
+    try Task.checkCancellation()
 
     // 2. Resolve JangPress policy → concrete options.
     let resolvedOptions = loadConfiguration.jangPress.resolve(facts: facts)
+    try Task.checkCancellation()
 
     // 3. Apply resident cap (allocator pool) for the duration of load.
     //    Skipped when `.unlimited` so existing iter-25 in-loader cap
@@ -664,6 +670,7 @@ public func loadModel(
     let loadDirectory = try JangPressPrestacker.prepareBundleIfNeeded(
         originalURL: directory,
         enabled: loadConfiguration.useMmapSafetensors)
+    try Task.checkCancellation()
 
     // 5. Load the model normally. Patched osaurus mlx-swift pins honor
     //    MLX_SAFETENSORS_MMAP=1 inside loadArraysAndMetadata(url:),
@@ -695,23 +702,32 @@ public func loadModel(
             }
         }
     }
+    try Task.checkCancellation()
+
     _ = adviseCanonicalMmapRoutedExpertsIfAvailable(
         options: resolvedOptions,
         mmapEnabled: loadConfiguration.useMmapSafetensors)
+    try Task.checkCancellation()
+
     JangPressCanonicalExpertAdvisor.shared.configure(
         options: resolvedOptions,
         mmapEnabled: loadConfiguration.useMmapSafetensors,
         numRoutedExperts: facts.numRoutedExperts,
         topK: facts.topK)
+    try Task.checkCancellation()
 
     // 5. Activate JangPress per resolved options. `.disabled` short-
     //    circuits inside `JangPressActivation.activate` and returns
     //    `.none` so the caller still gets a uniform tuple shape.
     let runtime = JangPressActivation.activate(
         bundleURL: loadDirectory, options: resolvedOptions)
+    try Task.checkCancellation()
+
     if JangPressPrestacker.cleanupEphemeralPrestackDirectory(loadDirectory) {
         context.configuration.id = .directory(directory)
     }
+    try Task.checkCancellation()
+
     context.jangPressRuntime = runtime
     return (context, runtime)
 }

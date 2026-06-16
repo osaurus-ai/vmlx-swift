@@ -63,14 +63,11 @@ class GraniteMoeHybridMamba2Mixer: Module {
     @ModuleInfo(key: "norm") var norm: GraniteMoeHybridRMSNormGated
 
     init(_ args: GraniteMoeHybridConfiguration) {
-        guard let numHeads = args.mambaHeads,
-            let headDim = args.mambaHeadDim,
-            let stateDim = args.mambaStateDim,
-            let convKernel = args.mambaConvKernel,
-            let groups = args.mambaGroups
-        else {
-            fatalError("GraniteMoeHybridMamba2Mixer requires Mamba parameters in the configuration")
-        }
+        let numHeads = args.mambaHeads!
+        let headDim = args.mambaHeadDim!
+        let stateDim = args.mambaStateDim!
+        let convKernel = args.mambaConvKernel!
+        let groups = args.mambaGroups!
 
         self.numHeads = numHeads
         self.hiddenSize = args.hiddenSize
@@ -292,11 +289,8 @@ class GraniteMoeHybridMoE: Module, UnaryLayer {
     let router: GraniteMoeHybridTopKGating
 
     init(_ args: GraniteMoeHybridConfiguration, layerIdx: Int) {
-        guard let numExperts = args.numLocalExperts,
-            let topK = args.numExpertsPerToken
-        else {
-            fatalError("GraniteMoeHybridMoE requires MoE parameters in the configuration")
-        }
+        let numExperts = args.numLocalExperts!
+        let topK = args.numExpertsPerToken!
 
         self.layerIdx = layerIdx
         self._switchMLP.wrappedValue = SwitchGLU(
@@ -326,10 +320,7 @@ class GraniteMoeHybridSharedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "output_linear") var outputLinear: Linear
 
     init(_ args: GraniteMoeHybridConfiguration) {
-        guard let intermediate = args.sharedIntermediateSize else {
-            fatalError(
-                "GraniteMoeHybridSharedMLP requires shared_intermediate_size when MoE is enabled")
-        }
+        let intermediate = args.sharedIntermediateSize!
 
         self._inputLinear.wrappedValue = Linear(
             args.hiddenSize, intermediate * 2, bias: false)
@@ -447,7 +438,6 @@ public class GraniteMoeHybridModelInner: Module {
 
     init(_ args: GraniteMoeHybridConfiguration) {
         self.args = args
-        precondition(args.vocabularySize > 0)
 
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
@@ -705,5 +695,150 @@ public struct GraniteMoeHybridConfiguration: Codable, Sendable {
         self.tieWordEmbeddings =
             try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? true
         self._timeStepLimit = try container.decodeIfPresent([Float].self, forKey: ._timeStepLimit)
+
+        try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try Self.validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+        try Self.validatePositive(embeddingMultiplier, key: .embeddingMultiplier, in: container)
+        try Self.validatePositive(attentionMultiplier, key: .attentionMultiplier, in: container)
+        try Self.validatePositive(logitsScaling, key: .logitsScaling, in: container)
+        try Self.validatePositive(residualMultiplier, key: .residualMultiplier, in: container)
+        try Self.validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try Self.validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        if let numLocalExperts {
+            try Self.validatePositive(numLocalExperts, key: .numLocalExperts, in: container)
+        }
+        if let numExpertsPerToken {
+            try Self.validatePositive(numExpertsPerToken, key: .numExpertsPerToken, in: container)
+        }
+        if let sharedIntermediateSize {
+            try Self.validatePositive(
+                sharedIntermediateSize, key: .sharedIntermediateSize, in: container)
+        }
+        if let mambaHeads {
+            try Self.validatePositive(mambaHeads, key: .mambaHeads, in: container)
+        }
+        if let mambaHeadDim {
+            try Self.validatePositive(mambaHeadDim, key: .mambaHeadDim, in: container)
+        }
+        if let mambaStateDim {
+            try Self.validatePositive(mambaStateDim, key: .mambaStateDim, in: container)
+        }
+        if let mambaConvKernel {
+            try Self.validatePositive(mambaConvKernel, key: .mambaConvKernel, in: container)
+        }
+        if let mambaGroups {
+            try Self.validatePositive(mambaGroups, key: .mambaGroups, in: container)
+        }
+        guard hiddenSize % attentionHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription:
+                    "GraniteMoeHybrid hidden_size must be divisible by num_attention_heads.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "GraniteMoeHybrid num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard layerTypes.count == hiddenLayers else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layerTypes,
+                in: container,
+                debugDescription:
+                    "GraniteMoeHybrid layer_types count must match num_hidden_layers.")
+        }
+        let allowedLayerTypes = Set(["mamba", "attention"])
+        guard layerTypes.allSatisfy({ allowedLayerTypes.contains($0) }) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layerTypes,
+                in: container,
+                debugDescription:
+                    "GraniteMoeHybrid layer_types entries must be mamba or attention.")
+        }
+        if layerTypes.contains("mamba") {
+            guard mambaHeads != nil,
+                mambaHeadDim != nil,
+                mambaStateDim != nil,
+                mambaConvKernel != nil,
+                mambaGroups != nil
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .mambaHeads,
+                    in: container,
+                    debugDescription:
+                        "GraniteMoeHybrid mamba layers require complete Mamba parameters.")
+            }
+        }
+        if useMoE {
+            guard let numLocalExperts, let numExpertsPerToken, sharedIntermediateSize != nil else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .numLocalExperts,
+                    in: container,
+                    debugDescription:
+                        "GraniteMoeHybrid MoE layers require num_local_experts, num_experts_per_tok, and shared_intermediate_size.")
+            }
+            guard numExpertsPerToken <= numLocalExperts else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .numExpertsPerToken,
+                    in: container,
+                    debugDescription:
+                        "GraniteMoeHybrid num_experts_per_tok must be less than or equal to num_local_experts.")
+            }
+        } else if numExpertsPerToken != nil || sharedIntermediateSize != nil {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numLocalExperts,
+                in: container,
+                debugDescription:
+                    "GraniteMoeHybrid MoE metadata requires positive num_local_experts.")
+        }
+        if let timeStepLimit = _timeStepLimit {
+            guard timeStepLimit.count == 2,
+                timeStepLimit.allSatisfy({ $0.isFinite && $0 > 0 }),
+                timeStepLimit[0] <= timeStepLimit[1]
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: ._timeStepLimit,
+                    in: container,
+                    debugDescription:
+                        "GraniteMoeHybrid time_step_limit must contain two positive ascending values.")
+            }
+        }
+        guard positionEmbeddingType == "rope" || positionEmbeddingType == "nope" else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .positionEmbeddingType,
+                in: container,
+                debugDescription:
+                    "GraniteMoeHybrid position_embedding_type must be rope or nope.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be greater than zero.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be finite and greater than zero.")
+        }
     }
 }

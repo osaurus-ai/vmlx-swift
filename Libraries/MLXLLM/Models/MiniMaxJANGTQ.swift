@@ -65,6 +65,21 @@ private func miniMaxJANGTQRouter(numExperts: Int, k: Int) -> ([MLXArray]) -> [ML
     return router
 }
 
+private func miniMaxJANGTQHasCompleteExpertSet(
+    _ weights: [String: MLXArray],
+    prefix: String,
+    originalProjection: String,
+    suffix: String,
+    expertCount: Int
+) -> Bool {
+    for expert in 0 ..< expertCount {
+        if weights["\(prefix).experts.\(expert).\(originalProjection).\(suffix)"] == nil {
+            return false
+        }
+    }
+    return true
+}
+
 // MARK: - Attention (identical to MiniMax.swift)
 
 private class MiniMaxJANGTQAttention: Module {
@@ -333,20 +348,21 @@ public class MiniMaxJANGTQModel: Module, LLMModel, KVCacheDimensionProvider {
             let kPacked = kW.dim(kW.ndim - 1)
             let vPacked = vW.dim(vW.ndim - 1)
             if qPacked != kPacked || kPacked != vPacked {
-                fatalError(
+                FileHandle.standardError.write(Data(
                     """
                     [MiniMaxJANGTQ sanitize] layer \(layerIndex) self_attn has \
                     mismatched bit widths across q/k/v projections \
                     (q packed_in=\(qPacked), k=\(kPacked), v=\(vPacked)). \
-                    QKV fusion requires identical bit widths.
-                    """
-                )
+                    QKV fusion requires identical bit widths. \
+                    Leaving source q/k/v keys intact so load verification fails.
+                    """.utf8))
+                continue
             }
 
             sanitized["\(fusedKey).weight"] = concatenated([qW, kW, vW], axis: 0)
-            sanitized.removeValue(forKey: "\(qKey).weight")
-            sanitized.removeValue(forKey: "\(kKey).weight")
-            sanitized.removeValue(forKey: "\(vKey).weight")
+            sanitized["\(qKey).weight"] = nil
+            sanitized["\(kKey).weight"] = nil
+            sanitized["\(vKey).weight"] = nil
 
             for suffix in ["scales", "biases"] {
                 let qS = sanitized["\(qKey).\(suffix)"]
@@ -354,9 +370,9 @@ public class MiniMaxJANGTQModel: Module, LLMModel, KVCacheDimensionProvider {
                 let vS = sanitized["\(vKey).\(suffix)"]
                 guard let qS, let kS, let vS else { continue }
                 sanitized["\(fusedKey).\(suffix)"] = concatenated([qS, kS, vS], axis: 0)
-                sanitized.removeValue(forKey: "\(qKey).\(suffix)")
-                sanitized.removeValue(forKey: "\(kKey).\(suffix)")
-                sanitized.removeValue(forKey: "\(vKey).\(suffix)")
+                sanitized["\(qKey).\(suffix)"] = nil
+                sanitized["\(kKey).\(suffix)"] = nil
+                sanitized["\(vKey).\(suffix)"] = nil
             }
         }
 
@@ -378,19 +394,30 @@ public class MiniMaxJANGTQModel: Module, LLMModel, KVCacheDimensionProvider {
                     guard sanitized[first] != nil else { continue }
                     if JANGTQStreamingExperts.isEnabled {
                         for e in 0 ..< configuration.numLocalExperts {
-                            sanitized.removeValue(
-                                forKey: "\(prefix).experts.\(e).\(orig).\(key)")
+                            sanitized["\(prefix).experts.\(e).\(orig).\(key)"] = nil
                         }
                         continue
                     }
                     if residentExperts {
+                        guard miniMaxJANGTQHasCompleteExpertSet(
+                            sanitized,
+                            prefix: prefix,
+                            originalProjection: orig,
+                            suffix: key,
+                            expertCount: configuration.numLocalExperts)
+                        else {
+                            FileHandle.standardError.write(Data(
+                                """
+                                [MiniMaxJANGTQ sanitize] layer \(layer) \(orig).\(key) \
+                                has an incomplete resident expert tensor set. \
+                                Leaving source expert keys intact so load verification fails.
+                                """.utf8))
+                            continue
+                        }
                         for e in 0 ..< configuration.numLocalExperts {
-                            guard let array = sanitized.removeValue(
-                                forKey: "\(prefix).experts.\(e).\(orig).\(key)")
-                            else {
-                                fatalError(
-                                    "[MiniMaxJANGTQ sanitize] missing resident expert tensor \(prefix).experts.\(e).\(orig).\(key)")
-                            }
+                            let source = "\(prefix).experts.\(e).\(orig).\(key)"
+                            guard let array = sanitized[source] else { continue }
+                            sanitized[source] = nil
                             JANGTQStreamingExperts.registerResidentTensor(
                                 layerIdx: layer,
                                 expertIdx: e,
@@ -403,14 +430,30 @@ public class MiniMaxJANGTQModel: Module, LLMModel, KVCacheDimensionProvider {
                     let target = "\(prefix).switch_mlp.\(updated).\(key)"
                     if sanitized[target] != nil {
                         for e in 0 ..< configuration.numLocalExperts {
-                            sanitized.removeValue(
-                                forKey: "\(prefix).experts.\(e).\(orig).\(key)")
+                            sanitized["\(prefix).experts.\(e).\(orig).\(key)"] = nil
                         }
                         continue
                     }
+                    guard miniMaxJANGTQHasCompleteExpertSet(
+                        sanitized,
+                        prefix: prefix,
+                        originalProjection: orig,
+                        suffix: key,
+                        expertCount: configuration.numLocalExperts)
+                    else {
+                        FileHandle.standardError.write(Data(
+                            """
+                            [MiniMaxJANGTQ sanitize] layer \(layer) \(orig).\(key) \
+                            has an incomplete expert tensor set. \
+                            Leaving source expert keys intact so load verification fails.
+                            """.utf8))
+                        continue
+                    }
                     let stacked = (0 ..< configuration.numLocalExperts).map { e -> MLXArray in
-                        sanitized.removeValue(
-                            forKey: "\(prefix).experts.\(e).\(orig).\(key)")!
+                        let source = "\(prefix).experts.\(e).\(orig).\(key)"
+                        let array = sanitized[source]!
+                        sanitized[source] = nil
+                        return array
                     }
                     sanitized[target] = loadTimeMachBackedStacked(stacked, label: target)
                         ?? loadTimeMaterializedStacked(stacked)

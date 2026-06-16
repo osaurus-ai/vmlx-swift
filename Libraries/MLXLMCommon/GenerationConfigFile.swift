@@ -16,6 +16,7 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
     public var minP: Float?
     public var repetitionPenalty: Float?
     public var doSample: Bool?
+    public var suppressTokens: [Int]?
 
     public init(
         eosTokenIds: IntOrIntArray? = nil,
@@ -25,7 +26,8 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         topK: Int? = nil,
         minP: Float? = nil,
         repetitionPenalty: Float? = nil,
-        doSample: Bool? = nil
+        doSample: Bool? = nil,
+        suppressTokens: [Int]? = nil
     ) {
         self.eosTokenIds = eosTokenIds
         self.maxNewTokens = maxNewTokens
@@ -35,6 +37,7 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         self.minP = minP
         self.repetitionPenalty = repetitionPenalty
         self.doSample = doSample
+        self.suppressTokens = suppressTokens
     }
 
     enum CodingKeys: String, CodingKey {
@@ -46,5 +49,50 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         case minP = "min_p"
         case repetitionPenalty = "repetition_penalty"
         case doSample = "do_sample"
+        case suppressTokens = "suppress_tokens"
+    }
+}
+
+public enum ModelTokenConfigurationResolver {
+    public static func resolvedEOSTokenIds(
+        baseConfig: BaseConfiguration,
+        configurationData: Data,
+        generationConfig: GenerationConfigFile?
+    ) -> Set<Int> {
+        var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+        if eosTokenIds.isEmpty,
+            let textConfigEosTokenIds = Self.textConfigEOSTokenIds(configurationData: configurationData)
+        {
+            eosTokenIds = Set(textConfigEosTokenIds)
+        }
+        if let generationEosTokenIds = generationConfig?.eosTokenIds?.values {
+            eosTokenIds = Set(generationEosTokenIds)
+        }
+        return eosTokenIds
+    }
+
+    private struct TextConfigTokens: Codable {
+        let eosTokenIds: IntOrIntArray?
+
+        enum CodingKeys: String, CodingKey {
+            case eosTokenIds = "eos_token_id"
+        }
+    }
+
+    private struct TextConfigWrapper: Codable {
+        let textConfig: TextConfigTokens?
+
+        enum CodingKeys: String, CodingKey {
+            case textConfig = "text_config"
+        }
+    }
+
+    private static func textConfigEOSTokenIds(configurationData: Data) -> [Int]? {
+        guard let wrapper = try? JSONDecoder.json5().decode(
+            TextConfigWrapper.self, from: configurationData)
+        else {
+            return nil
+        }
+        return wrapper.textConfig?.eosTokenIds?.values
     }
 }

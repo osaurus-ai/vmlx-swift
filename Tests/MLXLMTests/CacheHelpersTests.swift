@@ -144,6 +144,39 @@ import Testing
     #expect(restored == 0)  // Mismatch -> no restoration
 }
 
+@Test func restoreLayerDataRejectsRankDeficientPagedBlock() {
+    let block = CacheBlock(blockId: 0, blockSize: 32)
+    block.tokenIds = [1, 2]
+    block.cacheData = [
+        (keys: MLXArray.ones([2, 8]), values: MLXArray.zeros([2, 8])),
+    ]
+
+    let cache = KVCacheSimple()
+    let restored = restoreLayerData(from: [block], into: [cache])
+
+    #expect(restored == 0)
+    #expect(cache.offset == 0)
+    #expect(cache.state.isEmpty)
+}
+
+@Test func restoreLayerDataRejectsMismatchedPagedKVShapes() {
+    let block = CacheBlock(blockId: 0, blockSize: 32)
+    block.tokenIds = [1, 2]
+    block.cacheData = [
+        (
+            keys: MLXArray.ones([1, 2, 2, 8]),
+            values: MLXArray.zeros([1, 2, 3, 8])
+        ),
+    ]
+
+    let cache = KVCacheSimple()
+    let restored = restoreLayerData(from: [block], into: [cache])
+
+    #expect(restored == 0)
+    #expect(cache.offset == 0)
+    #expect(cache.state.isEmpty)
+}
+
 // MARK: - extractSSMStates Tests
 
 @Test func extractSSMStatesFromMambaCache() {
@@ -228,6 +261,26 @@ import Testing
     // KVCacheSimple should be untouched
     #expect(kv.offset == 0)
     #expect(kv.state.isEmpty)
+}
+
+@Test func restoreSSMStatesRejectsMalformedZayaCCACompanionState() {
+    let zaya = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
+    zaya.writeCCA(
+        conv: MLXArray.ones([1, 4, 2], dtype: .float32) * 3,
+        prev: MLXArray.ones([1, 8], dtype: .float32) * 4)
+    let before = zaya.readCCA()
+
+    let malformedStates = [
+        MLXArray.ones([1, 5, 2], dtype: .float32),
+        MLXArray.ones([1, 8], dtype: .float32) * 9,
+    ]
+
+    restoreSSMStates(malformedStates, into: [zaya])
+
+    let convDelta = (zaya.readCCA().conv - before.conv).abs().sum().item(Float.self)
+    let prevDelta = (zaya.readCCA().prev - before.prev).abs().sum().item(Float.self)
+    #expect(convDelta < 1e-6)
+    #expect(prevDelta < 1e-6)
 }
 
 // MARK: - CacheList.count Tests

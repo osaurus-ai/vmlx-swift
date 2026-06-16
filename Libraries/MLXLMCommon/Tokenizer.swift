@@ -86,6 +86,7 @@ public protocol StreamingDetokenizer: IteratorProtocol<String> {
 
 public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
     let tokenizer: any Tokenizer
+    static let trailingHoldbackCharacters = 24
 
     var segmentTokens = [Int]()
     var segment = ""
@@ -110,7 +111,24 @@ public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
     }
 
     public mutating func next() -> String? {
-        let newSegment = tokenizer.decode(tokenIds: segmentTokens)
+        emitDecodedSegment(segmentTokens, holdBackTail: true)
+    }
+
+    public mutating func flush() -> String? {
+        emitDecodedSegment(segmentTokens, holdBackTail: false)
+    }
+
+    private mutating func emitDecodedSegment(_ tokens: [Int], holdBackTail: Bool) -> String? {
+        var newSegment = tokenizer.decode(tokenIds: tokens)
+        if holdBackTail {
+            guard newSegment.count > Self.trailingHoldbackCharacters else {
+                return nil
+            }
+            let stableEnd = newSegment.index(
+                newSegment.endIndex,
+                offsetBy: -Self.trailingHoldbackCharacters)
+            newSegment = String(newSegment[..<stableEnd])
+        }
 
         // Decode can produce a SHORTER string than the previous segment
         // when the tokenizer's stateful reassembly reinterprets earlier

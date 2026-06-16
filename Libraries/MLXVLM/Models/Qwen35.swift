@@ -52,7 +52,7 @@ private let _vlmCompiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         (gate: MLXArray, x: MLXArray) -> MLXArray in
         silu(gate) * x
     }
-    return compile(shapeless: true, body)
+    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
 /// Compiled precise swiglu: casts to float32, does silu+mul, casts back.
@@ -65,7 +65,7 @@ private let _vlmCompiledPreciseSwiGLU: @Sendable (MLXArray, MLXArray, MLXArray) 
         let xF32 = x.asType(.float32)
         return (gateF32 * xF32).asType(h.dtype)
     }
-    return compile(shapeless: true, body)
+    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
 private func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray)
@@ -97,13 +97,15 @@ private func _vlmRawStepOps(
 }
 
 /// Compiled GatedDelta step — fuses ~10 ops into 1 Metal dispatch.
-private let _vlmCompiledStepOps: @Sendable ([MLXArray]) -> [MLXArray] =
-    compile { (args: [MLXArray]) -> [MLXArray] in
+private let _vlmCompiledStepOps: @Sendable ([MLXArray]) -> [MLXArray] = {
+    let body: @Sendable ([MLXArray]) -> [MLXArray] = { (args: [MLXArray]) -> [MLXArray] in
         let (y, state) = _vlmRawStepOps(
             q: args[0], k: args[1], v: args[2],
             g: args[3], beta: args[4], state: args[5])
         return [y, state]
     }
+    return HardwareInfo.isCompiledDecodeSupported ? compile(body) : body
+}()
 
 private func gatedDeltaStepOps(
     q: MLXArray,
@@ -333,8 +335,10 @@ private func vlmGatedDeltaKernel(
             hasMask: false,
             roundStateEachStep: roundStateEachStep)
     }
-    guard let kernel = selectedKernel else {
-        fatalError("VLM gated delta kernel not available")
+    guard let kernel = selectedKernel, Dk >= 32, Dk % 32 == 0 else {
+        return gatedDeltaOps(
+            q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask,
+            roundStateEachStep: roundStateEachStep)
     }
     let outputs = kernel(
         inputs,
@@ -568,6 +572,78 @@ public struct Qwen35Configuration: Codable, Sendable {
 
             if self.headDim == nil {
                 self.headDim = self.hiddenSize / self.attentionHeads
+            }
+
+            try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+            try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+            try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+            try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+            try Self.validatePositive(linearNumValueHeads, key: .linearNumValueHeads, in: container)
+            try Self.validatePositive(linearNumKeyHeads, key: .linearNumKeyHeads, in: container)
+            try Self.validatePositive(linearKeyHeadDim, key: .linearKeyHeadDim, in: container)
+            try Self.validatePositive(linearValueHeadDim, key: .linearValueHeadDim, in: container)
+            try Self.validatePositive(linearConvKernelDim, key: .linearConvKernelDim, in: container)
+            try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+            try Self.validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+            try Self.validatePositive(fullAttentionInterval, key: .fullAttentionInterval, in: container)
+            try Self.validateNonNegative(mtpNumHiddenLayers, key: .mtpNumHiddenLayers, in: container)
+            try Self.validatePositive(decoderSparseStep, key: .decoderSparseStep, in: container)
+            if let headDim {
+                try Self.validatePositive(headDim, key: .headDim, in: container)
+            }
+            guard hiddenSize % attentionHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize,
+                    in: container,
+                    debugDescription:
+                        "Qwen35 VLM hidden_size must be divisible by num_attention_heads.")
+            }
+            guard attentionHeads % kvHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .kvHeads,
+                    in: container,
+                    debugDescription:
+                        "Qwen35 VLM num_attention_heads must be divisible by num_key_value_heads.")
+            }
+            guard linearNumValueHeads % linearNumKeyHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .linearNumKeyHeads,
+                    in: container,
+                    debugDescription:
+                        "Qwen35 VLM linear_num_value_heads must be divisible by linear_num_key_heads.")
+            }
+            if numExpertsPerTok > 0 {
+                guard numExperts > 0, numExpertsPerTok <= numExperts else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .numExpertsPerTok,
+                        in: container,
+                        debugDescription:
+                            "Qwen35 VLM MoE config incoherent: num_experts_per_tok must be in 1...num_experts when enabled.")
+                }
+                try Self.validatePositive(moeIntermediateSize, key: .moeIntermediateSize, in: container)
+            }
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "Qwen35 VLM config \(key.stringValue) must be greater than zero.")
+            }
+        }
+
+        private static func validateNonNegative<K: CodingKey>(
+            _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value >= 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "Qwen35 VLM config \(key.stringValue) must be non-negative.")
             }
         }
     }
@@ -889,11 +965,6 @@ enum Qwen35Language {
             self.valueDim = headVDim * numVHeads
             self.convKernelSize = args.linearConvKernelDim
             self.convDim = keyDim * 2 + valueDim
-
-            precondition(
-                numVHeads % numKHeads == 0,
-                "num_v_heads (\(numVHeads)) must be divisible by num_k_heads (\(numKHeads))"
-            )
 
             _conv1d.wrappedValue = Conv1d(
                 inputChannels: convDim,
@@ -1374,7 +1445,6 @@ enum Qwen35Language {
         let faIdx: Int
 
         init(_ args: Qwen35Configuration.TextConfiguration) {
-            precondition(args.vocabularySize > 0)
             _embedTokens.wrappedValue = Embedding(
                 embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
             _layers.wrappedValue = (0 ..< args.hiddenLayers).map {
@@ -2118,19 +2188,11 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     }
 
     private static func mtpNormWeightsNeedShift(_ weights: [String: MLXArray]) -> Bool {
-        let probeSuffixes = [
-            "mtp.layers.0.input_layernorm.weight",
-            "mtp.pre_fc_norm_hidden.weight",
-            "mtp.pre_fc_norm_embedding.weight",
-        ]
-        for suffix in probeSuffixes {
-            for (key, value) in weights where value.ndim == 1 {
-                guard Self.isMTPWeightKey(key), key.hasSuffix(suffix) else {
-                    continue
-                }
-                return value.asType(.float32).mean().item(Float.self) < 0.5
-            }
-        }
+        // Do not sample MTP norm tensor values during sanitize. Like the base
+        // norm fallback, scalar extraction forces MLX eval while weights are
+        // still loading. Explicit `norm_convention` metadata, key namespace,
+        // or base conv-layout evidence must carry the plus-one decision for
+        // MTP norms.
         return false
     }
 
@@ -2153,18 +2215,10 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     }
 
     private static func baseNormWeightsNeedShift(_ weights: [String: MLXArray]) -> Bool {
-        let probeSuffixes = [
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-        ]
-        for (key, value) in weights where value.ndim == 1 {
-            guard probeSuffixes.contains(where: { key.hasSuffix($0) }) else {
-                continue
-            }
-            let mean = value.asType(.float32).mean().item(Float.self)
-            if mean < 0.5 { return true }
-            if mean > 0.5 { return false }
-        }
+        // Do not sample norm tensor values during sanitize. Scalar extraction forces
+        // MLX eval while weights are still loading and Sentry has caught this
+        // path inside Metal command-buffer crashes. For VLM wrappers, key
+        // namespace remains the only safe fallback when metadata is absent.
         return !isMLXFormatLike(weights)
     }
 

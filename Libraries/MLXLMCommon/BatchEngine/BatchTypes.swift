@@ -47,6 +47,14 @@ public enum BatchGeneration: Sendable {
     case info(GenerateCompletionInfo)
 }
 
+public struct BatchSamplerOverride: @unchecked Sendable {
+    let sampler: LogitSampler
+
+    public init(_ sampler: LogitSampler) {
+        self.sampler = sampler
+    }
+}
+
 // MARK: - Internal Request Wrapper
 
 /// Internal representation of a submitted request before it becomes an active slot.
@@ -58,17 +66,20 @@ struct BatchPendingRequest {
     // slot's cache is allocated. Per-request values set by the caller
     // always win; the coordinator only fills nils.
     var parameters: GenerateParameters
+    let samplerOverride: BatchSamplerOverride?
     let continuation: AsyncStream<BatchGeneration>.Continuation
     let submittedAt: Date
 
     init(
         input: LMInput,
         parameters: GenerateParameters,
+        samplerOverride: BatchSamplerOverride? = nil,
         continuation: AsyncStream<BatchGeneration>.Continuation
     ) {
         self.id = BatchRequestID()
         self.input = input
         self.parameters = parameters
+        self.samplerOverride = samplerOverride
         self.continuation = continuation
         self.submittedAt = Date()
     }

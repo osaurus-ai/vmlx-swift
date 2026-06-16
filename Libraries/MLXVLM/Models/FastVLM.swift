@@ -58,6 +58,140 @@ public struct FastVLMConfiguration: Codable, Sendable {
             case repMixerKernelSize = "repmixer_kernel_size"
             case tokenMixers = "token_mixers"
         }
+
+        public init(from decoder: any Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.classHeadRatio = try container.decode(Float.self, forKey: .classHeadRatio)
+            self.downPatchSize = try container.decode(Int.self, forKey: .downPatchSize)
+            self.downStride = try container.decode(Int.self, forKey: .downStride)
+            self.downSamples = try container.decode([Bool].self, forKey: .downSamples)
+            self.embedDimensions = try container.decode([Int].self, forKey: .embedDimensions)
+            self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+            self.imageSize = try container.decode(Int.self, forKey: .imageSize)
+            self.intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+            self.layers = try container.decode([Int].self, forKey: .layers)
+            self.layerScaleInitValue = try container.decode(
+                Float.self, forKey: .layerScaleInitValue)
+            self.mlpRatios = try container.decode([Int].self, forKey: .mlpRatios)
+            self.numClasses = try container.decode(Int.self, forKey: .numClasses)
+            self.patchSize = try container.decode(Int.self, forKey: .patchSize)
+            self.posEmbedShapes = try container.decode([[Int]?].self, forKey: .posEmbedShapes)
+            self.projectionDim = try container.decode(Int.self, forKey: .projectionDim)
+            self.repMixerKernelSize = try container.decode(Int.self, forKey: .repMixerKernelSize)
+            self.tokenMixers = try container.decode([String].self, forKey: .tokenMixers)
+
+            try Self.validatePositive(classHeadRatio, key: .classHeadRatio, in: container)
+            try Self.validatePositive(downPatchSize, key: .downPatchSize, in: container)
+            try Self.validatePositive(downStride, key: .downStride, in: container)
+            try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try Self.validatePositive(imageSize, key: .imageSize, in: container)
+            try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+            try Self.validatePositive(layerScaleInitValue, key: .layerScaleInitValue, in: container)
+            try Self.validatePositive(numClasses, key: .numClasses, in: container)
+            try Self.validatePositive(patchSize, key: .patchSize, in: container)
+            try Self.validatePositive(projectionDim, key: .projectionDim, in: container)
+            try Self.validatePositive(repMixerKernelSize, key: .repMixerKernelSize, in: container)
+            try Self.validateNonEmpty(embedDimensions, key: .embedDimensions, in: container)
+            try Self.validateNonEmpty(layers, key: .layers, in: container)
+            guard embedDimensions.count == layers.count,
+                downSamples.count == layers.count,
+                mlpRatios.count == layers.count,
+                posEmbedShapes.count == layers.count,
+                tokenMixers.count == layers.count
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .layers,
+                    in: container,
+                    debugDescription:
+                        "FastVLM vision config stage arrays must all match layers count.")
+            }
+            guard embedDimensions.allSatisfy({ $0 > 0 }) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .embedDimensions,
+                    in: container,
+                    debugDescription:
+                        "FastVLM vision config embed_dims values must be greater than zero.")
+            }
+            guard layers.allSatisfy({ $0 > 0 }) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .layers,
+                    in: container,
+                    debugDescription:
+                        "FastVLM vision config layers values must be greater than zero.")
+            }
+            guard mlpRatios.allSatisfy({ $0 > 0 }) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .mlpRatios,
+                    in: container,
+                    debugDescription:
+                        "FastVLM vision config mlp_ratios values must be greater than zero.")
+            }
+            guard tokenMixers.allSatisfy({ $0 == "repmixer" || $0 == "attention" }) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .tokenMixers,
+                    in: container,
+                    debugDescription:
+                        "FastVLM vision config token_mixers values must be repmixer or attention.")
+            }
+            for (index, tokenMixer) in tokenMixers.enumerated() where tokenMixer == "attention" {
+                guard embedDimensions[index] % 32 == 0 else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .embedDimensions,
+                        in: container,
+                        debugDescription:
+                            "FastVLM attention token mixer embed_dim must be divisible by 32.")
+                }
+            }
+            for shape in posEmbedShapes.compactMap({ $0 }) {
+                guard shape.count == 2, shape.allSatisfy({ $0 > 0 }) else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .posEmbedShapes,
+                        in: container,
+                        debugDescription:
+                            "FastVLM vision config pos_embs_shapes entries must be positive 2D shapes.")
+                }
+            }
+            guard imageSize % patchSize == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .imageSize,
+                    in: container,
+                    debugDescription:
+                        "FastVLM vision config image_size must be divisible by patch_size.")
+            }
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be greater than zero.")
+            }
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value.isFinite, value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be finite and greater than zero.")
+            }
+        }
+
+        private static func validateNonEmpty<K: CodingKey, T>(
+            _ value: [T], key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard !value.isEmpty else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must not be empty.")
+            }
+        }
     }
 
     public struct BaseConfiguration: Codable, Sendable {
@@ -79,6 +213,58 @@ public struct FastVLMConfiguration: Codable, Sendable {
             case tokenizerModelMaxLangth = "tokenizer_model_max_length"
             case tokenizerPaddingSide = "tokenizer_padding_side"
         }
+
+        public init(from decoder: any Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.modelType = try container.decode(String.self, forKey: .modelType)
+            self._imageTokenIndex = try container.decodeIfPresent(
+                Int.self, forKey: ._imageTokenIndex)
+            self.eosTokenId = try container.decode(Int.self, forKey: .eosTokenId)
+            self.multimodalProjectorType = try container.decode(
+                String.self, forKey: .multimodalProjectorType)
+            self.multimodalProjectorHiddenSize = try container.decode(
+                Int.self, forKey: .multimodalProjectorHiddenSize)
+            self.tokenizerModelMaxLangth = try container.decode(
+                Int.self, forKey: .tokenizerModelMaxLangth)
+            self.tokenizerPaddingSide = try container.decode(String.self, forKey: .tokenizerPaddingSide)
+
+            try Self.validatePositive(eosTokenId, key: .eosTokenId, in: container)
+            try Self.validatePositive(
+                multimodalProjectorHiddenSize, key: .multimodalProjectorHiddenSize, in: container)
+            try Self.validatePositive(
+                tokenizerModelMaxLangth, key: .tokenizerModelMaxLangth, in: container)
+            guard !modelType.isEmpty else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .modelType,
+                    in: container,
+                    debugDescription: "FastVLM base config model_type must not be empty.")
+            }
+            guard !multimodalProjectorType.isEmpty else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .multimodalProjectorType,
+                    in: container,
+                    debugDescription:
+                        "FastVLM base config mm_projector_type must not be empty.")
+            }
+            guard tokenizerPaddingSide == "left" || tokenizerPaddingSide == "right" else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .tokenizerPaddingSide,
+                    in: container,
+                    debugDescription:
+                        "FastVLM base config tokenizer_padding_side must be left or right.")
+            }
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be greater than zero.")
+            }
+        }
     }
 
     public let textConfiguration: TextConfiguration
@@ -99,6 +285,22 @@ public struct FastVLMConfiguration: Codable, Sendable {
         // these are overlaid in the top level
         self.textConfiguration = try TextConfiguration(from: decoder)
         self.baseConfiguration = try BaseConfiguration(from: decoder)
+
+        guard baseConfiguration.imageTokenIndex < textConfiguration.vocabularySize else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .visionConfiguration,
+                in: container,
+                debugDescription:
+                    "FastVLM config image_token_index must be less than vocab_size.")
+        }
+        guard visionConfiguration.projectionDim == baseConfiguration.multimodalProjectorHiddenSize
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .visionConfiguration,
+                in: container,
+                debugDescription:
+                    "FastVLM vision projection_dim must match mm_hidden_size.")
+        }
     }
 }
 
@@ -222,8 +424,6 @@ private enum Language {
         fileprivate let norm: RMSNorm
 
         public init(_ args: Qwen2VLConfiguration.TextConfiguration) {
-            precondition(args.vocabularySize > 0)
-
             self._embedTokens.wrappedValue = Embedding(
                 embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -235,17 +435,26 @@ private enum Language {
         }
 
         public func callAsFunction(
-            _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil
+            _ inputs: MLXArray, cache: [KVCache]? = nil
         ) -> MLXArray {
-            var h: MLXArray
-            if let inputEmbedding {
-                h = inputEmbedding
-            } else if let inputs {
-                h = embedTokens(inputs)
-            } else {
-                fatalError("one of inputs or inputEmbedding must be non-nil")
-            }
+            forward(hiddenStates: embedTokens(inputs), cache: cache)
+        }
 
+        func embeddingsForward(_ inputEmbedding: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+            forward(hiddenStates: inputEmbedding, cache: cache)
+        }
+
+        func embeddingsForward(_ inputEmbedding: MLXArray?, cache: [KVCache]? = nil) throws
+            -> MLXArray
+        {
+            guard let inputEmbedding else {
+                throw VLMError.processing("FastVLM prepare requires input ids or input embeddings.")
+            }
+            return embeddingsForward(inputEmbedding, cache: cache)
+        }
+
+        private func forward(hiddenStates: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+            var h = hiddenStates
             let mask = createAttentionMask(h: h, cache: cache?.first)
 
             for (i, layer) in layers.enumerated() {
@@ -273,9 +482,28 @@ private enum Language {
         }
 
         public func callAsFunction(
-            _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil
+            _ inputs: MLXArray, cache: [KVCache]? = nil
         ) -> LMOutput {
-            var out = model(inputs, cache: cache, inputEmbedding: inputEmbedding)
+            let out = model(inputs, cache: cache)
+            return logits(from: out)
+        }
+
+        func embeddingsForward(_ inputEmbedding: MLXArray, cache: [KVCache]? = nil) -> LMOutput {
+            let out = model.embeddingsForward(inputEmbedding, cache: cache)
+            return logits(from: out)
+        }
+
+        func embeddingsForward(_ inputEmbedding: MLXArray?, cache: [KVCache]? = nil) throws
+            -> LMOutput
+        {
+            guard let inputEmbedding else {
+                throw VLMError.processing("FastVLM prepare requires input ids or input embeddings.")
+            }
+            return embeddingsForward(inputEmbedding, cache: cache)
+        }
+
+        private func logits(from out: MLXArray) -> LMOutput {
+            var out = out
             if let lmHead {
                 out = lmHead(out)
             } else {
@@ -305,7 +533,6 @@ private enum Vision {
             dim: Int, headDim: Int = 32, qkvBias: Bool = false, attnDrop: Float = 0.0,
             projDrop: Float = 0.0
         ) {
-            precondition(dim % headDim == 0, "dim should be divisible by headDim")
             self.headDim = headDim
             self.numHeads = dim / headDim
             self.scale = pow(Float(headDim), -0.5)
@@ -644,8 +871,6 @@ private enum Vision {
         @ModuleInfo(key: "layer_scale") var layerScale: MLXArray
 
         public init(dim: Int, kernelSize: Int = 3, mlpRatio: Float = 4) {
-            precondition(mlpRatio > 0, "MLP ratio should be greater than 0, found: \(mlpRatio)")
-
             self._tokenMixer.wrappedValue = RepMixer(dim: dim, kernelSize: kernelSize)
             let mlpHiddenDim = Int(Float(dim) * mlpRatio)
             self._convFFN.wrappedValue = ConvFFN(
@@ -673,8 +898,6 @@ private enum Vision {
         let layerScale2: MLXArray
 
         public init(dim: Int, mlpRatio: Float = 4.0) {
-            precondition(mlpRatio > 0, "MLP ratio should be greater than 0, found: \(mlpRatio)")
-
             _norm.wrappedValue = LayerNormChannel(numFeatures: dim)
             self._tokenMixer.wrappedValue = MHSA(dim: dim)
 
@@ -720,8 +943,6 @@ private enum Vision {
                         mlpRatio: mlpRatio
                     )
                 )
-            } else {
-                fatalError("Token mixer type: \(tokenMixerType) not supported")
             }
         }
         return Sequential(layers: blocks)
@@ -964,6 +1185,35 @@ public struct FastVLMProcessorConfiguration: Codable, Sendable {
         case imageStd = "image_std"
         case cropSize = "crop_size"
     }
+
+    public init(from decoder: any Swift.Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.imageMean = try container.decode([CGFloat].self, forKey: .imageMean)
+        self.imageStd = try container.decode([CGFloat].self, forKey: .imageStd)
+        self.cropSize = try container.decode(Size.self, forKey: .cropSize)
+
+        try Self.validateRGBTuple(imageMean, key: .imageMean, in: container)
+        try Self.validateRGBTuple(imageStd, key: .imageStd, in: container)
+        guard cropSize.width > 0, cropSize.height > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .cropSize,
+                in: container,
+                debugDescription:
+                    "FastVLM processor crop_size width and height must be greater than zero.")
+        }
+    }
+
+    private static func validateRGBTuple<K: CodingKey>(
+        _ values: [CGFloat], key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard values.count == 3, values.allSatisfy({ $0.isFinite }) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription:
+                    "FastVLM processor \(key.stringValue) must contain exactly three finite RGB values.")
+        }
+    }
 }
 
 public struct FastVLMProcessor: UserInputProcessor {
@@ -1138,7 +1388,7 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
             pixelValues: input.image?.pixels,
             mask: input.text.mask
         )
-        let result = languageModel(nil, cache: cache, inputEmbedding: embeddings)
+        let result = languageModel.embeddingsForward(embeddings, cache: cache)
         return .logits(result)
     }
 

@@ -316,10 +316,20 @@ let package = Package(
         .library(name: "MLXDistributedTP", targets: ["MLXDistributedTP"]),
         .library(name: "MLXPress", targets: ["MLXPress"]),
         .library(name: "VMLX", targets: ["VMLX"]),
+        // Native mFLUX image/video generation (vendored from jjang-ai/vmlx-flux).
+        .library(name: "vMLXFluxKit", targets: ["vMLXFluxKit"]),
+        .library(name: "vMLXFluxModels", targets: ["vMLXFluxModels"]),
+        .library(name: "vMLXFluxVideo", targets: ["vMLXFluxVideo"]),
+        .library(name: "vMLXFlux", targets: ["vMLXFlux"]),
+        .executable(name: "vmlxflux-probe", targets: ["vMLXFluxProbe"]),
         .executable(name: "RunBench", targets: ["RunBench"]),
         .executable(name: "ANEProbe", targets: ["ANEProbe"]),
         .executable(name: "OmniAudioLatencyBench", targets: ["OmniAudioLatencyBench"]),
         .executable(name: "OmniAudioChunkStabilityBench", targets: ["OmniAudioChunkStabilityBench"]),
+        .executable(name: "ZayaTemplateContractProbe", targets: ["ZayaTemplateContractProbe"]),
+        .executable(name: "MiMoTPPlanProbe", targets: ["MiMoTPPlanProbe"]),
+        .executable(name: "LoadRaceProbe", targets: ["LoadRaceProbe"]),
+        .executable(name: "DistributedProbe", targets: ["DistributedProbe"]),
         .executable(name: "DistributedPeerSmoke", targets: ["DistributedPeerSmoke"]),
         .executable(name: "Qwen35TPProofRunner", targets: ["Qwen35TPProofRunner"]),
         .executable(name: "mlxpress", targets: ["MLXPressCLI"]),
@@ -546,6 +556,7 @@ let package = Package(
                 "CmlxDistributedShim",
                 "MLX",
                 "MLXNN",
+                "MLXLMCommon",
             ],
             path: "Libraries/MLXDistributedTP",
             exclude: ["README.md"]
@@ -645,6 +656,11 @@ let package = Package(
             path: "tools/TPRankWorker"
         ),
         .executableTarget(
+            name: "DistributedProbe",
+            dependencies: ["MLXDistributedCore", "MLXDistributedJACCL"],
+            path: "tools/DistributedProbe"
+        ),
+        .executableTarget(
             name: "DistributedPeerSmoke",
             dependencies: [
                 "MLXDistributedCore",
@@ -676,6 +692,7 @@ let package = Package(
             dependencies: [
                 "MLXLMCommon",
                 "MLXLLM",
+                "MLXDistributedTP",
                 "MLXVLM",
                 "MLXHuggingFace",
                 "MLX",
@@ -712,6 +729,32 @@ let package = Package(
             path: "RunBench",
             exclude: ["coherency-matrix.sh", "test_slice.swift.bak"]
         ),
+        .executableTarget(
+            name: "ZayaTemplateContractProbe",
+            dependencies: ["MLXLMCommon", "VMLXJinja"],
+            path: "tools/ZayaTemplateContractProbe"
+        ),
+        .executableTarget(
+            name: "MiMoTPPlanProbe",
+            dependencies: [
+                "MLX",
+                "MLXNN",
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXDistributedTP",
+            ],
+            path: "tools/MiMoTPPlanProbe"
+        ),
+        .executableTarget(
+            name: "LoadRaceProbe",
+            dependencies: [
+                "MLX",
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+            ],
+            path: "tools/LoadRaceProbe"
+        ),
 
         .testTarget(
             name: "MLXTests",
@@ -730,6 +773,8 @@ let package = Package(
                 "VMLXTokenizers",
                 "MLXLMCommon",
                 "MLXLLM",
+                "MLXDistributedTP",
+                "CmlxDistributedShim",
                 "MLXVLM",
                 "MLXEmbedders",
                 "MLXHuggingFace",
@@ -750,6 +795,11 @@ let package = Package(
             sources: ["MLXPressLowRamPolicySourceTests.swift"]
         ),
         .testTarget(
+            name: "MLXDistributedCoreTests",
+            dependencies: ["MLXDistributedCore"],
+            path: "Tests/MLXDistributedCoreTests"
+        ),
+        .testTarget(
             name: "MLXLMCommonFocusedTests",
             dependencies: ["MLX", "MLXLMCommon", "MLXLLM", "MLXVLM", "VMLXJinja", "VMLX"],
             path: "Tests/MLXLMCommonFocusedTests",
@@ -764,24 +814,58 @@ let package = Package(
                 "ZayaConfigDecodeFocusedTests.swift",
                 "VLShapeGuardFocusedTests.swift",
                 "JANGTQStreamingExpertDescriptorTests.swift",
+                "NemotronHJANGTQDispatchFocusedTests.swift",
                 "JANGTQHadamardShuffleTests.swift",
                 "MiniMaxJANGTQResidentExpertTests.swift",
                 "JangPressMachCacheTests.swift",
                 "JangPressPrestackerCleanupTests.swift",
                 "DeepseekV4IndexerCausalTopKTests.swift",
                 "DeepseekV4ReasoningPolicyTests.swift",
+                "Gemma4ToolCallParserFocusedTests.swift",
                 "Gemma4ThoughtChannelParserFocusedTests.swift",
                 "Gemma3nTextSanitizeFocusedTests.swift",
                 "MediaCachePlaceholderTests.swift",
                 "NemotronHOmniPreEncodedAudioTests.swift",
                 "MTPRuntimeFocusedTests.swift",
                 "MLXPressCLISourceContractsTests.swift",
+                "SDPAAttentionIndexWidthFocusedTests.swift",
                 "VMLXServerRuntimeSettingsTests.swift",
                 "VMLXMemorySafetySettingsTests.swift",
                 "DSV4AgenticToolSourceTests.swift",
                 "NoHiddenReasoningCloseBiasFocusedTests.swift",
                 "TokenizerAddedTokenRegexFocusedTests.swift",
             ]
+        ),
+
+        // ------
+        // Native mFLUX image/video generation
+        // Vendored from jjang-ai/vmlx-flux. Shares the in-tree MLX runtime,
+        // MLXLMCommon (JangLoader reuse) and VMLXTokenizers so the whole vMLX
+        // stack uses one MLX binary. Umbrella import: `import vMLXFlux`.
+        .target(
+            name: "vMLXFluxKit",
+            dependencies: ["MLX", "MLXNN", "MLXRandom", "MLXLMCommon"],
+            path: "Libraries/vMLXFluxKit"
+        ),
+        .target(
+            name: "vMLXFluxModels",
+            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXRandom", "VMLXTokenizers"],
+            path: "Libraries/vMLXFluxModels"
+        ),
+        .target(
+            name: "vMLXFluxVideo",
+            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXRandom"],
+            path: "Libraries/vMLXFluxVideo"
+        ),
+        .target(
+            name: "vMLXFlux",
+            dependencies: ["vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo"],
+            path: "Libraries/vMLXFlux"
+        ),
+        .executableTarget(
+            name: "vMLXFluxProbe",
+            dependencies: ["vMLXFlux", "vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo"],
+            path: "tools/vMLXFluxProbe"
         ),
 
         // ------

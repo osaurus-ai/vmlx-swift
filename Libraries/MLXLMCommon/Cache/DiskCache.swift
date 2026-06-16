@@ -26,7 +26,14 @@ public struct DiskCacheStats: Sendable {
 /// arrays. Keep them globally serialized until MLX's safetensors IO is proven
 /// safe for cross-thread, cross-model overlap.
 enum MLXDiskCacheIOLock {
-    static let shared = OSAllocatedUnfairLock()
+    static let shared = NSRecursiveLock()
+}
+
+@discardableResult
+func withMLXDiskCacheIOLock<T>(_ body: () throws -> T) rethrows -> T {
+    MLXDiskCacheIOLock.shared.lock()
+    defer { MLXDiskCacheIOLock.shared.unlock() }
+    return try body()
 }
 
 /// L2 SSD cache with SQLite index and safetensors file storage.

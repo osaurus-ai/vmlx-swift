@@ -585,9 +585,6 @@ private func withActiveExpertStreamingEnv<R>(
     })
     setenv("MLXPRESS_STREAMING_EXPERTS", "1", 1)
     setenv("MLXPRESS_MODEL_DIR", modelDirectory.resolvingSymlinksInPath().path, 1)
-    if getenv("MLXPRESS_STREAMING_EVAL_EACH_LAYER") == nil {
-        setenv("MLXPRESS_STREAMING_EVAL_EACH_LAYER", "1", 1)
-    }
     setenv("MLXPRESS_PRESTACK", "0", 1)
     setenv("JANGPRESS_PRESTACK", "0", 1)
     FileHandle.standardError.write(Data(

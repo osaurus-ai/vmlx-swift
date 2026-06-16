@@ -149,6 +149,27 @@ func testQKVDiskRestoreMaterializesFreshSimpleCache() async throws {
 }
 
 @Test
+func testQKVDiskRestoreRejectsMalformedStateArrayCount() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let source = QuantizedKVCache(groupSize: 32, bits: 8)
+    let keys = MLXArray.ones([1, 4, 8, 32], dtype: .float16)
+    let values = MLXArray.ones([1, 4, 8, 32], dtype: .float16) * Float(0.5)
+    _ = source.updateQuantized(keys: keys, values: values)
+
+    var dict = TQDiskSerializer.serialize(cache: [source])
+    dict["__qkv_0_count__"] = MLXArray([Int32(3)])
+
+    var restored: [any KVCache] = [QuantizedKVCache(groupSize: 32, bits: 8)]
+    let restoredTokens = restoreFromDiskArrays(dict, into: &restored)
+
+    #expect(restoredTokens == 0)
+    #expect(restored[0].state.isEmpty)
+    #expect(restored[0].offset == 0)
+}
+
+@Test
 func testTQDiskRestoreMaterializesFreshSimpleCache() async throws {
     let mlxTestLock = lockSerializedMLXTest()
     defer { mlxTestLock.unlock() }
@@ -335,6 +356,33 @@ func testRoundTripRotatingKVCache() async throws {
     #expect(restoredMeta[0] == "4")
     #expect(restoredMeta[1] == "32")
     #expect(restoredMeta[3] == "13")
+}
+
+@Test
+func testRotatingDiskRestoreRejectsMalformedRingMetadata() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let original = RotatingKVCache(maxSize: 32, keep: 4, step: 8)
+    let (k, v) = smallKV(seqLen: 12)
+    _ = original.update(keys: k, values: v)
+
+    var dict = TQDiskSerializer.serialize(cache: [original])
+    dict["__rot_0_meta__"] = MLXArray([
+        Int32(4),   // keep
+        Int32(32),  // maxSize
+        Int32(8),   // step
+        Int32(12),  // offset
+        Int32(32),  // invalid: idx must be < maxSize
+    ])
+
+    let target = RotatingKVCache(maxSize: 32, keep: 4, step: 8)
+    var restoreTarget: [any KVCache] = [target]
+    let restoredTokens = restoreFromDiskArrays(dict, into: &restoreTarget)
+
+    #expect(restoredTokens == 0)
+    #expect(target.offset == 0)
+    #expect(target.state.isEmpty)
 }
 
 @Test

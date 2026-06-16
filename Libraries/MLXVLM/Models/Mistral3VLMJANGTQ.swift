@@ -58,14 +58,9 @@ internal final class Mistral3JANGTQAttention: Module {
             inFeatures: nHeads * headDim, outFeatures: dim,
             bits: bits, seed: seed, bias: false)
 
-        guard let ropeParams = config.ropeParameters,
-            let ropeTheta = ropeParams["rope_theta"]?.asFloat()
-        else {
-            fatalError("rope_parameters['rope_theta'] is required")
-        }
         self.rope = initializeRope(
             dims: headDim,
-            base: ropeTheta,
+            base: config.ropeTheta,
             traditional: false,
             scalingConfig: config.ropeParameters,
             maxPositionEmbeddings: config.maxPositionEmbeddings

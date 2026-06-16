@@ -1009,6 +1009,18 @@ public final class JANGTQRuntimeCache: @unchecked Sendable {
         return generated
     }
 
+    public func requiredSigns(inFeatures: Int, seed: Int) -> MLXArray {
+        if let signs = signs(inFeatures: inFeatures, seed: seed) {
+            return signs
+        }
+        let generated = NumPyPCG64.generateRandomSigns(dim: inFeatures, seed: seed)
+        let key = "signs.\(inFeatures).\(seed)"
+        lock.lock()
+        signsByKey[key] = generated
+        lock.unlock()
+        return generated
+    }
+
     public func codebook(inFeatures: Int, bits: Int) -> MLXArray? {
         let key = "codebook.\(inFeatures).\(bits)"
         lock.lock()
@@ -1019,6 +1031,18 @@ public final class JANGTQRuntimeCache: @unchecked Sendable {
         lock.unlock()
         let centroids = TQCodebook.computeCodebook(dim: inFeatures, bits: bits)
         let arr = MLXArray(centroids)
+        lock.lock()
+        codebookByKey[key] = arr
+        lock.unlock()
+        return arr
+    }
+
+    public func requiredCodebook(inFeatures: Int, bits: Int) -> MLXArray {
+        if let codebook = codebook(inFeatures: inFeatures, bits: bits) {
+            return codebook
+        }
+        let arr = MLXArray(TQCodebook.computeCodebook(dim: inFeatures, bits: bits))
+        let key = "codebook.\(inFeatures).\(bits)"
         lock.lock()
         codebookByKey[key] = arr
         lock.unlock()

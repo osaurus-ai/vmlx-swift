@@ -10,13 +10,95 @@ import MLXNN
 #endif
 
 public enum JANGTQStreamingExperts {
-    public static var isEnabled: Bool {
+    public static var explicitStreamingEnabled: Bool? {
         let env = ProcessInfo.processInfo.environment
-        let raw =
-            env["MLXPRESS_STREAMING_EXPERTS"]?.lowercased()
-            ?? env["JANGPRESS_STREAMING_EXPERTS"]?.lowercased()
-            ?? "0"
-        return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+        guard let rawValue = env["MLXPRESS_STREAMING_EXPERTS"]
+            ?? env["JANGPRESS_STREAMING_EXPERTS"]
+        else {
+            return nil
+        }
+        let raw = rawValue.lowercased()
+        if raw == "1" || raw == "true" || raw == "yes" || raw == "on" {
+            return true
+        }
+        if raw == "0" || raw == "false" || raw == "no" || raw == "off" {
+            return false
+        }
+        return nil
+    }
+
+    public static var isEnabled: Bool {
+        explicitStreamingEnabled == true
+    }
+
+    public static func shouldAutoEnableNemotronUltra(
+        nRoutedExperts: Int,
+        numExpertsPerTok: Int,
+        routedBits: Int?
+    ) -> Bool {
+        if let explicit = explicitStreamingEnabled {
+            return explicit
+        }
+        // The Ultra active-streaming path is still diagnostic-only: current
+        // live rows keep footprint low but fall far below the resident decode
+        // target. Keep it opt-in until a coherent low-footprint row proves it.
+        return false
+    }
+
+    public static func shouldAutoEnableNemotronUltra(modelDirectory: URL) -> Bool {
+        if let explicit = explicitStreamingEnabled {
+            return explicit
+        }
+        let configURL = modelDirectory.appendingPathComponent("config.json")
+        guard
+            let configData = try? Data(contentsOf: configURL),
+            let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+            (config["model_type"] as? String)?.lowercased() == "nemotron_h"
+        else {
+            return false
+        }
+
+        let jangURL = modelDirectory.appendingPathComponent("jang_config.json")
+        let jangConfig =
+            (try? Data(contentsOf: jangURL))
+                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let weightFormat =
+            ((config["weight_format"] as? String)
+                ?? (jangConfig?["weight_format"] as? String))?.lowercased()
+        let profile = (jangConfig?["profile"] as? String)?.lowercased() ?? ""
+        let sidecar = FileManager.default.fileExists(
+            atPath: modelDirectory.appendingPathComponent("jangtq_runtime.safetensors").path)
+        guard weightFormat == "mxtq" || profile.contains("jangtq") || sidecar else {
+            return false
+        }
+
+        let routedBits =
+            routedBits(from: config["mxtq_bits"])
+            ?? routedBits(from: jangConfig?["mxtq_bits"])
+            ?? config["routed_expert_bits"] as? Int
+            ?? jangConfig?["routed_expert_bits"] as? Int
+        let nRoutedExperts = config["n_routed_experts"] as? Int ?? 0
+        let numExpertsPerTok = config["num_experts_per_tok"] as? Int ?? 0
+        return shouldAutoEnableNemotronUltra(
+            nRoutedExperts: nRoutedExperts,
+            numExpertsPerTok: numExpertsPerTok,
+            routedBits: routedBits)
+    }
+
+    private static func routedBits(from value: Any?) -> Int? {
+        if let value = value as? Int {
+            return value
+        }
+        guard let dict = value as? [String: Any] else {
+            return nil
+        }
+        if let routed = dict["routed_expert"] as? Int {
+            return routed
+        }
+        if let routed = dict["routed_expert"] as? [String: Any] {
+            return routed["up_proj"] as? Int ?? routed["down_proj"] as? Int
+        }
+        return nil
     }
 
     public static var residentExpertsEnabled: Bool {
@@ -740,7 +822,12 @@ private func mlXPressStreamingFastReduceMaxTokens() -> Int {
 }
 
 private func mlXPressStreamingEvaluateEachLayerEnabled() -> Bool {
-    ProcessInfo.processInfo.environment["MLXPRESS_STREAMING_EVAL_EACH_LAYER"] != "0"
+    mlXPressStreamingBoolEnv(
+        [
+            "MLXPRESS_STREAMING_EVAL_EACH_LAYER",
+            "JANGPRESS_STREAMING_EVAL_EACH_LAYER",
+        ],
+        defaultValue: false)
 }
 
 private func mlXPressStreamingEvalLayerStride() -> Int {
@@ -966,24 +1053,60 @@ private func mlXPressStreamingDirectStackedEnabled() -> Bool {
     return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
 }
 
-private func mlXPressStreamingOffsetKernelsEnabled() -> Bool {
+private func mlXPressStreamingOffsetKernelsOverride() -> Bool? {
     let env = ProcessInfo.processInfo.environment
-    let raw =
+    guard let raw =
         env["MLXPRESS_STREAMING_OFFSET_KERNELS"]?
         .lowercased()
         ?? env["JANGPRESS_STREAMING_OFFSET_KERNELS"]?.lowercased()
-        ?? "0"
-    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+    else { return nil }
+    if raw == "1" || raw == "true" || raw == "yes" || raw == "on" {
+        return true
+    }
+    if raw == "0" || raw == "false" || raw == "no" || raw == "off" {
+        return false
+    }
+    return nil
+}
+
+private func mlXPressStreamingOffsetKernelsEnabled() -> Bool {
+    mlXPressStreamingOffsetKernelsOverride() == true
+}
+
+private func mlXPressStreamingMmapActiveTensorsOverride() -> Bool? {
+    let env = ProcessInfo.processInfo.environment
+    guard let raw =
+        env["MLXPRESS_STREAMING_MMAP_ACTIVE_TENSORS"]?
+        .lowercased()
+        ?? env["JANGPRESS_STREAMING_MMAP_ACTIVE_TENSORS"]?.lowercased()
+    else { return nil }
+    if raw == "1" || raw == "true" || raw == "yes" || raw == "on" {
+        return true
+    }
+    if raw == "0" || raw == "false" || raw == "no" || raw == "off" {
+        return false
+    }
+    return nil
 }
 
 private func mlXPressStreamingOffsetActiveShardFilterEnabled() -> Bool {
+    mlXPressStreamingOffsetActiveShardFilterOverride() == true
+}
+
+private func mlXPressStreamingOffsetActiveShardFilterOverride() -> Bool? {
     let env = ProcessInfo.processInfo.environment
-    let raw =
+    guard let raw =
         env["MLXPRESS_STREAMING_OFFSET_ACTIVE_SHARD_FILTER"]?
         .lowercased()
         ?? env["JANGPRESS_STREAMING_OFFSET_ACTIVE_SHARD_FILTER"]?.lowercased()
-        ?? "0"
-    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+    else { return nil }
+    if raw == "1" || raw == "true" || raw == "yes" || raw == "on" {
+        return true
+    }
+    if raw == "0" || raw == "false" || raw == "no" || raw == "off" {
+        return false
+    }
+    return nil
 }
 
 private func mlXPressStreamingOffsetActiveWindowCoalesceBytes() -> UInt64? {
@@ -1702,7 +1825,10 @@ private final class JANGTQStreamingExpertIndex: @unchecked Sendable {
             && downPacked == downNorms
     }
 
-    func hasOffsetDispatchCoverage(layerIdx: Int) -> Bool {
+    func hasOffsetDispatchCoverage(
+        layerIdx: Int,
+        requiredProjections: [StreamingProjection] = StreamingProjection.allCases
+    ) -> Bool {
         func expertSet(_ projection: StreamingProjection, _ suffix: StreamingSuffix) -> Set<Int> {
             var experts = Set<Int>()
             for descriptor in stackedOffsetDescriptors(
@@ -1719,13 +1845,40 @@ private final class JANGTQStreamingExpertIndex: @unchecked Sendable {
             return experts
         }
 
-        let sets = StreamingProjection.allCases.flatMap { projection in
+        let sets = requiredProjections.flatMap { projection in
             StreamingSuffix.allCases.map { suffix in
                 expertSet(projection, suffix)
             }
         }
         guard let first = sets.first, !first.isEmpty else { return false }
         return sets.allSatisfy { $0 == first }
+    }
+
+    func shouldAutoUseOffsetDispatch(
+        layerIdx: Int,
+        requiredProjections: [StreamingProjection]
+    ) -> Bool {
+        guard let layer = layers[layerIdx],
+            layer.experts.isEmpty,
+            !layer.stacked.isEmpty,
+            hasOffsetDispatchCoverage(
+                layerIdx: layerIdx,
+                requiredProjections: requiredProjections)
+        else { return false }
+
+        var expertCounts: [Int] = []
+        for projection in requiredProjections {
+            for suffix in StreamingSuffix.allCases {
+                let descriptors = stackedOffsetDescriptors(
+                    layerIdx: layerIdx,
+                    projection: projection,
+                    suffix: suffix)
+                guard !descriptors.isEmpty else { return false }
+                expertCounts.append(contentsOf: descriptors.compactMap { $0.logicalShape.first })
+            }
+        }
+        guard let minExpertCount = expertCounts.min() else { return false }
+        return minExpertCount >= 512
     }
 
     private static func computeTotalTensorBytes(_ layers: [Int: StreamingLayerRef]) -> UInt64 {
@@ -1919,6 +2072,7 @@ public final class StreamingTurboQuantSwitchReLUSquaredMLP: Module {
     private let hiddenDims: Int
     private let evaluateEachLayer: Bool
     private let tokenChunkSize: Int
+    private let scoredDownKernelsEnabled: Bool
 
     public init(
         inputDims: Int,
@@ -1933,18 +2087,21 @@ public final class StreamingTurboQuantSwitchReLUSquaredMLP: Module {
         self.hiddenDims = hiddenDims
         self.evaluateEachLayer = mlXPressStreamingShouldEvaluateLayer(layerIdx)
         self.tokenChunkSize = mlXPressStreamingTokenChunkSize()
+        self.scoredDownKernelsEnabled = mlXPressStreamingScoredDownKernelsEnabled()
         self._fc1.wrappedValue = TurboQuantSwitchLinear(
             inFeatures: inputDims,
             outFeatures: hiddenDims,
             numExperts: numExperts,
             bits: bits,
-            seed: seed)
+            seed: seed,
+            useStreamingPlaceholders: true)
         self._fc2.wrappedValue = TurboQuantSwitchLinear(
             inFeatures: hiddenDims,
             outFeatures: inputDims,
             numExperts: numExperts,
             bits: bits,
-            seed: seed)
+            seed: seed,
+            useStreamingPlaceholders: true)
         super.init()
         _ = JANGTQStreamingExpertStore.shared.index()
     }
@@ -1954,7 +2111,24 @@ public final class StreamingTurboQuantSwitchReLUSquaredMLP: Module {
         let kSlots = indices.dim(-1)
         let xFlat = x.reshaped([totalTokens, inputDims])
         let indicesFlat = indices.reshaped([totalTokens, kSlots])
-        let allIndexValues = indicesFlat.reshaped([-1]).asArray(Int32.self).map(Int.init)
+        let requiredProjections: [StreamingProjection] = [.up, .down]
+        let useOffsetDispatch = JANGTQStreamingExpertStore.shared.canUseOffsetDispatch(
+            layerIdx: layerIdx,
+            requiredProjections: requiredProjections)
+        let shouldAutoFilterOffsetSpans =
+            useOffsetDispatch
+            && mlXPressStreamingOffsetActiveShardFilterOverride() == nil
+            && JANGTQStreamingExpertStore.shared.shouldAutoFilterOffsetSpans(
+                layerIdx: layerIdx,
+                requiredProjections: requiredProjections)
+        let shouldReadOffsetIndices = useOffsetDispatch
+            && (mlXPressStreamingOffsetActiveShardFilterEnabled()
+                || shouldAutoFilterOffsetSpans)
+        let allIndexValues: [Int]? = useOffsetDispatch && !shouldReadOffsetIndices
+            ? nil
+            : MLXPressStreamingProfile.time("router.indices_readback") {
+                indicesFlat.reshaped([-1]).asArray(Int32.self).map(Int.init)
+            }
         let chunkSize = max(1, tokenChunkSize)
         if totalTokens <= chunkSize {
             let chunk = callChunk(
@@ -1975,11 +2149,14 @@ public final class StreamingTurboQuantSwitchReLUSquaredMLP: Module {
             let end = min(start + chunkSize, totalTokens)
             let valueStart = start * kSlots
             let valueEnd = end * kSlots
+            let indexValues = allIndexValues.map {
+                Array($0[valueStart ..< valueEnd])
+            }
             chunks.append(
                 callChunk(
                     xFlat: xFlat[start ..< end, 0...],
                     indicesFlat: indicesFlat[start ..< end, 0...],
-                    indexValues: Array(allIndexValues[valueStart ..< valueEnd]),
+                    indexValues: indexValues,
                     tokenCount: end - start,
                     kSlots: kSlots))
             start = end
@@ -1990,6 +2167,69 @@ public final class StreamingTurboQuantSwitchReLUSquaredMLP: Module {
         return joined.reshaped(outShape)
     }
 
+    public func reduced(_ x: MLXArray, indices: MLXArray, scores: MLXArray) -> MLXArray {
+        let totalTokens = x.size / inputDims
+        let kSlots = indices.dim(-1)
+        let xFlat = x.reshaped([totalTokens, inputDims])
+        let indicesFlat = indices.reshaped([totalTokens, kSlots])
+        let scoresFlat = stopGradient(scores.reshaped([totalTokens, kSlots]))
+        let requiredProjections: [StreamingProjection] = [.up, .down]
+        let useOffsetDispatch = JANGTQStreamingExpertStore.shared.canUseOffsetDispatch(
+            layerIdx: layerIdx,
+            requiredProjections: requiredProjections)
+
+        guard useOffsetDispatch, scoredDownKernelsEnabled else {
+            let expertOutput = callAsFunction(x, indices)
+            return (expertOutput * scores[.ellipsis, .newAxis]).sum(axis: -2)
+                .asType(expertOutput.dtype)
+        }
+
+        let shouldReadOffsetIndices = mlXPressStreamingOffsetActiveShardFilterEnabled()
+        let allIndexValues: [Int]? = shouldReadOffsetIndices
+            ? MLXPressStreamingProfile.time("router.indices_readback") {
+                indicesFlat.reshaped([-1]).asArray(Int32.self).map(Int.init)
+            }
+            : nil
+        if let allIndexValues, !allIndexValues.isEmpty {
+            MLXPressActiveExpertTrace.record(
+                layerIdx: layerIdx,
+                expertIndices: allIndexValues,
+                tokenCount: totalTokens,
+                kSlots: kSlots)
+        }
+
+        let chunkSize = max(1, tokenChunkSize)
+        func reduceChunk(start: Int, end: Int) -> MLXArray {
+            let tokenCount = end - start
+            let valueStart = start * kSlots
+            let valueEnd = end * kSlots
+            let indexValues = allIndexValues.map {
+                Array($0[valueStart ..< valueEnd])
+            }
+            return callChunkScoredOffsets(
+                xFlat: xFlat[start ..< end, 0...],
+                indicesFlat: indicesFlat[start ..< end, 0...],
+                scoresFlat: scoresFlat[start ..< end, 0...],
+                activeExperts: indexValues.map { Set($0) },
+                tokenCount: tokenCount,
+                kSlots: kSlots)
+        }
+
+        if totalTokens <= chunkSize {
+            return reduceChunk(start: 0, end: totalTokens).reshaped(x.shape)
+        }
+
+        var chunks: [MLXArray] = []
+        chunks.reserveCapacity((totalTokens + chunkSize - 1) / chunkSize)
+        var start = 0
+        while start < totalTokens {
+            let end = min(start + chunkSize, totalTokens)
+            chunks.append(reduceChunk(start: start, end: end))
+            start = end
+        }
+        return concatenated(chunks, axis: 0).reshaped(x.shape)
+    }
+
     private func callChunk(
         xFlat: MLXArray,
         indicesFlat: MLXArray,
@@ -1997,20 +2237,41 @@ public final class StreamingTurboQuantSwitchReLUSquaredMLP: Module {
         tokenCount: Int,
         kSlots: Int
     ) -> MLXArray {
-        let indexValues =
-            indexValues
-            ?? indicesFlat.reshaped([-1]).asArray(Int32.self).map(Int.init)
-        let uniqueExperts = Array(Set(indexValues)).sorted()
-        guard !uniqueExperts.isEmpty else {
-            fatalError("[MLXPressStreaming] empty routed expert set in layer \(layerIdx)")
-        }
-        MLXPressActiveExpertTrace.record(
+        let requiredProjections: [StreamingProjection] = [.up, .down]
+        let useOffsetDispatch = JANGTQStreamingExpertStore.shared.canUseOffsetDispatch(
             layerIdx: layerIdx,
-            expertIndices: indexValues,
-            tokenCount: tokenCount,
-            kSlots: kSlots)
-        let useDirectStacked = JANGTQStreamingExpertStore.shared.canUseDirectStacked(
-            layerIdx: layerIdx)
+            requiredProjections: requiredProjections)
+        let resolvedIndexValues: [Int]
+        if let indexValues {
+            resolvedIndexValues = indexValues
+        } else if useOffsetDispatch
+            && !MLXPressActiveExpertTrace.isEnabled
+            && !mlXPressStreamingOffsetActiveShardFilterEnabled()
+        {
+            resolvedIndexValues = []
+        } else {
+            resolvedIndexValues = MLXPressStreamingProfile.time("router.indices_readback") {
+                indicesFlat.reshaped([-1]).asArray(Int32.self).map(Int.init)
+            }
+        }
+        let uniqueExperts: [Int]
+        if useOffsetDispatch {
+            uniqueExperts = []
+        } else {
+            uniqueExperts = Array(Set(resolvedIndexValues)).sorted()
+            guard !uniqueExperts.isEmpty else {
+                fatalError("[MLXPressStreaming] empty routed expert set in layer \(layerIdx)")
+            }
+        }
+        if !resolvedIndexValues.isEmpty {
+            MLXPressActiveExpertTrace.record(
+                layerIdx: layerIdx,
+                expertIndices: resolvedIndexValues,
+                tokenCount: tokenCount,
+                kSlots: kSlots)
+        }
+        let useDirectStacked = !useOffsetDispatch
+            && JANGTQStreamingExpertStore.shared.canUseDirectStacked(layerIdx: layerIdx)
 
         func stack(_ projection: StreamingProjection, _ suffix: StreamingSuffix) -> MLXArray? {
             MLXPressStreamingProfile.time("stack.\(projection.rawValue).\(suffix.rawValue)") {
@@ -2088,48 +2349,93 @@ public final class StreamingTurboQuantSwitchReLUSquaredMLP: Module {
             }
         }
 
-        guard
-            let signsIn = JANGTQRuntimeCache.shared.signs(
-                inFeatures: inputDims, seed: fc1.mxtqSeed),
-            let signsInter = JANGTQRuntimeCache.shared.signs(
-                inFeatures: hiddenDims, seed: fc2.mxtqSeed),
-            let cbIn = JANGTQRuntimeCache.shared.codebook(inFeatures: inputDims, bits: fc1.bits),
-            let cbInter = JANGTQRuntimeCache.shared.codebook(inFeatures: hiddenDims, bits: fc2.bits)
-        else {
-            fatalError(
-                "[MLXPressStreaming] missing active Nemotron JANGTQ tensors for layer \(layerIdx)")
-        }
+        let signsIn = JANGTQRuntimeCache.shared.requiredSigns(
+            inFeatures: inputDims, seed: fc1.mxtqSeed)
+        let signsInter = JANGTQRuntimeCache.shared.requiredSigns(
+            inFeatures: hiddenDims, seed: fc2.mxtqSeed)
+        let cbIn = JANGTQRuntimeCache.shared.requiredCodebook(
+            inFeatures: inputDims, bits: fc1.bits)
+        let cbInter = JANGTQRuntimeCache.shared.requiredCodebook(
+            inFeatures: hiddenDims, bits: fc2.bits)
 
         var remap: [Int: Int32] = [:]
-        if !useDirectStacked {
+        if !useDirectStacked && !useOffsetDispatch {
             for (local, expert) in uniqueExperts.enumerated() {
                 remap[expert] = Int32(local)
             }
         }
-        let rhsIndexValues: [Int32] = useDirectStacked
-            ? indexValues.map { Int32($0) }
-            : indexValues.map { remap[$0] ?? 0 }
-        let rhsIndices = MLXArray(rhsIndexValues, indicesFlat.shape).asType(.uint32).reshaped([-1])
-
-        guard let fc1Packed = stack(.up, .packed),
-            let fc1Norms = stack(.up, .norms)
-        else {
-            fatalError(
-                "[MLXPressStreaming] missing active Nemotron JANGTQ fc1 tensors for layer \(layerIdx)"
-            )
+        let rhsIndices: MLXArray
+        if useOffsetDispatch {
+            rhsIndices = indicesFlat.asType(.uint32).reshaped([-1])
+        } else {
+            let rhsIndexValues: [Int32] = useDirectStacked
+                ? resolvedIndexValues.map { Int32($0) }
+                : resolvedIndexValues.map { remap[$0] ?? 0 }
+            rhsIndices = MLXArray(rhsIndexValues, indicesFlat.shape).asType(.uint32).reshaped([-1])
         }
+        let activeExperts = useOffsetDispatch && !resolvedIndexValues.isEmpty
+            ? Set(resolvedIndexValues)
+            : nil
+
         let xRot1 = JANGTQKernels.hadamardRotate(xFlat, signs: signsIn, dim: inputDims)
-        var hidden = JANGTQKernels.gatherTQTopK(
-            xRot: xRot1,
-            packed: fc1Packed,
-            norms: fc1Norms,
-            codebook: cbIn,
-            rhsIndices: rhsIndices,
-            batchTokens: tokenCount,
-            K: kSlots,
-            inFeatures: inputDims,
-            outFeatures: hiddenDims,
-            bits: fc1.bits)
+        var hidden: MLXArray
+        if useOffsetDispatch {
+            let fc1PackedSpans = JANGTQStreamingExpertStore.shared.loadOffsetSpans(
+                layerIdx: layerIdx,
+                projection: .up,
+                suffix: .packed,
+                activeExperts: activeExperts)
+            let fc1NormSpans = JANGTQStreamingExpertStore.shared.loadOffsetSpans(
+                layerIdx: layerIdx,
+                projection: .up,
+                suffix: .norms,
+                activeExperts: activeExperts)
+            let fc1Groups = mlXPressStreamingDownOffsetSpanGroups(
+                packed: fc1PackedSpans,
+                norms: fc1NormSpans)
+            guard !fc1Groups.isEmpty else {
+                fatalError(
+                    "[MLXPressStreaming] missing offset-addressed Nemotron fc1 tensors for layer \(layerIdx)"
+                )
+            }
+            hidden = MLXPressStreamingProfile.time("relu_fc1.offset_build") {
+                let partials = fc1Groups.map { group -> MLXArray in
+                    JANGTQKernels.gatherTQTopKOffsets(
+                        xRot: xRot1,
+                        packed: group.packed.array,
+                        packedOffsets: group.packed.offsets,
+                        norms: group.norms.array,
+                        normOffsets: group.norms.offsets,
+                        codebook: cbIn,
+                        rhsIndices: rhsIndices,
+                        batchTokens: tokenCount,
+                        K: kSlots,
+                        inFeatures: inputDims,
+                        outFeatures: hiddenDims,
+                        bits: fc1.bits)
+                }
+                return partials.dropFirst().reduce(partials[0]) { $0 + $1 }
+            }
+        } else {
+            guard let fc1Packed = stack(.up, .packed),
+                let fc1Norms = stack(.up, .norms)
+            else {
+                fatalError(
+                    "[MLXPressStreaming] missing active Nemotron JANGTQ fc1 tensors for layer \(layerIdx)"
+                )
+            }
+            hidden = JANGTQKernels.gatherTQTopK(
+                xRot: xRot1,
+                packed: fc1Packed,
+                norms: fc1Norms,
+                codebook: cbIn,
+                rhsIndices: rhsIndices,
+                batchTokens: tokenCount,
+                K: kSlots,
+                inFeatures: inputDims,
+                outFeatures: hiddenDims,
+                bits: fc1.bits)
+        }
         let relu = MLX.maximum(hidden, MLXArray(0, dtype: hidden.dtype))
         hidden = relu * relu
         mlXPressStreamingMaterializeIfNeeded(
@@ -2139,25 +2445,63 @@ public final class StreamingTurboQuantSwitchReLUSquaredMLP: Module {
             phase: "relu_hidden",
             profileName: "relu_hidden.eval")
 
-        guard let fc2Packed = stack(.down, .packed),
-            let fc2Norms = stack(.down, .norms)
-        else {
-            fatalError(
-                "[MLXPressStreaming] missing active Nemotron JANGTQ fc2 tensors for layer \(layerIdx)"
-            )
-        }
-
         let xRot2 = JANGTQKernels.hadamardRotate(hidden, signs: signsInter, dim: hiddenDims)
-        let out = JANGTQKernels.gatherTQ(
-            xRot: xRot2,
-            packed: fc2Packed,
-            norms: fc2Norms,
-            codebook: cbInter,
-            rhsIndices: rhsIndices,
-            nRows: tokenCount * kSlots,
-            inFeatures: hiddenDims,
-            outFeatures: inputDims,
-            bits: fc2.bits)
+        let out: MLXArray
+        if useOffsetDispatch {
+            let fc2PackedSpans = JANGTQStreamingExpertStore.shared.loadOffsetSpans(
+                layerIdx: layerIdx,
+                projection: .down,
+                suffix: .packed,
+                activeExperts: activeExperts)
+            let fc2NormSpans = JANGTQStreamingExpertStore.shared.loadOffsetSpans(
+                layerIdx: layerIdx,
+                projection: .down,
+                suffix: .norms,
+                activeExperts: activeExperts)
+            let fc2Groups = mlXPressStreamingDownOffsetSpanGroups(
+                packed: fc2PackedSpans,
+                norms: fc2NormSpans)
+            guard !fc2Groups.isEmpty else {
+                fatalError(
+                    "[MLXPressStreaming] missing offset-addressed Nemotron fc2 tensors for layer \(layerIdx)"
+                )
+            }
+            out = MLXPressStreamingProfile.time("relu_fc2.offset_build") {
+                let partials = fc2Groups.map { group -> MLXArray in
+                    JANGTQKernels.gatherTQOffsets(
+                        xRot: xRot2,
+                        packed: group.packed.array,
+                        packedOffsets: group.packed.offsets,
+                        norms: group.norms.array,
+                        normOffsets: group.norms.offsets,
+                        codebook: cbInter,
+                        rhsIndices: rhsIndices,
+                        nRows: tokenCount * kSlots,
+                        inFeatures: hiddenDims,
+                        outFeatures: inputDims,
+                        bits: fc2.bits)
+                }
+                return partials.dropFirst().reduce(partials[0]) { $0 + $1 }
+            }
+        } else {
+            guard let fc2Packed = stack(.down, .packed),
+                let fc2Norms = stack(.down, .norms)
+            else {
+                fatalError(
+                    "[MLXPressStreaming] missing active Nemotron JANGTQ fc2 tensors for layer \(layerIdx)"
+                )
+            }
+            out = JANGTQKernels.gatherTQ(
+                xRot: xRot2,
+                packed: fc2Packed,
+                norms: fc2Norms,
+                codebook: cbInter,
+                rhsIndices: rhsIndices,
+                nRows: tokenCount * kSlots,
+                inFeatures: hiddenDims,
+                outFeatures: inputDims,
+                bits: fc2.bits)
+        }
 
         let shaped = out.reshaped([tokenCount, kSlots, inputDims]).asType(xFlat.dtype)
         mlXPressStreamingMaterializeIfNeeded(
@@ -2167,6 +2511,123 @@ public final class StreamingTurboQuantSwitchReLUSquaredMLP: Module {
             phase: "relu_down",
             profileName: "relu_down.eval")
         return shaped
+    }
+
+    private func callChunkScoredOffsets(
+        xFlat: MLXArray,
+        indicesFlat: MLXArray,
+        scoresFlat: MLXArray,
+        activeExperts: Set<Int>? = nil,
+        tokenCount: Int,
+        kSlots: Int
+    ) -> MLXArray {
+        let rhsIndices = indicesFlat.asType(.uint32).reshaped([-1])
+
+        let signsIn = JANGTQRuntimeCache.shared.requiredSigns(
+            inFeatures: inputDims, seed: fc1.mxtqSeed)
+        let signsInter = JANGTQRuntimeCache.shared.requiredSigns(
+            inFeatures: hiddenDims, seed: fc2.mxtqSeed)
+        let cbIn = JANGTQRuntimeCache.shared.requiredCodebook(
+            inFeatures: inputDims, bits: fc1.bits)
+        let cbInter = JANGTQRuntimeCache.shared.requiredCodebook(
+            inFeatures: hiddenDims, bits: fc2.bits)
+
+        let xRot1 = JANGTQKernels.hadamardRotate(xFlat, signs: signsIn, dim: inputDims)
+        let fc1PackedSpans = JANGTQStreamingExpertStore.shared.loadOffsetSpans(
+            layerIdx: layerIdx,
+            projection: .up,
+            suffix: .packed,
+            activeExperts: activeExperts)
+        let fc1NormSpans = JANGTQStreamingExpertStore.shared.loadOffsetSpans(
+            layerIdx: layerIdx,
+            projection: .up,
+            suffix: .norms,
+            activeExperts: activeExperts)
+        let fc1Groups = mlXPressStreamingDownOffsetSpanGroups(
+            packed: fc1PackedSpans,
+            norms: fc1NormSpans)
+        guard !fc1Groups.isEmpty else {
+            fatalError(
+                "[MLXPressStreaming] missing offset-addressed Nemotron fc1 tensors for scored layer \(layerIdx)"
+            )
+        }
+
+        var hidden = MLXPressStreamingProfile.time("relu_fc1.offset_build") {
+            let partials = fc1Groups.map { group -> MLXArray in
+                JANGTQKernels.gatherTQTopKOffsets(
+                    xRot: xRot1,
+                    packed: group.packed.array,
+                    packedOffsets: group.packed.offsets,
+                    norms: group.norms.array,
+                    normOffsets: group.norms.offsets,
+                    codebook: cbIn,
+                    rhsIndices: rhsIndices,
+                    batchTokens: tokenCount,
+                    K: kSlots,
+                    inFeatures: inputDims,
+                    outFeatures: hiddenDims,
+                    bits: fc1.bits)
+            }
+            return partials.dropFirst().reduce(partials[0]) { $0 + $1 }
+        }
+        let relu = MLX.maximum(hidden, MLXArray(0, dtype: hidden.dtype))
+        hidden = relu * relu
+        mlXPressStreamingMaterializeIfNeeded(
+            hidden,
+            force: evaluateEachLayer,
+            layerIdx: layerIdx,
+            phase: "relu_hidden_scored",
+            profileName: "relu_hidden.scored_eval")
+
+        let fc2PackedSpans = JANGTQStreamingExpertStore.shared.loadOffsetSpans(
+            layerIdx: layerIdx,
+            projection: .down,
+            suffix: .packed,
+            activeExperts: activeExperts)
+        let fc2NormSpans = JANGTQStreamingExpertStore.shared.loadOffsetSpans(
+            layerIdx: layerIdx,
+            projection: .down,
+            suffix: .norms,
+            activeExperts: activeExperts)
+        let fc2Groups = mlXPressStreamingDownOffsetSpanGroups(
+            packed: fc2PackedSpans,
+            norms: fc2NormSpans)
+        guard !fc2Groups.isEmpty else {
+            fatalError(
+                "[MLXPressStreaming] missing offset-addressed Nemotron fc2 tensors for scored layer \(layerIdx)"
+            )
+        }
+
+        let out = MLXPressStreamingProfile.time("relu_fc2.offset_scored_build") {
+            let xRot2 = JANGTQKernels.hadamardRotate(hidden, signs: signsInter, dim: hiddenDims)
+            let scoreValues = scoresFlat.asType(.float32).reshaped([-1])
+            let partials = fc2Groups.map { group -> MLXArray in
+                JANGTQKernels.gatherTQTopKOffsetsScored(
+                    xRot: xRot2,
+                    packed: group.packed.array,
+                    packedOffsets: group.packed.offsets,
+                    norms: group.norms.array,
+                    normOffsets: group.norms.offsets,
+                    codebook: cbInter,
+                    rhsIndices: rhsIndices,
+                    scores: scoreValues,
+                    batchTokens: tokenCount,
+                    K: kSlots,
+                    inFeatures: hiddenDims,
+                    outFeatures: inputDims,
+                    bits: fc2.bits)
+            }
+            return partials.dropFirst().reduce(partials[0]) { $0 + $1 }.asType(xFlat.dtype)
+        }
+        let materialized = stopGradient(out)
+        mlXPressStreamingMaterializeIfNeeded(
+            materialized,
+            force: evaluateEachLayer,
+            layerIdx: layerIdx,
+            phase: "relu_down_offset_scored",
+            profileName: "relu_down.offset_scored_eval",
+            releaseMachColdTiles: true)
+        return materialized
     }
 }
 
@@ -2180,7 +2641,8 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
     private let offsetSpanCacheBudgetBytes = mlXPressStreamingOffsetSpanCacheBudgetBytes()
     private let bankLoadEnabled = mlXPressStreamingBankLoadEnabled()
     private let directStackedEnabled = mlXPressStreamingDirectStackedEnabled()
-    private let offsetKernelsEnabled = mlXPressStreamingOffsetKernelsEnabled()
+    private let offsetKernelsOverride = mlXPressStreamingOffsetKernelsOverride()
+    private let mmapActiveTensorsOverride = mlXPressStreamingMmapActiveTensorsOverride()
     private let machActiveTensorsEnabled = mlXPressStreamingMachActiveTensorsEnabled()
     private let machOffsetSpansEnabled = mlXPressStreamingMachOffsetSpansEnabled()
     private let machFullOffsetSpansEnabled = mlXPressStreamingMachFullOffsetSpansEnabled()
@@ -2356,9 +2818,17 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
             FileHandle.standardError.write(
                 Data("[MLXPressStreaming] direct stacked mmap dispatch enabled\n".utf8))
         }
-        if offsetKernelsEnabled {
+        if offsetKernelsOverride == true {
             FileHandle.standardError.write(
                 Data("[MLXPressStreaming] offset-addressed active expert kernels enabled\n".utf8))
+        }
+        if offsetKernelsOverride == nil,
+            built.layers.keys.sorted().contains(where: {
+                built.shouldAutoUseOffsetDispatch(layerIdx: $0, requiredProjections: [.up, .down])
+            })
+        {
+            FileHandle.standardError.write(
+                Data("[MLXPressStreaming] offset-addressed active expert kernels auto-enabled for stacked Ultra layout\n".utf8))
         }
         if machActiveTensorsEnabled {
             FileHandle.standardError.write(
@@ -2510,12 +2980,15 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         lock.unlock()
     }
 
-    func canUseDirectStacked(layerIdx: Int) -> Bool {
+    func canUseDirectStacked(
+        layerIdx: Int,
+        requiredProjections: [StreamingProjection] = StreamingProjection.allCases
+    ) -> Bool {
         guard directStackedEnabled,
             let layer = index()?.layers[layerIdx],
             !layer.stacked.isEmpty
         else { return false }
-        for projection in StreamingProjection.allCases {
+        for projection in requiredProjections {
             guard layer.stacked[projection]?[.packed] != nil,
                 layer.stacked[projection]?[.norms] != nil
             else { return false }
@@ -2523,12 +2996,28 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         return true
     }
 
-    func canUseOffsetDispatch(layerIdx: Int) -> Bool {
-        guard offsetKernelsEnabled,
-            mmapActiveTensorsEnabled(),
-            let index = index()
+    func canUseOffsetDispatch(
+        layerIdx: Int,
+        requiredProjections: [StreamingProjection] = StreamingProjection.allCases
+    ) -> Bool {
+        guard let index = index() else { return false }
+        if let offsetKernelsOverride {
+            guard offsetKernelsOverride else { return false }
+        } else {
+            guard index.shouldAutoUseOffsetDispatch(
+                layerIdx: layerIdx,
+                requiredProjections: requiredProjections)
+            else { return false }
+        }
+        guard activeTensorMmapAllowed(
+            index: index,
+            layerIdx: layerIdx,
+            requiredProjections: requiredProjections)
         else { return false }
-        guard index.hasOffsetDispatchCoverage(layerIdx: layerIdx) else {
+        guard index.hasOffsetDispatchCoverage(
+            layerIdx: layerIdx,
+            requiredProjections: requiredProjections)
+        else {
             MLXPressStreamingProfile.record("offset_dispatch_incomplete_coverage")
             return false
         }
@@ -2536,7 +3025,7 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
             MLXPressStreamingProfile.record("offset_dispatch_unaligned_shards")
             MLXPressStreamingProfile.record("offset_dispatch_flexible_shard_groups")
         }
-        for projection in StreamingProjection.allCases {
+        for projection in requiredProjections {
             for suffix in StreamingSuffix.allCases {
                 guard !index.stackedOffsetDescriptors(
                     layerIdx: layerIdx,
@@ -2548,21 +3037,57 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         return true
     }
 
+    private func activeTensorMmapAllowed(
+        index: JANGTQStreamingExpertIndex?,
+        layerIdx: Int,
+        requiredProjections: [StreamingProjection]
+    ) -> Bool {
+        if let mmapActiveTensorsOverride {
+            return mmapActiveTensorsOverride
+        }
+        guard let index else { return false }
+        return index.shouldAutoUseOffsetDispatch(
+            layerIdx: layerIdx,
+            requiredProjections: requiredProjections)
+    }
+
+    func shouldAutoFilterOffsetSpans(
+        layerIdx: Int,
+        requiredProjections: [StreamingProjection]
+    ) -> Bool {
+        guard offsetKernelsOverride == nil,
+            let index = index()
+        else { return false }
+        return index.shouldAutoUseOffsetDispatch(
+            layerIdx: layerIdx,
+            requiredProjections: requiredProjections)
+    }
+
     func loadOffsetSpans(
         layerIdx: Int,
         projection: StreamingProjection,
         suffix: StreamingSuffix,
         activeExperts: Set<Int>? = nil
     ) -> [StreamingOffsetSpan] {
-        guard offsetKernelsEnabled,
-            let descriptors = index()?.stackedOffsetDescriptors(
+        let requiredProjections = [projection]
+        guard let index = index(),
+            (offsetKernelsOverride == true
+                || (offsetKernelsOverride == nil
+                    && index.shouldAutoUseOffsetDispatch(
+                        layerIdx: layerIdx,
+                        requiredProjections: requiredProjections))),
+            let descriptors = Optional(index.stackedOffsetDescriptors(
                 layerIdx: layerIdx,
                 projection: projection,
-                suffix: suffix),
+                suffix: suffix)),
             !descriptors.isEmpty
         else { return [] }
+        let allowMmap = activeTensorMmapAllowed(
+            index: index,
+            layerIdx: layerIdx,
+            requiredProjections: requiredProjections)
         let spans = descriptors.flatMap {
-            makeOffsetSpans(from: $0, activeExperts: activeExperts)
+            makeOffsetSpans(from: $0, activeExperts: activeExperts, allowMmap: allowMmap)
         }
         if activeExperts != nil {
             return spans
@@ -2572,7 +3097,8 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
 
     private func makeOffsetSpans(
         from descriptor: JANGTQStackedOffsetDescriptor,
-        activeExperts: Set<Int>? = nil
+        activeExperts: Set<Int>? = nil,
+        allowMmap: Bool
     ) -> [StreamingOffsetSpan] {
         guard
             let elementByteSize = elementByteSize(from: descriptor.dtype),
@@ -2595,7 +3121,8 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
                     descriptor.expertByteOffsets.enumerated().compactMap { expertIdx, byteOffset in
                         byteOffset == UInt64.max ? nil : expertIdx
                     }),
-                elementByteSize: elementByteSize)
+                elementByteSize: elementByteSize,
+                allowMmap: allowMmap)
             else { return [] }
             return [span]
         }
@@ -2625,7 +3152,8 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
                 spanOffset: window.start,
                 spanByteCount: Int(window.end - window.start),
                 selectedExperts: Set(window.experts),
-                elementByteSize: elementByteSize)
+                elementByteSize: elementByteSize,
+                allowMmap: allowMmap)
         }
     }
 
@@ -2711,7 +3239,8 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         spanOffset: UInt64,
         spanByteCount: Int,
         selectedExperts: Set<Int>,
-        elementByteSize: Int
+        elementByteSize: Int,
+        allowMmap: Bool
     ) -> StreamingOffsetSpan? {
         guard !selectedExperts.isEmpty,
             spanByteCount > 0,
@@ -2768,7 +3297,8 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
                 offset: spanOffset,
                 count: spanByteCount,
                 shape: shape,
-                dtype: descriptor.dtype)
+                dtype: descriptor.dtype,
+                allowAuto: allowMmap)
         }
         guard let array else { return nil }
         MLXPressStreamingProfile.record(
@@ -3907,13 +4437,7 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
     }
 
     private func mmapActiveTensorsEnabled() -> Bool {
-        let env = ProcessInfo.processInfo.environment
-        let raw =
-            env["MLXPRESS_STREAMING_MMAP_ACTIVE_TENSORS"]?
-            .lowercased()
-            ?? env["JANGPRESS_STREAMING_MMAP_ACTIVE_TENSORS"]?.lowercased()
-            ?? "0"
-        return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+        mmapActiveTensorsOverride == true
     }
 
     private func makeMmapArray(
@@ -3921,9 +4445,10 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         offset: UInt64,
         count: Int,
         shape: [Int],
-        dtype safetensorsDType: String
+        dtype safetensorsDType: String,
+        allowAuto: Bool = false
     ) -> MLXArray? {
-        guard mmapActiveTensorsEnabled(),
+        guard (mmapActiveTensorsEnabled() || allowAuto),
               count > 0,
               let dtype = dtype(from: safetensorsDType)
         else { return nil }
@@ -4221,7 +4746,8 @@ public final class StreamingTurboQuantSwitchGLU: TurboQuantSwitchGLU {
             gateUpBits: gateUpBits,
             downBits: downBits,
             seed: seed,
-            swigluLimit: swigluLimit)
+            swigluLimit: swigluLimit,
+            useStreamingPlaceholders: true)
         _ = JANGTQStreamingExpertStore.shared.index()
     }
 
@@ -4230,8 +4756,10 @@ public final class StreamingTurboQuantSwitchGLU: TurboQuantSwitchGLU {
         let kSlots = indices.dim(-1)
         let xFlat = x.reshaped([batchTokens, inputDims])
         let indicesFlat = indices.reshaped([batchTokens, kSlots])
+        let requiredProjections: [StreamingProjection] = [.up, .down]
         let useOffsetDispatch = JANGTQStreamingExpertStore.shared.canUseOffsetDispatch(
-            layerIdx: layerIdx)
+            layerIdx: layerIdx,
+            requiredProjections: requiredProjections)
         let shouldReadOffsetIndices = useOffsetDispatch
             && mlXPressStreamingOffsetActiveShardFilterEnabled()
         let allIndexValues: [Int]? = useOffsetDispatch && !shouldReadOffsetIndices
@@ -4425,21 +4953,14 @@ public final class StreamingTurboQuantSwitchGLU: TurboQuantSwitchGLU {
     ) -> MLXArray {
         let rhsIndices = indicesFlat.asType(.uint32).reshaped([-1])
 
-        let signsIn = JANGTQRuntimeCache.shared.signs(inFeatures: inputDims, seed: mxtqSeed)
-        let signsDn = JANGTQRuntimeCache.shared.signs(inFeatures: hiddenDims, seed: mxtqSeed)
-        let cbGate = JANGTQRuntimeCache.shared.codebook(inFeatures: inputDims, bits: gateUpBits)
-        let cbDown = JANGTQRuntimeCache.shared.codebook(inFeatures: hiddenDims, bits: downBits)
-        guard let signsIn, let signsDn, let cbGate, let cbDown else {
-            let missing = [
-                signsIn == nil ? "signs.\(inputDims).\(mxtqSeed)" : nil,
-                signsDn == nil ? "signs.\(hiddenDims).\(mxtqSeed)" : nil,
-                cbGate == nil ? "codebook.\(inputDims).\(gateUpBits)" : nil,
-                cbDown == nil ? "codebook.\(hiddenDims).\(downBits)" : nil,
-            ].compactMap { $0 }.joined(separator: ", ")
-            fatalError(
-                "[MLXPressStreaming] missing JANGTQ sidecar array(s) for layer "
-                    + "\(layerIdx): \(missing)")
-        }
+        let signsIn = JANGTQRuntimeCache.shared.requiredSigns(
+            inFeatures: inputDims, seed: mxtqSeed)
+        let signsDn = JANGTQRuntimeCache.shared.requiredSigns(
+            inFeatures: hiddenDims, seed: mxtqSeed)
+        let cbGate = JANGTQRuntimeCache.shared.requiredCodebook(
+            inFeatures: inputDims, bits: gateUpBits)
+        let cbDown = JANGTQRuntimeCache.shared.requiredCodebook(
+            inFeatures: hiddenDims, bits: downBits)
 
         if tokenCount == 1,
             kSlots > 0,
@@ -4723,8 +5244,10 @@ public final class StreamingTurboQuantSwitchGLU: TurboQuantSwitchGLU {
         tokenCount: Int,
         kSlots: Int
     ) -> MLXArray {
+        let requiredProjections: [StreamingProjection] = [.up, .down]
         let useOffsetDispatch = JANGTQStreamingExpertStore.shared.canUseOffsetDispatch(
-            layerIdx: layerIdx)
+            layerIdx: layerIdx,
+            requiredProjections: requiredProjections)
         let resolvedIndexValues: [Int]
         if let provided = indexValues {
             resolvedIndexValues = provided
@@ -4757,7 +5280,9 @@ public final class StreamingTurboQuantSwitchGLU: TurboQuantSwitchGLU {
                 kSlots: kSlots)
         }
         let useDirectStacked = !useOffsetDispatch
-            && JANGTQStreamingExpertStore.shared.canUseDirectStacked(layerIdx: layerIdx)
+            && JANGTQStreamingExpertStore.shared.canUseDirectStacked(
+                layerIdx: layerIdx,
+                requiredProjections: requiredProjections)
 
         func stack(_ projection: StreamingProjection, _ suffix: StreamingSuffix) -> MLXArray? {
             MLXPressStreamingProfile.time("stack.\(projection.rawValue).\(suffix.rawValue)") {
@@ -4835,21 +5360,14 @@ public final class StreamingTurboQuantSwitchGLU: TurboQuantSwitchGLU {
             }
         }
 
-        let signsIn = JANGTQRuntimeCache.shared.signs(inFeatures: inputDims, seed: mxtqSeed)
-        let signsDn = JANGTQRuntimeCache.shared.signs(inFeatures: hiddenDims, seed: mxtqSeed)
-        let cbGate = JANGTQRuntimeCache.shared.codebook(inFeatures: inputDims, bits: gateUpBits)
-        let cbDown = JANGTQRuntimeCache.shared.codebook(inFeatures: hiddenDims, bits: downBits)
-        guard let signsIn, let signsDn, let cbGate, let cbDown else {
-            let missing = [
-                signsIn == nil ? "signs.\(inputDims).\(mxtqSeed)" : nil,
-                signsDn == nil ? "signs.\(hiddenDims).\(mxtqSeed)" : nil,
-                cbGate == nil ? "codebook.\(inputDims).\(gateUpBits)" : nil,
-                cbDown == nil ? "codebook.\(hiddenDims).\(downBits)" : nil,
-            ].compactMap { $0 }.joined(separator: ", ")
-            fatalError(
-                "[MLXPressStreaming] missing JANGTQ sidecar array(s) for layer "
-                    + "\(layerIdx): \(missing)")
-        }
+        let signsIn = JANGTQRuntimeCache.shared.requiredSigns(
+            inFeatures: inputDims, seed: mxtqSeed)
+        let signsDn = JANGTQRuntimeCache.shared.requiredSigns(
+            inFeatures: hiddenDims, seed: mxtqSeed)
+        let cbGate = JANGTQRuntimeCache.shared.requiredCodebook(
+            inFeatures: inputDims, bits: gateUpBits)
+        let cbDown = JANGTQRuntimeCache.shared.requiredCodebook(
+            inFeatures: hiddenDims, bits: downBits)
 
         var remap: [Int: Int32] = [:]
         if !useDirectStacked && !useOffsetDispatch {

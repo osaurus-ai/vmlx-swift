@@ -134,8 +134,6 @@ public class LlamaModelInner: Module {
     let norm: RMSNorm
 
     init(_ args: LlamaConfiguration) {
-        precondition(args.vocabularySize > 0)
-
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -307,6 +305,8 @@ public struct LlamaConfiguration: Codable, Sendable {
             self.mlpBias = mlpBias
         }
 
+        try validateDecodedFields(container: container)
+
         if let ropeScaling {
             if ropeScaling["factor"] == nil {
                 throw DecodingError.dataCorruptedError(
@@ -332,6 +332,71 @@ public struct LlamaConfiguration: Codable, Sendable {
                     forKey: .ropeScaling, in: container,
                     debugDescription: "rope_scaling must contain either 'type' or 'rope_type'")
             }
+        }
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+
+        if let headDimensions {
+            try validatePositive(headDimensions, key: .headDimensions, in: container)
+        }
+        if let maxPositionEmbeddings {
+            try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        }
+
+        guard hiddenSize == attentionHeads * resolvedHeadDimensions else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "Llama hidden_size must equal num_attention_heads * head_dim.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription: "Llama num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        if let factor = ropeScaling?["factor"]?.asFloat() {
+            guard factor.isFinite, factor > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling,
+                    in: container,
+                    debugDescription: "Llama rope_scaling.factor must be finite and > 0.")
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Llama \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Llama \(key.rawValue) must be finite and > 0.")
         }
     }
 }

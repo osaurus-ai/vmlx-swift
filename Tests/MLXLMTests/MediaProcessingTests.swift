@@ -125,4 +125,15 @@ public class MediaProcesingTests: XCTestCase {
         XCTAssert(frames.frames.count == 10)
         XCTAssert(frames.frames[0].shape == [1, 3, 224, 224])
     }
+
+    func testEmptyVideoFramesAsProcessedSequenceThrows() async throws {
+        let video = UserInput.Video.frames([])
+
+        do {
+            _ = try await MediaProcessing.asProcessedSequence(video, samplesPerSecond: 2)
+            XCTFail("Expected empty frame-backed video to throw")
+        } catch let error as VLMError {
+            XCTAssertEqual(error, .emptyVideoFrames)
+        }
+    }
 }

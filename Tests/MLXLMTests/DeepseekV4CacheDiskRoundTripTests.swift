@@ -110,6 +110,33 @@ struct DeepseekV4CacheDiskRoundTripTests {
             "indexer pool must survive disk round-trip")
     }
 
+    @Test("DeepseekV4Cache restore rejects mismatched hybrid metadata")
+    func deepseekV4CacheRejectsMismatchedHybridMetadata() {
+        let v4 = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
+        Self.fillRotating(v4.local)
+        v4.setPooled(.compressor, value: MLXArray.ones([1, 5, 8]) * 7.0)
+
+        var encoded = TQDiskSerializer.serialize(cache: [v4])
+        encoded["__dsv4_0_meta__"] = MLXArray([
+            Int32(0),   // keep
+            Int32(16),  // maxSize
+            Int32(256), // step
+            Int32(5),   // offset
+            Int32(5),   // idx
+            Int32(128), // invalid for target: compressRatio is 4
+            Int32(16),  // slidingWindow
+        ])
+
+        let target = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
+        var restoreTarget: [any KVCache] = [target]
+        let restoredTokens = restoreFromDiskArrays(encoded, into: &restoreTarget)
+
+        #expect(restoredTokens == 0)
+        #expect(target.offset == 0)
+        #expect(target.getPooled(.compressor) == nil)
+        #expect(target.getPooled(.indexer) == nil)
+    }
+
     @Test("Mixed per-layer array: RotatingKVCache + DeepseekV4Cache round-trip together")
     func mixedPerLayerRoundTrip() {
         let layer0 = RotatingKVCache(maxSize: 16, keep: 0)

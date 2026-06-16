@@ -364,6 +364,149 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             "Generation prompt must end with open model turn.")
     }
 
+    // MARK: - KV-cache prefix-stability contract (osaurus ↔ vmlx wiring)
+
+    /// Locate `Libraries/MLXLMCommon/ChatTemplates/<name>.jinja` by walking up
+    /// from this test source, regardless of CWD.
+    private func loadBundledTemplate(_ name: String) throws -> Template {
+        var searchPath = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        for _ in 0..<6 {
+            let candidate = searchPath
+                .appendingPathComponent("Libraries/MLXLMCommon/ChatTemplates/\(name).jinja")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return try Template(try String(contentsOf: candidate, encoding: .utf8))
+            }
+            searchPath = searchPath.deletingLastPathComponent()
+        }
+        throw XCTSkip("\(name).jinja not found relative to test source.")
+    }
+
+    /// The system turn (`<|turn>system\n … <turn|>\n`) is the front of every
+    /// Gemma-4 prompt and the segment the KV cache reuses across an agent
+    /// loop's iterations. Returns everything up to and including the first
+    /// `<turn|>\n`, or nil if no system turn was emitted.
+    private func systemTurn(of rendered: String) -> String? {
+        guard let closeRange = rendered.range(of: "<turn|>\n") else { return nil }
+        return String(rendered[rendered.startIndex..<closeRange.upperBound])
+    }
+
+    /// Regression for the Gemma-4 "prefill resets to 0 after a tool call" bug
+    /// (tpae's report; osaurus root cause removed in osaurus-ai/osaurus#1525).
+    ///
+    /// The agent loop renders the SAME conversation twice: once at the turn
+    /// that produces a tool call, then again after appending the tool result.
+    /// As long as the caller holds `tools` (and `tool_choice`) byte-stable —
+    /// which #1525 now guarantees by deleting `finalizingPostToolChoice` and
+    /// passing `resolvedToolChoice` unchanged every iteration — the rendered
+    /// system turn (system content + `<|tool>declaration:` block) MUST be
+    /// byte-identical and remain a literal prefix of the continuation prompt.
+    /// That is exactly what lets the runtime extend the cached KV prefix
+    /// instead of re-prefilling from token ~0.
+    func testGemma4WithToolsSystemPrefixStableAcrossToolResultTurn() throws {
+        let template = try loadBundledTemplate("Gemma4WithTools")
+        let tools: [[String: Any]] = [[
+            "type": "function",
+            "function": [
+                "name": "capabilities_discover",
+                "description": "discover host capabilities",
+            ] as [String: Any],
+        ] as [String: Any]]
+
+        let toolCallTurn: [[String: Any]] = [
+            ["role": "system", "content": "You are a helpful assistant."] as [String: Any],
+            ["role": "user", "content": "what can you do?"] as [String: Any],
+        ]
+        // Continuation: the assistant tool_call plus the tool result appended.
+        let toolResultTurn: [[String: Any]] = toolCallTurn + [
+            [
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [[
+                    "function": [
+                        "name": "capabilities_discover",
+                        "arguments": [:] as [String: Any],
+                    ] as [String: Any],
+                ] as [String: Any]] as [Any],
+            ] as [String: Any],
+            ["role": "tool", "name": "capabilities_discover", "content": "{\"ok\":true}"] as [String: Any],
+        ]
+
+        let render: ([[String: Any]]) throws -> String = { messages in
+            try template.renderAny([
+                "bos_token": "<bos>",
+                "messages": messages,
+                "tools": tools,
+                "add_generation_prompt": true,
+            ])
+        }
+
+        let p1 = try render(toolCallTurn)
+        let p2 = try render(toolResultTurn)
+
+        let sys1 = try XCTUnwrap(systemTurn(of: p1), "tool-call turn emitted no system turn")
+        let sys2 = try XCTUnwrap(systemTurn(of: p2), "tool-result turn emitted no system turn")
+
+        XCTAssertTrue(sys1.contains("<|tool>declaration:capabilities_discover"),
+            "system turn must carry the tool declaration. Got: \(sys1)")
+        XCTAssertEqual(sys1, sys2,
+            "system turn (system + tool declarations) must be byte-stable across the "
+            + "tool-call → tool-result iterations so the KV prefix is reused.")
+        XCTAssertTrue(p2.hasPrefix(sys1),
+            "the continuation prompt must begin with the identical system turn — "
+            + "otherwise the cache re-prefills from ~0.")
+    }
+
+    /// Locks in WHY the caller must never drop the tools list on a
+    /// tool-result turn (the osaurus-side regression that #1525 removed):
+    /// when `tools` disappears, the `<|tool>declaration:` block leaves the
+    /// front of the system turn, so the continuation prompt no longer shares
+    /// the cached prefix and the runtime re-prefills the whole context. This
+    /// test asserts the busting mechanism directly, documenting the wiring
+    /// contract for any future caller.
+    func testGemma4WithToolsDroppingToolsBustsSystemPrefix() throws {
+        let template = try loadBundledTemplate("Gemma4WithTools")
+        let tools: [[String: Any]] = [[
+            "type": "function",
+            "function": [
+                "name": "capabilities_discover",
+                "description": "discover host capabilities",
+            ] as [String: Any],
+        ] as [String: Any]]
+        let messages: [[String: Any]] = [
+            ["role": "system", "content": "You are a helpful assistant."] as [String: Any],
+            ["role": "user", "content": "what can you do?"] as [String: Any],
+            [
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [[
+                    "function": [
+                        "name": "capabilities_discover",
+                        "arguments": [:] as [String: Any],
+                    ] as [String: Any],
+                ] as [String: Any]] as [Any],
+            ] as [String: Any],
+            ["role": "tool", "name": "capabilities_discover", "content": "{\"ok\":true}"] as [String: Any],
+        ]
+
+        let withTools = try template.renderAny([
+            "bos_token": "<bos>", "messages": messages, "tools": tools,
+            "add_generation_prompt": true,
+        ])
+        let withoutTools = try template.renderAny([
+            "bos_token": "<bos>", "messages": messages,
+            "add_generation_prompt": true,
+        ])
+
+        let sysWith = try XCTUnwrap(systemTurn(of: withTools))
+        XCTAssertTrue(sysWith.contains("<|tool>declaration:capabilities_discover"))
+        // Dropping the tools strips the declaration block, so the with-tools
+        // system turn is NO LONGER a prefix of the prompt — the cache busts.
+        XCTAssertFalse(withoutTools.hasPrefix(sysWith),
+            "dropping the tools list must (and here does) bust the cached system "
+            + "prefix — this is the failure mode osaurus#1525 fixed by holding "
+            + "tools byte-stable across iterations.")
+    }
+
     /// Iter 52: the system-message branch must handle multi-part content
     /// too. iter 50's version assumed `content` was always a string —
     /// would crash on a system turn whose content comes through as a

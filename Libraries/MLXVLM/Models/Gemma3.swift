@@ -66,6 +66,76 @@ public struct Gemma3TextConfiguration: Codable, Sendable {
         case _headDim = "head_dim"
         case _queryPreAttnScalar = "query_pre_attn_scalar"
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        modelType = try container.decode(String.self, forKey: .modelType)
+        hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+        intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        slidingWindow = try container.decode(Int.self, forKey: .slidingWindow)
+        ropeScaling = try container.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: .ropeScaling)
+        finalLogitSoftcapping = try container.decodeIfPresent(Float.self, forKey: .finalLogitSoftcapping)
+        _attentionHeads = try container.decodeIfPresent(Int.self, forKey: ._attentionHeads)
+        _kvHeads = try container.decodeIfPresent(Int.self, forKey: ._kvHeads)
+        _headDim = try container.decodeIfPresent(Int.self, forKey: ._headDim)
+        _queryPreAttnScalar = try container.decodeIfPresent(Float.self, forKey: ._queryPreAttnScalar)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(slidingWindow, key: .slidingWindow, in: container)
+        try validatePositive(attentionHeads, key: ._attentionHeads, in: container)
+        try validatePositive(kvHeads, key: ._kvHeads, in: container)
+        try validatePositive(headDim, key: ._headDim, in: container)
+        try validatePositive(queryPreAttnScalar, key: ._queryPreAttnScalar, in: container)
+        if let finalLogitSoftcapping {
+            guard finalLogitSoftcapping.isFinite, finalLogitSoftcapping >= 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .finalLogitSoftcapping, in: container,
+                    debugDescription: "Gemma3 text config final_logit_softcapping must be finite and >= 0.")
+            }
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._kvHeads, in: container,
+                debugDescription: "Gemma3 text config num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard hiddenSize == attentionHeads * headDim else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize, in: container,
+                debugDescription: "Gemma3 text config hidden_size must equal num_attention_heads * head_dim.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Gemma3 text config \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Gemma3 text config \(key.rawValue) must be finite and > 0.")
+        }
+    }
 }
 
 // MARK: - Vision Configuration
@@ -90,6 +160,50 @@ public struct Gemma3VisionConfiguration: Codable, Sendable {
         case attentionHeads = "num_attention_heads"
         case patchSize = "patch_size"
         case imageSize = "image_size"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        modelType = try container.decode(String.self, forKey: .modelType)
+        hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+        hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+        patchSize = try container.decode(Int.self, forKey: .patchSize)
+        imageSize = try container.decode(Int.self, forKey: .imageSize)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(patchSize, key: .patchSize, in: container)
+        try validatePositive(imageSize, key: .imageSize, in: container)
+        guard hiddenSize % attentionHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize, in: container,
+                debugDescription: "Gemma3 vision config hidden_size must be divisible by num_attention_heads.")
+        }
+        guard imageSize % patchSize == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .patchSize, in: container,
+                debugDescription: "Gemma3 vision config image_size must be divisible by patch_size.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Gemma3 vision config \(key.rawValue) must be > 0.")
+        }
     }
 }
 
@@ -140,6 +254,52 @@ public struct Gemma3Configuration: Codable, Sendable {
         case _vocabularySize = "vocab_size"
         case _padTokenId = "pad_token_id"
         case _imageTokenId = "image_token_id"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        textConfiguration = try container.decode(Gemma3TextConfiguration.self, forKey: .textConfiguration)
+        visionConfiguration = try container.decode(Gemma3VisionConfiguration.self, forKey: .visionConfiguration)
+        modelType = try container.decode(String.self, forKey: .modelType)
+        mmTokensPerImage = try container.decode(Int.self, forKey: .mmTokensPerImage)
+        quantization = try container.decodeIfPresent(BaseConfiguration.Quantization.self, forKey: .quantization)
+        _vocabularySize = try container.decodeIfPresent(Int.self, forKey: ._vocabularySize)
+        _padTokenId = try container.decodeIfPresent(Int.self, forKey: ._padTokenId)
+        _imageTokenId = try container.decodeIfPresent(Int.self, forKey: ._imageTokenId)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(mmTokensPerImage, key: .mmTokensPerImage, in: container)
+        try validatePositive(vocabularySize, key: ._vocabularySize, in: container)
+        guard padTokenId >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._padTokenId, in: container,
+                debugDescription: "Gemma3 config pad_token_id must be >= 0.")
+        }
+        guard imageTokenId >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._imageTokenId, in: container,
+                debugDescription: "Gemma3 config image_token_id must be >= 0.")
+        }
+        guard imageTokenId < vocabularySize else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._imageTokenId, in: container,
+                debugDescription: "Gemma3 config image_token_id must be less than vocab_size.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Gemma3 config \(key.rawValue) must be > 0.")
+        }
     }
 }
 
@@ -327,22 +487,41 @@ private class GemmaModel: Module {
     }
 
     func callAsFunction(
-        _ inputs: MLXArray? = nil,
-        inputEmbedding: MLXArray? = nil,
+        _ inputs: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: [KVCache?]? = nil
     ) -> MLXArray {
-        var h: MLXArray
-        if let inputEmbedding = inputEmbedding {
-            h = inputEmbedding
-        } else if let inputs = inputs {
-            h = embedTokens(inputs)
-        } else {
-            fatalError("Either inputs or inputEmbedding must be provided")
-        }
+        forward(hiddenStates: embedTokens(inputs), scaleDType: inputs.dtype, mask: mask, cache: cache)
+    }
 
+    func embeddingsForward(
+        _ inputEmbedding: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
+        cache: [KVCache?]? = nil
+    ) -> MLXArray {
+        forward(hiddenStates: inputEmbedding, scaleDType: inputEmbedding.dtype, mask: mask, cache: cache)
+    }
+
+    func embeddingsForward(
+        _ inputEmbedding: MLXArray?,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
+        cache: [KVCache?]? = nil
+    ) throws -> MLXArray {
+        guard let inputEmbedding else {
+            throw VLMError.processing("Gemma3 prepare requires input ids or input embeddings.")
+        }
+        return embeddingsForward(inputEmbedding, mask: mask, cache: cache)
+    }
+
+    private func forward(
+        hiddenStates: MLXArray,
+        scaleDType: DType,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
+        cache: [KVCache?]? = nil
+    ) -> MLXArray {
+        var h = hiddenStates
         // Apply embedding scaling
-        let scale = MLXArray(sqrtf(Float(config.hiddenSize)), dtype: inputs?.dtype ?? h.dtype)
+        let scale = MLXArray(sqrtf(Float(config.hiddenSize)), dtype: scaleDType)
         h = h * scale
 
         var layerCache = cache
@@ -400,14 +579,36 @@ private class LanguageModel: Module, KVCacheDimensionProvider {
     }
 
     func callAsFunction(
-        _ inputs: MLXArray? = nil,
+        _ inputs: MLXArray,
         cache: [KVCache]? = nil,
-        inputEmbedding: MLXArray? = nil,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil
     ) -> LMOutput {
         let optionalCache = cache?.map { $0 as KVCache? }
-        let out = model(inputs, inputEmbedding: inputEmbedding, mask: mask, cache: optionalCache)
+        let out = model(inputs, mask: mask, cache: optionalCache)
+        return logits(from: out)
+    }
 
+    func embeddingsForward(
+        _ inputEmbedding: MLXArray,
+        cache: [KVCache]? = nil,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil
+    ) -> LMOutput {
+        let optionalCache = cache?.map { $0 as KVCache? }
+        let out = model.embeddingsForward(inputEmbedding, mask: mask, cache: optionalCache)
+        return logits(from: out)
+    }
+
+    func embeddingsForward(
+        _ inputEmbedding: MLXArray?,
+        cache: [KVCache]? = nil,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil
+    ) throws -> LMOutput {
+        let optionalCache = cache?.map { $0 as KVCache? }
+        let out = try model.embeddingsForward(inputEmbedding, mask: mask, cache: optionalCache)
+        return logits(from: out)
+    }
+
+    private func logits(from out: MLXArray) -> LMOutput {
         // Call the lmHead (works whether it's Linear or QuantizedLinear)
         var finalLogits: MLXArray
         if let linear = lmHead as? Linear {
@@ -503,10 +704,6 @@ private class VisionAttention: Module {
         valueOutputDimensions: Int? = nil,
         bias: Bool = true
     ) {
-        if dimensions % numHeads != 0 {
-            fatalError("The input feature dimensions should be divisible by the number of heads")
-        }
-
         self.numHeads = numHeads
         let headDim = dimensions / numHeads
         self.scale = pow(Float(headDim), -0.5)
@@ -920,15 +1117,15 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     private func getInputEmbeddings(
-        inputIds: MLXArray? = nil,
+        inputIds: MLXArray,
         pixelValues: MLXArray? = nil,
         mask: MLXArray? = nil
     ) throws -> (MLXArray, MLXArray?) {
         guard let pixelValues else {
-            return (languageModel.model.embedTokens(inputIds!), nil)
+            return (languageModel.model.embedTokens(inputIds), nil)
         }
 
-        let inputsEmbeds = languageModel.model.embedTokens(inputIds!)
+        let inputsEmbeds = languageModel.model.embedTokens(inputIds)
 
         // Process image through vision tower
         let processedPixels = pixelValues.transposed(0, 2, 3, 1).asType(inputsEmbeds.dtype)
@@ -943,7 +1140,7 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
         let (finalEmbedding, finalAttentionMask4d) = try prepareInputsForMultimodal(
             imageFeatures: imageFeatures,
             inputsEmbeds: inputsEmbeds,
-            inputIds: inputIds!,
+            inputIds: inputIds,
             attentionMask: mask
         )
 
@@ -1010,7 +1207,7 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
             // Text-only input
             let convertedCache = cache.compactMap { $0 as KVCache }
             let result = languageModel(
-                input.text.tokens, cache: convertedCache, inputEmbedding: nil, mask: nil)
+                input.text.tokens, cache: convertedCache, mask: nil)
             return .logits(result)
         }
 
@@ -1033,12 +1230,7 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
             cache: convertedCache,
             prefillStepSize: windowSize ?? 512
         ) { chunk in
-            languageModel(
-                nil,  // Pass nil for tokens when using embeddings
-                cache: convertedCache,
-                inputEmbedding: chunk,
-                mask: maskMode
-            )
+            languageModel.embeddingsForward(chunk, cache: convertedCache, mask: maskMode)
         }
 
         return .logits(result)
@@ -1207,6 +1399,79 @@ public struct Gemma3ProcessorConfiguration: Codable, Sendable {
         case panAndScanMaxNumCrops = "pan_and_scan_max_num_crops"
         case panAndScanMinCropSize = "pan_and_scan_min_crop_size"
         case panAndScanMinRatioToActivate = "pan_and_scan_min_ratio_to_activate"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        processorClass = try container.decode(String.self, forKey: .processorClass)
+        imageProcessorType = try container.decode(String.self, forKey: .imageProcessorType)
+        doNormalize = try container.decode(Bool.self, forKey: .doNormalize)
+        doRescale = try container.decode(Bool.self, forKey: .doRescale)
+        doResize = try container.decode(Bool.self, forKey: .doResize)
+        doConvertRgb = try container.decodeIfPresent(Bool.self, forKey: .doConvertRgb)
+        doPanAndScan = try container.decodeIfPresent(Bool.self, forKey: .doPanAndScan)
+        imageMean = try container.decode([CGFloat].self, forKey: .imageMean)
+        imageStd = try container.decode([CGFloat].self, forKey: .imageStd)
+        imageSeqLength = try container.decode(Int.self, forKey: .imageSeqLength)
+        resample = try container.decode(Int.self, forKey: .resample)
+        rescaleFactor = try container.decode(Float.self, forKey: .rescaleFactor)
+        size = try container.decode(ImageSize.self, forKey: .size)
+        panAndScanMaxNumCrops = try container.decodeIfPresent(Int.self, forKey: .panAndScanMaxNumCrops)
+        panAndScanMinCropSize = try container.decodeIfPresent(Int.self, forKey: .panAndScanMinCropSize)
+        panAndScanMinRatioToActivate = try container.decodeIfPresent(
+            Float.self, forKey: .panAndScanMinRatioToActivate)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validateRGBTuple(imageMean, key: .imageMean, in: container)
+        try validateRGBTuple(imageStd, key: .imageStd, in: container)
+        try validatePositive(imageSeqLength, key: .imageSeqLength, in: container)
+        guard rescaleFactor.isFinite, rescaleFactor > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .rescaleFactor, in: container,
+                debugDescription: "Gemma3 processor config rescale_factor must be finite and > 0.")
+        }
+        try validatePositive(size.height, key: .size, in: container)
+        try validatePositive(size.width, key: .size, in: container)
+        if let panAndScanMaxNumCrops {
+            try validatePositive(panAndScanMaxNumCrops, key: .panAndScanMaxNumCrops, in: container)
+        }
+        if let panAndScanMinCropSize {
+            try validatePositive(panAndScanMinCropSize, key: .panAndScanMinCropSize, in: container)
+        }
+        if let panAndScanMinRatioToActivate {
+            guard panAndScanMinRatioToActivate.isFinite, panAndScanMinRatioToActivate > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .panAndScanMinRatioToActivate, in: container,
+                    debugDescription: "Gemma3 processor config pan_and_scan_min_ratio_to_activate must be finite and > 0.")
+            }
+        }
+    }
+
+    private func validateRGBTuple(
+        _ values: [CGFloat],
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard values.count == 3 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Gemma3 processor config \(key.rawValue) must contain exactly 3 RGB values.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Gemma3 processor config \(key.rawValue) must be > 0.")
+        }
     }
 }
 

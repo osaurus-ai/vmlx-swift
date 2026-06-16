@@ -20,10 +20,6 @@ private enum Vision {
         @ModuleInfo(key: "out_proj") var outProj: Linear
 
         init(dims: Int, numHeads: Int, bias: Bool = true) {
-            precondition(
-                dims % numHeads == 0,
-                "The input feature dimensions should be divisible by the number of heads")
-
             self.numHeads = numHeads
             let headDim = dims / numHeads
             self.scale = pow(Float(headDim), -0.5)
@@ -497,8 +493,6 @@ private enum Language {
             self.vocabularySize = config.vocabularySize
             self.numHiddenLayers = config.hiddenLayers
 
-            precondition(vocabularySize > 0)
-
             self._embedTokens.wrappedValue = Embedding(
                 embeddingCount: vocabularySize, dimensions: config.hiddenSize)
 
@@ -881,7 +875,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         pixelValues: MLXArray?,
         spatialShapes: MLXArray?,
         pixelAttentionMask: MLXArray?
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         // Ensure inputIds has batch dimension
         var batchedInputIds = inputIds
         if inputIds.ndim == 1 {
@@ -939,7 +933,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         let concatenatedImageFeatures = concatenated(imageFeatures, axis: 0)
 
         // Merge image features with text embeddings
-        return mergeInputIdsWithImageFeatures(
+        return try mergeInputIdsWithImageFeatures(
             imageFeatures: concatenatedImageFeatures,
             inputsEmbeds: inputsEmbeds,
             inputIds: inputIds,
@@ -952,7 +946,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         inputsEmbeds: MLXArray,
         inputIds: MLXArray,
         imageTokenIndex: Int
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         // Find image token positions
         var imageIndices = [Int]()
         for (i, v) in inputIds.flattened().asArray(Int.self).enumerated() {
@@ -963,7 +957,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
 
         let nImageFeatures = imageFeatures.dim(0)
         if imageIndices.count != nImageFeatures {
-            fatalError(
+            throw VLMError.processing(
                 "Image features and image tokens do not match: tokens: \(imageIndices.count), features \(nImageFeatures)"
             )
         }
@@ -1033,7 +1027,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
             pixelAttentionMask = MLXArray.ones([1, numPatches]).asType(.int32)
         }
 
-        let inputEmbeddings = getInputEmbeddings(
+        let inputEmbeddings = try getInputEmbeddings(
             inputIds: input.text.tokens,
             pixelValues: pixelValues,
             spatialShapes: spatialShapes,
@@ -1170,6 +1164,93 @@ public struct LFM2VLConfiguration: Codable, Sendable {
             case layerTypes = "layer_types"
             case _ropeTheta = "rope_theta"
         }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            modelType = try container.decode(String.self, forKey: .modelType)
+            hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+            hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+            attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+            kvHeads = try container.decode(Int.self, forKey: .kvHeads)
+            vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+            _normEps = try container.decodeIfPresent(Float.self, forKey: ._normEps)
+            _convBias = try container.decodeIfPresent(Bool.self, forKey: ._convBias)
+            _convLCache = try container.decodeIfPresent(Int.self, forKey: ._convLCache)
+            _blockDim = try container.decodeIfPresent(Int.self, forKey: ._blockDim)
+            _blockFFDim = try container.decodeIfPresent(Int.self, forKey: ._blockFFDim)
+            _blockMultipleOf = try container.decodeIfPresent(Int.self, forKey: ._blockMultipleOf)
+            _blockFFNDimMultiplier = try container.decodeIfPresent(Float.self, forKey: ._blockFFNDimMultiplier)
+            _blockAutoAdjustFFDim = try container.decodeIfPresent(Bool.self, forKey: ._blockAutoAdjustFFDim)
+            _fullAttnIdxs = try container.decodeIfPresent([Int].self, forKey: ._fullAttnIdxs)
+            layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes)
+            _ropeTheta = try container.decodeIfPresent(Float.self, forKey: ._ropeTheta)
+
+            try validateDecodedFields(container: container)
+        }
+
+        private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+            try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+            try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+            try validatePositive(kvHeads, key: .kvHeads, in: container)
+            try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+            try validatePositive(normEps, key: ._normEps, in: container)
+            try validatePositive(convLCache, key: ._convLCache, in: container)
+            try validatePositive(blockDim, key: ._blockDim, in: container)
+            try validatePositive(blockFFDim, key: ._blockFFDim, in: container)
+            try validatePositive(blockMultipleOf, key: ._blockMultipleOf, in: container)
+            try validatePositive(blockFFNDimMultiplier, key: ._blockFFNDimMultiplier, in: container)
+            try validatePositive(ropeTheta, key: ._ropeTheta, in: container)
+
+            guard hiddenSize % attentionHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize, in: container,
+                    debugDescription: "LFM2-VL text config hidden_size must be divisible by num_attention_heads.")
+            }
+            guard attentionHeads % kvHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .kvHeads, in: container,
+                    debugDescription: "LFM2-VL text config num_attention_heads must be divisible by num_key_value_heads.")
+            }
+            if let layerTypes {
+                guard layerTypes.count == hiddenLayers else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .layerTypes, in: container,
+                        debugDescription: "LFM2-VL text config layer_types count must equal num_hidden_layers.")
+                }
+            }
+            for index in fullAttnIdxs {
+                guard index >= 0 && index < hiddenLayers else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: ._fullAttnIdxs, in: container,
+                        debugDescription: "LFM2-VL text config full_attn_idxs entries must be within num_hidden_layers.")
+                }
+            }
+        }
+
+        private func validatePositive(
+            _ value: Int,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "LFM2-VL text config \(key.rawValue) must be > 0.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Float,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value.isFinite, value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "LFM2-VL text config \(key.rawValue) must be finite and > 0.")
+            }
+        }
     }
 
     public struct VisionConfiguration: Codable, Sendable {
@@ -1200,6 +1281,75 @@ public struct LFM2VLConfiguration: Codable, Sendable {
             case _patchSize = "patch_size"
             case _numPatches = "num_patches"
             case _layerNormEps = "layer_norm_eps"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            modelType = try container.decode(String.self, forKey: .modelType)
+            hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+            intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+            numHiddenLayers = try container.decode(Int.self, forKey: .numHiddenLayers)
+            numAttentionHeads = try container.decode(Int.self, forKey: .numAttentionHeads)
+            _numChannels = try container.decodeIfPresent(Int.self, forKey: ._numChannels)
+            _imageSize = try container.decodeIfPresent(Int.self, forKey: ._imageSize)
+            _patchSize = try container.decodeIfPresent(Int.self, forKey: ._patchSize)
+            _numPatches = try container.decodeIfPresent(Int.self, forKey: ._numPatches)
+            _layerNormEps = try container.decodeIfPresent(Float.self, forKey: ._layerNormEps)
+
+            try validateDecodedFields(container: container)
+        }
+
+        private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+            try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+            try validatePositive(numHiddenLayers, key: .numHiddenLayers, in: container)
+            try validatePositive(numAttentionHeads, key: .numAttentionHeads, in: container)
+            try validatePositive(numChannels, key: ._numChannels, in: container)
+            try validatePositive(imageSize, key: ._imageSize, in: container)
+            try validatePositive(patchSize, key: ._patchSize, in: container)
+            try validatePositive(numPatches, key: ._numPatches, in: container)
+            try validatePositive(layerNormEps, key: ._layerNormEps, in: container)
+
+            guard hiddenSize % numAttentionHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize, in: container,
+                    debugDescription: "LFM2-VL vision config hidden_size must be divisible by num_attention_heads.")
+            }
+            guard imageSize % patchSize == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: ._patchSize, in: container,
+                    debugDescription: "LFM2-VL vision config image_size must be divisible by patch_size.")
+            }
+            let positionSide = Int(sqrt(Double(numPatches)))
+            guard positionSide * positionSide == numPatches else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: ._numPatches, in: container,
+                    debugDescription: "LFM2-VL vision config num_patches must be a square.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Int,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "LFM2-VL vision config \(key.rawValue) must be > 0.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Float,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value.isFinite, value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "LFM2-VL vision config \(key.rawValue) must be finite and > 0.")
+            }
         }
     }
 
@@ -1249,6 +1399,67 @@ public struct LFM2VLConfiguration: Codable, Sendable {
         case _minTiles = "min_tiles"
         case _useThumbnail = "use_thumbnail"
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        textConfiguration = try container.decode(TextConfiguration.self, forKey: .textConfiguration)
+        visionConfiguration = try container.decode(VisionConfiguration.self, forKey: .visionConfiguration)
+        modelType = try container.decode(String.self, forKey: .modelType)
+        _downsampleFactor = try container.decodeIfPresent(Int.self, forKey: ._downsampleFactor)
+        _imageTokenId = try container.decodeIfPresent(Int.self, forKey: ._imageTokenId)
+        _projectorBias = try container.decodeIfPresent(Bool.self, forKey: ._projectorBias)
+        _projectorHiddenSize = try container.decodeIfPresent(Int.self, forKey: ._projectorHiddenSize)
+        _projectorUseLayernorm = try container.decodeIfPresent(Bool.self, forKey: ._projectorUseLayernorm)
+        _visionFeatureLayer = try container.decodeIfPresent(Int.self, forKey: ._visionFeatureLayer)
+        _doImageSplitting = try container.decodeIfPresent(Bool.self, forKey: ._doImageSplitting)
+        _maxImageTokens = try container.decodeIfPresent(Int.self, forKey: ._maxImageTokens)
+        _maxNumPatches = try container.decodeIfPresent(Int.self, forKey: ._maxNumPatches)
+        _minImageTokens = try container.decodeIfPresent(Int.self, forKey: ._minImageTokens)
+        _minTiles = try container.decodeIfPresent(Int.self, forKey: ._minTiles)
+        _useThumbnail = try container.decodeIfPresent(Bool.self, forKey: ._useThumbnail)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(downsampleFactor, key: ._downsampleFactor, in: container)
+        try validatePositive(projectorHiddenSize, key: ._projectorHiddenSize, in: container)
+        try validatePositive(maxImageTokens, key: ._maxImageTokens, in: container)
+        try validatePositive(maxNumPatches, key: ._maxNumPatches, in: container)
+        try validatePositive(minImageTokens, key: ._minImageTokens, in: container)
+        try validatePositive(minTiles, key: ._minTiles, in: container)
+
+        guard imageTokenIndex >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._imageTokenId, in: container,
+                debugDescription: "LFM2-VL config image_token_id must be >= 0.")
+        }
+        guard maxImageTokens >= minImageTokens else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._maxImageTokens, in: container,
+                debugDescription: "LFM2-VL config max_image_tokens must be >= min_image_tokens.")
+        }
+        guard visionFeatureLayer == -1
+                || (visionFeatureLayer >= 0 && visionFeatureLayer < visionConfiguration.numHiddenLayers)
+                || (visionFeatureLayer < -1 && visionConfiguration.numHiddenLayers + visionFeatureLayer >= 0)
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._visionFeatureLayer, in: container,
+                debugDescription: "LFM2-VL config vision_feature_layer is outside vision num_hidden_layers.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "LFM2-VL config \(key.rawValue) must be > 0.")
+        }
+    }
 }
 
 /// Configuration for ``LFM2VLProcessor``
@@ -1287,5 +1498,55 @@ public struct LFM2VLProcessorConfiguration: Codable, Sendable {
         case _encoderPatchSize = "encoder_patch_size"
         case _maxTiles = "max_tiles"
         case _downsampleFactor = "downsample_factor"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        _imageMean = try container.decodeIfPresent([CGFloat].self, forKey: ._imageMean)
+        _imageStd = try container.decodeIfPresent([CGFloat].self, forKey: ._imageStd)
+        _tileSize = try container.decodeIfPresent(Int.self, forKey: ._tileSize)
+        _encoderPatchSize = try container.decodeIfPresent(Int.self, forKey: ._encoderPatchSize)
+        _maxTiles = try container.decodeIfPresent(Int.self, forKey: ._maxTiles)
+        _downsampleFactor = try container.decodeIfPresent(Int.self, forKey: ._downsampleFactor)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validateRGBTuple(imageMean, key: ._imageMean, in: container)
+        try validateRGBTuple(imageStd, key: ._imageStd, in: container)
+        try validatePositive(tileSize, key: ._tileSize, in: container)
+        try validatePositive(encoderPatchSize, key: ._encoderPatchSize, in: container)
+        try validatePositive(maxTiles, key: ._maxTiles, in: container)
+        try validatePositive(downsampleFactor, key: ._downsampleFactor, in: container)
+        guard tileSize % encoderPatchSize == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._encoderPatchSize, in: container,
+                debugDescription: "LFM2-VL processor config tile_size must be divisible by encoder_patch_size.")
+        }
+    }
+
+    private func validateRGBTuple(
+        _ values: [CGFloat],
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard values.count == 3 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "LFM2-VL processor config \(key.rawValue) must contain exactly 3 RGB values.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "LFM2-VL processor config \(key.rawValue) must be > 0.")
+        }
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import CmlxGraphShim
 import MLX
 import MLXHuggingFace
@@ -16,6 +17,226 @@ import MLXVLM
 
 @main
 struct Bench {
+    private final class LiveRunLock {
+        let dir: URL
+        let pidFile: URL
+        private var acquired = false
+
+        init(dir: URL) {
+            self.dir = dir
+            self.pidFile = dir.appendingPathComponent("pid")
+        }
+
+        func acquire() throws {
+            let fm = FileManager.default
+            do {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: false)
+                let payload = "\(getpid())\n\(Date())\n\(CommandLine.arguments.joined(separator: " "))\n"
+                try payload.write(to: pidFile, atomically: true, encoding: .utf8)
+                acquired = true
+                FileHandle.standardError.write(
+                    Data("[vmlx][runbench-lock] acquired \(dir.path)\n".utf8))
+            } catch {
+                if isStaleLock() {
+                    try? fm.removeItem(at: dir)
+                    try fm.createDirectory(at: dir, withIntermediateDirectories: false)
+                    let payload = "\(getpid())\n\(Date())\n\(CommandLine.arguments.joined(separator: " "))\n"
+                    try payload.write(to: pidFile, atomically: true, encoding: .utf8)
+                    acquired = true
+                    FileHandle.standardError.write(
+                        Data("[vmlx][runbench-lock] removed stale lock and acquired \(dir.path)\n".utf8))
+                    return
+                }
+                let owner = (try? String(contentsOf: pidFile, encoding: .utf8))
+                    ?? "unknown owner"
+                throw NSError(
+                    domain: "RunBench.LiveRunLock",
+                    code: 75,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "another RunBench live row is active; refusing to start a concurrent model load. lock=\(dir.path) owner=\(owner)",
+                    ])
+            }
+        }
+
+        func release() {
+            guard acquired else { return }
+            guard ownerPID() == getpid() else {
+                acquired = false
+                return
+            }
+            try? FileManager.default.removeItem(at: dir)
+            acquired = false
+            FileHandle.standardError.write(
+                Data("[vmlx][runbench-lock] released \(dir.path)\n".utf8))
+        }
+
+        private func isStaleLock() -> Bool {
+            guard let pid = ownerPID() else { return false }
+            if kill(pid, 0) == 0 {
+                return false
+            }
+            return errno == ESRCH
+        }
+
+        private func ownerPID() -> pid_t? {
+            guard let text = try? String(contentsOf: pidFile, encoding: .utf8),
+                  let first = text.split(separator: "\n").first,
+                  let pid = pid_t(first.trimmingCharacters(in: .whitespacesAndNewlines))
+            else {
+                return nil
+            }
+            return pid
+        }
+    }
+
+    private nonisolated(unsafe) static var liveRunLockForExit: LiveRunLock?
+    private nonisolated(unsafe) static var didRegisterLiveRunLockAtexit = false
+
+    private static func acquireLiveRunLock(environment env: [String: String]) throws -> LiveRunLock? {
+        guard env["VMLINUX_RUNBENCH_LOCK"] != "0",
+              env["VMLX_RUNBENCH_LOCK"] != "0"
+        else { return nil }
+        let path = env["VMLINUX_RUNBENCH_LOCK_DIR"]
+            ?? env["VMLX_RUNBENCH_LOCK_DIR"]
+            ?? "/tmp/vmlx-runbench-live.lock"
+        let lock = LiveRunLock(dir: URL(fileURLWithPath: path))
+        try lock.acquire()
+        return lock
+    }
+
+    private static func installLiveRunLockAtexit(_ lock: LiveRunLock?) {
+        guard let lock else { return }
+        liveRunLockForExit = lock
+        guard !didRegisterLiveRunLockAtexit else { return }
+        didRegisterLiveRunLockAtexit = true
+        atexit {
+            Bench.liveRunLockForExit?.release()
+            Bench.liveRunLockForExit = nil
+        }
+    }
+
+    private static func releaseLiveRunLock(_ lock: LiveRunLock?) {
+        lock?.release()
+        if let lock, liveRunLockForExit === lock {
+            liveRunLockForExit = nil
+        }
+    }
+
+    private static func runDiskCacheMetalStress(environment env: [String: String]) throws {
+        let workers = max(1, Int(env["BENCH_DISK_CACHE_WORKERS"] ?? "6") ?? 6)
+        let iterations = max(1, Int(env["BENCH_DISK_CACHE_ITERS"] ?? "160") ?? 160)
+        let edge = max(8, Int(env["BENCH_DISK_CACHE_EDGE"] ?? "64") ?? 64)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-disk-cache-metal-stress-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let keepArtifacts = env["BENCH_DISK_CACHE_KEEP"] == "1"
+        defer {
+            if !keepArtifacts {
+                try? FileManager.default.removeItem(at: root)
+            }
+        }
+
+        print("\n=== BENCH_DISK_CACHE_STRESS: MLX safetensors IO concurrency ===")
+        print("root=\(root.path) workers=\(workers) iterations=\(iterations) edge=\(edge)")
+
+        let caches: [DiskCache] = (0..<workers).map { worker in
+            DiskCache(
+                cacheDir: root.appendingPathComponent("cache-\(worker)"),
+                maxSizeGB: 1.0,
+                modelKey: "sentry-cache-store-worker-\(worker)")
+        }
+
+        let payload: @Sendable (Int, Int) -> [String: MLXArray] = { seed, tokenCount in
+            let count = edge * edge
+            let base = MLXArray(Array(repeating: Float(seed), count: count))
+                .reshaped([edge, edge])
+            let offset = MLXArray(Array(repeating: Float(tokenCount), count: count))
+                .reshaped([edge, edge])
+            return [
+                "layer_0_keys": base + offset,
+                "layer_0_values": base * 0.5 + offset,
+            ]
+        }
+
+        let seedTokens: [[Int]] = (0..<workers).map { worker in
+            (0..<16).map { worker * 10_000 + $0 }
+        }
+
+        print("preseed begin")
+        for worker in 0..<workers {
+            caches[worker].store(
+                tokens: seedTokens[worker],
+                arrays: payload(worker + 1, seedTokens[worker].count))
+        }
+        Stream.gpu.synchronize()
+        print("preseed complete")
+
+        var failures: [String] = []
+        let started = CFAbsoluteTimeGetCurrent()
+
+        DispatchQueue.concurrentPerform(iterations: iterations) { op in
+            let worker = op % workers
+            let cache = caches[worker]
+            let action = op % 5
+            let tokens = (0..<16).map { worker * 10_000 + op * 32 + $0 }
+
+            switch action {
+            case 0, 3:
+                cache.store(
+                    tokens: tokens,
+                    arrays: payload(op + worker + 10, tokens.count))
+            case 1:
+                _ = cache.fetch(tokens: seedTokens[worker])
+            case 2:
+                _ = cache.fetch(tokens: tokens)
+            default:
+                if op % max(workers * 8, 1) == 0 {
+                    cache.clear()
+                    cache.store(
+                        tokens: seedTokens[worker],
+                        arrays: payload(worker + 2_000, seedTokens[worker].count))
+                } else {
+                    _ = cache.snapshotStats()
+                }
+            }
+
+            if op % max(iterations / 8, 1) == 0 {
+                Stream.gpu.synchronize()
+            }
+        }
+
+        Stream.gpu.synchronize()
+        let elapsed = CFAbsoluteTimeGetCurrent() - started
+
+        for worker in 0..<workers {
+            caches[worker].store(
+                tokens: seedTokens[worker],
+                arrays: payload(worker + 3_000, seedTokens[worker].count))
+            guard caches[worker].fetch(tokens: seedTokens[worker]) != nil else {
+                failures.append("worker \(worker) final seed fetch missed")
+                continue
+            }
+        }
+        Stream.gpu.synchronize()
+
+        let stats = caches.enumerated().map { index, cache in
+            let s = cache.snapshotStats()
+            return "cache\(index){stores=\(s.stores),hits=\(s.hits),misses=\(s.misses)}"
+        }.joined(separator: " ")
+        print(String(format: "stress wall %.2fs", elapsed))
+        print("stats \(stats)")
+        if keepArtifacts {
+            print("kept artifacts at \(root.path)")
+        }
+
+        if !failures.isEmpty {
+            fputs("BENCH_DISK_CACHE_STRESS failed:\n\(failures.joined(separator: "\n"))\n", stderr)
+            exit(1)
+        }
+        print("=== BENCH_DISK_CACHE_STRESS: passed ===")
+    }
+
     private static func homePath(_ relativePath: String) -> String {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(relativePath)
@@ -33,10 +254,26 @@ struct Bench {
     static func main() async throws {
         setvbuf(stdout, nil, _IONBF, 0)
         FileHandle.standardError.write("[STDERR] Bench main() started\n".data(using: .utf8)!)
+        let env = ProcessInfo.processInfo.environment
+        let liveRunLock: LiveRunLock?
+        do {
+            liveRunLock = try acquireLiveRunLock(environment: env)
+        } catch {
+            let nsError = error as NSError
+            fputs("RunBench.LiveRunLock: \(nsError.localizedDescription)\n", stderr)
+            let code = nsError.domain == "RunBench.LiveRunLock" ? nsError.code : 1
+            exit(Int32(code))
+        }
+        installLiveRunLockAtexit(liveRunLock)
+        defer { releaseLiveRunLock(liveRunLock) }
+
+        if (env["BENCH_DISK_CACHE_STRESS"] ?? "0") == "1" {
+            try runDiskCacheMetalStress(environment: env)
+            return
+        }
 
         // Model path and tokens file are configurable via env vars so a single
         // executable serves any model. Defaults preserve historical Qwen3.5 behavior.
-        let env = ProcessInfo.processInfo.environment
         let modelPath = env["BENCH_MODEL"] ?? homePath("models/Qwen3.5-35B-A3B-4bit")
         let tokensPath = env["BENCH_TOKENS"] ?? "/tmp/qwen35_multiturn_tokens.json"
         let maxNew = Int(env["BENCH_MAX_TOKENS"] ?? "256") ?? 256
@@ -289,8 +526,9 @@ struct Bench {
         }
 
         // BENCH_DSV4_AGENTIC_TOOL=1: DSV4-specific structured tool row.
-        // It proves DSML parser/tool autodetection, bundle-derived sampler
-        // defaults, multi-turn tool history, and L2 disk cache reuse.
+        // It proves the DSML parser emits `.toolCall`, then feeds the
+        // assistant tool-call message plus tool result back through
+        // UserInput(chat:) and validates a coherent follow-up answer.
         if (env["BENCH_DSV4_AGENTIC_TOOL"] ?? "0") == "1" {
             try await runDSV4AgenticToolCheck(modelPath: modelPath, maxNew: maxNew)
             return
@@ -360,12 +598,11 @@ struct Bench {
             return
         }
 
-        // BENCH_QWEN_MULTITURN_TOOL=1: mirrors tpae's 2026-04-20 3:02 /
-        // 3:04 PM screenshots — Qwen3.6, first turn asks "create README
-        // for my game", turn 2 pretends a file_read tool returned game
-        // source, turn 3 asks for a second tool. Asserts ZERO <think>
-        // markers in `.chunk` across all 3 turns — the EXACT bug tpae
-        // screenshotted.
+        // BENCH_QWEN_MULTITURN_TOOL=1: Qwen3.x multi-surface parser check.
+        // Exercises thinking-on visible output, thinking-off structured tool
+        // calls with a real schema, and a thinking-off follow-up. Asserts
+        // ZERO <think> markers in `.chunk`; empty visible output is accepted
+        // only for turns that emit structured tool calls.
         if (env["BENCH_QWEN_MULTITURN_TOOL"] ?? "0") == "1" {
             try await runQwenMultiturnToolCheck(
                 modelPath: modelPath, maxNew: maxNew)
@@ -396,11 +633,12 @@ struct Bench {
 
         // BENCH_JPREG=1 (2026-05-03): per-bundle regression sweep that
         // exercises the new typed `LoadConfiguration` path end-to-end.
-        // Loads with `LoadConfiguration.default` (auto JangPress + 70%
-        // resident cap), runs 3-turn coherency, samples RSS at four
-        // checkpoints, verifies the JangPress controller advances past
-        // .armed during a 6s quiesce window, plus hybrid-SSM warm-pass
-        // and TurboQuant disk round-trip checks where applicable.
+        // Loads with `LoadConfiguration.default` (JangPress disabled,
+        // 70% memory caps, mmap safetensors), runs 3-turn coherency,
+        // samples RSS at four checkpoints, reports MLXPress/JangPress
+        // status, plus hybrid-SSM warm-pass and TurboQuant disk
+        // round-trip checks where applicable. Set BENCH_JPREG_FORCE=1
+        // for the explicit low-footprint MLXPress/JangPress diagnostic.
         // Designed to be invoked once per bundle from a shell loop so
         // each model gets a fresh process.
         if (env["BENCH_JPREG"] ?? "0") == "1" {
@@ -1162,7 +1400,10 @@ func runBatchEngineToolCall(modelPath: String, maxNew: Int) async throws {
     print("Reasoning stamp: \(context.configuration.reasoningParserName ?? "nil")")
 
     nonisolated(unsafe) let ctx = context
-    let engine = BatchEngine(context: ctx, maxBatchSize: 1)
+    let maxBatchSize =
+        Int(ProcessInfo.processInfo.environment["BENCH_BATCH_TOOLCALL_MAX_BATCH"] ?? "") ?? 1
+    let engine = BatchEngine(context: ctx, maxBatchSize: maxBatchSize)
+    print("BatchEngine maxBatchSize: \(maxBatchSize)")
 
     let weatherParams: [String: any Sendable] = [
         "type": "object",
@@ -1192,7 +1433,18 @@ func runBatchEngineToolCall(modelPath: String, maxNew: Int) async throws {
     var params = GenerateParameters(
         generationConfig: ctx.configuration.generationDefaults,
         fallback: fallbackParams)
+    params.randomSeed = ProcessInfo.processInfo.environment["BENCH_BATCH_TOOLCALL_SEED"]
+        .flatMap(UInt64.init)
     params.enableCompiledBatchDecode = false
+    print(String(format:
+        "Sampling: maxTokens=%d temp=%.3f topP=%.3f topK=%d minP=%.3f rep=%@ seed=%@",
+        params.maxTokens ?? -1,
+        Double(params.temperature),
+        Double(params.topP),
+        params.topK,
+        Double(params.minP),
+        params.repetitionPenalty.map { String(format: "%.3f", Double($0)) } ?? "nil",
+        params.randomSeed.map(String.init) ?? "nil"))
 
     let input = try await ctx.processor.prepare(input: UserInput(
         prompt: prompt,
@@ -3959,10 +4211,13 @@ func runConfigSmoke(modelPath: String) async throws {
     let attnListCount = (config["attn_type_list"] as? [Any])?.count
 
     let configEOS = jsonInts(config["eos_token_id"])
+    let textConfigEOS = jsonInts(jsonAt(config, ["text_config", "eos_token_id"]))
     let generationEOS = jsonInts(generationConfig?["eos_token_id"])
     let configBOS = jsonInts(config["bos_token_id"])
     let generationBOS = jsonInts(generationConfig?["bos_token_id"])
-    var effectiveEOS = generationEOS.isEmpty ? configEOS : generationEOS
+    var effectiveEOS = generationEOS.isEmpty
+        ? (configEOS.isEmpty ? textConfigEOS : configEOS)
+        : generationEOS
     if modelType == "deepseek_v4" {
         effectiveEOS = Array(Set(effectiveEOS).union([1, 128803, 128804])).sorted()
     }
@@ -4032,7 +4287,7 @@ func runConfigSmoke(modelPath: String) async throws {
     }
 
     print(
-        "CONFIG_SMOKE status=\(failures.isEmpty ? "PASS" : "FAIL") modelType=\(modelType) dispatch=\(dispatchHint) layers=\(layers.map(String.init) ?? "nil") hidden=\(hidden.map(String.init) ?? "nil") heads=\(heads.map(String.init) ?? "nil") kvHeads=\(kvHeads.map(String.init) ?? "nil") attnList=\(attnListCount.map(String.init) ?? "nil") weightFormat=\(weightFormat) profile=\(profile) sidecar=\(sidecarExists) tqPacked=\(tqPackedCount) tqNorms=\(tqNormsCount) tqBits=\(tqBitsCount) routedBits=\(routed.description) eosConfig=\(configEOS) eosGen=\(generationEOS) eosEffective=\(effectiveEOS) tokenizerEOS=\(tokenizerEOS.map(String.init) ?? "nil") tokenizerEOSCovered=\(tokenizerEOSCovered) bosConfig=\(configBOS) bosGen=\(generationBOS) bosEffective=\(effectiveBOS) tokenizerBOS=\(tokenizerBOS.map(String.init) ?? "nil") tokenizerBOSCovered=\(tokenizerBOSCovered) bosInEOS=\(bosInEOS)"
+        "CONFIG_SMOKE status=\(failures.isEmpty ? "PASS" : "FAIL") modelType=\(modelType) dispatch=\(dispatchHint) layers=\(layers.map(String.init) ?? "nil") hidden=\(hidden.map(String.init) ?? "nil") heads=\(heads.map(String.init) ?? "nil") kvHeads=\(kvHeads.map(String.init) ?? "nil") attnList=\(attnListCount.map(String.init) ?? "nil") weightFormat=\(weightFormat) profile=\(profile) sidecar=\(sidecarExists) tqPacked=\(tqPackedCount) tqNorms=\(tqNormsCount) tqBits=\(tqBitsCount) routedBits=\(routed.description) eosConfig=\(configEOS) eosTextConfig=\(textConfigEOS) eosGen=\(generationEOS) eosEffective=\(effectiveEOS) tokenizerEOS=\(tokenizerEOS.map(String.init) ?? "nil") tokenizerEOSCovered=\(tokenizerEOSCovered) bosConfig=\(configBOS) bosGen=\(generationBOS) bosEffective=\(effectiveBOS) tokenizerBOS=\(tokenizerBOS.map(String.init) ?? "nil") tokenizerBOSCovered=\(tokenizerBOSCovered) bosInEOS=\(bosInEOS)"
     )
     if !warnings.isEmpty {
         print("CONFIG_SMOKE warnings=\(warnings)")
@@ -4709,7 +4964,7 @@ func runTemplateSmoke(modelPath: String) async throws {
     let (tokenizer, tokenizerDir) = try await loadBenchTokenizer(from: modelDir)
     print("Tokenizer dir: \(tokenizerDir.path)")
     print("Tokenizer: bos=\(tokenizer.bosToken ?? "nil") eos=\(tokenizer.eosToken ?? "nil")")
-    let directTemplate: Template? = {
+    let directTemplateInfo: (template: Template, sourceMentionsTools: Bool)? = {
         let candidate = tokenizerDir.appendingPathComponent("chat_template.jinja")
         let source: String?
         if let fileSource = try? String(contentsOf: candidate, encoding: .utf8) {
@@ -4725,7 +4980,15 @@ func runTemplateSmoke(modelPath: String) async throws {
             }
         }
         guard let source else { return nil }
-        return try? Template(source, with: .init(lstripBlocks: true, trimBlocks: true))
+        guard let template = try? Template(source, with: .init(lstripBlocks: true, trimBlocks: true)) else {
+            return nil
+        }
+        let lowerSource = source.lowercased()
+        let sourceMentionsTools = lowerSource.contains("tools")
+            || lowerSource.contains("tool_call")
+            || lowerSource.contains("function_call")
+            || lowerSource.contains("start_function_call")
+        return (template, sourceMentionsTools)
     }()
 
     let plainMessages: [[String: any Sendable]] = [
@@ -4863,7 +5126,8 @@ func runTemplateSmoke(modelPath: String) async throws {
             let renderMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
             let text = tokenizer.decode(tokenIds: ids, skipSpecialTokens: false)
             var directProfile = "direct=unavailable"
-            if let directTemplate {
+            let nativeTemplateMentionsTools = directTemplateInfo?.sourceMentionsTools
+            if let directTemplateInfo {
                 var rawContext: [String: Any] = [
                     "messages": testCase.messages,
                     "add_generation_prompt": true,
@@ -4890,7 +5154,7 @@ func runTemplateSmoke(modelPath: String) async throws {
                 }
                 let valueMs = Int((CFAbsoluteTimeGetCurrent() - valueStart) * 1000)
                 let directRenderStart = CFAbsoluteTimeGetCurrent()
-                let rendered = try directTemplate.render(jinjaValues)
+                let rendered = try directTemplateInfo.template.render(jinjaValues)
                 let directRenderMs = Int((CFAbsoluteTimeGetCurrent() - directRenderStart) * 1000)
                 let encodeStart = CFAbsoluteTimeGetCurrent()
                 let directIds = tokenizer.encode(text: rendered, addSpecialTokens: false)
@@ -4910,16 +5174,22 @@ func runTemplateSmoke(modelPath: String) async throws {
                 || text.contains("get_weather")
                 || text.contains("get_time")
                 || text.contains("osaurus_probe_tool_0")
-            let ok = !ids.isEmpty && !text.isEmpty && !hasJinjaLeak && toolMention
+            let toolsUnsupportedByNativeTemplate = testCase.tools != nil
+                && nativeTemplateMentionsTools == false
+                && !toolMention
+            let ok = !ids.isEmpty
+                && !text.isEmpty
+                && !hasJinjaLeak
+                && (toolMention || toolsUnsupportedByNativeTemplate)
             print(
-                "TEMPLATE_SMOKE label=\(testCase.label) status=\(ok ? "PASS" : "FAIL") ms=\(renderMs) \(directProfile) ids=\(ids.count) chars=\(text.count) tools=\(testCase.tools?.count ?? 0) thinkOpen=\(hasThinkOpen) thinkClose=\(hasThinkClose) toolMention=\(toolMention) tail=\"\(clippedTail(text))\""
+                "TEMPLATE_SMOKE label=\(testCase.label) status=\(ok ? (toolsUnsupportedByNativeTemplate ? "UNSUPPORTED" : "PASS") : "FAIL") ms=\(renderMs) \(directProfile) ids=\(ids.count) chars=\(text.count) tools=\(testCase.tools?.count ?? 0) nativeTemplateMentionsTools=\(nativeTemplateMentionsTools.map(String.init(describing:)) ?? "unknown") thinkOpen=\(hasThinkOpen) thinkClose=\(hasThinkClose) toolMention=\(toolMention) tail=\"\(clippedTail(text))\""
             )
             if !ok {
                 var reasons: [String] = []
                 if ids.isEmpty { reasons.append("empty ids") }
                 if text.isEmpty { reasons.append("empty decode") }
                 if hasJinjaLeak { reasons.append("raw Jinja leaked") }
-                if !toolMention { reasons.append("tool schema/name missing") }
+                if !toolMention { reasons.append("tool schema/name missing despite native tool-capable template") }
                 failures.append("\(testCase.label): \(reasons.joined(separator: ", "))")
             }
         } catch {
@@ -5373,14 +5643,15 @@ func runLagunaLoopProbe(modelPath: String, maxNew: Int) async throws {
     let maxTokens = max(maxNew, 512)
     let temperature = Float(env["LAGUNA_TEMP"] ?? "0") ?? 0
     let topP = Float(env["LAGUNA_TOP_P"] ?? "1.0") ?? 1.0
-    let rep = Float(env["LAGUNA_REP"] ?? "1.15") ?? 1.15
+    let rep = env["LAGUNA_REP"].flatMap(Float.init)
     let repCtx = Int(env["LAGUNA_REP_CTX"] ?? "256") ?? 256
 
     print("\n=== BENCH_LAGUNA_LOOP: Osaurus Laguna no-thinking loop probe ===")
     print("Model: \(modelDir.path)")
     print(String(format:
-        "Params: maxTokens=%d temp=%.2f topP=%.2f rep=%.2f repCtx=%d",
-        maxTokens, Double(temperature), Double(topP), Double(rep), repCtx))
+        "Params: maxTokens=%d temp=%.2f topP=%.2f rep=%@ repCtx=%d",
+        maxTokens, Double(temperature), Double(topP),
+        rep.map { String(format: "%.2f", Double($0)) } ?? "nil", repCtx))
 
     let loadStart = CFAbsoluteTimeGetCurrent()
     let context = try await MLXLMCommon.loadModel(
@@ -5494,10 +5765,13 @@ func runLagunaLoopProbe(modelPath: String, maxNew: Int) async throws {
     await engine.shutdown()
 
     func printResult(_ r: ProbeResult) {
-        let visible = r.text.isEmpty ? r.reasoning : r.text
-        let preview = visible.count > 500
-            ? String(visible.prefix(500)) + "..."
+        let visible = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let previewSource = visible.isEmpty
+            ? "[empty visible; reasoning chars=\(r.reasoning.count)]"
             : visible
+        let preview = previewSource.count > 500
+            ? String(previewSource.prefix(500)) + "..."
+            : previewSource
         print(String(format:
             "\n[%@] finish=%@ total=%.2fs apiGen=%.2fs genTok=%d wallTokps=%.1f infoTokps=%.1f chunks=%d reasoningDeltas=%d text=%d reasoning=%d loop=%@ unclosedReasoning=%@ leaks=%@",
             r.thinking ? "thinking=ON" : "thinking=OFF",
@@ -5794,7 +6068,9 @@ func runNoGuardSamplingProbe(modelPath: String, maxNew: Int) async throws {
         for c in cases {
             let r = try await run(c)
             let visible = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let display = visible.isEmpty ? r.reasoning : visible
+            let display = visible.isEmpty
+                ? "[empty visible; reasoning chars=\(r.reasoning.count)]"
+                : visible
             let combined = r.text + "\n" + r.reasoning
             let loop = lagunaLoopHeuristic(combined)
             let leaks = markerLeaks(in: r.text)
@@ -6124,7 +6400,9 @@ func runReasoningTurnMatrix(modelPath: String, maxNew: Int) async throws {
             stop: stopString(info),
             unclosedReasoning: info?.unclosedReasoning ?? false)
         let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let previewSource = visible.isEmpty ? reasoning : visible
+        let previewSource = visible.isEmpty
+            ? "[empty visible; reasoning chars=\(reasoning.count)]"
+            : visible
         let preview = String(previewSource.prefix(180))
             .replacingOccurrences(of: "\n", with: "\\n")
         print(String(format:
@@ -6254,14 +6532,21 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
         ?? max(96, maxNew)
     let chatMaxNew = Int(env["BENCH_DSV4_CHAT_MAX_TOKENS"] ?? "\(max(160, maxNew))")
         ?? max(160, maxNew)
-    let reasoningMaxNew = Int(env["BENCH_DSV4_REASONING_MAX_TOKENS"] ?? "384")
-        ?? 384
-    let dsv4Temperature = Float(env["BENCH_DSV4_TEMP"] ?? "0") ?? 0
-    let dsv4TopP = Float(env["BENCH_DSV4_TOP_P"] ?? "0.95") ?? 0.95
+    // DSV4 max-effort prompts need enough budget to close the think_xml block
+    // at bundle-derived sampling defaults; 384 can length-stop before visible
+    // text and create a false coherence failure.
+    let reasoningMaxDefault = max(1024, maxNew)
+    let reasoningMaxNew = Int(env["BENCH_DSV4_REASONING_MAX_TOKENS"] ?? "\(reasoningMaxDefault)")
+        ?? reasoningMaxDefault
+    let dsv4Temperature = env["BENCH_DSV4_TEMP"].flatMap(Float.init)
+    let dsv4TopP = env["BENCH_DSV4_TOP_P"].flatMap(Float.init)
+    let dsv4TopK = env["BENCH_DSV4_TOP_K"].flatMap(Int.init)
+    let dsv4MinP = env["BENCH_DSV4_MIN_P"].flatMap(Float.init)
+    let dsv4Seed = env["BENCH_DSV4_SEED"].flatMap(UInt64.init)
     let dsv4RepetitionPenalty =
-        Float(env["BENCH_DSV4_REPETITION_PENALTY"] ?? "1.0") ?? 1.0
+        env["BENCH_DSV4_REPETITION_PENALTY"].flatMap(Float.init)
     let dsv4MaxRepetitionPenalty =
-        Float(env["BENCH_DSV4_MAX_REPETITION_PENALTY"] ?? "1.05") ?? 1.05
+        env["BENCH_DSV4_MAX_REPETITION_PENALTY"].flatMap(Float.init)
     let dsv4RepetitionContext =
         Int(env["BENCH_DSV4_REPETITION_CONTEXT"] ?? "64") ?? 64
     let useCacheCoordinator =
@@ -6281,6 +6566,18 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
     print("Reasoning stamp: \(context.configuration.reasoningParserName ?? "nil")")
+    if let defaults = context.configuration.generationDefaults {
+        print(String(format:
+            "Generation defaults: temp=%@ topP=%@ topK=%@ minP=%@ rep=%@ doSample=%@",
+            defaults.temperature.map { String(format: "%.3f", Double($0)) } ?? "nil",
+            defaults.topP.map { String(format: "%.3f", Double($0)) } ?? "nil",
+            defaults.topK.map(String.init) ?? "nil",
+            defaults.minP.map { String(format: "%.3f", Double($0)) } ?? "nil",
+            defaults.repetitionPenalty.map { String(format: "%.3f", Double($0)) } ?? "nil",
+            defaults.doSample.map(String.init) ?? "nil"))
+    } else {
+        print("Generation defaults: nil")
+    }
 
     nonisolated(unsafe) let ctx = context
     let engine: BatchEngine
@@ -6364,14 +6661,38 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
 
         let requestedPenalty =
             reasoningEffort == "max" ? dsv4MaxRepetitionPenalty : dsv4RepetitionPenalty
-        var params = GenerateParameters(
+        let fallbackParams = GenerateParameters(
             maxTokens: maxTokens,
-            temperature: dsv4Temperature,
-            topP: dsv4TopP,
-            repetitionPenalty: requestedPenalty == 1.0 ? nil : requestedPenalty,
-            repetitionContextSize: dsv4RepetitionContext,
+            randomSeed: dsv4Seed,
             prefillStepSize: 512)
+        var params = GenerateParameters(
+            generationConfig: ctx.configuration.generationDefaults,
+            fallback: fallbackParams)
+        // The row owns decode budget and any explicit diagnostic overrides.
+        // Sampling defaults otherwise stay bundle-derived.
+        params.maxTokens = maxTokens
+        params.randomSeed = dsv4Seed
+        if let dsv4Temperature { params.temperature = dsv4Temperature }
+        if let dsv4TopP { params.topP = dsv4TopP }
+        if let dsv4TopK { params.topK = dsv4TopK }
+        if let dsv4MinP { params.minP = dsv4MinP }
+        if let requestedPenalty, requestedPenalty != 1.0 {
+            params.repetitionPenalty = requestedPenalty
+            params.repetitionContextSize = dsv4RepetitionContext
+        } else if requestedPenalty == 1.0 {
+            params.repetitionPenalty = nil
+        }
         params.enableCompiledBatchDecode = false
+        print(String(format:
+            "  %@ sampling: maxTokens=%d temp=%.3f topP=%.3f topK=%d minP=%.3f rep=%@ seed=%@",
+            label,
+            params.maxTokens ?? -1,
+            Double(params.temperature),
+            Double(params.topP),
+            params.topK,
+            Double(params.minP),
+            params.repetitionPenalty.map { String(format: "%.3f", Double($0)) } ?? "nil",
+            params.randomSeed.map(String.init) ?? "nil"))
 
         let t0 = CFAbsoluteTimeGetCurrent()
         let stream = await engine.generate(input: sendable, parameters: params)
@@ -7216,9 +7537,17 @@ func runPerfBench(
             context = loaded.0
             jangPressRuntime = loaded.1
         } else {
-            context = try await MLXLMCommon.loadModel(
-                from: modelDir, using: #huggingFaceTokenizerLoader())
-            jangPressRuntime = nil
+            let loaded = try await MLXLMCommon.loadModel(
+                from: modelDir,
+                using: #huggingFaceTokenizerLoader(),
+                loadConfiguration: LoadConfiguration(
+                    jangPress: .disabled,
+                    maxResidentBytes: .default,
+                    memoryLimit: .default,
+                    useMmapSafetensors: useMmap,
+                    nativeMTP: false))
+            context = loaded.0
+            jangPressRuntime = loaded.1
         }
         let rssAfterLoad = currentRSSMiB()
         let footprintAfterLoad = currentPhysFootprintMiB()
@@ -7490,6 +7819,9 @@ func runPerfBench(
                         result.unclosedReasoning = info.unclosedReasoning
                     }
                 }
+                if env["BENCH_PERF_RAW_TOKENS"] == "1" {
+                    print("    RAW_TOKENS \(rawTokens.map(String.init).joined(separator: ","))")
+                }
                 result.text = ctxSendable.tokenizer.decode(
                     tokenIds: rawTokens, skipSpecialTokens: false)
             } else {
@@ -7608,6 +7940,28 @@ func runPerfBench(
             : lastResult.text
         let leaks = markerLeaks(in: lastResult.text)
         let loop = lagunaLoopHeuristic(lastVisible)
+        if let requiredStop = env["BENCH_PERF_REQUIRE_STOP"],
+           !requiredStop.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           lastResult.stopReason != requiredStop {
+            print(
+                "PERF_VALIDATION status=FAIL reason=stop expected=\(requiredStop) actual=\(lastResult.stopReason)"
+            )
+            throw NSError(domain: "BENCH_PERF_VALIDATION", code: 1, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "PERF stop validation failed: expected \(requiredStop), got \(lastResult.stopReason)",
+            ])
+        }
+        if let requiredVisible = env["BENCH_PERF_REQUIRE_VISIBLE_CONTAINS"],
+           !requiredVisible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !lastResult.text.localizedCaseInsensitiveContains(requiredVisible) {
+            print(
+                "PERF_VALIDATION status=FAIL reason=visible_contains expected=\(requiredVisible) textChars=\(lastResult.text.count) reasoningChars=\(lastResult.reasoning.count)"
+            )
+            throw NSError(domain: "BENCH_PERF_VALIDATION", code: 2, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "PERF visible-content validation failed: missing \(requiredVisible)",
+            ])
+        }
         let head = String(
             gitShortHead(modelDir: FileManager.default.currentDirectoryPath))
         perfLine = String(format:
@@ -8684,7 +9038,10 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
         let v = validate(r)
         let status = v.ok ? "PASS" : "FAIL"
         if v.ok { stats.pass += 1 } else { stats.fail += 1 }
-        let preview = r.text.isEmpty ? r.reasoning : r.text
+        let visible = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preview = visible.isEmpty
+            ? "[empty visible; reasoning chars=\(r.reasoning.count)]"
+            : visible
         let short = preview.count > 120 ? String(preview.prefix(120)) + "…" : preview
         print(String(format:
             "  [%@] %@  ttft=%4dms prompt=%4.0fms total=%5.2fs genTokens=%d tokps=%5.1f stop=%@ chunks=%4d reasoning=%4d tools=%d rss=%.0fMiB %@-> \"%@\"",
@@ -8842,8 +9199,7 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
         )
     }
     if stats.fail > 0 {
-        throw NSError(domain: "BENCH_PROD", code: 1, userInfo: [
-            NSLocalizedDescriptionKey: "\(stats.fail) scenario(s) failed validation",
-        ])
+        fputs("BENCH_PROD: \(stats.fail) scenario(s) failed validation\n", stderr)
+        exit(1)
     }
 }

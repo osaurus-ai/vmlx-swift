@@ -4,6 +4,21 @@ import Foundation
 import MLX
 import MLXNN
 
+public protocol LoadedWeightsValidatingModel {
+    func validateLoadedWeights() throws
+}
+
+private enum MLXLoadMaterializationLock {
+    static let shared = NSRecursiveLock()
+}
+
+@discardableResult
+private func withMLXLoadMaterializationLock<T>(_ body: () throws -> T) rethrows -> T {
+    MLXLoadMaterializationLock.shared.lock()
+    defer { MLXLoadMaterializationLock.shared.unlock() }
+    return try body()
+}
+
 private func isPreservedMTPWeightKey(_ key: String) -> Bool {
     let lower = key.lowercased()
     return lower.hasPrefix("mtp.")
@@ -340,12 +355,17 @@ public func loadWeights(
         // bits=4)`) and would re-introduce the wrong values.
         let hiddenHint = readHiddenSizeHint(at: modelDirectory)
         let linearAttnValueDimHint = readLinearAttnValueDimHint(at: modelDirectory)
-        let validInDims = readValidInDims(at: modelDirectory)
+        let expertIntermediateSizeHint = readExpertIntermediateSizeHint(at: modelDirectory)
+        let validInDims = readValidInDimsForJANGQuantization(at: modelDirectory)
+        let attentionOutputDimHints = readAttentionOutputDimHintsForJANGQuantization(
+            at: modelDirectory)
         let inferred = JangLoader.inferPerLayerQuantization(
             weights: weights, jangConfig: jangConfig,
             hiddenSizeHint: hiddenHint,
             linearAttnValueDimHint: linearAttnValueDimHint,
+            expertIntermediateSizeHint: expertIntermediateSizeHint,
             validInDims: validInDims,
+            attentionOutputDimHints: attentionOutputDimHints,
             declaredDefaultQuantization: declaredAffineQuantization ?? quantization,
             declaredPerLayerQuantization: perLayerQuantization)
 
@@ -574,6 +594,12 @@ public func loadWeights(
             let gs = resolvedQuantization.groupSize
             let b = resolvedQuantization.bits
             var mode = resolvedQuantization.mode
+            if ProcessInfo.processInfo.environment["VMLX_LOAD_DIAG"] == "1",
+               (matchedBase.contains("self_attn.o_proj") || matchedBase.contains("switch_mlp"))
+            {
+                FileHandle.standardError.write(Data(
+                    "[quant-diag] path=\(path) matchedBase=\(matchedBase) weightShape=\(loadedWeight.shape) scalesShape=\(loadedScales.shape) resolved=(bits=\(b), gs=\(gs), mode=\(mode.rawValue)) module=\(type(of: m))\n".utf8))
+            }
             if weights[biasesKey] != nil && (mode == .mxfp4 || mode == .mxfp8) {
                 // MXFP kernels have no affine zero-point/bias companion. If a
                 // converter stamped the bundle as MXFP but emitted `.biases`,
@@ -646,6 +672,9 @@ public func loadWeights(
         let parameters = ModuleParameters.unflattened(weights)
         try model.update(parameters: parameters, verify: [.noUnusedKeys])
     }
+    if let validatingModel = model as? LoadedWeightsValidatingModel {
+        try validatingModel.validateLoadedWeights()
+    }
 
     // `weights` is only a load/update staging dictionary. Drop it before
     // any post-load dtype materialization so quantized bundles do not keep
@@ -654,21 +683,34 @@ public func loadWeights(
     weights.removeAll(keepingCapacity: false)
     MLX.Memory.clearCache()
 
-    // Convert all float16/float32 parameters to bfloat16 to prevent AsType cascades.
-    // float16 causes AsType when mixed with internal float32 ops (softmax, RMSNorm).
-    // bfloat16 shares float32's exponent range, so promotion is cheaper/eliminated.
-    //
-    // JANGTQ bypass: Python baseline runs with fp16 TurboQuant norms, and the
-    // JANGTQ Metal kernels infer their signature from the norm dtype. Casting
-    // those norms to bf16 breaks the gate/up/down projections (verified on
-    // MiniMax M2.7 JANGTQ_2L). JANGTQ dispatches are already fp32 internally,
-    // so there's no fp16↔fp32 ping-pong to collapse. Skip the cast entirely.
-    if !isJANGTQNative {
-        convertToBFloat16(model: model)
-    }
+    // Sentry APPLE-MACOS-25/31/5M: duplicate model loads can overlap in
+    // load-time BF16 materialization and submit concurrent MLX.eval work to the
+    // process-global Metal backend. Keep the dtype/perf contract, but serialize
+    // this load-materialization boundary inside vMLX.
+    withMLXLoadMaterializationLock {
+        // Convert float16/float32 parameters to bfloat16 to prevent AsType cascades.
+        // float16 causes AsType when mixed with internal float32 ops (softmax, RMSNorm).
+        // bfloat16 shares float32's exponent range, so promotion is cheaper/eliminated.
+        //
+        // JANGTQ-native bundles mix two quantization families:
+        // - TurboQuant routed experts use tq_packed/tq_norms and must keep the raw
+        //   norm dtype because kernels infer their signature from it.
+        // - Affine QuantizedLinear projections still use weight/scales/biases, and
+        //   QuantizedMatmul uses scale dtype to choose output dtype. Leaving those
+        //   affine scales/biases fp16 causes the same decode AsType cascade seen in
+        //   non-JANGTQ quantized bundles. Convert only affine quantization metadata.
+        if isJANGTQNative {
+            convertToBFloat16(model: model) { key, _ in
+                (key.hasSuffix(".scales") || key.hasSuffix(".biases"))
+                    && !key.hasSuffix(".tq_norms")
+            }
+        } else {
+            convertToBFloat16(model: model)
+        }
 
-    eval(model)
-    MLX.Memory.clearCache()
+        eval(model)
+        MLX.Memory.clearCache()
+    }
 }
 
 /// Convert float16/float32 model parameters to bfloat16 for MoE performance.
@@ -685,11 +727,17 @@ public func loadWeights(
 /// both fp16 and bf16 copies alive until the final eval and can push peak
 /// memory past 100 GB. Chunking bounds the transient extra allocation while
 /// preserving the dtype contract.
-private func convertToBFloat16(model: Module) {
+private func convertToBFloat16(
+    model: Module,
+    shouldConvert: (String, MLXArray) -> Bool = { _, _ in true }
+) {
     let convertibleParams: [(key: String, convertedBytes: Int)] = {
         let flat = model.parameters().flattened()
         return flat.compactMap { key, array in
             guard array.dtype == .float16 || array.dtype == .float32 else {
+                return nil
+            }
+            guard shouldConvert(key, array) else {
                 return nil
             }
             return (key: key, convertedBytes: estimatedByteCount(array, as: .bfloat16))
@@ -803,11 +851,25 @@ private func readLinearAttnValueDimHint(at modelDirectory: URL) -> Int? {
     return valueHeads * valueHeadDim
 }
 
+private func readExpertIntermediateSizeHint(at modelDirectory: URL) -> Int? {
+    let configURL = modelDirectory.appendingPathComponent("config.json")
+    guard let data = try? Data(contentsOf: configURL),
+          let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    let config = (top["text_config"] as? [String: Any]) ?? top
+    for key in ["moe_intermediate_size", "expert_intermediate_size", "intermediate_size"] {
+        if let value = config[key] as? Int, value > 0 {
+            return value
+        }
+    }
+    return nil
+}
+
 /// Build architecture-valid input dimensions for JANG bit/group-size
 /// disambiguation. Shape math alone can make (8, 32), (4, 64), and
 /// (2, 128) look equivalent; these dimensions constrain Qwen hybrid SSM,
 /// MLA, and MoE projections to real model widths.
-private func readValidInDims(at modelDirectory: URL) -> Set<Int> {
+func readValidInDimsForJANGQuantization(at modelDirectory: URL) -> Set<Int> {
     let configURL = modelDirectory.appendingPathComponent("config.json")
     guard let data = try? Data(contentsOf: configURL),
           let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -831,15 +893,39 @@ private func readValidInDims(at modelDirectory: URL) -> Set<Int> {
     add(config["qk_nope_head_dim"])
     add(config["qk_rope_head_dim"])
 
-    let headDims = [config["head_dim"], config["global_head_dim"]].compactMap { $0 as? Int }
+    let headDims = [
+        config["head_dim"],
+        config["swa_head_dim"],
+        config["global_head_dim"],
+    ].compactMap { $0 as? Int }
     let headCounts = [
         config["num_attention_heads"],
         config["num_key_value_heads"],
+        config["swa_num_attention_heads"],
+        config["swa_num_key_value_heads"],
         config["num_global_key_value_heads"],
     ].compactMap { $0 as? Int }
     for headDim in headDims where headDim > 0 {
         for count in headCounts where count > 0 {
             dims.insert(headDim * count)
+        }
+    }
+
+    let valueHeadDims = [
+        config["v_head_dim"],
+        config["swa_v_head_dim"],
+        config["global_v_head_dim"],
+    ].compactMap { $0 as? Int }
+    let valueHeadCounts = [
+        config["num_attention_heads"],
+        config["num_key_value_heads"],
+        config["swa_num_attention_heads"],
+        config["swa_num_key_value_heads"],
+        config["num_global_key_value_heads"],
+    ].compactMap { $0 as? Int }
+    for valueHeadDim in valueHeadDims where valueHeadDim > 0 {
+        for count in valueHeadCounts where count > 0 {
+            dims.insert(valueHeadDim * count)
         }
     }
 
@@ -874,6 +960,39 @@ private func readValidInDims(at modelDirectory: URL) -> Set<Int> {
             if convDim > 0 { dims.insert(convDim) }
         }
     }
+
+    return dims
+}
+
+func readAttentionOutputDimHintsForJANGQuantization(at modelDirectory: URL) -> Set<Int> {
+    let configURL = modelDirectory.appendingPathComponent("config.json")
+    guard let data = try? Data(contentsOf: configURL),
+          let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return [] }
+    let config = (top["text_config"] as? [String: Any]) ?? top
+    var dims = Set<Int>()
+
+    func add(headsKey: String, valueDimKey: String, fallbackDimKey: String) {
+        guard let heads = config[headsKey] as? Int, heads > 0 else { return }
+        if let valueDim = config[valueDimKey] as? Int, valueDim > 0 {
+            dims.insert(heads * valueDim)
+        } else if let headDim = config[fallbackDimKey] as? Int, headDim > 0 {
+            dims.insert(heads * headDim)
+        }
+    }
+
+    add(
+        headsKey: "num_attention_heads",
+        valueDimKey: "v_head_dim",
+        fallbackDimKey: "head_dim")
+    add(
+        headsKey: "swa_num_attention_heads",
+        valueDimKey: "swa_v_head_dim",
+        fallbackDimKey: "swa_head_dim")
+    add(
+        headsKey: "num_global_attention_heads",
+        valueDimKey: "global_v_head_dim",
+        fallbackDimKey: "global_head_dim")
 
     return dims
 }

@@ -119,6 +119,90 @@ final class SSMReDeriveParityTests: XCTestCase {
         XCTAssertEqual(coordinator.ssmStateCache.reDerives, 1)
     }
 
+    func testPromptBoundaryStoreAlsoCapturesSeedBoundaryForFullHybridHits() throws {
+        let model = TinyHybridSSMModel()
+        let tokens = [17, 19, 23, 29, 31]
+
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            modelKey: "tiny-hybrid|full-hit-seed"))
+        coordinator.setHybrid(true)
+
+        _ = try XCTUnwrap(
+            reDeriveAndStoreSSMStatesForPromptBoundaries(
+                coordinator: coordinator,
+                model: model,
+                promptTokenIds: tokens,
+                prefillStepSize: 2))
+
+        let seedBoundary = tokens.count - 1
+        let seedStates = try XCTUnwrap(
+            coordinator.ssmStateCache.fetch(
+                tokens: tokens,
+                boundary: seedBoundary))
+        let exactStates = try XCTUnwrap(
+            coordinator.ssmStateCache.fetch(
+                tokens: tokens,
+                boundary: tokens.count))
+
+        let warmSeed = try warmPassStates(
+            model: model,
+            tokens: Array(tokens.prefix(seedBoundary)),
+            prefillStepSize: 2)
+        let warmExact = try warmPassStates(
+            model: model,
+            tokens: tokens,
+            prefillStepSize: 2)
+
+        assertStatesEqual(seedStates, warmSeed)
+        assertStatesEqual(exactStates, warmExact)
+    }
+
+    func testLegacyMaybeRederiveWrapperStoresPagedBlockAndExactBoundaries() throws {
+        let model = TinyHybridSSMModel()
+        let promptOnly = [3, 5, 7, 11, 13]
+        let generationPrompt = [101, 102]
+        let fullPrompt = promptOnly + generationPrompt
+
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: true,
+            enableDiskCache: false,
+            pagedBlockSize: 2,
+            modelKey: "tiny-hybrid|legacy-wrapper"))
+        coordinator.setHybrid(true)
+
+        maybeReDeriveSSMState(
+            coordinator: coordinator,
+            model: model,
+            promptTokenIds: fullPrompt,
+            genPromptLen: generationPrompt.count,
+            enableSSMReDerive: true)
+
+        let blockBoundary = 4
+        let blockStates = try XCTUnwrap(
+            coordinator.ssmStateCache.fetch(
+                tokens: promptOnly,
+                boundary: blockBoundary))
+        let exactStates = try XCTUnwrap(
+            coordinator.ssmStateCache.fetch(
+                tokens: promptOnly,
+                boundary: promptOnly.count))
+
+        let warmBlock = try warmPassStates(
+            model: model,
+            tokens: Array(promptOnly.prefix(blockBoundary)),
+            prefillStepSize: 2)
+        let warmExact = try warmPassStates(
+            model: model,
+            tokens: promptOnly,
+            prefillStepSize: 2)
+
+        assertStatesEqual(blockStates, warmBlock)
+        assertStatesEqual(exactStates, warmExact)
+        XCTAssertEqual(coordinator.ssmStateCache.reDerives, 1)
+    }
+
     private func warmPassStates(
         model: TinyHybridSSMModel,
         tokens: [Int],

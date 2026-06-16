@@ -99,6 +99,117 @@ public struct LFM2MoEConfiguration: Codable, Sendable {
         self.ropeTheta = ropeParameters?["rope_theta"]?.asFloat() ?? ropeTheta
         self._fullAttnIdxs = try container.decodeIfPresent([Int].self, forKey: ._fullAttnIdxs)
         self.layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(
+        container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(moeIntermediateSize, key: .moeIntermediateSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(numExperts, key: .numExperts, in: container)
+        try validatePositive(numExpertsPerToken, key: .numExpertsPerToken, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try validatePositive(normEps, key: .normEps, in: container)
+        try validatePositive(convLCache, key: .convLCache, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+
+        if hiddenSize % attentionHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "LFM2MoE hidden_size must be divisible by num_attention_heads."
+            )
+        }
+
+        if attentionHeads % kvHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "LFM2MoE num_attention_heads must be divisible by num_key_value_heads."
+            )
+        }
+
+        if numExpertsPerToken > numExperts {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numExpertsPerToken,
+                in: container,
+                debugDescription: "LFM2MoE num_experts_per_tok must be <= num_experts."
+            )
+        }
+
+        if numDenseLayers < 0 || numDenseLayers > hiddenLayers {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numDenseLayers,
+                in: container,
+                debugDescription:
+                    "LFM2MoE num_dense_layers must be >= 0 and <= num_hidden_layers."
+            )
+        }
+
+        if let fullAttnIdxs = _fullAttnIdxs,
+            !fullAttnIdxs.allSatisfy({ $0 >= 0 && $0 < hiddenLayers })
+        {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._fullAttnIdxs,
+                in: container,
+                debugDescription: "LFM2MoE full_attn_idxs entries must be within layer bounds."
+            )
+        }
+
+        if let layerTypes {
+            if layerTypes.count != hiddenLayers {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .layerTypes,
+                    in: container,
+                    debugDescription: "LFM2MoE layer_types count must equal num_hidden_layers."
+                )
+            }
+
+            if !layerTypes.allSatisfy({ $0 == "full_attention" || $0 == "short_conv" }) {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .layerTypes,
+                    in: container,
+                    debugDescription:
+                        "LFM2MoE layer_types entries must be full_attention or short_conv."
+                )
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "LFM2MoE \(key.rawValue) must be > 0."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if !value.isFinite || value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "LFM2MoE \(key.rawValue) must be finite and > 0."
+            )
+        }
     }
 }
 
@@ -371,7 +482,6 @@ public class LFM2MoEModelInner: Module {
 
     init(_ args: LFM2MoEConfiguration) {
         self.args = args
-        precondition(args.vocabularySize > 0)
 
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize,

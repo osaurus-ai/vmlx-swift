@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OSAURUS_ROOT="${OSAURUS_ROOT:-/Users/eric/osaurus-staging}"
 QWEN_DIR="${VMLX_QWEN_PROOF_DIR:-/tmp/vmlx-qwen35-jangtq-turnmatrix-post-vlfix-20260524-1545}"
-GEMMA_DIR="${VMLX_GEMMA_PROOF_DIR:-/tmp/vmlx-gemma4-turnmatrix-post-thoughtfix-20260524}"
+GEMMA_DIR="${VMLX_GEMMA_PROOF_DIR:-/tmp/vmlx-gemma4-turnmatrix-current-20260524-1516}"
+DSV4_CURRENT_APP_CACHE_PROOF="${VMLX_DSV4_CURRENT_APP_CACHE_PROOF:-/tmp/osaurus-624a9a9f-dsv4-current-tool-cache-proof-20260525-1122/SUMMARY.json}"
 LOG_ROOT="${VMLX_RELEASE_AUDIT_LOG_ROOT:-/tmp/vmlx-osaurus-release-readiness-audit-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$LOG_ROOT"
 : >"$LOG_ROOT/gates.tsv"
@@ -161,12 +162,78 @@ require_no_live_overclaim() {
   fi
 }
 
+require_current_dsv4_cache_boundary() {
+  local summary="$DSV4_CURRENT_APP_CACHE_PROOF"
+  local osaurus_head
+
+  if [[ ! -f "$summary" ]]; then
+    fail_msg "current-app DSV4 cache proof summary exists"
+    return
+  fi
+
+  osaurus_head="$(git -C "$OSAURUS_ROOT" rev-parse HEAD)"
+
+  if python3 - "$summary" "$osaurus_head" <<'PY'
+import json
+import sys
+
+summary_path = sys.argv[1]
+current_osaurus_head = sys.argv[2]
+with open(summary_path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+
+checks = data.get("checks", {})
+topology = data.get("topology", {})
+deltas = data.get("deltas", {})
+before = data.get("before", {})
+after = data.get("after", {})
+
+requirements = {
+    "summary head matches current Osaurus head": data.get("head") == current_osaurus_head,
+    "classification pass": data.get("classification") == "pass",
+    "DSV4 current model health": checks.get("health_current_dsv4") is True,
+    "chat marker proof": checks.get("chat_outputs_contain_marker") is True,
+    "responses semantic recall": checks.get("responses_semantic_recall") is True,
+    "disk L2 hits increased": deltas.get("disk_l2_hits", 0) > 0,
+    "disk L2 stores increased": deltas.get("disk_l2_stores", 0) > 0,
+    "prefix hits not promoted": before.get("prefix_hits", 0) == 0 and after.get("prefix_hits", 0) == 0,
+    "prefix misses not promoted": before.get("prefix_misses", 0) == 0 and after.get("prefix_misses", 0) == 0,
+    "DSV4 layer count": topology.get("layer_count") == 43,
+    "DSV4 hybrid pool layers": topology.get("hybrid_pool_layer_count") == 41,
+    "DSV4 rotating KV layers": topology.get("rotating_kv_layer_count") == 2,
+    "DSV4 rotating wrappers": topology.get("rotating_wrapper_layer_count") == 41,
+    "disk-backed restore": topology.get("requires_disk_backed_restore") is True,
+    "no SSM companion": topology.get("requires_ssm_companion_state") is False,
+    "no TurboQuant KV substitute": (
+        topology.get("turbo_quant_kv_layer_count") == 0
+        and topology.get("quantized_kv_layer_count") == 0
+    ),
+    "no sampler override boundary": "No sampler overrides" in data.get("boundary", ""),
+}
+
+failed = [name for name, ok in requirements.items() if not ok]
+if failed:
+    for name in failed:
+        print(f"FAIL {name}", file=sys.stderr)
+    sys.exit(1)
+
+for name in requirements:
+    print(f"PASS {name}")
+PY
+  then
+    pass "current-app DSV4 disk-backed hybrid-pool L2 proof with prefix-counter boundary"
+  else
+    fail_msg "current-app DSV4 disk-backed hybrid-pool L2 proof with prefix-counter boundary"
+  fi
+}
+
 require_clean_process_baseline
 require_lock_clear
 require_ledger
 require_current_state_consistency
 require_no_partial_family_promotion
 require_no_live_overclaim
+require_current_dsv4_cache_boundary
 
 if [[ -x "$ROOT/scripts/vmlx-push-readiness-scope-check.sh" ]]; then
   run_gate vmlx-push-readiness "$ROOT/scripts/vmlx-push-readiness-scope-check.sh"
@@ -201,6 +268,24 @@ else
   fail_msg "vmlx family matrix coverage gate exists"
 fi
 
+if [[ -x "$ROOT/scripts/vmlx-downloaded-model-inventory-check.sh" ]]; then
+  run_gate vmlx-downloaded-model-inventory "$ROOT/scripts/vmlx-downloaded-model-inventory-check.sh"
+else
+  fail_msg "vmlx downloaded model inventory gate exists"
+fi
+
+if [[ -x "$ROOT/scripts/vmlx-ram-footprint-proof-boundary-check.sh" ]]; then
+  run_gate vmlx-ram-footprint-boundary "$ROOT/scripts/vmlx-ram-footprint-proof-boundary-check.sh"
+else
+  fail_msg "vmlx RAM/physical-footprint boundary gate exists"
+fi
+
+if [[ -x "$ROOT/scripts/vmlx-reasoning-visible-boundary-check.sh" ]]; then
+  run_gate vmlx-reasoning-visible-boundary "$ROOT/scripts/vmlx-reasoning-visible-boundary-check.sh"
+else
+  fail_msg "vmlx reasoning/visible boundary gate exists"
+fi
+
 if [[ -x "$OSAURUS_ROOT/scripts/live-proof/assert-keychain-free-proof-path.sh" ]]; then
   run_gate osaurus-keychain-free "$OSAURUS_ROOT/scripts/live-proof/assert-keychain-free-proof-path.sh"
 else
@@ -229,6 +314,12 @@ if [[ -x "$OSAURUS_ROOT/scripts/live-proof/assert-vmlx-gemma4-parser-fix-wired.s
   run_gate osaurus-gemma-parser-wire "$OSAURUS_ROOT/scripts/live-proof/assert-vmlx-gemma4-parser-fix-wired.sh"
 else
   fail_msg "Osaurus Gemma parser wire guard exists"
+fi
+
+if [[ -x "$OSAURUS_ROOT/scripts/live-proof/assert-model-tool-capability-surfaces.sh" ]]; then
+  run_gate osaurus-model-tool-capability "$OSAURUS_ROOT/scripts/live-proof/assert-model-tool-capability-surfaces.sh"
+else
+  fail_msg "Osaurus model/tool capability guard exists"
 fi
 
 if [[ -x "$OSAURUS_ROOT/scripts/live-proof/assert-osaurus-no-forced-behavior-pr.sh" ]]; then

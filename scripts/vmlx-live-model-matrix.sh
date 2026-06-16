@@ -42,6 +42,15 @@ Profiles:
 
 This is a proof harness, not a pass generator. Skipped or failed rows remain
 blocked/failed until the artifact says otherwise.
+
+Turnmatrix rows are expected to produce real evidence, not load-only proof:
+visible output, reasoning ON/OFF behavior when supported, no reasoning/tool
+marker leakage in user-visible chunks, tool-call parser events, bundle-derived
+generation defaults, token/s, RSS/peak memory, and architecture-matched cache
+telemetry. Full-attention models need KV/prefix/L2 proof; hybrid SSM models
+need attention KV plus SSM companion proof; CCA/HY3 style models need companion
+cache/pooling proof; DeepSeek-V4 needs CSA/HSA/SWA pool restore proof rather
+than generic TurboQuant KV substitution; MiMo v2.5 needs full-attention KV plus rotating SWA L2 proof with TurboQuant KV only on full-attention layers; VL/video models need media payload cache proof.
 EOF
 }
 
@@ -246,6 +255,38 @@ def int_value(value):
 config = load_json(root / "config.json")
 text_config = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
 jang = load_json(root / "jang_config.json")
+tuning_doc = load_json(root / "vmlx_mtp_tuning.json")
+tuning = tuning_doc.get("native_mtp") if isinstance(tuning_doc.get("native_mtp"), dict) else None
+
+def float_value(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+def tuning_usable(value):
+    if not isinstance(value, dict):
+        return False
+    if value.get("blocked") is True:
+        return False
+    if value.get("validated") is not True or value.get("output_equivalent") is not True:
+        return False
+    depth = int_value(value.get("best_depth"))
+    baseline = float_value(value.get("baseline_tok_s"))
+    best = float_value(value.get("best_tok_s"))
+    speedup = float_value(value.get("speedup_vs_baseline"))
+    return (
+        depth is not None and depth > 0
+        and baseline is not None and baseline > 0
+        and best is not None and best > baseline
+        and speedup is not None and speedup > 1
+    )
 
 model_types = set()
 for value in (
@@ -282,6 +323,8 @@ if profile == "jang_2k":
     sys.exit(1)
 if is_moe and bits is not None and bits <= 2:
     sys.exit(1)
+if not tuning_usable(tuning):
+    sys.exit(1)
 
 sys.exit(0)
 PY
@@ -315,11 +358,11 @@ discover_models() {
 }
 
 write_inventory() {
-  printf "status\tsize_gb\tbytes\tprofile\tmtp_tensors\tmtp_auto\tarchitecture\tmodel_type\tgen_max_new_tokens\tgen_temperature\tgen_top_p\tgen_top_k\tgen_min_p\tgen_repetition_penalty\tgen_do_sample\tpath\n" \
+  printf "status\tsize_gb\tbytes\tprofile\tmtp_tensors\tmtp_auto\tarchitecture\tmodel_type\tgen_max_new_tokens\tgen_temperature\tgen_top_p\tgen_top_k\tgen_min_p\tgen_repetition_penalty\tgen_do_sample\tsampler_defaults\tpath\n" \
     >"${RUN_DIR}/models.tsv"
   while IFS= read -r dir; do
     [[ -n "$dir" && -f "$dir/config.json" ]] || continue
-    local bytes size arch model_type profile mtp_tensors mtp_auto gen_config gen_max gen_temp gen_top_p gen_top_k gen_min_p gen_rep gen_do_sample
+    local bytes size arch model_type profile mtp_tensors mtp_auto gen_config gen_max gen_temp gen_top_p gen_top_k gen_min_p gen_rep gen_do_sample sampler_defaults
     bytes="$(model_size_bytes "$dir")"
     size="$(model_size_gb "$bytes")"
     arch="$(json_value "$dir/config.json" '.architectures?[0]' unknown)"
@@ -345,10 +388,19 @@ write_inventory() {
       gen_top_k="missing"; gen_min_p="missing"; gen_rep="missing"
       gen_do_sample="missing"
     fi
-    printf "discovered\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    sampler_defaults="partial"
+    if [[ "$gen_temp" =~ ^(nil|missing)$ && "$gen_top_p" =~ ^(nil|missing)$ \
+        && "$gen_top_k" =~ ^(nil|missing)$ && "$gen_min_p" =~ ^(nil|missing)$ \
+        && "$gen_rep" =~ ^(nil|missing)$ && "$gen_do_sample" =~ ^(nil|missing)$ ]]; then
+      sampler_defaults="missing"
+    elif [[ ! "$gen_temp" =~ ^(nil|missing)$ && ! "$gen_top_p" =~ ^(nil|missing)$ \
+        && ! "$gen_top_k" =~ ^(nil|missing)$ ]]; then
+      sampler_defaults="complete"
+    fi
+    printf "discovered\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
       "$size" "$bytes" "$profile" "$mtp_tensors" "$mtp_auto" "$arch" "$model_type" \
       "$gen_max" "$gen_temp" "$gen_top_p" "$gen_top_k" "$gen_min_p" \
-      "$gen_rep" "$gen_do_sample" "$dir" \
+      "$gen_rep" "$gen_do_sample" "$sampler_defaults" "$dir" \
       >>"${RUN_DIR}/models.tsv"
   done < <(discover_models)
 }
@@ -394,13 +446,14 @@ raw_prefix_cache_probe_applicable() {
   lowered="$(printf "%s %s" "$model_type" "$arch" | tr '[:upper:]' '[:lower:]')"
 
   # `BENCH_BATCH_CACHE_HIT` is a structural raw-token prefix-extension
-  # diagnostic. MiniMax chat behavior is only production-valid through its chat
-  # template; the raw Q/A prompt can coherently continue the pattern until the
-  # max-token cap. Keep the structural bench available for direct diagnostics,
-  # but do not count it as a production matrix row for MiniMax. The production
-  # cache proof for these bundles is `BENCH_GROWING_CHAT_CACHE`.
+  # diagnostic. Some families are only production-valid through their native
+  # chat template and cache-boundary salts; the raw Q/A prompt can coherently
+  # continue the pattern until the max-token cap. Keep the structural bench
+  # available for direct diagnostics, but do not count it as a production
+  # matrix row for those families. The production cache proof for these bundles
+  # is `BENCH_GROWING_CHAT_CACHE` plus disk/TurboQuant architecture rows.
   case "$lowered" in
-    *minimax*) return 1 ;;
+    *gemma*|*minimax*) return 1 ;;
   esac
   return 0
 }
@@ -430,6 +483,17 @@ matrix_prod_max_tokens() {
 
 matrix_prod_seed() {
   printf "%s" "${VMLX_MATRIX_PROD_SEED:-${VMLINUX_MATRIX_PROD_SEED:-0}}"
+}
+
+qwen_multiturn_tool_applicable() {
+  local dir="$1" model_type arch lowered
+  model_type="$(json_value "$dir/config.json" '.model_type // .text_config.model_type' unknown)"
+  arch="$(json_value "$dir/config.json" '.architectures?[0]' unknown)"
+  lowered="$(printf "%s %s" "$model_type" "$arch" | tr '[:upper:]' '[:lower:]')"
+  case "$lowered" in
+    *qwen*) return 0 ;;
+  esac
+  return 1
 }
 
 run_text_turn_matrix() {
@@ -496,6 +560,16 @@ run_batch_stack() {
   run_runbench "${name}.batch_chat" \
     BENCH_MODEL="$dir" BENCH_BATCH_CHAT=1 \
     BENCH_MAX_TOKENS="$max_tokens" || true
+  run_runbench "${name}.batch_toolcall" \
+    BENCH_MODEL="$dir" BENCH_BATCH_TOOLCALL=1 BENCH_BATCH_TOOLCALL_MAX_BATCH=1 \
+    BENCH_MAX_TOKENS="$max_tokens" || true
+  if qwen_multiturn_tool_applicable "$dir"; then
+    run_runbench "${name}.qwen_multiturn_tool" \
+      BENCH_MODEL="$dir" BENCH_QWEN_MULTITURN_TOOL=1 \
+      BENCH_MAX_TOKENS="$max_tokens" || true
+  else
+    mark_status "${name}.qwen_multiturn_tool" "n-a:not-qwen-family"
+  fi
   if raw_prefix_cache_probe_applicable "$dir"; then
     run_runbench "${name}.batch_cache_hit" \
       BENCH_MODEL="$dir" BENCH_BATCH_CACHE_HIT=1 \
@@ -570,7 +644,13 @@ safe_name() {
 }
 
 maybe_build() {
-  [[ "$BUILD" -eq 0 || "$PROFILE" == "inventory" ]] && return 0
+  if [[ "$PROFILE" == "inventory" ]]; then
+    return 0
+  fi
+  if [[ "$BUILD" -eq 0 ]]; then
+    assert_runbench_fresh
+    return 0
+  fi
   if [[ "$BUILD_CONFIGURATION" == "release" ]]; then
     run_logged build_runbench env DEVELOPER_DIR="$SWIFT_DEVELOPER_DIR" \
       swift build -c release --jobs "${VMLINUX_SWIFT_BUILD_JOBS:-2}" \
@@ -582,8 +662,60 @@ maybe_build() {
   fi
 }
 
+assert_runbench_fresh() {
+  local binary=".build/${BUILD_CONFIGURATION}/RunBench"
+  if [[ "${VMLX_MATRIX_ALLOW_STALE_RUNBENCH:-${VMLINUX_MATRIX_ALLOW_STALE_RUNBENCH:-0}}" == "1" ]]; then
+    echo "WARNING: allowing stale RunBench binary because VMLX_MATRIX_ALLOW_STALE_RUNBENCH=1" >&2
+    return 0
+  fi
+  if [[ ! -x "$binary" ]]; then
+    echo "--no-build requested but $binary is missing or not executable" >&2
+    echo "Re-run without --no-build, or set VMLX_MATRIX_ALLOW_STALE_RUNBENCH=1 for an explicit diagnostic override." >&2
+    exit 2
+  fi
+  local newer
+  newer="$(find Package.swift RunBench Libraries Tests scripts \
+    -type f \
+    \( -name '*.swift' -o -name '*.sh' -o -name 'Package.swift' \) \
+    -newer "$binary" -print -quit 2>/dev/null || true)"
+  if [[ -n "$newer" ]]; then
+    echo "--no-build requested but $binary is older than source file: $newer" >&2
+    echo "Matrix live proof must not reuse a stale RunBench binary. Re-run without --no-build, or set VMLX_MATRIX_ALLOW_STALE_RUNBENCH=1 for an explicit diagnostic override." >&2
+    exit 2
+  fi
+}
+
+assert_live_lane_clear() {
+  if [[ "$PROFILE" == "inventory" || "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+  if [[ "${VMLX_MATRIX_ALLOW_ACTIVE_RUNBENCH:-${VMLINUX_MATRIX_ALLOW_ACTIVE_RUNBENCH:-0}}" == "1" ]]; then
+    echo "WARNING: allowing active RunBench lane because VMLX_MATRIX_ALLOW_ACTIVE_RUNBENCH=1" >&2
+    return 0
+  fi
+
+  local lock_dir="${VMLINUX_RUNBENCH_LOCK_DIR:-${VMLX_RUNBENCH_LOCK_DIR:-/tmp/vmlx-runbench-live.lock}}"
+  local pid_file="${lock_dir}/pid"
+  [[ -f "$pid_file" ]] || return 0
+
+  local owner_pid owner_started owner_cmd
+  owner_pid="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
+  owner_started="$(sed -n '2p' "$pid_file" 2>/dev/null || true)"
+  owner_cmd="$(sed -n '3p' "$pid_file" 2>/dev/null || true)"
+  if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
+    echo "Refusing to start matrix while another RunBench live row is active." >&2
+    echo "lock=${lock_dir} owner=${owner_pid} started=${owner_started} command=${owner_cmd}" >&2
+    echo "Wait for that row to finish, or set VMLX_MATRIX_ALLOW_ACTIVE_RUNBENCH=1 for an explicit diagnostic override." >&2
+    exit 2
+  fi
+
+  echo "Removing stale RunBench lock before matrix start: ${lock_dir}" >&2
+  rm -rf "$lock_dir"
+}
+
 write_inventory
 maybe_build
+assert_live_lane_clear
 
 if [[ "$PROFILE" == "inventory" ]]; then
   {
@@ -598,9 +730,16 @@ if [[ "$PROFILE" == "inventory" ]]; then
   exit 0
 fi
 
-while IFS=$'\t' read -r status size_gb bytes family_profile mtp_tensors mtp_auto arch model_type gen_max gen_temp gen_top_p gen_top_k gen_min_p gen_rep gen_do_sample dir; do
+while IFS=$'\t' read -r status size_gb bytes family_profile mtp_tensors mtp_auto arch model_type gen_max gen_temp gen_top_p gen_top_k gen_min_p gen_rep gen_do_sample sampler_defaults dir; do
   [[ "$status" == "discovered" ]] || continue
   name="$(safe_name "$dir")"
+  if [[ "$sampler_defaults" == "missing" ]]; then
+    mark_status "${name}.sampler_defaults" \
+      "fail:missing-bundle-sampler-defaults-would-use-engine-fallback"
+  elif [[ "$sampler_defaults" == "partial" ]]; then
+    mark_status "${name}.sampler_defaults" \
+      "partial:incomplete-bundle-sampler-defaults"
+  fi
   if [[ "$ALLOW_HUGE" -eq 0 ]] && is_gt_gb "$bytes" "$MAX_SIZE_GB"; then
     printf "%s\tskipped:size>%sGB\n" "$name" "$MAX_SIZE_GB" >>"${RUN_DIR}/status.tsv"
     continue
@@ -678,6 +817,14 @@ done <"${RUN_DIR}/models.tsv"
   printf -- "- batch/media max tokens: %s\n" "$(matrix_max_tokens)"
   printf -- "- allow huge: %s\n" "$ALLOW_HUGE"
   printf -- "- dry run: %s\n\n" "$DRY_RUN"
+  printf "## Acceptance contract\n\n"
+  printf -- "- no row is production-ready from load success alone\n"
+  printf -- "- every generated row must report token/s and memory evidence\n"
+  printf -- "- reasoning ON/OFF rows must not leak thinking/tool markers into visible chunks\n"
+  printf -- "- tool rows must emit structured tool-call events, not raw prompt markup\n"
+  printf -- "- sampling defaults must be bundle-derived unless explicitly overridden by the row\n"
+  printf -- "- missing bundle sampler defaults are failing evidence because they require engine fallback values\n"
+  printf -- "- cache rows must match architecture: KV/TurboQuant KV, hybrid SSM companion, CCA/HY3 companion, DSV4 CSA/HSA/SWA, MiMo full/SWA rotating KV, and VL/video media cache where applicable\n\n"
   printf "## Status\n\n"
   printf "| Row | Status |\n|---|---|\n"
   while IFS=$'\t' read -r row row_status; do

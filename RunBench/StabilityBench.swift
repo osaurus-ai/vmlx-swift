@@ -107,20 +107,21 @@ enum StabilityBench {
 
         func makeCoord(diskCache: Bool, modelKey: String,
                        defaultMaxKVSize: Int? = nil,
-                       defaultKVMode: KVQuantizationMode = .none) -> CacheCoordinator {
-            let cfg = CacheCoordinatorConfig(
-                usePagedCache: true,
-                enableDiskCache: diskCache,
-                pagedBlockSize: 256,
-                maxCacheBlocks: 1024,
-                diskCacheMaxGB: 10,
-                diskCacheDir: diskCache ? kvDir : nil,
-                ssmMaxEntries: 64,
+                       liveKVCodec: VMLXKVCacheCodec = .engineSelected) -> CacheCoordinator {
+            var settings = VMLXServerRuntimeSettings()
+            settings.cache.prefix.enabled = true
+            settings.cache.pagedKV.enabled = true
+            settings.cache.pagedKV.blockSize = 256
+            settings.cache.pagedKV.maxBlocks = 1024
+            settings.cache.blockDisk.enabled = diskCache
+            settings.cache.blockDisk.maxSizeGB = 10
+            settings.cache.liveKVCodec = liveKVCodec
+            settings.cache.defaultMaxKVSize = defaultMaxKVSize
+            settings.cache.enableSSMReDerive = true
+            let cfg = settings.cacheCoordinatorConfig(
                 modelKey: modelKey,
-                defaultKVMode: defaultKVMode,
-                defaultMaxKVSize: defaultMaxKVSize,
-                longPromptMultiplier: 2.0
-            )
+                diskCacheDirectory: diskCache ? kvDir : nil,
+                ssmMaxEntries: 64)
             let c = CacheCoordinator(config: cfg)
             c.setHybrid(true)
             return c
@@ -136,7 +137,12 @@ enum StabilityBench {
             ui.additionalContext = ["enable_thinking": enableThinking]
             let lm = try await ctx.processor.prepare(input: ui)
             nonisolated(unsafe) let sendable = lm
-            var p = GenerateParameters(maxTokens: maxNew ?? maxNewTokens, temperature: 0)
+            let budget = maxNew ?? maxNewTokens
+            let fallback = GenerateParameters(maxTokens: budget)
+            var p = GenerateParameters(
+                generationConfig: ctx.configuration.generationDefaults,
+                fallback: fallback)
+            p.maxTokens = budget
             p.prefillStepSize = 512
             if let rp = repPenalty { p.repetitionPenalty = rp }
             let stream = await engine.generate(input: sendable, parameters: p)
@@ -297,7 +303,11 @@ enum StabilityBench {
                 ui.additionalContext = ["enable_thinking": false]
                 let lm = try await ctx.processor.prepare(input: ui)
                 nonisolated(unsafe) let sendable = lm
-                var p = GenerateParameters(maxTokens: 200, temperature: 0)
+                let fallback = GenerateParameters(maxTokens: 200)
+                var p = GenerateParameters(
+                    generationConfig: ctx.configuration.generationDefaults,
+                    fallback: fallback)
+                p.maxTokens = 200
                 p.prefillStepSize = 512
                 let stream = await engine.generate(input: sendable, parameters: p)
                 var n = 0
@@ -322,8 +332,7 @@ enum StabilityBench {
         // -------------------------------------------------------------
         rows.append(await runRow("S8. TQ KV mode + disk round-trip") {
             let coord = makeCoord(
-                diskCache: true, modelKey: "S8",
-                defaultKVMode: .turboQuant(keyBits: 3, valueBits: 3))
+                diskCache: true, modelKey: "S8")
             // First engine populates disk.
             let e1 = BatchEngine(
                 context: ctx, maxBatchSize: 1,

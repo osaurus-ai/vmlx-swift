@@ -145,8 +145,6 @@ public class Gemma2ModelInner: Module {
     let hiddenScale: Float
 
     public init(_ args: Gemma2Configuration) {
-        precondition(args.vocabularySize > 0)
-
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -264,6 +262,62 @@ public struct Gemma2Configuration: Codable {
             Float.self, forKey: CodingKeys.finalLogitSoftcapping)
         self.queryPreAttnScalar = try container.decode(
             Float.self, forKey: CodingKeys.queryPreAttnScalar)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(headDimensions, key: .headDimensions, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try validatePositive(attnLogitSoftcapping, key: .attnLogitSoftcapping, in: container)
+        try validatePositive(finalLogitSoftcapping, key: .finalLogitSoftcapping, in: container)
+        try validatePositive(queryPreAttnScalar, key: .queryPreAttnScalar, in: container)
+
+        guard hiddenSize == attentionHeads * headDimensions else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "Gemma2 hidden_size must equal num_attention_heads * head_dim.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription: "Gemma2 num_attention_heads must be divisible by num_key_value_heads.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Gemma2 \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Gemma2 \(key.rawValue) must be finite and > 0.")
+        }
     }
 }
 

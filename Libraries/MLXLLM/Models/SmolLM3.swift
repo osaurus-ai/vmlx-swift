@@ -144,8 +144,6 @@ public class SmolLM3ModelInner: Module {
     let norm: RMSNorm
 
     init(_ args: SmolLM3Configuration) {
-        precondition(args.vocabularySize > 0)
-
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -344,12 +342,122 @@ public struct SmolLM3Configuration: Codable, Sendable {
         self.noRopeLayerInterval =
             try container.decodeIfPresent(Int.self, forKey: .noRopeLayerInterval) ?? 4
 
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        if noRopeLayerInterval <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .noRopeLayerInterval,
+                in: container,
+                debugDescription: "SmolLM3 no_rope_layer_interval must be positive."
+            )
+        }
+
         if let noRopeLayers = try container.decodeIfPresent([Int].self, forKey: .noRopeLayers) {
             self.noRopeLayers = noRopeLayers
         } else {
             self.noRopeLayers = (0 ..< hiddenLayers).map { i in
                 (i + 1) % noRopeLayerInterval != 0 ? 1 : 0
             }
+        }
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(
+        container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+
+        if let headDimensions {
+            try validatePositive(headDimensions, key: .headDimensions, in: container)
+        }
+        if let maxPositionEmbeddings {
+            try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        }
+
+        if noRopeLayerInterval <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .noRopeLayerInterval,
+                in: container,
+                debugDescription: "SmolLM3 no_rope_layer_interval must be positive."
+            )
+        }
+
+        if hiddenSize != attentionHeads * resolvedHeadDimensions {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "SmolLM3 hidden_size must equal num_attention_heads * head_dim."
+            )
+        }
+
+        if attentionHeads % kvHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "SmolLM3 num_attention_heads must be divisible by num_key_value_heads."
+            )
+        }
+
+        if noRopeLayers.count != hiddenLayers {
+            throw DecodingError.dataCorruptedError(
+                forKey: .noRopeLayers,
+                in: container,
+                debugDescription: "SmolLM3 no_rope_layers count must equal num_hidden_layers."
+            )
+        }
+
+        if !noRopeLayers.allSatisfy({ $0 == 0 || $0 == 1 }) {
+            throw DecodingError.dataCorruptedError(
+                forKey: .noRopeLayers,
+                in: container,
+                debugDescription: "SmolLM3 no_rope_layers entries must be 0 or 1."
+            )
+        }
+
+        if let factor = ropeScaling?["factor"]?.asFloat() {
+            if !factor.isFinite || factor <= 0 {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling,
+                    in: container,
+                    debugDescription: "SmolLM3 rope_scaling.factor must be finite and > 0."
+                )
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "SmolLM3 \(key.rawValue) must be > 0."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if !value.isFinite || value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "SmolLM3 \(key.rawValue) must be finite and > 0."
+            )
         }
     }
 }

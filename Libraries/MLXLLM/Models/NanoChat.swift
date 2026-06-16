@@ -81,7 +81,6 @@ final class NanoChatAttention: Module {
         self.numHeads = config.attentionHeads
         self.numKVHeads = config.kvHeads
         self.headDim = config.hiddenSize / config.attentionHeads
-        precondition(headDim % 2 == 0, "Head dimension must be even for rotary embeddings.")
 
         self.scale = pow(Float(headDim), -0.5)
 
@@ -189,7 +188,6 @@ public final class NanoChatModelInner: Module {
     @ModuleInfo(key: "h") var layers: [NanoChatBlock]
 
     init(_ config: NanoChatConfiguration) {
-        precondition(config.vocabularySize > 0)
         self.config = config
 
         _embedTokens.wrappedValue = Embedding(
@@ -288,6 +286,85 @@ public struct NanoChatConfiguration: Codable, Sendable {
         self.rmsNormEps = try container.decodeIfPresent(Float.self, forKey: .rmsNormEps) ?? 1e-5
         self.logitsSoftcap =
             try container.decodeIfPresent(Float.self, forKey: .logitsSoftcap) ?? 15.0
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validateNonNegative(logitsSoftcap, key: .logitsSoftcap, in: container)
+
+        guard hiddenSize % attentionHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription:
+                    "NanoChat hidden_size must be divisible by num_attention_heads.")
+        }
+
+        let headDim = hiddenSize / attentionHeads
+        guard headDim % 2 == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription:
+                    "NanoChat head dimension must be even for rotary embeddings.")
+        }
+
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "NanoChat num_attention_heads must be divisible by num_key_value_heads.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "NanoChat \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite && value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "NanoChat \(key.rawValue) must be finite and > 0.")
+        }
+    }
+
+    private func validateNonNegative(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite && value >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "NanoChat \(key.rawValue) must be finite and >= 0.")
+        }
     }
 }
 

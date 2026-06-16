@@ -199,8 +199,6 @@ public final class Qwen3NextGatedDeltaNet: Module {
         self.convKernelSize = args.linearConvKernelDim
         self.convDim = keyDim * 2 + valueDim
 
-        precondition(numVHeads % numKHeads == 0, "num_v_heads must be divisible by num_k_heads")
-
         _conv1d.wrappedValue = Conv1d(
             inputChannels: convDim,
             outputChannels: convDim,
@@ -458,8 +456,6 @@ public class Qwen3NextModelInner: Module {
     let faIdx: Int
 
     init(_ args: Qwen3NextConfiguration) {
-        precondition(args.vocabularySize > 0)
-
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize,
             dimensions: args.hiddenSize
@@ -701,6 +697,95 @@ public struct Qwen3NextConfiguration: Codable, Sendable {
             [String: StringOrNumber].self, forKey: .ropeScaling)
         self.fullAttentionInterval =
             try container.decodeIfPresent(Int.self, forKey: .fullAttentionInterval) ?? 4
+
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try Self.validatePositive(linearNumValueHeads, key: .linearNumValueHeads, in: container)
+        try Self.validatePositive(linearNumKeyHeads, key: .linearNumKeyHeads, in: container)
+        try Self.validatePositive(linearKeyHeadDim, key: .linearKeyHeadDim, in: container)
+        try Self.validatePositive(linearValueHeadDim, key: .linearValueHeadDim, in: container)
+        try Self.validatePositive(linearConvKernelDim, key: .linearConvKernelDim, in: container)
+        try Self.validatePositive(decoderSparseStep, key: .decoderSparseStep, in: container)
+        try Self.validatePositive(sharedExpertIntermediateSize, key: .sharedExpertIntermediateSize, in: container)
+        try Self.validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+        try Self.validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try Self.validatePositive(partialRotaryFactor, key: .partialRotaryFactor, in: container)
+        try Self.validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try Self.validatePositive(fullAttentionInterval, key: .fullAttentionInterval, in: container)
+        if let headDim {
+            try Self.validatePositive(headDim, key: .headDim, in: container)
+        }
+
+        if hiddenSize % attentionHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "Qwen3Next config hidden_size must be divisible by num_attention_heads.")
+        }
+        if attentionHeads % kvHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .attentionHeads,
+                in: container,
+                debugDescription: "Qwen3Next config num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        if linearNumValueHeads % linearNumKeyHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .linearNumValueHeads,
+                in: container,
+                debugDescription: "Qwen3Next config linear_num_value_heads must be divisible by linear_num_key_heads.")
+        }
+        if fullAttentionInterval > hiddenLayers {
+            throw DecodingError.dataCorruptedError(
+                forKey: .fullAttentionInterval,
+                in: container,
+                debugDescription: "Qwen3Next config full_attention_interval must not exceed num_hidden_layers.")
+        }
+        if numExperts < 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numExperts,
+                in: container,
+                debugDescription: "Qwen3Next config num_experts must be non-negative.")
+        }
+        if numExperts > 0 {
+            try Self.validatePositive(numExpertsPerTok, key: .numExpertsPerTok, in: container)
+            try Self.validatePositive(moeIntermediateSize, key: .moeIntermediateSize, in: container)
+            if numExpertsPerTok > numExperts {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .numExpertsPerTok,
+                    in: container,
+                    debugDescription: "Qwen3Next config num_experts_per_tok must not exceed num_experts.")
+            }
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int,
+        key: K,
+        in container: KeyedDecodingContainer<K>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Qwen3Next config \(key.stringValue) must be greater than zero.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Float,
+        key: K,
+        in container: KeyedDecodingContainer<K>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Qwen3Next config \(key.stringValue) must be greater than zero.")
+        }
     }
 }
 

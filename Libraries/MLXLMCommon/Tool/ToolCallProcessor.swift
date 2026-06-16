@@ -49,6 +49,7 @@ public class ToolCallProcessor {
     private enum InlineToolCallKind {
         case json
         case functionCall
+        case bareNameJSON
     }
 
     // MARK: - Initialization
@@ -169,6 +170,27 @@ public class ToolCallProcessor {
                 return visible.isEmpty ? nil : visible
             }
 
+            if let callIndex = firstInlineBareNameJSONToolCallStart(in: inlineText) {
+                let leading = String(inlineText[..<callIndex])
+                inlineToolCallKind = .bareNameJSON
+                toolCallBuffer = String(inlineText[callIndex...])
+                state = .collectingInlineToolCall
+
+                if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
+                    toolCalls.append(toolCall)
+                    toolCallBuffer = ""
+                    state = .normal
+                    suppressingTextAfterInlineToolCall = true
+                }
+                return leading.isEmpty ? nil : leading
+            }
+
+            if let pendingIndex = partialInlineBareNameJSONToolCallStart(in: inlineText) {
+                let visible = String(inlineText[..<pendingIndex])
+                leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
+                return visible.isEmpty ? nil : visible
+            }
+
             // Check if this chunk starts what looks like a JSON tool call
             if let braceIndex = inlineText.firstIndex(of: "{") {
                 let leading = String(inlineText[..<braceIndex])
@@ -206,7 +228,7 @@ public class ToolCallProcessor {
                 toolCalls.append(toolCall)
                 toolCallBuffer = ""
                 state = .normal
-                if inlineToolCallKind == .functionCall {
+                if inlineToolCallKind == .functionCall || inlineToolCallKind == .bareNameJSON {
                     suppressingTextAfterInlineToolCall = true
                 }
                 return nil
@@ -245,7 +267,14 @@ public class ToolCallProcessor {
             return jsonBracesBalanced(text)
         case .functionCall:
             return functionCallParenthesesBalanced(text)
+        case .bareNameJSON:
+            return bareNameJSONCallBalanced(text)
         }
+    }
+
+    private func bareNameJSONCallBalanced(_ text: String) -> Bool {
+        guard let open = text.firstIndex(of: "{") else { return false }
+        return jsonBracesBalanced(String(text[open...]))
     }
 
     private func functionCallParenthesesBalanced(_ text: String) -> Bool {
@@ -301,7 +330,11 @@ public class ToolCallProcessor {
                         && compact.contains(#""name":"\#(name)""#)
             }
         }
-        return inlineFunctionToolNames().contains { compact.hasPrefix("\($0)(") }
+        return inlineFunctionToolNames().contains {
+            compact.hasPrefix("\($0)(")
+                || compact.hasPrefix("\($0){")
+                || compact.hasPrefix("\($0)```")
+        }
     }
 
     private func firstInlineFunctionToolCallStart(in text: String) -> String.Index? {
@@ -335,6 +368,95 @@ public class ToolCallProcessor {
             cursor = text.index(after: cursor)
         }
         return best
+    }
+
+    private func firstInlineBareNameJSONToolCallStart(in text: String) -> String.Index? {
+        inlineFunctionToolNames()
+            .compactMap { name -> String.Index? in
+                var searchStart = text.startIndex
+                while let range = text.range(of: name, range: searchStart ..< text.endIndex) {
+                    if isInlineFunctionBoundary(text, before: range.lowerBound)
+                        && bareNameJSONTailStartsObject(in: text, afterName: range.upperBound)
+                    {
+                        return range.lowerBound
+                    }
+                    searchStart = range.upperBound
+                }
+                return nil
+            }
+            .min()
+    }
+
+    private func partialInlineBareNameJSONToolCallStart(in text: String) -> String.Index? {
+        guard !text.isEmpty else { return nil }
+        var best: String.Index?
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            if isInlineFunctionBoundary(text, before: cursor) {
+                let suffix = String(text[cursor...])
+                for name in inlineFunctionToolNames() {
+                    if name.hasPrefix(suffix) && suffix.count < name.count {
+                        best = cursor
+                        break
+                    }
+                    guard suffix.hasPrefix(name),
+                        let afterName = text.index(
+                            cursor,
+                            offsetBy: name.count,
+                            limitedBy: text.endIndex)
+                    else { continue }
+                    let tailCursor = bareNameJSONTailObjectStart(in: text, afterName: afterName)
+                    if tailCursor == text.endIndex {
+                        best = cursor
+                        break
+                    }
+                    if text[tailCursor] != "{" {
+                        continue
+                    }
+                }
+            }
+            cursor = text.index(after: cursor)
+        }
+        return best
+    }
+
+    private func bareNameJSONTailStartsObject(in text: String, afterName: String.Index) -> Bool {
+        let cursor = bareNameJSONTailObjectStart(in: text, afterName: afterName)
+        return cursor < text.endIndex && text[cursor] == "{"
+    }
+
+    private func bareNameJSONTailObjectStart(
+        in text: String,
+        afterName: String.Index
+    ) -> String.Index {
+        var cursor = afterName
+        while cursor < text.endIndex, isInlineWhitespace(text[cursor]) {
+            cursor = text.index(after: cursor)
+        }
+        guard cursor < text.endIndex else { return cursor }
+        guard text[cursor...].hasPrefix("```") else { return cursor }
+
+        var fenceCursor = cursor
+        for _ in 0..<3 {
+            guard fenceCursor < text.endIndex else { return cursor }
+            fenceCursor = text.index(after: fenceCursor)
+        }
+        while fenceCursor < text.endIndex,
+            text[fenceCursor] != "\n",
+            text[fenceCursor] != "\r"
+        {
+            fenceCursor = text.index(after: fenceCursor)
+        }
+        while fenceCursor < text.endIndex, isInlineWhitespace(text[fenceCursor]) {
+            fenceCursor = text.index(after: fenceCursor)
+        }
+        return fenceCursor
+    }
+
+    private func isInlineWhitespace(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy {
+            CharacterSet.whitespacesAndNewlines.contains($0)
+        }
     }
 
     private func isInlineFunctionBoundary(_ text: String, before index: String.Index) -> Bool {
@@ -374,6 +496,8 @@ public class ToolCallProcessor {
                 if !leadingTextBeforeToolCall.isEmpty
                     || firstInlineFunctionToolCallStart(in: chunk) != nil
                     || partialInlineFunctionToolCallStart(in: chunk) != nil
+                    || firstInlineBareNameJSONToolCallStart(in: chunk) != nil
+                    || partialInlineBareNameJSONToolCallStart(in: chunk) != nil
                 {
                     return processInlineChunk(chunk)
                 }

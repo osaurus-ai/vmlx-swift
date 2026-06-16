@@ -337,12 +337,12 @@ public class Mistral4VLM: Module, VLMModel, KVCacheDimensionProvider {
     public var vocabularySize: Int { config.vocabSize }
     public var kvHeads: [Int] { languageModel.kvHeads }
 
-    public init(_ config: Mistral4VLMConfiguration) {
+    public init(_ config: Mistral4VLMConfiguration) throws {
         self.config = config
         _visionTower.wrappedValue = PixtralVision.VisionModel(config.visionConfig)
         _languageModel.wrappedValue = M4LanguageModel(config)
         _multiModalProjector.wrappedValue = Mistral3MultiModalProjector(
-            Mistral3VLMConfiguration(from: config))
+            try Mistral3VLMConfiguration.projectorConfiguration(from: config))
     }
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
@@ -450,17 +450,16 @@ extension Mistral4VLM: LoRAModel {
 
 // Helper to create Mistral3VLMConfiguration from Mistral4VLMConfiguration (for projector reuse)
 private extension Mistral3VLMConfiguration {
-    init(from m4: Mistral4VLMConfiguration) {
-        // Create a minimal Mistral3VLMConfiguration for the projector
-        self.init(
+    static func projectorConfiguration(from m4: Mistral4VLMConfiguration) throws -> Mistral3VLMConfiguration {
+        try Mistral3VLMConfiguration(
             textConfig: m4.textConfig,
             visionConfig: m4.visionConfig,
             modelType: m4.modelType
         )
     }
 
-    init(textConfig: Mistral3VLMTextConfiguration, visionConfig: Mistral3VisionConfiguration, modelType: String) {
-        self = try! JSONDecoder().decode(
+    init(textConfig: Mistral3VLMTextConfiguration, visionConfig: Mistral3VisionConfiguration, modelType: String) throws {
+        self = try JSONDecoder().decode(
             Self.self,
             from: JSONSerialization.data(
                 withJSONObject: [
@@ -472,6 +471,9 @@ private extension Mistral3VLMConfiguration {
                         "num_attention_heads": textConfig.numAttentionHeads,
                         "rms_norm_eps": textConfig.rmsNormEps,
                         "vocab_size": textConfig.vocabSize,
+                        "rope_parameters": [
+                            "rope_theta": textConfig.ropeParameters?["rope_theta"]?.asFloat() ?? textConfig.ropeTheta
+                        ],
                     ] as [String: Any],
                     "vision_config": [
                         "model_type": "pixtral",

@@ -1432,6 +1432,35 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
+    @Test("shape-walk quantization uses expert intermediate for routed down projection")
+    func shapeWalkQuantizationUsesExpertIntermediateForRoutedDownProjection() {
+        let base = "model.layers.17.mlp.switch_mlp.down_proj"
+        let weights: [String: MLXArray] = [
+            "\(base).weight": MLXArray.zeros([256, 4096, 128], dtype: .uint32),
+            "\(base).scales": MLXArray.zeros([256, 4096, 16], dtype: .float32),
+            "\(base).biases": MLXArray.zeros([256, 4096, 16], dtype: .float32),
+        ]
+
+        let inferred = JangLoader.inferPerLayerQuantization(
+            weights: weights,
+            jangConfig: JangConfig(
+                quantization: JangQuantization(
+                    blockSize: 32,
+                    bitWidthsUsed: [2, 3, 8])),
+            hiddenSizeHint: 4096,
+            expertIntermediateSizeHint: 2048,
+            validInDims: [512, 2048, 4096],
+            declaredDefaultQuantization: BaseConfiguration.Quantization(
+                groupSize: 64, bits: 8))
+
+        if case .quantize(let override)? = inferred.perLayerQuantization[base] {
+            #expect(override.bits == 2)
+            #expect(override.groupSize == 128)
+        } else {
+            Issue.record("Expected routed down projection to use MoE intermediate input width")
+        }
+    }
+
     @Test("shape-walk honors role-level MXTQ metadata for dense JANGTQ roles")
     func shapeWalkHonorsRoleLevelMXTQMetadata() {
         let base = "backbone.layers.0.mixer.in_proj"
@@ -1511,6 +1540,126 @@ struct MTPRuntimeFocusedTests {
             #expect(override.groupSize == 32)
         } else {
             Issue.record("Expected ZAYA CCA o_proj override to use 1024-wide attention input")
+        }
+    }
+
+    @Test("JANG valid input dims include MiMo V-head attention output")
+    func jangValidInputDimsIncludeMiMoVHeadAttentionOutput() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mimo-valid-input-dims-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let config = """
+        {
+          "hidden_size": 4096,
+          "intermediate_size": 8192,
+          "num_attention_heads": 64,
+          "num_key_value_heads": 4,
+          "head_dim": 192,
+          "v_head_dim": 128,
+          "swa_num_attention_heads": 64,
+          "swa_num_key_value_heads": 8,
+          "swa_head_dim": 192,
+          "swa_v_head_dim": 128
+        }
+        """
+        try config.data(using: .utf8)!.write(to: root.appendingPathComponent("config.json"))
+
+        let dims = readValidInDimsForJANGQuantization(at: root)
+
+        #expect(dims.contains(4096))
+        #expect(dims.contains(64 * 128))
+        #expect(dims.contains(8 * 128))
+        #expect(dims.contains(64 * 192))
+        #expect(dims.contains(8 * 192))
+    }
+
+    @Test("shape-walk quantization uses MiMo V-head output for attention o_proj")
+    func shapeWalkQuantizationUsesMiMoVHeadOutputForAttentionOProj() {
+        let base = "model.layers.0.self_attn.o_proj"
+        let weights: [String: MLXArray] = [
+            "\(base).weight": MLXArray.zeros([4096, 1024], dtype: .uint32),
+            "\(base).scales": MLXArray.zeros([4096, 128], dtype: .float32),
+            "\(base).biases": MLXArray.zeros([4096, 128], dtype: .float32),
+        ]
+
+        let inferred = JangLoader.inferPerLayerQuantization(
+            weights: weights,
+            jangConfig: JangConfig(
+                quantization: JangQuantization(
+                    blockSize: 32,
+                    bitWidthsUsed: [2, 4, 8])),
+            hiddenSizeHint: 4096,
+            validInDims: [4096, 8192, 16_384],
+            attentionOutputDimHints: [8192],
+            declaredDefaultQuantization: BaseConfiguration.Quantization(
+                groupSize: 64, bits: 8))
+
+        if case .quantize(let override)? = inferred.perLayerQuantization[base] {
+            #expect(override.bits == 4)
+            #expect(override.groupSize == 64)
+        } else {
+            Issue.record("Expected MiMo attention o_proj to use 8192-wide V-head output")
+        }
+    }
+
+    @Test("shape-walk quantization resolves Nex N2 JANG_1L hybrid SSM tensors")
+    func shapeWalkQuantizationResolvesNexN2Jang1LHybridSSMTensors() {
+        let linearOut = "model.layers.0.linear_attn.out_proj"
+        let routedGate = "model.layers.0.mlp.switch_mlp.gate_proj"
+        let routedDown = "model.layers.0.mlp.switch_mlp.down_proj"
+        let sharedGate = "model.layers.0.mlp.shared_expert.gate_proj"
+        let weights: [String: MLXArray] = [
+            "\(linearOut).weight": MLXArray.zeros([4096, 512], dtype: .uint32),
+            "\(linearOut).scales": MLXArray.zeros([4096, 64], dtype: .float32),
+            "\(routedGate).weight": MLXArray.zeros([512, 1024, 256], dtype: .uint32),
+            "\(routedGate).scales": MLXArray.zeros([512, 1024, 32], dtype: .float32),
+            "\(routedDown).weight": MLXArray.zeros([512, 4096, 64], dtype: .uint32),
+            "\(routedDown).scales": MLXArray.zeros([512, 4096, 8], dtype: .float32),
+            "\(sharedGate).weight": MLXArray.zeros([1024, 1024], dtype: .uint32),
+            "\(sharedGate).scales": MLXArray.zeros([1024, 32], dtype: .float32),
+        ]
+
+        let inferred = JangLoader.inferPerLayerQuantization(
+            weights: weights,
+            jangConfig: JangConfig(
+                quantization: JangQuantization(
+                    blockSize: 128,
+                    bitWidthsUsed: [2, 8])),
+            hiddenSizeHint: 4096,
+            linearAttnValueDimHint: 8192,
+            expertIntermediateSizeHint: 1024,
+            validInDims: [1024, 2048, 4096, 6144, 8192],
+            declaredDefaultQuantization: BaseConfiguration.Quantization(
+                groupSize: 128, bits: 2))
+
+        if case .quantize(let override)? = inferred.perLayerQuantization[linearOut] {
+            #expect(override.bits == 2)
+            #expect(override.groupSize == 128)
+        } else {
+            Issue.record("Expected N2 JANG_1L linear attention out_proj to use 8192-wide value state")
+        }
+
+        if case .quantize(let override)? = inferred.perLayerQuantization[routedGate] {
+            #expect(override.bits == 2)
+            #expect(override.groupSize == 128)
+        } else {
+            Issue.record("Expected N2 JANG_1L routed gate projection to use hidden input width")
+        }
+
+        if case .quantize(let override)? = inferred.perLayerQuantization[routedDown] {
+            #expect(override.bits == 2)
+            #expect(override.groupSize == 128)
+        } else {
+            Issue.record("Expected N2 JANG_1L routed down projection to use MoE intermediate width")
+        }
+
+        if case .quantize(let override)? = inferred.perLayerQuantization[sharedGate] {
+            #expect(override.bits == 8)
+            #expect(override.groupSize == 128)
+        } else {
+            Issue.record("Expected N2 JANG_1L shared expert projection to use hidden input width")
         }
     }
 
@@ -1671,7 +1820,7 @@ struct MTPRuntimeFocusedTests {
         """.data(using: .utf8)!
         let configuration = try JSONDecoder().decode(
             Qwen35JANGTQTextConfiguration.self, from: configData)
-        let model = Qwen35JANGTQTextModel(configuration)
+        let model = try Qwen35JANGTQTextModel(configuration)
         let norm = MLXArray([Float](repeating: 0.5, count: 4))
 
         let sanitized = model.sanitize(weights: [

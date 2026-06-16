@@ -67,6 +67,105 @@ public struct Mistral3VLMTextConfiguration: Codable, Sendable {
         case _slidingWindow = "sliding_window"
         case _useQkNorm = "use_qk_norm"
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        modelType = try container.decode(String.self, forKey: .modelType)
+        hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        numHiddenLayers = try container.decode(Int.self, forKey: .numHiddenLayers)
+        intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        numAttentionHeads = try container.decode(Int.self, forKey: .numAttentionHeads)
+        rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
+        vocabSize = try container.decode(Int.self, forKey: .vocabSize)
+        _headDim = try container.decodeIfPresent(Int.self, forKey: ._headDim)
+        _maxPositionEmbeddings = try container.decodeIfPresent(Int.self, forKey: ._maxPositionEmbeddings)
+        _numKeyValueHeads = try container.decodeIfPresent(Int.self, forKey: ._numKeyValueHeads)
+        _ropeTheta = try container.decodeIfPresent(Float.self, forKey: ._ropeTheta)
+        _ropeParameters = try container.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: ._ropeParameters)
+        _ropeTraditional = try container.decodeIfPresent(Bool.self, forKey: ._ropeTraditional)
+        _ropeScaling = try container.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: ._ropeScaling)
+        _tieWordEmbeddings = try container.decodeIfPresent(Bool.self, forKey: ._tieWordEmbeddings)
+        _layerTypes = try container.decodeIfPresent([String].self, forKey: ._layerTypes)
+        _slidingWindow = try container.decodeIfPresent(Int.self, forKey: ._slidingWindow)
+        _useQkNorm = try container.decodeIfPresent(Bool.self, forKey: ._useQkNorm)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(numHiddenLayers, key: .numHiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(numAttentionHeads, key: .numAttentionHeads, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabSize, key: .vocabSize, in: container)
+        if let headDim {
+            try validatePositive(headDim, key: ._headDim, in: container)
+        }
+        if let maxPositionEmbeddings {
+            try validatePositive(maxPositionEmbeddings, key: ._maxPositionEmbeddings, in: container)
+        }
+        try validatePositive(numKeyValueHeads, key: ._numKeyValueHeads, in: container)
+        try validatePositive(ropeTheta, key: ._ropeTheta, in: container)
+        if let slidingWindow {
+            try validatePositive(slidingWindow, key: ._slidingWindow, in: container)
+        }
+        if let layerTypes {
+            guard layerTypes.count == numHiddenLayers else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: ._layerTypes, in: container,
+                    debugDescription: "Mistral3 VLM text config layer_types count must equal num_hidden_layers.")
+            }
+        }
+
+        let effectiveHeadDim = headDim ?? (hiddenSize / numAttentionHeads)
+        guard hiddenSize == numAttentionHeads * effectiveHeadDim else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize, in: container,
+                debugDescription: "Mistral3 VLM text config hidden_size must equal num_attention_heads * head_dim.")
+        }
+        guard numAttentionHeads % numKeyValueHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._numKeyValueHeads, in: container,
+                debugDescription: "Mistral3 VLM text config num_attention_heads must be divisible by num_key_value_heads.")
+        }
+
+        guard let ropeParams = ropeParameters,
+            let ropeTheta = ropeParams["rope_theta"]?.asFloat(),
+            ropeTheta.isFinite,
+            ropeTheta > 0
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._ropeParameters, in: container,
+                debugDescription: "Mistral3 VLM text config rope_parameters.rope_theta is required and must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Mistral3 VLM text config \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "Mistral3 VLM text config \(key.rawValue) must be finite and > 0.")
+        }
+    }
 }
 
 // MARK: - Model Configuration
@@ -335,15 +434,9 @@ private enum Language {
             self._wv.wrappedValue = Linear(dim, nKVHeads * headDim, bias: false)
             self._wo.wrappedValue = Linear(nHeads * headDim, dim, bias: false)
 
-            // Initialize RoPE using rope_parameters - rope_theta is required like in Python
-            guard let ropeParams = config.ropeParameters,
-                let ropeTheta = ropeParams["rope_theta"]?.asFloat()
-            else {
-                fatalError("rope_parameters['rope_theta'] is required")
-            }
             self.rope = initializeRope(
                 dims: headDim,
-                base: ropeTheta,
+                base: config.ropeTheta,
                 traditional: false,
                 scalingConfig: config.ropeParameters,
                 maxPositionEmbeddings: config.maxPositionEmbeddings
@@ -1028,6 +1121,66 @@ public struct Mistral3VLMProcessorConfiguration: Codable, Sendable {
             case doRescale = "do_rescale"
             case doResize = "do_resize"
             case rescaleFactor = "rescale_factor"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            imageMean = try container.decode([CGFloat].self, forKey: .imageMean)
+            imageStd = try container.decode([CGFloat].self, forKey: .imageStd)
+            size = try container.decode(ProcessorSize.self, forKey: .size)
+            patchSize = try container.decode(Int.self, forKey: .patchSize)
+            doNormalize = try container.decodeIfPresent(Bool.self, forKey: .doNormalize)
+            doRescale = try container.decodeIfPresent(Bool.self, forKey: .doRescale)
+            doResize = try container.decodeIfPresent(Bool.self, forKey: .doResize)
+            rescaleFactor = try container.decodeIfPresent(Float.self, forKey: .rescaleFactor)
+
+            try validateDecodedFields(container: container)
+        }
+
+        private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+            try validateRGBTuple(imageMean, key: .imageMean, in: container)
+            try validateRGBTuple(imageStd, key: .imageStd, in: container)
+            try validatePositive(patchSize, key: .patchSize, in: container)
+            if let rescaleFactor {
+                guard rescaleFactor.isFinite, rescaleFactor > 0 else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .rescaleFactor, in: container,
+                        debugDescription: "Mistral3 VLM processor config rescale_factor must be finite and > 0.")
+                }
+            }
+            if let width = size.width {
+                try validatePositive(width, key: .size, in: container)
+            }
+            if let height = size.height {
+                try validatePositive(height, key: .size, in: container)
+            }
+            if let longestEdge = size.longestEdge {
+                try validatePositive(longestEdge, key: .size, in: container)
+            }
+        }
+
+        private func validateRGBTuple(
+            _ values: [CGFloat],
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard values.count == 3 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "Mistral3 VLM processor config \(key.rawValue) must contain exactly 3 RGB values.")
+            }
+        }
+
+        private func validatePositive(
+            _ value: Int,
+            key: CodingKeys,
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "Mistral3 VLM processor config \(key.rawValue) values must be > 0.")
+            }
         }
     }
 

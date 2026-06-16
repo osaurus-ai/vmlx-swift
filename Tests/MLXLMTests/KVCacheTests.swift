@@ -1,6 +1,6 @@
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import Testing
 
 private let cacheCreators: [@Sendable () -> any KVCache] = [
@@ -46,6 +46,33 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
         #expect(type(of: lhs) == type(of: rhs))
         #expect(lhs.metaState == rhs.metaState)
         #expect(lhs.state.count == rhs.state.count)
+    }
+}
+
+@Test
+func testLoadPromptCacheRejectsMalformedKVCacheStateFile() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+        .appendingPathExtension("safetensors")
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    try save(
+        arrays: ["0.0": MLXArray.ones([1, 2])],
+        metadata: [
+            "0.0.0": "",
+            "2.0": "KVCache",
+        ],
+        url: url
+    )
+
+    do {
+        _ = try loadPromptCache(url: url)
+        Issue.record("Malformed prompt-cache file should throw before assigning cache.state")
+    } catch {
+        #expect(String(describing: error).contains("KVCacheSimple prompt cache state must have 0 or 2 arrays"))
     }
 }
 

@@ -117,6 +117,156 @@ public struct AfMoEConfiguration: Codable, Sendable {
         self.slidingWindow =
             try container.decodeIfPresent(Int.self, forKey: .slidingWindow) ?? 2048
         self.mupEnabled = try container.decodeIfPresent(Bool.self, forKey: .mupEnabled) ?? true
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(moeIntermediateSize, key: .moeIntermediateSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(headDim, key: .headDim, in: container)
+        try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try validatePositive(numExperts, key: .numExperts, in: container)
+        try validatePositive(numExpertsPerToken, key: .numExpertsPerToken, in: container)
+        try validateNonNegative(numSharedExperts, key: .numSharedExperts, in: container)
+        try validateNonNegative(numDenseLayers, key: .numDenseLayers, in: container)
+        try validatePositive(routeScale, key: .routeScale, in: container)
+        try validatePositive(nGroup, key: .nGroup, in: container)
+        try validatePositive(topkGroup, key: .topkGroup, in: container)
+        try validatePositive(slidingWindow, key: .slidingWindow, in: container)
+
+        if hiddenSize != attentionHeads * headDim {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "AfMoE hidden_size must equal num_attention_heads * head_dim."
+            )
+        }
+
+        if attentionHeads % kvHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "AfMoE num_attention_heads must be divisible by num_key_value_heads."
+            )
+        }
+
+        if numExpertsPerToken > numExperts {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numExpertsPerToken,
+                in: container,
+                debugDescription: "AfMoE num_experts_per_tok must be <= num_experts."
+            )
+        }
+
+        if numExperts % nGroup != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .nGroup,
+                in: container,
+                debugDescription: "AfMoE num_experts must be divisible by n_group."
+            )
+        }
+
+        if topkGroup > nGroup {
+            throw DecodingError.dataCorruptedError(
+                forKey: .topkGroup,
+                in: container,
+                debugDescription: "AfMoE topk_group must be > 0 and <= n_group."
+            )
+        }
+
+        if numDenseLayers > hiddenLayers {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numDenseLayers,
+                in: container,
+                debugDescription: "AfMoE num_dense_layers must be <= num_hidden_layers."
+            )
+        }
+
+        if layerTypes.count != hiddenLayers {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layerTypes,
+                in: container,
+                debugDescription: "AfMoE layer_types count must equal num_hidden_layers."
+            )
+        }
+
+        if !layerTypes.allSatisfy({ $0 == "full_attention" || $0 == "sliding_attention" }) {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layerTypes,
+                in: container,
+                debugDescription:
+                    "AfMoE layer_types entries must be full_attention or sliding_attention."
+            )
+        }
+
+        if scoreFunc != "sigmoid" && scoreFunc != "softmax" {
+            throw DecodingError.dataCorruptedError(
+                forKey: .scoreFunc,
+                in: container,
+                debugDescription: "AfMoE score_func must be sigmoid or softmax."
+            )
+        }
+
+        if let factor = ropeScaling?["factor"]?.asFloat() {
+            if !factor.isFinite || factor <= 0 {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling,
+                    in: container,
+                    debugDescription: "AfMoE rope_scaling.factor must be finite and > 0."
+                )
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "AfMoE \(key.rawValue) must be > 0."
+            )
+        }
+    }
+
+    private func validateNonNegative(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value < 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "AfMoE \(key.rawValue) must be >= 0."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if !value.isFinite || value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "AfMoE \(key.rawValue) must be finite and > 0."
+            )
+        }
     }
 }
 
@@ -312,11 +462,17 @@ class AfMoEMoE: Module, UnaryLayer {
         if nGroup > 1 {
             selectionScores = unflatten(selectionScores, axis: -1, shape: [nGroup, -1])
             let groupScores = top(selectionScores, k: 2, axis: -1).sum(axis: -1, keepDims: true)
-            let k = nGroup - topkGroup
-            let groupIdx = argPartition(groupScores, kth: k - 1, axis: -2)[.ellipsis, ..<k, 0...]
-            selectionScores = putAlong(
-                selectionScores, stopGradient(groupIdx), values: MLXArray(0.0, dtype: selectionScores.dtype), axis: -2)
-            selectionScores = flattened(selectionScores, start: -2, end: -1)
+            let droppedGroups = nGroup - topkGroup
+            if droppedGroups > 0 {
+                let groupIdx = argPartition(groupScores, kth: droppedGroups - 1, axis: -2)[
+                    .ellipsis, ..<droppedGroups, 0...]
+                selectionScores = putAlong(
+                    selectionScores, stopGradient(groupIdx),
+                    values: MLXArray(0.0, dtype: selectionScores.dtype), axis: -2)
+                selectionScores = flattened(selectionScores, start: -2, end: -1)
+            } else {
+                selectionScores = flattened(selectionScores, start: -2, end: -1)
+            }
         }
 
         // Select top-k experts
@@ -427,8 +583,6 @@ private class AfMoEModelInner: Module {
         self.slidingWindow = args.slidingWindow
         self.mupEnabled = args.mupEnabled
         self.hiddenSize = args.hiddenSize
-
-        precondition(args.vocabularySize > 0)
 
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)

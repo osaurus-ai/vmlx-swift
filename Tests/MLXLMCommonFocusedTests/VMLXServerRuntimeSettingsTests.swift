@@ -67,6 +67,120 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(resolved.reasoningParserName == "none")
     }
 
+    @Test("Nemotron Ultra JANG capability stamps survive Osaurus auto settings")
+    func nemotronUltraJANGCapabilityStampsSurviveOsaurusAutoSettings() {
+        let capabilities = JangCapabilities(
+            reasoningParser: "deepseek_r1",
+            toolParser: "nemotron",
+            thinkInTemplate: true,
+            supportsTools: true,
+            supportsThinking: true,
+            supportsText: true,
+            family: "nemotron_h",
+            modality: "text",
+            cacheType: "hybrid")
+
+        let reasoning = ParserResolution.reasoning(
+            capabilities: capabilities,
+            modelType: "nemotron_h")
+        let tool = ParserResolution.toolCall(
+            capabilities: capabilities,
+            modelType: "nemotron_h")
+        let base = ModelConfiguration(
+            directory: URL(fileURLWithPath: "/tmp/nemotron-ultra-jangtq1l"),
+            toolCallFormat: tool.format,
+            reasoningParserName: capabilities.reasoningParser)
+
+        var settings = VMLXServerRuntimeSettings()
+        settings.tools.toolParserOverride = "auto"
+        settings.tools.reasoningParserOverride = "auto"
+        let resolved = settings.resolvedModelConfiguration(base: base)
+
+        #expect(reasoning.parser != nil)
+        #expect(reasoning.source == .jangStamped)
+        #expect(tool.format == .xmlFunction)
+        #expect(tool.source == .jangStamped)
+        #expect(resolved.toolCallFormat == .xmlFunction)
+        #expect(resolved.reasoningParserName == "deepseek_r1")
+        #expect(capabilities.thinkInTemplate == true)
+        #expect(capabilities.supportsTools == true)
+        #expect(capabilities.supportsThinking == true)
+        #expect(capabilities.supportsVision == nil)
+        #expect(capabilities.supportsVideo == nil)
+        #expect(capabilities.supportsAudio == nil)
+        #expect(capabilities.modality == "text")
+        #expect(capabilities.cacheType == "hybrid")
+    }
+
+    @Test("Nemotron Ultra Osaurus launch contract resolves from bundle metadata")
+    func nemotronUltraOsaurusLaunchContractResolvesFromBundleMetadata() throws {
+        let jangConfig = JangConfig(
+            quantization: JangQuantization(
+                profile: "JANGTQ_1L",
+                targetBits: 1,
+                actualBits: 1,
+                bitWidthsUsed: [1, 8],
+                quantizationBackend: "mxtq"),
+            architecture: JangArchitecture(type: "nemotron_h", hasSSM: true, hasMoE: true),
+            capabilities: JangCapabilities(
+                reasoningParser: "deepseek_r1",
+                toolParser: "nemotron",
+                thinkInTemplate: true,
+                supportsTools: true,
+                supportsThinking: true,
+                family: "nemotron_h",
+                modality: "text",
+                cacheType: "hybrid"))
+        let generationConfig = GenerationConfigFile(
+            eosTokenIds: IntOrIntArray([2, 11]),
+            temperature: 1.0,
+            topP: 0.95,
+            doSample: true)
+        let settings = VMLXServerRuntimeSettings()
+
+        let toolResolution = ParserResolution.toolCall(
+            capabilities: jangConfig.capabilities,
+            modelType: "nemotron_h")
+        let reasoningResolution = ParserResolution.reasoning(
+            capabilities: jangConfig.capabilities,
+            modelType: "nemotron_h")
+        let cacheConfig = settings.cacheCoordinatorConfig(
+            modelKey: "nemotron-ultra|reasoning=deepseek_r1|tools=nemotron|kv=tq3x3",
+            diskCacheDirectory: URL(fileURLWithPath: "/tmp/vmlx-nemotron-ultra-l2"),
+            ssmMaxEntries: 108)
+        let generate = settings.resolvedGenerateParameters(
+            generationConfig: generationConfig,
+            fallback: GenerateParameters(maxTokens: 64, temperature: 0.6, topP: 1.0, topK: 0))
+
+        #expect(toolResolution.source == JangCapabilities.ResolutionSource.jangStamped)
+        #expect(toolResolution.format == ToolCallFormat.xmlFunction)
+        #expect(reasoningResolution.source == JangCapabilities.ResolutionSource.jangStamped)
+        #expect(reasoningResolution.parser != nil)
+        #expect(jangConfig.capabilities?.thinkInTemplate == true)
+        #expect(jangConfig.capabilities?.supportsTools == true)
+        #expect(jangConfig.capabilities?.supportsThinking == true)
+        #expect(jangConfig.capabilities?.supportsText == nil)
+        #expect(jangConfig.capabilities?.supportsVision == nil)
+        #expect(jangConfig.capabilities?.supportsVideo == nil)
+        #expect(jangConfig.capabilities?.supportsAudio == nil)
+        #expect(jangConfig.capabilities?.cacheType == "hybrid")
+        #expect(cacheConfig.usePagedCache)
+        #expect(cacheConfig.enableDiskCache)
+        #expect(cacheConfig.enableSSMReDerive)
+        #expect(cacheConfig.ssmMaxEntries == 108)
+        #expect(cacheConfig.modelKey == "nemotron-ultra|reasoning=deepseek_r1|tools=nemotron|kv=tq3x3")
+        if case .turboQuant(let keyBits, let valueBits) = cacheConfig.defaultKVMode {
+            #expect(keyBits == 3)
+            #expect(valueBits == 3)
+        } else {
+            Issue.record("Ultra Osaurus launch contract should keep engine-selected TurboQuant KV.")
+        }
+        #expect(generate.temperature == 1.0)
+        #expect(generate.topP == 0.95)
+        #expect(generate.topK == 0)
+        #expect(generate.repetitionPenalty == nil)
+    }
+
     @Test("local load configuration entrypoint preserves caller model configuration")
     func localLoadConfigurationEntrypointPreservesCallerModelConfiguration() throws {
         let repoRoot = URL(fileURLWithPath: #filePath)
@@ -759,6 +873,7 @@ struct VMLXServerRuntimeSettingsTests {
             ("gemma4", .gemma4, "harmony"),
             ("hy3", .hunyuan, "think_xml"),
             ("mimo_v2", .xmlFunction, "think_xml"),
+            ("nemotron_h", .xmlFunction, "think_xml"),
         ]
         let settings = VMLXServerRuntimeSettings()
         let config = settings.cacheCoordinatorConfig(
@@ -787,6 +902,46 @@ struct VMLXServerRuntimeSettingsTests {
             #expect(ToolCallFormat.infer(from: row.modelType) == row.tool)
             #expect(reasoningStampFromModelType(row.modelType) == row.reasoning)
         }
+    }
+
+    @Test("README keeps Nemotron Ultra resident and mmap speed rows separate")
+    func readmeKeepsNemotronUltraSpeedBoundaryHonest() throws {
+        let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
+
+        #expect(readme.contains("Nemotron Ultra JANGTQ_1L has two distinct rows today"))
+        #expect(readme.contains("Python/JANG reference row"))
+        #expect(readme.contains("not a Swift RunBench row"))
+        #expect(readme.contains("8.335 tok/s"))
+        #expect(readme.contains("low-footprint"))
+        #expect(readme.contains("mmap/JangPress"))
+        #expect(readme.contains("3.6-3.8 tok/s"))
+        #expect(readme.contains("do not describe the Swift or"))
+        #expect(readme.contains("path as an 8-10 tok/s row"))
+    }
+
+    @Test("Nemotron Ultra status doc keeps fixed and partial rows separate")
+    func nemotronUltraStatusDocKeepsFixedAndPartialRowsHonest() throws {
+        let status = try String(
+            contentsOfFile: "docs/NEMOTRON_ULTRA_RUNTIME_STATUS_2026_06_06.md",
+            encoding: .utf8)
+
+        #expect(status.contains("## Fixed"))
+        #expect(status.contains("## Partial"))
+        #expect(status.contains("best_live_tps=8.335"))
+        #expect(status.contains("min_live_tps=8.000"))
+        #expect(status.contains("block_disk_hits=3"))
+        #expect(status.contains("ssm_companion_hits=3"))
+        #expect(status.contains("topology_kv_layer_count=12"))
+        #expect(status.contains("topology_mamba_layer_count=48"))
+        #expect(status.contains("activation dtype retention"))
+        #expect(status.contains("embedding dtype before"))
+        #expect(status.contains("3.8-4.5 tok/s"))
+        #expect(status.contains("not yet an"))
+        #expect(status.contains("8-10 tok/s row"))
+        #expect(status.contains("not itself a decode-speed proof"))
+        #expect(status.contains("synchronous prompt-boundary"))
+        #expect(status.contains("10.000 tok/s"))
+        #expect(status.contains("40.000 ms"))
     }
 
     @Test("prefix cache off disables coordinator reuse tiers")

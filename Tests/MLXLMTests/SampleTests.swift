@@ -203,6 +203,42 @@ public class SampleTests: XCTestCase {
         )
     }
 
+    func testDirectPenaltyContextsWithNonPositiveCapacityNoOp() {
+        let logits =
+            MLXArray([1.0 as Float, 2.0 as Float, 3.0 as Float, 4.0 as Float])[.newAxis, .ellipsis]
+        let expected = logits[0].asArray(Float.self)
+
+        var repetitionZero = RepetitionContext(repetitionPenalty: 1.5, repetitionContextSize: 0)
+        repetitionZero.prompt(MLXArray([1, 2, 3]))
+        repetitionZero.didSample(token: MLXArray(1))
+        XCTAssertEqual(repetitionZero.process(logits: logits)[0].asArray(Float.self), expected)
+
+        var repetitionNegative = RepetitionContext(repetitionPenalty: 1.5, repetitionContextSize: -4)
+        repetitionNegative.prompt(MLXArray([1, 2, 3]))
+        repetitionNegative.didSample(token: MLXArray(1))
+        XCTAssertEqual(repetitionNegative.process(logits: logits)[0].asArray(Float.self), expected)
+
+        var presenceZero = PresencePenaltyContext(presencePenalty: 0.5, presenceContextSize: 0)
+        presenceZero.prompt(MLXArray([1, 2, 3]))
+        presenceZero.didSample(token: MLXArray(1))
+        XCTAssertEqual(presenceZero.process(logits: logits)[0].asArray(Float.self), expected)
+
+        var presenceNegative = PresencePenaltyContext(presencePenalty: 0.5, presenceContextSize: -4)
+        presenceNegative.prompt(MLXArray([1, 2, 3]))
+        presenceNegative.didSample(token: MLXArray(1))
+        XCTAssertEqual(presenceNegative.process(logits: logits)[0].asArray(Float.self), expected)
+
+        var frequencyZero = FrequencyPenaltyContext(frequencyPenalty: 0.5, frequencyContextSize: 0)
+        frequencyZero.prompt(MLXArray([1, 2, 3]))
+        frequencyZero.didSample(token: MLXArray(1))
+        XCTAssertEqual(frequencyZero.process(logits: logits)[0].asArray(Float.self), expected)
+
+        var frequencyNegative = FrequencyPenaltyContext(frequencyPenalty: 0.5, frequencyContextSize: -4)
+        frequencyNegative.prompt(MLXArray([1, 2, 3]))
+        frequencyNegative.didSample(token: MLXArray(1))
+        XCTAssertEqual(frequencyNegative.process(logits: logits)[0].asArray(Float.self), expected)
+    }
+
     /// 2026-04-30 (Bug 3a): `repetition_penalty: 1.0` is the HuggingFace
     /// idiom for "no penalty" — multiplying / dividing logits by 1.0 is
     /// a no-op. Models like Nemotron-3-Nano-Omni ship `1.0` as a default

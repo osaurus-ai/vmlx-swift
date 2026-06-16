@@ -107,18 +107,40 @@ struct HiddenStateCaptureTests {
     }
 
     @Test("extractContextFeature concatenates in the requested order")
-    func testExtractContextFeatureShape() {
+    func testExtractContextFeatureShape() throws {
         let model = newModel()
         let input = tokens([1, 2, 3])
         let (_, states) = model(
             input, cache: nil, captureLayerIDs: [0, 1, 2])
         // Request a specific order — output concat must follow it.
-        let stacked = extractContextFeature(
+        let stacked = try extractContextFeature(
             captured: states, targetLayerIDs: [2, 0, 1])
         materialize(stacked)
         #expect(stacked.ndim == 3)
         #expect(stacked.dim(0) == 1)
         #expect(stacked.dim(1) == 3)
         #expect(stacked.dim(2) == 3 * Self.tinyConfig.hiddenSize)
+    }
+
+    @Test("extractContextFeature rejects empty target layer IDs")
+    func testExtractContextFeatureRejectsEmptyTargetLayerIDs() throws {
+        do {
+            _ = try extractContextFeature(captured: [:], targetLayerIDs: [])
+            Issue.record("Expected empty target layer IDs to throw")
+        } catch let error as SpecDecError {
+            #expect(String(describing: error).contains("target_layer_ids"))
+        }
+    }
+
+    @Test("extractContextFeature rejects missing captured target layer")
+    func testExtractContextFeatureRejectsMissingCapturedLayer() throws {
+        let hidden = MLXArray.zeros([1, 2, Self.tinyConfig.hiddenSize], dtype: .float32)
+
+        do {
+            _ = try extractContextFeature(captured: [0: hidden], targetLayerIDs: [0, 1])
+            Issue.record("Expected missing captured layer to throw")
+        } catch let error as SpecDecError {
+            #expect(String(describing: error).contains("missing captured hidden state"))
+        }
     }
 }

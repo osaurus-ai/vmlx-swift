@@ -3,10 +3,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OSAURUS_ROOT="${OSAURUS_ROOT:-/Users/eric/osaurus-staging}"
-QWEN_DIR="${VMLINUX_QWEN_PROOF_DIR:-/tmp/vmlx-qwen35-jangtq-turnmatrix-post-vlfix-20260524-1545}"
-GEMMA_DIR="${VMLINUX_GEMMA_PROOF_DIR:-/tmp/vmlx-gemma4-turnmatrix-post-thoughtfix-20260524}"
-ZAYA_DIR="${VMLINUX_ZAYA_PROOF_DIR:-/tmp/vmlx-zaya-text-turnmatrix-20260524-1456}"
-DSV4_DIR="${VMLINUX_DSV4_PROOF_DIR:-/tmp/vmlx-dsv4-band-pe2-turnmatrix-20260524-1445}"
+QWEN_DIR="${VMLX_QWEN_PROOF_DIR:-/tmp/vmlx-qwen35-jangtq-turnmatrix-post-vlfix-20260524-1545}"
+GEMMA_DIR="${VMLX_GEMMA_PROOF_DIR:-/tmp/vmlx-gemma4-turnmatrix-current-20260524-1516}"
+ZAYA_DIR="${VMLX_ZAYA_PROOF_DIR:-/tmp/vmlx-zaya-text-turnmatrix-20260524-1456}"
+DSV4_DIR="${VMLX_DSV4_PROOF_DIR:-/tmp/vmlx-dsv4-band-pe2-turnmatrix-20260524-1445}"
+DSV4_JANGTQ2_DIR="${VMLX_DSV4_JANGTQ2_PROOF_DIR:-/tmp/vmlx-dsv4-jangtq2-final-20260524}"
+DSV4_AGENTIC_DIR="${VMLX_DSV4_AGENTIC_PROOF_DIR:-/tmp/vmlx-dsv4-jangtq2-agentic-tool-current-20260525}"
 fail=0
 
 pass() { echo "PASS $*"; }
@@ -119,6 +121,8 @@ require_dir "$QWEN_DIR" "Qwen artifact dir"
 require_dir "$GEMMA_DIR" "Gemma artifact dir"
 require_dir "$ZAYA_DIR" "ZAYA artifact dir"
 require_dir "$DSV4_DIR" "DSV4 artifact dir"
+require_dir "$DSV4_JANGTQ2_DIR" "DSV4 JANGTQ2 coherence artifact dir"
+require_dir "$DSV4_AGENTIC_DIR" "DSV4 JANGTQ2 agentic DSML artifact dir"
 require_text "$QWEN_DIR" 'qwen_multiturn_tool|tool' \
   "Qwen artifact includes multi-turn/tool evidence"
 require_text "$QWEN_DIR" 'ssm\{hits=[1-9]|companion=ssm|ssm_companion' \
@@ -135,6 +139,40 @@ require_text "$ZAYA_DIR" 'fail|failed|partial|blocked|missing bundle sampler def
   "ZAYA artifact remains partial/failed rather than promoted"
 require_text "$DSV4_DIR" 'fail|failed|partial|blocked|café|UTF-8|coherence' \
   "DSV4 artifact remains partial/failed rather than promoted"
+require_text "$DSV4_JANGTQ2_DIR/template_kwargs.out" 'BENCH_DSV4_TEMPLATE_KWARGS: passed' \
+  "DSV4 JANGTQ2 template kwargs proof passed"
+require_text "$DSV4_JANGTQ2_DIR/coherence_chat.out" 'BENCH_DSV4_COHERENCE: PASS' \
+  "DSV4 JANGTQ2 chat coherence row passed"
+require_text "$DSV4_JANGTQ2_DIR/coherence_chat.out" 'Sapphire-42|SAPPHIRE-42' \
+  "DSV4 JANGTQ2 chat recall evidence"
+require_text "$DSV4_JANGTQ2_DIR/coherence_reasoning.out" 'DSV4_REASONING_ON_REASONING_BEGIN' \
+  "DSV4 JANGTQ2 reasoning channel evidence"
+require_text "$DSV4_JANGTQ2_DIR/coherence_reasoning.out" 'BENCH_DSV4_COHERENCE: PASS' \
+  "DSV4 JANGTQ2 reasoning coherence row passed"
+require_text "$DSV4_JANGTQ2_DIR/coherence_long.out" 'CERULEAN RIVER and OSLO' \
+  "DSV4 JANGTQ2 long-context semantic recall evidence"
+require_text "$DSV4_JANGTQ2_DIR/dsv4_cache_disk_roundtrip.out" 'Test run with 4 tests in 1 suite passed' \
+  "DSV4 JANGTQ2 L2 disk round-trip source proof passed"
+require_text "$DSV4_JANGTQ2_DIR/dsv4_cache_topology.out" 'DSV4 paged-incompatible cache skips paged blocks and restores CSA HSA pools from disk.*passed|Test run with 1 test in 1 suite passed' \
+  "DSV4 JANGTQ2 CSA/HSA pool disk restore proof passed"
+require_text "$DSV4_JANGTQ2_DIR/coherence_long.err" 'peak memory footprint' \
+  "DSV4 JANGTQ2 long-context footprint caveat captured"
+require_text "$DSV4_AGENTIC_DIR" 'BENCH_DSV4_AGENTIC_TOOL: PASS' \
+  "DSV4 JANGTQ2 agentic DSML tool row passed"
+require_text "$DSV4_AGENTIC_DIR" 'Tool format: dsml' \
+  "DSV4 JANGTQ2 agentic row uses DSML tool format"
+require_text "$DSV4_AGENTIC_DIR" 'DSV4_AGENTIC_TOOL_CALL name=lookup_launch_status.*DSV4-77' \
+  "DSV4 JANGTQ2 agentic row emitted structured DSML tool call"
+require_text "$DSV4_AGENTIC_DIR" 'turn2-tool-result-summary: text=.*toolCalls=0' \
+  "DSV4 JANGTQ2 agentic row summarized tool result without recursive tool call"
+require_text "$DSV4_AGENTIC_DIR" 'turn3-tool-history-recall: text=.*DSV4-77' \
+  "DSV4 JANGTQ2 agentic row recalled tool history"
+require_text "$DSV4_AGENTIC_DIR" 'DSV4_AGENTIC_CACHE_STATS.*pagedIncompatible=true.*disk\{hits=[1-9]' \
+  "DSV4 JANGTQ2 agentic row proves paged-incompatible disk L2 hit"
+require_text "$DSV4_AGENTIC_DIR" 'rep=nil' \
+  "DSV4 JANGTQ2 agentic row keeps repetition penalty unset"
+require_text "$DSV4_AGENTIC_DIR" 'peak memory footprint' \
+  "DSV4 JANGTQ2 agentic footprint caveat captured"
 
 echo "--- release ledger/checklist no-overclaim coverage ---"
 require_text "$RELEASE_LEDGER" 'Qwen35 RAM/OOM user crash path is not fully proven fixed end-to-end' \
@@ -143,19 +181,25 @@ require_text "$RELEASE_LEDGER" 'Big-model load cancellation.*live proof blocked|
   "ledger keeps first-load cancellation live-proof gated"
 require_text "$RELEASE_LEDGER" 'ZAYA.*partial/failed|ZAYA/CCA/VL remains partial/failed' \
   "ledger keeps ZAYA partial/failed"
-require_text "$RELEASE_LEDGER" 'DSV4 remains failed/partial|DSV4.*not promoted' \
-  "ledger keeps DSV4 partial/failed"
+require_text "$RELEASE_LEDGER" 'DSV4 Flash JANGTQ2 coherence is live-proven in local vMLX' \
+  "ledger records DSV4 JANGTQ2 coherence promotion"
+require_text "$RELEASE_LEDGER" 'DSV4 JANGTQ2 agentic DSML tool/cache proof' \
+  "ledger records DSV4 JANGTQ2 agentic DSML/cache proof"
+require_text "$RELEASE_LEDGER" 'DSV4 long-context low-footprint remains partial' \
+  "ledger keeps DSV4 low-footprint partial"
 require_text "$RELEASE_LEDGER" 'Chat UI Think panel routing' \
   "ledger includes Chat UI reasoning route"
 require_text "$PR_CHECKLIST" 'Low-level diagnostic rows with raw markers are explicitly excluded' \
   "PR checklist excludes raw diagnostic markers from parser proof"
 require_text "$PR_CHECKLIST" 'DSS?V4|DSV4' \
   "PR checklist names DSV4 family"
+require_text "$PR_CHECKLIST" 'DSML agentic|agentic DSML|tool history' \
+  "PR checklist names DSV4 agentic DSML/tool-history proof"
 require_text "$PR_CHECKLIST" 'ZAYA/CCA|CCA/HY3' \
   "PR checklist names CCA/ZAYA family"
 require_text "$PR_CHECKLIST" 'Qwen35 JANGTQ RAM/OOM' \
   "PR checklist names Qwen35 RAM/OOM"
-reject_text "$RELEASE_LEDGER" 'Qwen35 RAM/OOM user crash path is fully proven|Qwen35.*is release-ready|Qwen35.*release-ready: yes|ZAYA.*is promoted|DSV4.*is promoted|ZAYA.*is release-ready|DSV4.*is release-ready' \
+reject_text "$RELEASE_LEDGER" 'Qwen35 RAM/OOM user crash path is fully proven|Qwen35.*is release-ready|Qwen35.*release-ready: yes|ZAYA.*is promoted|DSV4.*is release-ready|ZAYA.*is release-ready' \
   "release overclaim wording"
 
 active="$({ ps -axo pid,ppid,rss,etime,command || true; } \

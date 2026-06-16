@@ -150,19 +150,12 @@ public struct DeepseekV3JANGTQConfiguration: Codable, Sendable {
 
     /// Project into the affine-side `DeepseekV3Configuration` via JSON
     /// round-trip. The internal DeepseekV3 modules all init from that
-    /// type; we fabricate one by re-encoding without the three JANGTQ
-    /// fields. Programming error (not input data) if the round-trip
-    /// fails.
-    fileprivate func asAffine() -> DeepseekV3Configuration {
+    /// type; we fabricate one by re-encoding without the JANGTQ fields.
+    fileprivate func asAffine() throws -> DeepseekV3Configuration {
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()
-        do {
-            let data = try encoder.encode(AffineProjection(self))
-            return try decoder.decode(DeepseekV3Configuration.self, from: data)
-        } catch {
-            fatalError(
-                "DeepseekV3JANGTQConfiguration.asAffine encode/decode failed: \(error)")
-        }
+        let data = try encoder.encode(AffineProjection(self))
+        return try decoder.decode(DeepseekV3Configuration.self, from: data)
     }
 }
 
@@ -500,9 +493,9 @@ public class DeepseekV3JANGTQModel: Module, LLMModel, KVCacheDimensionProvider, 
     public var model: DeepseekV3JANGTQModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
-    public init(_ args: DeepseekV3JANGTQConfiguration) {
+    public init(_ args: DeepseekV3JANGTQConfiguration) throws {
         self.jangtqConfig = args
-        self.affineConfig = args.asAffine()
+        self.affineConfig = try args.asAffine()
         self.kvHeads = Array(
             repeating: args.numKeyValueHeads,
             count: args.numHiddenLayers)

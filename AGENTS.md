@@ -63,13 +63,31 @@ agents must treat these as hard gates, not nice-to-have follow-ups:
   even if the output is coherent.
 - Always record token/s when generation occurs. If no token/s is emitted,
   document that as a failed/blocked row.
-- Coherency matters every time: visible answer, reasoning channel, no looping,
-  no hidden reasoning-only output, and no length-cap fake pass.
+- Coherency matters every time: visible answer, exact-copy/factual text when
+  the prompt or tool result requires it, reasoning channel, no looping, no
+  hidden reasoning-only output, and no length-cap fake pass.
+- Weird visible text is a hard regression, not a cosmetic issue. Any response
+  with corrupted ordinary words, dropped/duplicated letters, wrong copied
+  numbers, mojibake, replacement/control/sentinel characters, protocol marker
+  residue, or spelling/character drift such as `seleed`, `protctoocol`, or
+  `28a` fails the row. A tool card plus cache hits is only `PARTIAL` if the
+  final visible answer is corrupted; trace tokenizer, detokenizer, tool-result
+  history, cache restore, sampling, and UI/API transport until clean text is
+  proven.
 - Multi-turn proof is required before calling a model family working. Single
   prompt or load-only evidence is not enough.
 - Cache-stack proof must include the relevant cache topology: prefix/paged/L2
   disk hits, TurboQuant KV when enabled, and architecture-specific companion
   state for VL, video, SSM/linear-attention, or other path-dependent caches.
+- Server setting wiring is a live-runtime gate. Do not call a setting wired
+  because a source field, JSON key, or UI control exists. For generation
+  defaults/overrides, tool availability/tool choice, memory-safety, prefix
+  cache, paged KV, disk L2, TurboQuant KV, media/VL/audio controls,
+  concurrency, and reasoning controls, read the current setting through the
+  Osaurus API/panel/CLI surface, apply or toggle it, run a real live Osaurus
+  chat turn, then verify the response, token/s, health, and telemetry changed
+  as expected or returned a typed incompatibility/refusal. If a setting is
+  next-load-only, reload the model and prove the new topology took effect.
 - Cache proof must match the model architecture. Full-attention models need
   real KV/prefix/L2 proof; Qwen-style hybrid SSM needs KV plus SSM companion
   rederive/hit proof; ZAYA/CCA and HY3-style models need companion cache and
@@ -135,12 +153,24 @@ while closing this Gemma PR unless a current Gemma proof directly depends on
 that work.
 
 For this Gemma release lane, the live proof must stay app-facing: Osaurus
-chat/API multi-turn output, exact tool-call arguments, no weird/control
+chat/API multi-turn output, exact tool-call arguments, exact copied text and
+numbers when requested, no corrupted ordinary words, no weird/control
 characters, no loops, no protocol/reasoning/tool marker leakage, bundle-driven
 generation config, token/s recorded, and cache telemetry from the active
 architecture. Current Gemma cache proof is rotating KV plus disk-backed
 restore/L2 where `turbo_quant_kv_layer_count=0`; do not claim TurboQuant KV for
 those rows until the runtime reports and proves it.
+
+Every Gemma 4 QAT MXFP4/JANG_4M model in this lane must also get a real
+Osaurus tool-call and AgentLoop harness row before any benchmark score is used
+for release judgment. The minimum useful row is: model loads from the
+OsaurusAI QAT bundle, executes at least one real tool with exact name and
+parseable JSON arguments, continues from tool results into clean visible text,
+records token/s and cache topology with paged KV off, and produces a scored
+harness artifact with every failed case attributed. A decent non-perfect score
+can be teammate-testable; missing tools, corrupted text, marker leakage,
+source/BF16 bundles, or unproven cache telemetry keep the row partial or
+blocked.
 
 ## Osaurus PR / Sentry Crash Coordination
 
@@ -246,6 +276,11 @@ Required evidence:
   for hybrid SSM, VL/video media payload cache for multimodal rows, ZAYA/CCA
   companion/pooling cache when applicable, and TurboQuant KV only when it is the
   real configured path.
+- Settings behavior: validate every Osaurus server setting touched by the
+  release lane with read-toggle-chat-status evidence. Include tools and memory
+  wiring in the same live multi-turn run where possible, and record settings
+  that are unsupported, ignored, stale until reload, or incompatible as
+  `PARTIAL`/`BLOCKED` instead of assuming they work.
 - Memory behavior: large-context and low-RAM rows must report physical footprint
   and either run successfully within the gate or gracefully refuse with a clear
   in-app message. Do not enforce fake context limits or silently alter user

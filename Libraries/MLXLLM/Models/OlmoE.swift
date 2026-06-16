@@ -163,8 +163,6 @@ public class OlmoEModelInner: Module {
     let norm: RMSNorm
 
     init(_ args: OlmoEConfiguration) {
-        precondition(args.vocabularySize > 0)
-
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -319,6 +317,81 @@ public struct OlmoEConfiguration: Codable, Sendable {
         numExperts = try container.decode(Int.self, forKey: .numExperts)
         numExpertsPerToken = try container.decode(Int.self, forKey: .numExpertsPerToken)
         normTopkProb = try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? false
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try validatePositive(numExperts, key: .numExperts, in: container)
+        try validatePositive(numExpertsPerToken, key: .numExpertsPerToken, in: container)
+
+        if let headDimensions {
+            try validatePositive(headDimensions, key: .headDimensions, in: container)
+        }
+        if let maxPositionEmbeddings {
+            try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        }
+
+        guard hiddenSize == attentionHeads * resolvedHeadDimensions else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "OlmoE hidden_size must equal num_attention_heads * head_dim.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription: "OlmoE num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard numExpertsPerToken <= numExperts else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .numExpertsPerToken,
+                in: container,
+                debugDescription: "OlmoE num_experts_per_tok must be less than or equal to num_experts.")
+        }
+        if let factor = ropeScaling?["factor"]?.asFloat() {
+            guard factor.isFinite, factor > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling,
+                    in: container,
+                    debugDescription: "OlmoE rope_scaling.factor must be finite and > 0.")
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "OlmoE \(key.rawValue) must be > 0.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "OlmoE \(key.rawValue) must be finite and > 0.")
+        }
     }
 }
 

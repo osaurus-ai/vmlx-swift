@@ -49,10 +49,13 @@ Package.resolved
 .build/
 
 # Local release-gate evidence and generated MLX/Xcode artifacts.
+.logs/
+codex/logs/
 docs/local/
 docs/superpowers/
 *.metallib
 *.profraw
+.sentry.local.env
 
 # CocoaPods
 #
@@ -98,3 +101,4 @@ iOSInjectionProject/
 
 # VS Code
 .vscode/
+.claude/*.local.md

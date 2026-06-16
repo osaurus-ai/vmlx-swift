@@ -73,17 +73,18 @@ extension HiddenStateCaptureModel {
 public func extractContextFeature(
     captured: [Int: MLXArray],
     targetLayerIDs: [Int]
-) -> MLXArray {
-    precondition(!targetLayerIDs.isEmpty,
-        "DFlash extractContextFeature: targetLayerIDs must be non-empty")
-    let tensors = targetLayerIDs.map { id -> MLXArray in
+) throws -> MLXArray {
+    guard !targetLayerIDs.isEmpty else {
+        throw SpecDecError.invalidRequest("DFlash target_layer_ids must be non-empty")
+    }
+    var tensors: [MLXArray] = []
+    tensors.reserveCapacity(targetLayerIDs.count)
+    for id in targetLayerIDs {
         guard let h = captured[id] else {
-            fatalError(
-                "DFlash extractContextFeature: missing captured hidden state "
-                + "for layer \(id). captureLayerIDs must cover all "
-                + "target_layer_ids.")
+            throw SpecDecError.invalidRequest(
+                "DFlash missing captured hidden state for target layer \(id)")
         }
-        return h
+        tensors.append(h)
     }
     return concatenated(tensors, axis: -1)
 }

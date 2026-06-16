@@ -21,6 +21,19 @@ final class LocalChatTemplateFamilySnapshotTests: XCTestCase {
         let name: String
         let candidatePaths: [String]
         let expectedFragments: [String]
+        let expectedNormalizedFragments: [String]
+
+        init(
+            name: String,
+            candidatePaths: [String],
+            expectedFragments: [String],
+            expectedNormalizedFragments: [String] = []
+        ) {
+            self.name = name
+            self.candidatePaths = candidatePaths
+            self.expectedFragments = expectedFragments
+            self.expectedNormalizedFragments = expectedNormalizedFragments
+        }
     }
 
     private let cases: [TemplateCase] = [
@@ -65,6 +78,8 @@ final class LocalChatTemplateFamilySnapshotTests: XCTestCase {
             name: "qwen35",
             candidatePaths: [
                 "models/Qwen3.5-35B-A3B-4bit/chat_template.jinja",
+                "models/dealign.ai/Qwen3.6-35B-A3B-MXFP4-CRACK-MTP/chat_template.jinja",
+                "models/dealign.ai/Qwen3.6-35B-A3B-MXFP8-CRACK-MTP/chat_template.jinja",
             ],
             expectedFragments: [
                 "<|im_start|>user\nSay ping.<|im_end|>",
@@ -85,6 +100,7 @@ final class LocalChatTemplateFamilySnapshotTests: XCTestCase {
             candidatePaths: [
                 "models/JANGQ/Ling-2.6-flash-JANGTQ/chat_template.jinja",
                 "models/dealign.ai/Ling-2.6-flash-MXFP4-CRACK/chat_template.jinja",
+                ".mlxstudio/models/dealignai/Ling-2.6-flash-JANGTQ2-CRACK/chat_template.jinja",
             ],
             expectedFragments: [
                 "<role>HUMAN</role>Say ping.<|role_end|>",
@@ -93,14 +109,18 @@ final class LocalChatTemplateFamilySnapshotTests: XCTestCase {
         TemplateCase(
             name: "nemotron",
             candidatePaths: [
+                "models/NVIDIA-Nemotron-3-Ultra-550B-A55B-JANGTQ_1L/chat_template.jinja",
                 ".mlxstudio/models/Nemotron-Cascade-2-30B-A3B-JANG_2L/chat_template.jinja",
                 ".mlxstudio/models/Nemotron-3-Super-120B-A12B-JANG_2L/chat_template.jinja",
+                ".mlxstudio/models/dealignai/Nemotron-Omni-Nano-JANGTQ-CRACK/chat_template.jinja",
                 "models/dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK/chat_template.jinja",
             ],
             expectedFragments: [
-                "<|im_start|>user\nSay ping.",
-                "{thinking token budget: 0}<|im_end|>",
+                "<think></think>",
                 "<|im_start|>assistant",
+            ],
+            expectedNormalizedFragments: [
+                "<|im_start|>user Say ping.",
             ]),
         TemplateCase(
             name: "zaya",
@@ -137,6 +157,13 @@ final class LocalChatTemplateFamilySnapshotTests: XCTestCase {
                 XCTAssertTrue(
                     rendered.contains(fragment),
                     "\(item.name) snapshot from \(templateURL.path) missing \(fragment.debugDescription). Rendered: \(rendered)"
+                )
+            }
+            let normalizedRendered = Self.normalizedWhitespace(rendered)
+            for fragment in item.expectedNormalizedFragments {
+                XCTAssertTrue(
+                    normalizedRendered.contains(Self.normalizedWhitespace(fragment)),
+                    "\(item.name) normalized snapshot from \(templateURL.path) missing \(fragment.debugDescription). Rendered: \(rendered)"
                 )
             }
         }
@@ -202,5 +229,9 @@ final class LocalChatTemplateFamilySnapshotTests: XCTestCase {
             }
         }
         return paths.sorted()
+    }
+
+    private static func normalizedWhitespace(_ text: String) -> String {
+        text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 }

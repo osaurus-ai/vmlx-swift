@@ -1164,6 +1164,28 @@ public func dequantized(
     return MLXArray(result)
 }
 
+/// Decode an array of E4M3 FP8 bytes to a real floating type.
+///
+/// This is distinct from ``MLXArray/asType(_:stream:)``: casting `uint8` to
+/// `float32` treats the byte as an integer value, while FP8 decoding interprets
+/// the byte as an E4M3 floating-point payload.
+public func fromFP8(
+    _ x: MLXArray,
+    dtype: DType = .bfloat16,
+    stream: StreamOrDevice = .default
+) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_from_fp8(&result, x.ctx, dtype.cmlxDtype, stream.ctx)
+    return MLXArray(result)
+}
+
+/// Encode a real floating array as E4M3 FP8 bytes.
+public func toFP8(_ x: MLXArray, stream: StreamOrDevice = .default) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_to_fp8(&result, x.ctx, stream.ctx)
+    return MLXArray(result)
+}
+
 /// Element-wise division.
 ///
 /// Divide two arrays with <doc:broadcasting>.

@@ -141,8 +141,6 @@ public class Exaone4ModelInner: Module {
     let norm: RMSNorm
 
     public init(_ args: Exaone4Configuration) {
-        precondition(args.vocabularySize > 0)
-
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -278,6 +276,113 @@ public struct Exaone4Configuration: Codable, Sendable {
         self.slidingWindow = try container.decodeIfPresent(Int.self, forKey: .slidingWindow)
         self.slidingWindowPattern = try container.decodeIfPresent(
             String.self, forKey: .slidingWindowPattern)
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(
+        container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try validatePositive(headDim, key: .headDim, in: container)
+
+        if hiddenSize != attentionHeads * headDim {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "Exaone4 hidden_size must equal num_attention_heads * head_dim."
+            )
+        }
+
+        if attentionHeads % kvHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "Exaone4 num_attention_heads must be divisible by num_key_value_heads."
+            )
+        }
+
+        if let slidingWindowPattern {
+            if slidingWindowPattern.isEmpty {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .slidingWindowPattern,
+                    in: container,
+                    debugDescription: "Exaone4 sliding_window_pattern must not be empty."
+                )
+            }
+
+            if !slidingWindowPattern.allSatisfy({ $0 == "L" || $0 == "G" }) {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .slidingWindowPattern,
+                    in: container,
+                    debugDescription: "Exaone4 sliding_window_pattern entries must be L or G."
+                )
+            }
+
+            guard let slidingWindow, slidingWindow > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .slidingWindow,
+                    in: container,
+                    debugDescription:
+                        "Exaone4 sliding_window must be positive when sliding_window_pattern is present."
+                )
+            }
+        }
+
+        if let slidingWindow, slidingWindow <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .slidingWindow,
+                in: container,
+                debugDescription: "Exaone4 sliding_window must be positive."
+            )
+        }
+
+        if let factor = ropeScaling?["factor"]?.asFloat() {
+            if !factor.isFinite || factor <= 0 {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeScaling,
+                    in: container,
+                    debugDescription: "Exaone4 rope_scaling.factor must be finite and > 0."
+                )
+            }
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Exaone4 \(key.rawValue) must be > 0."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if !value.isFinite || value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Exaone4 \(key.rawValue) must be finite and > 0."
+            )
+        }
     }
 }
 

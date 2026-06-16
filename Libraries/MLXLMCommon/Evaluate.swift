@@ -192,6 +192,10 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
+    /// Token ids that must never be sampled. Mirrors Hugging Face
+    /// `generation_config.json`'s `suppress_tokens` field.
+    public var suppressTokens: [Int]
+
     /// Speculative-decoding strategy (opt-in). `nil` preserves the existing
     /// autoregressive decode path byte-for-byte — callers who don't set this
     /// see no behaviour change.
@@ -248,7 +252,8 @@ public struct GenerateParameters: Sendable {
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
         prefillStepSize: Int = 512,
-        extraStopStrings: [String] = []
+        extraStopStrings: [String] = [],
+        suppressTokens: [Int] = []
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -273,6 +278,7 @@ public struct GenerateParameters: Sendable {
         self.presenceContextSize = presenceContextSize
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
+        self.suppressTokens = suppressTokens
         self.prefillStepSize = prefillStepSize
         self.extraStopStrings = extraStopStrings
     }
@@ -304,6 +310,9 @@ public struct GenerateParameters: Sendable {
         }
         if generationConfig.doSample == false {
             self.temperature = 0
+        }
+        if let suppressTokens = generationConfig.suppressTokens {
+            self.suppressTokens = suppressTokens
         }
     }
 
@@ -367,14 +376,20 @@ public struct GenerateParameters: Sendable {
             frequencyContext = nil
         }
 
-        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil {
+        let suppressContext =
+            suppressTokens.isEmpty ? nil : SuppressTokensProcessor(tokens: suppressTokens)
+
+        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil
+            && suppressContext == nil
+        {
             return nil
         }
 
         return PenaltyProcessor(
             repetitionContext: repetitionContext,
             presenceContext: presenceContext,
-            frequencyContext: frequencyContext
+            frequencyContext: frequencyContext,
+            suppressContext: suppressContext
         )
     }
 
@@ -704,20 +719,21 @@ struct TokenRing {
     private let positions: MLXArray
 
     init(capacity: Int) {
-        precondition(capacity > 0)
-        self.capacity = capacity
-        self.buffer = MLXArray.zeros([capacity], type: Int32.self)
-        self.positions = MLXArray.arange(capacity)
+        self.capacity = max(0, capacity)
+        self.buffer = MLXArray.zeros([self.capacity], type: Int32.self)
+        self.positions = MLXArray.arange(self.capacity)
     }
 
     /// The valid portion of the ring (all of it once full), or `nil` if empty.
     var validTokens: MLXArray? {
+        guard capacity > 0 else { return nil }
         guard count > 0 else { return nil }
         return count < capacity ? buffer[..<count] : buffer
     }
 
     /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
     mutating func loadPrompt(_ prompt: MLXArray) {
+        guard capacity > 0 else { return }
         let n = prompt.dim(0)
         let promptTokens = prompt.asType(.int32)
         if n <= capacity {
@@ -738,6 +754,7 @@ struct TokenRing {
 
     /// Append a single token using GPU-only mask write (no CPU←GPU sync).
     mutating func append(_ token: MLXArray) {
+        guard capacity > 0 else { return }
         let mask = positions .== Int32(writeIndex)
         buffer = MLX.where(mask, token.asType(.int32), buffer)
         writeIndex = (writeIndex + 1) % capacity
@@ -837,26 +854,52 @@ public struct FrequencyPenaltyContext: LogitProcessor {
     }
 }
 
-/// Processor that composes penalty processors in Python mlx-lm order.
+/// Processor that masks configured token ids out of the next-token distribution.
+public struct SuppressTokensProcessor: LogitProcessor {
+    private let tokens: [Int]
+    private let negInf = MLXArray(-Float.infinity)
+
+    public init(tokens: [Int]) {
+        self.tokens = Array(Set(tokens)).sorted()
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {}
+
+    public func process(logits: MLXArray) -> MLXArray {
+        let vocabSize = logits.dim(-1)
+        let valid = tokens.filter { $0 >= 0 && $0 < vocabSize }
+        guard !valid.isEmpty else { return logits }
+        logits[0..., MLXArray(valid.map(Int32.init)).asType(.uint32)] = negInf
+        return logits
+    }
+
+    mutating public func didSample(token: MLXArray) {}
+}
+
+/// Processor that composes generation-config logits processors.
 public struct PenaltyProcessor: LogitProcessor {
     var repetitionContext: RepetitionContext?
     var presenceContext: PresencePenaltyContext?
     var frequencyContext: FrequencyPenaltyContext?
+    var suppressContext: SuppressTokensProcessor?
 
     public init(
         repetitionContext: RepetitionContext?,
         presenceContext: PresencePenaltyContext?,
-        frequencyContext: FrequencyPenaltyContext?
+        frequencyContext: FrequencyPenaltyContext?,
+        suppressContext: SuppressTokensProcessor? = nil
     ) {
         self.repetitionContext = repetitionContext
         self.presenceContext = presenceContext
         self.frequencyContext = frequencyContext
+        self.suppressContext = suppressContext
     }
 
     mutating public func prompt(_ prompt: MLXArray) {
         repetitionContext?.prompt(prompt)
         presenceContext?.prompt(prompt)
         frequencyContext?.prompt(prompt)
+        suppressContext?.prompt(prompt)
     }
 
     public func process(logits: MLXArray) -> MLXArray {
@@ -864,6 +907,7 @@ public struct PenaltyProcessor: LogitProcessor {
         logits = repetitionContext?.process(logits: logits) ?? logits
         logits = presenceContext?.process(logits: logits) ?? logits
         logits = frequencyContext?.process(logits: logits) ?? logits
+        logits = suppressContext?.process(logits: logits) ?? logits
         return logits
     }
 
@@ -871,6 +915,7 @@ public struct PenaltyProcessor: LogitProcessor {
         repetitionContext?.didSample(token: token)
         presenceContext?.didSample(token: token)
         frequencyContext?.didSample(token: token)
+        suppressContext?.didSample(token: token)
     }
 }
 
@@ -1163,7 +1208,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     public init(
         input: LMInput, model: any LanguageModel, cache: [KVCache]? = nil,
         parameters: GenerateParameters,
-        cacheCoordinator: CacheCoordinator? = nil
+        cacheCoordinator: CacheCoordinator? = nil,
+        samplerOverride: LogitSampler? = nil
     ) throws {
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
@@ -1188,7 +1234,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         self.processor = effectiveParameters.processor()
-        self.sampler = effectiveParameters.sampler()
+        self.sampler = samplerOverride ?? effectiveParameters.sampler()
         self.maxTokens = effectiveParameters.maxTokens
 
         self.kvBits = effectiveParameters.kvBits
@@ -1320,20 +1366,43 @@ public struct TokenIterator: TokenIteratorProtocol {
                     let unsafePartial =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
                     let unsafeFullHit = remainingTokens.isEmpty && hasPathDependentLayer
-                    if unsafePartial || unsafeFullHit {
-                        let why: String
-                        if unsafePartial {
-                            why = "media placeholder tokens remain in cache-hit suffix"
-                        } else if unsafeFullHit {
-                            why = "path-dependent full cache hit: re-feeding last token would double-count recurrent state"
-                        } else {
-                            why = "cache hit can't be extended safely"
-                        }
+                    if unsafePartial {
                         Self.logger.info(
-                            "TokenIterator: cache hit rolling back to full prefill (\(why))"
+                            "TokenIterator: cache hit rolling back to full prefill (media placeholder tokens remain in cache-hit suffix)"
                         )
                         self.cache = self.model.newCache(parameters: effectiveParameters)
                         inputForPrepare = input
+                    } else if unsafeFullHit {
+                        let promptLen = cacheLookupTokenIds.count
+                        let seedBoundary = promptLen - 1
+                        if seedBoundary > 0,
+                           let last = cacheLookupTokenIds.last,
+                           let seedSSM = coordinator.ssmStateCache.fetch(
+                                tokens: cacheLookupTokenIds,
+                                boundary: seedBoundary,
+                                mediaSalt: mediaSalt)
+                        {
+                            let cacheOffset = self.cache.first?.offset ?? promptLen
+                            let trimNeeded = cacheOffset - seedBoundary
+                            if trimNeeded > 0 {
+                                for layer in self.cache where layer.isTrimmable {
+                                    _ = layer.trim(trimNeeded)
+                                }
+                            }
+                            restoreSSMStates(seedSSM, into: self.cache)
+                            MLX.eval(self.cache)
+                            let lastToken = MLXArray([Int32(last)])
+                                .expandedDimensions(axis: 0)
+                            inputForPrepare = LMInput(
+                                text: LMInput.Text(tokens: lastToken),
+                                image: nil, video: nil)
+                        } else {
+                            Self.logger.info(
+                                "TokenIterator: cache hit rolling back to full prefill (path-dependent full cache hit missing seed-boundary SSM state)"
+                            )
+                            self.cache = self.model.newCache(parameters: effectiveParameters)
+                            inputForPrepare = input
+                        }
                     } else {
                         // Rebuild inputForPrepare with tokens shaped as `[1, T]`
                         // (2D batch-first). Some model forward paths — notably
@@ -1740,85 +1809,121 @@ public struct TokenIterator: TokenIteratorProtocol {
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
-        guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else {
-            return
-        }
+        withMLXDiskCacheIOLock {
+            guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else {
+                return
+            }
 
-        func store(
-            tokens: [Int],
-            cache cacheToStore: [KVCache],
-            kvBits diskKVBits: Int?,
-            kvMode diskKVMode: KVQuantizationMode
-        ) {
-            guard !tokens.isEmpty else { return }
-            let snapshot = cacheToStore.map { $0.copy() }
-            MLX.eval(snapshot)
-            let requiresDiskBackedRestore =
-                cacheRequiresDiskBackedCoordinatorRestore(snapshot)
-            let perLayerData = requiresDiskBackedRestore
-                ? []
-                : extractLayerData(from: snapshot)
-            let ssmCapture: [MLXArray]? = coordinator.isHybrid &&
-                coordinator.config.enableSSMReDerive &&
-                !requiresDiskBackedRestore &&
-                !originalInput.hasMediaContent
-                ? reDeriveAndStoreSSMStatesForPromptBoundaries(
-                    coordinator: coordinator,
-                    model: model,
-                    promptTokenIds: tokens,
-                    mediaSalt: mediaSalt)
-                : (coordinator.isHybrid ? extractSSMStates(from: snapshot) : nil)
-            let diskStoreCache = makeDiskStoreCache(
-                fromPromptBoundary: snapshot,
-                kvBits: diskKVBits,
-                kvGroupSize: kvGroupSize,
-                quantizedKVStart: quantizedKVStart,
-                kvMode: diskKVMode)
-            coordinator.storeAfterGeneration(
-                promptTokens: tokens,
-                perLayerData: perLayerData,
-                ssmStates: ssmCapture,
-                cache: diskStoreCache,
-                mediaSalt: mediaSalt
-            )
-        }
+            func store(
+                tokens: [Int],
+                cache cacheToStore: [KVCache],
+                kvBits diskKVBits: Int?,
+                kvMode diskKVMode: KVQuantizationMode
+            ) {
+                guard !tokens.isEmpty else { return }
+                let snapshot = cacheToStore.map { $0.copy() }
+                MLX.eval(snapshot)
+                let requiresDiskBackedRestore =
+                    cacheRequiresDiskBackedCoordinatorRestore(snapshot)
+                let perLayerData = requiresDiskBackedRestore
+                    ? []
+                    : extractLayerData(from: snapshot)
+                let ssmCapture: [MLXArray]? = coordinator.isHybrid &&
+                    coordinator.config.enableSSMReDerive &&
+                    !originalInput.hasMediaContent
+                    ? reDeriveAndStoreSSMStatesForPromptBoundaries(
+                        coordinator: coordinator,
+                        model: model,
+                        promptTokenIds: tokens,
+                        mediaSalt: mediaSalt)
+                    : (coordinator.isHybrid ? extractSSMStates(from: snapshot) : nil)
+                let diskStoreCache = makeDiskStoreCache(
+                    fromPromptBoundary: snapshot,
+                    kvBits: diskKVBits,
+                    kvGroupSize: kvGroupSize,
+                    quantizedKVStart: quantizedKVStart,
+                    kvMode: diskKVMode)
+                coordinator.storeAfterGeneration(
+                    promptTokens: tokens,
+                    perLayerData: perLayerData,
+                    ssmStates: ssmCapture,
+                    cache: diskStoreCache,
+                    mediaSalt: mediaSalt
+                )
+            }
 
-        if let promptCacheSnapshot {
-            // Prompt-boundary disk entries must remain raw KV even when the
-            // live decode path uses TurboQuant/affine KV. Cold decode delays
-            // lossy KV compression until after the first surfaced token; a
-            // warm full-prefix hit must therefore seed first-token sampling
-            // from the same exact prompt KV, not from a compressed prompt.
-            store(
-                tokens: promptTokenIds,
-                cache: promptCacheSnapshot,
-                kvBits: nil,
-                kvMode: .none)
+            if let promptCacheSnapshot {
+                // Prompt-boundary disk entries must remain raw KV even when the
+                // live decode path uses TurboQuant/affine KV. Cold decode delays
+                // lossy KV compression until after the first surfaced token; a
+                // warm full-prefix hit must therefore seed first-token sampling
+                // from the same exact prompt KV, not from a compressed prompt.
+                store(
+                    tokens: promptTokenIds,
+                    cache: promptCacheSnapshot,
+                    kvBits: nil,
+                    kvMode: .none)
 
-            if !originalInput.requiresPostPrepareCacheKey {
-                for boundary in Set(cachePrefixTokenCounts).sorted()
-                where boundary > 0 && boundary < promptTokenIds.count {
-                    let boundaryTokens = Array(promptTokenIds.prefix(boundary))
-                    if let boundarySnapshot = cacheSnapshotForBoundary(
-                        tokens: boundaryTokens,
-                        promptSnapshot: promptCacheSnapshot)
-                    {
-                        store(
+                if !originalInput.requiresPostPrepareCacheKey {
+                    for boundary in Set(cachePrefixTokenCounts).sorted()
+                    where boundary > 0 && boundary < promptTokenIds.count {
+                        let boundaryTokens = Array(promptTokenIds.prefix(boundary))
+                        if let boundarySnapshot = cacheSnapshotForBoundary(
                             tokens: boundaryTokens,
-                            cache: boundarySnapshot,
-                            kvBits: nil,
-                            kvMode: .none)
+                            promptSnapshot: promptCacheSnapshot)
+                        {
+                            store(
+                                tokens: boundaryTokens,
+                                cache: boundarySnapshot,
+                                kvBits: nil,
+                                kvMode: .none)
+                        }
                     }
                 }
             }
-        }
 
-        guard includeGeneratedBoundary, !generatedTokenIds.isEmpty else { return }
-        guard !needsCacheQuantization else { return }
-        let generatedBoundaryTokens = promptTokenIds + generatedTokenIds
-        guard (cache.map(\.offset).max() ?? 0) >= generatedBoundaryTokens.count
-        else { return }
-        store(tokens: generatedBoundaryTokens, cache: cache, kvBits: kvBits, kvMode: kvMode)
+            guard includeGeneratedBoundary, !generatedTokenIds.isEmpty else { return }
+            guard !needsCacheQuantization else { return }
+            let generatedBoundaryTokens = promptTokenIds + generatedTokenIds
+            guard (cache.map(\.offset).max() ?? 0) >= generatedBoundaryTokens.count
+            else { return }
+            store(tokens: generatedBoundaryTokens, cache: cache, kvBits: kvBits, kvMode: kvMode)
+        }
+    }
+
+    public func cacheDiagnostics() -> [String: Int] {
+        var result: [String: Int] = [
+            "layers": cache.count,
+            "max_offset": cache.map(\.offset).max() ?? 0,
+            "kv_simple": 0,
+            "rotating": 0,
+            "turboquant_fill": 0,
+            "turboquant_compressed": 0,
+            "quantized": 0,
+            "cache_list": 0,
+            "other": 0,
+        ]
+        for layer in cache {
+            if let tq = layer as? TurboQuantKVCache {
+                switch tq.phase {
+                case .fill:
+                    result["turboquant_fill", default: 0] += 1
+                case .compressed:
+                    result["turboquant_compressed", default: 0] += 1
+                }
+            } else if layer is RotatingKVCache {
+                result["rotating", default: 0] += 1
+            } else if layer is KVCacheSimple {
+                result["kv_simple", default: 0] += 1
+            } else if layer is QuantizedKVCache {
+                result["quantized", default: 0] += 1
+            } else if layer is CacheList {
+                result["cache_list", default: 0] += 1
+            } else {
+                result["other", default: 0] += 1
+            }
+        }
+        return result
     }
 
     private func cacheSnapshotForBoundary(
@@ -1835,6 +1940,20 @@ public struct TokenIterator: TokenIteratorProtocol {
         {
             MLX.eval(trimmed)
             return trimmed
+        }
+
+        if cacheCoordinator?.isHybrid == true {
+            Self.logger.debug(
+                "TokenIterator: skipped hybrid history-boundary cache rederive after trim miss"
+            )
+            return nil
+        }
+
+        if String(describing: Swift.type(of: model)).contains("Gemma3n") {
+            Self.logger.debug(
+                "TokenIterator: skipped Gemma3n history-boundary cache rederive after trim miss"
+            )
+            return nil
         }
 
         do {
@@ -2754,6 +2873,49 @@ public func generateTask(
     )
 }
 
+private func debugGenerateTokenTraceEnabled() -> Bool {
+    let env = ProcessInfo.processInfo.environment
+    return env["VMLX_BATCH_TOKEN_TRACE"] == "1"
+        || env["VMLINUX_BATCH_TOKEN_TRACE"] == "1"
+}
+
+private func debugGenerateTokenTraceLimit() -> Int {
+    let env = ProcessInfo.processInfo.environment
+    return Int(env["VMLX_BATCH_TOKEN_TRACE_LIMIT"] ?? "")
+        ?? Int(env["VMLINUX_BATCH_TOKEN_TRACE_LIMIT"] ?? "")
+        ?? 64
+}
+
+private func debugGenerateTokenTraceDecodeEnabled() -> Bool {
+    let env = ProcessInfo.processInfo.environment
+    return env["VMLX_BATCH_TOKEN_TRACE_DECODE"] == "1"
+        || env["VMLINUX_BATCH_TOKEN_TRACE_DECODE"] == "1"
+}
+
+private func debugGenerateTokenTraceLine(
+    path: String,
+    modelName: String,
+    index: Int,
+    tokenID: Int,
+    tokenizer: Tokenizer
+) {
+    guard debugGenerateTokenTraceEnabled(), index <= debugGenerateTokenTraceLimit() else { return }
+    let decodedPart: String
+    if debugGenerateTokenTraceDecodeEnabled() {
+        let decoded = tokenizer.decode(tokenIds: [tokenID], skipSpecialTokens: false)
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+        decodedPart = " decoded=\"\(decoded)\""
+    } else {
+        decodedPart = ""
+    }
+    let line = "[vmlx] batchTokenTrace path=\(path) model=\(modelName) index=\(index) token=\(tokenID)\(decodedPart)\n"
+    if let data = line.data(using: .utf8) {
+        FileHandle.standardError.write(data)
+    }
+}
+
 /// Generates raw token IDs asynchronously using the provided language model input, parameters, and context.
 ///
 /// This is similar to `generate(input:cache:parameters:context:)`, but yields raw token IDs instead of decoded text/tool calls.
@@ -3006,6 +3168,12 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 }
 
                 tokenCount += 1
+                debugGenerateTokenTraceLine(
+                    path: "generateLoopTask.token",
+                    modelName: modelConfiguration.name,
+                    index: tokenCount,
+                    tokenID: token,
+                    tokenizer: tokenizer)
                 if !handler.onToken(token, emit: continuation.yield) {
                     // Distinguish "downstream consumer terminated the
                     // stream" from "library-internal stop-sequence
@@ -3457,6 +3625,10 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     mutating func onGenerationEnd(
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) {
+        if let chunk = detokenizer.flush(), !dispatch(chunk, emit: emit) {
+            return
+        }
+
         // Flush the reasoning parser — any buffered tail becomes content
         // (or a trailing `.reasoning` segment if the model stopped mid-
         // think block) per ReasoningParser.flush contract. The tool-call

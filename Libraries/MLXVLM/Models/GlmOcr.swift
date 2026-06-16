@@ -271,8 +271,6 @@ private enum Language {
         let rotaryEmb: GlmOcrRotaryEmbedding
 
         public init(_ args: GlmOcrConfiguration.TextConfiguration) {
-            precondition(args.vocabularySize > 0)
-
             self._embedTokens.wrappedValue = Embedding(
                 embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -283,18 +281,34 @@ private enum Language {
         }
 
         public func callAsFunction(
-            _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil,
+            _ inputs: MLXArray, cache: [KVCache]? = nil,
             positionIds: MLXArray? = nil
         ) -> MLXArray {
-            var h: MLXArray
-            if let inputEmbedding {
-                h = inputEmbedding
-            } else if let inputs {
-                h = embedTokens(inputs)
-            } else {
-                fatalError("one of inputs or inputEmbedding must be non-nil")
-            }
+            forward(hiddenStates: embedTokens(inputs), cache: cache, positionIds: positionIds)
+        }
 
+        func embeddingsForward(
+            _ inputEmbedding: MLXArray, cache: [KVCache]? = nil,
+            positionIds: MLXArray? = nil
+        ) -> MLXArray {
+            forward(hiddenStates: inputEmbedding, cache: cache, positionIds: positionIds)
+        }
+
+        func embeddingsForward(
+            _ inputEmbedding: MLXArray?, cache: [KVCache]? = nil,
+            positionIds: MLXArray? = nil
+        ) throws -> MLXArray {
+            guard let inputEmbedding else {
+                throw VLMError.processing("GlmOcr prepare requires input ids or input embeddings.")
+            }
+            return embeddingsForward(inputEmbedding, cache: cache, positionIds: positionIds)
+        }
+
+        private func forward(
+            hiddenStates: MLXArray, cache: [KVCache]? = nil,
+            positionIds: MLXArray? = nil
+        ) -> MLXArray {
+            var h = hiddenStates
             // Compute position_ids if not provided (autoregressive generation)
             var posIds: MLXArray
             if let positionIds {
@@ -342,8 +356,36 @@ private enum Language {
         }
 
         public func callAsFunction(
-            _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil
+            _ inputs: MLXArray, cache: [KVCache]? = nil
         ) -> LMOutput {
+            let positionIds = resolvedPositionIds(
+                inputs: inputs, inputEmbedding: nil, cache: cache)
+            let out = model(inputs, cache: cache, positionIds: positionIds)
+            return logits(from: out)
+        }
+
+        func embeddingsForward(
+            _ inputEmbedding: MLXArray, cache: [KVCache]? = nil
+        ) -> LMOutput {
+            let positionIds = resolvedPositionIds(
+                inputs: nil, inputEmbedding: inputEmbedding, cache: cache)
+            let out = model.embeddingsForward(
+                inputEmbedding, cache: cache, positionIds: positionIds)
+            return logits(from: out)
+        }
+
+        func embeddingsForward(
+            _ inputEmbedding: MLXArray?, cache: [KVCache]? = nil
+        ) throws -> LMOutput {
+            guard let inputEmbedding else {
+                throw VLMError.processing("GlmOcr prepare requires input ids or input embeddings.")
+            }
+            return embeddingsForward(inputEmbedding, cache: cache)
+        }
+
+        private func resolvedPositionIds(
+            inputs: MLXArray?, inputEmbedding: MLXArray?, cache: [KVCache]? = nil
+        ) -> MLXArray? {
             var positionIds: MLXArray? = nil
 
             let cacheOffset: Int
@@ -384,9 +426,11 @@ private enum Language {
                 }
             }
 
-            var out = model(
-                inputs, cache: cache, inputEmbedding: inputEmbedding,
-                positionIds: positionIds)
+            return positionIds
+        }
+
+        private func logits(from out: MLXArray) -> LMOutput {
+            var out = out
             if let lmHead {
                 out = lmHead(out)
             } else {
@@ -894,7 +938,7 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
     /// Returns position_ids (3, batch, seq) and rope_deltas.
     private func getRopeIndex(
         inputIds: MLXArray, imageGridThw: [THW]?
-    ) -> (MLXArray, MLXArray) {
+    ) throws -> (MLXArray, MLXArray) {
         let batchSize = inputIds.dim(0)
         let seqLength = inputIds.dim(1)
         let spatialMergeSize = config.visionConfiguration.spatialMergeSize
@@ -910,8 +954,12 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
             return (positionIds, deltas)
         }
 
+        guard batchSize == 1 else {
+            throw VLMError.processing(
+                "GlmOcr image prefill only supports batch size 1; received batch size \(batchSize).")
+        }
+
         // Build position_ids per batch element using 3 separate dimension arrays
-        precondition(batchSize == 1, "GlmOcr getRopeIndex only supports batchSize == 1")
         let positionIds = zeros([3, batchSize, seqLength], type: Int32.self)
         var imageIndex = 0
         var mropePositionDelta: Int = 0
@@ -991,7 +1039,7 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     private func inputEmbeddings(inputIds: MLXArray, pixelValues: MLXArray?, frames: [THW]?)
-        -> MLXArray
+        throws -> MLXArray
     {
         guard let pixelValues, let frames else {
             languageModel._positionIds = nil
@@ -1007,13 +1055,23 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
             hiddenStates = hiddenStates[.newAxis, 0..., 0...]
         }
 
+        let imageFeatureCount = hiddenStates.dim(1)
+        let imageTokenCount = inputIds.asArray(Int.self).filter {
+            $0 == config.baseConfiguration.imageTokenId
+                || $0 == config.baseConfiguration.videoTokenId
+        }.count
+        guard imageTokenCount == imageFeatureCount else {
+            throw VLMError.processing(
+                "GlmOcr image token count \(imageTokenCount) does not match image feature count \(imageFeatureCount).")
+        }
+
         let merged = QwenVL.mergeInputIdsWithImageFeatures(
             inputIds: inputIds, inputEmbeds: inputEmbeds, imageFeatures: hiddenStates,
             imageTokenId: config.baseConfiguration.imageTokenId,
             videoTokenId: config.baseConfiguration.videoTokenId)
 
         // Pre-compute M-RoPE position IDs
-        let (positionIds, ropeDeltas) = getRopeIndex(
+        let (positionIds, ropeDeltas) = try getRopeIndex(
             inputIds: inputIds, imageGridThw: frames)
         languageModel._positionIds = positionIds
         languageModel._ropeDeltas = ropeDeltas
@@ -1034,11 +1092,11 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
             allFrames.append(contentsOf: imageFrames)
         }
 
-        let inputEmbeddings = self.inputEmbeddings(
+        let inputEmbeddings = try self.inputEmbeddings(
             inputIds: input.text.tokens, pixelValues: allPixels,
             frames: allFrames.isEmpty ? nil : allFrames)
 
-        let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings)
+        let result = languageModel.embeddingsForward(inputEmbeddings, cache: cache)
 
         return .logits(result)
     }
@@ -1101,6 +1159,35 @@ public struct GlmOcrConfiguration: Codable, Sendable {
             case _partialRotaryFactor = "partial_rotary_factor"
             case _ropeTheta = "rope_theta"
         }
+
+        public init(from decoder: any Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.mropeSection = try container.decode([Int].self, forKey: .mropeSection)
+            self._partialRotaryFactor = try container.decodeIfPresent(
+                Float.self, forKey: ._partialRotaryFactor)
+            self._ropeTheta = try container.decodeIfPresent(Float.self, forKey: ._ropeTheta)
+
+            guard !mropeSection.isEmpty, mropeSection.allSatisfy({ $0 > 0 }) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .mropeSection,
+                    in: container,
+                    debugDescription:
+                        "GlmOcr rope_parameters.mrope_section must contain positive integers.")
+            }
+            try Self.validatePositive(partialRotaryFactor, key: ._partialRotaryFactor, in: container)
+            try Self.validatePositive(ropeTheta, key: ._ropeTheta, in: container)
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value.isFinite, value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be finite and greater than zero.")
+            }
+        }
     }
 
     public struct TextConfiguration: Codable, Sendable {
@@ -1130,6 +1217,83 @@ public struct GlmOcrConfiguration: Codable, Sendable {
             case _rmsNormEps = "rms_norm_eps"
             case _tieWordEmbeddings = "tie_word_embeddings"
         }
+
+        public init(from decoder: any Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+            self.hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+            self.intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+            self.attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+            self.kvHeads = try container.decode(Int.self, forKey: .kvHeads)
+            self.headDim = try container.decode(Int.self, forKey: .headDim)
+            self.vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+            self.ropeParameters = try container.decode(RopeParameters.self, forKey: .ropeParameters)
+            self._rmsNormEps = try container.decodeIfPresent(Float.self, forKey: ._rmsNormEps)
+            self._tieWordEmbeddings = try container.decodeIfPresent(
+                Bool.self, forKey: ._tieWordEmbeddings)
+
+            try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+            try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+            try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+            try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+            try Self.validatePositive(headDim, key: .headDim, in: container)
+            try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+            try Self.validatePositive(rmsNormEps, key: ._rmsNormEps, in: container)
+            guard hiddenSize == attentionHeads * headDim else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize,
+                    in: container,
+                    debugDescription:
+                        "GlmOcr text config hidden_size must equal num_attention_heads * head_dim.")
+            }
+            guard attentionHeads % kvHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .kvHeads,
+                    in: container,
+                    debugDescription:
+                        "GlmOcr text config num_attention_heads must be divisible by num_key_value_heads.")
+            }
+            let rotaryDim = Int(Float(headDim) * ropeParameters.partialRotaryFactor)
+            guard rotaryDim > 0, rotaryDim <= headDim, rotaryDim % 2 == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeParameters,
+                    in: container,
+                    debugDescription:
+                        "GlmOcr text config rotary dimension must be positive, even, and no larger than head_dim.")
+            }
+            let rotaryFrequencyDim = rotaryDim / 2
+            let lastSplitIndex = ropeParameters.mropeSection.dropLast().reduce(0, +)
+            guard lastSplitIndex < rotaryFrequencyDim else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .ropeParameters,
+                    in: container,
+                    debugDescription:
+                        "GlmOcr rope_parameters.mrope_section split indices must fit within the rotary frequency dimension.")
+            }
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be greater than zero.")
+            }
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value.isFinite, value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be finite and greater than zero.")
+            }
+        }
     }
 
     public struct VisionConfiguration: Codable, Sendable {
@@ -1158,6 +1322,67 @@ public struct GlmOcrConfiguration: Codable, Sendable {
             case _inChannels = "in_channels"
             case _rmsNormEps = "rms_norm_eps"
         }
+
+        public init(from decoder: any Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.depth = try container.decode(Int.self, forKey: .depth)
+            self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+            self.intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+            self.numHeads = try container.decode(Int.self, forKey: .numHeads)
+            self.patchSize = try container.decode(Int.self, forKey: .patchSize)
+            self.outHiddenSize = try container.decode(Int.self, forKey: .outHiddenSize)
+            self.spatialMergeSize = try container.decode(Int.self, forKey: .spatialMergeSize)
+            self.temporalPatchSize = try container.decode(Int.self, forKey: .temporalPatchSize)
+            self._inChannels = try container.decodeIfPresent(Int.self, forKey: ._inChannels)
+            self._rmsNormEps = try container.decodeIfPresent(Float.self, forKey: ._rmsNormEps)
+
+            try Self.validatePositive(depth, key: .depth, in: container)
+            try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+            try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+            try Self.validatePositive(numHeads, key: .numHeads, in: container)
+            try Self.validatePositive(patchSize, key: .patchSize, in: container)
+            try Self.validatePositive(outHiddenSize, key: .outHiddenSize, in: container)
+            try Self.validatePositive(spatialMergeSize, key: .spatialMergeSize, in: container)
+            try Self.validatePositive(temporalPatchSize, key: .temporalPatchSize, in: container)
+            try Self.validatePositive(inChannels, key: ._inChannels, in: container)
+            try Self.validatePositive(rmsNormEps, key: ._rmsNormEps, in: container)
+            guard hiddenSize % numHeads == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize,
+                    in: container,
+                    debugDescription:
+                        "GlmOcr vision config hidden_size must be divisible by num_heads.")
+            }
+            guard hiddenSize % 2 == 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hiddenSize,
+                    in: container,
+                    debugDescription:
+                        "GlmOcr vision config hidden_size must be even for rotary embeddings.")
+            }
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be greater than zero.")
+            }
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value.isFinite, value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be finite and greater than zero.")
+            }
+        }
     }
 
     public struct BaseConfiguration: Codable, Sendable {
@@ -1182,6 +1407,52 @@ public struct GlmOcrConfiguration: Codable, Sendable {
             case _imageStartTokenId = "image_start_token_id"
             case _hiddenSize = "hidden_size"
         }
+
+        public init(from decoder: any Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.modelType = try container.decode(String.self, forKey: .modelType)
+            self._vocabularySize = try container.decodeIfPresent(
+                Int.self, forKey: ._vocabularySize)
+            self._imageTokenId = try container.decodeIfPresent(Int.self, forKey: ._imageTokenId)
+            self._videoTokenId = try container.decodeIfPresent(Int.self, forKey: ._videoTokenId)
+            self._imageStartTokenId = try container.decodeIfPresent(
+                Int.self, forKey: ._imageStartTokenId)
+            self._hiddenSize = try container.decodeIfPresent(Int.self, forKey: ._hiddenSize)
+
+            guard !modelType.isEmpty else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .modelType,
+                    in: container,
+                    debugDescription: "GlmOcr base config model_type must not be empty.")
+            }
+            try Self.validatePositive(vocabularySize, key: ._vocabularySize, in: container)
+            try Self.validatePositive(hiddenSize, key: ._hiddenSize, in: container)
+            try Self.validateTokenId(imageTokenId, key: ._imageTokenId, in: container)
+            try Self.validateTokenId(videoTokenId, key: ._videoTokenId, in: container)
+            try Self.validateTokenId(imageStartTokenId, key: ._imageStartTokenId, in: container)
+        }
+
+        private static func validatePositive<K: CodingKey>(
+            _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be greater than zero.")
+            }
+        }
+
+        private static func validateTokenId<K: CodingKey>(
+            _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+        ) throws {
+            guard value >= 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "\(key.stringValue) must be non-negative.")
+            }
+        }
     }
 
     public let textConfiguration: TextConfiguration
@@ -1203,6 +1474,31 @@ public struct GlmOcrConfiguration: Codable, Sendable {
 
         // BaseConfiguration overlaid at top level (fields may be absent)
         self.baseConfiguration = try BaseConfiguration(from: decoder)
+
+        guard baseConfiguration.vocabularySize == textConfiguration.vocabularySize else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .textConfiguration,
+                in: container,
+                debugDescription:
+                    "GlmOcr base vocab_size must match text_config vocab_size.")
+        }
+        guard baseConfiguration.imageTokenId < baseConfiguration.vocabularySize,
+            baseConfiguration.videoTokenId < baseConfiguration.vocabularySize,
+            baseConfiguration.imageStartTokenId < baseConfiguration.vocabularySize
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .textConfiguration,
+                in: container,
+                debugDescription:
+                    "GlmOcr image/video token ids must be less than vocab_size.")
+        }
+        guard baseConfiguration.hiddenSize == textConfiguration.hiddenSize else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .textConfiguration,
+                in: container,
+                debugDescription:
+                    "GlmOcr base hidden_size must match text_config hidden_size.")
+        }
     }
 }
 
@@ -1216,6 +1512,20 @@ public struct GlmOcrProcessorConfiguration: Codable, Sendable {
         enum CodingKeys: String, CodingKey {
             case shortestEdge = "shortest_edge"
             case longestEdge = "longest_edge"
+        }
+
+        public init(from decoder: any Swift.Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.shortestEdge = try container.decode(Int.self, forKey: .shortestEdge)
+            self.longestEdge = try container.decode(Int.self, forKey: .longestEdge)
+
+            guard shortestEdge > 0, longestEdge > 0, shortestEdge <= longestEdge else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .shortestEdge,
+                    in: container,
+                    debugDescription:
+                        "GlmOcr processor size shortest_edge and longest_edge must be positive with shortest_edge <= longest_edge.")
+            }
         }
     }
 
@@ -1243,6 +1553,45 @@ public struct GlmOcrProcessorConfiguration: Codable, Sendable {
         case patchSize = "patch_size"
         case temporalPatchSize = "temporal_patch_size"
         case size
+    }
+
+    public init(from decoder: any Swift.Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.imageMean = try container.decode([CGFloat].self, forKey: .imageMean)
+        self.imageStd = try container.decode([CGFloat].self, forKey: .imageStd)
+        self.mergeSize = try container.decode(Int.self, forKey: .mergeSize)
+        self.patchSize = try container.decode(Int.self, forKey: .patchSize)
+        self.temporalPatchSize = try container.decode(Int.self, forKey: .temporalPatchSize)
+        self.size = try container.decode(Size.self, forKey: .size)
+
+        try Self.validateRGBTuple(imageMean, key: .imageMean, in: container)
+        try Self.validateRGBTuple(imageStd, key: .imageStd, in: container)
+        try Self.validatePositive(mergeSize, key: .mergeSize, in: container)
+        try Self.validatePositive(patchSize, key: .patchSize, in: container)
+        try Self.validatePositive(temporalPatchSize, key: .temporalPatchSize, in: container)
+    }
+
+    private static func validateRGBTuple<K: CodingKey>(
+        _ values: [CGFloat], key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard values.count == 3, values.allSatisfy({ $0.isFinite }) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription:
+                    "GlmOcr processor \(key.stringValue) must contain exactly three finite RGB values.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be greater than zero.")
+        }
     }
 }
 

@@ -189,11 +189,39 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
             currentTopK: try container.decodeIfPresent(Int.self, forKey: .topKExperts) ?? 0,
             modelType: modelType,
             field: CodingKeys.topKExperts.rawValue)
+        try Self.validateGemma4MoERouterConfig(
+            enableMoeBlock: enableMoeBlock,
+            moeIntermediateSize: moeIntermediateSize,
+            numExperts: numExperts,
+            topKExperts: topKExperts,
+            container: container)
         ropeTraditional =
             try container.decodeIfPresent(Bool.self, forKey: .ropeTraditional) ?? false
         ropeParameters =
             try container.decodeIfPresent(
                 [String: [String: StringOrNumber]].self, forKey: .ropeParameters) ?? [:]
+    }
+
+    private static func validateGemma4MoERouterConfig(
+        enableMoeBlock: Bool,
+        moeIntermediateSize: Int,
+        numExperts: Int,
+        topKExperts: Int,
+        container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard enableMoeBlock else { return }
+        guard numExperts > 0, moeIntermediateSize > 0, topKExperts > 0,
+              topKExperts <= numExperts
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .topKExperts,
+                in: container,
+                debugDescription:
+                    "Gemma4 MoE config incoherent: enable_moe_block=true requires num_experts > 0, "
+                    + "moe_intermediate_size > 0, and 0 < top_k_experts <= num_experts; "
+                    + "got num_experts=\(numExperts), top_k_experts=\(topKExperts), "
+                    + "moe_intermediate_size=\(moeIntermediateSize).")
+        }
     }
 }
 
@@ -262,11 +290,20 @@ class Gemma4Attention: Module {
         let ropeParams = config.ropeParameters[layerKey] ?? [:]
         let ropeTheta = ropeParams["rope_theta"]?.asFloat() ?? (isSliding ? 10000.0 : 1_000_000.0)
         let partialRotaryFactor = ropeParams["partial_rotary_factor"]?.asFloat() ?? (isSliding ? 1.0 : 0.25)
-        let ropeDims = max(1, Int(Float(headDim) * partialRotaryFactor))
+        let ropeType: String = {
+            if let typeValue = ropeParams["type"] ?? ropeParams["rope_type"],
+                case .string(let s) = typeValue
+            {
+                return s
+            }
+            return "default"
+        }()
+        let ropeDims =
+            ropeType == "proportional" ? headDim : max(1, Int(Float(headDim) * partialRotaryFactor))
 
         self.rope = initializeRope(
             dims: ropeDims, base: ropeTheta, traditional: config.ropeTraditional,
-            scalingConfig: nil, maxPositionEmbeddings: nil)
+            scalingConfig: ropeParams.isEmpty ? nil : ropeParams, maxPositionEmbeddings: nil)
 
         super.init()
     }
@@ -335,14 +372,23 @@ class Gemma4Attention: Module {
             }
         }
 
-        // Load.swift casts fp16 params to bf16 at load time, so attention
-        // arrives with the fp32 exponent range needed to avoid overflow.
-        // Keep SDPA native; the prior fp32 upcast/cast-back path was a
-        // decode-time tax on Gemma4-26B.
-        let sdpa = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: cachedKeys, values: cachedValues,
+        let origDType = queries.dtype
+        let needsUpcast = isSliding && (origDType == .float16 || origDType == .bfloat16)
+        var qF = queries
+        var kF = cachedKeys
+        var vF = cachedValues
+        if needsUpcast {
+            qF = qF.asType(.float32)
+            kF = kF.asType(.float32)
+            vF = vF.asType(.float32)
+        }
+        var sdpa = MLXFast.scaledDotProductAttention(
+            queries: qF, keys: kF, values: vF,
             scale: scale, mask: mask
         )
+        if needsUpcast {
+            sdpa = sdpa.asType(origDType)
+        }
         let output = sdpa.transposed(0, 2, 1, 3).reshaped(B, L, -1)
 
         return (outputProj(output), cachedKeys, cachedValues, usedOffset)
@@ -378,16 +424,39 @@ class Gemma4MLP: Module {
 /// Python: (x @ self.weight.T) * scalar
 class Gemma4ScaledLinear: Module {
     let weight: MLXArray
+    @ParameterInfo(key: "scales") var scales: MLXArray
+    @ParameterInfo(key: "biases") var biases: MLXArray?
+
+    let inputDims: Int
     let scalar: Float
 
     init(inputDims: Int, outputDims: Int, scalar: Float) {
         self.weight = MLXArray.zeros([outputDims, inputDims])
+        self._scales.wrappedValue = MLXArray.zeros([outputDims, max(1, inputDims / 32)])
+        self._biases.wrappedValue = MLXArray.zeros([0])
+        self.inputDims = inputDims
         self.scalar = scalar
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        matmul(x, weight.T) * scalar
+        let packedDim = weight.dim(-1)
+        if packedDim != inputDims {
+            let bits = max(1, (packedDim * 32) / max(inputDims, 1))
+            let groupSize = max(1, inputDims / max(scales.dim(-1), 1))
+            let loadedBiases = biases?.size == 0 ? nil : biases
+            let mode: QuantizationMode = loadedBiases == nil ? .mxfp4 : .affine
+            return quantizedMM(
+                x,
+                weight,
+                scales: scales,
+                biases: loadedBiases,
+                transpose: true,
+                groupSize: groupSize,
+                bits: bits,
+                mode: mode) * scalar
+        }
+        return matmul(x, weight.T) * scalar
     }
 }
 
@@ -883,6 +952,18 @@ public class Gemma4TextModel: Module, LLMModel {
         return processedWeights
     }
 
+    public func validateLoadedWeights() throws {
+        guard config.enableMoeBlock, config.numExperts > 0 else { return }
+
+        let flat = Dictionary(uniqueKeysWithValues: parameters().flattened())
+        try validateGemma4RouterLoadedWeights(
+            flat,
+            prefix: "model",
+            layers: config.numHiddenLayers,
+            hiddenSize: config.hiddenSize,
+            numExperts: config.numExperts)
+    }
+
     // Per-layer-type cache: RotatingKVCache for sliding, KVCacheSimple for full attention.
     // For KV-shared models, only create caches for non-shared layers.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
@@ -900,6 +981,52 @@ public class Gemma4TextModel: Module, LLMModel {
             } else {
                 return RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
             }
+        }
+    }
+}
+
+extension Gemma4TextModel: LoadedWeightsValidatingModel {}
+
+private func validateGemma4RouterLoadedWeights(
+    _ weights: [String: MLXArray],
+    prefix: String,
+    layers: Int,
+    hiddenSize: Int,
+    numExperts: Int
+) throws {
+    func fail(_ message: String) throws -> Never {
+        throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: message))
+    }
+
+    func require(_ key: String) throws -> MLXArray {
+        guard let value = weights[key] else {
+            try fail("Gemma4 MoE router checkpoint incoherent: missing \(key).")
+        }
+        return value
+    }
+
+    func requireShape(_ key: String, _ expected: [Int]) throws {
+        let value = try require(key)
+        guard value.shape == expected else {
+            try fail("Gemma4 MoE router checkpoint incoherent: \(key) has shape \(value.shape), expected \(expected).")
+        }
+    }
+
+    for layer in 0 ..< layers {
+        let router = "\(prefix).layers.\(layer).router"
+        try requireShape("\(router).scale", [hiddenSize])
+        try requireShape("\(router).per_expert_scale", [numExperts])
+
+        let projWeight = try require("\(router).proj.weight")
+        guard projWeight.ndim == 2, projWeight.dim(0) == numExperts else {
+            try fail("Gemma4 MoE router checkpoint incoherent: \(router).proj.weight has shape \(projWeight.shape), expected first dimension \(numExperts).")
+        }
+
+        if let projScales = weights["\(router).proj.scales"], projScales.dim(0) != numExperts {
+            try fail("Gemma4 MoE router checkpoint incoherent: \(router).proj.scales has shape \(projScales.shape), expected first dimension \(numExperts).")
+        }
+        if let projBiases = weights["\(router).proj.biases"], projBiases.dim(0) != numExperts {
+            try fail("Gemma4 MoE router checkpoint incoherent: \(router).proj.biases has shape \(projBiases.shape), expected first dimension \(numExperts).")
         }
     }
 }

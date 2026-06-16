@@ -86,6 +86,36 @@ struct ZayaCCACacheDiskRoundTripTests {
         #expect(pDelta < 1e-3)
     }
 
+    @Test("Corrupted CCA disk metadata misses without mutating live cache")
+    func corruptedMetadataMissesWithoutMutation() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
+        let src = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
+        _ = src.update(
+            keys: MLXArray.ones([1, 1, 3, 8], dtype: .bfloat16),
+            values: MLXArray.ones([1, 1, 3, 8], dtype: .bfloat16) * 2)
+        src.writeCCA(
+            conv: MLXArray.ones([1, 4, 2], dtype: .float32) * 3,
+            prev: MLXArray.ones([1, 8], dtype: .float32) * 4)
+
+        var encoded = TQDiskSerializer.serialize(cache: [src])
+        encoded["__zaya_0_meta__"] = MLXArray([Int32(src.offset), 4, 16, 1])
+
+        let dst = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
+        let before = dst.readCCA()
+        var restoreTarget: [any KVCache] = [dst]
+
+        let restored = restoreFromDiskArrays(encoded, into: &restoreTarget)
+
+        #expect(restored == 0)
+        #expect(dst.offset == 0)
+        let convDelta = (dst.readCCA().conv - before.conv).abs().sum().item(Float.self)
+        let prevDelta = (dst.readCCA().prev - before.prev).abs().sum().item(Float.self)
+        #expect(convDelta < 1e-6)
+        #expect(prevDelta < 1e-6)
+    }
+
     @Test("Empty source cache round-trips cleanly via zero-seq sentinel")
     func emptyKVRoundTrip() {
         let mlxTestLock = lockSerializedMLXTest()

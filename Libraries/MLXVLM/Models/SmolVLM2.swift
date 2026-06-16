@@ -59,6 +59,18 @@ public struct SmolVLMProcessorConfiguration: Codable, Sendable {
         self._imageSequenceLength = imageSequenceLength
     }
 
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        imageMean = try container.decode([CGFloat].self, forKey: .imageMean)
+        imageStd = try container.decode([CGFloat].self, forKey: .imageStd)
+        size = try container.decode(Size.self, forKey: .size)
+        maxImageSize = try container.decode(Size.self, forKey: .maxImageSize)
+        videoSampling = try container.decode(VideoSampling.self, forKey: .videoSampling)
+        _imageSequenceLength = try container.decodeIfPresent(Int.self, forKey: ._imageSequenceLength)
+
+        try validateDecodedFields(container: container)
+    }
+
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
         (imageMean[0], imageMean[1], imageMean[2])
     }
@@ -73,6 +85,40 @@ public struct SmolVLMProcessorConfiguration: Codable, Sendable {
         case maxImageSize = "max_image_size"
         case videoSampling = "video_sampling"
         case _imageSequenceLength = "image_seq_len"
+    }
+
+    private func validateDecodedFields(container: KeyedDecodingContainer<CodingKeys>) throws {
+        try validateRGBTuple(imageMean, key: .imageMean, in: container)
+        try validateRGBTuple(imageStd, key: .imageStd, in: container)
+        try validatePositive(size.longestEdge, key: .size, in: container)
+        try validatePositive(maxImageSize.longestEdge, key: .maxImageSize, in: container)
+        try validatePositive(videoSampling.fps, key: .videoSampling, in: container)
+        try validatePositive(videoSampling.maxFrames, key: .videoSampling, in: container)
+        try validatePositive(imageSequenceLength, key: ._imageSequenceLength, in: container)
+    }
+
+    private func validateRGBTuple(
+        _ values: [CGFloat],
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard values.count == 3 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "SmolVLM2 processor config \(key.rawValue) must contain exactly 3 RGB values.")
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key, in: container,
+                debugDescription: "SmolVLM2 processor config \(key.rawValue) values must be > 0.")
+        }
     }
 }
 

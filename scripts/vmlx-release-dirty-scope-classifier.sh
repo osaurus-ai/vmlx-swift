@@ -14,7 +14,9 @@ all_dirty="$({
 classify() {
   local path="$1"
   case "$path" in
-    scripts/vmlx-osaurus-release-readiness-audit.sh|scripts/vmlx-release-dirty-scope-classifier.sh|scripts/vmlx-push-readiness-scope-check.sh|scripts/vmlx-architecture-cache-proof-check.sh|scripts/vmlx-qwen-gemma-proof-check.sh)
+    .gitignore)
+      echo "release-guard" ;;
+    scripts/vmlx-osaurus-release-readiness-audit.sh|scripts/vmlx-release-dirty-scope-classifier.sh|scripts/vmlx-push-readiness-scope-check.sh|scripts/vmlx-architecture-cache-proof-check.sh|scripts/vmlx-qwen-gemma-proof-check.sh|scripts/vmlx-family-matrix-coverage-check.sh|scripts/vmlx-downloaded-model-inventory-check.sh|scripts/vmlx-ram-footprint-proof-boundary-check.sh|scripts/vmlx-reasoning-visible-boundary-check.sh)
       echo "release-guard" ;;
     .agents/vmlx-osaurus/codex/*)
       echo "coordination-doc" ;;
@@ -22,7 +24,7 @@ classify() {
       echo "evidence-log-artifact" ;;
     Libraries/vMLXFlux/*|Libraries/vMLXFluxKit/*|Libraries/vMLXFluxModels/*|Libraries/vMLXFluxVideo/*|Tests/vMLXFluxTests/*|tools/vMLXFluxProbe/*)
       echo "flux-generated-or-unrelated" ;;
-    Libraries/MLXLMCommon/*|Libraries/MLXHuggingFaceMacros/*|RunBench/*|Tests/MLXLMCommonFocusedTests/*|Tests/MLXLMTests/*|Tests/MLXPressPolicyTests/*|scripts/vmlx-live-model-matrix.sh|AGENTS.md)
+    Package.swift|Libraries/MLXLMCommon/*|Libraries/MLXHuggingFaceMacros/*|RunBench/*|Tests/MLXLMCommonFocusedTests/*|Tests/MLXLMTests/*|Tests/MLXPressPolicyTests/*|scripts/vmlx-live-model-matrix.sh|AGENTS.md)
       echo "runtime-source-or-test" ;;
     docs/*|goalnew.md)
       echo "docs-or-planning" ;;

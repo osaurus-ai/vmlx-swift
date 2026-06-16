@@ -222,7 +222,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             let prefillStepSize = windowSize ?? 512
             let tokensShape = input.text.tokens.shape
             if tokensShape.count >= 2 && tokensShape[0] != 1 {
-                fatalError(
+                throw VLMError.processing(
                     "NemotronHOmni.prepare expects single-sequence input (batch=1), "
                     + "got shape \(tokensShape).")
             }
@@ -259,11 +259,13 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         var imageEmbedCount = 0
         var videoRetention: (keepIndices: [Int], totalTokens: Int)? = nil
         if let pixelValues = input.image?.pixels {
-            visualEmbeds = extractImageEmbeds(pixelValues: pixelValues)
+            try validateRadioPixelValues(pixelValues, modality: "image", expectedChannels: 3)
+            visualEmbeds = try extractImageEmbeds(pixelValues: pixelValues)
             imageEmbedCount = visualEmbeds?.dim(0) ?? 0
         }
         if let video = input.video {
-            let videoEmbedsWithRetention = extractVideoEmbedsWithRetention(
+            try validateRadioPixelValues(video.pixels, modality: "video", expectedChannels: 6)
+            let videoEmbedsWithRetention = try extractVideoEmbedsWithRetention(
                 pixelValues: video.pixels,
                 targetTokenCount: video.embeddingTokenCount)
             let videoEmbeds = videoEmbedsWithRetention.fullEmbeds
@@ -275,7 +277,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             } ?? videoEmbeds
         }
         if let visualEmbeds {
-            spliced = spliceAtToken(
+            spliced = try spliceAtToken(
                 tokens: input.text.tokens,
                 inputsEmbeds: spliced,
                 replacement: visualEmbeds,
@@ -288,7 +290,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             let audioEmbeds: MLXArray = audio.preEncodedEmbedding
                 ?? extractAudioEmbeds(waveformArray: audio.waveform,
                                       sampleRate: audio.sampleRate)
-            spliced = spliceAtToken(
+            spliced = try spliceAtToken(
                 tokens: input.text.tokens,
                 inputsEmbeds: spliced,
                 replacement: audioEmbeds,
@@ -313,11 +315,47 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             effectivePromptTokens: effectivePromptTokens))
     }
 
+    private func validateRadioPixelValues(
+        _ pixelValues: MLXArray,
+        modality: String,
+        expectedChannels: Int
+    ) throws {
+        let shape = pixelValues.shape
+        guard shape.count == 4 else {
+            throw VLMError.processing(
+                "NemotronHOmni \(modality) pixels must have rank 4 [N,C,H,W]; got shape \(shape).")
+        }
+        let batch = pixelValues.dim(0)
+        let channels = pixelValues.dim(1)
+        let height = pixelValues.dim(2)
+        let width = pixelValues.dim(3)
+        guard batch > 0, height > 0, width > 0 else {
+            throw VLMError.processing(
+                "NemotronHOmni \(modality) pixels must have positive N/H/W; got shape \(shape).")
+        }
+        guard channels == expectedChannels else {
+            throw VLMError.processing(
+                "NemotronHOmni \(modality) pixels expected \(expectedChannels) channels; got shape \(shape).")
+        }
+        guard height % config.visionPatchSize == 0, width % config.visionPatchSize == 0 else {
+            throw VLMError.processing(
+                "NemotronHOmni \(modality) pixels H/W must be divisible by patch size \(config.visionPatchSize); got shape \(shape).")
+        }
+        let gridH = height / config.visionPatchSize
+        let gridW = width / config.visionPatchSize
+        guard gridH > 0, gridW > 0,
+              gridH <= config.visionMaxGrid, gridW <= config.visionMaxGrid
+        else {
+            throw VLMError.processing(
+                "NemotronHOmni \(modality) patch grid \(gridH)x\(gridW) exceeds RADIO max grid \(config.visionMaxGrid)x\(config.visionMaxGrid); resize media before prepare.")
+        }
+    }
+
     // MARK: - Multimodal embedding extraction
 
     /// Run RADIO + mlp1 on a (B, 3, H, W) pixel tensor (already CLIP-normalized).
     /// Returns flat (totalTokens, llmHidden) embeddings in tile-row-major order.
-    public func extractImageEmbeds(pixelValues: MLXArray, video: Bool = false) -> MLXArray {
+    public func extractImageEmbeds(pixelValues: MLXArray, video: Bool = false) throws -> MLXArray {
         var feats = radioModel(pixelValues, video: video)
         // Strip cls/register tokens (first numClsTokens)
         feats = feats[0..., config.visionNumClsTokens..., 0...]
@@ -326,8 +364,10 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         let P = feats.dim(1)
         let D = feats.dim(2)
         let side = Int(Double(P).squareRoot())
-        precondition(side * side == P,
-                     "RADIO patch count must be a perfect square; got P=\(P)")
+        guard side * side == P else {
+            throw VLMError.processing(
+                "NemotronHOmni RADIO patch count must be a perfect square; got P=\(P).")
+        }
         feats = feats.reshaped([N, side, side, D])
         // Pixel shuffle (scale = 0.5)
         feats = nemotronOmniPixelShuffle(feats, scaleFactor: config.downsampleRatio)
@@ -352,8 +392,8 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         targetTokenCount: Int? = nil,
         applyEVS: Bool = true,
         pruningRate: Float = 0.7
-    ) -> MLXArray {
-        var feats = projectedVideoEmbedsByGroup(pixelValues: pixelValues)
+    ) throws -> MLXArray {
+        var feats = try projectedVideoEmbedsByGroup(pixelValues: pixelValues)
         if applyEVS {
             if let targetTokenCount {
                 feats = nemotronOmniApplyEVS(feats, targetTokenCount: targetTokenCount)
@@ -364,7 +404,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         return feats.reshaped([feats.dim(0) * feats.dim(1), feats.dim(-1)])
     }
 
-    private func projectedVideoEmbedsByGroup(pixelValues: MLXArray) -> MLXArray {
+    private func projectedVideoEmbedsByGroup(pixelValues: MLXArray) throws -> MLXArray {
         var feats = radioModel(pixelValues, video: true)
         feats = feats[0..., config.visionNumClsTokens..., 0...]
         let nGroups = feats.dim(0)
@@ -372,8 +412,10 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         let hidden = feats.dim(2)
         let gridH = pixelValues.dim(2) / config.visionPatchSize
         let gridW = pixelValues.dim(3) / config.visionPatchSize
-        precondition(gridH * gridW == patches,
-                     "RADIO video patch grid mismatch; got P=\(patches), H=\(gridH), W=\(gridW)")
+        guard gridH * gridW == patches else {
+            throw VLMError.processing(
+                "NemotronHOmni RADIO video patch grid mismatch; got P=\(patches), H=\(gridH), W=\(gridW).")
+        }
         feats = feats.reshaped([nGroups, gridH, gridW, hidden])
         feats = nemotronOmniPixelShuffle(feats, scaleFactor: config.downsampleRatio)
         let tokensPerGroup = feats.dim(1) * feats.dim(2)
@@ -386,8 +428,8 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         pixelValues: MLXArray,
         targetTokenCount: Int? = nil,
         pruningRate: Float = 0.7
-    ) -> (fullEmbeds: MLXArray, keepIndices: [Int], totalTokens: Int) {
-        let feats = projectedVideoEmbedsByGroup(pixelValues: pixelValues)
+    ) throws -> (fullEmbeds: MLXArray, keepIndices: [Int], totalTokens: Int) {
+        let feats = try projectedVideoEmbedsByGroup(pixelValues: pixelValues)
         let nGroups = feats.dim(0)
         let tokensPerGroup = feats.dim(1)
         let hidden = feats.dim(2)
@@ -453,7 +495,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         inputsEmbeds: MLXArray,
         replacement: MLXArray,
         tokenId: Int
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         // tokens: (B, T) or (T,); inputsEmbeds: (B, T, D); replacement: (N, D)
         let mask = MLX.equal(tokens, MLXArray(tokenId))
         // Squeeze batch dim to (T,), find positions
@@ -467,8 +509,10 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         // Count placeholder positions; assemble a scattered tensor by iterating.
         let nReplace = positions.reduce(0, +)
         if nReplace == 0 { return inputsEmbeds }
-        precondition(nReplace == replacement.dim(0),
-                     "Multimodal placeholder count (\(nReplace)) does not match replacement embeds (\(replacement.dim(0)))")
+        guard nReplace == replacement.dim(0) else {
+            throw VLMError.processing(
+                "NemotronHOmni multimodal placeholder count (\(nReplace)) does not match replacement embeds (\(replacement.dim(0))).")
+        }
 
         // Build replacement-broadcast tensor: same shape as inputsEmbeds with
         // replacement[i] at the i-th placeholder slot, zeros elsewhere.
@@ -476,7 +520,10 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         var replIdx = 0
         let totalSlots = positions.count
         let B = inputsEmbeds.dim(0)
-        precondition(B == 1, "spliceAtToken currently supports batch=1 only")
+        guard B == 1 else {
+            throw VLMError.processing(
+                "NemotronHOmni spliceAtToken currently supports batch=1 only; got B=\(B).")
+        }
         for slot in 0 ..< totalSlots {
             if positions[slot] != 0 {
                 let row = replacement[replIdx ..< (replIdx + 1)] // (1, D)

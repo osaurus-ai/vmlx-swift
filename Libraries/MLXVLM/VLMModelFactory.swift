@@ -14,6 +14,7 @@ public enum VLMError: LocalizedError, Equatable {
     case processing(String)
     case noVideoTrackFound
     case videoNotDecodable
+    case emptyVideoFrames
 
     public var errorDescription: String? {
         switch self {
@@ -37,6 +38,8 @@ public enum VLMError: LocalizedError, Equatable {
             return String(localized: "Video file has no video tracks.")
         case .videoNotDecodable:
             return String(localized: "Video file not decodable.")
+        case .emptyVideoFrames:
+            return String(localized: "Frame-backed video input must contain at least one frame.")
         }
     }
 }
@@ -121,6 +124,8 @@ public enum VLMTypeRegistry {
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
         "gemma4": create(Gemma4Configuration.self, Gemma4.init),
+        "gemma4_unified": create(Gemma4Configuration.self, Gemma4.init),
+        "gemma4_unified_vlm": create(Gemma4Configuration.self, Gemma4.init),
         "nemotron_h_omni": create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
         "NemotronH_Nano_Omni_Reasoning_V3":
             create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
@@ -170,7 +175,7 @@ public enum VLMTypeRegistry {
             check.textConfig?.modelType == "mistral4"
         {
             let config = try JSONDecoder.json5().decode(Mistral4VLMConfiguration.self, from: data)
-            return Mistral4VLM(config)
+            return try Mistral4VLM(config)
         }
         let config = try JSONDecoder.json5().decode(Mistral3VLMConfiguration.self, from: data)
         return Mistral3VLM(config)
@@ -206,6 +211,8 @@ public enum VLMProcessorTypeRegistry {
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
         "Gemma4Processor": create(
+            Gemma4ProcessorConfiguration.self, Gemma4Processor.init),
+        "Gemma4UnifiedProcessor": create(
             Gemma4ProcessorConfiguration.self, Gemma4Processor.init),
         "NemotronHOmniProcessor": create(
             NemotronHOmniProcessorConfiguration.self, NemotronHOmniProcessor.init),
@@ -539,8 +546,7 @@ public final class VLMModelFactory: ModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        // Load EOS token IDs from config.json, with optional override from generation_config.json
-        var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+        // Load EOS token IDs from config.json/text_config, with optional generation_config override.
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let generationConfig =
             if let generationData = try? Data(contentsOf: generationConfigURL) {
@@ -548,9 +554,10 @@ public final class VLMModelFactory: ModelFactory {
             } else {
                 nil as GenerationConfigFile?
             }
-        if let genEosIds = generationConfig?.eosTokenIds?.values {
-            eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
-        }
+        var eosTokenIds = ModelTokenConfigurationResolver.resolvedEOSTokenIds(
+            baseConfig: baseConfig,
+            configurationData: mergedConfigData,
+            generationConfig: generationConfig)
         if baseConfig.modelType == "deepseek_v4" {
             eosTokenIds.formUnion([1, 128803, 128804])
         }

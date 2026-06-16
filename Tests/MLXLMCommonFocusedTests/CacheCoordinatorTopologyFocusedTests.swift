@@ -276,6 +276,33 @@ struct CacheCoordinatorTopologyFocusedTests {
         }
     }
 
+    @Test("hybrid disk hit rejects legacy KV-only payload without companion state")
+    func hybridDiskHitRejectsLegacyKVOnlyPayloadWithoutSSMCompanion() {
+        FocusedMLXTestSupport.withLock {
+            let tmp = makeTempDir("hybrid-disk-legacy-kv-only")
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            let coordinator = makeCoordinator(
+                usePagedCache: false,
+                enableDiskCache: true,
+                diskCacheDir: tmp,
+                modelKey: "nemotron-ultra-hybrid-legacy-kv-only")
+            coordinator.setHybrid(true)
+            let tokens = [91, 92, 93, 94, 95]
+
+            coordinator.storeAfterGeneration(
+                promptTokens: tokens,
+                perLayerData: fakeLayerData(tokenCount: tokens.count),
+                ssmStates: nil)
+
+            if case .hit = coordinator.fetch(tokens: tokens + [96]) {
+                Issue.record(
+                    "Nemotron-style hybrid disk cache must not accept legacy KV-only L2 payloads without complete SSM companion state")
+            }
+            #expect(coordinator.ssmStateCache.snapshotStats().hits == 0)
+            #expect(coordinator.ssmStateCache.snapshotStats().misses > 0)
+        }
+    }
+
     @Test("DSV4 paged-incompatible cache skips paged blocks and restores CSA HSA pools from disk")
     func dsv4PagedIncompatibleUsesDiskWithPools() {
         FocusedMLXTestSupport.withLock {
@@ -453,6 +480,38 @@ struct CacheCoordinatorTopologyFocusedTests {
                 tokens: tokens,
                 boundary: tokens.count,
                 modelKey: reasoningOn))
+    }
+
+    @Test("SSM companion disk key stays identical to memory key with model and media salt")
+    func ssmCompanionDiskKeyMatchesMemoryKeyWithModelAndMediaSalt() {
+        let tokens = [111, 112, 113, 114, 115]
+        let modelKey = "nemotron-ultra|reasoning=deepseek_r1|tools=nemotron|kv=tq3x3"
+        let mediaSalt = "text-only|no-media-processors"
+
+        let memoryKey = SSMStateCache.makeKey(
+            tokens: tokens,
+            boundary: 4,
+            mediaSalt: mediaSalt,
+            modelKey: modelKey)
+        let diskKey = SSMCompanionDiskStore.keyFor(
+            tokens: tokens,
+            boundary: 4,
+            mediaSalt: mediaSalt,
+            modelKey: modelKey)
+
+        #expect(diskKey == memoryKey)
+        #expect(
+            SSMCompanionDiskStore.keyFor(
+                tokens: tokens,
+                boundary: 4,
+                mediaSalt: "text-only|different-policy",
+                modelKey: modelKey) != diskKey)
+        #expect(
+            SSMCompanionDiskStore.keyFor(
+                tokens: tokens,
+                boundary: 4,
+                mediaSalt: mediaSalt,
+                modelKey: "other-model") != diskKey)
     }
 
     @Test("cache scope salt includes only semantic reasoning keys")

@@ -78,9 +78,7 @@ struct MLXPressLowRamPolicySourceTests {
         #expect(mlxpress.contains("temporary routed overlay will be removed"))
         #expect(mlxpress.contains(#"setenv("MLXPRESS_PRESTACK", "0", 1)"#))
         #expect(mlxpress.contains(#"setenv("JANGPRESS_PRESTACK", "0", 1)"#))
-        #expect(
-            mlxpress.contains(
-                #"if getenv("MLXPRESS_STREAMING_EVAL_EACH_LAYER") == nil"#))
+        #expect(!mlxpress.contains(#"setenv("MLXPRESS_STREAMING_EVAL_EACH_LAYER", "1", 1)"#))
         #expect(mlxpress.contains("allocatorCacheLimit: configuration.allocatorCacheLimit"))
         #expect(mlxpress.contains("decodeCacheLimitOverride"))
         #expect(mlxpress.contains("MLXPRESS_DECODE_CACHE_LIMIT_MB"))
@@ -173,8 +171,10 @@ struct MLXPressLowRamPolicySourceTests {
         #expect(evaluate.contains("CompilableKVCache(from: layer, maxLength: maxCacheLength)"))
         #expect(evaluate.contains("CompilableTurboQuantKVCache(from: layer as! TurboQuantKVCache)"))
         #expect(evaluate.contains("self.cache = promoted"))
-        #expect(cli.contains(#""enable_thinking": enableThinking"#))
-        #expect(cli.contains(#""thinking": enableThinking"#))
+        #expect(cli.contains("additionalContext: options.chatTemplateContext"))
+        #expect(cli.contains(#"context["enable_thinking"] = enableThinking"#))
+        #expect(cli.contains(#"context["thinking"] = enableThinking"#))
+        #expect(cli.contains(#""thinking": options.enableThinking.map"#))
         #expect(cli.contains("--metrics-jsonl"))
         #expect(cli.contains("MetricsJSONLWriter"))
         #expect(!cli.contains("gateAwareMemoryLimit"))
@@ -327,6 +327,7 @@ struct MLXPressLowRamPolicySourceTests {
         #expect(streamingExperts.contains("MLXPRESS_STREAMING_EVAL_LAYER_STRIDE"))
         #expect(streamingExperts.contains("JANGPRESS_STREAMING_EVAL_LAYER_STRIDE"))
         #expect(streamingExperts.contains("mlXPressStreamingShouldEvaluateLayer"))
+        #expect(streamingExperts.contains("defaultValue: false"))
         #expect(streamingExperts.contains("MLXPRESS_STREAMING_EVAL_MLX_PEAK_MB"))
         #expect(streamingExperts.contains("JANGPRESS_STREAMING_EVAL_MLX_PEAK_MB"))
         #expect(streamingExperts.contains("MLXPRESS_STREAMING_EVAL_MLX_ACTIVE_MB"))
@@ -373,9 +374,8 @@ struct MLXPressLowRamPolicySourceTests {
             streamingExperts.contains(#"profileName: "gateup.eval""#))
         #expect(
             streamingExperts.contains(#"profileName: "down.eval""#))
-        #expect(
-            streamingExperts.contains("indexValues: Array(allIndexValues[valueStart ..< valueEnd])")
-        )
+        #expect(streamingExperts.contains("let indexValues = allIndexValues.map"))
+        #expect(streamingExperts.contains("Array($0[valueStart ..< valueEnd])"))
         #expect(
             streamingExperts.contains(
                 "slotIndexValues.append(allIndexValues[token * kSlots + slot])"))

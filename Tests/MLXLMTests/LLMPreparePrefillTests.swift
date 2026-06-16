@@ -166,4 +166,18 @@ final class LLMPreparePrefillTests: XCTestCase {
             XCTAssertEqual(remainderMask.size, totalLen - 2 * step)
         }
     }
+
+    func testTrueBatchedInputThrowsUnsupportedBatchInput() throws {
+        let model = makeModel()
+        let cache = model.newCache(parameters: nil)
+        let tokens = MLXArray((0..<12).map { Int32($0 % 64) }).reshaped(2, 6)
+        let input = LMInput(text: .init(tokens: tokens))
+
+        do {
+            _ = try model.prepare(input, cache: cache, windowSize: step)
+            XCTFail("Expected true batched input to throw")
+        } catch LLMModelError.unsupportedBatchInput(let shape) {
+            XCTAssertEqual(shape, [2, 6])
+        }
+    }
 }

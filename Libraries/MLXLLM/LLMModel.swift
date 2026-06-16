@@ -13,6 +13,17 @@ public protocol LLMModel: LanguageModel, LoRAModel {
     func messageGenerator(tokenizer: Tokenizer) -> MessageGenerator
 }
 
+public enum LLMModelError: LocalizedError, Equatable {
+    case unsupportedBatchInput(shape: [Int])
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedBatchInput(let shape):
+            return "LLMModel.prepare expects single-sequence input (batch=1), got shape \(shape). BatchEngine handles multi-sequence batching outside this extension."
+        }
+    }
+}
+
 extension LLMModel {
 
     /// Default prepare step for ``LLMModel``.
@@ -40,11 +51,7 @@ extension LLMModel {
         // sequences into one; fail fast instead of producing silent garbage.
         let tokensShape = input.text.tokens.shape
         if tokensShape.count >= 2 && tokensShape[0] != 1 {
-            fatalError(
-                "LLMModel.prepare expects single-sequence input (batch=1), "
-                + "got shape \(tokensShape). BatchEngine handles multi-sequence "
-                + "batching outside this extension."
-            )
+            throw LLMModelError.unsupportedBatchInput(shape: tokensShape)
         }
 
         var flatTokens = input.text.tokens.reshaped([-1])

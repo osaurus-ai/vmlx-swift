@@ -75,6 +75,36 @@ struct VMLXMemorySafetySettingsTests {
         #expect(fields.contains("memorySafety.customMaxConcurrentSequences"))
     }
 
+    @Test("memory safety preserves explicit cache disable")
+    func memorySafetyPreservesExplicitCacheDisable() {
+        var settings = VMLXServerRuntimeSettings()
+        settings.cache.prefix.enabled = false
+        settings.cache.pagedKV.enabled = true
+        settings.cache.blockDisk.enabled = true
+        settings.cache.legacyDisk.enabled = true
+
+        let plan = settings.resolvedMemorySafetyPlan(
+            baseLoadConfiguration: .osaurusProduction,
+            bundleFacts: LoadBundleFacts(
+                totalSafetensorsBytes: 4 << 30,
+                isRouted: false,
+                physicalMemory: 64 << 30,
+                modelType: "gemma4",
+                weightFormat: "mxfp4"))
+        let coordinator = VMLXServerRuntimeSettings(
+            cache: plan.cache,
+            memorySafety: settings.memorySafety
+        )
+        .cacheCoordinatorConfig(modelKey: "gemma4|cache=disabled")
+
+        #expect(!plan.cache.prefix.enabled)
+        #expect(!plan.cache.pagedKV.enabled)
+        #expect(!plan.cache.blockDisk.enabled)
+        #expect(!plan.cache.legacyDisk.enabled)
+        #expect(!coordinator.usePagedCache)
+        #expect(!coordinator.enableDiskCache)
+    }
+
     @Test("strict mode returns typed refusal for unknown and over budget estimates")
     func strictModeReturnsTypedRefusalForUnknownAndOverBudgetEstimates() {
         var settings = VMLXServerRuntimeSettings()

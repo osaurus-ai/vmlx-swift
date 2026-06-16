@@ -187,8 +187,8 @@ template <
   // const bool is_last_tq = int(simd_group_id) >= (params->qL_rem / UQ);
   const bool is_last_q = is_last_bq;
 
-  const short lim_rows_q = params->qL_rem - (tm + sm);
-  const short lim_rows_k = params->kL_rem - sm;
+  const int lim_rows_q = params->qL_rem - int(tm + sm);
+  const int lim_rows_k = params->kL_rem - int(sm);
 
   // Loop over KV seq length
   for (int kb = 0; kb < kb_lim; kb++) {
@@ -311,8 +311,8 @@ template <
       for (short iq = 0; iq < TQ; iq++) {
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
-          const short row_pos = base_row + iq * UQ;
-          const short col_pos = base_col + ik * UK;
+          const int row_pos = base_row + iq * UQ;
+          const int col_pos = base_col + ik * UK;
 
           thread auto& fg = Ptile.subtile_at(iq, ik).frag_at(0, 0);
 
@@ -345,8 +345,8 @@ template <
       for (short iq = 0; iq < TQ; iq++) {
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
-          const short row_pos = base_row + iq * UQ + sm;
-          const short col_pos = base_col + ik * UK + sn;
+          const int row_pos = base_row + iq * UQ + sm;
+          const int col_pos = base_col + ik * UK + sn;
 
           MSubTile mfrag;
           mfrag.load_safe(

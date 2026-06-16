@@ -35,6 +35,49 @@ final class GenerationConfigDefaultsTests: XCTestCase {
         XCTAssertEqual(config.doSample, true)
     }
 
+    func testResolvedEOSTokenIdsFallsBackToNestedTextConfig() throws {
+        let json = """
+        {
+          "model_type": "qwen3_5_moe",
+          "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "eos_token_id": 248046
+          }
+        }
+        """
+        let data = Data(json.utf8)
+        let baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: data)
+
+        let eos = ModelTokenConfigurationResolver.resolvedEOSTokenIds(
+            baseConfig: baseConfig,
+            configurationData: data,
+            generationConfig: nil)
+
+        XCTAssertEqual(eos, [248046])
+    }
+
+    func testResolvedEOSTokenIdsGenerationConfigOverridesNestedTextConfig() throws {
+        let json = """
+        {
+          "model_type": "qwen3_5_moe",
+          "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "eos_token_id": 248046
+          }
+        }
+        """
+        let data = Data(json.utf8)
+        let baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: data)
+        let generationConfig = GenerationConfigFile(eosTokenIds: IntOrIntArray([2, 11]))
+
+        let eos = ModelTokenConfigurationResolver.resolvedEOSTokenIds(
+            baseConfig: baseConfig,
+            configurationData: data,
+            generationConfig: generationConfig)
+
+        XCTAssertEqual(eos, [2, 11])
+    }
+
     func testGenerateParametersApplyConfigDefaultsAndPreserveRuntimeControls() {
         let fallback = GenerateParameters(
             maxTokens: 64,
@@ -108,6 +151,38 @@ final class GenerationConfigDefaultsTests: XCTestCase {
         XCTAssertEqual(params.temperature, 0)
         XCTAssertEqual(params.topP, 0.95)
         XCTAssertTrue(params.sampler() is ArgMaxSampler)
+    }
+
+    func testNemotronUltraGenerationConfigDoesNotInventTopK() throws {
+        let json = """
+        {
+          "_from_model_config": true,
+          "bos_token_id": 1,
+          "do_sample": true,
+          "eos_token_id": [2, 11],
+          "pad_token_id": 0,
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "transformers_version": "5.3.0"
+        }
+        """
+
+        let config = try JSONDecoder.json5().decode(
+            GenerationConfigFile.self, from: Data(json.utf8))
+
+        XCTAssertEqual(config.eosTokenIds?.values, [2, 11])
+        XCTAssertEqual(config.doSample, true)
+        XCTAssertEqual(config.temperature, 1.0)
+        XCTAssertEqual(config.topP, 0.95)
+        XCTAssertNil(config.topK)
+
+        let params = GenerateParameters(
+            generationConfig: config,
+            fallback: GenerateParameters(maxTokens: 64, temperature: 0.2, topP: 0.8, topK: 0))
+        XCTAssertEqual(params.maxTokens, 64)
+        XCTAssertEqual(params.temperature, 1.0)
+        XCTAssertEqual(params.topP, 0.95)
+        XCTAssertEqual(params.topK, 0)
     }
 
     func testModelConfigurationCarriesResolvedGenerationDefaults() {

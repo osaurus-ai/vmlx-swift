@@ -162,6 +162,110 @@ public struct Gemma3nTextConfiguration: Codable {
         ropeScaling = try container.decodeIfPresent([String: String].self, forKey: .ropeScaling)
         slidingWindowPattern = try container.decodeIfPresent(
             Int.self, forKey: .slidingWindowPattern)
+
+        func fail(_ key: CodingKeys, _ message: String) throws -> Never {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: message)
+        }
+
+        func requirePositive(_ value: Int, _ key: CodingKeys, _ name: String) throws {
+            guard value > 0 else {
+                try fail(key, "Gemma3n text config \(name) must be positive.")
+            }
+        }
+
+        func requirePositiveFinite(_ value: Float, _ key: CodingKeys, _ name: String) throws {
+            guard value.isFinite, value > 0 else {
+                try fail(key, "Gemma3n text config \(name) must be positive and finite.")
+            }
+        }
+
+        try requirePositive(hiddenSize, .hiddenSize, "hidden_size")
+        try requirePositive(numHiddenLayers, .numHiddenLayers, "num_hidden_layers")
+        try requirePositive(numAttentionHeads, .numAttentionHeads, "num_attention_heads")
+        try requirePositive(headDim, .headDim, "head_dim")
+        try requirePositive(vocabSize, .vocabSize, "vocab_size")
+        try requirePositive(numKeyValueHeads, .numKeyValueHeads, "num_key_value_heads")
+        try requirePositive(
+            vocabSizePerLayerInput, .vocabSizePerLayerInput, "vocab_size_per_layer_input")
+        try requirePositive(slidingWindow, .slidingWindow, "sliding_window")
+        try requirePositive(maxPositionEmbeddings, .maxPositionEmbeddings, "max_position_embeddings")
+        try requirePositive(
+            hiddenSizePerLayerInput, .hiddenSizePerLayerInput, "hidden_size_per_layer_input")
+        try requirePositive(altupNumInputs, .altupNumInputs, "altup_num_inputs")
+        try requirePositive(laurelRank, .laurelRank, "laurel_rank")
+        try requirePositiveFinite(rmsNormEps, .rmsNormEps, "rms_norm_eps")
+        try requirePositiveFinite(ropeLocalBaseFreq, .ropeLocalBaseFreq, "rope_local_base_freq")
+        try requirePositiveFinite(ropeTheta, .ropeTheta, "rope_theta")
+        try requirePositiveFinite(finalLogitSoftcapping, .finalLogitSoftcapping, "final_logit_softcapping")
+
+        guard intermediateSize.values.count == 1 || intermediateSize.values.count == numHiddenLayers else {
+            try fail(
+                .intermediateSize,
+                "Gemma3n text config intermediate_size must be a scalar or have num_hidden_layers entries.")
+        }
+        guard intermediateSize.values.allSatisfy({ $0 > 0 }) else {
+            try fail(.intermediateSize, "Gemma3n text config intermediate_size entries must be positive.")
+        }
+
+        guard numAttentionHeads % numKeyValueHeads == 0 else {
+            try fail(
+                .numKeyValueHeads,
+                "Gemma3n text config num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        guard numKvSharedLayers >= 0 && numKvSharedLayers < numHiddenLayers else {
+            try fail(
+                .numKvSharedLayers,
+                "Gemma3n text config num_kv_shared_layers must be in 0..<num_hidden_layers.")
+        }
+        guard altupActiveIdx >= 0 && altupActiveIdx < altupNumInputs else {
+            try fail(
+                .altupActiveIdx,
+                "Gemma3n text config altup_active_idx must be within altup_num_inputs.")
+        }
+        if let altupCoefClip {
+            guard altupCoefClip.isFinite, altupCoefClip > 0 else {
+                try fail(
+                    .altupCoefClip,
+                    "Gemma3n text config altup_coef_clip must be positive and finite.")
+            }
+        }
+        if let activationSparsityPattern {
+            guard activationSparsityPattern.count == numHiddenLayers else {
+                try fail(
+                    .activationSparsityPattern,
+                    "Gemma3n text config activation_sparsity_pattern must have num_hidden_layers entries.")
+            }
+            guard activationSparsityPattern.allSatisfy({ $0.isFinite && $0 >= 0 && $0 < 1 }) else {
+                try fail(
+                    .activationSparsityPattern,
+                    "Gemma3n text config activation_sparsity_pattern entries must be finite values in [0, 1).")
+            }
+        }
+
+        guard let layerTypes else {
+            try fail(
+                .layerTypes,
+                "Gemma3n text config layer_types is required because this runtime needs explicit "
+                    + "full/sliding cache topology.")
+        }
+        guard layerTypes.count == numHiddenLayers else {
+            try fail(.layerTypes, "Gemma3n text config layer_types count must match num_hidden_layers.")
+        }
+        let allowedLayerTypes = Set(["full_attention", "sliding_attention"])
+        guard layerTypes.allSatisfy({ allowedLayerTypes.contains($0) }) else {
+            try fail(
+                .layerTypes,
+                "Gemma3n text config layer_types entries must be full_attention or sliding_attention.")
+        }
+        guard layerTypes.contains("sliding_attention") else {
+            try fail(.layerTypes, "Gemma3n text config layer_types must include sliding_attention.")
+        }
+        guard layerTypes.contains("full_attention") else {
+            try fail(.layerTypes, "Gemma3n text config layer_types must include full_attention.")
+        }
     }
 }
 
@@ -719,14 +823,8 @@ public class Gemma3nLanguageModel: Module {
         let layerTypes =
             config.layerTypes ?? Array(repeating: "global_attention", count: config.numHiddenLayers)
 
-        guard let firstSlidingIdx = layerTypes.firstIndex(of: "sliding_attention") else {
-            fatalError("Layer type 'sliding_attention' not found in layer_types")
-        }
-        guard let firstFullIdx = layerTypes.firstIndex(of: "full_attention") else {
-            fatalError("Layer type 'full_attention' not found in layer_types")
-        }
-        self.firstSlidingIdx = firstSlidingIdx
-        self.firstFullIdx = firstFullIdx
+        self.firstSlidingIdx = layerTypes.firstIndex(of: "sliding_attention")!
+        self.firstFullIdx = layerTypes.firstIndex(of: "full_attention")!
 
         var layerIdxToCacheIdx: [Int] = []
         let concreteLayerTypes = Array(layerTypes[..<firstKvSharedLayerIdx])
@@ -747,8 +845,6 @@ public class Gemma3nLanguageModel: Module {
             }
         }
         self.layerIdxToCacheIdx = layerIdxToCacheIdx
-
-        assert(vocabSize > 0)
 
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabSize,
@@ -819,13 +915,13 @@ public class Gemma3nLanguageModel: Module {
             fatalError("Either inputs or inputsEmbeds must be provided")
         }
 
-        let perLayerInputsProcessed: MLXArray
+        let perLayerInputsProcessed: MLXArray?
         if let perLayerInputs {
             perLayerInputsProcessed = perLayerInputs
         } else if let inputs {
             perLayerInputsProcessed = getPerLayerInputs(inputs)
         } else {
-            fatalError("Cannot generate per layer inputs without input ids")
+            perLayerInputsProcessed = nil
         }
 
         let finalPerLayerInputs = projectPerLayerInputs(h, perLayerInputs: perLayerInputsProcessed)

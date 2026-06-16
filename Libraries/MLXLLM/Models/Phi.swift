@@ -28,10 +28,6 @@ class PhiAttention: Module {
         self.headDim = args.hiddenSize / heads
         let kvHeads = args.kvHeads
 
-        if headDim * heads != hiddenSize {
-            fatalError("hidden_size must be divisible by num_heads")
-        }
-
         self._wq.wrappedValue = Linear(hiddenSize, heads * headDim, bias: true)
         self._wk.wrappedValue = Linear(hiddenSize, kvHeads * headDim, bias: true)
         self._wv.wrappedValue = Linear(hiddenSize, kvHeads * headDim, bias: true)
@@ -226,6 +222,61 @@ public struct PhiConfiguration: Codable, Sendable {
             try container.decodeIfPresent(Float.self, forKey: PhiConfiguration.CodingKeys.ropeTheta)
             ?? 10_000
 
+        try Self.validatePositive(maxPositionalEmbeddings, key: .maxPositionalEmbeddings, in: container)
+        try Self.validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try Self.validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try Self.validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try Self.validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try Self.validatePositive(kvHeads, key: .kvHeads, in: container)
+        try Self.validatePositive(partialRotaryFactor, key: .partialRotaryFactor, in: container)
+        try Self.validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try Self.validatePositive(layerNormEps, key: .layerNormEps, in: container)
+        try Self.validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        guard hiddenSize % attentionHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription:
+                    "Phi hidden_size must be divisible by num_attention_heads.")
+        }
+        guard attentionHeads % kvHeads == 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "Phi num_attention_heads must be divisible by num_key_value_heads.")
+        }
+        let headDim = hiddenSize / attentionHeads
+        let rotaryDim = Int(partialRotaryFactor * Float(headDim))
+        guard rotaryDim > 0, rotaryDim <= headDim else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .partialRotaryFactor,
+                in: container,
+                debugDescription:
+                    "Phi rotary dimension must be positive and no larger than head_dim.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Int, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be greater than zero.")
+        }
+    }
+
+    private static func validatePositive<K: CodingKey>(
+        _ value: Float, key: K, in container: KeyedDecodingContainer<K>
+    ) throws {
+        guard value.isFinite, value > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) must be finite and greater than zero.")
+        }
     }
 }
 

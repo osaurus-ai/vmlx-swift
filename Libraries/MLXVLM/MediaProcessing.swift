@@ -561,7 +561,9 @@ public enum MediaProcessing {
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedVideoFrames {
 
-        precondition(videoFrames.isEmpty == false)
+        guard videoFrames.isEmpty == false else {
+            throw VLMError.emptyVideoFrames
+        }
 
         let startTime = videoFrames.first?.timeStamp ?? .zero
         let endTime = videoFrames.last?.timeStamp ?? .zero

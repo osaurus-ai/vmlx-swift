@@ -53,7 +53,7 @@ public enum LLMTypeRegistry {
                 {
                     let config = try JSONDecoder.json5().decode(
                         Qwen35JANGTQConfiguration.self, from: data)
-                    return Qwen35JANGTQModel(config)
+                    return try Qwen35JANGTQModel(config)
                 }
                 let config = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: data)
                 return Qwen35MoEModel(config)
@@ -358,9 +358,52 @@ public enum LLMTypeRegistry {
     }
 
     private static func dispatchNemotronH(data: Data) throws -> any LanguageModel {
+        enum ProbeBits: Codable {
+            case flat(Int)
+            case roles([String: Int])
+            case projections(up: Int?, down: Int?)
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.singleValueContainer()
+                if let v = try? c.decode(Int.self) {
+                    self = .flat(v)
+                    return
+                }
+                if let v = try? c.decode([String: Int].self) {
+                    self = .roles(v)
+                    return
+                }
+                struct ProjectionBits: Decodable {
+                    let upProj: Int?
+                    let downProj: Int?
+                    enum CodingKeys: String, CodingKey {
+                        case upProj = "up_proj"
+                        case downProj = "down_proj"
+                    }
+                }
+                struct NestedBits: Decodable {
+                    let routedExpert: ProjectionBits?
+                    enum CodingKeys: String, CodingKey { case routedExpert = "routed_expert" }
+                }
+                if let nested = try? c.decode(NestedBits.self),
+                    let routedExpert = nested.routedExpert
+                {
+                    self = .projections(
+                        up: routedExpert.upProj,
+                        down: routedExpert.downProj)
+                    return
+                }
+                throw DecodingError.typeMismatch(
+                    ProbeBits.self,
+                    .init(
+                        codingPath: decoder.codingPath,
+                        debugDescription:
+                            "mxtq_bits must be Int, [String: Int], or routed projection metadata"))
+            }
+        }
         struct Probe: Codable {
             let weightFormat: String?
-            let mxtqBits: Int?
+            let mxtqBits: ProbeBits?
             let routedExpertBits: Int?
             let mxtqSeed: Int?
 
@@ -375,11 +418,20 @@ public enum LLMTypeRegistry {
         let config = try JSONDecoder.json5().decode(NemotronHConfiguration.self, from: data)
         let probe = try? JSONDecoder.json5().decode(Probe.self, from: data)
         let weightFormat = probe?.weightFormat?.lowercased()
+        let routedBits: Int? = {
+            switch probe?.mxtqBits {
+            case .flat(let v): return v
+            case .roles(let dict): return dict["routed_expert"] ?? dict.values.first
+            case .projections(let up, let down): return up ?? down
+            case nil: return nil
+            }
+        }()
         let isJANGTQ =
             weightFormat == "mxtq"
+            || weightFormat == "jangtq1"
             || weightFormat == "jangtq2"
             || weightFormat == "jangtq4"
-            || probe?.mxtqBits != nil
+            || routedBits != nil
             || probe?.routedExpertBits != nil
 
         guard isJANGTQ else {
@@ -388,7 +440,7 @@ public enum LLMTypeRegistry {
 
         return NemotronHModel(
             jangtqContext: NemotronHJANGTQContext(
-                bits: probe?.mxtqBits ?? probe?.routedExpertBits ?? 2,
+                bits: routedBits ?? probe?.routedExpertBits ?? 2,
                 mxtqSeed: probe?.mxtqSeed ?? 42),
             configuration: config)
     }
@@ -656,7 +708,7 @@ public enum LLMTypeRegistry {
         {
             let config = try JSONDecoder.json5().decode(
                 DeepseekV3JANGTQConfiguration.self, from: effectiveData)
-            return DeepseekV3JANGTQModel(config)
+            return try DeepseekV3JANGTQModel(config)
         }
         let config = try JSONDecoder.json5().decode(
             DeepseekV3Configuration.self, from: effectiveData)
@@ -1498,9 +1550,11 @@ public final class LLMModelFactory: ModelFactory {
                 throw error
             }
         }
+        if let preLoadModelMutation = ModelLoadHooks.preLoadModelMutation {
+            try preLoadModelMutation(model)
+        }
 
-        // Load EOS token IDs from config.json, with optional override from generation_config.json
-        var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+        // Load EOS token IDs from config.json/text_config, with optional generation_config override.
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let generationConfig =
             if let generationData = try? Data(contentsOf: generationConfigURL) {
@@ -1508,9 +1562,10 @@ public final class LLMModelFactory: ModelFactory {
             } else {
                 nil as GenerationConfigFile?
             }
-        if let genEosIds = generationConfig?.eosTokenIds?.values {
-            eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
-        }
+        var eosTokenIds = ModelTokenConfigurationResolver.resolvedEOSTokenIds(
+            baseConfig: baseConfig,
+            configurationData: configData,
+            generationConfig: generationConfig)
         if baseConfig.modelType == "deepseek_v4" {
             // DSV4's Python runtime treats EOS plus both role-boundary
             // sentinels as hard stops: {1, 128803, 128804}. The public

@@ -11,6 +11,7 @@ private struct Arguments {
     var tlsFingerprint: String?
     var rdmaGID: String?
     var rdmaDevices: [String] = []
+    var dataPlaneAddresses: [String] = []
     var modelHashes: [String] = []
 
     init(_ raw: [String]) {
@@ -33,6 +34,9 @@ private struct Arguments {
                 rdmaGID = Self.value(after: &index, in: raw)
             case "--rdma-devices":
                 rdmaDevices = Self.value(after: &index, in: raw)?
+                    .split(separator: ",").map(String.init) ?? []
+            case "--data-plane-addresses", "--tp-hosts":
+                dataPlaneAddresses = Self.value(after: &index, in: raw)?
                     .split(separator: ",").map(String.init) ?? []
             case "--models":
                 modelHashes = Self.value(after: &index, in: raw)?
@@ -75,10 +79,12 @@ private struct Arguments {
       swift run DistributedProbe [--json]
       swift run DistributedProbe --modes replica,pp --tls-port 7901 --tls-fingerprint <64-hex> --models <hash[,hash]>
       swift run DistributedProbe --modes tp --tls-port 7901 --tls-fingerprint <64-hex> --rdma-gid <gid> --rdma-devices <dev[,dev]>
+      swift run DistributedProbe --modes tp --data-plane-addresses 10.20.0.1:29500,10.20.0.2:29500
 
     Notes:
       - This does not start a server and does not prove peer reachability.
       - JACCL/RDMA availability means the local backend can be loaded, not that a TB5 peer is connected.
+      - Tailscale 100.x addresses are control-plane only and are rejected for TP data-plane use.
       - TXT output is only emitted when enough endpoint data is supplied to avoid false advertising.
     """
 }
@@ -111,6 +117,8 @@ private struct ProbeReport: Codable {
     let mlxDistBackend: String?
     let mlxJacclCoordinator: String?
     let mlxIBVDevicesSet: Bool
+    let tensorDataPlaneAddresses: [TensorDataPlaneAddress]
+    let tensorDataPlaneFindings: [TensorDataPlaneFinding]
     let interfaces: [NetworkInterface]
     let thunderboltCandidates: [NetworkInterface]
     let txtPreview: [String: String]?
@@ -129,6 +137,12 @@ struct DistributedProbe {
         let anyBackend = JACCL.anyBackendAvailable()
         let ibvSet = !(env["MLX_IBV_DEVICES"] ?? "").isEmpty
         let rdmaConfigured = ibvSet || !args.rdmaDevices.isEmpty
+        let rawDataPlaneAddresses = orderedUnique(
+            args.dataPlaneAddresses
+                + [env["MLX_JACCL_COORDINATOR"]].compactMap { $0 }
+        )
+        let dataPlaneAddresses = rawDataPlaneAddresses.map(TensorDataPlaneAddress.init)
+        let dataPlaneFindings = TensorDataPlanePolicy.findings(for: rawDataPlaneAddresses)
         let txtPreview = makeTXTPreview(
             args: args,
             hostname: currentHostname(),
@@ -138,6 +152,7 @@ struct DistributedProbe {
             args: args,
             jacclAvailable: jaccl,
             rdmaConfigured: rdmaConfigured,
+            dataPlaneFindings: dataPlaneFindings,
             thunderboltCandidates: tbCandidates,
             txtPreview: txtPreview
         )
@@ -152,6 +167,8 @@ struct DistributedProbe {
             mlxDistBackend: env["MLX_DIST_BACKEND"],
             mlxJacclCoordinator: env["MLX_JACCL_COORDINATOR"],
             mlxIBVDevicesSet: ibvSet,
+            tensorDataPlaneAddresses: dataPlaneAddresses,
+            tensorDataPlaneFindings: dataPlaneFindings,
             interfaces: interfaces,
             thunderboltCandidates: tbCandidates,
             txtPreview: txtPreview,
@@ -212,6 +229,7 @@ struct DistributedProbe {
         args: Arguments,
         jacclAvailable: Bool,
         rdmaConfigured: Bool,
+        dataPlaneFindings: [TensorDataPlaneFinding],
         thunderboltCandidates: [NetworkInterface],
         txtPreview: [String: String]?
     ) -> [Finding] {
@@ -234,6 +252,9 @@ struct DistributedProbe {
             out.append(Finding(
                 level: "info",
                 message: "MLX_IBV_DEVICES or --rdma-devices is not set; RDMA wiring is not configured yet."))
+        }
+        for finding in dataPlaneFindings {
+            out.append(Finding(level: finding.level, message: finding.message))
         }
         if args.modes.contains(.wired), !jacclAvailable {
             out.append(Finding(
@@ -258,6 +279,17 @@ struct DistributedProbe {
         return out
     }
 
+    private static func orderedUnique(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for value in values {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { continue }
+            out.append(trimmed)
+        }
+        return out
+    }
+
     private static func printHuman(_ report: ProbeReport) {
         print("DistributedProbe")
         print("  generated: \(report.generatedAt)")
@@ -269,6 +301,16 @@ struct DistributedProbe {
         print("  MLX_DIST_BACKEND: \(report.mlxDistBackend ?? "(unset)")")
         print("  MLX_JACCL_COORDINATOR: \(report.mlxJacclCoordinator ?? "(unset)")")
         print("  MLX_IBV_DEVICES set: \(report.mlxIBVDevicesSet)")
+        print("")
+        print("Tensor data-plane addresses:")
+        if report.tensorDataPlaneAddresses.isEmpty {
+            print("  none")
+        } else {
+            for address in report.tensorDataPlaneAddresses {
+                let allowed = address.isAllowedForTensorParallelDataPlane ? "allowed" : "blocked"
+                print("  \(address.rawValue) host=\(address.host) class=\(address.addressClass.rawValue) \(allowed)")
+            }
+        }
         print("")
         print("Thunderbolt candidates:")
         if report.thunderboltCandidates.isEmpty {

@@ -81,7 +81,9 @@ public enum TreeVerify {
         captureLayerIDs: Set<Int> = []
     ) throws -> TreeVerifyResult {
         let treeSize = compiled.treeSize
-        precondition(treeSize >= 1, "verifyForward: tree must have root")
+        guard treeSize >= 1 else {
+            throw SpecDecError.invalidRequest("DDTree verify tree must have a root")
+        }
 
         let inputIds = compiled.inputIds.asType(.int32).asArray(Int32.self)
         let parents = compiled.parents
@@ -105,8 +107,10 @@ public enum TreeVerify {
             while cursor != 0 {
                 path.append(inputIds[cursor])
                 cursor = Int(parents[cursor])
-                precondition(cursor >= 0,
-                    "verifyForward: parent chain broken at node \(i)")
+                guard cursor >= 0 else {
+                    throw SpecDecError.invalidRequest(
+                        "DDTree verify parent chain broken at node \(i)")
+                }
             }
             path.append(inputIds[0])   // root
             path.reverse()
@@ -143,6 +147,10 @@ public enum TreeVerify {
             while cursor != 0 {
                 path.append(inputIds[cursor])
                 cursor = Int(parents[cursor])
+                guard cursor >= 0 else {
+                    throw SpecDecError.invalidRequest(
+                        "DDTree verify parent chain broken at node \(i)")
+                }
             }
             path.append(inputIds[0])
             path.reverse()

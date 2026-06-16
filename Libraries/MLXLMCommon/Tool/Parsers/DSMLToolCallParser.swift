@@ -79,6 +79,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         if let pythonCall = parsePythonStyleToolFallback(in: text, tools: tools) {
             return pythonCall
         }
+        if let bareNameJSONCall = parseBareNameJSONToolFallback(in: text, tools: tools) {
+            return bareNameJSONCall
+        }
         return parseInlineJSONToolFallback(in: text, tools: tools)
     }
 
@@ -95,6 +98,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         if !calls.isEmpty { return calls }
         if let pythonCall = parsePythonStyleToolFallback(in: buffer, tools: tools) {
             return [pythonCall]
+        }
+        if let bareNameJSONCall = parseBareNameJSONToolFallback(in: buffer, tools: tools) {
+            return [bareNameJSONCall]
         }
         return parseInlineJSONToolFallback(in: buffer, tools: tools).map { [$0] } ?? []
     }
@@ -332,6 +338,92 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         return ToolCall(function: .init(name: candidate.name, arguments: args))
     }
 
+    /// Live DSV4 JANGTQ2 app rows have also emitted a bare tool name followed
+    /// by a JSON argument object, for example:
+    ///
+    ///     file_read
+    ///     {"path":"/tmp/file.swift","start_line":1}
+    ///
+    /// Treat that as a tool attempt instead of visible prose. The JSON object is
+    /// parsed as the argument payload for the preceding known tool name; trailing
+    /// text is ignored so the streaming processor can stop before post-tool prose
+    /// leaks into the answer.
+    private func parseBareNameJSONToolFallback(
+        in text: String,
+        tools: [[String: any Sendable]]?
+    ) -> ToolCall? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("{") else { return nil }
+
+        for name in pythonStyleToolNames(from: tools) {
+            guard trimmed.hasPrefix(name) else { continue }
+            guard
+                let afterName = trimmed.index(
+                    trimmed.startIndex,
+                    offsetBy: name.count,
+                    limitedBy: trimmed.endIndex)
+            else { continue }
+            guard afterName == trimmed.endIndex
+                || isInlineFallbackWhitespace(trimmed[afterName])
+                || trimmed[afterName] == "{"
+            else { continue }
+
+            let cursor = bareNameJSONTailObjectStart(in: trimmed, afterName: afterName)
+            guard cursor < trimmed.endIndex, trimmed[cursor] == "{" else { continue }
+            guard let jsonObject = firstBalancedJSONObject(in: trimmed[cursor...]) else {
+                continue
+            }
+            guard
+                let data = jsonObject.data(using: .utf8),
+                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+
+            let args = normalizeInlineArguments(object)
+            if let tools, !tools.isEmpty {
+                guard let spec = functionSpec(named: name, in: tools) else { return nil }
+                if let invalidArgs = inlineSchemaValidationFailure(
+                    toolName: name,
+                    arguments: args,
+                    functionSpec: spec)
+                {
+                    return ToolCall(function: .init(name: name, arguments: invalidArgs))
+                }
+            } else if !Self.schemaLessFallbackToolNames.contains(name) {
+                return nil
+            }
+            return ToolCall(function: .init(name: name, arguments: args))
+        }
+        return nil
+    }
+
+    private func bareNameJSONTailObjectStart(
+        in text: String,
+        afterName: String.Index
+    ) -> String.Index {
+        var cursor = afterName
+        while cursor < text.endIndex, isInlineFallbackWhitespace(text[cursor]) {
+            cursor = text.index(after: cursor)
+        }
+        guard cursor < text.endIndex else { return cursor }
+        guard text[cursor...].hasPrefix("```") else { return cursor }
+
+        var fenceCursor = cursor
+        for _ in 0..<3 {
+            guard fenceCursor < text.endIndex else { return cursor }
+            fenceCursor = text.index(after: fenceCursor)
+        }
+        while fenceCursor < text.endIndex,
+            text[fenceCursor] != "\n",
+            text[fenceCursor] != "\r"
+        {
+            fenceCursor = text.index(after: fenceCursor)
+        }
+        while fenceCursor < text.endIndex, isInlineFallbackWhitespace(text[fenceCursor]) {
+            fenceCursor = text.index(after: fenceCursor)
+        }
+        return fenceCursor
+    }
+
     private static let schemaLessFallbackToolNames: Set<String> = [
         "file_tree",
         "file_read",
@@ -418,6 +510,50 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             }
         }
         return nil
+    }
+
+    private func firstBalancedJSONObject(in text: Substring) -> String? {
+        guard let open = text.firstIndex(of: "{") else { return nil }
+        var depth = 0
+        var quote: Character?
+        var escaped = false
+        var cursor = open
+        while cursor < text.endIndex {
+            let ch = text[cursor]
+            defer { cursor = text.index(after: cursor) }
+            if escaped {
+                escaped = false
+                continue
+            }
+            if ch == "\\" {
+                escaped = quote != nil
+                continue
+            }
+            if let activeQuote = quote {
+                if ch == activeQuote { quote = nil }
+                continue
+            }
+            if ch == "\"" {
+                quote = ch
+                continue
+            }
+            if ch == "{" {
+                depth += 1
+            } else if ch == "}" {
+                depth -= 1
+                if depth == 0 {
+                    return String(text[open...cursor])
+                }
+                if depth < 0 { return nil }
+            }
+        }
+        return nil
+    }
+
+    private func isInlineFallbackWhitespace(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy {
+            CharacterSet.whitespacesAndNewlines.contains($0)
+        }
     }
 
     private func normalizePythonStyleArguments(_ arguments: String) -> [String: any Sendable] {

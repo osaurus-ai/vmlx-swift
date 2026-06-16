@@ -21,14 +21,32 @@ import MLXVLM
 /// 6. Issues a SECOND turn over the same conversation to exercise multi-turn cache reuse
 /// 7. Reports decode tok/s + first decoded text per turn
 enum VLBench {
+    private static func loadProductionContext(
+        modelDir: URL,
+        nativeMTPDepth: Int? = nil
+    ) async throws -> ModelContext {
+        let loadConfiguration: LoadConfiguration =
+            nativeMTPDepth != nil
+            ? LoadConfiguration(
+                jangPress: .disabled,
+                maxResidentBytes: .default,
+                memoryLimit: .default,
+                useMmapSafetensors: true,
+                nativeMTP: true)
+            : .default
+        let loaded = try await MLXLMCommon.loadModel(
+            from: modelDir,
+            using: #huggingFaceTokenizerLoader(),
+            loadConfiguration: loadConfiguration)
+        return loaded.0
+    }
 
     static func run(modelPath: String, maxNewTokens: Int) async throws {
         let modelDir = URL(fileURLWithPath: modelPath)
         print("=== VLBench — \(modelDir.lastPathComponent) ===")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(modelDir: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -80,8 +98,7 @@ enum VLBench {
             preLoadRSS, preLoadFootprint, modelMiB))
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(modelDir: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -326,8 +343,7 @@ enum VLBench {
         print("video: \(videoURL.lastPathComponent)")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(modelDir: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -360,8 +376,8 @@ enum VLBench {
                 lmInput = try await ctx.processor.prepare(input: userInput)
             } catch {
                 if isVideoNotImplemented(error) {
-                    print("    not applicable: processor video input is not implemented for this model: \(error)")
-                    return
+                    fputs("[VL VideoBatch] FAIL: requested video but processor does not implement video input: \(error)\n", stderr)
+                    exit(1)
                 }
                 print("    PREPARE ERROR: \(error)")
                 throw error
@@ -429,8 +445,7 @@ enum VLBench {
         print("=== VLBench MIXED MULTI-TURN — \(modelDir.lastPathComponent) ===")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(modelDir: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -500,10 +515,21 @@ enum VLBench {
             lmInput = try await ctx.processor.prepare(input: userInput)
         } catch {
             if video != nil, isVideoNotImplemented(error) {
-                print("  not applicable: processor video input is not implemented for this model: \(error)")
-                return
+                fputs("FAIL [\(label)]: requested video but processor does not implement video input: \(error)\n", stderr)
+                exit(1)
             }
             throw error
+        }
+        if image != nil && lmInput.image == nil {
+            fputs("FAIL [\(label)]: requested image but processor.prepare produced LMInput.image=nil\n", stderr)
+            exit(1)
+        }
+        if video != nil && lmInput.video == nil {
+            fputs("FAIL [\(label)]: requested video but processor.prepare produced LMInput.video=nil\n", stderr)
+            exit(1)
+        }
+        if let image = lmInput.image {
+            print("  image pixels shape: \(image.pixels.shape)")
         }
         if let video = lmInput.video {
             print("  video pixels shape: \(video.pixels.shape)")
@@ -582,8 +608,7 @@ enum VLBench {
             preLoadRSS, preLoadFootprint, modelMiB))
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(modelDir: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -740,8 +765,7 @@ enum VLBench {
         print("=== VLBench cross-engine byte-identity (iter 47) ===")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(modelDir: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -838,8 +862,7 @@ enum VLBench {
         print("=== VLBench multi-turn cache reuse (iter 48) ===")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(modelDir: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -973,22 +996,9 @@ enum VLBench {
         print("model: \(modelDir.lastPathComponent)")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context: ModelContext
-        if nativeMTPDepth != nil {
-            let loaded = try await MLXLMCommon.loadModel(
-                from: modelDir,
-                using: #huggingFaceTokenizerLoader(),
-                loadConfiguration: LoadConfiguration(
-                    jangPress: .disabled,
-                    maxResidentBytes: .unlimited,
-                    memoryLimit: .unlimited,
-                    useMmapSafetensors: true,
-                    nativeMTP: true))
-            context = loaded.0
-        } else {
-            context = try await MLXLMCommon.loadModel(
-                from: modelDir, using: #huggingFaceTokenizerLoader())
-        }
+        let context = try await loadProductionContext(
+            modelDir: modelDir,
+            nativeMTPDepth: nativeMTPDepth)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -1224,8 +1234,7 @@ enum VLBench {
         print("  video: \(videoPath)")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(modelDir: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -1253,8 +1262,8 @@ enum VLBench {
             lmInput = try await context.processor.prepare(input: userInput)
         } catch {
             if isVideoNotImplemented(error) {
-                print("  not applicable: processor video input is not implemented for this model: \(error)")
-                return
+                fputs("[VideoSmoke] FAIL: requested video but processor does not implement video input: \(error)\n", stderr)
+                exit(1)
             }
             fputs("[VideoSmoke] FAIL: processor.prepare threw: \(error)\n", stderr)
             exit(1)

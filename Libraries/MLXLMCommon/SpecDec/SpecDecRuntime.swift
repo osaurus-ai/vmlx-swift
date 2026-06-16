@@ -121,9 +121,12 @@ public enum SpecDecRuntimeLinear {
         onCommitted: ((_ newTokens: [Int32]) -> Void)? = nil
     ) throws -> DFlashLinearResult {
         let blockSize = args.drafter.config.blockSize
-        precondition(blockSize >= 2, "DFlash block_size must be >= 2")
-        precondition(args.inputIds.ndim == 2 && args.inputIds.dim(0) == 1,
-            "DFlash input_ids shape must be (1, prompt_len)")
+        guard blockSize >= 2 else {
+            throw SpecDecError.invalidRequest("DFlash block_size must be >= 2")
+        }
+        guard args.inputIds.ndim == 2 && args.inputIds.dim(0) == 1 else {
+            throw SpecDecError.invalidRequest("DFlash input_ids shape must be (1, prompt_len)")
+        }
 
         let promptLen = args.inputIds.dim(1)
         let maxLen = promptLen + args.maxNewTokens
@@ -171,11 +174,11 @@ public enum SpecDecRuntimeLinear {
         // Grows by (accepted + 1) positions per round. Drafter attends
         // to this full accumulated context on every call since we don't
         // yet have a drafter KV cache.
-        var accumulatedHidden = extractContextFeature(
+        var accumulatedHidden = try extractContextFeature(
             captured: prefillHidden, targetLayerIDs: args.targetBlockIDs)
         materialize(accumulatedHidden)
 
-        var bonus: Int32 = sampleArgmax(prefillLogits, temperature: args.temperature)
+        var bonus: Int32 = try sampleArgmax(prefillLogits, temperature: args.temperature)
         tokens.append(bonus)
         onCommitted?([bonus])
 
@@ -295,7 +298,7 @@ public enum SpecDecRuntimeLinear {
             //   *). Slice positions [blockStartIdx ..< blockStartIdx +
             //   accepted + 1].
             let commitCount = acceptanceLength + 1
-            let newHidden = extractContextFeature(
+            let newHidden = try extractContextFeature(
                 captured: verifyHidden, targetLayerIDs: args.targetBlockIDs)
             let hiddenStart = blockStartIdx
             let commitHidden = newHidden[
@@ -331,16 +334,17 @@ public enum SpecDecRuntimeLinear {
     /// in iter 4. Iter 5 adds temperature + topK/topP sampling.
     private static func sampleArgmax(
         _ logits: MLXArray, temperature: Float
-    ) -> Int32 {
-        precondition(temperature < 1e-5,
-            "runDflashLinear iter 4: only temperature=0 supported")
+    ) throws -> Int32 {
+        guard temperature < 1e-5 else {
+            throw SpecDecError.invalidRequest("runDflashLinear iter 4: only temperature=0 supported")
+        }
         let last: MLXArray
         if logits.ndim == 3 {
             last = logits[0, logits.dim(1) - 1, 0...]
         } else if logits.ndim == 2 {
             last = logits[logits.dim(0) - 1, 0...]
         } else {
-            fatalError("unexpected logits shape: ndim=\(logits.ndim)")
+            throw SpecDecError.invalidRequest("unexpected logits shape: ndim=\(logits.ndim)")
         }
         let idx = argMax(last, axis: -1).asType(.int32)
         materialize(idx)
@@ -439,11 +443,15 @@ public enum SpecDecRuntimeDDTree {
         onCommitted: ((_ newTokens: [Int32]) -> Void)? = nil
     ) throws -> DDTreeResult {
         let blockSize = args.drafter.config.blockSize
-        precondition(blockSize >= 2, "DFlash block_size must be >= 2")
-        precondition(args.inputIds.ndim == 2 && args.inputIds.dim(0) == 1,
-            "DDTree input_ids shape must be (1, prompt_len)")
-        precondition(args.branchingBudget >= 1,
-            "DDTree branchingBudget must be >= 1")
+        guard blockSize >= 2 else {
+            throw SpecDecError.invalidRequest("DFlash block_size must be >= 2")
+        }
+        guard args.inputIds.ndim == 2 && args.inputIds.dim(0) == 1 else {
+            throw SpecDecError.invalidRequest("DDTree input_ids shape must be (1, prompt_len)")
+        }
+        guard args.branchingBudget >= 1 else {
+            throw SpecDecError.invalidRequest("DDTree branchingBudget must be >= 1")
+        }
 
         let promptLen = args.inputIds.dim(1)
         let maxLen = promptLen + args.maxNewTokens
@@ -459,11 +467,11 @@ public enum SpecDecRuntimeDDTree {
         let (prefillLogits, prefillHidden) = args.target(
             args.inputIds, cache: nil, captureLayerIDs: targetLayerSet)
         materialize(prefillLogits)
-        var targetHidden = extractContextFeature(
+        var targetHidden = try extractContextFeature(
             captured: prefillHidden, targetLayerIDs: args.targetBlockIDs)
         materialize(targetHidden)
 
-        var bonus: Int32 = sampleArgmax(prefillLogits, temperature: args.temperature)
+        var bonus: Int32 = try sampleArgmax(prefillLogits, temperature: args.temperature)
         tokens.append(bonus)
         onCommitted?([bonus])
 
@@ -515,10 +523,10 @@ public enum SpecDecRuntimeDDTree {
                 let (nextLogits, nextHidden) = args.target(
                     nextInput, cache: nil, captureLayerIDs: targetLayerSet)
                 materialize(nextLogits)
-                bonus = sampleArgmax(nextLogits, temperature: args.temperature)
+                bonus = try sampleArgmax(nextLogits, temperature: args.temperature)
                 tokens.append(bonus)
                 onCommitted?([bonus])
-                targetHidden = extractContextFeature(
+                targetHidden = try extractContextFeature(
                     captured: nextHidden, targetLayerIDs: args.targetBlockIDs)
                 materialize(targetHidden)
                 continue
@@ -566,7 +574,7 @@ public enum SpecDecRuntimeDDTree {
             let reprefill = MLXArray(tokens).reshaped(1, tokens.count)
             let (_, reprefillHidden) = args.target(
                 reprefill, cache: nil, captureLayerIDs: targetLayerSet)
-            let feature = extractContextFeature(
+            let feature = try extractContextFeature(
                 captured: reprefillHidden, targetLayerIDs: args.targetBlockIDs)
             targetHidden = feature
             materialize(targetHidden)
@@ -584,16 +592,17 @@ public enum SpecDecRuntimeDDTree {
     /// — private there, mirrored here to avoid cross-module plumbing.
     private static func sampleArgmax(
         _ logits: MLXArray, temperature: Float
-    ) -> Int32 {
-        precondition(temperature < 1e-5,
-            "runDDTree iter 9: only temperature=0 supported")
+    ) throws -> Int32 {
+        guard temperature < 1e-5 else {
+            throw SpecDecError.invalidRequest("runDDTree iter 9: only temperature=0 supported")
+        }
         let last: MLXArray
         if logits.ndim == 3 {
             last = logits[0, logits.dim(1) - 1, 0...]
         } else if logits.ndim == 2 {
             last = logits[logits.dim(0) - 1, 0...]
         } else {
-            fatalError("unexpected logits shape: ndim=\(logits.ndim)")
+            throw SpecDecError.invalidRequest("unexpected logits shape: ndim=\(logits.ndim)")
         }
         let idx = argMax(last, axis: -1).asType(.int32)
         materialize(idx)
@@ -681,6 +690,10 @@ public enum SpecDecError: Error, LocalizedError {
     /// the drafter needs to perform KV injection.
     case targetDoesNotSupportHiddenStateCapture
 
+    /// Thrown when a speculative decoding request or drafter config cannot be
+    /// executed safely by the current runtime.
+    case invalidRequest(String)
+
     public var errorDescription: String? {
         switch self {
         case .notImplemented(let msg):
@@ -691,6 +704,8 @@ public enum SpecDecError: Error, LocalizedError {
             return "SpecDec: drafter checkpoint is missing required key '\(k)'"
         case .targetDoesNotSupportHiddenStateCapture:
             return "SpecDec: target model does not expose a hidden-state capture hook (required for DFlash KV injection)"
+        case .invalidRequest(let msg):
+            return "SpecDec: invalid request — \(msg)"
         }
     }
 }

@@ -178,6 +178,52 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) ->
     #expect(config.maxSoftTokens == 280)
 }
 
+@Test func gemma4SanitizeSplitsFusedMoEExpertWeights() throws {
+    let json = """
+    {
+      "model_type": "gemma4",
+      "text_config": {
+        "hidden_size": 8,
+        "intermediate_size": 4,
+        "moe_intermediate_size": 4,
+        "num_hidden_layers": 1,
+        "num_experts": 2,
+        "top_k_experts": 1,
+        "enable_moe_block": true
+      },
+      "vision_config": {
+        "hidden_size": 8,
+        "output_proj_dims": 8,
+        "default_output_length": 2
+      }
+    }
+    """
+    let config = try JSONDecoder().decode(Gemma4Configuration.self, from: Data(json.utf8))
+    let model = Gemma4(config)
+    let sanitized = model.sanitize(weights: [
+        "model.language_model.layers.0.experts.gate_up_proj": MLXArray.zeros([2, 8, 3]),
+        "model.language_model.layers.0.experts.down_proj": MLXArray.zeros([2, 3, 4]),
+        "language_model.model.layers.0.experts.gate_up_proj.weight": MLXArray.zeros([2, 8, 3]),
+        "language_model.model.layers.0.experts.gate_up_proj.scales": MLXArray.zeros([2, 8, 2]),
+        "language_model.model.layers.0.experts.down_proj.weight": MLXArray.zeros([2, 3, 4]),
+        "language_model.model.layers.0.experts.down_proj.scales": MLXArray.zeros([2, 3, 1]),
+    ])
+
+    #expect(sanitized["language_model.model.layers.0.experts.gate_up_proj"] == nil)
+    #expect(sanitized["language_model.model.layers.0.experts.down_proj"] == nil)
+    #expect(sanitized["language_model.model.layers.0.experts.gate_up_proj.weight"] == nil)
+    #expect(sanitized["language_model.model.layers.0.experts.down_proj.weight"] == nil)
+    #expect(sanitized["language_model.model.layers.0.experts.switch_glu.gate_proj"]?.shape == [2, 4, 3])
+    #expect(sanitized["language_model.model.layers.0.experts.switch_glu.up_proj"]?.shape == [2, 4, 3])
+    #expect(sanitized["language_model.model.layers.0.experts.switch_glu.down_proj"]?.shape == [2, 3, 4])
+    #expect(sanitized["language_model.model.layers.0.experts.switch_glu.gate_proj.weight"]?.shape == [2, 4, 3])
+    #expect(sanitized["language_model.model.layers.0.experts.switch_glu.up_proj.weight"]?.shape == [2, 4, 3])
+    #expect(sanitized["language_model.model.layers.0.experts.switch_glu.gate_proj.scales"]?.shape == [2, 4, 2])
+    #expect(sanitized["language_model.model.layers.0.experts.switch_glu.up_proj.scales"]?.shape == [2, 4, 2])
+    #expect(sanitized["language_model.model.layers.0.experts.switch_glu.down_proj.weight"]?.shape == [2, 3, 4])
+    #expect(sanitized["language_model.model.layers.0.experts.switch_glu.down_proj.scales"]?.shape == [2, 3, 1])
+}
+
 @Test func imageSeqLengthMatchesVisionOutput() throws {
     let configPath = NSString(string: "~/.cache/huggingface/hub/models--mlx-community--gemma-4-e2b-it-4bit/snapshots/76b6a5af250fa029339a757deeb93716baa8ead0/config.json").expandingTildeInPath
     let procPath = NSString(string: "~/.cache/huggingface/hub/models--mlx-community--gemma-4-e2b-it-4bit/snapshots/76b6a5af250fa029339a757deeb93716baa8ead0/processor_config.json").expandingTildeInPath

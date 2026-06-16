@@ -38,10 +38,15 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
             "RunBench/StabilityBench.swift",
             "RunBench/VLBench.swift",
             "RunBench/OmniBench.swift",
+            "RunBench/JangPressRegressionBench.swift",
         ]
         for file in files {
             let source = try String(contentsOfFile: file, encoding: .utf8)
             #expect(!source.contains("text.isEmpty ? reasoning : text"))
+            #expect(!source.contains("visible.isEmpty ? reasoning : visible"))
+            #expect(!source.contains("visible.isEmpty ? r.reasoning : visible"))
+            #expect(!source.contains("r.text.isEmpty ? r.reasoning : r.text"))
+            #expect(!source.contains("visible.isEmpty ? reasoning.trimmingCharacters"))
             #expect(!source.contains("reasoning.isEmpty ? r.text : r.reasoning"))
             #expect(!source.contains("r1.reasoning.isEmpty ? r1.text : r1.reasoning"))
             #expect(!source.contains("r2.reasoning.isEmpty ? r2.text : r2.reasoning"))
@@ -58,6 +63,10 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
             contentsOfFile: "RunBench/StabilityBench.swift",
             encoding: .utf8)
         #expect(stability.contains("empty visible output"))
+        let jangPress = try String(
+            contentsOfFile: "RunBench/JangPressRegressionBench.swift",
+            encoding: .utf8)
+        #expect(!jangPress.contains("var p = GenerateParameters(maxTokens: maxNewTokens, temperature: 0)"))
     }
 
     @Test("VL media-salt proof reports token rate and peak memory gate")
@@ -85,6 +94,23 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(source.contains("batchPeakDelta > modelMiB"))
     }
 
+    @Test("VL bench loads through typed production load configuration")
+    func vlBenchLoadsThroughTypedProductionLoadConfiguration() throws {
+        let source = try String(contentsOfFile: "RunBench/VLBench.swift", encoding: .utf8)
+
+        #expect(source.contains("private static func loadProductionContext("))
+        #expect(source.contains("loadConfiguration: loadConfiguration"))
+        #expect(source.contains(": .default"))
+        #expect(source.contains("nativeMTP: true"))
+        #expect(source.contains("let context = try await loadProductionContext(modelDir: modelDir)"))
+        #expect(source.contains("nativeMTPDepth: nativeMTPDepth"))
+        #expect(!source.contains("maxResidentBytes: .unlimited"))
+        #expect(!source.contains("memoryLimit: .unlimited"))
+
+        let directLoads = source.components(separatedBy: "MLXLMCommon.loadModel(").count - 1
+        #expect(directLoads == 1)
+    }
+
     @Test("live model matrix exits nonzero when rows fail")
     func liveModelMatrixExitsNonzeroWhenRowsFail() throws {
         let source = try String(
@@ -94,6 +120,138 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(source.contains("grep -q $'\\tfail:'"))
         #expect(source.contains("matrix completed with failing rows"))
         #expect(source.contains("exit 1"))
+        #expect(source.contains("BENCH_BATCH_TOOLCALL=1"))
+        #expect(source.contains("BENCH_QWEN_MULTITURN_TOOL=1"))
+        #expect(source.contains("tool-call parser events"))
+        #expect(source.contains("bundle-derived"))
+        #expect(source.contains("sampler_defaults"))
+        #expect(source.contains("fail:missing-bundle-sampler-defaults-would-use-engine-fallback"))
+        #expect(source.contains("missing bundle sampler defaults are failing evidence"))
+        #expect(source.contains("hybrid SSM companion"))
+        #expect(source.contains("DSV4 CSA/HSA/SWA"))
+        #expect(source.contains("*gemma*|*minimax*) return 1"))
+        #expect(source.contains(
+            "matrix row for those families. The production"))
+        #expect(source.contains(
+            "is `BENCH_GROWING_CHAT_CACHE` plus disk/TurboQuant architecture rows"))
+        #expect(source.contains("assert_runbench_fresh"))
+        #expect(source.contains("VMLX_MATRIX_ALLOW_STALE_RUNBENCH"))
+        #expect(source.contains("Matrix live proof must not reuse a stale RunBench binary"))
+        #expect(source.contains("-newer \"$binary\""))
+        #expect(source.contains("assert_live_lane_clear"))
+        #expect(source.contains("VMLINUX_RUNBENCH_LOCK_DIR"))
+        #expect(source.contains("VMLX_MATRIX_ALLOW_ACTIVE_RUNBENCH"))
+        #expect(source.contains("Refusing to start matrix while another RunBench live row is active"))
+        #expect(source.contains("Removing stale RunBench lock before matrix start"))
+        #expect(source.contains("vmlx_mtp_tuning.json"))
+        #expect(source.contains("tuning_usable(tuning)"))
+        #expect(source.contains("best > baseline"))
+        #expect(source.contains("speedup is not None and speedup > 1"))
+
+        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        #expect(bench.contains("empty visible output is accepted"))
+        #expect(bench.contains("only for turns that emit structured tool calls"))
+        #expect(bench.contains("Turn 2 — structured tool call"))
+        #expect(bench.contains("$0.emptyVisible && $0.toolCalls == 0"))
+    }
+
+    @Test("PERF live rows can fail closed on stop reason and visible content")
+    func perfLiveRowsCanFailClosedOnStopReasonAndVisibleContent() throws {
+        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+
+        #expect(bench.contains("BENCH_PERF_REQUIRE_STOP"))
+        #expect(bench.contains("BENCH_PERF_REQUIRE_VISIBLE_CONTAINS"))
+        #expect(bench.contains("PERF_VALIDATION status=FAIL"))
+        #expect(bench.contains("lastResult.text.localizedCaseInsensitiveContains(requiredVisible)"))
+        #expect(!bench.contains("lastVisible.localizedCaseInsensitiveContains(requiredVisible)"))
+    }
+
+    @Test("BENCH_PROD validation failures exit cleanly instead of trapping")
+    func benchProdValidationFailuresExitCleanlyInsteadOfTrapping() throws {
+        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+
+        #expect(bench.contains("BENCH_PROD: \\(stats.fail) scenario(s) failed validation"))
+        #expect(bench.contains("exit(1)"))
+        #expect(!bench.contains("throw NSError(domain: \"BENCH_PROD\""))
+    }
+
+    @Test("RunBench lock refusals exit cleanly instead of trapping")
+    func runBenchLockRefusalsExitCleanlyInsteadOfTrapping() throws {
+        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+
+        #expect(bench.contains("RunBench.LiveRunLock: \\(nsError.localizedDescription)"))
+        #expect(bench.contains("let code = nsError.domain == \"RunBench.LiveRunLock\" ? nsError.code : 1"))
+        #expect(bench.contains("exit(Int32(code))"))
+        #expect(bench.contains("do {\n            liveRunLock = try acquireLiveRunLock(environment: env)"))
+        #expect(bench.contains("installLiveRunLockAtexit(liveRunLock)"))
+        #expect(bench.contains("Bench.liveRunLockForExit?.release()"))
+        #expect(bench.contains("guard ownerPID() == getpid()"))
+    }
+
+    @Test("typed local load checks cancellation between expensive load stages")
+    func typedLocalLoadChecksCancellationBetweenExpensiveLoadStages() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/ModelFactory.swift",
+            encoding: .utf8)
+        let start = try #require(source.range(of: "public func loadModel(\n    from directory: URL,\n    using tokenizerLoader: any TokenizerLoader,\n    configuration: ModelConfiguration,\n    loadConfiguration: LoadConfiguration"))
+        let end = try #require(
+            source.range(of: "private func load<R>", range: start.upperBound ..< source.endIndex))
+        let body = String(source[start.lowerBound ..< end.lowerBound])
+
+        #expect(body.contains("try Task.checkCancellation()"))
+        #expect(body.contains("let facts = LoadBundleFacts.inspect(bundleURL: directory)\n    try Task.checkCancellation()"))
+        #expect(body.contains("let resolvedOptions = loadConfiguration.jangPress.resolve(facts: facts)\n    try Task.checkCancellation()"))
+        #expect(body.contains("let loadDirectory = try JangPressPrestacker.prepareBundleIfNeeded"))
+        #expect(body.contains("enabled: loadConfiguration.useMmapSafetensors)\n    try Task.checkCancellation()"))
+        #expect(body.contains("var context = try await withMmapSafetensorsEnv"))
+        #expect(body.contains("try Task.checkCancellation()\n\n    _ = adviseCanonicalMmapRoutedExpertsIfAvailable"))
+        #expect(body.contains("JangPressCanonicalExpertAdvisor.shared.configure"))
+        #expect(body.contains("let runtime = JangPressActivation.activate"))
+        #expect(body.contains("context.jangPressRuntime = runtime"))
+    }
+
+    @Test("DSV4 coherence gate has no hidden repetition-penalty rescue")
+    func dsv4CoherenceGateHasNoHiddenRepetitionPenaltyRescue() throws {
+        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+
+        #expect(bench.contains("generationConfig: ctx.configuration.generationDefaults"))
+        #expect(bench.contains("env[\"BENCH_DSV4_REPETITION_PENALTY\"].flatMap(Float.init)"))
+        #expect(bench.contains("env[\"BENCH_DSV4_MAX_REPETITION_PENALTY\"].flatMap(Float.init)"))
+        #expect(!bench.contains("env[\"BENCH_DSV4_TEMP\"] ?? \"0\""))
+        #expect(!bench.contains("env[\"BENCH_DSV4_TOP_P\"] ?? \"0.95\""))
+        #expect(!bench.contains("BENCH_DSV4_REPETITION_PENALTY\"] ?? \"1.0\""))
+        #expect(!bench.contains("BENCH_DSV4_MAX_REPETITION_PENALTY\"] ?? \"1.05\""))
+        #expect(!bench.contains("dsv4MaxReasoningRepetitionPenalty"))
+        #expect(bench.contains("let reasoningMaxDefault = max(1024, maxNew)"))
+        #expect(bench.contains("BENCH_DSV4_REASONING_MAX_TOKENS\"] ?? \"\\(reasoningMaxDefault)\""))
+    }
+
+    @Test("DSV4 agentic tool row uses bundle defaults and chat tool history")
+    func dsv4AgenticToolRowUsesBundleDefaultsAndChatToolHistory() throws {
+        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+
+        #expect(bench.contains("BENCH_DSV4_AGENTIC_TOOL"))
+        #expect(bench.contains("func runDSV4AgenticToolCheck("))
+        #expect(bench.contains("generationConfig: ctx.configuration.generationDefaults"))
+        #expect(bench.contains(".assistant(toolText, toolCalls: toolCalls)"))
+        #expect(bench.contains(".tool(toolResultJSON, toolCallId: toolCallId)"))
+        #expect(bench.contains("Tool format: \\(context.configuration.toolCallFormat"))
+        #expect(bench.contains("context.configuration.toolCallFormat == .dsml"))
+        #expect(bench.contains("context.configuration.reasoningParserName == \"think_xml\""))
+        #expect(bench.contains("snapshot.isPagedIncompatible"))
+        #expect(bench.contains("diskStats.stores > 0"))
+        #expect(bench.contains("diskStats.hits > 0"))
+        #expect(!bench.contains("BENCH_DSV4_AGENTIC_TEMP\"] ??"))
+        #expect(!bench.contains("BENCH_DSV4_AGENTIC_REPETITION_PENALTY\"] ??"))
+    }
+
+    @Test("Laguna loop probe has no hidden repetition-penalty rescue")
+    func lagunaLoopProbeHasNoHiddenRepetitionPenaltyRescue() throws {
+        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+
+        #expect(bench.contains("let rep = env[\"LAGUNA_REP\"].flatMap(Float.init)"))
+        #expect(!bench.contains("env[\"LAGUNA_REP\"] ?? \"1.15\""))
+        #expect(!bench.contains("Float(env[\"LAGUNA_REP\"] ?? \"1.15\")"))
     }
 
     @Test("terminal info snapshots unclosed reasoning before parser flush")
@@ -221,6 +379,44 @@ struct HarmonyParserFocusedTests {
         #expect(content == "preanswer")
         #expect(!content.contains("<|channel>"))
         #expect(!content.contains("<channel|>"))
+    }
+
+    @Test("Gemma4 pipe harmony thought channel routes reasoning and strips thought label")
+    func gemma4PipeHarmonyThoughtChannelRoutesReasoning() {
+        var parser = ReasoningParser.fromCapabilityName("gemma4")
+        let stream = "pre<|channel|>thought\nhidden plan<channel|>answer"
+        var segments: [ReasoningSegment] = []
+        for chunk in chunked(stream, by: 3) {
+            segments.append(contentsOf: parser?.feed(chunk) ?? [])
+        }
+        segments.append(contentsOf: parser?.flush() ?? [])
+
+        let (reasoning, content) = collect(segments)
+        #expect(reasoning == "hidden plan")
+        #expect(content == "preanswer")
+        for marker in ["thought", "<|channel|>", "<channel|>"] {
+            #expect(!reasoning.contains(marker))
+            #expect(!content.contains(marker))
+        }
+    }
+
+    @Test("Gemma4 empty thought channel without newline does not surface thought")
+    func gemma4EmptyThoughtChannelWithoutNewlineDoesNotSurfaceThought() {
+        var parser = ReasoningParser.fromCapabilityName("gemma4")
+        let stream = "pre<|channel>thought<channel|>answer"
+        var segments: [ReasoningSegment] = []
+        for chunk in chunked(stream, by: 2) {
+            segments.append(contentsOf: parser?.feed(chunk) ?? [])
+        }
+        segments.append(contentsOf: parser?.flush() ?? [])
+
+        let (reasoning, content) = collect(segments)
+        #expect(reasoning.isEmpty)
+        #expect(content == "preanswer")
+        for marker in ["thought", "<|channel>", "<channel|>"] {
+            #expect(!reasoning.contains(marker))
+            #expect(!content.contains(marker))
+        }
     }
 
     @Test("GPT-OSS harmony analysis/final channels split reasoning and content")
@@ -463,6 +659,33 @@ struct HarmonyParserFocusedTests {
         #expect(function.body.contains("$0.requiresToolCall && $0.toolCalls == 0"))
         #expect(function.body.contains("tool-required turn"))
         #expect(function.body.contains("structured .toolCall event"))
+    }
+
+    @Test("StabilityBench exercises server runtime cache defaults and bundle sampling")
+    func stabilityBenchUsesServerRuntimeDefaults() throws {
+        let source = try String(contentsOfFile: "RunBench/StabilityBench.swift", encoding: .utf8)
+
+        #expect(source.contains("var settings = VMLXServerRuntimeSettings()"))
+        #expect(source.contains("settings.cache.liveKVCodec = liveKVCodec"))
+        #expect(source.contains("settings.cache.enableSSMReDerive = true"))
+        #expect(source.contains("settings.cacheCoordinatorConfig("))
+        #expect(source.contains("generationConfig: ctx.configuration.generationDefaults"))
+        #expect(!source.contains("temperature: 0"))
+        #expect(!source.contains("defaultKVMode: .none"))
+    }
+
+    @Test("RunBench live rows fail closed under a process lock")
+    func runBenchLiveRowsUseProcessLock() throws {
+        let source = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+
+        #expect(source.contains("private final class LiveRunLock"))
+        #expect(source.contains("acquireLiveRunLock(environment: env)"))
+        #expect(source.contains("defer { releaseLiveRunLock(liveRunLock) }"))
+        #expect(source.contains("atexit"))
+        #expect(source.contains("/tmp/vmlx-runbench-live.lock"))
+        #expect(source.contains("another RunBench live row is active"))
+        #expect(source.contains("refusing to start a concurrent model load"))
+        #expect(source.contains("VMLINUX_RUNBENCH_LOCK") || source.contains("VMLX_RUNBENCH_LOCK"))
     }
 
     private func chunked(_ text: String, by size: Int) -> [String] {
@@ -1378,6 +1601,8 @@ struct Gemma4VLMFocusedSourceContractsTests {
 
         #expect(overload.contains("ChatTemplateFallbacks.gemma4Minimal"))
         #expect(overload.contains("ChatTemplateFallbacks.gemma4WithTools"))
+        #expect(overload.contains("if isGemma {\n                                throw error\n                            }"))
+        #expect(!overload.contains("} else if isGemma {\n                                ordered = ["))
         #expect(overload.contains("ChatTemplateFallbacks.dsv4Minimal"))
         #expect(overload.contains("ChatTemplateFallbacks.nemotronMinimal"))
         #expect(overload.contains("addGenerationPrompt: addGenerationPrompt"))

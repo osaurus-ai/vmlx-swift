@@ -132,8 +132,6 @@ public class GLM4ModelInner: Module {
     let norm: RMSNorm
 
     public init(_ args: GLM4Configuration) {
-        precondition(args.vocabularySize > 0)
-
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
@@ -266,6 +264,77 @@ public struct GLM4Configuration: Codable, Sendable {
             try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
         self.maxPositionEmbeddings =
             try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 32768
+
+        try validateDecodedFields(container: container)
+    }
+
+    private func validateDecodedFields(
+        container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        try validatePositive(hiddenSize, key: .hiddenSize, in: container)
+        try validatePositive(hiddenLayers, key: .hiddenLayers, in: container)
+        try validatePositive(intermediateSize, key: .intermediateSize, in: container)
+        try validatePositive(attentionHeads, key: .attentionHeads, in: container)
+        try validatePositive(headDim, key: .headDim, in: container)
+        try validatePositive(rmsNormEps, key: .rmsNormEps, in: container)
+        try validatePositive(vocabularySize, key: .vocabularySize, in: container)
+        try validatePositive(kvHeads, key: .kvHeads, in: container)
+        try validatePositive(partialRotaryFactor, key: .partialRotaryFactor, in: container)
+        try validatePositive(ropeTheta, key: .ropeTheta, in: container)
+        try validatePositive(maxPositionEmbeddings, key: .maxPositionEmbeddings, in: container)
+
+        if hiddenSize != attentionHeads * headDim {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSize,
+                in: container,
+                debugDescription: "GLM4 hidden_size must equal num_attention_heads * head_dim."
+            )
+        }
+
+        if attentionHeads % kvHeads != 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kvHeads,
+                in: container,
+                debugDescription:
+                    "GLM4 num_attention_heads must be divisible by num_key_value_heads."
+            )
+        }
+
+        if Int(Float(headDim) * partialRotaryFactor) <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .partialRotaryFactor,
+                in: container,
+                debugDescription: "GLM4 partial_rotary_factor must produce a positive RoPE dimension."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Int,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "GLM4 \(key.rawValue) must be > 0."
+            )
+        }
+    }
+
+    private func validatePositive(
+        _ value: Float,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        if !value.isFinite || value <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "GLM4 \(key.rawValue) must be finite and > 0."
+            )
+        }
     }
 }
 
