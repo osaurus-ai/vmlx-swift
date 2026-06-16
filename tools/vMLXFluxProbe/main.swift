@@ -617,7 +617,7 @@ struct VMLXFluxProbe {
         case "z-image-turbo", "flux1-schnell", "qwen-image":
             return "native_pipeline_implemented"
         case "qwen-image-edit":
-            return [4, 5].contains(model.quantizationBits ?? -1)
+            return [4, 5, 6, 8].contains(model.quantizationBits ?? -1)
                 && model.readiness == .loadableScaffold
                 ? "native_pipeline_implemented"
                 : "native_pipeline_partial"
@@ -669,14 +669,36 @@ struct VMLXFluxProbe {
                 "live coherent text-to-image proof is missing for this quant variant",
             ]
         case "qwen-image-edit":
+            if model.quantizationBits == 8
+                && model.readiness == .loadableScaffold
+            {
+                return [
+                    "current ed84bac6 main qwen-image-edit q8 text-image edit path completed a 20-step three-turn live probe with same-seed deterministic repeat and prompt-sensitive SHA changes on 2026-06-16",
+                    "visual proof: q8 cleanly edits the source apple into a centered blue apple and a green pear on a plain white background",
+                    "mask/inpaint edit fields are not wired yet",
+                    "q3 is loadable after staging the missing shard but remains hidden because the viewed output is high-noise and not a clean prompt-following edit",
+                    "run a broader Osaurus-side production matrix before release promotion",
+                ]
+            }
+            if model.quantizationBits == 6
+                && model.readiness == .loadableScaffold
+            {
+                return [
+                    "current ed84bac6 main qwen-image-edit q6 text-image edit path completed a 20-step three-turn live probe with same-seed deterministic repeat and prompt-sensitive SHA changes on 2026-06-16",
+                    "visual proof: q6 cleanly edits the source apple into a centered blue apple and a green pear on a plain white background",
+                    "mask/inpaint edit fields are not wired yet",
+                    "q3 is loadable after staging the missing shard but remains hidden because the viewed output is high-noise and not a clean prompt-following edit",
+                    "run a broader Osaurus-side production matrix before release promotion",
+                ]
+            }
             if model.quantizationBits == 5
                 && model.readiness == .loadableScaffold
             {
                 return [
                     "current 103be437 main qwen-image-edit q5 text-image edit path completed a 20-step three-turn live probe with same-seed deterministic repeat and prompt-sensitive SHA changes on 2026-06-16",
-                    "visual boundary: q5 cleanly edits blue apple and green pear; q4 has current-103be proof but remains noisier/weaker on shape-changing green-pear prompts",
+                    "visual boundary: q5 cleanly edits blue apple and green pear; q4 has current-103be proof but remains noisier/weaker on shape-changing green-pear prompts; q6/q8 now have current-ed84 clean proof",
                     "mask/inpaint edit fields are not wired yet",
-                    "q3 and q6 variants require complete local bundles before UI promotion",
+                    "q3 is loadable after staging the missing shard but remains hidden because the viewed output is high-noise and not a clean prompt-following edit",
                     "run a broader Osaurus-side production matrix before release promotion",
                 ]
             }
@@ -685,21 +707,21 @@ struct VMLXFluxProbe {
             {
                 return [
                     "current 103be437 main qwen-image-edit q4 text-image edit path completed a 20-step three-turn live probe with same-seed deterministic repeat and prompt-sensitive SHA changes on 2026-06-16",
-                    "visual boundary: q4 changes color and shape but remains noisier/weaker on shape-changing green-pear prompts; q5 is the cleaner current-head edit row",
+                    "visual boundary: q4 changes color and shape but remains noisier/weaker on shape-changing green-pear prompts; q5/q6/q8 are cleaner current-head edit rows",
                     "mask/inpaint edit fields are not wired yet",
-                    "q3 and q6 variants require complete local bundles before UI promotion",
+                    "q3 is loadable after staging the missing shard but remains hidden because the viewed output is high-noise and not a clean prompt-following edit",
                     "run a broader Osaurus-side production matrix before release promotion",
                 ]
             }
             if model.readiness != .loadableScaffold {
                 return [
                     "local qwen-image-edit bundle is incomplete and cannot enter the native load path",
-                    "qwen-image-edit q4 and q5 have current-103be live proof; this quant variant has not completed live generation",
+                    "qwen-image-edit q4/q5 have current-103be live proof and q6/q8 have current-ed84 live proof; this quant variant has not completed live generation",
                     "mask/inpaint edit fields are not wired yet",
                 ]
             }
             return [
-                "qwen-image-edit q4 and q5 have current-103be live proof; this quant variant has not been generated and visually checked",
+                "qwen-image-edit q4/q5 have current-103be live proof and q6/q8 have current-ed84 live proof; q3 loads but viewed q3 output is high-noise and not a clean prompt-following edit",
                 "mask/inpaint edit fields are not wired yet",
                 "live coherent edited-image proof is missing for this quant variant",
             ]

@@ -12,12 +12,12 @@ contract osaurus implements server-side and the UI builds against.
 
 > Status: the engine is real on Osaurus `vmlx-origin/main`. Current scanner/load
 > proof exists for all local image rows at
-> `docs/local/vmlx-flux-probes/2026-06-16-current-103be-load-matrix/compatibility-matrix.json`
-> (12 scanned, 10 loaded, qwen-edit q3/q6 blocked before load with explicit
-> missing-shard/component reasons).
+> `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q6q8-status-refresh-load-matrix/compatibility-matrix.json`
+> (13 scanned, 13 loaded after staging qwen-edit q3/q6/q8).
 > Current 103be live generation/edit proof exists for `z-image-turbo` 4/8-bit,
-> `flux1-schnell` 4/8-bit, `qwen-image` 4/6-bit, `qwen-image-edit` q4/q5, and
-> staged `ideogram-4-fp8`/`ideogram-4-nf4`:
+> `flux1-schnell` 4/8-bit, `qwen-image` 4/6-bit, qwen-edit q4/q5, and staged
+> `ideogram-4-fp8`/`ideogram-4-nf4`; current ed84 follow-up proof adds clean
+> qwen-edit q6/q8 rows:
 > `docs/local/vmlx-flux-probes/2026-06-16-current-103be-zimage-4bit-gen/`,
 > `2026-06-16-current-103be-zimage-8bit-gen/`,
 > `2026-06-16-current-103be-flux-schnell-4bit-gen/`,
@@ -26,17 +26,19 @@ contract osaurus implements server-side and the UI builds against.
 > `2026-06-16-current-103be-qwen-image-6bit-gen20/`,
 > `2026-06-16-current-103be-qwen-edit-q4-gen20/`,
 > `2026-06-16-current-103be-qwen-edit-q5-gen20/`,
+> `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q6-after-download-gen20/`,
+> `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q8-after-download-gen20/`,
 > `2026-06-16-current-103be-ideogram-fp8-bb4-exact/`, and
 > `2026-06-16-current-103be-ideogram-nf4-bb4-exact/`.
 > Viewed contact sheet:
 > `docs/local/vmlx-flux-outputs/2026-06-16-current-103be-contact-sheet.png`.
-> Expose only proven local variants for normal testing. Keep qwen-edit q3
-> blocked because its text-encoder index references missing
-> `text_encoder/3.safetensors`; keep q6 blocked until its local bundle is
-> complete; hide qwen mask/inpaint controls because the mflux qwen-edit
-> reference exposes no qwen mask path. qwen-edit q5 is cleanest; q4 is
-> current-103be deterministic and color-prompt-sensitive but visibly noisy/weaker
-> on shape-changing edits.
+> Expose only proven local variants for normal testing. Keep qwen-edit q3 hidden:
+> it now loads after staging `q3/text_encoder/3.safetensors`, but the viewed
+> 20-step edit output is high-noise and not a clean prompt-following edit. Hide
+> qwen mask/inpaint controls because the mflux qwen-edit reference exposes no
+> qwen mask path. qwen-edit q6 and q8 are clean current-ed84 edit rows; q5 is
+> clean; q4 is current-103be deterministic and color-prompt-sensitive but visibly
+> noisier/weaker on shape-changing edits.
 > Ideogram fp8 is implemented/testable for the staged mirror with typography
 > and current-103be strict clean object-icon proof. Ideogram NF4 is implemented/testable for
 > the staged `cocktailpeanut/ideogram-4-nf4` mirror with strict 512px
@@ -126,9 +128,10 @@ Notes for UI:
 - `native_runtime_status != native_pipeline_implemented` → disable normal user
   actions and show the blocker text. `native_pipeline_partial` is an internal
   diagnostic state, not a release-ready user model. For qwen-image-edit, the
-  status is variant-specific: `Qwen-Image-Edit-mflux-q4` and
-  `Qwen-Image-Edit-mflux-q5` are implemented/testable; q3/q6 remain partial or
-  blocked until complete local bundles are staged and proven.
+  status is variant-specific: `Qwen-Image-Edit-mflux-q4`,
+  `Qwen-Image-Edit-mflux-q5`, `Qwen-Image-Edit-mflux-q6`, and
+  `Qwen-Image-Edit-mflux-q8` are implemented/testable; q3 loads but remains
+  partial/hidden because current live edit output is high-noise.
 - Use `capabilities` to show/hide fields. e.g. `negative_prompt:false` → hide the
   negative box; `mask:false` → no mask tool;
   `multiple_source_images:true` → allow ordered multi-reference upload.

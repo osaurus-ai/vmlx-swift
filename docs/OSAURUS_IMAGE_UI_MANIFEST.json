@@ -3,7 +3,7 @@
   "generated_for": "osaurus image UI and server wiring",
   "status": {
     "overall": "PARTIAL",
-    "reason": "vMLX native image pipelines have source and probe evidence for the listed local variants, but the Osaurus /v1/images/* bridge and UI are not implemented or live-proven here.",
+    "reason": "vMLX native image pipelines have source and probe evidence for the listed local variants; qwen-image-edit q6/q8 are now staged and live-proven, q3 loads but remains hidden because visual edit output is high-noise, and the Osaurus /v1/images/* bridge and UI are not implemented or live-proven here.",
     "normal_ui_policy": "show only entries with ui_exposure=show_for_testing; hide blocked variants and unsupported controls."
   },
   "source_trace": {
@@ -16,7 +16,7 @@
     "api_spec": "docs/OSAURUS_IMAGE_API_SPEC.md"
   },
   "runtime_evidence": {
-    "status_load_matrix": "docs/local/vmlx-flux-probes/2026-06-16-current-103be-load-matrix/compatibility-matrix.json",
+    "status_load_matrix": "docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q6q8-status-refresh-load-matrix/compatibility-matrix.json",
     "visual_contact_sheet": "docs/local/vmlx-flux-outputs/2026-06-16-current-103be-contact-sheet.png",
     "runtime_generation_baseline": "103be4375d88f7f8249b39853feedcf390d41465",
     "runtime_generation_baseline_scope": [
@@ -29,10 +29,16 @@
       "qwen-image-edit q4",
       "qwen-image-edit q5",
       "ideogram fp8",
-      "ideogram NF4"
+      "ideogram NF4",
+      "qwen-image-edit q6",
+      "qwen-image-edit q8"
     ],
     "runtime_generation_source_commit": "103be4375d88f7f8249b39853feedcf390d41465",
-    "proof_artifacts_root": "/Users/eric/vmlx-swift-fluxwt/docs/local"
+    "proof_artifacts_root": "/Users/eric/vmlx-swift-fluxwt/docs/local",
+    "qwen_edit_q3_boundary_artifact": "docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q3-after-shard-gen20/Qwen-Image-Edit-mflux-q3-load.json",
+    "qwen_edit_q6_live_artifact": "docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q6-after-download-gen20/Qwen-Image-Edit-mflux-q6-load.json",
+    "qwen_edit_q8_live_artifact": "docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q8-after-download-gen20/Qwen-Image-Edit-mflux-q8-load.json",
+    "qwen_edit_latest_source_commit": "ed84bac6cb256cac6ebbb39bc564acd16e8ea717"
   },
   "engine_contract": {
     "swift_import": "import vMLXFlux",
@@ -316,7 +322,8 @@
       ],
       "notes": [
         "sourceImages order must be preserved; the last source image drives sizing and all source images contribute Qwen-VL prompt features plus VAE conditioning latents.",
-        "Do not expose masks for qwen-image-edit; current mflux qwen-edit reference has no qwen mask/inpaint path."
+        "Do not expose masks for qwen-image-edit; current mflux qwen-edit reference has no qwen mask/inpaint path.",
+        "q6 and q8 are cleaner live-proven edit rows after staging the missing local shards on 2026-06-16; q3 loads but stays hidden because viewed output is high-noise and not a clean edit."
       ],
       "variants": [
         {
@@ -340,16 +347,40 @@
             "blue_apple_repeat": "67b48f966f598552db85d21284bf0a3607af9bf58451a2efac698adf7723f835",
             "green_pear": "f98b8f78e283dc347513cac1521313f88b6be833a223aa48d14419f5110ee839"
           }
+        },
+        {
+          "model_id": "Qwen-Image-Edit-mflux-q6",
+          "quantization_bits": 6,
+          "local_load_status": "loaded",
+          "proof_status": "live_proven_current_ed84_clean",
+          "proof_artifact": "docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q6-after-download-gen20/Qwen-Image-Edit-mflux-q6-load.json",
+          "sha256": {
+            "blue_apple_repeat": "475cdbc7e3066d74c646245cdb99d23c52fcaca070376447bdfee3d295a97330",
+            "green_pear": "d4a05f4e424f1679441bce643be16dabbdb425efb0c866d91415efce17f96271"
+          }
+        },
+        {
+          "model_id": "Qwen-Image-Edit-mflux-q8",
+          "quantization_bits": 8,
+          "local_load_status": "loaded",
+          "proof_status": "live_proven_current_ed84_clean",
+          "proof_artifact": "docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q8-after-download-gen20/Qwen-Image-Edit-mflux-q8-load.json",
+          "sha256": {
+            "blue_apple_repeat": "72862df44d35d2db7e386cde402dd8c602d48c0e6d07ba55d4839ae1e438b743",
+            "green_pear": "9eb6868adb9e3d0f601bbca537522a39a672051a3938a3df17995a2d52fe8678"
+          }
         }
       ],
       "blocked_variants": [
         {
           "model_id": "Qwen-Image-Edit-mflux-q3",
-          "reason": "missing indexed shard text_encoder/3.safetensors"
-        },
-        {
-          "model_id": "Qwen-Image-Edit-mflux-q6",
-          "reason": "missing transformer, vae, text_encoder/3.safetensors, and text_encoder/6.safetensors"
+          "local_load_status": "loaded",
+          "reason": "loadable after staging q3/text_encoder/3.safetensors, but 20-step live edit output was high-noise and not a clean prompt-following edit",
+          "proof_artifact": "docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q3-after-shard-gen20/Qwen-Image-Edit-mflux-q3-load.json",
+          "sha256": {
+            "blue_apple_repeat": "bbc6e873ae7aeab37bdcb5943ae843044fa990f44bf6478394fae87899ce296f",
+            "green_pear": "f2ae4e292a7a5432ef64d07f048a4589a17a7af6d61190fa92475ae17cd223c9"
+          }
         }
       ]
     },
