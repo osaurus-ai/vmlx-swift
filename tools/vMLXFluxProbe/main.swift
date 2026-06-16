@@ -623,7 +623,8 @@ struct VMLXFluxProbe {
                 : "native_pipeline_partial"
         case "ideogram":
             return model.readiness == .loadableScaffold
-                ? "native_pipeline_partial"
+                && model.directoryName.localizedCaseInsensitiveContains("fp8")
+                ? "native_pipeline_implemented"
                 : "not_implemented"
         case "flux1-dev", "flux1-kontext", "flux1-fill",
              "flux2-klein", "flux2-klein-edit",
@@ -642,20 +643,21 @@ struct VMLXFluxProbe {
         switch model.canonicalName {
         case "z-image-turbo", "flux1-schnell":
             return [
-                "requires live same-seed prompt-sensitivity and multi-turn matrix before production promotion",
+                "current e0f main 4/8-bit live probes completed three turns with same-seed repeated-prompt SHA match, different-prompt SHA change, and viewed coherent apple/mountain images on 2026-06-16",
+                "run a broader Osaurus-side production matrix before release promotion",
             ]
         case "qwen-image":
             if [4, 6].contains(model.quantizationBits ?? -1)
                 && model.readiness == .loadableScaffold
             {
                 return [
-                    "qwen-image q4 and q6 text-to-image paths are live-proven for same-seed prompt sensitivity and deterministic repeat on 2026-06-16",
+                    "current e0f main qwen-image 4-bit and 6-bit text-to-image paths completed 20-step three-turn live probes with same-seed prompt sensitivity, deterministic repeat, finite diagnostics, and viewed coherent apple/mountain images on 2026-06-16",
                     "public mflux 8-bit bundle was not found in current HF search",
                     "run a broader Osaurus-side production matrix before release promotion",
                 ]
             }
             return [
-                "qwen-image q4 and q6 are live-proven; this quant variant has not completed live generation",
+                "qwen-image 4-bit and 6-bit are live-proven; this quant variant has not completed live generation",
                 "live coherent text-to-image proof is missing for this quant variant",
             ]
         case "qwen-image-edit":
@@ -663,7 +665,8 @@ struct VMLXFluxProbe {
                 && model.readiness == .loadableScaffold
             {
                 return [
-                    "qwen-image-edit q4 and q5 text-image edit paths are live-proven for same-seed prompt sensitivity and deterministic repeat on 2026-06-16",
+                    "current e0f main qwen-image-edit q4 and q5 text-image edit paths completed 20-step three-turn live probes with same-seed deterministic repeat and prompt-sensitive SHA changes on 2026-06-16",
+                    "visual boundary: q5 cleanly edits blue apple and green pear; q4 changes color but remains weaker on shape-changing green-pear prompts",
                     "mask/inpaint edit fields are not wired yet",
                     "q3 and q6 variants require complete local bundles before UI promotion",
                     "run a broader Osaurus-side production matrix before release promotion",
@@ -693,14 +696,14 @@ struct VMLXFluxProbe {
                 return [
                     "Ideogram fp8 source path is wired through Qwen3 text encoder, conditional/unconditional 34-layer DiT, VAE decode, and PNG output",
                     "live 20-step fp8 typography probe completed after the rotary-half correction; HELLO/BANANA outputs were prompt-sensitive and repeated HELLO had identical SHA",
-                    "512px object-scene probe completed but produced an apple icon with extra hallucinated text, so broader coherent object-scene proof is still missing",
-                    "official ideogram-ai/ideogram-4-fp8 and ideogram-ai/ideogram-4-nf4 downloads still require approval for the current HF account; current live proof uses the staged cocktailpeanut/ideogram-4-fp8 mirror",
+                    "current e0f main 512px object-icon probe completed three turns; apple and mountain prompts were coherent, prompt-sensitive, and repeated apple had identical SHA",
+                    "official ideogram-ai/ideogram-4-fp8 and ideogram-ai/ideogram-4-nf4 dry-runs still return access denied for the current HF account; current live proof uses the staged cocktailpeanut/ideogram-4-fp8 mirror",
                     "nf4 support remains incomplete until a complete local nf4 bundle is staged and load/generation proof passes",
                 ]
             }
             return [
                 "local Ideogram bundle is incomplete and cannot enter the native load path",
-                "official ideogram-ai/ideogram-4-fp8 and ideogram-ai/ideogram-4-nf4 downloads still require approval for the current HF account",
+                "official ideogram-ai/ideogram-4-fp8 and ideogram-ai/ideogram-4-nf4 dry-runs still return access denied for the current HF account",
             ]
         case "wan-2.1", "wan-2.2":
             return [

@@ -10,32 +10,33 @@ determinate progress bar so users always see "step N / M" and never a stuck spin
 field below maps to an engine request/event — see the mapping notes. This is the
 contract osaurus implements server-side and the UI builds against.
 
-> Status: the engine is real. `z-image-turbo` and `flux1-schnell` are
-> live-proven for 4-bit and 8-bit text-to-image; `qwen-image` is live-proven for
-> 4-bit and 6-bit text-to-image (public mflux 8-bit not found). `qwen-image-edit` q4 and q5 are live-proven for
-> single-image and multi-image text-image edit after the VL-grid conditioning
-> fix; expose only the proven q4/q5 paths for normal testing, keep q3 blocked
-> because its text-encoder index references missing `text_encoder/3.safetensors`,
-> keep q6 blocked until its local bundle is complete, and hide mask/inpaint
-> controls for qwen-edit. The mflux qwen-edit reference supports one or more
-> source images, but does not expose a qwen mask/inpaint path.
-> Ideogram fp8 is no longer a `notImplemented` generate stub: the staged
-> `cocktailpeanut/ideogram-4-fp8` mirror now runs through Qwen3 text encoder,
-> conditional/unconditional 34-layer DiT, mflux fp8 `weight_scale` linears,
-> Flux2 VAE decode, and PNG output. Keep it gated as `PARTIAL`: live
-> 2026-06-16 typography proof rendered HELLO/BANANA, repeated HELLO with the
-> same seed byte-identically, and changed SHA for BANANA, but the 512px
-> object-scene probe produced an apple icon with extra hallucinated text.
-> Official `ideogram-ai/*` downloads still require approval for the current
-> account, and nf4 is not staged/proven.
-> Current-main proof refresh: after PR #67, `vmlx-origin/main`
-> `9f1faea11aee78f17041c5bed6da039e70c11d05` was live-probed with
-> z-image 4/8, flux-schnell 4/8, qwen-image 4/6, and qwen-edit q4/q5.
-> Artifact root: `docs/local/vmlx-flux-probes/2026-06-16-current-main-*`;
-> viewed contact sheet:
-> `docs/local/vmlx-flux-outputs/2026-06-16-current-main-contact-sheet.png`.
-> Multi-image qwen-edit proof: branch `codex/qwen-edit-multi-image` adds
-> ordered `ImageEditRequest.sourceImages`. q4 artifact:
+> Status: the engine is real on current Osaurus `vmlx-origin/main`
+> `e0f3ccff7ae78a6b3e8ccc4989825f582d1b7ee5`. Fresh live proof exists for
+> `z-image-turbo` 4/8-bit, `flux1-schnell` 4/8-bit, `qwen-image` 4/6-bit,
+> `qwen-image-edit` q4/q5, and staged `ideogram-4-fp8`. Load matrix:
+> `docs/local/vmlx-flux-probes/2026-06-16-current-e0f-load-matrix/compatibility-matrix.json`.
+> Generation/edit artifact roots:
+> `docs/local/vmlx-flux-probes/2026-06-16-current-e0f-zimage-4bit-gen/`,
+> `2026-06-16-current-e0f-zimage-8bit-gen/`,
+> `2026-06-16-current-e0f-flux-schnell-4bit-gen/`,
+> `2026-06-16-current-e0f-flux-schnell-8bit-gen/`,
+> `2026-06-16-current-e0f-qwen-image-4bit-gen20/`,
+> `2026-06-16-current-e0f-qwen-image-6bit-gen20/`,
+> `2026-06-16-current-e0f-qwen-edit-q4-gen20/`,
+> `2026-06-16-current-e0f-qwen-edit-q5-gen20/`, and
+> `2026-06-16-current-e0f-ideogram-fp8-object-determinism/`.
+> Expose only proven local variants for normal testing. Keep qwen-edit q3
+> blocked because its text-encoder index references missing
+> `text_encoder/3.safetensors`; keep q6 blocked until its local bundle is
+> complete; hide qwen mask/inpaint controls because the mflux qwen-edit
+> reference exposes no qwen mask path. qwen-edit q5 is cleanest; q4 is
+> deterministic and color-prompt-sensitive but weaker on shape-changing edits.
+> Ideogram fp8 is now implemented/testable for the staged mirror with typography
+> and clean object-icon proof; official `ideogram-ai/*` downloads still require
+> approval for the current account (`hf download ... --dry-run` returned access
+> denied for both fp8 and nf4 on 2026-06-16), and nf4 is not staged/proven.
+> Multi-image qwen-edit proof: current main includes ordered
+> `ImageEditRequest.sourceImages`. q4 artifact:
 > `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-multi-image-live/Qwen-Image-Edit-mflux-q4-load.json`;
 > q5 artifact:
 > `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q5-multi-image-live/Qwen-Image-Edit-mflux-q5-load.json`;
