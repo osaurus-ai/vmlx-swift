@@ -13,7 +13,9 @@
     "local_model_store": "Libraries/vMLXFluxKit/LocalModelStore.swift",
     "probe": "tools/vMLXFluxProbe/main.swift",
     "integration_spec": "docs/OSAURUS_VMLX_FLUX_INTEGRATION_SPEC.md",
-    "api_spec": "docs/OSAURUS_IMAGE_API_SPEC.md"
+    "api_spec": "docs/OSAURUS_IMAGE_API_SPEC.md",
+    "openapi_spec": "docs/OSAURUS_IMAGE_OPENAPI.json",
+    "contract_verifier": "scripts/vmlx-image-openapi-manifest-check.sh"
   },
   "runtime_evidence": {
     "status_load_matrix": "docs/local/vmlx-flux-probes/2026-06-16-current-ee9-status-load-matrix/compatibility-matrix.json",
@@ -80,6 +82,8 @@
     "models": "GET /v1/images/models",
     "generate": "POST /v1/images/generations",
     "edit": "POST /v1/images/edits",
+    "upscale": "POST /v1/images/upscale",
+    "cancel": "POST /v1/images/cancel",
     "job_status": "GET /v1/images/jobs/{id}",
     "job_events": "GET /v1/images/jobs/{id}/events",
     "output": "GET /v1/images/{image_id}"

@@ -72,7 +72,9 @@
   UI/server teams should consume `docs/OSAURUS_IMAGE_UI_MANIFEST.json` as the
   machine-readable model/control/exposure/proof manifest; this integration spec
   remains the source for Swift engine semantics and concurrency requirements.
-  See §6 and §7b.
+  `docs/OSAURUS_IMAGE_OPENAPI.json` is the route/schema contract for the
+  `/v1/images/*` bridge, and `scripts/vmlx-image-openapi-manifest-check.sh`
+  verifies the manifest/OpenAPI pair. See §6 and §7b.
 
 ---
 
@@ -510,14 +512,19 @@ Mirror the documented `FluxBackend` pattern (the bridge lives on the osaurus
 
 1. Hold a lazily-created `FluxEngine` on the osaurus engine actor (store as `Any?`
    so non-image files don't import vMLXFlux).
-2. `generateImage(prompt:model:settings:)`: acquire MetalGate (§7) → ensure the
+2. Use `docs/OSAURUS_IMAGE_OPENAPI.json` as the route/schema source and
+   `docs/OSAURUS_IMAGE_UI_MANIFEST.json` as the live model/control exposure
+   source. Run `scripts/vmlx-image-openapi-manifest-check.sh` after edits; set
+   `VMLX_REQUIRE_LOCAL_PROOF=1` when the local `docs/local` proof artifacts are
+   present and you want proof-path/SHA verification too.
+3. `generateImage(prompt:model:settings:)`: acquire MetalGate (§7) → ensure the
    requested model is loaded (`load(name:from:)`, load-if-different) → build
    `ImageGenRequest` from osaurus settings → drain the stream → translate
    `ImageGenEvent` → osaurus's UI event type → return final URL → release gate.
-3. `editImage(...)` / `upscaleImage(...)`: same, via `edit` / `upscale`.
-4. Fan events to the UI via a per-job bridge so the chat surface can subscribe
+4. `editImage(...)` / `upscaleImage(...)`: same, via `edit` / `upscale`.
+5. Fan events to the UI via a per-job bridge so the chat surface can subscribe
    without holding a direct flux reference.
-5. Event-shape translation: vmlx-flux emits separate `.step` and `.preview`; if
+6. Event-shape translation: vmlx-flux emits separate `.step` and `.preview`; if
    osaurus uses a unified `.step(step:total:preview:)`, coalesce them in the bridge.
 
 ---
@@ -617,7 +624,9 @@ seeds, and the CFG path. z-image-turbo is **production-compatible** — the May-
 1. Wire the osaurus app/server bridge: `/v1/images/models`,
    `/v1/images/generations`, `/v1/images/edits`, progress SSE, output path
    policy, exact directory-name resolution, and the required `MetalGate`
-   exclusion around the full stream drain.
+   exclusion around the full stream drain. Use `docs/OSAURUS_IMAGE_OPENAPI.json`
+   for route/schema wiring and run
+   `scripts/vmlx-image-openapi-manifest-check.sh` after any manifest/API edits.
 2. Ideogram 4 follow-through: staged fp8 and NF4 native generation are
    source-wired. fp8 is live-proven for typography plus strict object-icon
    prompts; NF4 is live-proven for strict object-icon prompts. Keep broader

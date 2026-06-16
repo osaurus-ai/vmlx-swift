@@ -1,0 +1,937 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Osaurus Image Generation API",
+    "version": "2026-06-16",
+    "description": "Proposed Osaurus /v1/images bridge contract for the native vMLXFlux engine. The engine is in vmlx-swift; the HTTP bridge is still app-side work.",
+    "x-vmlx-status": "PARTIAL",
+    "x-vmlx-manifest": "docs/OSAURUS_IMAGE_UI_MANIFEST.json"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:1337",
+      "description": "Local Osaurus server"
+    }
+  ],
+  "paths": {
+    "/v1/images/models": {
+      "get": {
+        "summary": "List installed image models, defaults, controls, and proof exposure status.",
+        "operationId": "listImageModels",
+        "responses": {
+          "200": {
+            "description": "Installed image model catalog.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageModelList"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/images/generations": {
+      "post": {
+        "summary": "Create image(s) from a text prompt.",
+        "operationId": "createImageGeneration",
+        "x-vmlx-engine-call": "FluxEngine.generate",
+        "x-vmlx-metal-gate-required": true,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageGenerationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Image result for non-streaming requests.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Accepted streaming job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          }
+        }
+      }
+    },
+    "/v1/images/edits": {
+      "post": {
+        "summary": "Edit image(s) with a prompt.",
+        "description": "For qwen-image-edit, preserve source image order. Hide mask controls unless a future model advertises mask support; current qwen mask requests must return an unsupported-model error before pipeline load.",
+        "operationId": "createImageEdit",
+        "x-vmlx-engine-call": "FluxEngine.edit",
+        "x-vmlx-metal-gate-required": true,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageEditRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Edit result for non-streaming requests.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Accepted streaming job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          }
+        }
+      }
+    },
+    "/v1/images/upscale": {
+      "post": {
+        "summary": "Upscale one image.",
+        "operationId": "createImageUpscale",
+        "x-vmlx-engine-call": "FluxEngine.upscale",
+        "x-vmlx-metal-gate-required": true,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageUpscaleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Upscale result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Accepted streaming job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          }
+        }
+      }
+    },
+    "/v1/images/cancel": {
+      "post": {
+        "summary": "Cancel an in-flight image job.",
+        "operationId": "cancelImageJob",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageCancelRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Cancellation accepted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageJob"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/images/jobs/{id}": {
+      "get": {
+        "summary": "Read image job status.",
+        "operationId": "getImageJob",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ImageJobId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current job status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageJob"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/images/jobs/{id}/events": {
+      "get": {
+        "summary": "Subscribe to Server-Sent Events for an image job.",
+        "operationId": "streamImageJobEvents",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ImageJobId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream of ImageEvent JSON objects followed by [DONE].",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v1/images/{image_id}": {
+      "get": {
+        "summary": "Fetch or stream a generated image artifact.",
+        "operationId": "getImageArtifact",
+        "parameters": [
+          {
+            "name": "image_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Generated image bytes.",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/webp": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "ImageJobId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid request or wrong model kind.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ImageError"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Model, job, or image artifact not found.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ImageError"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "Model bundle exists but is incomplete or blocked.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ImageError"
+            }
+          }
+        }
+      },
+      "NotImplemented": {
+        "description": "Requested operation is registered but not implemented for this model.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ImageError"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ImageModelList": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImageModel"
+            }
+          }
+        }
+      },
+      "ImageModel": {
+        "type": "object",
+        "required": [
+          "id",
+          "display_name",
+          "kind",
+          "ready",
+          "capabilities",
+          "defaults",
+          "limits"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Canonical model id or exact local variant id accepted by the bridge."
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "imageGen",
+              "imageEdit",
+              "imageUpscale"
+            ]
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "ui_exposure": {
+            "type": "string",
+            "enum": [
+              "show_for_testing",
+              "show_for_testing_with_prompt_caveat",
+              "hidden",
+              "blocked"
+            ]
+          },
+          "quantization_bits": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/ImageCapabilities"
+          },
+          "defaults": {
+            "$ref": "#/components/schemas/ImageModelDefaults"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/ImageModelLimits"
+          },
+          "blocked_reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ImageCapabilities": {
+        "type": "object",
+        "required": [
+          "text_to_image",
+          "image_edit",
+          "upscale",
+          "negative_prompt",
+          "mask",
+          "multiple_source_images",
+          "lora"
+        ],
+        "properties": {
+          "text_to_image": {
+            "type": "boolean"
+          },
+          "image_edit": {
+            "type": "boolean"
+          },
+          "upscale": {
+            "type": "boolean"
+          },
+          "negative_prompt": {
+            "type": "boolean"
+          },
+          "mask": {
+            "type": "boolean",
+            "description": "False for current qwen-image-edit rows; hide mask controls until a real model path is wired."
+          },
+          "multiple_source_images": {
+            "type": "boolean"
+          },
+          "lora": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ImageModelDefaults": {
+        "type": "object",
+        "required": [
+          "steps",
+          "guidance"
+        ],
+        "properties": {
+          "steps": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "guidance": {
+            "type": "number",
+            "minimum": 0
+          }
+        }
+      },
+      "ImageModelLimits": {
+        "type": "object",
+        "required": [
+          "min_steps",
+          "max_steps",
+          "size_multiple",
+          "max_pixels",
+          "supported_sizes"
+        ],
+        "properties": {
+          "min_steps": {
+            "type": "integer",
+            "const": 1
+          },
+          "max_steps": {
+            "type": "integer"
+          },
+          "size_multiple": {
+            "type": "integer",
+            "const": 16
+          },
+          "max_pixels": {
+            "type": "integer"
+          },
+          "supported_sizes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9]+x[0-9]+$"
+            }
+          }
+        }
+      },
+      "ImageGenerationRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "prompt"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "negative_prompt": {
+            "type": "string"
+          },
+          "n": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1
+          },
+          "size": {
+            "type": "string",
+            "pattern": "^[0-9]+x[0-9]+$"
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 16
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 16
+          },
+          "steps": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "guidance": {
+            "type": "number",
+            "minimum": 0
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "response_format": {
+            "type": "string",
+            "enum": [
+              "url",
+              "b64_json"
+            ],
+            "default": "url"
+          },
+          "output_format": {
+            "$ref": "#/components/schemas/ImageOutputFormat"
+          },
+          "stream": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "ImageEditRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "prompt"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "image": {
+            "type": "string",
+            "description": "Single source image URL or data URL."
+          },
+          "images": {
+            "type": "array",
+            "description": "Ordered source images. If present, preserve order and prefer this over image.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "mask": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Unsupported for current qwen-image-edit rows; hide this control for qwen."
+          },
+          "strength": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.75
+          },
+          "negative_prompt": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "guidance": {
+            "type": "number",
+            "minimum": 0
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "width": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "height": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "response_format": {
+            "type": "string",
+            "enum": [
+              "url",
+              "b64_json"
+            ],
+            "default": "url"
+          },
+          "output_format": {
+            "$ref": "#/components/schemas/ImageOutputFormat"
+          },
+          "stream": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "image"
+            ]
+          },
+          {
+            "required": [
+              "images"
+            ]
+          }
+        ]
+      },
+      "ImageUpscaleRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "image"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "image": {
+            "type": "string"
+          },
+          "scale": {
+            "type": "integer",
+            "enum": [
+              2,
+              4
+            ],
+            "default": 4
+          },
+          "steps": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 10
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "response_format": {
+            "type": "string",
+            "enum": [
+              "url",
+              "b64_json"
+            ],
+            "default": "url"
+          },
+          "output_format": {
+            "$ref": "#/components/schemas/ImageOutputFormat"
+          },
+          "stream": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "ImageCancelRequest": {
+        "type": "object",
+        "required": [
+          "job_id"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ImageJob": {
+        "type": "object",
+        "required": [
+          "job_id",
+          "status"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "loading_model",
+              "running",
+              "completed",
+              "error",
+              "cancelled"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "step": {
+            "type": "integer"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "progress": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "eta_seconds": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImageResult"
+            }
+          },
+          "error": {
+            "$ref": "#/components/schemas/ImageError"
+          }
+        }
+      },
+      "ImageEvent": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "loading_model",
+              "step",
+              "preview",
+              "completed",
+              "error",
+              "cancelled"
+            ]
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "step": {
+            "type": "integer"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "progress": {
+            "type": "number"
+          },
+          "eta_seconds": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "image": {
+            "type": "string",
+            "description": "Preview data URL when type=preview."
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImageResult"
+            }
+          },
+          "message": {
+            "type": "string"
+          },
+          "hf_auth": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ImageResponse": {
+        "type": "object",
+        "required": [
+          "created",
+          "data"
+        ],
+        "properties": {
+          "created": {
+            "type": "integer"
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImageResult"
+            }
+          }
+        }
+      },
+      "ImageResult": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string"
+          },
+          "b64_json": {
+            "type": "string"
+          },
+          "seed": {
+            "type": "integer"
+          }
+        }
+      },
+      "ImageOutputFormat": {
+        "type": "string",
+        "enum": [
+          "png",
+          "jpeg",
+          "webp"
+        ],
+        "default": "png"
+      },
+      "ImageError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "message"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string"
+              },
+              "hf_auth": {
+                "type": "boolean"
+              },
+              "reasons": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

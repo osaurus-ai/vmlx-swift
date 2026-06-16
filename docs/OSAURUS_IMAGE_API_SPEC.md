@@ -63,9 +63,11 @@ contract osaurus implements server-side and the UI builds against.
 > The HTTP surface below is the **proposed contract** for the osaurus team to
 > expose; design it once, wire all models through it.
 > Machine-readable companion for UI/server wiring:
-> `docs/OSAURUS_IMAGE_UI_MANIFEST.json`. Treat that JSON as the current
-> dropdown/control/exposure/proof manifest; this prose spec explains the HTTP
-> contract and field semantics.
+> `docs/OSAURUS_IMAGE_UI_MANIFEST.json`. HTTP/OpenAPI companion:
+> `docs/OSAURUS_IMAGE_OPENAPI.json`. Contract drift check:
+> `scripts/vmlx-image-openapi-manifest-check.sh`. Treat the JSON manifest as
+> the current dropdown/control/exposure/proof source; treat the OpenAPI file as
+> the route/schema target; this prose spec explains field semantics.
 
 ---
 
