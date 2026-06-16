@@ -13,22 +13,28 @@ import Testing
 /// text (observed live: the whole envelope printed in the chat transcript).
 @Suite("Gemma4 drifted tool-call envelope")
 struct Gemma4DriftedToolCallEnvelopeTests {
-    private let capabilitiesTool: [[String: any Sendable]] = [
-        [
-            "type": "function",
-            "function": [
-                "name": "capabilities_load",
-                "description": "Load capability tools by id.",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "ids": ["type": "array", "items": ["type": "string"]]
-                    ],
-                    "required": ["ids"],
-                ],
-            ],
+    private var capabilitiesTool: [[String: any Sendable]] {
+        let idsSchema: [String: any Sendable] = [
+            "type": "array",
+            "items": ["type": "string"] as [String: any Sendable],
         ]
-    ]
+        let parameters: [String: any Sendable] = [
+            "type": "object",
+            "properties": ["ids": idsSchema] as [String: any Sendable],
+            "required": ["ids"],
+        ]
+        let function: [String: any Sendable] = [
+            "name": "capabilities_load",
+            "description": "Load capability tools by id.",
+            "parameters": parameters,
+        ]
+        return [
+            [
+                "type": "function",
+                "function": function,
+            ] as [String: any Sendable]
+        ]
+    }
 
     private func feed(_ envelope: String, chunkSize: Int, tools: [[String: any Sendable]]?)
         -> (visible: String, processor: ToolCallProcessor)
