@@ -36,6 +36,8 @@ public final class Ideogram4: ImageGenerator, @unchecked Sendable {
 
     public let modelPath: URL
     public let quantize: Int?
+    public let loadedWeights: LoadedWeights
+    private let store: MFluxStore
 
     public init(modelPath: URL, quantize: Int?) throws {
         self.modelPath = modelPath
@@ -44,6 +46,10 @@ public final class Ideogram4: ImageGenerator, @unchecked Sendable {
         guard FileManager.default.fileExists(atPath: modelPath.path) else {
             throw FluxError.weightsNotFound(modelPath)
         }
+        let loaded = try WeightLoader.load(from: modelPath)
+        try Ideogram4BundleValidator.validate(modelPath, loaded: loaded)
+        self.loadedWeights = loaded
+        self.store = MFluxStore(loaded)
     }
 
     public func generate(_ request: ImageGenRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {
@@ -51,6 +57,66 @@ public final class Ideogram4: ImageGenerator, @unchecked Sendable {
             continuation.finish(throwing: FluxError.notImplemented(
                 "Ideogram4.generate — port from mflux/models/ideogram4 "
                     + "(Qwen3 encoder + 34-layer fp8 DiT + unconditional transformer + VAE)."))
+        }
+    }
+}
+
+enum Ideogram4BundleValidator {
+    private static let requiredFiles = [
+        "tokenizer/tokenizer.json",
+    ]
+
+    private static let requiredWeightsByComponent: [String: [String]] = [
+        "text_encoder": [
+            "language_model.embed_tokens.weight",
+            "language_model.layers.0.self_attn.q_proj.weight",
+            "language_model.layers.35.mlp.down_proj.weight",
+            "language_model.norm.weight",
+        ],
+        "transformer": [
+            "input_proj.weight",
+            "input_proj.weight_scale",
+            "llm_cond_proj.weight",
+            "layers.0.attention.qkv.weight",
+            "layers.33.feed_forward.w3.weight",
+            "final_layer.linear.weight",
+        ],
+        "unconditional_transformer": [
+            "input_proj.weight",
+            "input_proj.weight_scale",
+            "layers.0.attention.qkv.weight",
+            "layers.33.feed_forward.w3.weight",
+            "final_layer.linear.weight",
+        ],
+        "vae": [
+            "decoder.conv_in.weight",
+            "decoder.conv_out.weight",
+            "post_quant_conv.weight",
+        ],
+    ]
+
+    static func validate(_ modelPath: URL, loaded: LoadedWeights) throws {
+        let fm = FileManager.default
+        var reasons: [String] = []
+        for relativePath in requiredFiles {
+            let url = modelPath.appendingPathComponent(relativePath)
+            if !fm.fileExists(atPath: url.path) {
+                reasons.append("missing \(relativePath)")
+            }
+        }
+
+        for component in requiredWeightsByComponent.keys.sorted() {
+            guard let weights = loaded.componentWeights[component], !weights.isEmpty else {
+                reasons.append("missing \(component) component")
+                continue
+            }
+            for key in requiredWeightsByComponent[component, default: []] where weights[key] == nil {
+                reasons.append("missing \(component) weight \(key)")
+            }
+        }
+
+        if !reasons.isEmpty {
+            throw FluxError.localModelIncomplete(modelPath, reasons: reasons)
         }
     }
 }

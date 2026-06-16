@@ -21,7 +21,9 @@ contract osaurus implements server-side and the UI builds against.
 > `cocktailpeanut/ideogram-4-fp8`, and the scanner reports it as loadable
 > scaffold. The shared source can now load Ideogram's
 > `unconditional_transformer` component and decode fp8 linear `weight_scale`
-> rows. Keep it disabled because the native `Ideogram4.generate` body still
+> rows; direct load validates required sentinel keys from text encoder,
+> conditional transformer, unconditional transformer, and VAE. Keep it disabled
+> because the native `Ideogram4.generate` body still
 > throws `FluxError.notImplemented`, and no live generation proof exists.
 > Official `ideogram-ai/*` downloads still require approval for the current
 > account.

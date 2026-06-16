@@ -1,3 +1,4 @@
+import MLX
 import XCTest
 @testable import vMLXFlux
 @testable import vMLXFluxKit
@@ -107,6 +108,30 @@ final class RegistryTests: XCTestCase {
         }
     }
 
+    func testIdeogramLoadRejectsBundleMissingUnconditionalTransformerKeys() async throws {
+        let model = try makeTemporaryIdeogramBundle(includeUnconditionalTransformer: false)
+        let engine = FluxEngine()
+
+        do {
+            try await engine.load(name: "ideogram", modelPath: model)
+            XCTFail("expected incomplete Ideogram bundle rejection")
+        } catch FluxError.localModelIncomplete(let url, let reasons) {
+            XCTAssertEqual(url.lastPathComponent, model.lastPathComponent)
+            XCTAssertTrue(
+                reasons.contains("missing unconditional_transformer component"),
+                "blocked reasons: \(reasons)")
+        } catch {
+            XCTFail("wrong error: \(error)")
+        }
+    }
+
+    func testIdeogramLoadAcceptsRequiredFp8Components() async throws {
+        let model = try makeTemporaryIdeogramBundle(includeUnconditionalTransformer: true)
+        let engine = FluxEngine()
+
+        try await engine.load(name: "ideogram", modelPath: model)
+    }
+
     func testEngineGenerateRequiresLoad() async {
         let engine = FluxEngine()
         let request = ImageGenRequest(
@@ -188,5 +213,72 @@ final class RegistryTests: XCTestCase {
         try data.write(to: url)
         try Data([0]).write(
             to: url.deletingLastPathComponent().appendingPathComponent("0.safetensors"))
+    }
+
+    private func makeTemporaryIdeogramBundle(includeUnconditionalTransformer: Bool) throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-flux-ideogram-tests-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: root)
+        }
+        let model = root.appendingPathComponent("ideogram-4-fp8", isDirectory: true)
+        let fm = FileManager.default
+        try fm.createDirectory(
+            at: model.appendingPathComponent("tokenizer", isDirectory: true),
+            withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: model.appendingPathComponent("tokenizer/tokenizer.json"))
+
+        try writeSafetensor(
+            keys: [
+                "language_model.embed_tokens.weight",
+                "language_model.layers.0.self_attn.q_proj.weight",
+                "language_model.layers.35.mlp.down_proj.weight",
+                "language_model.norm.weight",
+            ],
+            component: "text_encoder",
+            model: model)
+        try writeSafetensor(
+            keys: [
+                "input_proj.weight",
+                "input_proj.weight_scale",
+                "llm_cond_proj.weight",
+                "layers.0.attention.qkv.weight",
+                "layers.33.feed_forward.w3.weight",
+                "final_layer.linear.weight",
+            ],
+            component: "transformer",
+            model: model)
+        if includeUnconditionalTransformer {
+            try writeSafetensor(
+                keys: [
+                    "input_proj.weight",
+                    "input_proj.weight_scale",
+                    "layers.0.attention.qkv.weight",
+                    "layers.33.feed_forward.w3.weight",
+                    "final_layer.linear.weight",
+                ],
+                component: "unconditional_transformer",
+                model: model)
+        }
+        try writeSafetensor(
+            keys: [
+                "decoder.conv_in.weight",
+                "decoder.conv_out.weight",
+                "post_quant_conv.weight",
+            ],
+            component: "vae",
+            model: model)
+        return model
+    }
+
+    private func writeSafetensor(keys: [String], component: String, model: URL) throws {
+        let directory = model.appendingPathComponent(component, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let arrays = Dictionary(uniqueKeysWithValues: keys.map {
+            ($0, MLXArray([Float(1)], [1]))
+        })
+        try MLX.save(
+            arrays: arrays,
+            url: directory.appendingPathComponent("diffusion_pytorch_model.safetensors"))
     }
 }

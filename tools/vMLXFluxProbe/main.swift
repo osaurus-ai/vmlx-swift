@@ -670,7 +670,7 @@ struct VMLXFluxProbe {
         case "ideogram":
             return [
                 "Ideogram4.generate body throws FluxError.notImplemented",
-                "local ideogram-4-fp8 mirror bundle is staged and scans loadable, but live generation is blocked until the native pipeline is implemented",
+                "local ideogram-4-fp8 mirror bundle is staged, scans loadable, and passes load-time sentinel-key validation, but live generation is blocked until the native pipeline is implemented",
                 "official ideogram-ai/ideogram-4-fp8 and ideogram-ai/ideogram-4-nf4 downloads still require approval for the current HF account",
                 "Qwen3 text encoder, 34-layer DiT execution, unconditional transformer execution, VAE, and nf4 support are missing; shared fp8 Linear weight_scale support is present",
             ]
