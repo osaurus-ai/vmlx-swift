@@ -116,7 +116,7 @@ public enum WeightLoader {
         if !rootShards.isEmpty {
             groups.append(ShardGroup(component: "root", shards: rootShards))
         }
-        for component in ["transformer", "text_encoder", "text_encoder_2", "vae"] {
+        for component in ["transformer", "unconditional_transformer", "text_encoder", "text_encoder_2", "vae"] {
             let componentURL = directory.appendingPathComponent(component, isDirectory: true)
             let shards = try enumerateShards(in: componentURL)
             if !shards.isEmpty {
