@@ -5,9 +5,10 @@
 are live-proven for 4/8-bit; qwen-image 4-bit and 6-bit are live-proven; qwen-image-edit
 q4/q5 are live-proven for text-image edit after the conditioning-grid fix. qwen-edit
 q3 is incomplete (`text_encoder/3.safetensors` missing from its index), q6 is incomplete on disk, masks are
-not wired, and Ideogram has no complete staged local bundle/proof because the
-current HF account is not approved for `ideogram-ai/ideogram-4-nf4` or
-`ideogram-ai/ideogram-4-fp8`.
+not wired, and Ideogram has a staged fp8 mirror bundle but no native
+implementation/live generation proof yet. The current HF account still is not
+approved for the official `ideogram-ai/ideogram-4-nf4` or
+`ideogram-ai/ideogram-4-fp8` repos.
 
 **2026-06-16 continuation evidence:** live baseline probes were rerun from
 `/Users/eric/vmlx-swift` so MLX could resolve `default.metallib`; the standalone
@@ -52,12 +53,16 @@ byte-identical. Shape proof:
 (`target_latent_count=1024`, `conditioning_latent_count=576`,
 `combined_velocity_shape=1x1600x64`, `image_shapes=[[1,32,32],[1,24,24]]`).
 Current local scan: `docs/local/vmlx-flux-probes/2026-06-16-goal-current-scan/scan.json`.
-No complete Ideogram bundle was found under the scanned local image-model roots.
-The HF dry-runs left local `ideogram-4-nf4` and `ideogram-4-fp8` asset/cache
-skeleton directories only; the scanner reports them as incomplete Ideogram rows.
-Ideogram has no live load/generation evidence on this machine. `hf download`
-dry-runs for both `ideogram-ai/ideogram-4-nf4` and `ideogram-ai/ideogram-4-fp8`
-returned `Access denied. This repository requires approval.` on 2026-06-16.
+At that point no complete Ideogram bundle was staged. Later on 2026-06-16,
+`cocktailpeanut/ideogram-4-fp8` was staged locally at
+`~/.mlxstudio/models/image/ideogram-4-fp8`; fresh scan artifact
+`docs/local/vmlx-flux-probes/2026-06-16-ideogram-fp8-mirror-scan/scan.json`
+reports `ideogram-4-fp8` as `readiness=loadableScaffold`, 4 safetensors,
+27,526,985,054 bytes, with tokenizer/text_encoder/transformer/
+unconditional_transformer/vae present. Ideogram still has no live generation
+evidence because `Ideogram4.generate` throws `FluxError.notImplemented`.
+Official `hf download --dry-run` for `ideogram-ai/ideogram-4-fp8` still returned
+`Access denied. This repository requires approval.` on 2026-06-16.
 Qwen-Image 6-bit was staged from `filipstrand/Qwen-Image-mflux-6bit` on
 2026-06-16; its slow tokenizer was converted to `tokenizer.json`, and the
 Diffusers-style mod-linear key layout (`img_norm1.mod_linear` /
@@ -82,7 +87,7 @@ This is the single starting doc. Read it top to bottom, then the per-model port 
 | **flux-schnell** | ✅ proven | ✅ proven | ⬜ (not staged) | `Libraries/vMLXFluxModels/Flux1/Flux1Native.swift` |
 | **qwen-image** (txt2img) | ✅ proven; ✅ 6-bit also proven | ⬜ (public mflux 8-bit not found) | ⬜ | `Libraries/vMLXFluxModels/Common/QwenImageNative.swift` |
 | qwen-image-edit | ✅ q4/q5 text-image edit proven; q3/q6 incomplete | — | — | `Libraries/vMLXFluxModels/QwenImage/QwenImageEditSupport.swift`; masks/inpaint pending |
-| ideogram (4) | ⬜ scaffold, no local bundle staged/proven | — | — | `Libraries/vMLXFluxModels/Ideogram4/Ideogram4.swift` (fp8/nf4 path missing) |
+| ideogram (4) | ⬜ scaffold; fp8 mirror staged/scans loadable; no live generation proof | — | — | `Libraries/vMLXFluxModels/Ideogram4/Ideogram4.swift` (fp8/nf4 path missing) |
 | flux1-dev/kontext/fill, flux2-klein, fibo, seedvr2, wan | ⬜ scaffold | — | — | registered, throw `notImplemented` |
 
 "Proven" = live-generated a coherent, prompt-accurate image that is **deterministic** (same seed+prompt -> byte-identical) and **prompt-sensitive** (different prompt same seed -> different coherent image). Per Eric's HARD RULE: *do not trust/claim a model works until you have generated and visually checked a real image.* 2026-06-16 rerun: z-image 4/8 and flux-schnell 4/8 passed live load + three-turn generate + SHA determinism/prompt-sensitivity + visual inspection. Qwen-image 4-bit also passed live load + 20-step generation + three-turn SHA determinism/prompt-sensitivity + visual inspection after the mflux guidance rescale fix; turn 1/3 apple SHA `2f1c27c68993fe9a537bca2cc019ac3d32d59818b92c606c00726104661bcea7`, turn 2 mountain SHA `2bf77ce59c8ed99c1b1aa5fb8940c9d35948b1763fbd360e14f577032b62f060`, artifact `docs/local/vmlx-flux-probes/2026-06-16-qwen-image-q4-guidance-proof/qwen-image-mflux-4bit-load.json`. Qwen-image 6-bit also passed live load + 20-step three-turn SHA determinism/prompt-sensitivity + visual inspection; turn 1/3 apple SHA `66e8187e887087e8a8e9227a99f16236c5ba15717a5e31e08a5772868b3a456a`, turn 2 mountain SHA `44069312716932d6d72181a808625a33777ed29af7723eea8f76b0ac5ba96a52`, artifact `docs/local/vmlx-flux-probes/2026-06-16-qwen-image-6bit-gen20-after-key-fix/Qwen-Image-mflux-6bit-load.json`.
@@ -90,7 +95,7 @@ This is the single starting doc. Read it top to bottom, then the per-model port 
 Qwen-image-edit q4/q5 are live-proven after fixing the source-image conditioning grid to match mflux. Source trace: mflux `qwen_image_edit.py` passes `vl_width/vl_height` into `QwenEditUtil.create_image_conditioning_latents`, and `qwen_edit_util.py` uses those VL dimensions for the source-image VAE encode when present. Swift now mirrors that in `QwenImageEditSupport.swift`: square source images encode conditioning at 384x384, pack 24x24=576 static latents, and denoise with 1024 target latents + 576 conditioning latents. q4 live proof artifact: `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-determinism-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json` (blue prompt SHA `005ab8baddfe9b7a94aa83f8ddd22d192e7e5a0275c556dcf2ead76a565e474a`, green-pear prompt SHA `815711be73a9e89599b3e97f9f15196115875103f9407d7b1b61bab33de8e3b4`, repeated blue prompt same SHA). q5 live proof artifact: `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q5-determinism/Qwen-Image-Edit-mflux-q5-load.json` (blue prompt SHA `5cd5d9197bd659bd8b59b4a2f2bca413266146ad4e08249289d5fa6a8025fa4e`, green-pear prompt SHA `d2c6c4eb4a19dcf48122b5216fc15ac37b9f5aa49c15f596acd1276a4df57034`, repeated blue prompt same SHA). Viewed q4/q5 outputs are coherent and prompt-sensitive. Boundary artifacts remain useful: `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-prompt-live/Qwen-Image-Edit-mflux-q4-load.json`, `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-vl-encode-live/Qwen-Image-Edit-mflux-q4-load.json`, `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-conditioning-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`, and `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-denoise-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`.
 
 **Next work, in priority order:**
-1. **Ideogram 4** — get HF approval for `ideogram-ai/ideogram-4-nf4` or `ideogram-ai/ideogram-4-fp8`, stage one local bundle, then implement the **fp8/nf4 quant path** (different from the MLX group-quant used by the others) + Qwen3 encoder + 34-layer DiT + unconditional transformer.
+1. **Ideogram 4** — local fp8 mirror bundle is now staged; implement the **fp8/nf4 quant path** (different from the MLX group-quant used by the others) + Qwen3 encoder + 34-layer DiT + unconditional transformer + VAE, then live-prove. Official `ideogram-ai/*` approval is still needed for canonical official bundles.
 2. **qwen-image-edit follow-through** — wire real masks/inpaint semantics. Today non-null masks are rejected before the edit pipeline loads; q3/q6 need complete local bundles before they can be exposed.
 3. **Full-precision** flux-schnell + z-image (download + prove with existing pipelines — should "just work").
 4. Consolidated PR of all the new models to `osaurus-ai/vmlx-swift` main.
@@ -176,8 +181,9 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter vML
 - ideogram: `ideogram-ai/ideogram-4-fp8` (the mflux canonical), `ideogram-ai/ideogram-4-nf4` (4-bit).
   Current account state: both repos are visible through `hf models info`, but
   `hf download --dry-run` is approval-gated (`Access denied. This repository
-  requires approval.`), so live Ideogram load/generation is blocked until access
-  is granted.
+  requires approval.`). The third-party `cocktailpeanut/ideogram-4-fp8` mirror is
+  staged locally and scans complete; live Ideogram generation remains blocked on
+  the missing native pipeline and fp8/nf4 path, not on local mirror availability.
 
 **TOKENIZER GOTCHA:** mflux bundles ship SLOW tokenizers (CLIP vocab.json+merges, T5 spiece.model). swift-transformers' `AutoTokenizer.from(modelFolder:)` needs `tokenizer.json` (fast). Convert once:
 ```python
@@ -279,7 +285,7 @@ Full per-model transcription specs are in `docs/FLUX_SCHNELL_PORT_PLAN.md` and `
 ## 9. How to continue (concrete next steps)
 1. **qwen-image-edit:** the q4/q5 text-image edit paths are live-proven. Source-image conditioning now follows mflux's VL-size path (`vlWidth/vlHeight`) instead of the 1024-area VAE target grid. Current proof artifacts: `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-determinism-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json`, `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q5-determinism/Qwen-Image-Edit-mflux-q5-load.json`, `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-conditioning-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json` (`latents_shape=1x576x64`, `image_ids_shape=1x576x3`), and `docs/local/vmlx-flux-probes/2026-06-16-qwen-edit-q4-denoise-after-cond-fix/Qwen-Image-Edit-mflux-q4-load.json` (`combined_velocity_shape=1x1600x64`). Current non-null masks are rejected before pipeline load; next qwen-edit work is real masks/inpaint semantics and complete q3/q6 bundle staging if those variants matter.
    - Current staged bundle is already present at `~/.mlxstudio/models/image/Qwen-Image-Edit-mflux`; use `Qwen-Image-Edit-mflux-q4` or `Qwen-Image-Edit-mflux-q5` for current Osaurus wiring. Keep q3/q6 hidden/blocked until their indexed shards/components are complete.
-2. **Ideogram 4:** get HF approval, then stage `ideogram-ai/ideogram-4-nf4` or `ideogram-ai/ideogram-4-fp8` locally before live proof. Port = Qwen3 text encoder (close to the qwen LM encoder) + 34-layer DiT (emb 4608, 18 heads, `llm_features 4096×13` = multi-layer Qwen3 hidden states, rope θ5e6) + unconditional transformer + VAE. **Build an fp8/nf4 dequant/matmul path** in `MFluxStore` (the transformer is fp8 in the mflux canonical bundle, not group-quant). Ref: `/tmp/mflux-ref/src/mflux/models/ideogram4/`.
+2. **Ideogram 4:** `cocktailpeanut/ideogram-4-fp8` is staged locally and scans complete; official `ideogram-ai/*` access remains approval-gated. Port = Qwen3 text encoder (close to the qwen LM encoder) + 34-layer DiT (emb 4608, 18 heads, `llm_features 4096×13` = multi-layer Qwen3 hidden states, rope θ5e6) + unconditional transformer + VAE. **Build an fp8/nf4 dequant/matmul path** in `MFluxStore` (the transformer is fp8 in the mflux canonical bundle, not group-quant). Ref: `/tmp/mflux-ref/src/mflux/models/ideogram4/`.
 3. **Full precision** flux/z-image: download, run the probe — existing pipelines (`MFluxLinear` handles non-quant). Should just work.
 4. **Consolidated osaurus PR:** keep `codex/mflux-qwen-edit-main` rebased on
    current `vmlx-origin/main`, keep standalone imports rewritten to
