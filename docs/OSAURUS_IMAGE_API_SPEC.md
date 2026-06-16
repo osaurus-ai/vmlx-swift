@@ -17,9 +17,12 @@ contract osaurus implements server-side and the UI builds against.
 > q4/q5 paths for normal testing, keep q3 blocked because its text-encoder index
 > references missing `text_encoder/3.safetensors`, keep q6 blocked until its
 > local bundle is complete, and hide mask/inpaint controls until wired.
-> Ideogram is metadata-visible on HF but not downloadable for the current account
-> yet (`Access denied. This repository requires approval.`), so keep it disabled
-> until a local bundle exists and live load/generation proof is captured.
+> Ideogram has a complete local fp8 mirror bundle staged from
+> `cocktailpeanut/ideogram-4-fp8`, and the scanner reports it as loadable
+> scaffold. Keep it disabled because the native `Ideogram4.generate` body still
+> throws `FluxError.notImplemented`, and no live generation proof exists.
+> Official `ideogram-ai/*` downloads still require approval for the current
+> account.
 > The HTTP surface below is the **proposed contract** for the osaurus team to
 > expose; design it once, wire all models through it.
 
