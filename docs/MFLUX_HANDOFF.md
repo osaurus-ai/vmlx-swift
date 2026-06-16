@@ -22,9 +22,10 @@ monorepo worktree also has fresh load artifacts from `/Users/eric/vmlx-swift-flu
 `docs/local/vmlx-flux-probes/2026-06-16-osaurus-qwen-edit-q4-load-final/Qwen-Image-Edit-mflux-q4-load.json`
 (`load_status=loaded`, pre-fix `native_runtime_status=native_pipeline_partial`).
 
-**2026-06-16 Osaurus PR #64 live-proof refresh:** rerun from
-`/Users/eric/vmlx-swift-fluxwt` on branch `codex/mflux-qwen-edit-main` at
-pre-doc commit `81fae70e`. Text-to-image artifacts:
+**2026-06-16 Osaurus PR #64 pre-merge live-proof refresh:** rerun from
+`/Users/eric/vmlx-swift-fluxwt` on then-active branch
+`codex/mflux-qwen-edit-main` at pre-doc commit `81fae70e`. Text-to-image
+artifacts:
 `docs/local/vmlx-flux-probes/2026-06-16-goal-zimage-4bit-explicit-gen/Z-Image-Turbo-mflux-4bit-load.json`,
 `docs/local/vmlx-flux-probes/2026-06-16-goal-zimage-8bit-explicit-gen/Z-Image-Turbo-mflux-8bit-load.json`,
 `docs/local/vmlx-flux-probes/2026-06-16-goal-flux-schnell-4bit-explicit-gen/FLUX.1-schnell-mflux-4bit-load.json`,
@@ -86,6 +87,43 @@ turn 2 blue watercolor mountain SHA
 Viewed outputs are coherent and prompt-sensitive. Current HF search did not find
 a public Qwen-Image mflux 8-bit bundle.
 
+**2026-06-16 current-main refresh:** after PR #67 merged, `/Users/eric/vmlx-swift-fluxwt`
+was fast-forwarded to `vmlx-origin/main` `9f1faea11aee78f17041c5bed6da039e70c11d05`
+and the supported rows were rerun from that main checkout. Source gate:
+`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter vMLXFluxTests`
+passed 48 tests with 0 failures; `swift build --product vmlxflux-probe` passed
+with existing Swift warnings. Live proof artifacts:
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-zimage-4bit/Z-Image-Turbo-mflux-4bit-load.json`
+(apple SHA `d4e90622247926338cdf25b70912b35ca1cb533b4d4b1855d88c1c1e8ad2362f`,
+mountain SHA `1b8fe70d72b2fb048bceb2e9a3d529dcfc673bf20e6496b3ae30d0d9e1c244fc`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-zimage-8bit/Z-Image-Turbo-mflux-8bit-load.json`
+(apple `a48724b2145ed1f580a60aa142463d67bc796ad41d51837270dbd0d7ac6bb6af`,
+mountain `4671f293c7302855df22579b51884cfd9e7323fbbd67dcb9e85d09c5b17670ee`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-flux-schnell-4bit/FLUX.1-schnell-mflux-4bit-load.json`
+(apple `d3ed219d4a33ac85de101f26aacb34ffc5c74eece283e65d626d3465e9a2eed5`,
+mountain `7f5847f352cf974caecbdf3feebcc06a96bebef528e7f15837a8ff4e8d65418a`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-flux-schnell-8bit/FLUX.1-schnell-mflux-8bit-load.json`
+(apple `6c4d247a60b101c0b3d3809cb0a2b3934ef9e5fbbc1a9e9125800593a8f147af`,
+mountain `728fe78dfae0e73c179d2e2e2f8320f7ee3452ad47e7a52a6a075cd4558191bd`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-qwen-image-4bit/qwen-image-mflux-4bit-load.json`
+(apple `941026906d25738c3dd1354a0066d2957e6e0840b09de7015460a301b937e8ec`,
+mountain `eb8af5d21bf08047a98eda008ce041734819e77a943ef8287ba8b126dd0e5b50`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-qwen-image-6bit/Qwen-Image-mflux-6bit-load.json`
+(apple `4ff67d3a3e89403d4516c77cd6806ca7682614227884744f1b37e91d99ea62c1`,
+mountain `e5cf83f268786f030dc0cc5384085e4ac4ac6bd7d2a5e4835d4e8da3f1a413`),
+`docs/local/vmlx-flux-probes/2026-06-16-current-main-qwen-edit-q4/Qwen-Image-Edit-mflux-q4-load.json`
+(blue/edit-repeat SHA `83755dc3c90a8669a2c882391c51e275c7737d379cd4aa746a42bb2e920a9568`,
+green-edit SHA `4c677d9e76cba3e37ebb58a4de23a374ccbd262201bdfb73329aff5134c872bb`),
+and `docs/local/vmlx-flux-probes/2026-06-16-current-main-qwen-edit-q5/Qwen-Image-Edit-mflux-q5-load.json`
+(blue/edit-repeat `cb4fcb2d2cf85161bd612cd15f5370b3863f62fa72d9a52ce79ba3d962eadc4c`,
+green-pear `b9c1534f0ccf3cf04c39596c89f2a829a26d0e1114c5bbbe1f1906658c738e37`).
+All rows loaded and completed all three turns; turn 1 and turn 3 match exactly
+for the repeated prompt, and turn 2 differs. Contact sheet viewed:
+`docs/local/vmlx-flux-outputs/2026-06-16-current-main-contact-sheet.png`.
+Visual note: z-image/flux/qwen text-to-image rows are coherent and prompt
+sensitive; qwen-edit q5 is clearly prompt-sensitive, and qwen-edit q4 is
+deterministic/prompt-sensitive but weaker than q5 on the 384px green-pear edit.
+
 This is the single starting doc. Read it top to bottom, then the per-model port plans.
 
 ---
@@ -109,21 +147,27 @@ Qwen-image-edit q4/q5 are live-proven after fixing the source-image conditioning
 1. **Ideogram 4** — local fp8 mirror bundle is now staged; `MFluxStore` can decode fp8 linear `weight_scale` rows, `WeightLoader` includes `unconditional_transformer`, and direct load validates sentinel keys from text encoder/conditional transformer/unconditional transformer/VAE. Next implement the Qwen3 encoder + 34-layer DiT + unconditional transformer execution + VAE path, extend nf4 if needed, then live-prove. Official `ideogram-ai/*` approval is still needed for canonical official bundles.
 2. **qwen-image-edit follow-through** — wire real masks/inpaint semantics. Today non-null masks are rejected before the edit pipeline loads; q3/q6 need complete local bundles before they can be exposed.
 3. **Full-precision** flux-schnell + z-image (download + prove with existing pipelines — should "just work").
-4. Consolidated PR of all the new models to `osaurus-ai/vmlx-swift` main.
+4. Osaurus app/server wiring: implement the `/v1/images/*` bridge from the
+   specs below, wrap every image request in the required `MetalGate` exclusion,
+   expose only proven variants, and pin Osaurus to `vmlx-origin/main`
+   `9f1faea11aee78f17041c5bed6da039e70c11d05` or a later verified main SHA.
 
 ---
 
 ## 1. Where the code lives
 
 - **vmlx-swift integration worktree:** `/Users/eric/vmlx-swift-fluxwt` — clean
-  Osaurus monorepo worktree for this lane. Current integration branch:
-  `codex/mflux-qwen-edit-main`, based on `vmlx-origin/main`.
+  Osaurus monorepo worktree for this lane. Current checked-out branch is
+  `main` at `vmlx-origin/main` `9f1faea11aee78f17041c5bed6da039e70c11d05`.
 - **Dirty local dev tree:** `/Users/eric/vmlx-swift` — branch
   `codex/mimo-v25-cache-contract` carries unrelated MLXPress/MiMo/Gemma/JANG
   WIP; do not commit the image-gen integration from that dirty checkout.
 - **Pushable remotes:**
   - `jjang-ai/vmlx-flux` (standalone SwiftPM engine) — **all native work is pushed here** on branch `native-zimage-proven`. This is the durable home. Latest: branch HEAD.
-  - `osaurus-ai/vmlx-swift` (the monorepo) — z-image engine vendored + merged via **PR #63** (`90e64687`). Current qwen/flux-schnell integration is on `codex/mflux-qwen-edit-main` for PR/merge to main. Remote name `vmlx-origin`. (Note: the `osaurus-upstream` remote is DO_NOT_PUSH — only the mlx-swift fork.)
+  - `osaurus-ai/vmlx-swift` (the monorepo) — image engine work is merged to
+    `main` through PRs #63, #64, #65, #66, and #67. Remote name
+    `vmlx-origin`. (Note: the `osaurus-upstream` remote is DO_NOT_PUSH — only
+    the mlx-swift fork.)
 - **Standalone clone (for vmlx-flux pushes):** `/Users/eric/vmlx-flux-push` (sibling to `../vmlx-swift-lm` so its path-deps resolve).
 
 ### Module layout (vendored in `vmlx-swift/Package.swift` as in-tree targets)
@@ -302,12 +346,11 @@ Full per-model transcription specs are in `docs/FLUX_SCHNELL_PORT_PLAN.md` and `
    - Current staged bundle is already present at `~/.mlxstudio/models/image/Qwen-Image-Edit-mflux`; use `Qwen-Image-Edit-mflux-q4` or `Qwen-Image-Edit-mflux-q5` for current Osaurus wiring. Keep q3/q6 hidden/blocked until their indexed shards/components are complete.
 2. **Ideogram 4:** `cocktailpeanut/ideogram-4-fp8` is staged locally, scans complete, and load-validates required sentinel keys; official `ideogram-ai/*` access remains approval-gated. Port = Qwen3 text encoder (close to the qwen LM encoder) + 34-layer DiT (emb 4608, 18 heads, `llm_features 4096×13` = multi-layer Qwen3 hidden states, rope θ5e6) + unconditional transformer execution + VAE. `MFluxStore` already has the fp8 `weight_scale` linear path and `WeightLoader` already includes `unconditional_transformer`; remaining quant work is nf4 if that bundle is used. Ref: `/tmp/mflux-ref/src/mflux/models/ideogram4/`.
 3. **Full precision** flux/z-image: download, run the probe — existing pipelines (`MFluxLinear` handles non-quant). Should just work.
-4. **Consolidated osaurus PR:** keep `codex/mflux-qwen-edit-main` rebased on
-   current `vmlx-origin/main`, keep standalone imports rewritten to
-   `VMLXTokenizers` in the monorepo, verify build/tests (Swift 6), then open or
-   update the PR to main. The mlx-swift / swift-transformers fork pins must
-   match `../vmlx-swift-lm` (mlx-swift `0a56f904`, swift-transformers osaurus
-   fork `087a66b1`) — see vmlx-flux Package.swift.
+4. **Osaurus app/server bridge:** the consolidated vMLX work is already on
+   `osaurus-ai/vmlx-swift` main. Next osaurus-side work is the `/v1/images/*`
+   bridge, model list/capability mapping, progress SSE, output file policy, and
+   `MetalGate` exclusion. Pin Osaurus to `vmlx-origin/main`
+   `9f1faea11aee78f17041c5bed6da039e70c11d05` or a later verified main SHA.
 
 **Reference:** the mflux Python source (the source of truth for every arch + weight key) is at `/tmp/mflux-ref` (clone of `github.com/filipstrand/mflux`). Re-clone if gone.
 
@@ -315,12 +358,18 @@ Full per-model transcription specs are in `docs/FLUX_SCHNELL_PORT_PLAN.md` and `
 
 ## 10. GH PR / commit references
 - `osaurus-ai/vmlx-swift` **PR #63** — z-image engine vendored + merged to main (`36aebd42→90e64687`).
-- `osaurus-ai/vmlx-swift` branch **`codex/mflux-qwen-edit-main`** — current
-  Osaurus monorepo sync branch, based on `vmlx-origin/main` `90e64687`. Its
-  HEAD vendors the standalone flux-schnell + qwen-image pipelines, fixes
-  qwen-image-edit q4 conditioning-grid parity with mflux, and updates the
-  osaurus image API / integration docs for team wiring.
-- `jjang-ai/vmlx-flux` branch **`native-zimage-proven`** — all native work: `9915417` (z-image vendor+proof), `4a88089` (resolution fix), `a2c1a28` (flux-schnell working), `f82dd1b` (probe flags), `fc6e5b1` (qwen-image working + ideogram scaffold), `f7014e0` (handoff); current HEAD adds qwen-edit nested scan, manifest-gated q4 load, q4 source-image tensor preprocess proof, q4 VAE conditioning latent proof, q4 Qwen2.5-VL prompt-image encode proof, q4 first transformer velocity proof, qwen mflux guidance rescale, and q4 edit-loop PNG plumbing. Open a PR from this branch to vmlx-flux main when ready.
+- `osaurus-ai/vmlx-swift` **PR #64** — flux-schnell, qwen-image,
+  qwen-image-edit q4/q5, and Osaurus image docs merged to main.
+- `osaurus-ai/vmlx-swift` **PR #65** — staged Ideogram fp8 mirror status/docs
+  merged to main.
+- `osaurus-ai/vmlx-swift` **PR #66** — Ideogram fp8 `weight_scale` loader
+  support and `unconditional_transformer` loader support merged to main.
+- `osaurus-ai/vmlx-swift` **PR #67** — Ideogram fp8 load-time sentinel
+  validation merged to main. Merge commit:
+  `9f1faea11aee78f17041c5bed6da039e70c11d05`.
+- `jjang-ai/vmlx-flux` branch **`native-zimage-proven`** — standalone mirror of
+  the native work. Current pushed checkpoint includes Ideogram fp8 load
+  validation (`6d7901d01b19f76b9d4a0754188eff1dba80b10c`).
 - Wiki note (private `jjang-ai/wiki`): `notes/2026-06-15-vmlx-flux-native-z-image-proven-fork-lockstep.md`.
 - Per-project memory: `~/.claude/projects/-Users-eric-vmlx-swift/memory/vmlx-flux-native-zimage-integration.md`.
 - Proof artifacts (gitignored): `docs/local/vmlx-flux-{outputs,probes}/` (PROOF-*, FLUX-proof, QWEN-proof, Q8b-*).

@@ -27,6 +27,12 @@ contract osaurus implements server-side and the UI builds against.
 > throws `FluxError.notImplemented`, and no live generation proof exists.
 > Official `ideogram-ai/*` downloads still require approval for the current
 > account.
+> Current-main proof refresh: after PR #67, `vmlx-origin/main`
+> `9f1faea11aee78f17041c5bed6da039e70c11d05` was live-probed with
+> z-image 4/8, flux-schnell 4/8, qwen-image 4/6, and qwen-edit q4/q5.
+> Artifact root: `docs/local/vmlx-flux-probes/2026-06-16-current-main-*`;
+> viewed contact sheet:
+> `docs/local/vmlx-flux-outputs/2026-06-16-current-main-contact-sheet.png`.
 > The HTTP surface below is the **proposed contract** for the osaurus team to
 > expose; design it once, wire all models through it.
 
