@@ -543,7 +543,7 @@ private func qvL2Norm(_ x: MLXArray, weight: MLXArray, eps: Float = 1e-12) -> ML
     let c = x.dim(1)
     let l2 = sqrt(sum(x * x, axis: 1, keepDims: true))
     let denom = maximum(l2, MLXArray(eps))
-    return (x / denom) * Float(c).squareRoot() * weight.reshaped([1, c, 1, 1])
+    return (x / denom) * MLXArray(Float(c).squareRoot()) * weight.reshaped([1, c, 1, 1])
 }
 
 private final class QVResBlock {
