@@ -116,6 +116,15 @@ internal enum StringOrNumberOrDict: Codable {
 
 // MARK: - Configuration
 
+/// Attention-output gate mode. The bundle's `gating` field is a Bool on the
+/// poolside XS.2 line (legacy per-head) and a String on Laguna-M.1
+/// (`"per-element"`). `none` disables the gate.
+public enum LagunaGateMode: String, Codable, Sendable {
+    case perElement = "per_element"
+    case perHead = "per_head"
+    case none = "none"
+}
+
 public struct LagunaConfiguration: Codable, Sendable {
     public var modelType: String
     public var vocabularySize: Int
@@ -138,7 +147,10 @@ public struct LagunaConfiguration: Codable, Sendable {
     public var sharedExpertIntermediateSize: Int
     public var moeRoutedScalingFactor: Float
     public var moeApplyRouterWeightOnInput: Bool
-    public var gating: Bool
+    public var gateMode: LagunaGateMode
+
+    /// Back-compat: any gate enabled. Existing XS.2 call sites read `gating`.
+    public var gating: Bool { gateMode != .none }
 
     /// Per-layer arrays. Defaults populated by `decode` if missing
     /// from the bundle's `config.json` (some converted bundles omit
@@ -176,7 +188,7 @@ public struct LagunaConfiguration: Codable, Sendable {
         case sharedExpertIntermediateSize = "shared_expert_intermediate_size"
         case moeRoutedScalingFactor = "moe_routed_scaling_factor"
         case moeApplyRouterWeightOnInput = "moe_apply_router_weight_on_input"
-        case gating
+        case gateMode = "gating"
         case layerTypes = "layer_types"
         case mlpLayerTypes = "mlp_layer_types"
         case numAttentionHeadsPerLayer = "num_attention_heads_per_layer"
@@ -215,7 +227,20 @@ public struct LagunaConfiguration: Codable, Sendable {
             try c.decodeIfPresent(Float.self, forKey: .moeRoutedScalingFactor) ?? 2.5
         self.moeApplyRouterWeightOnInput =
             try c.decodeIfPresent(Bool.self, forKey: .moeApplyRouterWeightOnInput) ?? false
-        self.gating = try c.decodeIfPresent(Bool.self, forKey: .gating) ?? true
+        // `gating` is a Bool on XS.2 (true → legacy per-head) and a String on
+        // Laguna-M.1 (`"per-element"`/`"per-head"`). decodeIfPresent(Bool) throws
+        // on a string, so probe both shapes explicitly.
+        if let s = try? c.decode(String.self, forKey: .gateMode) {
+            switch s {
+            case "per-element", "per_element": self.gateMode = .perElement
+            case "none", "false", "off": self.gateMode = .none
+            default: self.gateMode = .perHead
+            }
+        } else if let b = try? c.decode(Bool.self, forKey: .gateMode) {
+            self.gateMode = b ? .perHead : .none
+        } else {
+            self.gateMode = .perHead
+        }
 
         let lt = try c.decodeIfPresent([String].self, forKey: .layerTypes) ?? []
         self.layerTypes = lt.isEmpty

@@ -182,6 +182,13 @@ public enum LLMTypeRegistry {
                 let probe = try? JSONDecoder.json5().decode(LagunaProbe.self, from: data)
                 let cfg = try JSONDecoder.json5().decode(
                     LagunaConfiguration.self, from: data)
+                // Laguna-M.1 (Mistral lineage): per-element gating, SEPARATE
+                // q/k/v/o_proj, per-module affine quant, all-full-attention.
+                // Architecturally distinct from the poolside XS.2 fused-qkv /
+                // JANGTQ path below — route to the dedicated affine engine.
+                if cfg.gateMode == .perElement {
+                    return LagunaM1Model(cfg)
+                }
                 let isMxtq =
                     probe?.weightFormat?.lowercased() == "mxtq"
                     || probe?.mxtqBits != nil
