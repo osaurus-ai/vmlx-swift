@@ -322,10 +322,14 @@ struct VMLXFluxProbe {
                     steps: options.steps,
                     guidance: options.guidance ?? 4.0)
                 let conditioningStart = Date()
-                let conditioning = try QwenImageEditConditioner.encode(
+                let vaeInputs = try options.sourceImages.map {
+                    try QwenImageEditPreprocessor.vaeInput(sourceImage: $0, plan: plan)
+                }
+                let trace = try QwenImageEditConditioner.trace(
                     modelPath: local.directory,
                     sourceImages: options.sourceImages,
                     plan: plan)
+                let conditioning = trace.conditioning
                 payload["qwen_edit_conditioning"] = [
                     "status": "encoded",
                     "elapsed_seconds": Date().timeIntervalSince(conditioningStart),
@@ -338,6 +342,16 @@ struct VMLXFluxProbe {
                     "patch_rows": conditioning.patchRows,
                     "patch_columns": conditioning.patchColumns,
                     "image_count": conditioning.imageCount,
+                    "vae_input_stats": vaeInputs.map { mlxStats($0.tensor) },
+                    "encoded_latents_stats": trace.encodedLatents.map { mlxStats($0) },
+                    "encoder_snapshot_stats": trace.encoderSnapshots.map { snapshots in
+                        snapshots.map { snapshot in
+                            [
+                                "name": snapshot.name,
+                                "stats": mlxStats(snapshot.value),
+                            ] as [String: Any]
+                        }
+                    },
                     "latents_shape": conditioning.latents.shape,
                     "image_ids_shape": conditioning.imageIDs.shape,
                     "latents_stats": mlxStats(conditioning.latents),

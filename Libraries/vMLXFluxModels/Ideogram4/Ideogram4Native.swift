@@ -252,8 +252,8 @@ enum Ideogram4Latents {
     }
 
     static func createNoise(seed: UInt64?, width: Int, height: Int) -> MLXArray {
-        if let seed { MLXRandom.seed(seed) }
-        return MLXRandom.normal([1, (height / 16) * (width / 16), 128]).asType(.float32)
+        MLXRandom.normal([1, (height / 16) * (width / 16), 128], key: seed.map(MLXRandom.key))
+            .asType(.float32)
     }
 
     static func unpack(_ latents: MLXArray, width: Int, height: Int) throws -> MLXArray {

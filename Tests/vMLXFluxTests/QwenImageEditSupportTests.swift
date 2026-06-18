@@ -332,6 +332,24 @@ final class QwenImageEditSupportTests: XCTestCase {
         XCTAssertEqual(values[384 * 384 * 2], -1.0, accuracy: 0.001)
     }
 
+    func testImageIOPreservesProfiledRGBSamplesForMFluxParity() throws {
+        let source = try makePNG(
+            width: 1,
+            height: 1,
+            rgba: (206, 119, 81, 255),
+            colorSpace: CGColorSpace(name: "kCGColorSpaceGenericRGB" as CFString))
+
+        let values = try vMLXFluxKit.ImageIO.readRGBValues(
+            source,
+            width: 1,
+            height: 1,
+            normalization: .zeroToOne)
+
+        XCTAssertEqual(values[0], 206.0 / 255.0, accuracy: 0.001)
+        XCTAssertEqual(values[1], 119.0 / 255.0, accuracy: 0.001)
+        XCTAssertEqual(values[2], 81.0 / 255.0, accuracy: 0.001)
+    }
+
     func testConditioningLatentsPackEncodedVAELatentsWithImageIDs() throws {
         let encoded = MLXArray((0 ..< (16 * 4 * 6)).map(Float.init), [1, 16, 4, 6])
             .asType(.float32)
@@ -433,7 +451,8 @@ final class QwenImageEditSupportTests: XCTestCase {
     private func makePNG(
         width: Int,
         height: Int,
-        rgba: (UInt8, UInt8, UInt8, UInt8) = (255, 255, 255, 255)
+        rgba: (UInt8, UInt8, UInt8, UInt8) = (255, 255, 255, 255),
+        colorSpace: CGColorSpace? = nil
     ) throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("qwen-edit-source-\(UUID().uuidString).png")
@@ -455,7 +474,7 @@ final class QwenImageEditSupportTests: XCTestCase {
                 bitsPerComponent: 8,
                 bitsPerPixel: 32,
                 bytesPerRow: bytesPerRow,
-                space: CGColorSpaceCreateDeviceRGB(),
+                space: colorSpace ?? CGColorSpaceCreateDeviceRGB(),
                 bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
                 provider: provider,
                 decode: nil,

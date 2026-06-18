@@ -279,6 +279,17 @@ public struct QwenImageEditConditioningLatents {
     }
 }
 
+public struct QwenImageEditConditioningTrace {
+    public let conditioning: QwenImageEditConditioningLatents
+    public let encodedLatents: [MLXArray]
+    public let encoderSnapshots: [[QwenImageEditLatentSnapshot]]
+}
+
+public struct QwenImageEditLatentSnapshot {
+    public let name: String
+    public let value: MLXArray
+}
+
 public struct QwenImageEditImageShape {
     public let frame: Int
     public let height: Int
@@ -618,6 +629,15 @@ public enum QwenImageEditConditioner {
         return try encode(store: store, sourceImages: sourceImages, plan: plan)
     }
 
+    public static func trace(
+        modelPath: URL,
+        sourceImages: [URL],
+        plan: QwenImageEditPreprocessPlan
+    ) throws -> QwenImageEditConditioningTrace {
+        let store = MFluxStore(try WeightLoader.load(from: modelPath))
+        return try trace(store: store, sourceImages: sourceImages, plan: plan)
+    }
+
     static func encode(
         store: MFluxStore,
         sourceImage: URL,
@@ -656,6 +676,51 @@ public enum QwenImageEditConditioner {
             patchRows: plan.conditioningPatchRows,
             patchColumns: plan.conditioningPatchColumns,
             imageCount: sourceImages.count)
+    }
+
+    static func trace(
+        store: MFluxStore,
+        sourceImages: [URL],
+        plan: QwenImageEditPreprocessPlan
+    ) throws -> QwenImageEditConditioningTrace {
+        guard !sourceImages.isEmpty else {
+            throw FluxError.invalidRequest("Qwen edit conditioning requires at least one source image")
+        }
+        let encoder = try Qwen3DVAEEncoder(store: store)
+        var latentParts: [MLXArray] = []
+        var idParts: [MLXArray] = []
+        var encodedParts: [MLXArray] = []
+        var encoderSnapshotParts: [[QwenImageEditLatentSnapshot]] = []
+        latentParts.reserveCapacity(sourceImages.count)
+        idParts.reserveCapacity(sourceImages.count)
+        encodedParts.reserveCapacity(sourceImages.count)
+        encoderSnapshotParts.reserveCapacity(sourceImages.count)
+        for sourceImage in sourceImages {
+            let vaeInput = try QwenImageEditPreprocessor.vaeInput(sourceImage: sourceImage, plan: plan)
+            let snapshots = encoder.encodeSnapshots(vaeInput.tensor)
+            guard let encoded = snapshots.last?.value else {
+                throw FluxError.invalidRequest("Qwen edit VAE encoder trace produced no encoded latents")
+            }
+            eval(encoded)
+            encodedParts.append(encoded)
+            encoderSnapshotParts.append(snapshots)
+            let conditioning = try QwenImageEditPreprocessor.conditioningLatents(
+                encodedLatents: encoded,
+                height: plan.vlHeight,
+                width: plan.vlWidth)
+            latentParts.append(conditioning.latents)
+            idParts.append(conditioning.imageIDs)
+        }
+        let conditioning = QwenImageEditConditioningLatents(
+            latents: concatenated(latentParts, axis: 1),
+            imageIDs: concatenated(idParts, axis: 1),
+            patchRows: plan.conditioningPatchRows,
+            patchColumns: plan.conditioningPatchColumns,
+            imageCount: sourceImages.count)
+        return QwenImageEditConditioningTrace(
+            conditioning: conditioning,
+            encodedLatents: encodedParts,
+            encoderSnapshots: encoderSnapshotParts)
     }
 }
 
@@ -840,15 +905,15 @@ public enum QwenImageEditDenoiseProbe {
         let targetRows = plan.outputHeight / 16
         let targetColumns = plan.outputWidth / 16
         let targetCount = targetRows * targetColumns
-        if let seed { MLXRandom.seed(seed) }
-        let targetLatents = MLXRandom.normal([1, targetCount, 64]).asType(.float32)
+        let targetLatents = MLXRandom.normal([1, targetCount, 64], key: seed.map(MLXRandom.key))
+            .asType(.float32)
         let inputs = try QwenImageEditTransformerInputs(
             targetLatents: targetLatents,
             targetPatchRows: targetRows,
             targetPatchColumns: targetColumns,
             conditioning: conditioning)
         let transformer = try QwenTransformer(store: store)
-        let scheduler = FlowMatchEulerScheduler(steps: plan.steps, imageSeqLen: targetCount)
+        let scheduler = FlowMatchEulerScheduler.qwenImage(steps: plan.steps, imageSeqLen: targetCount)
         let imageShapes = inputs.imageShapes.map {
             (frame: $0.frame, height: $0.height, width: $0.width)
         }
@@ -935,9 +1000,9 @@ final class QwenImageEditPipeline {
         let targetRows = plan.outputHeight / 16
         let targetColumns = plan.outputWidth / 16
         let targetCount = targetRows * targetColumns
-        if let seed { MLXRandom.seed(seed) }
-        var latents = MLXRandom.normal([1, targetCount, 64]).asType(.float32)
-        let scheduler = FlowMatchEulerScheduler(steps: plan.steps, imageSeqLen: targetCount)
+        var latents = MLXRandom.normal([1, targetCount, 64], key: seed.map(MLXRandom.key))
+            .asType(.float32)
+        let scheduler = FlowMatchEulerScheduler.qwenImage(steps: plan.steps, imageSeqLen: targetCount)
 
         let start = Date()
         for step in 0 ..< plan.steps {

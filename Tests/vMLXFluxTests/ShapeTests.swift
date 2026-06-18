@@ -62,6 +62,19 @@ final class ShapeTests: XCTestCase {
         XCTAssertEqual(above, 1.15, accuracy: 1e-6, "clamps at max")
     }
 
+    func testQwenImageEditSchedulerMatchesMFluxTerminalShift() {
+        let scheduler = FlowMatchEulerScheduler.qwenImage(
+            steps: 4,
+            imageSeqLen: 4096)
+
+        XCTAssertEqual(scheduler.sigmas.count, 5)
+        XCTAssertEqual(scheduler.sigmas[0], 1.0, accuracy: 0.000001)
+        XCTAssertEqual(scheduler.sigmas[1], 0.76670943, accuracy: 0.000001)
+        XCTAssertEqual(scheduler.sigmas[2], 0.45561380, accuracy: 0.000001)
+        XCTAssertEqual(scheduler.sigmas[3], 0.02, accuracy: 0.000001)
+        XCTAssertEqual(scheduler.sigmas[4], 0.0, accuracy: 0.000001)
+    }
+
     // MARK: - FluxDiTConfig presets
 
     func testFluxDiTConfigPresetsSanity() {

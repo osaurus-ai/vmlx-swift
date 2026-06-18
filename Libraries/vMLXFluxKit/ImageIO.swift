@@ -55,7 +55,7 @@ public enum ImageIO {
 
         let bytesPerRow = width * 4
         var rgba = [UInt8](repeating: 0, count: height * bytesPerRow)
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let colorSpace = image.colorSpace ?? CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
             | CGBitmapInfo.byteOrder32Big.rawValue
         let rendered = rgba.withUnsafeMutableBytes { buffer -> Bool in

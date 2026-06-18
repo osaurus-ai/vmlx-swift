@@ -38,7 +38,11 @@ public struct FlowMatchEulerScheduler: Sendable {
         steps: Int,
         imageSeqLen: Int = 4096,
         baseShift: Float = 0.5,
-        maxShift: Float = 1.15
+        maxShift: Float = 1.15,
+        baseSeqLen: Float = 256,
+        maxSeqLen: Float = 4096,
+        shiftTerminal: Float? = nil,
+        exponentialShift: Bool = false
     ) {
         self.steps = steps
 
@@ -46,7 +50,9 @@ public struct FlowMatchEulerScheduler: Sendable {
         let shift = Self.computeShift(
             imageSeqLen: imageSeqLen,
             baseShift: baseShift,
-            maxShift: maxShift
+            maxShift: maxShift,
+            baseSeqLen: baseSeqLen,
+            maxSeqLen: maxSeqLen
         )
 
         // Linspace sigmas from 1 → 0 over (steps + 1) points.
@@ -56,13 +62,39 @@ public struct FlowMatchEulerScheduler: Sendable {
             rawSigmas.append(1.0 - t)
         }
 
-        // Apply the flow-match shift: sigma' = shift * sigma / (1 + (shift - 1) * sigma)
-        self.sigmas = rawSigmas.map { sigma in
-            shift * sigma / (1.0 + (shift - 1.0) * sigma)
+        let shifted = rawSigmas.dropLast().map { sigma in
+            if exponentialShift {
+                let expShift = exp(shift)
+                return expShift / (expShift + (1.0 / sigma - 1.0))
+            }
+            return shift * sigma / (1.0 + (shift - 1.0) * sigma)
+        }
+        if let shiftTerminal, let last = shifted.last {
+            let scale = (1.0 - last) / (1.0 - shiftTerminal)
+            self.sigmas = shifted.map { sigma in
+                1.0 - ((1.0 - sigma) / scale)
+            } + [0.0]
+        } else {
+            self.sigmas = shifted + [0.0]
         }
 
         // Timesteps match sigmas[0..<steps] (discrete conditioning value).
         self.timesteps = Array(sigmas.prefix(steps)).map { $0 * 1000.0 }
+    }
+
+    public static func qwenImage(
+        steps: Int,
+        imageSeqLen: Int
+    ) -> FlowMatchEulerScheduler {
+        FlowMatchEulerScheduler(
+            steps: steps,
+            imageSeqLen: imageSeqLen,
+            baseShift: 0.5,
+            maxShift: 0.9,
+            baseSeqLen: 256,
+            maxSeqLen: 8192,
+            shiftTerminal: 0.02,
+            exponentialShift: true)
     }
 
     /// Apply a single Euler update step. `latent` is the current noisy
@@ -83,11 +115,11 @@ public struct FlowMatchEulerScheduler: Sendable {
     public static func computeShift(
         imageSeqLen: Int,
         baseShift: Float = 0.5,
-        maxShift: Float = 1.15
+        maxShift: Float = 1.15,
+        baseSeqLen: Float = 256,
+        maxSeqLen: Float = 4096
     ) -> Float {
-        let minSeq: Float = 256
-        let maxSeq: Float = 4096
-        let t = (Float(imageSeqLen) - minSeq) / (maxSeq - minSeq)
+        let t = (Float(imageSeqLen) - baseSeqLen) / (maxSeqLen - baseSeqLen)
         let clamped = min(max(t, 0), 1)
         return baseShift + (maxShift - baseShift) * clamped
     }

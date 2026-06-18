@@ -77,6 +77,7 @@ check(Boolean(qwenEdit), "manifest missing qwen-image-edit model");
 if (qwenEdit) {
   const shownIds = new Set((qwenEdit.variants ?? []).map((variant) => variant.model_id));
   check(shownIds.has("Qwen-Image-Edit-mflux-q4"), "qwen edit q4 must remain exposed");
+  check(shownIds.has("Qwen-Image-Edit-mflux-q5"), "qwen edit q5 must remain exposed");
   check(shownIds.has("Qwen-Image-Edit-mflux-q8"), "qwen edit q8 must remain exposed");
   check(!shownIds.has("Qwen-Image-Edit-mflux-q3"), "qwen edit q3 must not be exposed as a normal variant");
   check((qwenEdit.hide_controls ?? []).includes("mask"), "qwen edit must hide mask controls");
@@ -84,16 +85,21 @@ if (qwenEdit) {
   const blockedIds = new Set((qwenEdit.blocked_variants ?? []).map((variant) => variant.model_id));
   check(blockedIds.has("Qwen-Image-Edit-mflux-q3"), "qwen edit q3 boundary must be listed as blocked");
   const q4 = (qwenEdit.variants ?? []).find((variant) => variant.model_id === "Qwen-Image-Edit-mflux-q4");
+  const q5 = (qwenEdit.variants ?? []).find((variant) => variant.model_id === "Qwen-Image-Edit-mflux-q5");
   const q8 = (qwenEdit.variants ?? []).find((variant) => variant.model_id === "Qwen-Image-Edit-mflux-q8");
-  check((q4?.proof_status ?? "").includes("current_ee9"), "qwen edit q4 proof status must mention current ee9");
-  check((q8?.proof_status ?? "").includes("current_ee9"), "qwen edit q8 proof status must mention current ee9");
+  check((q4?.proof_status ?? "").includes("20260618"), "qwen edit q4 proof status must mention 20260618 stress proof");
+  check((q5?.proof_status ?? "").includes("20260618"), "qwen edit q5 proof status must mention 20260618 stress proof");
+  check((q8?.proof_status ?? "").includes("20260618"), "qwen edit q8 proof status must mention 20260618 stress proof");
 }
 
 const ideogram = manifest.models?.find((model) => model.canonical === "ideogram");
 check(Boolean(ideogram), "manifest missing ideogram model");
 if (ideogram) {
   const ids = new Set((ideogram.variants ?? []).map((variant) => variant.model_id));
-  check(ideogram.ui_exposure === "show_for_testing_with_prompt_caveat", "ideogram must keep prompt-caveat UI exposure");
+  check(
+    ideogram.ui_exposure === "show_for_testing_with_json_caption_caveat",
+    "ideogram must keep JSON-caption caveat UI exposure"
+  );
   check(ids.has("ideogram-4-fp8"), "ideogram fp8 staged mirror variant missing");
   check(ids.has("ideogram-4-nf4"), "ideogram NF4 staged mirror variant missing");
   check((ideogram.hide_controls ?? []).includes("mask"), "ideogram must hide mask controls");

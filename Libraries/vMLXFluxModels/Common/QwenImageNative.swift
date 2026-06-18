@@ -672,6 +672,7 @@ private final class QVUpBlock {
         if let resample { h = resample(h) }
         return h
     }
+
 }
 
 private final class QVDownBlock {
@@ -692,6 +693,24 @@ private final class QVDownBlock {
         for r in resnets { h = r(h) }
         if let resample { h = resample(h) }
         return h
+    }
+
+    func snapshots(_ x: MLXArray, prefix: String) -> ([QwenImageEditLatentSnapshot], MLXArray) {
+        var h = x
+        var output: [QwenImageEditLatentSnapshot] = []
+        func snap(_ name: String, _ value: MLXArray) {
+            eval(value)
+            output.append(QwenImageEditLatentSnapshot(name: name, value: value))
+        }
+        for (index, r) in resnets.enumerated() {
+            h = r(h)
+            snap("\(prefix)_res_\(index)", h)
+        }
+        if let resample {
+            h = resample(h)
+            snap("\(prefix)_resample", h)
+        }
+        return (output, h)
     }
 }
 
@@ -735,6 +754,39 @@ final class Qwen3DVAEEncoder {
         let meanA = MLXArray(Qwen3DVAEStats.mean, [1, 16, 1, 1])
         let stdA = MLXArray(Qwen3DVAEStats.std, [1, 16, 1, 1])
         return (h - meanA) / stdA
+    }
+
+    func encodeSnapshots(_ image: MLXArray) -> [QwenImageEditLatentSnapshot] {
+        var snapshots: [QwenImageEditLatentSnapshot] = []
+        func snap(_ name: String, _ value: MLXArray) {
+            eval(value)
+            snapshots.append(QwenImageEditLatentSnapshot(name: name, value: value))
+        }
+        var h = convIn(image)
+        snap("conv_in", h)
+        for (index, d) in down.enumerated() {
+            let (downSnapshots, next) = d.snapshots(h, prefix: "down_\(index)")
+            h = next
+            snapshots.append(contentsOf: downSnapshots)
+            snap("down_\(index)", h)
+        }
+        h = midRes1(midAttn(midRes0(h)))
+        snap("mid_block", h)
+        h = qvL2Norm(h, weight: normOut)
+        snap("norm_out", h)
+        h = silu(h)
+        snap("silu_out", h)
+        h = convOut(h)
+        snap("conv_out", h)
+        h = quant(h)
+        snap("quant", h)
+        h = h[0..., 0 ..< 16, 0..., 0...]
+        snap("quant_first16", h)
+        let meanA = MLXArray(Qwen3DVAEStats.mean, [1, 16, 1, 1])
+        let stdA = MLXArray(Qwen3DVAEStats.std, [1, 16, 1, 1])
+        let normalized = (h - meanA) / stdA
+        snap("normalized", normalized)
+        return snapshots
     }
 }
 
@@ -829,9 +881,9 @@ final class QwenImagePipeline {
 
         let latH = height / 16, latW = width / 16
         let hw = latH * latW
-        if let seed { MLXRandom.seed(seed) }
-        var latents = MLXRandom.normal([1, hw, 64]).asType(.float32)
-        let scheduler = FlowMatchEulerScheduler(steps: steps, imageSeqLen: hw)
+        var latents = MLXRandom.normal([1, hw, 64], key: seed.map(MLXRandom.key))
+            .asType(.float32)
+        let scheduler = FlowMatchEulerScheduler.qwenImage(steps: steps, imageSeqLen: hw)
 
         let start = Date()
         for step in 0 ..< steps {

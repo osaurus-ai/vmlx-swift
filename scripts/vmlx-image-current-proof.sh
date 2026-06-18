@@ -27,8 +27,16 @@ IDEOGRAM_STEPS="${VMLX_IMAGE_PROOF_IDEOGRAM_STEPS:-20}"
 SKIP_BUILD="${VMLX_IMAGE_PROOF_SKIP_BUILD:-0}"
 RUN_CONTRACT_CHECK="${VMLX_IMAGE_PROOF_CONTRACT_CHECK:-1}"
 SUMMARY_ONLY="${VMLX_IMAGE_PROOF_SUMMARY_ONLY:-0}"
+MIN_OPEN_FILES="${VMLX_IMAGE_PROOF_MIN_OPEN_FILES:-4096}"
 
 mkdir -p "$ART_ROOT" "$OUT_ROOT"
+
+if [[ "$SUMMARY_ONLY" != "1" ]]; then
+  CURRENT_OPEN_FILES="$(ulimit -n)"
+  if [[ "$CURRENT_OPEN_FILES" != "unlimited" && "$CURRENT_OPEN_FILES" -lt "$MIN_OPEN_FILES" ]]; then
+    ulimit -n "$MIN_OPEN_FILES" 2>/dev/null || true
+  fi
+fi
 
 if [[ "$SKIP_BUILD" != "1" && "$SUMMARY_ONLY" != "1" ]]; then
   swift build --product vmlxflux-probe
@@ -76,8 +84,8 @@ APPLE_PROMPT="a red apple on a plain white background, centered, clean product p
 MOUNTAIN_PROMPT="a blue mountain landscape under a golden sun, watercolor"
 EDIT_APPLE_PROMPT="turn the apple blue while keeping it centered on a plain white background"
 EDIT_PEAR_PROMPT="turn the apple into a green pear on a plain white background"
-IDEOGRAM_APPLE_PROMPT="a clean vector icon of one red apple centered on a pure white background, no text, no letters, no watermark"
-IDEOGRAM_MOUNTAIN_PROMPT="a clean vector icon of blue mountains and a yellow sun centered on a pure white background, no text, no letters, no watermark"
+IDEOGRAM_APPLE_PROMPT='{"high_level_description":"A clean studio photograph of a green glass apple on a white ceramic plate.","style_description":{"aesthetics":"clean, crisp, minimal","lighting":"soft diffuse studio lighting","photo":"eye-level product photography with shallow depth of field","medium":"photograph","color_palette":["#31A354","#FFFFFF","#D9D9D9"]},"compositional_deconstruction":{"background":"A neutral pale studio backdrop and white tabletop.","elements":[{"type":"obj","bbox":[260,300,650,700],"desc":"A translucent green glass apple centered on a white ceramic plate with bright highlights."},{"type":"obj","bbox":[580,260,760,740],"desc":"A simple round white ceramic plate under the apple."}]}}'
+IDEOGRAM_MOUNTAIN_PROMPT='{"high_level_description":"A clean stylized landscape poster of blue mountains under a warm yellow sun on a white background.","style_description":{"aesthetics":"clean, balanced, graphic","lighting":"bright even poster lighting","medium":"graphic_design","art_style":"crisp vector-style illustration with soft print texture","color_palette":["#2F6FAE","#F5C542","#FFFFFF","#D6E7F5"]},"compositional_deconstruction":{"background":"A pure white poster background with no text or lettering.","elements":[{"type":"obj","bbox":[350,160,760,840],"desc":"Layered blue mountain peaks centered in the frame."},{"type":"obj","bbox":[170,420,340,580],"desc":"A warm yellow sun above the mountains."}]}}'
 
 if [[ "$SUMMARY_ONLY" != "1" ]]; then
   run_probe "status-load-matrix" \
@@ -108,6 +116,11 @@ if [[ "$SUMMARY_ONLY" != "1" ]]; then
     --seed "$SEED" --width "$WIDTH" --height "$HEIGHT" --steps "$QWEN_IMAGE_STEPS" \
     --turn "$APPLE_PROMPT" --turn "$MOUNTAIN_PROMPT" --turn "$APPLE_PROMPT"
 
+  run_probe "qwen-image-6bit-gen" \
+    --model Qwen-Image-mflux-6bit --generate \
+    --seed "$SEED" --width "$WIDTH" --height "$HEIGHT" --steps "$QWEN_IMAGE_STEPS" \
+    --turn "$APPLE_PROMPT" --turn "$MOUNTAIN_PROMPT" --turn "$APPLE_PROMPT"
+
   run_probe "qwen-image-8bit-gen" \
     --model qwen-image-mflux-8bit --generate \
     --seed "$SEED" --width "$WIDTH" --height "$HEIGHT" --steps "$QWEN_IMAGE_STEPS" \
@@ -116,14 +129,8 @@ if [[ "$SUMMARY_ONLY" != "1" ]]; then
   QWEN_SOURCE_IMAGE="${VMLX_IMAGE_PROOF_SOURCE_IMAGE:-}"
   if [[ -z "$QWEN_SOURCE_IMAGE" ]]; then
     QWEN_SOURCE_IMAGE="$(
-      node - "$ART_ROOT/qwen-image-8bit-gen/qwen-image-mflux-8bit-load.json" <<'NODE'
-const fs = require("fs");
-const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-const turn = (payload.generation_turns || []).find((entry) => entry.turn === 1 && entry.status === "completed");
-const output = turn?.image_diagnostics?.path || turn?.output;
-if (!output) process.exit(2);
-process.stdout.write(output);
-NODE
+      jq -r '.generation_turns[] | select(.turn == 1 and .status == "completed") | (.image_diagnostics.path // .output)' \
+        "$ART_ROOT/qwen-image-8bit-gen/qwen-image-mflux-8bit-load.json"
     )"
   fi
 
@@ -134,6 +141,16 @@ NODE
 
   run_probe "qwen-edit-q4-gen" \
     --model Qwen-Image-Edit-mflux-q4 --edit --source-image "$QWEN_SOURCE_IMAGE" \
+    --seed "$SEED" --width "$WIDTH" --height "$HEIGHT" --steps "$QWEN_EDIT_STEPS" \
+    --turn "$EDIT_APPLE_PROMPT" --turn "$EDIT_APPLE_PROMPT" --turn "$EDIT_PEAR_PROMPT"
+
+  run_probe "qwen-edit-q5-gen" \
+    --model Qwen-Image-Edit-mflux-q5 --edit --source-image "$QWEN_SOURCE_IMAGE" \
+    --seed "$SEED" --width "$WIDTH" --height "$HEIGHT" --steps "$QWEN_EDIT_STEPS" \
+    --turn "$EDIT_APPLE_PROMPT" --turn "$EDIT_APPLE_PROMPT" --turn "$EDIT_PEAR_PROMPT"
+
+  run_probe "qwen-edit-q6-gen" \
+    --model Qwen-Image-Edit-mflux-q6 --edit --source-image "$QWEN_SOURCE_IMAGE" \
     --seed "$SEED" --width "$WIDTH" --height "$HEIGHT" --steps "$QWEN_EDIT_STEPS" \
     --turn "$EDIT_APPLE_PROMPT" --turn "$EDIT_APPLE_PROMPT" --turn "$EDIT_PEAR_PROMPT"
 
@@ -154,90 +171,130 @@ NODE
 fi
 
 SUMMARY="$ART_ROOT/current-proof-summary.json"
-node - "$ART_ROOT" "$OUT_ROOT" "$SUMMARY" <<'NODE'
-const fs = require("fs");
-const path = require("path");
+RUNS=(
+  "zimage-4bit-gen|Z-Image-Turbo-mflux-4bit-load.json|generation_turns"
+  "zimage-8bit-gen|Z-Image-Turbo-mflux-8bit-load.json|generation_turns"
+  "flux-schnell-4bit-gen|FLUX.1-schnell-mflux-4bit-load.json|generation_turns"
+  "flux-schnell-8bit-gen|FLUX.1-schnell-mflux-8bit-load.json|generation_turns"
+  "qwen-image-4bit-gen|qwen-image-mflux-4bit-load.json|generation_turns"
+  "qwen-image-6bit-gen|Qwen-Image-mflux-6bit-load.json|generation_turns"
+  "qwen-image-8bit-gen|qwen-image-mflux-8bit-load.json|generation_turns"
+  "qwen-edit-q4-gen|Qwen-Image-Edit-mflux-q4-load.json|edit_turns"
+  "qwen-edit-q5-gen|Qwen-Image-Edit-mflux-q5-load.json|edit_turns"
+  "qwen-edit-q6-gen|Qwen-Image-Edit-mflux-q6-load.json|edit_turns"
+  "qwen-edit-q8-gen|Qwen-Image-Edit-mflux-q8-load.json|edit_turns"
+  "ideogram-fp8-gen|ideogram-4-fp8-load.json|generation_turns"
+  "ideogram-nf4-gen|ideogram-4-nf4-load.json|generation_turns"
+)
 
-const artifactRoot = process.argv[2];
-const outputRoot = process.argv[3];
-const summaryPath = process.argv[4];
+FAILED=0
+ROWS_JSON='[]'
+for run in "${RUNS[@]}"; do
+  IFS='|' read -r label file key <<< "$run"
+  file_path="$ART_ROOT/$label/$file"
+  statuses="$(jq -c --arg key "$key" '.[$key] // [] | map(.status)' "$file_path")"
+  shas="$(jq -c --arg key "$key" '.[$key] // [] | map(.image_diagnostics.sha256 // null)' "$file_path")"
+  outputs="$(jq -c --arg key "$key" '.[$key] // [] | map(.image_diagnostics.path // .output // null)' "$file_path")"
+  load_status="$(jq -r '.load_status // "unknown"' "$file_path")"
+  if [[ "$key" == "edit_turns" ]]; then
+    repeat_index=1
+    sensitive_index=2
+  else
+    repeat_index=2
+    sensitive_index=1
+  fi
+  completed="$(jq -r 'length == 3 and all(. == "completed")' <<< "$statuses")"
+  deterministic_repeat="$(jq -r --argjson i "$repeat_index" '.[0] != null and .[$i] != null and .[0] == .[$i]' <<< "$shas")"
+  prompt_sensitive="$(jq -r --argjson i "$sensitive_index" '.[0] != null and .[$i] != null and .[0] != .[$i]' <<< "$shas")"
+  if [[ "$completed" == "true" && "$deterministic_repeat" == "true" && "$prompt_sensitive" == "true" ]]; then
+    row_status="passed"
+  else
+    row_status="failed"
+    FAILED=1
+  fi
+  row_json="$(
+    jq -n \
+      --arg label "$label" \
+      --arg artifact "$file_path" \
+      --arg load_status "$load_status" \
+      --arg turn_key "$key" \
+      --arg status "$row_status" \
+      --argjson statuses "$statuses" \
+      --argjson shas "$shas" \
+      --argjson outputs "$outputs" \
+      --argjson repeat_index "$repeat_index" \
+      --argjson sensitive_index "$sensitive_index" \
+      --argjson deterministic_repeat "$deterministic_repeat" \
+      --argjson prompt_sensitive "$prompt_sensitive" \
+      '{
+        label: $label,
+        artifact: $artifact,
+        load_status: $load_status,
+        turn_key: $turn_key,
+        statuses: $statuses,
+        shas: $shas,
+        outputs: $outputs,
+        repeat_turns: [1, ($repeat_index + 1)],
+        prompt_sensitive_turns: [1, ($sensitive_index + 1)],
+        deterministic_repeat: $deterministic_repeat,
+        prompt_sensitive: $prompt_sensitive,
+        status: $status
+      }'
+  )"
+  ROWS_JSON="$(jq -c --argjson row "$row_json" '. + [$row]' <<< "$ROWS_JSON")"
+done
 
-const runs = [
-  ["zimage-4bit-gen", "Z-Image-Turbo-mflux-4bit-load.json", "generation_turns"],
-  ["zimage-8bit-gen", "Z-Image-Turbo-mflux-8bit-load.json", "generation_turns"],
-  ["flux-schnell-4bit-gen", "FLUX.1-schnell-mflux-4bit-load.json", "generation_turns"],
-  ["flux-schnell-8bit-gen", "FLUX.1-schnell-mflux-8bit-load.json", "generation_turns"],
-  ["qwen-image-4bit-gen", "qwen-image-mflux-4bit-load.json", "generation_turns"],
-  ["qwen-image-8bit-gen", "qwen-image-mflux-8bit-load.json", "generation_turns"],
-  ["qwen-edit-q4-gen", "Qwen-Image-Edit-mflux-q4-load.json", "edit_turns"],
-  ["qwen-edit-q8-gen", "Qwen-Image-Edit-mflux-q8-load.json", "edit_turns"],
-  ["ideogram-fp8-gen", "ideogram-4-fp8-load.json", "generation_turns"],
-  ["ideogram-nf4-gen", "ideogram-4-nf4-load.json", "generation_turns"],
-];
+MATRIX_PATH="$ART_ROOT/status-load-matrix/compatibility-matrix.json"
+MODEL_COUNT="$(jq -r '.model_count' "$MATRIX_PATH")"
+LOADED_COUNT="$(jq -r '[.rows[] | select(.load_status == "loaded")] | length' "$MATRIX_PATH")"
+UNLOADED="$(jq -c '[.rows[] | select(.load_status != "loaded") | .directory_name]' "$MATRIX_PATH")"
+if [[ "$(jq -r 'length' <<< "$UNLOADED")" != "0" ]]; then
+  FAILED=1
+fi
 
-let failed = false;
-const rows = runs.map(([label, file, key]) => {
-  const filePath = path.join(artifactRoot, label, file);
-  const payload = JSON.parse(fs.readFileSync(filePath, "utf8"));
-  const turns = payload[key] || [];
-  const statuses = turns.map((turn) => turn.status);
-  const shas = turns.map((turn) => turn.image_diagnostics?.sha256 || null);
-  const outputs = turns.map((turn) => turn.image_diagnostics?.path || turn.output || null);
-  const completed = statuses.length === 3 && statuses.every((status) => status === "completed");
-  const repeatIndex = key === "edit_turns" ? 1 : 2;
-  const sensitiveIndex = key === "edit_turns" ? 2 : 1;
-  const deterministicRepeat = Boolean(shas[0] && shas[repeatIndex] && shas[0] === shas[repeatIndex]);
-  const promptSensitive = Boolean(shas[0] && shas[sensitiveIndex] && shas[0] !== shas[sensitiveIndex]);
-  const status = completed && deterministicRepeat && promptSensitive ? "passed" : "failed";
-  if (status !== "passed") failed = true;
-  return {
-    label,
-    artifact: filePath,
-    load_status: payload.load_status,
-    turn_key: key,
-    statuses,
-    shas,
-    outputs,
-    repeat_turns: [1, repeatIndex + 1],
-    prompt_sensitive_turns: [1, sensitiveIndex + 1],
-    deterministic_repeat: deterministicRepeat,
-    prompt_sensitive: promptSensitive,
-    status,
-  };
-});
+if [[ "$FAILED" == "0" ]]; then
+  SUMMARY_STATUS="passed"
+else
+  SUMMARY_STATUS="failed"
+fi
 
-const matrixPath = path.join(artifactRoot, "status-load-matrix", "compatibility-matrix.json");
-const matrix = JSON.parse(fs.readFileSync(matrixPath, "utf8"));
-const unloaded = (matrix.rows || []).filter((row) => row.load_status !== "loaded");
-if (unloaded.length > 0) failed = true;
+jq -n \
+  --arg status "$SUMMARY_STATUS" \
+  --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg artifact_root "$ART_ROOT" \
+  --arg output_root "$OUT_ROOT" \
+  --arg matrix_artifact "$MATRIX_PATH" \
+  --argjson model_count "$MODEL_COUNT" \
+  --argjson loaded_count "$LOADED_COUNT" \
+  --argjson unloaded "$UNLOADED" \
+  --argjson rows "$ROWS_JSON" \
+  '{
+    status: $status,
+    generated_at: $generated_at,
+    artifact_root: $artifact_root,
+    output_root: $output_root,
+    matrix: {
+      artifact: $matrix_artifact,
+      model_count: $model_count,
+      loaded_count: $loaded_count,
+      unloaded: $unloaded
+    },
+    rows: $rows,
+    visual_gate: "View generated PNGs before claiming visual quality or Osaurus release readiness.",
+    osaurus_gate: "Osaurus HTTP/UI bridge proof is outside this CLI runner and remains required before app-side readiness claims."
+  }' > "$SUMMARY"
 
-const summary = {
-  status: failed ? "failed" : "passed",
-  generated_at: new Date().toISOString(),
-  artifact_root: artifactRoot,
-  output_root: outputRoot,
-  matrix: {
-    artifact: matrixPath,
-    model_count: matrix.model_count,
-    loaded_count: (matrix.rows || []).filter((row) => row.load_status === "loaded").length,
-    unloaded: unloaded.map((row) => row.directory_name),
-  },
-  rows,
-  visual_gate: "View generated PNGs before claiming visual quality or Osaurus release readiness.",
-  osaurus_gate: "Osaurus HTTP/UI bridge proof is outside this CLI runner and remains required before app-side readiness claims.",
-};
+printf 'current proof summary: %s\n' "$SUMMARY"
+printf 'status=%s matrix_loaded=%s/%s\n' "$SUMMARY_STATUS" "$LOADED_COUNT" "$MODEL_COUNT"
+jq -r '.rows[] | "\(.label): \(.status) repeat=\(.deterministic_repeat) sensitive=\(.prompt_sensitive) sha=\(.shas | join(","))"' "$SUMMARY"
+if [[ "$FAILED" != "0" ]]; then
+  exit 1
+fi
 
-fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2) + "\n");
-console.log(`current proof summary: ${summaryPath}`);
-console.log(`status=${summary.status} matrix_loaded=${summary.matrix.loaded_count}/${summary.matrix.model_count}`);
-for (const row of rows) {
-  console.log(`${row.label}: ${row.status} repeat=${row.deterministic_repeat} sensitive=${row.prompt_sensitive} sha=${row.shas.join(",")}`);
-}
-if (failed) process.exit(1);
-NODE
-
-if [[ "$RUN_CONTRACT_CHECK" == "1" && -x "$ROOT/scripts/vmlx-image-openapi-manifest-check.sh" ]]; then
+if [[ "$RUN_CONTRACT_CHECK" == "1" && -x "$ROOT/scripts/vmlx-image-openapi-manifest-check.sh" && -x "$(command -v node || true)" ]]; then
   "$ROOT/scripts/vmlx-image-openapi-manifest-check.sh"
+elif [[ "$RUN_CONTRACT_CHECK" == "1" && ! -x "$(command -v node || true)" ]]; then
+  printf 'Skipping manifest/OpenAPI contract check: node is not available on PATH.\n' >&2
 fi
 
 printf '\nProof artifacts: %s\n' "$ART_ROOT"

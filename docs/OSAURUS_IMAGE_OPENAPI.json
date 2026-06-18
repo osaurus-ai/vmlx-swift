@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Osaurus Image Generation API",
-    "version": "2026-06-16",
-    "description": "Proposed Osaurus /v1/images bridge contract for the native vMLXFlux engine. The engine is in vmlx-swift; the HTTP bridge is still app-side work.",
+    "version": "2026-06-18",
+    "description": "Osaurus /v1/images bridge contract for the native vMLXFlux engine. The engine is in vmlx-swift; the Osaurus feat/image-generation-vmlxflux bridge must stay pinned to the proven vMLX revision and still needs live HTTP/UI proof before release.",
     "x-vmlx-status": "PARTIAL",
     "x-vmlx-manifest": "docs/OSAURUS_IMAGE_UI_MANIFEST.json"
   },
