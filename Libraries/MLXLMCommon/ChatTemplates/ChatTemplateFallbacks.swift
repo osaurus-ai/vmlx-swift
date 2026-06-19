@@ -661,7 +661,7 @@ value_1
 {{- "〈|EOS|〉" -}}
 {%- set enable_thinking = enable_thinking | default(false) -%}
 {%- set add_generation_prompt = add_generation_prompt | default(false) -%}
-{%- set system_message = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations." -%}
+{%- set system_message = "" -%}
 {%- if messages and messages[0].role == "system" -%}
   {%- set system_message = messages[0].content -%}
 {%- endif -%}

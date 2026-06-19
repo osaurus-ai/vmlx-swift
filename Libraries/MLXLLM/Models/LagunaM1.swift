@@ -67,10 +67,13 @@ private final class LagunaM1Attention: Module {
             self._gProj.wrappedValue = Linear(h, nHeads, bias: false)
         }
 
-        // M.1 PARTIAL rotary: rotate the first `rotary_dim` (64) of head_dim
-        // (128), pass the tail through. The config ships rotary_dim=64 AND
-        // partial_rotary_factor=1.0 (= rotate 100% of the 64 rotary dims). Using
-        // the full 128 head_dim was wrong AND crashed YarnRoPE's mscale path.
+        // M.1 rotary: config ships NO `rotary_dim` and `partial_rotary_factor=1.0`,
+        // so this is FULL rotary over the entire head_dim (128) — matching
+        // modeling_laguna.py (partial=1.0 → rotary_dim=cos.shape[-1]=128, q_pass
+        // empty). `cfg.rotaryDim` decodes to 0 when absent → falls back to
+        // `headDim` here. The `rotaryDim>0` branch only engages if a future
+        // bundle explicitly declares a partial `rotary_dim`. (Earlier crash was
+        // YarnRoPE's mscale path, fixed below by pinning mscale_all_dim=mscale.)
         self.ropeDim = (cfg.rotaryDim > 0 && cfg.rotaryDim <= headDim) ? cfg.rotaryDim : headDim
         let (theta, _) = cfg.ropeFor(layerType: "full_attention")
         var scalingCfg: [String: StringOrNumber]? = nil
@@ -268,8 +271,6 @@ public final class LagunaM1Model: Module, LLMModel, KVCacheDimensionProvider {
         let mask = createAttentionMask(h: h, cache: cache?.first)
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])
-            if i <= 3 {
-            }
         }
         h = norm(h)
         if let lmHead {

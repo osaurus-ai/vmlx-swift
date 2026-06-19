@@ -366,14 +366,16 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .nemotron
         }
 
-        // Qwen2 / Qwen2.5 family (qwen2, qwen2_5, qwen2_5_vl, …) — same XML
-        // `<tool_call>{"name","arguments"}</tool_call>` envelope as Qwen3.x.
-        // VibeThinker-3B ships `model_type=qwen2` with exactly that tool
-        // template, so config-only inference must map it to the XML-function
-        // parser rather than nil (which makes the app's capability gate report
-        // tool calling unsupported and block the request).
+        // Qwen2 / Qwen2.5 family (qwen2, qwen2_5, qwen2_5_vl, …) emit a BARE
+        // JSON object inside `<tool_call>…</tool_call>`:
+        //   <tool_call>\n{"name": "...", "arguments": {...}}\n</tool_call>
+        // (verified from VibeThinker-3B `chat_template.jinja` line 13). That is
+        // the `.json` parser's shape, NOT `.xmlFunction` (which requires the
+        // `<function=name>…</function>` markup used by qwen3-coder and returns
+        // nil on bare JSON → the call leaks into visible content). Route qwen2*
+        // to `.json` so the call parses AND the capability gate stays satisfied.
         if normalized.hasPrefix("qwen2") || compact.hasPrefix("qwen2") {
-            return .xmlFunction
+            return .json
         }
 
         // Qwen3.5 family (qwen3_5, qwen3_5_moe, etc.)
