@@ -32,6 +32,7 @@ private final class LagunaM1Attention: Module {
     let nHeads: Int
     let nKVHeads: Int
     let headDim: Int
+    let ropeDim: Int
     let scale: Float
     let gateMode: LagunaGateMode
 
@@ -66,7 +67,11 @@ private final class LagunaM1Attention: Module {
             self._gProj.wrappedValue = Linear(h, nHeads, bias: false)
         }
 
-        // M.1 is all full_attention → single YaRN rope, full rotary.
+        // M.1 PARTIAL rotary: rotate the first `rotary_dim` (64) of head_dim
+        // (128), pass the tail through. The config ships rotary_dim=64 AND
+        // partial_rotary_factor=1.0 (= rotate 100% of the 64 rotary dims). Using
+        // the full 128 head_dim was wrong AND crashed YarnRoPE's mscale path.
+        self.ropeDim = (cfg.rotaryDim > 0 && cfg.rotaryDim <= headDim) ? cfg.rotaryDim : headDim
         let (theta, _) = cfg.ropeFor(layerType: "full_attention")
         var scalingCfg: [String: StringOrNumber]? = nil
         if let entry = cfg.ropeParameters["full_attention"] {
@@ -80,15 +85,33 @@ private final class LagunaM1Attention: Module {
                     dict["mscale"] = af
                     dict["attention_factor"] = nil
                 }
+                // `attention_factor` IS YaRN's final length scale (1.0 = none on
+                // M.1, so `_mscale` should be 1.0). This YarnRoPE instead RECOMPUTES
+                // mscale from the factor unless mscale == mscale_all_dim — and a
+                // non-1.0 `_mscale` triggers a fragile in-place subscript that
+                // crashed here. Pin mscale_all_dim = mscale → `_mscale = 1.0`,
+                // matching attention_factor and skipping that path.
+                if let ms = dict["mscale"] {
+                    dict["mscale_all_dim"] = ms
+                }
                 scalingCfg = dict.compactMapValues { $0 }
             }
         }
         self.rope = initializeRope(
-            dims: headDim,
+            dims: ropeDim,
             base: theta,
             traditional: false,
             scalingConfig: scalingCfg,
             maxPositionEmbeddings: cfg.maxPositionEmbeddings)
+    }
+
+    /// Partial rotary: rotate the first `ropeDim` channels of head_dim, pass the
+    /// tail through unchanged. `ropeDim == headDim` → full rotary.
+    private func applyPartialRope(_ t: MLXArray, offset: Int) -> MLXArray {
+        if ropeDim >= headDim { return rope(t, offset: offset) }
+        let rot = t[.ellipsis, ..<ropeDim]
+        let pass = t[.ellipsis, ropeDim...]
+        return MLX.concatenated([rope(rot, offset: offset), pass], axis: -1)
     }
 
     func callAsFunction(
@@ -102,8 +125,8 @@ private final class LagunaM1Attention: Module {
         q = qNorm(q).transposed(0, 2, 1, 3)
         k = kNorm(k).transposed(0, 2, 1, 3)
         let off = cache?.offset ?? 0
-        q = rope(q, offset: off)
-        k = rope(k, offset: off)
+        q = applyPartialRope(q, offset: off)
+        k = applyPartialRope(k, offset: off)
 
         var out = attentionWithCacheUpdate(
             queries: q, keys: k, values: v, cache: cache, scale: scale, mask: mask
