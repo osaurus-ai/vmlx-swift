@@ -118,7 +118,10 @@ private final class LagunaM1Attention: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let (B, T) = (x.dim(0), x.dim(1))
-        var q = qProj(x).reshaped(B, T, nHeads, headDim)
+        let qRaw = qProj(x)
+        FileHandle.standardError.write(Data(
+            "[LagunaM1Attn] x=\(x.shape) qProj=\(qRaw.shape) kProj=\(kProj(x).shape) vProj=\(vProj(x).shape)\n".utf8))
+        var q = qRaw.reshaped(B, T, nHeads, headDim)
         var k = kProj(x).reshaped(B, T, nKVHeads, headDim)
         let v = vProj(x).reshaped(B, T, nKVHeads, headDim).transposed(0, 2, 1, 3)
         // Per-head q/k norm AFTER projection, BEFORE rope (reference order).
@@ -133,6 +136,8 @@ private final class LagunaM1Attention: Module {
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, T, nHeads * headDim)
+        FileHandle.standardError.write(Data(
+            "[LagunaM1Attn] q=\(q.shape) sdpaOut=\(out.shape)\n".utf8))
 
         if let g = gProj {
             // softplus (unbounded) — NOT sigmoid: HF reference amplifies rather
@@ -233,8 +238,13 @@ private final class LagunaM1Layer: Module {
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
-        let h = x + attention(inputLayerNorm(x), mask: mask, cache: cache)
-        return h + mlp(postAttentionLayerNorm(h))
+        let normed = inputLayerNorm(x)
+        let attnOut = attention(normed, mask: mask, cache: cache)
+        let h = x + attnOut
+        let mlpOut = mlp(postAttentionLayerNorm(h))
+        FileHandle.standardError.write(Data(
+            "[LagunaM1Layer] x=\(x.shape) normed=\(normed.shape) attnOut=\(attnOut.shape) h=\(h.shape) mlpOut=\(mlpOut.shape)\n".utf8))
+        return h + mlpOut
     }
 }
 
