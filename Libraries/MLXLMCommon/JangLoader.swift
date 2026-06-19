@@ -469,12 +469,35 @@ public enum ParserResolution {
         if let modelType, let inferred = ToolCallFormat.infer(from: modelType) {
             return (inferred, .modelTypeHeuristic)
         }
+        // Non-JANG bundle whose `model_type` the heuristic doesn't recognise.
+        // The canonical example is plain Qwen3: `infer` deliberately leaves
+        // `qwen3` / `qwen3_moe` nil because `qwen3_moe` is shared by BOTH the
+        // instruct line (Hermes `<tool_call>{"name":…,"arguments":…}` → .json)
+        // and Qwen3-Coder (`<tool_call><function=…><parameter=…>` → .xmlFunction),
+        // so model_type alone cannot disambiguate them. Read the model's OWN
+        // chat template — the ground truth for what it emits — to recover the
+        // format instead of guessing or returning "tools unsupported".
+        if let templateFormat = templateDeclaredToolCallFormat(chatTemplate) {
+            return (templateFormat, .chatTemplate)
+        }
         return (nil, .none)
     }
 
     private static func templateDeclaredToolCallFormat(_ chatTemplate: String?) -> ToolCallFormat? {
         guard let chatTemplate else { return nil }
         let lower = chatTemplate.lowercased()
+        // XML-function envelope: `<tool_call><function=name><parameter=key>…`
+        // (Qwen3-Coder, Qwen3.5/3.6, Nemotron-style). Checked BEFORE the bare-JSON
+        // rule because a coder template still contains `<tool_call>` but carries
+        // `<function=>`/`<parameter=>` bodies rather than a `{"name":…,"arguments":…}`
+        // object. Verified against real Qwen3-Coder-30B-A3B `chat_template`.
+        if lower.contains("<function=") && lower.contains("<parameter=") {
+            return .xmlFunction
+        }
+        // Hermes bare-JSON envelope: `<tool_call>\n{"name":…,"arguments":…}\n</tool_call>`.
+        // Verified against real Qwen3-4B (qwen3) and Qwen3-30B-A3B (qwen3_moe)
+        // instruct `chat_template`. The `<arg_key>` exclusion keeps GLM/Ling-style
+        // `<arg_key>`/`<arg_value>` templates from matching here.
         if lower.contains("<tool_call>")
             && lower.contains("\"name\"")
             && lower.contains("\"arguments\"")
