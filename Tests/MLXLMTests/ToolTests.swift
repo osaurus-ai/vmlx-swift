@@ -1068,9 +1068,12 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "zaya_text") == .zayaXml)
         #expect(ToolCallFormat.infer(from: "zyphra_zaya") == .zayaXml)
 
+        // Qwen2 / Qwen2.5 family emit Hermes bare-JSON inside <tool_call> → .json.
+        #expect(ToolCallFormat.infer(from: "qwen2") == .json)
+        #expect(ToolCallFormat.infer(from: "qwen2_5") == .json)
+
         // Unknown models should return nil (use default JSON format)
         #expect(ToolCallFormat.infer(from: "llama") == nil)
-        #expect(ToolCallFormat.infer(from: "qwen2") == nil)
         #expect(ToolCallFormat.infer(from: "mistral") == nil)
     }
 
