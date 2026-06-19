@@ -1579,43 +1579,18 @@ public struct TokenIterator: TokenIteratorProtocol {
                             "Populated-cache miss: full prefix matches cache (offset=\(cacheOffset)), seeding with last token only"
                         )
                     } else {
-                        // cacheOffset < promptTokenIds.count. The coordinator
-                        // returned .miss — its hash-based lookup found NO matching
-                        // cached prefix. Reusing the populated in-process cache is
-                        // only safe when the coordinator can FALSELY miss a still-
-                        // valid cache: that happens for HYBRID models whose recurrent
-                        // (ArraysCache/Mamba) state the multi-tier disk/paged
-                        // coordinator can't round-trip (Ling-2.6-flash). For
-                        // HOMOGENEOUS attention-only caches (all KVCacheSimple/
-                        // Rotating — Laguna ×70, Gemma-full, Qwen2, etc.) a miss is a
-                        // TRUE miss: the new prompt's prefix genuinely diverges from
-                        // what's cached — e.g. at the assistant-turn boundary the
-                        // cached turn ends in the GENERATED eos while the re-rendered
-                        // prompt ends in template scaffolding (`\n</assistant>\n` +
-                        // next turn). Optimistically trusting the prefix there reuses
-                        // WRONG KV/RoPE state → coherent-start-then-degeneration over
-                        // a multi-turn conversation (live-confirmed on Laguna-M.1).
-                        // So: reset + full prefill for homogeneous caches; keep the
-                        // optimistic trim only for hybrid (recurrent) caches.
-                        let cacheHasRecurrentLayers = self.cache.contains { $0 is ArraysCache }
-                        if cacheHasRecurrentLayers {
-                            let remaining = Array(cacheLookupTokenIds[cacheOffset...])
-                            let remainingArray = MLXArray(remaining.map { Int32($0) })
-                                .expandedDimensions(axis: 0)
-                            inputForPrepare = LMInput(
-                                text: LMInput.Text(tokens: remainingArray),
-                                image: nil, video: nil)
-                            Self.logger.info(
-                                "Populated-cache miss (hybrid): trimmed \(cacheOffset) cached tokens, prefilling \(remaining.count) remaining"
-                            )
-                        } else {
-                            // True coordinator miss on an attention-only cache:
-                            // reset and full-prefill (inputForPrepare stays = input).
-                            self.cache = self.model.newCache(parameters: effectiveParameters)
-                            Self.logger.info(
-                                "Populated-cache miss (homogeneous attn): coordinator true-miss at offset \(cacheOffset) < prompt \(cacheLookupTokenIds.count) — reset cache, full prefill (prefix diverged)"
-                            )
-                        }
+                        // cacheOffset < promptTokenIds.count — assume
+                        // prefix matches (safe for templates that don't
+                        // strip past content). Trim and prefill remainder.
+                        let remaining = Array(cacheLookupTokenIds[cacheOffset...])
+                        let remainingArray = MLXArray(remaining.map { Int32($0) })
+                            .expandedDimensions(axis: 0)
+                        inputForPrepare = LMInput(
+                            text: LMInput.Text(tokens: remainingArray),
+                            image: nil, video: nil)
+                        Self.logger.info(
+                            "Populated-cache miss: trimmed \(cacheOffset) cached tokens, prefilling \(remaining.count) remaining"
+                        )
                     }
                 }
                 }
