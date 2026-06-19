@@ -128,7 +128,11 @@ public struct Mistral4Configuration: Codable, Sendable {
             if merged["beta_fast"] == nil { merged["beta_fast"] = rp["beta_fast"] ?? .float(32.0) }
             if merged["beta_slow"] == nil { merged["beta_slow"] = rp["beta_slow"] ?? .float(1.0) }
             if merged["mscale"] == nil { merged["mscale"] = rp["mscale"] ?? .float(1.0) }
-            if merged["mscale_all_dim"] == nil { merged["mscale_all_dim"] = rp["mscale_all_dim"] ?? .float(1.0) }
+            // Canonical YaRN default is 0.0 (matches mlx_lm/HF + every other YaRN consumer in this
+            // repo: RoPEUtils, DeepseekV3, GLM4MOELite, BailingHybrid). Defaulting to 1.0 made
+            // _mscale = yarnGetMscale(f,1)/yarnGetMscale(f,1) = 1.0, stripping YaRN's ~1.4-1.5x
+            // length-scale (the exact Laguna mscale-pin bug class) on checkpoints that omit the key.
+            if merged["mscale_all_dim"] == nil { merged["mscale_all_dim"] = rp["mscale_all_dim"] ?? .float(0.0) }
             if merged["llama_4_scaling_beta"] == nil { merged["llama_4_scaling_beta"] = rp["llama_4_scaling_beta"] ?? .float(0.0) }
             ropeScaling = merged
             let fallbackTheta = try c.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 10000.0
