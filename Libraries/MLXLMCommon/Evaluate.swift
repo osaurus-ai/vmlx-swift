@@ -735,27 +735,39 @@ struct TokenRing {
     }
 
     /// The valid portion of the ring (all of it once full), or `nil` if empty.
+    /// Clamped to the buffer's real size and guarded against a non-1-D buffer so a
+    /// `count`/`buffer` desync can never trip an out-of-range subscript (was an
+    /// `Index out of range` crash at high `repetitionContextSize` — e.g. Laguna's
+    /// 256 — when a batched/2-D prompt made `count` and the buffer length disagree).
     var validTokens: MLXArray? {
-        guard count > 0 else { return nil }
-        return count < capacity ? buffer[..<count] : buffer
+        guard count > 0, buffer.ndim == 1 else { return nil }
+        let size = buffer.dim(0)
+        let n = Swift.min(count, size)
+        guard n > 0 else { return nil }
+        return n < size ? buffer[..<n] : buffer
     }
 
     /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
     mutating func loadPrompt(_ prompt: MLXArray) {
-        let n = prompt.dim(0)
-        let promptTokens = prompt.asType(.int32)
-        if n <= capacity {
-            if n < capacity {
-                let padding = MLXArray.zeros([capacity - n], type: Int32.self)
-                buffer = concatenated([promptTokens.reshaped(-1), padding])
-            } else {
-                buffer = promptTokens.reshaped(-1)
-            }
+        // Flatten FIRST so `n` is the true token count. The old code used
+        // `prompt.dim(0)`, which is the BATCH axis for a `[1, n]` prompt (→ n=1),
+        // desyncing `count` from the real buffer length and crashing `validTokens`.
+        let flat = prompt.asType(.int32).reshaped(-1)
+        let n = flat.dim(0)
+        if n >= capacity {
+            // Last `capacity` tokens via an explicit positive start index
+            // (avoids relying on negative-range slice semantics).
+            buffer = n == capacity ? flat : flat[(n - capacity)...]
+            count = capacity
+            writeIndex = 0
+        } else if n > 0 {
+            let padding = MLXArray.zeros([capacity - n], type: Int32.self)
+            buffer = concatenated([flat, padding])
             count = n
             writeIndex = n % capacity
         } else {
-            buffer = promptTokens[(-capacity)...].reshaped(-1)
-            count = capacity
+            buffer = MLXArray.zeros([capacity], type: Int32.self)
+            count = 0
             writeIndex = 0
         }
     }

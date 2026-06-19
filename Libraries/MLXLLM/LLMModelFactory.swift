@@ -182,6 +182,13 @@ public enum LLMTypeRegistry {
                 let probe = try? JSONDecoder.json5().decode(LagunaProbe.self, from: data)
                 let cfg = try JSONDecoder.json5().decode(
                     LagunaConfiguration.self, from: data)
+                // Laguna-M.1 (Mistral lineage): per-element gating, SEPARATE
+                // q/k/v/o_proj, per-module affine quant, all-full-attention.
+                // Architecturally distinct from the poolside XS.2 fused-qkv /
+                // JANGTQ path below — route to the dedicated affine engine.
+                if cfg.gateMode == .perElement {
+                    return LagunaM1Model(cfg)
+                }
                 let isMxtq =
                     probe?.weightFormat?.lowercased() == "mxtq"
                     || probe?.mxtqBits != nil
@@ -1386,6 +1393,17 @@ public final class LLMModelFactory: ModelFactory {
         return (try? JSONSerialization.data(withJSONObject: configDict)) ?? configData
     }
 
+    /// Bundle names of always-reasoning models that emit `<think>...</think>`
+    /// intrinsically but ship NO declarative reasoning signal (empty chat
+    /// template, no `reasoning_parser` stamp, no `enable_thinking` kwarg). These
+    /// can't be caught by template or `model_type` heuristics, so they're
+    /// recognised by name and given the think_xml parser. Keep this list narrow
+    /// — only models confirmed to ALWAYS reason without any other signal.
+    private static func bundleNameImpliesIntrinsicThinking(_ modelDirectory: URL) -> Bool {
+        let name = modelDirectory.lastPathComponent.lowercased()
+        return name.contains("vibethinker")
+    }
+
     private static func chatTemplateText(modelDirectory: URL) -> String? {
         let templateURL = modelDirectory.appending(component: "chat_template.jinja")
         if let template = try? String(contentsOf: templateURL, encoding: .utf8) {
@@ -1794,7 +1812,18 @@ public final class LLMModelFactory: ModelFactory {
         // GLM 4/5, MiniMax M2+, Kimi K2.x, Nemotron-H). Every other
         // model_type falls through to `"none"` and emits plain `.chunk`.
         if mutableConfiguration.reasoningParserName == nil {
-            if ParserResolution.shouldIgnoreReasoningStamp(
+            if Self.bundleNameImpliesIntrinsicThinking(modelDirectory) {
+                // Always-reasoning model that emits <think>...</think>
+                // intrinsically with NO declarative signal anywhere — empty
+                // chat template, no reasoning_parser stamp, no enable_thinking
+                // kwarg (e.g. VibeThinker, a qwen2 reasoner). Template- and
+                // model_type-based detection both correctly see "no thinking
+                // template" and would leave the CoT leaking into visible
+                // content. Recognise it by bundle name and apply the think_xml
+                // parser (`<think>…</think>` stripping; startInReasoning=false
+                // since the tag is emitted by the model, not the prompt tail).
+                mutableConfiguration.reasoningParserName = "think_xml"
+            } else if ParserResolution.shouldIgnoreReasoningStamp(
                 capabilities: jangConfig?.capabilities,
                 modelType: baseConfig.modelType)
             {

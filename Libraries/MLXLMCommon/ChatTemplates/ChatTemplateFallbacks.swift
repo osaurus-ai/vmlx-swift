@@ -658,10 +658,20 @@ value_1
     /// `<system>`, `<user>`, `<assistant>`, `</think>` for direct-answer
     /// mode, and `<think>` for reasoning mode.
     public static let lagunaMinimal: String = #"""
+{#- The template MUST emit the BOS (〈|EOS|〉) here. swift-transformers'
+    applyChatTemplate tokenizes the rendered template with add_special_tokens=false
+    (matching HF apply_chat_template), so the post-processor does NOT prepend a BOS
+    — the chat prompt has exactly the special tokens the template writes. Omitting
+    it leaves the prompt with ZERO BOS (first token becomes `<` = id 97 instead of
+    id 2), which is out-of-distribution and drives the model into punct/number
+    garbage. (Verified at the Swift layer: applyChatTemplate of this template
+    starts at id 97 without this line, id 2 with it. The `/v1/completions` path is
+    unaffected because encode(addSpecialTokens:true) adds the BOS itself — which is
+    what previously masked this bug.) -#}
 {{- "〈|EOS|〉" -}}
 {%- set enable_thinking = enable_thinking | default(false) -%}
 {%- set add_generation_prompt = add_generation_prompt | default(false) -%}
-{%- set system_message = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations." -%}
+{%- set system_message = "" -%}
 {%- if messages and messages[0].role == "system" -%}
   {%- set system_message = messages[0].content -%}
 {%- endif -%}

@@ -343,6 +343,19 @@ public enum ParserResolution {
                 .chatTemplate
             )
         }
+        // Template-native `<think>...</think>` envelope. This is the PRECISE
+        // reasoning signal: a reasoning-tuned bundle (e.g. VibeThinker, a
+        // qwen2-based thinker) carries the literal tag pair in its chat
+        // template, while its non-reasoning siblings (Qwen2.5-Instruct, also
+        // model_type `qwen2`) do not. The model_type heuristic below cannot
+        // separate them, so resolving here keeps `qwen2` OUT of the model_type
+        // allowlist (which would over-trigger and route plain answers into the
+        // think pane — the original reverse-allowlist bug). Explicit JANG
+        // stamps are already honoured above; Gemma's `<|think|>` mode marker
+        // has no `</think>` close form, so the harmony path is unaffected.
+        if templateDeclaresThinkEnvelope(chatTemplate) {
+            return (ReasoningParser.fromCapabilityName("qwen3"), .chatTemplate)
+        }
         // Heuristic: delegate to the canonical factory helper so this
         // stays byte-identical with `LLMModelFactory` / `VLMModelFactory`.
         // Historical note: this function previously carried its own
@@ -359,6 +372,16 @@ public enum ParserResolution {
             ReasoningParser.fromCapabilityName(stamp),
             .modelTypeHeuristic
         )
+    }
+
+    /// True when the chat template carries a literal `<think>...</think>`
+    /// reasoning envelope. This is the precise per-bundle reasoning signal that
+    /// distinguishes a reasoning-tuned model from a non-reasoning sibling that
+    /// shares its `model_type` (e.g. VibeThinker vs Qwen2.5-Instruct, both
+    /// `qwen2`). Mirrors osaurus `LocalReasoningCapability.analyze`.
+    static func templateDeclaresThinkEnvelope(_ chatTemplate: String?) -> Bool {
+        guard let chatTemplate else { return false }
+        return chatTemplate.contains("<think>") && chatTemplate.contains("</think>")
     }
 
     public static func shouldIgnoreReasoningStamp(
@@ -1945,7 +1968,24 @@ public struct JangLoader: Sendable {
                 return (first.bits, first.groupSize)
             }
 
-            if (isHiddenAnchor || isHiddenInputProjection),
+            // Trust the bundle's EXPLICIT declared per-module quant when it unpacks the
+            // real `.weight`/`.scales` to an inputDim that is a known model dimension.
+            // On ambiguous packed widths (512 → bits ∈ {2,4,8}) the shape walk can pick
+            // a different, WRONG bit width: Laguna-M.1 ships 4-bit dense MLP, the walk
+            // re-stamped 8-bit, and the 4-bit weights dequantized to a degenerate (empty)
+            // output that collapsed the forward. A self-consistent declaration whose
+            // inputDim ∈ validInDims is the author's verified intent. A genuinely stale
+            // config (claims 8-bit for 4-bit-packed) unpacks to a NON-model inputDim,
+            // fails this check, and still falls through to the shape walk.
+            if let dq = declaredQuantization(for: basePath),
+               dq.bits > 0, numGroups > 0, (packedDim * 32) % dq.bits == 0,
+               case let declaredInputDim = (packedDim * 32) / dq.bits,
+               declaredInputDim % numGroups == 0,
+               declaredInputDim / numGroups == dq.groupSize,
+               validInDims.contains(declaredInputDim)
+            {
+                (bits, inferredGroupSize) = (dq.bits, dq.groupSize)
+            } else if (isHiddenAnchor || isHiddenInputProjection),
                let hiddenSize = hiddenSizeHint, hiddenSize > 0
             {
                 (bits, inferredGroupSize) = inferBitWidthAndGroupSize(

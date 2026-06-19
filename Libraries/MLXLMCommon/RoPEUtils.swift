@@ -168,8 +168,18 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
         // https://github.com/ml-explore/mlx-swift/issues/364
         var x = x
         if _mscale != 1.0 {
-            x = x[0..., .ellipsis]
-            x[.ellipsis, 0 ..< dimensions] *= _mscale
+            // Apply YaRN length-scale to the first `dimensions` channels.
+            // Built functionally (not the in-place `x[.ellipsis, 0..<dims] *= s`
+            // subscript, which trips mlx-swift's expandEllipsisOperations
+            // precondition on some ranks). When `dimensions` spans the whole
+            // last axis (full rotary), scale the tensor directly.
+            if dimensions >= x.dim(-1) {
+                x = x * _mscale
+            } else {
+                x = MLX.concatenated(
+                    [x[.ellipsis, 0 ..< dimensions] * _mscale, x[.ellipsis, dimensions...]],
+                    axis: -1)
+            }
         }
 
         return MLXFast.RoPE(
@@ -186,8 +196,18 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
         var x = x
         if _mscale != 1.0 {
-            x = x[0..., .ellipsis]
-            x[.ellipsis, 0 ..< dimensions] *= _mscale
+            // Apply YaRN length-scale to the first `dimensions` channels.
+            // Built functionally (not the in-place `x[.ellipsis, 0..<dims] *= s`
+            // subscript, which trips mlx-swift's expandEllipsisOperations
+            // precondition on some ranks). When `dimensions` spans the whole
+            // last axis (full rotary), scale the tensor directly.
+            if dimensions >= x.dim(-1) {
+                x = x * _mscale
+            } else {
+                x = MLX.concatenated(
+                    [x[.ellipsis, 0 ..< dimensions] * _mscale, x[.ellipsis, dimensions...]],
+                    axis: -1)
+            }
         }
 
         return MLXFast.RoPE(

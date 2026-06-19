@@ -366,6 +366,18 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .nemotron
         }
 
+        // Qwen2 / Qwen2.5 family (qwen2, qwen2_5, qwen2_5_vl, …) emit a BARE
+        // JSON object inside `<tool_call>…</tool_call>`:
+        //   <tool_call>\n{"name": "...", "arguments": {...}}\n</tool_call>
+        // (verified from VibeThinker-3B `chat_template.jinja` line 13). That is
+        // the `.json` parser's shape, NOT `.xmlFunction` (which requires the
+        // `<function=name>…</function>` markup used by qwen3-coder and returns
+        // nil on bare JSON → the call leaks into visible content). Route qwen2*
+        // to `.json` so the call parses AND the capability gate stays satisfied.
+        if normalized.hasPrefix("qwen2") || compact.hasPrefix("qwen2") {
+            return .json
+        }
+
         // Qwen3.5 family (qwen3_5, qwen3_5_moe, etc.)
         if normalized.hasPrefix("qwen3_5") || compact.hasPrefix("qwen35") {
             return .xmlFunction

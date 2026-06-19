@@ -480,12 +480,40 @@ public func loadWeights(
             defaultGroupSize: perLayerQuantization.quantization?.groupSize,
             defaultMode: perLayerQuantization.quantization?.mode ?? .affine)
         {
+            // A declared per-module (bits, groupSize) is "shape-consistent" when it
+            // unpacks the actual `.weight`/`.scales` to integer dims that agree:
+            //   inputDim = packed*32 / bits   (must divide cleanly)
+            //   inputDim / numGroups == groupSize
+            // Some packed widths satisfy MULTIPLE bit-widths (e.g. 512 → bits∈{2,4,8}),
+            // so the shape walk's first-match guess can disagree with a config that is
+            // itself perfectly consistent. In that case the explicit config is the
+            // author's stated intent and the shape walk's guess is ambiguous — keep
+            // config. Only override when config is DEMONSTRABLY broken (its declared
+            // bits don't unpack consistently with the on-disk shapes). Was: Laguna-M.1
+            // shipped correct 4-bit dense-MLP, the walk re-stamped it 8-bit (512 is
+            // ambiguous), and the 4-bit weights dequantized to garbage.
+            func declaredBitsAreShapeConsistent(
+                _ path: String, _ cq: BaseConfiguration.Quantization
+            ) -> Bool {
+                guard let w = weights["\(path).weight"], let s = weights["\(path).scales"],
+                    let packed = w.shape.last, let numGroups = s.shape.last,
+                    cq.bits > 0, numGroups > 0, (packed * 32) % cq.bits == 0
+                else { return false }
+                let inputDim = (packed * 32) / cq.bits
+                return inputDim % numGroups == 0 && inputDim / numGroups == cq.groupSize
+            }
             var corrections = 0
             for (path, expected) in shapeInferred.perLayerQuantization {
                 if case .quantize(let q) = expected {
                     if let configured = remappedPerLayer[path],
                         case .quantize(let cq) = configured,
                         cq.bits == q.bits && cq.groupSize == q.groupSize && cq.mode == q.mode
+                    { continue }
+                    // Keep an explicit config that is itself shape-consistent (the walk
+                    // disagreed only because the packed width is bit-width ambiguous).
+                    if let configured = remappedPerLayer[path],
+                        case .quantize(let cq) = configured,
+                        declaredBitsAreShapeConsistent(path, cq)
                     { continue }
                     remappedPerLayer[path] = expected
                     corrections += 1
