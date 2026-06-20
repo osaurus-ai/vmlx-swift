@@ -122,6 +122,13 @@ public enum TQDiskSerializer {
         /// CCA state is a false hit per the Zyphra runtime contract, so
         /// the four arrays round-trip together. Added 2026-05-06.
         case zayaCCA = 9
+        /// `MiniMaxM3SparseCache` — rolling KV plus the Lightning-Indexer key
+        /// lane (`idx_keys`). The paged tier stores only full KV history and
+        /// cannot round-trip idx_keys, so M3 forces disk restore (see
+        /// `cacheRequiresDiskBackedCoordinatorRestore`). The three state arrays
+        /// (keys, values, idx_keys) round-trip together; a KV-only restore is a
+        /// false hit because MSA block selection is recomputed from idx_keys.
+        case miniMaxM3Sparse = 10
         /// Cache type we don't know how to persist. On restore, treated as
         /// a forced miss for the affected layer only.
         case skip = 4
@@ -223,6 +230,9 @@ public enum TQDiskSerializer {
                 // ZAYA CCA-attention: round-trip the four-slot state
                 // (keys, values, conv_state, prev_hs) as one unit.
                 serializeZayaCCALayer(zaya, index: i, into: &result)
+            } else if let m3 = layer as? MiniMaxM3SparseCache {
+                // MiniMax-M3 MSA: round-trip keys, values, AND idx_keys together.
+                serializeMiniMaxM3Layer(m3, index: i, into: &result)
             } else if let hybrid = layer as? HybridPoolCache {
                 // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
                 // serialize the rotating window AND the compressor +
@@ -610,6 +620,32 @@ public enum TQDiskSerializer {
         result[kindKey(for: i)] = kindArray(.zayaCCA)
     }
 
+    /// Serialize a single `MiniMaxM3SparseCache` layer — keys, values, AND the
+    /// idx_keys lane — as one unit, plus `(offset, indexDim, batchSize)` meta so
+    /// restore rebuilds without the model. KV-only restore is a false hit since
+    /// MSA block selection recomputes from idx_keys every step. `.skip` if the
+    /// 3-array state shape is unexpectedly wrong.
+    private static func serializeMiniMaxM3Layer(
+        _ m3: MiniMaxM3SparseCache,
+        index i: Int,
+        into result: inout [String: MLXArray]
+    ) {
+        let s = m3.state
+        guard s.count == 3 else {
+            result[kindKey(for: i)] = kindArray(.skip)
+            return
+        }
+        result["mm3_\(i)_keys"] = s[0]
+        result["mm3_\(i)_values"] = s[1]
+        result["mm3_\(i)_idx_keys"] = s[2]
+        result["__mm3_\(i)_meta__"] = MLXArray([
+            Int32(m3.offset),
+            Int32(m3.indexDim),
+            Int32(m3.batchSize),
+        ])
+        result[kindKey(for: i)] = kindArray(.miniMaxM3Sparse)
+    }
+
     /// Serialize a single QuantizedKVCache layer's state (4 or 6 arrays
     /// covering qweight/scales/[biases] for both keys and values), plus
     /// group size, bit width and offset metadata so the restore path can
@@ -728,6 +764,17 @@ public enum TQDiskSerializer {
         public let batchSize: Int
     }
 
+    /// MiniMax-M3 MSA layer: keys, values, idx_keys + (offset, indexDim,
+    /// batchSize). The three arrays restore together as a `MiniMaxM3SparseCache`.
+    public struct MiniMaxM3SparseLayerComponents {
+        public let keys: MLXArray
+        public let values: MLXArray
+        public let idxKeys: MLXArray
+        public let offset: Int
+        public let indexDim: Int
+        public let batchSize: Int
+    }
+
     /// Result of deserializing one cache layer from a dict.
     public indirect enum LayerData {
         case tq(TQLayerComponents)
@@ -737,6 +784,7 @@ public enum TQDiskSerializer {
         case rotating(RotatingLayerComponents)
         case deepseekV4(DeepseekV4LayerComponents)
         case zayaCCA(ZayaCCALayerComponents)
+        case miniMaxM3Sparse(MiniMaxM3SparseLayerComponents)
         /// `CacheList` composite: ordered per-sub-cache LayerData. Each
         /// sub-element carries its own kind (`.standard`, `.mamba`,
         /// `.rotating`, etc.). Restore walks the array and dispatches
@@ -886,6 +934,12 @@ public enum TQDiskSerializer {
             case .zayaCCA:
                 if let comp = deserializeZayaCCALayer(index: i, from: arrays) {
                     out.append(IndexedLayerData(index: i, data: .zayaCCA(comp)))
+                } else {
+                    out.append(IndexedLayerData(index: i, data: .skip))
+                }
+            case .miniMaxM3Sparse:
+                if let comp = deserializeMiniMaxM3Layer(index: i, from: arrays) {
+                    out.append(IndexedLayerData(index: i, data: .miniMaxM3Sparse(comp)))
                 } else {
                     out.append(IndexedLayerData(index: i, data: .skip))
                 }
@@ -1162,7 +1216,7 @@ public enum TQDiskSerializer {
                 }
             case .skip, .unknown:
                 subs.append(.skip)
-            case .tq, .qkv, .deepseekV4, .cacheList, .zayaCCA:
+            case .tq, .qkv, .deepseekV4, .cacheList, .zayaCCA, .miniMaxM3Sparse:
                 // Not currently emitted as sub-cache types — see
                 // serializeCacheListLayer. If a future bundle ships
                 // these we'll need to extend serialize too. Skip for
@@ -1242,6 +1296,30 @@ public enum TQDiskSerializer {
             convChannels: Int(m[1]),
             hiddenSize: Int(m[2]),
             batchSize: Int(m[3]))
+    }
+
+    /// Deserialize a single `MiniMaxM3SparseCache` layer. Reads three state
+    /// arrays (keys, values, idx_keys) plus the 3-element `__mm3_{i}_meta__`
+    /// tuple `(offset, index_dim, batch_size)`.
+    private static func deserializeMiniMaxM3Layer(
+        index i: Int,
+        from arrays: [String: MLXArray]
+    ) -> MiniMaxM3SparseLayerComponents? {
+        guard let keys = arrays["mm3_\(i)_keys"],
+              let values = arrays["mm3_\(i)_values"],
+              let idxKeys = arrays["mm3_\(i)_idx_keys"],
+              let metaArr = arrays["__mm3_\(i)_meta__"]
+        else { return nil }
+        guard !metaArr.shape.isEmpty, metaArr.shape[0] == 3 else { return nil }
+        let m = metaArr.asArray(Int32.self)
+        guard m.count == 3 else { return nil }
+        return MiniMaxM3SparseLayerComponents(
+            keys: keys,
+            values: values,
+            idxKeys: idxKeys,
+            offset: Int(m[0]),
+            indexDim: Int(m[1]),
+            batchSize: Int(m[2]))
     }
 
     // MARK: - Helpers

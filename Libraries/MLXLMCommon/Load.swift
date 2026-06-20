@@ -637,6 +637,27 @@ public func loadWeights(
             let quantBiases =
                 (mode == .mxfp4 || mode == .mxfp8) ? nil : weights[biasesKey]
 
+            // Disambiguate (bits, group_size) from the placeholder module's TRUE
+            // input dim. Pre-quantized shapes alone are ambiguous: `bits*group_size`
+            // is invariant under affine packing, so e.g. (bits=6, gs=64) and
+            // (bits=3, gs=128) produce IDENTICAL weight/scales shapes (the scales
+            // tensor has the same column count either way). Only the real input dim
+            // resolves it. The placeholder Linear/SwitchLinear/Embedding carries
+            // that dim, so this is unconditional and module-local — no reliance on
+            // config defaults or shape-walk candidate ordering, which mis-read
+            // MiniMax-M3's mixed 6/8-bit modules as 3-bit/gs128 and crashed
+            // quantized_matmul. Affine only; MXFP modes pack differently.
+            func resolveAffineBitsGS(inputDim: Int) -> (bits: Int, groupSize: Int)? {
+                guard mode == .affine, inputDim > 0 else { return nil }
+                let packed = loadedWeight.dim(-1)
+                let groups = loadedScales.dim(-1)
+                guard groups > 0, inputDim % groups == 0, (packed * 32) % inputDim == 0
+                else { return nil }
+                let derivedBits = (packed * 32) / inputDim
+                guard derivedBits > 0 else { return nil }
+                return (derivedBits, inputDim / groups)
+            }
+
             // Pre-quantized safetensors already provide `.weight` +
             // `.scales` (+ optional quant `.biases`). Build the quantized
             // module from those arrays directly instead of quantizing the
@@ -645,15 +666,17 @@ public func loadWeights(
             // especially important for routed-MoE `SwitchLinear`, where the
             // placeholder can be tens of GB on Ling/DSV4-class bundles.
             if let linear = m as? Linear {
+                let (rb, rgs) = resolveAffineBitsGS(inputDim: linear.weight.dim(-1)) ?? (b, gs)
                 return (path, QuantizedLinear(
                     weight: loadedWeight,
                     bias: weights[biasKey] ?? linear.bias,
                     scales: loadedScales,
                     biases: quantBiases,
-                    groupSize: gs, bits: b, mode: mode))
+                    groupSize: rgs, bits: rb, mode: mode))
             }
 
             if let switchLinear = m as? SwitchLinear {
+                let (rb, rgs) = resolveAffineBitsGS(inputDim: switchLinear.inputDims) ?? (b, gs)
                 return (path, QuantizedSwitchLinear(
                     inputDims: switchLinear.inputDims,
                     outputDims: switchLinear.outputDims,
@@ -662,16 +685,17 @@ public func loadWeights(
                     bias: weights[biasKey] ?? switchLinear.bias,
                     scales: loadedScales,
                     biases: quantBiases,
-                    groupSize: gs, bits: b, mode: mode))
+                    groupSize: rgs, bits: rb, mode: mode))
             }
 
-            if m is Embedding {
+            if let embedding = m as? Embedding {
+                let (rb, rgs) = resolveAffineBitsGS(inputDim: embedding.weight.dim(-1)) ?? (b, gs)
                 return (path, QuantizedEmbedding(
                     weight: loadedWeight,
                     scales: loadedScales,
                     biases: quantBiases,
-                    groupSize: gs,
-                    bits: b,
+                    groupSize: rgs,
+                    bits: rb,
                     mode: mode))
             }
 

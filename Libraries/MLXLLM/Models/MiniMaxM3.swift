@@ -58,6 +58,17 @@ private class SwiGLUOAIMLP: Module, UnaryLayer {
     }
 }
 
+// MARK: - MSA trace (opt-in, one-shot)
+
+/// Set `MM3_MSA_TRACE=1` to emit a single stderr line the first time the
+/// Lightning Indexer falls back to full attention and the first time it fires
+/// real block-sparse selection (context past `topk*block` = 2048 tokens). This
+/// is the conclusive GO signal for the MSA decode path during live validation —
+/// one-shot so it never floods the 57 sparse layers × N steps decode loop.
+private let mm3MSATrace = ProcessInfo.processInfo.environment["MM3_MSA_TRACE"] != nil
+nonisolated(unsafe) private var mm3FullAttnLogged = false
+nonisolated(unsafe) private var mm3SparseFiredLogged = false
+
 // MARK: - Lightning Indexer (block selection)
 
 /// Scores `idx_q` against cached `idx_k`, max-pools per `block`-token block,
@@ -129,7 +140,17 @@ private class MiniMaxM3Indexer: Module {
 
         let keep = min(topk, nBlocks)
         if keep >= nBlocks {
+            if mm3MSATrace, !mm3FullAttnLogged {
+                mm3FullAttnLogged = true
+                FileHandle.standardError.write(
+                    Data("[MM3-MSA] full attention (offset=\(offset) Sk=\(Sk) nBlocks=\(nBlocks) <= topk=\(topk)); indexer not yet firing\n".utf8))
+            }
             return nil  // all blocks visible → only causal matters
+        }
+        if mm3MSATrace, !mm3SparseFiredLogged {
+            mm3SparseFiredLogged = true
+            FileHandle.standardError.write(
+                Data("[MM3-MSA] SPARSE SELECTION FIRED (offset=\(offset) Sk=\(Sk) nBlocks=\(nBlocks) keep=\(keep) of topk=\(topk)); block-sparse MSA active\n".utf8))
         }
 
         // top-k blocks per query → [B,1,Sq,Sk] keep-bias (0 kept / -inf else)
