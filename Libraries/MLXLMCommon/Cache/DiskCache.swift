@@ -259,6 +259,12 @@ public final class DiskCache: @unchecked Sendable {
                 "[vmlx][cache/disk] fetch corrupt entry at \(url.lastPathComponent): \(error) — removing\n"
                 .utf8))
             try? FileManager.default.removeItem(at: url)
+            // Drop the SQLite row too. Removing only the file orphans the
+            // `cache_entries` row, whose `file_size` then permanently inflates
+            // the `SUM(file_size)` eviction quota (unbounded on-disk growth and
+            // premature eviction of live entries). The fetch path already holds
+            // `lock`, so delete in-place.
+            _deleteEntryLocked(hash: hash)
             return nil
         }
     }
@@ -397,6 +403,25 @@ public final class DiskCache: @unchecked Sendable {
             sqlite3_bind_text(stmt, 1, cStr, -1, nil)
             sqlite3_bind_int64(stmt, 2, Int64(tokenCount))
             sqlite3_bind_int64(stmt, 3, Int64(fileSize))
+            sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
+    }
+
+    /// Delete a single `cache_entries` row by hash. Caller MUST hold `lock`.
+    ///
+    /// Used when the on-disk file for an entry is removed (corrupt/truncated
+    /// payload) so the row's `file_size` stops counting toward the eviction
+    /// quota. Removing only the file would orphan the row and permanently
+    /// inflate `SUM(file_size)`.
+    private func _deleteEntryLocked(hash: String) {
+        guard let db else { return }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "DELETE FROM cache_entries WHERE hash = ?", -1, &stmt, nil)
+            == SQLITE_OK
+        else { return }
+        hash.withCString { cStr in
+            sqlite3_bind_text(stmt, 1, cStr, -1, nil)
             sqlite3_step(stmt)
         }
         sqlite3_finalize(stmt)

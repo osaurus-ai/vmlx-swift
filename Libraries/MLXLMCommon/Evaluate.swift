@@ -1164,6 +1164,13 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// warm restore can pollute prompt boundaries before tool selection.
     let disableDiskBackedRequiredToolRestore: Bool
 
+    /// Caller-proven policy gate that suppresses storing the `promptLen-1`
+    /// seed-boundary disk entry for disk-backed required-tool prompts whose
+    /// warm restore is not proven safe. Mirrors the batched-path
+    /// `shouldSkipDiskBackedToolPromptSeedBoundary` so the solo path does not
+    /// persist a seed entry the batched path deliberately skips.
+    let skipDiskBackedToolPromptSeedBoundary: Bool
+
     /// Prompt token IDs captured at init for cache store after generation.
     public private(set) var promptTokenIds: [Int]
 
@@ -1238,6 +1245,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.cacheCoordinator = nil
         self.disableDiskBackedRequiredToolRestore = false
+        self.skipDiskBackedToolPromptSeedBoundary = false
         self.promptTokenIds = []
         self.cachePrefixTokenCounts = []
         self.originalInput = LMInput(text: y)
@@ -1274,6 +1282,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         parameters: GenerateParameters,
         cacheCoordinator: CacheCoordinator? = nil,
         disableDiskBackedRequiredToolRestore: Bool = false,
+        skipDiskBackedToolPromptSeedBoundary: Bool = false,
         prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil
     ) throws {
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
@@ -1282,6 +1291,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.y = input.text
         self.cacheCoordinator = cacheCoordinator
         self.disableDiskBackedRequiredToolRestore = disableDiskBackedRequiredToolRestore
+        self.skipDiskBackedToolPromptSeedBoundary = skipDiskBackedToolPromptSeedBoundary
         let promptTokenCount = input.text.tokens.size
         var effectiveParameters = parameters
         if let coordinator = cacheCoordinator {
@@ -1680,6 +1690,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.cacheCoordinator = nil
         self.disableDiskBackedRequiredToolRestore = false
+        self.skipDiskBackedToolPromptSeedBoundary = false
         self.promptTokenIds = []
         self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
         self.originalInput = input
@@ -2006,6 +2017,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
                 if requiresDiskBackedRestore,
+                   !skipDiskBackedToolPromptSeedBoundary,
                    promptTokenIds.count > 1,
                    let boundarySnapshot = cacheSnapshotForBoundary(
                         tokens: Array(promptTokenIds.dropLast()),

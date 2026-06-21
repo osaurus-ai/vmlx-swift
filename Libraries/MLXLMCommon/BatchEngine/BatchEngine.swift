@@ -953,6 +953,9 @@ public actor BatchEngine {
         let disableDiskBackedRequiredToolRestore = shouldDisableDiskBackedRequiredToolRestore(
             toolSchemas: toolSchemas,
             disablesGeneratedCacheBoundary: false)
+        let skipDiskBackedToolPromptSeedBoundary = shouldSkipDiskBackedToolPromptSeedBoundary(
+            toolSchemas: toolSchemas,
+            disablesGeneratedCacheBoundary: false)
         let fastPathID = UUID()
         var soloParameters = parameters
         soloParameters.extraStopStrings = mergeStopStrings(
@@ -1063,6 +1066,7 @@ public actor BatchEngine {
                 let promptTokenIdsForTail = input.text.tokens.reshaped(-1).asArray(Int.self)
                 let deferredParameters = soloParameters
                 let deferredDisableRestore = disableDiskBackedRequiredToolRestore
+                let deferredSkipSeedBoundary = skipDiskBackedToolPromptSeedBoundary
                 let deferredInputs = SendableBox(
                     (input, context.model, cacheCoordinator))
                 let deferredContinuation = continuation
@@ -1076,6 +1080,7 @@ public actor BatchEngine {
                         parameters: deferredParameters,
                         cacheCoordinator: deferredCoordinator,
                         disableDiskBackedRequiredToolRestore: deferredDisableRestore,
+                        skipDiskBackedToolPromptSeedBoundary: deferredSkipSeedBoundary,
                         prefillProgressHandler: { progress in
                             deferredContinuation.yield(.prefillProgress(prefillGate.clamp(progress)))
                         })
