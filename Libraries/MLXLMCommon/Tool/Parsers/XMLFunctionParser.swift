@@ -27,7 +27,19 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
         guard
             let funcMatch = content.range(
                 of: #"<function=([\s\S]*?)</function>"#, options: .regularExpression)
-        else { return nil }
+        else {
+            // The `qwen` capability stamp covers two wire formats: Qwen3-Coder
+            // emits the `<function=…><parameter=…>` XML handled above, but
+            // Qwen3 (non-coder) and deepseek_v3-arch bundles such as
+            // Kanana-2-30B-A3B emit a JSON object inside the `<tool_call>` tags
+            // (`<tool_call>\n{"name": …, "arguments": …}\n</tool_call>`) per their
+            // chat template. The XML pattern never matches that, so the call
+            // would be silently dropped. Fall back to JSON decoding — only when
+            // no `<function=>` block is present and the body is a JSON object —
+            // so the same stamp drives both forms with no regression to the XML
+            // path (it is still tried first) and no risk to non-tool prose.
+            return parseJSONToolCallFallback(content)
+        }
 
         let funcContent = String(content[funcMatch])
 
@@ -128,6 +140,26 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
         }
 
         return ToolCall(function: .init(name: funcName, arguments: arguments))
+    }
+
+    /// Qwen JSON wire form fallback: `<tool_call>{"name": …, "arguments": …}</tool_call>`.
+    /// Strips the surrounding start/end tags (if present) and decodes the body as a
+    /// `ToolCall.Function`, mirroring `JSONToolCallParser`. Returns nil unless the body
+    /// is a JSON object so ordinary prose is never misread as a tool call.
+    private func parseJSONToolCallFallback(_ content: String) -> ToolCall? {
+        var text = content
+        if let startTag, let r = text.range(of: startTag) {
+            text = String(text[r.upperBound...])
+        }
+        if let endTag, let r = text.range(of: endTag) {
+            text = String(text[..<r.lowerBound])
+        }
+        let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard jsonStr.hasPrefix("{"), jsonStr.hasSuffix("}"),
+            let data = jsonStr.data(using: .utf8),
+            let function = try? JSONDecoder().decode(ToolCall.Function.self, from: data)
+        else { return nil }
+        return ToolCall(function: function)
     }
 
     private func schemaValidationFailure(

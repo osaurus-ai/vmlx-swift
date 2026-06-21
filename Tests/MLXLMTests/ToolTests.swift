@@ -131,6 +131,39 @@ struct ToolTests {
         #expect(toolCall.function.arguments["query"] == .string("swift programming"))
     }
 
+    // MARK: - XMLFunctionParser dual-format (qwen XML + qwen JSON)
+
+    @Test("XMLFunctionParser - Qwen3-Coder <function=> XML form still parses")
+    func testXMLFunctionParserXMLForm() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content =
+            "<function=get_weather><parameter=location>Paris</parameter></function>"
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+    }
+
+    @Test("XMLFunctionParser - Qwen JSON form (Kanana/Qwen3) parses via fallback")
+    func testXMLFunctionParserJSONFallback() throws {
+        // Kanana-2-30B-A3B (deepseek_v3) and Qwen3 (non-coder) stamp
+        // tool_parser: "qwen" → .xmlFunction but emit the JSON wire form per
+        // their chat template. The fallback must decode it (regression: was
+        // silently dropped → no structured tool call).
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        // The processor strips the leading <tool_call> tag before parse(); the
+        // segment retains the trailing close tag + the model's newlines.
+        let content = "\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Tokyo\"}}\n</tool_call>"
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    @Test("XMLFunctionParser - prose is not misread as a tool call")
+    func testXMLFunctionParserIgnoresProse() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        #expect(parser.parse(content: "I will check the weather for you.", tools: nil) == nil)
+    }
+
     // MARK: - Pythonic Format Tests (LFM2/LFM2.5)
 
     @Test("Test Pythonic Tool Call Parser - Basic")

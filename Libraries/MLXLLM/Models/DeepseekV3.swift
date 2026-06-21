@@ -19,7 +19,12 @@ public struct DeepseekV3Configuration: Codable, Sendable {
     var nRoutedExperts: Int?
     var routedScalingFactor: Float
     var kvLoraRank: Int
-    var qLoraRank: Int
+    /// Optional: DeepSeek-V3 671B compresses Q via a LoRA (`q_a_proj`/`q_b_proj`),
+    /// but smaller deepseek_v3-arch bundles (e.g. Kanana-2-30B-A3B) set
+    /// `q_lora_rank: null` and use a direct `q_proj`. The attention already
+    /// branches on `qLoraRank == nil`; the config must accept null/absent too
+    /// or Codable throws "Missing value at 'q_lora_rank'" on load.
+    var qLoraRank: Int?
     var qkRopeHeadDim: Int
     var vHeadDim: Int
     var qkNopeHeadDim: Int
