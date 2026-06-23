@@ -985,7 +985,30 @@ public struct JangLoader: Sendable {
             return template
         }()
 
-        guard zayaToolAware || lfm2ToolAware || sidecarTemplate != nil else {
+        // Modern-HuggingFace fallback: current `transformers` ships the chat
+        // template as a standalone `chat_template.jinja` text file and leaves
+        // `tokenizer_config.json` without an inline `chat_template`. swift-
+        // transformers only reads the inline field, so such a model is prompted
+        // with no turn structure — an instruct model then emits EOS/pad
+        // immediately and the response detokenizes to empty (observed on
+        // LFM2.5 mxfp4/mxfp8 and VibeThinker-3B mxfp4/mxfp8/jang). When there is
+        // no usable inline template and no more-specific substitution above
+        // applies, inject the model's own `.jinja` template verbatim.
+        let genericJinjaTemplate: String? = {
+            if let currentTemplate, !currentTemplate.isEmpty { return nil }
+            let jinjaURL = directory.appendingPathComponent("chat_template.jinja")
+            guard fileManager.fileExists(atPath: jinjaURL.path),
+                  let text = try? String(contentsOf: jinjaURL, encoding: .utf8),
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else {
+                return nil
+            }
+            return text
+        }()
+
+        guard zayaToolAware || lfm2ToolAware || sidecarTemplate != nil
+            || genericJinjaTemplate != nil
+        else {
             return directory
         }
         if !zayaToolAware,
@@ -1001,8 +1024,10 @@ public struct JangLoader: Sendable {
             effectiveTemplate = ChatTemplateFallbacks.zayaVLVisionToolMinimal
         } else if lfm2ToolAware {
             effectiveTemplate = ChatTemplateFallbacks.lfm2ToolMinimal
+        } else if let sidecarTemplate {
+            effectiveTemplate = sidecarTemplate
         } else {
-            effectiveTemplate = sidecarTemplate!
+            effectiveTemplate = genericJinjaTemplate!
         }
         configJSON["chat_template"] = effectiveTemplate
 

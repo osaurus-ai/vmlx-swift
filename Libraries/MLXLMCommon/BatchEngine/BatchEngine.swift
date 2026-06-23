@@ -2673,6 +2673,22 @@ public actor BatchEngine {
             }
         }
 
+        // Drain the GPU before signaling end-of-stream. Everything above —
+        // the decode tail and the end-of-turn cache store (`MLX.eval` on
+        // trimmed/boundary snapshots, hybrid-SSM re-derive forward passes) —
+        // only SUBMITS work; MLX completes it asynchronously on its stream
+        // thread. The host releases the process-wide GPU gate (osaurus'
+        // MetalGate) when this stream finishes, so if the next exclusive
+        // producer (image generation via a second MLX graph, the embedder, a
+        // model load) starts while this cache-store eval is still in flight,
+        // the two race on the shared Metal command buffer and crash
+        // (EXC_BAD_ACCESS in `tryCoalescingPreviousComputeCommandEncoder`, or
+        // `addCompletedHandler: provided after commit call`). Synchronizing on
+        // THIS thread — which owns the command buffers — drains them in order
+        // with no foreign-commit hazard, so "stream finished" provably means
+        // "GPU idle." Mirrors the solo-fast-path drain in `finishSoloFastPath`.
+        Stream().synchronize()
+
         slot.continuation.finish()
 
         // Long-context pressure relief: the global memoryPurgeInterval (256
