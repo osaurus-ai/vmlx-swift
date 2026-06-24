@@ -66,10 +66,6 @@ public struct MistralToolCallParser: ToolCallParser, Sendable {
     public func parseEOS(
         _ toolCallBuffer: String, tools: [[String: any Sendable]]?
     ) -> [ToolCall] {
-        if ProcessInfo.processInfo.environment["VMLX_TOOL_DEBUG"] == "1" {
-            try? ("BUFFER>>>" + toolCallBuffer + "<<<\n")
-                .write(toFile: "/tmp/vmlx_tool_buffer.log", atomically: true, encoding: .utf8)
-        }
         // Each `[TOOL_CALLS]` segment is either a single `name[ARGS]{json}` call
         // (V13) or a JSON array/object that may itself carry multiple calls (V7).
         let segments =
