@@ -954,6 +954,25 @@ public struct PixtralProcessorConfiguration: Codable, Sendable {
     public let imageEndToken: String?
     public let patchSize: Int
 
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Accept both the nested `image_processor` layout (combined bundles) and
+        // the flat top-level layout (split HF preprocessor_config.json, e.g.
+        // mlx-community Pixtral). Mirrors Mistral3VLMProcessorConfiguration.
+        if let nested = try c.decodeIfPresent(ImageProcessorConfig.self, forKey: .imageProcessor) {
+            self.imageProcessor = nested
+        } else {
+            self.imageProcessor = try ImageProcessorConfig(from: decoder)
+        }
+        self.imageToken = try c.decodeIfPresent(String.self, forKey: .imageToken) ?? "[IMG]"
+        self.imageBreakToken =
+            try c.decodeIfPresent(String.self, forKey: .imageBreakToken) ?? "[IMG_BREAK]"
+        self.imageEndToken =
+            try c.decodeIfPresent(String.self, forKey: .imageEndToken) ?? "[IMG_END]"
+        self.patchSize =
+            try c.decodeIfPresent(Int.self, forKey: .patchSize) ?? imageProcessor.patchSize
+    }
+
     public struct ImageProcessorConfig: Codable, Sendable {
         public let imageMean: [CGFloat]
         public let imageStd: [CGFloat]

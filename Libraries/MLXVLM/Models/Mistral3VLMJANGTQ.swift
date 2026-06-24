@@ -58,15 +58,15 @@ internal final class Mistral3JANGTQAttention: Module {
             inFeatures: nHeads * headDim, outFeatures: dim,
             bits: bits, seed: seed, bias: false)
 
-        guard let ropeParams = config.ropeParameters,
-            let ropeTheta = ropeParams["rope_theta"]?.asFloat()
-        else {
-            fatalError("rope_parameters['rope_theta'] is required")
-        }
+        // RoPE base: prefer nested rope_parameters["rope_theta"] (Ministral-3.x
+        // layout), else the flat top-level rope_theta (standard Mistral/Ministral).
+        // Mirrors the fp Mistral3 path; only the nested dict drives scaling.
+        let ropeTheta = config.ropeParameters?["rope_theta"]?.asFloat()
+            ?? config.ropeTheta
         self.rope = initializeRope(
             dims: headDim,
             base: ropeTheta,
-            traditional: false,
+            traditional: config.ropeTraditional,
             scalingConfig: config.ropeParameters,
             maxPositionEmbeddings: config.maxPositionEmbeddings
         )

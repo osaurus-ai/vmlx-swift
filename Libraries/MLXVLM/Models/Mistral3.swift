@@ -335,16 +335,16 @@ private enum Language {
             self._wv.wrappedValue = Linear(dim, nKVHeads * headDim, bias: false)
             self._wo.wrappedValue = Linear(nHeads * headDim, dim, bias: false)
 
-            // Initialize RoPE using rope_parameters - rope_theta is required like in Python
-            guard let ropeParams = config.ropeParameters,
-                let ropeTheta = ropeParams["rope_theta"]?.asFloat()
-            else {
-                fatalError("rope_parameters['rope_theta'] is required")
-            }
+            // RoPE base: prefer the nested rope_parameters["rope_theta"]
+            // (Ministral-3.x layout), else the flat top-level rope_theta
+            // (standard Mistral/Ministral configs). Both are parsed by
+            // the config; only the nested dict drives scaling.
+            let ropeTheta = config.ropeParameters?["rope_theta"]?.asFloat()
+                ?? config.ropeTheta
             self.rope = initializeRope(
                 dims: headDim,
                 base: ropeTheta,
-                traditional: false,
+                traditional: config.ropeTraditional,
                 scalingConfig: config.ropeParameters,
                 maxPositionEmbeddings: config.maxPositionEmbeddings
             )
@@ -988,6 +988,31 @@ public struct Mistral3VLMProcessorConfiguration: Codable, Sendable {
     public let imageEndToken: String?
     public let patchSize: Int
     public let spatialMergeSize: Int?
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Image-processor params live under a nested `image_processor` key in
+        // osaurus's combined bundles, but at the top level in the split HF
+        // layout (preprocessor_config.json — e.g. PixtralImageProcessorFast,
+        // as shipped by mlx-community Mistral-Small-3.1/3.2). Accept both so
+        // externally-packaged Mistral3/Pixtral VLMs load, not just combined ones.
+        if let nested = try c.decodeIfPresent(ImageProcessorConfig.self, forKey: .imageProcessor) {
+            self.imageProcessor = nested
+        } else {
+            self.imageProcessor = try ImageProcessorConfig(from: decoder)
+        }
+        // Pixtral/Mistral3 image tokens are standardized; the split layout keeps
+        // them in processor_config.json, which the preprocessor-preferring loader
+        // does not read — fall back to the canonical values when absent.
+        self.imageToken = try c.decodeIfPresent(String.self, forKey: .imageToken) ?? "[IMG]"
+        self.imageBreakToken =
+            try c.decodeIfPresent(String.self, forKey: .imageBreakToken) ?? "[IMG_BREAK]"
+        self.imageEndToken =
+            try c.decodeIfPresent(String.self, forKey: .imageEndToken) ?? "[IMG_END]"
+        self.patchSize =
+            try c.decodeIfPresent(Int.self, forKey: .patchSize) ?? imageProcessor.patchSize
+        self.spatialMergeSize = try c.decodeIfPresent(Int.self, forKey: .spatialMergeSize)
+    }
 
     public struct ImageProcessorConfig: Codable, Sendable {
         public let imageMean: [CGFloat]
