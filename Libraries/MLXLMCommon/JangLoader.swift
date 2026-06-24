@@ -1006,8 +1006,37 @@ public struct JangLoader: Sendable {
             return text
         }()
 
+        // Modern Mistral / Pixtral (and other non-Qwen/Gemma) VLM bundles ship
+        // their real chat template ONLY in a sibling `chat_template.json` — the
+        // Mistral-family `[SYSTEM_PROMPT]` / `[INST]` / `[IMG]` format — with no
+        // inline `tokenizer_config.json` template and no `chat_template.jinja`.
+        // The vision-sidecar path above only fires for templates
+        // `isVisionChatTemplate` recognizes (Qwen/Gemma `<|vision_start|>` etc.,
+        // NOT Mistral's `[IMG]`), so that template is skipped, swift-transformers
+        // sees no template, and the model is prompted with a ChatML default that
+        // leaks `<|im_start|>` markers (observed on mlx-community Mistral-Small
+        // 3.1/3.2). When there is no usable inline template, no recognized-vision
+        // sidecar substitution, and no `.jinja`, inject the model's own
+        // `chat_template.json` template verbatim. Gated on an empty inline
+        // template and a nil vision-sidecar, so bundles that already resolve a
+        // template (inline, `.jinja`, or recognized-vision sidecar) are untouched.
+        let genericJsonTemplate: String? = {
+            if let currentTemplate, !currentTemplate.isEmpty { return nil }
+            if sidecarTemplate != nil { return nil }
+            guard fileManager.fileExists(atPath: sidecarURL.path),
+                  let data = try? Data(contentsOf: sidecarURL),
+                  let json = try? JSONSerialization.jsonObject(with: data)
+                    as? [String: Any],
+                  let template = json["chat_template"] as? String,
+                  !template.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else {
+                return nil
+            }
+            return template
+        }()
+
         guard zayaToolAware || lfm2ToolAware || sidecarTemplate != nil
-            || genericJinjaTemplate != nil
+            || genericJinjaTemplate != nil || genericJsonTemplate != nil
         else {
             return directory
         }
@@ -1026,8 +1055,10 @@ public struct JangLoader: Sendable {
             effectiveTemplate = ChatTemplateFallbacks.lfm2ToolMinimal
         } else if let sidecarTemplate {
             effectiveTemplate = sidecarTemplate
+        } else if let genericJinjaTemplate {
+            effectiveTemplate = genericJinjaTemplate
         } else {
-            effectiveTemplate = genericJinjaTemplate!
+            effectiveTemplate = genericJsonTemplate!
         }
         configJSON["chat_template"] = effectiveTemplate
 
