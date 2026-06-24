@@ -1035,13 +1035,37 @@ public struct JangLoader: Sendable {
             return template
         }()
 
+        // Mistral 3.x packs whose template (inline OR chat_template.json) is the
+        // vision/text `[INST]` format with NO tool support (e.g. mlx-community
+        // Mistral-Small-3.1/3.2 ship only the HF vision template). Mistral does
+        // tools natively via the tekken `[TOOL_CALLS]name[ARGS]{}` format, but
+        // the shipped template never renders `[AVAILABLE_TOOLS]`, so tools go
+        // ungrounded. Swap in the complete Mistral template, which preserves the
+        // native `[INST]`/`[IMG]` surface and adds tools + conditional reasoning.
+        // Data-driven (`[INST]` present, `[AVAILABLE_TOOLS]` absent), not by name.
+        let mistralCompleteTemplate: String? = {
+            let existing: String? = {
+                if let currentTemplate, !currentTemplate.isEmpty { return currentTemplate }
+                return sidecarTemplate ?? genericJsonTemplate
+            }()
+            guard let existing,
+                  existing.contains("[INST]"),
+                  !existing.contains("[AVAILABLE_TOOLS]")
+            else {
+                return nil
+            }
+            return ChatTemplateFallbacks.mistral3CompleteMinimal
+        }()
+
         guard zayaToolAware || lfm2ToolAware || sidecarTemplate != nil
             || genericJinjaTemplate != nil || genericJsonTemplate != nil
+            || mistralCompleteTemplate != nil
         else {
             return directory
         }
         if !zayaToolAware,
            !lfm2ToolAware,
+           mistralCompleteTemplate == nil,
            let currentTemplate,
            isVisionChatTemplate(currentTemplate)
         {
@@ -1053,6 +1077,8 @@ public struct JangLoader: Sendable {
             effectiveTemplate = ChatTemplateFallbacks.zayaVLVisionToolMinimal
         } else if lfm2ToolAware {
             effectiveTemplate = ChatTemplateFallbacks.lfm2ToolMinimal
+        } else if let mistralCompleteTemplate {
+            effectiveTemplate = mistralCompleteTemplate
         } else if let sidecarTemplate {
             effectiveTemplate = sidecarTemplate
         } else if let genericJinjaTemplate {

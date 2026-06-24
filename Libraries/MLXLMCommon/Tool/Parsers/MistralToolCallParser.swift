@@ -2,22 +2,27 @@
 
 import Foundation
 
-/// Parser for Mistral V13 tool call format: `[TOOL_CALLS]name[ARGS]{"json_args"}`
+/// Parser for the Mistral tekken tool-call formats.
 ///
-/// This format is used by Mistral3/Ministral-3 2512 models and Devstral 2.
-/// The special tokens `[TOOL_CALLS]` (token ID 9) and `[ARGS]` (ID 32) are used
-/// as delimiters. Multiple tool calls use repeated `[TOOL_CALLS]` tokens.
+/// Mistral has shipped two on-the-wire encodings, both opened by the
+/// `[TOOL_CALLS]` special token (ID 9) and ended at EOS (no end tag):
 ///
-/// Also handles the older V11 format which includes an optional `[CALL_ID]`
-/// between the function name and `[ARGS]` (V13 does not use `[CALL_ID]`).
+/// - V7 / V11 (Mistral-Small-3.1/3.2 2503/2506, Pixtral): a JSON array of
+///   call objects — `[TOOL_CALLS][{"name": "get_weather", "arguments": {...}}]`.
+///   These tokenizers do NOT contain an `[ARGS]` token.
+/// - V13 (Mistral-3 2512, Devstral 2): `[TOOL_CALLS]name[ARGS]{json}`, with an
+///   optional `[CALL_ID]` between the name and `[ARGS]` (the V11 variant).
+///
+/// This parser accepts both: it uses `[ARGS]` when present, otherwise decodes
+/// the remainder as a JSON array (or single object) of `{name, arguments}`.
+/// Since stop tokens are intercepted at the token-ID level before
+/// detokenization, the buffered tool body is handed to `parseEOS()` at the end
+/// of generation.
 ///
 /// Examples:
+/// - `[TOOL_CALLS][{"name": "get_weather", "arguments": {"city": "Tokyo"}}]`
 /// - `[TOOL_CALLS]get_weather[ARGS]{"location": "Tokyo"}`
 /// - `[TOOL_CALLS]fn1[ARGS]{...}[TOOL_CALLS]fn2[ARGS]{...}` (multiple calls)
-///
-/// Mistral does not use an end tag — tool calls end at EOS. Since stop tokens
-/// are intercepted at the token ID level before detokenization, tool calls are
-/// extracted via `ToolCallProcessor.processEOS()` at generation end.
 public struct MistralToolCallParser: ToolCallParser, Sendable {
     public let startTag: String? = "[TOOL_CALLS]"
     public let endTag: String? = nil
@@ -33,31 +38,90 @@ public struct MistralToolCallParser: ToolCallParser, Sendable {
             text = String(text.dropFirst(start.count))
             text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        // Split on [ARGS] to get function name and arguments
-        guard let argsRange = text.range(of: "[ARGS]") else {
-            return nil
-        }
 
-        var namePart = String(text[..<argsRange.lowerBound])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let argsPart = String(text[argsRange.upperBound...])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Handle optional [CALL_ID] between name and [ARGS]
-        if let callIdRange = namePart.range(of: "[CALL_ID]") {
-            namePart = String(namePart[..<callIdRange.lowerBound])
+        // V13 / V11: `[name][CALL_ID?][ARGS]{json}`
+        if let argsRange = text.range(of: "[ARGS]") {
+            var namePart = String(text[..<argsRange.lowerBound])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            let argsPart = String(text[argsRange.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // Handle optional [CALL_ID] between name and [ARGS]
+            if let callIdRange = namePart.range(of: "[CALL_ID]") {
+                namePart = String(namePart[..<callIdRange.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            guard !namePart.isEmpty else { return nil }
+            guard let argsDict = tryParseJSON(argsPart) as? [String: any Sendable] else {
+                return nil
+            }
+            return ToolCall(function: ToolCall.Function(name: namePart, arguments: argsDict))
         }
 
-        guard !namePart.isEmpty else { return nil }
+        // V7 / V11 (2503/2506): JSON array or single object of {name, arguments}.
+        return Self.firstToolCall(fromJSON: text)
+    }
 
-        // Parse arguments as JSON using tryParseJSON from ParserUtilities
-        guard let argsDict = tryParseJSON(argsPart) as? [String: any Sendable] else {
-            return nil
+    public func parseEOS(
+        _ toolCallBuffer: String, tools: [[String: any Sendable]]?
+    ) -> [ToolCall] {
+        // Each `[TOOL_CALLS]` segment is either a single `name[ARGS]{json}` call
+        // (V13) or a JSON array/object that may itself carry multiple calls (V7).
+        let segments =
+            toolCallBuffer
+            .components(separatedBy: startTag ?? "[TOOL_CALLS]")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var calls: [ToolCall] = []
+        for segment in segments {
+            if segment.range(of: "[ARGS]") != nil {
+                if let call = parse(content: segment, tools: tools) {
+                    calls.append(call)
+                }
+            } else if let parsed = tryParseJSON(segment) as? [Any] {
+                for element in parsed {
+                    if let call = Self.toolCall(fromObject: element) {
+                        calls.append(call)
+                    }
+                }
+            } else if let call = Self.firstToolCall(fromJSON: segment) {
+                calls.append(call)
+            }
         }
+        return calls
+    }
 
-        return ToolCall(
-            function: ToolCall.Function(name: namePart, arguments: argsDict)
-        )
+    /// Decode a JSON array (first element) or single object into a `ToolCall`.
+    private static func firstToolCall(fromJSON text: String) -> ToolCall? {
+        let parsed = tryParseJSON(text)
+        if let array = parsed as? [Any] {
+            return array.lazy.compactMap { toolCall(fromObject: $0) }.first
+        }
+        return toolCall(fromObject: parsed)
+    }
+
+    /// Map a `{"name": ..., "arguments": ...}` (or `parameters`) object to a
+    /// `ToolCall`. Accepts string-encoded arguments as well as objects.
+    private static func toolCall(fromObject object: Any?) -> ToolCall? {
+        guard let dict = object as? [String: any Sendable] else { return nil }
+        // Some encodings nest under `function`.
+        if let fn = dict["function"] as? [String: any Sendable] {
+            return toolCall(fromObject: fn)
+        }
+        guard let name = (dict["name"] as? String), !name.isEmpty else { return nil }
+        let rawArgs = dict["arguments"] ?? dict["parameters"]
+        let args: [String: any Sendable]
+        if let mapping = rawArgs as? [String: any Sendable] {
+            args = mapping
+        } else if let string = rawArgs as? String,
+            let mapping = tryParseJSON(string) as? [String: any Sendable]
+        {
+            args = mapping
+        } else {
+            args = [:]
+        }
+        return ToolCall(function: ToolCall.Function(name: name, arguments: args))
     }
 }
