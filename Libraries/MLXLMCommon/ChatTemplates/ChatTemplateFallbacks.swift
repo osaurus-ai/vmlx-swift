@@ -852,6 +852,76 @@ value_1
 {%- endfor -%}
 """#
 
+    /// Complete Mistral 3.x chat template for bundles that ship only the
+    /// vision-only `chat_template.json` (e.g. mlx-community Mistral-Small-3.1 /
+    /// 3.2): `[SYSTEM_PROMPT]` + `[INST]` + `[IMG]` but NO tool support, and a
+    /// `raise_exception` on a `tool` role. Mistral-Small-3.x does tools natively
+    /// via the tekken `[TOOL_CALLS]name[ARGS]{json}` format (see
+    /// MistralToolCallParser); the HF chat_template never rendered it, so tools
+    /// went ungrounded and the model hallucinated a foreign format.
+    ///
+    /// This template preserves the native Mistral surface and adds the missing
+    /// pieces, so reasoning / tools / vision all work natively:
+    /// - `[SYSTEM_PROMPT]` (passthrough or a Mistral default),
+    /// - `[MODEL_SETTINGS]{"reasoning_effort": ...}` ONLY when a meaningful
+    ///   `reasoning_effort` is set (Magistral / 3.5); omitted for non-reasoning
+    ///   2503 so its prompt is byte-native,
+    /// - `[AVAILABLE_TOOLS]<tools json>[/AVAILABLE_TOOLS]` rendered immediately
+    ///   before the last user turn (Mistral's canonical placement),
+    /// - `[INST]...[/INST]` with `[IMG]` for image blocks (vision preserved),
+    /// - assistant tool calls as `[TOOL_CALLS]name[ARGS]{args}` (tekken-native,
+    ///   round-trips with the parser), and `[TOOL_RESULTS]...[/TOOL_RESULTS]`
+    ///   for the tool role.
+    public static let mistral3CompleteMinimal: String = #"""
+{%- set ns = namespace(last_user_index=-1) -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'user' -%}{%- set ns.last_user_index = loop.index0 -%}{%- endif -%}
+{%- endfor -%}
+{%- set default_system = "You are Mistral Small, a Large Language Model (LLM) created by Mistral AI, a French startup headquartered in Paris.\nWhen you're not sure about some information, you say that you don't have the information and don't make up anything." -%}
+{{- bos_token -}}
+{%- if messages and messages[0]['role'] == 'system' -%}
+{{- '[SYSTEM_PROMPT]' -}}
+{%- if messages[0]['content'] is string -%}{{- messages[0]['content'] -}}
+{%- else -%}{%- for item in messages[0]['content'] -%}{%- if item['type'] == 'text' -%}{{- item['text'] -}}{%- endif -%}{%- endfor -%}{%- endif -%}
+{{- '[/SYSTEM_PROMPT]' -}}
+{%- else -%}
+{{- '[SYSTEM_PROMPT]' + default_system + '[/SYSTEM_PROMPT]' -}}
+{%- endif -%}
+{%- set effort = reasoning_effort | default('') -%}
+{%- if effort and effort != 'none' and effort != 'default' -%}
+{{- '[MODEL_SETTINGS]{"reasoning_effort": "' + effort + '"}[/MODEL_SETTINGS]' -}}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'system' -%}
+{%- elif message['role'] == 'user' -%}
+{%- if tools and loop.index0 == ns.last_user_index -%}
+{{- '[AVAILABLE_TOOLS]' + (tools | tojson) + '[/AVAILABLE_TOOLS]' -}}
+{%- endif -%}
+{{- '[INST]' -}}
+{%- if message['content'] is string -%}{{- message['content'] -}}
+{%- else -%}{%- for item in message['content'] -%}{%- if item['type'] == 'text' -%}{{- item['text'] -}}{%- elif item['type'] == 'image' or item['type'] == 'image_url' -%}{{- '[IMG]' -}}{%- endif -%}{%- endfor -%}{%- endif -%}
+{{- '[/INST]' -}}
+{%- elif message['role'] == 'assistant' -%}
+{%- if message['tool_calls'] -%}
+{%- for tc in message['tool_calls'] -%}
+{%- set fn = tc['function'] if tc['function'] is defined else tc -%}
+{{- '[TOOL_CALLS]' + fn['name'] + '[ARGS]' -}}
+{%- if fn['arguments'] is string -%}{{- fn['arguments'] -}}{%- else -%}{{- fn['arguments'] | tojson -}}{%- endif -%}
+{%- endfor -%}
+{{- eos_token -}}
+{%- else -%}
+{%- if message['content'] is string -%}{{- message['content'] -}}
+{%- else -%}{%- for item in message['content'] -%}{%- if item['type'] == 'text' -%}{{- item['text'] -}}{%- endif -%}{%- endfor -%}{%- endif -%}
+{{- eos_token -}}
+{%- endif -%}
+{%- elif message['role'] == 'tool' -%}
+{{- '[TOOL_RESULTS]' -}}
+{%- if message['content'] is string -%}{{- message['content'] -}}{%- else -%}{{- message['content'] | tojson -}}{%- endif -%}
+{{- '[/TOOL_RESULTS]' -}}
+{%- endif -%}
+{%- endfor -%}
+"""#
+
     /// MiniMax-M2 minimal chat template that honors `enable_thinking`.
     /// The bundle-shipped native template ignores the flag and always
     /// prefills `<think>\n` at the assistant tail. That makes the model
