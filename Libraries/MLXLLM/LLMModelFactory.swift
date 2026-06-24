@@ -104,6 +104,10 @@ public enum LLMTypeRegistry {
             "mimo_v2": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
             "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
             "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),
+            // MiniMax-M3 (MSA / Lightning-Indexer). The text decoder is shared by
+            // the plain and VL outer types; text-only sanitize drops vision keys.
+            "minimax_m3": create(MiniMaxM3Configuration.self, MiniMaxM3Model.init),
+            "minimax_m3_vl": create(MiniMaxM3Configuration.self, MiniMaxM3Model.init),
             "minimax_m2": { data in
                 // Peek at weight_format — "mxtq" routes to the JANGTQ variant,
                 // which swaps the MoE SwitchGLU for TurboQuantSwitchGLU so the

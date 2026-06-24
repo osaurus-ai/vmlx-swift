@@ -1971,7 +1971,7 @@ public struct JangLoader: Sendable {
 
             let packedDim = weightArray.shape.last ?? 0
             let numGroups = scalesArray.shape.last ?? 1
-            let (bits, inferredGroupSize): (Int, Int)
+            var (bits, inferredGroupSize): (Int, Int)
 
             let isHiddenAnchor =
                 basePath.hasSuffix("embed_tokens")
@@ -2205,6 +2205,29 @@ public struct JangLoader: Sendable {
 
             let mode = weights[basePath + ".biases"] == nil ? defaultMode : .affine
             let declaredForLayer = declaredQuantization(for: basePath)
+
+            // Resolve shape ambiguity in favor of the authoritative config.
+            // `bits * group_size` is invariant under affine packing, so e.g.
+            // (bits=6, gs=64) and (bits=3, gs=128) yield IDENTICAL weight/scales
+            // shapes (embed_tokens here: 1152 packed cols, 96 groups). The scales
+            // tensor cannot tell them apart — only the true input dim can. When
+            // config.json declares a per-module (bits, gs) that is itself
+            // shape-consistent with the observed tensors, trust it over the shape
+            // walk; otherwise embed_tokens (6-bit/gs64) is mis-read as 3-bit/gs128,
+            // doubling the input dim (12288 vs 6144) and crashing quantized_matmul.
+            // A declared value that is INconsistent with the shapes (a genuinely
+            // wrong "lying config") still falls through to the inferred value.
+            if let declared = declaredForLayer,
+               declared.bits > 0, declared.groupSize > 0,
+               numGroups > 0,
+               (packedDim * 32) % declared.bits == 0,
+               (packedDim * 32) / declared.bits == numGroups * declared.groupSize,
+               (bits != declared.bits || inferredGroupSize != declared.groupSize)
+            {
+                bits = declared.bits
+                inferredGroupSize = declared.groupSize
+            }
+
             let declaredMatches =
                 declaredForLayer?.bits == bits
                 && declaredForLayer?.groupSize == inferredGroupSize

@@ -653,6 +653,23 @@ extension ReasoningParser {
                 startInReasoning: false)
         }
 
+        if compact.hasPrefix("minimaxm3") {
+            // MiniMax-M3 native reasoning envelope is <mm:think>…</mm:think>,
+            // NOT minimax_m2's <think>. The template's default (adaptive) and
+            // disabled modes do NOT prefill the open tag — the model emits its
+            // own <mm:think> — so start in content and flip on the open tag.
+            // The explicit thinking_mode="enabled" path prefills <mm:think> at
+            // the prompt tail (model starts mid-reasoning); the runtime sets
+            // startInReasoning per-request for that case (matrix B13). With the
+            // generic "minimax" stamp the <think> tag never matches <mm:think>
+            // and the whole CoT leaks into visible content (verified live
+            // 2026-06-19). minimax_m2 stays on <think> via the switch below.
+            return ReasoningParser(
+                startTag: "<mm:think>",
+                endTag: "</mm:think>",
+                startInReasoning: false)
+        }
+
         if normalized.hasPrefix("qwen3_vl")
             || normalized.hasPrefix("qwen3_5_vl")
             || normalized.hasPrefix("qwen3_6_vl")
@@ -924,6 +941,14 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
     // Harmony marker leak.
     if compact.hasPrefix("gptoss") {
         return "harmony"
+    }
+
+    // MiniMax-M3 emits <mm:think>…</mm:think>, not minimax_m2's <think>. Route
+    // to a dedicated stamp so fromCapabilityName builds the <mm:think> parser;
+    // the generic "minimax" think_xml stamp leaves <mm:think> unmatched → CoT
+    // leaks into content. minimax_m2 keeps the "minimax" stamp below.
+    if compact.hasPrefix("minimaxm3") {
+        return "minimax_m3"
     }
 
     // ZAYA1-VL is a sibling multimodal architecture, not the text

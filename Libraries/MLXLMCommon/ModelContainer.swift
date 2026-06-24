@@ -27,6 +27,13 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
     public var arraysLayerCount: Int
     public var zayaCCALayerCount: Int
     public var cacheListLayerCount: Int
+    /// MiniMax-M3 MSA layers carry a `MiniMaxM3SparseCache` (KV + an idx_keys
+    /// lane). Counted separately so reuse tiers preserve the composite (never a
+    /// plain KV copy that drops idx_keys) and the coordinator marks it
+    /// paged-incompatible — dynamic block selection has no page format. This is
+    /// NOT an SSM companion (no conv/recurrent state); see
+    /// `requiresMiniMaxM3SparseState`.
+    public var miniMaxM3SparseLayerCount: Int
 
     public init(
         layerCount: Int = 0,
@@ -44,7 +51,8 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
         compilableMambaLayerCount: Int = 0,
         arraysLayerCount: Int = 0,
         zayaCCALayerCount: Int = 0,
-        cacheListLayerCount: Int = 0
+        cacheListLayerCount: Int = 0,
+        miniMaxM3SparseLayerCount: Int = 0
     ) {
         self.layerCount = layerCount
         self.kvLayerCount = kvLayerCount
@@ -62,6 +70,7 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
         self.arraysLayerCount = arraysLayerCount
         self.zayaCCALayerCount = zayaCCALayerCount
         self.cacheListLayerCount = cacheListLayerCount
+        self.miniMaxM3SparseLayerCount = miniMaxM3SparseLayerCount
     }
 
     public init(cache: [any KVCache]) {
@@ -80,12 +89,20 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
         zayaCCALayerCount > 0
     }
 
+    /// True when any layer is a MiniMax-M3 sparse (MSA) cache. The reuse tiers
+    /// must keep that cache first-class (preserve the idx_keys lane) and the
+    /// coordinator must run paged-incompatible for it.
+    public var requiresMiniMaxM3SparseState: Bool {
+        miniMaxM3SparseLayerCount > 0
+    }
+
     public var requiresRecurrentSSMCompanionState: Bool {
         mambaLayerCount > 0 || arraysLayerCount > 0
     }
 
     public var requiresDiskBackedCoordinatorRestore: Bool {
         requiresSSMCompanionState
+            || requiresMiniMaxM3SparseState
             || rotatingKVLayerCount > 0
             || compilableRotatingKVLayerCount > 0
             || rotatingWrapperLayerCount > 0
@@ -115,6 +132,7 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
         if compilableMambaLayerCount > 0 { tags.append("compilableMambaLayers=\(compilableMambaLayerCount)") }
         if arraysLayerCount > 0 { tags.append("arraysLayers=\(arraysLayerCount)") }
         if zayaCCALayerCount > 0 { tags.append("zayaCCALayers=\(zayaCCALayerCount)") }
+        if miniMaxM3SparseLayerCount > 0 { tags.append("minimaxM3SparseLayers=\(miniMaxM3SparseLayerCount)") }
         if cacheListLayerCount > 0 { tags.append("cacheListLayers=\(cacheListLayerCount)") }
         if requiresRecurrentSSMCompanionState { tags.append("companion=ssm") }
         if requiresZayaCCACompanionState { tags.append("companion=zaya-cca") }
@@ -146,6 +164,12 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
             rotatingWrapperLayerCount += 1
         case is ZayaCCACache:
             zayaCCALayerCount += 1
+        case is MiniMaxM3SparseCache:
+            // KV + idx_keys composite. Distinct bucket so it is NOT miscounted as
+            // a plain KV layer (which would let a reuse path drop the idx_keys
+            // lane and loop). Drives requiresMiniMaxM3SparseState / disk-backed
+            // restore / paged-incompatible.
+            miniMaxM3SparseLayerCount += 1
         case is CompilableMambaCache:
             compilableMambaLayerCount += 1
             mambaLayerCount += 1
