@@ -1048,8 +1048,13 @@ public struct JangLoader: Sendable {
                 if let currentTemplate, !currentTemplate.isEmpty { return currentTemplate }
                 return sidecarTemplate ?? genericJsonTemplate
             }()
+            // Require BOTH Mistral-family markers: `[INST]` alone is also used
+            // by Llama-2-family templates (which use `<<SYS>>`, not
+            // `[SYSTEM_PROMPT]`), so gate on `[SYSTEM_PROMPT]` too to avoid
+            // mis-applying the Mistral template to a non-Mistral `[INST]` model.
             guard let existing,
                   existing.contains("[INST]"),
+                  existing.contains("[SYSTEM_PROMPT]"),
                   !existing.contains("[AVAILABLE_TOOLS]")
             else {
                 return nil
