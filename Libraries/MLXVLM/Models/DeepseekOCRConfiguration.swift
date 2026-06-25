@@ -138,6 +138,21 @@ public struct DeepseekOCRConfiguration: Codable, Sendable {
             layerNormEps = f("layer_norm_eps", 1e-6)
             mlpRatio = f("mlp_ratio", 3.7362)
         }
+
+        // NOTE: compile-fix — factory's create<C: Codable> requires Encodable; this
+        // struct decodes via dynamic AnyKey so encode cannot be synthesized. Never
+        // called at runtime (factory only decodes); provided to satisfy conformance.
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: AnyKey.self)
+            try c.encode(layers, forKey: AnyKey("layers"))
+            try c.encode(width, forKey: AnyKey("width"))
+            try c.encode(heads, forKey: AnyKey("num_attention_heads"))
+            try c.encode(imageSize, forKey: AnyKey("image_size"))
+            try c.encode(patchSize, forKey: AnyKey("patch_size"))
+            try c.encode(numChannels, forKey: AnyKey("num_channels"))
+            try c.encode(layerNormEps, forKey: AnyKey("layer_norm_eps"))
+            try c.encode(mlpRatio, forKey: AnyKey("mlp_ratio"))
+        }
     }
 
     /// SAM-ViT-B encoder (the `sam_model` branch of the DeepEncoder).
@@ -221,14 +236,30 @@ public struct DeepseekOCRConfiguration: Codable, Sendable {
         // image token index: prefer image_token_index, fall back to image_token_id,
         // then the mlx-vlm default 128815.
         imageTokenIndex =
-            (try c.decodeIfPresent(Int.self, forKey: .imageTokenIndex))
-            ?? (try c.decodeIfPresent(Int.self, forKey: .imageTokenId))
+            try (c.decodeIfPresent(Int.self, forKey: .imageTokenIndex)
+                ?? c.decodeIfPresent(Int.self, forKey: .imageTokenId))
             ?? 128815
         tileTag = try c.decodeIfPresent(String.self, forKey: .tileTag) ?? "2D"
         globalViewPos = try c.decodeIfPresent(String.self, forKey: .globalViewPos) ?? "head"
         numImageTokens = try c.decodeIfPresent(Int.self, forKey: .numImageTokens) ?? 576
         quantization = try c.decodeIfPresent(
             BaseConfiguration.Quantization.self, forKey: .quantization)
+    }
+
+    // NOTE: compile-fix — factory's create<C: Codable> requires Encodable. Encode
+    // cannot be synthesized here because CodingKeys has an extra `imageTokenId` key
+    // with no matching property. Never called at runtime (factory only decodes).
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(textConfiguration, forKey: .textConfiguration)
+        try c.encode(visionConfiguration, forKey: .visionConfiguration)
+        try c.encode(projectorConfiguration, forKey: .projectorConfiguration)
+        try c.encode(modelType, forKey: .modelType)
+        try c.encode(imageTokenIndex, forKey: .imageTokenIndex)
+        try c.encode(tileTag, forKey: .tileTag)
+        try c.encode(globalViewPos, forKey: .globalViewPos)
+        try c.encode(numImageTokens, forKey: .numImageTokens)
+        try c.encodeIfPresent(quantization, forKey: .quantization)
     }
 }
 

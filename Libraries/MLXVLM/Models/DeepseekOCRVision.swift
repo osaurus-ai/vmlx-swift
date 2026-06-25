@@ -280,9 +280,10 @@ private class DeepseekOCRVisionEmbeddings: Module {
 /// CLIP-L/14 vision tower (the `vision_model` branch of the DeepEncoder).
 /// Mirrors vision.py `VisionModel`.
 public class DeepseekOCRVisionModel: Module {
-    @ModuleInfo var embeddings: DeepseekOCRVisionEmbeddings
+    // NOTE: compile-fix — fileprivate so these private-typed members can live in a public class.
+    @ModuleInfo fileprivate var embeddings: DeepseekOCRVisionEmbeddings
     @ModuleInfo(key: "pre_layrnorm") var preLayerNorm: LayerNorm
-    @ModuleInfo var transformer: DeepseekOCRTransformer
+    @ModuleInfo fileprivate var transformer: DeepseekOCRTransformer
 
     public init(_ config: DeepseekOCRConfiguration.VisionConfiguration) {
         self.embeddings = DeepseekOCRVisionEmbeddings(config: config)

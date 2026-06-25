@@ -30,7 +30,6 @@ import CoreImage
 import Foundation
 import MLX
 import MLXLMCommon
-import Tokenizers
 
 // MARK: - Processor
 

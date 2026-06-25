@@ -26,7 +26,8 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-private typealias TextConfiguration = DeepseekOCRConfiguration.TextConfiguration
+// NOTE: compile-fix (public so it can appear in public init signatures)
+public typealias TextConfiguration = DeepseekOCRConfiguration.TextConfiguration
 
 // MARK: - Attention (LlamaAttention branch)
 

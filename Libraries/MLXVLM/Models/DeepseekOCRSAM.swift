@@ -320,9 +320,10 @@ public class DeepseekOCRSAMEncoder: Module {
     let imgSize: Int
     let useAbsPos: Bool
 
-    @ModuleInfo(key: "patch_embed") var patchEmbed: PatchEmbed
+    // NOTE: compile-fix — fileprivate so these private-typed members can live in a public class.
+    @ModuleInfo(key: "patch_embed") fileprivate var patchEmbed: PatchEmbed
     @ParameterInfo(key: "pos_embed") var posEmbed: MLXArray
-    @ModuleInfo var blocks: [Block]
+    @ModuleInfo fileprivate var blocks: [Block]
 
     // The neck is a heterogeneous list (Conv2d, LayerNorm, Conv2d, LayerNorm) in
     // sam.py. MLX-Swift requires a homogeneous container, so we name the four
@@ -343,9 +344,9 @@ public class DeepseekOCRSAMEncoder: Module {
             embedDim: config.width,
             depth: config.layers,
             numHeads: config.heads,
+            outChans: config.promptEmbedDim,
             windowSize: config.windowSize,
             globalAttnIndexes: config.globalAttnIndexes,
-            outChans: config.promptEmbedDim,
             finalOutChans: config.downsampleChannels.last ?? 1024)
     }
 
