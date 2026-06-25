@@ -81,3 +81,9 @@ Both deepseek-ai/DeepSeek-OCR and baidu/Unlimited-OCR are DeepseekOCRForCausalLM
 2. Diff our inputEmbeddings/feature-assembly vs official modeling_deepseekocr.py; fix until Swift reproduces the PyTorch ground-truth text on the 2 test images. THIS is the gate.
 3. Then osaurus OCR spawn/delegate component: new OCR delegate tool (mirror local_delegate + image-gen): model detection, default-OCR-model setting, single-residency handoff vs keep-loaded per RAM-safety setting, prompt+context pass-through after OCR, multiturn. Settings UI like image-gen/edit/spawn/text-delegate.
 4. UI E2E via gpt-5.5 computer-use: model loads, OCR correct, multiturn, reasoning on/off, spawn-tool-for-OCR usable by other models.
+
+### LIVE STATE 2026-06-25 (dev app built + OCR engine loaded)
+- osaurus dev app built with engine (vmlx feccec2), OCR model `unlimited-ocr-8bit-mlx` (model_type `deepseekocr`) is RECOGNIZED + routed as VLM (factory alias works).
+- First load blocker (concrete, weight-key): `Unhandled keys ["neck"] in sam_model in DeepseekOCRSAMEncoder` — the SAM `neck` module structure (built as explicit neck.0..3 members, cross-checked against deepseek-ai/DeepSeek-OCR) does NOT match the 8-bit `unlimited-ocr-8bit-mlx` neck key layout. Fix the SAM neck module to consume the actual `sam_model.neck.*` keys of the load target (the 8-bit MLX pack — confirm its exact keys; it may differ from the bf16 deepseek-ai pack the subagent checked). Likely the rest of the load surfaces a few more key/shape mismatches (net_2/net_3, pos_embed, quant scales/biases for 8-bit).
+- THEN the numerical image-injection gate (mlx-vlm-buggy; match official PyTorch).
+NEXT-SESSION START HERE: fix weight-key mapping (neck first) → load clean → run OCR → fix image-injection vs official → osaurus OCR delegate component + settings/RAM + UI E2E.
