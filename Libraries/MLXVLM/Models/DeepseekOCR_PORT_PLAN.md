@@ -56,3 +56,28 @@ RAM: model ~6.7GB bf16 / smaller quant; single resident, ram_feasibility gated.
 - [x] branches off main (osaurus 161e6ca5, vmlx b68502a), model downloaded, arch verified
 - [ ] config + scaffold / language / sam / vision / processor / top-model glue
 - [ ] build, behavioral verify vs mlx-vlm, live OCR on dev app, PRs
+
+## STATUS 2026-06-25 — engine compiles; CRITICAL correctness finding
+
+### Done
+- All 6 Swift files written; `swift build --target MLXVLM` is GREEN (commit feccec2).
+- osaurus repinned to feccec2; dev-app build in progress.
+- Ground-truth OCR captured from OFFICIAL PyTorch (baidu/Unlimited-OCR, torch+transformers `model.infer`, trust_remote_code), saved `/tmp/ocr_reference_output.txt`:
+  - test img1 → "OSAURUS OCR TEST" / "DeepSeek-OCR 2026"
+  - test img2 → "Invoice #2026-0042" / "Date: June 25, 2026" / "Total: $1,337.00 USD"
+  - Output format is `<|det|>LABEL [x1,y1,x2,y2]<|/det|>TEXT` triples (bbox 0–1000 grid); recognized text is the segment after each `<|/det|>`. Needs no_repeat_ngram. Defaults base_size=1024, image_size=640, crop_mode=True (gundam).
+  - Good prompts: `<image>\n<|grounding|>OCR this image.` or `<image>\nFree OCR.`
+
+### CRITICAL: the mlx-vlm reference is BUGGY (do not match it)
+mlx-vlm 0.6.3's `deepseekocr` collapses to a single repeated token (id 31670 "筆") the moment IMAGE embeddings are injected — bf16 AND int8, every prompt. Text-only works; vision outputs are non-NaN. The bug is in mlx-vlm's `get_input_embeddings` image-feature assembly/injection — **the exact code our Swift port mirrors**. So our port most likely reproduces the same collapse.
+
+=> CORRECTNESS GATE CHANGES: verify/fix our `inputEmbeddings` against the OFFICIAL PyTorch `modeling_deepseekocr.py` + `deepencoder.py` (downloaded at /tmp/dsocr_code/), NOT mlx-vlm. Suspects to diff vs official: (a) the concat order `concat(clip[:,1:], sam.flatten(1,2))` and which axis, (b) the global/local tiling reassembly + image_newline/view_separator placement, (c) the projector input layout (downsample vs linear), (d) the image-token COUNT vs feature count alignment (processor↔model), (e) SAM/CLIP feature normalization. The token-collapse signature = image features landing wrong / shape or position mismatch.
+
+### Arch note
+Both deepseek-ai/DeepSeek-OCR and baidu/Unlimited-OCR are DeepseekOCRForCausalLM / model_type deepseek_vl_v2. The 8-bit MLX (/tmp/ocr_models/unlimited-ocr-8bit-mlx) is the load target. mlx-vlm crashed loading deepseek-ai/DeepSeek-OCR's Conv2d but loaded baidu/Unlimited-OCR — minor config delta to watch.
+
+### Next phase (needs careful/fresh attention — numerical)
+1. Build dev app done → load 8-bit OCR model in osaurus → run OCR → observe (expect collapse like mlx-vlm).
+2. Diff our inputEmbeddings/feature-assembly vs official modeling_deepseekocr.py; fix until Swift reproduces the PyTorch ground-truth text on the 2 test images. THIS is the gate.
+3. Then osaurus OCR spawn/delegate component: new OCR delegate tool (mirror local_delegate + image-gen): model detection, default-OCR-model setting, single-residency handoff vs keep-loaded per RAM-safety setting, prompt+context pass-through after OCR, multiturn. Settings UI like image-gen/edit/spawn/text-delegate.
+4. UI E2E via gpt-5.5 computer-use: model loads, OCR correct, multiturn, reasoning on/off, spawn-tool-for-OCR usable by other models.
