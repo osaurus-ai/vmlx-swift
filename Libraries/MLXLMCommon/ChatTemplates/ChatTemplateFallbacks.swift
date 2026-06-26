@@ -1401,17 +1401,12 @@ value_1
 {%- endmacro -%}
 
 {%- macro render_tool_summary() -%}
-    {{- 'Available functions:' -}}
-    {%- for tool in tools -%}
-        {%- set fn = tool['function'] if tool['function'] is defined else tool -%}
-        {{- '\n- ' ~ fn['name'] -}}
-        {%- if fn['description'] is defined and fn['description'] -%}
-            {{- ': ' ~ (fn['description'] | trim) -}}
-        {%- endif -%}
-        {%- if fn['parameters'] is defined and fn['parameters']['required'] is defined -%}
-            {{- '\n  required arguments: ' ~ (fn['parameters']['required'] | join(', ')) -}}
-        {%- endif -%}
-    {%- endfor -%}
+    {#- LFM2 native tool-list format: the model is trained on the full JSON
+        tool schemas under `List of tools: [...]`, NOT a bare name/desc summary.
+        Restoring this (removed in 46973d1 'Remove LFM tool schema markup', which
+        silently broke auto tool-calling for ALL lfm2/lfm2_moe models) is what lets
+        the model actually emit <|tool_call_start|> calls. -#}
+    {{- 'List of tools: ' ~ (tools | tojson) -}}
 {%- endmacro -%}
 
 {%- macro render_required_tool_choice_instruction(latest_user_content='') -%}
