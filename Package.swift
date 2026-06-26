@@ -330,6 +330,7 @@ let package = Package(
         .executable(name: "DistributedReplicaSmoke", targets: ["DistributedReplicaSmoke"]),
         .executable(name: "ANEProbe", targets: ["ANEProbe"]),
         .executable(name: "Gemma4AudioSmoke", targets: ["Gemma4AudioSmoke"]),
+        .executable(name: "DeepseekOCRSmoke", targets: ["DeepseekOCRSmoke"]),
         .executable(name: "OmniAudioLatencyBench", targets: ["OmniAudioLatencyBench"]),
         .executable(name: "OmniAudioChunkStabilityBench", targets: ["OmniAudioChunkStabilityBench"]),
         .executable(name: "mlxpress", targets: ["MLXPressCLI"]),
@@ -708,6 +709,17 @@ let package = Package(
                 "VMLXTokenizers",
             ],
             path: "tools/Gemma4AudioSmoke"
+        ),
+        .executableTarget(
+            name: "DeepseekOCRSmoke",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXVLM",
+                "MLXHuggingFace",
+                "MLX",
+                "VMLXTokenizers",
+            ],
+            path: "tools/DeepseekOCRSmoke"
         ),
         .executableTarget(
             name: "OmniAudioLatencyBench",

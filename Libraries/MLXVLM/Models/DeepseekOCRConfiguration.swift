@@ -227,11 +227,21 @@ public struct DeepseekOCRConfiguration: Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        textConfiguration = try c.decode(TextConfiguration.self, forKey: .textConfiguration)
-        visionConfiguration = try c.decode(
-            VisionConfiguration.self, forKey: .visionConfiguration)
-        projectorConfiguration = try c.decode(
-            ProjectorConfiguration.self, forKey: .projectorConfiguration)
+        // The same struct is decoded from BOTH config.json (full model config,
+        // carries language_config/vision_config/projector_config) AND
+        // processor_config.json (carries only image_token + tiling fields). The
+        // sub-configs are therefore decodeIfPresent with all-defaulted fallbacks
+        // (every sub-config field is itself decodeIfPresent-defaulted), so the
+        // processor path doesn't trap on the missing `language_config` key.
+        textConfiguration =
+            try c.decodeIfPresent(TextConfiguration.self, forKey: .textConfiguration)
+            ?? TextConfiguration(from: EmptyDecoder())
+        visionConfiguration =
+            try c.decodeIfPresent(VisionConfiguration.self, forKey: .visionConfiguration)
+            ?? VisionConfiguration(from: EmptyDecoder())
+        projectorConfiguration =
+            try c.decodeIfPresent(ProjectorConfiguration.self, forKey: .projectorConfiguration)
+            ?? ProjectorConfiguration(from: EmptyDecoder())
         modelType = try c.decodeIfPresent(String.self, forKey: .modelType) ?? "deepseek_vl_v2"
         // image token index: prefer image_token_index, fall back to image_token_id,
         // then the mlx-vlm default 128815.
@@ -260,6 +270,52 @@ public struct DeepseekOCRConfiguration: Codable, Sendable {
         try c.encode(globalViewPos, forKey: .globalViewPos)
         try c.encode(numImageTokens, forKey: .numImageTokens)
         try c.encodeIfPresent(quantization, forKey: .quantization)
+    }
+}
+
+/// Minimal `Decoder` that exposes an empty keyed container, so a sub-config
+/// whose fields are all `decodeIfPresent`-defaulted can be constructed with
+/// every default (used when decoding from processor_config.json, which omits
+/// language_config / vision_config / projector_config).
+private struct EmptyDecoder: Decoder {
+    var codingPath: [CodingKey] { [] }
+    var userInfo: [CodingUserInfoKey: Any] { [:] }
+
+    func container<Key: CodingKey>(keyedBy type: Key.Type)
+        -> KeyedDecodingContainer<Key>
+    {
+        KeyedDecodingContainer(EmptyKeyed<Key>())
+    }
+    func unkeyedContainer() throws -> UnkeyedDecodingContainer {
+        throw DecodingError.dataCorrupted(
+            .init(codingPath: [], debugDescription: "EmptyDecoder has no unkeyed container"))
+    }
+    func singleValueContainer() throws -> SingleValueDecodingContainer {
+        throw DecodingError.dataCorrupted(
+            .init(codingPath: [], debugDescription: "EmptyDecoder has no single-value container"))
+    }
+
+    private struct EmptyKeyed<K: CodingKey>: KeyedDecodingContainerProtocol {
+        typealias Key = K
+        var codingPath: [CodingKey] { [] }
+        var allKeys: [K] { [] }
+        func contains(_ key: K) -> Bool { false }
+        func decodeNil(forKey key: K) throws -> Bool { true }
+        func decode<T: Decodable>(_ type: T.Type, forKey key: K) throws -> T {
+            throw DecodingError.keyNotFound(
+                key, .init(codingPath: [], debugDescription: "empty"))
+        }
+        func nestedContainer<NK: CodingKey>(keyedBy type: NK.Type, forKey key: K) throws
+            -> KeyedDecodingContainer<NK>
+        {
+            KeyedDecodingContainer(EmptyKeyed<NK>())
+        }
+        func nestedUnkeyedContainer(forKey key: K) throws -> UnkeyedDecodingContainer {
+            throw DecodingError.keyNotFound(
+                key, .init(codingPath: [], debugDescription: "empty"))
+        }
+        func superDecoder() throws -> Decoder { EmptyDecoder() }
+        func superDecoder(forKey key: K) throws -> Decoder { EmptyDecoder() }
     }
 }
 

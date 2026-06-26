@@ -344,13 +344,12 @@ public class DeepseekOCRLanguageModel: Module, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        (0 ..< config.numHiddenLayers).map { _ in
-            if let maxKVSize = parameters?.maxKVSize {
-                return RotatingKVCache(maxSize: maxKVSize, keep: 4)
-            } else {
-                return KVCacheSimple()
-            }
-        }
+        // DeepSeek-V2 decoder here is FULL attention (use_mla=false, standard
+        // Llama MHA + RoPE; the `sliding_window` field in config is unused by
+        // this code path). A RotatingKVCache would both be semantically wrong
+        // (it would drop early tokens the model still attends to) and defeat
+        // prefix/paged reuse. Always use the growable full-attention cache.
+        (0 ..< config.numHiddenLayers).map { _ in KVCacheSimple() }
     }
 
     /// Stacks per-expert MLP weights into the SwitchGLU `switch_mlp` layout.

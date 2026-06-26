@@ -29,14 +29,25 @@ import MLXNN
 /// sam.py is omitted because tgt_size always equals src_size here; if a
 /// different image size is ever used this must grow a bicubic path.
 private func getAbsPosSAM(_ absPos: MLXArray, tgtSize: Int) -> MLXArray {
+    // absPos: (1, src, src, C). The SAM pos embed is the 64x64 grid for the
+    // 1024px global view (1024/16). The 640px CROP tiles produce a 40x40 patch
+    // grid, so src(64) != tgt(40) and the embedding MUST be bicubically resized
+    // — matching deepencoder.py `get_abs_pos_sam`:
+    //   permute(0,3,1,2) -> float32 -> F.interpolate(bicubic, antialias,
+    //   align_corners=False) -> permute(0,2,3,1).
+    // Returning identity here (the prior behavior) left crop tiles with the
+    // wrong positional encoding (and a shape mismatch on the add), collapsing
+    // multi-tile OCR.
     let srcSize = absPos.dim(1)
-    if srcSize != tgtSize {
-        // NOTE: Non-square / resized input not exercised by DeepSeek-OCR's fixed
-        // 1024x1024 SAM geometry. Fall back to identity rather than silently
-        // mis-interpolate; revisit if dynamic image sizes are added.
+    if srcSize == tgtSize {
         return absPos
     }
-    return absPos
+    let dtype = absPos.dtype
+    // (1, src, src, C) -> (1, C, src, src)
+    var p = absPos.transposed(0, 3, 1, 2).asType(.float32)
+    p = bicubicInterpolate(p, size: (tgtSize, tgtSize))
+    // (1, C, tgt, tgt) -> (1, tgt, tgt, C)
+    return p.asType(dtype).transposed(0, 2, 3, 1)
 }
 
 /// Partition (B, H, W, C) into non-overlapping windows with padding if needed.
@@ -309,6 +320,39 @@ private class PatchEmbed: Module {
     }
 }
 
+// MARK: - LayerNorm2d (channel-axis norm in NHWC)
+
+/// Channel-wise LayerNorm matching deepencoder.py `LayerNorm2d`.
+///
+/// The official PyTorch code runs the neck in NCHW and normalizes over axis 1
+/// (channels) — `u = x.mean(1)`, then scales by `weight[:,None,None]`. Our SAM
+/// tower flows in NHWC, where the channel axis is the LAST axis, so a normal
+/// channel-last LayerNorm reduction is numerically identical. We keep an
+/// explicit small module (rather than reusing MLXNN.LayerNorm) so the
+/// `weight`/`bias` parameter keys resolve directly under the neck container
+/// (`neck.1.weight`, `neck.1.bias`, …) and the reduction axis is unambiguous.
+private class LayerNorm2dNHWC: Module, UnaryLayer {
+    var weight: MLXArray
+    var bias: MLXArray
+    let eps: Float
+
+    init(_ numChannels: Int, eps: Float = 1e-6) {
+        self.weight = MLXArray.ones([numChannels])
+        self.bias = MLXArray.zeros([numChannels])
+        self.eps = eps
+        super.init()
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // x: (B, H, W, C) NHWC — normalize over the channel (last) axis.
+        let u = mean(x, axis: -1, keepDims: true)
+        let d = x - u
+        let s = mean(d * d, axis: -1, keepDims: true)
+        let normed = d * rsqrt(s + eps)
+        return weight * normed + bias
+    }
+}
+
 // MARK: - SAM encoder
 
 /// SAM-ViT-B encoder. Wrapped as `sam_model` by the top model so weight keys
@@ -325,14 +369,13 @@ public class DeepseekOCRSAMEncoder: Module {
     @ParameterInfo(key: "pos_embed") var posEmbed: MLXArray
     @ModuleInfo fileprivate var blocks: [Block]
 
-    // The neck is a heterogeneous list (Conv2d, LayerNorm, Conv2d, LayerNorm) in
-    // sam.py. MLX-Swift requires a homogeneous container, so we name the four
-    // members explicitly with @ModuleInfo keys "neck.0".."neck.3" to reproduce
-    // the exact safetensors paths.
-    @ModuleInfo(key: "neck.0") var neck0: Conv2d   // 1x1 conv, embed_dim -> 256, no bias
-    @ModuleInfo(key: "neck.1") var neck1: LayerNorm
-    @ModuleInfo(key: "neck.2") var neck2: Conv2d   // 3x3 conv, 256 -> 256, pad 1, no bias
-    @ModuleInfo(key: "neck.3") var neck3: LayerNorm
+    // The neck is a heterogeneous Sequential (Conv2d, LayerNorm2d, Conv2d,
+    // LayerNorm2d) in sam.py, serialized with numeric paths (`neck.0.weight`,
+    // `neck.1.weight`, …). An @ModuleInfo array keyed "neck" produces exactly
+    // those `neck.<index>.*` paths and the checkpoint's array structure lines
+    // up element-for-element. Conv2d and LayerNorm2dNHWC both conform to
+    // UnaryLayer, so the heterogeneous stack fits one array.
+    @ModuleInfo(key: "neck") fileprivate var neck: [UnaryLayer]
 
     @ModuleInfo(key: "net_2") var net2: Conv2d     // 3x3 stride-2, 256 -> 512
     @ModuleInfo(key: "net_3") var net3: Conv2d     // 3x3 stride-2, 512 -> final_out_chans
@@ -385,15 +428,17 @@ public class DeepseekOCRSAMEncoder: Module {
                 inputSize: (grid, grid))
         }
 
-        // Neck: matches nn.Conv2d/nn.LayerNorm stack in sam.py.
-        self._neck0.wrappedValue = Conv2d(
-            inputChannels: embedDim, outputChannels: outChans,
-            kernelSize: IntOrPair(1), bias: false)
-        self._neck1.wrappedValue = LayerNorm(dimensions: outChans, eps: 1e-6)
-        self._neck2.wrappedValue = Conv2d(
-            inputChannels: outChans, outputChannels: outChans,
-            kernelSize: IntOrPair(3), padding: IntOrPair(1), bias: false)
-        self._neck3.wrappedValue = LayerNorm(dimensions: outChans, eps: 1e-6)
+        // Neck: matches nn.Conv2d/LayerNorm2d Sequential in sam.py (4 elements).
+        self._neck.wrappedValue = [
+            Conv2d(
+                inputChannels: embedDim, outputChannels: outChans,
+                kernelSize: IntOrPair(1), bias: false),                 // neck.0
+            LayerNorm2dNHWC(outChans),                                  // neck.1
+            Conv2d(
+                inputChannels: outChans, outputChannels: outChans,
+                kernelSize: IntOrPair(3), padding: IntOrPair(1), bias: false),  // neck.2
+            LayerNorm2dNHWC(outChans),                                  // neck.3
+        ]
 
         self._net2.wrappedValue = Conv2d(
             inputChannels: 256, outputChannels: 512,
@@ -419,13 +464,10 @@ public class DeepseekOCRSAMEncoder: Module {
             x = blk(x)
         }
 
-        // Neck: Conv2d operate in NHWC; LayerNorm normalizes the last (channel)
-        // axis, matching sam.py where the neck LayerNorm acts over channels in
-        // NHWC layout.
-        x = neck0(x)
-        x = neck1(x)
-        x = neck2(x)
-        x = neck3(x)
+        // Neck: Conv2d operate in NHWC; LayerNorm2dNHWC normalizes the last
+        // (channel) axis, matching sam.py where the neck LayerNorm2d acts over
+        // channels (axis 1 in its NCHW layout == last axis here in NHWC).
+        for layer in neck { x = layer(x) }
 
         // Additional 2x + 2x downsampling -> (B, 16, 16, final_out_chans)
         x = net2(x)

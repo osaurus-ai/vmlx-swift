@@ -291,16 +291,21 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
 
     // MARK: - Prompt formatting (port of conversation.py "deepseek" template)
 
-    /// Extract the user text and image count from the structured input. DeepSeek-OCR
-    /// has no useful HF chat template (the bundled one is a near-no-op), so we build
-    /// the DeepSeek conversation prompt directly:
+    /// Build the prompt string exactly like the official `model.infer`:
+    /// `format_messages(sft_format='plain', system_prompt='')` over a single
+    /// `{role:<|User|>, content: prompt}` + `{role:<|Assistant|>, content:""}`
+    /// conversation. The `'plain'` conv template has EMPTY roles and EMPTY
+    /// separators, so the formatted prompt is simply the user content
+    /// (`.strip()`-ed) with no `<|User|>` / `<|Assistant|>` markers — the
+    /// assistant turn is empty and contributes nothing.
     ///
-    ///   <|User|>: <image>\n{user text}\n\n<|Assistant|>:
-    ///
-    /// with one `<image>` marker per supplied image, and a leading BOS (id 0).
+    /// The user content the official caller passes is `<image>\n{instruction}`
+    /// (one `<image>` marker per image), e.g. `<image>\nFree OCR.`. A leading
+    /// BOS (id 0) is prepended later in `prepare`.
     private func renderPrompt(text: String, imageCount: Int) -> String {
         let imageMarkers = String(repeating: "<image>\n", count: imageCount)
-        return "<|User|>: \(imageMarkers)\(text)\n\n<|Assistant|>:"
+        // Mirror `sft_prompt.strip()` on the concatenated content.
+        return "\(imageMarkers)\(text)".trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func userText(from input: UserInput) -> String {

@@ -236,6 +236,10 @@ public enum VLMProcessorTypeRegistry {
         // it decodes cleanly from processor_config.json too.
         "DeepseekVLV2Processor": create(
             DeepseekOCRConfiguration.self, DeepseekOCRProcessor.init),
+        // Some packs (e.g. unlimited-ocr-8bit-mlx) stamp
+        // `processor_class: "DeepseekOCRProcessor"` directly.
+        "DeepseekOCRProcessor": create(
+            DeepseekOCRConfiguration.self, DeepseekOCRProcessor.init),
         "Gemma4Processor": create(
             Gemma4ProcessorConfiguration.self, Gemma4Processor.init),
         "Gemma4UnifiedProcessor": create(

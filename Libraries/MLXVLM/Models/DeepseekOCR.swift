@@ -110,6 +110,20 @@ public class DeepseekOCR: Module, VLMModel, KVCacheDimensionProvider {
         self._viewSeparator.wrappedValue = MLXArray.zeros([nEmbed])
     }
 
+    /// Debug: print mean/std/shape of an intermediate tensor when DSOCR_DUMP=1.
+    /// Used to localize numerical divergence vs the PyTorch reference (SAM /
+    /// CLIP / fused / projector ranges). No-op in normal operation.
+    static func dumpStat(_ name: String, _ x: MLXArray) {
+        guard ProcessInfo.processInfo.environment["DSOCR_DUMP"] == "1" else { return }
+        let xf = x.asType(.float32)
+        let m = xf.mean().item(Float.self)
+        let s = sqrt((xf * xf).mean().item(Float.self) - m * m)
+        let mn = xf.min().item(Float.self)
+        let mx = xf.max().item(Float.self)
+        FileHandle.standardError.write(Data(
+            "[stat] \(name): shape=\(x.shape) mean=\(m) std=\(s) min=\(mn) max=\(mx)\n".utf8))
+    }
+
     // MARK: get_input_embeddings
 
     /// Port of deepseekocr.py `Model.get_input_embeddings`.
@@ -166,15 +180,19 @@ public class DeepseekOCR: Module, VLMModel, KVCacheDimensionProvider {
 
             if let imagePatches, imagePatches.sum().item(Float.self) != 0 {
                 // --- local crop features ---
+                Self.dumpStat("crop.imagePatches", imagePatches)
                 let localFeatures1 = samModel(imagePatches.transposed(0, 2, 3, 1))
+                Self.dumpStat("crop.sam_out", localFeatures1)
                 let localFeatures2 = visionModel(
                     imagePatches.transposed(0, 2, 3, 1), patchEmbeds: localFeatures1)
+                Self.dumpStat("crop.clip_out", localFeatures2)
                 var localFeatures = concatenated(
                     [
                         localFeatures2[0..., 1...],
                         flattened(localFeatures1, start: 1, end: 2),
                     ], axis: -1)
                 localFeatures = projector(localFeatures)
+                Self.dumpStat("crop.localProjected", localFeatures)
 
                 // --- global view features ---
                 let globalFeatures1 = samModel(imageOriSingle.transposed(0, 2, 3, 1))
@@ -236,7 +254,14 @@ public class DeepseekOCR: Module, VLMModel, KVCacheDimensionProvider {
                         globalFeatures2[0..., 1...],
                         flattened(globalFeatures1, start: 1, end: 2),
                     ], axis: -1)
+                Self.dumpStat("imageOri", imageOriSingle)
+                Self.dumpStat("sam_out(globalFeatures1)", globalFeatures1)
+                Self.dumpStat("clip_out(globalFeatures2)", globalFeatures2)
+                Self.dumpStat("fused", globalFeatures)
                 globalFeatures = projector(globalFeatures)
+                Self.dumpStat("projected", globalFeatures)
+                Self.dumpStat("image_newline", imageNewline)
+                Self.dumpStat("view_separator", viewSeparator)
 
                 globalFeatures = globalFeatures[0]
                 let hw = globalFeatures.dim(0)
@@ -323,9 +348,14 @@ public class DeepseekOCR: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        // SAM's PatchEmbed is `private` in its component file, so derive the
-        // working dtype from a reachable weight (the text embedding table).
-        let dtype = languageModel.model.embedTokens.weight.dtype
+        // Working float dtype for the pixel buffer. Must NOT be taken from the
+        // text embedding table: under quantization that weight is uint32 (a
+        // QuantizedEmbedding), and casting normalized [-1,1] pixels to uint32
+        // truncates every value to 0 (the whole global view became zero, which
+        // tripped the `imageOri.sum()==0` guard and silently dropped image
+        // injection). `image_newline` is a plain learned parameter in the
+        // embedding space (bf16), so it gives the correct float dtype.
+        let dtype = imageNewline.dtype
 
         let inputIds = input.text.tokens
         let seqMask = input.text.mask
