@@ -141,6 +141,9 @@ public enum VLMTypeRegistry {
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
+        // DeepSeek-OCR / Unlimited-OCR (top model_type "deepseek_vl_v2").
+        "deepseek_vl_v2": create(DeepseekOCRConfiguration.self, DeepseekOCR.init),
+        "deepseekocr": create(DeepseekOCRConfiguration.self, DeepseekOCR.init),
         "gemma4": create(Gemma4Configuration.self, Gemma4.init),
         "gemma4_unified": create(Gemma4Configuration.self, Gemma4.init),
         "nemotron_h_omni": create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
@@ -227,6 +230,16 @@ public enum VLMProcessorTypeRegistry {
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
+        // DeepSeek-OCR ships `processor_class: "DeepseekVLV2Processor"`. The
+        // processor reads only `imageTokenIndex` from the model config, and
+        // every DeepseekOCRConfiguration field is decodeIfPresent-defaulted, so
+        // it decodes cleanly from processor_config.json too.
+        "DeepseekVLV2Processor": create(
+            DeepseekOCRConfiguration.self, DeepseekOCRProcessor.init),
+        // Some packs (e.g. unlimited-ocr-8bit-mlx) stamp
+        // `processor_class: "DeepseekOCRProcessor"` directly.
+        "DeepseekOCRProcessor": create(
+            DeepseekOCRConfiguration.self, DeepseekOCRProcessor.init),
         "Gemma4Processor": create(
             Gemma4ProcessorConfiguration.self, Gemma4Processor.init),
         "Gemma4UnifiedProcessor": create(
