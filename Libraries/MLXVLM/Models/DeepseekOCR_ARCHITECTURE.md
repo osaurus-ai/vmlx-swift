@@ -42,3 +42,24 @@ load fix (neck container) → H2 (assert newline/separator non-zero; fix sanitiz
 New `LocalOCRDelegateTool` (Tools/), mirrors `LocalTextDelegateTool` but VLM + image:
 - gate `ocrDelegationEnabled` (+ global `agentDelegationEnabled`); resolve a VLM model (filter via `VLMDetection.isVLM`/`ModelMediaCapabilities.supportsImage`, reject non-VLM); `ChatResidencyHandoff.memoryPreflight` (refuse-before-evict 1.3×+3GB) → unload resident chat model → run → `restoreBestEffort`; load policy `unloadAfterJob` default (VLM weights large) vs keep-warm per RAM setting; seed `ChatMessage(contentParts:[.text(instruction), .imageUrl(dataURL)])` → `ChatEngine.completeChat` under `LocalTextDelegateContext.$isActive` (no recursive spawn); return compact OCR digest; multiturn/context pass via the same budget loop.
 - Settings to add: `ocrDelegationEnabled`, `defaultOCRModelId`, `permissionDefaults.ocrExtract`, `ocrJobLoadPolicy`; register `LocalOCRDelegateTool()` in ToolRegistry; settings UI picker filtered to VLM/image-capable installed models. Gate residency on ACTUAL residency (avoids the SpawnTool SIGABRT class).
+
+## F. VERIFIED WORKING 2026-06-25 (engine gate PASSED, commit 9a52851)
+Independently re-verified via tools/DeepseekOCRSmoke on 3 images, both code paths:
+- img1 global/`Free OCR.` → "OSAURUS OCR TEST" / "DeepSeek-OCR 2026" ✓
+- img2 crop/multi-tile/`<|grounding|>OCR this image.` → "Invoice #2026-0042" / "Date: June 25, 2026" / "Total: $1,337.00 USD" ✓
+- img3 unseen → "jumps over 13 lazy dogs." / "Receipt: GBP 42.50" ✓ (generalizes; numbers+currency exact)
+~105-121 tok/s, bbox grounding correct. The decisive port bug was: prepare() took the pixel
+working dtype from the (quantized→uint32) embed weights, zeroing the global view and silently
+dropping image injection; fixed to bf16 (imageNewline.dtype). Plus SAM neck array-container load,
+LayerNorm2dNHWC channel-axis, crop abs-pos bicubic, KVCacheSimple, plain sft prompt.
+
+### Two known items that are NOT engine bugs (for serving/model-card, team-owned):
+1. **Tokenizer packaging defect in `sahilchachra/unlimited-ocr-8bit-mlx`**: its tokenizer.json ships a
+   SentencePiece `Metaspace` pretokenizer over a GPT-2 ByteLevel vocab → crashes on plain ASCII. The base
+   `baidu/Unlimited-OCR` tokenizer.json (identical vocab/merges) is correct and was swapped in
+   (orig backed up `tokenizer.json.broken-metaspace.bak`). **The shipped OCR pack must include the correct
+   ByteLevel tokenizer.json.** Not a vmlx bug.
+2. **Bare `Free OCR.` + crop path can emit a leading EOS → empty output** (known DeepSeek-OCR greedy quirk;
+   official mitigates with no_repeat_ngram_size). The `<|grounding|>OCR this image.` prompt is clean on all
+   paths. Serving should default to the grounding prompt (or add no-repeat-ngram). Not a port bug
+   (global path + grounding prompt are clean).
