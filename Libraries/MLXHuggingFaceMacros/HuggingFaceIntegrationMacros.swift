@@ -481,6 +481,17 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                     ("Gemma4WithTools", MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools),
                                     ("Gemma4Minimal",   MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal),
                                 ]
+                            } else if (upstream.convertTokenToId("[INST]").flatMap { upstream.convertIdToToken($0) } == "[INST]")
+                                && (upstream.convertTokenToId("[SYSTEM_PROMPT]").flatMap { upstream.convertIdToToken($0) } == "[SYSTEM_PROMPT]") {
+                                // Mistral-family native template threw in swift-jinja. Use the
+                                // complete Mistral template, NOT the Gemma/Nemotron default in
+                                // orderedFallbacks — feeding a Mistral model a ChatML/Gemma prompt
+                                // (<|im_start|>/<|turn|>) for tokens it lacks loops/incoheres.
+                                // (Round-trip the [INST]/[SYSTEM_PROMPT] sentinels — convertTokenToId
+                                // alone returns the <unk> id for absent tokens.)
+                                ordered = [
+                                    ("Mistral3CompleteMinimal", MLXLMCommon.ChatTemplateFallbacks.mistral3CompleteMinimal),
+                                ]
                             } else if hasNemotronSentinel {
                                 ordered = [
                                     ("NemotronMinimal", MLXLMCommon.ChatTemplateFallbacks.nemotronMinimal),
@@ -792,6 +803,17 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 ordered = [
                                     ("Gemma4WithTools", MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools),
                                     ("Gemma4Minimal",   MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal),
+                                ]
+                            } else if (upstream.convertTokenToId("[INST]").flatMap { upstream.convertIdToToken($0) } == "[INST]")
+                                && (upstream.convertTokenToId("[SYSTEM_PROMPT]").flatMap { upstream.convertIdToToken($0) } == "[SYSTEM_PROMPT]") {
+                                // Mistral-family native template threw in swift-jinja. Use the
+                                // complete Mistral template, NOT the Gemma/Nemotron default in
+                                // orderedFallbacks — feeding a Mistral model a ChatML/Gemma prompt
+                                // (<|im_start|>/<|turn|>) for tokens it lacks loops/incoheres.
+                                // (Round-trip the [INST]/[SYSTEM_PROMPT] sentinels — convertTokenToId
+                                // alone returns the <unk> id for absent tokens.)
+                                ordered = [
+                                    ("Mistral3CompleteMinimal", MLXLMCommon.ChatTemplateFallbacks.mistral3CompleteMinimal),
                                 ]
                             } else if hasNemotronSentinel {
                                 ordered = [

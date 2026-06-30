@@ -1101,8 +1101,12 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         self.config = config
         self.tokenizer = tokenizer
         self.imageToken = config.imageToken
-        // Get image token ID from tokenizer, fallback to 10 (default for Mistral3)
-        if let vocabTokenId = tokenizer.convertTokenToId(config.imageToken) {
+        // Get image token ID from tokenizer, fallback to 10 (default for Mistral3).
+        // Round-trip the lookup: convertTokenToId returns the <unk> id for an
+        // ABSENT token, so a bare non-nil check would use the unk id as the image
+        // placeholder. Only accept an id that decodes back to the image token.
+        if let vocabTokenId = tokenizer.convertTokenToId(config.imageToken),
+            tokenizer.convertIdToToken(vocabTokenId) == config.imageToken {
             self.imageTokenId = vocabTokenId
         } else {
             self.imageTokenId = 10
