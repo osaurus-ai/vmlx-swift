@@ -26,6 +26,20 @@ struct RampartSmoke {
             exit(1)
         }
 
+        // Tokenizer parity dump: prints `id:start:end` per token so the
+        // Swift WordPiece can be diffed against the HF fast tokenizer.
+        if let dumpText = env["RAMPART_DUMP"] {
+            let tokenizer = try RampartTokenizer(
+                vocabURL: dir.appendingPathComponent("vocab.txt"))
+            let toks = tokenizer.encode(dumpText)
+            let parts = toks.map { t -> String in
+                if let r = t.range { return "\(t.id):\(r.lowerBound):\(r.upperBound)" }
+                return "\(t.id):-:-"
+            }
+            print(parts.joined(separator: " "))
+            return
+        }
+
         print("[rampart] loading \(dir.lastPathComponent) ...")
         let start = CFAbsoluteTimeGetCurrent()
         let pii = try RampartPII(directory: dir)
