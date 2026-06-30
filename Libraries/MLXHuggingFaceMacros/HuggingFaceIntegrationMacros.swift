@@ -145,10 +145,10 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         let hasLagunaSentinel =
                             upstream.bosToken == lagunaEos
                             && upstream.eosToken == lagunaEos
-                            && upstream.convertTokenToId("<assistant>") != nil
-                            && upstream.convertTokenToId("</assistant>") != nil
-                            && upstream.convertTokenToId("<think>") != nil
-                            && upstream.convertTokenToId("</think>") != nil
+                            && (upstream.convertTokenToId("<assistant>").flatMap { upstream.convertIdToToken($0) } == "<assistant>")
+                            && (upstream.convertTokenToId("</assistant>").flatMap { upstream.convertIdToToken($0) } == "</assistant>")
+                            && (upstream.convertTokenToId("<think>").flatMap { upstream.convertIdToToken($0) } == "<think>")
+                            && (upstream.convertTokenToId("</think>").flatMap { upstream.convertIdToToken($0) } == "</think>")
                         if hasLagunaSentinel
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
@@ -169,8 +169,8 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         let hasLFM2NativeToolSentinels =
                             upstream.bosToken == "<|startoftext|>"
                             && upstream.eosToken == "<|im_end|>"
-                            && upstream.convertTokenToId("<|tool_call_start|>") != nil
-                            && upstream.convertTokenToId("<|tool_call_end|>") != nil
+                            && (upstream.convertTokenToId("<|tool_call_start|>").flatMap { upstream.convertIdToToken($0) } == "<|tool_call_start|>")
+                            && (upstream.convertTokenToId("<|tool_call_end|>").flatMap { upstream.convertIdToToken($0) } == "<|tool_call_end|>")
                         if !(tools?.isEmpty ?? true),
                            hasLFM2NativeToolSentinels,
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
@@ -190,11 +190,11 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                     additionalContext: additionalContext)
                         }
                         let hasGemma4NativeToolSentinels =
-                            upstream.convertTokenToId("<|tool_call>") != nil
-                            && upstream.convertTokenToId("<|turn>") != nil
+                            (upstream.convertTokenToId("<|tool_call>").flatMap { upstream.convertIdToToken($0) } == "<|tool_call>")
+                            && (upstream.convertTokenToId("<|turn>").flatMap { upstream.convertIdToToken($0) } == "<|turn>")
                         if !(tools?.isEmpty ?? true),
                            upstream.bosToken == "<s>",
-                           upstream.convertTokenToId("<|im_end|>") != nil,
+                           (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>"),
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
                                 FileHandle.standardError.write(
@@ -239,9 +239,9 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         let hasStep37Sentinels =
                             upstream.bosToken == step37Bos
                             && upstream.eosToken == "<|im_end|>"
-                            && upstream.convertTokenToId("<|im_start|>") != nil
-                            && upstream.convertTokenToId("<tool_call>") != nil
-                            && upstream.convertTokenToId("<im_patch>") != nil
+                            && (upstream.convertTokenToId("<|im_start|>").flatMap { upstream.convertIdToToken($0) } == "<|im_start|>")
+                            && (upstream.convertTokenToId("<tool_call>").flatMap { upstream.convertIdToToken($0) } == "<tool_call>")
+                            && (upstream.convertTokenToId("<im_patch>").flatMap { upstream.convertIdToToken($0) } == "<im_patch>")
                         let step37NeedsFallback =
                             hasStep37Sentinels
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
@@ -315,7 +315,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         // "Mistral 4 effort not normalized").
                         var mistral4AdjustedContext = additionalContext
                         if mistral4AdjustedContext?["reasoning_effort"] == nil,
-                           upstream.convertTokenToId("[MODEL_SETTINGS]") != nil,
+                           (upstream.convertTokenToId("[MODEL_SETTINGS]").flatMap { upstream.convertIdToToken($0) } == "[MODEL_SETTINGS]"),
                            let enableThinking = mistral4AdjustedContext?["enable_thinking"] as? Bool {
                             var ctx = mistral4AdjustedContext ?? [:]
                             ctx["reasoning_effort"] = enableThinking ? "high" : "none"
@@ -335,7 +335,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         }
                         if !(tools?.isEmpty ?? true),
                            upstream.bosToken == "<s>",
-                           upstream.convertTokenToId("<|im_end|>") != nil,
+                           (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>"),
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
                                 FileHandle.standardError.write(
@@ -429,7 +429,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                         additionalContext: additionalContext)
                                 }
                                 if upstream.bosToken == "<s>",
-                                   upstream.convertTokenToId("<|im_end|>") != nil {
+                                   (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>") {
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
                                         FileHandle.standardError.write(
                                             "[vmlx] chat-template missing -> NemotronMinimal fallback engaged\\n"
@@ -469,8 +469,8 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             // sentinel tokens are not in vocab.
                             let isGemma = upstream.bosToken == "<bos>"
                             let hasNemotronSentinel =
-                                upstream.convertTokenToId("<|im_start|>") != nil
-                                || upstream.convertTokenToId("<|im_end|>") != nil
+                                (upstream.convertTokenToId("<|im_start|>").flatMap { upstream.convertIdToToken($0) } == "<|im_start|>")
+                                || (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>")
                             let ordered: [(label: String, template: String)]
                             if hasLagunaSentinel {
                                 ordered = [
@@ -544,10 +544,10 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         let hasLagunaSentinel =
                             upstream.bosToken == lagunaEos
                             && upstream.eosToken == lagunaEos
-                            && upstream.convertTokenToId("<assistant>") != nil
-                            && upstream.convertTokenToId("</assistant>") != nil
-                            && upstream.convertTokenToId("<think>") != nil
-                            && upstream.convertTokenToId("</think>") != nil
+                            && (upstream.convertTokenToId("<assistant>").flatMap { upstream.convertIdToToken($0) } == "<assistant>")
+                            && (upstream.convertTokenToId("</assistant>").flatMap { upstream.convertIdToToken($0) } == "</assistant>")
+                            && (upstream.convertTokenToId("<think>").flatMap { upstream.convertIdToToken($0) } == "<think>")
+                            && (upstream.convertTokenToId("</think>").flatMap { upstream.convertIdToToken($0) } == "</think>")
                         if hasLagunaSentinel
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             return try upstream.applyChatTemplate(
@@ -563,8 +563,8 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         let hasLFM2NativeToolSentinels =
                             upstream.bosToken == "<|startoftext|>"
                             && upstream.eosToken == "<|im_end|>"
-                            && upstream.convertTokenToId("<|tool_call_start|>") != nil
-                            && upstream.convertTokenToId("<|tool_call_end|>") != nil
+                            && (upstream.convertTokenToId("<|tool_call_start|>").flatMap { upstream.convertIdToToken($0) } == "<|tool_call_start|>")
+                            && (upstream.convertTokenToId("<|tool_call_end|>").flatMap { upstream.convertIdToToken($0) } == "<|tool_call_end|>")
                         if !(tools?.isEmpty ?? true),
                            hasLFM2NativeToolSentinels,
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
@@ -584,11 +584,11 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                     additionalContext: additionalContext)
                         }
                         let hasGemma4NativeToolSentinels =
-                            upstream.convertTokenToId("<|tool_call>") != nil
-                            && upstream.convertTokenToId("<|turn>") != nil
+                            (upstream.convertTokenToId("<|tool_call>").flatMap { upstream.convertIdToToken($0) } == "<|tool_call>")
+                            && (upstream.convertTokenToId("<|turn>").flatMap { upstream.convertIdToToken($0) } == "<|turn>")
                         if !(tools?.isEmpty ?? true),
                            upstream.bosToken == "<s>",
-                           upstream.convertTokenToId("<|im_end|>") != nil,
+                           (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>"),
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             return try upstream.applyChatTemplate(
                                 messages: messages,
@@ -628,9 +628,9 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         let hasStep37Sentinels =
                             upstream.bosToken == step37Bos
                             && upstream.eosToken == "<|im_end|>"
-                            && upstream.convertTokenToId("<|im_start|>") != nil
-                            && upstream.convertTokenToId("<tool_call>") != nil
-                            && upstream.convertTokenToId("<im_patch>") != nil
+                            && (upstream.convertTokenToId("<|im_start|>").flatMap { upstream.convertIdToToken($0) } == "<|im_start|>")
+                            && (upstream.convertTokenToId("<tool_call>").flatMap { upstream.convertIdToToken($0) } == "<tool_call>")
+                            && (upstream.convertTokenToId("<im_patch>").flatMap { upstream.convertIdToToken($0) } == "<im_patch>")
                         let step37NeedsFallback =
                             hasStep37Sentinels
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
@@ -671,7 +671,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         }
                         var mistral4AdjustedContext = additionalContext
                         if mistral4AdjustedContext?["reasoning_effort"] == nil,
-                           upstream.convertTokenToId("[MODEL_SETTINGS]") != nil,
+                           (upstream.convertTokenToId("[MODEL_SETTINGS]").flatMap { upstream.convertIdToToken($0) } == "[MODEL_SETTINGS]"),
                            let enableThinking = mistral4AdjustedContext?["enable_thinking"] as? Bool {
                             var ctx = mistral4AdjustedContext ?? [:]
                             ctx["reasoning_effort"] = enableThinking ? "high" : "none"
@@ -691,7 +691,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         }
                         if !(tools?.isEmpty ?? true),
                            upstream.bosToken == "<s>",
-                           upstream.convertTokenToId("<|im_end|>") != nil,
+                           (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>"),
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             return try upstream.applyChatTemplate(
                                 messages: messages,
@@ -750,7 +750,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                         additionalContext: additionalContext)
                                 }
                                 if upstream.bosToken == "<s>",
-                                   upstream.convertTokenToId("<|im_end|>") != nil {
+                                   (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>") {
                                     return try upstream.applyChatTemplate(
                                         messages: messages,
                                         chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
@@ -781,8 +781,8 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             }
                             let isGemma = upstream.bosToken == "<bos>"
                             let hasNemotronSentinel =
-                                upstream.convertTokenToId("<|im_start|>") != nil
-                                || upstream.convertTokenToId("<|im_end|>") != nil
+                                (upstream.convertTokenToId("<|im_start|>").flatMap { upstream.convertIdToToken($0) } == "<|im_start|>")
+                                || (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>")
                             let ordered: [(label: String, template: String)]
                             if hasLagunaSentinel {
                                 ordered = [
