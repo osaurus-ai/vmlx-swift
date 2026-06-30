@@ -254,6 +254,8 @@ public enum LLMTypeRegistry {
             "hy_v3": create(Hy3Configuration.self, Hy3Model.init),
             "hy3":   create(Hy3Configuration.self, Hy3Model.init),
             "hy-v3": create(Hy3Configuration.self, Hy3Model.init),
+            "hunyuan_v1_dense": create(
+                HunyuanV1DenseConfiguration.self, HunyuanV1DenseModel.init),
         ]
     }
 
