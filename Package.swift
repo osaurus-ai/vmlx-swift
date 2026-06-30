@@ -307,6 +307,7 @@ let package = Package(
         .library(name: "MLXLLM", targets: ["MLXLLM"]),
         .library(name: "MLXVLM", targets: ["MLXVLM"]),
         .library(name: "MLXEmbedders", targets: ["MLXEmbedders"]),
+        .library(name: "RampartPII", targets: ["RampartPII"]),
         .library(name: "MLXHuggingFace", targets: ["MLXHuggingFace"]),
         .library(name: "BenchmarkHelpers", targets: ["BenchmarkHelpers"]),
         .library(name: "IntegrationTestHelpers", targets: ["IntegrationTestHelpers"]),
@@ -331,6 +332,7 @@ let package = Package(
         .executable(name: "ANEProbe", targets: ["ANEProbe"]),
         .executable(name: "Gemma4AudioSmoke", targets: ["Gemma4AudioSmoke"]),
         .executable(name: "DeepseekOCRSmoke", targets: ["DeepseekOCRSmoke"]),
+        .executable(name: "RampartSmoke", targets: ["RampartSmoke"]),
         .executable(name: "OmniAudioLatencyBench", targets: ["OmniAudioLatencyBench"]),
         .executable(name: "OmniAudioChunkStabilityBench", targets: ["OmniAudioChunkStabilityBench"]),
         .executable(name: "mlxpress", targets: ["MLXPressCLI"]),
@@ -507,6 +509,11 @@ let package = Package(
             dependencies: ["MLX", "MLXNN", "MLXLMCommon"],
             path: "Libraries/MLXEmbedders",
             exclude: ["README.md"]
+        ),
+        .target(
+            name: "RampartPII",
+            dependencies: ["MLX", "MLXNN"],
+            path: "Libraries/RampartPII"
         ),
         .target(
             name: "MLXDistributedCore",
@@ -720,6 +727,11 @@ let package = Package(
                 "VMLXTokenizers",
             ],
             path: "tools/DeepseekOCRSmoke"
+        ),
+        .executableTarget(
+            name: "RampartSmoke",
+            dependencies: ["RampartPII", "MLX"],
+            path: "tools/RampartSmoke"
         ),
         .executableTarget(
             name: "OmniAudioLatencyBench",
