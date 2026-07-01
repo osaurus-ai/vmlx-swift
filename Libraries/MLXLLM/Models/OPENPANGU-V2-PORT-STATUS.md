@@ -49,7 +49,7 @@ Layer-type dispatch: `i in dsa_layers` → full+indexer; `i in swa_layers` → s
 | attention sinks (128) | prepended-KV (NOT SDPA sinks) | 🟨 written; mask-widen refine pending |
 | DSA indexer (16 layers) + top-2048 | DeepseekV4 Indexer | ⬜ |
 | SWA per-layer (sliding_window_list) | RotatingKVCache | ⬜ |
-| MHC hyper-connections (4-stream) + merge | NEW | ⬜ |
+| MHC hyper-connections (4-stream) + merge | adapt DeepseekV4HyperConnection | 🟨 module+params written (OpenPanguV2MHC.swift); forward = PLACEHOLDER, needs reference-numeric-validation (jang-tools) |
 | sandwich norm (4/layer + block_post×9) | trivial | ⬜ |
 | MoE (256+1 shared, biased top-k) | DeepseekV3 gate | ✅ written (OpenPanguV2.swift) |
 | MTP depth-3 autodetect | NativeMTP infra | ⬜ |
