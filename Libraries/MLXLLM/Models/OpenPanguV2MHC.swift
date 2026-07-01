@@ -47,11 +47,12 @@ final class OpenPanguV2MHCModule: Module {
     let sinkhornIters: Int      // mhc_recur_norm = 20
     let eps: Float
 
-    /// phi is a (quantized, 2-bit in JANG_2L) linear projection `4H → mix`; as a
-    /// `Linear` module the standard loader substitutes `QuantizedLinear` and loads
-    /// its weight+scales+biases. (A raw MLXArray param can't receive the quant
-    /// scales/biases.) Used as `mixes = phi(normed)` = `normed @ phi.weight.T`.
-    @ModuleInfo(key: "phi") var phi: Linear
+    /// phi is the `mix × 4H` projection matrix (`mixes = normed @ phi.T`). It is
+    /// a RAW param (not a `Linear`) so the quant substitution never touches it —
+    /// its JANG_2L 2-bit form is bit-width ambiguous and the shape-walk mis-infers
+    /// it, so sanitize dequantizes phi to dense fp16 up front (see
+    /// OpenPanguV2Model.sanitize). Kept fp32 for the projection like DSV4 `fn`.
+    @ParameterInfo(key: "phi.weight") var phi: MLXArray          // [mix, 4*hidden]
     @ParameterInfo(key: "branch_alpha") var branchAlpha: MLXArray // [3]
     @ParameterInfo(key: "branch_beta") var branchBeta: MLXArray   // [3]
     @ParameterInfo(key: "norm_gamma") var normGamma: MLXArray     // [4*hidden]
@@ -63,7 +64,7 @@ final class OpenPanguV2MHCModule: Module {
         self.sinkhornIters = config.mhcRecurNorm
         self.eps = config.rmsNormEps
         let wide = config.mhcNumStream * config.hiddenSize
-        self._phi.wrappedValue = Linear(wide, mixDim, bias: false)
+        self._phi.wrappedValue = MLXArray.zeros([mixDim, wide])
         self._branchAlpha.wrappedValue = MLXArray.zeros([3])
         self._branchBeta.wrappedValue = MLXArray.zeros([3])
         self._normGamma.wrappedValue = MLXArray.ones([wide])
@@ -90,14 +91,10 @@ final class OpenPanguV2MHCModule: Module {
     /// rsqrt (see the DSV4 HC fp32-cast note).
     private func mixes(_ h: MLXArray) -> MLXArray {
         let (B, L) = (h.dim(0), h.dim(1))
-        let dtype = h.dtype
         let flat = h.reshaped(B, L, numStream * hiddenSize)
         let normed = MLXFast.rmsNorm(
             flat.asType(.float32), weight: normGamma.asType(.float32), eps: eps)
-        // phi is (quantized) — run the projection in the model dtype, then lift
-        // the mix back to fp32 for the sinkhorn (the 2-bit phi dominates error,
-        // so the fp16 projection is negligible next to it).
-        return phi(normed.asType(dtype)).asType(.float32)  // (B,L,mix)
+        return normed.matmul(phi.asType(.float32).transposed())  // (B,L,mix)
     }
 
     /// Collapse the 4 residual streams `(B,L,4,H)` → single block input `(B,L,H)`,
@@ -134,9 +131,9 @@ final class OpenPanguV2MergeMHC: Module {
     let hiddenSize: Int
     let eps: Float
 
-    /// merge phi is fp16 in JANG_2L (not in the quant dict) — a plain `Linear`
-    /// (`4H → mhcNumStream`) loads its `phi.weight`; the loader leaves it unquantized.
-    @ModuleInfo(key: "phi") var phi: Linear
+    /// merge phi is fp16 in JANG_2L (not quantized) — a raw `[mhcNumStream, 4H]`
+    /// param loaded straight from `phi.weight` (`mixes = normed @ phi.T`).
+    @ParameterInfo(key: "phi.weight") var phi: MLXArray           // [4, 4*hidden]
     @ParameterInfo(key: "branch_alpha_pre") var branchAlphaPre: MLXArray  // [1]
     @ParameterInfo(key: "branch_beta_pre") var branchBetaPre: MLXArray    // [1]
     @ParameterInfo(key: "norm_gamma") var normGamma: MLXArray      // [4*hidden]
@@ -146,7 +143,7 @@ final class OpenPanguV2MergeMHC: Module {
         self.hiddenSize = config.hiddenSize
         self.eps = config.rmsNormEps
         let wide = config.mhcNumStream * config.hiddenSize
-        self._phi.wrappedValue = Linear(wide, config.mhcNumStream, bias: false)
+        self._phi.wrappedValue = MLXArray.zeros([config.mhcNumStream, wide])
         self._branchAlphaPre.wrappedValue = MLXArray.zeros([1])
         self._branchBetaPre.wrappedValue = MLXArray.zeros([1])
         self._normGamma.wrappedValue = MLXArray.ones([wide])
@@ -163,7 +160,7 @@ final class OpenPanguV2MergeMHC: Module {
         let flat = h.reshaped(B, L, numStream * hiddenSize)
         let normed = MLXFast.rmsNorm(
             flat.asType(.float32), weight: normGamma.asType(.float32), eps: eps)
-        let mixes = phi(normed.asType(dtype)).asType(.float32)          // (B,L,4)
+        let mixes = normed.matmul(phi.asType(.float32).transposed())    // (B,L,4)
         let pre = sigmoid(
             mixes * branchAlphaPre.asType(.float32) + branchBetaPre.asType(.float32))
             + MLXArray(eps)

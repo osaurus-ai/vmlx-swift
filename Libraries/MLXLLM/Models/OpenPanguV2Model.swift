@@ -186,11 +186,38 @@ public final class OpenPanguV2Model: Module, LLMModel, KVCacheDimensionProvider,
         var out: [String: MLXArray] = [:]
         let convSuffixes = ["qa_conv", "compresskv_conv", "o_conv"]
 
+        // phi's packed dim is bit-width AMBIGUOUS (e.g. 2-bit/gs128 vs 8-bit/gs32
+        // unpack to the same [24,640]+[24,80] shapes), so the JANG shape-walk
+        // mis-infers it and corrupts the projection (mixes → malformed). We KNOW
+        // phi's logical input dim (mhcNumStream*hiddenSize), so dequantize it to
+        // dense fp16 here — bits = packedCols*32/logicalIn is then exact — and drop
+        // the scales/biases so the walk leaves the dense weight alone. Merge phi is
+        // already fp16 (no scales) → passes through untouched.
+        let phiLogicalIn = config.mhcNumStream * config.hiddenSize
+
         for (key, value) in weights {
             // Drop MTP layers (46,47,48) and the DSA indexer (later passes).
             if let li = Self.layerIndex(of: key), li >= config.numHiddenLayers { continue }
             if key.contains(".indexer.") { continue }
             if key.contains("rotary_emb.inv_freq") { continue }
+
+            // MHC phi: dequantize when quantized (attn/mlp), pass through fp16 (merge).
+            if key.contains("mhc_module.phi.") {
+                if key.hasSuffix(".phi.scales") || key.hasSuffix(".phi.biases") { continue }
+                if key.hasSuffix(".phi.weight") {
+                    let base = String(key.dropLast(".weight".count))
+                    if let scales = weights["\(base).scales"], let packed = value.shape.last {
+                        let bits = packed * 32 / phiLogicalIn
+                        let gs = phiLogicalIn / (scales.shape.last ?? 1)
+                        out[key] = dequantized(
+                            value, scales: scales, biases: weights["\(base).biases"],
+                            groupSize: gs, bits: bits)
+                    } else {
+                        out[key] = value  // merge phi (fp16, no scales)
+                    }
+                    continue
+                }
+            }
 
             // Depthwise conv weight axis reorder + wrap-path route.
             if convSuffixes.contains(where: { key.hasSuffix(".self_attn.\($0).weight") }) {
