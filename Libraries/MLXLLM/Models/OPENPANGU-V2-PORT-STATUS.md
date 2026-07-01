@@ -44,14 +44,14 @@ Layer-type dispatch: `i in dsa_layers` → full+indexer; `i in swa_layers` → s
 |---|---|---|
 | Config struct | new | ✅ done (OpenPanguV2Configuration.swift) |
 | Factory registration (`openpangu_v2`) | LLMModelFactory | ⬜ |
-| MLA attention (q/kv low-rank + rope) | DeepseekV3 | ⬜ |
-| qa/compresskv/o convs + conv-state cache | new (Mamba-style) | ⬜ |
-| attention sinks (128) | DeepseekV4 sinks | ⬜ |
+| MLA attention (q/kv low-rank + rope) | DeepseekV3 | 🟨 code written (OpenPanguV2.swift) |
+| qa/compresskv/o convs + conv-state cache | new (Mamba-style) | 🟨 conv module written; cache pass pending |
+| attention sinks (128) | prepended-KV (NOT SDPA sinks) | 🟨 written; mask-widen refine pending |
 | DSA indexer (16 layers) + top-2048 | DeepseekV4 Indexer | ⬜ |
 | SWA per-layer (sliding_window_list) | RotatingKVCache | ⬜ |
 | MHC hyper-connections (4-stream) + merge | NEW | ⬜ |
 | sandwich norm (4/layer + block_post×9) | trivial | ⬜ |
-| MoE (256+1 shared, biased top-k) | DeepseekV4MathHelpers | ⬜ |
+| MoE (256+1 shared, biased top-k) | DeepseekV3 gate | ✅ written (OpenPanguV2.swift) |
 | MTP depth-3 autodetect | NativeMTP infra | ⬜ |
 | hybrid cache (prefix/SSD/paged) + quant pool | DeepseekV4Cache: HybridPoolCache | ⬜ |
 | cache sync / async rederive | DeepseekV4 + SSMReDerive | ⬜ |
