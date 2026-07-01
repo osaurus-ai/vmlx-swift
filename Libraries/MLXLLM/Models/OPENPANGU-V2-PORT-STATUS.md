@@ -76,6 +76,28 @@ config.json + safetensors index inspected; the bundle is ALREADY in MLX-swift la
 - **Config validated**: dsa_layers(16)/swa_layers(33, incl. MTP 46-48)/sliding_window_list(33)/block_post_layernorm_idx[0,4,9,14,19,24,29,34,39]/param_sink_number(128)/mhc_num_stream(4)/mhc_recur_norm(20)/index_topk(2048) all match config.json.
 - Dropped in sanitize (later passes): MTP layers ≥46, `self_attn.indexer.*` (160 keys).
 
+## LIVE STATUS (2026-07-01) — loads + runs + emits REAL tokens, NOT yet coherent
+Driven live via osaurus (JANG_2L, :1337). The model **loads, runs the full
+forward end-to-end, and emits real vocabulary tokens** — so embed / lm_head /
+quantization / tokenizer / cache / MoE-routing are correct. But the output is
+**incoherent** (degenerate/looping tokens). Bisected via env gates:
+`OPENPANGU_MHC_BYPASS`, `OPENPANGU_NO_CONVS`, `OPENPANGU_NO_SINKS`,
+`OPENPANGU_ROPE_TRAD`, `OPENPANGU_MHC_TRACE`.
+- **Sinks ON → punctuation collapse; sinks OFF → real-word garbage.** The sink
+  KV construction actively corrupts attention (suspect: double `kv_a_layernorm`
+  on `param_sink_compressed_kv`, and/or the prepend-mask convention).
+- Base incoherence persists with everything stripped → a wiring/math detail in
+  the novel components is off (MHC exact pre/post/comb gating, conv activation,
+  or sink math). NOT a missing component: verified **every** bundle key maps to
+  a module, **no MoME weights** exist (`use_mome` is a weightless flag), and no
+  `n_group`/`rope_scaling`/`rope_parameters` in config (plain top-k + plain rope).
+- **Blocker**: the modeling source is unreleased (only `configuration_*.py` +
+  `tokenization_*.py` ship; no `modeling_openpangu_v2.py`). The exact numerics of
+  MHC / sinks / convs can't be reverse-engineered from weight shapes alone — needs
+  the reference forward (Huawei release, or a jang-tools openpangu forward if one
+  is authored). Fixes already landed: tokenizer map, phi dequant (dodge shape-walk),
+  block_post_layernorm [10240] flatten, MHC base[24]/base_pre[4], rope=config.
+
 ## Live-confirm plan
 Short-ctx: raw bf16 or JANG_2L, coherent single-turn + multiturn. Long-ctx: >2048 (crosses SWA 512→2048 boundary + DSA top-k + sink) — verify coherence + prefix/SSD/paged cache hit + quant-pool. Wire cache_window → osaurus for auto-loading (hybrid cache_type from JANG capabilities).
 
