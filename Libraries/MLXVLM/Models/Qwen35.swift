@@ -1877,7 +1877,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     public func prepare(
         _ input: LMInput,
         cache: [any KVCache],
-        windowSize _: Int?
+        windowSize: Int?
     ) throws -> PrepareResult {
         let inputIds = input.text.tokens
 
@@ -1923,6 +1923,59 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         }
 
         let typedCache = castCache(cache)
+
+        // Chunked text-only prefill so the UI prefill counter advances instead
+        // of freezing at "0/N". The single-shot forward below emits no
+        // `PrefillProgress` frames, so a long hybrid (Ornith / qwen3_5) prompt
+        // showed a frozen counter until first token. Only the pure-text,
+        // causal-mask path is chunked: image/video prefill and custom masks keep
+        // the single-shot path because mrope position ids are derived from the
+        // full image grid. Chunking is numerically identical to single-shot —
+        // the hybrid cache (GatedDeltaNet conv+recurrent state + KV) carries
+        // state across forwards, and the language model derives position ids and
+        // the causal mask from `cache.offset` (the same invariant that makes
+        // token-by-token decode correct). Mirrors Gemma4's VLM prefill.
+        // No `input.text.mask == nil` guard: each chunk passes `mask: nil` and
+        // the model rebuilds the causal mask from `cache.offset` (identical to
+        // how token-by-token decode runs), so a causal/padding prefill mask is
+        // reconstructed correctly per chunk — same as Gemma4's chunked VLM
+        // prefill, which also drops the incoming mask.
+        let prefillStepSize = windowSize ?? 512
+        let promptTokenCount = inputIds.dim(1)
+        if inputEmbeddings == nil, pixelValues == nil,
+            prefillStepSize > 0, promptTokenCount > prefillStepSize
+        {
+            var offset = 0
+            while offset + prefillStepSize < promptTokenCount {
+                let end = offset + prefillStepSize
+                _ = languageModel(
+                    inputIds[0..., offset ..< end],
+                    inputsEmbeds: nil,
+                    cache: typedCache,
+                    mask: nil,
+                    positionIds: nil,
+                    pixelValues: nil,
+                    imageGridTHW: nil,
+                    videoGridTHW: nil
+                )
+                MLX.eval(cache)
+                PrefillProgressReporter.reportCompletedUnits(end)
+                offset = end
+                MLX.Memory.clearCache()
+            }
+            let output = languageModel(
+                inputIds[0..., offset...],
+                inputsEmbeds: nil,
+                cache: typedCache,
+                mask: nil,
+                positionIds: nil,
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil
+            )
+            return .logits(output)
+        }
+
         let output = languageModel(
             inputIds,
             inputsEmbeds: inputEmbeddings,
