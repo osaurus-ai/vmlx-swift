@@ -202,13 +202,28 @@ func resolveStopSequences(
             textStopStrings: &textStopStrings,
             allowExactTextFallback: true)
     }
-    for token in commonEndTokenStrings {
-        resolveStopTokenString(
-            token,
-            tokenizer: tokenizer,
-            tokenIDs: &tokenIDs,
-            textStopStrings: &textStopStrings,
-            allowExactTextFallback: false)
+    // The hard-coded `commonEndTokenStrings` fallback is applied ONLY to models that did
+    // NOT authoritatively declare their stop set in `generation_config.json`. When a model
+    // ships that file with an `eos_token_id` (the HF-canonical, mlx-lm-honored generation-time
+    // stop list), the declaration is complete and authoritative — augmenting it with hard-coded
+    // end strings can only ADD stops the model deliberately omitted. That over-reach is exactly
+    // what made gpt-oss (OpenAI harmony) halt at the `<|end|>` channel separator that its own
+    // `generation_config.json` correctly excludes from eos. So: trust the declaration when present;
+    // keep the blanket only as a safety net for under-declared conversions that ship no
+    // `generation_config.json` eos at all (e.g. some Phi-3 builds whose only `<|end|>` signal is
+    // the tokenizer eos). `generationDefaults` is nil for any caller that didn't load one, so this
+    // is conservative by default — the blanket is skipped only on positive evidence of a declaration.
+    let hasAuthoritativeEOS =
+        !(modelConfiguration.generationDefaults?.eosTokenIds?.values ?? []).isEmpty
+    if !hasAuthoritativeEOS {
+        for token in commonEndTokenStrings {
+            resolveStopTokenString(
+                token,
+                tokenizer: tokenizer,
+                tokenIDs: &tokenIDs,
+                textStopStrings: &textStopStrings,
+                allowExactTextFallback: false)
+        }
     }
 
     return ResolvedStopSequences(
