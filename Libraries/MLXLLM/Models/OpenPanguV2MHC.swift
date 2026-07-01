@@ -47,7 +47,11 @@ final class OpenPanguV2MHCModule: Module {
     let sinkhornIters: Int      // mhc_recur_norm = 20
     let eps: Float
 
-    @ParameterInfo(key: "phi.weight") var phi: MLXArray          // [mix, 4*hidden]
+    /// phi is a (quantized, 2-bit in JANG_2L) linear projection `4H → mix`; as a
+    /// `Linear` module the standard loader substitutes `QuantizedLinear` and loads
+    /// its weight+scales+biases. (A raw MLXArray param can't receive the quant
+    /// scales/biases.) Used as `mixes = phi(normed)` = `normed @ phi.weight.T`.
+    @ModuleInfo(key: "phi") var phi: Linear
     @ParameterInfo(key: "branch_alpha") var branchAlpha: MLXArray // [3]
     @ParameterInfo(key: "branch_beta") var branchBeta: MLXArray   // [3]
     @ParameterInfo(key: "norm_gamma") var normGamma: MLXArray     // [4*hidden]
@@ -59,7 +63,7 @@ final class OpenPanguV2MHCModule: Module {
         self.sinkhornIters = config.mhcRecurNorm
         self.eps = config.rmsNormEps
         let wide = config.mhcNumStream * config.hiddenSize
-        self._phi.wrappedValue = MLXArray.zeros([mixDim, wide])
+        self._phi.wrappedValue = Linear(wide, mixDim, bias: false)
         self._branchAlpha.wrappedValue = MLXArray.zeros([3])
         self._branchBeta.wrappedValue = MLXArray.zeros([3])
         self._normGamma.wrappedValue = MLXArray.ones([wide])
@@ -86,10 +90,14 @@ final class OpenPanguV2MHCModule: Module {
     /// rsqrt (see the DSV4 HC fp32-cast note).
     private func mixes(_ h: MLXArray) -> MLXArray {
         let (B, L) = (h.dim(0), h.dim(1))
+        let dtype = h.dtype
         let flat = h.reshaped(B, L, numStream * hiddenSize)
         let normed = MLXFast.rmsNorm(
             flat.asType(.float32), weight: normGamma.asType(.float32), eps: eps)
-        return normed.matmul(phi.asType(.float32).transposed())  // (B,L,mix)
+        // phi is (quantized) — run the projection in the model dtype, then lift
+        // the mix back to fp32 for the sinkhorn (the 2-bit phi dominates error,
+        // so the fp16 projection is negligible next to it).
+        return phi(normed.asType(dtype)).asType(.float32)  // (B,L,mix)
     }
 
     /// Collapse the 4 residual streams `(B,L,4,H)` → single block input `(B,L,H)`,
@@ -126,7 +134,9 @@ final class OpenPanguV2MergeMHC: Module {
     let hiddenSize: Int
     let eps: Float
 
-    @ParameterInfo(key: "phi.weight") var phi: MLXArray            // [4, 4*hidden]
+    /// merge phi is fp16 in JANG_2L (not in the quant dict) — a plain `Linear`
+    /// (`4H → mhcNumStream`) loads its `phi.weight`; the loader leaves it unquantized.
+    @ModuleInfo(key: "phi") var phi: Linear
     @ParameterInfo(key: "branch_alpha_pre") var branchAlphaPre: MLXArray  // [1]
     @ParameterInfo(key: "branch_beta_pre") var branchBetaPre: MLXArray    // [1]
     @ParameterInfo(key: "norm_gamma") var normGamma: MLXArray      // [4*hidden]
@@ -136,7 +146,7 @@ final class OpenPanguV2MergeMHC: Module {
         self.hiddenSize = config.hiddenSize
         self.eps = config.rmsNormEps
         let wide = config.mhcNumStream * config.hiddenSize
-        self._phi.wrappedValue = MLXArray.zeros([config.mhcNumStream, wide])
+        self._phi.wrappedValue = Linear(wide, config.mhcNumStream, bias: false)
         self._branchAlphaPre.wrappedValue = MLXArray.zeros([1])
         self._branchBetaPre.wrappedValue = MLXArray.zeros([1])
         self._normGamma.wrappedValue = MLXArray.ones([wide])
@@ -153,7 +163,7 @@ final class OpenPanguV2MergeMHC: Module {
         let flat = h.reshaped(B, L, numStream * hiddenSize)
         let normed = MLXFast.rmsNorm(
             flat.asType(.float32), weight: normGamma.asType(.float32), eps: eps)
-        let mixes = normed.matmul(phi.asType(.float32).transposed())   // (B,L,4)
+        let mixes = phi(normed.asType(dtype)).asType(.float32)          // (B,L,4)
         let pre = sigmoid(
             mixes * branchAlphaPre.asType(.float32) + branchBetaPre.asType(.float32))
             + MLXArray(eps)

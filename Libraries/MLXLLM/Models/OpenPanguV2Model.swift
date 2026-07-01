@@ -170,15 +170,18 @@ public final class OpenPanguV2Model: Module, LLMModel, KVCacheDimensionProvider,
         lmHead(model(inputs, cache: cache))
     }
 
-    /// Remap the openpangu-v2 bundle key names to the module attribute paths and
-    /// stack per-expert MoE weights into the `switch_mlp` layout. The HF-style
-    /// native names already match most module paths (`model.layers.N.self_attn.*`,
-    /// `attn_mhc_module.*`, `merge_mhc_module.*`, the 4 sandwich norms, the sinks);
-    /// the transforms below are the ones that differ:
-    ///   • depthwise conv weight `[C,1,k]` (PyTorch) → `[C,k,1]` (MLX Conv1d)
-    ///   • `mlp.experts.{E}.{gate,up,down}_proj.*` → `mlp.switch_mlp.*` (stacked)
-    ///   • MTP layers (>= numHiddenLayers) dropped — the MTP head is a later pass.
-    ///   • DSA `self_attn.indexer.*` dropped — the indexer module is a later pass.
+    /// Remap the openpangu-v2 (JANG_2L) bundle key names to the module attribute
+    /// paths. The bundle is already in MLX-swift layout — routed experts ship
+    /// pre-stacked as `mlp.switch_mlp.{gate,up,down}_proj.*` (matching our
+    /// `SwitchGLU`), phi is a quantized `Linear` (`attn_mhc_module.phi.*`), and the
+    /// self_attn/MoE projections + embed/lm_head are quantized `Linear`/`Embedding`
+    /// (loaded by the standard quant substitution). Only three transforms differ:
+    ///   • depthwise conv weight `[C,1,k]` (PyTorch) → `[C,k,1]` (MLX Conv1d), and
+    ///     route `*.qa_conv.weight` to the wrapped path `*.qa_conv.conv.weight`.
+    ///   • `mlp.e_score_correction_bias` → `mlp.gate.e_score_correction_bias`
+    ///     (the router bias ships one level up from where our gate holds it).
+    ///   • Drop MTP layers (>= numHiddenLayers) and the DSA `self_attn.indexer.*`
+    ///     (both are later passes; the indexer module isn't wired yet).
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var out: [String: MLXArray] = [:]
         let convSuffixes = ["qa_conv", "compresskv_conv", "o_conv"]
@@ -189,44 +192,23 @@ public final class OpenPanguV2Model: Module, LLMModel, KVCacheDimensionProvider,
             if key.contains(".indexer.") { continue }
             if key.contains("rotary_emb.inv_freq") { continue }
 
-            // Depthwise conv weight axis reorder: PyTorch [out,in/g=1,k] → MLX
-            // Conv1d [out,k,in/g=1]. Route the raw `*.qa_conv.weight` param to the
-            // wrapped module path `*.qa_conv.conv.weight`.
-            if let base = convSuffixes.first(where: {
-                key.hasSuffix(".self_attn.\($0).weight")
-            }) {
+            // Depthwise conv weight axis reorder + wrap-path route.
+            if convSuffixes.contains(where: { key.hasSuffix(".self_attn.\($0).weight") }) {
                 let prefix = String(key.dropLast(".weight".count))  // …self_attn.<base>
-                _ = base
-                if value.ndim == 3 {
-                    out["\(prefix).conv.weight"] = value.transposed(0, 2, 1)
-                } else {
-                    out["\(prefix).conv.weight"] = value
-                }
+                out["\(prefix).conv.weight"] = value.ndim == 3 ? value.transposed(0, 2, 1) : value
+                continue
+            }
+
+            // Router bias lives at `mlp.e_score_correction_bias`; our gate holds it
+            // at `mlp.gate.e_score_correction_bias`.
+            if key.hasSuffix(".mlp.e_score_correction_bias") {
+                let prefix = String(key.dropLast(".e_score_correction_bias".count))
+                out["\(prefix).gate.e_score_correction_bias"] = value
                 continue
             }
 
             out[key] = value
         }
-
-        // Stack per-expert MoE weights → SwitchGLU layout.
-        for l in config.firstKDenseReplace..<config.numHiddenLayers {
-            let prefix = "model.layers.\(l)"
-            for projName in ["gate_proj", "up_proj", "down_proj"] {
-                for field in ["weight", "scales", "biases"] {
-                    let first = "\(prefix).mlp.experts.0.\(projName).\(field)"
-                    guard weights[first] != nil else { continue }
-                    let joined = (0..<config.nRoutedExperts).compactMap {
-                        weights["\(prefix).mlp.experts.\($0).\(projName).\(field)"]
-                    }
-                    guard joined.count == config.nRoutedExperts else { continue }
-                    out["\(prefix).mlp.switch_mlp.\(projName).\(field)"] = stacked(joined)
-                    for e in 0..<config.nRoutedExperts {
-                        out["\(prefix).mlp.experts.\(e).\(projName).\(field)"] = nil
-                    }
-                }
-            }
-        }
-
         return out
     }
 
