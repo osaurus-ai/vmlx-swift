@@ -27,8 +27,10 @@ public enum OpenPanguConvKind: Int, CaseIterable, Sendable {
 
 public final class OpenPanguV2Cache: HybridPoolCache {
     /// The underlying KV cache: `RotatingKVCache` on SWA layers, `KVCacheSimple`
-    /// (unbounded, full attention) on DSA layers.
-    public let kv: KVCache
+    /// (unbounded, full attention) on DSA layers. `var` (not `let`) so the
+    /// `state`/`metaState` setters can mutate through the existential — KVCache
+    /// is not class-constrained, so member-setter access requires a `var`.
+    public var kv: KVCache
     /// True for DSA (full-attention + indexer) layers.
     public let isDSA: Bool
     /// Per-layer sliding window (SWA) or 0 (DSA full).

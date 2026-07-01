@@ -37,7 +37,6 @@
 
 import Foundation
 import MLX
-import MLXFast
 import MLXNN
 
 /// Per-layer MHC module (attn_mhc_module / mlp_mhc_module).
