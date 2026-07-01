@@ -53,8 +53,8 @@ Layer-type dispatch: `i in dsa_layers` → full+indexer; `i in swa_layers` → s
 | sandwich norm (4/layer + block_post×9) | trivial | ⬜ |
 | MoE (256+1 shared, biased top-k) | DeepseekV3 gate | ✅ written (OpenPanguV2.swift) |
 | MTP depth-3 autodetect | NativeMTP infra | ⬜ |
-| hybrid cache (prefix/SSD/paged) + quant pool | DeepseekV4Cache: HybridPoolCache | ⬜ |
-| cache sync / async rederive | DeepseekV4 + SSMReDerive | ⬜ |
+| hybrid cache (prefix/SSD/paged) + quant pool | OpenPanguV2Cache (HybridPoolCache) | 🟨 v1 written (kv+3 conv-state+idx pool); switch-sites pending |
+| cache sync / async rederive | trim invalidates conv-state | 🟨 wired in OpenPanguV2Cache.trim |
 | JANGTQ (JANG_2L 3.17-bit load) | DeepseekV4JANGTQ pattern | ⬜ |
 | Build + live short-ctx | — | ⬜ |
 | Build + live long-ctx | — | ⬜ |
