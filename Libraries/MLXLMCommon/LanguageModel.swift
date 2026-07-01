@@ -353,6 +353,13 @@ public protocol LanguageModel: Module {
     /// Models can override this to inspect metadata (e.g. check `metadata["format"] == "mlx"`)
     /// and skip or customize sanitization accordingly.
     func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
+
+    /// The architecture's authoritative RMSNorm "(1 + weight)" convention marker (e.g.
+    /// `"mlx_plus_one"`), consulted when neither bundle metadata nor `config.json` declares one.
+    /// `nil` (the default) means the architecture declares no such convention. Architectures that
+    /// store RMSNorm weights as the deviation-from-1 should override this; see
+    /// ``NormConventionResolver`` and `Qwen35` for the template.
+    var declaredNormConvention: String? { get }
 }
 
 extension LanguageModel {
@@ -369,6 +376,9 @@ extension LanguageModel {
 }
 
 extension LanguageModel {
+    /// Default: the architecture declares no `(1 + weight)` convention. Override per architecture.
+    public var declaredNormConvention: String? { nil }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights
     }

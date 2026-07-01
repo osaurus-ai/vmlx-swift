@@ -50,6 +50,9 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     var ropeScaling: [String: StringOrNumber]?
     var fullAttentionInterval: Int = 4
     var mtpNumHiddenLayers: Int = 0
+    /// Authoritative RMSNorm convention declared by the bundle (config.json `norm_convention`).
+    /// When set it overrides the architecture default; nil when the bundle declares none.
+    var normConvention: String? = nil
 
     // MoE fields
     var numExperts: Int = 0
@@ -82,6 +85,7 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         case ropeScaling = "rope_scaling"
         case fullAttentionInterval = "full_attention_interval"
         case mtpNumHiddenLayers = "mtp_num_hidden_layers"
+        case normConvention = "norm_convention"
         case numExperts = "num_experts"
         case numExpertsPerTok = "num_experts_per_tok"
         case decoderSparseStep = "decoder_sparse_step"
@@ -130,6 +134,8 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
             try container.decodeIfPresent(Int.self, forKey: .fullAttentionInterval) ?? 4
         self.mtpNumHiddenLayers =
             try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
+        self.normConvention =
+            try container.decodeIfPresent(String.self, forKey: .normConvention)
 
         // MoE fields
         self.numExperts = try container.decodeIfPresent(Int.self, forKey: .numExperts) ?? 0
@@ -1022,13 +1028,18 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
     {
         let loadNativeMTP = configuration.mtpNumHiddenLayers > 0
         var weights = loadNativeMTP ? weights : weights.filter { !Self.isMTPWeightKey($0.key) }
-        let hasUnsanitizedConv1d = weights.contains { key, value in
-            !Self.isMTPWeightKey(key) && key.contains("conv1d.weight") && value.dim(-1) != 1
-        }
-        let explicitNormConvention = normConvention != nil
-        let shouldShiftNormWeights = Self.usesQwenPlusOneNormConvention(normConvention)
-            || (!explicitNormConvention
-                && (hasUnsanitizedConv1d || Self.baseNormWeightsNeedShift(weights)))
+        // Resolve the (1 + weight) RMSNorm shift via the shared resolver: a per-bundle
+        // metadata/config declaration wins; otherwise (this arch uses the convention) the
+        // order-independent majority vote decides raw (→ shift) vs already-shifted (→ leave it).
+        // The same architecture ships both — JangQ stores raw, MXFP4 stores already-shifted — so
+        // this MUST be measured per bundle, not declared as always-on.
+        let shouldShiftNormWeights = NormConventionResolver.shouldApplyPlusOneShift(
+            metadataConvention: normConvention,
+            configConvention: configuration.normConvention,
+            declaredConvention: declaredNormConvention,
+            weights: weights,
+            probeSuffixes: [".input_layernorm.weight", ".post_attention_layernorm.weight"],
+            excluding: Self.isMTPWeightKey)
         let shouldShiftMTPNormWeights = loadNativeMTP
             && (shouldShiftNormWeights || Self.mtpNormWeightsNeedShift(weights))
 
@@ -1089,11 +1100,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
         return value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    private static func usesQwenPlusOneNormConvention(_ value: String?) -> Bool {
-        value == "qwen3_5_language_mlx_plus_one"
-            || value == "qwen35_language_mlx_plus_one"
-            || value == "mlx_plus_one"
-    }
+    // NB: qwen3.5 deliberately does NOT declare a class-level `norm_convention`. This architecture
+    // uses the (1 + weight) convention, but its bundles are stored in BOTH states — JangQ stores the
+    // norms raw (needs +1), MXFP4 stores them already-shifted (must not be shifted again) — so no
+    // truthful architecture-level claim exists. A per-bundle `config.json` / metadata declaration or,
+    // failing that, the order-independent vote decides. Do NOT override `declaredNormConvention`
+    // here: an authoritative class declaration would wrongly short-circuit the vote and degrade one
+    // of the two storage states. See ``NormConventionResolver``.
 
     private static func isMTPWeightKey(_ key: String) -> Bool {
         key.hasPrefix("mtp.")
@@ -1102,22 +1115,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
             || key.contains(".mtp_layers.")
     }
 
-    private static func baseNormWeightsNeedShift(_ weights: [String: MLXArray]) -> Bool {
-        let probeSuffixes = [
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-        ]
-        for (key, value) in weights where value.ndim == 1 {
-            guard !Self.isMTPWeightKey(key),
-                  probeSuffixes.contains(where: { key.hasSuffix($0) }) else {
-                continue
-            }
-            let mean = value.asType(.float32).mean().item(Float.self)
-            if mean < 0.5 { return true }
-            if mean > 0.5 { return false }
-        }
-        return false
-    }
+    // The order-independent "are these norms already shifted?" fallback now lives in
+    // `NormConventionResolver.weightsAppearUnshifted` (MLXLMCommon), invoked via
+    // `shouldApplyPlusOneShift` above. Architectures share that one implementation.
 }
 
 extension Qwen35TextModel: LoRAModel {
