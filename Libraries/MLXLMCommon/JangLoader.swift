@@ -1275,6 +1275,11 @@ public struct JangLoader: Sendable {
         // TikTokenTokenizer as a class name, but the generated tokenizer
         // is a standard byte-level BPE tokenizer.
         "TikTokenTokenizer": "Qwen2Tokenizer",
+        // OpenPangu-v2 ships a custom `OpenPanguV2Tokenizer` class, but its
+        // tokenizer.json is a standard byte-level BPE (model type BPE + merges,
+        // Sequence pre-tokenizer) with a Qwen-sized vocab — functionally
+        // Qwen2Tokenizer. swift-transformers loads it via tokenizer.json.
+        "OpenPanguV2Tokenizer": "Qwen2Tokenizer",
     ]
 
     /// Like `resolveTokenizerDirectory(for:)` but also fixes
