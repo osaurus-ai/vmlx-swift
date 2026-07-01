@@ -64,3 +64,6 @@ Layer-type dispatch: `i in dsa_layers` → full+indexer; `i in swa_layers` → s
 Short-ctx: raw bf16 or JANG_2L, coherent single-turn + multiturn. Long-ctx: >2048 (crosses SWA 512→2048 boundary + DSA top-k + sink) — verify coherence + prefix/SSD/paged cache hit + quant-pool. Wire cache_window → osaurus for auto-loading (hybrid cache_type from JANG capabilities).
 
 ## Branch: `feat/openpangu-v2` (off vmlx main). Loop-driven; update this matrix each iteration.
+
+## Build note (iteration)
+- Standalone `swift build --target MLXLLM` is blocked by a stale `.build` SDK mismatch (MLXFast.swiftmodule built with macosx26.4 vs current 26.5) — NOT a code error. **Real compile/build = osaurus xcodebuild** (fresh current-SDK, as used all session). Do the full build via the osaurus dev app once the model is structurally complete (MHC + decoder + inner/outer + factory), then fix API errors + live-test.
