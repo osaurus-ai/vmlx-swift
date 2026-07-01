@@ -42,7 +42,7 @@ Layer-type dispatch: `i in dsa_layers` → full+indexer; `i in swa_layers` → s
 ## Status matrix
 | Component | vmlx reuse | Status |
 |---|---|---|
-| Config struct | new | ⬜ scaffolding |
+| Config struct | new | ✅ done (OpenPanguV2Configuration.swift) |
 | Factory registration (`openpangu_v2`) | LLMModelFactory | ⬜ |
 | MLA attention (q/kv low-rank + rope) | DeepseekV3 | ⬜ |
 | qa/compresskv/o convs + conv-state cache | new (Mamba-style) | ⬜ |
