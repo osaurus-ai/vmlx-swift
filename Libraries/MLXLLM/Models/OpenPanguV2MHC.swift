@@ -45,7 +45,8 @@ final class OpenPanguV2MHCModule: Module {
     let hiddenSize: Int         // 2560
     let mixDim: Int             // 24 = (2+hc)*hc, = phi rows
     let sinkhornIters: Int      // mhc_recur_norm = 20
-    let eps: Float
+    let eps: Float              // rms_norm_eps — the pre-phi RMS norm
+    let hcEps: Float = 1e-6     // hc_eps — the sigmoid/softmax/sinkhorn epsilon
 
     /// phi is the `mix × 4H` projection (`mixes = normed @ phi.T`). It is a RAW
     /// param keyed `phi` (NOT a `Linear`) on purpose: the config.json quant dict
@@ -114,18 +115,20 @@ final class OpenPanguV2MHCModule: Module {
         }
         let (pre, post, comb) = DeepseekV4Math.hcSplitSinkhorn(
             mixes: mixes(h), scale: scaleParam, base: baseParam,
-            hcMult: numStream, iters: sinkhornIters, eps: eps)
+            hcMult: numStream, iters: sinkhornIters, eps: hcEps)
         // y = sum(pre[..., None] * h, axis=2)
         let y = (pre.asType(dtype).expandedDimensions(axis: -1) * h).sum(axis: -2)
         return (x: y, post: post, comb: comb)
     }
 
     /// Expand block output `(B,L,H)` + prior residual `(B,L,4,H)` back to 4
-    /// streams. Mirrors `DeepseekV4HyperConnection.expand`:
-    ///   y = post[..., None] * blockOut[..., None, :] + matmul(comb, residual)
+    /// streams. Reference `_mhc_post_naive`:
+    ///   new[j] = post[j]*blockOut + Σᵢ h_res[i,j]·residual[i]   (h_res TRANSPOSED)
+    /// i.e. the residual mix is `h_resᵀ @ residual`, not `h_res @ residual`.
     func expand(blockOut: MLXArray, residual: MLXArray, post: MLXArray, comb: MLXArray) -> MLXArray {
         let dtype = blockOut.dtype
-        let combResid = comb.asType(dtype).matmul(residual)
+        // transpose the last two (stream) axes of comb before the matmul.
+        let combResid = comb.transposed(0, 1, 3, 2).asType(dtype).matmul(residual)
         return post.asType(dtype).expandedDimensions(axis: -1)
             * blockOut.expandedDimensions(axis: -2) + combResid
     }
@@ -159,9 +162,9 @@ final class OpenPanguV2MergeMHC: Module {
         super.init()
     }
 
-    /// Reduce `(B,L,4,H)` → `(B,L,H)`.
-    ///   mixes = rms_norm(flatten(h), norm_gamma, eps) @ phi.T   # (B,L,4)
-    ///   pre   = sigmoid(mixes * alpha_pre + beta_pre) + eps
+    /// Reduce `(B,L,4,H)` → `(B,L,H)`. Reference `mhc_pre` (pre_only=True):
+    ///   mixes = rms_norm(flatten(h), norm_gamma) @ phi.T          # (B,L,4)
+    ///   pre   = sigmoid(mixes * alpha_pre + beta_pre)             # NO +eps
     ///   y     = sum(pre[..., None] * h, axis=2)
     func callAsFunction(_ h: MLXArray) -> MLXArray {
         let dtype = h.dtype
@@ -172,7 +175,6 @@ final class OpenPanguV2MergeMHC: Module {
         let mixes = normed.matmul(phi.asType(.float32).transposed())    // (B,L,4)
         let pre = sigmoid(
             mixes * branchAlphaPre.asType(.float32) + branchBetaPre.asType(.float32))
-            + MLXArray(eps)
         return (pre.asType(dtype).expandedDimensions(axis: -1) * h).sum(axis: -2)
             .asType(dtype)
     }

@@ -55,7 +55,9 @@ final class OpenPanguCausalConv: Module {
         let y = conv(padded)                                    // (B, L, C) — 'valid'
         // carry the last `pad` input columns (from the padded stream) forward.
         let newState = padded[0..., (padded.dim(1) - pad)..., 0...]
-        return (y, newState)
+        // Reference `npu_ai_infra_fused_causal_conv1d(..., residual_connection=1)`:
+        // the conv output is added back to the input.
+        return (y + x, newState)
     }
 }
 
