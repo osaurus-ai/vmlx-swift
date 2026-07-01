@@ -56,6 +56,14 @@ func makeDiskStoreCache(
         kvMode: parameters.kvMode)
 }
 
+/// Marker for a cache that carries path-dependent (SSM/conv-style) recurrent
+/// state beyond plain KV — a paged-only or KV-only reuse would be a silent false
+/// hit unless that state is restored/re-derived alongside the KV. Conformed by
+/// caches defined *outside* MLXLMCommon that it can't name concretely (e.g.
+/// OpenPangu-v2's `HybridPoolCache` also carries 3 causal-conv states). Concrete
+/// MLXLMCommon caches (Mamba/Arrays/ZayaCCA) are still matched by type below.
+public protocol PathDependentStateCache {}
+
 /// True when any cache layer carries path-dependent non-KV recurrent state.
 ///
 /// Paged KV blocks store attention KV tensors only. Mamba, linear-attention
@@ -64,7 +72,9 @@ func makeDiskStoreCache(
 /// companion disk restore or re-derive path supplies that state too.
 public func cacheContainsPathDependentState(_ cache: [any KVCache]) -> Bool {
     cache.contains { layer in
-        if layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache {
+        if layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache
+            || layer is PathDependentStateCache
+        {
             return true
         }
         if let cacheList = layer as? CacheList {

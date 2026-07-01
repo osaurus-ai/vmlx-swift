@@ -57,10 +57,24 @@ Layer-type dispatch: `i in dsa_layers` → full+indexer; `i in swa_layers` → s
 | MTP depth-3 autodetect | NativeMTP infra | ⬜ |
 | hybrid cache (prefix/SSD/paged) + quant pool | OpenPanguV2Cache (HybridPoolCache) | 🟨 v1 written (kv+3 conv-state+idx pool); switch-sites pending |
 | cache sync / async rederive | trim invalidates conv-state | 🟨 wired in OpenPanguV2Cache.trim |
-| JANGTQ (JANG_2L 3.17-bit load) | DeepseekV4JANGTQ pattern | ⬜ |
-| Build + live short-ctx | — | ⬜ |
+| JANG_2L 3.17-bit load (uniform affine) | standard quant loader | 🟩 NO dedicated JANGTQ engine needed — JANG_2L is uniform affine (scales/biases, no codebook). Loader quantizes per-module by `.scales` presence. All fixes landed (see "Loader alignment" below). |
+| Full osaurus dev-app BUILD | — | ✅ BUILD SUCCEEDED (0 errors) via cc/osaurus `.package(path:)` local override + `DEVELOPER_DIR=Xcode`. 4 compile fixes: MLXType→DType, drop transitive `import MLXFast`, `let kv`→`var`, phi→Linear. |
+| cache path-dependent detection (step h) | PathDependentStateCache marker | 🟩 marker protocol added in MLXLMCommon + conformed (conv-state now flagged path-dependent so no false paged/KV-only hit). SSM extract/restore skip it; conv-state rides the HybridPoolCache `.state` disk path. Remaining switch-sites verified-by-protocol. |
+| Build + live short-ctx (JANG_2L) | RunBench / osaurus | ⬜ NEXT — RAM-gated 40GB load; validates MHC E2E |
 | Build + live long-ctx | — | ⬜ |
-| osaurus cache-window auto-load PR | — | ⬜ |
+| MTP depth-3 head (g) | Qwen35MTPModule | ⬜ |
+| DSA indexer (d) | DeepseekV4Indexer | ⬜ deferred (full MLA = numeric superset) |
+| osaurus catalog + cache-window auto-load PR (k) | — | ⬜ |
+
+## Loader alignment (validated against the real JANG_2L bundle 2026-07-01)
+config.json + safetensors index inspected; the bundle is ALREADY in MLX-swift layout. Confirmed/fixed:
+- **Affine, not codebook**: 684 `.scales`/`.biases`, zero codebook/tq_packed. `weight_format` absent → dispatch routes to `OpenPanguV2Model`. Per-module bits vary (embed 6b, lm_head 8b, attn/MoE 8b/2b, phi 2b) — loader's `inferPerLayerQuantizationFromShapes` handles it.
+- **Experts pre-stacked** as `mlp.switch_mlp.{gate,up,down}_proj.*` (match `SwitchGLU`) → removed the per-expert stacking loop from sanitize (bundle has NO `experts.N.*`).
+- **phi is a quantized Linear** (`attn/mlp_mhc_module.phi.{weight,scales,biases}`, 2-bit) → phi is now a `Linear` (was raw param) so QuantizedLinear is substituted; merge phi is fp16 (no scales) → plain Linear.
+- **`mlp.e_score_correction_bias`** ships one level up from the gate → sanitize remaps to `mlp.gate.e_score_correction_bias`.
+- **convs** `[C,1,3]` F16 (not quantized) → sanitize reorders to MLX `[C,3,1]` + routes to `.conv.weight`.
+- **Config validated**: dsa_layers(16)/swa_layers(33, incl. MTP 46-48)/sliding_window_list(33)/block_post_layernorm_idx[0,4,9,14,19,24,29,34,39]/param_sink_number(128)/mhc_num_stream(4)/mhc_recur_norm(20)/index_topk(2048) all match config.json.
+- Dropped in sanitize (later passes): MTP layers ≥46, `self_attn.indexer.*` (160 keys).
 
 ## Live-confirm plan
 Short-ctx: raw bf16 or JANG_2L, coherent single-turn + multiturn. Long-ctx: >2048 (crosses SWA 512→2048 boundary + DSA top-k + sink) — verify coherence + prefix/SSD/paged cache hit + quant-pool. Wire cache_window → osaurus for auto-loading (hybrid cache_type from JANG capabilities).

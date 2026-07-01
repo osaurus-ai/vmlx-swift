@@ -25,7 +25,7 @@ public enum OpenPanguConvKind: Int, CaseIterable, Sendable {
     case o = 2
 }
 
-public final class OpenPanguV2Cache: HybridPoolCache {
+public final class OpenPanguV2Cache: HybridPoolCache, PathDependentStateCache {
     /// The underlying KV cache: `RotatingKVCache` on SWA layers, `KVCacheSimple`
     /// (unbounded, full attention) on DSA layers. `var` (not `let`) so the
     /// `state`/`metaState` setters can mutate through the existential — KVCache
