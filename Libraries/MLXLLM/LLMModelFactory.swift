@@ -27,6 +27,7 @@ public enum LLMTypeRegistry {
             "phi": create(PhiConfiguration.self, PhiModel.init),
             "phi3": create(Phi3Configuration.self, Phi3Model.init),
             "phimoe": create(PhiMoEConfiguration.self, PhiMoEModel.init),
+            "mixtral": create(MixtralConfiguration.self, MixtralModel.init),
             "gemma": create(GemmaConfiguration.self, GemmaModel.init),
             "gemma2": create(Gemma2Configuration.self, Gemma2Model.init),
             "gemma3": create(Gemma3TextConfiguration.self, Gemma3TextModel.init),
@@ -1061,6 +1062,16 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: ""
     )
 
+    // NOTE (maintainer review): the `extraEOSTokens: ["<end_of_turn>"]` on the three
+    // `gemma4_*` configs below is STALE and a candidate for removal. Gemma-4 renamed its
+    // turn-end token — `<end_of_turn>` is NOT in the gemma-4 vocabulary (it tokenizes to
+    // nothing matchable, so this entry resolves to an inert text-stop that can never fire);
+    // gemma-4 ends turns with `<turn|>` (id 106), which it already declares in
+    // `generation_config.json` (`eos_token_id: [1, 106, 50]`) and which the loader honors via
+    // `resolvedEOSTokenIds`. So for gemma-4 this override is both inert and redundant — safe to
+    // delete. (Left in place pending review precisely because it is inert: removing it changes
+    // nothing at runtime.) NB: do NOT remove the identical entry from the `gemma3_*` / `gemma3n_*`
+    // configs — `<end_of_turn>` IS still those models' real turn-end token.
     static public let gemma4_27b_it_4bit = ModelConfiguration(
         id: "mlx-community/gemma-4-27b-it-4bit",
         defaultPrompt: "Explain quantum computing briefly.",
