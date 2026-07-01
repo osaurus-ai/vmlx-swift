@@ -76,7 +76,28 @@ config.json + safetensors index inspected; the bundle is ALREADY in MLX-swift la
 - **Config validated**: dsa_layers(16)/swa_layers(33, incl. MTP 46-48)/sliding_window_list(33)/block_post_layernorm_idx[0,4,9,14,19,24,29,34,39]/param_sink_number(128)/mhc_num_stream(4)/mhc_recur_norm(20)/index_topk(2048) all match config.json.
 - Dropped in sanitize (later passes): MTP layers ≥46, `self_attn.indexer.*` (160 keys).
 
-## LIVE STATUS (2026-07-01) — loads + runs + emits REAL tokens, NOT yet coherent
+## LIVE STATUS (2026-07-01, updated) — COHERENT ✅
+Found the ground-truth reference: **gitcode.com/ascend-tribe/openPangu-2.0-Infer**
+(omni-npu: `layers/mhc/npu_mhc.py`, `layers/attention/npu_pangu.py`,
+`models/pangu/pangu_v2_moe.py`). Diffed it and fixed the two real per-layer bugs:
+- **mHC expand** (`NPUmHC._mhc_post_naive`): residual mix is `h_resᵀ @ residual`
+  (`new[j]=Σᵢ h_res[i,j]·residual[i]`), not `h_res @ residual`. Transpose comb's
+  stream axes before the matmul. Plus hc_eps=1e-6 for sigmoid/sinkhorn, merge no +eps.
+- **convs** (`npu_ai_infra_fused_causal_conv1d`, `residual_connection=1`): the qa/
+  compresskv/o conv is `y = conv(x) + x` (residual), was `conv(x)` only.
+→ With mHC+convs+sinks the model now emits **fluent, coherent, structured text**
+  (multi-paragraph EN + ZH). Sinks are CORRECT (removing them re-degrades output);
+  the earlier "sinks make it worse" was an artifact of the then-present mHC/conv bugs.
+Confirmed-correct from the ref: rope `half` (non-traditional; config
+rope_interleave=False), scale=qk_head_dim^-0.5 (no mscale), block_post_layernorm
+=[4*hidden], sinks position-free (no rope on param_sink_k_pe), attention scale/MLA
+geometry, MoE plain-sigmoid-top-k (no n_group).
+Reference clone: /private/tmp/.../scratchpad/openPangu-2.0-Infer.
+OPEN: instruction-following/factual accuracy still weak on JANG_2L (3.17-bit avg,
+2-bit experts — likely quant quality) — verify vs a higher-bit bundle; reasoning
+mode (deepseek_r1) needs high max_tokens to close &lt;think&gt; and emit `content`.
+
+## (superseded) earlier status — loads + runs + emits REAL tokens, NOT yet coherent
 Driven live via osaurus (JANG_2L, :1337). The model **loads, runs the full
 forward end-to-end, and emits real vocabulary tokens** — so embed / lm_head /
 quantization / tokenizer / cache / MoE-routing are correct. But the output is
