@@ -55,7 +55,10 @@ final class OpenPanguV2DecoderLayer: Module {
         self._preMlpLayerNorm.wrappedValue = RMSNorm(dimensions: h, eps: eps)
         self._postMlpLayerNorm.wrappedValue = RMSNorm(dimensions: h, eps: eps)
         if config.blockPostLayernormIdx.contains(layerIdx) {
-            self._blockPostLayerNorm.wrappedValue = RMSNorm(dimensions: h, eps: eps)
+            // block_post_layernorm normalizes the FLATTENED 4-stream residual
+            // (weight is [mhcNumStream*hidden] = 10240, not per-stream 2560).
+            self._blockPostLayerNorm.wrappedValue = RMSNorm(
+                dimensions: config.mhcNumStream * h, eps: eps)
         }
         self._attnMHC.wrappedValue = OpenPanguV2MHCModule(config)
         self._mlpMHC.wrappedValue = OpenPanguV2MHCModule(config)
@@ -79,12 +82,23 @@ final class OpenPanguV2DecoderLayer: Module {
         let residualF = hOut
         let (xF, postF, combF) = mlpMHC.collapse(hOut)
         let mlpOut = postMlpLayerNorm(mlp(preMlpLayerNorm(xF)))
+        if ProcessInfo.processInfo.environment["OPENPANGU_MHC_TRACE"] != nil {
+            FileHandle.standardError.write(Data(
+                "[LYR \(layerIdx)] xF=\(xF.shape) mlpOut=\(mlpOut.shape) postF=\(postF.shape) combF=\(combF.shape) residF=\(residualF.shape)\n".utf8))
+        }
         hOut = mlpMHC.expand(
             blockOut: mlpOut, residual: residualF, post: postF, comb: combF)
 
         // ---- Optional per-block post-norm (per-stream over hidden axis) ----
+        if ProcessInfo.processInfo.environment["OPENPANGU_MHC_TRACE"] != nil {
+            FileHandle.standardError.write(Data(
+                "[LYR \(layerIdx)] afterMLPexpand=\(hOut.shape) hasBPLN=\(blockPostLayerNorm != nil)\n".utf8))
+        }
         if let bpln = blockPostLayerNorm {
-            hOut = bpln(hOut)
+            // Norm the flattened 4-stream residual (weight is [4*hidden]) then
+            // restore the (B,L,stream,hidden) shape.
+            let (B, L, S, H) = (hOut.dim(0), hOut.dim(1), hOut.dim(2), hOut.dim(3))
+            hOut = bpln(hOut.reshaped(B, L, S * H)).reshaped(B, L, S, H)
         }
         return hOut
     }
@@ -201,19 +215,21 @@ public final class OpenPanguV2Model: Module, LLMModel, KVCacheDimensionProvider,
             if key.contains(".indexer.") { continue }
             if key.contains("rotary_emb.inv_freq") { continue }
 
-            // MHC phi: dequantize when quantized (attn/mlp), pass through fp16 (merge).
+            // MHC phi: dequantize when quantized (attn/mlp), pass through fp16
+            // (merge), and rename `<base>.phi.weight` → `<base>.phi` to match the
+            // raw `phi` param (so the config quant dict can't substitute it).
             if key.contains("mhc_module.phi.") {
                 if key.hasSuffix(".phi.scales") || key.hasSuffix(".phi.biases") { continue }
                 if key.hasSuffix(".phi.weight") {
-                    let base = String(key.dropLast(".weight".count))
+                    let base = String(key.dropLast(".weight".count))  // …phi
                     if let scales = weights["\(base).scales"], let packed = value.shape.last {
                         let bits = packed * 32 / phiLogicalIn
                         let gs = phiLogicalIn / (scales.shape.last ?? 1)
-                        out[key] = dequantized(
+                        out[base] = dequantized(
                             value, scales: scales, biases: weights["\(base).biases"],
                             groupSize: gs, bits: bits)
                     } else {
-                        out[key] = value  // merge phi (fp16, no scales)
+                        out[base] = value  // merge phi (fp16, no scales)
                     }
                     continue
                 }

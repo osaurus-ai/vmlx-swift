@@ -124,10 +124,13 @@ final class OpenPanguV2Attention: Module {
         self._paramSinkKPe.wrappedValue =
             MLXArray.zeros([config.paramSinkNumber, qkRopeHeadDim])
 
-        // rope_interleave == false → split-half (non-traditional) rotation.
+        // rope_interleave=False in config → non-traditional (split-half) rope.
+        // `OPENPANGU_ROPE_TRAD=1` forces the interleaved path for A/B testing.
+        let ropeTrad = ProcessInfo.processInfo.environment["OPENPANGU_ROPE_TRAD"] == "1"
+            || config.ropeInterleave
         self.rope = initializeRope(
             dims: config.qkRopeHeadDim, base: config.ropeTheta,
-            traditional: config.ropeInterleave, scalingConfig: nil,
+            traditional: ropeTrad, scalingConfig: nil,
             maxPositionEmbeddings: config.maxPositionEmbeddings)
         super.init()
     }
@@ -156,12 +159,17 @@ final class OpenPanguV2Attention: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: OpenPanguV2Cache?
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
+        let env = ProcessInfo.processInfo.environment
+        let noConvs = env["OPENPANGU_NO_CONVS"] != nil
+        let noSinks = env["OPENPANGU_NO_SINKS"] != nil
 
         // Q: low-rank + qa_conv (on the 1024 latent) + up-proj.
         var qLat = qALayerNorm(qAProj(x))                         // (B,L,1024)
-        let (qConved, qaState) = qaConv(qLat, state: cache?.convState(.qa))
-        qLat = qConved
-        cache?.setConvState(.qa, qaState)
+        if !noConvs {
+            let (qConved, qaState) = qaConv(qLat, state: cache?.convState(.qa))
+            qLat = qConved
+            cache?.setConvState(.qa, qaState)
+        }
         var q = qBProj(qLat).reshaped(B, L, numHeads, qHeadDim).transposed(0, 2, 1, 3)
         let splitQ = split(q, indices: [qkNopeHeadDim], axis: -1)
         var (qNope, qPe) = (splitQ[0], splitQ[1])
@@ -170,9 +178,11 @@ final class OpenPanguV2Attention: Module {
         let kvA = kvAProjWithMqa(x)
         let splitKvA = split(kvA, indices: [kvLoraRank], axis: -1)
         var compressedKv = kvALayerNorm(splitKvA[0])              // (B,L,512)
-        let (kvConved, ckvState) = compressKvConv(compressedKv, state: cache?.convState(.compressKv))
-        compressedKv = kvConved
-        cache?.setConvState(.compressKv, ckvState)
+        if !noConvs {
+            let (kvConved, ckvState) = compressKvConv(compressedKv, state: cache?.convState(.compressKv))
+            compressedKv = kvConved
+            cache?.setConvState(.compressKv, ckvState)
+        }
         var kPe = splitKvA[1].reshaped(B, L, 1, qkRopeHeadDim).transposed(0, 2, 1, 3)
 
         var kv = kvBProj(compressedKv).reshaped(B, L, numHeads, -1).transposed(0, 2, 1, 3)
@@ -194,7 +204,7 @@ final class OpenPanguV2Attention: Module {
 
         // Prepend the 128 learned sink K/V (always-visible, position-free).
         var effMask = mask
-        if sinkCount > 0 {
+        if sinkCount > 0 && !noSinks {
             let (sinkK, sinkV) = sinkKeysValues(B, dtype: keys.dtype)
             keys = concatenated([sinkK, keys], axis: 2)
             values = concatenated([sinkV, values], axis: 2)
@@ -208,9 +218,11 @@ final class OpenPanguV2Attention: Module {
         .reshaped(B, L, numHeads * vHeadDim)                      // (B,L,6144)
 
         // o_conv on the concatenated head output, before o_proj.
-        let (oConved, oState) = oConv(output, state: cache?.convState(.o))
-        output = oConved
-        cache?.setConvState(.o, oState)
+        if !noConvs {
+            let (oConved, oState) = oConv(output, state: cache?.convState(.o))
+            output = oConved
+            cache?.setConvState(.o, oState)
+        }
         return oProj(output)
     }
 
