@@ -136,7 +136,7 @@ final class OpenPanguV2Attention: Module {
     /// Build the 128 synthetic sink K (qHeadDim) / V (vHeadDim) rows shared by
     /// all queries. Sinks are position-free (no RoPE on their k_pe — they are
     /// always-visible), broadcast to `numHeads`.
-    private func sinkKeysValues(_ B: Int, dtype: MLXType) -> (MLXArray, MLXArray) {
+    private func sinkKeysValues(_ B: Int, dtype: DType) -> (MLXArray, MLXArray) {
         // compressed_kv [S,512] -> kv_b_proj -> [S, numHeads*(nope+v)]
         let kv = kvBProj(kvALayerNorm(paramSinkCompressedKv.asType(dtype)))
             .reshaped(sinkCount, numHeads, qkNopeHeadDim + vHeadDim)

@@ -5,25 +5,35 @@
 // Structure (from the weight graph): each layer has `attn_mhc_module` +
 // `mlp_mhc_module`, and the model has a global `merge_mhc_module`. Each carries:
 //   phi.weight    [mix, 4*hidden]   attn/mlp: [24,10240];  merge: [4,10240]
-//   branch_alpha  [3] (attn/mlp) / [1] (merge, "_pre")
-//   branch_beta   [3] (attn/mlp) / [1] (merge, "_pre")
+//   branch_alpha  [3] (attn/mlp) / branch_alpha_pre [1] (merge)
+//   branch_beta   [3] (attn/mlp) / branch_beta_pre  [1] (merge)
 //   norm_gamma    [4*hidden]        learned RMS-norm weight (mhc_use_gamma=true)
 // `mhc_recur_norm`=20 (Sinkhorn iterations).
 //
-// This is structurally the DSV4 hyper-connection (RMS-norm the flattened 4-stream
-// residual → project via phi → Sinkhorn-normalize → pre/post/comb stream weights
-// → collapse before the block / expand after). See DeepseekV4HyperConnection
-// (collapse/expand) + DeepseekV4Math.hcSplitSinkhorn + DeepseekV4HyperHead.reduce.
+// This is the DeepSeek-V4 hyper-connection mechanism (arXiv 2409.19606). The
+// forward is a DIRECT reuse of `DeepseekV4Math.hcSplitSinkhorn` +
+// `DeepseekV4HyperConnection.collapse/expand` + `DeepseekV4HyperHead.reduce`,
+// which were validated numerically against the jang-tools reference
+// (`mlx_vlm/models/deepseek_v4/hyper_connection.py`). The mapping from
+// openpangu's parameters onto that mechanism is SHAPE-FORCED:
 //
-// ⚠️  GATING UNKNOWN — the exact forward math (how phi's `mix`=24 output and the
-// two [3] branch vectors produce the 4×4 pre/post/comb stream-mix under 20
-// Sinkhorn iters) is Pangu-specific and NOT recoverable from tensor shapes alone.
-// The modeling source is tf-5.0-native/unreleased. The `collapse`/`expand`/
-// `merge` bodies below are a best-effort adaptation of the DSV4 mechanism and
-// MUST be numerically validated against a reference activation (the jang-tools
-// converter in ~/jang/jang-tools that handles `merge_mhc phi`, or a one-layer
-// input→output dump) before this model is claimed correct. Until then the module
-// only guarantees: parameters load, shapes flow, and the model compiles.
+//   • phi[mix,4H]  ≡ DSV4 `fn`   — identical shape `((2+hc)*hc, hc*hidden)`
+//                                   = [24,10240] for hc=4,H=2560. `mix`=24
+//                                   splits pre[0:4], post[4:8], comb[8:24]→(4,4).
+//   • branch_alpha[3] ≡ DSV4 `scale[3]` — per-field (pre/post/comb) scalar scale.
+//   • branch_beta[3]  ≡ per-field bias → expanded to DSV4 `base[24]` by
+//                        broadcasting each of the 3 scalars across its field
+//                        (β0×hc pre, β1×hc post, β2×hc² comb). DSV4 stores a
+//                        full [24] base; openpangu factors it to 3 per-field
+//                        scalars — the per-field broadcast is the reconstruction.
+//   • norm_gamma[4H]  ≡ the RMSNorm weight (DSV4 passes ones; mhc_use_gamma=true).
+//
+// The one non-shape-forced inference is that branch_alpha is the multiplicative
+// scale and branch_beta the additive bias (standard affine naming: α=scale,
+// β=shift; the RMS weight is named separately as norm_gamma). This is validated
+// END-TO-END by live short-context coherence on JANG_2L (port step (i)); until
+// that passes, MHC is "mechanism-faithful" but not "proven". See
+// OPENPANGU-V2-PORT-STATUS.md.
 
 import Foundation
 import MLX
@@ -32,9 +42,9 @@ import MLXNN
 
 /// Per-layer MHC module (attn_mhc_module / mlp_mhc_module).
 final class OpenPanguV2MHCModule: Module {
-    let numStream: Int          // 4
+    let numStream: Int          // 4 = hcMult
     let hiddenSize: Int         // 2560
-    let mixDim: Int             // 24 (attn/mlp), = phi rows
+    let mixDim: Int             // 24 = (2+hc)*hc, = phi rows
     let sinkhornIters: Int      // mhc_recur_norm = 20
     let eps: Float
 
@@ -43,10 +53,10 @@ final class OpenPanguV2MHCModule: Module {
     @ParameterInfo(key: "branch_beta") var branchBeta: MLXArray   // [3]
     @ParameterInfo(key: "norm_gamma") var normGamma: MLXArray     // [4*hidden]
 
-    init(_ config: OpenPanguV2Configuration, mixDim: Int = 24) {
+    init(_ config: OpenPanguV2Configuration) {
         self.numStream = config.mhcNumStream
         self.hiddenSize = config.hiddenSize
-        self.mixDim = mixDim
+        self.mixDim = (2 + config.mhcNumStream) * config.mhcNumStream
         self.sinkhornIters = config.mhcRecurNorm
         self.eps = config.rmsNormEps
         let wide = config.mhcNumStream * config.hiddenSize
@@ -57,41 +67,49 @@ final class OpenPanguV2MHCModule: Module {
         super.init()
     }
 
-    /// RMS-norm the flattened 4-stream residual `(B,L,4,H)` → `(B,L,4H)` using the
-    /// learned `norm_gamma`, in fp32 (the reduction spans 4H≈10240 elements; bf16
-    /// rounding saturates — see the DSV4 HC fp32-cast note).
-    private func normedFlat(_ h: MLXArray) -> MLXArray {
+    /// DSV4 `scale` = branch_alpha (per-field pre/post/comb scale), shape (3,).
+    private var scaleParam: MLXArray { branchAlpha.asType(.float32) }
+
+    /// DSV4 `base[mix]` reconstructed from the 3 per-field `branch_beta` scalars:
+    /// β0 broadcast over the `hc` pre positions, β1 over `hc` post, β2 over `hc²`
+    /// comb. Shape ((2+hc)*hc,) = (24,).
+    private var baseParam: MLXArray {
+        let mh = numStream
+        let beta = branchBeta.asType(.float32)
+        let onesPre = MLXArray.ones([mh]).asType(.float32)
+        let onesComb = MLXArray.ones([mh * mh]).asType(.float32)
+        return concatenated(
+            [onesPre * beta[0], onesPre * beta[1], onesComb * beta[2]], axis: 0)
+    }
+
+    /// mixes = rms_norm(flatten(h), norm_gamma, eps) @ phi.T. fp32 throughout —
+    /// the reduction spans 4H≈10240 elements and bf16 rounding saturates the
+    /// rsqrt (see the DSV4 HC fp32-cast note).
+    private func mixes(_ h: MLXArray) -> MLXArray {
         let (B, L) = (h.dim(0), h.dim(1))
         let flat = h.reshaped(B, L, numStream * hiddenSize)
-        return MLXFast.rmsNorm(
+        let normed = MLXFast.rmsNorm(
             flat.asType(.float32), weight: normGamma.asType(.float32), eps: eps)
+        return normed.matmul(phi.asType(.float32).transposed())  // (B,L,mix)
     }
 
-    /// Collapse the 4 residual streams into a single `(B,L,H)` block input, and
-    /// return the (post, comb) needed to expand the block output back to 4 streams.
-    ///
-    /// ⚠️ best-effort forward — see file header. Placeholder until numerically
-    /// validated: uses `branch_alpha`-weighted stream averaging so shapes flow and
-    /// weights load; the Sinkhorn phi-mix is applied but the exact pre/post/comb
-    /// derivation is the gating unknown.
+    /// Collapse the 4 residual streams `(B,L,4,H)` → single block input `(B,L,H)`,
+    /// returning the (post, comb) needed to expand the block output back.
+    /// Mirrors `DeepseekV4HyperConnection.collapse` exactly.
     func collapse(_ h: MLXArray) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
-        let (B, L) = (h.dim(0), h.dim(1))
         let dtype = h.dtype
-        _ = normedFlat(h).matmul(phi.asType(.float32).transposed())  // (B,L,mix) — phi mix
-        // TODO(mhc): derive pre/post/comb from the phi mix + branch_alpha/beta via
-        // the Pangu Sinkhorn (mhc_recur_norm iters). Placeholder below.
-        let streams = h.reshaped(B, L, numStream, hiddenSize)
-        let x = streams.mean(axis: -2).asType(dtype)                 // collapse (placeholder)
-        let post = MLXArray.ones([B, L, numStream], dtype: .float32)
-        let comb = broadcast(
-            (MLXArray.zeros([numStream, numStream]) + (1.0 / Float(numStream)))
-                .reshaped(1, 1, numStream, numStream),
-            to: [B, L, numStream, numStream])
-        return (x: x, post: post, comb: comb)
+        let (B, L) = (h.dim(0), h.dim(1))
+        let (pre, post, comb) = DeepseekV4Math.hcSplitSinkhorn(
+            mixes: mixes(h), scale: scaleParam, base: baseParam,
+            hcMult: numStream, iters: sinkhornIters, eps: eps)
+        // y = sum(pre[..., None] * h, axis=2)
+        let y = (pre.asType(dtype).expandedDimensions(axis: -1) * h).sum(axis: -2)
+        return (x: y, post: post, comb: comb)
     }
 
-    /// Expand block output `(B,L,H)` + prior residual `(B,L,4,H)` back to 4 streams.
-    /// ⚠️ best-effort — see header.
+    /// Expand block output `(B,L,H)` + prior residual `(B,L,4,H)` back to 4
+    /// streams. Mirrors `DeepseekV4HyperConnection.expand`:
+    ///   y = post[..., None] * blockOut[..., None, :] + matmul(comb, residual)
     func expand(blockOut: MLXArray, residual: MLXArray, post: MLXArray, comb: MLXArray) -> MLXArray {
         let dtype = blockOut.dtype
         let combResid = comb.asType(dtype).matmul(residual)
@@ -102,7 +120,8 @@ final class OpenPanguV2MHCModule: Module {
 
 /// Global merge module (`model.merge_mhc_module`): collapse the 4 streams → 1
 /// `(B,L,H)` before the final `model.norm`. phi is `[4, 4*hidden]`; branch scalars
-/// are `[1]` (`branch_alpha_pre`/`branch_beta_pre`).
+/// are `[1]` (`branch_alpha_pre`/`branch_beta_pre`). Mirrors
+/// `DeepseekV4HyperHead.reduce` (sigmoid gate, NO sum-to-1 normalization).
 final class OpenPanguV2MergeMHC: Module {
     let numStream: Int
     let hiddenSize: Int
@@ -125,17 +144,21 @@ final class OpenPanguV2MergeMHC: Module {
         super.init()
     }
 
-    /// Reduce `(B,L,4,H)` → `(B,L,H)`. ⚠️ best-effort placeholder (mean over streams
-    /// + phi gate); numeric validation required — see OpenPanguV2MHCModule header.
+    /// Reduce `(B,L,4,H)` → `(B,L,H)`.
+    ///   mixes = rms_norm(flatten(h), norm_gamma, eps) @ phi.T   # (B,L,4)
+    ///   pre   = sigmoid(mixes * alpha_pre + beta_pre) + eps
+    ///   y     = sum(pre[..., None] * h, axis=2)
     func callAsFunction(_ h: MLXArray) -> MLXArray {
+        let dtype = h.dtype
         let (B, L) = (h.dim(0), h.dim(1))
         let flat = h.reshaped(B, L, numStream * hiddenSize)
         let normed = MLXFast.rmsNorm(
             flat.asType(.float32), weight: normGamma.asType(.float32), eps: eps)
         let mixes = normed.matmul(phi.asType(.float32).transposed())   // (B,L,4)
-        let pre = sigmoid(mixes * branchAlphaPre.asType(.float32) + branchBetaPre.asType(.float32))
-        let streams = flat.reshaped(B, L, numStream, hiddenSize)
-        return (pre.asType(h.dtype).expandedDimensions(axis: -1) * streams).sum(axis: -2)
-            .asType(h.dtype)
+        let pre = sigmoid(
+            mixes * branchAlphaPre.asType(.float32) + branchBetaPre.asType(.float32))
+            + MLXArray(eps)
+        return (pre.asType(dtype).expandedDimensions(axis: -1) * h).sum(axis: -2)
+            .asType(dtype)
     }
 }

@@ -251,6 +251,15 @@ public enum LLMTypeRegistry {
             // Swift port plan + status:
             //   Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md
             "deepseek_v4": dispatchDeepseekV4,
+            // OpenPangu 2.0 Flash — MLA + DSA/SWA hybrid + MHC hyper-connections
+            // + sandwich norm + 256-expert MoE + MTP depth-3. The JANG_2L bundle
+            // (3.17-bit) is UNIFORM AFFINE (no codebook / tq_packed keys), so the
+            // standard quantized-model loader applies per-layer QuantizedLinear
+            // directly — no dedicated JANGTQ engine needed. A codebook
+            // (`weight_format: "mxtq"/"jangtq*"`) bundle would need the JANGTQ
+            // port and is rejected clearly until that lands.
+            // See Models/OPENPANGU-V2-PORT-STATUS.md.
+            "openpangu_v2": dispatchOpenPanguV2,
             "hy_v3": create(Hy3Configuration.self, Hy3Model.init),
             "hy3":   create(Hy3Configuration.self, Hy3Model.init),
             "hy-v3": create(Hy3Configuration.self, Hy3Model.init),
@@ -619,6 +628,30 @@ public enum LLMTypeRegistry {
             return DeepseekV4JANGTQModel(config, mxtqBits: uniformBits, mxtqSeed: 42)
         }
         return DeepseekV4Model(config)
+    }
+
+    /// OpenPangu 2.0 Flash (`openpangu_v2`). The JANG_2L bundle (3.17-bit) is
+    /// uniform affine — no codebook — so the standard quantized loader applies
+    /// per-layer `QuantizedLinear` from the config's `quantization` block and
+    /// `OpenPanguV2Model` is used directly. A codebook bundle
+    /// (`weight_format` in {mxtq, jangtq2, jangtq4}) needs the JANGTQ port and
+    /// is rejected with a clear message until that lands.
+    private static func dispatchOpenPanguV2(data: Data) throws -> any LanguageModel {
+        struct FormatCheck: Codable {
+            let weightFormat: String?
+            enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
+        }
+        let weightFormat = (try? JSONDecoder.json5().decode(FormatCheck.self, from: data))?
+            .weightFormat?.lowercased()
+        if let wf = weightFormat, ["mxtq", "jangtq2", "jangtq4"].contains(wf) {
+            throw ModelFactoryError.unsupportedModelType(
+                "openpangu_v2 codebook bundle (weight_format=\(wf)) — the JANGTQ "
+                    + "engine is not yet ported; use the bf16 or JANG_2L (uniform "
+                    + "affine) bundle. See Models/OPENPANGU-V2-PORT-STATUS.md.")
+        }
+        let config = try JSONDecoder.json5().decode(
+            OpenPanguV2Configuration.self, from: data)
+        return OpenPanguV2Model(config)
     }
 
     /// Shared dispatch for `mistral3` and `ministral3` outer model_types.

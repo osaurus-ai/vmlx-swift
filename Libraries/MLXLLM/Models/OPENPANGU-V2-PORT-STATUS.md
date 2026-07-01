@@ -43,13 +43,15 @@ Layer-type dispatch: `i in dsa_layers` → full+indexer; `i in swa_layers` → s
 | Component | vmlx reuse | Status |
 |---|---|---|
 | Config struct | new | ✅ done (OpenPanguV2Configuration.swift) |
-| Factory registration (`openpangu_v2`) | LLMModelFactory | ⬜ |
-| MLA attention (q/kv low-rank + rope) | DeepseekV3 | 🟨 code written (OpenPanguV2.swift) |
-| qa/compresskv/o convs + conv-state cache | new (Mamba-style) | 🟨 conv module written; cache pass pending |
+| Factory registration (`openpangu_v2`) | LLMModelFactory | ✅ done (dispatchOpenPanguV2: bf16/JANG_2L affine → OpenPanguV2Model; codebook → clear reject) |
+| MLA attention (q/kv low-rank + rope) | DeepseekV3 | 🟨 code written (OpenPanguV2.swift); fixed MLXType→DType |
+| qa/compresskv/o convs + conv-state cache | new (Mamba-style) | 🟨 conv module written + wired to cache convState; conv-weight axis reorder in sanitize |
 | attention sinks (128) | prepended-KV (NOT SDPA sinks) | 🟨 written; mask-widen refine pending |
-| DSA indexer (16 layers) + top-2048 | DeepseekV4 Indexer | ⬜ |
-| SWA per-layer (sliding_window_list) | RotatingKVCache | ⬜ |
-| MHC hyper-connections (4-stream) + merge | adapt DeepseekV4HyperConnection | 🟨 module+params written (OpenPanguV2MHC.swift); forward = PLACEHOLDER, needs reference-numeric-validation (jang-tools) |
+| DSA indexer (16 layers) + top-2048 | DeepseekV4 Indexer | ⬜ DEFERRED — full MLA attn on DSA layers is a numerical superset (correct, just not sparse); add after first coherence |
+| SWA per-layer (sliding_window_list) | RotatingKVCache | ✅ newCache: RotatingKVCache(slidingWindowFor(i)) on SWA, KVCacheSimple on DSA; per-layer mask via createAttentionMask windowSize (gemma3 pattern) |
+| Decoder layer (sandwich norm + MHC wrap + dense/MoE) | DSV3/DSV4 | ✅ done (OpenPanguV2Model.swift: input→attn→post_attn, pre_mlp→mlp→post_mlp, block_post×9, MHC collapse/expand) |
+| Inner+outer model (tile 4 streams → merge → norm; LLMModel) | DSV4ModelInner | ✅ done (OpenPanguV2ModelInner/Model; kvHeads [48]*L; untied lm_head; sanitize: conv reorder + expert stacking + drop MTP/indexer) |
+| MHC hyper-connections (4-stream) + merge | reuse DeepseekV4Math.hcSplitSinkhorn + HyperConnection/HyperHead | 🟩 forward = mechanism-faithful (shape-forced map: phi≡fn, branch_alpha≡scale[3], branch_beta≡per-field base, norm_gamma≡RMS wt; merge≡HyperHead). Only inference: α=scale/β=bias roles → validated E2E by live step (i), not yet "proven" |
 | sandwich norm (4/layer + block_post×9) | trivial | ⬜ |
 | MoE (256+1 shared, biased top-k) | DeepseekV3 gate | ✅ written (OpenPanguV2.swift) |
 | MTP depth-3 autodetect | NativeMTP infra | ⬜ |
