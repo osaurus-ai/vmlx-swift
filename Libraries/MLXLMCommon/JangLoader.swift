@@ -2323,12 +2323,23 @@ public struct JangLoader: Sendable {
     ) -> (bits: Int, groupSize: Int) {
         guard packedDim > 0 && numGroups > 0 else { return (4, knownGroupSize ?? 64) }
 
+        // Affine quantized_matmul only supports bit widths {2,3,4,5,6,8}. JANGTQ
+        // `mxtq_bits` can carry non-affine sentinels (e.g. `norms_router: 16` =
+        // fp16 passthrough) that leak into `bitWidthsUsed` via topLevelBitWidths.
+        // 16 is never a valid affine packing width; if selected it yields a
+        // QuantizedLinear whose expanded in-dim is half the real one, crashing
+        // quantized_matmul (MiniMax fused qkv_proj: (8,64) truth vs (16,32)
+        // picked because gs=32 is the wrong per-layer group size). Filter to the
+        // physically valid set so an impossible width can never be returned.
+        let supportedAffineBits: [Int] = [2, 3, 4, 5, 6, 8]
+        let affineBitWidths = bitWidthsUsed.filter(supportedAffineBits.contains)
+
         if let knownGroupSize, knownGroupSize > 0 {
             let inputDim = numGroups * knownGroupSize
             let packedBits = packedDim * 32
             if inputDim > 0, packedBits % inputDim == 0 {
                 let bits = packedBits / inputDim
-                let validBits = bitWidthsUsed.isEmpty ? [2, 3, 4, 5, 6, 8] : bitWidthsUsed
+                let validBits = affineBitWidths.isEmpty ? supportedAffineBits : affineBitWidths
                 if bits > 0, validBits.contains(bits) {
                     return (bits, knownGroupSize)
                 }
@@ -2352,10 +2363,9 @@ public struct JangLoader: Sendable {
             }
         }
 
-        let validBits = [2, 3, 4, 5, 6, 8]
-        let candidates = bitWidthsUsed.isEmpty
-            ? validBits.sorted(by: >)
-            : bitWidthsUsed.sorted(by: >)
+        let candidates = affineBitWidths.isEmpty
+            ? supportedAffineBits.sorted(by: >)
+            : affineBitWidths.sorted(by: >)
         for bits in candidates {
             guard bits > 0, (packedDim * 32) % bits == 0 else { continue }
             let inputDim = (packedDim * 32) / bits
