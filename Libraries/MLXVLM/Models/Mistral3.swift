@@ -1123,8 +1123,16 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         var image = MediaProcessing.inSRGBToneCurveSpace(image)
         image = MediaProcessing.apply(image, processing: processing)
 
-        let maxVisionEdge = patchSize * 24  // Pixtral vision expects 24x24 patches (336px for patchSize=14)
-        let targetEdge = min(longestEdge ?? maxVisionEdge, maxVisionEdge)
+        // Pixtral / Mistral3 vision is VARIABLE-resolution: its 2D RoPE grid is
+        // precomputed for (image_size / patch_size) patches per side, so it
+        // handles any image up to the bundle's declared longest edge. Honor
+        // that `longest_edge` (e.g. 1540) instead of clamping to 336px. The old
+        // `patch_size * 24` (336px) cap crushed detailed images — handwriting,
+        // dense documents, small text — into an unreadable thumbnail, which made
+        // the model produce garbled or EMPTY responses on content it otherwise
+        // reads fine at native resolution. Fall back to a Pixtral-typical 1024px
+        // only when the bundle declares no size.
+        let targetEdge = longestEdge ?? (patchSize * 73)
 
         let originalSize = image.extent.size
         let scale = min(CGFloat(targetEdge) / max(originalSize.width, originalSize.height), 1.0)
