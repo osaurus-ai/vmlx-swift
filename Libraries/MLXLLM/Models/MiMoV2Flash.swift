@@ -553,8 +553,17 @@ struct MiMoRoutedExpertBits: Codable, Sendable {
             let nested = try container.decode([String: [String: Int]].self)
             if let routed = nested["routed_expert"] ?? nested["routed_experts"] {
                 self.init(projections: routed)
-            } else if let first = nested.values.first {
-                self.init(projections: first)
+            } else if let routed = nested.min(by: { lhs, rhs in
+                // `.values.first` over a Dictionary is per-process-random → the
+                // adopted projections map (and its bit widths) would flip on
+                // reload. Deterministic: the role with the smallest bit width
+                // (routed experts are JANG's most aggressively quantized tier),
+                // tie-broken by key so the choice never depends on dict order.
+                let lmin = lhs.value.values.min() ?? .max
+                let rmin = rhs.value.values.min() ?? .max
+                return lmin != rmin ? lmin < rmin : lhs.key < rhs.key
+            })?.value {
+                self.init(projections: routed)
             } else {
                 self.init(projections: [:])
             }

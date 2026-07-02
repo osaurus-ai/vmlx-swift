@@ -341,7 +341,16 @@ public enum LLMTypeRegistry {
         let routedBits: Int? = {
             switch probe?.mxtqBits {
             case .flat(let v): return v
-            case .roles(let dict): return dict["routed_expert"] ?? dict.values.first
+            // `dict` is a Dictionary — `.values.first` is randomized per process,
+            // so a bundle whose roles map lacks `routed_expert` would resolve the
+            // routed-expert bit width (→ gateUp/downBits → expert dequant) to an
+            // ARBITRARY value that flips on reload (garbage-on-some-loads). Prefer
+            // named routed aliases, then fall back to the MINIMUM declared width:
+            // routed experts are JANG's most aggressively quantized tier, and
+            // `.min()` is deterministic.
+            case .roles(let dict):
+                return dict["routed_expert"] ?? dict["routed"] ?? dict["expert"]
+                    ?? dict.values.min()
             case .projections(let gateUp, let down): return gateUp ?? down
             case nil: return nil
             }

@@ -1776,7 +1776,16 @@ public struct JangLoader: Sendable {
                 let prev = counts[k] ?? (0, t.bits, t.groupSize)
                 counts[k] = (prev.count + 1, prev.bits, prev.gs)
             }
-            if let top = counts.values.max(by: { $0.count < $1.count }) {
+            // `max(by: count)` alone is order-dependent on a frequency TIE
+            // between two distinct (bits, gs) pairs — the survivor would then
+            // depend on Dictionary iteration order and flip the shared default
+            // across reloads. Total-order the comparison (count, then higher
+            // bits, then larger gs) so the winner is deterministic and, on a
+            // tie, biases toward the higher-precision default.
+            if let top = counts.values.max(by: { a, b in
+                a.count != b.count ? a.count < b.count
+                    : (a.bits != b.bits ? a.bits < b.bits : a.gs < b.gs)
+            }) {
                 chosenDefault = (top.bits, top.gs)
             } else {
                 chosenDefault = (4, 64)

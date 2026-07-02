@@ -174,7 +174,12 @@ public func loadWeights(
         if totalsSeen.count > 1 {
             // Pick the LARGEST total whose count equals that total
             // (= the COMPLETE shard set). All others are partials.
-            let completeTotal = totalsSeen.first(where: { $0.key == $0.value })?.key
+            // NB: `totalsSeen` is a Dictionary — its iteration order is
+            // randomized per process, so `.first(where:)` would pick an
+            // ARBITRARY complete set when two coexist (garbage-on-some-loads,
+            // fixed-by-reload). `.max()` over the matches is deterministic AND
+            // matches the "largest" intent stated above.
+            let completeTotal = totalsSeen.filter { $0.key == $0.value }.keys.max()
                 ?? totalsSeen.keys.max()!
             let summary = totalsSeen
                 .map { "\($0.value)/\($0.key)" }
