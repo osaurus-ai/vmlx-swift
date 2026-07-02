@@ -243,10 +243,17 @@ final class OpenPanguV2Attention: Module {
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
         switch mask {
         case .array(let m):
-            // m: (..., L, K) → prepend `sinks` all-visible columns.
-            let ones = MLXArray.zeros(
-                Array(m.shape.dropLast()) + [sinks], dtype: m.dtype)
-            return .array(concatenated([ones, m], axis: -1))
+            // m: (..., L, K) → prepend `sinks` all-VISIBLE columns. createCausalMask
+            // returns a BOOLEAN mask (true = attend), so the sink columns must be
+            // `true`; a `false`/0 column would MASK the sinks (the prefill bug that
+            // left the prompt KV computed without sink attention). For an additive
+            // float mask, 0 = visible.
+            let sinkShape = Array(m.shape.dropLast()) + [sinks]
+            let visible: MLXArray =
+                m.dtype == .bool
+                ? MLXArray.ones(sinkShape).asType(.bool)
+                : MLXArray.zeros(sinkShape, dtype: m.dtype)
+            return .array(concatenated([visible, m], axis: -1))
         default:
             // causal/none: sinks visible to all; the (L,K) causal part is handled
             // by SDPA's causal mode over the non-sink columns via a materialized
