@@ -235,8 +235,11 @@ public struct Qwen35JANGTQTextConfiguration: Codable, Sendable {
             self.mxtqBits = flat
         } else if let dict = try? container.decodeIfPresent(
             [String: Int].self, forKey: .mxtqBits),
+            // `.values.first` is per-process-random on a multi-role dict → a
+            // reload-flipping routed bit width. Deterministic MINIMUM (routed
+            // experts are JANG's most aggressively quantized tier).
             let routed = dict["routed_expert"] ?? dict["routed"]
-                ?? dict.values.first
+                ?? dict.values.min()
         {
             self.mxtqBits = routed
         } else if let qBits = Self._peekQuantizationBits(decoder) {

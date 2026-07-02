@@ -191,7 +191,11 @@ public struct ZayaTextConfiguration: Codable, Sendable {
             return RoutedExpertBitMetadata(routedBits: nil, gateUpBits: nil, downBits: nil)
         }
         if let dict = try? container.decode([String: Int].self, forKey: .mxtqBits) {
-            let routed = dict["routed_expert"] ?? dict.values.first
+            // `.values.first` is per-process-random on a multi-role dict → the
+            // routed bit width (hence every MoE layer's dequant) would flip on
+            // reload. Deterministic: named aliases, then the MINIMUM width
+            // (routed experts are the most aggressively quantized JANG tier).
+            let routed = dict["routed_expert"] ?? dict["routed"] ?? dict.values.min()
             return RoutedExpertBitMetadata(
                 routedBits: routed,
                 gateUpBits: routed,
