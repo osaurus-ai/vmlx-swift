@@ -27,6 +27,12 @@ public struct MistralToolCallParser: ToolCallParser, Sendable {
     public let startTag: String? = "[TOOL_CALLS]"
     public let endTag: String? = nil
 
+    /// V7/V11 checkpoints drop the `[TOOL_CALLS]` token on tool turns whose
+    /// history contains images, emitting the call array as plain text
+    /// (`[{"name": "get_weather", "arguments": {...}}]`). Let the processor
+    /// buffer that exact shape for registered tools.
+    public let supportsBareJSONArrayToolFallback = true
+
     public init() {}
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {

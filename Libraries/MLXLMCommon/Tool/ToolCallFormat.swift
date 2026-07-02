@@ -67,6 +67,15 @@ public protocol ToolCallParser: Sendable {
     /// `call:name{...}` body as a possible tool call. Gemma4 can emit this
     /// body without its `<|tool_call>` wrapper on required-tool turns.
     var supportsBareCallToolFallback: Bool { get }
+
+    /// Whether a tagged parser should also buffer a bare
+    /// `[{"name": "...", "arguments": {...}}]` JSON array as a possible tool
+    /// call. Mistral V7/V11 drops the leading `[TOOL_CALLS]` token on tool
+    /// turns whose history contains images, emitting the call array as plain
+    /// text. The processor only engages while the bytes remain consistent
+    /// with that exact shape for a registered tool name, so ordinary prose
+    /// and JSON answers stay visible.
+    var supportsBareJSONArrayToolFallback: Bool { get }
 }
 
 extension ToolCallParser {
@@ -89,6 +98,8 @@ extension ToolCallParser {
     public var supportsInlineJSONToolFallback: Bool { false }
 
     public var supportsBareCallToolFallback: Bool { false }
+
+    public var supportsBareJSONArrayToolFallback: Bool { false }
 
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         if let startTag {

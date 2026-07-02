@@ -107,6 +107,7 @@ public class ToolCallProcessor {
         case embeddedAPIToolJSON
         case bareNameJSON
         case bareNameKeyValue
+        case bareJSONArray
     }
 
     private enum BareNameKeyValueTailState {
@@ -432,6 +433,34 @@ public class ToolCallProcessor {
         case .potentialToolCall, .collectingToolCall, .collectingInlineToolCall:
             toolCallBuffer += chunk
 
+            if state == .collectingInlineToolCall, inlineToolCallKind == .bareJSONArray {
+                switch bareJSONArrayToolCallMatch(toolCallBuffer) {
+                case .noMatch:
+                    // The bytes stopped looking like a tool-call array
+                    // (e.g. a JSON example whose "name" is not a registered
+                    // tool). Flush the held text verbatim.
+                    state = .normal
+                    let buffer = toolCallBuffer
+                    toolCallBuffer = ""
+                    inlineToolCallKind = .json
+                    return buffer
+                case .match where bareJSONArrayCallBalanced(toolCallBuffer):
+                    // Route through parseEOS: the array may carry multiple
+                    // calls, and parse(content:) only returns the first.
+                    let parsed = parser.parseEOS(toolCallBuffer, tools: tools)
+                    state = .normal
+                    let buffer = toolCallBuffer
+                    toolCallBuffer = ""
+                    inlineToolCallKind = .json
+                    guard !parsed.isEmpty else { return buffer }
+                    recordToolCalls(parsed)
+                    suppressingTextAfterInlineToolCall = true
+                    return nil
+                case .possible, .match:
+                    return nil
+                }
+            }
+
             if shouldAttemptInlineToolParse(toolCallBuffer),
                 let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
             {
@@ -492,12 +521,15 @@ public class ToolCallProcessor {
             return bareNameJSONCallBalanced(text)
         case .bareNameKeyValue:
             return bareNameKeyValueCallComplete(text)
+        case .bareJSONArray:
+            return bareJSONArrayCallBalanced(text)
         }
     }
 
     private func shouldAttemptInlineToolParse(_ text: String) -> Bool {
         switch inlineToolCallKind {
-        case .actionJSON, .requestToolXML, .embeddedAPIToolJSON, .bareNameKeyValue:
+        case .actionJSON, .requestToolXML, .embeddedAPIToolJSON, .bareNameKeyValue,
+            .bareJSONArray:
             return inlineToolCallComplete(text)
         case .json, .functionCall, .bareCall, .bareNameJSON:
             return true
@@ -507,6 +539,98 @@ public class ToolCallProcessor {
     private func bareCallBracesBalanced(_ text: String) -> Bool {
         guard let open = text.firstIndex(of: "{") else { return false }
         return jsonBracesBalanced(String(text[open...]))
+    }
+
+    private enum BareJSONArrayMatch {
+        case noMatch
+        case possible
+        case match
+    }
+
+    /// Match `text` against the opening shape of a bare tool-call JSON array:
+    /// `[` `{` `"name"` `:` `"<registered tool>"`, whitespace-tolerant between
+    /// tokens. `.possible` means every byte so far is consistent with that
+    /// shape but the tool name has not closed yet; `.match` means a registered
+    /// tool name closed its quote (the rest of the array is governed by the
+    /// balance check). Requires request tool schemas — with no registered
+    /// names there is nothing safe to match against.
+    private func bareJSONArrayToolCallMatch(_ text: String) -> BareJSONArrayMatch {
+        let toolNames = registeredToolNames()
+        guard !toolNames.isEmpty else { return .noMatch }
+
+        var cursor = text.startIndex
+        func skipWhitespace() {
+            while cursor < text.endIndex, isInlineWhitespace(text[cursor]) {
+                cursor = text.index(after: cursor)
+            }
+        }
+        // Consume `literal`; `.possible` if text ended inside it, `.noMatch`
+        // on a mismatch, nil when fully consumed.
+        func expect(_ literal: String) -> BareJSONArrayMatch? {
+            for ch in literal {
+                guard cursor < text.endIndex else { return .possible }
+                guard text[cursor] == ch else { return .noMatch }
+                cursor = text.index(after: cursor)
+            }
+            return nil
+        }
+
+        if let early = expect("[") { return early }
+        skipWhitespace()
+        if let early = expect("{") { return early }
+        skipWhitespace()
+        if let early = expect("\"name\"") { return early }
+        skipWhitespace()
+        if let early = expect(":") { return early }
+        skipWhitespace()
+        if let early = expect("\"") { return early }
+
+        var name = ""
+        while cursor < text.endIndex {
+            let ch = text[cursor]
+            if ch == "\"" {
+                return toolNames.contains(name) ? .match : .noMatch
+            }
+            name.append(ch)
+            cursor = text.index(after: cursor)
+        }
+        return toolNames.contains(where: { $0.hasPrefix(name) }) ? .possible : .noMatch
+    }
+
+    /// Whether a bare tool-call JSON array has closed its top-level `[`.
+    /// String-aware so bracket characters inside argument values don't
+    /// terminate the scan early.
+    private func bareJSONArrayCallBalanced(_ text: String) -> Bool {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for ch in text {
+            if escaped {
+                escaped = false
+                continue
+            }
+            if ch == "\\" {
+                escaped = inString
+                continue
+            }
+            if inString {
+                if ch == "\"" { inString = false }
+                continue
+            }
+            switch ch {
+            case "\"":
+                inString = true
+            case "[", "{":
+                depth += 1
+            case "]", "}":
+                depth -= 1
+                if depth == 0 { return true }
+                if depth < 0 { return false }
+            default:
+                break
+            }
+        }
+        return false
     }
 
     private func bareNameJSONCallBalanced(_ text: String) -> Bool {
@@ -1417,6 +1541,12 @@ public class ToolCallProcessor {
             }
         }
 
+        if allowInlineFallback && parser.supportsBareJSONArrayToolFallback,
+            state == .collectingInlineToolCall, inlineToolCallKind == .bareJSONArray
+        {
+            return processInlineChunk(chunk)
+        }
+
         if allowInlineFallback && parser.supportsInlineJSONToolFallback && !hasTaggedStartCandidate {
             switch state {
             case .collectingInlineToolCall:
@@ -1524,6 +1654,25 @@ public class ToolCallProcessor {
                     return nil
                 }
             } else {
+                // A failed `[`-tag candidate may still be a bare tool-call
+                // JSON array: Mistral drops the leading [TOOL_CALLS] token on
+                // tool turns whose history contains images, emitting
+                // `[{"name": "...", "arguments": {...}}]` as plain text. Only
+                // engage while the bytes remain consistent with that shape
+                // for a registered tool; anything else flushes verbatim.
+                if allowInlineFallback, parser.supportsBareJSONArrayToolFallback,
+                    bareJSONArrayToolCallMatch(toolCallBuffer) != .noMatch
+                {
+                    state = .collectingInlineToolCall
+                    inlineToolCallKind = .bareJSONArray
+                    let visible = leadingTextBeforeToolCall
+                    leadingTextBeforeToolCall = ""
+                    // The array may already be complete within this chunk;
+                    // an empty append re-evaluates the buffer.
+                    let inline = processInlineChunk("") ?? ""
+                    let combined = visible + inline
+                    return combined.isEmpty ? nil : combined
+                }
                 // Otherwise, return the collected text and reset the state
                 state = .normal
                 let buffer = toolCallBuffer
