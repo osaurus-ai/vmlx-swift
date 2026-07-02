@@ -76,7 +76,19 @@ config.json + safetensors index inspected; the bundle is ALREADY in MLX-swift la
 - **Config validated**: dsa_layers(16)/swa_layers(33, incl. MTP 46-48)/sliding_window_list(33)/block_post_layernorm_idx[0,4,9,14,19,24,29,34,39]/param_sink_number(128)/mhc_num_stream(4)/mhc_recur_norm(20)/index_topk(2048) all match config.json.
 - Dropped in sanitize (later passes): MTP layers ≥46, `self_attn.indexer.*` (160 keys).
 
-## LIVE STATUS (2026-07-01, updated) — COHERENT ✅
+## LIVE STATUS (2026-07-01, FINAL) — WORKING ✅ (multi-turn coherent, on-topic)
+The last bug was a RUNTIME bug (NOT quant): `prependSinkMask` prepended a FALSE column
+to the BOOLEAN causal mask (`createCausalMask` returns bool, true=attend), MASKING the 128
+attention sinks during prefill → prompt KV computed without sink attention → fluent but
+context-blind. Fixed to prepend `true` (visible) for bool masks. Proven via RunBench
+BENCH_COHERENT (TokenIterator, JANG_2L 2-bit, temp=0): tracks multi-turn context —
+"favorite color is blue" → "what is my favorite color?" → "the user stated blue, so I know
+it's blue" → "is that warm or cool?" → **"Blue is a cool color."** The 2-bit quant was
+never the problem. Full root-cause + diagnostic ladder in ~/jang/docs/openpangu-v2-port.md.
+NEXT: validate through osaurus's BatchEngine (its own paged mask path — the "prefix caching
+and whatnot" layer), then DSA indexer / MTP head / osaurus catalog PR.
+
+## (earlier) LIVE STATUS — COHERENT via mHC/conv fixes
 Found the ground-truth reference: **gitcode.com/ascend-tribe/openPangu-2.0-Infer**
 (omni-npu: `layers/mhc/npu_mhc.py`, `layers/attention/npu_pangu.py`,
 `models/pangu/pangu_v2_moe.py`). Diffed it and fixed the two real per-layer bugs:

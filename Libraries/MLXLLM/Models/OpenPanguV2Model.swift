@@ -132,6 +132,29 @@ public final class OpenPanguV2ModelInner: Module {
         // Flattened view for mask sizing (createAttentionMask reads dim(1)=L).
         let hFlat = h.reshaped(h.dim(0), h.dim(1), -1)
 
+        let trace = ProcessInfo.processInfo.environment["OPENPANGU_STATE_TRACE"] != nil
+        func stdev(_ x: MLXArray, axis: Int? = nil) -> MLXArray {
+            let f = x.asType(.float32)
+            if let axis {
+                let mn = f.mean(axis: axis, keepDims: true)
+                return (f - mn).square().mean(axis: axis).sqrt()
+            }
+            let mn = f.mean()
+            return (f - mn).square().mean().sqrt()
+        }
+        func stat(_ label: String, _ a: MLXArray) {
+            let last = a.dim(1) - 1
+            let v = a.ndim == 4 ? a[0, last, 0..., 0...] : a[0, last, 0...]
+            let m = v.mean().item(Float.self)
+            let sd = stdev(v).item(Float.self)
+            // per-stream divergence (4D only): std ACROSS the stream axis, then mean
+            var streamSd: Float = -1
+            if a.ndim == 4 { streamSd = stdev(a[0, last, 0..., 0...], axis: 0).mean().item(Float.self) }
+            FileHandle.standardError.write(Data(
+                "[state] \(label) shape=\(a.shape) mean=\(m) std=\(sd) streamDivergenceStd=\(streamSd)\n".utf8))
+        }
+        if trace { stat("embed(tiled)", h) }
+
         for (i, layer) in layers.enumerated() {
             let opCache = cache?[i] as? OpenPanguV2Cache
             // DSA layers: full causal. SWA layers: sliding window.
@@ -139,10 +162,17 @@ public final class OpenPanguV2ModelInner: Module {
             let mask = createAttentionMask(
                 h: hFlat, cache: opCache, windowSize: window, returnArray: true)
             h = layer(h, mask: mask, cache: opCache)
+            if trace && (i == 0 || i == 1 || i == config.numHiddenLayers - 1) {
+                h.eval(); stat("afterLayer\(i)", h)
+            }
         }
 
         // Collapse the mhcNumStream streams → (B, L, H), then final norm.
-        return norm(mergeMHC(h))
+        let merged = mergeMHC(h)
+        if trace { merged.eval(); stat("afterMerge", merged) }
+        let normed = norm(merged)
+        if trace { normed.eval(); stat("afterNorm", normed) }
+        return normed
     }
 }
 
@@ -168,8 +198,13 @@ public final class OpenPanguV2Model: Module, LLMModel, KVCacheDimensionProvider,
     /// layer's sliding window. Both are wrapped by `OpenPanguV2Cache`, which also
     /// carries the 3 causal-conv states (path-dependent) + the indexer pool.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        (0..<config.numHiddenLayers).map { layerIdx in
-            if config.isSlidingLayer(layerIdx) {
+        // Diagnostic: force the simplest cache (unbounded KVCacheSimple) on ALL
+        // layers. For prompts shorter than the sliding window this is equivalent
+        // to the SWA RotatingKVCache — so if this fixes coherence, the SWA/rotating
+        // path is the bug.
+        let allSimple = ProcessInfo.processInfo.environment["OPENPANGU_ALL_SIMPLE_CACHE"] != nil
+        return (0..<config.numHiddenLayers).map { layerIdx in
+            if config.isSlidingLayer(layerIdx) && !allSimple {
                 let win = config.slidingWindowFor(layerIdx)
                 return OpenPanguV2Cache(
                     kv: RotatingKVCache(maxSize: win, keep: 0),
@@ -181,7 +216,21 @@ public final class OpenPanguV2Model: Module, LLMModel, KVCacheDimensionProvider,
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
-        lmHead(model(inputs, cache: cache))
+        let logits = lmHead(model(inputs, cache: cache))
+        // Probe: dump the top-8 next-token ids of the LAST prompt position on the
+        // prefill forward (L>1). If these are sensible for the prompt, the forward
+        // is correct and any incoherence is downstream (sampler/engine/cache).
+        if inputs.dim(1) > 1,
+            ProcessInfo.processInfo.environment["OPENPANGU_LOGIT_PROBE"] != nil
+        {
+            let last = logits[0, logits.dim(1) - 1, 0...]
+            let top = argSort(last, axis: -1)[(-8)...]  // ascending → last 8 = top
+            top.eval()
+            let ids = (0..<8).map { top[7 - $0].item(Int.self) }
+            FileHandle.standardError.write(Data(
+                "[logit-probe] top8 next-token ids: \(ids)\n".utf8))
+        }
+        return logits
     }
 
     /// Remap the openpangu-v2 (JANG_2L) bundle key names to the module attribute

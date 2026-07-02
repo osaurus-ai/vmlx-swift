@@ -696,6 +696,23 @@ public func loadWeights(
     // in the weight files, but QuantizedLinear's optional .biases property gets initialized
     // by the quantize step. Strict .all verification would fail on the missing keys.
     do {
+        // Diagnostic: list model params that have NO matching weight (they stay at
+        // their init value — a silent source of "coherent but wrong" bugs, since the
+        // default verify only checks for UNUSED weights, not UNSET params).
+        if ProcessInfo.processInfo.environment["VMLX_DUMP_UNLOADED_PARAMS"] != nil {
+            let modelKeys = Set(model.parameters().flattened().map { $0.0 })
+            let weightKeys = Set(weights.keys)
+            let unloaded = modelKeys.subtracting(weightKeys).sorted()
+            let extra = weightKeys.subtracting(modelKeys).sorted()
+            let summary = "[params] model=\(modelKeys.count) weights=\(weightKeys.count) UNLOADED(param-no-weight)=\(unloaded.count) EXTRA(weight-no-param)=\(extra.count)\n"
+            FileHandle.standardError.write(Data(summary.utf8))
+            for k in unloaded.prefix(80) {
+                FileHandle.standardError.write(Data("[params] UNLOADED \(k)\n".utf8))
+            }
+            for k in extra.prefix(40) {
+                FileHandle.standardError.write(Data("[params] EXTRA \(k)\n".utf8))
+            }
+        }
         let parameters = ModuleParameters.unflattened(weights)
         try model.update(parameters: parameters, verify: [.noUnusedKeys])
     }
