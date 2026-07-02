@@ -165,26 +165,32 @@ final class OpenPanguV2Attention: Module {
         let noConvs = env["OPENPANGU_NO_CONVS"] != nil
         let noSinks = env["OPENPANGU_NO_SINKS"] != nil
 
-        // Q: low-rank + qa_conv (on the 1024 latent) + up-proj.
-        var qLat = qALayerNorm(qAProj(x))                         // (B,L,1024)
+        // Q: q_a_proj → qa_conv → q_a_layernorm → q_b_proj. The conv runs on the
+        // RAW projected latent BEFORE the layernorm (reference `_forward*`:
+        // q_lora=q_a_proj(x); q_lora=MOME(qa_conv); q_lora=q_a_layernorm(q_lora)).
+        var qLat = qAProj(x)                                      // (B,L,1024) raw
         if !noConvs {
             let (qConved, qaState) = qaConv(qLat, state: cache?.convState(.qa))
             qLat = qConved
             cache?.setConvState(.qa, qaState)
         }
+        qLat = qALayerNorm(qLat)                                  // layernorm AFTER conv
         var q = qBProj(qLat).reshaped(B, L, numHeads, qHeadDim).transposed(0, 2, 1, 3)
         let splitQ = split(q, indices: [qkNopeHeadDim], axis: -1)
         var (qNope, qPe) = (splitQ[0], splitQ[1])
 
-        // KV: low-rank split into compressed_kv (512) + k_pe (64); conv on the 512.
+        // KV: kv_a_proj → split → compresskv_conv(k_nope) → kv_a_layernorm →
+        // kv_b_proj. The conv runs on the RAW compressed split BEFORE the layernorm
+        // (reference: k_nope=split(kv); k_nope=MOME(compresskv_conv); then rmsnorm).
         let kvA = kvAProjWithMqa(x)
         let splitKvA = split(kvA, indices: [kvLoraRank], axis: -1)
-        var compressedKv = kvALayerNorm(splitKvA[0])              // (B,L,512)
+        var compressedKv = splitKvA[0]                           // (B,L,512) raw
         if !noConvs {
             let (kvConved, ckvState) = compressKvConv(compressedKv, state: cache?.convState(.compressKv))
             compressedKv = kvConved
             cache?.setConvState(.compressKv, ckvState)
         }
+        compressedKv = kvALayerNorm(compressedKv)                // layernorm AFTER conv
         var kPe = splitKvA[1].reshaped(B, L, 1, qkRopeHeadDim).transposed(0, 2, 1, 3)
 
         var kv = kvBProj(compressedKv).reshaped(B, L, numHeads, -1).transposed(0, 2, 1, 3)
