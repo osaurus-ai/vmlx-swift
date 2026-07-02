@@ -1189,10 +1189,22 @@ public actor BatchEngine {
     ///
     /// Pending requests receive a `.info` with `.cancelled` stop reason.
     /// Active slots are allowed to complete their current step before finishing.
-    public func shutdown() {
+    ///
+    /// Returns only after the engine's producer tasks have actually exited
+    /// and their queued GPU work has drained. This is the invariant serving
+    /// layers rely on for teardown ordering: "shutdown returned" must mean
+    /// "no producer owned by this engine will touch the shared Metal command
+    /// queue again". Cancelling alone is not enough — a producer mid-prefill
+    /// observes cancellation only at its next chunk/token boundary, and a
+    /// model unload that frees weights while that producer is still encoding
+    /// segfaults inside the Metal encoder (osaurus cold-load disconnect
+    /// crash: disconnect → unload raced the dropped request's prefill).
+    public func shutdown() async {
         guard !isShutdown else { return }
         isShutdown = true
 
+        let drainLoopTask = loopTask
+        let drainSoloTask = soloFastPathTask
         loopTask?.cancel()
         loopTask = nil
         soloFastPathTask?.cancel()
@@ -1217,6 +1229,19 @@ public actor BatchEngine {
             finishSlot(slot, reason: .cancelled)
         }
         activeSlots.removeAll()
+
+        // Await the cancelled producers before returning. Both tasks observe
+        // cancellation at their next boundary (chunked prefill, per-token
+        // decode) and end with their own GPU drains, so this is bounded.
+        // The producers never call back into this actor, so awaiting them
+        // here cannot deadlock; concurrent calls that interleave during the
+        // suspension see `isShutdown == true` and fail closed.
+        await drainSoloTask?.value
+        await drainLoopTask?.value
+
+        // Final fence: producers submit via `asyncEval`, so their last
+        // command buffers may still be in flight when the tasks return.
+        Stream().synchronize()
     }
 
     /// The number of requests currently waiting in the queue.
