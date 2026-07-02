@@ -185,8 +185,22 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        // Some quantized checkpoints (e.g. vMLX JANG_6M conversions of text-only Llama
+        // classifiers) emit the output projection under a VLM-style `language_model.lm_head.*`
+        // prefix while the body stays at `model.*`. The text LlamaModel binds the head at the
+        // top-level key `lm_head`, so strip that stray prefix instead of failing with
+        // "Unhandled keys [language_model]". Covers .weight and the quant .scales/.biases.
+        var remapped = [String: MLXArray]()
+        remapped.reserveCapacity(weights.count)
+        for (key, value) in weights {
+            if key.hasPrefix("language_model.lm_head.") {
+                remapped[String(key.dropFirst("language_model.".count))] = value
+            } else {
+                remapped[key] = value
+            }
+        }
         // Remove unused precomputed rotary frequencies
-        weights.filter {
+        return remapped.filter {
             !$0.key.contains("self_attn.rotary_emb.inv_freq")
         }
     }
