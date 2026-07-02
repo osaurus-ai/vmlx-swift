@@ -3307,6 +3307,21 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             var iterator: any TokenIteratorProtocol
             do {
                 iterator = try makeIterator.consume()()
+            } catch is CancellationError {
+                // Client disconnected while the prompt was still prefilling —
+                // the chunked prepare loops bail between chunks. Not an error;
+                // finish the stream with a `.cancelled` info like any other
+                // cancellation.
+                handler.onGenerationEnd(emit: continuation.yield)
+                _ = continuation.yield(handler.infoEvent(GenerateCompletionInfo(
+                    promptTokenCount: promptTokenCount,
+                    generationTokenCount: 0,
+                    promptTime: 0,
+                    generationTime: 0,
+                    stopReason: .cancelled
+                )))
+                continuation.finish()
+                return
             } catch {
                 Logger(subsystem: "vmlx", category: "generateLoopTask").error(
                     "Iterator construction failed: \(error.localizedDescription, privacy: .public)")

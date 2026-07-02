@@ -1308,6 +1308,11 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         if prefillStepSize > 0, tokenCount > prefillStepSize {
             var offset = 0
             while offset + prefillStepSize < tokenCount {
+                // Bound the orphan-producer window on client disconnect —
+                // see LLMModel.prepare. Prefill has no other cancellation
+                // points and an orphan producer racing a follow-up request
+                // on the shared GPU command queue aborts the process.
+                try Task.checkCancellation()
                 let end = offset + prefillStepSize
                 let tokenChunk = llmTokens[0..., offset ..< end]
                 let embeddingChunk = emb[0..., offset ..< end, 0...]

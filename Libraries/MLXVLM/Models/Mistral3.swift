@@ -842,7 +842,7 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         // attention-scale length, which reflects the per-chunk embedding.
         // Without chunking, large-image prompts (100k+ token embeddings)
         // blow past the Metal single-buffer cap on the bigger MoE models.
-        let logits = chunkedPrefillEmbedding(
+        let logits = try chunkedPrefillEmbedding(
             inputEmbedding: embeddings,
             cache: cache,
             prefillStepSize: windowSize ?? 512

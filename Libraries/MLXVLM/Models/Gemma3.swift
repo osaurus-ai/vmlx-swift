@@ -1028,7 +1028,7 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
         // per-chunk inside the LM, so slicing the embedding along axis 1
         // is safe. Without chunking, multi-image / long-image prompts
         // exceed the Metal single-buffer cap on large MoE models.
-        let result = chunkedPrefillEmbedding(
+        let result = try chunkedPrefillEmbedding(
             inputEmbedding: inputEmbeddings,
             cache: convertedCache,
             prefillStepSize: windowSize ?? 512

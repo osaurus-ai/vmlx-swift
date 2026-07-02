@@ -176,6 +176,96 @@ final class LLMPreparePrefillTests: XCTestCase {
         XCTAssertEqual(r.tokens.ndim, 1)
     }
 
+    // MARK: - Cancellation between chunks
+
+    /// A client that disconnects mid-prefill cancels the producer task; the
+    /// chunk loop must bail at the next chunk boundary instead of encoding
+    /// the rest of the prompt for a dead request (an orphan producer racing
+    /// a follow-up request's prefill on the shared GPU command queue aborts
+    /// the process — osaurus cold-load disconnect crash).
+    func testPrepareThrowsCancellationErrorWhenTaskCancelled() async {
+        let recorder = ProgressRecorder()
+        let totalLen = self.totalLen
+        let step = self.step
+
+        let task = Task { () throws -> Void in
+            // Build the (non-Sendable) model/input inside the task so the
+            // closure sends nothing across the boundary.
+            let model = makeTinyPrefillLlama()
+            let cache = model.newCache(parameters: nil)
+            let tokens = MLXArray((0..<totalLen).map { Int32($0 % 64) })[.newAxis, 0...]
+            let input = LMInput(text: .init(tokens: tokens))
+            // Deterministic: set the cancellation flag before prepare runs so
+            // the first chunk-boundary check observes it.
+            withUnsafeCurrentTask { $0?.cancel() }
+            _ = try PrefillProgressReporter.withHandler({ recorder.append($0) }) {
+                try model.prepare(input, cache: cache, windowSize: step)
+            }
+        }
+
+        do {
+            try await task.value
+            XCTFail("prepare must throw CancellationError when the task is cancelled")
+        } catch is CancellationError {
+            // Expected — and no chunk may have completed.
+            XCTAssertEqual(
+                recorder.snapshot(), [],
+                "cancelled prepare must not encode any prompt chunks")
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+    }
+
+    /// Uncancelled tasks are unaffected: the loop still consumes the whole
+    /// prompt and returns the remainder (guards against an over-eager check).
+    func testPrepareInsideLiveTaskStillCompletes() async throws {
+        let totalLen = self.totalLen
+        let step = self.step
+
+        let task = Task { () throws -> Int in
+            let model = makeTinyPrefillLlama()
+            let cache = model.newCache(parameters: nil)
+            let tokens = MLXArray((0..<totalLen).map { Int32($0 % 64) })[.newAxis, 0...]
+            let input = LMInput(text: .init(tokens: tokens))
+            let result = try model.prepare(input, cache: cache, windowSize: step)
+            guard case .tokens(let r) = result else { return -1 }
+            return r.tokens.size
+        }
+        let remainderSize = try await task.value
+        XCTAssertEqual(remainderSize, totalLen - 2 * step)
+    }
+
+    /// The VLM chunked-embedding helper shares the same contract.
+    func testChunkedPrefillEmbeddingThrowsCancellationErrorWhenTaskCancelled() async {
+        let stepCalls = ProgressRecorder()
+        let totalLen = self.totalLen
+        let step = self.step
+
+        let task = Task { () throws -> Void in
+            let embedding = MLXArray.zeros([1, totalLen, 8])
+            withUnsafeCurrentTask { $0?.cancel() }
+            _ = try chunkedPrefillEmbedding(
+                inputEmbedding: embedding,
+                cache: [],
+                prefillStepSize: step
+            ) { chunk in
+                stepCalls.append(chunk.dim(1))
+                return chunk
+            }
+        }
+
+        do {
+            try await task.value
+            XCTFail("chunkedPrefillEmbedding must throw when the task is cancelled")
+        } catch is CancellationError {
+            XCTAssertEqual(
+                stepCalls.snapshot(), [],
+                "cancelled chunked prefill must not invoke the model step")
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+    }
+
     // MARK: - Mask rank follows tokens rank
 
     func testMaskFlattenedAlongsideTokens() throws {
@@ -196,4 +286,17 @@ final class LLMPreparePrefillTests: XCTestCase {
             XCTAssertEqual(remainderMask.size, totalLen - 2 * step)
         }
     }
+}
+
+/// Free-function twin of `LLMPreparePrefillTests.makeModel` for use inside
+/// `Task` closures, where capturing the (non-Sendable) test instance would
+/// trip strict-concurrency sending checks.
+private func makeTinyPrefillLlama(vocab: Int = 64) -> LlamaModel {
+    let config = LlamaConfiguration(
+        hiddenSize: 32, hiddenLayers: 2, intermediateSize: 64,
+        attentionHeads: 4, rmsNormEps: 1e-5,
+        vocabularySize: vocab, kvHeads: 4)
+    let model = LlamaModel(config)
+    MLX.eval(model)
+    return model
 }

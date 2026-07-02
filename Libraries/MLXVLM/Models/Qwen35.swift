@@ -1953,6 +1953,11 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         {
             var offset = 0
             while offset + prefillStepSize < promptTokenCount {
+                // Bound the orphan-producer window on client disconnect —
+                // see LLMModel.prepare. Prefill has no other cancellation
+                // points and an orphan producer racing a follow-up request
+                // on the shared GPU command queue aborts the process.
+                try Task.checkCancellation()
                 let end = offset + prefillStepSize
                 _ = languageModel(
                     inputIds[0..., offset ..< end],

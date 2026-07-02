@@ -542,7 +542,7 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
             imageSizes: imageSizes
         )
 
-        let logits = chunkedPrefillEmbedding(
+        let logits = try chunkedPrefillEmbedding(
             inputEmbedding: embeddings,
             cache: cache,
             prefillStepSize: windowSize ?? 512

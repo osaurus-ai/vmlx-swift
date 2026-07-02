@@ -7,11 +7,11 @@ import XCTest
 
 final class ChunkedPrefillVLMTests: XCTestCase {
 
-    func testShortEmbeddingCallsStepOnceWithFullInput() {
+    func testShortEmbeddingCallsStepOnceWithFullInput() throws {
         let embedding = MLXArray.zeros([1, 4, 3])
         var chunkShapes: [[Int]] = []
 
-        let result = chunkedPrefillEmbedding(
+        let result = try chunkedPrefillEmbedding(
             inputEmbedding: embedding,
             cache: [],
             prefillStepSize: 8
@@ -24,11 +24,11 @@ final class ChunkedPrefillVLMTests: XCTestCase {
         XCTAssertEqual(chunkShapes, [[1, 4, 3]])
     }
 
-    func testDisabledChunkingCallsStepOnceWithFullInput() {
+    func testDisabledChunkingCallsStepOnceWithFullInput() throws {
         let embedding = MLXArray.zeros([1, 6, 3])
         var callCount = 0
 
-        let result = chunkedPrefillEmbedding(
+        let result = try chunkedPrefillEmbedding(
             inputEmbedding: embedding,
             cache: [],
             prefillStepSize: 0
@@ -41,11 +41,11 @@ final class ChunkedPrefillVLMTests: XCTestCase {
         XCTAssertEqual(result, [1, 6, 3])
     }
 
-    func testExactChunkBoundaryCallsStepOnceWithFullInput() {
+    func testExactChunkBoundaryCallsStepOnceWithFullInput() throws {
         let embedding = MLXArray.zeros([1, 5, 3])
         var chunkShapes: [[Int]] = []
 
-        let result = chunkedPrefillEmbedding(
+        let result = try chunkedPrefillEmbedding(
             inputEmbedding: embedding,
             cache: [],
             prefillStepSize: 5
@@ -58,11 +58,11 @@ final class ChunkedPrefillVLMTests: XCTestCase {
         XCTAssertEqual(chunkShapes, [[1, 5, 3]])
     }
 
-    func testLongEmbeddingChunksAlongSequenceAxisAndReturnsFinalChunkResult() {
+    func testLongEmbeddingChunksAlongSequenceAxisAndReturnsFinalChunkResult() throws {
         let embedding = MLXArray.zeros([1, 10, 3])
         var chunkShapes: [[Int]] = []
 
-        let result = chunkedPrefillEmbedding(
+        let result = try chunkedPrefillEmbedding(
             inputEmbedding: embedding,
             cache: [KVCacheSimple()],
             prefillStepSize: 4

@@ -52,7 +52,7 @@ public func chunkedPrefillEmbedding<Result>(
     cache: [KVCache],
     prefillStepSize: Int,
     step: (MLXArray) -> Result
-) -> Result {
+) throws -> Result {
     let T = inputEmbedding.dim(1)
     guard prefillStepSize > 0, T > prefillStepSize else {
         return step(inputEmbedding)
@@ -60,6 +60,11 @@ public func chunkedPrefillEmbedding<Result>(
 
     var offset = 0
     while offset + prefillStepSize < T {
+        // Bound the orphan-producer window on client disconnect: prefill has
+        // no other cancellation points, and an uncancellable producer racing
+        // a follow-up request's prefill on the shared GPU command queue
+        // aborts the process. See LLMModel.prepare for the full story.
+        try Task.checkCancellation()
         let end = offset + prefillStepSize
         let chunk = inputEmbedding[0..., offset ..< end, 0...]
         _ = step(chunk)

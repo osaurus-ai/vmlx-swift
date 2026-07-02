@@ -57,6 +57,16 @@ extension LLMModel {
         // Clear Metal cache between chunks to reduce memory pressure,
         // matching Python mlx-lm behavior. Critical for MoE models.
         while flatTokens.size > prefillStepSize {
+            // Prefill is the only long-running generation phase with no
+            // cancellation points: a client that disconnects mid-prefill
+            // cancels the producer task, but without this check the loop
+            // keeps encoding GPU work for the dead request until the whole
+            // prompt is consumed. A follow-up request racing that orphan
+            // producer on the shared command queue aborts the process
+            // ("A command encoder is already encoding to this command
+            // buffer"). Checking between chunks bounds the orphan window
+            // to a single chunk.
+            try Task.checkCancellation()
             // Build a [1, prefillStepSize] chunk for the model forward pass.
             let chunkTokens = flatTokens[..<prefillStepSize][.newAxis, 0...]
             let chunkMask = flatMask.map { $0[..<prefillStepSize] }
