@@ -47,6 +47,14 @@ public struct Gemma4ToolCallParser: ToolCallParser, Sendable {
         native.endTagAliases + zyphra.endTagAliases
     }
 
+    /// Both transports' closers strip when orphaned: Gemma-4 AppleScript
+    /// fine-tunes emit the Zyphra XML envelope (and its stray-closer leak
+    /// shape), and an orphan native `<tool_call|>` is the same protocol
+    /// residue class.
+    public var orphanStripTags: [String] {
+        native.endTagAliases + zyphra.orphanStripTags
+    }
+
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         native.parse(content: content, tools: tools)
             ?? zyphra.parse(content: content, tools: tools)

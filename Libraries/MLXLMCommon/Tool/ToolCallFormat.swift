@@ -36,6 +36,19 @@ public protocol ToolCallParser: Sendable {
     /// Prefixes for dynamic end tags matching ``startTagPrefixes``.
     var endTagPrefixes: [String] { get }
 
+    /// Exact protocol CLOSER tags that must be stripped from the visible
+    /// stream even when they appear WITHOUT a matching opener ("orphan
+    /// closers"). Live rows of some families (ZAYA / Gemma-4 AppleScript
+    /// fine-tunes) emit stray `</parameter></function></zyphra_tool_call>`
+    /// runs after several agent-loop steps; the state machine only enters
+    /// collection on an OPEN tag, so without this registry the orphan closer
+    /// would stream to the user as literal protocol text. Scoped to the
+    /// format's OWN registered closers so ordinary tag-looking prose
+    /// (`</div>`) is never touched — the same robustness class as the
+    /// `ReasoningParser` stray-tag strip. Default: empty (no behavior
+    /// change for formats that have not opted in).
+    var orphanStripTags: [String] { get }
+
     /// Parse the content into a `ToolCall`.
     /// - Parameters:
     ///   - content: The text content to parse (may include tags)
@@ -90,6 +103,8 @@ extension ToolCallParser {
     public var startTagPrefixes: [String] { [] }
 
     public var endTagPrefixes: [String] { [] }
+
+    public var orphanStripTags: [String] { [] }
 
     public func isValidPartialContent(_ toolCallBuffer: String) -> Bool {
         true

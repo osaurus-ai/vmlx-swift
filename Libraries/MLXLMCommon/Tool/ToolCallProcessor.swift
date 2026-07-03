@@ -722,6 +722,7 @@ public class ToolCallProcessor {
         let tags =
             parser.startTagAliases + parser.endTagAliases
             + parser.startTagPrefixes + parser.endTagPrefixes
+            + parser.orphanStripTags
 
         if tags.contains(where: { trimmed.hasPrefix($0) }) {
             return true
@@ -1673,6 +1674,67 @@ public class ToolCallProcessor {
                     let combined = visible + inline
                     return combined.isEmpty ? nil : combined
                 }
+
+                // The buffer is not a start tag. Before flushing it as
+                // visible text, screen it against the format's registered
+                // ORPHAN closers: live rows (ZAYA / Gemma-4 AppleScript) emit
+                // stray `</parameter></function></zyphra_tool_call>` runs
+                // with no matching opener, and those protocol markers must
+                // strip rather than stream to the user. Only the format's
+                // own registered tags are touched — unregistered tag-looking
+                // prose (`</div>`) still flushes verbatim.
+                let orphanTags = parser.orphanStripTags
+                if !orphanTags.isEmpty {
+                    var remainder = toolCallBuffer
+                    var strippedOrphan = false
+                    while let tag = orphanTags.first(where: { remainder.hasPrefix($0) }) {
+                        remainder.removeFirst(tag.count)
+                        strippedOrphan = true
+                    }
+                    if strippedOrphan {
+                        state = .normal
+                        toolCallBuffer = ""
+                        let leading = leadingTextBeforeToolCall
+                        leadingTextBeforeToolCall = ""
+                        // Whatever follows the orphan run goes back through
+                        // the machine — it may hold prose, another marker, or
+                        // a real envelope.
+                        let trailing =
+                            remainder.isEmpty
+                            ? nil
+                            : processTaggedChunk(
+                                remainder, allowInlineFallback: allowInlineFallback)
+                        let visible = leading + (trailing ?? "")
+                        return visible.isEmpty ? nil : visible
+                    }
+                    // A strict prefix of an orphan closer may still complete
+                    // on the next chunk — keep buffering instead of leaking
+                    // the partial marker.
+                    if orphanTags.contains(where: { $0.hasPrefix(toolCallBuffer) }) {
+                        return nil
+                    }
+                    // A closer can also sit EMBEDDED later in this same
+                    // non-matching buffer (one big chunk: `<zyx</function>`).
+                    // Emit the non-matching head and re-scan the tail so the
+                    // embedded marker still strips; each level drops at least
+                    // one character, so this terminates.
+                    if toolCallBuffer.count > 1,
+                        toolCallBuffer.dropFirst().contains(startChar)
+                    {
+                        state = .normal
+                        let head = String(toolCallBuffer.prefix(1))
+                        let tail = String(toolCallBuffer.dropFirst())
+                        toolCallBuffer = ""
+                        let leading = leadingTextBeforeToolCall
+                        leadingTextBeforeToolCall = ""
+                        let trailing =
+                            processTaggedChunk(tail, allowInlineFallback: allowInlineFallback)
+                            ?? ""
+                        let visible = leading + head + trailing
+                        return visible.isEmpty ? nil : visible
+                    }
+                }
+
                 // Otherwise, return the collected text and reset the state
                 state = .normal
                 let buffer = toolCallBuffer

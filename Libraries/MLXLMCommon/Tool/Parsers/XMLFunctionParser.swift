@@ -22,6 +22,17 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
         self.unwrapJSONQuotedStringParameters = unwrapJSONQuotedStringParameters
     }
 
+    /// The XML-function transport's closers are protocol control markers even
+    /// when orphaned (no matching opener): live ZAYA rows emit stray
+    /// `</parameter></function></zyphra_tool_call>` runs mid-conversation
+    /// (MODEL_ISSUES_TRIAGE Issue 3 — the wrapper tags are dedicated special
+    /// tokens for that family). Register the wrapper closer plus the body
+    /// closers so the streaming processor strips an orphan run instead of
+    /// surfacing it as visible assistant text.
+    public var orphanStripTags: [String] {
+        endTagAliases + ["</function>", "</parameter>"]
+    }
+
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         // Pattern: <function=(content)</function> — [\s\S] matches newlines
         guard
