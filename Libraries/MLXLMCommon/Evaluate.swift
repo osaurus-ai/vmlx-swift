@@ -3675,6 +3675,19 @@ public enum Generation: Sendable {
     /// A tool call from the language model.
     case toolCall(ToolCall)
 
+    /// An incremental delta of a tool-call envelope that is still being
+    /// generated.
+    ///
+    /// Emitted while the tool-call processor is collecting a committed call —
+    /// the payload is the raw envelope text (format-specific, e.g. the growing
+    /// JSON object), NOT parsed arguments. Consumers can use it to preview long
+    /// calls (such as a file write) as they stream, instead of showing a silent
+    /// gap for the whole call. The complete, parsed call still arrives as a
+    /// single `.toolCall` when the envelope closes, so `.toolCall` remains the
+    /// only actionable tool event. Callers that don't need previews can ignore
+    /// this case (a `@unknown default`/`default` branch is unaffected).
+    case toolCallProgress(String)
+
     /// Generated text or nil
     public var chunk: String? {
         switch self {
@@ -3683,6 +3696,7 @@ public enum Generation: Sendable {
         case .info: nil
         case .prefillProgress: nil
         case .toolCall: nil
+        case .toolCallProgress: nil
         }
     }
 
@@ -3694,6 +3708,7 @@ public enum Generation: Sendable {
         case .info: nil
         case .prefillProgress: nil
         case .toolCall: nil
+        case .toolCallProgress: nil
         }
     }
 
@@ -3705,6 +3720,7 @@ public enum Generation: Sendable {
         case .info(let info): info
         case .prefillProgress: nil
         case .toolCall: nil
+        case .toolCallProgress: nil
         }
     }
 
@@ -3716,6 +3732,7 @@ public enum Generation: Sendable {
         case .info: nil
         case .prefillProgress(let progress): progress
         case .toolCall: nil
+        case .toolCallProgress: nil
         }
     }
 
@@ -3727,6 +3744,19 @@ public enum Generation: Sendable {
         case .info: nil
         case .prefillProgress: nil
         case .toolCall(let toolCall): toolCall
+        case .toolCallProgress: nil
+        }
+    }
+
+    /// In-flight tool-call envelope delta text, or nil
+    public var toolCallProgress: String? {
+        switch self {
+        case .chunk: nil
+        case .reasoning: nil
+        case .info: nil
+        case .prefillProgress: nil
+        case .toolCall: nil
+        case .toolCallProgress(let text): text
         }
     }
 
@@ -4056,7 +4086,7 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
                 return false
             }
             return !stopSequenceHit
-        case .reasoning, .prefillProgress, .toolCall, .info:
+        case .reasoning, .prefillProgress, .toolCall, .toolCallProgress, .info:
             if case .toolCall = event {
                 emittedToolCall = true
             }

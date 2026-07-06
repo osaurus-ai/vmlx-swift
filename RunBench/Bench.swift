@@ -1178,7 +1178,7 @@ func runBatchEngineTurn(
             reasoning += r
             chunkCount += 1
             if chunkCount > maxNew * 2 { break }
-        case .prefillProgress, .info, .toolCall:
+        case .prefillProgress, .info, .toolCall, .toolCallProgress:
             break
         }
     }
@@ -1303,6 +1303,8 @@ func runBatchEngineToolCall(modelPath: String, maxNew: Int) async throws {
                 argText = String(describing: call.function.arguments)
             }
             toolCallDetails.append("\(call.function.name)(\(argText))")
+        case .toolCallProgress:
+            break
         case .prefillProgress:
 
             break
@@ -2115,6 +2117,8 @@ func runBatchEngineCacheHit(modelPath: String, maxNew: Int) async throws {
                 reasoning += chunk
             case .toolCall:
                 toolCalls += 1
+            case .toolCallProgress:
+                break
             case .prefillProgress:
 
                 break
@@ -4057,7 +4061,7 @@ func runHarmonyReasoningCheck(modelPath: String, maxNew: Int) async throws {
             case .reasoning(let r):
                 reasoningText += r
                 reasoningCount += 1
-            case .prefillProgress, .toolCall, .info:
+            case .prefillProgress, .toolCall, .info, .toolCallProgress:
                 break
             }
         }
@@ -4151,7 +4155,7 @@ func runQwenThinkingReasoningCheck(modelPath: String, maxNew: Int) async throws 
                 case .reasoning(let r):
                     reasoningText += r
                     reasoningCount += 1
-                case .prefillProgress, .toolCall, .info:
+                case .prefillProgress, .toolCall, .info, .toolCallProgress:
                     break
                 }
             }
@@ -5608,6 +5612,8 @@ func runThinkingLoopProbe(modelPath: String, maxNew: Int) async throws {
                 reasoningOut += text
             case .toolCall:
                 break
+            case .toolCallProgress:
+                break
             case .prefillProgress:
 
                 break
@@ -5815,6 +5821,8 @@ func runLagunaLoopProbe(modelPath: String, maxNew: Int) async throws {
                 result.reasoning += r
                 result.reasoningDeltas += 1
             case .toolCall:
+                break
+            case .toolCallProgress:
                 break
             case .prefillProgress:
 
@@ -6133,6 +6141,8 @@ func runNoGuardSamplingProbe(modelPath: String, maxNew: Int) async throws {
                 result.reasoning += text
             case .toolCall:
                 result.toolCalls += 1
+            case .toolCallProgress:
+                break
             case .prefillProgress:
 
                 break
@@ -7171,6 +7181,8 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
                 result.reasoning += reasoning
             case .toolCall(let call):
                 result.toolCalls.append(call)
+            case .toolCallProgress:
+                break
             case .prefillProgress:
 
                 break
@@ -7494,6 +7506,8 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
                 reasoningCount += 1
             case .toolCall:
                 toolCallCount += 1
+            case .toolCallProgress:
+                break
             case .prefillProgress:
 
                 break
@@ -7895,6 +7909,8 @@ func runPerfBench(
                             result.ttftSec = CFAbsoluteTimeGetCurrent() - start
                         }
                         result.toolCalls += 1
+                    case .toolCallProgress:
+                        break
                     case .prefillProgress:
 
                         break
@@ -7949,6 +7965,8 @@ func runPerfBench(
                             result.ttftSec = CFAbsoluteTimeGetCurrent() - start
                         }
                         result.toolCalls += 1
+                    case .toolCallProgress:
+                        break
                     case .prefillProgress:
 
                         break
@@ -8501,6 +8519,8 @@ func runCrashFuzzV2(modelPath: String, maxNew: Int) async throws {
             case .chunk(let c): chunks += c
             case .reasoning(let r): reasoning += r
             case .toolCall: tools += 1
+            case .toolCallProgress:
+                break
             case .prefillProgress:
 
                 break
@@ -8726,6 +8746,8 @@ func runOfficialMultiTurn(modelPath: String, maxNew: Int) async throws {
                 if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
                 reasoning += r; reasoningDeltas += 1
             case .toolCall: toolCalls += 1
+            case .toolCallProgress:
+                break
             case .prefillProgress:
 
                 break
@@ -9112,6 +9134,8 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
                 if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
                 r.reasoning += rs; deltas += 1
             case .toolCall: r.tools += 1
+            case .toolCallProgress:
+                break
             case .prefillProgress:
 
                 break

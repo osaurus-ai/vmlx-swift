@@ -826,6 +826,7 @@ let package = Package(
                 "DeepseekV4Step37RuntimeContractsTests.swift",
                 "DSMLInlineJSONToolFallbackFocusedTests.swift",
                 "DSMLToolCallParserFocusedTests.swift",
+                "ToolCallProgressRoutingTests.swift",
                 "FocusedMLXTestSupport.swift",
                 "BatchEngineGrowingChatCacheSourceTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",

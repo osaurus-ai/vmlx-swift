@@ -875,7 +875,7 @@ class BatchEngineIntegrationTests: XCTestCase {
             case .prefillProgress(let p):
                 XCTAssertFalse(sawChunkOrInfo, "prefill progress must arrive before output/info")
                 progress.append(p)
-            case .chunk, .reasoning, .toolCall, .info:
+            case .chunk, .reasoning, .toolCall, .toolCallProgress, .info:
                 sawChunkOrInfo = true
             }
         }

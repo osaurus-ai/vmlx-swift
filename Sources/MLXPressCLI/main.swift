@@ -204,6 +204,9 @@ struct MLXPressCLI {
                         break
                     case .toolCall:
                         break
+                    case .toolCallProgress:
+                        // Envelope-preview delta; not user-visible CLI text.
+                        break
                     case .info(let info):
                         completionInfo = info
                     }

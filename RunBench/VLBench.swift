@@ -208,7 +208,7 @@ enum VLBench {
                 promptTokensPerSecond = info.promptTokensPerSecond
                 decodeTokensPerSecond = info.tokensPerSecond
                 stopReason = String(describing: info.stopReason)
-            case .reasoning, .toolCall:
+            case .reasoning, .toolCall, .toolCallProgress:
                 break
             }
         }
@@ -406,7 +406,7 @@ enum VLBench {
                     chunkCount += 1
                 case .reasoning:
                     reasoningCount += 1
-                case .prefillProgress, .info, .toolCall:
+                case .prefillProgress, .info, .toolCall, .toolCallProgress:
                     break
                 }
             }
@@ -549,7 +549,7 @@ enum VLBench {
             case .reasoning(let r):
                 if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
                 reasoningText += r; reasoningDeltas += 1; sawAnyEvent = true
-            case .prefillProgress, .info, .toolCall:
+            case .prefillProgress, .info, .toolCall, .toolCallProgress:
                 break
             }
         }
@@ -1234,7 +1234,7 @@ enum VLBench {
             case .info(let info):
                 promptTime = info.promptTime
                 tokenCount = info.generationTokenCount
-            case .toolCall:
+            case .toolCall, .toolCallProgress:
                 break
             }
         }

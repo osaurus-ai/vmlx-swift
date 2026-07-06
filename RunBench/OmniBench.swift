@@ -1248,6 +1248,8 @@ enum OmniBench {
                 break
             case .toolCall:
                 break
+            case .toolCallProgress:
+                break
             }
             if events > maxNewTokens * 2 {
                 throw NSError(
