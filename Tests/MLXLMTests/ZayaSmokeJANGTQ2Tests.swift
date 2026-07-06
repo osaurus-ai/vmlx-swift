@@ -278,6 +278,8 @@ struct ZayaSmokeJANGTQ2Tests {
                 reasoning += chunk
             case .toolCall:
                 toolCalls += 1
+            case .toolCallProgress:
+                break
             case .prefillProgress:
 
                 break
