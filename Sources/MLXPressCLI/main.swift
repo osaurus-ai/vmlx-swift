@@ -202,7 +202,7 @@ struct MLXPressCLI {
                         reasoningText += text
                     case .prefillProgress:
                         break
-                    case .toolCall:
+                    case .toolCall, .toolCallProgress:
                         break
                     case .info(let info):
                         completionInfo = info

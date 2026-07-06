@@ -25,6 +25,7 @@ public func routeGenerationText(
 
     var events: [Generation] = []
     let toolCallCountBeforeChunk = toolCallProcessor.toolCalls.count
+    let collectingBeforeChunk = toolCallProcessor.collectingToolCallText
     let visibleChunk: String?
     if channel == .reasoning, toolCallProcessor.usesTaggedOnlyReasoningExtraction {
         visibleChunk = toolCallProcessor.processTaggedProtocolChunk(text)
@@ -40,6 +41,22 @@ public func routeGenerationText(
             if !parsedToolCallInChunk || toolCallProcessor.preservesReasoningTextAroundToolCalls {
                 events.append(.reasoning(visible))
             }
+        }
+    }
+    // Surface the growth of an in-flight tool-call envelope as a progress
+    // delta. Diffing the processor's collecting buffer around the chunk
+    // keeps the parser state machines untouched: a call that completed (or
+    // reverted to plain text) within this chunk simply reports no growth.
+    // The prefix check guards the boundary where one call completed and the
+    // next began inside the same chunk — the buffer then holds unrelated
+    // text, so the whole new buffer is the delta.
+    if let after = toolCallProcessor.collectingToolCallText, !after.isEmpty {
+        if let before = collectingBeforeChunk, after.hasPrefix(before) {
+            if after.count > before.count {
+                events.append(.toolCallProgress(String(after.dropFirst(before.count))))
+            }
+        } else {
+            events.append(.toolCallProgress(after))
         }
     }
     events.append(contentsOf: drainToolCallEvents(from: toolCallProcessor))

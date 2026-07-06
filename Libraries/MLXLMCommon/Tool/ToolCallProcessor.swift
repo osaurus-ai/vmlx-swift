@@ -47,6 +47,27 @@ public class ToolCallProcessor {
     /// The tool calls extracted during processing.
     public var toolCalls: [ToolCall] = []
 
+    /// Raw text of the tool-call envelope currently being collected, or nil
+    /// when no call is in flight. The stream-routing layer diffs this around
+    /// each processed chunk to surface incremental `.toolCallProgress`
+    /// deltas while the model is still writing the call (e.g. a UI that
+    /// previews a large file write as it streams). `potentialToolCall` — an
+    /// ambiguous prefix that may still revert to plain text — intentionally
+    /// reports nil so consumers never see text that might later be
+    /// re-emitted as a visible chunk.
+    public var collectingToolCallText: String? {
+        // Strip-only processors discard the parsed calls entirely (no tools
+        // were offered), so surfacing their envelope as progress would leak
+        // text the consumer will never get a `.toolCall` for.
+        guard !stripOnly else { return nil }
+        switch state {
+        case .collectingToolCall, .collectingInlineToolCall:
+            return toolCallBuffer
+        case .normal, .potentialToolCall:
+            return nil
+        }
+    }
+
     /// Record extracted tool calls unless running strip-only (markers are
     /// stripped from visible text either way; in strip-only mode the call
     /// itself is discarded because no tools were offered).

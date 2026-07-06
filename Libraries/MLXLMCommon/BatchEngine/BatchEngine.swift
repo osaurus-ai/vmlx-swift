@@ -690,6 +690,8 @@ public actor BatchEngine {
                     continuation.yield(event)
                 case .toolCall:
                     continuation.yield(event)
+                case .toolCallProgress:
+                    continuation.yield(event)
                 case .info:
                     continuation.yield(event)
                 }
