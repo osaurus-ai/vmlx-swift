@@ -2036,7 +2036,10 @@ struct MTPRuntimeFocusedTests {
         #expect(loadSource.contains("loadJangConfigSanitizeMetadata"))
         #expect(loadSource.contains("\"norm_convention\""))
         #expect(vlmSource.contains("normConvention: Self.normConvention(metadata)"))
-        #expect(vlmSource.contains("usesQwenPlusOneNormConvention"))
+        // The (1+weight) shift decision routes through the shared deterministic resolver
+        // (rcfa 18f803c9 replaced the old per-loader `usesQwenPlusOneNormConvention` helper,
+        // whose Dictionary-iteration-order probe silently mis-shifted ~7.5% of loads).
+        #expect(vlmSource.contains("NormConventionResolver.shouldApplyPlusOneShift"))
     }
 
     @Test("LLM and VLM factories carry MTP tuning status like generation config")
