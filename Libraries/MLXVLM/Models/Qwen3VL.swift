@@ -1474,10 +1474,19 @@ enum Qwen3VLLanguage {
                         delta = repeated(delta, count: batch, axis: 0)
                     }
 
-                    base = base + delta
-
-                    positionIds = base[.newAxis, 0..., 0...]
-                    positionIds = broadcast(positionIds!, to: [3, batch, seqLength])
+                    if delta.dim(0) == batch {
+                        // Reshape to [batch, 1] so the add broadcasts per
+                        // sequence; a bare [batch] vector against
+                        // [batch, seqLength] aligns on the trailing axis and
+                        // yields [batch, batch] garbage on decode steps.
+                        base = base + delta.reshaped(batch, 1)
+                        positionIds = base[.newAxis, 0..., 0...]
+                        positionIds = broadcast(positionIds!, to: [3, batch, seqLength])
+                    }
+                    // Otherwise ropeDeltas is stale for this batch composition
+                    // (a sequence joined or left since prefill) — leave
+                    // positionIds nil so attention rebuilds them from the
+                    // per-sequence cache offsets instead of trapping.
                 }
             }
 
