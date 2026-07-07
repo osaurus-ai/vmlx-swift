@@ -413,6 +413,12 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let splitStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         let splits = split(
             projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
+        // A failed split (e.g. a checkpoint whose in_proj width disagrees with
+        // intermediateSize + convDim + numHeads) records an MLX error and
+        // returns an empty vector; subscripting it traps the process before
+        // the recorded error can surface. Bail with the input — the enclosing
+        // withError scope throws the real diagnostic at exit.
+        guard splits.count == 3 else { return hiddenStates }
         let gate = splits[0]
         let convInput = splits[1]
         let dt = splits[2]
@@ -435,6 +441,7 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
             axis: -1
         )
 
+        guard convSplits.count == 3 else { return hiddenStates }
         var hidden = convSplits[0]
         var B = convSplits[1]
         var C = convSplits[2]

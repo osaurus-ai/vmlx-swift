@@ -1101,11 +1101,15 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) th
     // mis-stamped `imageSeqLength` would crash the whole process on
     // first image. Throw so the caller (osaurus, JANG Studio, etc.)
     // can surface the diagnostic without process abort.
-    guard sourceFlat.shape[0] == posArray.shape[0] else {
+    // `shape.first` (not `shape[0]`): a failed upstream MLX op inside a
+    // `withError` scope hands back a rank-0 error array, and a bare `shape[0]`
+    // on it traps in the Swift array bounds check before the recorded error is
+    // ever surfaced.
+    guard let sourceCount = sourceFlat.shape.first, sourceCount == posArray.shape.first else {
         throw VLMError.processing(
             """
             Gemma4 maskedScatter: size mismatch between vision features and image token positions. \
-            Vision features: \(sourceFlat.shape[0]), image positions: \(posArray.shape[0]). \
+            Vision features: \(sourceFlat.shape.first ?? 0), image positions: \(posArray.shape.first ?? 0). \
             Check that imageSeqLength in preprocessor_config matches vision tower output (defaultOutputLength).
             """)
     }
