@@ -1099,6 +1099,13 @@ enum Qwen3VLLanguage {
 
         func callAsFunction(positionIds: MLXArray, dtype: MLX.DType) -> (MLXArray, MLXArray) {
             var positionIds = positionIds
+            // Normalize to the [3, batch, seq] mrope layout. The 4-op subscript
+            // below traps on anything lower-rank (Sentry: over-rank subscript
+            // during batch decode), so lift 1-D [seq] and 2-D [batch, seq]
+            // inputs instead of assuming callers always pre-shape.
+            if positionIds.ndim == 1 {
+                positionIds = positionIds[.newAxis, 0...]
+            }
             if positionIds.ndim == 2 {
                 positionIds = positionIds[.newAxis, 0..., 0...]
                 positionIds = tiled(positionIds, repetitions: [3, 1, 1])
