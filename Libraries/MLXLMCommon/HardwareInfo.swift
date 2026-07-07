@@ -30,11 +30,22 @@ public enum HardwareInfo {
     /// crash was confirmed on M4 Pro (Mac16,x) as well — the bug is a macOS Tahoe
     /// Metal shader compiler issue, not hardware-specific.
     ///
-    /// Performance impact of disabling: minimal. These are small activation function
-    /// fusions (GELU, SwiGLU, softcap). The individual Metal ops work correctly on
-    /// all hardware and the per-op overhead is negligible vs. the model forward pass.
+    /// Performance impact of disabling: SIGNIFICANT for real decode, not the
+    /// negligible micro-fusion cost this comment previously claimed.
+    /// `compile(shapeless:)` fuses the whole single-slot decode step (not just
+    /// GELU/SwiGLU/softcap), so gating it off leaves the per-token graph
+    /// unfused. Local decode-throughput benchmarks put the compile-ON gain in
+    /// the ~+45% to +70% range across gemma-4-e2b and qwen (the exact magnitude
+    /// varies with build config and measurement path — RunBench direct decode
+    /// vs. the full server path differ substantially in absolute tok/s, so
+    /// treat the *ratio*, not any single absolute, as the takeaway). It is
+    /// disabled only because it is not yet proven model-switch-safe (see #1173
+    /// below), NOT because it is cheap — enabling it (Settings -> Decode
+    /// Performance, or VMLX_ENABLE_UNSAFE_COMPILE=1) is the single biggest
+    /// local-decode speedup available.
     ///
-    /// Re-enable when Apple fixes the Metal JIT in a future macOS update.
+    /// Re-enable by default once the Metal JIT is fixed AND the #1173 model-switch
+    /// corruption is resolved (e.g. clearing the MLX compile cache on model swap).
     public static var isCompiledDecodeSupported: Bool {
         // 2026-05-20: keep MLX compile off by default for host apps. A live
         // Osaurus PR #1173 switch test reproduced process-local decode
