@@ -131,7 +131,11 @@ final class CompiledFunction: @unchecked (Sendable) {
             s._updateInternal(newValues)
         }
 
-        let resultLength = resultsPlusStateOutput.count - stateOutput.count
+        // A failed `mlx_closure_apply` (error recorded via the withError
+        // handler) leaves `resultVector` empty. Clamp so `prefix` doesn't trap
+        // on a negative length — the caller sees an empty result and the
+        // recorded error surfaces when the enclosing error scope exits.
+        let resultLength = max(0, resultsPlusStateOutput.count - stateOutput.count)
         let results = Array(resultsPlusStateOutput.prefix(resultLength))
         return results
     }
@@ -182,7 +186,10 @@ public func compile(
     }
 
     return { a in
-        compileState.call([a])[0]
+        // `.first ?? .mlxNone`: a failed compiled evaluation returns an empty
+        // result (error already recorded); a bare `[0]` traps the process
+        // before that error can surface.
+        compileState.call([a]).first ?? .mlxNone
     }
 }
 
@@ -203,7 +210,7 @@ public func compile(
     }
 
     return { a, b in
-        compileState.call([a, b])[0]
+        compileState.call([a, b]).first ?? .mlxNone
     }
 }
 
@@ -224,7 +231,7 @@ public func compile(
     }
 
     return { a, b, c in
-        compileState.call([a, b, c])[0]
+        compileState.call([a, b, c]).first ?? .mlxNone
     }
 }
 
