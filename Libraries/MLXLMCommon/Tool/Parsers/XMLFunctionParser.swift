@@ -34,6 +34,26 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
     }
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
+        // Some ZAYA rows emit a fully *nested* XML body instead of the
+        // attribute form this parser was written for:
+        //
+        //   <function>file_write
+        //   <parameter>
+        //   <name>path</name>
+        //   <value>out.txt</value>
+        //   </parameter>
+        //
+        // i.e. `<function>name` (no `=`) and `<parameter><name>k</name>
+        // <value>v</value></parameter>` instead of `<function=name>` /
+        // `<parameter=k>v</parameter>`. The attribute scan below finds no
+        // `<parameter=` and drops every argument (observed: file_write parses
+        // but `path` is reported missing). Handle the nested form first — gated
+        // on the distinctive `<name>`-inside-`<parameter>` marker so the
+        // attribute path is left completely untouched (no regression). See
+        // MODEL_ISSUES_TRIAGE / ZAYA tool-arg extraction.
+        if let nested = parseNestedParameterForm(content, tools: tools) {
+            return nested
+        }
         // Pattern: <function=(content)</function> — [\s\S] matches newlines
         guard
             let funcMatch = content.range(
@@ -150,6 +170,79 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             return ToolCall(function: .init(name: funcName, arguments: invalidArguments))
         }
 
+        return ToolCall(function: .init(name: funcName, arguments: arguments))
+    }
+
+    /// Parse the *nested* ZAYA XML body:
+    /// `<function>name … <parameter><name>key</name><value>val</value></parameter> …`.
+    /// Returns nil — so the caller falls through to the attribute-style scan —
+    /// unless the distinctive nested `<name>…</name>` / `<value>…</value>`
+    /// parameter markers are present, so attribute-style calls are never
+    /// rerouted here. Reuses the same value post-processing / schema validation
+    /// as the attribute path so both wire forms behave identically downstream.
+    private func parseNestedParameterForm(
+        _ content: String,
+        tools: [[String: any Sendable]]?
+    ) -> ToolCall? {
+        // Gate on the nested markers so the attribute path stays untouched.
+        guard content.range(of: "<name>") != nil,
+            content.range(of: "<value>") != nil,
+            let funcOpen = content.range(of: "<function")
+        else { return nil }
+
+        // Function name: `<function>name` (nested) or `<function=name>`
+        // (attribute) — read from just after the opener to the first
+        // newline / `<` / `>`.
+        var cursor = funcOpen.upperBound
+        if cursor < content.endIndex, content[cursor] == "=" || content[cursor] == ">" {
+            cursor = content.index(after: cursor)
+        }
+        let nameStop =
+            content[cursor...].firstIndex { $0 == "\n" || $0 == "<" || $0 == ">" }
+            ?? content.endIndex
+        let funcName = String(content[cursor ..< nameStop])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !funcName.isEmpty else { return nil }
+
+        // Pair each `<name>key</name>` with the following `<value>val</value>`.
+        var arguments: [String: any Sendable] = [:]
+        var search = content.startIndex ..< content.endIndex
+        while let nameOpen = content.range(of: "<name>", range: search),
+            let nameClose = content.range(
+                of: "</name>", range: nameOpen.upperBound ..< content.endIndex)
+        {
+            let key = String(content[nameOpen.upperBound ..< nameClose.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            search = nameClose.upperBound ..< content.endIndex
+            guard !key.isEmpty,
+                let valueOpen = content.range(of: "<value>", range: search),
+                let valueClose = content.range(
+                    of: "</value>", range: valueOpen.upperBound ..< content.endIndex)
+            else { continue }
+
+            var value = String(content[valueOpen.upperBound ..< valueClose.lowerBound])
+            value = trimBoundaryNewlines(value)
+            if decodesHTMLLineBreaks,
+                isStringType(funcName: funcName, argName: key, tools: tools) {
+                value = decodeHTMLLineBreaks(value)
+            }
+            if unwrapJSONQuotedStringParameters,
+                isStringType(funcName: funcName, argName: key, tools: tools),
+                let unwrapped = decodeQuotedStringParameter(value) {
+                value = trimBoundaryNewlines(unwrapped)
+            }
+            arguments[key] = convertParameterValue(
+                value, paramName: key, funcName: funcName, tools: tools)
+            search = valueClose.upperBound ..< content.endIndex
+        }
+
+        // No nested params extracted → let the attribute-style scan try.
+        guard !arguments.isEmpty else { return nil }
+
+        if let invalidArguments = schemaValidationFailure(
+            toolName: funcName, arguments: arguments, tools: tools) {
+            return ToolCall(function: .init(name: funcName, arguments: invalidArguments))
+        }
         return ToolCall(function: .init(name: funcName, arguments: arguments))
     }
 
