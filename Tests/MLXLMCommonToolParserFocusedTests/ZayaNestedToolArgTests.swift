@@ -82,6 +82,87 @@ struct ZayaNestedToolArgTests {
         #expect(call.function.arguments["content"] == .string("hi"))
     }
 
+    /// VERBATIM live JANGTQ4 capture: `<name>` / `<type>` / `<value>` interleaved.
+    /// The `<type>string</type>` tag sits between name and value — the pairing
+    /// must skip it and still bind name→value.
+    @Test("nested body with interleaved <type> tag extracts every argument")
+    func nestedWithTypeTagExtractsArgs() throws {
+        let content = """
+            <zyphra_tool_call>
+            <function=file_write>
+            <parameter>
+            <name>content</name>
+            <type>string</type>
+            <value>hi</value>
+            </parameter>
+            <parameter>
+            <name>path</name>
+            <type>string</type>
+            <value>note.txt</value>
+            </parameter>
+            </function>
+            </zyphra_tool_call>
+            """
+        let call = try #require(zayaParser().parse(content: content, tools: fileWrite))
+        #expect(call.function.name == "file_write")
+        #expect(call.function.arguments["path"] == .string("note.txt"))
+        #expect(call.function.arguments["content"] == .string("hi"))
+    }
+
+    /// VERBATIM live JANGTQ4 capture under `tool_choice:required`: the function
+    /// name is wrapped in a *closed* `<function>name</function>` tag (not
+    /// `<function=name>`), followed by nested `<name>`/`<value>` params.
+    @Test("closed <function>name</function> tag with nested values extracts args")
+    func closedFunctionTagNestedValuesExtractsArgs() throws {
+        let content = """
+            <zyphra_tool_call>
+            <function>file_write</function>
+            <parameter>
+            <name>path</name>
+            <value>note.txt</value>
+            </parameter>
+            <parameter>
+            <name>content</name>
+            <value>hi there</value>
+            </parameter>
+            </function>
+            </zyphra_tool_call>
+            """
+        let call = try #require(zayaParser().parse(content: content, tools: fileWrite))
+        #expect(call.function.name == "file_write")
+        #expect(call.function.arguments["path"] == .string("note.txt"))
+        #expect(call.function.arguments["content"] == .string("hi there"))
+    }
+
+    /// REGRESSION GUARD: a nested body that carries names/types but NO `<value>`
+    /// tags (live JANGTQ4 auto-mode: the model echoes the tool-definition
+    /// skeleton) must NOT fabricate arguments — it yields the schema-validation
+    /// envelope, never a partial call with mispaired values.
+    @Test("nested names without values does not fabricate arguments")
+    func nestedNamesWithoutValuesNoFabrication() {
+        let content = """
+            <zyphra_tool_call>
+            <function=file_write>
+            <parameter>
+            <name>content</name>
+            <type>string</type>
+            </parameter>
+            <parameter>
+            <name>path</name>
+            <type>string</type>
+            </parameter>
+            </function>
+            </zyphra_tool_call>
+            """
+        let call = zayaParser().parse(content: content, tools: fileWrite)
+        // No <value> anywhere → nested gate fails → attribute scan finds no
+        // `<parameter=` → schema validation envelope (not a real call).
+        if let call {
+            #expect(call.function.arguments["path"] == nil)
+            #expect(call.function.arguments["_error"] == .string("invalid_tool_arguments"))
+        }
+    }
+
     /// REGRESSION GUARD: the classic attribute form must be unchanged.
     @Test("attribute-style body is untouched")
     func attributeStyleUnchanged() throws {
