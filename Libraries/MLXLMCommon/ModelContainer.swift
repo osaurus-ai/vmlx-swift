@@ -263,8 +263,41 @@ public final class ModelContainer: Sendable {
 
         let coordinator = CacheCoordinator(config: config)
         coordinator.setHybrid(isHybrid)
+        coordinator.setGenPromptSuffixTokens(await computeGenPromptSuffixTokens())
 
         _cacheCoordinator.withLock { $0 = coordinator }
+    }
+
+    /// Compute the chat template's generation-prompt suffix — the tokens
+    /// `add_generation_prompt=true` appends after the last message — by diffing
+    /// a dummy chat rendered with vs. without the generation prompt. The store
+    /// path uses this to persist an extra cache boundary stripped back to the
+    /// user turn, so the NEXT chat turn (which replaces this suffix with the
+    /// assistant reply) still matches a stored prefix and reuses it. Returns
+    /// `[]` when unavailable/implausible (store then skips the stripped
+    /// boundary; safe).
+    private func computeGenPromptSuffixTokens() async -> [Int] {
+        await context.read { ctx in
+            guard let gp = ctx.tokenizer as? GenerationPromptControllableTokenizer
+            else { return [] }
+            let dummy: [[String: any Sendable]] = [["role": "user", "content": "x"]]
+            guard
+                let withGen = try? gp.applyChatTemplate(
+                    messages: dummy, tools: nil, additionalContext: nil,
+                    addGenerationPrompt: true),
+                let withoutGen = try? gp.applyChatTemplate(
+                    messages: dummy, tools: nil, additionalContext: nil,
+                    addGenerationPrompt: false)
+            else { return [] }
+            var common = 0
+            let maxCommon = min(withGen.count, withoutGen.count)
+            while common < maxCommon, withGen[common] == withoutGen[common] {
+                common += 1
+            }
+            let suffix = Array(withGen[common...])
+            guard (1...64).contains(suffix.count) else { return [] }
+            return suffix
+        }
     }
 
     /// Inspect the loaded model's real cache topology without relying on

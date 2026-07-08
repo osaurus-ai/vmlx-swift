@@ -1435,8 +1435,35 @@ public struct TokenIterator: TokenIteratorProtocol {
                         () -> Int in
                         let count = restoreFromDiskArrays(diskArrays, into: &self.cache)
                         if count > 0 {
+                            // The v2 disk format has NO LayerKind for the
+                            // GatedDeltaNet linear-attention (ArraysCache) state
+                            // used by qwen3.5/ornith, so restoreFromDiskArrays
+                            // serializes those layers as `.skip` and leaves them
+                            // at their initial value on restore. For such caches
+                            // the companion SSM sidecar is the ONLY carrier of
+                            // that recurrent state and MUST be applied even at
+                            // fmtV>=2 — otherwise cross-turn restore feeds the
+                            // model an empty GatedDeltaNet state → wrong output
+                            // (proven: stripped-boundary reuse diverged from the
+                            // cache-off ground truth on GatedDeltaNet MoE). mamba/
+                            // zayaCCA models DO round-trip in v2, so this extra
+                            // apply is gated on the cache actually holding an
+                            // Arrays state (and is a same-value no-op otherwise).
+                            let cacheHasArraysState = self.cache.contains {
+                                String(describing: type(of: $0)).contains("Arrays")
+                            }
+                            if ProcessInfo.processInfo.environment["VMLX_SSM_STORE_TRACE"] != nil {
+                                let types = self.cache.map { String(describing: type(of: $0)) }
+                                let counts = Dictionary(grouping: types, by: { $0 }).mapValues { $0.count }
+                                let ssmN = ssmStates?.count ?? -1
+                                let fmtV = TQDiskSerializer.formatVersion(of: diskArrays)
+                                FileHandle.standardError.write(
+                                    "[vmlx][ssm-restore] types=\(counts) hasArrays=\(cacheHasArraysState) ssmN=\(ssmN) fmtV=\(fmtV) willRestore=\(ssmStates != nil && (fmtV < 2 || cacheHasArraysState))\n"
+                                        .data(using: .utf8)!)
+                            }
                             if let ssm = ssmStates,
                                TQDiskSerializer.formatVersion(of: diskArrays) < 2
+                                || cacheHasArraysState
                             {
                                 restoreSSMStates(ssm, into: self.cache)
                             }
@@ -2045,6 +2072,55 @@ public struct TokenIterator: TokenIteratorProtocol {
                         kvBits: nil,
                         kvMode: .none)
                 }
+                // Cross-turn reuse boundary for hybrid-SSM models (qwen3.5 /
+                // ornith GatedDeltaNet, Nemotron-H Mamba-2, LFM2, ZAYA CCA, …):
+                // store the generation-prompt-STRIPPED prompt, ending just before
+                // the LAST turn-start token (`<|im_start|>` / `<start_of_turn>` —
+                // the first token of the gen-prompt diff computed at load).
+                // `add_generation_prompt` appends `<turn-start>assistant\n` + a
+                // request-dependent scaffold, so we anchor on the structural
+                // turn-start token, not the exact suffix. The NEXT chat turn
+                // replaces that trailing gen prompt with the actual assistant
+                // reply, so the full-prompt key never matches next turn — but
+                // this stripped boundary (ending at the user turn) DOES, which is
+                // what restores hybrid cross-turn prefix reuse (proven live on
+                // qwen-agentworld-35B / qwen3.6-35B-A3B GDN MoE + Qwen3.6-27B MTP:
+                // growing turns HIT the stripped boundary and stay coherent —
+                // byte-identical to cache-off ground truth). Default ON for hybrid
+                // models; disable with `VMLX_HYBRID_STRIPPED_STORE=0`. Dense /
+                // sliding-window models are excluded — they already reuse via the
+                // post-answer boundary and don't need the extra re-derive. The
+                // re-derive runs post-`.info` (after the response is delivered),
+                // so it never adds to the current turn's TTFT or token rate.
+                if ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
+                   coordinator.isHybrid,
+                   !originalInput.hasMediaContent,
+                   let turnStartTok = coordinator.genPromptSuffixTokens.first,
+                   let stripAt = promptTokenIds.lastIndex(of: turnStartTok),
+                   stripAt > 0, stripAt < promptTokenIds.count
+                {
+                    // NOTE: intentionally NOT gated on
+                    // `!cachePrefixTokenCounts.contains(stripAt)`. For hybrid
+                    // caches the history-boundary loop below calls
+                    // `cacheSnapshotForBoundary` WITHOUT `allowDiskBackedRederive`
+                    // and returns nil (path-dependent skip guard), so it never
+                    // stores this boundary — this re-derive store is the only one
+                    // that can, and `stripAt` routinely coincides with a
+                    // `cachePrefixTokenCounts` entry.
+                    let strippedTokens = Array(promptTokenIds.prefix(stripAt))
+                    if let strippedSnapshot = cacheSnapshotForBoundary(
+                        tokens: strippedTokens,
+                        promptSnapshot: promptCacheSnapshot,
+                        allowDiskBackedRederive: true)
+                    {
+                        store(
+                            tokens: strippedTokens,
+                            cache: strippedSnapshot,
+                            kvBits: nil,
+                            kvMode: .none)
+                    }
+                }
+
                 for boundary in Set(cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokenIds.count {
                     let boundaryTokens = Array(promptTokenIds.prefix(boundary))
@@ -2072,7 +2148,8 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     private func cacheSnapshotForBoundary(
         tokens: [Int],
-        promptSnapshot: [KVCache]
+        promptSnapshot: [KVCache],
+        allowDiskBackedRederive: Bool = false
     ) -> [KVCache]? {
         guard !tokens.isEmpty, tokens.count < promptTokenIds.count else {
             return nil
@@ -2086,7 +2163,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             return trimmed
         }
 
-        if shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot) {
+        if !allowDiskBackedRederive,
+           shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot) {
             Self.logger.debug(
                 "TokenIterator: skipped history-boundary cache rederive after trim miss for disk-backed cache topology"
             )
@@ -2111,12 +2189,22 @@ public struct TokenIterator: TokenIteratorProtocol {
                 mediaTokenIds: originalInput.mediaTokenIds,
                 cacheScopeSalt: originalInput.cacheScopeSalt)
             let cache = model.newCache(parameters: cacheInitParameters)
+            // Path-dependent hybrids (Mamba/GatedDeltaNet SSM) leave a cache
+            // state that DEPENDS on the prefill chunk size: a single giant
+            // chunk produces a different recurrent state than the live decode's
+            // chunked prefill, so a boundary re-derived single-chunk would
+            // restore a divergent state → wrong output. Re-derive with the SAME
+            // `prefillStepSize` the live prefill used so the stored boundary
+            // state is bit-identical to what the next turn's own prefill yields.
+            let rederiveWindow = allowDiskBackedRederive
+                ? (cacheInitParameters?.prefillStepSize ?? 512)
+                : effectivePrefillWindow(
+                    requested: promptTokenIds.count,
+                    input: boundaryInput)
             switch try model.prepare(
                 boundaryInput,
                 cache: cache,
-                windowSize: effectivePrefillWindow(
-                    requested: promptTokenIds.count,
-                    input: boundaryInput))
+                windowSize: rederiveWindow)
             {
             case .tokens(let remaining):
                 // Keep the solo TokenIterator rederive path aligned with

@@ -390,12 +390,23 @@ public func restoreSSMStates(_ states: [MLXArray], into cache: [any KVCache]) {
                 stateIdx += existingCount
             }
         } else if let arrays = layer as? ArraysCache {
-            // ArraysCache (non-Mamba variant) — restore however many slots it has
-            let existingCount = arrays.state.count
-            if existingCount > 0, stateIdx + existingCount <= states.count {
-                arrays.state = Array(states[stateIdx..<(stateIdx + existingCount)])
+            // ArraysCache (GatedDeltaNet / linear-attention recurrence, e.g.
+            // qwen3.5/ornith). Use `slotCount` (the fixed number of state
+            // slots), NOT `state.count`: a FRESH cache (the disk-restore target
+            // is `model.newCache`) has all-nil slots, so `state` — which is
+            // `cache.compactMap { $0 }` — returns [] and `state.count == 0`.
+            // Gating on `state.count > 0` (the old code) therefore SKIPPED
+            // restore into every fresh cache, leaving the GatedDeltaNet state
+            // empty so the next turn's prefill built its recurrence from only
+            // the post-boundary tokens → wrong output. A prefilled cache stores
+            // exactly `slotCount` companion arrays, so this consumes the right
+            // span. (Mamba's branch already special-cases the empty cache with
+            // its fixed 2-slot layout; this is the ArraysCache analogue.)
+            let slotCount = arrays.slotCount
+            if slotCount > 0, stateIdx + slotCount <= states.count {
+                arrays.state = Array(states[stateIdx..<(stateIdx + slotCount)])
                     .map { $0[.ellipsis] }
-                stateIdx += existingCount
+                stateIdx += slotCount
             }
         } else if layer is ZayaCCACache {
             // ZAYA CCA restore is owned by the LayerKind.zayaCCA disk payload,
