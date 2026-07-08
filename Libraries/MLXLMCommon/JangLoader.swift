@@ -1167,12 +1167,20 @@ public struct JangLoader: Sendable {
         }
 
         let family = config.capabilities?.family?.lowercased() ?? ""
+        // Fall back to `source_model.architecture` when `capabilities.family` is
+        // absent. Some ZAYA bundles (e.g. ZAYA1-VL JANGTQ) stamp only
+        // `source_model.architecture = zaya1_vl` and omit `capabilities.family`;
+        // without this fallback the tool-aware template never materializes, the
+        // bare role-only template is used, and the model leaks raw `<tool_call>`
+        // XML as visible text. The contract stays data-driven (parser +
+        // think_in_template + supports_tools), just not family-name-only.
+        let arch = config.sourceModel.architecture.lowercased()
         let parser = config.capabilities?.toolParser?.lowercased() ?? ""
         let supportsTools = config.capabilities?.supportsTools
-        let isZayaText = family == "zaya"
-            || family == "zaya1"
-            || family.hasPrefix("zaya1_")
-            || family.hasPrefix("zaya1-")
+        func isZayaIdent(_ s: String) -> Bool {
+            s == "zaya" || s == "zaya1" || s.hasPrefix("zaya1_") || s.hasPrefix("zaya1-")
+        }
+        let isZayaText = isZayaIdent(family) || isZayaIdent(arch)
         return isZayaText
             && ["zaya", "zaya_xml", "zyphra", "zyphra_xml"].contains(parser)
             && config.capabilities?.thinkInTemplate == false
@@ -1185,9 +1193,12 @@ public struct JangLoader: Sendable {
         }
 
         let family = config.capabilities?.family?.lowercased() ?? ""
+        // Same architecture fallback as the text gate: ZAYA1-VL JANGTQ bundles
+        // stamp `source_model.architecture = zaya1_vl` without a `capabilities.family`.
+        let arch = config.sourceModel.architecture.lowercased()
         let parser = config.capabilities?.toolParser?.lowercased() ?? ""
         let supportsTools = config.capabilities?.supportsTools
-        return family.contains("zaya1_vl")
+        return (family.contains("zaya1_vl") || arch.contains("zaya1_vl"))
             && ["zaya", "zaya_xml", "zyphra", "zyphra_xml"].contains(parser)
             && config.capabilities?.thinkInTemplate == false
             && supportsTools != false
