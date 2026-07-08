@@ -151,6 +151,10 @@ public final class DiskCache: @unchecked Sendable {
         let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
         let url = safetensorsURL(for: hash)
         let tokenCount = tokens.count
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            FileHandle.standardError.write(Data(
+                "[vmlx][cache/disk-store] count=\(tokenCount) keys=\(arrays.keys.sorted().prefix(6))\n".utf8))
+        }
 
         // Iter 61: the full write path (realize + save + SQLite insert)
         // must be serialized. MLX.eval AND the safetensors save both

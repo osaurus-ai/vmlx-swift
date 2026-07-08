@@ -1616,8 +1616,28 @@ public actor BatchEngine {
                             () -> Int in
                             let count = restoreFromDiskArrays(diskArrays, into: &slot.cache)
                             if count > 0 {
+                                // The v2 disk format has NO LayerKind for the
+                                // GatedDeltaNet linear-attention (ArraysCache)
+                                // state used by qwen3.5/ornith, so
+                                // restoreFromDiskArrays serializes those layers
+                                // as `.skip` and leaves them at their initial
+                                // (empty) value. For such caches the companion
+                                // SSM sidecar is the ONLY carrier of that
+                                // recurrent state and MUST be applied even at
+                                // fmtV>=2 — otherwise a cross-turn restore feeds
+                                // the model an empty GatedDeltaNet state and the
+                                // reused turn diverges from the cache-off ground
+                                // truth. mamba/zayaCCA DO round-trip in v2, so
+                                // this extra apply is gated on the cache actually
+                                // holding an Arrays state (and is a same-value
+                                // no-op otherwise). Mirrors the solo TokenIterator
+                                // disk-restore path in Evaluate.swift.
+                                let cacheHasArraysState = slot.cache.contains {
+                                    String(describing: type(of: $0)).contains("Arrays")
+                                }
                                 if let ssm = ssmStates,
                                    TQDiskSerializer.formatVersion(of: diskArrays) < 2
+                                    || cacheHasArraysState
                                 {
                                     restoreSSMStates(ssm, into: slot.cache)
                                 }
@@ -2601,7 +2621,7 @@ public actor BatchEngine {
                 )
             }
 
-            func boundarySnapshot(tokens: [Int]) -> [KVCache]? {
+            func boundarySnapshot(tokens: [Int], forceRederive: Bool = false) -> [KVCache]? {
                 guard !tokens.isEmpty, tokens.count < promptTokens.count else {
                     return nil
                 }
@@ -2614,7 +2634,19 @@ public actor BatchEngine {
                     return trimmed
                 }
 
-                if shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptCacheSnapshot) {
+                // `forceRederive` bypasses the disk-backed skip-guard for the
+                // cross-turn gen-suffix-stripped boundary — the ONE boundary the
+                // next chat turn actually reuses. The guard was added to dodge a
+                // Metal command-encoder race between the just-finished decode and
+                // this re-derive; that race is now closed by the evalLock around
+                // encode+commit (vmlx e0e2eb6e), and `finishSlot` runs
+                // synchronously in the scheduling loop, so re-entering
+                // `model.prepare` here no longer races live decode. Path-dependent
+                // hybrid SSM caches aren't trimmable, so without this the stripped
+                // boundary would never be stored and growing hybrid turns could
+                // never reuse prefill.
+                if !forceRederive,
+                   shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptCacheSnapshot) {
                     Self.logger.debug(
                         "Skipped history-boundary cache rederive after trim miss for slot \(slot.id.description, privacy: .public): disk-backed cache topology"
                     )
@@ -2662,6 +2694,10 @@ public actor BatchEngine {
                     MLX.eval(cache)
                     return cache
                 } catch {
+                    if ProcessInfo.processInfo.environment["VMLX_SSM_STORE_TRACE"] != nil {
+                        FileHandle.standardError.write(Data(
+                            "[vmlx][ssm-strip-store] boundarySnapshot rederive THREW: \(String(describing: error))\n".utf8))
+                    }
                     Self.logger.debug(
                         "Skipped history-boundary cache rederive for slot \(slot.id.description, privacy: .public): \(String(describing: error), privacy: .public)"
                     )
@@ -2702,6 +2738,52 @@ public actor BatchEngine {
                             tokens: Array(promptTokens.prefix(boundary)),
                             snapshot: snapshot,
                             label: "history-boundary")
+                    }
+                }
+
+                // Gen-suffix-stripped cross-turn boundary (hybrid SSM).
+                //
+                // The prompt boundary stored above ends in the chat template's
+                // generation-prompt suffix (`<|im_start|>assistant\n`, …). The
+                // NEXT chat turn replaces that suffix with the assistant reply +
+                // the following user turn, so the full-prompt key can never match
+                // as a prefix — which is why growing hybrid turns never reused
+                // prefill and recomputed the whole context every turn. The
+                // boundary the next turn DOES contain as an exact prefix is this
+                // prompt stripped back to the end of the last real (user) message,
+                // i.e. everything before the final turn-start token. Store it so
+                // hybrid multi-turn chat reuses prior prefill.
+                //
+                // Correctness: KV comes from the prompt-boundary trim/re-derive;
+                // clean SSM/GatedDeltaNet state at the stripped position comes from
+                // `storeCacheEntry`'s re-derive (enableSSMReDerive), NOT from the
+                // live post-generation state (which is ahead by the gen suffix).
+                // The store only fires when the prompt's tail actually is the
+                // template's gen-prompt suffix, so non-chat / tool-scaffold prompts
+                // that don't match simply skip it (no reuse, still correct). Proven
+                // cache-ON == cache-OFF on osaurusagent-35b-a3b (GatedDeltaNet MoE).
+                // NOTE: intentionally NOT gated on
+                // `!cachePrefixTokenCounts.contains(stripAt)`. For hybrid caches
+                // the history-boundary path can't store this boundary without a
+                // forced re-derive, and `stripAt` routinely coincides with a
+                // `cachePrefixTokenCounts` entry — gating on it silently disables
+                // the store entirely (the re-derive here is the only writer).
+                if ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
+                   coordinator.isHybrid,
+                   !slot.originalInput.hasMediaContent,
+                   let turnStartToken = coordinator.genPromptSuffixTokens.first,
+                   let stripAt = promptTokens.lastIndex(of: turnStartToken),
+                   stripAt > 0,
+                   stripAt < promptTokens.count - 1
+                {
+                    let strippedTokens = Array(promptTokens.prefix(stripAt))
+                    if let snapshot = boundarySnapshot(
+                        tokens: strippedTokens, forceRederive: true)
+                    {
+                        storeCacheEntry(
+                            tokens: strippedTokens,
+                            snapshot: snapshot,
+                            label: "gen-suffix-stripped")
                     }
                 }
             } else if !slot.originalInput.cachePrefixTokenCounts.isEmpty {

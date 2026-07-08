@@ -101,7 +101,16 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// suppressed the disk-tier lookup that WOULD have hit.
     private var _isPagedIncompatible: Bool = false
 
-    /// Lock protecting `_isHybrid` and `_isPagedIncompatible`.
+    /// The chat template's generation-prompt suffix token sequence — the
+    /// tokens `add_generation_prompt=true` appends (e.g. `<|im_start|>assistant\n`
+    /// + channel/think scaffold). Used to store a cross-turn-reusable cache
+    /// boundary stripped back to the user turn, before the gen prompt that the
+    /// NEXT turn replaces with the assistant reply. Empty = unknown/non-chat
+    /// (stripped-boundary store skipped; safe). See Evaluate.storeCacheAfterGeneration.
+    private var _genPromptSuffixTokens: [Int] = []
+
+    /// Lock protecting `_isHybrid`, `_isPagedIncompatible`, and
+    /// `_genPromptSuffixTokens`.
     private let lock = OSAllocatedUnfairLock()
 
     private struct PostPrepareCacheKeyAlias: Hashable {
@@ -193,6 +202,18 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// cache state can't be reduced to per-token KV blocks.
     public func setPagedIncompatible(_ incompatible: Bool) {
         lock.withLock { _isPagedIncompatible = incompatible }
+    }
+
+    /// Set the chat template's generation-prompt suffix tokens (computed once
+    /// at model load by diffing a dummy chat render with vs. without
+    /// `add_generation_prompt`).
+    public func setGenPromptSuffixTokens(_ tokens: [Int]) {
+        lock.withLock { _genPromptSuffixTokens = tokens }
+    }
+
+    /// The chat template's generation-prompt suffix tokens (may be empty).
+    public var genPromptSuffixTokens: [Int] {
+        lock.withLock { _genPromptSuffixTokens }
     }
 
     /// Whether the model is paged-incompatible (hybrid pool caches).
@@ -323,6 +344,12 @@ public final class CacheCoordinator: @unchecked Sendable {
         mediaSalt: String? = nil,
         skipExactDiskBoundary: Bool = false
     ) -> CacheFetchResult {
+        func ftrace(_ msg: String) {
+            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                FileHandle.standardError.write(Data(
+                    "[vmlx][cache/fetch] \(msg) tokens=\(tokens.count) skipExactDisk=\(skipExactDiskBoundary)\n".utf8))
+            }
+        }
         func hasRequiredHybridSSM(
             _ states: [MLXArray]?,
             diskArrays: [String: MLXArray]? = nil
@@ -406,6 +433,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                     diskArrays: arrays,
                     mediaSalt: mediaSalt)
                 if hasRequiredHybridSSM(ssmStates, diskArrays: arrays) {
+                    ftrace("HIT disk boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))")
                     return .hit(
                         matchedTokens: boundary,
                         remainingTokens: Array(tokens.dropFirst(boundary)),
@@ -438,6 +466,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         }
 
         // All tiers missed
+        ftrace("MISS all tiers")
         return .miss
     }
 

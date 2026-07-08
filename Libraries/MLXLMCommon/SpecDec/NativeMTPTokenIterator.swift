@@ -464,6 +464,40 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                             label: "history-boundary")
                     }
                 }
+
+                // Gen-suffix-stripped cross-turn boundary (hybrid SSM) — same as
+                // the solo TokenIterator path. The prompt boundary ends in the
+                // chat template's generation-prompt suffix, which the NEXT chat
+                // turn replaces with the assistant reply + following user turn, so
+                // the full-prompt key never matches as a prefix. The stripped
+                // boundary (everything before the final turn-start token) DOES,
+                // so store it to enable growing-turn reuse under MTP. Clean SSM
+                // comes from `store`'s re-derive (enableSSMReDerive).
+                if ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
+                   coordinator.isHybrid,
+                   !originalInput.hasMediaContent,
+                   let turnStartToken = coordinator.genPromptSuffixTokens.first,
+                   let stripAt = promptTokenIds.lastIndex(of: turnStartToken),
+                   stripAt > 0,
+                   stripAt < promptTokenIds.count - 1
+                {
+                    // NOTE: intentionally NOT gated on
+                    // `!cachePrefixTokenCounts.contains(stripAt)` — see the solo
+                    // TokenIterator path. For hybrid caches the history-boundary
+                    // loop can't store this boundary (no allowDiskBackedRederive),
+                    // and `stripAt` routinely coincides with a prefix-count entry.
+                    let strippedTokens = Array(promptTokenIds.prefix(stripAt))
+                    if let strippedSnapshot = cacheSnapshotForBoundary(
+                        tokens: strippedTokens,
+                        promptSnapshot: promptCacheSnapshot,
+                        allowDiskBackedRederive: true)
+                    {
+                        store(
+                            tokens: strippedTokens,
+                            snapshot: strippedSnapshot,
+                            label: "gen-suffix-stripped")
+                    }
+                }
             }
 
             if includeGeneratedBoundary,
@@ -589,7 +623,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
     private func cacheSnapshotForBoundary(
         tokens: [Int],
-        promptSnapshot: [KVCache]
+        promptSnapshot: [KVCache],
+        allowDiskBackedRederive: Bool = false
     ) -> [KVCache]? {
         guard !tokens.isEmpty, tokens.count < promptTokenIds.count else {
             return nil
@@ -603,7 +638,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return trimmed
         }
 
-        if shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot) {
+        // `allowDiskBackedRederive` bypasses the disk-backed skip-guard for the
+        // cross-turn gen-suffix-stripped boundary (the one the next turn reuses).
+        // Path-dependent hybrid SSM caches aren't trimmable, so without this the
+        // stripped boundary is never stored and growing hybrid turns can't reuse
+        // prefill. Mirrors the solo TokenIterator path in Evaluate.swift.
+        if !allowDiskBackedRederive,
+           shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot) {
             if Self.traceEnabled {
                 let line =
                     "[NativeMTPTrace] skipped history-boundary cache rederive after trim miss for disk-backed cache topology\n"
