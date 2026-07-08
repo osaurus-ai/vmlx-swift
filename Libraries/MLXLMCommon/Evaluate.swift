@@ -1445,7 +1445,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                             // fmtV>=2 — otherwise cross-turn restore feeds the
                             // model an empty GatedDeltaNet state → wrong output
                             // (proven: stripped-boundary reuse diverged from the
-                            // cache-off ground truth on osaurusagent-35b). mamba/
+                            // cache-off ground truth on GatedDeltaNet MoE). mamba/
                             // zayaCCA models DO round-trip in v2, so this extra
                             // apply is gated on the cache actually holding an
                             // Arrays state (and is a same-value no-op otherwise).
@@ -2084,8 +2084,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // reply, so the full-prompt key never matches next turn — but
                 // this stripped boundary (ending at the user turn) DOES, which is
                 // what restores hybrid cross-turn prefix reuse (proven live on
-                // osaurusagent-35B GDN MoE + Qwen3.6-27B MTP: growing turns HIT
-                // the stripped boundary and stay coherent). Default ON for hybrid
+                // qwen-agentworld-35B / qwen3.6-35B-A3B GDN MoE + Qwen3.6-27B MTP:
+                // growing turns HIT the stripped boundary and stay coherent —
+                // byte-identical to cache-off ground truth). Default ON for hybrid
                 // models; disable with `VMLX_HYBRID_STRIPPED_STORE=0`. Dense /
                 // sliding-window models are excluded — they already reuse via the
                 // post-answer boundary and don't need the extra re-derive. The

@@ -2761,7 +2761,9 @@ public actor BatchEngine {
                 // The store only fires when the prompt's tail actually is the
                 // template's gen-prompt suffix, so non-chat / tool-scaffold prompts
                 // that don't match simply skip it (no reuse, still correct). Proven
-                // cache-ON == cache-OFF on osaurusagent-35b-a3b (GatedDeltaNet MoE).
+                // cache-ON == cache-OFF (byte-identical, temp=0, fresh disk cache)
+                // on qwen-agentworld-35b-a3b MXFP8 (GatedDeltaNet MoE) and
+                // nemotron-omni-nano (Mamba-2); inert on dense gemma-4-e2b.
                 // NOTE: intentionally NOT gated on
                 // `!cachePrefixTokenCounts.contains(stripAt)`. For hybrid caches
                 // the history-boundary path can't store this boundary without a
