@@ -1494,12 +1494,46 @@ public class ToolCallProcessor {
         }
 
         let hasTaggedStartCandidate: Bool = {
-            guard state == .normal,
-                let taggedStart = chunk.firstIndex(of: startChar)
-            else { return false }
-            let suffix = String(chunk[taggedStart...])
-            guard suffix.count > 1 else { return false }
-            return partialMatch(buffer: suffix, tags: startTags, prefixes: startTagPrefixes)
+            guard state == .normal else { return false }
+            // Scan EVERY occurrence of the start character, not just the first,
+            // and treat a lone trailing `<` as a candidate too. Two live
+            // gemma-4-E2B-qat leaks motivate this:
+            //   1. A false `<` earlier in the chunk — ordinary prose such as
+            //      `DOUBLED=<product*2>` — must not mask a real `<|tool_call>`
+            //      later in the SAME chunk. Checking only the first `<` let such
+            //      chunks fall through to the bare-call fallback, which matched
+            //      the `call:` INSIDE `<|tool_call>call:…` and leaked the whole
+            //      envelope.
+            //   2. A chunk ending in a lone `<` (detokenizer split right before
+            //      `|tool_call>`) is the START of a real tag continuing next
+            //      chunk. The old `suffix.count > 1` guard rejected it, so the
+            //      bare-call fallback flushed the buffered leading text WITH the
+            //      trailing `<`, then streamed the tag out piecemeal.
+            // In both cases routing to the tagged path is correct: `firstTag`
+            // locates a complete tag past any false `<`, and a lone `<` is held
+            // in the potential-tool-call buffer until the next chunk resolves
+            // it. `partialMatch` already returns true for a single `<` (it is
+            // the first character of the start tag).
+            //
+            // The lone-trailing-`<` relaxation (case 2) is SCOPED to the
+            // bare-call fallback family — gemma-4 only, per the comment further
+            // down ("Gemma is the only family with bare-call fallback"). That
+            // fallback is the code that flushed the trailing `<`. Other tagged
+            // formats (e.g. DSML request_tool XML) stream `<invoke>`/`<target>`
+            // rails char-by-char and depend on a lone `<` NOT being a start
+            // candidate, so they keep the original length guard.
+            let allowLoneTrailingStart = parser.supportsBareCallToolFallback
+            var searchStart = chunk.startIndex
+            while let taggedStart = chunk[searchStart...].firstIndex(of: startChar) {
+                let suffix = String(chunk[taggedStart...])
+                if suffix.count > 1 || allowLoneTrailingStart,
+                    partialMatch(buffer: suffix, tags: startTags, prefixes: startTagPrefixes)
+                {
+                    return true
+                }
+                searchStart = chunk.index(after: taggedStart)
+            }
+            return false
         }()
 
         if allowInlineFallback && parser.supportsBareCallToolFallback && !hasTaggedStartCandidate {
