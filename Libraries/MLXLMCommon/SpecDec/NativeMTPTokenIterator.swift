@@ -45,6 +45,119 @@ private struct NativeMTPCacheCheckpoint {
     }
 }
 
+/// Structured per-generation diagnostics for native-MTP speculative decoding.
+///
+/// Carries the headline engagement/acceptance counters of the `[NativeMTP]`
+/// summary line the iterator writes to stderr at the end of every generation.
+/// Each field documents the `key=` entry it is assigned from; the assignment
+/// reads the same source values, at the same lifecycle point, as the
+/// `String(format:)` that renders the line, but representation can differ
+/// where a field's doc says so (rounding, `nil` vs `none`, dense histogram).
+/// The struct is a subset: the stderr line remains the complete diagnostic
+/// surface and additionally carries repair/commit counters
+/// (`residualCorrection=`, `prefixCommit=`, `rollbackRepair=`,
+/// `mtpCacheRefresh=`), forward-pass counters, per-phase timing fields,
+/// GDN-replay diagnostics, `phaseDiag=`, and `samplingMode=`, none of which
+/// appear here. Hosts that only need these headline counters can read them
+/// from ``GenerateCompletionInfo/nativeMTPStats`` instead of parsing stderr;
+/// that property is `nil` for any generation that did not run the native-MTP
+/// iterator.
+public struct NativeMTPGenerationStats: Sendable, Equatable {
+    /// Requested draft depth (`depth=`).
+    public let depth: Int
+
+    /// Draft depth in effect at end of generation, after any adaptive
+    /// downshifts (`activeDepth=`).
+    public let activeDepth: Int
+
+    /// Number of verify cycles executed (`verifyCalls=`).
+    public let verifyCalls: Int
+
+    /// The `generatedTokenIds.count` the generate loop passed to
+    /// `storeCacheAfterGeneration` — identical to the stderr `outputTokens=`
+    /// value. Because a generation-ending stop token is counted by the loop
+    /// but never appended to `generatedTokenIds`, this can be one less than
+    /// ``GenerateCompletionInfo/generationTokenCount`` on stop-token paths
+    /// (`outputTokens=`).
+    public let outputTokens: Int
+
+    /// Tokens produced by the autoregressive fallback path
+    /// (`arFallbackTokens=`).
+    public let arFallbackTokens: Int
+
+    /// Histogram of verify cycles by accepted draft count:
+    /// `acceptedByDepth[n]` is the number of cycles that accepted exactly `n`
+    /// draft tokens. Dense representation of the same counts the stderr line
+    /// prints sparsely as non-zero `n:count` pairs — and as the literal
+    /// `none` when the histogram is empty, which here is `[]`
+    /// (`acceptedByDepth=`).
+    public let acceptedByDepth: [Int]
+
+    /// Bonus tokens sampled from the target after full acceptance (`bonus=`).
+    public let bonusTokens: Int
+
+    /// Rejected draft tokens (`rejected=`).
+    public let rejectedTokens: Int
+
+    /// Average committed tokens per verify cycle over the speculative output.
+    /// Stores the same source double the stderr line prints, at full
+    /// precision — the line renders it rounded to two decimals via `%.2f`
+    /// (`avgCommittedPerVerify=`).
+    public let avgCommittedPerVerify: Double
+
+    /// Average draft acceptance probability; 0 under greedy sampling. Stores
+    /// the same source double the stderr line prints, at full precision — the
+    /// line renders it rounded to three decimals via `%.3f` (`avgAcceptP=`).
+    public let avgAcceptProbability: Double
+
+    /// Number of adaptive depth downshifts (`adaptiveDownshifts=`).
+    public let adaptiveDownshifts: Int
+
+    /// Why the adaptive controller fell back to autoregressive decode, or
+    /// `nil` when it did not. `nil` here corresponds exactly to the stderr
+    /// line printing `adaptiveFallback=none`; a non-`nil` reason is printed
+    /// verbatim (`adaptiveFallback=`).
+    public let adaptiveFallbackReason: String?
+
+    /// Verifier mode used for this generation (`verifierMode=`).
+    public let verifierMode: String
+
+    /// Cache handling mode (`cacheMode=`).
+    public let cacheMode: String
+
+    public init(
+        depth: Int,
+        activeDepth: Int,
+        verifyCalls: Int,
+        outputTokens: Int,
+        arFallbackTokens: Int,
+        acceptedByDepth: [Int],
+        bonusTokens: Int,
+        rejectedTokens: Int,
+        avgCommittedPerVerify: Double,
+        avgAcceptProbability: Double,
+        adaptiveDownshifts: Int,
+        adaptiveFallbackReason: String?,
+        verifierMode: String,
+        cacheMode: String
+    ) {
+        self.depth = depth
+        self.activeDepth = activeDepth
+        self.verifyCalls = verifyCalls
+        self.outputTokens = outputTokens
+        self.arFallbackTokens = arFallbackTokens
+        self.acceptedByDepth = acceptedByDepth
+        self.bonusTokens = bonusTokens
+        self.rejectedTokens = rejectedTokens
+        self.avgCommittedPerVerify = avgCommittedPerVerify
+        self.avgAcceptProbability = avgAcceptProbability
+        self.adaptiveDownshifts = adaptiveDownshifts
+        self.adaptiveFallbackReason = adaptiveFallbackReason
+        self.verifierMode = verifierMode
+        self.cacheMode = cacheMode
+    }
+}
+
 struct NativeMTPTokenIterator: TokenIteratorProtocol {
     let model: any NativeMTPModel
     var cache: [KVCache]
@@ -108,6 +221,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var hybridSafetyWarmupComplete = false
     private var adaptiveWindow: [AdaptiveCycle] = []
     private var adaptiveFallbackReason: String?
+    private(set) var nativeMTPStats: NativeMTPGenerationStats?
     private let iteratorStartTime = Date.timeIntervalSinceReferenceDate
 
     private var usesHybridMambaCache: Bool {
@@ -560,6 +674,34 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         } else {
             verifierMode = "sequential_repair"
         }
+        // Structured snapshot of the headline counters of the stderr summary
+        // line below: each stats field is assigned here from the same source
+        // value the corresponding `key=` entry prints, at this same point.
+        // Representation differs where documented (the line rounds
+        // `avgCommittedPerVerify`/`avgAcceptP`, prints a nil fallback reason
+        // as `none`, and renders the histogram sparsely); the line's
+        // repair/forward/timing/diagnostic keys have no struct counterpart.
+        // `generateLoopTask` reads this after `storeCacheAfterGeneration`
+        // returns and carries it on `GenerateCompletionInfo.nativeMTPStats`.
+        let acceptedHistogram: [Int] = {
+            guard let maxAccepted = acceptedByDepth.keys.max() else { return [] }
+            return (0...maxAccepted).map { acceptedByDepth[$0] ?? 0 }
+        }()
+        nativeMTPStats = NativeMTPGenerationStats(
+            depth: depth,
+            activeDepth: currentDepth,
+            verifyCalls: verifyCalls,
+            outputTokens: generatedTokenIds.count,
+            arFallbackTokens: autoregressiveFallbackTokenCount,
+            acceptedByDepth: acceptedHistogram,
+            bonusTokens: bonusCount,
+            rejectedTokens: rejectedCount,
+            avgCommittedPerVerify: avgCommitted,
+            avgAcceptProbability: avgAcceptP,
+            adaptiveDownshifts: adaptiveDepthDownshiftCount,
+            adaptiveFallbackReason: adaptiveFallbackReason,
+            verifierMode: verifierMode,
+            cacheMode: "private-mtp+verifier-prefix-commit")
         let line = String(
             format:
                 "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",

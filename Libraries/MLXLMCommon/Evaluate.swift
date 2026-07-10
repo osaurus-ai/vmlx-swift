@@ -945,6 +945,7 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var promptPrefillTime: TimeInterval { get }
     var promptTokenIds: [Int] { get }
     var turboQuantCompressionCount: Int { get }
+    var nativeMTPStats: NativeMTPGenerationStats? { get }
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool)
@@ -953,6 +954,7 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
 extension TokenIteratorProtocol {
     public var promptTokenIds: [Int] { [] }
     public var turboQuantCompressionCount: Int { 0 }
+    public var nativeMTPStats: NativeMTPGenerationStats? { nil }
 
     public mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
@@ -3523,15 +3525,6 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             MLXPressGenerationProfile.dumpAndReset(
                 reason: "generation-end tokens=\(tokenCount)")
 
-            let info = GenerateCompletionInfo(
-                promptTokenCount: promptTokenCount,
-                generationTokenCount: tokenCount,
-                promptTime: promptTime + iterator.promptPrefillTime,
-                generationTime: generateTime,
-                stopReason: stopReason ?? .cancelled,
-                turboQuantCompressions: iterator.turboQuantCompressionCount,
-                unclosedReasoning: unclosedReasoning
-            )
             // Multi-tier cache: drain the final async token eval before cache
             // snapshot/store, then keep completion info behind the cache-store
             // drain. Local chat/tool consumers may start a post-tool decode as
@@ -3543,6 +3536,27 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 includeGeneratedBoundary: stopReason == .stop
                     && !handler.stopSequenceHit
                     && !handler.emittedToolCall)
+
+            // Build completion info only after `storeCacheAfterGeneration`
+            // returns: the native-MTP iterator snapshots `nativeMTPStats`
+            // there, from the same source values its `[NativeMTP]` stderr
+            // summary line prints for the corresponding keys (`outputTokens`
+            // depends on `generatedTokenIds`, which the iterator only sees
+            // in that call). `.info` is yielded
+            // further below, after the cache-store drain, exactly as before —
+            // only the construction moved — and no iterator mutates
+            // `turboQuantCompressionCount` or `promptPrefillTime` during the
+            // cache store, so every existing field is unchanged.
+            let info = GenerateCompletionInfo(
+                promptTokenCount: promptTokenCount,
+                generationTokenCount: tokenCount,
+                promptTime: promptTime + iterator.promptPrefillTime,
+                generationTime: generateTime,
+                stopReason: stopReason ?? .cancelled,
+                turboQuantCompressions: iterator.turboQuantCompressionCount,
+                unclosedReasoning: unclosedReasoning,
+                nativeMTPStats: iterator.nativeMTPStats
+            )
 
             Stream().synchronize()
 
@@ -3643,6 +3657,16 @@ public struct GenerateCompletionInfo: Sendable {
     /// (no behavior change on non-reasoning workloads).
     public let unclosedReasoning: Bool
 
+    /// Structured native-MTP speculative-decoding diagnostics for this
+    /// generation: the headline counters of the `[NativeMTP]` summary line
+    /// written to stderr, assigned from the same source values at the same
+    /// lifecycle point. Representation differs where
+    /// ``NativeMTPGenerationStats`` says so (rounding, `nil` vs `none`,
+    /// dense histogram), and the stderr line carries additional keys the
+    /// struct omits. `nil` for any generation that did not run the
+    /// native-MTP iterator.
+    public let nativeMTPStats: NativeMTPGenerationStats?
+
     /// The number of tokens processed per second during the prompt phase.
     public var promptTokensPerSecond: Double {
         Double(promptTokenCount) / promptTime
@@ -3660,7 +3684,8 @@ public struct GenerateCompletionInfo: Sendable {
         generationTime: TimeInterval,
         stopReason: GenerateStopReason = .stop,
         turboQuantCompressions: Int = 0,
-        unclosedReasoning: Bool = false
+        unclosedReasoning: Bool = false,
+        nativeMTPStats: NativeMTPGenerationStats? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
@@ -3669,6 +3694,7 @@ public struct GenerateCompletionInfo: Sendable {
         self.stopReason = stopReason
         self.turboQuantCompressions = turboQuantCompressions
         self.unclosedReasoning = unclosedReasoning
+        self.nativeMTPStats = nativeMTPStats
     }
 
     public func summary() -> String {
