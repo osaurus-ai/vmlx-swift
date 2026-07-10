@@ -253,7 +253,19 @@ public class ToolCallProcessor {
                 unparsedText = leadingTextBeforeToolCall + toolCallBuffer
             }
         } else {
-            unparsedText = nil
+            // A successful parse consumes only the ENVELOPE. The prose that
+            // preceded it — held in `leadingTextBeforeToolCall` since the
+            // chunk that carried the start tag — is the visible answer text
+            // and must still surface. Models that stop right after their
+            // envelope (Qwen3.5 `</tool_call>` then EOS) complete the call
+            // HERE rather than on the streaming end-tag path, so dropping
+            // the leading text cut the assistant's sentence mid-word on
+            // essentially every prose-then-tool-call turn ("…removing the
+            // temporary director" — live ornith-1.0-9b). Mirrors the
+            // streaming completion path, including its suppression of a
+            // bare tool-name echo.
+            let leading = visibleLeadingTextBeforeToolCall(parsedToolCalls: parsed)
+            unparsedText = leading.isEmpty ? nil : leading
         }
 
         toolCallBuffer = ""

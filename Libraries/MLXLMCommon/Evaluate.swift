@@ -4311,6 +4311,24 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
             return !stopSequenceHit
         case .reasoning, .prefillProgress, .toolCall, .toolCallProgress, .info:
             if case .toolCall = event {
+                // Drain the stop-string matcher BEFORE the call event goes
+                // out. Text still held there for disambiguation precedes the
+                // call in the model's output, but consumers stop forwarding
+                // text the moment a tool call lands (deliberate no-leak
+                // suppression of post-tool prose) — so a tail emitted after
+                // this event is silently dropped, cutting the visible answer
+                // mid-word ("…removing the temporary director", live ornith).
+                // A stop string can no longer straddle the call boundary, but
+                // stops match the assistant's answer text and a tool call
+                // legitimately ends that span.
+                if stopStringMatcher.isEnabled {
+                    let tail = stopStringMatcher.flush()
+                    if !tail.isEmpty {
+                        if case .terminated = emit(.chunk(tail)) {
+                            return false
+                        }
+                    }
+                }
                 emittedToolCall = true
             }
             if case .terminated = emit(event) {
