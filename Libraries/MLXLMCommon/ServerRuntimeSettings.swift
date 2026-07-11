@@ -483,6 +483,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             base: baseLoadConfiguration.jangPress,
             facts: bundleFacts)
 
+
         var resolvedConcurrency = concurrency
         resolvedConcurrency.maxConcurrentSequences =
             memorySafety.customMaxConcurrentSequences
@@ -510,6 +511,42 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             ?? profile.defaultMaxKVSize
 
         var warnings = profile.warnings
+        // Near-RAM-scale packs must materialize, not mmap. File-backed
+        // weights are "reclaimable under pressure" — for a bundle whose
+        // weights approach physical memory (Hy3-JANG_2K: 94 GB on 128 GB),
+        // macOS cannot keep the full mapping hot next to KV, apps, and the
+        // file cache itself, so decode refaults experts from SSD on every
+        // step: the model answers a 10-token probe in ~a minute, times out
+        // on real turns, and never shows up in RAM — reported live as "it
+        // attempted to load and then nothing happened". Anonymous
+        // (materialized) pages are not reclaimed that way, and a pack this
+        // size fits the working set (87.6 GiB weights vs a ~96 GB budget).
+        // The load fraction is raised to cover the weights plus headroom;
+        // the load entry clamps it to the GPU working set, so an impossible
+        // limit cannot be constructed here.
+        if profile.allowsNearRAMScaleMaterialization,
+            memorySafety.customPhysicalMemoryFraction == nil,
+            let facts = bundleFacts,
+            facts.totalSafetensorsBytes > 0,
+            physicalMemory > 0,
+            Double(facts.totalSafetensorsBytes) > 0.55 * Double(physicalMemory),
+            // Only when the weights actually fit. A pack larger than ~86%
+            // of RAM (e.g. 30 GiB on a 24 GiB host) cannot be made resident
+            // at all — mmap streaming is its only viable mode, and
+            // materializing it would push the host into swap/jetsam.
+            Double(facts.totalSafetensorsBytes) <= 0.86 * Double(physicalMemory)
+        {
+            loadConfiguration.useMmapSafetensors = false
+            let needFraction = min(
+                0.92,
+                Double(facts.totalSafetensorsBytes) / Double(physicalMemory) + 0.06)
+            if needFraction > requestedFraction {
+                loadConfiguration.memoryLimit = .fraction(needFraction)
+            }
+            warnings.append(
+                "Weights (\(facts.totalSafetensorsBytes / 1_073_741_824) GiB) approach physical memory; loading materialized instead of mmap so pages stay resident."
+            )
+        }
         var blockingIssues: [VMLXServerSettingsIssue] = []
 
         if case .diagnosticDangerous = memorySafety.mode {
@@ -1276,6 +1313,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         case .performance:
             return .init(
                 loadFraction: customPhysicalMemoryFraction ?? 0.90,
+                allowsNearRAMScaleMaterialization: true,
                 allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute) ?? .unlimited,
                 maxConcurrentSequences: customMaxConcurrentSequences ?? 2,
                 prefixMemoryLimitMB: nil,
@@ -1287,6 +1325,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         case .balanced:
             return .init(
                 loadFraction: customPhysicalMemoryFraction ?? 0.75,
+                allowsNearRAMScaleMaterialization: true,
                 allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute) ?? .absolute(1 << 30),
                 maxConcurrentSequences: customMaxConcurrentSequences ?? 2,
                 prefixMemoryLimitMB: 512,
@@ -1298,6 +1337,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         case .safeAuto:
             return .init(
                 loadFraction: customPhysicalMemoryFraction ?? 0.70,
+                allowsNearRAMScaleMaterialization: true,
                 allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute) ?? .absolute(128 << 20),
                 maxConcurrentSequences: customMaxConcurrentSequences ?? 1,
                 prefixMemoryLimitMB: 128,
@@ -1334,6 +1374,11 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
 
 fileprivate struct VMLXMemorySafetyProfile: Sendable, Equatable {
     var loadFraction: Double
+    /// Whether this profile may switch a near-RAM-scale bundle from mmap to
+    /// a materialized load (and raise the load fraction to cover it). The
+    /// strict profile keeps its explicit budget authoritative, and the
+    /// diagnostic mode uses caller-supplied limits verbatim.
+    var allowsNearRAMScaleMaterialization: Bool = false
     var allocatorCap: ResidentCap
     var maxConcurrentSequences: Int
     var prefixMemoryLimitMB: Int?
