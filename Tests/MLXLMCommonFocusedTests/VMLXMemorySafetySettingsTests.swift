@@ -183,6 +183,54 @@ struct VMLXMemorySafetySettingsTests {
         #expect(routedPlan.loadConfiguration.jangPress == .auto(envFallback: true))
     }
 
+    @Test("near-RAM-scale packs materialize instead of mmap when they fit")
+    func nearRAMScalePacksMaterializeInsteadOfMmapWhenTheyFit() {
+        var settings = VMLXServerRuntimeSettings()
+        let hy3Scale = LoadBundleFacts(
+            totalSafetensorsBytes: 94 << 30,
+            isRouted: true,
+            physicalMemory: 128 << 30,
+            modelType: "hy_v3",
+            weightFormat: "jang-affine-mixed")
+
+        let plan = settings.resolvedMemorySafetyPlan(
+            baseLoadConfiguration: .osaurusProduction,
+            bundleFacts: hy3Scale)
+        #expect(!plan.loadConfiguration.useMmapSafetensors)
+        #expect(plan.loadConfiguration.memoryLimit == .fraction(94.0 / 128.0 + 0.06))
+        #expect(plan.warnings.contains { $0.contains("materialized instead of mmap") })
+
+        // A user-pinned load fraction wins: the rule must not override it.
+        settings.memorySafety.customPhysicalMemoryFraction = 0.75
+        let pinned = settings.resolvedMemorySafetyPlan(
+            baseLoadConfiguration: .osaurusProduction,
+            bundleFacts: hy3Scale)
+        #expect(pinned.loadConfiguration.useMmapSafetensors)
+        #expect(pinned.loadConfiguration.memoryLimit == .fraction(0.75))
+
+        // Strict mode never opts in.
+        settings.memorySafety.customPhysicalMemoryFraction = nil
+        settings.memorySafety.mode = .strict
+        let strict = settings.resolvedMemorySafetyPlan(
+            baseLoadConfiguration: .osaurusProduction,
+            bundleFacts: hy3Scale)
+        #expect(strict.loadConfiguration.useMmapSafetensors)
+
+        // A pack that cannot fit in RAM keeps mmap streaming.
+        settings.memorySafety.mode = .safeAuto
+        let cannotFit = LoadBundleFacts(
+            totalSafetensorsBytes: 30 << 30,
+            isRouted: false,
+            physicalMemory: 24 << 30,
+            modelType: "gemma4",
+            weightFormat: "mxfp4")
+        let oversized = settings.resolvedMemorySafetyPlan(
+            baseLoadConfiguration: .osaurusProduction,
+            bundleFacts: cannotFit)
+        #expect(oversized.loadConfiguration.useMmapSafetensors)
+        #expect(!oversized.warnings.contains { $0.contains("materialized instead of mmap") })
+    }
+
     @Test("memory safety preserves hybrid SSM and engine selected cache topology")
     func memorySafetyPreservesHybridSSMAndEngineSelectedCacheTopology() {
         var settings = VMLXServerRuntimeSettings()
