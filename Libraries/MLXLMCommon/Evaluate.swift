@@ -1111,6 +1111,11 @@ public struct TokenIterator: TokenIteratorProtocol {
     private static let logger = Logger(subsystem: "vmlx", category: "TokenIterator")
 
     private static func compiledDecodeDenied(for model: any LanguageModel) -> Bool {
+        // A conforming model answers for itself (per-instance, from its own
+        // configuration) and bypasses the name-based fallback below.
+        if let vetoing = model as? CompiledDecodeVetoing {
+            return vetoing.vetoesCompiledDecode
+        }
         let typeName = String(describing: type(of: model)).lowercased()
         if typeName.contains("hy3") || typeName.contains("hunyuan") {
             return true

@@ -807,3 +807,14 @@ public class Hy3Model: Module, LLMModel, KVCacheDimensionProvider {
         model.layers
     }
 }
+
+extension Hy3Model: CompiledDecodeVetoing {
+    /// TurboQuant expert packs stream codebook weights on the CPU
+    /// mid-forward (and diverge under the compiled trace), so they must stay
+    /// on the eager path. The official affine packs run standard `SwitchGLU`
+    /// gather kernels, which trace correctly — and need compile badly: eager
+    /// decode across 80 MoE layers is CPU-encode-bound at ~11 tok/s.
+    public var vetoesCompiledDecode: Bool {
+        configuration.usesTurboQuantRoutedExperts
+    }
+}
