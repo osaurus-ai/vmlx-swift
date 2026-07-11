@@ -682,8 +682,18 @@ extension ReasoningParser {
             || normalized == "hy_v3"
             || normalized.hasPrefix("hy_v3_")
             || compact.hasPrefix("hunyuan")
+            || compact == "tencent"
         {
-            return ReasoningParser(startInReasoning: true)
+            // Official Hunyuan v3 suffixes every protocol marker with
+            // `:opensource` (`<think:opensource>…</think:opensource>`); the
+            // template pre-fills an OPEN think at the prompt tail in
+            // high/low reasoning modes and a CLOSED empty pair in no_think —
+            // `forPrompt(stampName:promptTail:)` resolves the start state
+            // from that tail, which is why these exact tags matter.
+            return ReasoningParser(
+                startTag: "<think:opensource>",
+                endTag: "</think:opensource>",
+                startInReasoning: true)
         }
 
         switch n {
@@ -692,7 +702,6 @@ extension ReasoningParser {
             "nemotron", "nemotron_h", "minimax", "minimax_m2",
             "kimi", "kimi_k2", "kimik2",
             "laguna", "laguna_xs", "laguna_s",
-            "hy3", "hy_v3", "hy-v3", "hunyuan", "tencent",
             "zaya", "zaya1", "zaya2",
             "step", "stepfun", "step3p5", "step3p7", "step3_5", "step3_7":
             // Start inside the reasoning block — matches the Qwen 3.x
@@ -904,6 +913,12 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
         .replacingOccurrences(of: ".", with: "_")
     let compact = normalized.replacingOccurrences(of: "_", with: "")
 
+    // Official Hunyuan v3 uses `:opensource`-suffixed think markers; the
+    // dedicated stamp resolves to that parser (see `fromCapabilityName`).
+    if compact.hasPrefix("hy3") || compact.hasPrefix("hyv3") || compact.hasPrefix("hunyuan") {
+        return "hy_v3"
+    }
+
     // Gemma-4 harmony channel envelope: `<|channel>thought\n…<channel|>`.
     // Distinct from `<think>` XML.
     if compact.hasPrefix("gemma4") {
@@ -970,9 +985,6 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
                         // bundle lacks a JANG reasoning stamp, model_type
                         // fallback must still route pre-`</think>` bytes to
                         // `.reasoning` instead of `.chunk`.
-        "hy3",          // Tencent Hunyuan v3 aliases. Real JANG bundles stamp
-        "hyv3",         // `capabilities.reasoning_parser = "qwen3"`, but
-                        // non-JANG/fallback paths should still pick think_xml.
         "mimo",         // MiMo-V2 templates use the same `<think>` envelope.
         "step3p5",      // StepFun Step 3.5 text runtime / parser family.
         "step3p7",      // Step 3.7 VLM wrapper uses Step 3.5 text template.

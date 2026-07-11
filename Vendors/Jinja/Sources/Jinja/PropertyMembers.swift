@@ -127,6 +127,75 @@ public enum PropertyMembers {
                 }
                 return .boolean(str.hasPrefix(prefix))
             }
+        case "format":
+            // Python `str.format` subset used by chat templates (Hunyuan v3's
+            // official template builds every special-token string with
+            // `'<x{}>'.format(HYTK)`): auto-numbered `{}`, indexed `{0}`,
+            // named `{key}` fields, and `{{`/`}}` literal-brace escapes.
+            // Format specs (`{:>8}`) are rejected rather than mis-rendered.
+            return .function { args, kwargs, _ in
+                var result = ""
+                var autoIndex = 0
+                var iterator = str.makeIterator()
+                while let ch = iterator.next() {
+                    if ch == "{" {
+                        guard let next = iterator.next() else {
+                            throw JinjaError.runtime("format() has a dangling '{'")
+                        }
+                        if next == "{" {
+                            result.append("{")
+                            continue
+                        }
+                        var field = ""
+                        var current: Character? = next
+                        while let c = current, c != "}" {
+                            field.append(c)
+                            current = iterator.next()
+                        }
+                        guard current == "}" else {
+                            throw JinjaError.runtime("format() has an unterminated field")
+                        }
+                        guard !field.contains(":") && !field.contains("!") else {
+                            throw JinjaError.runtime(
+                                "format() specs/conversions ('\(field)') are not supported")
+                        }
+                        let value: Value
+                        if field.isEmpty {
+                            guard autoIndex < args.count else {
+                                throw JinjaError.runtime(
+                                    "format() ran out of positional arguments")
+                            }
+                            value = args[autoIndex]
+                            autoIndex += 1
+                        } else if let index = Int(field) {
+                            guard index >= 0, index < args.count else {
+                                throw JinjaError.runtime(
+                                    "format() index \(index) out of range")
+                            }
+                            value = args[index]
+                        } else {
+                            guard let named = kwargs[field] else {
+                                throw JinjaError.runtime(
+                                    "format() missing keyword argument '\(field)'")
+                            }
+                            value = named
+                        }
+                        result += stringifyForFormat(value)
+                    } else if ch == "}" {
+                        if let next = iterator.next() {
+                            guard next == "}" else {
+                                throw JinjaError.runtime("format() has a stray '}'")
+                            }
+                            result.append("}")
+                        } else {
+                            throw JinjaError.runtime("format() has a stray '}'")
+                        }
+                    } else {
+                        result.append(ch)
+                    }
+                }
+                return .string(result)
+            }
         case "endswith":
             return .function { args, kwargs, _ in
                 let arguments = try resolveCallArguments(
@@ -288,5 +357,19 @@ private func replace(string: String, old: String, new: String, maxReplacements: 
         return result
     } else {
         return string.replacingOccurrences(of: old, with: new)
+    }
+}
+
+/// Render a `format()` argument the way Python renders `str(x)` in a
+/// formatted field: bare strings without quotes, numbers/booleans in their
+/// canonical text form.
+private func stringifyForFormat(_ value: Value) -> String {
+    switch value {
+    case .string(let s): return s
+    case .int(let i): return String(i)
+    case .double(let d): return String(d)
+    case .boolean(let b): return b ? "True" : "False"
+    case .null, .undefined: return "None"
+    default: return value.description
     }
 }

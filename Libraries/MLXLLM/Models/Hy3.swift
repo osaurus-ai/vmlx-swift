@@ -69,6 +69,18 @@ public struct Hy3Configuration: Codable, Sendable {
     public var routedExpertGateUpBits: Int? { mxtqGateUpBits ?? mxtqBits }
     public var routedExpertDownBits: Int? { mxtqDownBits ?? mxtqBits }
 
+    /// Whether the pack ships JANGTQ codebook routed experts (the Hy3-preview
+    /// conversion: `weight_format`/`mxtq_*` present, per-expert `tq_packed`
+    /// tensors) as opposed to the official-release JANG affine conversion
+    /// (pre-stacked `switch_mlp.{proj}.{weight,scales,biases}`, per-module
+    /// bits in `config.quantization`, no mxtq markers). Selects the MoE
+    /// expert module: TurboQuant codebook kernels vs the standard SwitchGLU
+    /// that the affine quantize walk wraps into QuantizedSwitchLinear.
+    public var usesTurboQuantRoutedExperts: Bool {
+        if let weightFormat, weightFormat.lowercased().contains("tq") { return true }
+        return mxtqBits != nil || mxtqGateUpBits != nil || mxtqDownBits != nil
+    }
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case architectures
@@ -465,6 +477,42 @@ class Hy3MoE: Module, UnaryLayer {
     }
 }
 
+/// Routed experts for the official-release affine packs: the same
+/// sigmoid+expert-bias gate and always-on shared expert as `Hy3MoE`, with the
+/// standard `SwitchGLU` expert bank instead of the TurboQuant codebook path.
+/// The pack ships pre-stacked `switch_mlp.{proj}.{weight,scales,biases}`, and
+/// the JANG affine quantize walk wraps each projection into
+/// `QuantizedSwitchLinear` from the per-module bits in `config.quantization`
+/// (2-bit routed experts on JANG_2L) — the same hydration path DeepseekV3 /
+/// Kanana packs use.
+class Hy3AffineMoE: Module, UnaryLayer {
+    let layerIdx: Int
+
+    @ModuleInfo(key: "gate") var gate: Hy3MoEGate
+    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    @ModuleInfo(key: "shared_experts") var sharedExperts: Hy3MLP
+
+    init(_ configuration: Hy3Configuration, layerIdx: Int) {
+        self.layerIdx = layerIdx
+        _gate.wrappedValue = Hy3MoEGate(configuration)
+        _switchMLP.wrappedValue = SwitchGLU(
+            inputDims: configuration.hiddenSize,
+            hiddenDims: configuration.moeIntermediateSize,
+            numExperts: configuration.numExperts)
+        _sharedExperts.wrappedValue = Hy3MLP(
+            dimensions: configuration.hiddenSize,
+            hiddenDimensions: configuration.moeIntermediateSize * configuration.numSharedExperts)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let (indices, scores) = gate(x)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
+        let y = switchMLP(x, indices)
+        let routed = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        return routed + sharedExperts(x)
+    }
+}
+
 // MARK: - Logit head
 
 func hy3LMHead(_ hidden: MLXArray, _ lmHead: Linear) -> MLXArray {
@@ -502,7 +550,10 @@ class Hy3DecoderLayer: Module {
             eps: configuration.rmsNormEps)
 
         if layerIdx >= configuration.firstKDenseReplace {
-            mlp = Hy3MoE(configuration, layerIdx: layerIdx)
+            mlp =
+                configuration.usesTurboQuantRoutedExperts
+                ? Hy3MoE(configuration, layerIdx: layerIdx)
+                : Hy3AffineMoE(configuration, layerIdx: layerIdx)
         } else {
             mlp = Hy3MLP(
                 dimensions: configuration.hiddenSize,

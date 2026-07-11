@@ -5040,6 +5040,16 @@ private func loadBenchTokenizer(from modelDir: URL) async throws -> (any MLXLMCo
 /// Tokenizer-only smoke for model-family chat-template compatibility.
 /// It catches missing templates, swift-jinja parser/runtime failures,
 /// lost tool schemas, and raw Jinja leakage before a full model load.
+/// Read `model_type` from the bundle's config.json so the template smoke can
+/// apply the same per-family context adapters the real request path applies.
+func modelTypeForTemplateSmoke(modelPath: String) -> String? {
+    let url = URL(fileURLWithPath: modelPath).appendingPathComponent("config.json")
+    guard let data = try? Data(contentsOf: url),
+        let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    return obj["model_type"] as? String
+}
+
 func runTemplateSmoke(modelPath: String) async throws {
     struct TemplateSmokeCase {
         let label: String
@@ -5203,10 +5213,18 @@ func runTemplateSmoke(modelPath: String) async throws {
     for testCase in cases {
         do {
             let start = CFAbsoluteTimeGetCurrent()
+            // Route the raw request context through the same per-family
+            // template adapter the real request path applies in
+            // `LLMModelFactory.prepare` — hy_v3 clamps `reasoning_effort`
+            // ("max" → "high") and maps `enable_thinking` to the template's
+            // no_think/low/high contract; every other family passes through.
+            let adaptedContext = Hy3ReasoningTemplateContext.apply(
+                additionalContext: testCase.context,
+                modelType: modelTypeForTemplateSmoke(modelPath: modelPath))
             let ids = try tokenizer.applyChatTemplate(
                 messages: testCase.messages,
                 tools: testCase.tools,
-                additionalContext: testCase.context)
+                additionalContext: adaptedContext)
             let renderMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
             let text = tokenizer.decode(tokenIds: ids, skipSpecialTokens: false)
             var directProfile = "direct=unavailable"
@@ -5220,7 +5238,7 @@ func runTemplateSmoke(modelPath: String) async throws {
                 if let tools = testCase.tools {
                     rawContext["tools"] = tools
                 }
-                if let context = testCase.context {
+                if let context = adaptedContext {
                     for (key, value) in context {
                         rawContext[key] = value
                     }

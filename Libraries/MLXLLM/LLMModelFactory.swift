@@ -1172,7 +1172,10 @@ private struct LLMUserInputProcessor: UserInputProcessor {
     }
 
     func prepare(input: UserInput) throws -> LMInput {
-        let additionalContext = mergedAdditionalContext(input.additionalContext)
+        let additionalContext = Hy3ReasoningTemplateContext.apply(
+            additionalContext: mergedAdditionalContext(input.additionalContext),
+            modelType: modelType
+        )
         let bailingMessages = BailingThinkingTemplateContext.apply(
             to: messageGenerator.generate(from: input),
             modelType: modelType,
