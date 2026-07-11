@@ -319,11 +319,21 @@ public actor BatchEngine {
     /// Maximum B=1 decode steps before yielding back to the actor executor.
     private let controlPlaneYieldInterval: Int = 8
 
-    /// Hy3/Hunyuan, Laguna, and MiniMax currently decode coherently on the uncompiled
-    /// path but diverge on the single-slot compiled trace. Keep compile opt-in
+    /// Laguna and MiniMax currently decode coherently on the uncompiled path
+    /// but diverge on the single-slot compiled trace. Keep compile opt-in
     /// from silently taking those unsafe routes until each model path has a
     /// dedicated compiled-vs-uncompiled parity test.
+    ///
+    /// A model conforming to `CompiledDecodeVetoing` answers for itself and
+    /// bypasses the name-based fallback entirely: Hy3 vetoes only its
+    /// TurboQuant streaming-expert packs (mid-forward CPU weight streaming is
+    /// untraceable), while the official affine `SwitchGLU` packs compile —
+    /// eager decode on those is CPU-encode-bound (~2,800 kernel encodes per
+    /// token across 80 layers).
     private var compiledDecodeDeniedForModel: Bool {
+        if let vetoing = context.model as? CompiledDecodeVetoing {
+            return vetoing.vetoesCompiledDecode
+        }
         if context.configuration.toolCallFormat == .hunyuan {
             return true
         }
@@ -1958,6 +1968,7 @@ public actor BatchEngine {
             slot.generatedTokenCount += 1
             slot.generatedTokenIds.append(tokenID)
             slot.nextToken = firstToken
+            slot.nextTokenAlreadyRouted = true
 
             if let maxTokens = slot.maxTokens, slot.generatedTokenCount >= maxTokens {
                 finishSlot(slot, reason: .length)
@@ -2078,6 +2089,7 @@ public actor BatchEngine {
             slot.generatedTokenCount += 1
             slot.generatedTokenIds.append(tokenID)
             slot.nextToken = token
+            slot.nextTokenAlreadyRouted = true
 
             if let maxTokens = slot.maxTokens, slot.generatedTokenCount >= maxTokens {
                 finishSlot(slot, reason: .length)
@@ -2435,6 +2447,52 @@ public actor BatchEngine {
         }
         asyncEval(sampledTokens)
 
+        // B=1 two-deep pipeline: the freshly sampled token is NOT synced
+        // here. Instead the ROUTE of the previous iteration's token (this
+        // forward's own input, whose value finished computing during this
+        // iteration's graph build) happens now, while the GPU is already
+        // running the step just enqueued. mlx_lm's generate_step uses the
+        // same structure; without it the loop serializes graph-build → GPU →
+        // item() every token, which measured 10.1 tok/s on an 80-layer MoE
+        // where the pipelined Python runtime reaches 30.6 on the same
+        // machine. Stop conditions are therefore detected one step late; the
+        // extra in-flight step's KV entry is trimmed so cache-coordinator
+        // stores keep exact prompt-boundary offsets.
+        if B == 1, slotSupportsPipelinedDecode(activeSlots[slotIndices[0]]) {
+            var slot = activeSlots[slotIndices[0]]
+            let fresh = sampledTokens[0]
+            if slot.nextTokenAlreadyRouted {
+                // The input token was already surfaced (prefill's first
+                // token, or a sync-path step). Nothing to route this round.
+                slot.nextToken = fresh
+                slot.nextTokenAlreadyRouted = false
+                activeSlots[slotIndices[0]] = slot
+                return
+            }
+            guard let routed = slot.nextToken else {
+                activeSlots[slotIndices[0]] = slot
+                return
+            }
+            let tokenID = routed.item(Int.self)
+            if stopTokenIDs.contains(tokenID) {
+                trimPipelinedOverstep(&slot)
+                finishSlot(slot, reason: .stop)
+                slot.isFinished = true
+            } else {
+                slot.continuation.yield(.token(tokenID))
+                slot.generatedTokenCount += 1
+                slot.generatedTokenIds.append(tokenID)
+                slot.nextToken = fresh
+                if let maxTokens = slot.maxTokens, slot.generatedTokenCount >= maxTokens {
+                    trimPipelinedOverstep(&slot)
+                    finishSlot(slot, reason: .length)
+                    slot.isFinished = true
+                }
+            }
+            activeSlots[slotIndices[0]] = slot
+            return
+        }
+
         // Sample per sequence and route results
         for (batchIdx, slotIdx) in slotIndices.enumerated() {
             var slot = activeSlots[slotIdx]
@@ -2463,6 +2521,7 @@ public actor BatchEngine {
                 slot.generatedTokenCount += 1
                 slot.generatedTokenIds.append(tokenID)
                 slot.nextToken = token
+                slot.nextTokenAlreadyRouted = true
 
                 if let maxTokens = slot.maxTokens, slot.generatedTokenCount >= maxTokens {
                     finishSlot(slot, reason: .length)
@@ -2471,6 +2530,35 @@ public actor BatchEngine {
             }
 
             activeSlots[slotIdx] = slot
+        }
+    }
+
+    /// Whether a slot may take the two-deep pipelined B=1 decode route.
+    ///
+    /// Restricted to plain `KVCacheSimple` topologies with no live KV
+    /// quantization and no logit processor:
+    /// - trimming the one over-stepped KV entry on late stop detection is
+    ///   only proven for the simple cache (rotating/SSM/hybrid states are
+    ///   not one-token-trimmable),
+    /// - TurboQuant's per-step compression hook mutates the cache between
+    ///   steps and must stay strictly ordered with the forward,
+    /// - a logit processor may sync the sampled token internally
+    ///   (`didSample`), which would silently re-serialize the loop.
+    private func slotSupportsPipelinedDecode(_ slot: BatchSlot) -> Bool {
+        guard slot.processor == nil else { return false }
+        guard case .none = slot.parameters.kvMode else { return false }
+        guard slot.parameters.kvBits == nil else { return false }
+        return slot.cache.allSatisfy { type(of: $0) == KVCacheSimple.self }
+    }
+
+    /// Drop the KV entry written by the forward pass that ran before the
+    /// stop was detected (pipelined decode detects stops one step late), so
+    /// the cache's offsets — and every prompt/post-answer boundary the cache
+    /// coordinator stores from them — match what the sync path would have
+    /// produced.
+    private func trimPipelinedOverstep(_ slot: inout BatchSlot) {
+        for layer in slot.cache where layer.isTrimmable {
+            _ = layer.trim(1)
         }
     }
 

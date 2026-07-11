@@ -87,6 +87,15 @@ struct BatchSlot {
     /// The next token to feed into the model (last sampled token during decode).
     var nextToken: MLXArray?
 
+    /// True when `nextToken` has already been surfaced to the consumer.
+    ///
+    /// Prefill routes the first sampled token itself (EOS check + yield) so
+    /// TTFT isn't delayed; the pipelined B=1 decode path must therefore skip
+    /// routing on its first iteration and only start routing from the second
+    /// input token. The sync decode path ignores this flag (it routes the
+    /// freshly sampled token, never the input).
+    var nextTokenAlreadyRouted: Bool = false
+
     /// Current generation phase.
     var phase: SlotPhase = .prefill
 

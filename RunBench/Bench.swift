@@ -1073,10 +1073,19 @@ final class NullTokenizerLoader: TokenizerLoader, @unchecked Sendable {
 }
 
 private func loadBenchModelContext(from modelDir: URL) async throws -> ModelContext {
+    var loadConfiguration = LoadConfiguration.osaurusProduction
+    // Near-RAM-scale packs (Hy3-JANG_2K: 94 GB) refault from SSD on every
+    // decode step under the default mmap load, which turns any timing this
+    // bench reports into an SSD benchmark. Opt into a materialized load to
+    // measure real decode throughput.
+    if ProcessInfo.processInfo.environment["VMLX_BENCH_MATERIALIZE"] == "1" {
+        loadConfiguration.useMmapSafetensors = false
+        loadConfiguration.memoryLimit = .fraction(0.92)
+    }
     let loaded = try await MLXLMCommon.loadModel(
         from: modelDir,
         using: #huggingFaceTokenizerLoader(),
-        loadConfiguration: .osaurusProduction)
+        loadConfiguration: loadConfiguration)
     return loaded.0
 }
 
@@ -7669,9 +7678,18 @@ func runPerfBench(
                 context = loaded.0
                 jangPressRuntime = loaded.1
             } else {
-                context = try await MLXLMCommon.loadModel(
-                    from: modelDir, using: #huggingFaceTokenizerLoader())
-                jangPressRuntime = nil
+                // BENCH_PERF_MMAP=0 promises a materialized load, but the
+                // bare `loadModel` default is mmap-on — near-RAM-scale packs
+                // then refault from SSD per token and the "perf" numbers
+                // measure the disk. Pass the flag explicitly.
+                let loaded = try await MLXLMCommon.loadModel(
+                    from: modelDir,
+                    using: #huggingFaceTokenizerLoader(),
+                    loadConfiguration: LoadConfiguration(
+                        memoryLimit: .fraction(0.92),
+                        useMmapSafetensors: false))
+                context = loaded.0
+                jangPressRuntime = loaded.1
             }
         }
         let rssAfterLoad = currentRSSMiB()
@@ -7865,6 +7883,13 @@ func runPerfBench(
             }
             if let perfSeed {
                 params.randomSeed = perfSeed
+            }
+            // BENCH_COMPILE_DECODE=1: route decode through the Stage 1B.3
+            // compiled trace so eager-vs-compiled tok/s can be compared with
+            // the same deterministic harness.
+            params.enableCompiledBatchDecode = (env["BENCH_COMPILE_DECODE"] ?? "0") == "1"
+            if let compileMaxLen = env["BENCH_COMPILE_MAXLEN"].flatMap(Int.init) {
+                params.compiledMaxCacheLength = compileMaxLen
             }
             if let override = env["BENCH_PERF_TEMP"].flatMap(Float.init) {
                 params.temperature = override
@@ -8063,6 +8088,20 @@ func runPerfBench(
             return result
         }
 
+        // BENCH_PERF_WIRED=1: raise the wired limit for the measurement,
+        // mirroring mlx_lm's `wired_limit` context. Python decodes
+        // Hy3-JANG_2K at ~30 tok/s where the unwired Swift path measures
+        // ~10; wiring is the first suspect for that gap on near-RAM packs.
+        let wiredTicket: WiredMemoryTicket?
+        if env["BENCH_PERF_WIRED"] == "1" {
+            let size = Int(Double(ProcessInfo.processInfo.physicalMemory) * 0.84)
+            wiredTicket = WiredSumPolicy(id: UUID()).ticket(size: size)
+            let applied = await wiredTicket!.start()
+            print("PERF_WIRED limit=\(applied)")
+        } else {
+            wiredTicket = nil
+        }
+
         for i in 0..<warmup {
             _ = try await oneTurn("warmup\(i)")
         }
@@ -8078,6 +8117,7 @@ func runPerfBench(
             lastGenSec = result.genSec
             lastResult = result
         }
+        if let wiredTicket { _ = await wiredTicket.end() }
         await engine.shutdown()
 
         let median = tokps.sorted()[tokps.count / 2]
