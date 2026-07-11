@@ -21,7 +21,7 @@ struct Hy3ParserDispatchTests {
             #expect(ReasoningParser.fromCapabilityName(stamp) != nil)
         }
         for modelType in ["hy_v3", "hy-v3", "hy3", "Hy3"] {
-            #expect(reasoningStampFromModelType(modelType) == "think_xml")
+            #expect(reasoningStampFromModelType(modelType) == "hy_v3")
         }
     }
 

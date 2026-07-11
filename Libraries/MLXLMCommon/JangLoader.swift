@@ -415,11 +415,25 @@ public enum ParserResolution {
         // assistant output into `.reasoning` and prevents tool extraction.
         // Keep the tool parser stamp, but demote the impossible reasoning
         // stamp back to the model-type/template resolver.
-        return family.hasPrefix("lfm2")
+        if family.hasPrefix("lfm2")
             || family.contains("lfm")
             || type.hasPrefix("lfm2")
             || compactType.hasPrefix("lfm25")
             || toolParser == "lfm2"
+        {
+            return true
+        }
+
+        // Official Hunyuan v3 emits `:opensource`-suffixed think markers
+        // (`<think:opensource>…</think:opensource>`), but converted bundles
+        // stamp the generic `reasoning_parser=qwen3` — a plain-`<think>`
+        // parser that can never match the model's actual markers, so the
+        // whole answer leaks as content with protocol tags embedded. Demote
+        // the generic stamp back to the model-type resolver, which returns
+        // the hy_v3-specific parser.
+        return family == "hy_v3" || family.hasPrefix("hy_v3")
+            || compactType.hasPrefix("hyv3") || compactType.hasPrefix("hy3")
+            || compactType.hasPrefix("hunyuan")
     }
 
     private static func declaresLFM25ThinkingTemplate(

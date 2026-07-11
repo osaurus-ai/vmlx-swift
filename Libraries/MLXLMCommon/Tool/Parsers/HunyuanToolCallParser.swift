@@ -21,6 +21,24 @@ public struct HunyuanToolCallParser: ToolCallParser, Sendable {
     public let startTag: String? = "<tool_calls>"
     public let endTag: String? = "</tool_calls>"
 
+    /// Official Hunyuan v3 suffixes every protocol marker with `:opensource`
+    /// (`<tool_calls:opensource>…`); the preview conversion used the bare
+    /// spellings. Both are accepted: the processor state machine matches
+    /// either wrapper via these aliases, and `normalize` collapses the
+    /// suffix before the body is parsed so one marker set serves both
+    /// generations. An argument VALUE containing the literal
+    /// `":opensource>"` would be collapsed too — accepted; the sequence
+    /// cannot appear in real argument text without the model already
+    /// speaking the protocol.
+    public var startTagAliases: [String] { ["<tool_calls>", "<tool_calls:opensource>"] }
+    public var endTagAliases: [String] { ["</tool_calls>", "</tool_calls:opensource>"] }
+
+    private func normalize(_ text: String) -> String {
+        text.contains(":opensource>")
+            ? text.replacingOccurrences(of: ":opensource>", with: ">")
+            : text
+    }
+
     private let toolCallStart = "<tool_call>"
     private let toolCallEnd = "</tool_call>"
     private let toolSeparator = "<tool_sep>"
@@ -34,7 +52,7 @@ public struct HunyuanToolCallParser: ToolCallParser, Sendable {
     public func isValidPartialContent(_ toolCallBuffer: String) -> Bool {
         guard let startTag else { return true }
 
-        var text = toolCallBuffer
+        var text = normalize(toolCallBuffer)
         if text.hasPrefix(startTag) {
             text.removeFirst(startTag.count)
         }
@@ -45,10 +63,16 @@ public struct HunyuanToolCallParser: ToolCallParser, Sendable {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return true }
 
-        if body.count <= toolCallStart.count {
-            return toolCallStart.hasPrefix(body)
+        // `normalize` collapses COMPLETE `:opensource` markers, but the
+        // buffer's trailing marker can still be mid-suffix
+        // (`<tool_call:opens`), so the partial check must accept both
+        // spellings directly.
+        let inner = [toolCallStart, "<tool_call:opensource>"]
+        return inner.contains { candidate in
+            body.count <= candidate.count
+                ? candidate.hasPrefix(body)
+                : body.hasPrefix(candidate)
         }
-        return body.hasPrefix(toolCallStart)
     }
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
@@ -60,7 +84,7 @@ public struct HunyuanToolCallParser: ToolCallParser, Sendable {
     }
 
     private func parseCalls(_ content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
-        let block = stripOuterWrapper(content)
+        let block = stripOuterWrapper(normalize(content))
         var calls: [ToolCall] = []
         var searchRange = block.startIndex..<block.endIndex
 
