@@ -249,6 +249,16 @@ public protocol Tokenizer: Sendable {
     /// - Returns: An array of token IDs
     func encode(text: String, addSpecialTokens: Bool) -> [Int]
 
+    /// `encode`, but a token the vocabulary cannot represent is reported rather than fatal.
+    ///
+    /// `encode` force-unwraps the token→id lookup, so a piece that is absent from the vocab
+    /// in a tokenizer that declares no unknown token takes the process down. Callers that
+    /// feed the tokenizer text they did not author — a chat template's control markers, say —
+    /// need to be able to survive a bundle that never shipped one of those markers.
+    ///
+    /// - Throws: `TokenizerError.unencodableToken` naming the offending piece.
+    func encodeThrowing(text: String, addSpecialTokens: Bool) throws -> [Int]
+
     /// Function call syntax for encoding text.
     ///
     /// - Parameters:
@@ -405,6 +415,16 @@ public protocol Tokenizer: Sendable {
 
 extension Tokenizer {
     public var hasChatTemplate: Bool { false }
+
+    /// Default: defer to `encode`.
+    ///
+    /// `PreTrainedTokenizer` overrides this with a real implementation, and it is the type
+    /// that force-unwraps the token→id lookup — so it is the one that could take the process
+    /// down, and the one that now reports instead. A conformer that cannot fail that way loses
+    /// nothing by inheriting this; a conformer that CAN must override it, or it keeps the trap.
+    public func encodeThrowing(text: String, addSpecialTokens: Bool = true) throws -> [Int] {
+        encode(text: text, addSpecialTokens: addSpecialTokens)
+    }
 
     /// Call previous signature for backwards compatibility
     func applyChatTemplate(
