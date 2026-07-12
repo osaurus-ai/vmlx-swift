@@ -7866,6 +7866,21 @@ func runPerfBench(
             if let perfSeed {
                 params.randomSeed = perfSeed
             }
+            // BENCH_COMPILE_DECODE=1 routes decode through the compiled trace so
+            // eager-vs-compiled tok/s can be compared on the same deterministic
+            // harness.
+            //
+            // The perf bench used to SILENTLY IGNORE this variable. The only thing
+            // that set compile here was `enableCompiledDecode = useTokenIterator`,
+            // so a `BENCH_COMPILE_DECODE=1` run on the default `path=batch` measured
+            // the EAGER path and reported it as compiled — every "compiled decode is
+            // worth N%" figure taken from this bench on the batch path was actually
+            // eager-vs-eager. A flag that a harness accepts and drops is worse than
+            // one it rejects: it manufactures a comparison nobody ran.
+            params.enableCompiledBatchDecode = (env["BENCH_COMPILE_DECODE"] ?? "0") == "1"
+            if let compileMaxLen = env["BENCH_COMPILE_MAXLEN"].flatMap(Int.init) {
+                params.compiledMaxCacheLength = compileMaxLen
+            }
             if let override = env["BENCH_PERF_TEMP"].flatMap(Float.init) {
                 params.temperature = override
             }
