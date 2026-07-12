@@ -25,6 +25,10 @@ public enum TokenizerError: LocalizedError {
     case chatTemplate(String)
     case missingChatTemplate
     case tooLong(String)
+    /// A piece the vocabulary cannot represent, in a tokenizer that declares no unknown
+    /// token to stand in for it. Usually a chat-template control marker the bundle never
+    /// shipped.
+    case unencodableToken(String)
     case mismatchedConfig(String)
 
     public var errorDescription: String? {
@@ -43,6 +47,11 @@ public enum TokenizerError: LocalizedError {
             String(localized: "Chat template error: \(message)", comment: "Error with chat template")
         case .missingChatTemplate:
             String(localized: "This tokenizer does not have a chat template, and no template was passed.")
+        case let .unencodableToken(token):
+            String(
+                localized:
+                    "The tokenizer cannot encode '\(token)': it is not in the vocabulary and this model declares no unknown token.",
+                comment: "Error when a token has no id and there is no unknown token to fall back on")
         case let .tooLong(message):
             String(localized: "Input is too long: \(message)", comment: "Error when input exceeds maximum length")
         case let .mismatchedConfig(message):
@@ -654,6 +663,29 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     /// - Returns: An array of token IDs
     public func encode(text: String, addSpecialTokens: Bool = true) -> [Int] {
         postProcess(tokenize(text: text), addSpecialTokens: addSpecialTokens).map { model.convertTokenToId($0)! }
+    }
+
+    /// `encode`, but a token the vocabulary cannot represent is an error rather than a
+    /// process kill.
+    ///
+    /// `convertTokenToId` already falls back to the unknown token, so it returns nil only
+    /// when the piece is absent from the vocab AND the tokenizer declares no unknown token
+    /// — normal for DeepSeek's byte-level BPE. Force-unwrapping that in `encode` turned a
+    /// bad chat-template marker into a fatal trap, which is how the app died inside the
+    /// DeepSeek-V4 template while merely *measuring* the generation-prompt suffix (Sentry
+    /// APPLE-MACOS-10S, 9 events in 0.22.0).
+    ///
+    /// There is nothing honest to substitute for such a token — dropping it would shorten
+    /// the prompt and shift every position after it, which reads like a working model — so
+    /// this reports failure and lets the caller decide. Callers that treat the encode as
+    /// an optimization (a cache-boundary probe, say) can then simply do without it.
+    public func encodeThrowing(text: String, addSpecialTokens: Bool = true) throws -> [Int] {
+        try postProcess(tokenize(text: text), addSpecialTokens: addSpecialTokens).map { token in
+            guard let id = model.convertTokenToId(token) else {
+                throw TokenizerError.unencodableToken(token)
+            }
+            return id
+        }
     }
 
     /// Encodes input text into token IDs with special tokens included by default.
