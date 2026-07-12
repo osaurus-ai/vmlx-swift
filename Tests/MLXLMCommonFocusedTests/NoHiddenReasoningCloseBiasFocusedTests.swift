@@ -163,25 +163,60 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(source.contains("Removing stale RunBench lock before matrix start"))
     }
 
-    @Test("terminal info snapshots unclosed reasoning before parser flush")
-    func terminalInfoSnapshotsUnclosedReasoningBeforeParserFlush() throws {
+    /// The reasoning state must be captured in the window BETWEEN the detokenizer
+    /// flush and `ReasoningParser.flush()`, and reported from that capture.
+    ///
+    /// This test used to require the read to happen before `onGenerationEnd` — which
+    /// protected the right invariant (`flush()` ends by clearing `insideReasoning`,
+    /// so reading afterwards would erase the trapped-thinking signal) but at the
+    /// wrong point. The detokenizer withholds a 24-character tail, so a close marker
+    /// short enough to sit inside it is still unparsed when the loop ends:
+    /// `</think:opensource>` is 20 characters and hides completely, which made
+    /// Hunyuan v3 report "thinking didn't close" on streams that closed cleanly.
+    ///
+    /// Both edges matter, so the capture lives inside `onGenerationEnd`: after the
+    /// held-back tail has gone through the parser, before `flush()` clears it.
+    @Test("terminal info snapshots unclosed reasoning between the two flushes")
+    func terminalInfoSnapshotsUnclosedReasoningBetweenTheTwoFlushes() throws {
         let evaluate = try String(
             contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
             encoding: .utf8)
 
-        guard let snapshot = evaluate.range(
-            of: "let unclosedReasoning = handler.unclosedReasoning"),
+        guard
+            let read = evaluate.range(
+                of: "let unclosedReasoning = handler.unclosedReasoning"),
             let flush = evaluate.range(
                 of: "handler.onGenerationEnd(emit: continuation.yield)")
         else {
-            Issue.record("Evaluate.swift missing unclosed reasoning snapshot or terminal flush")
+            Issue.record("Evaluate.swift missing unclosed reasoning read or terminal flush")
             return
         }
 
-        #expect(snapshot.lowerBound < flush.lowerBound)
+        // The public read now happens AFTER the flush, because the flush is what
+        // pushes the detokenizer's held tail through the parser.
+        #expect(flush.lowerBound < read.lowerBound)
+
+        // ...and the value it reads is the snapshot taken inside that flush, before
+        // the parser flush clears the flag.
+        guard
+            let detokFlush = evaluate.range(
+                of: "if let chunk = detokenizer.flush(), !dispatch(chunk, emit: emit) {"),
+            let capture = evaluate.range(
+                of: "terminalInsideReasoning = reasoningParser?.isInsideReasoning ?? false"),
+            let parserFlush = evaluate.range(
+                of: "for segment in parser.flush() {", range: capture.upperBound ..< evaluate.endIndex)
+        else {
+            Issue.record("Evaluate.swift missing the terminal reasoning-state capture window")
+            return
+        }
+        #expect(detokFlush.lowerBound < capture.lowerBound)
+        #expect(capture.lowerBound < parserFlush.lowerBound)
+
         #expect(evaluate.contains("unclosedReasoning: unclosedReasoning"))
         #expect(evaluate.contains("var unclosedReasoning: Bool { get }"))
-        #expect(evaluate.contains("reasoningParser?.isInsideReasoning ?? false"))
+        #expect(
+            evaluate.contains(
+                "terminalInsideReasoning ?? (reasoningParser?.isInsideReasoning ?? false)"))
     }
 
     @Test("growing chat cache probe distinguishes unsafe template divergence")
@@ -673,8 +708,71 @@ struct Hy3ParserFocusedTests {
             #expect(ReasoningParser.fromCapabilityName(stamp) != nil)
         }
         for modelType in ["hy_v3", "hy-v3", "hy3", "Hy3"] {
-            #expect(reasoningStampFromModelType(modelType) == "think_xml")
+            // NOT `think_xml`: Hunyuan v3 gets its own stamp because its markers
+            // may carry the `:opensource` suffix, which the plain think_xml
+            // parser does not recognise. Stamping it think_xml would leave the
+            // close marker unmatched and swallow the answer into reasoning.
+            #expect(reasoningStampFromModelType(modelType) == "hy_v3")
             #expect(ToolCallFormat.infer(from: modelType) == .hunyuan)
+        }
+    }
+
+    /// The bare `</think>` alias is a strict PREFIX of `</think:opensource>`, and
+    /// the suffix arrives in a later chunk. A parser that accepts the short
+    /// spelling the moment it appears would close reasoning early and then emit
+    /// the trailing `:opensource>` as visible text — the exact marker leak we
+    /// check every HY3 build for. Feed it one character at a time, the way tokens
+    /// actually arrive, and require that never happens.
+    @Test("Hy3 streaming: a split :opensource close marker never leaks")
+    func hy3SplitCloseMarkerDoesNotLeak() {
+        var parser = try! #require(ReasoningParser.fromCapabilityName("hy_v3"))
+        var reasoning = ""
+        var visible = ""
+        let stream = "weighing it</think:opensource>The answer is 42."
+        for character in stream {
+            for segment in parser.feed(String(character)) {
+                switch segment {
+                case .reasoning(let text): reasoning += text
+                case .content(let text): visible += text
+                }
+            }
+        }
+        for segment in parser.flush() {
+            if case .content(let text) = segment { visible += text }
+        }
+
+        #expect(visible == "The answer is 42.")
+        #expect(!visible.contains(":opensource"))
+        #expect(!visible.contains("think"))
+        #expect(reasoning == "weighing it")
+        #expect(!parser.isInsideReasoning)
+    }
+
+    /// The marker suffix is a template variable (`'<think{}>'.format(HYTK)`):
+    /// open-source packs set it to `:opensource`, preview conversions leave it
+    /// empty. The parser starts inside reasoning, so a spelling it cannot match
+    /// is not a cosmetic miss — it routes the model's entire answer, tool calls
+    /// included, into the thinking block and leaves the visible reply empty.
+    @Test("Hy3 reasoning parser closes on both bare and :opensource markers")
+    func hy3ReasoningClosesOnEitherMarkerSpelling() {
+        for close in ["</think>", "</think:opensource>"] {
+            var parser = try! #require(ReasoningParser.fromCapabilityName("hy_v3"))
+            var reasoning = ""
+            var visible = ""
+            for segment in parser.feed("weighing the options\(close)The answer is 42.") {
+                switch segment {
+                case .reasoning(let text): reasoning += text
+                case .content(let text): visible += text
+                }
+            }
+            for segment in parser.flush() {
+                if case .content(let text) = segment { visible += text }
+            }
+
+            #expect(reasoning == "weighing the options", "close marker \(close)")
+            #expect(visible == "The answer is 42.", "close marker \(close)")
+            #expect(!parser.isInsideReasoning, "close marker \(close)")
+            #expect(!visible.contains(":opensource"), "close marker \(close)")
         }
     }
 
@@ -1235,7 +1333,10 @@ struct DirectCapabilityParserAliasFocusedTests {
             ("gpt-oss-20b", "harmony", .glm4),
             ("glm-5.1-flash", "think_xml", .glm4),
             ("Ling-2.6-flash", "think_xml", .glm4),
-            ("hy3-preview", "think_xml", .hunyuan),
+            // Hunyuan v3 resolves to its OWN stamp, not think_xml: its think markers
+            // may carry the `:opensource` suffix that the plain think_xml parser
+            // cannot match. The hy_v3 parser accepts both spellings.
+            ("hy3-preview", "hy_v3", .hunyuan),
         ]
 
         for (modelType, expectedStamp, expectedTool) in heuristicCases {

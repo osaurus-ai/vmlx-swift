@@ -2142,6 +2142,22 @@ public struct TokenIterator: TokenIteratorProtocol {
             kvMode diskKVMode: KVQuantizationMode
         ) {
             guard !tokens.isEmpty else { return }
+            // Saving the cache duplicates it several times over (snapshot, host
+            // `Data` for the disk write, disk-store cache) at the point where
+            // memory is already at its peak. A prefix-cache entry is only ever a
+            // speed-up for some later request — it must never be able to take the
+            // host down. If the copies won't fit, don't make them.
+            guard CacheStoreBudget.canStore(cacheToStore) else {
+                let gib = Double(CacheStoreBudget.cacheBytes(cacheToStore)) / 1_073_741_824
+                Self.logger.info(
+                    """
+                    prefix-cache: skipping store of a \(String(format: "%.1f", gib), privacy: .public) GiB \
+                    KV cache — the copies it requires do not fit in memory. The request completed \
+                    normally; only the cache entry was dropped.
+                    """
+                )
+                return
+            }
             let snapshot = cacheToStore.map { $0.copy() }
             let requiresDiskBackedRestore =
                 cacheRequiresDiskBackedCoordinatorRestore(snapshot)
@@ -3650,8 +3666,12 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 }
             }
 
-            let unclosedReasoning = handler.unclosedReasoning
             handler.onGenerationEnd(emit: continuation.yield)
+            // Read AFTER the flush: `onGenerationEnd` pushes the detokenizer's
+            // held-back tail through the parser, which is where a close marker
+            // stuck in that tail finally lands. Reading before it reported
+            // "unclosed" for streams that closed cleanly.
+            let unclosedReasoning = handler.unclosedReasoning
 
             let now = Date.timeIntervalSinceReferenceDate
             let generateTime = now - start
@@ -4101,6 +4121,22 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     /// tool-call processor (matches upstream ml-explore/mlx-swift-lm
     /// behaviour byte-for-byte).
     var reasoningParser: ReasoningParser?
+    /// Reasoning state captured at end-of-stream, *after* the
+    /// detokenizer's held-back tail has been pushed through the parser
+    /// but *before* `ReasoningParser.flush()` clears the flag.
+    ///
+    /// Neither edge of that window can be read from outside. The
+    /// detokenizer withholds a 24-character tail (`Tokenizer.swift`,
+    /// `trailingHoldbackCharacters`) so a close marker can still be sitting
+    /// unparsed when the loop ends — `</think:opensource>` is 20 characters
+    /// and fits entirely inside it, which is why Hunyuan v3 reported
+    /// "still inside reasoning" on streams that in fact closed cleanly and
+    /// split reasoning from content correctly (a short `</think>` clears the
+    /// holdback, so most families never showed it). And `flush()` ends by
+    /// setting `insideReasoning = false` unconditionally, so reading the
+    /// parser afterwards would report "closed" even for a model that really
+    /// did stop mid-thought — the pathology this flag exists to detect.
+    var terminalInsideReasoning: Bool?
     /// Text-level stop-sequence matcher. Runs at the tail of the
     /// pipeline against `.chunk` text only (reasoning + tool-call bytes
     /// are scoped out by construction). When a stop string matches,
@@ -4237,6 +4273,11 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
             return
         }
 
+        // The detokenizer's held-back tail has now gone through the parser,
+        // so this is the first moment the reasoning state is trustworthy —
+        // and the last, since `flush()` below clears it unconditionally.
+        terminalInsideReasoning = reasoningParser?.isInsideReasoning ?? false
+
         // Flush the reasoning parser — any buffered tail becomes content
         // (or a trailing `.reasoning` segment if the model stopped mid-
         // think block) per ReasoningParser.flush contract. The tool-call
@@ -4365,7 +4406,7 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     }
 
     var unclosedReasoning: Bool {
-        reasoningParser?.isInsideReasoning ?? false
+        terminalInsideReasoning ?? (reasoningParser?.isInsideReasoning ?? false)
     }
 }
 

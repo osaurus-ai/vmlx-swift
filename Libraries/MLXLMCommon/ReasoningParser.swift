@@ -67,6 +67,27 @@ public struct ReasoningParser: Sendable {
     /// The tag that ends a reasoning block. Default `</think>`.
     public let endTag: String
 
+    /// Additional spellings of `startTag` / `endTag` that the same family
+    /// may emit, matched exactly like the primary tags.
+    ///
+    /// Hunyuan v3 is the reason these exist. Its chat template writes every
+    /// protocol marker through one variable — `'<think{}>'.format(HYTK)` — and
+    /// the open-source packs set `HYTK = ':opensource'` while the preview
+    /// conversions leave it empty. A parser that knows only the suffixed
+    /// spelling never sees a bare pack's `</think>`, and since the Hunyuan
+    /// parser starts *inside* reasoning, the entire answer — tool calls
+    /// included — is routed to `.reasoning` and the user sees an empty reply.
+    /// `HunyuanToolCallParser` already accepts both spellings; this is the
+    /// same defence for the reasoning side.
+    public let startTagAliases: [String]
+    public let endTagAliases: [String]
+
+    /// Every accepted spelling of each tag, primary first. The drain loop
+    /// matches against these, so a family that declares no aliases behaves
+    /// exactly as before.
+    private var openerSpellings: [String] { [startTag] + startTagAliases }
+    private var closerSpellings: [String] { [endTag] + endTagAliases }
+
     /// When true, the drain loop strips stray markers regardless of
     /// state — a `</think>` while in content mode is consumed as a
     /// model artifact (state stays in content), and a `<think>` while
@@ -135,12 +156,16 @@ public struct ReasoningParser: Sendable {
         startTag: String = "<think>",
         endTag: String = "</think>",
         startInReasoning: Bool = false,
-        stripStrayTags: Bool = true
+        stripStrayTags: Bool = true,
+        startTagAliases: [String] = [],
+        endTagAliases: [String] = []
     ) {
         self.startTag = startTag
         self.endTag = endTag
         self.insideReasoning = startInReasoning
         self.stripStrayTags = stripStrayTags
+        self.startTagAliases = startTagAliases.filter { !$0.isEmpty && $0 != startTag }
+        self.endTagAliases = endTagAliases.filter { !$0.isEmpty && $0 != endTag }
     }
 
     // MARK: Streaming API
@@ -499,6 +524,58 @@ public struct ReasoningParser: Sendable {
     /// those stray markers leaked into the visible stream verbatim
     /// (reproduced 2026-04-25 on a MiniMax-Small JANGTQ chat where the
     /// model emitted three `</think>` markers across one assistant turn).
+    /// Earliest occurrence in `buffer` of any of `spellings`. When two
+    /// spellings match at the same offset the longer one wins, so a bare
+    /// `</think>` alias can never shadow the `</think:opensource>` it is a
+    /// prefix of — matching the short one first would leave `:opensource>`
+    /// behind as visible content.
+    /// True when `range` matched a spelling that is a strict prefix of a longer
+    /// accepted spelling, and the buffer does not yet hold enough characters to
+    /// rule that longer spelling out.
+    ///
+    /// This is the streaming hazard that makes aliases dangerous. `</think>` is a
+    /// prefix of `</think:opensource>`, and the suffix arrives in a LATER chunk.
+    /// The instant the buffer holds `…</think>`, the short spelling is a complete,
+    /// legitimate match — so without this check the parser would consume it, flip
+    /// to content, and then emit the `:opensource>` that arrives next as visible
+    /// text. The tie-break in `earliestMatch` cannot help: at that moment the long
+    /// spelling is not in the buffer to compete. So when the match could still grow
+    /// into a longer one, treat it as no match at all and let the holdback wait for
+    /// the next chunk. At end-of-stream there is no next chunk, so the caller does
+    /// not consult this and the short spelling wins — which is right for a pack that
+    /// really does end its reasoning with a bare marker.
+    private func couldGrowIntoLongerSpelling(
+        _ range: Range<String.Index>, among spellings: [String]
+    ) -> Bool {
+        let matched = buffer[range]
+        let tail = buffer[range.lowerBound...]
+        for spelling in spellings
+        where spelling.count > matched.count && spelling.hasPrefix(matched) {
+            // Fewer characters than the long spelling needs, and everything we do
+            // have agrees with it → the next chunk could still complete it.
+            if tail.count < spelling.count && spelling.hasPrefix(tail) { return true }
+        }
+        return false
+    }
+
+    private func earliestMatch(of spellings: [String]) -> Range<String.Index>? {
+        var best: Range<String.Index>?
+        for spelling in spellings {
+            guard let range = buffer.range(of: spelling) else { continue }
+            guard let current = best else {
+                best = range
+                continue
+            }
+            if range.lowerBound < current.lowerBound
+                || (range.lowerBound == current.lowerBound
+                    && range.upperBound > current.upperBound)
+            {
+                best = range
+            }
+        }
+        return best
+    }
+
     private mutating func drain(allowPartialTagAtEnd: Bool = true)
         -> [ReasoningSegment]
     {
@@ -512,8 +589,8 @@ public struct ReasoningParser: Sendable {
             let firstTagRange: Range<String.Index>?
             let firstTagIsOpener: Bool
             if stripStrayTags {
-                let openRange = buffer.range(of: startTag)
-                let closeRange = buffer.range(of: endTag)
+                let openRange = earliestMatch(of: openerSpellings)
+                let closeRange = earliestMatch(of: closerSpellings)
                 switch (openRange, closeRange) {
                 case (let o?, let c?):
                     if o.lowerBound <= c.lowerBound {
@@ -534,11 +611,20 @@ public struct ReasoningParser: Sendable {
                     firstTagIsOpener = false
                 }
             } else {
-                let lookFor = insideReasoning ? endTag : startTag
-                firstTagRange = buffer.range(of: lookFor)
+                let lookFor = insideReasoning ? closerSpellings : openerSpellings
+                firstTagRange = earliestMatch(of: lookFor)
                 firstTagIsOpener = !insideReasoning
             }
-            if let range = firstTagRange {
+            // A match that could still grow into a longer accepted spelling is not
+            // yet a match. Fall through to the holdback and wait for the rest.
+            let pendingLongerSpelling =
+                allowPartialTagAtEnd
+                && firstTagRange.map {
+                    couldGrowIntoLongerSpelling(
+                        $0, among: firstTagIsOpener ? openerSpellings : closerSpellings)
+                } == true
+
+            if let range = firstTagRange, !pendingLongerSpelling {
                 // Emit everything before the tag in the current mode.
                 let before = String(buffer[..<range.lowerBound])
                 if !before.isEmpty {
@@ -558,12 +644,16 @@ public struct ReasoningParser: Sendable {
             // a tag prefix at the end, hold back enough characters that a
             // future chunk can complete it.
             if allowPartialTagAtEnd {
-                // `max(startTag, endTag).count - 1` — use `max(0, …)` so
-                // an edge-case empty tag (e.g. a model-specific override
-                // mis-configured at init) doesn't produce a negative
-                // `safeTail`, which would make the `offsetBy: -safeTail`
-                // move forward past `endIndex` and trap in the stdlib.
-                let safeTail = max(0, max(startTag.count, endTag.count) - 1)
+                // Longest accepted spelling minus one — holding back any less
+                // could let a tag straddle two chunks and go unmatched. Aliases
+                // count: `</think:opensource>` is longer than `</think>`, and
+                // holding back only the shorter one would split it. `max(0, …)`
+                // guards the edge case of an empty tag (a mis-configured
+                // model-specific override), where a negative `safeTail` would
+                // make `offsetBy: -safeTail` walk past `endIndex` and trap.
+                let longestTag = (openerSpellings + closerSpellings)
+                    .map(\.count).max() ?? 0
+                let safeTail = max(0, longestTag - 1)
                 if buffer.count > safeTail {
                     let splitAt = buffer.index(buffer.endIndex, offsetBy: -safeTail)
                     let safe = String(buffer[..<splitAt])
@@ -690,10 +780,19 @@ extension ReasoningParser {
             // high/low reasoning modes and a CLOSED empty pair in no_think —
             // `forPrompt(stampName:promptTail:)` resolves the start state
             // from that tail, which is why these exact tags matter.
+            //
+            // The suffix is a template variable (`'<think{}>'.format(HYTK)`),
+            // and the preview conversions ship it empty — those packs emit a
+            // bare `</think>`. Accept both: this parser starts inside
+            // reasoning, so failing to recognise the close marker routes the
+            // model's whole answer into the thinking block and leaves the
+            // visible reply empty.
             return ReasoningParser(
                 startTag: "<think:opensource>",
                 endTag: "</think:opensource>",
-                startInReasoning: true)
+                startInReasoning: true,
+                startTagAliases: ["<think>"],
+                endTagAliases: ["</think>"])
         }
 
         switch n {
@@ -769,6 +868,29 @@ extension ReasoningParser {
     ///     last ~100 characters of the prompt suffice. Pass `nil` to
     ///     fall back to stamp defaults.
     /// - Returns: a parser, or nil if the stamp resolves to no parser.
+    /// Last occurrence of any of `spellings` in `text`. Ties at the same
+    /// offset resolve to the longer spelling, for the same reason
+    /// `earliestMatch` does.
+    private static func lastMatch(
+        of spellings: [String], in text: String
+    ) -> Range<String.Index>? {
+        var best: Range<String.Index>?
+        for spelling in spellings {
+            guard let range = text.range(of: spelling, options: .backwards) else { continue }
+            guard let current = best else {
+                best = range
+                continue
+            }
+            if range.lowerBound > current.lowerBound
+                || (range.lowerBound == current.lowerBound
+                    && range.upperBound > current.upperBound)
+            {
+                best = range
+            }
+        }
+        return best
+    }
+
     public static func forPrompt(
         stampName: String?,
         promptTail: String?
@@ -779,11 +901,16 @@ extension ReasoningParser {
         // was baked into `base` by fromCapabilityName).
         guard let promptTail, !promptTail.isEmpty else { return base }
 
-        // Detect the last tag at the prompt tail.
+        // Detect the last tag at the prompt tail. Search every accepted
+        // spelling: a Hunyuan pack with an empty marker suffix prefills a bare
+        // `<think>`, and missing it here would resolve the start state from
+        // the stamp default instead of from the prompt the model actually saw.
         let startTag = base.startTag
         let endTag = base.endTag
-        let lastOpener = promptTail.range(of: startTag, options: .backwards)
-        let lastCloser = promptTail.range(of: endTag, options: .backwards)
+        let lastOpener = Self.lastMatch(
+            of: [startTag] + base.startTagAliases, in: promptTail)
+        let lastCloser = Self.lastMatch(
+            of: [endTag] + base.endTagAliases, in: promptTail)
 
         let startInReasoning: Bool
         switch (lastOpener, lastCloser) {
@@ -823,7 +950,12 @@ extension ReasoningParser {
             // think_xml family keeps `stripStrayTags: true`, harmony
             // keeps `false`. Without this carry-over, harmony lost
             // its A2/A3 contract whenever `forPrompt(...)` was used.
-            stripStrayTags: base.stripStrayTags)
+            stripStrayTags: base.stripStrayTags,
+            // Likewise the accepted marker spellings: dropping them here
+            // would give prompt-resolved Hunyuan parsers a narrower tag set
+            // than stamp-resolved ones.
+            startTagAliases: base.startTagAliases,
+            endTagAliases: base.endTagAliases)
         if startInReasoning && parser.isHarmonyChannelParser {
             parser.insideHarmonyChannel = true
             parser.harmonyChannelIsReasoning = true

@@ -28,8 +28,12 @@
 
 import Foundation
 import MLX
+import os
 
 public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
+    private static let logger = Logger(
+        subsystem: "vmlx", category: "BlockDiffusionTokenIterator")
+
     let model: any BlockDiffusionModel
     var cache: [KVCache]
     let options: BlockDiffusionParameters
@@ -393,6 +397,23 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             return
         }
 
+        // Same guard as the other two store paths: saving the cache duplicates it
+        // several times over at the memory high-water mark, and a prefix-cache entry
+        // is only ever a speed-up for a later request — it must never be able to take
+        // the host down. If the copies won't fit, don't make them.
+        guard CacheStoreBudget.canStore(promptCacheSnapshot) else {
+            let gib = Double(CacheStoreBudget.cacheBytes(promptCacheSnapshot)) / 1_073_741_824
+            Self.logger.info(
+                """
+                prefix-cache: skipping store of a \(String(format: "%.1f", gib), privacy: .public) GiB \
+                KV cache — the copies it requires do not fit in memory. Generation was unaffected; \
+                only the cache entry was dropped.
+                """
+            )
+            reportStatsOnce()
+            return
+        }
+
         let cacheSnapshot = promptCacheSnapshot.map { $0.copy() }
         let requiresDiskBackedRestore =
             cacheRequiresDiskBackedCoordinatorRestore(cacheSnapshot)
@@ -421,6 +442,11 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
         // boundary store is skipped gracefully.
         for boundary in Set(cachePrefixTokenCounts).sorted()
         where boundary > 0 && boundary < promptTokenIds.count {
+            // Re-check per boundary rather than relying on the check above: each
+            // boundary copies the *untrimmed* cache again, and the stores before it
+            // have already raised the memory floor. One store fitting does not mean
+            // N more do.
+            guard CacheStoreBudget.canStore(promptCacheSnapshot) else { break }
             let trimCount = promptTokenIds.count - boundary
             let boundarySnapshot = promptCacheSnapshot.map { $0.copy() }
             guard canTrimPromptCache(boundarySnapshot),

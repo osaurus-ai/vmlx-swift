@@ -54,8 +54,11 @@ public enum MLXCacheIOLock {
 ///
 /// `DiskCache` provides persistent KV cache storage on disk using safetensors
 /// files for tensor data and a SQLite database for indexing. Writes are
-/// dispatched to a background task to avoid blocking the caller. Reads are
-/// synchronous since they typically feed directly into model inference.
+/// synchronous and serialized under a lock — the comment here previously claimed
+/// they were dispatched to a background task, which they are not (see `store`);
+/// that mattered, because it implies the caller's arrays are retained past the
+/// call, and callers reasoning about copy lifetimes were misled by it. Reads are
+/// likewise synchronous since they typically feed directly into model inference.
 public final class DiskCache: @unchecked Sendable {
 
     // MARK: - Properties

@@ -34,6 +34,16 @@ func makeDiskStoreCache(
     quantizedKVStart: Int,
     kvMode: KVQuantizationMode
 ) -> [any KVCache] {
+    // The copy exists only to protect `snapshot` from `maybeQuantizeKVCache`'s
+    // in-place mutation. When nothing will be quantized that call is a no-op
+    // (`kvMode == .none` falls through to a `guard let kvBits` that returns), so
+    // the copy protects against nothing — and it is not a cheap nothing: it is a
+    // second full duplicate of the KV cache, allocated at the moment memory is
+    // already at its high-water mark. The prompt-boundary store takes exactly this
+    // path (`kvBits: nil, kvMode: .none`), and on a 64K-token context that copy is
+    // tens of GiB. Share the snapshot instead; the caller drops it right after.
+    guard kvBits != nil || kvMode != .none else { return snapshot }
+
     var diskCache = snapshot.map { $0.copy() }
     maybeQuantizeKVCache(
         cache: &diskCache,
