@@ -68,7 +68,7 @@ struct CacheStoreBudgetTests {
     @Test("The budget counts every copy the store will make, plus a safety margin")
     func budgetCountsAllMaterializations() {
         #expect(CacheStoreBudget.materializationFactor >= 2)
-        #expect(CacheStoreBudget.safetyMarginBytes > 0)
+        #expect(CacheStoreBudget.safetyMarginBytes(budgetBytes: 128 * Self.gib) > 0)
 
         // A cache sized so that one copy fits but the full store does not: the
         // guard must refuse it. This is the case that panicked the host — the
@@ -79,6 +79,32 @@ struct CacheStoreBudgetTests {
         let kv = headroom / 2  // one copy fits; factor x copies do not
         #expect(
             !CacheStoreBudget.canStore(cacheBytes: kv, activeBytes: active, budgetBytes: budget))
+    }
+
+    /// A flat 4 GiB reserve is right on a 128 GB Mac and nonsense on an 8 GB one:
+    /// with a 4.5 GiB model resident, `active + 0 + 4 GiB` already exceeds 8 GiB,
+    /// so the guard would refuse EVERY store — silently disabling the prefix cache
+    /// on the machines whose users most notice a slow re-prefill. The margin scales
+    /// with the host, so a small Mac running a small model still caches.
+    @Test("A small Mac running a small model still caches")
+    func smallHostStillCaches() {
+        // 8 GB Mac, ~4.5 GiB 8B 4-bit model resident, 4k-token KV (~0.5 GiB).
+        let budget = 8 * Self.gib
+        let active = 9 * Self.gib / 2
+        #expect(
+            CacheStoreBudget.canStore(
+                cacheBytes: Self.gib / 2, activeBytes: active, budgetBytes: budget),
+            "an 8 GB host must not have its prefix cache silently disabled")
+
+        // 16 GB Mac, same model, a much longer 32k context (~4 GiB of KV): three
+        // copies of that genuinely will not fit, so this one is still refused.
+        #expect(
+            !CacheStoreBudget.canStore(
+                cacheBytes: 4 * Self.gib, activeBytes: active, budgetBytes: 16 * Self.gib))
+
+        // The margin never exceeds the original 4 GiB on a large host.
+        #expect(CacheStoreBudget.safetyMarginBytes(budgetBytes: 128 * Self.gib) == 4 << 30)
+        #expect(CacheStoreBudget.safetyMarginBytes(budgetBytes: 8 * Self.gib) == Self.gib)
     }
 
     /// The guard must not quietly disable the prefix cache for the long-context

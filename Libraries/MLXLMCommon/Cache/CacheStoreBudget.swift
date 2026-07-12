@@ -34,7 +34,17 @@ public enum CacheStoreBudget {
 
     /// Headroom kept free for everything else in flight — activations, the disk
     /// write buffer, and the rest of the system.
-    static let safetyMarginBytes = 4 << 30  // 4 GiB
+    ///
+    /// Scaled to the host, not fixed. A flat 4 GiB reserve is right on a 128 GB
+    /// Mac and nonsense on an 8 GB one: with a 4.5 GB model resident, `active +
+    /// 0 + 4 GiB` already exceeds 8 GB, so the guard would refuse EVERY store —
+    /// silently disabling the prefix cache on exactly the machines whose users
+    /// most notice a slow re-prefill. An eighth of RAM keeps the same absolute
+    /// headroom on large hosts (128 GB → 4 GiB, unchanged) while staying
+    /// proportionate on small ones (8 GB → 1 GiB).
+    static func safetyMarginBytes(budgetBytes: Int) -> Int {
+        min(4 << 30, budgetBytes / 8)
+    }
 
     /// Live bytes held by a KV cache, without copying its contents.
     ///
@@ -82,7 +92,7 @@ public enum CacheStoreBudget {
             return true
         }
         let storeCost = liveBytes * materializationFactor
-        let projected = activeBytes + storeCost + safetyMarginBytes
+        let projected = activeBytes + storeCost + safetyMarginBytes(budgetBytes: budgetBytes)
         return projected <= budgetBytes
     }
 }

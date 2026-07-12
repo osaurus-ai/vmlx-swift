@@ -717,6 +717,56 @@ struct Hy3ParserFocusedTests {
         }
     }
 
+    /// The shipped Hunyuan v3 bundles stamp `reasoning_parser: "qwen3"` — a
+    /// plain-`<think>` parser that can NEVER match `</think:opensource>`. Honouring
+    /// that stamp would leave the close marker unmatched and the model's whole
+    /// answer, raw protocol markers and all, in the visible reply.
+    ///
+    /// `shouldIgnoreReasoningStamp` demotes the bogus stamp back to the model-type
+    /// resolver, which returns the hy_v3 parser. That demotion is the only thing
+    /// standing between the user and a marker leak, so pin the WHOLE chain — the
+    /// real bundle's capabilities in, a parser that actually closes on the model's
+    /// markers out — not just `fromCapabilityName` in isolation.
+    @Test("Hy3's bogus qwen3 reasoning stamp is demoted, not honoured")
+    func hy3BogusQwen3StampIsDemoted() {
+        // Verbatim from Hy3-JANG_2K's jang_config.json.
+        let shipped = JangCapabilities(
+            reasoningParser: "qwen3",
+            toolParser: "hunyuan",
+            thinkInTemplate: false,
+            supportsTools: true,
+            supportsThinking: true,
+            family: "hy_v3")
+
+        #expect(
+            ParserResolution.shouldIgnoreReasoningStamp(
+                capabilities: shipped, modelType: "hy_v3"),
+            "honouring the qwen3 stamp would leak every marker into the answer")
+
+        let resolved = ParserResolution.reasoning(
+            capabilities: shipped,
+            modelType: "hy_v3",
+            chatTemplate: "{%- set HYTK = ':opensource' %}<think:opensource>")
+        #expect(resolved.source == .modelTypeHeuristic)
+
+        var parser = try! #require(resolved.parser)
+        var reasoning = ""
+        var visible = ""
+        for segment in parser.feed("deciding</think:opensource>The answer is 42.") {
+            switch segment {
+            case .reasoning(let text): reasoning += text
+            case .content(let text): visible += text
+            }
+        }
+        for segment in parser.flush() {
+            if case .content(let text) = segment { visible += text }
+        }
+
+        #expect(reasoning == "deciding")
+        #expect(visible == "The answer is 42.")
+        #expect(!visible.contains(":opensource"))
+    }
+
     /// The bare `</think>` alias is a strict PREFIX of `</think:opensource>`, and
     /// the suffix arrives in a later chunk. A parser that accepts the short
     /// spelling the moment it appears would close reasoning early and then emit
