@@ -734,6 +734,19 @@ public actor BatchEngine {
                 }
             }
 
+            // Reasoning state at end-of-stream, captured inside `flush()` in the
+            // only window where it is truthful: after the detokenizer's held-back
+            // tail has been pumped through the parser, and before
+            // `ReasoningParser.flush()` clears the flag unconditionally.
+            //
+            // The detokenizer withholds a 24-character tail, so a close marker can
+            // still be unparsed when the loop ends. `</think:opensource>` is 20
+            // characters and fits entirely inside it — which is why Hunyuan v3
+            // reported "ended inside <think>" on streams that closed cleanly and
+            // split reasoning from content correctly. A short `</think>` clears the
+            // holdback, so most families never surfaced this.
+            var terminalInsideReasoning: Bool? = nil
+
             func flush() {
                 // A matched stop string is the semantic end of the
                 // response: everything still held in the detokenizer /
@@ -746,6 +759,7 @@ public actor BatchEngine {
                 if let text = detokenizer.flush() {
                     pump(text)
                 }
+                terminalInsideReasoning = reasoningParser?.isInsideReasoning ?? false
                 if var parser = reasoningParser {
                     for segment in parser.flush() {
                         switch segment {
@@ -824,8 +838,9 @@ public actor BatchEngine {
                     // the consumer wants: "was the LAST CONSUMED TOKEN
                     // inside a reasoning block?" If yes, the model
                     // ended without ever emitting `</think>`.
-                    let unclosed = reasoningParser?.isInsideReasoning ?? false
                     flush()
+                    let unclosed =
+                        terminalInsideReasoning ?? (reasoningParser?.isInsideReasoning ?? false)
                     detokenizer.startNewSegment()
                     // Detect "trapped thinking": stream ended while the
                     // reasoning parser was still inside a `<think>…</think>`
@@ -861,8 +876,9 @@ public actor BatchEngine {
                 // normally emit `.info` themselves, but if a lower layer closes
                 // early we still need to flush held reasoning/tool-call text and
                 // surface whether the model ended inside `<think>`.
-                let unclosed = reasoningParser?.isInsideReasoning ?? false
                 flush()
+                let unclosed =
+                    terminalInsideReasoning ?? (reasoningParser?.isInsideReasoning ?? false)
                 detokenizer.startNewSegment()
                 let elapsed = Date().timeIntervalSince(streamStartedAt)
                 let finalInfo = GenerateCompletionInfo(
@@ -2580,6 +2596,23 @@ public actor BatchEngine {
 
             func storeCacheEntry(tokens: [Int], snapshot: [KVCache], label: String) {
                 guard !tokens.isEmpty else { return }
+                // Serialising the cache materialises it again (host `Data` for the
+                // disk write, plus the disk-store cache) while the snapshot and the
+                // live cache are both still resident. A prefix-cache entry only ever
+                // speeds up some later request — it must never be able to take the
+                // host down, so if the copies won't fit, don't make them.
+                guard CacheStoreBudget.canStore(snapshot) else {
+                    let gib = Double(CacheStoreBudget.cacheBytes(snapshot)) / 1_073_741_824
+                    Self.logger.info(
+                        """
+                        prefix-cache: skipping \(label, privacy: .public) store of a \
+                        \(String(format: "%.1f", gib), privacy: .public) GiB KV cache — the copies it \
+                        requires do not fit in memory. Generation was unaffected; only the cache \
+                        entry was dropped.
+                        """
+                    )
+                    return
+                }
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(snapshot)
                 let perLayerData = requiresDiskBackedRestore

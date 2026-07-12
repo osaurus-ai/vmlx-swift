@@ -406,6 +406,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         {
             func store(tokens: [Int], snapshot: [KVCache], label _: String) {
                 guard !tokens.isEmpty else { return }
+                // Same guard as the other store paths: saving a cache materialises
+                // it several times over at the memory high-water mark, and a
+                // prefix-cache entry is only ever a speed-up for a later request —
+                // it must never be able to take the host down. Re-checked per call
+                // because this helper runs once per boundary. (MTP was the fourth
+                // store path; the first three were guarded and this one was missed.)
+                guard CacheStoreBudget.canStore(snapshot) else { return }
                 let cacheSnapshot = snapshot.map { $0.copy() }
                 MLX.eval(cacheSnapshot)
                 let requiresDiskBackedRestore =
