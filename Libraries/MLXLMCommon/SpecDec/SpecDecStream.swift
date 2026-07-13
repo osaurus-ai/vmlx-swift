@@ -330,43 +330,59 @@ public enum SpecDecStream {
         for t in tokens {
             detokenizer.append(token: Int(t))
             guard let chunk = detokenizer.next() else { continue }
+            routeChunk(
+                chunk,
+                toolCallProcessor: toolCallProcessor,
+                reasoningParser: &reasoningParser,
+                continuation: continuation)
+        }
+    }
 
-            // 1. Reasoning pass (if configured) — peels off <think>…
-            //    segments. `.reasoning(String)` events are emitted on
-            //    the stream so callers can render a think-pane UI;
-            //    content continues into the tool-call processor.
-            let contentPieces: [String]
-            if var parser = reasoningParser {
-                var pieces: [String] = []
-                for segment in parser.feed(chunk) {
-                    switch segment {
-                    case .content(let c):
-                        pieces.append(c)
-                    case .reasoning(let r):
-                        for event in routeGenerationText(
-                            r,
-                            channel: .reasoning,
-                            through: toolCallProcessor
-                        ) {
-                            continuation.yield(event)
-                        }
+    /// Route one detokenized chunk through the reasoning parser and the
+    /// tool-call processor. Shared by the per-round feed and the end-of-stream
+    /// flush so the detokenizer's held-back tail goes through exactly the same
+    /// pipeline the streamed chunks did.
+    private static func routeChunk(
+        _ chunk: String,
+        toolCallProcessor: ToolCallProcessor?,
+        reasoningParser: inout ReasoningParser?,
+        continuation: AsyncStream<Generation>.Continuation
+    ) {
+        // 1. Reasoning pass (if configured) — peels off <think>…
+        //    segments. `.reasoning(String)` events are emitted on
+        //    the stream so callers can render a think-pane UI;
+        //    content continues into the tool-call processor.
+        let contentPieces: [String]
+        if var parser = reasoningParser {
+            var pieces: [String] = []
+            for segment in parser.feed(chunk) {
+                switch segment {
+                case .content(let c):
+                    pieces.append(c)
+                case .reasoning(let r):
+                    for event in routeGenerationText(
+                        r,
+                        channel: .reasoning,
+                        through: toolCallProcessor
+                    ) {
+                        continuation.yield(event)
                     }
                 }
-                reasoningParser = parser
-                contentPieces = pieces
-            } else {
-                contentPieces = [chunk]
             }
+            reasoningParser = parser
+            contentPieces = pieces
+        } else {
+            contentPieces = [chunk]
+        }
 
-            // 2. Tool-call pass — same contract as non-speculative path.
-            for piece in contentPieces {
-                for event in routeGenerationText(
-                    piece,
-                    channel: .content,
-                    through: toolCallProcessor
-                ) {
-                    continuation.yield(event)
-                }
+        // 2. Tool-call pass — same contract as non-speculative path.
+        for piece in contentPieces {
+            for event in routeGenerationText(
+                piece,
+                channel: .content,
+                through: toolCallProcessor
+            ) {
+                continuation.yield(event)
             }
         }
     }
@@ -379,6 +395,24 @@ public enum SpecDecStream {
         reasoningParser: inout ReasoningParser?,
         continuation: AsyncStream<Generation>.Continuation
     ) {
+        // Drain the detokenizer FIRST. `next()` withholds the trailing 24
+        // characters while it waits for a stable boundary, and emits nothing at
+        // all until the decoded segment exceeds that — so without this the last
+        // ≤24 characters of every answer are lost, and an answer shorter than
+        // the holdback renders as nothing whatsoever. The `detokenizer`
+        // parameter was accepted here and never used.
+        //
+        // The tail goes through the parsers, not straight to the stream: a
+        // reasoning or tool-call close marker stranded in it only lands once it
+        // does. Same ordering as `Evaluate.TextToolTokenLoopHandler.onGenerationEnd`.
+        if let tail = detokenizer.flush(), !tail.isEmpty {
+            routeChunk(
+                tail,
+                toolCallProcessor: toolCallProcessor,
+                reasoningParser: &reasoningParser,
+                continuation: continuation)
+        }
+
         if var parser = reasoningParser {
             for segment in parser.flush() {
                 switch segment {
