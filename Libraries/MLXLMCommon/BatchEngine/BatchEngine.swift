@@ -689,6 +689,19 @@ public actor BatchEngine {
                 case .prefillProgress:
                     continuation.yield(event)
                 case .toolCall:
+                    // Drain the stop-string matcher BEFORE the call event goes
+                    // out, exactly as the solo path does (`Evaluate.swift`).
+                    // Text still held there for disambiguation precedes the call
+                    // in the model's output, but consumers stop forwarding text
+                    // the moment a tool call lands (deliberate no-leak
+                    // suppression of post-tool prose) — so a tail emitted after
+                    // this event is silently dropped, cutting the visible answer
+                    // mid-word. Without this, batch serving reproduced the same
+                    // truncation the solo path already fixed.
+                    if stopMatcher.isEnabled && !stopMatched {
+                        let tail = stopMatcher.flush()
+                        if !tail.isEmpty { continuation.yield(.chunk(tail)) }
+                    }
                     continuation.yield(event)
                 case .toolCallProgress:
                     continuation.yield(event)

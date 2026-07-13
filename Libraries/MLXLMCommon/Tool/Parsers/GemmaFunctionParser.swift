@@ -114,7 +114,15 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.hasPrefix(escapeMarker) {
             text = String(text.dropFirst(escapeMarker.count))
-            guard let endEscape = text.range(of: escapeMarker) else { return nil }
+            guard let endEscape = text.range(of: escapeMarker) else {
+                // Unterminated string. Returning nil here breaks the caller's
+                // key/value loop, which silently drops this argument *and* every
+                // argument after it — a tool call arrives with no arguments at
+                // all. Taking the remainder loses nothing and keeps the call.
+                let value = text
+                text = ""
+                return decodeEscapedStringValue(value)
+            }
             let value = String(text[..<endEscape.lowerBound])
             text = String(text[endEscape.upperBound...])
             return decodeEscapedStringValue(value)
@@ -129,6 +137,14 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         }
 
         let value = takeRawValue(from: &text, terminators: [","])
+        // A model that omits the *opening* delimiter still emits the closing one,
+        // leaving it stranded after an unquoted scalar. It is structure, not data
+        // — consume it so it neither leaks into this value nor corrupts the next
+        // key. Live: an image-edit `source_path` reached the runtime as
+        // `/tmp/a.png<|"|>` and was rejected as a non-existent file.
+        while text.hasPrefix(escapeMarker) {
+            text = String(text.dropFirst(escapeMarker.count))
+        }
         return decodeRawValue(value)
     }
 
@@ -214,6 +230,12 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
     private func takeRawValue(from text: inout String, terminators: Set<Character>) -> String {
         var index = text.startIndex
         while index < text.endIndex {
+            // The escape marker delimits string values in the wire format, so it
+            // can never occur inside an unquoted scalar. Stop before a stray one
+            // rather than swallowing it into the value.
+            if text[index...].hasPrefix(escapeMarker) {
+                break
+            }
             let character = text[index]
             // `]` and `}` always terminate a raw scalar so an element inside a
             // nested array/object (e.g. the `1` in `{mark:1}`) stops at the
