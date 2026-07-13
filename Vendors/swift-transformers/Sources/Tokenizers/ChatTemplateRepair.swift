@@ -51,6 +51,38 @@ public enum ChatTemplateRepair {
         ),
     ]
 
+    /// Templates already inspected, mapped to their repaired form.
+    ///
+    /// `applyChatTemplate` runs on every single request, and the overwhelmingly common case is
+    /// a template with nothing wrong with it — scanning it again on each turn is pure waste.
+    /// A template is immutable for the life of a tokenizer, so decide once and remember: a
+    /// healthy template maps to itself and is never scanned again.
+    private static let cache = Cache()
+
+    private final class Cache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var repairedByOriginal: [String: String] = [:]
+
+        func repaired(_ template: String, computing: (String) -> String) -> String {
+            lock.lock()
+            if let hit = repairedByOriginal[template] {
+                lock.unlock()
+                return hit
+            }
+            lock.unlock()
+
+            // Compute outside the lock: it is a pure function of the input, so a concurrent
+            // duplicate is harmless, and holding a lock across it would serialize every
+            // first-time template load behind one another.
+            let result = computing(template)
+
+            lock.lock()
+            repairedByOriginal[template] = result
+            lock.unlock()
+            return result
+        }
+    }
+
     /// Does this template contain the stranded-turn bug?
     public static func needsRepair(_ template: String) -> Bool {
         closeRepairs.contains { template.contains($0.broken) }
@@ -65,10 +97,12 @@ public enum ChatTemplateRepair {
     /// the close alone is what stops the runaway; the ordering is corrected at the source in
     /// the bundles.
     public static func repaired(_ template: String) -> String {
-        var out = template
-        for repair in closeRepairs where out.contains(repair.broken) {
-            out = out.replacingOccurrences(of: repair.broken, with: repair.fixed)
+        cache.repaired(template) { template in
+            var out = template
+            for repair in closeRepairs where out.contains(repair.broken) {
+                out = out.replacingOccurrences(of: repair.broken, with: repair.fixed)
+            }
+            return out
         }
-        return out
     }
 }

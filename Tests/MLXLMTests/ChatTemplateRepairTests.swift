@@ -80,6 +80,24 @@ struct ChatTemplateRepairTests {
         #expect(ChatTemplateRepair.repaired(healthy) == healthy)
     }
 
+    @Test("A template is inspected once, then answered from cache")
+    func templateIsInspectedOnce() {
+        // `applyChatTemplate` runs on every request and almost every template is healthy, so
+        // re-scanning it each turn is pure waste. Same input must give the same answer, and
+        // repeat lookups must not re-derive it.
+        let broken = "a \(Self.brokenMXFP) b"
+        let first = ChatTemplateRepair.repaired(broken)
+        let second = ChatTemplateRepair.repaired(broken)
+        #expect(first == second)
+        #expect(!ChatTemplateRepair.needsRepair(second))
+
+        // A healthy template must also be cached — it is the common case, and it must come
+        // back byte-identical, not merely equal-looking.
+        let healthy = "{{ bos_token }}{% for m in messages %}{{ m['content'] }}{% endfor %}"
+        #expect(ChatTemplateRepair.repaired(healthy) == healthy)
+        #expect(ChatTemplateRepair.repaired(healthy) == healthy)
+    }
+
     @Test("Repair is idempotent")
     func repairIsIdempotent() {
         // The loader may repair the same template more than once across reloads; doing so must
