@@ -2702,13 +2702,22 @@ public struct GenerateResult {
     public let generateTime: TimeInterval
 
     /// The number of tokens processed per second during the prompt phase.
+    ///
+    /// Zero when the phase did not measurably run. Dividing by an unguarded
+    /// `promptTime` returns `+inf` for a cache-hit prefill and `NaN` for a
+    /// cancelled stream (which reports `0` tokens in `0` seconds) -- and both
+    /// then travel intact through the wire format and into the UI.
     public var promptTokensPerSecond: Double {
-        Double(inputText.tokens.size) / promptTime
+        guard promptTime > 0 else { return 0 }
+        return Double(inputText.tokens.size) / promptTime
     }
 
     /// The number of tokens generated per second during the generation phase.
+    ///
+    /// Zero when nothing was generated or the phase did not measurably run.
     public var tokensPerSecond: Double {
-        Double(tokenIds.count) / generateTime
+        guard generateTime > 0 else { return 0 }
+        return Double(tokenIds.count) / generateTime
     }
 
     public func summary() -> String {
@@ -3799,13 +3808,24 @@ public struct GenerateCompletionInfo: Sendable {
     public let unclosedReasoning: Bool
 
     /// The number of tokens processed per second during the prompt phase.
+    ///
+    /// Zero when the phase did not measurably run. `promptTime` is legitimately
+    /// `0` on the cancelled-stream path and can round to `0` on a full
+    /// prefix-cache hit, so an unguarded divide hands the caller `+inf` (or
+    /// `NaN`, when the token count is also zero) rather than a speed.
     public var promptTokensPerSecond: Double {
-        Double(promptTokenCount) / promptTime
+        guard promptTime > 0 else { return 0 }
+        return Double(promptTokenCount) / promptTime
     }
 
     /// The number of tokens generated per second during the generation phase.
+    ///
+    /// Zero when nothing was generated or the phase did not measurably run --
+    /// e.g. the cancelled-stream constructors below, which report `0` tokens in
+    /// `0` seconds and would otherwise compute `0/0`.
     public var tokensPerSecond: Double {
-        Double(generationTokenCount) / generateTime
+        guard generateTime > 0 else { return 0 }
+        return Double(generationTokenCount) / generateTime
     }
 
     public init(
