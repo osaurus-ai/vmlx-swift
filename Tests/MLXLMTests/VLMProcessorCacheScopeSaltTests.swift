@@ -78,6 +78,47 @@ struct VLMProcessorCacheScopeSaltTests {
         }
     }
 
+    @Test("Qwen3VL processor preserves tool schemas for streaming parser")
+    func qwen3VLPreservesToolSchemas() async throws {
+        try await MLXMetalTestLock.withLock {
+            let config: Qwen3VLProcessorConfiguration = try Self.decode("""
+            {
+              "image_mean": [0.5, 0.5, 0.5],
+              "image_std": [0.5, 0.5, 0.5],
+              "merge_size": 2,
+              "patch_size": 14,
+              "temporal_patch_size": 1,
+              "image_processor_type": "Qwen3VLImageProcessor",
+              "size": {"min_pixels": 3136, "max_pixels": 12845056},
+              "video_min_pixels": 3136,
+              "video_max_pixels": 12845056,
+              "video_fps": 2.0,
+              "video_min_frames": 1,
+              "video_max_frames": 768
+            }
+            """)
+            let processor = Qwen3VLProcessor(config, tokenizer: GenerationPromptTokenizer())
+            let tool: [String: any Sendable] = [
+                "type": "function",
+                "function": [
+                    "name": "get_weather",
+                    "description": "Get current weather.",
+                    "parameters": ["type": "object"],
+                ] as [String: any Sendable],
+            ]
+
+            let input = try await processor.prepare(input: UserInput(
+                prompt: "Call the weather tool.",
+                tools: [tool],
+                additionalContext: ["enable_thinking": false]))
+
+            let schemas = try #require(input.toolSchemas)
+            #expect(schemas.count == 1)
+            let function = try #require(schemas[0]["function"] as? [String: any Sendable])
+            #expect(function["name"] as? String == "get_weather")
+        }
+    }
+
     @Test("GlmOcr processor threads reasoning cache scope on text-only inputs")
     func glmOcrThreadsCacheScopeSalt() async throws {
         try await MLXMetalTestLock.withLock {

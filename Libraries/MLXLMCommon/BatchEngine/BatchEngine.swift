@@ -303,6 +303,7 @@ public actor BatchEngine {
     /// `submit(...)` and maxBatchSize > 1 on the continuous-batching scheduler.
     private var soloFastPathTask: Task<Void, Never>?
     private var soloFastPathID: UUID?
+    private var soloFastPathHadMedia = false
 
     /// Terminal lifecycle flag. Once shutdown begins, stale engine handles
     /// reject future submissions instead of restarting GPU work.
@@ -994,6 +995,7 @@ public actor BatchEngine {
         promptTail: String?
     ) -> AsyncStream<Generation> {
         let promptTokenCount = input.text.tokens.size
+        let hasMediaContent = input.hasMediaContent
         let toolSchemas = input.toolSchemas
         let disableDiskBackedRequiredToolRestore = shouldDisableDiskBackedRequiredToolRestore(
             toolSchemas: toolSchemas,
@@ -1157,6 +1159,7 @@ public actor BatchEngine {
 
         soloFastPathID = fastPathID
         soloFastPathTask = generationTask
+        soloFastPathHadMedia = hasMediaContent
 
         continuation.onTermination = { @Sendable _ in
             generationTask.cancel()
@@ -1178,8 +1181,14 @@ public actor BatchEngine {
     private func finishSoloFastPath(id: UUID) {
         guard soloFastPathID == id else { return }
         Stream().synchronize()
+        let shouldPurgeMediaWorkingSet = soloFastPathHadMedia
         soloFastPathID = nil
         soloFastPathTask = nil
+        soloFastPathHadMedia = false
+        if shouldPurgeMediaWorkingSet {
+            Memory.clearCache()
+            stepsSinceMemoryPurge = 0
+        }
         if !isShutdown && !waitQueue.isEmpty {
             ensureLoopRunning()
         }
@@ -1236,11 +1245,13 @@ public actor BatchEngine {
 
         let drainLoopTask = loopTask
         let drainSoloTask = soloFastPathTask
+        let shouldPurgeSoloMediaWorkingSet = soloFastPathHadMedia
         loopTask?.cancel()
         loopTask = nil
         soloFastPathTask?.cancel()
         soloFastPathTask = nil
         soloFastPathID = nil
+        soloFastPathHadMedia = false
 
         // Finish all pending requests
         for request in waitQueue {
@@ -1273,6 +1284,10 @@ public actor BatchEngine {
         // Final fence: producers submit via `asyncEval`, so their last
         // command buffers may still be in flight when the tasks return.
         Stream().synchronize()
+        if shouldPurgeSoloMediaWorkingSet {
+            Memory.clearCache()
+            stepsSinceMemoryPurge = 0
+        }
     }
 
     /// The number of requests currently waiting in the queue.
@@ -1335,8 +1350,20 @@ public actor BatchEngine {
             // 2. Run one scheduling step
             step()
 
-            // 3. Remove finished slots
+            // 3. Remove finished slots. Media requests retain their prepared
+            //    image/video arrays in `originalInput` for the lifetime of the
+            //    slot. Purge only after removing those final strong references;
+            //    clearing inside `finishSlot` is too early and lets successive
+            //    short media turns accumulate the allocator's released working
+            //    set until the generic 256-step purge.
+            let finishedMediaSlot = activeSlots.contains {
+                $0.isFinished && $0.originalInput.hasMediaContent
+            }
             activeSlots.removeAll { $0.isFinished }
+            if finishedMediaSlot {
+                Memory.clearCache()
+                stepsSinceMemoryPurge = 0
+            }
 
             // 4. Periodic memory cleanup
             stepsSinceMemoryPurge += 1

@@ -276,6 +276,30 @@ public func loadWeights(
         }
     }
 
+    let jangTensorManifest = try JangLoader.loadTensorQuantizationManifest(
+        at: modelDirectory)
+    if let jangTensorManifest {
+        try JangLoader.validateTensorQuantizationManifest(
+            jangTensorManifest, against: weights)
+    }
+
+    // Affine-1 JANG bundles opt in through a schema-2 manifest. Validate that
+    // contract before model sanitization changes any weight paths, then leave
+    // the packed tensors untouched for MLX's native affine-1 Metal kernels.
+    if let contract = try JangLoader.loadAffine1RuntimeContract(at: modelDirectory) {
+        for modulePath in contract.modulePaths {
+            let key = "\(modulePath).weight"
+            guard let packed = weights[key], packed.dtype == .uint32,
+                packed.shape.last.map({ $0 > 0 }) == true
+            else {
+                throw JangLoaderError.loadFailed(
+                    "affine-1 manifest weight must be a non-empty uint32 tensor: \(key)")
+            }
+        }
+        FileHandle.standardError.write(Data(
+            "[Load] JANG affine-1 validated \(contract.modulePaths.count) native 1-bit weight(s)\n".utf8))
+    }
+
     // per-model cleanup (models can inspect metadata to customize behavior)
     //
     // Cap MetalAllocator's buffer_cache_ during sanitize() to keep the
@@ -377,7 +401,8 @@ public func loadWeights(
             validInDims: validInDims,
             attentionOutputDimHints: attentionOutputDimHints,
             declaredDefaultQuantization: declaredAffineQuantization ?? quantization,
-            declaredPerLayerQuantization: perLayerQuantization)
+            declaredPerLayerQuantization: perLayerQuantization,
+            declaredManifestQuantization: jangTensorManifest?.entries ?? [:])
 
         if !inferred.perLayerQuantization.isEmpty {
             let b = inferred.quantization?.bits ?? -1

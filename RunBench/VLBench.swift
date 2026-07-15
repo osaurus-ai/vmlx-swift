@@ -22,13 +22,24 @@ import MLXVLM
 /// 7. Reports decode tok/s + first decoded text per turn
 enum VLBench {
 
+    /// Load through the same mmap-backed policy Osaurus uses in production.
+    /// The plain `loadModel(from:using:)` overload bypasses that policy and
+    /// copies safetensors into anonymous storage, which makes VL memory gates
+    /// measure a harness-only residency spike instead of the host runtime.
+    private static func loadProductionContext(from modelDir: URL) async throws -> ModelContext {
+        let loaded = try await MLXLMCommon.loadModel(
+            from: modelDir,
+            using: #huggingFaceTokenizerLoader(),
+            loadConfiguration: .osaurusProduction)
+        return loaded.0
+    }
+
     static func run(modelPath: String, maxNewTokens: Int) async throws {
         let modelDir = URL(fileURLWithPath: modelPath)
         print("=== VLBench — \(modelDir.lastPathComponent) ===")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(from: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -80,8 +91,7 @@ enum VLBench {
             preLoadRSS, preLoadFootprint, modelMiB))
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(from: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -176,8 +186,12 @@ enum VLBench {
             print("    debug prompt tokens=\(ids.count) imageId=\(imageId) imageCount=\(imageCount) boiCount=\(boiCount) eoiCount=\(eoiCount)")
             print("    debug image pixels=\(lmInput.image?.pixels.shape.description ?? "nil") frames=\(lmInput.image?.frames?.map { "\($0.h)x\($0.w)" }.joined(separator: ",") ?? "nil")")
             if let pixels = lmInput.image?.pixels {
-                let means = pixels.mean(axes: [0, 2, 3]).asArray(Float.self)
-                print("    debug image channel means=\(means)")
+                if pixels.ndim >= 4 {
+                    let means = pixels.mean(axes: [0, 2, 3]).asArray(Float.self)
+                    print("    debug image channel means=\(means)")
+                } else {
+                    print("    debug image channel means=not-applicable for rank-\(pixels.ndim) processed features")
+                }
             }
             print("    debug prompt window: \(window.debugDescription)")
         }
@@ -349,16 +363,27 @@ enum VLBench {
         print("=== VLBench VIDEO BATCH — \(modelDir.lastPathComponent) ===")
         print("video: \(videoURL.lastPathComponent)")
 
+        let modelMiB = directorySizeMiB(modelDir)
+        let preLoadFootprint = currentPhysFootprintMiB()
+        var peakFootprint = preLoadFootprint
+        print(String(format:
+            "  video memory pre-load: footprintMiB=%.0f modelMiB=%.0f",
+            preLoadFootprint, modelMiB))
+
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(from: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
+        let postLoadFootprint = currentPhysFootprintMiB()
+        peakFootprint = max(peakFootprint, postLoadFootprint)
+        print(String(format:
+            "  video memory post-load: footprintMiB=%.0f footprintDeltaMiB=%+.0f",
+            postLoadFootprint, postLoadFootprint - preLoadFootprint))
 
         nonisolated(unsafe) let ctx = context
 
-        var params = GenerateParameters(
+        let params = GenerateParameters(
             maxTokens: maxNewTokens, temperature: 0,
             prefillStepSize: 512)
 
@@ -398,6 +423,10 @@ enum VLBench {
             var chunkCount = 0
             var reasoningCount = 0
             var ttft: Double?
+            var generationTokens = 0
+            var promptTokensPerSecond = 0.0
+            var decodeTokensPerSecond = 0.0
+            var stopReason = "unknown"
             for await ev in stream {
                 switch ev {
                 case .chunk(let c):
@@ -406,17 +435,67 @@ enum VLBench {
                     chunkCount += 1
                 case .reasoning:
                     reasoningCount += 1
-                case .prefillProgress, .info, .toolCall, .toolCallProgress:
+                case .info(let info):
+                    generationTokens = info.generationTokenCount
+                    promptTokensPerSecond = info.promptTokensPerSecond
+                    decodeTokensPerSecond = info.tokensPerSecond
+                    stopReason = String(describing: info.stopReason)
+                case .prefillProgress, .toolCall, .toolCallProgress:
                     break
                 }
             }
             let total = CFAbsoluteTimeGetCurrent() - t0
+            let footprint = currentPhysFootprintMiB()
+            peakFootprint = max(peakFootprint, footprint)
             let preview = text.count > 220
                 ? String(text.prefix(220)) + "..." : text
             print(String(format:
                 "    TTFT %dms total %.2fs chunks=%d reasoningDeltas=%d",
                 Int((ttft ?? 0) * 1000), total, chunkCount, reasoningCount))
+            print(String(format:
+                "    telemetry tokens=%d promptTok/s=%.1f decodeTok/s=%.1f stop=%@ footprintMiB=%.0f",
+                generationTokens, promptTokensPerSecond, decodeTokensPerSecond,
+                stopReason, footprint))
             print("    \"\(preview)\"")
+
+            let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard chunkCount > 0, !visible.isEmpty else {
+                throw NSError(
+                    domain: "VLBenchVideo",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "\(turnLabel) emitted no visible video output"])
+            }
+            let rawMarkers = ["<think>", "</think>", "<|channel>", "<|tool_call>", "<tool_call>"]
+            if let marker = rawMarkers.first(where: { visible.contains($0) }) {
+                throw NSError(
+                    domain: "VLBenchVideo",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "\(turnLabel) leaked raw parser marker \(marker): \(preview)"])
+            }
+            guard generationTokens > 0, decodeTokensPerSecond > 0 else {
+                throw NSError(
+                    domain: "VLBenchVideo",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "\(turnLabel) did not emit usable generation telemetry"])
+            }
+        }
+
+        let peakDelta = peakFootprint - preLoadFootprint
+        let peakPercent = modelMiB > 0 ? (peakDelta / modelMiB) * 100 : -1
+        print(String(format:
+            "  video memory peak: footprintMiB=%.0f footprintDeltaMiB=%+.0f modelMiB=%.0f ratio=%.1f%% verdict=%@",
+            peakFootprint, peakDelta, modelMiB, peakPercent,
+            (modelMiB <= 0 || peakDelta <= modelMiB) ? "passed" : "failed"))
+        if modelMiB > 0, peakDelta > modelMiB {
+            throw NSError(
+                domain: "VLBenchVideo",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey:
+                    String(format:
+                        "video memory gate failed (footprintDeltaMiB=%.0f modelMiB=%.0f ratio=%.1f%%)",
+                        peakDelta, modelMiB, peakPercent)])
         }
 
         print("=== VLBench VIDEO BATCH done ===")
@@ -453,8 +532,7 @@ enum VLBench {
         print("=== VLBench MIXED MULTI-TURN — \(modelDir.lastPathComponent) ===")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(from: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -606,8 +684,7 @@ enum VLBench {
             preLoadRSS, preLoadFootprint, modelMiB))
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(from: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -764,8 +841,7 @@ enum VLBench {
         print("=== VLBench cross-engine byte-identity (iter 47) ===")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(from: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -865,8 +941,7 @@ enum VLBench {
         print("=== VLBench multi-turn cache reuse (iter 48) ===")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(from: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -1019,8 +1094,7 @@ enum VLBench {
                     nativeMTP: true))
             context = loaded.0
         } else {
-            context = try await MLXLMCommon.loadModel(
-                from: modelDir, using: #huggingFaceTokenizerLoader())
+            context = try await loadProductionContext(from: modelDir)
         }
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
@@ -1263,8 +1337,7 @@ enum VLBench {
         print("  video: \(videoPath)")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadProductionContext(from: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")

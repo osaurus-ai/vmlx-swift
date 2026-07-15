@@ -143,6 +143,34 @@ public struct JangRuntime: Sendable, Equatable {
     }
 }
 
+/// Validated bundle contract for affine weights packed at one bit.
+///
+/// These tensors remain in their compact storage representation and are
+/// consumed directly by MLX's native affine-1 Metal kernels. The bundle's
+/// historical `runtime_bits=2` field documents the lossless widening fallback
+/// used by runtimes without native support; vMLX must not perform that
+/// expansion because it defeats the bundle's low-memory contract.
+public struct JangAffine1RuntimeContract: Sendable, Equatable {
+    public let storageBits: Int
+    public let runtimeBits: Int
+    public let modulePaths: Set<String>
+
+    public init(storageBits: Int, runtimeBits: Int, modulePaths: Set<String>) {
+        self.storageBits = storageBits
+        self.runtimeBits = runtimeBits
+        self.modulePaths = modulePaths
+    }
+}
+
+/// Per-tensor affine metadata from a schema-2 JANG manifest.
+public struct JangTensorQuantizationManifest: Sendable, Equatable {
+    public let entries: [String: BaseConfiguration.Quantization]
+
+    public init(entries: [String: BaseConfiguration.Quantization]) {
+        self.entries = entries
+    }
+}
+
 /// Capability hints stamped into `jang_config.json` by the JANG converter.
 ///
 /// Allows downstream consumers (osaurus, llm-tool, etc.) to pick the right
@@ -820,6 +848,170 @@ public struct JangConfig: Sendable {
 
 /// JANG model loader — detects, parses config, and infers per-layer quantization.
 public struct JangLoader: Sendable {
+
+    /// Load the exact per-tensor affine metadata stamped by the converter.
+    /// Shape inference remains the fallback for older bundles without a
+    /// schema-2 manifest.
+    public static func loadTensorQuantizationManifest(
+        at modelPath: URL
+    ) throws -> JangTensorQuantizationManifest? {
+        guard let configURL = findConfigPath(at: modelPath) else { return nil }
+        let data = try Data(contentsOf: configURL)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            throw JangLoaderError.invalidConfig("Failed to parse tensor manifest JSON")
+        }
+        guard let quantization = json["quantization"] as? [String: Any],
+            let schema = quantization["tensor_quantization_manifest_schema"] as? Int
+        else {
+            return nil
+        }
+        guard schema == 2,
+            let rawManifest = quantization["tensor_quantization_manifest"] as? [String: Any]
+        else {
+            throw JangLoaderError.invalidConfig(
+                "unsupported tensor quantization manifest schema \(schema)")
+        }
+        if let declaredCount = quantization["tensor_quantization_manifest_count"] as? Int,
+            declaredCount != rawManifest.count
+        {
+            throw JangLoaderError.invalidConfig(
+                "tensor quantization manifest count mismatch: declared \(declaredCount), found \(rawManifest.count)")
+        }
+
+        let supportedAffineBits = Set([1, 2, 3, 4, 5, 6, 8])
+        var entries: [String: BaseConfiguration.Quantization] = [:]
+        entries.reserveCapacity(rawManifest.count)
+        for (path, rawEntry) in rawManifest {
+            guard let entry = rawEntry as? [String: Any],
+                let bits = entry["bits"] as? Int,
+                let groupSize = entry["group_size"] as? Int,
+                let mode = (entry["mode"] as? String)?.lowercased(),
+                mode == "affine",
+                supportedAffineBits.contains(bits),
+                groupSize > 0
+            else {
+                throw JangLoaderError.invalidConfig(
+                    "invalid affine tensor quantization manifest entry: \(path)")
+            }
+            if let storageBits = entry["storage_bits"] as? Int, storageBits != bits {
+                throw JangLoaderError.invalidConfig(
+                    "manifest bits/storage_bits mismatch for \(path): \(bits)/\(storageBits)")
+            }
+            entries[path] = BaseConfiguration.Quantization(
+                groupSize: groupSize, bits: bits, mode: .affine)
+        }
+        guard !entries.isEmpty else {
+            throw JangLoaderError.invalidConfig("tensor quantization manifest is empty")
+        }
+        return JangTensorQuantizationManifest(entries: entries)
+    }
+
+    /// Validate every manifest entry present in the selected model's weight
+    /// set. Text-only factories may intentionally omit vision tensors, so
+    /// absent entries are ignored; half-present or shape-inconsistent entries
+    /// fail closed.
+    public static func validateTensorQuantizationManifest(
+        _ manifest: JangTensorQuantizationManifest,
+        against weights: [String: MLXArray]
+    ) throws {
+        var validated = 0
+        for (path, quantization) in manifest.entries {
+            let weightKey = "\(path).weight"
+            let scalesKey = "\(path).scales"
+            let weight = weights[weightKey]
+            let scales = weights[scalesKey]
+            guard weight != nil || scales != nil else { continue }
+            guard let weight, let scales,
+                weight.dtype == .uint32,
+                let packedDim = weight.shape.last, packedDim > 0,
+                let numGroups = scales.shape.last, numGroups > 0,
+                (packedDim * 32) % quantization.bits == 0
+            else {
+                throw JangLoaderError.loadFailed(
+                    "manifest tensor is missing or malformed: \(path)")
+            }
+            let inputDim = (packedDim * 32) / quantization.bits
+            guard inputDim == numGroups * quantization.groupSize else {
+                throw JangLoaderError.loadFailed(
+                    "manifest tensor shape mismatch for \(path): packed=\(packedDim), groups=\(numGroups), bits=\(quantization.bits), group_size=\(quantization.groupSize)")
+            }
+            validated += 1
+        }
+        guard validated > 0 else {
+            throw JangLoaderError.loadFailed(
+                "tensor quantization manifest matched no loaded weights")
+        }
+    }
+
+    /// Read and validate a bundle's opt-in affine-1 runtime contract.
+    /// Bundles that do not request affine-1 support return `nil` and retain the
+    /// existing load path unchanged.
+    public static func loadAffine1RuntimeContract(
+        at modelPath: URL
+    ) throws -> JangAffine1RuntimeContract? {
+        guard let configURL = findConfigPath(at: modelPath) else { return nil }
+        let data = try Data(contentsOf: configURL)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            throw JangLoaderError.invalidConfig("Failed to parse affine-1 contract JSON")
+        }
+        guard let runtime = json["runtime"] as? [String: Any],
+            runtime["requires_jang_affine1_expansion"] as? Bool == true
+        else {
+            return nil
+        }
+        guard let quantization = json["quantization"] as? [String: Any],
+            let expansion = quantization["affine1_runtime_expansion"] as? [String: Any]
+        else {
+            throw JangLoaderError.invalidConfig(
+                "runtime requires affine-1 expansion but quantization.affine1_runtime_expansion is missing")
+        }
+
+        guard let storageBits = expansion["storage_bits"] as? Int,
+            let runtimeBits = expansion["runtime_bits"] as? Int,
+            storageBits == 1, runtimeBits == 2,
+            expansion["lossless"] as? Bool == true,
+            expansion["scales_biases_unchanged"] as? Bool == true
+        else {
+            throw JangLoaderError.invalidConfig(
+                "unsupported affine-1 expansion contract; expected lossless storage_bits=1, runtime_bits=2, scales_biases_unchanged=true")
+        }
+        guard quantization["tensor_quantization_manifest_schema"] as? Int == 2,
+            let manifest = quantization["tensor_quantization_manifest"] as? [String: Any]
+        else {
+            throw JangLoaderError.invalidConfig(
+                "affine-1 expansion requires tensor_quantization_manifest schema 2")
+        }
+        if let declaredCount = quantization["tensor_quantization_manifest_count"] as? Int,
+            declaredCount != manifest.count
+        {
+            throw JangLoaderError.invalidConfig(
+                "tensor quantization manifest count mismatch: declared \(declaredCount), found \(manifest.count)")
+        }
+
+        var modulePaths = Set<String>()
+        for (path, rawEntry) in manifest {
+            guard let entry = rawEntry as? [String: Any] else {
+                throw JangLoaderError.invalidConfig(
+                    "tensor quantization manifest entry is not an object: \(path)")
+            }
+            guard entry["storage_bits"] as? Int == 1 else { continue }
+            guard entry["bits"] as? Int == 1,
+                (entry["mode"] as? String)?.lowercased() == "affine"
+            else {
+                throw JangLoaderError.invalidConfig(
+                    "storage_bits=1 entry must declare bits=1 and mode=affine: \(path)")
+            }
+            modulePaths.insert(path)
+        }
+        guard !modulePaths.isEmpty else {
+            throw JangLoaderError.invalidConfig(
+                "affine-1 expansion contract has no storage_bits=1 manifest entries")
+        }
+        return JangAffine1RuntimeContract(
+            storageBits: storageBits, runtimeBits: runtimeBits, modulePaths: modulePaths)
+    }
 
     /// Check if a model directory contains a JANG model.
     public static func isJangModel(at path: URL) -> Bool {
@@ -1845,7 +2037,8 @@ public struct JangLoader: Sendable {
         validInDims: Set<Int> = [],
         attentionOutputDimHints: Set<Int> = [],
         declaredDefaultQuantization: BaseConfiguration.Quantization? = nil,
-        declaredPerLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
+        declaredPerLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+        declaredManifestQuantization: [String: BaseConfiguration.Quantization] = [:]
     ) -> BaseConfiguration.PerLayerQuantization {
         // JANGTQ bundles use two independent bit namespaces:
         //   - `mxtq_bits` / `routed_expert_bits` for tq_packed routed experts.
@@ -2003,6 +2196,20 @@ public struct JangLoader: Sendable {
                 ?? declaredDefaultQuantization
         }
 
+        func manifestQuantization(for basePath: String) -> BaseConfiguration.Quantization? {
+            for key in [
+                basePath,
+                basePath.hasPrefix("language_model.")
+                    ? String(basePath.dropFirst("language_model.".count)) : nil,
+                basePath.hasPrefix("model.") ? "language_model.\(basePath)" : nil,
+            ].compactMap({ $0 }) {
+                if let quantization = declaredManifestQuantization[key] {
+                    return quantization
+                }
+            }
+            return nil
+        }
+
         func layerIndexFromQuantizedBasePath(_ basePath: String) -> Int? {
             guard let range = basePath.range(
                 of: #"(?:^|\.)(?:model\.)?layers\.(\d+)\."#,
@@ -2121,7 +2328,9 @@ public struct JangLoader: Sendable {
             // inputDim ∈ validInDims is the author's verified intent. A genuinely stale
             // config (claims 8-bit for 4-bit-packed) unpacks to a NON-model inputDim,
             // fails this check, and still falls through to the shape walk.
-            if let dq = declaredQuantization(for: basePath),
+            if let manifest = manifestQuantization(for: basePath) {
+                (bits, inferredGroupSize) = (manifest.bits, manifest.groupSize)
+            } else if let dq = declaredQuantization(for: basePath),
                dq.bits > 0, numGroups > 0, (packedDim * 32) % dq.bits == 0,
                case let declaredInputDim = (packedDim * 32) / dq.bits,
                declaredInputDim % numGroups == 0,
