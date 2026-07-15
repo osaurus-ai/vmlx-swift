@@ -165,4 +165,57 @@ struct JangAffine1RuntimeContractTests {
         }
         return result
     }
+
+    /// Regression: a bundle declaring a PRE-schema-2 manifest must fall back to shape
+    /// inference (this function's documented contract), not fail the load. Before the
+    /// schema-2 manifest path existed, `tensor_quantization_manifest_schema` was never read,
+    /// so every schema-1 bundle the converter emits loaded fine via the legacy route.
+    @Test("pre-schema-2 manifest falls back instead of failing the load")
+    func olderManifestSchemaFallsBack() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("jang-schema1-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let config: [String: Any] = [
+            "format": "jang",
+            "format_version": "2.0",
+            "quantization": [
+                "tensor_quantization_manifest_schema": 1,
+                "tensor_quantization_manifest_count": 1,
+                "tensor_quantization_manifest": [
+                    "model.six_bit": ["bits": 6, "group_size": 64, "mode": "affine"]
+                ],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
+            .write(to: root.appendingPathComponent("jang_config.json"))
+
+        // Must not throw: nil hands the bundle to the legacy shape-inference path.
+        let manifest = try JangLoader.loadTensorQuantizationManifest(at: root)
+        #expect(manifest == nil)
+    }
+
+    /// The other side of the fence: a bundle that DOES declare schema 2 but omits the
+    /// manifest payload is malformed and must still fail closed.
+    @Test("schema-2 declared without a manifest still fails closed")
+    func schema2WithoutManifestFailsClosed() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("jang-schema2-bad-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let config: [String: Any] = [
+            "format": "jang",
+            "format_version": "2.0",
+            "quantization": ["tensor_quantization_manifest_schema": 2],
+        ]
+        try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
+            .write(to: root.appendingPathComponent("jang_config.json"))
+
+        #expect(throws: JangLoaderError.self) {
+            _ = try JangLoader.loadTensorQuantizationManifest(at: root)
+        }
+    }
+
 }

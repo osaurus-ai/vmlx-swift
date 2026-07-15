@@ -866,11 +866,21 @@ public struct JangLoader: Sendable {
         else {
             return nil
         }
-        guard schema == 2,
-            let rawManifest = quantization["tensor_quantization_manifest"] as? [String: Any]
+        guard schema == 2 else {
+            // "Shape inference remains the fallback for older bundles without a schema-2
+            // manifest" (see the doc comment above). A bundle declaring a pre-2 manifest
+            // schema is exactly such a bundle: before this path existed the field was never
+            // read at all, and the legacy per-module / shape-inference route loaded those
+            // bundles correctly. Throwing here turns a previously-ignored field into a hard
+            // load failure for every pre-schema-2 bundle — including every schema-1 bundle
+            // the current converter emits. Fall back instead; only schema 2 is consumed here.
+            return nil
+        }
+        guard let rawManifest = quantization["tensor_quantization_manifest"] as? [String: Any]
         else {
+            // A declared schema-2 manifest that is missing its payload IS malformed: fail closed.
             throw JangLoaderError.invalidConfig(
-                "unsupported tensor quantization manifest schema \(schema)")
+                "schema-2 tensor quantization manifest declared but tensor_quantization_manifest is missing")
         }
         if let declaredCount = quantization["tensor_quantization_manifest_count"] as? Int,
             declaredCount != rawManifest.count
