@@ -4110,11 +4110,11 @@ func runQwenThinkingReasoningCheck(modelPath: String, maxNew: Int) async throws 
     var reasoningText = ""
     var chunkCount = 0
     var reasoningCount = 0
+    var completionInfo: GenerateCompletionInfo?
 
     do {
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+        let context = try await loadBenchModelContext(from: modelDir)
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Reasoning stamp: \(context.configuration.reasoningParserName ?? "nil")")
@@ -4155,7 +4155,9 @@ func runQwenThinkingReasoningCheck(modelPath: String, maxNew: Int) async throws 
                 case .reasoning(let r):
                     reasoningText += r
                     reasoningCount += 1
-                case .prefillProgress, .toolCall, .info, .toolCallProgress:
+                case .info(let info):
+                    completionInfo = info
+                case .prefillProgress, .toolCall, .toolCallProgress:
                     break
                 }
             }
@@ -4169,17 +4171,41 @@ func runQwenThinkingReasoningCheck(modelPath: String, maxNew: Int) async throws 
     try? await Task.sleep(nanoseconds: 50_000_000)
 
     print("chunks=\(chunkCount) reasoningDeltas=\(reasoningCount)")
+    if let completionInfo {
+        print(String(format:
+            "telemetry tokens=%d promptTok/s=%.1f decodeTok/s=%.1f stop=%@ unclosedReasoning=%@",
+            completionInfo.generationTokenCount,
+            completionInfo.promptTokensPerSecond,
+            completionInfo.tokensPerSecond,
+            String(describing: completionInfo.stopReason),
+            completionInfo.unclosedReasoning ? "yes" : "no"))
+    }
     print(".chunk preview: \"\(chunkText.prefix(300))\"")
     print(".reasoning preview: \"\(reasoningText.prefix(300))\"")
 
-    if chunkText.contains("<think>") || chunkText.contains("</think>") {
-        fputs("FAIL: .chunk leaked <think> markers — startInReasoning broken.\n", stderr)
+    let rawMarkers = ["<think>", "</think>", "<|channel>", "<|tool_call>", "<tool_call>"]
+        .filter { chunkText.contains($0) }
+    if !rawMarkers.isEmpty {
+        fputs("FAIL: .chunk leaked raw parser markers: \(rawMarkers).\n", stderr)
         exit(1)
     }
     if reasoningCount == 0 {
-        fputs("WARN: zero .reasoning deltas — prompt may not elicit CoT.\n", stderr)
+        fputs("FAIL: zero .reasoning deltas for an explicit thinking prompt.\n", stderr)
+        exit(1)
     }
-    print("PASS no <think> leakage in .chunk.")
+    if chunkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        fputs("FAIL: thinking turn emitted no visible final answer.\n", stderr)
+        exit(1)
+    }
+    guard let completionInfo,
+          completionInfo.generationTokenCount > 0,
+          completionInfo.tokensPerSecond > 0,
+          !completionInfo.unclosedReasoning
+    else {
+        fputs("FAIL: missing generation telemetry or reasoning did not close.\n", stderr)
+        exit(1)
+    }
+    print("PASS reasoning/content split, closed reasoning, telemetry, and no raw-marker leakage.")
     print("=== BENCH_QWEN_THINKING_CHECK: passed ===")
 }
 

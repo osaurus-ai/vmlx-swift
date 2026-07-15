@@ -175,7 +175,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
-                cachePrefixTokenCounts: cachePrefixTokenCounts)
+                cachePrefixTokenCounts: cachePrefixTokenCounts,
+                toolSchemas: input.tools)
         }
 
         var processedImage: LMInput.ProcessedImage?
@@ -257,7 +258,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
             image: processedImage,
             video: processedVideo,
-            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+            toolSchemas: input.tools)
     }
 }
 

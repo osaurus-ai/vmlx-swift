@@ -838,6 +838,7 @@ let package = Package(
                 "MiniMaxJANGTQResidentExpertTests.swift",
                 "JangPressMachCacheTests.swift",
                 "JangPressPrestackerCleanupTests.swift",
+                "JangAffine1RuntimeContractTests.swift",
                 "DeepseekV4IndexerCausalTopKTests.swift",
                 "DeepseekV4ReasoningPolicyTests.swift",
                 "Gemma4ZyphraToolParserFocusedTests.swift",
