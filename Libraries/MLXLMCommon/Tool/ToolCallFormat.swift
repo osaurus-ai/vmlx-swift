@@ -184,6 +184,13 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<invoke name="f"><parameter name="k">v</parameter></invoke>`
     case minimaxM2 = "minimax_m2"
 
+    /// MiniMax M3 namespaced XML invoke format. The template prefixes every tag
+    /// with `]<]minimax[>[` and uses BARE `<key>value</key>` arg tags inside a
+    /// `<tool_call>` wrapper — distinct from M2's `<minimax:tool_call>` +
+    /// `<parameter name=>`. Example:
+    /// `]<]minimax[>[<tool_call>]<]minimax[>[<invoke name="f">]<]minimax[>[<k>v]<]minimax[>[</k>]<]minimax[>[</invoke>]<]minimax[>[</tool_call>`
+    case minimaxM3 = "minimax_m3"
+
     /// Mistral V11+ format with [TOOL_CALLS] and [ARGS] delimiters.
     /// Example: `[TOOL_CALLS]get_weather [ARGS]{"location": "Tokyo"}`
     case mistral
@@ -244,6 +251,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return KimiK2ToolCallParser()
         case .minimaxM2:
             return MiniMaxM2ToolCallParser()
+        case .minimaxM3:
+            return MiniMaxM3ToolCallParser()
         case .mistral:
             return MistralToolCallParser()
         case .llama3:
@@ -289,7 +298,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// residue once a native tool call is extracted.
     public var preservesReasoningTextAroundToolCalls: Bool {
         switch self {
-        case .minimaxM2:
+        case .minimaxM2, .minimaxM3:
             return true
         default:
             return false
@@ -372,6 +381,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .gemma
         }
 
+        // MiniMax-M3 (minimax_m3 / minimax_m3_vl) uses a DIFFERENT tool envelope
+        // than M2 — must be checked first so it doesn't fall into the M2 arm.
+        if compact.hasPrefix("minimaxm3") {
+            return .minimaxM3
+        }
         // MiniMax family (minimax, minimax_m2)
         if compact.hasPrefix("minimax") {
             return .minimaxM2
@@ -622,6 +636,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // MiniMax — JANG converter stamps `minimax`; older artifacts use
         // the canonical `minimax_m2`. Future M2.5 variants use
         // `minimax_m2_5` per the converter.
+        case "minimax_m3", "minimax_m3_vl":
+            return .minimaxM3
         case "minimax", "minimax_m2_5":
             return .minimaxM2
         // GLM 4.x / 5 / DeepSeek tool format (arg_key / arg_value tags).

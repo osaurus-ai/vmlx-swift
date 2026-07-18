@@ -103,7 +103,15 @@ public func cacheRequiresDiskBackedCoordinatorRestore(_ cache: [any KVCache]) ->
             layer is RotatingKVCache ||
             layer is RotatingKVCacheWrapper ||
             layer is TurboQuantKVCache ||
-            layer is QuantizedKVCache
+            layer is QuantizedKVCache ||
+            // MiniMax-M3 MSA: the paged tier stores only full-history KV blocks
+            // and cannot round-trip the idx_keys lane. Force restore through the
+            // disk serializer (which carries all 3 lanes via `state`) so block
+            // selection is never recomputed against a cache missing idx_keys.
+            // Deliberately NOT in `cacheContainsPathDependentState`: M3 has no
+            // SSM/conv companion — idx_keys rides the standard state round-trip,
+            // so it must not trigger SSM-state extraction.
+            layer is MiniMaxM3SparseCache
     }
 }
 
@@ -589,6 +597,15 @@ private func restoreFromV2Arrays(
                 totalTokens = comp.offset
             }
 
+        case .miniMaxM3Sparse(let comp):
+            // MiniMax-M3 MSA: restore keys, values, AND idx_keys together. A
+            // KV-only restore would be a false hit because block selection is
+            // recomputed from idx_keys every step.
+            restoreMiniMaxM3Layer(comp, into: cache[i])
+            if totalTokens == 0 {
+                totalTokens = comp.offset
+            }
+
         case .cacheList(let subLayers):
             // CacheList composite (BaichuanM1, FalconH1, MiMoV2Flash
             // hybrid stacks). Dispatch each sub-LayerData via the
@@ -627,7 +644,7 @@ private func restoreFromV2Arrays(
                         totalTokens = comp.offset
                     }
 
-                case .tq, .qkv, .deepseekV4, .zayaCCA, .cacheList, .skip:
+                case .tq, .qkv, .deepseekV4, .zayaCCA, .miniMaxM3Sparse, .cacheList, .skip:
                     // .skip is a per-sub no-op (sub-cache had no
                     // persistable state). The other cases are not
                     // currently emitted as sub-cache kinds — see
@@ -1007,6 +1024,18 @@ private func restoreZayaCCALayer(
 ) {
     guard let zaya = layer as? ZayaCCACache else { return }
     zaya.state = [comp.keys, comp.values, comp.convState, comp.prevHS]
+}
+
+/// Restore a full `MiniMaxM3SparseCache` layer — keys, values, idx_keys — as
+/// one unit. The cache's `state` setter handles zero-seq sentinels (empty
+/// source) and re-derives `offset` from the keys length. No-ops on type
+/// mismatch so the caller falls back to fresh prefill.
+private func restoreMiniMaxM3Layer(
+    _ comp: TQDiskSerializer.MiniMaxM3SparseLayerComponents,
+    into layer: any KVCache
+) {
+    guard let m3 = layer as? MiniMaxM3SparseCache else { return }
+    m3.state = [comp.keys, comp.values, comp.idxKeys]
 }
 
 /// Helper: restore Mamba SSM state into a `MambaCache` layer (or a

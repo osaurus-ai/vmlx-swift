@@ -1384,6 +1384,13 @@ public func savePromptCache(
     // Use Python-compatible class names for cross-platform compatibility
     let cacheClasses = cache.map { cache -> String in
         switch cache {
+        case is MiniMaxM3SparseCache:
+            // M3 sparse layers carry a 3-lane composite cache (keys, values,
+            // idx_keys). Must precede the KVCacheSimple/default arms: it is NOT a
+            // KVCacheSimple subclass, so it would otherwise fall through to the
+            // "KVCache" default, drop idx_keys, and load back as a 2-array cache
+            // (state setter fatals on the 3-array payload). Keep it first-class.
+            return "MiniMaxM3SparseCache"
         case is ChunkedKVCache:
             return "ChunkedKVCache"  // Must precede KVCacheSimple because of inheritance
         case is KVCacheSimple:
@@ -1473,6 +1480,11 @@ public func loadPromptCache(
         switch className {
         case "KVCache", "KVCacheSimple":  // Handle both Python and Swift names
             cache = KVCacheSimple()
+        case "MiniMaxM3SparseCache":
+            // indexDim is recovered from the 3-lane `state` payload (the idx
+            // tensor's last dim); the default-constructed cache only needs a
+            // placeholder until `state`/`metaState` are applied below.
+            cache = MiniMaxM3SparseCache()
         case "RotatingKVCache":
             // Parse metaState first to get maxSize, then create cache
             let info = i < cacheInfo.count ? cacheInfo[i] : []
@@ -1764,7 +1776,10 @@ public func quantizedScaledDotProductAttention(
 ///   Returns float arrays — models need zero changes.
 ///
 /// Only converts `KVCacheSimple` layers. `RotatingKVCache`, `DeepseekV4Cache`,
-/// `MambaCache`, and already-converted caches are skipped automatically.
+/// `MambaCache`, `MiniMaxM3SparseCache` (native MSA — its idx_keys lane cannot be
+/// TQ/affine-encoded), and already-converted caches are skipped automatically.
+/// For MiniMax-M3 this means the 57 sparse MSA layers are never compressed; only
+/// the 3 dense full-attention `KVCacheSimple` layers are eligible.
 ///
 /// - Parameters:
 ///   - cache: Array of KV caches to potentially quantize/compress
