@@ -1,6 +1,8 @@
 # Nemotron Omni Multimodal Correctness Checkpoint — 2026-07-19
 
-Status: **PARTIAL — patched engine is not yet accepted in the rebuilt Osaurus UI.**
+Status: **PARTIAL — the patched engine passes the rebuilt isolated Release
+Osaurus default-cache multimodal matrix; video Thinking-on and 4/4
+TurboQuant-KV video accuracy remain open.**
 
 Scope is the locally available non-MXFP4 bundle:
 
@@ -77,18 +79,64 @@ payloads in `ModelRuntime`, and builds `MLXLMCommon.UserInput(chat:)` in
 `config_omni.json` as a VLM sidecar so this exact bundle is selectable through
 the multimodal UI instead of being filtered as text-only.
 
-## Remaining release proof
+## Rebuilt Osaurus live proof
 
-- Commit and push the bounded media-prefill and safe hybrid-media-boundary
-  change, then pin the exact revision in the isolated Osaurus checkout.
-- Run Osaurus multimodal-content and VLM-detection focused tests.
-- Build and ad-hoc sign an isolated Release Osaurus app under the proof bundle
-  identifier and proof root.
-- Use Computer Use to confirm settings and visible real-user flows for image,
-  video, audio, mixed media, multi-turn recall, media-salt isolation, and
-  Thinking on/off with this exact JANGTQ4 bundle.
-- Capture TTFT/token rate, Activity Monitor physical footprint, effective
-  prefix/paged/L2/TurboQuant telemetry, and a real L2 restore before changing
-  this checkpoint from PARTIAL.
-- Do not call video Thinking-on passed while it still length-stops, and do not
-  force Thinking off to manufacture a pass.
+Osaurus pinned this engine at
+`4634af5151ffd71262d180e32962939dd8b2263f`, built an ad-hoc-signed Release app
+at `/tmp/osaurus-nemotron-proof-dd-4634/Build/Products/Release/osaurus.app`, and
+ran it under the isolated bundle `com.dinoki.osaurus.nemotron4634proof` and
+root `/tmp/osaurus-nemotron-ui-proof-20260719-4634`. The exact JANGTQ4 bundle
+was selected from `/Users/eric/models` through the real UI; no MXFP4 bundle was
+loaded.
+
+With Thinking off, prefix on, paged RAM off, SSD L2 on, SSM re-derive on, and
+live KV codec `Engine Selected`, the UI produced:
+
+- correct image at 6.46s TTFT / 103.4 tok/s and correct no-attachment recall at
+  0.95s / 103.2 tok/s;
+- correct post-restart image recall at 1.17s / 102.6 tok/s, with fresh-process
+  telemetry showing four disk-L2 hits and four SSM-companion hits;
+- correct audio transcript at 1.05s / 101.3 tok/s;
+- correct mixed image/audio result at 5.53s / 101.4 tok/s;
+- SMPTE/timecode video recognition at 12.20s / 109.3 tok/s, with a remaining
+  fine-detail miss on the final frame number;
+- a correct fresh Thinking-on mixed-media answer at 5.56s / 101.8 tok/s and a
+  correct no-attachment follow-up at 0.95s / 101.9 tok/s.
+
+`vmmap -summary` measured a 17.6-17.9 GiB physical footprint and 20.3 GiB peak
+during the current live matrix, down from the pre-patch 76 GiB high-water mark.
+The isolated chat evidence is retained in
+`/tmp/osaurus-nemotron-ui-proof-20260719-4634/chat-history/history.sqlite`.
+
+The default fresh-load telemetry was six FP16 KV layers plus 23 Mamba layers,
+disk-backed restore and SSM companion state required, zero TurboQuant-KV
+layers, and paged cache off. JANGTQ4 describes the weights and was not reported
+as TurboQuant KV.
+
+## Explicit TurboQuant-KV live row
+
+The real Server -> Settings -> Cache UI was changed to TurboQuant with explicit
+4-bit key and value widths, saved, and the app restarted. Telemetry showed a
+selective transition from six KV + 23 Mamba layers to six TurboQuant-KV + 23
+Mamba layers, three compressions, four disk hits, four SSM companion hits, and
+zero paged hits. Mixed image/audio stayed correct at 6.71s / 21.3 tok/s and its
+cached follow-up stayed correct at 0.97s / 68.3 tok/s.
+
+The video row is not accepted for quality. On the same prompt and fixture, the
+4/4 cache run coherently recognized SMPTE bars but misread a roughly five-second
+clip as five minutes / 24 frames. After restoring `Engine Selected`, saving,
+and restarting, the FP16-cache run tracked the counter to about 140 at 11.91s
+TTFT / 110.6 tok/s. Fresh telemetry then confirmed effective `fp16`, zero
+TurboQuant-KV layers, and paged cache off.
+
+## Remaining release limits
+
+- Video with Thinking enabled still length-stops in the deterministic direct
+  matrix. Do not force Thinking off or change sampling to manufacture a pass.
+- One off-to-on Thinking transition follow-up repeated a correct sentence
+  three times; a fresh Thinking-on chat did not reproduce it.
+- One transcript-only audio request selected a valid but unsolicited
+  `share_artifact` tool. That is a model/tool-choice caveat, not a media
+  transport or schema-parser failure.
+- 4/4 TurboQuant-KV is structurally selective and cache-compatible for this
+  hybrid topology, but the live video-detail A/B is a quality failure.
