@@ -945,6 +945,7 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var promptPrefillTime: TimeInterval { get }
     var promptTokenIds: [Int] { get }
     var turboQuantCompressionCount: Int { get }
+    var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { get }
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool)
@@ -953,6 +954,7 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
 extension TokenIteratorProtocol {
     public var promptTokenIds: [Int] { [] }
     public var turboQuantCompressionCount: Int { 0 }
+    public var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { nil }
 
     public mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
@@ -1148,6 +1150,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     public var tokenCount = 0
     public let maxTokens: Int?
     public private(set) var turboQuantCompressionCount = 0
+    public private(set) var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot?
 
     // Cache quantization parameters
     let kvBits: Int?
@@ -1971,6 +1974,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     mutating func maybeQuantizeCacheForStep() {
         let hadTQ = cache.contains { $0 is TurboQuantKVCache }
+        let before = hadTQ ? nil : ModelCacheTopologySnapshot(cache: cache)
         maybeQuantizeKVCache(
             cache: &cache,
             kvBits: kvBits,
@@ -1978,8 +1982,12 @@ public struct TokenIterator: TokenIteratorProtocol {
             quantizedKVStart: quantizedKVStart,
             kvMode: kvMode)
         let hasTQ = cache.contains { $0 is TurboQuantKVCache }
-        if !hadTQ && hasTQ {
+        if !hadTQ, hasTQ, let before {
             turboQuantCompressionCount += 1
+            lastTurboQuantCacheTransition = TurboQuantCacheTransitionSnapshot(
+                before: before,
+                after: ModelCacheTopologySnapshot(cache: cache)
+            )
         }
     }
 
@@ -3694,6 +3702,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 generationTime: generateTime,
                 stopReason: stopReason ?? .cancelled,
                 turboQuantCompressions: iterator.turboQuantCompressionCount,
+                turboQuantCacheTransition: iterator.lastTurboQuantCacheTransition,
                 unclosedReasoning: unclosedReasoning
             )
             // Multi-tier cache: drain the final async token eval before cache
@@ -3786,6 +3795,12 @@ public struct GenerateCompletionInfo: Sendable {
     /// live KVCacheSimple -> TurboQuantKVCache transition.
     public let turboQuantCompressions: Int
 
+    /// Real cache-class topology immediately before and after the most recent
+    /// live TurboQuant transition in this generation. `nil` means no layer
+    /// transition was observed; callers must not infer activation from the
+    /// requested KV mode alone.
+    public let turboQuantCacheTransition: TurboQuantCacheTransitionSnapshot?
+
     /// True when the stream ended with the reasoning parser still in
     /// REASONING state — i.e. the model never emitted `</think>` (or
     /// the family-specific close tag) before EOS or `max_tokens`.
@@ -3835,6 +3850,7 @@ public struct GenerateCompletionInfo: Sendable {
         generationTime: TimeInterval,
         stopReason: GenerateStopReason = .stop,
         turboQuantCompressions: Int = 0,
+        turboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? = nil,
         unclosedReasoning: Bool = false
     ) {
         self.promptTokenCount = promptTokenCount
@@ -3843,6 +3859,7 @@ public struct GenerateCompletionInfo: Sendable {
         self.generateTime = generationTime
         self.stopReason = stopReason
         self.turboQuantCompressions = turboQuantCompressions
+        self.turboQuantCacheTransition = turboQuantCacheTransition
         self.unclosedReasoning = unclosedReasoning
     }
 

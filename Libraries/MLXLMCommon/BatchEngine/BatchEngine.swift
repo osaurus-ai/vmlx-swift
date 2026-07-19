@@ -292,6 +292,11 @@ public actor BatchEngine {
     /// proof that the live codec activated.
     private var turboQuantCompressionCount: Int = 0
 
+    /// Most recent real before/after layer topology for a successful
+    /// TurboQuant transition. This remains available after its request slot
+    /// completes so host diagnostics can prove which layers converted.
+    private var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot?
+
     /// Background scheduling loop task handle.
     private var loopTask: Task<Void, Never>?
 
@@ -876,9 +881,13 @@ public actor BatchEngine {
                         generationTime: info.generateTime,
                         stopReason: finalStop,
                         turboQuantCompressions: info.turboQuantCompressions,
+                        turboQuantCacheTransition: info.turboQuantCacheTransition,
                         unclosedReasoning: unclosed)
                     if info.turboQuantCompressions > 0 {
                         turboQuantCompressionCount += info.turboQuantCompressions
+                    }
+                    if let transition = info.turboQuantCacheTransition {
+                        lastTurboQuantCacheTransition = transition
                     }
                     terminationState.markCompleted()
                     continuation.yield(.info(finalInfo))
@@ -1169,6 +1178,11 @@ public actor BatchEngine {
                 if case .info(let info) = generation, info.turboQuantCompressions > 0 {
                     turboQuantCompressionCount += info.turboQuantCompressions
                 }
+                if case .info(let info) = generation,
+                   let transition = info.turboQuantCacheTransition
+                {
+                    lastTurboQuantCacheTransition = transition
+                }
                 continuation.yield(generation)
             }
             self.finishSoloFastPath(id: fastPathID)
@@ -1307,6 +1321,12 @@ public actor BatchEngine {
     /// Number of successful KVCacheSimple -> TurboQuantKVCache transitions.
     public var turboQuantCompressionCountForDiagnostics: Int {
         turboQuantCompressionCount
+    }
+
+    /// Exact before/after cache classes from the most recent successful live
+    /// TurboQuant transition, or `nil` when no transition has occurred.
+    public var lastTurboQuantCacheTransitionForDiagnostics: TurboQuantCacheTransitionSnapshot? {
+        lastTurboQuantCacheTransition
     }
 
     /// Whether the engine is currently running (has active or pending work).
@@ -2574,13 +2594,18 @@ public actor BatchEngine {
 
     private func maybeCompressSlotCache(_ slot: inout BatchSlot) {
         let hadTQ = slot.cache.contains { $0 is TurboQuantKVCache }
+        let before = hadTQ ? nil : ModelCacheTopologySnapshot(cache: slot.cache)
         BatchQuantize.maybeCompress(
             cache: &slot.cache,
             parameters: slot.parameters
         )
         let hasTQ = slot.cache.contains { $0 is TurboQuantKVCache }
-        if !hadTQ && hasTQ {
+        if !hadTQ, hasTQ, let before {
             turboQuantCompressionCount += 1
+            lastTurboQuantCacheTransition = TurboQuantCacheTransitionSnapshot(
+                before: before,
+                after: ModelCacheTopologySnapshot(cache: slot.cache)
+            )
         }
     }
 

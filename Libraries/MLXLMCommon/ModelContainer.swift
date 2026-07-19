@@ -169,6 +169,40 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
     }
 }
 
+/// Exact cache-layer transition observed when a live request crosses from
+/// ordinary float KV into TurboQuant KV.
+///
+/// A requested ``KVQuantizationMode/turboQuant(keyBits:valueBits:)`` value or
+/// a non-zero transition-event counter proves only that the hook ran. This
+/// snapshot records the real cache classes immediately before and after the
+/// hook so hosts can prove how many eligible full-attention layers converted
+/// and which architecture-specific layers (for example Gemma rotating SWA)
+/// remained native.
+public struct TurboQuantCacheTransitionSnapshot: Codable, Sendable, Equatable {
+    public let before: ModelCacheTopologySnapshot
+    public let after: ModelCacheTopologySnapshot
+    public let convertedTurboQuantKVLayerCount: Int
+
+    public init(
+        before: ModelCacheTopologySnapshot,
+        after: ModelCacheTopologySnapshot
+    ) {
+        self.before = before
+        self.after = after
+        self.convertedTurboQuantKVLayerCount = max(
+            0,
+            after.turboQuantKVLayerCount - before.turboQuantKVLayerCount
+        )
+    }
+
+    public init(before: [any KVCache], after: [any KVCache]) {
+        self.init(
+            before: ModelCacheTopologySnapshot(cache: before),
+            after: ModelCacheTopologySnapshot(cache: after)
+        )
+    }
+}
+
 /// Container for models that guarantees single threaded access.
 ///
 /// Wrap models used by e.g. the UI in a ModelContainer. Callers can access
