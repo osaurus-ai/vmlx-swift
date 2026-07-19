@@ -29,6 +29,29 @@ final class NemotronHOmniSmokeTests: XCTestCase {
         XCTAssertEqual(outA.shape, [1, 64, 2688])
     }
 
+    func testVisionProjectorUsesBundleRMSNormAndSquaredReLUContract() throws {
+        let projector = NemotronHVisionMLPProjector(
+            inDim: 2, projectorDim: 2, llmDim: 1)
+        var parameters = ModuleParameters()
+        parameters["layer_norm"] = .dictionary([
+            "weight": .value(MLXArray.ones([2])),
+        ])
+        parameters["fc1"] = .dictionary([
+            "weight": .value(MLXArray([Float(1), 0, 0, 1], [2, 2])),
+        ])
+        parameters["fc2"] = .dictionary([
+            "weight": .value(MLXArray([Float(1), 1], [1, 2])),
+        ])
+        try projector.update(parameters: parameters, verify: .all)
+
+        let output = projector(MLXArray([Float(3), 4], [1, 2]))
+        MLX.eval(output)
+        // RMSNorm([3,4]) is approximately [0.8485,1.1314]; squaring the
+        // positive components and summing produces 2.0. LayerNorm+GELU,
+        // the broken implementation, produces approximately 0.68 instead.
+        XCTAssertEqual(output.item(Float.self), 2.0, accuracy: 1e-4)
+    }
+
     func testRADIOForwardShape() throws {
         // Tiny ViT to keep test fast: 2 blocks, 64 hidden, 8 heads, 16 patch.
         // (The default V3 model is 1280-hidden 32-block; we only validate
@@ -130,7 +153,6 @@ final class NemotronHOmniSmokeTests: XCTestCase {
     func testRemapMlp1Weights() throws {
         let raw: [String: MLXArray] = [
             "mlp1.0.weight": MLXArray.zeros([5120]),
-            "mlp1.0.bias": MLXArray.zeros([5120]),
             "mlp1.1.weight": MLXArray.zeros([20_480, 5120]),
             "mlp1.3.weight": MLXArray.zeros([2688, 20_480]),
             "irrelevant.weight": MLXArray.zeros([1]),
@@ -138,7 +160,7 @@ final class NemotronHOmniSmokeTests: XCTestCase {
         let out = remapMlp1Weights(raw)
         // remap returns unprefixed keys — wrapper sanitize prefixes with mlp1.
         XCTAssertEqual(out["layer_norm.weight"]?.shape, [5120])
-        XCTAssertEqual(out["layer_norm.bias"]?.shape, [5120])
+        XCTAssertNil(out["layer_norm.bias"])
         XCTAssertEqual(out["fc1.weight"]?.shape, [20_480, 5120])
         XCTAssertEqual(out["fc2.weight"]?.shape, [2688, 20_480])
         XCTAssertNil(out["irrelevant.weight"])

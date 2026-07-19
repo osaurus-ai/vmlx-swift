@@ -154,9 +154,12 @@ public class NemotronHViTBlock: Module, UnaryLayer {
     @ModuleInfo(key: "mlp") var mlp: NemotronHViTMLP
 
     public init(dim: Int, numHeads: Int, mlpRatio: Float) {
-        self._norm1.wrappedValue = LayerNorm(dimensions: dim)
+        // timm's ViT blocks use LayerNorm(eps=1e-6). MLXNN defaults to
+        // 1e-5, which compounds across RADIO's 32 blocks and materially
+        // changes the vision embeddings.
+        self._norm1.wrappedValue = LayerNorm(dimensions: dim, eps: 1e-6)
         self._attn.wrappedValue = NemotronHViTAttention(dim: dim, numHeads: numHeads)
-        self._norm2.wrappedValue = LayerNorm(dimensions: dim)
+        self._norm2.wrappedValue = LayerNorm(dimensions: dim, eps: 1e-6)
         self._mlp.wrappedValue = NemotronHViTMLP(dim: dim, hiddenDim: Int(Float(dim) * mlpRatio))
     }
 

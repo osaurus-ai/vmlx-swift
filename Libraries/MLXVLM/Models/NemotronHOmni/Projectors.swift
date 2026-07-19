@@ -1,10 +1,12 @@
 // Projectors.swift
 // mlp1 (vision) and sound_projection (audio) projectors for Nemotron-Omni.
 //
-// Mirrors jang_tools/nemotron_omni/projectors.py.
+// Mirrors the model bundle's authoritative `modeling.py`.  The older
+// jang_tools projector copy used LayerNorm/GELU, but Nemotron Omni V3 was
+// trained with RMSNorm/SquaredReLU.
 //
 // Tensor naming on disk:
-//   mlp1.0.weight                       LayerNorm   (5120,)
+//   mlp1.0.weight                       RMSNorm     (5120,)
 //   mlp1.1.weight                       Linear      (20480, 5120)
 //   mlp1.3.weight                       Linear      (2688, 20480)
 //   sound_projection.norm.weight        RMSNorm     (1024,)
@@ -16,14 +18,14 @@ import MLX
 import MLXNN
 
 /// Vision MLP projector (post-pixel-shuffle ViT features → LLM hidden).
-/// Forward: LayerNorm → Linear → GELU → Linear
+/// Forward: RMSNorm → Linear → SquaredReLU → Linear
 public class NemotronHVisionMLPProjector: Module, UnaryLayer {
-    @ModuleInfo(key: "layer_norm") var layerNorm: LayerNorm
+    @ModuleInfo(key: "layer_norm") var layerNorm: RMSNorm
     @ModuleInfo(key: "fc1") var fc1: Linear
     @ModuleInfo(key: "fc2") var fc2: Linear
 
     public init(inDim: Int, projectorDim: Int, llmDim: Int) {
-        self._layerNorm.wrappedValue = LayerNorm(dimensions: inDim)
+        self._layerNorm.wrappedValue = RMSNorm(dimensions: inDim, eps: 1e-5)
         self._fc1.wrappedValue = Linear(inDim, projectorDim, bias: false)
         self._fc2.wrappedValue = Linear(projectorDim, llmDim, bias: false)
     }
@@ -31,7 +33,8 @@ public class NemotronHVisionMLPProjector: Module, UnaryLayer {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         var h = layerNorm(x)
         h = fc1(h)
-        h = gelu(h)
+        let r = MLX.maximum(h, MLXArray(0, dtype: h.dtype))
+        h = r * r
         h = fc2(h)
         return h
     }
@@ -70,7 +73,6 @@ public class NemotronHSoundProjector: Module, UnaryLayer {
 public func remapMlp1Weights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
     let rename: [String: String] = [
         "mlp1.0.weight": "layer_norm.weight",
-        "mlp1.0.bias": "layer_norm.bias",
         "mlp1.1.weight": "fc1.weight",
         "mlp1.1.bias": "fc1.bias",
         "mlp1.3.weight": "fc2.weight",

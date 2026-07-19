@@ -93,6 +93,82 @@ enum OmniBench {
             exit(1)
         }
 
+        if ProcessInfo.processInfo.environment["BENCH_OMNI_DIAG"] == "1",
+           let processor = context.processor as? NemotronHOmniProcessor
+        {
+            let image: CIImage
+            if let path = ProcessInfo.processInfo.environment["BENCH_OMNI_DIAG_IMAGE"],
+               let loaded = CIImage(contentsOf: URL(fileURLWithPath: path))
+            {
+                image = loaded
+            } else {
+                image = try synthesiseGradient(side: 224)
+            }
+            let (pixels, tokenCounts) = try processor.preprocess(images: [image])
+            MLX.eval(pixels)
+            let values = pixels.asArray(Float.self)
+            let height = pixels.dim(2)
+            let width = pixels.dim(3)
+            let channelSize = pixels.dim(2) * pixels.dim(3)
+            let channelMeans = (0 ..< pixels.dim(1)).map { channel -> Float in
+                let start = channel * channelSize
+                let end = start + channelSize
+                return values[start ..< end].reduce(0, +) / Float(channelSize)
+            }
+            let firstHalfMeans = (0 ..< pixels.dim(1)).map { channel -> Float in
+                let start = channel * channelSize
+                let end = start + (height / 2) * width
+                return values[start ..< end].reduce(0, +) / Float(end - start)
+            }
+            let secondHalfMeans = (0 ..< pixels.dim(1)).map { channel -> Float in
+                let start = channel * channelSize + (height / 2) * width
+                let end = (channel + 1) * channelSize
+                return values[start ..< end].reduce(0, +) / Float(end - start)
+            }
+            print(
+                "[OMNI_DIAG] image_pixels shape=\(pixels.shape) "
+                    + "tokens=\(tokenCounts) means=\(channelMeans) "
+                    + "firstHalf=\(firstHalfMeans) secondHalf=\(secondHalfMeans)")
+            let imageEmbeds = omni.extractImageEmbeds(pixelValues: pixels)
+            MLX.eval(imageEmbeds)
+            let embedValues = imageEmbeds.asArray(Float.self)
+            let embedMean = embedValues.reduce(0, +) / Float(embedValues.count)
+            let embedVariance = embedValues.reduce(Float(0)) { partial, value in
+                let delta = value - embedMean
+                return partial + delta * delta
+            } / Float(embedValues.count)
+            print(
+                "[OMNI_DIAG] image_embeds shape=\(imageEmbeds.shape) "
+                    + "mean=\(embedMean) std=\(sqrt(embedVariance)) "
+                    + "min=\(embedValues.min() ?? .nan) max=\(embedValues.max() ?? .nan) "
+                    + "first16=\(Array(embedValues.prefix(16)))")
+            if ProcessInfo.processInfo.environment["BENCH_OMNI_DIAG_ONLY"] == "1" {
+                return
+            }
+        }
+
+        if ProcessInfo.processInfo.environment["BENCH_OMNI_VIDEO_ONLY"] == "1" {
+            let videoURL = URL(
+                fileURLWithPath: ProcessInfo.processInfo.environment[
+                    "BENCH_OMNI_VIDEO_PATH"]
+                    ?? "Tests/MLXLMTests/Resources/1080p_30.mov")
+            let thinking = ProcessInfo.processInfo.environment[
+                "BENCH_OMNI_VIDEO_THINKING"] != "0"
+            let cache = context.model.newCache(parameters: .init())
+            let result = try await runVideoTurn(
+                prompt: "Describe this video briefly.",
+                videoURL: videoURL,
+                context: context,
+                cache: cache,
+                maxNewTokens: maxNewTokens,
+                enableThinking: thinking)
+            print(
+                "OMNI_VIDEO_ONLY thinking=\(thinking) tokens=\(result.tokens) "
+                    + "seconds=\(String(format: "%.2f", result.secs)) "
+                    + "text=\(result.shortText)")
+            return
+        }
+
 
         var results: [RowResult] = []
 
@@ -805,6 +881,7 @@ enum OmniBench {
             lmInput: lmInput,
             raw: raw,
             visibleText: text)
+        try requireNormalStop(raw, row: "text turn")
         if !enableThinking && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw NSError(
                 domain: "OmniBench", code: 104,
@@ -897,6 +974,7 @@ enum OmniBench {
             lmInput: lmInput,
             raw: raw,
             visibleText: text)
+        try requireNormalStop(raw, row: "image turn")
         try validateVisibleOmniText(text, row: "image turn")
         try validateSyntheticGradientImageText(text, row: "image turn")
         return TurnResult(
@@ -962,6 +1040,7 @@ enum OmniBench {
             totalTokens += tokens.count
             totalSecs += secs
             do {
+                try requireNormalStop(raw, row: "image tail \(variant.name)")
                 try validateVisibleOmniText(text, row: "image tail \(variant.name)")
                 try validateSyntheticGradientImageText(
                     text,
@@ -1060,6 +1139,7 @@ enum OmniBench {
             lmInput: lmInput,
             raw: raw,
             visibleText: text)
+        try requireNormalStop(raw, row: "video turn")
         try validateVisibleOmniText(text, row: "video turn")
         return TurnResult(
             shortText: text.replacingOccurrences(of: "\n", with: " "),
@@ -1356,6 +1436,7 @@ enum OmniBench {
             lmInput: lmInput,
             raw: raw,
             visibleText: text)
+        try requireNormalStop(raw, row: "audio turn")
         try validateVisibleOmniText(text, row: "audio turn")
         return TurnResult(
             shortText: text.replacingOccurrences(of: "\n", with: " "),
@@ -1397,6 +1478,18 @@ enum OmniBench {
             tokenIds: tokens,
             stopTokenID: nil,
             hitMaxTokens: false)
+    }
+
+    private static func requireNormalStop(
+        _ result: RawGenerationResult,
+        row: String
+    ) throws {
+        guard !result.hitMaxTokens else {
+            throw NSError(
+                domain: "OmniBench", code: 129,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "\(row) hit max_tokens before a normal stop"])
+        }
     }
 
     private static func debugOmniRawDecode(

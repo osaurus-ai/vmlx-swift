@@ -368,8 +368,8 @@ struct NemotronHOmniPreEncodedAudioTests {
         ]
     }
 
-    @Test("media no-thinking prompt carries explicit direct-answer instruction")
-    func mediaNoThinkingPromptCarriesDirectAnswerInstruction() async throws {
+    @Test("media no-thinking request preserves the caller template contract")
+    func mediaNoThinkingRequestPreservesCallerTemplateContract() async throws {
         try await FocusedMLXTestSupport.withLock {
             let tokenizer = FocusedOmniTemplateTokenizer()
             let processor = NemotronHOmniProcessor(
@@ -390,16 +390,16 @@ struct NemotronHOmniPreEncodedAudioTests {
                 tokenIds: lmInput.text.tokens.reshaped(-1).asArray(Int.self),
                 skipSpecialTokens: false)
 
-            #expect(rendered.contains(
+            #expect(!rendered.contains(
                 "Answer directly with only the final visible response."))
-            #expect(rendered.contains(
+            #expect(!rendered.contains(
                 "Do not include analysis, reasoning, scratchpad steps, or drafts."))
             #expect(rendered.hasSuffix("<|im_start|>assistant\n<think></think>"))
         }
     }
 
-    @Test("media thinking request uses direct-answer media contract")
-    func mediaThinkingRequestUsesDirectAnswerMediaContract() async throws {
+    @Test("media thinking request preserves the caller template contract")
+    func mediaThinkingRequestPreservesCallerTemplateContract() async throws {
         try await FocusedMLXTestSupport.withLock {
             let tokenizer = FocusedOmniTemplateTokenizer()
             let processor = NemotronHOmniProcessor(
@@ -420,15 +420,15 @@ struct NemotronHOmniPreEncodedAudioTests {
                 tokenIds: lmInput.text.tokens.reshaped(-1).asArray(Int.self),
                 skipSpecialTokens: false)
 
-            #expect(rendered.hasSuffix("<|im_start|>assistant\n<think></think>"))
-            #expect(!rendered.hasSuffix("<|im_start|>assistant\n<think>\n"))
-            #expect(rendered.contains(
+            #expect(!rendered.hasSuffix("<|im_start|>assistant\n<think></think>"))
+            #expect(rendered.hasSuffix("<|im_start|>assistant\n<think>\n"))
+            #expect(!rendered.contains(
                 "Answer directly with only the final visible response."))
         }
     }
 
-    @Test("media default prompt uses direct-answer media contract")
-    func mediaDefaultPromptUsesDirectAnswerMediaContract() async throws {
+    @Test("media default prompt preserves the bundle template default")
+    func mediaDefaultPromptPreservesBundleTemplateDefault() async throws {
         try await FocusedMLXTestSupport.withLock {
             let tokenizer = FocusedOmniTemplateTokenizer()
             let processor = NemotronHOmniProcessor(
@@ -448,9 +448,9 @@ struct NemotronHOmniPreEncodedAudioTests {
                 tokenIds: lmInput.text.tokens.reshaped(-1).asArray(Int.self),
                 skipSpecialTokens: false)
 
-            #expect(rendered.hasSuffix("<|im_start|>assistant\n<think></think>"))
-            #expect(!rendered.hasSuffix("<|im_start|>assistant\n<think>\n"))
-            #expect(rendered.contains(
+            #expect(!rendered.hasSuffix("<|im_start|>assistant\n<think></think>"))
+            #expect(rendered.hasSuffix("<|im_start|>assistant\n<think>\n"))
+            #expect(!rendered.contains(
                 "Answer directly with only the final visible response."))
         }
     }
@@ -537,14 +537,13 @@ struct NemotronHOmniPreEncodedAudioTests {
         FocusedMLXTestSupport.withLock {
             let mlpRaw: [String: MLXArray] = [
                 "mlp1.0.weight": MLXArray.zeros([5120]),
-                "mlp1.0.bias": MLXArray.zeros([5120]),
                 "mlp1.1.weight": MLXArray.zeros([20_480, 5120]),
                 "mlp1.3.weight": MLXArray.zeros([2688, 20_480]),
                 "irrelevant.weight": MLXArray.zeros([1]),
             ]
             let mlp = remapMlp1Weights(mlpRaw)
             #expect(mlp["layer_norm.weight"]?.shape == [5120])
-            #expect(mlp["layer_norm.bias"]?.shape == [5120])
+            #expect(mlp["layer_norm.bias"] == nil)
             #expect(mlp["fc1.weight"]?.shape == [20_480, 5120])
             #expect(mlp["fc2.weight"]?.shape == [2688, 20_480])
             #expect(mlp["irrelevant.weight"] == nil)
