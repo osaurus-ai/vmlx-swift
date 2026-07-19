@@ -337,6 +337,7 @@ public func reDeriveSSMStatesAtBoundaries(
     var out: [Int: [MLXArray]] = [:]
     var cursor = 0
     let step = max(1, prefillStepSize)
+    var needsFreshReplayPreparation = true
 
     for boundary in captureBoundaries {
         while cursor < boundary {
@@ -344,7 +345,36 @@ public func reDeriveSSMStatesAtBoundaries(
             let chunk = Array(tokens[cursor..<end])
             let tokenArray = MLXArray(chunk.map { Int32($0) })
                 .reshaped([1, chunk.count])
-            _ = model.callAsFunction(tokenArray, cache: freshCache)
+
+            if needsFreshReplayPreparation {
+                // A fresh cache is not sufficient to start an independent
+                // replay for every architecture. Qwen 3.5 VL, for example,
+                // keeps MRoPE position arrays on the model object as well as
+                // recurrent state in its cache. Calling `callAsFunction`
+                // directly can therefore slice position IDs left by the
+                // preceding user generation; once that stale array ends, its
+                // sequence dimension is shorter than this replay chunk and
+                // attention fails before the companion state can be stored.
+                //
+                // Route the first chunk through the model's normal `prepare`
+                // contract. Architectures with request-scoped state reset it
+                // there, while default LLM implementations return an
+                // unconsumed token tail that we explicitly forward below.
+                // Subsequent chunks continue through the same fresh cache so
+                // every recorded boundary remains one continuous replay.
+                let input = LMInput(text: LMInput.Text(tokens: tokenArray))
+                let prepared = try model.prepare(
+                    input, cache: freshCache, windowSize: step)
+                if case .tokens(let tail) = prepared, tail.tokens.size > 0 {
+                    let tailInput = tail.tokens.ndim >= 2
+                        ? tail.tokens
+                        : tail.tokens.reshaped([1, tail.tokens.size])
+                    _ = model.callAsFunction(tailInput, cache: freshCache)
+                }
+                needsFreshReplayPreparation = false
+            } else {
+                _ = model.callAsFunction(tokenArray, cache: freshCache)
+            }
             MLX.eval(freshCache)
             cursor = end
             Memory.clearCache()

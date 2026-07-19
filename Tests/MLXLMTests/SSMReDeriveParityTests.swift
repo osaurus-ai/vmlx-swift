@@ -8,11 +8,14 @@ import MLXNN
 import XCTest
 
 private final class TinyHybridSSMModel: Module, LanguageModel, @unchecked Sendable {
+    private(set) var prepareCalls = 0
+
     func newCache(parameters: GenerateParameters?) -> [KVCache] {
         [MambaCache()]
     }
 
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        prepareCalls += 1
         let step = max(1, windowSize ?? 512)
         var flatTokens = input.text.tokens.reshaped([-1])
 
@@ -110,6 +113,10 @@ final class SSMReDeriveParityTests: XCTestCase {
                 model: model,
                 promptTokenIds: tokens,
                 prefillStepSize: 2))
+        XCTAssertEqual(
+            model.prepareCalls,
+            1,
+            "A boundary replay must enter through model.prepare once so request-scoped model state is reset")
         let warm = try warmPassStates(model: model, tokens: tokens, prefillStepSize: 2)
         let fetched = try XCTUnwrap(
             coordinator.ssmStateCache.fetch(tokens: tokens, boundary: tokens.count))

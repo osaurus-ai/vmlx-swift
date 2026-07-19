@@ -122,3 +122,55 @@ These items must not be described as complete until their own evidence lands:
 7. Separate automatic model routing and clearer hardware guidance work in the
    preserved Osaurus routing lane. That work is intentionally paused until the
    runtime and pin chain is merged.
+
+## 2026-07-19 Bonsai cache regression checkpoint
+
+This follow-up uses the locally installed JANG bundle
+`/Users/eric/models/dealign.ai/Bonsai-27b-1bit-JANG-CRACK`, not an MXFP4
+bundle. It is a Qwen 3.5 hybrid with 16 attention-KV layers and 48
+GatedDeltaNet/Mamba companion layers. No model-behavior guard, forced marker,
+sampler override, prompt rewrite, or output cap is part of this checkpoint.
+
+### Current evidence
+
+| Gate | Current result | Status |
+| --- | --- | --- |
+| Default cache policy | Isolated Release Osaurus UI and `/admin/cache-stats` showed prefix ON, paged RAM OFF, disk L2 ON, and engine-selected KV | VERIFIED-LIVE baseline |
+| Disk-only native restart | Thinking off stayed off; exact short answers remained coherent; a fresh-process disk/SSM hit restored the stored prefix | VERIFIED-LIVE baseline |
+| Disk-only TurboQuant 4/4 restart | Telemetry showed exactly 16 converted TurboQuant KV layers plus 48 native Mamba layers; warm and fresh-process answers remained coherent with disk and companion hits | VERIFIED-LIVE / PERFORMANCE-PARTIAL |
+| TurboQuant performance | Native decode measured 36.9-39.3 tok/s; TurboQuant 4/4 measured 11.3-14.4 tok/s in the same Release app lane | OPEN root cause |
+| Paged RAM + TurboQuant + SSM rederive | Real Settings UI enabled paged RAM with two blocks, disk L2, TurboQuant 4/4, prefix, and SSM rederive. The same stored chat crashed after a 2,923-token disk hit and full-prefill fallback | REPRODUCED-LIVE baseline |
+| Fresh replay lifecycle patch | `reDeriveSSMStatesAtBoundaries` now enters the first independent replay chunk through `LanguageModel.prepare`, then preserves one continuous fresh cache for later boundaries | SOURCE-TESTED / LIVE-OPEN |
+| Focused regression suite | Xcode 26.6 / Swift 6.3.3 `SSMReDeriveParityTests`: 7 tests, 0 failures. The new assertion proves exactly one `prepare` entry and existing tests preserve boundary-state parity | PASS |
+| Total disk cap | Main BlockDisk records respected the configured 10 GB cap, but `ssm_companion` added about 2.35 GB outside the accounting, growing the root to about 12 GB | REPRODUCED-LIVE / OPEN |
+
+### Paged crash root trace
+
+The Release app was rerun under LLDB against the same stored cache. It restored
+the 2,923-token disk boundary, rejected the full hybrid hit because the seed
+boundary SSM state was missing, and entered prompt-boundary SSM rederivation.
+The crash stack was:
+
+`reDeriveSSMStatesAtBoundaries` -> Qwen 3.5 VLM/text forward ->
+`GatedDeltaNet.callAsFunction` -> MLX indexing precondition.
+
+Immediately before the precondition, MLX reported incompatible shapes
+`(1,24,16,64)` and `(1,1,3,64)`. The rederive helper allocated a fresh cache
+but called the model forward directly. Qwen 3.5 VLM also retains
+request-scoped MRoPE position arrays on the model object, and its normal
+text-only `prepare` path resets that state. Bypassing `prepare` therefore
+replayed a long prompt against stale, three-token position state. The patch
+restores the architecture's normal fresh-request lifecycle instead of
+changing generated content.
+
+### Required live closure
+
+The source test does not close the user-facing row. An isolated signed Release
+Osaurus build consuming the exact candidate vMLX revision must reopen the
+previously crashing disk cache with the same visible settings, complete the
+automatic warmup and user turn without a stale-position shape error, visibly
+remain coherent, report token/s, and show truthful paged/disk/SSM/TurboQuant
+counters. Paged OFF and engine-selected KV must then be restored through the
+UI and confirmed in effective server settings. The TurboQuant slowdown and
+companion-sidecar disk-cap defect remain separate open rows until their own
+source and live evidence exists.
