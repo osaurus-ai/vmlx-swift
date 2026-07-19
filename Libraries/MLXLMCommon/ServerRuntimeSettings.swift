@@ -492,7 +492,10 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
 
         var resolvedCache = cache
         if resolvedCache.prefix.enabled {
-            resolvedCache.blockDisk.enabled = true
+            // Block-disk L2 is enabled by default, but an explicit user Off
+            // must survive memory-safety resolution. Prefix reuse can still
+            // operate without a persistent tier; only the deprecated legacy
+            // disk implementation is suppressed here.
             resolvedCache.legacyDisk.enabled = false
             if resolvedCache.prefix.memoryLimitMB == nil {
                 resolvedCache.prefix.memoryLimitMB = profile.prefixMemoryLimitMB
@@ -941,7 +944,10 @@ public struct VMLXServerCacheSettings: Codable, Sendable, Equatable {
     public var defaultKVMode: KVQuantizationMode {
         switch liveKVCodec {
         case .engineSelected:
-            return .turboQuant()
+            // Engine-selected is the safe native default. TurboQuant KV is an
+            // explicit opt-in because its encode/decode cost and topology
+            // compatibility must be proven per runtime/model family.
+            return .none
         case .native, .none:
             return .none
         case .turboQuant:

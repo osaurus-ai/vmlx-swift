@@ -111,6 +111,35 @@ struct VMLXMemorySafetySettingsTests {
         #expect(!coordinator.enableDiskCache)
     }
 
+    @Test("memory safety preserves explicit block disk disable with prefix reuse enabled")
+    func memorySafetyPreservesExplicitBlockDiskDisableWithPrefixReuseEnabled() {
+        var settings = VMLXServerRuntimeSettings()
+        settings.cache.prefix.enabled = true
+        settings.cache.pagedKV.enabled = false
+        settings.cache.blockDisk.enabled = false
+
+        let plan = settings.resolvedMemorySafetyPlan(
+            baseLoadConfiguration: .osaurusProduction,
+            bundleFacts: LoadBundleFacts(
+                totalSafetensorsBytes: 12 << 30,
+                isRouted: false,
+                physicalMemory: 64 << 30,
+                modelType: "gemma4",
+                weightFormat: "mxfp8"))
+        let coordinator = VMLXServerRuntimeSettings(
+            cache: plan.cache,
+            memorySafety: settings.memorySafety
+        )
+        .cacheCoordinatorConfig(modelKey: "gemma4|disk=explicit-off")
+
+        #expect(plan.cache.prefix.enabled)
+        #expect(!plan.cache.pagedKV.enabled)
+        #expect(!plan.cache.blockDisk.enabled)
+        #expect(!plan.cache.legacyDisk.enabled)
+        #expect(!coordinator.usePagedCache)
+        #expect(!coordinator.enableDiskCache)
+    }
+
     @Test("strict mode returns typed refusal for unknown and over budget estimates")
     func strictModeReturnsTypedRefusalForUnknownAndOverBudgetEstimates() {
         var settings = VMLXServerRuntimeSettings()
@@ -266,11 +295,6 @@ struct VMLXMemorySafetySettingsTests {
         #expect(coordinator.enableDiskCache)
         #expect(coordinator.enableSSMReDerive)
         #expect(coordinator.ssmMaxEntries == 96)
-        if case .turboQuant(let keyBits, let valueBits) = coordinator.defaultKVMode {
-            #expect(keyBits == 3)
-            #expect(valueBits == 3)
-        } else {
-            Issue.record("Memory safety should preserve engine-selected TurboQuant KV policy.")
-        }
+        #expect(coordinator.defaultKVMode == .none)
     }
 }

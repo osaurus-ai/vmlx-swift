@@ -22,7 +22,7 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.cache.enableSSMReDerive)
         #expect(settings.cache.defaultMaxKVSize == nil)
         #expect(settings.cache.longPromptMultiplier == 2.0)
-        #expect(settings.cache.defaultKVMode == .turboQuant(keyBits: 3, valueBits: 3))
+        #expect(settings.cache.defaultKVMode == .none)
         #expect(settings.generation.temperature == nil)
         #expect(settings.generation.topP == nil)
         #expect(settings.generation.topK == nil)
@@ -750,17 +750,12 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
-    @Test("engine-selected cache codec enables automatic TurboQuant KV")
-    func engineSelectedCacheCodecEnablesAutomaticTurboQuantKV() {
+    @Test("engine-selected cache codec keeps TurboQuant KV off by default")
+    func engineSelectedCacheCodecKeepsTurboQuantKVOffByDefault() {
         var settings = VMLXServerRuntimeSettings()
         settings.cache.liveKVCodec = .engineSelected
 
-        if case .turboQuant(let keyBits, let valueBits) = settings.cacheCoordinatorConfig().defaultKVMode {
-            #expect(keyBits == 3)
-            #expect(valueBits == 3)
-        } else {
-            Issue.record("Engine-selected cache codec should resolve the production TurboQuant KV default")
-        }
+        #expect(settings.cacheCoordinatorConfig().defaultKVMode == .none)
 
         settings.cache.liveKVCodec = .native
         #expect(settings.cacheCoordinatorConfig().defaultKVMode == .none)
@@ -793,12 +788,7 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(config.enableSSMReDerive)
         #expect(config.modelKey == "matrix|reasoning=auto|tools=auto")
         #expect(resolvedPolicy.maxKVSize == nil)
-        if case .turboQuant(let keyBits, let valueBits) = resolvedPolicy.kvMode {
-            #expect(keyBits == 3)
-            #expect(valueBits == 3)
-        } else {
-            Issue.record("Engine-selected automatic cache policy did not resolve TurboQuant KV")
-        }
+        #expect(resolvedPolicy.kvMode == .none)
 
         for row in rows {
             #expect(ToolCallFormat.infer(from: row.modelType) == row.tool)
