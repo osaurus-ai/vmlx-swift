@@ -381,10 +381,10 @@ public func loadWeights(
         // the authoritative prior — see `JangLoader.swift` for the
         // root-cause writeup of the (8, 32) ≡ (4, 64) shape ambiguity
         // that crashed Cascade-2 JANG_4M / Nemotron-Omni MXFP4 with
-        // mid-prefill rmsNorm. We do NOT merge config.json's per-layer
-        // dict here because that dict can be HF-tooling-stale (claims
-        // `(gs=32, bits=8)` for layers actually packed at `(gs=64,
-        // bits=4)`) and would re-introduce the wrong values.
+        // mid-prefill rmsNorm. Config.json's per-layer dictionary is passed
+        // through as evidence, but the shape walk accepts an entry only when
+        // it is geometrically self-consistent and no exact manifest or
+        // narrowly defined semantic-width constraint has higher precedence.
         let hiddenHint = readHiddenSizeHint(at: modelDirectory)
         let hiddenSizePerLayerInputHint = readHiddenSizePerLayerInputHint(at: modelDirectory)
         let linearAttnValueDimHint = readLinearAttnValueDimHint(at: modelDirectory)

@@ -1892,10 +1892,10 @@ public final class LLMModelFactory: ModelFactory {
             for: templateResolvedDir)
         async let tokenizerTask = tokenizerLoader.load(from: tokenizerDirectory)
 
-        // When JANG, skip config.json's perLayerQuantization — JANG infers correct
-        // per-layer bits from tensor shapes. This avoids creating QuantizedLinear at
-        // the wrong bit width (which can't be re-quantized later).
-        // BUT: still pass `quantization` (the global config.json group_size /
+        // For JANG, pass config.json's per-layer metadata as declared evidence;
+        // loadWeights validates it against exact manifests, semantic widths, and
+        // tensor geometry before constructing QuantizedLinear modules.
+        // Also pass `quantization` (the global config.json group_size /
         // bits) so JangLoader.inferPerLayerQuantization gets the correct
         // `knownGroupSize` even when jang_config.json doesn't carry quant
         // metadata (e.g. DSV4-Flash bundles ship `weight_format: "bf16"`).
@@ -1903,10 +1903,9 @@ public final class LLMModelFactory: ModelFactory {
             modelDirectory: modelDirectory, model: model,
             quantization: jangConfig != nil ? baseConfig.quantizationContainer?.quantization : nil,
             // 2026-04-28: pass perLayerQuantization through even when JANG;
-            // loadWeights merges config.json's explicit per-layer dict on
-            // top of the shape walk to fix mis-inference of (bits, gs) pairs
-            // that share a packed shape (e.g., (4,64) ≡ (8,32)). Closes
-            // Cascade-2 JANG_4M / Nemotron-Omni MXFP4 first-prefill rmsNorm.
+            // loadWeights treats config.json's explicit per-layer dict as
+            // declared evidence, then validates it against exact manifests,
+            // semantic widths, and packed tensor geometry.
             perLayerQuantization: baseConfig.perLayerQuantization,
             jangConfig: jangConfig,
             loadPreservedMTP: loadNativeMTP)
