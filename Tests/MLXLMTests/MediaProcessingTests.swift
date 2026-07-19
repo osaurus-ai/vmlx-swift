@@ -5,10 +5,30 @@ import CoreMedia
 import Foundation
 import MLX
 import MLXLMCommon
-import MLXVLM
 import XCTest
 
+@testable import MLXVLM
+
 public class MediaProcesingTests: XCTestCase {
+
+    func testDecodedVideoFramesAreSortedByRequestedThenActualTime() {
+        let requested = [
+            CMTime(seconds: 2, preferredTimescale: 10),
+            CMTime(seconds: 0, preferredTimescale: 10),
+            CMTime(seconds: 1, preferredTimescale: 10),
+            CMTime(seconds: 1, preferredTimescale: 10),
+        ]
+        let actual = [
+            CMTime(seconds: 2.1, preferredTimescale: 10),
+            CMTime(seconds: 0.1, preferredTimescale: 10),
+            CMTime(seconds: 1.2, preferredTimescale: 10),
+            CMTime(seconds: 1.1, preferredTimescale: 10),
+        ]
+
+        XCTAssertEqual(
+            chronologicalVideoFrameOrder(requestedTimes: requested, actualTimes: actual),
+            [1, 3, 2, 0])
+    }
 
     func testResize() {
         // resampleBicubic should produce an image with the desired dimensions
@@ -35,6 +55,10 @@ public class MediaProcesingTests: XCTestCase {
         let frames = try await MediaProcessing.asProcessedSequence(video, samplesPerSecond: 1)
 
         XCTAssert(frames.frames.count == 5)
+        XCTAssertEqual(frames.timestamps.count, frames.frames.count)
+        for (earlier, later) in zip(frames.timestamps, frames.timestamps.dropFirst()) {
+            XCTAssertLessThanOrEqual(CMTimeCompare(earlier, later), 0)
+        }
     }
 
     func testVideoFileValidationThisShouldFail() async throws {

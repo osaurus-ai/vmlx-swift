@@ -20,6 +20,39 @@ public struct ProcessedVideoFrames {
 
 private let context = CIContext()
 
+private struct DecodedVideoFrame {
+    let requestedTime: CMTime
+    let actualTime: CMTime
+    let image: CGImage
+}
+
+func chronologicalVideoFrameOrder(
+    requestedTimes: [CMTime],
+    actualTimes: [CMTime]
+) -> [Int] {
+    precondition(requestedTimes.count == actualTimes.count)
+    return requestedTimes.indices.sorted { lhs, rhs in
+        let requestedOrder = CMTimeCompare(requestedTimes[lhs], requestedTimes[rhs])
+        if requestedOrder != 0 {
+            return requestedOrder < 0
+        }
+
+        let actualOrder = CMTimeCompare(actualTimes[lhs], actualTimes[rhs])
+        if actualOrder != 0 {
+            return actualOrder < 0
+        }
+
+        return lhs < rhs
+    }
+}
+
+private func chronologicallySorted(_ frames: [DecodedVideoFrame]) -> [DecodedVideoFrame] {
+    chronologicalVideoFrameOrder(
+        requestedTimes: frames.map(\.requestedTime),
+        actualTimes: frames.map(\.actualTime)
+    ).map { frames[$0] }
+}
+
 /// Collection of methods for processing media (images, video, etc.).
 ///
 /// A typical image preparation pipeline might look like this:
@@ -314,19 +347,25 @@ public enum MediaProcessing {
         let sampledTimes = sampledTimeValues.map { CMTime(value: $0, timescale: timescale) }
 
         // Collect the frames
-        var ciImages: [CIImage] = []
+        var decodedFrames: [DecodedVideoFrame] = []
         for await result in generator.images(for: sampledTimes) {
             switch result {
-            case .success(requestedTime: _, let image, actualTime: _):
-                let ciImage = CIImage(
-                    cgImage: image, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
-                ciImages.append(ciImage)
+            case .success(let requestedTime, let image, let actualTime):
+                decodedFrames.append(
+                    DecodedVideoFrame(
+                        requestedTime: requestedTime,
+                        actualTime: actualTime,
+                        image: image))
             case .failure(requestedTime: _, _):
                 break
             }
         }
 
-        return ciImages
+        return chronologicallySorted(decodedFrames).map { frame in
+            CIImage(
+                cgImage: frame.image,
+                options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
+        }
     }
 
     private static func validateAsset(_ asset: AVAsset) async throws {
@@ -516,18 +555,30 @@ public enum MediaProcessing {
         let sampledTimes = sampledTimeValues.map { CMTime(value: $0, timescale: timescale) }
 
         // Collect the frames
-        var frames: [VideoFrame] = []
+        var decodedFrames: [DecodedVideoFrame] = []
 
         for await result in generator.images(for: sampledTimes) {
             switch result {
-            case .success(requestedTime: _, let image, actualTime: let actual):
-                let ciImage = CIImage(
-                    cgImage: image, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
-                let frame = try frameProcessing(.init(frame: ciImage, timeStamp: actual))
-                frames.append(frame)
+            case .success(let requestedTime, let image, let actualTime):
+                decodedFrames.append(
+                    DecodedVideoFrame(
+                        requestedTime: requestedTime,
+                        actualTime: actualTime,
+                        image: image))
             case .failure(requestedTime: _, _):
                 break
             }
+        }
+
+        var frames: [VideoFrame] = []
+        frames.reserveCapacity(decodedFrames.count)
+        for decoded in chronologicallySorted(decodedFrames) {
+            let ciImage = CIImage(
+                cgImage: decoded.image,
+                options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
+            let frame = try frameProcessing(
+                .init(frame: ciImage, timeStamp: decoded.actualTime))
+            frames.append(frame)
         }
 
         return ProcessedVideoFrames(frames: frames, totalDuration: duration)
