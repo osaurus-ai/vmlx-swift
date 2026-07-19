@@ -44,6 +44,13 @@ import Testing
     // Flip the flag: subsequent fetch + store must skip the paged tier.
     coordinator.setPagedIncompatible(true)
     #expect(coordinator.isPagedIncompatible == true)
+    #expect(coordinator.canPersistBoundaries == false,
+        "an incompatible paged tier without disk L2 cannot persist a usable boundary")
+    let incompatibleSnapshot = coordinator.snapshotStats()
+    #expect(incompatibleSnapshot.pagedEnabled == false,
+        "telemetry must report effective paged state, not the inert requested allocation")
+    #expect(incompatibleSnapshot.pagedStats == nil,
+        "inert paged counters must not be exposed as an active cache tier")
     let result = coordinator.fetch(tokens: tokens)
     if case .miss = result {
         // expected — paged tier skipped, no disk tier present

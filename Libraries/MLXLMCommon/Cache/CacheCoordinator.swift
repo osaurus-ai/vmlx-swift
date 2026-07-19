@@ -200,7 +200,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// boundary snapshot — the hybrid stripped boundary in particular costs a
     /// retained cache copy or, failing that, a whole extra prefill.
     public var canPersistBoundaries: Bool {
-        pagedCache != nil || diskCache != nil
+        (pagedCache != nil && !isPagedIncompatible) || diskCache != nil
     }
 
     /// 2026-05-04: mark the model as paged-incompatible (DSV4 hybrid pool
@@ -231,9 +231,10 @@ public final class CacheCoordinator: @unchecked Sendable {
 
     /// Thread-safe snapshot for diagnostics, UI status, and admin routes.
     public func snapshotStats() -> CacheCoordinatorStatsSnapshot {
-        CacheCoordinatorStatsSnapshot(
-            pagedEnabled: pagedCache != nil,
-            pagedStats: pagedCache?.snapshotStats(),
+        let pagedIsEffective = pagedCache != nil && !isPagedIncompatible
+        return CacheCoordinatorStatsSnapshot(
+            pagedEnabled: pagedIsEffective,
+            pagedStats: pagedIsEffective ? pagedCache?.snapshotStats() : nil,
             diskEnabled: diskCache != nil,
             diskStats: diskCache?.snapshotStats(),
             ssmStats: ssmStateCache.snapshotStats(),
