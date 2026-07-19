@@ -1307,6 +1307,102 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
+    @Test("token iterators report nil native MTP stats by default")
+    func tokenIteratorsReportNilNativeMTPStatsByDefault() {
+        // `TokenIterator`, `SpeculativeTokenIterator`, and
+        // `BlockDiffusionTokenIterator` all inherit the same
+        // protocol-extension default this stub exercises; only
+        // `NativeMTPTokenIterator` overrides it.
+        var iterator = FocusedDefaultStatsIterator()
+
+        #expect(iterator.nativeMTPStats == nil)
+        #expect(iterator.next() == nil)
+    }
+
+    @Test("native MTP generation stats round-trip their fields")
+    func nativeMTPGenerationStatsRoundTripFields() {
+        func makeStats() -> NativeMTPGenerationStats {
+            NativeMTPGenerationStats(
+                depth: 3,
+                activeDepth: 2,
+                verifyCalls: 7,
+                outputTokens: 21,
+                arFallbackTokens: 4,
+                acceptedByDepth: [1, 3, 2, 1],
+                bonusTokens: 2,
+                rejectedTokens: 5,
+                avgCommittedPerVerify: 2.43,
+                avgAcceptProbability: 0.875,
+                adaptiveDownshifts: 1,
+                adaptiveFallbackReason: "acceptance-collapse",
+                verifierMode: "chunk_commit",
+                cacheMode: "private-mtp+verifier-prefix-commit")
+        }
+
+        let stats = makeStats()
+        #expect(stats.depth == 3)
+        #expect(stats.activeDepth == 2)
+        #expect(stats.verifyCalls == 7)
+        #expect(stats.outputTokens == 21)
+        #expect(stats.arFallbackTokens == 4)
+        #expect(stats.acceptedByDepth == [1, 3, 2, 1])
+        #expect(stats.bonusTokens == 2)
+        #expect(stats.rejectedTokens == 5)
+        #expect(stats.avgCommittedPerVerify == 2.43)
+        #expect(stats.avgAcceptProbability == 0.875)
+        #expect(stats.adaptiveDownshifts == 1)
+        #expect(stats.adaptiveFallbackReason == "acceptance-collapse")
+        #expect(stats.verifierMode == "chunk_commit")
+        #expect(stats.cacheMode == "private-mtp+verifier-prefix-commit")
+        #expect(stats == makeStats())
+    }
+
+    @Test("completion info defaults native MTP stats to nil")
+    func completionInfoDefaultsNativeMTPStatsToNil() {
+        let info = GenerateCompletionInfo(
+            promptTokenCount: 3,
+            generationTokenCount: 4,
+            promptTime: 0.1,
+            generationTime: 0.2)
+
+        #expect(info.nativeMTPStats == nil)
+    }
+
+    @Test("active native MTP generation carries structured stats on completion info")
+    func activeNativeMTPGenerationCarriesStructuredStats() async throws {
+        try await FocusedMLXTestSupport.withLock {
+            let model = FocusedNativeMTPProbeTarget()
+            let context = Self.nativeMTPDispatchContext(model: model)
+            let engine = BatchEngine(context: context, maxBatchSize: 2)
+            var params = GenerateParameters(maxTokens: 4, temperature: 0)
+            params.draftStrategy = .nativeMTP(depth: 3)
+
+            let stream = await engine.generate(
+                input: LMInput(tokens: MLXArray([3, 5, 7])),
+                parameters: params)
+            var completionInfo: GenerateCompletionInfo?
+            for await event in stream {
+                if case .info(let info) = event {
+                    completionInfo = info
+                }
+            }
+
+            let info = try #require(completionInfo)
+            let stats = try #require(info.nativeMTPStats)
+            #expect(stats.depth == 3)
+            #expect(stats.verifyCalls >= 1)
+            // No stop token fires with the zero-logit probe target, so the
+            // info's emitted-token count and the iterator's
+            // `generatedTokenIds.count` snapshot must agree.
+            #expect(stats.outputTokens == info.generationTokenCount)
+            // Every completed verify cycle records exactly one accepted-count
+            // histogram entry.
+            #expect(stats.acceptedByDepth.reduce(0, +) == stats.verifyCalls)
+            #expect(stats.cacheMode == "private-mtp+verifier-prefix-commit")
+            #expect(!stats.verifierMode.isEmpty)
+        }
+    }
+
     @Test("shape-walk quantization preserves MXFP4 mode")
     func shapeWalkQuantizationPreservesMXFP4Mode() {
         let weights: [String: MLXArray] = [
@@ -2216,4 +2312,14 @@ private final class FocusedNativeMTPProbeTarget: Module, LanguageModel, NativeMT
     private func hiddenStates(for inputs: MLXArray) -> MLXArray {
         MLXArray.zeros([1, sequenceLength(inputs), 4])
     }
+}
+
+/// Minimal conformer that relies on every `TokenIteratorProtocol`
+/// protocol-extension default, so tests can assert those defaults directly.
+private struct FocusedDefaultStatsIterator: TokenIteratorProtocol {
+    let maxTokens: Int? = nil
+    let tokenCount = 0
+    let promptPrefillTime: TimeInterval = 0
+
+    mutating func next() -> Int? { nil }
 }
