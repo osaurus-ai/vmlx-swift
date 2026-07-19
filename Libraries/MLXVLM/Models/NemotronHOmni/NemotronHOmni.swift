@@ -306,8 +306,31 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             effectivePromptTokens = pruned.tokenIds
         }
 
+        // The text-only path above chunks Nemotron-H prefill because every
+        // Mamba layer builds sequence-quadratic intermediate state. The
+        // multimodal path previously bypassed that protection and forwarded
+        // the entire 4K+ image/video/audio embedding sequence in one call.
+        // On the real JANGTQ4 Omni bundle a 512px image then reached a 76 GiB
+        // physical-footprint high-water mark despite an ~19 GiB bundle.
+        // Materialize the media tower once, then feed the language stack in
+        // the same bounded chunks used for text prompts.
+        MLX.eval(spliced)
+        Memory.clearCache()
+        let prefillStepSize = max(1, windowSize ?? 512)
+        let sequenceLength = spliced.dim(1)
+        var offset = 0
+        while sequenceLength - offset > prefillStepSize {
+            let end = offset + prefillStepSize
+            let chunk = spliced[0..., offset..<end, 0...]
+            _ = languageModel.callAsFunction(
+                inputsEmbeds: chunk, cache: convertedCache)
+            MLX.eval(convertedCache)
+            offset = end
+            Memory.clearCache()
+        }
         let logits = languageModel.callAsFunction(
-            inputsEmbeds: spliced, cache: convertedCache)
+            inputsEmbeds: spliced[0..., offset..<sequenceLength, 0...],
+            cache: convertedCache)
         return .logits(LMOutput(
             logits: logits,
             effectivePromptTokens: effectivePromptTokens))

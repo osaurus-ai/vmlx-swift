@@ -2883,11 +2883,13 @@ public actor BatchEngine {
                 // the store entirely (the re-derive here is the only writer).
                 if ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
                    coordinator.isHybrid,
-                   !slot.originalInput.hasMediaContent,
                    let turnStartToken = coordinator.genPromptSuffixTokens.first,
                    let stripAt = promptTokens.lastIndex(of: turnStartToken),
                    stripAt > 0,
-                   stripAt < promptTokens.count - 1
+                   stripAt < promptTokens.count - 1,
+                   slot.originalInput.canCaptureHybridStripBoundary(
+                       promptTokenIds: promptTokens,
+                       boundary: stripAt)
                 {
                     let strippedTokens = Array(promptTokens.prefix(stripAt))
                     if let snapshot = boundarySnapshot(

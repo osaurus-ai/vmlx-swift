@@ -232,6 +232,34 @@ public extension LMInput {
         image != nil || video != nil || audio != nil
     }
 
+    /// Whether a hybrid-cache snapshot taken at `boundary` can safely carry
+    /// this request's media-derived state into a later growing-chat request.
+    ///
+    /// Image/audio placeholders are expanded by the processor before model
+    /// prefill, so a boundary after the complete placeholder run has a stable
+    /// token identity and can be captured with the media tensors attached to
+    /// the head of the split. A boundary inside/before that run is unsafe.
+    /// Video EVS is also excluded here because it prunes placeholder tokens in
+    /// `model.prepare`; its cache key is only known after that transformation.
+    func canCaptureHybridStripBoundary(
+        promptTokenIds: [Int],
+        boundary: Int
+    ) -> Bool {
+        guard hasMediaContent else { return true }
+        guard !requiresPostPrepareCacheKey,
+              boundary > 0,
+              boundary <= promptTokenIds.count,
+              let mediaTokenIds,
+              !mediaTokenIds.isEmpty
+        else { return false }
+
+        let mediaTokens = Set(mediaTokenIds)
+        let prefix = promptTokenIds[..<boundary]
+        let suffix = promptTokenIds[boundary...]
+        return prefix.contains(where: mediaTokens.contains)
+            && !suffix.contains(where: mediaTokens.contains)
+    }
+
     /// True when a cache hit boundary would leave model-side media
     /// placeholder tokens in the suffix still being prefetched.
     ///

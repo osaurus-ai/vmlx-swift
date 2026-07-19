@@ -12,6 +12,7 @@ import XCTest
 private class RecordingHybridModel: Module, LanguageModel, @unchecked Sendable {
     private(set) var forwarded: [Int] = []
     private(set) var prepareCalls = 0
+    private(set) var prepareMediaFlags: [Bool] = []
 
     var vocabularySize: Int { 64 }
 
@@ -21,6 +22,7 @@ private class RecordingHybridModel: Module, LanguageModel, @unchecked Sendable {
 
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
         prepareCalls += 1
+        prepareMediaFlags.append(input.hasMediaContent)
         let step = max(1, windowSize ?? 512)
         var flatTokens = input.text.tokens.reshaped([-1])
         while flatTokens.size > step {
@@ -63,10 +65,24 @@ private final class RecordingDenseModel: RecordingHybridModel, @unchecked Sendab
 /// store sees is the state a warm pass over the stripped prefix produces.
 final class HybridStripBoundaryPrefillTests: XCTestCase {
 
+    private var tempDirs: [URL] = []
+
+    override func tearDown() {
+        for dir in tempDirs {
+            try? FileManager.default.removeItem(at: dir)
+        }
+        tempDirs.removeAll()
+        super.tearDown()
+    }
+
     private func makeCoordinator(hybrid: Bool = true) -> CacheCoordinator {
+        let diskDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hybrid-strip-\(UUID().uuidString)")
+        tempDirs.append(diskDir)
         let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
             usePagedCache: true,
-            enableDiskCache: false,
+            enableDiskCache: true,
+            diskCacheDir: diskDir,
             modelKey: "recording-hybrid|reasoning=off"))
         if hybrid { coordinator.setHybrid(true) }
         return coordinator
@@ -149,6 +165,63 @@ final class HybridStripBoundaryPrefillTests: XCTestCase {
         XCTAssertEqual(
             model.prepareCalls, 1,
             "dense models reuse via the post-answer boundary and must not pay for a split")
+        XCTAssertEqual(model.forwarded, prompt)
+    }
+
+    func testMediaBeforeBoundaryStaysOnHeadAndStillSplits() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+
+        let model = RecordingHybridModel()
+        let coordinator = makeCoordinator()
+        coordinator.setGenPromptSuffixTokens(genPromptSuffix)
+
+        let imageToken = 99
+        let prompt = [imageToken] + userTurn + genPromptSuffix
+        let input = LMInput(
+            text: .init(
+                tokens: MLXArray(prompt.map { Int32($0) }).expandedDimensions(axis: 0),
+                tokenIds: prompt),
+            image: .init(pixels: MLXArray.zeros([1, 3, 2, 2])),
+            mediaTokenIds: [imageToken])
+
+        _ = try TokenIterator(
+            input: input,
+            model: model,
+            parameters: GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 512),
+            cacheCoordinator: coordinator)
+
+        XCTAssertEqual(model.prepareCalls, 2)
+        XCTAssertEqual(model.prepareMediaFlags, [true, false])
+        XCTAssertEqual(model.forwarded, prompt)
+    }
+
+    func testMediaPlaceholderAfterBoundaryDoesNotSplit() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+
+        let model = RecordingHybridModel()
+        let coordinator = makeCoordinator()
+        coordinator.setGenPromptSuffixTokens(genPromptSuffix)
+
+        let imageToken = 99
+        let prompt = userTurn + [genPromptSuffix[0], imageToken]
+            + Array(genPromptSuffix.dropFirst())
+        let input = LMInput(
+            text: .init(
+                tokens: MLXArray(prompt.map { Int32($0) }).expandedDimensions(axis: 0),
+                tokenIds: prompt),
+            image: .init(pixels: MLXArray.zeros([1, 3, 2, 2])),
+            mediaTokenIds: [imageToken])
+
+        _ = try TokenIterator(
+            input: input,
+            model: model,
+            parameters: GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 512),
+            cacheCoordinator: coordinator)
+
+        XCTAssertEqual(model.prepareCalls, 1)
+        XCTAssertEqual(model.prepareMediaFlags, [true])
         XCTAssertEqual(model.forwarded, prompt)
     }
 

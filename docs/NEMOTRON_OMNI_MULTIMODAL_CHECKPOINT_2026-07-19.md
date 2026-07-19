@@ -19,6 +19,20 @@ Scope is the locally available non-MXFP4 bundle:
    defect and contradicted the caller's visible Thinking setting. They are
    removed; explicit on/off and an omitted control now reach the bundle chat
    template unchanged.
+4. `NemotronHOmni.prepare` chunked text prefill but forwarded the entire
+   multimodal embedding sequence to the Mamba/attention stack in one call. A
+   real 512 px image expands this bundle's prompt beyond 4K positions, so the
+   Mamba sequence-quadratic intermediates produced a 76 GiB live-app physical
+   footprint high-water mark. Multimodal embeddings are now materialized once
+   and sent through the same bounded 512-position prefill used by text.
+5. Hybrid cross-turn prefix capture rejected every media-bearing `LMInput`.
+   The first image turn therefore stored only full prompt/post-answer keys,
+   neither of which is a prefix of the next rendered chat turn. Image/audio
+   inputs may now capture the generation-suffix-stripped boundary only when
+   every media placeholder is wholly before that boundary. Media tensors stay
+   on the split head so the re-derived Mamba state includes the media. Video
+   EVS remains excluded because its stable key is only available after
+   post-prepare pruning.
 
 ## Current direct evidence
 
@@ -30,6 +44,25 @@ Scope is the locally available non-MXFP4 bundle:
 | Exact JANGTQ4 full matrix | PARTIAL | `/tmp/nemotron_jangtq4_projector_fix_full_matrix_20260719.log`: 19/20 rows passed across text, image, video, audio, mixed media, multi-turn, media salt, cache, and BatchEngine. Video with Thinking on hit the 512-token test ceiling. |
 | Exact JANGTQ4 1024-token matrix | PARTIAL | `/tmp/nemotron_jangtq4_projector_fix_native_1024_20260719.log`: 14/15; video with Thinking on remained the sole length-stop row. Three isolated Swift seeds reproduced the long-reasoning row in `/tmp/nemotron_swift_video_thinking_seed_{1,2,3}_20260719.log`. |
 | Independent reference | PASS with topology caveat | `/tmp/nemotron_python_vmlx_jangtq4_reference_20260719/SUMMARY.json` passed 13/13 image/video/audio/multi-turn rows. `/tmp/nemotron_python_reference_thinking_on_smpte_video_20260719.log` stopped normally, but that dispatcher sampled four images rather than exercising Swift's native 32-frame temporal-video tower, so it does not prove a Swift decode defect. |
+| Media-boundary source regression | PASS | `/tmp/nemotron_media_hybrid_strip_tests_swift_20260719.log`: 6/6 focused tests. The media tensor is present only on the prefix head, the suffix is media-free, placeholders after the boundary fail closed, and text/dense/no-cache controls retain their prior behavior. |
+| Patched Release exact-bundle matrix | PARTIAL | `/tmp/nemotron_jangtq4_patched_omni_192_20260719.log`: 19/20 with bundle sampling defaults and fixed seed. Text, three-turn text, image, image follow-up, audio, mixed media, media-salt isolation, hybrid SSM, BatchEngine image/audio, video Thinking off, and repeated-video disk alias passed. Video Thinking on remained the sole 192-token length stop. |
+| Patched direct physical footprint | PASS for direct diagnostic only | `/tmp/nemotron_jangtq4_patched_footprint_192_20260719.log`: `phys_footprint_peak` remained 29 GiB through the 20-row exact-bundle matrix, down from the 76 GiB high-water mark observed in the pre-patch live app. This is not the app acceptance gate. |
+
+## Pre-patch live-app reproduction
+
+The isolated Release Osaurus build at vMLX `6fb10658` was operated through the
+actual UI under bundle identifier `com.dinoki.osaurus.nemotron20260719proof`.
+The exact JANGTQ4 model was selected from the user-configured
+`/Users/eric/models` storage path with Thinking visibly off. A two-region image
+was correctly described as yellow over blue at 115.1 tok/s, and the text-only
+follow-up correctly recalled those colors at 55.4 tok/s. However, the first
+turn reached 76 GiB physical footprint and the follow-up visibly re-prefilled
+`0/4729`. Its isolated L2 database contained only the full 4433/4577 and
+4729/4758 boundaries, confirming that media-prefix reuse had not occurred.
+
+That run is reproduction evidence for the two additional root causes above;
+it is not verification of the current patch. A newly pinned and rebuilt app
+must show both lower physical footprint and a real partial-prefix/L2 restore.
 
 The 32-frame Swift default is retained. The bundle-side Nemotron video helper
 and the retained Python JANG tool both define `target_frames=32`; reducing the
@@ -46,8 +79,8 @@ the multimodal UI instead of being filtered as text-only.
 
 ## Remaining release proof
 
-- Commit and push this engine change, then pin the exact revision in the
-  isolated Osaurus checkout.
+- Commit and push the bounded media-prefill and safe hybrid-media-boundary
+  change, then pin the exact revision in the isolated Osaurus checkout.
 - Run Osaurus multimodal-content and VLM-detection focused tests.
 - Build and ad-hoc sign an isolated Release Osaurus app under the proof bundle
   identifier and proof root.

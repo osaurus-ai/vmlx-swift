@@ -1796,10 +1796,12 @@ public struct TokenIterator: TokenIteratorProtocol {
             let coordinator,
             coordinator.isHybrid,
             coordinator.canPersistBoundaries,
-            !input.hasMediaContent,
             let turnStartTok = coordinator.genPromptSuffixTokens.first,
             let stripAt = promptTokenIds.lastIndex(of: turnStartTok),
-            stripAt > 0, stripAt < promptTokenIds.count
+            stripAt > 0, stripAt < promptTokenIds.count,
+            input.canCaptureHybridStripBoundary(
+                promptTokenIds: promptTokenIds,
+                boundary: stripAt)
         else { return nil }
         return stripAt
     }
@@ -1839,17 +1841,29 @@ public struct TokenIterator: TokenIteratorProtocol {
         func slice(_ range: MLXArray) -> MLXArray { maskIsBatched ? range[.newAxis, 0...] : range }
 
         let flat = input.text.tokens.reshaped([-1])
+        let headTokenIds = input.text.tokenIds.map { Array($0[..<split]) }
+        let tailTokenIds = input.text.tokenIds.map { Array($0[split...]) }
         let head =
             split > 0
             ? LMInput(
                 text: LMInput.Text(
                     tokens: flat[..<split][.newAxis, 0...],
-                    mask: flatMask.map { slice($0[..<split]) }))
+                    mask: flatMask.map { slice($0[..<split]) },
+                    tokenIds: headTokenIds),
+                image: input.image,
+                video: input.video,
+                audio: input.audio,
+                mediaTokenIds: input.mediaTokenIds,
+                cacheScopeSalt: input.cacheScopeSalt,
+                toolSchemas: input.toolSchemas)
             : nil
         let tail = LMInput(
             text: LMInput.Text(
                 tokens: flat[split...][.newAxis, 0...],
-                mask: flatMask.map { slice($0[split...]) }))
+                mask: flatMask.map { slice($0[split...]) },
+                tokenIds: tailTokenIds),
+            cacheScopeSalt: input.cacheScopeSalt,
+            toolSchemas: input.toolSchemas)
         return (head, tail)
     }
 
