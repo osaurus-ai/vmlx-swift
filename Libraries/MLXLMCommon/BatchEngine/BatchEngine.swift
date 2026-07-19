@@ -2586,6 +2586,11 @@ public actor BatchEngine {
             if let tq = layer as? TurboQuantKVCache {
                 return "TurboQuantKVCache:\(tq.keyBits):\(tq.valueBits):\(tq.phase)"
             }
+            if let zaya = layer as? ZayaCCACache,
+               let tq = zaya.turboQuantKVCache
+            {
+                return "ZayaCCACache:TQ:\(tq.keyBits):\(tq.valueBits):\(tq.phase)"
+            }
             return String(reflecting: type(of: layer))
         }.joined(separator: "|")
 
@@ -2593,13 +2598,13 @@ public actor BatchEngine {
     }
 
     private func maybeCompressSlotCache(_ slot: inout BatchSlot) {
-        let hadTQ = slot.cache.contains { $0 is TurboQuantKVCache }
+        let hadTQ = ModelCacheTopologySnapshot(cache: slot.cache).turboQuantKVLayerCount > 0
         let before = hadTQ ? nil : ModelCacheTopologySnapshot(cache: slot.cache)
         BatchQuantize.maybeCompress(
             cache: &slot.cache,
             parameters: slot.parameters
         )
-        let hasTQ = slot.cache.contains { $0 is TurboQuantKVCache }
+        let hasTQ = ModelCacheTopologySnapshot(cache: slot.cache).turboQuantKVLayerCount > 0
         if !hadTQ, hasTQ, let before {
             turboQuantCompressionCount += 1
             lastTurboQuantCacheTransition = TurboQuantCacheTransitionSnapshot(
@@ -2704,9 +2709,17 @@ public actor BatchEngine {
                     }
                     return extractSSMStates(from: snapshot)
                 }()
+                let diskKVMode = snapshot.contains(where: { $0 is ZayaCCACache })
+                    ? selectivePromptBoundaryDiskKVMode(
+                        cache: snapshot,
+                        requested: slot.parameters.kvMode)
+                    : slot.parameters.kvMode
                 let diskStoreCache = makeDiskStoreCache(
                     fromPromptBoundary: snapshot,
-                    parameters: slot.parameters)
+                    kvBits: slot.parameters.kvBits,
+                    kvGroupSize: slot.parameters.kvGroupSize,
+                    quantizedKVStart: slot.parameters.quantizedKVStart,
+                    kvMode: diskKVMode)
                 coordinator.storeAfterGeneration(
                     promptTokens: tokens,
                     perLayerData: perLayerData,
@@ -2901,6 +2914,7 @@ public actor BatchEngine {
             let generatedBoundaryTokens = promptTokens + slot.generatedTokenIds
             if reason == .stop,
                !slot.disablesGeneratedCacheBoundary,
+               !containsUnprovenZayaTurboQuantDiskState(slot.cache),
                !slot.generatedTokenIds.isEmpty,
                cacheCovers(generatedBoundaryTokens.count, cache: slot.cache)
             {

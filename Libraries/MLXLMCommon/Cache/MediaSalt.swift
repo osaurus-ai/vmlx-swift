@@ -217,8 +217,8 @@ private func cachePolicySalt(for parameters: GenerateParameters) -> String {
     let kvBits = parameters.kvBits.map(String.init) ?? "none"
     let maxKV = parameters.maxKVSize.map(String.init) ?? "none"
     return [
-        "cache-policy-v3",
-        "promptBoundaryDisk=raw-kv",
+        "cache-policy-v4",
+        "promptBoundaryDisk=raw-kv|zaya-typed-tq-min44-v1",
         "kvMode=\(cachePolicyDescription(parameters.kvMode))",
         "kvBits=\(kvBits)",
         "kvGroup=\(parameters.kvGroupSize)",

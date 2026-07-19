@@ -122,6 +122,11 @@ public enum TQDiskSerializer {
         /// CCA state is a false hit per the Zyphra runtime contract, so
         /// the four arrays round-trip together. Added 2026-05-06.
         case zayaCCA = 9
+        /// `ZayaCCACache` with TurboQuant-native attention KV plus the same
+        /// native fp32 CCA companion arrays. The TQ payload and companion
+        /// state are one atomic prompt-boundary record; restoring either half
+        /// alone would be a false cache hit.
+        case zayaCCATQ = 10
         /// Cache type we don't know how to persist. On restore, treated as
         /// a forced miss for the affected layer only.
         case skip = 4
@@ -592,6 +597,21 @@ public enum TQDiskSerializer {
         index i: Int,
         into result: inout [String: MLXArray]
     ) {
+        if let tq = zaya.turboQuantKVCache {
+            serializeTQLayer(tq, index: i, into: &result)
+            let cca = zaya.readCCA()
+            result["zaya_\(i)_conv_state"] = cca.conv
+            result["zaya_\(i)_prev_hs"] = cca.prev
+            result["__zaya_\(i)_meta__"] = MLXArray([
+                Int32(zaya.offset),
+                Int32(zaya.convChannels),
+                Int32(zaya.hiddenSize),
+                Int32(zaya.batchSize),
+            ])
+            result[kindKey(for: i)] = kindArray(.zayaCCATQ)
+            return
+        }
+
         let s = zaya.state
         guard s.count == 4 else {
             result[kindKey(for: i)] = kindArray(.skip)
@@ -728,6 +748,17 @@ public enum TQDiskSerializer {
         public let batchSize: Int
     }
 
+    /// TurboQuant-native KV plus native path-dependent CCA state for one
+    /// ZAYA attention layer.
+    public struct ZayaCCATQLayerComponents {
+        public let tq: TQLayerComponents
+        public let convState: MLXArray
+        public let prevHS: MLXArray
+        public let convChannels: Int
+        public let hiddenSize: Int
+        public let batchSize: Int
+    }
+
     /// Result of deserializing one cache layer from a dict.
     public indirect enum LayerData {
         case tq(TQLayerComponents)
@@ -737,6 +768,11 @@ public enum TQDiskSerializer {
         case rotating(RotatingLayerComponents)
         case deepseekV4(DeepseekV4LayerComponents)
         case zayaCCA(ZayaCCALayerComponents)
+        case zayaCCATQ(ZayaCCATQLayerComponents)
+        /// A typed path-dependent layer advertised a payload that could not be
+        /// decoded completely. Callers must reject the whole restore rather
+        /// than treating it like an optional/unknown skipped layer.
+        case requiredMiss
         /// `CacheList` composite: ordered per-sub-cache LayerData. Each
         /// sub-element carries its own kind (`.standard`, `.mamba`,
         /// `.rotating`, etc.). Restore walks the array and dispatches
@@ -887,7 +923,13 @@ public enum TQDiskSerializer {
                 if let comp = deserializeZayaCCALayer(index: i, from: arrays) {
                     out.append(IndexedLayerData(index: i, data: .zayaCCA(comp)))
                 } else {
-                    out.append(IndexedLayerData(index: i, data: .skip))
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
+                }
+            case .zayaCCATQ:
+                if let comp = deserializeZayaCCATQLayer(index: i, from: arrays) {
+                    out.append(IndexedLayerData(index: i, data: .zayaCCATQ(comp)))
+                } else {
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
                 }
             case .cacheList:
                 let subs = deserializeCacheListLayer(index: i, from: arrays)
@@ -1162,7 +1204,7 @@ public enum TQDiskSerializer {
                 }
             case .skip, .unknown:
                 subs.append(.skip)
-            case .tq, .qkv, .deepseekV4, .cacheList, .zayaCCA:
+            case .tq, .qkv, .deepseekV4, .cacheList, .zayaCCA, .zayaCCATQ:
                 // Not currently emitted as sub-cache types — see
                 // serializeCacheListLayer. If a future bundle ships
                 // these we'll need to extend serialize too. Skip for
@@ -1242,6 +1284,28 @@ public enum TQDiskSerializer {
             convChannels: Int(m[1]),
             hiddenSize: Int(m[2]),
             batchSize: Int(m[3]))
+    }
+
+    private static func deserializeZayaCCATQLayer(
+        index i: Int,
+        from arrays: [String: MLXArray]
+    ) -> ZayaCCATQLayerComponents? {
+        guard let tq = deserializeTQLayer(index: i, from: arrays),
+              let convState = arrays["zaya_\(i)_conv_state"],
+              let prevHS = arrays["zaya_\(i)_prev_hs"],
+              let metaArr = arrays["__zaya_\(i)_meta__"],
+              !metaArr.shape.isEmpty,
+              metaArr.shape[0] == 4
+        else { return nil }
+        let meta = metaArr.asArray(Int32.self)
+        guard meta.count == 4, Int(meta[0]) == tq.offset else { return nil }
+        return ZayaCCATQLayerComponents(
+            tq: tq,
+            convState: convState,
+            prevHS: prevHS,
+            convChannels: Int(meta[1]),
+            hiddenSize: Int(meta[2]),
+            batchSize: Int(meta[3]))
     }
 
     // MARK: - Helpers

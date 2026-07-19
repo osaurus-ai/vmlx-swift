@@ -128,16 +128,17 @@ public enum CacheFamily: Hashable, Sendable, CustomStringConvertible {
         precondition(!cache.isEmpty, "CacheFamily.classify requires non-empty cache array")
 
         // ZAYA1 special case: the model returns 80 entries, even=ZayaCCACache
-        // (CCA-attention layers), odd=KVCacheSimple (MoE no-op stubs that the
+        // (CCA-attention layers), odd=ZayaMoEPlaceholderCache (MoE no-op
+        // stubs that the
         // forward never writes to). Treat the whole array as the `.zayaCCA`
         // family so diagnostics + future CompilableZayaCCACache wiring see a
         // coherent label instead of `.heterogeneous`.
         let hasZayaCCA = cache.contains { $0 is ZayaCCACache }
         if hasZayaCCA {
-            let onlyZayaOrSimple = cache.allSatisfy {
-                $0 is ZayaCCACache || $0 is KVCacheSimple
+            let onlyZayaOrPlaceholder = cache.allSatisfy {
+                $0 is ZayaCCACache || $0 is ZayaMoEPlaceholderCache
             }
-            if onlyZayaOrSimple {
+            if onlyZayaOrPlaceholder {
                 return .zayaCCA
             }
         }

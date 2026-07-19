@@ -54,6 +54,45 @@ func makeDiskStoreCache(
     return diskCache
 }
 
+/// Resolve the lossy codec used for a solo-generation prompt-boundary disk
+/// store.
+///
+/// The generic solo path keeps prompt boundaries raw so an exact warm hit
+/// samples its first token from the same KV values as a cold request. ZAYA is
+/// a narrower case: CCA makes the topology path-dependent, so coordinator
+/// lookup deliberately skips the exact prompt boundary and only uses a stored
+/// boundary as a prefix for additional prefill. Its typed serializer can keep
+/// CCA companion state native beside encoded attention KV, but exact JANG_6M
+/// A/B proof found that 3-bit disk KV drifted while 4-bit and raw disk did not.
+/// Keep sub-4-bit ZAYA prompt records lossless; the live attention KV can still
+/// transition to the user-selected TurboQuant mode after first-token sampling.
+///
+/// Do not generalize this to other hybrid families. Each needs its own typed
+/// companion-state proof before a lossy prompt-boundary record is eligible.
+func selectivePromptBoundaryDiskKVMode(
+    cache: [any KVCache],
+    requested: KVQuantizationMode
+) -> KVQuantizationMode {
+    guard case .turboQuant(let keyBits, let valueBits) = requested,
+          keyBits >= 4,
+          valueBits >= 4,
+          cache.contains(where: { $0 is ZayaCCACache })
+    else { return .none }
+    return requested
+}
+
+/// A sub-4-bit encoded ZAYA cache is valid for the live decode path, but is not
+/// a proven cross-turn disk boundary. Such a boundary must not be persisted as
+/// TQ-native; the raw prefill/stripped boundary remains available for reuse.
+func containsUnprovenZayaTurboQuantDiskState(_ cache: [any KVCache]) -> Bool {
+    cache.contains { layer in
+        guard let tq = (layer as? ZayaCCACache)?.turboQuantKVCache else {
+            return false
+        }
+        return tq.keyBits < 4 || tq.valueBits < 4
+    }
+}
+
 func makeDiskStoreCache(
     fromPromptBoundary snapshot: [any KVCache],
     parameters: GenerateParameters
@@ -492,6 +531,45 @@ private func restoreFromV2Arrays(
     let indexed = TQDiskSerializer.deserializeIndexed(arrays)
     guard !indexed.isEmpty else { return 0 }
 
+    // ZAYA disk records are an all-or-nothing prompt-boundary snapshot. Restore
+    // every typed layer into a private copy first, including encoded TQ state,
+    // so a corrupt later CCA layer cannot leave the caller's cache half-seated.
+    var validatedZayaIndices = Set<Int>()
+    var zayaBoundary: Int?
+    for entry in indexed {
+        guard entry.index < cache.count else {
+            if case .zayaCCA = entry.data { return 0 }
+            if case .zayaCCATQ = entry.data { return 0 }
+            continue
+        }
+        switch entry.data {
+        case .zayaCCA(let comp):
+            let staged = cache[entry.index].copy()
+            guard canRestoreZayaCCALayer(comp, into: staged),
+                  zayaBoundary == nil || zayaBoundary == comp.offset,
+                  restoreZayaCCALayer(comp, into: staged)
+            else {
+                return 0
+            }
+            zayaBoundary = comp.offset
+            validatedZayaIndices.insert(entry.index)
+        case .zayaCCATQ(let comp):
+            let staged = cache[entry.index].copy()
+            guard canRestoreZayaCCATQLayer(comp, into: staged),
+                  zayaBoundary == nil || zayaBoundary == comp.tq.offset,
+                  restoreZayaCCATQLayer(comp, into: staged)
+            else {
+                return 0
+            }
+            zayaBoundary = comp.tq.offset
+            validatedZayaIndices.insert(entry.index)
+        case .requiredMiss:
+            return 0
+        default:
+            break
+        }
+    }
+
     var totalTokens = 0
 
     for entry in indexed {
@@ -584,10 +662,25 @@ private func restoreFromV2Arrays(
             // Restore the four-array state (keys, values, conv_state,
             // prev_hs) as one unit. KV-only restore would be a false hit
             // because conv_state and prev_hs are path-dependent.
-            restoreZayaCCALayer(comp, into: cache[i])
+            guard validatedZayaIndices.contains(i),
+                  restoreZayaCCALayer(comp, into: cache[i])
+            else { return 0 }
             if totalTokens == 0 {
                 totalTokens = comp.offset
             }
+
+        case .zayaCCATQ(let comp):
+            // Atomic restore: encoded attention KV and native fp32 CCA state
+            // must both seat successfully at the same prompt boundary.
+            guard validatedZayaIndices.contains(i),
+                  restoreZayaCCATQLayer(comp, into: cache[i])
+            else { return 0 }
+            if totalTokens == 0 {
+                totalTokens = comp.tq.offset
+            }
+
+        case .requiredMiss:
+            return 0
 
         case .cacheList(let subLayers):
             // CacheList composite (BaichuanM1, FalconH1, MiMoV2Flash
@@ -627,7 +720,8 @@ private func restoreFromV2Arrays(
                         totalTokens = comp.offset
                     }
 
-                case .tq, .qkv, .deepseekV4, .zayaCCA, .cacheList, .skip:
+                case .tq, .qkv, .deepseekV4, .zayaCCA, .zayaCCATQ, .cacheList,
+                     .requiredMiss, .skip:
                     // .skip is a per-sub no-op (sub-cache had no
                     // persistable state). The other cases are not
                     // currently emitted as sub-cache kinds — see
@@ -1001,12 +1095,63 @@ private func restoreDeepseekV4Layer(
 /// cache); the cache's setter handles that case without instantiating an
 /// empty KVCacheSimple buffer. Silently no-ops on type mismatch so the
 /// caller falls back to fresh prefill.
+private func canRestoreZayaCCALayer(
+    _ comp: TQDiskSerializer.ZayaCCALayerComponents,
+    into layer: any KVCache
+) -> Bool {
+    guard let zaya = layer as? ZayaCCACache,
+          zaya.convChannels == comp.convChannels,
+          zaya.hiddenSize == comp.hiddenSize,
+          zaya.batchSize == comp.batchSize,
+          comp.keys.ndim >= 3,
+          comp.values.ndim >= 3,
+          comp.keys.dim(2) == comp.values.dim(2),
+          comp.keys.dim(2) == comp.offset,
+          comp.convState.shape == [comp.batchSize, comp.convChannels, 2],
+          comp.prevHS.shape == [comp.batchSize, comp.hiddenSize]
+    else { return false }
+    return true
+}
+
 private func restoreZayaCCALayer(
     _ comp: TQDiskSerializer.ZayaCCALayerComponents,
     into layer: any KVCache
-) {
-    guard let zaya = layer as? ZayaCCACache else { return }
+) -> Bool {
+    guard let zaya = layer as? ZayaCCACache,
+          canRestoreZayaCCALayer(comp, into: layer)
+    else { return false }
     zaya.state = [comp.keys, comp.values, comp.convState, comp.prevHS]
+    return zaya.offset == comp.offset
+}
+
+private func canRestoreZayaCCATQLayer(
+    _ comp: TQDiskSerializer.ZayaCCATQLayerComponents,
+    into layer: any KVCache
+) -> Bool {
+    guard let zaya = layer as? ZayaCCACache,
+          zaya.convChannels == comp.convChannels,
+          zaya.hiddenSize == comp.hiddenSize,
+          zaya.batchSize == comp.batchSize,
+          comp.tq.offset > 0,
+          comp.convState.shape == [comp.batchSize, comp.convChannels, 2],
+          comp.prevHS.shape == [comp.batchSize, comp.hiddenSize]
+    else { return false }
+    return true
+}
+
+private func restoreZayaCCATQLayer(
+    _ comp: TQDiskSerializer.ZayaCCATQLayerComponents,
+    into layer: any KVCache
+) -> Bool {
+    guard let zaya = layer as? ZayaCCACache,
+          canRestoreZayaCCATQLayer(comp, into: layer),
+          zaya.restoreTurboQuantAttentionKV(
+              encodedKeys: comp.tq.encodedKeys,
+              encodedValues: comp.tq.encodedValues,
+              sourceOffset: comp.tq.offset)
+    else { return false }
+    zaya.writeCCA(conv: comp.convState, prev: comp.prevHS)
+    return zaya.offset == comp.tq.offset && zaya.usesTurboQuantKV
 }
 
 /// Helper: restore Mamba SSM state into a `MambaCache` layer (or a

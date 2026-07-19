@@ -20,7 +20,7 @@ import MLXNN
 public final class ZayaCCACache: KVCache {
     /// Inner standard rolling KV. We delegate `update`, `makeMask`, and
     /// `offset` to it. The CCA-specific state lives outside it.
-    private let kv: KVCacheSimple
+    private var kv: any KVCache
 
     /// Path-dependent CCA state. Float32 per the runtime contract; do not
     /// downcast or compress these (the conv_qk module reads/writes them
@@ -47,7 +47,7 @@ public final class ZayaCCACache: KVCache {
     // MARK: - KVCache protocol
 
     public var offset: Int { kv.offset }
-    public var maxSize: Int? { nil }
+    public var maxSize: Int? { kv.maxSize }
     public var isTrimmable: Bool { false }   // v1: prefix-cache off, no trim path needed
 
     public func innerState() -> [MLXArray] {
@@ -57,6 +57,83 @@ public final class ZayaCCACache: KVCache {
 
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         kv.update(keys: keys, values: values)
+    }
+
+    /// True only when the *real CCA attention KV* is in TurboQuant's
+    /// compressed phase. ZAYA's odd decoder entries are MoE-only placeholders
+    /// and must never be counted as compressed attention layers.
+    public var usesTurboQuantKV: Bool {
+        (kv as? TurboQuantKVCache)?.phase == .compressed
+    }
+
+    /// The encoded attention KV owned by this CCA layer, when present.
+    /// CCA companion state is deliberately not part of this object and stays
+    /// native fp32 in ``convState`` and ``prevHS``.
+    public var turboQuantKVCache: TurboQuantKVCache? {
+        guard let tq = kv as? TurboQuantKVCache, tq.phase == .compressed else {
+            return nil
+        }
+        return tq
+    }
+
+    /// Promote only this CCA layer's ordinary attention KV to TurboQuant.
+    /// Returns true only after an actual encoded transition; a short/empty
+    /// cache remains native and can be retried after more prompt tokens exist.
+    @discardableResult
+    public func promoteAttentionKVToTurboQuant(
+        keyBits: Int,
+        valueBits: Int,
+        sinkTokens: Int = 4,
+        residualTokens: Int = TurboQuantKVCache.defaultResidualTokens
+    ) -> Bool {
+        guard let simple = kv as? KVCacheSimple,
+              TurboQuantKVCache.hasCompressibleMiddle(
+                  tokenCount: simple.offset,
+                  sinkTokens: sinkTokens,
+                  residualTokens: residualTokens)
+        else { return false }
+
+        let promoted = TurboQuantKVCache.fromSimpleCache(
+            simple,
+            keyBits: keyBits,
+            valueBits: valueBits,
+            sinkTokens: sinkTokens,
+            residualTokens: residualTokens)
+        guard promoted.phase == .compressed else { return false }
+        kv = promoted
+        return true
+    }
+
+    /// Restore TQ-native attention KV while leaving the native CCA companion
+    /// arrays untouched. The caller restores `conv_state` / `prev_hs` from
+    /// the same typed disk payload immediately before or after this call.
+    @discardableResult
+    public func restoreTurboQuantAttentionKV(
+        encodedKeys: EncodedKeys,
+        encodedValues: EncodedValues,
+        sourceOffset: Int
+    ) -> Bool {
+        let keyBits = encodedKeys.indexBits + 1
+        let valueBits = encodedValues.indexBits
+        let sinkTokens = max(encodedKeys.sinkCount, encodedValues.sinkCount, 4)
+        let residualTokens = max(
+            encodedKeys.tailCount,
+            encodedValues.tailCount,
+            TurboQuantKVCache.defaultResidualTokens)
+        let restored = TurboQuantKVCache(
+            keyBits: keyBits,
+            valueBits: valueBits,
+            sinkTokens: sinkTokens,
+            residualTokens: residualTokens)
+        restored.restoreCompressed(
+            encodedKeys: encodedKeys,
+            encodedValues: encodedValues,
+            sourceOffset: sourceOffset)
+        guard restored.phase == .compressed, restored.offset == sourceOffset else {
+            return false
+        }
+        kv = restored
+        return true
     }
 
     public func makeMask(
@@ -132,8 +209,9 @@ public final class ZayaCCACache: KVCache {
             batchSize: batchSize,
             convChannels: convChannels,
             hiddenSize: hiddenSize)
-        dup.state = self.state.map { $0[.ellipsis] }
-        dup.metaState = self.metaState
+        dup.kv = kv.copy()
+        dup.convState = convState[.ellipsis]
+        dup.prevHS = prevHS[.ellipsis]
         return dup
     }
 
@@ -152,5 +230,21 @@ public final class ZayaCCACache: KVCache {
             "ZayaCCACache: prev_hs must be [B=\(batchSize), \(hiddenSize)], got \(prev.shape)")
         convState = conv
         prevHS = prev
+    }
+}
+
+/// Explicit cache placeholder for ZAYA's odd MoE-only decoder entries.
+///
+/// Those layers have no attention operation and never read or write KV. A
+/// `KVCacheSimple` placeholder was structurally convenient but made generic
+/// cache policy and telemetry misidentify 40 non-attention slots as eligible
+/// KV layers. This type is intentionally state-free and non-quantizable.
+public final class ZayaMoEPlaceholderCache: BaseKVCache {
+    public override init() {
+        super.init()
+    }
+
+    public override func copy() -> any KVCache {
+        ZayaMoEPlaceholderCache()
     }
 }

@@ -144,8 +144,16 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
             rotatingWrapperLayerCount += 1
         case is RotatingKVCacheWrapper:
             rotatingWrapperLayerCount += 1
-        case is ZayaCCACache:
+        case let zaya as ZayaCCACache:
             zayaCCALayerCount += 1
+            if zaya.usesTurboQuantKV {
+                turboQuantKVLayerCount += 1
+            } else {
+                kvLayerCount += 1
+            }
+        case is ZayaMoEPlaceholderCache:
+            // Decoder-layer index placeholder only; not an attention KV layer.
+            break
         case is CompilableMambaCache:
             compilableMambaLayerCount += 1
             mambaLayerCount += 1

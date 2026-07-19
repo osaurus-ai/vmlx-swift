@@ -985,9 +985,10 @@ public final class ZayaModel: Module, LLMModel, KVCacheDimensionProvider {
                     convChannels: convChannels,
                     hiddenSize: cfg.hiddenSize)
             } else {
-                // No-op stub for MoE layers — the layer's forward never
-                // touches its slot, but the engine indexes per-decoder-layer.
-                return KVCacheSimple()
+                // Explicit no-op for MoE-only layers. Using KVCacheSimple here
+                // made generic TQ conversion compress unused placeholders
+                // while leaving the real KV inside ZayaCCACache untouched.
+                return ZayaMoEPlaceholderCache()
             }
         }
     }

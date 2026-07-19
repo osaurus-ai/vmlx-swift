@@ -150,4 +150,100 @@ struct ZayaCCACacheDiskRoundTripTests {
         let zayaDelta = (r1.readCCA().conv - l1.readCCA().conv).abs().sum().item(Float.self)
         #expect(zayaDelta < 1e-3)
     }
+
+    @Test("TQ-native ZAYA disk payload restores encoded KV and native CCA atomically")
+    func turboQuantNativeRoundTrip() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
+        let src = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
+        _ = src.update(
+            keys: MLXArray.ones([1, 1, 96, 32], dtype: .bfloat16),
+            values: MLXArray.ones([1, 1, 96, 32], dtype: .bfloat16) * 2)
+        src.writeCCA(
+            conv: MLXArray.ones([1, 4, 2], dtype: .float32) * 3,
+            prev: MLXArray.ones([1, 8], dtype: .float32) * 4)
+        #expect(src.promoteAttentionKVToTurboQuant(keyBits: 3, valueBits: 3))
+
+        let encoded = TQDiskSerializer.serialize(cache: [src])
+        #expect(
+            encoded["__layer_kind_0__"]?.item(Int32.self)
+                == TQDiskSerializer.LayerKind.zayaCCATQ.rawValue)
+        #expect(encoded["tq_0_ck_indices"] != nil)
+        #expect(encoded["tq_0_cv_indices"] != nil)
+        #expect(encoded["zaya_0_keys"] == nil)
+        #expect(encoded["zaya_0_values"] == nil)
+        #expect(encoded["zaya_0_conv_state"]?.dtype == .float32)
+        #expect(encoded["zaya_0_prev_hs"]?.dtype == .float32)
+
+        let dst = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
+        var target: [any KVCache] = [dst]
+        let restored = restoreFromDiskArrays(encoded, into: &target)
+
+        #expect(restored == 96)
+        #expect(dst.offset == 96)
+        #expect(dst.usesTurboQuantKV)
+        #expect(dst.turboQuantKVCache?.compressedKeys != nil)
+        #expect(dst.turboQuantKVCache?.compressedValues != nil)
+        #expect(dst.readCCA().conv.dtype == .float32)
+        #expect(dst.readCCA().prev.dtype == .float32)
+        #expect((dst.readCCA().conv - src.readCCA().conv).abs().sum().item(Float.self) < 1e-3)
+        #expect((dst.readCCA().prev - src.readCCA().prev).abs().sum().item(Float.self) < 1e-3)
+    }
+
+    @Test("TQ-native ZAYA restore rejects a missing CCA companion")
+    func turboQuantNativeRejectsMissingCompanion() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
+        let src = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
+        _ = src.update(
+            keys: MLXArray.ones([1, 1, 96, 32], dtype: .bfloat16),
+            values: MLXArray.ones([1, 1, 96, 32], dtype: .bfloat16))
+        #expect(src.promoteAttentionKVToTurboQuant(keyBits: 3, valueBits: 3))
+        var encoded = TQDiskSerializer.serialize(cache: [src])
+        encoded["zaya_0_prev_hs"] = nil
+
+        let dst = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
+        var target: [any KVCache] = [dst]
+        let restored = restoreFromDiskArrays(encoded, into: &target)
+
+        #expect(restored == 0)
+        #expect(dst.offset == 0)
+        #expect(!dst.usesTurboQuantKV)
+    }
+
+    @Test("A corrupt later ZAYA layer cannot partially mutate earlier layers")
+    func turboQuantNativeWholeRecordIsAtomic() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
+        func makeSource(multiplier: Float, tokens: Int = 96) -> ZayaCCACache {
+            let source = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
+            _ = source.update(
+                keys: MLXArray.ones([1, 1, tokens, 32], dtype: .bfloat16) * multiplier,
+                values: MLXArray.ones([1, 1, tokens, 32], dtype: .bfloat16) * multiplier)
+            source.writeCCA(
+                conv: MLXArray.ones([1, 4, 2], dtype: .float32) * multiplier,
+                prev: MLXArray.ones([1, 8], dtype: .float32) * multiplier)
+            #expect(source.promoteAttentionKVToTurboQuant(keyBits: 3, valueBits: 3))
+            return source
+        }
+
+        let encoded = TQDiskSerializer.serialize(cache: [
+            makeSource(multiplier: 1),
+            makeSource(multiplier: 2, tokens: 97),
+        ])
+
+        let dst0 = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
+        let dst1 = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
+        var target: [any KVCache] = [dst0, dst1]
+        let restored = restoreFromDiskArrays(encoded, into: &target)
+
+        #expect(restored == 0)
+        #expect(dst0.offset == 0)
+        #expect(dst1.offset == 0)
+        #expect(!dst0.usesTurboQuantKV)
+        #expect(!dst1.usesTurboQuantKV)
+    }
 }

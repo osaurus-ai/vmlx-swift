@@ -1973,7 +1973,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func maybeQuantizeCacheForStep() {
-        let hadTQ = cache.contains { $0 is TurboQuantKVCache }
+        let hadTQ = ModelCacheTopologySnapshot(cache: cache).turboQuantKVLayerCount > 0
         let before = hadTQ ? nil : ModelCacheTopologySnapshot(cache: cache)
         maybeQuantizeKVCache(
             cache: &cache,
@@ -1981,7 +1981,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             kvGroupSize: kvGroupSize,
             quantizedKVStart: quantizedKVStart,
             kvMode: kvMode)
-        let hasTQ = cache.contains { $0 is TurboQuantKVCache }
+        let hasTQ = ModelCacheTopologySnapshot(cache: cache).turboQuantKVLayerCount > 0
         if !hadTQ, hasTQ, let before {
             turboQuantCompressionCount += 1
             lastTurboQuantCacheTransition = TurboQuantCacheTransitionSnapshot(
@@ -2216,11 +2216,18 @@ public struct TokenIterator: TokenIteratorProtocol {
             // lossy KV compression until after the first surfaced token; a
             // warm full-prefix hit must therefore seed first-token sampling
             // from the same exact prompt KV, not from a compressed prompt.
+            // ZAYA is the typed exception only at four bits or higher: its CCA
+            // topology already rejects exact disk boundaries, and the typed
+            // record keeps path-dependent CCA arrays native beside encoded
+            // attention KV. Sub-four-bit ZAYA prompt boundaries stay raw.
+            let promptDiskKVMode = selectivePromptBoundaryDiskKVMode(
+                cache: promptCacheSnapshot,
+                requested: kvMode)
             store(
                 tokens: promptTokenIds,
                 cache: promptCacheSnapshot,
                 kvBits: nil,
-                kvMode: .none)
+                kvMode: promptDiskKVMode)
 
             if !originalInput.requiresPostPrepareCacheKey {
                 let requiresDiskBackedRestore =
@@ -2236,7 +2243,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                         tokens: Array(promptTokenIds.dropLast()),
                         cache: boundarySnapshot,
                         kvBits: nil,
-                        kvMode: .none)
+                        kvMode: selectivePromptBoundaryDiskKVMode(
+                            cache: boundarySnapshot,
+                            requested: kvMode))
                 }
                 // Cross-turn reuse boundary for hybrid-SSM models (qwen3.5 /
                 // ornith GatedDeltaNet, Nemotron-H Mamba-2, LFM2, ZAYA CCA, …):
@@ -2282,7 +2291,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                             tokens: Array(promptTokenIds.prefix(stripAt)),
                             cache: strippedSnapshot,
                             kvBits: nil,
-                            kvMode: .none)
+                            kvMode: selectivePromptBoundaryDiskKVMode(
+                                cache: strippedSnapshot,
+                                requested: kvMode))
                     } else {
                         Self.logger.debug(
                             "TokenIterator: no stripped-boundary snapshot to store at \(stripAt, privacy: .public); prefill did not cross the boundary"
@@ -2302,7 +2313,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                             tokens: boundaryTokens,
                             cache: boundarySnapshot,
                             kvBits: nil,
-                            kvMode: .none)
+                            kvMode: selectivePromptBoundaryDiskKVMode(
+                                cache: boundarySnapshot,
+                                requested: kvMode))
                     }
                 }
             }
@@ -2310,6 +2323,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         guard includeGeneratedBoundary, !generatedTokenIds.isEmpty else { return }
         guard !needsCacheQuantization else { return }
+        guard !containsUnprovenZayaTurboQuantDiskState(cache) else { return }
         let generatedBoundaryTokens = promptTokenIds + generatedTokenIds
         guard (cache.map(\.offset).max() ?? 0) >= generatedBoundaryTokens.count
         else { return }

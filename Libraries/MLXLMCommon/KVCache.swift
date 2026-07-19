@@ -1781,15 +1781,9 @@ public func maybeQuantizeKVCache(
 ) {
     guard !cache.isEmpty else { return }
 
-    // Find the first quantizable (KVCacheSimple) layer to check offset threshold.
-    // Hybrid models may have MambaCache/RotatingKVCache at layer 0, so we can't
-    // just check cache[0].
-    let firstSimple = cache.first { $0 is KVCacheSimple }
-
     // TurboQuant mode takes precedence
     switch kvMode {
     case .turboQuant(let keyBits, let valueBits):
-        // Already compressed? Skip. Check if any layer is already TQ.
         // TQ keeps exact sink tokens plus an exact recent tail; compression only
         // begins once there is a real middle span to encode. This preserves the
         // active prompt/instruction boundary instead of trying to repair model
@@ -1798,24 +1792,45 @@ public func maybeQuantizeKVCache(
             quantizedKVStart,
             4 + TurboQuantKVCache.defaultResidualTokens
                 + TurboQuantKVCache.minimumCompressedTokens)
-        guard !cache.contains(where: { $0 is TurboQuantKVCache }),
-              let ref = firstSimple,
-              ref.offset > tqMinStart,
-              TurboQuantKVCache.hasCompressibleMiddle(tokenCount: ref.offset)
-        else { return }
+        let hasEligibleLayer = cache.contains { layer in
+            if let simple = layer as? KVCacheSimple {
+                return simple.offset > tqMinStart
+                    && TurboQuantKVCache.hasCompressibleMiddle(tokenCount: simple.offset)
+            }
+            if let zaya = layer as? ZayaCCACache {
+                return !zaya.usesTurboQuantKV
+                    && zaya.offset > tqMinStart
+                    && TurboQuantKVCache.hasCompressibleMiddle(tokenCount: zaya.offset)
+            }
+            return false
+        }
+        guard hasEligibleLayer else { return }
 
         for i in 0..<cache.count {
             if let simpleCache = cache[i] as? KVCacheSimple {
-                cache[i] = TurboQuantKVCache.fromSimpleCache(
+                guard simpleCache.offset > tqMinStart,
+                      TurboQuantKVCache.hasCompressibleMiddle(tokenCount: simpleCache.offset)
+                else { continue }
+                let promoted = TurboQuantKVCache.fromSimpleCache(
                     simpleCache, keyBits: keyBits, valueBits: valueBits)
+                if promoted.phase == .compressed {
+                    cache[i] = promoted
+                }
+            } else if let zaya = cache[i] as? ZayaCCACache {
+                zaya.promoteAttentionKVToTurboQuant(
+                    keyBits: keyBits,
+                    valueBits: valueBits)
             }
-            // RotatingKVCache, DeepseekV4Cache, MambaCache, CacheList: skip
+            // RotatingKVCache, DeepseekV4Cache, MambaCache, CacheList,
+            // ZayaMoEPlaceholderCache: skip.
             // (no ordinary full-history KV to compress, or already manages its
             // own memory/pool layout)
         }
         return
 
     case .affine(let bits, let groupSize):
+        // Affine cache quantization remains limited to top-level simple KV.
+        let firstSimple = cache.first { $0 is KVCacheSimple }
         guard !cache.contains(where: { $0 is QuantizedKVCache }),
               let ref = firstSimple, ref.offset > quantizedKVStart
         else { return }
@@ -1832,6 +1847,7 @@ public func maybeQuantizeKVCache(
     }
 
     // Legacy path: use kvBits if set
+    let firstSimple = cache.first { $0 is KVCacheSimple }
     guard let kvBits = kvBits,
         !cache.contains(where: { $0 is QuantizedKVCache }),
         let ref = firstSimple, ref.offset > quantizedKVStart

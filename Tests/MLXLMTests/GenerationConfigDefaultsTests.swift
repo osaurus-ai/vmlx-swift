@@ -289,7 +289,9 @@ final class GenerationConfigDefaultsTests: XCTestCase {
         let topology = await container.cacheTopologySnapshot()
 
         XCTAssertEqual(topology.layerCount, 13)
-        XCTAssertEqual(topology.kvLayerCount, 3)
+        // ZayaCCACache owns one ordinary attention-KV cache in addition to
+        // its separately counted native CCA companion state.
+        XCTAssertEqual(topology.kvLayerCount, 4)
         XCTAssertEqual(topology.chunkedKVLayerCount, 1)
         XCTAssertEqual(topology.quantizedKVLayerCount, 1)
         XCTAssertEqual(topology.turboQuantKVLayerCount, 2)
