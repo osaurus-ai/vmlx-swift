@@ -28,6 +28,23 @@ struct ZayaNestedToolArgTests {
         ]
     ]
 
+    private let agentAction: [[String: any Sendable]] = [
+        [
+            "type": "function",
+            "function": [
+                "name": "agent_action",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "verb": ["type": "string"],
+                        "app": ["type": "string"],
+                    ] as [String: any Sendable],
+                    "required": ["verb"],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+    ]
+
     private func zayaParser() -> XMLFunctionParser {
         XMLFunctionParser(
             startTag: "<zyphra_tool_call>",
@@ -184,6 +201,62 @@ struct ZayaNestedToolArgTests {
         let call = try #require(zayaParser().parse(content: content, tools: tools))
         #expect(call.function.name == "line_count")
         #expect(call.function.arguments["text"] == .string("hi there"))
+    }
+
+    /// VERBATIM structural shape recovered from the AppleScript 8B JANG_6M
+    /// Computer Use row: the model started `app` before closing `verb`. The
+    /// old attribute scanner consumed the second opener/value into `verb`, so
+    /// the host saw `open\n<parameter=app>\nTextEdit` and rejected the enum.
+    @Test("attribute body resynchronizes at a recognized next parameter")
+    func attributeBodyRecoversMissingParameterCloser() throws {
+        let content = """
+            <zyphra_tool_call>
+            <function=agent_action>
+            <parameter=verb>
+            open
+            <parameter=app>
+            TextEdit
+            </parameter>
+            </function>
+            </zyphra_tool_call>
+            """
+        let call = try #require(zayaParser().parse(content: content, tools: agentAction))
+        #expect(call.function.name == "agent_action")
+        #expect(call.function.arguments["verb"] == .string("open"))
+        #expect(call.function.arguments["app"] == .string("TextEdit"))
+        #expect(call.function.arguments["_error"] == nil)
+    }
+
+    /// A string that merely contains a tag-looking sequence must not be split
+    /// unless the nested name is another declared parameter for this tool.
+    @Test("unknown tag-looking text inside a string remains literal")
+    func unknownParameterLikeTextRemainsLiteral() throws {
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "echo",
+                    "parameters": [
+                        "type": "object",
+                        "properties": ["content": ["type": "string"]] as [String: any Sendable],
+                        "required": ["content"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+        ]
+        let content = """
+            <zyphra_tool_call>
+            <function=echo>
+            <parameter=content>
+            literal <parameter=not_a_declared_field> text
+            </parameter>
+            </function>
+            </zyphra_tool_call>
+            """
+        let call = try #require(zayaParser().parse(content: content, tools: tools))
+        #expect(
+            call.function.arguments["content"]
+                == .string("literal <parameter=not_a_declared_field> text"))
     }
 
     /// REGRESSION GUARD: ordinary prose (no tool markers) never becomes a call.
