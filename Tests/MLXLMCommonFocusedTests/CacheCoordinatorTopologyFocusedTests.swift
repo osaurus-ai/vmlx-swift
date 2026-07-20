@@ -493,6 +493,32 @@ struct CacheCoordinatorTopologyFocusedTests {
         }
     }
 
+    @Test("prompt snapshot detaches Ornith GDN state from later in-place updates")
+    func promptSnapshotDetachesArraysCacheState() {
+        FocusedMLXTestSupport.withLock {
+            let live = ArraysCache(size: 1)
+            live[0] = MLXArray.ones([1, 4], dtype: .float32)
+            live.offset = 4
+            MLX.eval(live)
+
+            let snapshot = makePromptBoundaryCacheSnapshot(from: [live])
+            let detached = snapshot[0] as? ArraysCache
+            #expect(detached != nil)
+            #expect(detached?.offset == 4)
+
+            // Ornith's GatedDeltaNet path uses the same setter after every
+            // forward; with the old ellipsis-view copy this overwrote the
+            // prompt snapshot as well.
+            live[0] = MLXArray.ones([1, 4], dtype: .float32) * Float(9)
+            live.offset = 5
+            MLX.eval(live)
+
+            #expect(detached?.offset == 4)
+            #expect(detached?.state[0].sum().item(Float.self) == 4)
+            #expect(live.state[0].sum().item(Float.self) == 36)
+        }
+    }
+
     @Test("Nemotron Omni Mamba plus TurboQuant topology restores a paged partial prefix atomically")
     func nemotronOmniTurboQuantPagedPartialRestore() {
         FocusedMLXTestSupport.withLock {

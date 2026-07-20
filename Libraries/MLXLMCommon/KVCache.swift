@@ -1211,7 +1211,15 @@ public class ArraysCache: BaseKVCache {
         let new = ArraysCache(size: cache.count)
         let s = self.state
         if !s.isEmpty {
-            new.state = s.map { $0[.ellipsis] }
+            // ArraysCache users (Qwen 3.5/Ornith GatedDeltaNet among them)
+            // replace their recurrent tensor in place on every forward. An
+            // ellipsis slice is only a view of that storage, so a purported
+            // prompt-boundary `copy()` was later overwritten by tool/decode
+            // tokens and could be stored under the earlier prompt hash.
+            // Build fresh buffers here. Snapshot call sites materialize the
+            // complete cache list in one MLX.eval below, avoiding one GPU
+            // synchronization per layer.
+            new.state = s.map { $0 * 1 }
         }
         new.offset = self.offset
         new.leftPadding = self.leftPadding
@@ -1262,7 +1270,9 @@ public class MambaCache: ArraysCache {
 
     public func recordPrefixCommitState(length: Int, arrays: [MLXArray], offset: Int) {
         guard length > 0, !arrays.isEmpty else { return }
-        let snapshotArrays = arrays.map { $0[.ellipsis] }
+        // Prefix checkpoints must be independent of the next recurrent
+        // update for the same reason as `copy()` above.
+        let snapshotArrays = arrays.map { $0 * 1 }
         MLX.eval(snapshotArrays)
         prefixCommitStates[length] = PrefixCommitState(
             arrays: snapshotArrays,
@@ -1271,7 +1281,9 @@ public class MambaCache: ArraysCache {
 
     public func commitRecordedPrefix(length: Int) -> Bool {
         guard let snapshot = prefixCommitStates[length] else { return false }
-        self.state = snapshot.arrays.map { $0[.ellipsis] }
+        let restored = snapshot.arrays.map { $0 * 1 }
+        MLX.eval(restored)
+        self.state = restored
         self.offset = snapshot.offset
         clearRecordedPrefixes()
         return true
@@ -1285,7 +1297,7 @@ public class MambaCache: ArraysCache {
         let new = MambaCache()
         let s = self.state
         if !s.isEmpty {
-            new.state = s.map { $0[.ellipsis] }
+            new.state = s.map { $0 * 1 }
         }
         new.offset = self.offset
         new.leftPadding = self.leftPadding

@@ -14,7 +14,14 @@ import MLX
 /// valid while carrying generated-token state under a prompt-only key.
 func makePromptBoundaryCacheSnapshot(from cache: [any KVCache]) -> [any KVCache] {
     let snapshot = cache.map { $0.copy() }
-    if snapshot.contains(where: { $0 is HybridPoolCache }) {
+    // ArraysCache/MambaCache update their recurrent tensors in place. Their
+    // copy implementations create independent `* 1` graph nodes; materialize
+    // the whole list before decode mutates the live cache so the prompt
+    // snapshot cannot inherit later tool/output state. One batched eval keeps
+    // this substantially cheaper than synchronizing every recurrent layer.
+    if snapshot.contains(where: {
+        $0 is HybridPoolCache || cacheContainsPathDependentState([$0])
+    }) {
         MLX.eval(snapshot)
     }
     return snapshot
