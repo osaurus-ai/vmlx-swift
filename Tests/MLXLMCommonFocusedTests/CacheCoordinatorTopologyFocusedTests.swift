@@ -247,6 +247,131 @@ struct CacheCoordinatorTopologyFocusedTests {
         }
     }
 
+    @Test("Gemma mixed TQ and wrapped rotating cache bypasses paged RAM and resumes from L2")
+    func gemmaMixedTurboQuantWrappedRotatingResumesFromDisk() {
+        FocusedMLXTestSupport.withLock {
+        let tmp = makeTempDir("gemma-mixed-tq-rotating-disk")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let modelKey = "gemma-mixed-tq-rotating-disk-focused"
+        let tokens = Array(1...96)
+
+        let simple = KVCacheSimple()
+        _ = simple.update(
+            keys: MLXArray.ones([1, 1, tokens.count, 16], dtype: .bfloat16),
+            values: MLXArray.ones([1, 1, tokens.count, 16], dtype: .bfloat16)
+                * Float(0.5))
+        let turboQuant = TurboQuantKVCache.fromSimpleCache(
+            simple,
+            keyBits: 4,
+            valueBits: 4,
+            sinkTokens: 4)
+        #expect(turboQuant.phase == .compressed)
+
+        // Use repeated multi-token prefill chunks so the rotating cache crosses
+        // its window before the prompt-boundary snapshot, matching Gemma's
+        // chunked-prefill lifecycle rather than only testing an unwrapped ring.
+        let rotating = RotatingKVCache(maxSize: 16, keep: 0, step: 4)
+        for chunkStart in stride(from: 0, to: tokens.count, by: 12) {
+            let marker = Float(chunkStart / 12 + 1)
+            _ = rotating.update(
+                keys: MLXArray.ones([1, 1, 12, 16], dtype: .bfloat16) * marker,
+                values: MLXArray.ones([1, 1, 12, 16], dtype: .bfloat16)
+                    * (marker + Float(0.25)))
+        }
+        MLX.eval(turboQuant, rotating)
+        #expect(rotating.offset == tokens.count)
+        #expect(rotating.offset > (rotating.maxSize ?? 0))
+
+        do {
+            let writer = makeCoordinator(
+                usePagedCache: true,
+                enableDiskCache: true,
+                diskCacheDir: tmp,
+                modelKey: modelKey,
+                blockSize: 8)
+            writer.setPagedIncompatible(true)
+            writer.storeAfterGeneration(
+                promptTokens: tokens,
+                perLayerData: [],
+                ssmStates: nil,
+                cache: [turboQuant, rotating])
+
+            let stats = writer.snapshotStats()
+            #expect(!stats.pagedEnabled)
+            #expect(stats.isPagedIncompatible)
+            #expect((writer.pagedCache?.snapshotStats().allocatedBlocks ?? -1) == 0)
+            #expect((stats.diskStats?.stores ?? 0) > 0)
+        }
+
+        // A fresh coordinator models an app/model restart: no in-memory paged
+        // blocks survive, so the only valid prefix source is the typed SSD L2
+        // payload containing TQ attention KV plus rotating SWA ring metadata.
+        let reader = makeCoordinator(
+            usePagedCache: true,
+            enableDiskCache: true,
+            diskCacheDir: tmp,
+            modelKey: modelKey,
+            blockSize: 8)
+        reader.setPagedIncompatible(true)
+        let growingPrompt = tokens + [97, 98]
+        switch reader.fetch(tokens: growingPrompt, skipExactDiskBoundary: true) {
+        case .hit(let matched, let remaining, let detail, let blocks, _, let arrays):
+            #expect(matched == tokens.count)
+            #expect(remaining == [97, 98])
+            #expect(detail == .disk)
+            #expect(blocks.isEmpty)
+            guard let arrays else {
+                Issue.record("Gemma mixed L2 hit must carry typed cache arrays")
+                return
+            }
+
+            var restored: [any KVCache] = [
+                KVCacheSimple(),
+                RotatingKVCache(maxSize: 16, keep: 0, step: 4),
+            ]
+            let restoredTokens = restoreFromDiskArrays(arrays, into: &restored)
+            MLX.eval(restored)
+            #expect(restoredTokens == tokens.count)
+            #expect(restored[0] is TurboQuantKVCache)
+            #expect(restored[1] is RotatingKVCache)
+            #expect(ModelCacheTopologySnapshot(cache: restored).turboQuantKVLayerCount == 1)
+            #expect(ModelCacheTopologySnapshot(cache: restored).rotatingKVLayerCount == 1)
+
+            guard let restoredRotating = restored[1] as? RotatingKVCache else {
+                return
+            }
+            #expect(restoredRotating.metaState == rotating.metaState)
+            #expect(restoredRotating.state.count == rotating.state.count)
+            for (actual, expected) in zip(restoredRotating.state, rotating.state) {
+                #expect(actual.shape == expected.shape)
+                #expect(allClose(actual, expected).item(Bool.self))
+            }
+
+            // Resume both copies with the same suffix token. Exact state and
+            // temporal ordering prove the restored ring is synchronized, not
+            // merely shape-compatible telemetry.
+            let nextKeys = MLXArray.ones([1, 1, 1, 16], dtype: .bfloat16) * Float(99)
+            let nextValues = MLXArray.ones([1, 1, 1, 16], dtype: .bfloat16) * Float(99.25)
+            _ = rotating.update(keys: nextKeys, values: nextValues)
+            _ = restoredRotating.update(keys: nextKeys, values: nextValues)
+            MLX.eval(rotating, restoredRotating)
+            #expect(restoredRotating.metaState == rotating.metaState)
+            guard let expectedOrdered = rotating.temporallyOrderedKV(),
+                  let actualOrdered = restoredRotating.temporallyOrderedKV()
+            else {
+                Issue.record("continued rotating caches must expose temporal KV")
+                return
+            }
+            #expect(allClose(actualOrdered.keys, expectedOrdered.keys).item(Bool.self))
+            #expect(allClose(actualOrdered.values, expectedOrdered.values).item(Bool.self))
+            #expect((reader.diskCache?.snapshotStats().hits ?? 0) > 0)
+            #expect((reader.pagedCache?.snapshotStats().cacheHits ?? 0) == 0)
+        case .miss:
+            Issue.record("fresh Gemma coordinator should resume the wrapped mixed cache from SSD L2")
+        }
+        }
+    }
+
     @Test("hybrid disk hit rejects partial companion state")
     func hybridDiskHitRejectsPartialSSMCompanion() {
         FocusedMLXTestSupport.withLock {
