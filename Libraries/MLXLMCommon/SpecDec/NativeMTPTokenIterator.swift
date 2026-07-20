@@ -476,6 +476,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                                     promptTokenIds: promptTokenIds,
                                     mediaSalt: mediaSalt,
                                     additionalBoundaries: sharedPromptAdditionalBoundaries,
+                                    persistCapturedStatesToDisk: false,
                                     prefillStepSize: cacheInitParameters.prefillStepSize)
                         }
                         if let shared = sharedPromptRederivedStates?[tokens.count] {
@@ -487,6 +488,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         model: model,
                         promptTokenIds: tokens,
                         mediaSalt: mediaSalt,
+                        persistCapturedStatesToDisk: false,
                         prefillStepSize: cacheInitParameters.prefillStepSize)
                 }()
                 let diskStoreCache = makeDiskStoreCache(

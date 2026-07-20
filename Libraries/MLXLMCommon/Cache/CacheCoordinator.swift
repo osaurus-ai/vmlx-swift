@@ -4,6 +4,13 @@ import Foundation
 @preconcurrency import MLX
 import os
 
+/// Serializes process-wide combined disk-quota reconciliation. Individual KV
+/// and companion stores already own their IO locks; this lock only protects
+/// the cross-store snapshot/eviction decision.
+private enum CombinedDiskCacheQuotaLock {
+    static let shared = OSAllocatedUnfairLock()
+}
+
 // MARK: - CacheDetail
 
 /// Identifies which cache tier satisfied a lookup.
@@ -184,6 +191,8 @@ public final class CacheCoordinator: @unchecked Sendable {
                 modelKey: config.modelKey,
                 maxBytes: ssmMaxBytes)
         }
+
+        enforceCombinedDiskQuota()
     }
 
     // MARK: - Hybrid Flag
@@ -532,6 +541,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             tokens: tokens,
             boundary: boundary,
             mediaSalt: mediaSalt)
+        enforceCombinedDiskQuota()
         return folded
     }
 
@@ -675,6 +685,115 @@ public final class CacheCoordinator: @unchecked Sendable {
                 mediaSalt: mediaSalt
             )
         }
+
+        enforceCombinedDiskQuota()
+    }
+
+    /// Enforce `diskCacheMaxGB` across the whole persistent cache root, not
+    /// once for KV payloads and again for recurrent companion payloads.
+    ///
+    /// New companion sidecars record their matching KV hash, allowing an old
+    /// hybrid entry to be evicted as a unit. Legacy sidecars remain readable;
+    /// under quota pressure they retire before indexed KV because they cannot
+    /// prove which durable KV payload can still reach them. Companions whose
+    /// recorded KV payload is already gone are removed immediately.
+    func enforceCombinedDiskQuota() {
+        guard config.enableDiskCache,
+              let diskCache,
+              let companionStore = ssmStateCache.diskStore
+        else { return }
+
+        let maxBytes = Int64(max(1, Int(config.diskCacheMaxGB * 1_073_741_824)))
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+
+        let kvEntries = diskCache.quotaEntries()
+        let kvHashes = Set(kvEntries.map(\.hash))
+        var companionEntries = companionStore.quotaEntries()
+
+        let orphaned = companionEntries.filter {
+            guard let kvHash = $0.kvHash else { return false }
+            return !kvHashes.contains(kvHash)
+        }
+        if !orphaned.isEmpty {
+            companionStore.removeQuotaEntries(hashes: Set(orphaned.map(\.hash)))
+            let orphanHashes = Set(orphaned.map(\.hash))
+            companionEntries.removeAll { orphanHashes.contains($0.hash) }
+        }
+
+        struct EvictionGroup {
+            let sortKey: String
+            let kvHashes: Set<String>
+            let companionHashes: Set<String>
+            let bytes: Int64
+            let createdAt: Date
+            /// Legacy companions predate the KV-link sidecar. They cannot
+            /// prove that an indexed KV payload can still reach them, so quota
+            /// pressure retires them before directly addressable KV groups.
+            let priority: Int
+        }
+
+        let companionsByKVHash = Dictionary(grouping: companionEntries.compactMap { entry in
+            entry.kvHash.map { ($0, entry) }
+        }, by: { $0.0 })
+        var groupedCompanionHashes = Set<String>()
+        var groups: [EvictionGroup] = []
+
+        for kv in kvEntries {
+            let companions = companionsByKVHash[kv.hash]?.map(\.1) ?? []
+            groupedCompanionHashes.formUnion(companions.map(\.hash))
+            groups.append(EvictionGroup(
+                sortKey: "kv:\(kv.hash)",
+                kvHashes: [kv.hash],
+                companionHashes: Set(companions.map(\.hash)),
+                bytes: kv.bytes + companions.reduce(0) { $0 + $1.bytes },
+                createdAt: companions.reduce(kv.createdAt) {
+                    min($0, $1.modifiedAt)
+                },
+                priority: 1))
+        }
+
+        for companion in companionEntries
+        where !groupedCompanionHashes.contains(companion.hash)
+        {
+            groups.append(EvictionGroup(
+                sortKey: "ssm:\(companion.hash)",
+                kvHashes: [],
+                companionHashes: [companion.hash],
+                bytes: companion.bytes,
+                createdAt: companion.modifiedAt,
+                priority: companion.kvHash == nil ? 0 : 1))
+        }
+
+        let totalBefore = groups.reduce(Int64(0)) { $0 + $1.bytes }
+        guard totalBefore > maxBytes else { return }
+
+        var remaining = totalBefore
+        var evictKV = Set<String>()
+        var evictCompanion = Set<String>()
+        for group in groups.sorted(by: {
+            if $0.priority != $1.priority { return $0.priority < $1.priority }
+            if $0.createdAt == $1.createdAt { return $0.sortKey < $1.sortKey }
+            return $0.createdAt < $1.createdAt
+        }) where remaining > maxBytes {
+            evictKV.formUnion(group.kvHashes)
+            evictCompanion.formUnion(group.companionHashes)
+            remaining -= group.bytes
+        }
+
+        diskCache.removeQuotaEntries(hashes: evictKV)
+        companionStore.removeQuotaEntries(hashes: evictCompanion)
+
+        let legacyCompanionEvicted = companionEntries.reduce(into: 0) { count, entry in
+            if entry.kvHash == nil, evictCompanion.contains(entry.hash) {
+                count += 1
+            }
+        }
+
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            FileHandle.standardError.write(Data(
+                "[vmlx][cache/disk-quota] before=\(totalBefore) after=\(max(0, remaining)) max=\(maxBytes) kvEvicted=\(evictKV.count) companionEvicted=\(evictCompanion.count) legacyCompanionEvicted=\(legacyCompanionEvicted) orphanCompanionEvicted=\(orphaned.count)\n".utf8))
+        }
     }
 
     /// Split full-sequence per-layer KV data into block-sized chunks.
@@ -736,5 +855,6 @@ public final class CacheCoordinator: @unchecked Sendable {
     public func clear() {
         releaseVolatile()
         diskCache?.clear()
+        ssmStateCache.diskStore?.clear()
     }
 }

@@ -41,6 +41,16 @@ import Foundation
 import MLX
 import os
 
+/// One recurrent companion payload used by the coordinator's shared quota.
+/// New sidecars carry the hash of their matching KV payload so eviction can
+/// remove an old hybrid entry as one unit instead of orphaning half of it.
+struct SSMCompanionQuotaEntry: Sendable {
+    let hash: String
+    let kvHash: String?
+    let bytes: Int64
+    let modifiedAt: Date
+}
+
 /// Disk-backed extension to the in-memory `SSMStateCache`. See header
 /// comment for storage format + concurrency model.
 public final class SSMCompanionDiskStore: @unchecked Sendable {
@@ -123,6 +133,10 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             "num_states": ssmStates.count,
             "model_key": modelKey ?? "",
             "boundary": boundary,
+            "kv_hash": DiskCache.hashTokens(
+                Array(tokens.prefix(boundary)),
+                modelKey: modelKey,
+                mediaSalt: mediaSalt),
         ]
         let sidecarData = try JSONSerialization.data(
             withJSONObject: sidecar, options: [.sortedKeys])
@@ -206,6 +220,36 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         }
     }
 
+    /// Snapshot recurrent payloads for the coordinator's combined KV +
+    /// companion quota. Legacy sidecars have no `kv_hash`; they remain valid
+    /// for reads, but quota pressure retires them before indexed KV because
+    /// they cannot prove which durable KV payload can still reach them.
+    func quotaEntries() -> [SSMCompanionQuotaEntry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return diskEntriesLocked().map { hash, entry in
+            SSMCompanionQuotaEntry(
+                hash: hash,
+                kvHash: entry.kvHash,
+                bytes: Int64(entry.bytes),
+                modifiedAt: entry.modified)
+        }
+    }
+
+    /// Remove recurrent payloads selected by the combined quota pass.
+    func removeQuotaEntries(hashes: Set<String>) {
+        guard !hashes.isEmpty else { return }
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
+        lock.lock()
+        defer { lock.unlock() }
+
+        for hash in hashes {
+            try? FileManager.default.removeItem(at: safetensorsURL(for: hash))
+            try? FileManager.default.removeItem(at: sidecarURL(for: hash))
+        }
+    }
+
     // MARK: - Helpers
 
     private func safetensorsURL(for hash: String) -> URL {
@@ -220,18 +264,17 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         var urls: [URL] = []
         var bytes: Int = 0
         var modified: Date = .distantPast
+        var kvHash: String?
     }
 
-    private func evictIfNeededLocked() {
-        guard maxBytes > 0 else { return }
+    private func diskEntriesLocked() -> [String: DiskEntry] {
         guard let urls = try? FileManager.default.contentsOfDirectory(
             at: cacheDir,
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
             options: [.skipsHiddenFiles])
-        else { return }
+        else { return [:] }
 
         var entries: [String: DiskEntry] = [:]
-        var totalBytes = 0
         for url in urls {
             guard let hash = entryHash(for: url) else { continue }
             let values = try? url.resourceValues(forKeys: [
@@ -239,7 +282,6 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             ])
             let bytes = values?.fileSize ?? 0
             let modified = values?.contentModificationDate ?? .distantPast
-            totalBytes += bytes
 
             var entry = entries[hash] ?? DiskEntry()
             entry.urls.append(url)
@@ -247,8 +289,23 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             if entry.modified == .distantPast || modified < entry.modified {
                 entry.modified = modified
             }
+            if url.pathExtension == "json",
+               let data = try? Data(contentsOf: url),
+               let sidecar = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let kvHash = sidecar["kv_hash"] as? String,
+               !kvHash.isEmpty
+            {
+                entry.kvHash = kvHash
+            }
             entries[hash] = entry
         }
+        return entries
+    }
+
+    private func evictIfNeededLocked() {
+        guard maxBytes > 0 else { return }
+        let entries = diskEntriesLocked()
+        var totalBytes = entries.values.reduce(0) { $0 + $1.bytes }
 
         guard totalBytes > maxBytes else { return }
 

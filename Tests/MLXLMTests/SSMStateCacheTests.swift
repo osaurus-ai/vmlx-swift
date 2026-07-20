@@ -177,4 +177,51 @@ struct SSMStateCacheTests {
     let fetched = store.fetch(tokens: [1, 2, 3, 4], boundary: 4)
     #expect(fetched == nil)
 }
+
+@Test func transientPagedCompanionStateDoesNotWriteThroughToDisk() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ssm-companion-transient-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let disk = try SSMCompanionDiskStore(
+        cacheDir: dir,
+        modelKey: "test-model",
+        maxBytes: 10_000_000)
+    let cache = SSMStateCache(maxEntries: 4, modelKey: "test-model")
+    cache.diskStore = disk
+    let tokens = [1, 2, 3, 4]
+
+    cache.store(
+        ssmStates: [MLXArray.ones([4, 4])],
+        tokens: tokens,
+        boundary: tokens.count,
+        persistToDisk: false)
+
+    #expect(cache.contains(tokens: tokens, boundary: tokens.count))
+    #expect(disk.fetch(tokens: tokens, boundary: tokens.count) == nil)
+}
+
+@Test func coordinatorClearRemovesPersistentCompanionPayloads() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ssm-companion-clear-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let tokens = [5, 6, 7, 8]
+
+    let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+        usePagedCache: false,
+        enableDiskCache: true,
+        diskCacheMaxGB: 0.1,
+        diskCacheDir: root,
+        modelKey: "clear-test"))
+    coordinator.ssmStateCache.store(
+        ssmStates: [MLXArray.ones([4, 4])],
+        tokens: tokens,
+        boundary: tokens.count)
+    let disk = try #require(coordinator.ssmStateCache.diskStore)
+    #expect(disk.fetch(tokens: tokens, boundary: tokens.count) != nil)
+
+    coordinator.clear()
+
+    #expect(disk.fetch(tokens: tokens, boundary: tokens.count) == nil)
+}
 }

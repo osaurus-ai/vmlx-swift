@@ -14,6 +14,14 @@ public struct DiskCacheStats: Sendable {
     public let maxSizeBytes: Int
 }
 
+/// One indexed KV payload used by the coordinator's shared disk-quota pass.
+/// `createdAt` mirrors the existing oldest-entry eviction order.
+struct DiskCacheQuotaEntry: Sendable {
+    let hash: String
+    let bytes: Int64
+    let createdAt: Date
+}
+
 /// Process-wide guard for MLX safetensors disk-cache IO.
 ///
 /// Each model owns its own ``DiskCache`` instance, so an instance-local lock
@@ -307,6 +315,53 @@ public final class DiskCache: @unchecked Sendable {
         }
         sqlite3_finalize(stmt)
         return counts
+    }
+
+    /// Snapshot indexed KV payloads for the coordinator's combined KV +
+    /// recurrent-companion quota. Database/WAL bookkeeping is intentionally
+    /// excluded, matching this cache's existing `SUM(file_size)` contract.
+    func quotaEntries() -> [DiskCacheQuotaEntry] {
+        guard let db else { return [] }
+        lock.lock()
+        defer { lock.unlock() }
+
+        var entries: [DiskCacheQuotaEntry] = []
+        var stmt: OpaquePointer?
+        let sql = "SELECT hash, file_size, created_at FROM cache_entries"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return []
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let cHash = sqlite3_column_text(stmt, 0) else { continue }
+            let hash = String(cString: cHash)
+            let bytes = max(0, sqlite3_column_int64(stmt, 1))
+            let julianDay = sqlite3_column_double(stmt, 2)
+            let unixTime = (julianDay - 2_440_587.5) * 86_400
+            entries.append(DiskCacheQuotaEntry(
+                hash: hash,
+                bytes: bytes,
+                createdAt: Date(timeIntervalSince1970: unixTime)))
+        }
+        return entries
+    }
+
+    /// Remove indexed KV payloads selected by the combined quota pass.
+    /// The process-wide IO lock prevents another cache instance from loading
+    /// a file while it is removed; the SQLite row is deleted atomically with
+    /// respect to this instance's fetch/candidate queries.
+    func removeQuotaEntries(hashes: Set<String>) {
+        guard !hashes.isEmpty else { return }
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
+        lock.lock()
+        defer { lock.unlock() }
+
+        for hash in hashes {
+            try? FileManager.default.removeItem(at: safetensorsURL(for: hash))
+            _deleteEntryLocked(hash: hash)
+        }
     }
 
     /// Remove all cached entries and safetensors files.

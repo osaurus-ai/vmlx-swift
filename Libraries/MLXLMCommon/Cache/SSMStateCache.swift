@@ -126,7 +126,8 @@ public final class SSMStateCache: @unchecked Sendable {
         tokens: [Int],
         boundary: Int,
         mediaSalt: String? = nil,
-        isComplete: Bool = true
+        isComplete: Bool = true,
+        persistToDisk: Bool = true
     ) {
         let key = Self.makeKey(tokens: tokens, boundary: boundary, mediaSalt: mediaSalt, modelKey: modelKey)
 
@@ -183,7 +184,7 @@ public final class SSMStateCache: @unchecked Sendable {
         // Omni hybrid prefixes don't collide with text-only prefixes
         // sharing the same token sequence. Previously hardcoded nil
         // here → silent L2 alias on cold start of the next session.
-        if let disk {
+        if persistToDisk, let disk {
             try? disk.store(
                 ssmStates: copies,
                 tokens: tokens,

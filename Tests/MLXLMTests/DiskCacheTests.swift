@@ -106,3 +106,105 @@ import Testing
     let hash3 = DiskCache.hashTokens([42, 43, 44, 46])
     #expect(hash1 != hash3)
 }
+
+@Test func coordinatorEnforcesOneQuotaAcrossKVAndCompanionPayloads() async throws {
+    try await MLXMetalTestLock.withLock {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-combined-disk-quota-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let companionDir = root.appendingPathComponent("ssm_companion")
+        let modelKey = "combined-quota-model"
+        let tokens = [1, 2, 3, 4]
+
+        let disk = DiskCache(cacheDir: root, maxSizeGB: 1, modelKey: modelKey)
+        let companion = try SSMCompanionDiskStore(
+            cacheDir: companionDir,
+            modelKey: modelKey,
+            maxBytes: 1_000_000)
+        disk.store(
+            tokens: tokens,
+            arrays: ["data": MLXArray.ones([1_024])])
+        try companion.store(
+            ssmStates: [MLXArray.ones([1_024])],
+            tokens: tokens,
+            boundary: tokens.count)
+
+        let kvEntry = try #require(disk.quotaEntries().first)
+        let companionEntry = try #require(companion.quotaEntries().first)
+        #expect(companionEntry.kvHash == kvEntry.hash)
+
+        let smallerEntry = min(kvEntry.bytes, companionEntry.bytes)
+        let combinedBytes = kvEntry.bytes + companionEntry.bytes
+        let capBytes = combinedBytes - max(1, smallerEntry / 2)
+        #expect(capBytes > kvEntry.bytes)
+        #expect(capBytes > companionEntry.bytes)
+        #expect(capBytes < combinedBytes)
+
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: Float(capBytes) / 1_073_741_824,
+            diskCacheDir: root,
+            modelKey: modelKey))
+        coordinator.enforceCombinedDiskQuota()
+
+        #expect(coordinator.diskCache?.quotaEntries().isEmpty == true)
+        #expect(coordinator.ssmStateCache.diskStore?.quotaEntries().isEmpty == true)
+        #expect(disk.fetch(tokens: tokens) == nil)
+        #expect(companion.fetch(tokens: tokens, boundary: tokens.count) == nil)
+    }
+}
+
+@Test func combinedQuotaRetiresUnlinkedLegacyCompanionBeforeIndexedKV() async throws {
+    try await MLXMetalTestLock.withLock {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-legacy-companion-quota-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let companionDir = root.appendingPathComponent("ssm_companion")
+        let modelKey = "legacy-companion-quota-model"
+        let tokens = [8, 6, 7, 5, 3, 0, 9]
+
+        let disk = DiskCache(cacheDir: root, maxSizeGB: 1, modelKey: modelKey)
+        let companion = try SSMCompanionDiskStore(
+            cacheDir: companionDir,
+            modelKey: modelKey,
+            maxBytes: 1_000_000)
+        disk.store(
+            tokens: tokens,
+            arrays: ["data": MLXArray.ones([1_024])])
+        try companion.store(
+            ssmStates: [MLXArray.ones([1_024])],
+            tokens: tokens,
+            boundary: tokens.count)
+
+        let kvEntry = try #require(disk.quotaEntries().first)
+        let companionEntry = try #require(companion.quotaEntries().first)
+        let sidecarURL = companionDir
+            .appendingPathComponent("ssm-\(companionEntry.hash).json")
+        let sidecarData = try Data(contentsOf: sidecarURL)
+        var sidecar = try #require(
+            JSONSerialization.jsonObject(with: sidecarData) as? [String: Any])
+        sidecar.removeValue(forKey: "kv_hash")
+        try JSONSerialization.data(withJSONObject: sidecar, options: [.sortedKeys])
+            .write(to: sidecarURL, options: [.atomic])
+
+        let legacyEntry = try #require(companion.quotaEntries().first)
+        #expect(legacyEntry.kvHash == nil)
+        let combinedBytes = kvEntry.bytes + legacyEntry.bytes
+        let capBytes = combinedBytes - max(1, min(kvEntry.bytes, legacyEntry.bytes) / 2)
+        #expect(capBytes > kvEntry.bytes)
+        #expect(capBytes > legacyEntry.bytes)
+
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: Float(capBytes) / 1_073_741_824,
+            diskCacheDir: root,
+            modelKey: modelKey))
+
+        #expect(coordinator.diskCache?.quotaEntries().count == 1)
+        #expect(coordinator.ssmStateCache.diskStore?.quotaEntries().isEmpty == true)
+        #expect(disk.fetch(tokens: tokens) != nil)
+        #expect(companion.fetch(tokens: tokens, boundary: tokens.count) == nil)
+    }
+}

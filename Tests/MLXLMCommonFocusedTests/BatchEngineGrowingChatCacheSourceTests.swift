@@ -34,6 +34,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(exactSnapshot.lowerBound < rederive.lowerBound)
         #expect(source.contains("var sharedPromptRederivedStates"))
         #expect(source.contains("reDeriveAndStoreSSMStatesAtPromptBoundaries("))
+        #expect(source.contains("persistCapturedStatesToDisk: false"))
         #expect(source.contains("let unsafeFullHit ="))
         #expect(source.contains("remaining.isEmpty && requiresDiskBackedRestore"))
         #expect(source.contains("let seedBoundary = promptLen - 1"))
@@ -71,6 +72,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(exactSnapshot.lowerBound < rederive.lowerBound)
         #expect(source.contains("var sharedPromptRederivedStates"))
         #expect(source.contains("reDeriveAndStoreSSMStatesAtPromptBoundaries("))
+        #expect(source.contains("persistCapturedStatesToDisk: false"))
         #expect(source.contains("let seedBoundary = promptLen - 1"))
         #expect(source.contains("seedSSM, into: self.cache, boundary: seedBoundary"))
         #expect(source.contains("boundary: seedBoundary"))
@@ -96,6 +98,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(exactSnapshot.lowerBound < rederive.lowerBound)
         #expect(source.contains("var sharedPromptRederivedStates"))
         #expect(source.contains("reDeriveAndStoreSSMStatesAtPromptBoundaries("))
+        #expect(source.contains("persistCapturedStatesToDisk: false"))
     }
 
     @Test("token iterator drains MLX around cache store before completion info")

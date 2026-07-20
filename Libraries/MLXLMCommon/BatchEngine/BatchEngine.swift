@@ -2076,7 +2076,8 @@ public actor BatchEngine {
                             ssmStates: ssmStates,
                             tokens: promptTokens,
                             boundary: promptTokens.count,
-                            mediaSalt: slot.mediaSalt
+                            mediaSalt: slot.mediaSalt,
+                            persistToDisk: false
                         )
                         Self.logger.debug(
                             "Slot \(slot.id.description, privacy: .public): stored SSM seed at boundary=\(promptTokens.count) (\(ssmStates.count) state arrays)"
@@ -2740,6 +2741,7 @@ public actor BatchEngine {
                                         promptTokenIds: promptTokens,
                                         mediaSalt: slot.mediaSalt,
                                         additionalBoundaries: sharedPromptAdditionalBoundaries,
+                                        persistCapturedStatesToDisk: false,
                                         prefillStepSize: slot.parameters.prefillStepSize)
                             }
                             if let shared = sharedPromptRederivedStates?[tokens.count] {
@@ -2751,6 +2753,7 @@ public actor BatchEngine {
                             model: context.model,
                             promptTokenIds: tokens,
                             mediaSalt: slot.mediaSalt,
+                            persistCapturedStatesToDisk: false,
                             prefillStepSize: slot.parameters.prefillStepSize)
                     }
                     return extractSSMStates(from: snapshot)

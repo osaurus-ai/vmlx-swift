@@ -135,14 +135,17 @@ sampler override, prompt rewrite, or output cap is part of this checkpoint.
 
 | Gate | Current result | Status |
 | --- | --- | --- |
-| Default cache policy | Isolated Release Osaurus UI and `/admin/cache-stats` showed prefix ON, paged RAM OFF, disk L2 ON, and engine-selected KV | VERIFIED-LIVE baseline |
-| Disk-only native restart | Thinking off stayed off; exact short answers remained coherent; a fresh-process disk/SSM hit restored the stored prefix | VERIFIED-LIVE baseline |
-| Disk-only TurboQuant 4/4 restart | Telemetry showed exactly 16 converted TurboQuant KV layers plus 48 native Mamba layers; warm and fresh-process answers remained coherent with disk and companion hits | VERIFIED-LIVE / PERFORMANCE-PARTIAL |
-| TurboQuant performance | Native decode measured 36.9-39.3 tok/s; TurboQuant 4/4 measured 11.3-14.4 tok/s in the same Release app lane | OPEN root cause |
-| Paged RAM + TurboQuant + SSM rederive | Real Settings UI enabled paged RAM with two blocks, disk L2, TurboQuant 4/4, prefix, and SSM rederive. The same stored chat crashed after a 2,923-token disk hit and full-prefill fallback | REPRODUCED-LIVE baseline |
-| Fresh replay lifecycle patch | `reDeriveSSMStatesAtBoundaries` now enters the first independent replay chunk through `LanguageModel.prepare`, then preserves one continuous fresh cache for later boundaries | SOURCE-TESTED / LIVE-OPEN |
-| Focused regression suite | Xcode 26.6 / Swift 6.3.3 `SSMReDeriveParityTests`: 7 tests, 0 failures. The new assertion proves exactly one `prepare` entry and existing tests preserve boundary-state parity | PASS |
-| Total disk cap | Main BlockDisk records respected the configured 10 GB cap, but `ssm_companion` added about 2.35 GB outside the accounting, growing the root to about 12 GB | REPRODUCED-LIVE / OPEN |
+| Isolated app identity | Release app at `/private/tmp/osaurus-bonsai-cache-candidate-derived-20260719/Build/Products/Release/osaurus.app`; bundle ID `com.dinoki.osaurus.bonsaicachestateproof`; binary SHA-256 `de00ead1be7f6681bbbe2a46965c2074d55d90e9a4b4df2512277f9685bee7b9`; ad-hoc signature verified with `codesign --verify --deep --strict` | VERIFIED-BUILD |
+| Default cache policy | Real Settings UI showed prefix ON, paged RAM OFF, disk L2 ON, engine-selected KV, and SSM rederive ON. After saving and reloading the model, `/admin/cache-stats` reported `effective_kv_mode=fp16`, 16 KV + 48 Mamba layers, zero TurboQuant compressions, and paged cache disabled | VERIFIED-LIVE |
+| Disk-only native restart | A fresh app process restored a 4,669-token disk boundary plus SSM companion state, then answered the visible continuation coherently at TTFT 0.72s / 56.6 tok/s. After the Settings round-trip back to engine-selected, a later 4,943-token hit plus 454-token replay answered coherently at TTFT 2.05s / 54.7 tok/s | VERIFIED-LIVE |
+| Explicit TurboQuant 4/4 | The real Settings UI rejected TurboQuant until explicit key/value widths were entered, saved 4/4, unloaded the model, and reloaded it. Telemetry showed `turbo_quant_compressions=2`, exactly 16 converted KV layers, 48 native Mamba layers, paged hits remaining zero, disk-L2 hits 1 -> 3, and SSM hits 1 -> 3 | VERIFIED-LIVE / PERFORMANCE-PARTIAL |
+| TurboQuant behavior and speed | The first explicit-TurboQuant answer was coherent at TTFT 10.79s / 39.3 tok/s. A disk-only partial continuation hit boundary 5,301 with 30 tokens replayed and answered coherently at TTFT 1.76s / 17.0 tok/s. Functional cache conversion/reuse is proven; the decode slowdown versus the restored fp16/default row remains open | PERFORMANCE-PARTIAL |
+| Paged RAM + TurboQuant + SSM rederive baseline | Before the lifecycle fix, the same stored chat crashed after a 2,923-token disk hit and full-prefill fallback with real Settings enabling paged RAM (two blocks), disk L2, TurboQuant 4/4, prefix, and SSM rederive | REPRODUCED-LIVE baseline |
+| Fresh replay lifecycle patch | `reDeriveSSMStatesAtBoundaries` enters the first independent replay chunk through `LanguageModel.prepare`, clearing request-scoped Qwen 3.5 position state, then preserves one continuous fresh cache while capturing later boundaries. The candidate crossed the prior crash boundary repeatedly, including more than 5,000 prompt tokens, without the stale-position shape failure | VERIFIED-LIVE |
+| Focused regression suites | Xcode 26.6 / Swift 6.3.3: `SSMReDeriveParityTests` 8/8; filtered DiskCache, SSMStateCache, and BatchEngine cache coverage 33/33. The CommandLineTools-only invocation cannot import Swift Testing; the same current source passed under the full Xcode toolchain | PASS |
+| Total disk cap migration | A clean exact-model root migrated from 21,120,148,753 bytes to 10,685,640,588 bytes under a 10 GiB cap by retiring 133 unlinked legacy companions and zero indexed KV entries. After the live matrix it held 18 indexed KV payloads (8,994,768,622 bytes) and 18 linked companion pairs (1,412,190,222 bytes), total 10,406,958,844 bytes; every companion `kv_hash` resolved to a current SQLite row | VERIFIED-LIVE |
+| Transient companion writes | Replay, paged-boundary, first-token, inline-capture, and native-MTP seed paths now retain transient SSM state only in memory. Only durable exact generation boundaries write companion files; the live root no longer accumulated hundreds of per-16-token sidecars | VERIFIED-LIVE |
+| Visible instruction following | One earlier two-sentence recall omitted the requested arithmetic confirmation; a corrective turn and all restart/TurboQuant/default-restored continuations answered the requested facts coherently. This is recorded as model-level variance, not hidden with a prompt, sampler, marker, or output guard | PARTIAL, transparent |
 
 ### Paged crash root trace
 
@@ -163,14 +166,19 @@ replayed a long prompt against stale, three-token position state. The patch
 restores the architecture's normal fresh-request lifecycle instead of
 changing generated content.
 
-### Required live closure
+### Current closure and remaining limitation
 
-The source test does not close the user-facing row. An isolated signed Release
-Osaurus build consuming the exact candidate vMLX revision must reopen the
-previously crashing disk cache with the same visible settings, complete the
-automatic warmup and user turn without a stale-position shape error, visibly
-remain coherent, report token/s, and show truthful paged/disk/SSM/TurboQuant
-counters. Paged OFF and engine-selected KV must then be restored through the
-UI and confirmed in effective server settings. The TurboQuant slowdown and
-companion-sidecar disk-cap defect remain separate open rows until their own
-source and live evidence exists.
+The stale-position crash and the companion-sidecar quota defect now have both
+owning-layer source fixes and live proof in the isolated signed Release app.
+The UI was returned to prefix ON, paged RAM OFF, disk L2 ON, engine-selected KV,
+and SSM rederive ON; effective runtime telemetry confirmed fp16 KV and zero
+TurboQuant conversions after that restoration. No MXFP4 bundle was loaded or
+used as evidence.
+
+The explicit TurboQuant 4/4 path is functionally coherent and its hybrid cache
+topology, partial disk reuse, and SSM companion reuse are proven, but its
+17.0 tok/s continuation is materially slower than the 54.7 tok/s restored
+default row. That performance issue remains separate follow-up work and must
+not be described as fixed by this checkpoint. The first multi-clause recall's
+omission is likewise retained above rather than masked by a forced behavior
+guard.

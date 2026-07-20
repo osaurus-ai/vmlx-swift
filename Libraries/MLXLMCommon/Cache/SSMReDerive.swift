@@ -222,7 +222,8 @@ public func captureCleanSSMStateInline(
     coordinator.ssmStateCache.store(
         ssmStates: states,
         tokens: stripped,
-        boundary: stripped.count
+        boundary: stripped.count,
+        persistToDisk: false
     )
     coordinator.ssmStateCache.markReDeriveFired()
     log("ok/captured stateCount=\(states.count)")
@@ -405,6 +406,7 @@ public func reDeriveAndStoreSSMStatesForPromptBoundaries(
     model: any LanguageModel,
     promptTokenIds: [Int],
     mediaSalt: String? = nil,
+    persistCapturedStatesToDisk: Bool = true,
     prefillStepSize: Int = 512
 ) -> [MLXArray]? {
     reDeriveAndStoreSSMStatesAtPromptBoundaries(
@@ -412,6 +414,7 @@ public func reDeriveAndStoreSSMStatesForPromptBoundaries(
         model: model,
         promptTokenIds: promptTokenIds,
         mediaSalt: mediaSalt,
+        persistCapturedStatesToDisk: persistCapturedStatesToDisk,
         prefillStepSize: prefillStepSize
     )[promptTokenIds.count]
 }
@@ -432,6 +435,7 @@ public func reDeriveAndStoreSSMStatesAtPromptBoundaries(
     promptTokenIds: [Int],
     mediaSalt: String? = nil,
     additionalBoundaries: [Int] = [],
+    persistCapturedStatesToDisk: Bool = true,
     prefillStepSize: Int = 512
 ) -> [Int: [MLXArray]] {
     func trace(_ message: String) {
@@ -476,7 +480,8 @@ public func reDeriveAndStoreSSMStatesAtPromptBoundaries(
                 ssmStates: states,
                 tokens: promptTokenIds,
                 boundary: boundary,
-                mediaSalt: mediaSalt)
+                mediaSalt: mediaSalt,
+                persistToDisk: persistCapturedStatesToDisk)
         }
 
         if !statesByBoundary.isEmpty {
