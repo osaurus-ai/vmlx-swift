@@ -288,7 +288,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     }
                 }
             case .miss:
-                break
+                // Match TokenIterator's correctness invariant: a coordinator
+                // miss means this request's token/scope identity did not match
+                // any stored prefix. A caller-provided populated cache cannot
+                // be safely reused from offsets alone (reasoning/tool/media
+                // salts may have changed), so discard it before full prefill.
+                if populatedCacheRequiresResetAfterCoordinatorMiss(self.cache) {
+                    self.cache = model.newCache(parameters: effectiveParameters)
+                    inputForPrepare = input
+                }
             }
         }
 

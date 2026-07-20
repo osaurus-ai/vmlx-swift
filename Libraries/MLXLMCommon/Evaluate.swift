@@ -1108,6 +1108,14 @@ private final class SoloPrefillProgressAccumulator: @unchecked Sendable {
     }
 }
 
+/// A coordinator miss is authoritative for the request's token and semantic
+/// scope. A caller-owned cache with any populated layer therefore cannot be
+/// reused by numeric offset alone.
+@inline(__always)
+func populatedCacheRequiresResetAfterCoordinatorMiss(_ cache: [KVCache]) -> Bool {
+    cache.contains { $0.offset > 0 }
+}
+
 public struct TokenIterator: TokenIteratorProtocol {
 
     private static let logger = Logger(subsystem: "vmlx", category: "TokenIterator")
@@ -1617,70 +1625,24 @@ public struct TokenIterator: TokenIteratorProtocol {
                     let count = cacheLookupTokenIds.count
                     Self.logger.debug("Cache miss for \(count) prompt tokens")
 
-                // 2026-05-05 (Ling-2.6-flash multi-turn fix): coordinator
-                // missed but the cache may already hold a previous turn's
-                // state (e.g. ChatSession reuse path with a hybrid
-                // KVCache + ArraysCache that the multi-tier disk/paged
-                // coordinator can't yet round-trip). Without correcting,
-                // the model double-feeds previously-prefilled tokens onto
-                // the populated cache → wrong RoPE positions on KVCache
-                // layers AND duplicated GLA recurrence on ArraysCache
-                // (Linear-Attn) layers → NaN logits → fatalError SIGKILL.
-                //
-                // We can only safely trim if the new prompt's prefix
-                // matches the cached tokens. Some chat templates (Bailing,
-                // DeepSeek-R1, Qwen3 reasoning) STRIP `<think>...</think>`
-                // content from past assistant turns when re-rendering for
-                // the next turn — so the input on Turn 2 is SHORTER than
-                // what's actually cached (cache still holds the reasoning
-                // tokens that were generated and decoded on Turn 1).
-                //
-                // Detection: if cacheOffset > promptTokenIds.count, the
-                // cache holds content the new prompt doesn't include
-                // (chat-template stripping). We can't safely trim — the
-                // recurrent state encodes context the model would need
-                // to "forget". Reset the cache and prefill the full new
-                // prompt from scratch.
-                if let cacheOffset = self.cache.first?.offset, cacheOffset > 0 {
-                    if cacheOffset > cacheLookupTokenIds.count {
-                        // Reasoning-strip mismatch — replace cache entirely.
-                        // Some chat templates (Bailing, DeepSeek-R1, Qwen3
-                        // reasoning) drop `<think>...</think>` blocks from
-                        // past assistant turns when re-rendering for the
-                        // next turn, so the new prompt is SHORTER than what
-                        // was cached. We can't safely trim because we don't
-                        // know exactly which positions to drop. Replace the
-                        // cache with a fresh one — full re-prefill is
-                        // O(prompt) but correct, vs producing garbage.
-                        let resetMsg = "Populated-cache miss: cache offset (\(cacheOffset)) > prompt length (\(cacheLookupTokenIds.count)) — likely reasoning-strip in chat template; reset cache for full prefill"
+                    // The coordinator hashes the actual prompt tokens plus
+                    // reasoning/tool/media/KV-policy salt. A miss therefore
+                    // proves that a populated caller-owned cache has no
+                    // verified identity for this request. Offset equality or
+                    // ordering is not token-prefix proof: after an Off→On
+                    // reasoning change, Ornith/Qwen 3.5 reused the prior
+                    // turn's ArraysCache state and replayed its old tool call
+                    // before following the new prompt. Reusing any part of
+                    // that unverified KV/recurrent state is incorrect. Reset
+                    // and full-prefill; the .hit branch above remains the only
+                    // prefix-reuse path.
+                    if populatedCacheRequiresResetAfterCoordinatorMiss(self.cache) {
                         self.cache = self.model.newCache(parameters: effectiveParameters)
-                        Self.logger.info("\(resetMsg)")
-                    } else if cacheOffset == cacheLookupTokenIds.count,
-                              let last = cacheLookupTokenIds.last
-                    {
-                        let lastToken = MLXArray([Int32(last)])
-                            .expandedDimensions(axis: 0)
-                        inputForPrepare = LMInput(
-                            text: LMInput.Text(tokens: lastToken),
-                            image: nil, video: nil)
+                        inputForPrepare = input
                         Self.logger.info(
-                            "Populated-cache miss: full prefix matches cache (offset=\(cacheOffset)), seeding with last token only"
-                        )
-                    } else {
-                        // cacheOffset < promptTokenIds.count — assume
-                        // prefix matches (safe for templates that don't
-                        // strip past content). Trim and prefill remainder.
-                        let remaining = Array(cacheLookupTokenIds[cacheOffset...])
-                        let remainingArray = MLXArray(remaining.map { Int32($0) })
-                            .expandedDimensions(axis: 0)
-                        inputForPrepare = LMInput(
-                            text: LMInput.Text(tokens: remainingArray),
-                            image: nil, video: nil)
-                        Self.logger.info(
-                            "Populated-cache miss: trimmed \(cacheOffset) cached tokens, prefilling \(remaining.count) remaining"
+                            "Populated-cache coordinator miss: reset unverified cache for full prefill"
                         )
                     }
-                }
                 }
             }
         } else if cacheCoordinator != nil,

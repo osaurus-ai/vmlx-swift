@@ -1,10 +1,21 @@
 // Copyright © 2026 Osaurus AI. All rights reserved.
 
 import Foundation
+@testable import MLXLMCommon
 import Testing
 
 @Suite("BatchEngine growing-chat cache source coverage")
 struct BatchEngineGrowingChatCacheSourceTests {
+    @Test("coordinator miss resets only populated caller-owned caches")
+    func coordinatorMissResetRequiresPopulatedCache() {
+        let empty = KVCacheSimple()
+        #expect(!populatedCacheRequiresResetAfterCoordinatorMiss([empty]))
+
+        let populated = KVCacheSimple()
+        populated.offset = 37
+        #expect(populatedCacheRequiresResetAfterCoordinatorMiss([empty, populated]))
+    }
+
     @Test("batch engine stores post-answer cache boundaries and keeps hybrid full-hit guard")
     func batchEngineStoresPostAnswerBoundaryForGrowingChat() throws {
         let source = try String(
@@ -78,6 +89,10 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("boundary: seedBoundary"))
         #expect(!source.contains("disk-backed full cache hit: re-feeding last token can corrupt path-dependent or rotating state"))
         #expect(source.contains("cacheContainsPathDependentState(self.cache)"))
+        #expect(source.contains(
+            "Populated-cache coordinator miss: reset unverified cache for full prefill"))
+        #expect(!source.contains("Populated-cache miss: full prefix matches cache"))
+        #expect(!source.contains("Populated-cache miss: trimmed"))
         #expect(!source.contains("let hasPathDependentLayer = self.cache.contains"))
         #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot)"))
         #expect(source.contains("TokenIterator: skipped history-boundary cache rederive after trim miss"))
@@ -91,6 +106,10 @@ struct BatchEngineGrowingChatCacheSourceTests {
             encoding: .utf8)
 
         #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot)"))
+        #expect(source.contains(
+            "a coordinator\n                // miss means this request's token/scope identity did not match"))
+        #expect(source.contains("self.cache = model.newCache(parameters: effectiveParameters)"))
+        #expect(source.contains("inputForPrepare = input"))
         #expect(source.contains("return nil"))
         #expect(!source.contains("!requiresDiskBackedRestore,\n                        !originalInput.hasMediaContent"))
         let exactSnapshot = try #require(source.range(of: "exactBoundarySSMStatesFromSnapshotIfSufficient("))
