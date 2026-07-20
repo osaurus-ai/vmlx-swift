@@ -281,3 +281,60 @@ Testing identifier
 It passed 1/1 in 0.000 seconds. The first invocation omitted the identifier's
 trailing parentheses and therefore selected no leaf test; that invocation is
 not counted.
+
+## 2026-07-20 mmap-alignment follow-up
+
+This follow-up supersedes the earlier 12B near-full-residency row for the exact
+Gemma 4 JANG_4M bundle. It does not change the wider-family rows above.
+
+### Source trace
+
+- MLX `a828cb4726f603d1cc9ac63359cd563865fdf8f6` no longer rejects an
+  otherwise mmap-eligible safetensors shard because one tensor's byte offset is
+  not naturally aligned for its dtype. Aligned tensors remain backed by the
+  shard mapping; only an unaligned tensor is copied into an aligned MLX buffer
+  and excluded from mmap advice registration.
+- The exact 12B JANG_4M bundle has mixed dtype alignment in 8 of 10 shards;
+  4.8297 GiB of tensor payload was behind unaligned offsets. The local MXFP8
+  control has no affected shards. No MXFP4 model was loaded.
+- vMLX `f2b184841e98d969e46dec83109f27cd7bb57357` preserves bundle fp16/fp32
+  dtypes only for mmap-active Gemma 4 `jang_affine` loads. MXFP8, JANGTQ, and
+  non-Gemma families retain the prior conversion policy.
+- Focused MLX mmap tests passed 4/4, including exact CPU values, GPU sums, and
+  proof that an aligned tensor in a mixed shard remains mmap-advisable. Focused
+  vMLX dtype-policy tests passed 3/3 for Gemma 4 JANG affine, Gemma 4 MXFP8,
+  and Qwen 3.5 JANG affine classification.
+
+### Final isolated Release UI proof
+
+- App:
+  `/private/tmp/osaurus-gemma4-alignment-release-derived-20260720/Build/Products/Release/osaurus.app`
+- Bundle id: `com.dinoki.osaurus.gemma4alignmentproof20260720`
+- Executable SHA-256:
+  `61dbf6ddae5d4dded60e00aa383da3c69ec7683c096542f0db53906c2b48fa67`
+- Isolated/keychain-free root:
+  `/private/tmp/osaurus-gemma4-alignment-proof-root-20260720-1414`
+- Embedded revisions: vMLX `f2b18484`, MLX `a828cb47`.
+
+| Row | Visible result | Status |
+|---|---|---|
+| Restored defaults | Prefix On, GPU/Paged Off, SSD L2 On, Codec Engine Selected, SSM rederive On, Safe Auto, MLXPress Off; Thinking Off | VERIFIED-LIVE |
+| MXFP8 control | Exact `MXFP8-ALIGN-LIVE-8427`; TTFT 1.61 s, 30.7 tok/s, 25 tokens; Activity Monitor 2.02 GB | VERIFIED-LIVE |
+| JANG_4M native cold/warm | Exact `JANG4M-ALIGN-LIVE-5926` and `JANG4M-FOLLOWUP-5930`; TTFT 1.00/0.99 s, 37.6/37.5 tok/s | VERIFIED-LIVE |
+| Explicit TQ 4/4 | Exact `JANG4M-TQ44-LIVE-4182`; TTFT 4.31 s, 17.2 tok/s, 29 tokens; one TQ compression; Activity Monitor 6.84 GB | VERIFIED-LIVE correctness; opt-in speed regression retained |
+| Explicit paged native | Exact `JANG4M-PAGED-COLD-7013` and `JANG4M-PAGED-WARM-7014`; TTFT 2.35/1.13 s, 37.6/37.3 tok/s; paged hits/misses 129/4 and SSD hits/misses/stores 4/6/6 | VERIFIED-LIVE |
+| RAM refusal/override | Strict custom 10% visibly refused the 31B JANG_4M at a 12.8 GB load budget. No Automatic Limits then loaded the same model and returned exact `GEMMA31-NOLIMIT-RETRY-8803`; TTFT 40.39 s, 6.5 tok/s. Safe Auto was visibly restored | VERIFIED-LIVE |
+| Final model switch/reload | After a fresh-chat Ornith control, the UI selected exact `OsaurusAI  Gemma 4 12B it qat JANG_4M`, remained Thinking Off, visibly showed real `Prefill 512/1887`, and returned exact `GEMMA4-FINAL-SWITCH-7735`; TTFT 2.27 s, 35.7 tok/s, 28 tokens | VERIFIED-LIVE |
+| Final 12B footprint | Activity Monitor visibly showed exact proof PID 36563 at 6.92 GB after the final generation; the bundle is 9.439 GiB | VERIFIED-LIVE; below full bundle size |
+
+The prior 9.38-9.48 GB 12B rows were reproduced on the old whole-shard
+fallback and are retained above as historical failed evidence. They are not
+the current executable result. No sampler, prompt, template, reasoning closer,
+output cap, MLXPress opt-in, or other behavior guard was added.
+
+An adjacent same-chat model-switch probe returned a prior Gemma exact-answer
+turn when Ornith was asked a new exact-answer question inside the long mixed
+history. The same Ornith bundle, with the same cache settings and Thinking Off,
+answered a fresh chat coherently at TTFT 0.50 s and 70.1 tok/s. This does not
+reproduce as a global cross-model cache collision; no cache guard is added and
+no wider Ornith correctness claim is made from this checkpoint.
