@@ -1519,21 +1519,23 @@ public actor BatchEngine {
             // admission so the coordinator routes prefix reuse through the
             // disk serializer instead.
             //
-            // `PagedCacheManager` stores per-block full-history KV tensors.
-            // It cannot currently encode rotating/sliding-window ring
-            // metadata, and for mixed Gemma4-style caches it would restore
-            // only the full-attention KVCacheSimple layers while leaving SWA
-            // RotatingKVCache layers empty. The v2 disk serializer tags
-            // every layer kind (`.rotating`, `.deepseekV4`, `.kvSimple`,
-            // `.tqCompressed`, ...) and is therefore the correct restore
-            // mechanism for these models until paged blocks grow first-class
-            // rotating-cache payloads.
+            // `PagedCacheManager` stores token-sliceable full-attention KV.
+            // Mixed Gemma-style caches are eligible only with an exact-leaf
+            // rotating ring companion; pool/CCA/affine and other unsupported
+            // topologies continue through the typed disk serializer.
             if let coordinator = cacheCoordinator, !coordinator.isPagedIncompatible {
                 if cacheCannotUsePagedCoordinatorRestore(cache) {
-                    coordinator.setPagedIncompatible(true)
-                    Self.logger.info(
-                        "Coordinator flipped to isPagedIncompatible=true on first paged-incompatible slot admission"
-                    )
+                    if cacheCanUsePagedWithRotatingCompanion(cache) {
+                        coordinator.setPagedBoundaryCompanionRequired(true)
+                        Self.logger.info(
+                            "Coordinator enabled paged KV with rotating boundary companion on first mixed-cache slot admission"
+                        )
+                    } else {
+                        coordinator.setPagedIncompatible(true)
+                        Self.logger.info(
+                            "Coordinator flipped to isPagedIncompatible=true on first paged-incompatible slot admission"
+                        )
+                    }
                 }
             }
 

@@ -370,6 +370,30 @@ struct LoadConfigurationTests {
         #expect(facts.physicalMemory > 0)
     }
 
+    @Test(
+        "mmap dtype preservation is limited to Gemma 4 JANG affine",
+        arguments: [
+            ("gemma4_unified", "jang_affine", true),
+            ("gemma4_unified", "mxfp8", false),
+            ("qwen3_5", "jang_affine", false),
+        ])
+    func gemma4JANGAffineMmapDtypePolicy(
+        modelType: String,
+        weightFormat: String,
+        expected: Bool
+    ) throws {
+        let config = [
+            "model_type": modelType,
+            "weight_format": weightFormat,
+        ]
+        let dir = try Self.makeBundle(files: [
+            ("config.json", try JSONSerialization.data(withJSONObject: config))
+        ])
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        #expect(shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: dir) == expected)
+    }
+
     // MARK: - JangPressStatus.disabled
 
     @Test("JangPressRuntime.none.status() == .disabled")

@@ -1416,18 +1416,23 @@ public struct TokenIterator: TokenIteratorProtocol {
                     )
                 }
             }
-            // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass) and
-            // 2026-05-06 (Gemma4 SWA cache-hit fix):
-            // Mirror BatchEngine.admit's detection. Hybrid-pool and
-            // rotating/sliding-window caches must restore through the disk
-            // serializer because the paged tier stores only full-history KV
-            // blocks and cannot round-trip rotating ring metadata.
+            // Mirror BatchEngine.admit's topology detection. Mixed Gemma-style
+            // rotating/full-attention caches use paged KV only when an exact
+            // leaf also owns the rotating ring companion. Pool/CCA/affine and
+            // every unsupported cache type remain disk-only.
             if !coordinator.isPagedIncompatible {
                 if cacheCannotUsePagedCoordinatorRestore(self.cache) {
-                    coordinator.setPagedIncompatible(true)
-                    Self.logger.info(
-                        "TokenIterator: coordinator flipped to isPagedIncompatible=true"
-                    )
+                    if cacheCanUsePagedWithRotatingCompanion(self.cache) {
+                        coordinator.setPagedBoundaryCompanionRequired(true)
+                        Self.logger.info(
+                            "TokenIterator: coordinator enabled paged KV with rotating boundary companion"
+                        )
+                    } else {
+                        coordinator.setPagedIncompatible(true)
+                        Self.logger.info(
+                            "TokenIterator: coordinator flipped to isPagedIncompatible=true"
+                        )
+                    }
                 }
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(self.cache)

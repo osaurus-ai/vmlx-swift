@@ -246,6 +246,7 @@ public struct MLXPressCacheStatus: Sendable, Equatable {
     public let diskCacheEnabled: Bool
     public let hybrid: Bool
     public let pagedIncompatible: Bool
+    public let pagedBoundaryCompanionRequired: Bool
     public let defaultKVMode: String
     public let defaultMaxKVSize: Int?
 
@@ -256,6 +257,7 @@ public struct MLXPressCacheStatus: Sendable, Equatable {
             self.diskCacheEnabled = false
             self.hybrid = false
             self.pagedIncompatible = false
+            self.pagedBoundaryCompanionRequired = false
             self.defaultKVMode = "none"
             self.defaultMaxKVSize = nil
             return
@@ -265,6 +267,7 @@ public struct MLXPressCacheStatus: Sendable, Equatable {
         self.diskCacheEnabled = coordinator.diskCache != nil
         self.hybrid = coordinator.isHybrid
         self.pagedIncompatible = coordinator.isPagedIncompatible
+        self.pagedBoundaryCompanionRequired = coordinator.requiresPagedBoundaryCompanion
         self.defaultKVMode = MLXPressDescribeKVMode(coordinator.config.defaultKVMode)
         self.defaultMaxKVSize = coordinator.config.defaultMaxKVSize
     }

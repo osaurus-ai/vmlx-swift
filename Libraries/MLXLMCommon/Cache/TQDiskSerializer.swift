@@ -291,6 +291,43 @@ public enum TQDiskSerializer {
         return result
     }
 
+    /// Serialize only the path-dependent state required beside paged KV
+    /// blocks for a mixed full-attention + sliding-window cache.
+    ///
+    /// Paged blocks already own token-sliceable `KVCacheSimple` and
+    /// `TurboQuantKVCache` prefixes. Duplicating those tensors in every leaf
+    /// companion would erase the RAM benefit of paging. Rotating rings are
+    /// different: their bounded buffer plus `(keep, maxSize, step, offset,
+    /// idx)` metadata describes one exact prompt boundary and cannot be
+    /// reconstructed from independent token blocks. Preserve only those
+    /// layers here and tag every other layer as `.skip`, allowing the normal
+    /// v2 restore path to seat the ring without overwriting paged/TQ KV.
+    public static func serializePagedRotatingCompanion(
+        cache: [any KVCache],
+        expectedOffset: Int
+    ) -> [String: MLXArray]? {
+        var result: [String: MLXArray] = [
+            formatVersionKey: metaInt32(currentFormatVersion),
+            legacyMarkerKey: MLXArray([Int32(1)]),
+        ]
+        var hasRotatingLayer = false
+
+        for (i, layer) in cache.enumerated() {
+            if let rotating = layer as? RotatingKVCache {
+                hasRotatingLayer = true
+                serializeRotatingLayer(rotating, index: i, into: &result)
+                guard rotating.offset == expectedOffset,
+                      let kind = result[kindKey(for: i)],
+                      readMetaInt32(kind) == LayerKind.rotating.rawValue
+                else { return nil }
+            } else {
+                result[kindKey(for: i)] = kindArray(.skip)
+            }
+        }
+
+        return hasRotatingLayer ? result : nil
+    }
+
     /// Serialize a single TQ-compressed layer's encoded data.
     private static func serializeTQLayer(
         _ tq: TurboQuantKVCache,

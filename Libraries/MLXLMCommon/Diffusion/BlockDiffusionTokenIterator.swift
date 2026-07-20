@@ -134,7 +134,11 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             !coordinator.isPagedIncompatible,
             cacheCannotUsePagedCoordinatorRestore(self.cache)
         {
-            coordinator.setPagedIncompatible(true)
+            if cacheCanUsePagedWithRotatingCompanion(self.cache) {
+                coordinator.setPagedBoundaryCompanionRequired(true)
+            } else {
+                coordinator.setPagedIncompatible(true)
+            }
         }
         var tokensToEncode = promptTokenIds
         if let coordinator = cacheCoordinator,
@@ -420,9 +424,9 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
         if !requiresDiskBackedRestore {
             MLX.eval(cacheSnapshot)
         }
-        // Rotating layers only round-trip through the disk tier (LayerKind
-        // serialization); paged KV blocks cannot represent them, so skip
-        // the paged store for that topology — same as the AR iterators.
+        // Rotating layers require typed LayerKind persistence. The coordinator
+        // may also derive paged full-attention KV when this exact mixed cache
+        // was admitted with a rotating boundary companion, matching AR.
         let perLayerData =
             requiresDiskBackedRestore ? [] : extractLayerData(from: cacheSnapshot)
         let diskStoreCache = makeDiskStoreCache(

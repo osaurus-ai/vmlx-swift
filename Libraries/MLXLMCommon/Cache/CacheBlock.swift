@@ -31,6 +31,16 @@ public final class CacheBlock: @unchecked Sendable {
     /// layer; `nil` entries represent SSM/non-attention layers.
     public internal(set) var cacheData: [(keys: MLXArray, values: MLXArray)?]?
 
+    /// Typed state that must be restored together with this exact paged
+    /// boundary but cannot be represented as token-sliceable KV blocks.
+    ///
+    /// Gemma 4 mixed attention is the motivating topology: full-attention
+    /// KV lives in ``cacheData`` while sliding-window layers require their
+    /// rotating ring metadata at the same prompt boundary.  This payload is
+    /// attached only to a stored sequence leaf, so intermediate blocks never
+    /// masquerade as complete mixed-cache boundaries.
+    public internal(set) var boundaryCompanionData: [String: MLXArray]?
+
     /// Reference count for shared prefix blocks.
     public private(set) var refCount: Int
 
@@ -57,6 +67,7 @@ public final class CacheBlock: @unchecked Sendable {
         self.blockHash = nil
         self.tokenIds = []
         self.cacheData = nil
+        self.boundaryCompanionData = nil
         self.refCount = 0
     }
 
@@ -79,6 +90,7 @@ public final class CacheBlock: @unchecked Sendable {
         blockHash = nil
         tokenIds = []
         cacheData = nil
+        boundaryCompanionData = nil
         refCount = 0
     }
 

@@ -229,6 +229,7 @@ public final class PagedCacheManager: @unchecked Sendable {
     public func storeTokenSequence(
         tokens: [Int],
         layerData: [[(keys: MLXArray, values: MLXArray)]],
+        boundaryCompanionData: [String: MLXArray]? = nil,
         mediaSalt: String? = nil
     ) {
         lock.lock()
@@ -296,6 +297,15 @@ public final class PagedCacheManager: @unchecked Sendable {
             parentHash = hash
             offset = end
             chunkIndex += 1
+        }
+
+        // A typed companion describes the complete prompt boundary, not an
+        // independently reusable token block. Attach it only when the entire
+        // sequence was admitted. If the fixed pool ran out part-way through,
+        // the partial chain remains useful to ordinary KV models but must not
+        // be advertised as a complete mixed rotating/KV boundary.
+        if offset == tokens.count, let leaf = pinnedBlocks.last {
+            leaf.boundaryCompanionData = boundaryCompanionData
         }
     }
 

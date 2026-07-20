@@ -63,6 +63,7 @@ public struct CacheCoordinatorStatsSnapshot: Sendable {
     public let ssmStats: SSMStateCacheStats
     public let isHybrid: Bool
     public let isPagedIncompatible: Bool
+    public let requiresPagedBoundaryCompanion: Bool
 }
 
 // MARK: - CacheCoordinator
@@ -115,6 +116,11 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// suppressed the disk-tier lookup that WOULD have hit.
     private var _isPagedIncompatible: Bool = false
 
+    /// Whether a paged hit is valid only at a leaf carrying typed rotating
+    /// boundary state. Gemma 4's mixed SWA/full-attention cache uses paged KV
+    /// for the full-attention layers and this companion for the rotating ring.
+    private var _requiresPagedBoundaryCompanion: Bool = false
+
     /// The chat template's generation-prompt suffix token sequence — the
     /// tokens `add_generation_prompt=true` appends (e.g. `<|im_start|>assistant\n`
     /// + channel/think scaffold). Used to store a cross-turn-reusable cache
@@ -124,7 +130,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     private var _genPromptSuffixTokens: [Int] = []
 
     /// Lock protecting `_isHybrid`, `_requiresRecurrentSSMCompanion`,
-    /// `_isPagedIncompatible`, and
+    /// `_isPagedIncompatible`, `_requiresPagedBoundaryCompanion`, and
     /// `_genPromptSuffixTokens`.
     private let lock = OSAllocatedUnfairLock()
 
@@ -244,7 +250,24 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// prefix-reuse mechanism — which is correct for DSV4, where the
     /// cache state can't be reduced to per-token KV blocks.
     public func setPagedIncompatible(_ incompatible: Bool) {
-        lock.withLock { _isPagedIncompatible = incompatible }
+        lock.withLock {
+            _isPagedIncompatible = incompatible
+            if incompatible {
+                _requiresPagedBoundaryCompanion = false
+            }
+        }
+    }
+
+    /// Require an exact-boundary typed companion beside paged KV blocks.
+    /// Enabling this contract makes the topology paged-compatible; callers
+    /// must only set it after ``cacheCanUsePagedWithRotatingCompanion(_:)``.
+    public func setPagedBoundaryCompanionRequired(_ required: Bool) {
+        lock.withLock {
+            _requiresPagedBoundaryCompanion = required
+            if required {
+                _isPagedIncompatible = false
+            }
+        }
     }
 
     /// Set the chat template's generation-prompt suffix tokens (computed once
@@ -264,6 +287,11 @@ public final class CacheCoordinator: @unchecked Sendable {
         lock.withLock { _isPagedIncompatible }
     }
 
+    /// Whether paged hits require typed state on the exact matched leaf.
+    public var requiresPagedBoundaryCompanion: Bool {
+        lock.withLock { _requiresPagedBoundaryCompanion }
+    }
+
     /// Thread-safe snapshot for diagnostics, UI status, and admin routes.
     public func snapshotStats() -> CacheCoordinatorStatsSnapshot {
         let pagedIsEffective = pagedCache != nil && !isPagedIncompatible
@@ -274,7 +302,8 @@ public final class CacheCoordinator: @unchecked Sendable {
             diskStats: diskCache?.snapshotStats(),
             ssmStats: ssmStateCache.snapshotStats(),
             isHybrid: isHybrid,
-            isPagedIncompatible: isPagedIncompatible)
+            isPagedIncompatible: isPagedIncompatible,
+            requiresPagedBoundaryCompanion: requiresPagedBoundaryCompanion)
     }
 
     /// Release paged-cache blocks returned by ``fetch(tokens:mediaSalt:)``.
@@ -429,27 +458,48 @@ public final class CacheCoordinator: @unchecked Sendable {
            let pagedCache,
            let result = pagedCache.fetchPrefix(tokens: tokens, mediaSalt: mediaSalt)
         {
+            var matchedBlocks = result.blocks
+            var matchedTokens = result.matchedTokens
+            var remainingTokens = result.remainingTokens
             var ssmStates: [MLXArray]? = nil
             var canUsePagedHit = true
 
-            if isHybrid {
+            if requiresPagedBoundaryCompanion {
+                if let companionLeaf = matchedBlocks.lastIndex(where: {
+                    $0.boundaryCompanionData != nil
+                }) {
+                    if companionLeaf + 1 < matchedBlocks.count {
+                        let trailing = Array(matchedBlocks[(companionLeaf + 1)...])
+                        release(blocks: trailing)
+                        matchedBlocks = Array(matchedBlocks[...companionLeaf])
+                        matchedTokens = matchedBlocks.reduce(0) { $0 + $1.tokenCount }
+                        remainingTokens = Array(tokens.dropFirst(matchedTokens))
+                    }
+                } else {
+                    release(blocks: matchedBlocks)
+                    matchedBlocks = []
+                    canUsePagedHit = false
+                }
+            }
+
+            if canUsePagedHit, isHybrid {
                 ssmStates = fetchCompleteSSMStates(
                     tokens: tokens,
-                    boundary: result.matchedTokens,
+                    boundary: matchedTokens,
                     mediaSalt: mediaSalt
                 )
                 if ssmStates?.isEmpty ?? true {
-                    release(blocks: result.blocks)
+                    release(blocks: matchedBlocks)
                     canUsePagedHit = false
                 }
             }
 
             if canUsePagedHit {
                 return .hit(
-                    matchedTokens: result.matchedTokens,
-                    remainingTokens: result.remainingTokens,
+                    matchedTokens: matchedTokens,
+                    remainingTokens: remainingTokens,
                     detail: .paged,
-                    blocks: result.blocks,
+                    blocks: matchedBlocks,
                     ssmStates: ssmStates,
                     diskArrays: nil
                 )
@@ -614,7 +664,8 @@ public final class CacheCoordinator: @unchecked Sendable {
            pagedCache != nil,
            !isPagedIncompatible,
            let cache,
-           !cacheCannotUsePagedCoordinatorRestore(cache)
+           (!cacheCannotUsePagedCoordinatorRestore(cache)
+                || cacheCanUsePagedWithRotatingCompanion(cache))
         {
             effectivePerLayerData = extractLayerData(from: cache)
         } else {
@@ -625,14 +676,31 @@ public final class CacheCoordinator: @unchecked Sendable {
         let blockLayerData = splitLayerDataIntoBlocks(
             effectivePerLayerData, blockSize: blockSize, totalTokens: totalTokens)
         let hasPagedKVPayload = blockLayerData.contains { !$0.isEmpty }
+        let pagedBoundaryCompanion: [String: MLXArray]?
+        if requiresPagedBoundaryCompanion, let cache {
+            pagedBoundaryCompanion = TQDiskSerializer.serializePagedRotatingCompanion(
+                cache: cache,
+                expectedOffset: totalTokens)
+        } else {
+            pagedBoundaryCompanion = nil
+        }
+        let hasRequiredPagedCompanion = !requiresPagedBoundaryCompanion
+            || pagedBoundaryCompanion != nil
 
         // Store in paged cache (skip when the model is paged-incompatible —
         // see `isPagedIncompatible` above). Recurrent-only/state-only caches
         // must not publish token hashes without any restorable KV payload;
         // doing so would suppress the valid typed disk fallback on fetch.
-        if !isPagedIncompatible, hasPagedKVPayload, let pagedCache {
+        if !isPagedIncompatible,
+           hasPagedKVPayload,
+           hasRequiredPagedCompanion,
+           let pagedCache
+        {
             pagedCache.storeTokenSequence(
-                tokens: promptTokens, layerData: blockLayerData, mediaSalt: mediaSalt)
+                tokens: promptTokens,
+                layerData: blockLayerData,
+                boundaryCompanionData: pagedBoundaryCompanion,
+                mediaSalt: mediaSalt)
         }
 
         // Store in disk cache.

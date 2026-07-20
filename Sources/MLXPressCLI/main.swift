@@ -98,7 +98,7 @@ struct MLXPressCLI {
             if cacheStatus.enabled {
                 let maxKV = cacheStatus.defaultMaxKVSize.map(String.init) ?? "none"
                 fputs(
-                    "MLXPress cache-stack enabled paged=\(cacheStatus.pagedCacheEnabled) disk=\(cacheStatus.diskCacheEnabled) hybrid=\(cacheStatus.hybrid) paged-incompatible=\(cacheStatus.pagedIncompatible) default-kv=\(cacheStatus.defaultKVMode) default-max-kv=\(maxKV)\n",
+                    "MLXPress cache-stack enabled paged=\(cacheStatus.pagedCacheEnabled) disk=\(cacheStatus.diskCacheEnabled) hybrid=\(cacheStatus.hybrid) paged-incompatible=\(cacheStatus.pagedIncompatible) paged-boundary-companion=\(cacheStatus.pagedBoundaryCompanionRequired) default-kv=\(cacheStatus.defaultKVMode) default-max-kv=\(maxKV)\n",
                     stderr)
             }
 

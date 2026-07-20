@@ -153,6 +153,31 @@ public func cacheRequiresDiskBackedCoordinatorRestore(_ cache: [any KVCache]) ->
     }
 }
 
+/// Whether paged KV blocks can safely serve this mixed rotating topology when
+/// the exact leaf also carries a typed rotating-boundary companion.
+///
+/// This is intentionally narrow. It accepts only the Gemma-style composition
+/// of direct `RotatingKVCache` layers plus ordinary or TurboQuant attention
+/// KV. All-rotating caches have no pageable payload, while CacheList wrappers,
+/// affine quantized KV, CCA, SSM, and hybrid-pool caches retain their existing
+/// disk-only contracts until they have independent companion proof.
+public func cacheCanUsePagedWithRotatingCompanion(_ cache: [any KVCache]) -> Bool {
+    var hasRotating = false
+    var hasPagedKV = false
+
+    for layer in cache {
+        if layer is RotatingKVCache {
+            hasRotating = true
+        } else if layer is KVCacheSimple || layer is TurboQuantKVCache {
+            hasPagedKV = true
+        } else {
+            return false
+        }
+    }
+
+    return hasRotating && hasPagedKV
+}
+
 /// True when the paged coordinator tier cannot represent enough of the cache
 /// topology to restore it safely.
 ///
@@ -170,9 +195,10 @@ public func cacheRequiresDiskBackedCoordinatorRestore(_ cache: [any KVCache]) ->
 /// lossy encode. The recurrent companion state itself is never TurboQuant
 /// encoded.
 ///
-/// Rotating/SWA rings, legacy affine quantized caches, ZAYA CCA, and DSV4
-/// hybrid pools remain disk-only because paged blocks do not carry their ring,
-/// quantized tuple, CCA, or compressor/indexer metadata.
+/// Rotating/SWA rings without an explicitly admitted exact-boundary companion,
+/// legacy affine quantized caches, ZAYA CCA, and DSV4 hybrid pools remain
+/// disk-only because ordinary paged blocks do not carry their ring, quantized
+/// tuple, CCA, or compressor/indexer metadata.
 public func cacheCannotUsePagedCoordinatorRestore(_ cache: [any KVCache]) -> Bool {
     func incompatible(_ layer: any KVCache) -> Bool {
         if let cacheList = layer as? CacheList {
@@ -424,6 +450,11 @@ public func restoreLayerData(from blocks: [CacheBlock], into cache: [any KVCache
     }
 
     let totalTokens = blocks.reduce(0) { $0 + $1.tokenCount }
+    if let companion = blocks.last?.boundaryCompanionData {
+        var mutableCache = cache
+        let companionTokens = restoreFromDiskArrays(companion, into: &mutableCache)
+        guard companionTokens == totalTokens else { return 0 }
+    }
     return totalTokens
 }
 

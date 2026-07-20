@@ -215,7 +215,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             if !coordinator.isPagedIncompatible,
                cacheCannotUsePagedCoordinatorRestore(self.cache)
             {
-                coordinator.setPagedIncompatible(true)
+                if cacheCanUsePagedWithRotatingCompanion(self.cache) {
+                    coordinator.setPagedBoundaryCompanionRequired(true)
+                } else {
+                    coordinator.setPagedIncompatible(true)
+                }
             }
             switch coordinator.fetch(tokens: cacheLookupTokenIds, mediaSalt: mediaSalt) {
             case .hit(
