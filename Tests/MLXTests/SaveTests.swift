@@ -83,6 +83,50 @@ final class SaveTests: XCTestCase {
         }
     }
 
+    public func testMmapSafetensorsKeepsUnalignedTensorInMappedShard() throws {
+        try withMLXMetallibForTests {
+            let safetensorsPath = temporaryPath.appending(
+                path: "mmap-unaligned-u32.safetensors",
+                directoryHint: .notDirectory
+            )
+            let unalignedKey = "layers.97.mlp.gate_proj.weight"
+            let alignedKey = "layers.98.mlp.gate_proj.weight"
+            try writeMixedAlignmentUInt32Safetensors(
+                at: safetensorsPath,
+                unalignedKey: unalignedKey,
+                unalignedValues: [1, 2, 3, 4],
+                alignedKey: alignedKey,
+                alignedValues: [5, 6, 7, 8],
+                shape: [2, 2]
+            )
+
+            try withEnvironment("MLX_SAFETENSORS_MMAP", value: "1") {
+                let loadedArrays = try MLX.loadArrays(url: safetensorsPath, stream: .cpu)
+                let unaligned = try XCTUnwrap(loadedArrays[unalignedKey])
+                let aligned = try XCTUnwrap(loadedArrays[alignedKey])
+                let unalignedAdvisedBytes = mlx_safetensors_mmap_advise_layer(1, 97)
+                let alignedAdvisedBytes = mlx_safetensors_mmap_advise_layer(1, 98)
+                XCTAssertEqual(
+                    unalignedAdvisedBytes,
+                    0,
+                    "the realigned tensor must not be registered as mmap-backed"
+                )
+                XCTAssertGreaterThan(
+                    alignedAdvisedBytes,
+                    0,
+                    "an unaligned tensor must not make aligned tensors in the same shard fall back"
+                )
+                XCTAssertEqual(unaligned.asArray(UInt32.self), [1, 2, 3, 4])
+                XCTAssertEqual(aligned.asArray(UInt32.self), [5, 6, 7, 8])
+
+                let unalignedResult = MLX.sum(unaligned.asType(.float32), stream: .gpu)
+                let alignedResult = MLX.sum(aligned.asType(.float32), stream: .gpu)
+                XCTAssertEqual(unalignedResult.item(Float.self), 10.0, accuracy: 0.001)
+                XCTAssertEqual(alignedResult.item(Float.self), 26.0, accuracy: 0.001)
+            }
+        }
+    }
+
     public func testMmapSafetensorsTensorBufferModeDoesNotTrackWholeShard() throws {
         try withMLXMetallibForTests {
             let safetensorsPath = temporaryPath.appending(
@@ -270,6 +314,41 @@ private func writeAlignedFloat32Safetensors(
     for value in values {
         var bits = value.bitPattern.littleEndian
         withUnsafeBytes(of: &bits) { data.append(contentsOf: $0) }
+    }
+    try data.write(to: url)
+}
+
+private func writeMixedAlignmentUInt32Safetensors(
+    at url: URL,
+    unalignedKey: String,
+    unalignedValues: [UInt32],
+    alignedKey: String,
+    alignedValues: [UInt32],
+    shape: [Int]
+) throws {
+    let unalignedByteCount = unalignedValues.count * MemoryLayout<UInt32>.stride
+    let alignmentPadding = 2
+    let alignedStart = unalignedByteCount + alignmentPadding
+    let alignedEnd = alignedStart + alignedValues.count * MemoryLayout<UInt32>.stride
+    var header = """
+    {"__metadata__":{},"\(unalignedKey)":{"dtype":"U32","shape":\(shape),"data_offsets":[0,\(unalignedByteCount)]},"\(alignedKey)":{"dtype":"U32","shape":\(shape),"data_offsets":[\(alignedStart),\(alignedEnd)]}}
+    """
+    while (8 + header.utf8.count) % MemoryLayout<UInt32>.stride != 2 {
+        header.append(" ")
+    }
+
+    var data = Data()
+    var headerLength = UInt64(header.utf8.count).littleEndian
+    withUnsafeBytes(of: &headerLength) { data.append(contentsOf: $0) }
+    data.append(contentsOf: header.utf8)
+    for value in unalignedValues {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+    data.append(contentsOf: repeatElement(UInt8(0), count: alignmentPadding))
+    for value in alignedValues {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
     }
     try data.write(to: url)
 }

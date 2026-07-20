@@ -794,8 +794,17 @@ public func loadWeights(
     let allowJANGTQMmapBFloat16 = envFlag("VMLINUX_JANGTQ_BF16_MMAP")
         || envFlag("MLX_JANGTQ_BF16_MMAP")
     let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)
-    if !isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16
-        || autoJANGTQMmapBFloat16
+    // Gemma 4 JANG affine bundles carry several GiB of fp16 scales, biases,
+    // and preserved multimodal weights. Recasting those file-backed arrays to
+    // bf16 defeats mmap residency even though affine matmul accepts their
+    // bundle dtype directly. Keep this exception exact: MXFP8 and non-Gemma
+    // JANG families retain their established conversion policy.
+    let preserveGemma4JANGAffineMmapDtypes = mmapSafetensorsActive
+        && !isJANGTQNative
+        && shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: modelDirectory)
+    if !preserveGemma4JANGAffineMmapDtypes
+        && (!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16
+            || autoJANGTQMmapBFloat16)
     {
         convertToBFloat16(
             model: model,
@@ -804,6 +813,27 @@ public func loadWeights(
 
     eval(model)
     MLX.Memory.clearCache()
+}
+
+func shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: URL) -> Bool {
+    let configURL = modelDirectory.appendingPathComponent("config.json")
+    guard
+        let data = try? Data(contentsOf: configURL),
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else {
+        return false
+    }
+    let textConfig = object["text_config"] as? [String: Any]
+    let modelType = ((textConfig?["model_type"] as? String)
+        ?? (object["model_type"] as? String)
+        ?? "").lowercased()
+    let normalizedModelType = modelType
+        .replacingOccurrences(of: "_", with: "")
+        .replacingOccurrences(of: "-", with: "")
+    let weightFormat = ((textConfig?["weight_format"] as? String)
+        ?? (object["weight_format"] as? String)
+        ?? "").lowercased()
+    return normalizedModelType.hasPrefix("gemma4") && weightFormat == "jang_affine"
 }
 
 /// Convert float16/float32 model parameters to bfloat16 for MoE performance.
