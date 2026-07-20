@@ -1,16 +1,12 @@
 # Gemma 4 QAT cache correctness checkpoint — 2026-07-19
 
-Status: **PARTIAL — the prior exact merged vMLX tree was reconfirmed in an
-isolated Release Osaurus build with the local Gemma 4 12B JANG_4M bundle for
-native cache, explicit TurboQuant 4/4, SSD-only restart/partial restore, long
-rotating-window recall, visible prefill progress, and the safe rejection of an
-explicit paged-RAM request. A new unmerged source patch now admits that explicit
-request only for the exact mixed RotatingKVCache plus full-attention
-KVCacheSimple/TurboQuant topology, with a typed rotating boundary companion and
-typed SSD fallback after eviction. Its focused and 42-test topology regressions
-pass, but the changed behavior has not yet been proved in a fresh Release
-Osaurus UI build. The current 12B Activity Monitor Memory row is
-9.48 GB and remains a failed low-footprint gate. A controlled built-in web-tool
+Status: **PARTIAL — the exact mixed `RotatingKVCache` plus full-attention
+`KVCacheSimple`/`TurboQuantKVCache` paged-RAM admission is now source-tested
+and live-proven in an isolated Release Osaurus app using the local Gemma 4 12B
+JANG_4M bundle. The real UI proved default paged Off, explicit bounded paged On,
+native and TQ4/4 coherence, paged hits and eviction, fresh-process SSD activity,
+and return to the native defaults. The current Activity Monitor Memory row is
+9.38 GB and remains a failed low-footprint gate. A controlled built-in web-tool
 continuation is now live-proven with native cache and explicit TQ 4/4, but the
 Thinking on/off tool-loop propagation is only partial: both UI states completed
 one controlled tool continuation, but the thinking-on Gemma row emitted no
@@ -52,7 +48,7 @@ substitute test artifact and is not part of this checkpoint.
   Hybrid SSM/GDN/CCA async-rederive gates therefore remain separate family
   rows and must not be inferred from Gemma evidence.
 
-## 2026-07-20 explicit paged-RAM patch — source/test evidence only
+## 2026-07-20 explicit paged-RAM patch
 
 The clean worktree branch `codex/gemma4-paged-explicit-20260720` is based on
 vMLX `78cf0511`. It does not change the default: ordinary coordinator loads
@@ -86,10 +82,36 @@ MLX metallib:
   Nemotron TQ plus Mamba, ZAYA CCA, DSV4 pools, media salt, paged eviction,
   paged-off SSD partial restore, and actual Gemma cache factory topology.
 
-These are source/runtime-unit results, not release or UI proof. The new path
-remains open until the isolated Release app visibly proves default Off,
-explicit On, native and TQ 4/4 coherence, partial RAM reuse, real eviction to
-SSD fallback, tok/s, TTFT, and Activity Monitor physical footprint.
+### Exact Release Osaurus UI proof
+
+The companion Osaurus worktree was based on
+`4e29c0eb67c75f0892934aa7c629ced434bb12c0` and pinned this vMLX commit
+`db39150bc353cfd2df1bd50d796272424037c8bb` at all four resolution points.
+The isolated app was
+`/private/tmp/Osaurus Gemma4 Paged Proof 20260720.app`, bundle id
+`com.dinoki.osaurus.gemma4pagedproof20260720`, executable SHA-256
+`bc795f0b82a94c54920ce67b3e892a8ecae40f5168e764de7f7a6e52a62848b1`,
+with keychain-free root
+`/private/tmp/osaurus-gemma4-paged-explicit-proof-root-20260720-1219`.
+Only `/Users/eric/models/OsaurusAI/OsaurusAI--gemma-4-12B-it-qat-JANG_4M`
+was loaded; no MXFP4 model was used.
+
+| Row | Visible result | Runtime result | Status |
+|---|---|---|---|
+| Default native | `NATIVE-DEFAULT-OFF-7319`, TTFT 1.25 s, 31.5 tok/s | Paged false; 8 KV + 40 rotating; native fp16; SSD active; MLXPress off | VERIFIED-LIVE |
+| Paged native partial/warm | `PAGED-NATIVE-PARTIAL-8426` and `PAGED-NATIVE-WARM-1957`, TTFT 1.63/0.61 s, 43.5/43.0 tok/s | 32-block paged pool reached hits 83 / misses 4 / evictions 2; SSD hits 4 / misses 4 / stores 6 | VERIFIED-LIVE |
+| TQ4/4 validation | Selecting TurboQuant without widths visibly blocked save; explicit 4/4 saved and unloaded the old model | Codec `turboquant`, bits 4/4 | VERIFIED-LIVE |
+| Paged TQ4/4 cold/warm | `PAGED-TQ44-COLD-6048` and `PAGED-TQ44-WARM-9173`, TTFT 3.75/0.85 s, 14.1/37.5 tok/s; the warm content delta visibly completed to the exact answer | Exact 8 KV to 8 TQ transition with all 40 rotating layers preserved; paged and SSD counters active | VERIFIED-LIVE |
+| Fresh-process SSD/paged | After quit/relaunch and History restore, `TQ44-RESTART-L2-2864`, TTFT 0.79 s, 34.1 tok/s | New PID reported SSD hits 3 / misses 9 / stores 4 and paged hits 84 / misses 4 / evictions 2, with 8 TQ + 40 rotating | VERIFIED-LIVE for fresh-process tier use; causal eviction fallback VERIFIED-UNIT |
+| Restored default | UI saved paged Off, Engine Selected, blank block cap, Prefix/SSD On; `DEFAULTS-RESTORED-NATIVE-4092`, TTFT 3.01 s, 42.1 tok/s | fp16; 8 KV + 40 rotating; TQ 0; transition null; paged disabled; SSD hits 1 / misses 10 / stores 3 | VERIFIED-LIVE |
+| Physical footprint | Activity Monitor showed the exact proof PID at 9.38 GB | Weights 10,135,442,741 bytes; near-full dense residency | FAILED-LIVE |
+
+The fresh-process counters prove real disk and newly populated paged-tier use,
+but aggregate counters alone cannot assign one disk hit to one evicted RAM
+leaf. The exact causal eviction-to-SSD contract remains grounded in
+`gemmaMixedTurboQuantRotatingUsesPagedThenDiskAfterEviction`, and safe rollback
+when the rotating companion is absent remains grounded in
+`gemmaPagedMissingRotatingCompanionFallsThroughToDisk`.
 
 ## Current evidence
 
@@ -182,7 +204,7 @@ telemetry are both required.
 |---|---|---|
 | Current-build MXFP8 TQ transition | 48 total / 8 KV / 40 rotating before and 48 / 8 TQ / 40 rotating after, plus coherent visible native/TQ/restart output | VERIFIED-LIVE |
 | Current-build JANG_4M TQ transition | Same current-build exact transition and coherent visible native/TQ/restart output | VERIFIED-LIVE |
-| Paged default/effective policy | Prior Release UI proves default Off and the old safe rejection. The new exact mixed-cache paged admission has source plus 42-test coverage, but default Off, explicit On, real paged hits, eviction, SSD fallback, coherence, and footprint still need a fresh Release UI run | PARTIAL-SOURCE; NEW LIVE ROW OPEN |
+| Paged default/effective policy | Current Release UI proved default Off, explicit On with a 32-block cap, native/TQ4/4 coherent turns, real paged hits and two evictions, fresh-process SSD activity, and restored defaults. Exact unit tests causally prove eviction-to-SSD and missing-companion fallback. The 9.38 GB footprint row failed the strict low-footprint criterion | VERIFIED-SOURCE + VERIFIED-LIVE behavior; FAILED-LIVE footprint |
 | SSD L2 with paged off | Both 12B formats restored partial prefixes from disk after process restart while paged counters remained zero | VERIFIED-LIVE |
 | Explicit SSD L2 off | Visible SSD-Off save plus endpoint false/zero-counter proof | VERIFIED-LIVE |
 | Fresh-process L2 restore | Both 12B formats showed post-restart disk hits and coherent changed-prefix continuations | VERIFIED-LIVE |
@@ -244,8 +266,12 @@ Command Line Tools invocation could not import `Testing`; the first Xcode
 invocation built but stopped before assertions because the MLX metallib was
 absent. Neither is counted. After running the repository's
 `scripts/prepare-mlx-metal.sh`, the exact focused tests and 42-test topology
-selection completed. No fresh full-package test suite or Release Osaurus UI row
-is claimed yet.
+selection completed. No fresh full-package vMLX test suite is claimed. The
+current Osaurus Release UI rows are recorded above.
+The companion Osaurus Debug Xcode result
+`Test-OsaurusCoreTests-2026.07.20_12-37-14--0700.xcresult` records 94/94 passed,
+zero failed/skipped, for the complete `RuntimePolicySourceTests` and
+`ImageGenerationBridgeContractTests` selections.
 
 The companion Osaurus telemetry patch was built in the Xcode workspace's Debug
 test graph and then executed from that exact build with the enumerated Swift
