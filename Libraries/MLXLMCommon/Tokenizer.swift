@@ -87,6 +87,54 @@ public func canonicalChatCacheBoundaries(
         return tokens.count
     }
 
+    /// Some otherwise valid chat templates refuse to render instructions and
+    /// tools without a user query (Qwen 3.5 / Ornith / Bonsai raise
+    /// `No user query found in messages.`). Derive the stable boundary without
+    /// assuming a template shape: append two user probes whose first content
+    /// tokens differ, then keep only the token prefix shared by both probes and
+    /// the real prompt. The first probe divergence proves that no user content
+    /// is included; the real-prompt comparison proves the result is reusable by
+    /// this request.
+    func probeDerivedStableBoundary(
+        messages stableMessages: [[String: any Sendable]]
+    ) -> Int? {
+        func renderProbe(_ content: String) -> [Int]? {
+            var probeMessages = stableMessages
+            probeMessages.append(["role": "user", "content": content])
+            return try? controllable.applyChatTemplate(
+                messages: probeMessages,
+                tools: tools,
+                additionalContext: additionalContext,
+                addGenerationPrompt: false)
+        }
+
+        guard let probeA = renderProbe("0"),
+              let probeB = renderProbe("z"),
+              !probeA.isEmpty,
+              !probeB.isEmpty
+        else {
+            return nil
+        }
+
+        let limit = min(probeA.count, probeB.count, promptTokens.count)
+        var boundary = 0
+        while boundary < limit,
+              probeA[boundary] == probeB[boundary],
+              probeA[boundary] == promptTokens[boundary]
+        {
+            boundary += 1
+        }
+
+        guard boundary > 0,
+              boundary < probeA.count,
+              boundary < probeB.count,
+              boundary < promptTokens.count
+        else {
+            return nil
+        }
+        return boundary
+    }
+
     // Only the leading instruction rail is stable across unrelated chats.
     // Tool schemas remain present because they are a separate template input;
     // this also permits a tool-only stable prefix when a template emits one for
@@ -96,9 +144,11 @@ public func canonicalChatCacheBoundaries(
         return role == "system" || role == "developer"
     })
     let hasStableMaterial = !stableMessages.isEmpty || tools?.isEmpty == false
-    let stable = hasStableMaterial
-        ? exactPrefixBoundary(messages: stableMessages).map { [$0] } ?? []
-        : []
+    let stableBoundary = hasStableMaterial
+        ? exactPrefixBoundary(messages: stableMessages)
+            ?? probeDerivedStableBoundary(messages: stableMessages)
+        : nil
+    let stable = stableBoundary.map { [$0] } ?? []
     let history = exactPrefixBoundary(messages: messages).map { [$0] } ?? []
     let all = Array(Set(stable + history)).sorted()
     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {

@@ -2697,6 +2697,19 @@ public actor BatchEngine {
                 slot.originalInput.cachePrefixTokenCounts
                     + [sharedPromptStripBoundary].compactMap { $0 }
             ))
+            // A path-dependent hybrid chat prompt has one canonical reusable
+            // boundary: the prompt with its trailing generation scaffold
+            // removed.  The exact prompt boundary is deliberately rejected on
+            // restore for these topologies, while the generated/post-answer
+            // tokens are not guaranteed to match the template's historical
+            // assistant rendering.  Persisting all three used to serialize
+            // several almost-identical full snapshots at every turn (hundreds
+            // of MB each for Bonsai) even though only this stripped boundary is
+            // required by the next turn.  Dense/rotating, media-unsafe, raw,
+            // and non-chat prompts have no proven strip boundary and keep the
+            // existing prompt/post-answer policy.
+            let usesCanonicalHybridBoundary =
+                coordinator.isHybrid && sharedPromptStripBoundary != nil
 
             func storeCacheEntry(tokens: [Int], snapshot: [KVCache], label: String) {
                 guard !tokens.isEmpty else { return }
@@ -2780,6 +2793,10 @@ public actor BatchEngine {
                     cache: diskStoreCache,
                     mediaSalt: slot.mediaSalt
                 )
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    FileHandle.standardError.write(Data(
+                        "[vmlx][cache/store] label=\(label) count=\(tokens.count)\n".utf8))
+                }
                 Self.logger.debug(
                     "Stored \(label, privacy: .public) cache entry for slot \(slot.id.description, privacy: .public): \(tokens.count) tokens"
                 )
@@ -2869,15 +2886,18 @@ public actor BatchEngine {
                 }
             }
 
-            storeCacheEntry(
-                tokens: promptTokens,
-                snapshot: promptCacheSnapshot,
-                label: "prompt-boundary")
+            if !usesCanonicalHybridBoundary {
+                storeCacheEntry(
+                    tokens: promptTokens,
+                    snapshot: promptCacheSnapshot,
+                    label: "prompt-boundary")
+            }
 
             if !slot.cachePromptUsesPostPrepareKey {
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
-                if requiresDiskBackedRestore,
+                if !usesCanonicalHybridBoundary,
+                   requiresDiskBackedRestore,
                    !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot),
                    promptTokens.count > 1,
                    let snapshot = boundarySnapshot(tokens: Array(promptTokens.dropLast()))
@@ -2897,6 +2917,9 @@ public actor BatchEngine {
                 where boundary > 0 && boundary < promptTokens.count {
                     let isStableBoundary = slot.originalInput
                         .cacheStablePrefixTokenCounts.contains(boundary)
+                    if usesCanonicalHybridBoundary, !isStableBoundary {
+                        continue
+                    }
                     let boundaryTokens = Array(promptTokens.prefix(boundary))
                     if isStableBoundary,
                        coordinator.hasValidatedDiskEntry(
@@ -2955,7 +2978,14 @@ public actor BatchEngine {
                    let stripAt = sharedPromptStripBoundary
                 {
                     let strippedTokens = Array(promptTokens.prefix(stripAt))
-                    if let snapshot = boundarySnapshot(
+                    if coordinator.hasValidatedDiskEntry(
+                        tokens: strippedTokens,
+                        mediaSalt: slot.mediaSalt)
+                    {
+                        Self.logger.debug(
+                            "Skipped already-validated gen-suffix-stripped cache boundary for slot \(slot.id.description, privacy: .public): \(stripAt, privacy: .public) tokens"
+                        )
+                    } else if let snapshot = boundarySnapshot(
                         tokens: strippedTokens, forceRederive: true)
                     {
                         storeCacheEntry(
@@ -2977,7 +3007,8 @@ public actor BatchEngine {
             // Store the growing-chat boundary only when the cache offset proves
             // it covers prompt + generated tokens exactly enough to resume.
             let generatedBoundaryTokens = promptTokens + slot.generatedTokenIds
-            if reason == .stop,
+            if !usesCanonicalHybridBoundary,
+               reason == .stop,
                !slot.disablesGeneratedCacheBoundary,
                !containsUnprovenZayaTurboQuantDiskState(slot.cache),
                !slot.generatedTokenIds.isEmpty,
