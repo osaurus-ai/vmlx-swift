@@ -2,7 +2,35 @@
 
 ## Status
 
-`PARTIAL — SOURCE TESTS PASS; UPDATED STORAGE POLICY NOT RELEASE-PROVEN`
+`VERIFIED-LIVE — FEB35555 N-1 HYBRID SEED; BROADER FAMILY MATRIX PARTIAL`
+
+## Current `feb35555` isolated Release proof
+
+The exact vMLX head `feb35555900398dc638c82a3e13e98f8b1adbf41` was
+consumed by all four package-pin surfaces of a fresh Release Osaurus build.
+The app was ad-hoc signed as
+`com.dinoki.osaurus.ssdwarmfeb355proof20260721`; its executable SHA-256 was
+`488b2ce7106cb8e85bb3f27e69d4db7941abb6f977bc3174e09131169d22a3ea`.
+It was operated through Computer Use with an isolated test root and the local
+bundles under `/Users/eric/models`.
+
+Settings visibly showed Prefix Cache On, GPU/paged cache Off, Disk Cache On,
+codec `Engine Selected`, SSM re-derive On, and Thinking Off. The Disk toggle
+was changed and saved in the UI for the negative control, then restored On and
+saved before the topology regressions.
+
+| Model / request | Request-attributed cache trace | Visible result |
+| --- | --- | --- |
+| Qwen AgentWorld 35B A3B MXFP8, first new-chat warm-up | disk boundary 2,992, one token remaining, 60 recurrent states | warm-up first delta 0.36 s |
+| Same Qwen bundle after quit/relaunch | disk boundary 2,992, one token remaining, 60 recurrent states | warm-up first delta 0.21 s; `Au`, TTFT 0.49 s, 47.8 tok/s |
+| Same Qwen request with Disk Cache Off | `MISS all tiers`; UI visibly advanced through `Prefill 1024/3010` | `Au`, TTFT 1.89 s, 47.9 tok/s |
+| Gemma 4 12B QAT JANG_4M, later new chat | disk boundary 1,629, four tokens remaining, `ssm=-1` | warm-up 0.28 s; `Au`, TTFT 0.41 s, 35.3 tok/s |
+| Bonsai 27B Ternary JANG, later new chat | disk boundary 2,922, one token remaining, 96 recurrent states | warm-up 0.20 s; prior visible `Au`, TTFT 0.50 s, 30.7 tok/s |
+
+This closes the emergency N-1 safe-seed defect on the real Qwen 3.5 hybrid
+path and shows that the scoped change does not replace rotating-SWA semantics
+or lose Bonsai companion state. It does not close the separate TurboQuant,
+media, paged-hot-tier, quota-pressure, or all-family campaign.
 
 This gate tracks a report that Bonsai appears to prefill from zero in each new
 Osaurus chat while paged RAM cache is **Off** and SSD/Disk L2 is **On**. A valid
