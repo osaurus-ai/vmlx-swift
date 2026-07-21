@@ -26,6 +26,28 @@ struct CacheStoreBudgetTests {
     /// the default is what the assertions are really about.
     private static let safeAuto = CacheStorePolicy.safeAuto
 
+    /// MLX allocator accounting can describe the logical/mapped model while
+    /// Activity Monitor shows the much smaller set of pages actually charged to
+    /// the process. RAM safety must use the latter or it rejects harmless SSD
+    /// checkpoints for reclaimed JANG models.
+    @Test("Physical footprint wins over inflated MLX allocator accounting")
+    func physicalFootprintWinsOverMLXAccounting() {
+        let active = CacheStoreBudget.activeBytesForStoreBudget(
+            physicalFootprintBytes: UInt64(19 * Self.gib),
+            mlxActiveBytes: 96 * Self.gib
+        )
+        #expect(active == 19 * Self.gib)
+    }
+
+    @Test("MLX active memory remains the fallback when footprint is unavailable")
+    func mlxAccountingIsThePortableFallback() {
+        let active = CacheStoreBudget.activeBytesForStoreBudget(
+            physicalFootprintBytes: nil,
+            mlxActiveBytes: 37 * Self.gib
+        )
+        #expect(active == 37 * Self.gib)
+    }
+
     /// The reported panic, in numbers: a 70B 8-bit model already holds ~70 GB of
     /// weights, the 64K-token KV cache is ~20 GiB more, and the store then wants
     /// another copy of that cache. It does not fit, and must be refused.
@@ -231,7 +253,8 @@ struct MemorySafetyLevelTests {
     func decodingPrefersModeOverStaleSlider() throws {
         // Written by a build where the slider was stored and inert: the user dragged
         // it to Performance (0) but the engine kept running Strict.
-        let json = #"{"mode":"strict","slider":0,"allowExperimentalMLXPress":false,"failClosedWhenEstimateUnknown":false}"#
+        let json =
+            #"{"mode":"strict","slider":0,"allowExperimentalMLXPress":false,"failClosedWhenEstimateUnknown":false}"#
         let decoded = try JSONDecoder().decode(
             VMLXMemorySafetySettings.self, from: Data(json.utf8))
         #expect(decoded.mode == .strict, "the level actually in force must survive the upgrade")
