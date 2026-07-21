@@ -120,6 +120,9 @@ closed. The stable boundary is passed explicitly to the disk probe so it cannot
 fall out of the index's 128-largest-length scan. Dense caches trim to it.
 Disk-backed rotating Gemma SWA and Qwen/Ornith/Bonsai GDN/SSM topologies force
 an architecture-native boundary rederive rather than flattening typed state.
+Gemma 4 is wired explicitly through its custom `Gemma4Processor` for text-only
+requests; Qwen3VL is likewise wired only on its text branch. Their image/audio
+placeholder paths remain excluded until separate media-salt restore proof.
 After an entry has actually been written or deserialized in the current
 process, matching file fingerprint plus SQLite metadata suppresses redundant
 warm-turn rederive/write; inherited filenames alone are not trusted.
@@ -141,7 +144,9 @@ Current edited-tree evidence:
   proves the stable boundary is absent from the normal scan, and restores it
   only through the processor-proven preferred-boundary path;
 - 42/42 cache-topology tests, 10/10 recurrent companion tests, and 8/8 disk
-  cache tests pass after the validation-pair change.
+  cache tests pass after the validation-pair change; the Gemma processor source
+  row additionally proves normalized tools and both text-only boundary fields
+  reach `LMInput`.
 
 Status remains **PARTIAL**. Required live closure is an isolated Release app on
 the exact candidate pin showing cold store, unrelated-new-chat partial L2 hit,
