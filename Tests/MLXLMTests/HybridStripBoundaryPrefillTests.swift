@@ -123,6 +123,83 @@ final class HybridStripBoundaryPrefillTests: XCTestCase {
         XCTAssertEqual(model.prepareCalls, prepareCallsAfterPrefill)
     }
 
+    func testHybridStorePublishesOnlyCanonicalStrippedBoundary() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+
+        let model = RecordingHybridModel()
+        let coordinator = makeCoordinator()
+        coordinator.setGenPromptSuffixTokens(genPromptSuffix)
+
+        let prompt = userTurn + genPromptSuffix
+        let input = LMInput(
+            tokens: MLXArray(prompt.map { Int32($0) }).expandedDimensions(axis: 0))
+        let parameters = GenerateParameters(maxTokens: 1, temperature: 0)
+        let mediaSalt = computeCacheSalt(for: input, parameters: parameters)
+        var iterator = try TokenIterator(
+            input: input,
+            model: model,
+            parameters: parameters,
+            cacheCoordinator: coordinator)
+
+        iterator.storeCacheAfterGeneration(
+            generatedTokenIds: [42], includeGeneratedBoundary: true)
+
+        let stats = coordinator.snapshotStats().diskStats
+        XCTAssertEqual(
+            stats?.stores, 1,
+            "hybrid chat must not serialize prompt + stripped + post-answer full snapshots")
+        let restored = coordinator.fetch(
+            tokens: prompt + [77],
+            mediaSalt: mediaSalt,
+            skipExactDiskBoundary: true)
+        guard case .hit(let matched, let remaining, let detail, _, _, _) = restored else {
+            return XCTFail("canonical stripped boundary should be restorable")
+        }
+        XCTAssertEqual(matched, userTurn.count)
+        XCTAssertEqual(remaining, genPromptSuffix + [77])
+        XCTAssertEqual(detail, .disk)
+    }
+
+    func testHybridStableBoundaryPublishesWarmupSafeSeed() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+
+        let model = RecordingHybridModel()
+        let coordinator = makeCoordinator()
+        coordinator.setGenPromptSuffixTokens(genPromptSuffix)
+
+        let stable = [1, 2, 3, 4, 5]
+        let prompt = stable + userTurn + genPromptSuffix
+        let input = LMInput(
+            tokens: MLXArray(prompt.map { Int32($0) }).expandedDimensions(axis: 0),
+            tokenIds: prompt,
+            cachePrefixTokenCounts: [stable.count],
+            cacheStablePrefixTokenCounts: [stable.count])
+        let parameters = GenerateParameters(maxTokens: 1, temperature: 0)
+        let mediaSalt = computeCacheSalt(for: input, parameters: parameters)
+        var iterator = try TokenIterator(
+            input: input,
+            model: model,
+            parameters: parameters,
+            cacheCoordinator: coordinator)
+
+        iterator.storeCacheAfterGeneration(
+            generatedTokenIds: [42], includeGeneratedBoundary: true)
+
+        let restored = coordinator.fetch(
+            tokens: stable,
+            mediaSalt: mediaSalt,
+            skipExactDiskBoundary: true,
+            preferredDiskBoundaries: [stable.count])
+        guard case .hit(let matched, let remaining, let detail, _, _, _) = restored else {
+            return XCTFail("first new-chat warmup should restore the stable N-1 seed")
+        }
+        XCTAssertEqual(matched, stable.count - 1)
+        XCTAssertEqual(remaining, [stable.last!])
+        XCTAssertEqual(detail, .disk)
+    }
+
     func testPrefillSplitsAtTheTurnStartToken() throws {
         let lock = lockSerializedMLXTest()
         defer { lock.unlock() }

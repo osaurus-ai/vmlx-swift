@@ -2146,6 +2146,13 @@ public struct TokenIterator: TokenIteratorProtocol {
         let sharedPromptAdditionalBoundaries = Array(Set(
             cachePrefixTokenCounts + [hybridStripBoundary].compactMap { $0 }
         ))
+        // When a hybrid prompt exposes a generation-suffix-stripped boundary,
+        // that is the canonical cross-turn checkpoint.  Full-prompt and
+        // post-answer snapshots are both larger and not the boundary the next
+        // templated turn is guaranteed to contain.  Prompts without this
+        // processor-proven boundary keep the existing storage policy.
+        let usesCanonicalHybridBoundary =
+            coordinator.isHybrid && hybridStripBoundary != nil
 
         func store(
             tokens: [Int],
@@ -2245,16 +2252,19 @@ public struct TokenIterator: TokenIteratorProtocol {
             let promptDiskKVMode = selectivePromptBoundaryDiskKVMode(
                 cache: promptCacheSnapshot,
                 requested: kvMode)
-            store(
-                tokens: promptTokenIds,
-                cache: promptCacheSnapshot,
-                kvBits: nil,
-                kvMode: promptDiskKVMode)
+            if !usesCanonicalHybridBoundary {
+                store(
+                    tokens: promptTokenIds,
+                    cache: promptCacheSnapshot,
+                    kvBits: nil,
+                    kvMode: promptDiskKVMode)
+            }
 
             if !originalInput.requiresPostPrepareCacheKey {
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
-                if requiresDiskBackedRestore,
+                if !usesCanonicalHybridBoundary,
+                   requiresDiskBackedRestore,
                    !skipDiskBackedToolPromptSeedBoundary,
                    promptTokenIds.count > 1,
                    let boundarySnapshot = cacheSnapshotForBoundary(
@@ -2326,9 +2336,20 @@ public struct TokenIterator: TokenIteratorProtocol {
 
                 for boundary in Set(cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokenIds.count {
-                    let boundaryTokens = Array(promptTokenIds.prefix(boundary))
                     let isStableBoundary = originalInput
                         .cacheStablePrefixTokenCounts.contains(boundary)
+                    if usesCanonicalHybridBoundary, !isStableBoundary {
+                        continue
+                    }
+                    // Path-dependent hybrid caches reject exact disk restores
+                    // unless an N-1 recurrent seed exists. Store the stable
+                    // system/tool prefix one token short so the first new-chat
+                    // warmup can restore it instead of starting at token zero.
+                    let storeBoundary = isStableBoundary
+                        && requiresDiskBackedRestore && boundary > 1
+                        ? boundary - 1
+                        : boundary
+                    let boundaryTokens = Array(promptTokenIds.prefix(storeBoundary))
                     if isStableBoundary,
                        coordinator.hasValidatedDiskEntry(
                         tokens: boundaryTokens,
@@ -2356,7 +2377,9 @@ public struct TokenIterator: TokenIteratorProtocol {
             }
         }
 
-        guard includeGeneratedBoundary, !generatedTokenIds.isEmpty else { return }
+        guard !usesCanonicalHybridBoundary,
+            includeGeneratedBoundary, !generatedTokenIds.isEmpty
+        else { return }
         guard !needsCacheQuantization else { return }
         guard !containsUnprovenZayaTurboQuantDiskState(cache) else { return }
         let generatedBoundaryTokens = promptTokenIds + generatedTokenIds

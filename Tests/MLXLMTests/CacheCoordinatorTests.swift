@@ -308,7 +308,7 @@ import Testing
         modelKey: "zaya-cca-cache-contract-test"
     )
     let coordinator = CacheCoordinator(config: config)
-    coordinator.setHybrid(true)
+    coordinator.setHybrid(true, requiresRecurrentSSMCompanion: false)
     coordinator.setPagedIncompatible(true)
 
     let tokens = [201, 202, 203, 204]
