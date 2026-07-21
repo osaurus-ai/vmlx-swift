@@ -221,7 +221,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     coordinator.setPagedIncompatible(true)
                 }
             }
-            switch coordinator.fetch(tokens: cacheLookupTokenIds, mediaSalt: mediaSalt) {
+            switch coordinator.fetch(
+                tokens: cacheLookupTokenIds,
+                mediaSalt: mediaSalt,
+                preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts
+            ) {
             case .hit(
                 let matchedTokens, let remainingTokens, _, let blocks,
                 let ssmStates, let diskArrays):
@@ -523,9 +527,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 for boundary in Set(cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokenIds.count {
                     let boundaryTokens = Array(promptTokenIds.prefix(boundary))
+                    let isStableBoundary = originalInput
+                        .cacheStablePrefixTokenCounts.contains(boundary)
+                    if isStableBoundary,
+                       coordinator.hasValidatedDiskEntry(
+                        tokens: boundaryTokens,
+                        mediaSalt: mediaSalt)
+                    {
+                        continue
+                    }
                     if let boundarySnapshot = cacheSnapshotForBoundary(
                         tokens: boundaryTokens,
-                        promptSnapshot: promptCacheSnapshot)
+                        promptSnapshot: promptCacheSnapshot,
+                        allowDiskBackedRederive: isStableBoundary)
                     {
                         store(
                             tokens: boundaryTokens,

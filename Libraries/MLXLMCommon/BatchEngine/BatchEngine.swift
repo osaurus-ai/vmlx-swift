@@ -1664,7 +1664,9 @@ public actor BatchEngine {
                 let result = coordinator.fetch(
                     tokens: tokenIds,
                     mediaSalt: slot.mediaSalt,
-                    skipExactDiskBoundary: requiresDiskBackedRestore)
+                    skipExactDiskBoundary: requiresDiskBackedRestore,
+                    preferredDiskBoundaries: slot.originalInput
+                        .cacheStablePrefixTokenCounts)
                 if case .hit(
                     let matchedTokens, let remaining, let detail, let blocks,
                     let ssmStates, let diskArrays) = result
@@ -2893,13 +2895,29 @@ public actor BatchEngine {
                 }
                 for boundary in Set(slot.originalInput.cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokens.count {
+                    let isStableBoundary = slot.originalInput
+                        .cacheStablePrefixTokenCounts.contains(boundary)
+                    let boundaryTokens = Array(promptTokens.prefix(boundary))
+                    if isStableBoundary,
+                       coordinator.hasValidatedDiskEntry(
+                        tokens: boundaryTokens,
+                        mediaSalt: slot.mediaSalt)
+                    {
+                        Self.logger.debug(
+                            "Skipped already-validated stable system/tool cache boundary for slot \(slot.id.description, privacy: .public): \(boundary, privacy: .public) tokens"
+                        )
+                        continue
+                    }
                     if let snapshot = boundarySnapshot(
-                        tokens: Array(promptTokens.prefix(boundary)))
+                        tokens: boundaryTokens,
+                        forceRederive: isStableBoundary)
                     {
                         storeCacheEntry(
-                            tokens: Array(promptTokens.prefix(boundary)),
+                            tokens: boundaryTokens,
                             snapshot: snapshot,
-                            label: "history-boundary")
+                            label: isStableBoundary
+                                ? "stable-system-tool-boundary"
+                                : "history-boundary")
                     }
                 }
 

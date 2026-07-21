@@ -1444,7 +1444,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                 let result = coordinator.fetch(
                     tokens: cacheLookupTokenIds,
                     mediaSalt: mediaSalt,
-                    skipExactDiskBoundary: requiresDiskBackedRestore)
+                    skipExactDiskBoundary: requiresDiskBackedRestore,
+                    preferredDiskBoundaries: originalInput
+                        .cacheStablePrefixTokenCounts)
                 switch result {
                 case .hit(
                     let matchedTokens, let remainingTokens, let detail, let blocks,
@@ -2325,9 +2327,22 @@ public struct TokenIterator: TokenIteratorProtocol {
                 for boundary in Set(cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokenIds.count {
                     let boundaryTokens = Array(promptTokenIds.prefix(boundary))
+                    let isStableBoundary = originalInput
+                        .cacheStablePrefixTokenCounts.contains(boundary)
+                    if isStableBoundary,
+                       coordinator.hasValidatedDiskEntry(
+                        tokens: boundaryTokens,
+                        mediaSalt: mediaSalt)
+                    {
+                        Self.logger.debug(
+                            "TokenIterator: skipped already-validated stable system/tool cache boundary at \(boundary, privacy: .public) tokens"
+                        )
+                        continue
+                    }
                     if let boundarySnapshot = cacheSnapshotForBoundary(
                         tokens: boundaryTokens,
-                        promptSnapshot: promptCacheSnapshot)
+                        promptSnapshot: promptCacheSnapshot,
+                        allowDiskBackedRederive: isStableBoundary)
                     {
                         store(
                             tokens: boundaryTokens,
@@ -2352,7 +2367,8 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     private func cacheSnapshotForBoundary(
         tokens: [Int],
-        promptSnapshot: [KVCache]
+        promptSnapshot: [KVCache],
+        allowDiskBackedRederive: Bool = false
     ) -> [KVCache]? {
         guard !tokens.isEmpty, tokens.count < promptTokenIds.count else {
             return nil
@@ -2366,7 +2382,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             return trimmed
         }
 
-        if shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot) {
+        if !allowDiskBackedRederive,
+           shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot) {
             Self.logger.debug(
                 "TokenIterator: skipped history-boundary cache rederive after trim miss for disk-backed cache topology"
             )

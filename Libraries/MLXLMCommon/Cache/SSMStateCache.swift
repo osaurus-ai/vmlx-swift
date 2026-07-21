@@ -288,6 +288,17 @@ public final class SSMStateCache: @unchecked Sendable {
         return entries.contains { $0.key == key && !$0.states.isEmpty }
     }
 
+    /// Current-process validation state for the disk-backed complete companion
+    /// pair, without deserializing or copying its tensors.
+    public func hasValidatedCompleteDiskEntry(
+        tokens: [Int], boundary: Int, mediaSalt: String? = nil
+    ) -> Bool {
+        diskStore?.hasValidatedCompleteEntry(
+            tokens: tokens,
+            boundary: boundary,
+            mediaSalt: mediaSalt) ?? false
+    }
+
     /// Remove all entries and reset hit/miss/re-derive statistics.
     public func clear() {
         lock.lock()

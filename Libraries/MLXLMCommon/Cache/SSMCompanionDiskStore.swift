@@ -104,6 +104,43 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         return storeSkips
     }
 
+    /// Whether the current process has validated a complete companion pair for
+    /// this exact content-addressed boundary. Used with the KV validation gate
+    /// so a valid KV file cannot suppress healing a missing/corrupt recurrent
+    /// sidecar after a hybrid cache miss.
+    func hasValidatedCompleteEntry(
+        tokens: [Int],
+        boundary: Int,
+        mediaSalt: String? = nil
+    ) -> Bool {
+        guard boundary > 0, boundary <= tokens.count else { return false }
+        let key = Self.keyFor(
+            tokens: tokens, boundary: boundary,
+            mediaSalt: mediaSalt, modelKey: modelKey)
+        let expectedKVHash = DiskCache.hashTokens(
+            Array(tokens.prefix(boundary)),
+            modelKey: modelKey,
+            mediaSalt: mediaSalt)
+        let safetensorsURL = self.safetensorsURL(for: key)
+        let sidecarURL = self.sidecarURL(for: key)
+
+        lock.lock()
+        defer { lock.unlock() }
+        guard let validated = validatedEntries[key],
+              validated.isComplete,
+              validated.numStates > 0,
+              validated.boundary == boundary,
+              validated.kvHash == expectedKVHash,
+              let currentSafetensors = fileFingerprint(at: safetensorsURL),
+              let currentSidecar = fileFingerprint(at: sidecarURL),
+              currentSafetensors == validated.safetensors,
+              currentSidecar == validated.sidecar
+        else {
+            return false
+        }
+        return true
+    }
+
     /// Persist SSM layer states for a given token prefix. Mirrors
     /// `SSMStateCache.store(ssmStates:tokens:boundary:)` with the
     /// addition of an `isComplete` flag (parity with Python tuple).

@@ -417,7 +417,8 @@ public final class CacheCoordinator: @unchecked Sendable {
     public func fetch(
         tokens: [Int],
         mediaSalt: String? = nil,
-        skipExactDiskBoundary: Bool = false
+        skipExactDiskBoundary: Bool = false,
+        preferredDiskBoundaries: [Int] = []
     ) -> CacheFetchResult {
         func ftrace(_ msg: String) {
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
@@ -553,7 +554,16 @@ public final class CacheCoordinator: @unchecked Sendable {
                 }
             }
 
-            for boundary in diskCache.candidateTokenCounts(maxTokens: tokens.count) {
+            // Indexed lookup is intentionally bounded, so a frequently reused
+            // stable system/tool boundary can eventually fall below the 128
+            // largest historical prompt lengths. Merge processor-proven
+            // boundaries back into the probe set before sorting; each remains
+            // content-address checked against this request's exact token prefix.
+            let candidateBoundaries = Set(
+                diskCache.candidateTokenCounts(maxTokens: tokens.count)
+                    + preferredDiskBoundaries
+            ).sorted(by: >)
+            for boundary in candidateBoundaries {
                 // `skipExactDiskBoundary` is a correctness requirement for
                 // path-dependent hybrid caches, not merely a preference for
                 // the first two probes above. The indexed fallback used to
@@ -575,6 +585,26 @@ public final class CacheCoordinator: @unchecked Sendable {
         // All tiers missed
         ftrace("MISS all tiers")
         return .miss
+    }
+
+    /// True only after the current process has deserialized or written the
+    /// exact L2 entry and its on-disk fingerprint still matches the index.
+    public func hasValidatedDiskEntry(
+        tokens: [Int],
+        mediaSalt: String? = nil
+    ) -> Bool {
+        guard diskCache?.hasValidatedEntry(
+            tokens: tokens, mediaSalt: mediaSalt) == true
+        else {
+            return false
+        }
+        if isHybrid, requiresRecurrentSSMCompanion {
+            return ssmStateCache.hasValidatedCompleteDiskEntry(
+                tokens: tokens,
+                boundary: tokens.count,
+                mediaSalt: mediaSalt)
+        }
+        return true
     }
 
     /// Resolve SSM companion state for a disk-cache hit on a hybrid model.

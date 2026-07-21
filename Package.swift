@@ -828,6 +828,7 @@ let package = Package(
                 "DSMLToolCallParserFocusedTests.swift",
                 "ToolCallProgressRoutingTests.swift",
                 "FocusedMLXTestSupport.swift",
+                "CanonicalChatCacheBoundariesTests.swift",
                 "BatchEngineGrowingChatCacheSourceTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
                 "VMLXUmbrellaProductTests.swift",
