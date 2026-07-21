@@ -673,7 +673,9 @@ extension ModelRuntimeCapabilitySnapshot {
         if let explicit = ModelRuntimeCapabilitySupport.from(capabilities?.supportsAudio) {
             return explicit
         }
-        if modelType?.lowercased() == "nemotron_dense_audex" {
+        if let modelType = modelType?.lowercased(),
+            ["nemotron_dense_audex", "nemotron_h_audex"].contains(modelType)
+        {
             return .supported
         }
         return supportFromModality(

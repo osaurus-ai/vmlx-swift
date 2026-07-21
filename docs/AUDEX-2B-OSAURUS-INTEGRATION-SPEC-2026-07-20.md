@@ -7,6 +7,8 @@ catalog owners, and release-proof reviewers.
 
 Companion artifacts:
 
+- [Family quant release and 30B wiring sheet](AUDEX-FAMILY-QUANT-RELEASE-2026-07-20.md)
+- [Family quant release manifest](AUDEX-FAMILY-QUANT-RELEASE-2026-07-20.json)
 - [Runtime checkpoint](AUDEX-2B-RUNTIME-CHECKPOINT-2026-07-20.md)
 - [Machine-readable wiring manifest](AUDEX-2B-OSAURUS-WIRING-MANIFEST.json)
 - [Copy-paste PR comment](AUDEX-2B-PR-COMMENT-2026-07-20.md)

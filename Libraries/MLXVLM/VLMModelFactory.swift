@@ -147,6 +147,7 @@ public enum VLMTypeRegistry {
         "gemma4": create(Gemma4Configuration.self, Gemma4.init),
         "gemma4_unified": create(Gemma4Configuration.self, Gemma4.init),
         "nemotron_dense_audex": create(AudexConfiguration.self, Audex.init),
+        "nemotron_h_audex": create(AudexHConfiguration.self, AudexH.init),
         "nemotron_h_omni": create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
         "NemotronH_Nano_Omni_Reasoning_V3":
             create(NemotronHOmniConfiguration.self, NemotronHOmni.init),

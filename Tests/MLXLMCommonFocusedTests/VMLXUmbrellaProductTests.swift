@@ -422,12 +422,17 @@ struct VMLXUmbrellaProductTests {
         #expect(!encoded.contains("Gemma4-E2B"))
     }
 
-    @Test("Audex model type advertises native audio input")
-    func audexModelTypeAdvertisesAudio() {
+    @Test(
+        "Audex model types advertise native audio input",
+        arguments: [
+            ("Nemotron-Labs-Audex-2B", "nemotron_dense_audex"),
+            ("Nemotron-Labs-Audex-30B-A3B", "nemotron_h_audex"),
+        ])
+    func audexModelTypeAdvertisesAudio(directoryName: String, modelType: String) {
         let snapshot = ModelRuntimeCapabilitySnapshot(
             configuration: ModelConfiguration(
-                directory: URL(fileURLWithPath: "/tmp/Nemotron-Labs-Audex-2B")),
-            modelType: "nemotron_dense_audex")
+                directory: URL(fileURLWithPath: "/tmp/\(directoryName)")),
+            modelType: modelType)
 
         #expect(snapshot.supportsText == .supported)
         #expect(snapshot.supportsVision == .unknown)

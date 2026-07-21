@@ -3,11 +3,12 @@
 import Accelerate
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXNN
 
-// Native vMLX implementation of NVIDIA Nemotron-Labs-Audex-2B.
-// The checkpoint combines a Nemotron-Dense decoder, a Qwen2-Audio
+// Native vMLX implementation of NVIDIA Nemotron-Labs-Audex. The family
+// combines either a Nemotron-Dense or Nemotron-H decoder, a Qwen2-Audio
 // (NV-Whisper) encoder, and a squared-ReLU projector.
 
 public struct AudexConfiguration: Codable, Sendable {
@@ -120,6 +121,64 @@ public struct AudexConfiguration: Codable, Sendable {
         var rope = c.nestedContainer(keyedBy: RopeKeys.self, forKey: .ropeParameters)
         try rope.encode(ropeTheta, forKey: .theta)
         try c.encode(tieWordEmbeddings, forKey: .tieWordEmbeddings)
+        try c.encode(audio, forKey: .audio)
+        try c.encode(audioProjectorIntermediateSize, forKey: .audioProjectorIntermediateSize)
+        try c.encode(audioProjectorNormEps, forKey: .audioProjectorNormEps)
+        try c.encode(soundTokenId, forKey: .soundTokenId)
+        try c.encode(soundStartTokenId, forKey: .soundStartTokenId)
+        try c.encode(soundEndTokenId, forKey: .soundEndTokenId)
+        try c.encode(soundTargetRate, forKey: .soundTargetRate)
+        try c.encode(soundClipDuration, forKey: .soundClipDuration)
+        try c.encode(soundEmbeddingSize, forKey: .soundEmbeddingSize)
+    }
+}
+
+/// Configuration for the Nemotron-H MoE/SSM Audex checkpoint. The language
+/// fields decode through the existing Nemotron-H runtime while the audio
+/// fields retain the same NV-Whisper/projector contract as the dense model.
+public struct AudexHConfiguration: Codable, Sendable {
+    let language: NemotronHConfiguration
+    let audio: AudexConfiguration.AudioConfiguration
+    let audioProjectorIntermediateSize: Int
+    let audioProjectorNormEps: Float
+    let soundTokenId: Int
+    let soundStartTokenId: Int
+    let soundEndTokenId: Int
+    let soundTargetRate: Int
+    let soundClipDuration: Float
+    let soundEmbeddingSize: Int
+
+    enum CodingKeys: String, CodingKey {
+        case audio = "audio_config"
+        case audioProjectorIntermediateSize = "audio_projector_intermediate_size"
+        case audioProjectorNormEps = "audio_projector_norm_eps"
+        case soundTokenId = "sound_token_id"
+        case soundStartTokenId = "sound_start_token_id"
+        case soundEndTokenId = "sound_end_token_id"
+        case soundTargetRate = "sound_target_rate"
+        case soundClipDuration = "sound_clip_duration"
+        case soundEmbeddingSize = "sound_embedding_size"
+    }
+
+    public init(from decoder: Decoder) throws {
+        language = try NemotronHConfiguration(from: decoder)
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        audio = try c.decode(AudexConfiguration.AudioConfiguration.self, forKey: .audio)
+        audioProjectorIntermediateSize =
+            try c.decodeIfPresent(Int.self, forKey: .audioProjectorIntermediateSize) ?? 4096
+        audioProjectorNormEps =
+            try c.decodeIfPresent(Float.self, forKey: .audioProjectorNormEps) ?? 1e-5
+        soundTokenId = try c.decodeIfPresent(Int.self, forKey: .soundTokenId) ?? 29
+        soundStartTokenId = try c.decodeIfPresent(Int.self, forKey: .soundStartTokenId) ?? 30
+        soundEndTokenId = try c.decodeIfPresent(Int.self, forKey: .soundEndTokenId) ?? 31
+        soundTargetRate = try c.decodeIfPresent(Int.self, forKey: .soundTargetRate) ?? 16_000
+        soundClipDuration = try c.decodeIfPresent(Float.self, forKey: .soundClipDuration) ?? 30
+        soundEmbeddingSize = try c.decodeIfPresent(Int.self, forKey: .soundEmbeddingSize) ?? 750
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try language.encode(to: encoder)
+        var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(audio, forKey: .audio)
         try c.encode(audioProjectorIntermediateSize, forKey: .audioProjectorIntermediateSize)
         try c.encode(audioProjectorNormEps, forKey: .audioProjectorNormEps)
@@ -334,12 +393,17 @@ private final class AudexAudioProjector: Module {
     @ModuleInfo(key: "fc1") var fc1: Linear
     @ModuleInfo(key: "fc2") var fc2: Linear
 
-    init(_ config: AudexConfiguration) {
-        norm = RMSNorm(dimensions: config.audio.dModel, eps: config.audioProjectorNormEps)
+    init(
+        audio: AudexConfiguration.AudioConfiguration,
+        intermediateSize: Int,
+        outputSize: Int,
+        normEps: Float
+    ) {
+        norm = RMSNorm(dimensions: audio.dModel, eps: normEps)
         _fc1.wrappedValue = Linear(
-            config.audio.dModel, config.audioProjectorIntermediateSize, bias: false)
+            audio.dModel, intermediateSize, bias: false)
         _fc2.wrappedValue = Linear(
-            config.audioProjectorIntermediateSize, config.hiddenSize, bias: false)
+            intermediateSize, outputSize, bias: false)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray { fc2(audexRelu2(fc1(norm(x)))) }
@@ -363,7 +427,11 @@ public final class Audex: Module, VLMModel, KVCacheDimensionProvider {
         _textModel.wrappedValue = AudexTextModel(config)
         _lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
         _audioEncoder.wrappedValue = AudexAudioEncoder(config.audio)
-        _audioProjector.wrappedValue = AudexAudioProjector(config)
+        _audioProjector.wrappedValue = AudexAudioProjector(
+            audio: config.audio,
+            intermediateSize: config.audioProjectorIntermediateSize,
+            outputSize: config.hiddenSize,
+            normEps: config.audioProjectorNormEps)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -443,6 +511,123 @@ public final class Audex: Module, VLMModel, KVCacheDimensionProvider {
             } else {
                 result[key] = value
             }
+        }
+        return result
+    }
+}
+
+/// Audex-30B-A3B uses the production Nemotron-H hybrid Mamba/attention/MoE
+/// decoder and the same native NV-Whisper audio frontend as Audex-2B.
+public final class AudexH: Module, VLMModel, KVCacheDimensionProvider {
+    @ModuleInfo(key: "language_model") private var languageModel: NemotronHModel
+    @ModuleInfo(key: "audio_encoder") private var audioEncoder: AudexAudioEncoder
+    @ModuleInfo(key: "audio_projector") private var audioProjector: AudexAudioProjector
+
+    public let config: AudexHConfiguration
+    public var vocabularySize: Int { languageModel.vocabularySize }
+    public var kvHeads: [Int] { languageModel.kvHeads }
+    public var loraLayers: [Module] { languageModel.loraLayers }
+
+    public init(_ config: AudexHConfiguration) {
+        self.config = config
+        _languageModel.wrappedValue = NemotronHModel(config.language)
+        _audioEncoder.wrappedValue = AudexAudioEncoder(config.audio)
+        _audioProjector.wrappedValue = AudexAudioProjector(
+            audio: config.audio,
+            intermediateSize: config.audioProjectorIntermediateSize,
+            outputSize: config.language.hiddenSize,
+            normEps: config.audioProjectorNormEps)
+    }
+
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        languageModel.newCache(parameters: parameters)
+    }
+
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        languageModel(inputs, cache: cache)
+    }
+
+    private func forward(embeddings: MLXArray, cache: [KVCache]?) -> MLXArray {
+        languageModel(inputsEmbeds: embeddings, cache: cache)
+    }
+
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        guard input.image == nil, input.video == nil else {
+            throw VLMError.processing("Audex supports audio and text, not image or video input.")
+        }
+
+        let tokenShape = input.text.tokens.shape
+        guard tokenShape.count == 2, tokenShape[0] == 1 else {
+            throw VLMError.processing(
+                "Audex currently requires batch size 1; got \(tokenShape).")
+        }
+
+        var embeddings = languageModel.embedTokens(input.text.tokens)
+        if let audio = input.audio {
+            let audioFeatures: MLXArray
+            if let preEncoded = audio.preEncodedEmbedding {
+                audioFeatures =
+                    preEncoded.ndim == 2 ? preEncoded : preEncoded.reshaped(-1, preEncoded.dim(-1))
+            } else {
+                guard audio.sampleRate == config.soundTargetRate else {
+                    throw VLMError.processing(
+                        "Audex processor must provide \(config.soundTargetRate) Hz PCM; got \(audio.sampleRate) Hz."
+                    )
+                }
+                let clips =
+                    audio.waveform.ndim == 1
+                    ? audio.waveform.reshaped(1, -1) : audio.waveform
+                var melRows = [MLXArray]()
+                for i in 0 ..< clips.dim(0) {
+                    let pcm = clips[i].asType(.float32).asArray(Float.self)
+                    melRows.append(audexWhisperFeatures(pcm))
+                }
+                let mel = melRows.count == 1 ? melRows[0] : MLX.concatenated(melRows, axis: 0)
+                PrefillProgressReporter.reportCompletedUnits(1)
+                audioFeatures = audioProjector(audioEncoder(mel))
+                    .reshaped(-1, config.language.hiddenSize)
+            }
+            let mask = MLX.equal(input.text.tokens, MLXArray(Int32(config.soundTokenId)))
+            let count = mask.reshaped([-1]).asArray(Int.self).reduce(0, +)
+            guard count == audioFeatures.dim(0) else {
+                throw VLMError.processing(
+                    "Audex audio placeholder mismatch: prompt has \(count), encoder produced \(audioFeatures.dim(0))."
+                )
+            }
+            let expandedMask = MLX.broadcast(
+                mask.expandedDimensions(axis: -1), to: embeddings.shape)
+            embeddings = try gemma4MaskedScatter(
+                input: embeddings, mask: expandedMask,
+                source: audioFeatures.asType(embeddings.dtype))
+        }
+
+        let logits = try chunkedPrefillEmbedding(
+            inputEmbedding: embeddings, cache: cache,
+            prefillStepSize: windowSize ?? 512
+        ) { chunk in
+            forward(embeddings: chunk, cache: cache)
+        }
+        return .logits(LMOutput(logits: logits))
+    }
+
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        var languageWeights = [String: MLXArray]()
+        var result = [String: MLXArray]()
+        for (key, value) in weights {
+            if key.hasPrefix("audio_encoder.") || key.hasPrefix("audio_projector.") {
+                if key.hasPrefix("audio_encoder.conv"), key.hasSuffix(".weight"), value.ndim == 3 {
+                    result[key] = value.transposed(0, 2, 1)
+                } else {
+                    result[key] = value
+                }
+            } else {
+                languageWeights[key] = value
+            }
+        }
+        for (key, value) in languageModel.sanitize(weights: languageWeights) {
+            result["language_model.\(key)"] = value
         }
         return result
     }
@@ -563,57 +748,81 @@ public struct AudexProcessor: UserInputProcessor {
 
     public func prepare(input: UserInput) async throws -> LMInput {
         guard input.images.isEmpty, input.videos.isEmpty else {
-            throw VLMError.processing("Audex-2B accepts audio and text only.")
+            throw VLMError.processing("Audex accepts audio and text only.")
         }
         var clipRows = [[Float]]()
-        for audio in input.audios {
-            let pcm = try Self.waveform(audio)
-            let clipCount = max(1, Int(ceil(Double(max(1, pcm.count)) / Double(Self.clipSamples))))
-            for clipIndex in 0 ..< clipCount {
-                let start = clipIndex * Self.clipSamples
-                let end = min(start + Self.clipSamples, pcm.count)
-                var clip = start < end ? Array(pcm[start ..< end]) : [Float]()
-                if clip.count < Self.clipSamples {
-                    clip.append(contentsOf: repeatElement(0, count: Self.clipSamples - clip.count))
+        func appendClips(_ audios: [UserInput.Audio]) throws -> Int {
+            let initialCount = clipRows.count
+            for audio in audios {
+                let pcm = try Self.waveform(audio)
+                let clipCount = max(
+                    1, Int(ceil(Double(max(1, pcm.count)) / Double(Self.clipSamples))))
+                for clipIndex in 0 ..< clipCount {
+                    let start = clipIndex * Self.clipSamples
+                    let end = min(start + Self.clipSamples, pcm.count)
+                    var clip = start < end ? Array(pcm[start ..< end]) : [Float]()
+                    if clip.count < Self.clipSamples {
+                        clip.append(
+                            contentsOf: repeatElement(
+                                0, count: Self.clipSamples - clip.count))
+                    }
+                    clipRows.append(clip)
                 }
-                clipRows.append(clip)
             }
+            return clipRows.count - initialCount
         }
 
         var messages = DefaultMessageGenerator().generate(from: input)
-        var audioTokenCount = 0
-        if !clipRows.isEmpty {
-            audioTokenCount = clipRows.count * Self.tokensPerClip
-            // Render one special token through the chat template, then expand
-            // the resulting token ID below. Passing 750 concatenated textual
-            // markers through a BPE tokenizer is needlessly quadratic in the
-            // Swift tokenizer; the token stream is exactly the same.
-            let media = "<so_start><so_embedding><so_end>\n"
-            if let index = messages.indices.reversed().first(where: {
-                (messages[$0]["role"] as? String) == "user"
-            }) {
-                messages[index]["content"] = media + Self.contentText(messages[index]["content"])
-            } else {
-                messages.append(["role": "user", "content": media])
+        var audioTokenCounts = [Int]()
+        let media = "<so_start><so_embedding><so_end>\n"
+        switch input.prompt {
+        case .chat(let chat):
+            for (index, message) in chat.enumerated() where !message.audios.isEmpty {
+                let clipCount = try appendClips(message.audios)
+                audioTokenCounts.append(clipCount * Self.tokensPerClip)
+                guard messages.indices.contains(index) else {
+                    throw VLMError.processing(
+                        "Audex message generator changed the structured chat message count.")
+                }
+                messages[index]["content"] =
+                    media + Self.contentText(messages[index]["content"])
+            }
+        case .text, .messages:
+            let clipCount = try appendClips(input.audios)
+            if clipCount > 0 {
+                audioTokenCounts.append(clipCount * Self.tokensPerClip)
+                if let index = messages.indices.reversed().first(where: {
+                    (messages[$0]["role"] as? String) == "user"
+                }) {
+                    messages[index]["content"] =
+                        media + Self.contentText(messages[index]["content"])
+                } else {
+                    messages.append(["role": "user", "content": media])
+                }
             }
         }
 
         let renderedTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools, additionalContext: input.additionalContext)
         var tokens = [Int]()
-        tokens.reserveCapacity(renderedTokens.count + max(0, audioTokenCount - 1))
-        var expandedMarker = false
+        let totalAudioTokens = audioTokenCounts.reduce(0, +)
+        tokens.reserveCapacity(
+            renderedTokens.count + max(0, totalAudioTokens - audioTokenCounts.count))
+        var expandedMarkerCount = 0
         for token in renderedTokens {
-            if token == Self.soundTokenId, audioTokenCount > 0, !expandedMarker {
-                tokens.append(contentsOf: repeatElement(Self.soundTokenId, count: audioTokenCount))
-                expandedMarker = true
+            if token == Self.soundTokenId, expandedMarkerCount < audioTokenCounts.count {
+                tokens.append(
+                    contentsOf: repeatElement(
+                        Self.soundTokenId, count: audioTokenCounts[expandedMarkerCount]))
+                expandedMarkerCount += 1
             } else {
                 tokens.append(token)
             }
         }
-        if audioTokenCount > 0, !expandedMarker {
+        if expandedMarkerCount != audioTokenCounts.count {
             throw VLMError.processing(
-                "Audex tokenizer did not preserve <so_embedding> as token ID \(Self.soundTokenId).")
+                "Audex tokenizer preserved \(expandedMarkerCount)/\(audioTokenCounts.count) "
+                    + "<so_embedding> markers as token ID \(Self.soundTokenId).")
         }
         let tokenArray = MLXArray(tokens).expandedDimensions(axis: 0)
         let audio: LMInput.ProcessedAudio? =

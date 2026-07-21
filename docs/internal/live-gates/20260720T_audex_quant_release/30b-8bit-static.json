@@ -1,0 +1,20 @@
+{
+  "status": "PASS",
+  "bundle": "/Users/eric/models/OsaurusAI/Nemotron-Labs-Audex-30B-A3B-8bit",
+  "model_type": "nemotron_h_audex",
+  "source_model": "nvidia/Nemotron-Labs-Audex-30B-A3B",
+  "source_revision": "00f0afa02e8ec0a9afc88221e456a02591bfca4c",
+  "quantization": {
+    "group_size": 64,
+    "bits": 8,
+    "mode": "affine"
+  },
+  "weight_shards": 50,
+  "weight_bytes": 35290531729,
+  "tensor_count": 1219,
+  "quantized_module_count": 164,
+  "stacked_expert_group_count": 46,
+  "audio_tensor_count": 490,
+  "audio_precision": "source",
+  "audio_source_parity": "PASS"
+}
