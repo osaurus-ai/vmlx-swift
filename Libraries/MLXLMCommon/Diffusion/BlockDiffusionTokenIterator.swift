@@ -363,10 +363,24 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
                 tMin: options.tMin, tMax: options.tMax)
             let processed = logits.asType(.float32) / temperature
 
+            // No-empty-response guard. Block-diffusion collapses terse prompts (e.g. boolq's
+            // "Respond with one of: yes, no.") to an all-EOS first canvas → empty output, even though
+            // the model answers correctly whenever it emits anything. On the FIRST canvas, forbid EOS
+            // at position 0 so at least one content token is produced; later canvases end normally, so
+            // a genuinely complete reply can still stop. Mask only the SAMPLED copy — self-conditioning
+            // below keeps the UNMASKED `processed`, so the denoising dynamics stay natural and the
+            // position-0 content token is the model's real runner-up. (-1e9, not -inf, keeps entropy finite.)
+            var sampled = processed
+            if canvasesEmitted == 0 {
+                for eos in options.eosTokenIds {
+                    sampled[0, 0, eos] = MLXArray(Float(-1e9))
+                }
+            }
+
             let denoiserKey = nextRandomKey()
-            let denoiserCanvas = MLX.categorical(processed, key: denoiserKey).asType(.int32)
-            let argmaxCanvas = argMax(processed, axis: -1).asType(.int32)
-            let entropy = canvasTokenEntropy(processedLogits: processed)
+            let denoiserCanvas = MLX.categorical(sampled, key: denoiserKey).asType(.int32)
+            let argmaxCanvas = argMax(sampled, axis: -1).asType(.int32)
+            let entropy = canvasTokenEntropy(processedLogits: sampled)
             let acceptMask = entropyBoundAcceptMask(
                 tokenEntropy: entropy, entropyBound: options.entropyBound)
 
