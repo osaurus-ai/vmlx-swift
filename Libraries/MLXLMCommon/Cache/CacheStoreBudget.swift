@@ -3,6 +3,10 @@
 import Foundation
 import MLX
 
+#if canImport(Darwin)
+    import Darwin
+#endif
+
 /// How much of the host's remaining memory a single prefix-cache store may take.
 ///
 /// This is the engine-side projection of the user's memory-safety level. The
@@ -107,7 +111,47 @@ public enum CacheStoreBudget {
     public static func canStore(_ cache: [KVCache]) -> Bool {
         let liveBytes = cacheBytes(cache)
         guard liveBytes > 0 else { return true }
-        return canStore(cacheBytes: liveBytes)
+        let physicalFootprint = currentProcessPhysicalFootprintBytes()
+        let activeBytes = activeBytesForStoreBudget(
+            physicalFootprintBytes: physicalFootprint,
+            mlxActiveBytes: max(0, MLX.Memory.activeMemory)
+        )
+        let budgetBytes = Int(exactly: ProcessInfo.processInfo.physicalMemory)
+        let allowed = canStore(
+            cacheBytes: liveBytes,
+            activeBytes: activeBytes,
+            budgetBytes: budgetBytes
+        )
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            let source = physicalFootprint == nil ? "mlx_active_fallback" : "phys_footprint"
+            let budget = budgetBytes.map(String.init) ?? "unknown"
+            FileHandle.standardError.write(
+                Data(
+                    "[vmlx][cache/store-budget] cache=\(liveBytes) active=\(activeBytes) budget=\(budget) source=\(source) fraction=\(policy.headroomFraction) allowed=\(allowed)\n"
+                        .utf8
+                ))
+        }
+        return allowed
+    }
+
+    /// Resolve the process occupancy used by the store guard.
+    ///
+    /// `MLX.Memory.activeMemory` is allocator bookkeeping, not Activity Monitor
+    /// memory. With mmap-backed/JANG models it can remain near the logical model
+    /// size while macOS has reclaimed most cold pages. Charging that number as
+    /// physical occupancy silently disabled Safe Auto SSD checkpoints even when
+    /// the process had ample real headroom. `phys_footprint` is the kernel's
+    /// resident + compressed + IOKit accounting and is the number the host's RAM
+    /// safety gate and Activity Monitor expose. Keep MLX accounting only as a
+    /// conservative fallback on platforms where the kernel query is unavailable.
+    static func activeBytesForStoreBudget(
+        physicalFootprintBytes: UInt64?,
+        mlxActiveBytes: Int
+    ) -> Int {
+        if let physicalFootprintBytes {
+            return Int(clamping: physicalFootprintBytes)
+        }
+        return max(0, mlxActiveBytes)
     }
 
     /// Testable core: no MLX state, just the arithmetic.
@@ -118,7 +162,10 @@ public enum CacheStoreBudget {
     /// the host still has free.
     static func canStore(
         cacheBytes liveBytes: Int,
-        activeBytes: Int = max(0, MLX.Memory.activeMemory),
+        activeBytes: Int = activeBytesForStoreBudget(
+            physicalFootprintBytes: currentProcessPhysicalFootprintBytes(),
+            mlxActiveBytes: max(0, MLX.Memory.activeMemory)
+        ),
         budgetBytes: Int? = Int(exactly: ProcessInfo.processInfo.physicalMemory),
         policy: CacheStorePolicy = CacheStoreBudget.policy
     ) -> Bool {
@@ -138,3 +185,28 @@ public enum CacheStoreBudget {
         return liveBytes <= allowance / materializationFactor
     }
 }
+
+#if canImport(Darwin)
+    private func currentProcessPhysicalFootprintBytes() -> UInt64? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(
+                    mach_task_self_,
+                    task_flavor_t(TASK_VM_INFO),
+                    $0,
+                    &count
+                )
+            }
+        }
+        guard result == KERN_SUCCESS else { return nil }
+        return UInt64(info.phys_footprint)
+    }
+#else
+    private func currentProcessPhysicalFootprintBytes() -> UInt64? {
+        nil
+    }
+#endif
