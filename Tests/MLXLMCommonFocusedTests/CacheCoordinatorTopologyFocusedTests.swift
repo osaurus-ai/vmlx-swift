@@ -1207,8 +1207,8 @@ struct CacheCoordinatorTopologyFocusedTests {
         return url
     }
 
-    @Test("Gemma4 processor normalizes tool schemas before applying chat template")
-    func gemma4ProcessorNormalizesToolSchemasBeforeChatTemplate() throws {
+    @Test("Gemma4 processor normalizes tools and wires text-only stable boundaries")
+    func gemma4ProcessorNormalizesToolsAndWiresStableBoundaries() throws {
         let sourceURL = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -1217,6 +1217,10 @@ struct CacheCoordinatorTopologyFocusedTests {
         let source = try String(contentsOf: sourceURL)
         #expect(source.contains("normalizedToolsForChatTemplate(input.tools)"))
         #expect(source.contains("tools: chatTemplateTools"))
+        #expect(source.contains("input.images.isEmpty && input.audios.isEmpty"))
+        #expect(source.contains("canonicalChatCacheBoundaries("))
+        #expect(source.contains("cachePrefixTokenCounts: cacheBoundaries.all"))
+        #expect(source.contains("cacheStablePrefixTokenCounts: cacheBoundaries.stable"))
     }
 }
 

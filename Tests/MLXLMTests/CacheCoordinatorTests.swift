@@ -6,6 +6,125 @@ import Testing
 
 // MARK: - CacheCoordinator Tests
 
+@Test func coordinatorValidatedDiskEntryRequiresCurrentProcessProof() throws {
+    try MLXMetalTestLock.withLock {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("validated-stable-prefix-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let config = CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: 1.0,
+            diskCacheDir: tmp,
+            modelKey: "validated-stable-prefix")
+        let tokens = [71, 72, 73, 74]
+        let keys = MLXArray.ones([1, 1, tokens.count, 4])
+        let values = MLXArray.ones([1, 1, tokens.count, 4]) * 2.0
+
+        let writer = CacheCoordinator(config: config)
+        #expect(!writer.hasValidatedDiskEntry(tokens: tokens))
+        writer.storeAfterGeneration(
+            promptTokens: tokens,
+            perLayerData: [(keys: keys, values: values)],
+            ssmStates: nil,
+            cache: nil)
+        #expect(writer.hasValidatedDiskEntry(tokens: tokens))
+
+        let restarted = CacheCoordinator(config: config)
+        #expect(!restarted.hasValidatedDiskEntry(tokens: tokens),
+            "an inherited filename/index is not current-process validation")
+        guard case .hit = restarted.fetch(tokens: tokens) else {
+            Issue.record("the inherited stable prefix should deserialize from L2")
+            return
+        }
+        #expect(restarted.hasValidatedDiskEntry(tokens: tokens))
+
+        let files = try FileManager.default.contentsOfDirectory(
+            at: restarted.diskCache!.cacheDir,
+            includingPropertiesForKeys: nil)
+        let payload = try #require(files.first { $0.pathExtension == "safetensors" })
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: 5)],
+            ofItemAtPath: payload.path)
+        #expect(!restarted.hasValidatedDiskEntry(tokens: tokens),
+            "a changed file fingerprint must revoke the warm-store fast path")
+    }
+}
+
+@Test func coordinatorValidatedHybridEntryRequiresCompleteCompanionPair() {
+    MLXMetalTestLock.withLock {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("validated-hybrid-prefix-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: 1.0,
+            diskCacheDir: tmp,
+            modelKey: "validated-hybrid-prefix"))
+        coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true)
+        let tokens = [81, 82, 83, 84]
+        let keys = MLXArray.ones([1, 1, tokens.count, 4])
+        let values = MLXArray.ones([1, 1, tokens.count, 4]) * 2.0
+        coordinator.storeAfterGeneration(
+            promptTokens: tokens,
+            perLayerData: [(keys: keys, values: values)],
+            ssmStates: nil,
+            cache: nil)
+        #expect(!coordinator.hasValidatedDiskEntry(tokens: tokens),
+            "validated KV alone must not hide a missing recurrent companion")
+
+        coordinator.storeAfterGeneration(
+            promptTokens: tokens,
+            perLayerData: [(keys: keys, values: values)],
+            ssmStates: [MLXArray.ones([1, 4])],
+            cache: nil)
+        #expect(coordinator.hasValidatedDiskEntry(tokens: tokens))
+    }
+}
+
+@Test func coordinatorPreferredStableBoundarySurvivesBoundedDiskIndex() throws {
+    try MLXMetalTestLock.withLock {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("preferred-stable-prefix-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: 0.1,
+            diskCacheDir: tmp,
+            modelKey: "preferred-stable-prefix"))
+        let disk = try #require(coordinator.diskCache)
+        let arrays = ["data": MLXArray.ones([1, 1])]
+        let requestTokens = Array(0 ..< 160)
+        let stableBoundary = 8
+        disk.store(
+            tokens: Array(requestTokens.prefix(stableBoundary)),
+            arrays: arrays)
+
+        // More than the index probe's 128 distinct larger lengths makes the
+        // stable entry disappear from the ordinary candidate-length query.
+        // None of these decoys matches the active request prefix.
+        for count in 9 ... 137 {
+            disk.store(tokens: Array(repeating: -count, count: count), arrays: arrays)
+        }
+        #expect(!disk.candidateTokenCounts(maxTokens: requestTokens.count)
+            .contains(stableBoundary))
+
+        guard case .hit(let matched, let remaining, let detail, _, _, _) =
+            coordinator.fetch(
+                tokens: requestTokens,
+                preferredDiskBoundaries: [stableBoundary])
+        else {
+            Issue.record("processor-proven stable boundary should bypass the bounded index window")
+            return
+        }
+        #expect(matched == stableBoundary)
+        #expect(remaining == Array(requestTokens.dropFirst(stableBoundary)))
+        #expect(detail == .disk)
+    }
+}
+
 /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
 /// Verify the paged-incompatible short-circuit. With `setPagedIncompatible(true)`
 /// a fetch should miss the paged tier even when an exact-prefix block

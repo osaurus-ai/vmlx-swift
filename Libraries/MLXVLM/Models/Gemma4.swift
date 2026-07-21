@@ -1545,6 +1545,19 @@ public struct Gemma4Processor: UserInputProcessor {
             tools: chatTemplateTools,
             additionalContext: input.additionalContext
         )
+        // Text-only Gemma 4 requests share the same stable system/tool rail
+        // across unrelated chats. Derive it through the exact active template
+        // and fail closed unless it is a real token prefix. Media requests are
+        // intentionally excluded: their placeholder expansion and media salt
+        // require separate live cache proof before any cross-session claim.
+        let cacheBoundaries = input.images.isEmpty && input.audios.isEmpty
+            ? canonicalChatCacheBoundaries(
+                tokenizer: tokenizer,
+                messages: messages,
+                tools: chatTemplateTools,
+                additionalContext: input.additionalContext,
+                promptTokens: tokens)
+            : CanonicalChatCacheBoundaries(all: [], stable: [])
 
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {
@@ -1657,6 +1670,8 @@ public struct Gemma4Processor: UserInputProcessor {
             image: processedImage,
             audio: processedAudio,
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+            cachePrefixTokenCounts: cacheBoundaries.all,
+            cacheStablePrefixTokenCounts: cacheBoundaries.stable,
             toolSchemas: input.tools)
     }
 

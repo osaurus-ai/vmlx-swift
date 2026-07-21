@@ -73,6 +73,12 @@ public struct LMInput {
     /// actually contains.
     public let cachePrefixTokenCounts: [Int]
 
+    /// Subset of ``cachePrefixTokenCounts`` representing stable leading
+    /// system/developer instructions and tool schemas. These boundaries are
+    /// deliberately persisted for reuse by unrelated new chat sessions and may
+    /// require an architecture-native rederive when a cache cannot be trimmed.
+    public let cacheStablePrefixTokenCounts: [Int]
+
     /// Representation of tokenized input text.
     public struct Text {
 
@@ -180,12 +186,14 @@ public struct LMInput {
         tokenIds: [Int]? = nil,
         cacheScopeSalt: String? = nil,
         cachePrefixTokenCounts: [Int] = [],
+        cacheStablePrefixTokenCounts: [Int] = [],
         toolSchemas: [ToolSpec]? = nil
     ) {
         self.init(
             text: .init(tokens: tokens, mask: mask, tokenIds: tokenIds),
             cacheScopeSalt: cacheScopeSalt,
             cachePrefixTokenCounts: cachePrefixTokenCounts,
+            cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
             toolSchemas: toolSchemas)
     }
 
@@ -196,6 +204,7 @@ public struct LMInput {
         mediaTokenIds: [Int]? = nil,
         cacheScopeSalt: String? = nil,
         cachePrefixTokenCounts: [Int] = [],
+        cacheStablePrefixTokenCounts: [Int] = [],
         toolSchemas: [ToolSpec]? = nil
     ) {
         self.text = text
@@ -205,6 +214,7 @@ public struct LMInput {
         self.mediaTokenIds = mediaTokenIds
         self.cacheScopeSalt = cacheScopeSalt
         self.cachePrefixTokenCounts = cachePrefixTokenCounts
+        self.cacheStablePrefixTokenCounts = cacheStablePrefixTokenCounts
         self.toolSchemas = toolSchemas
     }
 
@@ -217,6 +227,7 @@ public struct LMInput {
             mediaTokenIds: mediaTokenIds,
             cacheScopeSalt: cacheScopeSalt,
             cachePrefixTokenCounts: cachePrefixTokenCounts,
+            cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
             toolSchemas: schemas)
     }
 }

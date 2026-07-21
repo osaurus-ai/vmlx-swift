@@ -36,6 +36,79 @@ public protocol GenerationPromptControllableTokenizer: Tokenizer {
     ) throws -> [Int]
 }
 
+/// Exact chat-template prefix boundaries that can be persisted independently.
+///
+/// `all` includes the canonical no-generation-prompt history boundary used by a
+/// growing conversation. `stable` is the subset rendered from only the leading
+/// system/developer instructions plus the request's tool schemas. Because the
+/// stable boundary excludes the current user turn, a different new chat can
+/// reuse the shared system/tool prefill from L2 instead of warming from token
+/// zero again.
+///
+/// Every returned boundary is proven by token equality to be an actual prefix
+/// of the active prompt. Templates that conditionally reorder or rewrite that
+/// material therefore fail closed and return no such boundary.
+public struct CanonicalChatCacheBoundaries: Sendable, Equatable {
+    public let all: [Int]
+    public let stable: [Int]
+
+    public init(all: [Int], stable: [Int]) {
+        self.all = all
+        self.stable = stable
+    }
+}
+
+/// Derive safe cache boundaries from the exact active chat template.
+public func canonicalChatCacheBoundaries(
+    tokenizer: any Tokenizer,
+    messages: [[String: any Sendable]],
+    tools: [[String: any Sendable]]?,
+    additionalContext: [String: any Sendable]?,
+    promptTokens: [Int]
+) -> CanonicalChatCacheBoundaries {
+    guard let controllable = tokenizer as? any GenerationPromptControllableTokenizer else {
+        return CanonicalChatCacheBoundaries(all: [], stable: [])
+    }
+
+    func exactPrefixBoundary(
+        messages boundaryMessages: [[String: any Sendable]]
+    ) -> Int? {
+        guard let tokens = try? controllable.applyChatTemplate(
+            messages: boundaryMessages,
+            tools: tools,
+            additionalContext: additionalContext,
+            addGenerationPrompt: false),
+            !tokens.isEmpty,
+            tokens.count < promptTokens.count,
+            promptTokens.prefix(tokens.count).elementsEqual(tokens)
+        else {
+            return nil
+        }
+        return tokens.count
+    }
+
+    // Only the leading instruction rail is stable across unrelated chats.
+    // Tool schemas remain present because they are a separate template input;
+    // this also permits a tool-only stable prefix when a template emits one for
+    // an empty message list. Exact-prefix validation below is the safety gate.
+    let stableMessages = Array(messages.prefix { message in
+        guard let role = message["role"] as? String else { return false }
+        return role == "system" || role == "developer"
+    })
+    let hasStableMaterial = !stableMessages.isEmpty || tools?.isEmpty == false
+    let stable = hasStableMaterial
+        ? exactPrefixBoundary(messages: stableMessages).map { [$0] } ?? []
+        : []
+    let history = exactPrefixBoundary(messages: messages).map { [$0] } ?? []
+    let all = Array(Set(stable + history)).sorted()
+    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+        FileHandle.standardError.write(Data(
+            "[vmlx][cache/boundaries] prompt=\(promptTokens.count) stable=\(stable) all=\(all)\n".utf8
+        ))
+    }
+    return CanonicalChatCacheBoundaries(all: all, stable: stable)
+}
+
 extension Tokenizer {
     public func encode(text: String) -> [Int] {
         encode(text: text, addSpecialTokens: true)

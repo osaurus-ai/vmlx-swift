@@ -96,6 +96,65 @@ row stays **PARTIAL** until a rebuilt Release app visibly proves suffix-only
 prefill, coherent output, both `disk-store SKIP` and `ssm-store SKIP`
 telemetry, and stable payload bytes.
 
+### Stable system/tool prefix across unrelated new chats
+
+The same isolated Release app subsequently reproduced a second, independent
+SSD miss after the exact-boundary rollback was removed. With Prefix On, paged
+RAM Off, Disk Cache On, native KV, SSM rederive On, Ornith MXFP8, and Thinking
+Off visible in the UI, an unrelated new chat showed `Prefill 1536/2420` and
+logged `MISS all tiers tokens=2420 skipExactDisk=true`. Prior turns had stored
+their complete prompt/history boundaries, but none had stored the leading
+system instructions plus tool schemas without the previous user message.
+Content-addressed lookup therefore had no prefix shared by the new session and
+correctly prefetched from zero.
+
+The current candidate derives two separate exact chat-template boundaries:
+
+- canonical full history without the assistant generation rail; and
+- the leading system/developer instructions plus the same tool schemas, also
+  without the generation rail.
+
+Both are accepted only when their token IDs are a byte-for-byte prefix of the
+active prompt; templates that reorder or conditionally rewrite the content fail
+closed. The stable boundary is passed explicitly to the disk probe so it cannot
+fall out of the index's 128-largest-length scan. Dense caches trim to it.
+Disk-backed rotating Gemma SWA and Qwen/Ornith/Bonsai GDN/SSM topologies force
+an architecture-native boundary rederive rather than flattening typed state.
+Gemma 4 is wired explicitly through its custom `Gemma4Processor` for text-only
+requests; Qwen3VL is likewise wired only on its text branch. Their image/audio
+placeholder paths remain excluded until separate media-salt restore proof.
+After an entry has actually been written or deserialized in the current
+process, matching file fingerprint plus SQLite metadata suppresses redundant
+warm-turn rederive/write; inherited filenames alone are not trusted.
+
+Current edited-tree evidence:
+
+- 5/5 canonical-template boundary tests pass: system+tools, tools-only,
+  non-prefix fail-closed behavior, no bare-BOS persistence when neither stable
+  instruction nor tool material exists, and distinct stable token prefixes
+  after a template configuration change;
+- 17/17 BatchEngine/TokenIterator/Native-MTP cache wiring tests pass;
+- the Metal-backed current-process validation test passes, including fresh
+  process false-before-fetch, true-after-deserialize, and false-after external
+  fingerprint mutation;
+- the hybrid validation test proves a current-process-validated KV file alone
+  cannot suppress healing when the matching complete recurrent sidecar is
+  absent, then accepts the same boundary after the companion pair is stored;
+- the bounded-index regression stores more than 128 larger candidate lengths,
+  proves the stable boundary is absent from the normal scan, and restores it
+  only through the processor-proven preferred-boundary path;
+- 42/42 cache-topology tests, 10/10 recurrent companion tests, and 8/8 disk
+  cache tests pass after the validation-pair change; the Gemma processor source
+  row additionally proves normalized tools and both text-only boundary fields
+  reach `LMInput`.
+
+Status remains **PARTIAL**. Required live closure is an isolated Release app on
+the exact candidate pin showing cold store, unrelated-new-chat partial L2 hit,
+full app restart partial L2 hit, truthful visible suffix-only prefill/TTFT, and
+coherent output on Ornith/Qwen hybrid plus Gemma 4 JANG_4M rotating-SWA. Qwen
+3.5 VL media reuse remains a separate media-salt/placeholder row; the text path
+shares the stable-boundary implementation, but no media claim is made here.
+
 | Family / bundle | Architecture and runtime | Current result | Current evidence | Missing before closure |
 |---|---|---|---|---|
 | Qwen 3.5 dense — `dealign.ai/Qwen3.6-27B-JANG_4M-CRACK` | 64 layers: 48 linear-attention + 16 full-attention; JANG_4M | PARTIAL | Thinking visibly off. Bundle-default row returned the requested two lines at TTFT 1.78 s, 22.5 tok/s, 22 tokens. Explicit greedy Settings row returned the requested two lines at TTFT 1.87 s, 22.5 tok/s, 24 tokens. No tool calls or reasoning deltas. | Multi-turn, required/automatic/no-tool/tool-error rows; real image/video; SSD cold/full/partial/restart; paged-on hot/eviction; explicit TQ on/off; Activity Monitor per row. |

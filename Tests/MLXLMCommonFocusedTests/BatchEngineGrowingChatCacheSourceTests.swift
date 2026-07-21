@@ -56,6 +56,10 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(!source.contains("let hasPathDependentLayer = slot.cache.contains"))
         #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptCacheSnapshot)"))
         #expect(source.contains("Skipped history-boundary cache rederive after trim miss for slot"))
+        #expect(source.contains("cacheStablePrefixTokenCounts.contains(boundary)"))
+        #expect(source.contains("forceRederive: isStableBoundary"))
+        #expect(source.contains(#""stable-system-tool-boundary""#))
+        #expect(source.contains("coordinator.hasValidatedDiskEntry("))
         #expect(!source.contains("let unsafePartial = !remaining.isEmpty &&\n                        (hasMediaContent || hasSSMLayer)"))
     }
 
@@ -96,6 +100,9 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(!source.contains("let hasPathDependentLayer = self.cache.contains"))
         #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot)"))
         #expect(source.contains("TokenIterator: skipped history-boundary cache rederive after trim miss"))
+        #expect(source.contains("cacheStablePrefixTokenCounts.contains(boundary)"))
+        #expect(source.contains("allowDiskBackedRederive: isStableBoundary"))
+        #expect(source.contains("coordinator.hasValidatedDiskEntry("))
         #expect(!source.contains("let unsafePartial = !remainingTokens.isEmpty &&\n                        (hasMediaContent || hasSSMLayer)"))
     }
 
@@ -118,6 +125,9 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("var sharedPromptRederivedStates"))
         #expect(source.contains("reDeriveAndStoreSSMStatesAtPromptBoundaries("))
         #expect(source.contains("persistCapturedStatesToDisk: false"))
+        #expect(source.contains("cacheStablePrefixTokenCounts.contains(boundary)"))
+        #expect(source.contains("allowDiskBackedRederive: isStableBoundary"))
+        #expect(source.contains("coordinator.hasValidatedDiskEntry("))
     }
 
     @Test("token iterator drains MLX around cache store before completion info")

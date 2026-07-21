@@ -336,6 +336,33 @@ public final class DiskCache: @unchecked Sendable {
         }
     }
 
+    /// Whether this process has already proved that the content-addressed
+    /// entry is intact and matches its SQLite metadata.
+    ///
+    /// This is intentionally stricter than a filename/index existence check.
+    /// A fresh process returns `false` until `fetch` deserializes the payload;
+    /// a successful store also validates it. Stable system/tool boundaries can
+    /// use this to avoid a second architecture rederive and serialization at
+    /// the end of every warm request without trusting inherited or stale files.
+    public func hasValidatedEntry(tokens: [Int], mediaSalt: String? = nil) -> Bool {
+        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
+        let url = safetensorsURL(for: hash)
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let validated = validatedFiles[hash],
+              let current = _fileFingerprint(url: url),
+              current == validated,
+              current.size > 0,
+              let indexed = _entryMetadataLocked(hash: hash),
+              indexed.tokenCount == tokens.count,
+              indexed.fileSize == current.size
+        else {
+            return false
+        }
+        return true
+    }
+
     /// Candidate prompt-boundary lengths currently present in the disk index.
     ///
     /// The disk tier is content-addressed by the full token prefix hash, so a

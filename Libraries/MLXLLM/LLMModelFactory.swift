@@ -1198,7 +1198,8 @@ private struct LLMUserInputProcessor: UserInputProcessor {
         do {
             let promptTokens = try tokenizer.applyChatTemplate(
                 messages: messages, tools: input.tools, additionalContext: additionalContext)
-            let cachePrefixTokenCounts = canonicalHistoryCacheBoundaries(
+            let cacheBoundaries = canonicalChatCacheBoundaries(
+                tokenizer: tokenizer,
                 messages: messages,
                 tools: input.tools,
                 additionalContext: additionalContext,
@@ -1208,7 +1209,8 @@ private struct LLMUserInputProcessor: UserInputProcessor {
                 tokens: MLXArray(promptTokens),
                 tokenIds: promptTokens,
                 cacheScopeSalt: cacheScopeSalt(from: additionalContext),
-                cachePrefixTokenCounts: cachePrefixTokenCounts,
+                cachePrefixTokenCounts: cacheBoundaries.all,
+                cacheStablePrefixTokenCounts: cacheBoundaries.stable,
                 toolSchemas: input.tools)
         } catch TokenizerError.missingChatTemplate {
             print(
@@ -1290,32 +1292,6 @@ private struct LLMUserInputProcessor: UserInputProcessor {
             compacted.append(contentsOf: messages[(latestUserIndex + 1)...])
         }
         return compacted
-    }
-
-    private func canonicalHistoryCacheBoundaries(
-        messages: [[String: any Sendable]],
-        tools: [[String: any Sendable]]?,
-        additionalContext: [String: any Sendable]?,
-        promptTokens: [Int]
-    ) -> [Int] {
-        guard let controllable = tokenizer as? any GenerationPromptControllableTokenizer else {
-            return []
-        }
-        guard let historyTokens = try? controllable.applyChatTemplate(
-            messages: messages,
-            tools: tools,
-            additionalContext: additionalContext,
-            addGenerationPrompt: false)
-        else {
-            return []
-        }
-        guard !historyTokens.isEmpty,
-              historyTokens.count < promptTokens.count,
-              promptTokens.prefix(historyTokens.count).elementsEqual(historyTokens)
-        else {
-            return []
-        }
-        return [historyTokens.count]
     }
 
     static func defaultContext(

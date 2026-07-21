@@ -24,32 +24,6 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         self.tokenizer = tokenizer
     }
 
-    private func canonicalHistoryCacheBoundaries(
-        messages: [[String: any Sendable]],
-        tools: [[String: any Sendable]]?,
-        additionalContext: [String: any Sendable]?,
-        promptTokens: [Int]
-    ) -> [Int] {
-        guard let controllable = tokenizer as? any GenerationPromptControllableTokenizer else {
-            return []
-        }
-        guard let historyTokens = try? controllable.applyChatTemplate(
-            messages: messages,
-            tools: tools,
-            additionalContext: additionalContext,
-            addGenerationPrompt: false)
-        else {
-            return []
-        }
-        guard !historyTokens.isEmpty,
-              historyTokens.count < promptTokens.count,
-              promptTokens.prefix(historyTokens.count).elementsEqual(historyTokens)
-        else {
-            return []
-        }
-        return [historyTokens.count]
-    }
-
     private func preprocess(image: CIImage, resizedSize: CGSize) -> CIImage {
         image
             .toSRGB()
@@ -167,7 +141,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         if input.images.isEmpty, input.videos.isEmpty {
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: promptArray).asType(.int8)
-            let cachePrefixTokenCounts = canonicalHistoryCacheBoundaries(
+            let cacheBoundaries = canonicalChatCacheBoundaries(
+                tokenizer: tokenizer,
                 messages: messages,
                 tools: input.tools,
                 additionalContext: input.additionalContext,
@@ -175,7 +150,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
-                cachePrefixTokenCounts: cachePrefixTokenCounts,
+                cachePrefixTokenCounts: cacheBoundaries.all,
+                cacheStablePrefixTokenCounts: cacheBoundaries.stable,
                 toolSchemas: input.tools)
         }
 

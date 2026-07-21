@@ -149,7 +149,11 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             // prior turns and must not be overwritten.
             self.cache.allSatisfy({ $0.offset == 0 })
         {
-            switch coordinator.fetch(tokens: promptTokenIds, mediaSalt: mediaSalt) {
+            switch coordinator.fetch(
+                tokens: promptTokenIds,
+                mediaSalt: mediaSalt,
+                preferredDiskBoundaries: input.cacheStablePrefixTokenCounts
+            ) {
             case .hit(let matchedTokens, let remainingTokens, _, let blocks, _, let diskArrays):
                 var restored = false
                 if !blocks.isEmpty {
