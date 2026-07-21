@@ -2336,12 +2336,20 @@ public struct TokenIterator: TokenIteratorProtocol {
 
                 for boundary in Set(cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokenIds.count {
-                    let boundaryTokens = Array(promptTokenIds.prefix(boundary))
                     let isStableBoundary = originalInput
                         .cacheStablePrefixTokenCounts.contains(boundary)
                     if usesCanonicalHybridBoundary, !isStableBoundary {
                         continue
                     }
+                    // Path-dependent hybrid caches reject exact disk restores
+                    // unless an N-1 recurrent seed exists. Store the stable
+                    // system/tool prefix one token short so the first new-chat
+                    // warmup can restore it instead of starting at token zero.
+                    let storeBoundary = isStableBoundary
+                        && requiresDiskBackedRestore && boundary > 1
+                        ? boundary - 1
+                        : boundary
+                    let boundaryTokens = Array(promptTokenIds.prefix(storeBoundary))
                     if isStableBoundary,
                        coordinator.hasValidatedDiskEntry(
                         tokens: boundaryTokens,

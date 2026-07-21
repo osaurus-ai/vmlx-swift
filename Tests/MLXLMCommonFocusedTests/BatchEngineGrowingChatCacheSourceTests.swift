@@ -59,6 +59,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("cacheStablePrefixTokenCounts.contains(boundary)"))
         #expect(source.contains("forceRederive: isStableBoundary"))
         #expect(source.contains(#""stable-system-tool-boundary""#))
+        #expect(source.contains("let storeBoundary = isStableBoundary"))
+        #expect(source.contains(#""stable-system-tool-safe-seed""#))
         #expect(source.contains("coordinator.hasValidatedDiskEntry("))
         #expect(!source.contains("let unsafePartial = !remaining.isEmpty &&\n                        (hasMediaContent || hasSSMLayer)"))
     }
@@ -102,6 +104,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("TokenIterator: skipped history-boundary cache rederive after trim miss"))
         #expect(source.contains("cacheStablePrefixTokenCounts.contains(boundary)"))
         #expect(source.contains("allowDiskBackedRederive: isStableBoundary"))
+        #expect(source.contains("let storeBoundary = isStableBoundary"))
         #expect(source.contains("coordinator.hasValidatedDiskEntry("))
         #expect(!source.contains("let unsafePartial = !remainingTokens.isEmpty &&\n                        (hasMediaContent || hasSSMLayer)"))
     }

@@ -2920,7 +2920,18 @@ public actor BatchEngine {
                     if usesCanonicalHybridBoundary, !isStableBoundary {
                         continue
                     }
-                    let boundaryTokens = Array(promptTokens.prefix(boundary))
+                    // Exact disk restores are deliberately rejected for
+                    // path-dependent hybrid caches: GDN/Mamba/CCA needs an
+                    // N-1 recurrent seed before the final token is re-fed.
+                    // Persist the processor-proven stable prefix one token
+                    // short so a brand-new chat can warm from SSD immediately
+                    // instead of doing one full cold prefill just to create
+                    // that seed for the *next* chat.
+                    let storeBoundary = isStableBoundary
+                        && requiresDiskBackedRestore && boundary > 1
+                        ? boundary - 1
+                        : boundary
+                    let boundaryTokens = Array(promptTokens.prefix(storeBoundary))
                     if isStableBoundary,
                        coordinator.hasValidatedDiskEntry(
                         tokens: boundaryTokens,
@@ -2939,7 +2950,9 @@ public actor BatchEngine {
                             tokens: boundaryTokens,
                             snapshot: snapshot,
                             label: isStableBoundary
-                                ? "stable-system-tool-boundary"
+                                ? (storeBoundary == boundary
+                                    ? "stable-system-tool-boundary"
+                                    : "stable-system-tool-safe-seed")
                                 : "history-boundary")
                     }
                 }

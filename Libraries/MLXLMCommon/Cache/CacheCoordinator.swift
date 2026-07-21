@@ -559,9 +559,20 @@ public final class CacheCoordinator: @unchecked Sendable {
             // largest historical prompt lengths. Merge processor-proven
             // boundaries back into the probe set before sorting; each remains
             // content-address checked against this request's exact token prefix.
+            // A path-dependent hybrid restore cannot consume an exact prompt
+            // boundary without an N-1 recurrent seed. Stable system/tool
+            // checkpoints are therefore persisted one token short. Keep that
+            // processor-proven seed in the probe set even after the bounded
+            // disk index has accumulated more than 128 larger entries.
+            let preferredSafeSeeds = skipExactDiskBoundary
+                ? preferredDiskBoundaries.compactMap { boundary in
+                    boundary > 1 ? boundary - 1 : nil
+                }
+                : []
             let candidateBoundaries = Set(
                 diskCache.candidateTokenCounts(maxTokens: tokens.count)
                     + preferredDiskBoundaries
+                    + preferredSafeSeeds
             ).sorted(by: >)
             for boundary in candidateBoundaries {
                 // `skipExactDiskBoundary` is a correctness requirement for
