@@ -18,6 +18,20 @@ Osaurus wiring PR: https://github.com/osaurus-ai/osaurus/pull/2116
 - https://huggingface.co/OsaurusAI/Nemotron-Labs-Audex-30B-A3B-6bit
 - https://huggingface.co/OsaurusAI/Nemotron-Labs-Audex-30B-A3B-8bit
 
+Every repository is public and byte-identical to its locally tested bundle.
+Immutable Hub revisions, respectively in the order above:
+
+- `2bfd4e593d6fc3e3ab5434e39a8c45fb9c7839de`
+- `3ac9e2b8055aff74e0a4167056e4aefd1106f147`
+- `3a6870afebc419f72f644aeab14a33e622bb8f2b`
+- `28bd7751c7d186802eb2b60286b778b1c8a47f45`
+- `5ee5f622cd6752a9bfcecf078388c416944049d3`
+- `edf93021d76b20e11234b0482fa6d36eef2d7fce`
+
+The post-upload check matched filenames, sizes, and SHA-256 content for every
+bundle file. This proves the public bytes are the same bytes exercised below;
+it does not substitute for a fresh-download inference run.
+
 The language decoder is MLX affine 4/6/8-bit, group size 64. NV-Whisper and
 the audio projector remain source precision. The 30B converter pre-stacks all
 46 routed-expert projection groups before quantization.

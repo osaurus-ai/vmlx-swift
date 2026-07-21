@@ -40,6 +40,21 @@ Destination model IDs:
 | 2B | `OsaurusAI/Nemotron-Labs-Audex-2B-4bit` | `OsaurusAI/Nemotron-Labs-Audex-2B-6bit` | `OsaurusAI/Nemotron-Labs-Audex-2B-8bit` |
 | 30B-A3B | `OsaurusAI/Nemotron-Labs-Audex-30B-A3B-4bit` | `OsaurusAI/Nemotron-Labs-Audex-30B-A3B-6bit` | `OsaurusAI/Nemotron-Labs-Audex-30B-A3B-8bit` |
 
+All six repositories are public. A post-upload verifier compared every local
+bundle file with its immutable Hub revision: filename and byte size for every
+file, LFS SHA-256 for large objects, and downloaded raw-content SHA-256 for
+ordinary Git objects. The Hub-created `.gitattributes` file is the only remote
+file not present in the local conversion directory.
+
+| Bundle | Hub revision | Bundle files | Bundle bytes | Remote manifest |
+| --- | --- | ---: | ---: | --- |
+| 2B 4-bit | `2bfd4e593d6fc3e3ab5434e39a8c45fb9c7839de` | 21 | 2,615,556,389 | PASS |
+| 2B 6-bit | `3ac9e2b8055aff74e0a4167056e4aefd1106f147` | 22 | 3,178,117,360 | PASS |
+| 2B 8-bit | `3a6870afebc419f72f644aeab14a33e622bb8f2b` | 22 | 3,740,678,520 | PASS |
+| 30B 4-bit | `28bd7751c7d186802eb2b60286b778b1c8a47f45` | 46 | 19,354,782,572 | PASS |
+| 30B 6-bit | `5ee5f622cd6752a9bfcecf078388c416944049d3` | 70 | 27,346,830,800 | PASS |
+| 30B 8-bit | `edf93021d76b20e11234b0482fa6d36eef2d7fce` | 70 | 35,338,878,501 | PASS |
+
 All six outputs use MLX affine quantization with group size 64. Only the
 language decoder is quantized. `audio_encoder.*` and `audio_projector.*`
 remain in their source precision.
@@ -118,6 +133,10 @@ The source 30B config contains the non-JSON literal `Infinity` in
 
 Machine-readable reports are under
 `docs/internal/live-gates/20260720T_audex_quant_release/`.
+
+The remote-manifest result proves that each public repository contains the
+same bundle bytes exercised locally. It is not a claim that six separate fresh
+Hub downloads were each executed through inference.
 
 ## 4. Live runtime matrix
 
