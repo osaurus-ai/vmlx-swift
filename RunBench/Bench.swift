@@ -301,6 +301,10 @@ struct Bench {
             try await runDSV4AgenticToolCheck(modelPath: modelPath, maxNew: maxNew)
             return
         }
+        if (env["BENCH_AGENTIC_TOOL"] ?? "0") == "1" {
+            try await runDSV4AgenticToolCheck(modelPath: modelPath, maxNew: maxNew)
+            return
+        }
 
         // BENCH_REASONING_TURN_MATRIX=1: generic BatchEngine multi-turn
         // reasoning gate. It keeps one loaded model, appends assistant
@@ -2700,15 +2704,20 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     print("Reasoning stamp: \(context.configuration.reasoningParserName ?? "nil")")
     print("Native MTP depth: \(nativeMTPDepth.map(String.init) ?? "off")")
 
+    let usePagedCache = env["BENCH_GROWING_CACHE_PAGED"] != "0"
+    let enableDiskCache = env["BENCH_GROWING_CACHE_DISK"] != "0"
     let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
-        usePagedCache: true,
-        enableDiskCache: true,
+        usePagedCache: usePagedCache,
+        enableDiskCache: enableDiskCache,
         pagedBlockSize: 64,
         maxCacheBlocks: 512,
         diskCacheMaxGB: 4.0,
         diskCacheDir: cacheDir,
         ssmMaxEntries: 64,
         modelKey: modelName))
+    print(
+        "Cache policy: paged=\(usePagedCache) disk=\(enableDiskCache) "
+            + "blockSize=64 maxBlocks=512")
 
     let budget = max(maxNew, 48)
     var params: GenerateParameters
@@ -2730,9 +2739,25 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     if let nativeMTPDepth {
         params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
     }
+    let growingKVMode: String
+    switch (env["BENCH_GROWING_KV_MODE"] ?? "none").lowercased() {
+    case "tq", "tq44", "turboquant":
+        params.kvMode = .turboQuant(keyBits: 4, valueBits: 4)
+        params.quantizedKVStart =
+            Int(env["BENCH_GROWING_TQ_START"] ?? "8") ?? 8
+        growingKVMode = "turboquant-4/4"
+    case "tq33":
+        params.kvMode = .turboQuant(keyBits: 3, valueBits: 3)
+        params.quantizedKVStart =
+            Int(env["BENCH_GROWING_TQ_START"] ?? "8") ?? 8
+        growingKVMode = "turboquant-3/3"
+    default:
+        growingKVMode = "none"
+    }
     print(String(format:
-        "Sampling: mode=%@ maxTokens=%d temp=%.3f topP=%.3f topK=%d minP=%.3f rep=%@",
+        "Sampling: mode=%@ kvMode=%@ maxTokens=%d temp=%.3f topP=%.3f topK=%d minP=%.3f rep=%@",
         env["BENCH_GROWING_BUNDLE_DEFAULTS"] == "1" ? "bundle-defaults" : "explicit-greedy",
+        growingKVMode,
         params.maxTokens ?? -1,
         Double(params.temperature),
         Double(params.topP),
@@ -2784,7 +2809,8 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     let turn1 = LMInput(
         text: LMInput.Text(tokens: promptArray),
         cacheScopeSalt: cacheScopeSalt(from: ["enable_thinking": false]),
-        cachePrefixTokenCounts: cachePrefixTokenCounts)
+        cachePrefixTokenCounts: cachePrefixTokenCounts,
+        cacheStablePrefixTokenCounts: cachePrefixTokenCounts)
     print("  Cache history-boundary counts: \(cachePrefixTokenCounts)")
 
     func run(label: String, input: sending LMInput) async throws
@@ -2792,6 +2818,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     {
         let promptSize = input.text.tokens.size
         let t0 = CFAbsoluteTimeGetCurrent()
+        var firstTokenWall: Double?
         var out: [Int] = []
         var info: GenerateCompletionInfo?
 
@@ -2804,6 +2831,9 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             for await event in stream {
                 switch event {
                 case .token(let id):
+                    if firstTokenWall == nil {
+                        firstTokenWall = CFAbsoluteTimeGetCurrent() - t0
+                    }
                     out.append(id)
                 case .prefillProgress:
 
@@ -2818,6 +2848,9 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             for await event in stream {
                 switch event {
                 case .token(let id):
+                    if firstTokenWall == nil {
+                        firstTokenWall = CFAbsoluteTimeGetCurrent() - t0
+                    }
                     out.append(id)
                 case .prefillProgress:
 
@@ -2831,12 +2864,13 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         let text = context.tokenizer.decode(tokenIds: out)
         let tokps = wall > 0 ? Double(out.count) / wall : 0
         print(String(format:
-            "  %@: prompt=%d gen=%d finish=%@ promptTime=%.3fs wall=%.2fs tokps=%.2f text=\"%@\"",
+            "  %@: prompt=%d gen=%d finish=%@ promptTime=%.3fs ttft=%.3fs wall=%.2fs tokps=%.2f text=\"%@\"",
             label,
             promptSize,
             out.count,
             String(describing: info?.stopReason ?? .cancelled),
             info?.promptTime ?? -1,
+            firstTokenWall ?? -1,
             wall,
             tokps,
             String(text.prefix(120)).replacingOccurrences(of: "\n", with: "\\n")))
@@ -2845,6 +2879,14 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
 
     nonisolated(unsafe) let t1Send = turn1
     let r1 = try await run(label: "Turn 1 cold", input: t1Send)
+    if let transition = await engine.lastTurboQuantCacheTransitionForDiagnostics {
+        print(
+            "  TurboQuant transition: before{\(transition.before.topologyTags.joined(separator: ","))} "
+                + "after{\(transition.after.topologyTags.joined(separator: ","))}")
+    }
+    print(
+        "  TurboQuant compressions: "
+            + "\(await engine.turboQuantCompressionCountForDiagnostics)")
     guard let info1 = r1.info else {
         throw NSError(domain: "BENCH_GROWING_CHAT_CACHE", code: 1,
             userInfo: [NSLocalizedDescriptionKey: "turn 1 emitted no completion info"])
@@ -2880,7 +2922,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
 
     func describeProbe(_ label: String, tokens: [Int], mediaSalt: String?) {
         switch coordinator.fetch(tokens: tokens, mediaSalt: mediaSalt) {
-        case .hit(let matched, let remaining, let detail, _, _, let diskArrays):
+        case .hit(let matched, let remaining, let detail, let blocks, _, let diskArrays):
             writeDiagnostic(String(format:
                 "  %@: HIT tier=%@ matched=%d/%d remaining=%d diskArrays=%@",
                 label,
@@ -2889,6 +2931,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
                 tokens.count,
                 remaining.count,
                 diskArraySummary(diskArrays)))
+            coordinator.release(blocks: blocks)
         case .miss:
             writeDiagnostic("  \(label): MISS tokens=\(tokens.count)")
         }
@@ -2913,6 +2956,21 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         throw NSError(domain: "BENCH_GROWING_CHAT_CACHE", code: 10,
             userInfo: [NSLocalizedDescriptionKey:
                 "turn 1 did not emit recall phrase \(recallPhrase.debugDescription); got \(String(turn1Text.prefix(160)).debugDescription)"])
+    }
+    if env["BENCH_GROWING_FORCE_PAGED_EVICTION"] == "1",
+       let paged = coordinator.pagedCache
+    {
+        var pressureBlocks: [CacheBlock] = []
+        while let block = paged.allocateBlock() {
+            pressureBlocks.append(block)
+        }
+        for block in pressureBlocks.reversed() {
+            paged.freeBlock(block)
+        }
+        let stats = paged.snapshotStats()
+        print(
+            "  Forced paged eviction: pressureBlocks=\(pressureBlocks.count) "
+                + "evictions=\(stats.evictions)")
     }
     let turn2Messages: [[String: any Sendable]] = [
         ["role": "user", "content": firstTurnPrompt],
@@ -2983,7 +3041,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     printCoordinatorStats("Before turn 2")
     let probe = coordinator.fetch(tokens: turn2Tokens, mediaSalt: turn2Salt)
     switch probe {
-    case .hit(let matched, let remaining, let detail, _, _, let diskArrays):
+    case .hit(let matched, let remaining, let detail, let blocks, _, let diskArrays):
         print(String(format:
             "  Coordinator probe before turn 2: HIT tier=%@ matched=%d/%d remaining=%d diskArrays=%@",
             detail.rawValue,
@@ -2991,6 +3049,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             turn2Tokens.count,
             remaining.count,
             diskArraySummary(diskArrays)))
+        coordinator.release(blocks: blocks)
         let expectedPromptBoundary = promptCommon < promptTokens.count
             ? (cachePrefixTokenCounts.max() ?? promptTokens.count)
             : promptTokens.count
@@ -7088,11 +7147,16 @@ func runDSV4CoherenceGate(modelPath: String, maxNew: Int) async throws {
 func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     let env = ProcessInfo.processInfo.environment
+    let genericAgentic = (env["BENCH_AGENTIC_TOOL"] ?? "0") == "1"
+    let rowName = genericAgentic ? "BENCH_AGENTIC_TOOL" : "BENCH_DSV4_AGENTIC_TOOL"
+    let launchID = genericAgentic ? "LAGUNA-77" : "DSV4-77"
     let maxTokens = max(96, min(maxNew, 192))
-    let cacheDir = URL(fileURLWithPath: env["BENCH_DSV4_AGENTIC_CACHE_DIR"]
-        ?? "/tmp/vmlx-dsv4-agentic-cache/\(modelDir.lastPathComponent)")
+    let cacheDir = URL(fileURLWithPath:
+        (genericAgentic ? env["BENCH_AGENTIC_CACHE_DIR"] : nil)
+            ?? env["BENCH_DSV4_AGENTIC_CACHE_DIR"]
+            ?? "/tmp/vmlx-agentic-cache/\(modelDir.lastPathComponent)")
 
-    print("\n=== BENCH_DSV4_AGENTIC_TOOL: DSML tool + chat history coherence ===")
+    print("\n=== \(rowName): structured tool + chat history coherence ===")
     let loadStart = CFAbsoluteTimeGetCurrent()
     let context = try await MLXLMCommon.loadModel(
         from: modelDir, using: #huggingFaceTokenizerLoader())
@@ -7100,7 +7164,7 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     print("Model: \(type(of: context.model))")
     print("Tool format: \(context.configuration.toolCallFormat.map { "\($0)" } ?? "json (default)")")
     print("Reasoning stamp: \(context.configuration.reasoningParserName ?? "nil")")
-    guard context.configuration.toolCallFormat == .dsml else {
+    guard genericAgentic || context.configuration.toolCallFormat == .dsml else {
         throw NSError(
             domain: "BENCH_DSV4_AGENTIC_TOOL",
             code: 1,
@@ -7109,7 +7173,7 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
                     "DSV4 agentic row requires DSML tool-call format, got \(context.configuration.toolCallFormat.map { "\($0)" } ?? "nil")",
             ])
     }
-    guard context.configuration.reasoningParserName == "think_xml" else {
+    guard genericAgentic || context.configuration.reasoningParserName == "think_xml" else {
         throw NSError(
             domain: "BENCH_DSV4_AGENTIC_TOOL",
             code: 2,
@@ -7127,7 +7191,7 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     coordConfig.diskCacheMaxGB = 4
     coordConfig.pagedBlockSize = 256
     coordConfig.maxCacheBlocks = 1024
-    coordConfig.modelKey = "\(modelDir.lastPathComponent)|dsv4-agentic-tool"
+    coordConfig.modelKey = "\(modelDir.lastPathComponent)|\(rowName.lowercased())"
     let coordinator = CacheCoordinator(config: coordConfig)
     let engine = BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
     defer { Task { await engine.shutdown() } }
@@ -7258,7 +7322,7 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
 
     var chat: [Chat.Message] = [
         .system("You are a concise assistant. Use tools when requested."),
-        .user("Use lookup_launch_status for launch_id DSV4-77. Emit only the tool call."),
+        .user("Use lookup_launch_status for launch_id \(launchID). Emit only the tool call."),
     ]
     let toolTurn = try await runTurn(
         label: "turn1-tool-call",
@@ -7281,7 +7345,7 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     }
     let toolArgs = toolCall.function.arguments.mapValues { $0.anyValue }
     print("DSV4_AGENTIC_TOOL_CALL name=\(toolCall.function.name) id=\(toolCallId) args=\(toolArgs)")
-    let toolResultJSON = #"{"launch_id":"DSV4-77","status":"green","window":"04:30Z"}"#
+    let toolResultJSON = "{\"launch_id\":\"\(launchID)\",\"status\":\"green\",\"window\":\"04:30Z\"}"
     chat.append(.assistant(toolText, toolCalls: toolCalls))
     chat.append(.tool(toolResultJSON, toolCallId: toolCallId))
     chat.append(.user("Summarize the launch status and window from the tool result. Answer in one short sentence."))
@@ -7306,8 +7370,8 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
         chat: chat,
         enableThinking: false)
     printBlock("DSV4_AGENTIC_T3_TEXT", recallTurn.text)
-    if !recallTurn.text.uppercased().contains("DSV4-77") {
-        try fail(31, "turn3 did not recall DSV4-77 from tool history")
+    if !recallTurn.text.uppercased().contains(launchID) {
+        try fail(31, "turn3 did not recall \(launchID) from tool history")
     }
 
     let snapshot = coordinator.snapshotStats()
@@ -7321,7 +7385,7 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     print(
         "DSV4_AGENTIC_CACHE_STATS hybrid=\(snapshot.isHybrid) pagedIncompatible=\(snapshot.isPagedIncompatible) paged{\(paged)} disk{\(disk)} ssm{hits=\(ssm.hits),misses=\(ssm.misses),reDerives=\(ssm.reDerives)}"
     )
-    guard snapshot.isPagedIncompatible else {
+    if !genericAgentic, !snapshot.isPagedIncompatible {
         try fail(40, "DSV4 agentic row did not mark cache as paged-incompatible")
     }
     guard let diskStats = snapshot.diskStats else {
@@ -7330,11 +7394,16 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     guard diskStats.stores > 0 else {
         try fail(42, "DSV4 agentic row did not store any disk L2 cache entries")
     }
-    guard diskStats.hits > 0 else {
+    if genericAgentic {
+        let pagedHits = snapshot.pagedStats?.cacheHits ?? 0
+        guard pagedHits > 0 || diskStats.hits > 0 else {
+            try fail(43, "generic agentic row did not observe paged or disk cache reuse")
+        }
+    } else if diskStats.hits == 0 {
         try fail(43, "DSV4 agentic row did not observe any disk L2 cache hits")
     }
     await engine.shutdown()
-    print("=== BENCH_DSV4_AGENTIC_TOOL: PASS ===")
+    print("=== \(rowName): PASS ===")
 }
 
 /// Side-by-side decode on the same simple factual prompt across DSV4's

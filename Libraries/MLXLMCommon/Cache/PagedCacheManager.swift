@@ -331,8 +331,15 @@ public final class PagedCacheManager: @unchecked Sendable {
             let hash = CacheBlock.computeBlockHash(
                 parentHash: parentHash, tokenIds: chunk,
                 modelKey: modelKey, mediaSalt: mediaSalt)
+            let exact = hashMap.find(hash: hash)
+            let block = exact ?? hashMap.findLongestPartialPrefix(
+                parentHash: parentHash,
+                tokenIds: chunk,
+                modelKey: modelKey,
+                mediaSalt: mediaSalt)
 
-            if let block = _findCachedBlock(hash: hash) {
+            if let block {
+                stats.cacheHits += 1
                 // Pin the cached-free block while the caller restores KV.
                 // If it remains in the free queue, a concurrent allocator
                 // could pop and reset it while restore reads `cacheData`.
@@ -343,9 +350,15 @@ public final class PagedCacheManager: @unchecked Sendable {
                 }
                 block.incrementRef()
                 matchedBlocks.append(block)
-                parentHash = hash
-                offset = end
+                parentHash = block.blockHash
+                offset += block.tokenCount
+                // A stored partial leaf is a complete cache boundary. It can
+                // seed the remaining prompt, but no later fixed-size block can
+                // be chained after it because block partitioning restarts from
+                // token zero for every stored sequence.
+                if exact == nil { break }
             } else {
+                stats.cacheMisses += 1
                 break
             }
         }

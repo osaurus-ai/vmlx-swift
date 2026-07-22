@@ -96,6 +96,31 @@ import Testing
     #expect(result!.blocks.count == 1)
 }
 
+@Test func pagedCacheReusesStoredPartialLeafForGrowingPrompt() throws {
+    let blockSize = 4
+    let manager = PagedCacheManager(blockSize: blockSize, maxBlocks: 20)
+    let fullLayer: [(keys: MLXArray, values: MLXArray)] = [
+        (keys: MLXArray.zeros([1, 1, 4, 8]),
+         values: MLXArray.zeros([1, 1, 4, 8]))
+    ]
+    let partialLayer: [(keys: MLXArray, values: MLXArray)] = [
+        (keys: MLXArray.zeros([1, 1, 2, 8]),
+         values: MLXArray.zeros([1, 1, 2, 8]))
+    ]
+
+    manager.storeTokenSequence(
+        tokens: [1, 2, 3, 4, 5, 6],
+        layerData: [fullLayer, partialLayer])
+
+    let result = try #require(manager.fetchPrefix(
+        tokens: [1, 2, 3, 4, 5, 6, 7, 8]))
+    #expect(result.matchedTokens == 6)
+    #expect(result.remainingTokens == [7, 8])
+    #expect(result.blocks.count == 2)
+    manager.freeBlock(result.blocks[1])
+    manager.freeBlock(result.blocks[0])
+}
+
 @Test func pagedCacheMiss() {
     let manager = PagedCacheManager(blockSize: 4, maxBlocks: 20)
 

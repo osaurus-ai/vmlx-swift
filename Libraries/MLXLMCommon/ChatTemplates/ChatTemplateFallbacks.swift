@@ -671,41 +671,34 @@ value_1
 {{- "〈|EOS|〉" -}}
 {%- set enable_thinking = enable_thinking | default(false) -%}
 {%- set add_generation_prompt = add_generation_prompt | default(false) -%}
-{%- set system_message = "" -%}
+{%- set system_message = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations." -%}
 {%- if messages and messages[0].role == "system" -%}
   {%- set system_message = messages[0].content -%}
 {%- endif -%}
-{%- if (system_message and system_message.strip()) or tools -%}
-  {{- "<system>\n" -}}
+{%- set has_sys = system_message and system_message.strip() -%}
+{%- if has_sys or tools or enable_thinking -%}
+  {{- "<system>" -}}
   {%- if system_message and system_message.strip() -%}
-    {{- "\n" -}}{{- system_message.rstrip() -}}
+    {{- system_message.rstrip() -}}
+    {%- if tools -%}{{- "\n\n" -}}{%- endif -%}
   {%- endif -%}
   {%- if tools -%}
-    {{- "\n\n### Tools\n\n" -}}
+    {{- "### Tools\n\n" -}}
     {{- "You may call functions to assist with the user query.\n" -}}
     {{- "All available function signatures are listed below:\n" -}}
     {{- "<available_tools>\n" -}}
     {%- for tool in tools -%}
       {{- tool | tojson -}}{{- "\n" -}}
     {%- endfor -%}
-    {{- "</available_tools>\n" -}}
-    {{- "\nFor each function call, reply only with an XML object in this format:\n" -}}
-    {{- "<tool_call>function-name\n<arg_key>argument-key</arg_key>\n<arg_value>value-of-argument-key</arg_value>\n</tool_call>\n" -}}
-    {%- if tool_choice is defined and tool_choice == "required" -%}
-      {{- "\nThe current assistant response MUST be a function call. Do not answer in prose before the tool result." -}}
-      {%- if tool_choice_name is defined and tool_choice_name -%}
-        {{- " Use the `" ~ tool_choice_name ~ "` function." -}}
-      {%- endif -%}
-      {{- " Include every required argument exactly as requested by the current user turn.\n" -}}
-    {%- endif -%}
+    {{- "</available_tools>" -}}
   {%- endif -%}
-  {{- "\n</system>\n" -}}
+  {{- "</system>\n" -}}
 {%- endif -%}
 {%- for message in messages -%}
   {%- if message.role == "system" -%}
     {#- handled above -#}
   {%- elif message.role == "user" -%}
-    {{- "<user>\n" -}}
+    {{- "<user>" -}}
     {%- if message.content is string -%}
       {{- message.content -}}
     {%- else -%}
@@ -713,9 +706,9 @@ value_1
         {%- if item.type == "text" -%}{{- item.text -}}{%- endif -%}
       {%- endfor -%}
     {%- endif -%}
-    {{- "\n</user>\n" -}}
+    {{- "</user>\n" -}}
   {%- elif message.role == "assistant" -%}
-    {{- "<assistant>\n" -}}
+    {{- "<assistant>" -}}
     {%- set content = message.content if message.content is string else "" -%}
     {%- set reasoning_content = "" -%}
     {%- if message['reasoning'] is string -%}
@@ -729,35 +722,46 @@ value_1
       {%- endif -%}
       {%- set content = content.split('</think>')[-1].lstrip('\n') -%}
     {%- endif -%}
-    {%- if reasoning_content -%}
-      {{- "<think>\n" -}}{{- reasoning_content.strip() -}}{{- "\n</think>\n" -}}
+    {%- if enable_thinking -%}
+      {{- "<think>" -}}{{- reasoning_content -}}{{- "</think>" -}}
     {%- else -%}
-      {{- "</think>\n" -}}
+      {{- "</think>" -}}
     {%- endif -%}
-    {%- if content.strip() -%}
-      {{- content.strip() -}}
+    {%- if content -%}
+      {{- content -}}
     {%- else -%}
       {%- for item in message.content -%}
         {%- if item.type == "text" -%}{{- item.text -}}{%- endif -%}
       {%- endfor -%}
     {%- endif -%}
-    {{- "\n</assistant>\n" -}}
+    {%- if message.tool_calls -%}
+      {%- for tool_call in message.tool_calls -%}
+        {%- set function_data = tool_call.function -%}
+        {{- "<tool_call>" ~ function_data.name -}}
+        {%- for k, v in function_data.arguments.items() -%}
+          {{- "<arg_key>" ~ k ~ "</arg_key>" -}}
+          {{- "<arg_value>" -}}{{- v | tojson if v is not string else v -}}{{- "</arg_value>" -}}
+        {%- endfor -%}
+        {{- "</tool_call>" -}}
+      {%- endfor -%}
+    {%- endif -%}
+    {{- "</assistant>\n" -}}
   {%- elif message.role == "tool" -%}
-    {{- "<tool_response>\n" -}}
+    {{- "<tool_response>" -}}
     {%- if message.content is string -%}
       {{- message.content -}}
     {%- else -%}
       {{- message.content | tojson -}}
     {%- endif -%}
-    {{- "\n</tool_response>\n" -}}
+    {{- "</tool_response>\n" -}}
   {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
-  {{- "<assistant>\n" -}}
+  {{- "<assistant>" -}}
   {%- if enable_thinking -%}
-    {{- "<think>\n" -}}
+    {{- "<think>" -}}
   {%- else -%}
-    {{- "</think>\n" -}}
+    {{- "</think>" -}}
   {%- endif -%}
 {%- endif -%}
 """#

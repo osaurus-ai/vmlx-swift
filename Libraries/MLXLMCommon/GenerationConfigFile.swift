@@ -2,6 +2,22 @@
 
 import Foundation
 
+/// Declarative defaults passed to a tokenizer chat template when a request
+/// does not provide an explicit value. Hugging Face bundles currently use
+/// this object primarily for `enable_thinking`; keeping it typed prevents an
+/// engine from silently dropping a model-authored reasoning default.
+public struct ChatTemplateKwargsDefaults: Codable, Equatable, Sendable {
+    public var enableThinking: Bool?
+
+    public init(enableThinking: Bool? = nil) {
+        self.enableThinking = enableThinking
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case enableThinking = "enable_thinking"
+    }
+}
+
 /// JSON wrapper for `generation_config.json` file.
 ///
 /// This file can override values from `config.json`, particularly `eos_token_id`.
@@ -17,6 +33,7 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
     public var repetitionPenalty: Float?
     public var doSample: Bool?
     public var suppressTokens: [Int]?
+    public var defaultChatTemplateKwargs: ChatTemplateKwargsDefaults?
 
     // Block-diffusion fields (DiffusionGemma). HF serializes the sampler
     // config as a nested object with a `_cls_name` discriminator; only the
@@ -51,6 +68,7 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         repetitionPenalty: Float? = nil,
         doSample: Bool? = nil,
         suppressTokens: [Int]? = nil,
+        defaultChatTemplateKwargs: ChatTemplateKwargsDefaults? = nil,
         maxDenoisingSteps: Int? = nil,
         tMin: Float? = nil,
         tMax: Float? = nil,
@@ -68,6 +86,7 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         self.repetitionPenalty = repetitionPenalty
         self.doSample = doSample
         self.suppressTokens = suppressTokens
+        self.defaultChatTemplateKwargs = defaultChatTemplateKwargs
         self.maxDenoisingSteps = maxDenoisingSteps
         self.tMin = tMin
         self.tMax = tMax
@@ -87,6 +106,7 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         case repetitionPenalty = "repetition_penalty"
         case doSample = "do_sample"
         case suppressTokens = "suppress_tokens"
+        case defaultChatTemplateKwargs = "default_chat_template_kwargs"
         case maxDenoisingSteps = "max_denoising_steps"
         case tMin = "t_min"
         case tMax = "t_max"

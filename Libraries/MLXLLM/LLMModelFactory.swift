@@ -132,15 +132,12 @@ public enum LLMTypeRegistry {
             "smollm3": create(SmolLM3Configuration.self, SmolLM3Model.init),
             "ernie4_5": create(Ernie45Configuration.self, Ernie45Model.init),
             "lfm2": create(LFM2Configuration.self, LFM2Model.init),
-            // Laguna (Poolside agentic-coding 33B/3B-active MoE). 40-layer
-            // hybrid SWA + full attention with per-layer head count
-            // (48 full / 64 SWA), dual RoPE, q_norm/k_norm, sigmoid +
-            // bias-corrected routing over 256 routed experts top-8 + 1
-            // shared. See `Models/Laguna.swift`. JANGTQ variant (paired
-            // JANGTQDenseLinear port) follows the Mistral 3 family
-            // pattern in a follow-up.
+            // Laguna is config-driven: S-2.1 uses 48 layers, alternating
+            // full/SWA attention, 48/72 query heads, dual RoPE, 256 routed
+            // experts with top-10 selection, and one shared expert. Older
+            // Laguna variants continue to decode their bundle-specific arrays.
             "laguna": { data in
-                // 2026-05-01: Real Laguna mxtq bundles are MIXED-QUANT.
+                // Legacy Laguna mxtq bundles are mixed-format.
                 //
                 //   - Dense paths (attention Q/K/V/O, layer-0 dense MLP
                 //     gate/up/down, shared expert, router gate) ship as
@@ -160,15 +157,14 @@ public enum LLMTypeRegistry {
                 //     and the model's `sanitize` splits the fused tensor
                 //     at load time.
                 //
-                // 2026-05-02 update: also support **mxfp4** Laguna bundles.
-                // Those ship the routed experts as MLX standard affine
-                // quant (`weight` + `scales` + `biases` per gate_up_proj /
-                // down_proj — gate_up still FUSED on the out-dim axis).
+                // Current JANG_2L/JANG_4M bundles ship routed experts as
+                // MLX standard per-module affine quant (`weight` + `scales`
+                // + `biases` on separate gate/up/down projections).
                 // Detect by `weight_format != "mxtq"` AND no `mxtq_bits`
                 // top-level key; route to the affine `SwitchGLU` MoE path
                 // (jangtq=nil) instead of the codebook
                 // `TurboQuantSwitchGLU` path. Sanitize splits the fused
-                // gate_up_proj for both formats.
+                // gate_up_proj only for legacy bundles that use it.
                 struct LagunaProbe: Codable {
                     let weightFormat: String?
                     let mxtqBits: Int?
@@ -198,7 +194,7 @@ public enum LLMTypeRegistry {
                         bits: probe?.mxtqBits ?? 2,
                         mxtqSeed: probe?.mxtqSeed ?? 42)
                 } else {
-                    // mxfp4 / affine bundle: nil context → SwitchGLU path.
+                    // Affine mixed-bit bundle: nil context → SwitchGLU path.
                     jangtqContext = nil
                 }
                 return LagunaModel(cfg, jangtq: jangtqContext)
@@ -1156,6 +1152,31 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 @available(*, deprecated, renamed: "LLMRegistry", message: "Please use LLMRegistry directly.")
 public typealias ModelRegistry = LLMRegistry
 
+internal func llmDefaultAdditionalContext(
+    modelType: String?,
+    capabilities: JangCapabilities?,
+    generationConfig: GenerationConfigFile?,
+    chatConfig: JangChatConfig?
+) -> [String: any Sendable]? {
+    var context: [String: any Sendable] = [:]
+
+    // Trust the bundle's capability stamp. A bundle that explicitly declares
+    // no thinking wins over stale template metadata. Otherwise use the
+    // model-authored default from generation_config.json, falling back to the
+    // mirrored JANG chat stamp. Request/UI context is merged later and wins.
+    if capabilities?.supportsThinking == false {
+        context["enable_thinking"] = false
+    } else if let enableThinking =
+        generationConfig?.defaultChatTemplateKwargs?.enableThinking
+            ?? chatConfig?.templateKwargsDefaults?.enableThinking
+    {
+        context["enable_thinking"] = enableThinking
+    }
+
+    _ = modelType  // intentionally unused: no family-name coercion
+    return context.isEmpty ? nil : context
+}
+
 private struct LLMUserInputProcessor: UserInputProcessor {
 
     let tokenizer: Tokenizer
@@ -1296,27 +1317,15 @@ private struct LLMUserInputProcessor: UserInputProcessor {
 
     static func defaultContext(
         modelType: String?,
-        capabilities: JangCapabilities?
+        capabilities: JangCapabilities?,
+        generationConfig: GenerationConfigFile?,
+        chatConfig: JangChatConfig?
     ) -> [String: any Sendable]? {
-        var context: [String: any Sendable] = [:]
-
-        // Trust the bundle's capability stamp. The runtime must NOT
-        // auto-rewrite or apply family-based default-template overrides
-        // by model_type prefix — that hides bundle-metadata bugs and
-        // contradicts a properly-stamped bundle's declaration. Fix bundle
-        // metadata at the source instead.
-        //
-        // The one universal rule that DOES belong here: a bundle that
-        // explicitly stamps `supports_thinking == false` (Ling/Bailing-style
-        // non-thinking models) gets `enable_thinking=false` seeded so a
-        // stale chat template can't produce noise. Per-request overrides
-        // are still respected.
-        if capabilities?.supportsThinking == false {
-            context["enable_thinking"] = false
-        }
-
-        _ = modelType  // intentionally unused — see above
-        return context.isEmpty ? nil : context
+        llmDefaultAdditionalContext(
+            modelType: modelType,
+            capabilities: capabilities,
+            generationConfig: generationConfig,
+            chatConfig: chatConfig)
     }
 }
 
@@ -1921,7 +1930,9 @@ public final class LLMModelFactory: ModelFactory {
             messageGenerator: messageGenerator,
             defaultAdditionalContext: LLMUserInputProcessor.defaultContext(
                 modelType: baseConfig.modelType,
-                capabilities: jangConfig?.capabilities))
+                capabilities: jangConfig?.capabilities,
+                generationConfig: generationConfig,
+                chatConfig: jangConfig?.chat))
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

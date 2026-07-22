@@ -170,7 +170,9 @@ public class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
     public func restoreCompressed(
         encodedKeys: EncodedKeys,
         encodedValues: EncodedValues,
-        sourceOffset: Int
+        sourceOffset: Int,
+        windowKeys: MLXArray? = nil,
+        windowValues: MLXArray? = nil
     ) {
         let keyDim = encodedKeys.shape.last ?? 0
         let valueDim = encodedValues.shape.last ?? 0
@@ -208,10 +210,56 @@ public class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
         self.windowOffset = 0
 
         self.phase = .compressed
-        self.offset = sourceOffset
+        self.offset = self.prefixTokenCount
 
         self.floatKeys = nil
         self.floatValues = nil
+
+        // The encoded payload is an immutable compression snapshot. Tokens
+        // generated after that transition live in the full-precision window.
+        // Disk restore must carry both pieces: assigning the later logical
+        // offset while discarding the window makes attention see fewer KV
+        // entries than its causal mask advertises.
+        let expectedWindowCount = sourceOffset - self.prefixTokenCount
+        guard expectedWindowCount >= 0 else {
+            resetToEmpty()
+            return
+        }
+        if expectedWindowCount == 0 {
+            guard windowKeys == nil, windowValues == nil else {
+                resetToEmpty()
+                return
+            }
+            return
+        }
+        guard let windowKeys, let windowValues,
+              windowKeys.ndim == 4, windowValues.ndim == 4,
+              windowKeys.dim(2) == expectedWindowCount,
+              windowValues.dim(2) == expectedWindowCount
+        else {
+            resetToEmpty()
+            return
+        }
+        _ = appendDecodeTokens(keys: windowKeys, values: windowValues)
+    }
+
+    /// Exact full-precision tokens appended after the immutable compressed
+    /// payload was created. The disk serializer stores this beside the encoded
+    /// prefix rather than re-encoding an already lossy decoded prefix.
+    internal var serializedWindowState: (keys: MLXArray, values: MLXArray)? {
+        guard phase == .compressed,
+              windowOffset > 0,
+              let unifiedKeys, let unifiedValues
+        else { return nil }
+        let end = prefixTokenCount + windowOffset
+        guard end == offset,
+              unifiedKeys.dim(2) >= end,
+              unifiedValues.dim(2) >= end
+        else { return nil }
+        return (
+            unifiedKeys[.ellipsis, prefixTokenCount..<end, 0...],
+            unifiedValues[.ellipsis, prefixTokenCount..<end, 0...]
+        )
     }
 
     /// Restore from already-decoded float keys/values (paged-cache fast path).

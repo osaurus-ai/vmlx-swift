@@ -1623,9 +1623,9 @@ struct LagunaFocusedContractsTests {
             "enable_thinking": false,
         ])
 
-        #expect(rendered.contains("<system>\n\nYou are a helpful"))
-        #expect(rendered.contains("<user>\nhi\n</user>\n"))
-        #expect(rendered.hasSuffix("<assistant>\n</think>\n"))
+        #expect(rendered.hasPrefix("〈|EOS|〉<system>You are a helpful"))
+        #expect(rendered.contains("<user>hi</user>\n"))
+        #expect(rendered.hasSuffix("<assistant></think>"))
         #expect(!rendered.contains("<|im_start|>"))
 
         var parser = ReasoningParser.forPrompt(
@@ -1646,7 +1646,7 @@ struct LagunaFocusedContractsTests {
             "enable_thinking": true,
         ])
 
-        #expect(rendered.hasSuffix("<assistant>\n<think>\n"))
+        #expect(rendered.hasSuffix("<assistant><think>"))
 
         var parser = ReasoningParser.forPrompt(
             stampName: "laguna",
@@ -1672,12 +1672,12 @@ struct LagunaFocusedContractsTests {
                 ["role": "user", "content": "again"],
             ],
             "add_generation_prompt": true,
-            "enable_thinking": false,
+            "enable_thinking": true,
         ])
 
-        #expect(rendered.contains("<think>\nbrief internal note\n</think>\nHello!\n</assistant>\n"))
-        #expect(rendered.contains("<user>\nagain\n</user>\n"))
-        #expect(rendered.hasSuffix("<assistant>\n</think>\n"))
+        #expect(rendered.contains("<think>brief internal note</think>Hello!</assistant>\n"))
+        #expect(rendered.contains("<user>again</user>\n"))
+        #expect(rendered.hasSuffix("<assistant><think>"))
     }
 
     @Test("Laguna mixed rope_parameters decodes dict entries only")

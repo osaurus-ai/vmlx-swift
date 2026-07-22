@@ -31,6 +31,44 @@ public final class BlockHashMap: @unchecked Sendable {
         map[hash]
     }
 
+    /// Find the longest stored partial leaf whose tokens are an exact prefix
+    /// of the query chunk and whose chained hash belongs to `parentHash`.
+    ///
+    /// A growing prompt changes the hash of its final, non-block-aligned chunk:
+    /// a stored 12-token leaf and a later 39-token query chunk have different
+    /// hashes even though the first 12 tokens (and their KV) are identical.
+    /// Full blocks continue to use the O(1) exact-hash path; this bounded scan
+    /// is reached only after that lookup misses at a partial leaf.
+    public func findLongestPartialPrefix(
+        parentHash: String?,
+        tokenIds: [Int],
+        modelKey: String?,
+        mediaSalt: String?
+    ) -> CacheBlock? {
+        var best: CacheBlock?
+        for block in map.values {
+            let stored = block.tokenIds
+            guard !stored.isEmpty,
+                  stored.count < block.blockSize,
+                  stored.count < tokenIds.count,
+                  tokenIds.prefix(stored.count).elementsEqual(stored),
+                  block.blockHash == CacheBlock.computeBlockHash(
+                      parentHash: parentHash,
+                      tokenIds: stored,
+                      modelKey: modelKey,
+                      mediaSalt: mediaSalt)
+            else { continue }
+
+            if best == nil
+                || stored.count > best!.tokenCount
+                || (stored.count == best!.tokenCount && block.blockId < best!.blockId)
+            {
+                best = block
+            }
+        }
+        return best
+    }
+
     /// Remove the entry for a block (keyed by its ``CacheBlock/blockHash``).
     /// No-op if the block's hash is `nil` or not present.
     public func remove(_ block: CacheBlock) {

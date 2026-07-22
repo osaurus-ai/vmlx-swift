@@ -35,6 +35,8 @@ import MLX
 ///       tq_{i}_ck_vec_norms     — EncodedKeys.vectorNorms (float16)
 ///       tq_{i}_ck_sink          — EncodedKeys.sinkData (float16, optional)
 ///       tq_{i}_ck_tail          — EncodedKeys.tailData (float16, optional)
+///       tq_{i}_window_keys      — exact tokens appended after compression (optional)
+///       tq_{i}_window_values    — exact tokens appended after compression (optional)
 ///       __tq_{i}_ck_shape__     — original compressed key shape (int32 array)
 ///       __tq_{i}_ck_index_bits__— key index bits (int32 scalar)
 ///       __tq_{i}_ck_seed__      — key encoding seed (int32 scalar)
@@ -218,7 +220,11 @@ public enum TQDiskSerializer {
         result[legacyMarkerKey] = MLXArray([Int32(1)])
 
         for (i, layer) in cache.enumerated() {
-            if let tq = layer as? TurboQuantKVCache, tq.phase == .compressed {
+            if let tq = layer as? TurboQuantKVCache,
+               tq.phase == .compressed,
+               tq.compressedKeys != nil,
+               tq.compressedValues != nil
+            {
                 serializeTQLayer(tq, index: i, into: &result)
                 result[kindKey(for: i)] = kindArray(.tq)
             } else if let mamba = layer as? MambaCache {
@@ -253,7 +259,11 @@ public enum TQDiskSerializer {
                 // empty caches as `.skip` instead of `.qkv`.
             } else if layer is KVCacheSimple || layer is TurboQuantKVCache {
                 // KVCacheSimple always, plus TurboQuantKVCache in fill phase.
-                // Both expose `state` as a 2-array [keys, values] pair.
+                // A compressed TQ layer restored from paged decoded KV also
+                // lands here because it has no native encoded payload. Store
+                // that decoded state as exact standard KV rather than writing
+                // a false TQ record or repeatedly re-quantizing it.
+                // All variants expose `state` as [keys, values].
                 let state = layer.state
                 if state.count >= 2 {
                     result["kv_\(i)_keys"] = state[0]
@@ -375,6 +385,20 @@ public enum TQDiskSerializer {
         // this the restored cache would report offset 0 and the next
         // generate() call would clobber the prefix on its first append.
         result["__tq_\(i)_offset__"] = metaInt32(Int32(tq.offset))
+
+        let compressedShape = tq.compressedKeys?.shape ?? []
+        let compressedMiddleCount = compressedShape.count >= 3 ? compressedShape[2] : 0
+        let compressedCount = compressedMiddleCount
+            + (tq.compressedKeys?.sinkCount ?? 0)
+            + (tq.compressedKeys?.tailCount ?? 0)
+        let liveWindowCount = tq.offset - compressedCount
+        if liveWindowCount > 0, let window = tq.serializedWindowState {
+            guard window.keys.dim(2) == liveWindowCount,
+                  window.values.dim(2) == liveWindowCount
+            else { return }
+            result["tq_\(i)_window_keys"] = window.keys
+            result["tq_\(i)_window_values"] = window.values
+        }
     }
 
     /// Serialize a single MambaCache layer's state (conv state + ssm state).
@@ -703,6 +727,9 @@ public enum TQDiskSerializer {
     public struct TQLayerComponents {
         public let encodedKeys: EncodedKeys
         public let encodedValues: EncodedValues
+        /// Exact full-precision tokens appended after the encoded snapshot.
+        public let windowKeys: MLXArray?
+        public let windowValues: MLXArray?
         /// Token offset the compressed prefix represents. Falls back to 0
         /// for legacy entries that pre-date the offset metadata key.
         public let offset: Int
@@ -898,7 +925,10 @@ public enum TQDiskSerializer {
                 if let components = deserializeTQLayer(index: i, from: arrays) {
                     out.append(IndexedLayerData(index: i, data: .tq(components)))
                 } else {
-                    out.append(IndexedLayerData(index: i, data: .skip))
+                    // A typed TQ layer is required state. Treat an incomplete
+                    // payload as an atomic miss so a rotating companion cannot
+                    // turn it into a false mixed-topology hit.
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
                 }
             case .kv:
                 if let keys = arrays["kv_\(i)_keys"],
@@ -1092,9 +1122,32 @@ public enum TQDiskSerializer {
             offset = ckShape.count >= 3 ? ckShape[2] : 0
         }
 
+        let encodedKeyCount = ckShape.count >= 3
+            ? ckShape[2] + encodedKeys.sinkCount + encodedKeys.tailCount : 0
+        let encodedValueCount = cvShape.count >= 3
+            ? cvShape[2] + encodedValues.sinkCount + encodedValues.tailCount : 0
+        guard encodedKeyCount > 0,
+              encodedKeyCount == encodedValueCount,
+              offset >= encodedKeyCount
+        else { return nil }
+        let windowCount = offset - encodedKeyCount
+        let windowKeys = arrays["tq_\(i)_window_keys"]
+        let windowValues = arrays["tq_\(i)_window_values"]
+        if windowCount == 0 {
+            guard windowKeys == nil, windowValues == nil else { return nil }
+        } else {
+            guard let windowKeys, let windowValues,
+                  windowKeys.ndim == 4, windowValues.ndim == 4,
+                  windowKeys.dim(2) == windowCount,
+                  windowValues.dim(2) == windowCount
+            else { return nil }
+        }
+
         return TQLayerComponents(
             encodedKeys: encodedKeys,
             encodedValues: encodedValues,
+            windowKeys: windowKeys,
+            windowValues: windowValues,
             offset: offset
         )
     }

@@ -2900,7 +2900,15 @@ public actor BatchEngine {
                    requiresDiskBackedRestore,
                    !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot),
                    promptTokens.count > 1,
-                   let snapshot = boundarySnapshot(tokens: Array(promptTokens.dropLast()))
+                   let snapshot = boundarySnapshot(
+                    tokens: Array(promptTokens.dropLast()),
+                    // Direct full-KV + rotating-SWA stacks are fully typed on
+                    // disk but stop being trimmable once the ring wraps. Their
+                    // exact N-1 seed is still safe to rebuild synchronously;
+                    // persisting it lets a fresh process re-feed only the final
+                    // prompt token instead of cold-prefilling the whole chat.
+                    forceRederive: cacheCanUsePagedWithRotatingCompanion(
+                        promptCacheSnapshot))
                 {
                     storeCacheEntry(
                         tokens: Array(promptTokens.dropLast()),
