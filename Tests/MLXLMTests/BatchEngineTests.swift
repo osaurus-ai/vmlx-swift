@@ -991,6 +991,52 @@ class BatchEngineIntegrationTests: XCTestCase {
         XCTAssertFalse(finalRunning)
     }
 
+    /// Regression for an Osaurus Stop -> New Chat race: the serving wrapper
+    /// needs an awaited cancellation boundary before it can release its
+    /// process-wide solo lease. Cancelling only the wrapper consumer left a
+    /// long prefill running with the next request stuck at `Queued 0/N`.
+    func testCancelActiveSoloGenerationAndWaitDrainsBeforeNextGenerate() async throws {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 100_000,
+            maxBatchSize: 1)
+        try await MLXMetalTestLock.withLock { [engine] in
+            let first = await engine.generate(
+                input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(256))),
+                parameters: GenerateParameters(maxTokens: 1_000, temperature: 0)
+            )
+            let firstConsumer = Task { @Sendable [first] in
+                var info: GenerateCompletionInfo?
+                for await event in first {
+                    if case .info(let completion) = event {
+                        info = completion
+                    }
+                }
+                return info
+            }
+
+            let soloActive = await engine.isSoloFastPathActiveForTesting
+            XCTAssertTrue(soloActive)
+
+            await engine.cancelActiveSoloGenerationAndWait()
+            let cancelled = await firstConsumer.value
+            XCTAssertEqual(cancelled?.stopReason, .cancelled)
+            let activeAfterCancel = await engine.isSoloFastPathActiveForTesting
+            XCTAssertFalse(activeAfterCancel)
+
+            let second = await engine.generate(
+                input: LMInput(tokens: MLXArray(Int32(9) ..< Int32(13))),
+                parameters: GenerateParameters(maxTokens: 2, temperature: 0)
+            )
+            var completed: GenerateCompletionInfo?
+            for await event in second {
+                if case .info(let completion) = event {
+                    completed = completion
+                }
+            }
+            XCTAssertEqual(completed?.stopReason, .length)
+        }
+    }
+
     /// Runtime resizing must not wake the batch scheduler while a B=1 direct
     /// generate owns the model. The queued request can start only after the
     /// solo task drains or cancels.
