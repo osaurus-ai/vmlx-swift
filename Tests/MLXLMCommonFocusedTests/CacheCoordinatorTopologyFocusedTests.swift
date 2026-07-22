@@ -1075,8 +1075,8 @@ struct CacheCoordinatorTopologyFocusedTests {
                 parameters: GenerateParameters()))
     }
 
-    @Test("Known unsafe required-tool rows skip disk-backed prompt seed boundary")
-    func knownUnsafeRequiredToolRowsSkipDiskBackedPromptSeedBoundary() throws {
+    @Test("LFM tool prompts use disk restore while the unproven Gemma MXFP4 seed exception remains")
+    func lfmToolPromptsUseDiskRestore() throws {
         let batchSource = try String(
             contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
             encoding: .utf8)
@@ -1086,15 +1086,18 @@ struct CacheCoordinatorTopologyFocusedTests {
 
         #expect(batchSource.contains("shouldSkipDiskBackedToolPromptSeedBoundary"))
         #expect(batchSource.contains("slot.disablesGeneratedCacheBoundary"))
-        #expect(batchSource.contains(#"modelName.contains("lfm2.5")"#))
-        #expect(batchSource.contains(#"modelName.contains("mxfp8")"#))
+        #expect(!batchSource.contains(#"modelName.contains("lfm2.5")"#))
+        #expect(!batchSource.contains(#"modelName.contains("mxfp8")"#))
         #expect(batchSource.contains(#"modelName.contains("gemma-4")"#))
         #expect(batchSource.contains(#"modelName.contains("mxfp4")"#))
         #expect(batchSource.contains("!shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)"))
-        #expect(batchSource.contains("shouldDisableDiskBackedRequiredToolRestore"))
-        #expect(batchSource.contains("disableDiskBackedRequiredToolRestore: deferredDisableRestore"))
-        #expect(batchSource.contains("Skipped disk-backed required-tool cache restore"))
+        #expect(!batchSource.contains("shouldDisableDiskBackedRequiredToolRestore"))
+        #expect(!batchSource.contains("disableDiskBackedRequiredToolRestore: deferredDisableRestore"))
+        #expect(!batchSource.contains("Skipped disk-backed required-tool cache restore"))
         #expect(batchSource.contains("Skipped disk-backed tool prompt seed boundary"))
+        // Keep the explicit iterator parameter source-compatible for callers
+        // that have their own measured safety policy. BatchEngine must not set
+        // it from a model-name heuristic.
         #expect(evaluateSource.contains("disableDiskBackedRequiredToolRestore"))
         #expect(evaluateSource.contains("TokenIterator: skipped disk-backed required-tool cache restore"))
         #expect(evaluateSource.contains("requiresDiskBackedRestore && disableDiskBackedRequiredToolRestore"))

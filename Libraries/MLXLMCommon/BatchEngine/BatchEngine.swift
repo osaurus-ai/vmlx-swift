@@ -950,30 +950,10 @@ public actor BatchEngine {
             return false
         }
         let modelName = context.configuration.name.lowercased()
-        if modelName.contains("lfm2.5") && modelName.contains("mxfp8") {
-            return true
-        }
         if modelName.contains("gemma-4") && modelName.contains("mxfp4") {
             return true
         }
         return false
-    }
-
-    private func shouldDisableDiskBackedRequiredToolRestore(for slot: BatchSlot) -> Bool {
-        shouldDisableDiskBackedRequiredToolRestore(
-            toolSchemas: slot.originalInput.toolSchemas,
-            disablesGeneratedCacheBoundary: slot.disablesGeneratedCacheBoundary)
-    }
-
-    private func shouldDisableDiskBackedRequiredToolRestore(
-        toolSchemas: [ToolSpec]?,
-        disablesGeneratedCacheBoundary: Bool
-    ) -> Bool {
-        guard disablesGeneratedCacheBoundary || toolSchemas?.isEmpty == false else {
-            return false
-        }
-        let modelName = context.configuration.name.lowercased()
-        return modelName.contains("lfm2.5") && modelName.contains("mxfp8")
     }
 
     /// Clamps prefill-progress frames so the reported completed count never
@@ -1006,9 +986,6 @@ public actor BatchEngine {
         let promptTokenCount = input.text.tokens.size
         let hasMediaContent = input.hasMediaContent
         let toolSchemas = input.toolSchemas
-        let disableDiskBackedRequiredToolRestore = shouldDisableDiskBackedRequiredToolRestore(
-            toolSchemas: toolSchemas,
-            disablesGeneratedCacheBoundary: false)
         let skipDiskBackedToolPromptSeedBoundary = shouldSkipDiskBackedToolPromptSeedBoundary(
             toolSchemas: toolSchemas,
             disablesGeneratedCacheBoundary: false)
@@ -1121,7 +1098,6 @@ public actor BatchEngine {
                 // when progress frames reach the consumer changes.
                 let promptTokenIdsForTail = input.text.tokens.reshaped(-1).asArray(Int.self)
                 let deferredParameters = soloParameters
-                let deferredDisableRestore = disableDiskBackedRequiredToolRestore
                 let deferredSkipSeedBoundary = skipDiskBackedToolPromptSeedBoundary
                 let deferredInputs = SendableBox(
                     (input, context.model, cacheCoordinator))
@@ -1135,7 +1111,6 @@ public actor BatchEngine {
                         cache: nil,
                         parameters: deferredParameters,
                         cacheCoordinator: deferredCoordinator,
-                        disableDiskBackedRequiredToolRestore: deferredDisableRestore,
                         skipDiskBackedToolPromptSeedBoundary: deferredSkipSeedBoundary,
                         prefillProgressHandler: { progress in
                             deferredContinuation.yield(.prefillProgress(prefillGate.clamp(progress)))
@@ -1654,13 +1629,10 @@ public actor BatchEngine {
                 return stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare)
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(slot.cache)
-            if requiresDiskBackedRestore,
-               shouldDisableDiskBackedRequiredToolRestore(for: slot)
-            {
-                Self.logger.info(
-                    "Skipped disk-backed required-tool cache restore for \(self.context.configuration.name, privacy: .public): warm restore is not proven safe for this topology"
-                )
-            } else {
+            // Scope the fetch result to this coordinator branch. Disk-backed
+            // topologies must all attempt restore; safety is decided by the
+            // topology-aware restore path below, not a model-name denylist.
+            do {
                 let result = coordinator.fetch(
                     tokens: tokenIds,
                     mediaSalt: slot.mediaSalt,
