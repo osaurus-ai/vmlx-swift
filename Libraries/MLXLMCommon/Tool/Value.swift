@@ -60,12 +60,21 @@ public enum JSONValue: Hashable, Codable, Sendable {
         switch value {
         case is NSNull:
             return .null
-        case let bool as Bool:
-            return .bool(bool)
-        case let int as Int:
-            return .int(int)
-        case let double as Double:
-            return .double(double)
+        case let number as NSNumber:
+            // Foundation bridges every Swift numeric scalar through NSNumber,
+            // and `NSNumber(value: 1) as? Bool` succeeds. Testing Bool before
+            // NSNumber therefore changed a valid JSON integer `1` into `true`
+            // while building ToolCall arguments (for example
+            // `target: {"mark": 1}` became `target: {"mark": true}`). Use the
+            // CoreFoundation type id to distinguish real JSON booleans, then
+            // preserve integral and floating-point numbers as numbers.
+            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                return .bool(number.boolValue)
+            }
+            if CFNumberIsFloatType(number) {
+                return .double(number.doubleValue)
+            }
+            return .int(number.intValue)
         case let string as String:
             return .string(string)
         case let array as [Any]:
