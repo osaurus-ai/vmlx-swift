@@ -253,7 +253,10 @@ struct CacheCoordinatorTopologyFocusedTests {
         let tmp = makeTempDir("gemma-mixed-tq-rotating-tiered")
         defer { try? FileManager.default.removeItem(at: tmp) }
         let modelKey = "gemma-mixed-tq-rotating-tiered-focused"
-        let tokens = Array(1...24)
+        // Deliberately stop between 8-token block boundaries. Growing chat
+        // must reuse the stored 6-token partial leaf instead of falling
+        // through to disk merely because the next prompt extends that chunk.
+        let tokens = Array(1...22)
 
         let simple = KVCacheSimple()
         _ = simple.update(
@@ -274,9 +277,10 @@ struct CacheCoordinatorTopologyFocusedTests {
         let rotating = RotatingKVCache(maxSize: 8, keep: 0, step: 4)
         for chunkStart in stride(from: 0, to: tokens.count, by: 6) {
             let marker = Float(chunkStart / 6 + 1)
+            let chunkCount = min(6, tokens.count - chunkStart)
             _ = rotating.update(
-                keys: MLXArray.ones([1, 1, 6, 16], dtype: .bfloat16) * marker,
-                values: MLXArray.ones([1, 1, 6, 16], dtype: .bfloat16)
+                keys: MLXArray.ones([1, 1, chunkCount, 16], dtype: .bfloat16) * marker,
+                values: MLXArray.ones([1, 1, chunkCount, 16], dtype: .bfloat16)
                     * (marker + Float(0.25)))
         }
         MLX.eval(turboQuant, rotating)
@@ -303,11 +307,11 @@ struct CacheCoordinatorTopologyFocusedTests {
         #expect(storedStats.requiresPagedBoundaryCompanion)
         #expect((storedStats.diskStats?.stores ?? 0) > 0)
 
-        let growingPrompt = tokens + [25, 26]
+        let growingPrompt = tokens + [23, 24]
         switch coordinator.fetch(tokens: growingPrompt, skipExactDiskBoundary: true) {
         case .hit(let matched, let remaining, let detail, let blocks, _, let arrays):
             #expect(matched == tokens.count)
-            #expect(remaining == [25, 26])
+            #expect(remaining == [23, 24])
             #expect(detail == .paged)
             #expect(blocks.count == 3)
             #expect(arrays == nil)
@@ -353,7 +357,7 @@ struct CacheCoordinatorTopologyFocusedTests {
         switch coordinator.fetch(tokens: growingPrompt, skipExactDiskBoundary: true) {
         case .hit(let matched, let remaining, let detail, let blocks, _, let arrays):
             #expect(matched == tokens.count)
-            #expect(remaining == [25, 26])
+            #expect(remaining == [23, 24])
             #expect(detail == .disk)
             #expect(blocks.isEmpty)
             guard let arrays else {

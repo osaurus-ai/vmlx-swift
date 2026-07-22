@@ -19,6 +19,7 @@ final class GenerationConfigDefaultsTests: XCTestCase {
           "min_p": 0.05,
           "repetition_penalty": 1.05,
           "do_sample": true,
+          "default_chat_template_kwargs": {"enable_thinking": true},
           "suppress_tokens": [258883, 258882]
         }
         """
@@ -34,6 +35,7 @@ final class GenerationConfigDefaultsTests: XCTestCase {
         XCTAssertEqual(config.minP, 0.05)
         XCTAssertEqual(config.repetitionPenalty, 1.05)
         XCTAssertEqual(config.doSample, true)
+        XCTAssertEqual(config.defaultChatTemplateKwargs?.enableThinking, true)
         XCTAssertEqual(config.suppressTokens, [258883, 258882])
     }
 

@@ -1,32 +1,28 @@
 //
-// Laguna — Poolside agentic-coding 33B/3B-active MoE.
+// Laguna — Poolside agentic-coding hybrid-attention MoE family.
 //
 // Architecture (from jang_tools/laguna/{config,model}.py @ jang-tools 2.5.x):
-//   - 40 hybrid layers: layer 0 dense MLP, layers 1..39 sparse MoE
-//   - Per-layer attention head count: 48 (full) or 64 (SWA), via
+//   - Bundle-configured hybrid layers: layer 0 dense MLP, remaining sparse MoE
+//   - Per-layer attention head count (S-2.1: 48 full / 72 SWA), via
 //     `num_attention_heads_per_layer`
 //   - 8 KV heads (constant across layers)
 //   - head_dim 128
 //   - Hybrid mask: `full_attention` layers use causal mask; `sliding_attention`
 //     layers use windowed causal mask (`sliding_window` = 512)
 //   - Dual RoPE per `rope_parameters[layer_type]`:
-//       full_attention    → YaRN base 500K factor 32 partial 0.5
+//       full_attention    → YaRN base 500K, bundle factor, partial 0.5
 //       sliding_attention → default base 10K partial 1.0
 //   - q_norm / k_norm: per-head RMSNorm applied AFTER projection,
 //     BEFORE rope/SDPA. Norm dim = head_dim (128).
-//   - `g_proj` per-head sigmoid gating: gates SDPA output
+//   - `g_proj` per-head softplus gating: gates SDPA output
 //     element-wise per attention head before o_proj
-//   - MoE topology: 256 routed experts top-8, expert dim 512, plus
-//     1 shared expert with separate intermediate size 512
+//   - Bundle-configured routed-expert top-k plus one shared expert
 //   - Sigmoid routing with `e_score_correction_bias` (DeepSeek-V3 recipe)
 //   - `moe_routed_scaling_factor`: 2.5
 //   - `tie_word_embeddings`: false (separate lm_head)
 //
-// MXFP4 bundles route through this class via vanilla `Linear` weight
-// loading. JANGTQ bundles need a paired `LagunaJANGTQ.swift` port that
-// swaps each `Linear` for `JANGTQDenseLinear` (same pattern as
-// Mistral3TextJANGTQ.swift). End-to-end weight-load + decode quality
-// verification gated on a real bundle on disk.
+// Affine mixed-bit JANG bundles route through this class via `SwitchGLU`.
+// Legacy JANGTQ bundles use the same math with `TurboQuantSwitchGLU`.
 //
 
 import Foundation
@@ -117,7 +113,7 @@ internal enum StringOrNumberOrDict: Codable {
 // MARK: - Configuration
 
 /// Attention-output gate mode. The bundle's `gating` field is a Bool on the
-/// poolside XS.2 line (legacy per-head) and a String on Laguna-M.1
+/// poolside Laguna line (legacy Bool per-head) and a String on Laguna-M.1/S2.1
 /// (`"per-element"`). `none` disables the gate.
 public enum LagunaGateMode: String, Codable, Sendable {
     case perElement = "per_element"
@@ -327,7 +323,7 @@ internal final class LagunaAttention: Module {
     @ModuleInfo(key: "g_proj") var gProj: Linear?
 
     // 2026-05-01: Use the dispatching `RoPELayer` so YaRN-scaled
-    // full-attention layers get their factor=32 / mscale stretch
+    // full-attention layers get their bundle-configured YaRN factor / mscale
     // applied. Plain `RoPE` for full_attention destroyed long-context
     // accuracy on prompts > 4096 tokens (Laguna's
     // original_max_position_embeddings) — same class of bug as the
@@ -471,7 +467,7 @@ internal final class LagunaDenseMLP: Module, UnaryLayer {
 //
 // 2026-05-01: rewritten to match real Laguna bundle layout.
 //
-// On-disk routed-expert tensors at `layers.<i>.mlp.experts.*`:
+// Legacy on-disk routed-expert tensors at `layers.<i>.mlp.experts.*`:
 //
 //   experts.gate_up_proj.tq_packed : (n_exp, 2 × moe_inter, packed_in_hidden)
 //   experts.gate_up_proj.tq_norms  : (n_exp, 2 × moe_inter)
@@ -501,17 +497,17 @@ internal final class LagunaDenseMLP: Module, UnaryLayer {
 // splits the fused `gate_up_proj` tensor at sanitize time into the
 // `gate_proj` / `up_proj` halves the primitive expects.
 //
-// 2026-05-02: also support **mxfp4** Laguna bundles. Those ship the
+// Current affine mixed-bit Laguna bundles ship the
 // routed experts as MLX standard affine quant (`weight` + `scales` +
 // `biases` per gate_up_proj/down_proj), NOT TurboQuant codebook. Add
 // a polymorphic `LagunaSwitchMLPLayer` protocol and dispatch the
 // experts module to either `TurboQuantSwitchGLU` (mxtq) or a
-// standard `SwitchGLU` (mxfp4) at construction time. Mirrors the
+// standard `SwitchGLU` (affine mixed-bit) at construction time. Mirrors the
 // `NemotronHJANGTQContext` pattern in NemotronH.
 
 /// Type-erased switch-MLP forward. Both `TurboQuantSwitchGLU` (codebook
 /// MoE used for JANGTQ Laguna bundles) and `SwitchGLU` (affine-quant MoE
-/// used for mxfp4 Laguna bundles) implement
+/// used for affine mixed-bit Laguna bundles) implement
 /// `callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray`.
 internal protocol LagunaSwitchMLPLayer: Module {
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray
@@ -522,7 +518,7 @@ extension SwitchGLU: LagunaSwitchMLPLayer {}
 
 /// Bundle-format hint for Laguna's MoE. Non-nil → JANGTQ codebook path
 /// via `TurboQuantSwitchGLU` with the supplied `bits` / `seed`. Nil →
-/// affine mxfp4 path via standard `SwitchGLU` (per-Linear quant info
+/// affine mixed-bit path via standard `SwitchGLU` (per-Linear quant info
 /// auto-substituted by MLX from `config.json::quantization.{bits,
 /// group_size}` at load time).
 public struct LagunaMoEContext: Sendable {
@@ -540,10 +536,11 @@ internal final class LagunaMoE: Module, UnaryLayer {
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
-    /// `experts` is type-erased so JANGTQ bundles can hold a
-    /// `TurboQuantSwitchGLU` (codebook) and mxfp4 bundles can hold a
+    /// `switch_mlp` matches current Laguna S-2.1 weight and per-module
+    /// quantization paths. It is type-erased so legacy JANGTQ bundles can hold a
+    /// `TurboQuantSwitchGLU` (codebook) and affine bundles can hold a
     /// `SwitchGLU` (affine). Dispatched via `LagunaSwitchMLPLayer`.
-    @ModuleInfo(key: "experts") var experts: Module
+    @ModuleInfo(key: "switch_mlp") var switchMLP: Module
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaDenseMLP
 
     init(_ cfg: LagunaConfiguration, layerIndex: Int, jangtq: LagunaMoEContext?) {
@@ -552,17 +549,17 @@ internal final class LagunaMoE: Module, UnaryLayer {
         self._gate.wrappedValue = Linear(cfg.hiddenSize, cfg.numExperts, bias: false)
         self._eScoreCorrectionBias.wrappedValue = MLXArray.zeros([cfg.numExperts])
         // Routed experts: codebook MoE via TurboQuantSwitchGLU when the
-        // bundle stamps mxtq; affine mxfp4 path via standard SwitchGLU
+        // bundle stamps mxtq; affine mixed-bit path via standard SwitchGLU
         // otherwise. inputDims == hiddenSize (gate/up in_dim == down
         // out_dim); hiddenDims == moeIntermediateSize.
         if let jangtq {
-            self._experts.wrappedValue = TurboQuantSwitchGLU(
+            self._switchMLP.wrappedValue = TurboQuantSwitchGLU(
                 inputDims: cfg.hiddenSize,
                 hiddenDims: cfg.moeIntermediateSize,
                 numExperts: cfg.numExperts,
                 bits: jangtq.bits, seed: jangtq.mxtqSeed)
         } else {
-            self._experts.wrappedValue = SwitchGLU(
+            self._switchMLP.wrappedValue = SwitchGLU(
                 inputDims: cfg.hiddenSize,
                 hiddenDims: cfg.moeIntermediateSize,
                 numExperts: cfg.numExperts)
@@ -604,15 +601,15 @@ internal final class LagunaMoE: Module, UnaryLayer {
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIndex, indices: topkIdx)
         let topkW = routed[1]                                         // (B, T, K) — un-biased!
 
-        // SwitchGLU dispatch: returns (B, T, K, H). `experts` is
+        // SwitchGLU dispatch: returns (B, T, K, H). `switchMLP` is
         // type-erased — TurboQuantSwitchGLU (mxtq) and SwitchGLU
-        // (mxfp4) both implement the same `(x, indices)` shape
+        // (affine mixed-bit) both implement the same `(x, indices)` shape
         // contract via `LagunaSwitchMLPLayer`.
-        guard let switchLayer = experts as? LagunaSwitchMLPLayer else {
+        guard let switchLayer = switchMLP as? LagunaSwitchMLPLayer else {
             fatalError(
-                "LagunaMoE.experts must conform to LagunaSwitchMLPLayer "
-                + "(got \(type(of: experts))). Bundle weight_format may be "
-                + "unsupported — only mxtq (codebook) and mxfp4 (affine) "
+                "LagunaMoE.switch_mlp must conform to LagunaSwitchMLPLayer "
+                + "(got \(type(of: switchMLP))). Bundle weight format may be "
+                + "unsupported — only mxtq (codebook) and affine mixed-bit "
                 + "are wired today.")
         }
         if let streaming = switchLayer as? StreamingTurboQuantSwitchGLU {
@@ -684,12 +681,13 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
 
     /// `jangtq != nil` selects the `TurboQuantSwitchGLU` codebook MoE
     /// path with the supplied `bits` / `mxtqSeed`. `jangtq == nil`
-    /// selects the affine `SwitchGLU` mxfp4 path. The factory
+    /// selects the affine `SwitchGLU` path. The factory
     /// (`LLMModelFactory.swift`) reads `weight_format` and `mxtq_bits`
     /// from `config.json` and threads the right context here. Default
-    /// is JANGTQ-2L (the canonical Laguna distribution) for backwards
-    /// compatibility with existing call sites.
-    public init(_ cfg: LagunaConfiguration, jangtq: LagunaMoEContext? = LagunaMoEContext(bits: 2, mxtqSeed: 42)) {
+    /// is affine because current JANG_2L/JANG_4M distributions use ordinary
+    /// per-module affine weights; legacy codebook bundles pass an explicit
+    /// context from the factory.
+    public init(_ cfg: LagunaConfiguration, jangtq: LagunaMoEContext? = nil) {
         self.cfg = cfg
         self.vocabularySize = cfg.vocabularySize
         self.kvHeads = (0..<cfg.numHiddenLayers).map { _ in cfg.numKeyValueHeads }
@@ -710,18 +708,10 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var h = embedTokens(inputs)
         let cacheArr = cache ?? []
-
-        let fullMask = createAttentionMask(h: h, cache: cacheArr.isEmpty ? nil : cacheArr[faIdx])
-        let swaMask: MLXFast.ScaledDotProductAttentionMaskMode
-        if let swaIdx, !cacheArr.isEmpty {
-            swaMask = createAttentionMask(
-                h: h, cache: cacheArr[swaIdx], windowSize: cfg.slidingWindow)
-        } else {
-            swaMask = .none
-        }
+        let masks = attentionMasks(h: h, cache: cache)
 
         for (i, layer) in layers.enumerated() {
-            h = layer(h, fullMask: fullMask, swaMask: swaMask,
+            h = layer(h, fullMask: masks.full, swaMask: masks.sliding,
                 cache: cacheArr.isEmpty ? nil : cacheArr[i])
         }
 
@@ -734,52 +724,42 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
         return out
     }
 
+    /// Build masks from a representative cache of each attention type. This
+    /// remains callable by focused tests so the no-cache `T > window` path is
+    /// guarded as strongly as cached prefill.
+    internal func attentionMasks(
+        h: MLXArray,
+        cache: [KVCache]?
+    ) -> (
+        full: MLXFast.ScaledDotProductAttentionMaskMode,
+        sliding: MLXFast.ScaledDotProductAttentionMaskMode
+    ) {
+        let cacheArr = cache ?? []
+        let fullMask = createAttentionMask(
+            h: h, cache: cacheArr.isEmpty ? nil : cacheArr[faIdx])
+        let slidingMask: MLXFast.ScaledDotProductAttentionMaskMode
+        if let swaIdx {
+            slidingMask = createAttentionMask(
+                h: h,
+                cache: cacheArr.isEmpty ? nil : cacheArr[swaIdx],
+                windowSize: cfg.slidingWindow)
+        } else {
+            slidingMask = .none
+        }
+        return (fullMask, slidingMask)
+    }
+
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        // 2026-05-01: pick full-attention cache class based on
-        // caller-supplied `kvMode` to avoid clobbering TurboQuant.
-        //
-        //   - When `kvMode == .turboQuant(...)` is set: keep
-        //     `KVCacheSimple()` for full layers. `BatchQuantize.maybeCompress`
-        //     in BatchEngine then promotes those Simple layers to
-        //     `TurboQuantKVCache` once offset > `quantizedKVStart`,
-        //     giving 4.7-5x memory savings. The cache family becomes
-        //     heterogeneous (TurboQuantKVCache + RotatingKVCache) and
-        //     compile is correctly skipped — the user picked memory
-        //     over compile speed.
-        //
-        //   - Otherwise (no kvMode, or `.none`): route full-attention
-        //     through `RotatingKVCache(maxSize: cfg.maxPositionEmbeddings,
-        //     keep: 4)`. All 40 layers are now `RotatingKVCache` →
-        //     `CacheFamily.classify` returns `.rotating` →
-        //     `BatchCompile` Stage 3 promotes to
-        //     `CompilableRotatingKVCache` and traces the forward.
-        //     Decode speedup +15-25 % vs the heterogeneous baseline
-        //     (verified against BENCH_BATCH_CHAT compile turns).
-        //     For chat workloads < trained context the rotation never
-        //     fires, so this is bit-identical to `KVCacheSimple` —
-        //     same memory semantics, just a different concrete class.
-        //
-        // This mirrors the Stage-3 / Stage-2 compile-eligibility split
-        // documented in `BatchEngine.swift:1140-1247`. Gemma4 still
-        // takes the heterogeneous path by default because its
-        // unbounded full-attention cache predates this knob; if/when
-        // Gemma4's full layers also adopt this gating it'll get the
-        // same speedup without losing TQ optionality.
-        let callerWantsTQ: Bool = {
-            guard let p = parameters else { return false }
-            if case .turboQuant = p.kvMode { return true }
-            return false
-        }()
-        let fullKVSize = parameters?.maxKVSize ?? cfg.maxPositionEmbeddings
+        // S-2.1 has no attention sinks. Full-attention layers grow normally;
+        // SWA layers retain exactly the latest window with keep=0. Keeping
+        // full layers as KVCacheSimple also preserves the opt-in TurboQuant
+        // promotion path without changing the default cache representation.
+        _ = parameters
         return cfg.layerTypes.map { layerType in
             if layerType == "sliding_attention" {
-                return RotatingKVCache(maxSize: cfg.slidingWindow)
+                return RotatingKVCache(maxSize: cfg.slidingWindow, keep: 0)
             }
-            if callerWantsTQ {
-                // Preserve `maybeQuantizeKVCache` promotion path.
-                return KVCacheSimple()
-            }
-            return RotatingKVCache(maxSize: fullKVSize, keep: 4)
+            return KVCacheSimple()
         }
     }
 
@@ -814,6 +794,13 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
                 of: ".mlp.experts.e_score_correction_bias",
                 with: ".mlp.e_score_correction_bias"
             )
+            // Current S-2.1 affine bundles already use `switch_mlp`.
+            // Normalize legacy JANGTQ expert payloads to that same module
+            // path so both formats share one production model topology.
+            k = k.replacingOccurrences(
+                of: ".mlp.experts.",
+                with: ".mlp.switch_mlp."
+            )
             // Drop unused / config-only keys.
             if k.contains("self_attn.rotary_emb.inv_freq") { continue }
             if k.hasSuffix(".tq_bits") { continue }
@@ -822,7 +809,7 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         // Second pass: split fused gate_up_proj for routed experts.
-        // Both JANGTQ (codebook: tq_packed/tq_norms) and mxfp4 (affine:
+        // Both JANGTQ (codebook: tq_packed/tq_norms) and affine mixed-bit
         // weight/scales/biases) bundles ship the routed expert gate+up
         // FUSED on the out-dim axis. SwitchGLU (affine) and
         // TurboQuantSwitchGLU (codebook) both expect the two halves at
@@ -833,35 +820,35 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
         // Tensor shapes (verified on real bundles):
         //   JANGTQ tq_packed : (n_exp, 2 × mid, packed_in)  → split axis=1
         //   JANGTQ tq_norms  : (n_exp, 2 × mid)             → split axis=1
-        //   mxfp4 weight     : (n_exp, 2 × mid, packed_in)  → split axis=1
-        //   mxfp4 scales     : (n_exp, 2 × mid, in/gs)      → split axis=1
-        //   mxfp4 biases     : (n_exp, 2 × mid, in/gs)      → split axis=1
+        //   affine weight    : (n_exp, 2 × mid, packed_in)  → split axis=1
+        //   affine scales    : (n_exp, 2 × mid, in/gs)      → split axis=1
+        //   affine biases    : (n_exp, 2 × mid, in/gs)      → split axis=1
         let mid = cfg.moeIntermediateSize
         var out: [String: MLXArray] = [:]
         for (k, v) in firstPass {
-            // Match `layers.<i>.mlp.experts.gate_up_proj.<param>` exactly —
-            // the fused tensor lives only on the routed-expert MoE
-            // (`experts`), never on the shared expert (which has separate
+            // Match the normalized routed-expert `switch_mlp` path exactly.
+            // The fused tensor lives only on the routed-expert MoE,
+            // never on the shared expert (which has separate
             // gate_proj / up_proj keys per the affine-quant scheme).
-            if k.contains(".mlp.experts.gate_up_proj.tq_packed") {
+            if k.contains(".mlp.switch_mlp.gate_up_proj.tq_packed") {
                 let gateK = k.replacingOccurrences(
                     of: ".gate_up_proj.tq_packed", with: ".gate_proj.tq_packed")
                 let upK = k.replacingOccurrences(
                     of: ".gate_up_proj.tq_packed", with: ".up_proj.tq_packed")
                 out[gateK] = v[0..., ..<mid, 0...]
                 out[upK]   = v[0..., mid..., 0...]
-            } else if k.contains(".mlp.experts.gate_up_proj.tq_norms") {
+            } else if k.contains(".mlp.switch_mlp.gate_up_proj.tq_norms") {
                 let gateK = k.replacingOccurrences(
                     of: ".gate_up_proj.tq_norms", with: ".gate_proj.tq_norms")
                 let upK = k.replacingOccurrences(
                     of: ".gate_up_proj.tq_norms", with: ".up_proj.tq_norms")
                 out[gateK] = v[0..., ..<mid]
                 out[upK]   = v[0..., mid...]
-            } else if k.contains(".mlp.experts.gate_up_proj.weight")
-                || k.contains(".mlp.experts.gate_up_proj.scales")
-                || k.contains(".mlp.experts.gate_up_proj.biases")
+            } else if k.contains(".mlp.switch_mlp.gate_up_proj.weight")
+                || k.contains(".mlp.switch_mlp.gate_up_proj.scales")
+                || k.contains(".mlp.switch_mlp.gate_up_proj.biases")
             {
-                // mxfp4 affine path — split the same out-dim axis (axis=1
+                // Legacy fused affine path — split the same out-dim axis (axis=1
                 // of the (n_exp, 2×mid, …) tensor) into gate / up halves.
                 let suffix: String
                 if k.hasSuffix(".weight") { suffix = ".weight" }

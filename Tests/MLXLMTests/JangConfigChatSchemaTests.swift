@@ -52,6 +52,9 @@ struct JangConfigChatSchemaTests {
                     "top_p": 0.95,
                     "max_new_tokens": 300,
                 ] as [String: Any],
+                "template_kwargs_defaults": [
+                    "enable_thinking": true
+                ],
             ] as [String: Any],
         ]
 
@@ -88,6 +91,7 @@ struct JangConfigChatSchemaTests {
         #expect(sd.temperature == 0.6)
         #expect(sd.topP == 0.95)
         #expect(sd.maxNewTokens == 300)
+        #expect(chat.templateKwargsDefaults?.enableThinking == true)
     }
 
     @Test("Missing chat block leaves JangConfig.chat nil (pre-DSV4 bundle)")

@@ -175,6 +175,117 @@ func testTQDiskRestoreMaterializesFreshSimpleCache() async throws {
     #expect(tq.compressedKeys?.tailCount == TurboQuantKVCache.defaultResidualTokens)
 }
 
+@Test
+func testTQDiskRestorePreservesPostCompressionWindow() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let sourceSimple = KVCacheSimple()
+    let (prefixKeys, prefixValues) = smallKV(seqLen: 96)
+    _ = sourceSimple.update(keys: prefixKeys, values: prefixValues)
+    let sourceTQ = TurboQuantKVCache.fromSimpleCache(
+        sourceSimple,
+        keyBits: 4,
+        valueBits: 4,
+        sinkTokens: 4)
+    let windowKeys = MLXArray.ones([1, 4, 4, 16], dtype: .bfloat16) * Float(0.75)
+    let windowValues = MLXArray.ones([1, 4, 4, 16], dtype: .bfloat16) * Float(0.25)
+    _ = sourceTQ.update(keys: windowKeys, values: windowValues)
+    MLX.eval(sourceTQ)
+
+    #expect(sourceTQ.offset == 100)
+    #expect(sourceTQ.state[0].dim(2) == 100)
+
+    let dict = TQDiskSerializer.serialize(cache: [sourceTQ])
+    #expect(dict["tq_0_window_keys"]?.dim(2) == 4)
+    #expect(dict["tq_0_window_values"]?.dim(2) == 4)
+
+    var restored: [any KVCache] = [KVCacheSimple()]
+    let restoredTokens = restoreFromDiskArrays(dict, into: &restored)
+    guard let restoredTQ = restored[0] as? TurboQuantKVCache else {
+        Issue.record("Expected a TurboQuantKVCache restore")
+        return
+    }
+    MLX.eval(restoredTQ)
+    #expect(restoredTokens == 100)
+    #expect(restoredTQ.offset == 100)
+    #expect(restoredTQ.state[0].dim(2) == 100)
+    #expect(allClose(
+        restoredTQ.state[0][.ellipsis, 96..<100, 0...],
+        windowKeys).item(Bool.self))
+    #expect(allClose(
+        restoredTQ.state[1][.ellipsis, 96..<100, 0...],
+        windowValues).item(Bool.self))
+}
+
+@Test
+func testTQDiskRestoreRejectsMissingPostCompressionWindow() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let sourceSimple = KVCacheSimple()
+    let (prefixKeys, prefixValues) = smallKV(seqLen: 96)
+    _ = sourceSimple.update(keys: prefixKeys, values: prefixValues)
+    let sourceTQ = TurboQuantKVCache.fromSimpleCache(
+        sourceSimple, keyBits: 4, valueBits: 4, sinkTokens: 4)
+    let (windowKeys, windowValues) = smallKV(seqLen: 4)
+    _ = sourceTQ.update(keys: windowKeys, values: windowValues)
+
+    var incomplete = TQDiskSerializer.serialize(cache: [sourceTQ])
+    incomplete.removeValue(forKey: "tq_0_window_values")
+    var restored: [any KVCache] = [KVCacheSimple()]
+    let restoredTokens = restoreFromDiskArrays(incomplete, into: &restored)
+
+    #expect(restoredTokens == 0)
+    #expect(restored[0].offset == 0)
+}
+
+@Test
+func testCompilableTQPromotionPreservesPostCompressionWindow() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let sourceSimple = KVCacheSimple()
+    let (prefixKeys, prefixValues) = smallKV(seqLen: 96)
+    _ = sourceSimple.update(keys: prefixKeys, values: prefixValues)
+    let sourceTQ = TurboQuantKVCache.fromSimpleCache(
+        sourceSimple, keyBits: 4, valueBits: 4, sinkTokens: 4)
+    let (windowKeys, windowValues) = smallKV(seqLen: 4)
+    _ = sourceTQ.update(keys: windowKeys, values: windowValues)
+
+    let promoted = CompilableTurboQuantKVCache(from: sourceTQ)
+    MLX.eval(promoted)
+    #expect(promoted.offset == 100)
+    #expect(promoted.state[0].dim(2) == 100)
+    #expect(allClose(
+        promoted.state[0][.ellipsis, 96..<100, 0...],
+        windowKeys).item(Bool.self))
+}
+
+@Test
+func testPagedDecodedTQPersistsAsRestorableStandardKV() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let (keys, values) = smallKV(seqLen: 96)
+    let pagedRestored = TurboQuantKVCache(keyBits: 4, valueBits: 4)
+    pagedRestored.restoreFromDecodedKV(
+        keys: keys, values: values, sourceOffset: 96)
+    #expect(pagedRestored.phase == .compressed)
+    #expect(pagedRestored.compressedKeys == nil)
+
+    let dict = TQDiskSerializer.serialize(cache: [pagedRestored])
+    #expect(dict["__layer_kind_0__"]?.item(Int32.self)
+        == TQDiskSerializer.LayerKind.kv.rawValue)
+    #expect(dict["kv_0_keys"]?.dim(2) == 96)
+
+    var restored: [any KVCache] = [KVCacheSimple()]
+    let restoredTokens = restoreFromDiskArrays(dict, into: &restored)
+    #expect(restoredTokens == 96)
+    #expect(restored[0] is KVCacheSimple)
+    #expect(restored[0].offset == 96)
+}
+
 // MARK: - Hybrid mix (KV + Mamba) + SSM companion state
 
 @Test

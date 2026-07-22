@@ -144,15 +144,19 @@ public final class CompilableTurboQuantKVCache: TurboQuantKVCache, @unchecked Se
         // is slightly wasteful (re-decodes the compressed prefix) but
         // happens exactly once per promotion and preserves correctness.
         if let ck = tq.compressedKeys, let cv = tq.compressedValues {
+            let window = tq.serializedWindowState
             self.restoreCompressed(
-                encodedKeys: ck, encodedValues: cv, sourceOffset: tq.offset)
+                encodedKeys: ck,
+                encodedValues: cv,
+                sourceOffset: tq.offset,
+                windowKeys: window?.keys,
+                windowValues: window?.values)
         }
 
-        // After restoreCompressed, `unifiedKeys` is re-allocated at the
-        // same shape as before. windowOffset is reset to 0. Our
-        // MLXArray counters track from this reset baseline.
-        self.writePosArray = MLXArray([Int32(0)])
-        self.offsetArray = MLXArray([Int32(self.prefixTokenCount)])
+        // Restore seats both the encoded prefix and any exact live window.
+        // The trace counters must begin at that same logical boundary.
+        self.writePosArray = MLXArray([Int32(self.windowOffset)])
+        self.offsetArray = MLXArray([Int32(self.offset)])
         // `offset` (super, Int) was set to `tq.offset` by restoreCompressed.
     }
 

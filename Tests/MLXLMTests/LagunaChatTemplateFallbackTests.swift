@@ -27,10 +27,10 @@ final class LagunaChatTemplateFallbackTests: XCTestCase {
         ])
 
         XCTAssertTrue(
-            rendered.hasPrefix("〈|EOS|〉<system>\n\nYou are a helpful"),
+            rendered.hasPrefix("〈|EOS|〉<system>You are a helpful"),
             rendered.debugDescription)
-        XCTAssertTrue(rendered.contains("<user>\nhi\n</user>\n"), rendered.debugDescription)
-        XCTAssertTrue(rendered.hasSuffix("<assistant>\n</think>\n"), rendered.debugDescription)
+        XCTAssertTrue(rendered.contains("<user>hi</user>\n"), rendered.debugDescription)
+        XCTAssertTrue(rendered.hasSuffix("<assistant></think>"), rendered.debugDescription)
         XCTAssertFalse(rendered.contains("<|im_start|>"))
     }
 
@@ -44,7 +44,7 @@ final class LagunaChatTemplateFallbackTests: XCTestCase {
             "enable_thinking": true,
         ])
 
-        XCTAssertTrue(rendered.hasSuffix("<assistant>\n<think>\n"), rendered.debugDescription)
+        XCTAssertTrue(rendered.hasSuffix("<assistant><think>"), rendered.debugDescription)
     }
 
     func testLagunaMinimalAssistantHistoryPreservesReasoningAndContent() throws {
@@ -60,17 +60,17 @@ final class LagunaChatTemplateFallbackTests: XCTestCase {
                 ["role": "user", "content": "again"],
             ],
             "add_generation_prompt": true,
-            "enable_thinking": false,
+            "enable_thinking": true,
         ])
 
         XCTAssertTrue(
-            rendered.contains("<think>\nbrief internal note\n</think>\nHello!\n</assistant>\n"),
+            rendered.contains("<think>brief internal note</think>Hello!</assistant>\n"),
             rendered.debugDescription)
-        XCTAssertTrue(rendered.contains("<user>\nagain\n</user>\n"), rendered.debugDescription)
-        XCTAssertTrue(rendered.hasSuffix("<assistant>\n</think>\n"), rendered.debugDescription)
+        XCTAssertTrue(rendered.contains("<user>again</user>\n"), rendered.debugDescription)
+        XCTAssertTrue(rendered.hasSuffix("<assistant><think>"), rendered.debugDescription)
     }
 
-    func testLagunaRequiredToolChoiceRendersFunctionCallOnlyContract() throws {
+    func testLagunaToolsMatchBundleContractWithoutPromptCoercion() throws {
         let template = try Template(ChatTemplateFallbacks.lagunaMinimal)
         let rendered = try template.renderLaguna([
             "messages": [
@@ -101,13 +101,8 @@ final class LagunaChatTemplateFallbackTests: XCTestCase {
 
         XCTAssertTrue(rendered.contains("<available_tools>"), rendered.debugDescription)
         XCTAssertTrue(rendered.contains("\"name\":\"line_count\""), rendered.debugDescription)
-        XCTAssertTrue(rendered.contains("<tool_call>function-name"), rendered.debugDescription)
-        XCTAssertTrue(rendered.contains("<arg_key>argument-key</arg_key>"), rendered.debugDescription)
-        XCTAssertTrue(rendered.contains("<arg_value>value-of-argument-key</arg_value>"), rendered.debugDescription)
-        XCTAssertTrue(rendered.contains("The current assistant response MUST be a function call."), rendered.debugDescription)
-        XCTAssertTrue(rendered.contains("Use the `line_count` function."), rendered.debugDescription)
-        XCTAssertTrue(rendered.contains("Include every required argument exactly as requested"), rendered.debugDescription)
-        XCTAssertFalse(rendered.contains("Reply with prose"), rendered.debugDescription)
-        XCTAssertTrue(rendered.hasSuffix("<assistant>\n</think>\n"), rendered.debugDescription)
+        XCTAssertFalse(rendered.contains("The current assistant response MUST be a function call."), rendered.debugDescription)
+        XCTAssertFalse(rendered.contains("function-name"), rendered.debugDescription)
+        XCTAssertTrue(rendered.hasSuffix("<assistant></think>"), rendered.debugDescription)
     }
 }

@@ -702,6 +702,8 @@ public final class CacheCoordinator: @unchecked Sendable {
     ) {
         let totalTokens = promptTokens.count
         let blockSize = config.pagedBlockSize
+        let traceCacheStore =
+            ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
 
         // Older generation call sites intentionally supplied an empty paged
         // payload for every cache that also needed typed disk persistence.
@@ -738,6 +740,21 @@ public final class CacheCoordinator: @unchecked Sendable {
         }
         let hasRequiredPagedCompanion = !requiresPagedBoundaryCompanion
             || pagedBoundaryCompanion != nil
+
+        if traceCacheStore {
+            let rotatingOffsets = cache?.compactMap {
+                ($0 as? RotatingKVCache)?.offset
+            } ?? []
+            let uniqueRotatingOffsets = Array(Set(rotatingOffsets)).sorted()
+            let effectiveKVLayerCount = effectivePerLayerData.compactMap { $0 }.count
+            let message = "[vmlx][cache/paged-store] tokens=\(totalTokens) "
+                + "requiredCompanion=\(requiresPagedBoundaryCompanion) "
+                + "effectiveKVLayers=\(effectiveKVLayerCount) "
+                + "blocks=\(blockLayerData.count) payload=\(hasPagedKVPayload) "
+                + "companion=\(pagedBoundaryCompanion != nil) "
+                + "rotatingOffsets=\(uniqueRotatingOffsets)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+        }
 
         // Store in paged cache (skip when the model is paged-incompatible —
         // see `isPagedIncompatible` above). Recurrent-only/state-only caches

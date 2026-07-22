@@ -111,7 +111,9 @@ public final class ZayaCCACache: KVCache {
     public func restoreTurboQuantAttentionKV(
         encodedKeys: EncodedKeys,
         encodedValues: EncodedValues,
-        sourceOffset: Int
+        sourceOffset: Int,
+        windowKeys: MLXArray? = nil,
+        windowValues: MLXArray? = nil
     ) -> Bool {
         let keyBits = encodedKeys.indexBits + 1
         let valueBits = encodedValues.indexBits
@@ -128,7 +130,9 @@ public final class ZayaCCACache: KVCache {
         restored.restoreCompressed(
             encodedKeys: encodedKeys,
             encodedValues: encodedValues,
-            sourceOffset: sourceOffset)
+            sourceOffset: sourceOffset,
+            windowKeys: windowKeys,
+            windowValues: windowValues)
         guard restored.phase == .compressed, restored.offset == sourceOffset else {
             return false
         }

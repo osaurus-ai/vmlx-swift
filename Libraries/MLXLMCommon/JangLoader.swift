@@ -740,6 +740,7 @@ public struct JangChatConfig: Sendable, Equatable {
     public let reasoning: JangChatReasoning?
     public let toolCalling: JangChatToolCalling?
     public let samplingDefaults: JangChatSamplingDefaults?
+    public let templateKwargsDefaults: ChatTemplateKwargsDefaults?
 
     public init(
         encoder: String? = nil,
@@ -751,7 +752,8 @@ public struct JangChatConfig: Sendable, Equatable {
         roleTokens: [String: String]? = nil,
         reasoning: JangChatReasoning? = nil,
         toolCalling: JangChatToolCalling? = nil,
-        samplingDefaults: JangChatSamplingDefaults? = nil
+        samplingDefaults: JangChatSamplingDefaults? = nil,
+        templateKwargsDefaults: ChatTemplateKwargsDefaults? = nil
     ) {
         self.encoder = encoder
         self.hasTokenizerChatTemplate = hasTokenizerChatTemplate
@@ -763,6 +765,7 @@ public struct JangChatConfig: Sendable, Equatable {
         self.reasoning = reasoning
         self.toolCalling = toolCalling
         self.samplingDefaults = samplingDefaults
+        self.templateKwargsDefaults = templateKwargsDefaults
     }
 }
 
@@ -1782,6 +1785,14 @@ public struct JangLoader: Sendable {
                 )
             } else { sampling = nil }
 
+            let templateKwargsDefaults: ChatTemplateKwargsDefaults?
+            if let defaults = chDict["template_kwargs_defaults"] as? [String: Any] {
+                templateKwargsDefaults = ChatTemplateKwargsDefaults(
+                    enableThinking: defaults["enable_thinking"] as? Bool)
+            } else {
+                templateKwargsDefaults = nil
+            }
+
             chat = JangChatConfig(
                 encoder: chDict["encoder"] as? String,
                 hasTokenizerChatTemplate:
@@ -1793,7 +1804,8 @@ public struct JangLoader: Sendable {
                 roleTokens: chDict["role_tokens"] as? [String: String],
                 reasoning: reasoning,
                 toolCalling: toolCalling,
-                samplingDefaults: sampling
+                samplingDefaults: sampling,
+                templateKwargsDefaults: templateKwargsDefaults
             )
         } else {
             chat = nil

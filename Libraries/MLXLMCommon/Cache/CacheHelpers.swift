@@ -1052,7 +1052,9 @@ private func restoreTQLayer(
         tq.restoreCompressed(
             encodedKeys: comp.encodedKeys,
             encodedValues: comp.encodedValues,
-            sourceOffset: comp.offset
+            sourceOffset: comp.offset,
+            windowKeys: comp.windowKeys,
+            windowValues: comp.windowValues
         )
         return tq.offset > 0
     }
@@ -1061,7 +1063,9 @@ private func restoreTQLayer(
         tq.restoreCompressed(
             encodedKeys: comp.encodedKeys,
             encodedValues: comp.encodedValues,
-            sourceOffset: comp.offset
+            sourceOffset: comp.offset,
+            windowKeys: comp.windowKeys,
+            windowValues: comp.windowValues
         )
         guard tq.offset > 0 else { return false }
         layer = tq
@@ -1073,7 +1077,9 @@ private func restoreTQLayer(
                 tq.restoreCompressed(
                     encodedKeys: comp.encodedKeys,
                     encodedValues: comp.encodedValues,
-                    sourceOffset: comp.offset
+                    sourceOffset: comp.offset,
+                    windowKeys: comp.windowKeys,
+                    windowValues: comp.windowValues
                 )
                 return tq.offset > 0
             }
@@ -1082,7 +1088,9 @@ private func restoreTQLayer(
                 tq.restoreCompressed(
                     encodedKeys: comp.encodedKeys,
                     encodedValues: comp.encodedValues,
-                    sourceOffset: comp.offset
+                    sourceOffset: comp.offset,
+                    windowKeys: comp.windowKeys,
+                    windowValues: comp.windowValues
                 )
                 guard tq.offset > 0 else { return false }
                 cacheList.caches[i] = tq
@@ -1247,7 +1255,9 @@ private func restoreZayaCCATQLayer(
           zaya.restoreTurboQuantAttentionKV(
               encodedKeys: comp.tq.encodedKeys,
               encodedValues: comp.tq.encodedValues,
-              sourceOffset: comp.tq.offset)
+              sourceOffset: comp.tq.offset,
+              windowKeys: comp.tq.windowKeys,
+              windowValues: comp.tq.windowValues)
     else { return false }
     zaya.writeCCA(conv: comp.convState, prev: comp.prevHS)
     return zaya.offset == comp.tq.offset && zaya.usesTurboQuantKV
