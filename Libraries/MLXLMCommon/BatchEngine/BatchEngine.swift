@@ -1183,6 +1183,31 @@ public actor BatchEngine {
         }
     }
 
+    /// Cancel the active direct B=1 generation and wait until its producer
+    /// has stopped touching the shared MLX/Metal stream.
+    ///
+    /// A serving layer that wraps ``generate(input:parameters:)`` in another
+    /// `AsyncStream` cannot safely infer this drain point from its own
+    /// consumer termination: dropping the wrapper must cancel the underlying
+    /// solo task, but releasing the next-request gate before that task exits
+    /// can overlap the cancelled prefill with the next prompt's cache restore.
+    /// This method provides the missing cancellation-and-drain handshake.
+    /// It is idempotent and is a no-op when no solo generation is active.
+    public func cancelActiveSoloGenerationAndWait() async {
+        guard let task = soloFastPathTask else { return }
+        let id = soloFastPathID
+        task.cancel()
+        await task.value
+
+        // The bridge that forwards the producer stream normally clears solo
+        // ownership. It may not have reached that actor hop yet when
+        // `task.value` resumes, so clear the same id here as well. The helper
+        // is idempotent; the bridge's later call becomes a no-op.
+        if let id {
+            finishSoloFastPath(id: id)
+        }
+    }
+
     /// Cancel a specific request by ID.
     ///
     /// If the request is still in the wait queue, it is removed immediately.
