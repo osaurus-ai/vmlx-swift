@@ -118,14 +118,13 @@ private func hashMLXArray(_ array: MLXArray, into hasher: inout SHA256) {
 /// Derive a cache-scope salt string from a request's `additionalContext`.
 ///
 /// Recognized scopes are intentionally narrow: only context keys that can
-/// change prompt rendering or model behavior are folded into the cache key.
+/// change KV state without being represented by the concrete token prefix are
+/// folded into the cache key.
 ///
 /// - Returns:
 ///   - `"reasoning=off"` when `enable_thinking == false`
 ///   - `"reasoning=on"`  when `enable_thinking == true`
 ///   - `"effort=<value>"` when `reasoning_effort` is present
-///   - `"tool=required"` when `tool_choice == "required"`
-///   - `"tool_name=<value>"` when `tool_choice_name` is present
 ///   - a `|`-joined composition when multiple keys are present
 ///   - `nil` when no recognized semantic key is present (so unrelated metadata
 ///     in `additionalContext` does not fragment cache keys)
@@ -145,18 +144,6 @@ public func cacheScopeSalt(from additionalContext: [String: any Sendable]?) -> S
             parts.append("effort=\(normalized)")
         }
     }
-    if let toolChoice = additionalContext["tool_choice"] as? String {
-        let normalized = toolChoice.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalized == "required" {
-            parts.append("tool=required")
-        }
-    }
-    if let toolChoiceName = additionalContext["tool_choice_name"] as? String {
-        let normalized = toolChoiceName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if !normalized.isEmpty {
-            parts.append("tool_name=\(normalized)")
-        }
-    }
     return parts.isEmpty ? nil : parts.joined(separator: "|")
 }
 
@@ -169,8 +156,8 @@ public func cacheScopeSalt(from additionalContext: [String: any Sendable]?) -> S
 ///
 /// When either side is present the result is a stable hex SHA256 over a
 /// tag-prefixed concatenation, so:
-/// - identical media + identical scope → identical salt (cache hit),
-/// - identical media + different scope → different salt (key isolation),
+/// - identical media + identical reasoning scope → identical salt (cache hit),
+/// - identical media + different reasoning scope → different salt (key isolation),
 /// - identical scope + different media → different salt (false-positive
 ///   protection that already existed via `computeMediaSalt`).
 public func computeCacheSalt(for input: LMInput) -> String? {

@@ -79,6 +79,7 @@ struct Mistral3LagunaCoverageTests {
         #expect(ToolCallFormat.fromCapabilityName("laguna") == .glm4)
         #expect(ToolCallFormat.fromCapabilityName("laguna_xs") == .glm4)
         #expect(ToolCallFormat.fromCapabilityName("laguna_s") == .glm4)
+        #expect(ToolCallFormat.fromCapabilityName("poolside_v1") == .glm4)
     }
 
     @Test("Mistral 4 → .mistral (sibling family, same parser)")

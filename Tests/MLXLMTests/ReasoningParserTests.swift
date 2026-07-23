@@ -391,7 +391,7 @@ struct ReasoningParserTests {
     // MARK: - Capability-name resolution
 
     @Test func capabilityAliasesQwen3() {
-        for name in ["qwen3", "qwen3_5", "qwen3_6", "think_xml", "deepseek_r1"] {
+        for name in ["qwen3", "qwen3_5", "qwen3_6", "think_xml", "deepseek_r1", "poolside_v1"] {
             #expect(
                 ReasoningParser.fromCapabilityName(name) != nil,
                 "\(name) should resolve to a parser")
