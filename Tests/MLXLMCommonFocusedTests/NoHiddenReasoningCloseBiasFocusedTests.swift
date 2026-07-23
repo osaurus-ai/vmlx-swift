@@ -1611,6 +1611,8 @@ struct LagunaFocusedContractsTests {
             #expect(ToolCallFormat.infer(from: stamp) == .glm4)
             #expect(ToolCallFormat.fromCapabilityName(stamp) == .glm4)
         }
+        #expect(ReasoningParser.fromCapabilityName("poolside_v1") != nil)
+        #expect(ToolCallFormat.fromCapabilityName("poolside_v1") == .glm4)
     }
 
     @Test("Laguna minimal template thinking off closes reasoning in prompt")
@@ -1657,6 +1659,28 @@ struct LagunaFocusedContractsTests {
         #expect(reasoning == "private plan")
         #expect(content == "Visible answer.")
         #expect(!content.contains("</think>"))
+    }
+
+    @Test("Laguna Poolside vendor stamp opens reasoning from prompt tail")
+    func lagunaPoolsideVendorStampOpensReasoning() throws {
+        let rendered = try renderLaguna([
+            "messages": [
+                ["role": "user", "content": "hi"],
+            ],
+            "add_generation_prompt": true,
+            "enable_thinking": true,
+        ])
+
+        #expect(rendered.hasSuffix("<assistant><think>"))
+
+        var parser = ReasoningParser.forPrompt(
+            stampName: "poolside_v1",
+            promptTail: String(rendered.suffix(128)))!
+        let (reasoning, content) = collectParser(
+            &parser,
+            "private plan</think>Visible answer.")
+        #expect(reasoning == "private plan")
+        #expect(content == "Visible answer.")
     }
 
     @Test("Laguna minimal template omitted thinking follows vendor default ON")

@@ -728,6 +728,8 @@ extension ReasoningParser {
             || compact.hasPrefix("glm5")
             || normalized.hasPrefix("deepseek")
             || normalized.hasPrefix("laguna")
+            || normalized == "poolside_v1"
+            || normalized.hasPrefix("poolside_v1_")
         {
             return ReasoningParser(startInReasoning: true)
         }
@@ -800,7 +802,7 @@ extension ReasoningParser {
             "deepseek_r1", "deepseek-r1", "deepseek", "glm", "glm4", "glm5",
             "nemotron", "nemotron_h", "minimax", "minimax_m2",
             "kimi", "kimi_k2", "kimik2",
-            "laguna", "laguna_xs", "laguna_s",
+            "laguna", "laguna_xs", "laguna_s", "poolside_v1",
             "zaya", "zaya1", "zaya2",
             "step", "stepfun", "step3p5", "step3p7", "step3_5", "step3_7":
             // Start inside the reasoning block — matches the Qwen 3.x

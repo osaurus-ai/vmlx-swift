@@ -561,6 +561,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             || compact.hasPrefix("glm47")
             || compact.hasPrefix("deepseek")
             || compact.hasPrefix("laguna")
+            || compact.hasPrefix("poolsidev1")
         {
             return .glm4
         }
@@ -629,7 +630,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // the direct lookup above, but is listed here for parity with
         // `glm4_moe` / `glm47` family aliases.
         case "glm4", "glm47", "glm5", "glm4_moe", "deepseek",
-            "laguna", "laguna_xs", "laguna_s":
+            "laguna", "laguna_xs", "laguna_s", "poolside_v1":
             return .glm4
         // Nemotron-H / Cascade — canonical templates use Qwen-style XML
         // function calls, but live Omni/JANGTQ rows can emit DSML protocol
