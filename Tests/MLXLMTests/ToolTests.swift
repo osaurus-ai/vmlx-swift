@@ -3,6 +3,29 @@ import MLXLMCommon
 import Testing
 
 struct ToolTests {
+    private func stringArrayTools(
+        functionName: String = "capabilities_load",
+        parameterName: String = "ids"
+    ) -> [[String: any Sendable]] {
+        [
+            [
+                "function": [
+                    "name": functionName,
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            parameterName: [
+                                "type": "array",
+                                "items": ["type": "string"] as [String: any Sendable],
+                            ] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                        "required": [parameterName],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+    }
+
     private func lineCountTools() -> [ToolSpec] {
         [
             [
@@ -637,23 +660,7 @@ struct ToolTests {
     @Test("XML Function Parser recovers schema-bound unquoted string array")
     func testXMLFunctionParserUnquotedStringArrayRecovery() throws {
         let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
-        let tools: [[String: any Sendable]] = [
-            [
-                "function": [
-                    "name": "capabilities_load",
-                    "parameters": [
-                        "type": "object",
-                        "properties": [
-                            "ids": [
-                                "type": "array",
-                                "items": ["type": "string"] as [String: any Sendable],
-                            ] as [String: any Sendable]
-                        ] as [String: any Sendable],
-                        "required": ["ids"],
-                    ] as [String: any Sendable],
-                ] as [String: any Sendable]
-            ]
-        ]
+        let tools = stringArrayTools()
         let content = """
             <tool_call>
             <function=capabilities_load>
@@ -672,6 +679,25 @@ struct ToolTests {
                 == .array([
                     .string("skill/Autonomous Scheduler"),
                     .string("skill/Data Keeper"),
+                ])
+        )
+    }
+
+    @Test("XML Function Parser keeps valid JSON string arrays on the normal path")
+    func testXMLFunctionParserValidJSONStringArrayUnchanged() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content =
+            #"<function=capabilities_load><parameter=ids>["skill/One","skill/Two"]</parameter></function>"#
+
+        let call = try #require(
+            parser.parse(content: content, tools: stringArrayTools())
+        )
+
+        #expect(
+            call.function.arguments["ids"]
+                == .array([
+                    .string("skill/One"),
+                    .string("skill/Two"),
                 ])
         )
     }
@@ -706,22 +732,7 @@ struct ToolTests {
     @Test("XML Function Parser rejects ambiguous nested unquoted string arrays")
     func testXMLFunctionParserUnquotedStringArrayRecoveryRejectsNestedSyntax() throws {
         let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
-        let tools: [[String: any Sendable]] = [
-            [
-                "function": [
-                    "name": "capabilities_load",
-                    "parameters": [
-                        "type": "object",
-                        "properties": [
-                            "ids": [
-                                "type": "array",
-                                "items": ["type": "string"] as [String: any Sendable],
-                            ] as [String: any Sendable]
-                        ] as [String: any Sendable],
-                    ] as [String: any Sendable],
-                ] as [String: any Sendable]
-            ]
-        ]
+        let tools = stringArrayTools()
         let content =
             "<function=capabilities_load><parameter=ids>[[skill/One], skill/Two]</parameter></function>"
 
@@ -730,6 +741,33 @@ struct ToolTests {
         #expect(
             call.function.arguments["ids"]
                 == .string("[[skill/One], skill/Two]")
+        )
+    }
+
+    @Test("Qwen XML streaming recovers split schema-bound string array")
+    func testQwenXMLStreamingUnquotedStringArrayRecovery() throws {
+        let processor = ToolCallProcessor(
+            format: .xmlFunction,
+            tools: stringArrayTools()
+        )
+        let chunks = [
+            "<tool", "_call>\n<function=capabilities_load>\n<parameter=ids>\n[skill/",
+            "Autonomous Scheduler, skill/Data ",
+            "Keeper]\n</parameter>\n</function>\n</tool_call>",
+        ]
+
+        for chunk in chunks {
+            _ = processor.processChunk(chunk)
+        }
+
+        let call = try #require(processor.toolCalls.first)
+        #expect(processor.toolCalls.count == 1)
+        #expect(
+            call.function.arguments["ids"]
+                == .array([
+                    .string("skill/Autonomous Scheduler"),
+                    .string("skill/Data Keeper"),
+                ])
         )
     }
 
