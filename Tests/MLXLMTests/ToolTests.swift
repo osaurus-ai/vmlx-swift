@@ -634,6 +634,105 @@ struct ToolTests {
         #expect(toolCall.function.arguments["enabled"] == .bool(true))
     }
 
+    @Test("XML Function Parser recovers schema-bound unquoted string array")
+    func testXMLFunctionParserUnquotedStringArrayRecovery() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "capabilities_load",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "ids": [
+                                "type": "array",
+                                "items": ["type": "string"] as [String: any Sendable],
+                            ] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                        "required": ["ids"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content = """
+            <tool_call>
+            <function=capabilities_load>
+            <parameter=ids>
+            [skill/Autonomous Scheduler, skill/Data Keeper]
+            </parameter>
+            </function>
+            </tool_call>
+            """
+
+        let call = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(call.function.name == "capabilities_load")
+        #expect(
+            call.function.arguments["ids"]
+                == .array([
+                    .string("skill/Autonomous Scheduler"),
+                    .string("skill/Data Keeper"),
+                ])
+        )
+    }
+
+    @Test("XML Function Parser does not apply string-array recovery to object arrays")
+    func testXMLFunctionParserUnquotedStringArrayRecoveryIsSchemaBound() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "store_rows",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "rows": [
+                                "type": "array",
+                                "items": ["type": "object"] as [String: any Sendable],
+                            ] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content =
+            "<function=store_rows><parameter=rows>[first, second]</parameter></function>"
+
+        let call = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(call.function.arguments["rows"] == .string("[first, second]"))
+    }
+
+    @Test("XML Function Parser rejects ambiguous nested unquoted string arrays")
+    func testXMLFunctionParserUnquotedStringArrayRecoveryRejectsNestedSyntax() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "capabilities_load",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "ids": [
+                                "type": "array",
+                                "items": ["type": "string"] as [String: any Sendable],
+                            ] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content =
+            "<function=capabilities_load><parameter=ids>[[skill/One], skill/Two]</parameter></function>"
+
+        let call = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(
+            call.function.arguments["ids"]
+                == .string("[[skill/One], skill/Two]")
+        )
+    }
+
     @Test("Test XML Function Parser - Multiline Content (Qwen3.5 style)")
     func testXMLFunctionParserMultiline() throws {
         let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")

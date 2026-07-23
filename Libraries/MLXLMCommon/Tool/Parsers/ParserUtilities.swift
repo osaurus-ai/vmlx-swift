@@ -56,16 +56,28 @@ func isStringType(funcName: String, argName: String, tools: [[String: any Sendab
 func getParameterType(
     funcName: String, paramName: String, tools: [[String: any Sendable]]?
 ) -> String? {
+    getParameterSchema(funcName: funcName, paramName: paramName, tools: tools)?["type"] as? String
+}
+
+/// Get the full parameter schema for a specific function argument.
+///
+/// Collection conversion needs more than the top-level `type`: an unquoted
+/// bracket list is only safe to recover when the schema explicitly declares
+/// an array whose ITEMS are strings. Keeping that check here prevents the XML
+/// parser from applying a string-list heuristic to object arrays or ordinary
+/// string parameters.
+func getParameterSchema(
+    funcName: String, paramName: String, tools: [[String: any Sendable]]?
+) -> [String: any Sendable]? {
     guard let tools else { return nil }
     for tool in tools {
         guard let function = tool["function"] as? [String: any Sendable],
             function["name"] as? String == funcName,
             let parameters = function["parameters"] as? [String: any Sendable],
             let properties = parameters["properties"] as? [String: any Sendable],
-            let param = properties[paramName] as? [String: any Sendable],
-            let type = param["type"] as? String
+            let param = properties[paramName] as? [String: any Sendable]
         else { continue }
-        return type
+        return param
     }
     return nil
 }
@@ -233,14 +245,67 @@ func convertParameterValue(
             value.lowercased().trimmingCharacters(in: .whitespaces))
     }
 
-    // Object/Array types - JSON decode
+    // Object/Array types - JSON decode.
     if ["object", "array"].contains(type) || type.hasPrefix("dict") || type.hasPrefix("list") {
         if let json = tryParseJSON(value) {
             return json
         }
+        // Qwen XML tool calls occasionally render a schema-declared string
+        // array as an unquoted bracket list:
+        //
+        //   <parameter=ids>[skill/One, skill/Two]</parameter>
+        //
+        // That is neither valid JSON nor a scalar value. Recover only the
+        // unambiguous shape: the parameter must be an ARRAY, its item schema
+        // must be STRING, the outer brackets must be present, and every
+        // comma-delimited member must be a non-empty plain scalar. Object
+        // arrays, nested arrays, and arbitrary bare strings remain untouched
+        // and reach the normal schema error path.
+        if type == "array",
+            let schema = getParameterSchema(
+                funcName: funcName,
+                paramName: paramName,
+                tools: tools
+            ),
+            let recovered = parseUnquotedStringArray(value, schema: schema)
+        {
+            return recovered
+        }
     }
 
     return value
+}
+
+/// Parse the exact plain `[alpha, beta]` fallback shape for `array<string>`.
+private func parseUnquotedStringArray(
+    _ value: String,
+    schema: [String: any Sendable]
+) -> [String]? {
+    guard schema["type"] as? String == "array",
+        let items = schema["items"] as? [String: any Sendable],
+        items["type"] as? String == "string"
+    else { return nil }
+
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.count >= 2, trimmed.first == "[", trimmed.last == "]" else {
+        return nil
+    }
+    let body = trimmed.dropFirst().dropLast()
+    guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return []
+    }
+
+    let forbidden = CharacterSet(charactersIn: "[]{}<>\"'")
+        .union(.controlCharacters)
+    var result: [String] = []
+    for rawMember in body.split(separator: ",", omittingEmptySubsequences: false) {
+        let member = rawMember.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !member.isEmpty,
+            member.rangeOfCharacter(from: forbidden) == nil
+        else { return nil }
+        result.append(member)
+    }
+    return result
 }
 
 private func unescapeJSONStringScalar(_ value: String) -> String {
