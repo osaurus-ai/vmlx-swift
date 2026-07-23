@@ -16,6 +16,18 @@ private extension Template {
 }
 
 final class LagunaChatTemplateFallbackTests: XCTestCase {
+    func testLagunaMinimalOmittedThinkingUsesVendorDefaultOn() throws {
+        let template = try Template(ChatTemplateFallbacks.lagunaMinimal)
+        let rendered = try template.renderLaguna([
+            "messages": [
+                ["role": "user", "content": "hi"],
+            ],
+            "add_generation_prompt": true,
+        ])
+
+        XCTAssertTrue(rendered.hasSuffix("<assistant><think>"), rendered.debugDescription)
+    }
+
     func testLagunaMinimalThinkingOffUsesPoolsideTurns() throws {
         let template = try Template(ChatTemplateFallbacks.lagunaMinimal)
         let rendered = try template.renderLaguna([

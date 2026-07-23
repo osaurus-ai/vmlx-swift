@@ -1659,6 +1659,27 @@ struct LagunaFocusedContractsTests {
         #expect(!content.contains("</think>"))
     }
 
+    @Test("Laguna minimal template omitted thinking follows vendor default ON")
+    func lagunaTemplateOmittedThinkingOpensReasoning() throws {
+        let rendered = try renderLaguna([
+            "messages": [
+                ["role": "user", "content": "hi"],
+            ],
+            "add_generation_prompt": true,
+        ])
+
+        #expect(rendered.hasSuffix("<assistant><think>"))
+
+        var parser = ReasoningParser.forPrompt(
+            stampName: "laguna",
+            promptTail: String(rendered.suffix(128)))!
+        let (reasoning, content) = collectParser(
+            &parser,
+            "private plan</think>Visible answer.")
+        #expect(reasoning == "private plan")
+        #expect(content == "Visible answer.")
+    }
+
     @Test("Laguna assistant history preserves reasoning and content")
     func lagunaAssistantHistoryPreservesReasoningAndContent() throws {
         let rendered = try renderLaguna([

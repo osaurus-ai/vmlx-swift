@@ -669,7 +669,13 @@ value_1
     unaffected because encode(addSpecialTokens:true) adds the BOS itself — which is
     what previously masked this bug.) -#}
 {{- "〈|EOS|〉" -}}
-{%- set enable_thinking = enable_thinking | default(false) -%}
+{#- Laguna S 2.1 serving defaults thinking ON through
+    generation_config.default_chat_template_kwargs.enable_thinking=true.
+    The raw sidecar Jinja fallback is false, but this production fallback is
+    used when the include-based sidecar cannot be rendered by the Swift bridge;
+    it must preserve the bundle/runtime serving contract when the caller omits
+    an explicit override. -#}
+{%- set enable_thinking = enable_thinking | default(true) -%}
 {%- set add_generation_prompt = add_generation_prompt | default(false) -%}
 {%- set system_message = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations." -%}
 {%- if messages and messages[0].role == "system" -%}
