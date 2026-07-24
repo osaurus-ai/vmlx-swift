@@ -1398,11 +1398,21 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
             if nk.contains(".switch_mlp.") { nk = nk.replacingOccurrences(of: ".switch_mlp.", with: ".experts.switch_glu.") }
             if nk.contains(".experts.down_proj.") {
                 nk = nk.replacingOccurrences(of: ".experts.down_proj.", with: ".experts.switch_glu.down_proj.")
+            } else if nk.hasSuffix(".experts.down_proj") {
+                nk = String(nk.dropLast(".experts.down_proj".count)) + ".experts.switch_glu.down_proj"
             }
-            if nk.contains(".experts.gate_up_proj.") {
+            if nk.contains(".experts.gate_up_proj.") || nk.hasSuffix(".experts.gate_up_proj") {
                 let mid = config.textConfig.moeIntermediateSize
-                let gateKey = nk.replacingOccurrences(of: ".experts.gate_up_proj.", with: ".experts.switch_glu.gate_proj.")
-                let upKey = nk.replacingOccurrences(of: ".experts.gate_up_proj.", with: ".experts.switch_glu.up_proj.")
+                let gateKey: String
+                let upKey: String
+                if nk.contains(".experts.gate_up_proj.") {
+                    gateKey = nk.replacingOccurrences(of: ".experts.gate_up_proj.", with: ".experts.switch_glu.gate_proj.")
+                    upKey = nk.replacingOccurrences(of: ".experts.gate_up_proj.", with: ".experts.switch_glu.up_proj.")
+                } else {
+                    let base = String(nk.dropLast(".experts.gate_up_proj".count))
+                    gateKey = base + ".experts.switch_glu.gate_proj"
+                    upKey = base + ".experts.switch_glu.up_proj"
+                }
                 if v.shape.count >= 3 {
                     p[gateKey] = v[0..., ..<mid, 0...]
                     p[upKey] = v[0..., mid..., 0...]
