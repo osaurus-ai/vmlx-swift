@@ -568,9 +568,30 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     }
 
     private static func isUnusedPlaceholderAddedToken(_ content: String) -> Bool {
-        guard content.hasPrefix("<unused"), content.hasSuffix(">") else { return false }
+        let prefix: String
+        if content.hasPrefix("<unused") {
+            prefix = "<unused"
+        } else if content.hasPrefix("<SPECIAL_") {
+            // NVIDIA's large Tekken vocabulary serializes tens of thousands
+            // of reserved `<SPECIAL_N>` slots as added tokens. Compiling all
+            // of them into one ICU alternation makes every encode call spend
+            // minutes in NSRegularExpression. They are placeholders, just
+            // like `<unusedN>`; real named specials remain in the regex.
+            prefix = "<SPECIAL_"
+        } else if content.hasPrefix("<speechcodec_") {
+            // Audex exposes its 65,536 speech-decoder codebook entries as
+            // added tokens. They must stay addressable by ID for decoding,
+            // but must not become a 65k-branch input-isolation regex.
+            prefix = "<speechcodec_"
+        } else if content.hasPrefix("<audiocodec_") {
+            // Same contract for the 8,192 XCodec text-to-audio entries.
+            prefix = "<audiocodec_"
+        } else {
+            return false
+        }
+        guard content.hasSuffix(">") else { return false }
 
-        let numberStart = content.index(content.startIndex, offsetBy: "<unused".count)
+        let numberStart = content.index(content.startIndex, offsetBy: prefix.count)
         let numberEnd = content.index(before: content.endIndex)
         guard numberStart < numberEnd else { return false }
 

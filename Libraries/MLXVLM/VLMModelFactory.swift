@@ -146,6 +146,8 @@ public enum VLMTypeRegistry {
         "deepseekocr": create(DeepseekOCRConfiguration.self, DeepseekOCR.init),
         "gemma4": create(Gemma4Configuration.self, Gemma4.init),
         "gemma4_unified": create(Gemma4Configuration.self, Gemma4.init),
+        "nemotron_dense_audex": create(AudexConfiguration.self, Audex.init),
+        "nemotron_h_audex": create(AudexHConfiguration.self, AudexH.init),
         "nemotron_h_omni": create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
         "NemotronH_Nano_Omni_Reasoning_V3":
             create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
@@ -244,6 +246,8 @@ public enum VLMProcessorTypeRegistry {
             Gemma4ProcessorConfiguration.self, Gemma4Processor.init),
         "Gemma4UnifiedProcessor": create(
             Gemma4ProcessorConfiguration.self, Gemma4Processor.init),
+        "Qwen2AudioProcessor": create(
+            AudexProcessorConfiguration.self, AudexProcessor.init),
         "NemotronHOmniProcessor": create(
             NemotronHOmniProcessorConfiguration.self, NemotronHOmniProcessor.init),
         "Zaya1VLProcessor": create(
@@ -791,12 +795,15 @@ private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
 ) {
     let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
     let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
+    let audioPreprocessorConfigURL = modelDirectory.appending(
+        path: "audio_preprocessor/preprocessor_config.json")
     let videoPreprocessorConfigURL = modelDirectory.appending(
         component: "video_preprocessor_config.json")
     let url =
         FileManager.default.fileExists(atPath: preprocessorConfigURL.path)
         ? preprocessorConfigURL
-        : processorConfigURL
+        : (FileManager.default.fileExists(atPath: processorConfigURL.path)
+            ? processorConfigURL : audioPreprocessorConfigURL)
     do {
         var data = try Data(contentsOf: url)
         if FileManager.default.fileExists(atPath: videoPreprocessorConfigURL.path) {

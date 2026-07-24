@@ -6,7 +6,7 @@ import Testing
 
 @Suite("Tokenizer added-token regex focused guards")
 struct TokenizerAddedTokenRegexFocusedTests {
-    @Test("unused placeholder added tokens are excluded from regex construction")
+    @Test("indexed placeholder added tokens are excluded from regex construction")
     func unusedPlaceholderAddedTokensAreExcludedFromRegexConstruction() throws {
         let source = try String(
             contentsOfFile: "Vendors/swift-transformers/Sources/Tokenizers/Tokenizer.swift",
@@ -14,6 +14,9 @@ struct TokenizerAddedTokenRegexFocusedTests {
 
         #expect(source.contains("private static func isUnusedPlaceholderAddedToken"))
         #expect(source.contains("if Self.isUnusedPlaceholderAddedToken(content)"))
+        #expect(source.contains("content.hasPrefix(\"<SPECIAL_\")"))
+        #expect(source.contains("content.hasPrefix(\"<speechcodec_\")"))
+        #expect(source.contains("content.hasPrefix(\"<audiocodec_\")"))
         #expect(source.contains("return nil"))
         #expect(source.contains("content[numberStart..<numberEnd].allSatisfy { $0.isNumber }"))
     }

@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-20",
+  "overall_status": "partial_default_thinking_packaged_app_and_cache_proof_open",
+  "runtime_pr": "https://github.com/osaurus-ai/vmlx-swift/pull/168",
+  "osaurus_pr": "https://github.com/osaurus-ai/osaurus/pull/2116",
+  "quantization": {
+    "method": "mlx_affine",
+    "group_size": 64,
+    "language_decoder": "quantized",
+    "audio_encoder": "source_precision",
+    "audio_projector": "source_precision"
+  },
+  "live_contract": {
+    "audio_fixture": "sample_speech.wav",
+    "template_mode": "explicit_instruct",
+    "additional_context": {
+      "enable_thinking": false
+    },
+    "generation_defaults": {
+      "temperature": 0.6,
+      "top_p": 1.0,
+      "top_k": 0,
+      "min_p": 0.0,
+      "repetition_penalty": null
+    },
+    "required_stop": "stop",
+    "turn_count": 3,
+    "required_visible_output": true,
+    "required_reasoning_characters": 0,
+    "protocol_marker_leak_allowed": false
+  },
+  "families": [
+    {
+      "name": "Nemotron-Labs-Audex-2B",
+      "source_model": "nvidia/Nemotron-Labs-Audex-2B",
+      "source_revision": "d43e996bab673833ffb56dcfcc5b658f229f7343",
+      "model_type": "nemotron_dense_audex",
+      "cache_topology": {
+        "standard_kv_layers": 28,
+        "mamba_layers": 0
+      },
+      "bundles": [
+        {
+          "repo_id": "OsaurusAI/Nemotron-Labs-Audex-2B-4bit",
+          "hub_revision": "2bfd4e593d6fc3e3ab5434e39a8c45fb9c7839de",
+          "hub_file_count": 21,
+          "hub_bundle_bytes": 2615556389,
+          "remote_manifest_status": "pass",
+          "bits": 4,
+          "weight_bytes": 2567319984,
+          "weight_shards": 3,
+          "tensor_count": 1057,
+          "quantized_module_count": 170,
+          "audio_tensor_count": 490,
+          "load_seconds": 4.8,
+          "turn_tokens_per_second": [117.1, 119.6, 114.7],
+          "current_phys_footprint_gib": 3.868,
+          "peak_sampled_phys_footprint_gib": 6.427,
+          "static_status": "pass",
+          "instruct_runtime_status": "pass"
+        },
+        {
+          "repo_id": "OsaurusAI/Nemotron-Labs-Audex-2B-6bit",
+          "hub_revision": "3ac9e2b8055aff74e0a4167056e4aefd1106f147",
+          "hub_file_count": 22,
+          "hub_bundle_bytes": 3178117360,
+          "remote_manifest_status": "pass",
+          "bits": 6,
+          "weight_bytes": 3129880955,
+          "weight_shards": 4,
+          "tensor_count": 1057,
+          "quantized_module_count": 170,
+          "audio_tensor_count": 490,
+          "load_seconds": 4.6,
+          "turn_tokens_per_second": [117.6, 114.9, 113.8],
+          "current_phys_footprint_gib": 4.365,
+          "peak_sampled_phys_footprint_gib": 6.413,
+          "static_status": "pass",
+          "instruct_runtime_status": "pass"
+        },
+        {
+          "repo_id": "OsaurusAI/Nemotron-Labs-Audex-2B-8bit",
+          "hub_revision": "3a6870afebc419f72f644aeab14a33e622bb8f2b",
+          "hub_file_count": 22,
+          "hub_bundle_bytes": 3740678520,
+          "remote_manifest_status": "pass",
+          "bits": 8,
+          "weight_bytes": 3692442115,
+          "weight_shards": 4,
+          "tensor_count": 1057,
+          "quantized_module_count": 170,
+          "audio_tensor_count": 490,
+          "load_seconds": 4.6,
+          "turn_tokens_per_second": [121.8, 114.8, 122.1],
+          "current_phys_footprint_gib": 4.839,
+          "peak_sampled_phys_footprint_gib": 6.897,
+          "static_status": "pass",
+          "instruct_runtime_status": "pass"
+        }
+      ]
+    },
+    {
+      "name": "Nemotron-Labs-Audex-30B-A3B",
+      "source_model": "nvidia/Nemotron-Labs-Audex-30B-A3B",
+      "source_revision": "00f0afa02e8ec0a9afc88221e456a02591bfca4c",
+      "model_type": "nemotron_h_audex",
+      "cache_topology": {
+        "attention_kv_layers": 6,
+        "mamba_layers": 23,
+        "moe_layers_without_kv": 23
+      },
+      "bundles": [
+        {
+          "repo_id": "OsaurusAI/Nemotron-Labs-Audex-30B-A3B-4bit",
+          "hub_revision": "28bd7751c7d186802eb2b60286b778b1c8a47f45",
+          "hub_file_count": 46,
+          "hub_bundle_bytes": 19354782572,
+          "remote_manifest_status": "pass",
+          "bits": 4,
+          "weight_bytes": 19306435800,
+          "weight_shards": 26,
+          "tensor_count": 1219,
+          "quantized_module_count": 164,
+          "stacked_expert_group_count": 46,
+          "audio_tensor_count": 490,
+          "load_seconds": 4.7,
+          "turn_tokens_per_second": [50.8, 50.6, 51.3],
+          "current_phys_footprint_gib": 20.444,
+          "peak_sampled_phys_footprint_gib": 24.127,
+          "static_status": "pass",
+          "instruct_runtime_status": "pass"
+        },
+        {
+          "repo_id": "OsaurusAI/Nemotron-Labs-Audex-30B-A3B-6bit",
+          "hub_revision": "5ee5f622cd6752a9bfcecf078388c416944049d3",
+          "hub_file_count": 70,
+          "hub_bundle_bytes": 27346830800,
+          "remote_manifest_status": "pass",
+          "bits": 6,
+          "weight_bytes": 27298484028,
+          "weight_shards": 50,
+          "tensor_count": 1219,
+          "quantized_module_count": 164,
+          "stacked_expert_group_count": 46,
+          "audio_tensor_count": 490,
+          "load_seconds": 4.9,
+          "turn_tokens_per_second": [50.0, 51.1, 49.8],
+          "current_phys_footprint_gib": 27.873,
+          "peak_sampled_phys_footprint_gib": 31.452,
+          "static_status": "pass",
+          "instruct_runtime_status": "pass"
+        },
+        {
+          "repo_id": "OsaurusAI/Nemotron-Labs-Audex-30B-A3B-8bit",
+          "hub_revision": "edf93021d76b20e11234b0482fa6d36eef2d7fce",
+          "hub_file_count": 70,
+          "hub_bundle_bytes": 35338878501,
+          "remote_manifest_status": "pass",
+          "bits": 8,
+          "weight_bytes": 35290531729,
+          "weight_shards": 50,
+          "tensor_count": 1219,
+          "quantized_module_count": 164,
+          "stacked_expert_group_count": 46,
+          "audio_tensor_count": 490,
+          "load_seconds": 5.2,
+          "turn_tokens_per_second": [49.5, 50.2, 50.2],
+          "current_phys_footprint_gib": 35.367,
+          "peak_sampled_phys_footprint_gib": 38.944,
+          "static_status": "pass",
+          "instruct_runtime_status": "pass"
+        }
+      ]
+    }
+  ],
+  "known_failed_rows": [
+    {
+      "scope": "2B and 30B representative 4-bit bundles",
+      "mode": "bundle_default_thinking",
+      "result": "fail",
+      "evidence": "normal stop with 195-196 reasoning characters and zero visible characters",
+      "forbidden_workarounds": [
+        "forced reasoning close token",
+        "reclassifying unclosed reasoning as visible output",
+        "hidden sampler override",
+        "prompt coercion"
+      ]
+    }
+  ],
+  "unproven": [
+    "Osaurus packaged-app audio attachment run",
+    "prefix cache hit counters",
+    "paged cache hit counters",
+    "L2 disk restore",
+    "30B Mamba companion-state restore",
+    "audio encoder embedding reuse",
+    "text-to-speech output",
+    "text-to-audio output",
+    "speech-to-speech audio output"
+  ]
+}

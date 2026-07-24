@@ -1,0 +1,311 @@
+{
+  "schema_version": 1,
+  "status_date": "2026-07-20",
+  "status": "partial_osaurus_integration",
+  "model": {
+    "display_name": "NVIDIA Nemotron-Labs-Audex-2B",
+    "hugging_face_id": "nvidia/Nemotron-Labs-Audex-2B",
+    "hugging_face_revision": "d43e996bab673833ffb56dcfcc5b658f229f7343",
+    "space_id": "nvidia/Nemotron-Labs-Audex",
+    "space_revision": "c66674198bafcc086730538b1d0c86b759b133ee",
+    "model_type": "nemotron_dense_audex",
+    "architecture": "NemotronDenseAudexForConditionalGeneration",
+    "license": "NVIDIA OneWay Noncommercial License",
+    "research_and_development_only": true
+  },
+  "local_artifacts": {
+    "source_snapshot": "~/models/nvidia/Nemotron-Labs-Audex-2B",
+    "runtime_checkpoint": "~/models/nvidia/Nemotron-Labs-Audex-2B/checkpoint_folder_full",
+    "space_snapshot": "~/models/nvidia/Nemotron-Labs-Audex-Space",
+    "quantized_bundle": "~/models/nvidia/Nemotron-Labs-Audex-2B-4bit-vMLX",
+    "quantized_weight_bytes": 2567320669,
+    "model_payload_file_count": 106,
+    "model_payload_bytes": 12281588752
+  },
+  "modality_contract": {
+    "input": {
+      "text": "supported",
+      "audio": "supported",
+      "image": "unsupported",
+      "video": "unsupported"
+    },
+    "output": {
+      "text": "supported",
+      "audio": "blocked_not_implemented"
+    },
+    "batch_size": 1,
+    "audio_output_blocker": "The causal speech decoder, XCodec/XCodec2 token decoder, text-to-audio CFG path, and optional enhancement VAE are not implemented in Swift."
+  },
+  "text_architecture": {
+    "vocabulary_size": 205312,
+    "hidden_size": 2048,
+    "intermediate_size": 9216,
+    "layer_count": 28,
+    "attention_heads": 16,
+    "key_value_heads": 8,
+    "head_dimension": 128,
+    "normalization": "RMSNorm",
+    "normalization_epsilon": 0.00001,
+    "mlp_activation": "ReLU squared",
+    "rope_theta": 100000000,
+    "maximum_position_embeddings": 131072,
+    "tied_word_embeddings": false
+  },
+  "audio_architecture": {
+    "family": "NV-Whisper/Qwen2 audio encoder",
+    "mel_bins": 128,
+    "model_dimension": 1280,
+    "layer_count": 32,
+    "attention_heads": 20,
+    "feed_forward_dimension": 5120,
+    "maximum_source_positions": 1500,
+    "projector_intermediate_size": 4096,
+    "projector_output_size": 2048,
+    "projector_activation": "ReLU squared"
+  },
+  "audio_processor": {
+    "processor_class": "Qwen2AudioProcessor",
+    "accepted_vmlx_inputs": [
+      "UserInput.Audio.url",
+      "UserInput.Audio.samples",
+      "UserInput.Audio.array",
+      "UserInput.Audio.preEncoded"
+    ],
+    "target_sample_rate_hz": 16000,
+    "channel_contract": "mono Float32 PCM after decoding",
+    "clip_samples": 480000,
+    "clip_duration_seconds": 30,
+    "tokens_per_clip": 750,
+    "feature_shape_per_clip": [
+      1,
+      128,
+      3000
+    ],
+    "stft": {
+      "fft_size": 400,
+      "hop_length": 160,
+      "window": "periodic Hann",
+      "center_padding": "reflect 200 samples on both sides",
+      "power_spectrum": true,
+      "drop_final_frame": true
+    },
+    "mel": {
+      "scale": "Slaney",
+      "normalization": "Slaney area normalization",
+      "minimum_power": 1e-10,
+      "dynamic_range_db": 8,
+      "final_transform": "(log10_mel + 4) / 4"
+    },
+    "long_audio_policy": "Split into consecutive 30-second clips, right-pad the final clip, and allocate 750 placeholder tokens per clip. Long-duration production behavior remains unproven."
+  },
+  "token_contract": {
+    "unknown_token_id": 0,
+    "bos_token_id": 1,
+    "primary_eos_token_id": 2,
+    "chat_eos_token_id": 11,
+    "generation_eos_token_ids": [
+      2,
+      11
+    ],
+    "sound_embedding_token_id": 29,
+    "sound_start_token_id": 30,
+    "sound_end_token_id": 31,
+    "thinking_start_token_id": 12,
+    "thinking_end_token_id": 13,
+    "placeholder_wrapper": "<so_start><so_embedding><so_end>",
+    "indexed_added_token_counts": {
+      "SPECIAL": 970,
+      "speechcodec": 65536,
+      "audiocodec": 8192
+    },
+    "indexed_added_token_id_ranges": {
+      "SPECIAL": [
+        18,
+        999
+      ],
+      "speechcodec": [
+        131077,
+        196612
+      ],
+      "audiocodec": [
+        196613,
+        204804
+      ]
+    },
+    "regex_policy": "Indexed placeholder tokens remain addressable in token-to-id maps but are excluded from the ICU added-token alternation. Named special tokens remain isolated normally."
+  },
+  "generation_contract": {
+    "defaults_source": "generation_config.json plus explicit request overrides",
+    "bundle_bos_token_id": 1,
+    "bundle_eos_token_ids": [
+      2,
+      11
+    ],
+    "bundle_pad_token_id": 0,
+    "thinking_default": true,
+    "instruct_mode_context": {
+      "enable_thinking": false
+    },
+    "forbidden_runtime_behavior": [
+      "forced thinking tags outside the bundle template",
+      "hidden temperature, top-p, top-k, or repetition overrides",
+      "decode-loop audio-token masking presented as a correctness fix",
+      "prompt coercion",
+      "synthetic output length caps used as pass criteria"
+    ],
+    "task_sampling_note": "ASR/translation may explicitly request greedy decoding; audio QA may explicitly request task sampling. Osaurus must not silently promote either recipe into a family-wide default."
+  },
+  "quantization_contract": {
+    "format": "MLX affine",
+    "bits": 4,
+    "group_size": 64,
+    "quantized_components": [
+      "model.* two-dimensional dense text weights",
+      "lm_head.weight"
+    ],
+    "source_precision_components": [
+      "audio_encoder.*",
+      "audio_projector.*",
+      "normalization weights",
+      "non-matrix tensors"
+    ],
+    "converter": "scripts/convert-audex-affine.py",
+    "overwrite_policy": "Refuse a non-empty destination."
+  },
+  "vmlx_runtime": {
+    "factory_model_registration": "VLMTypeRegistry[nemotron_dense_audex] -> Audex",
+    "factory_processor_registration": "VLMProcessorTypeRegistry[Qwen2AudioProcessor] -> AudexProcessor",
+    "processor_config_fallback": "audio_preprocessor/preprocessor_config.json",
+    "capability_snapshot": {
+      "text": "supported",
+      "audio": "supported",
+      "vision": "unknown",
+      "video": "unknown"
+    },
+    "typed_rejections": [
+      "image input",
+      "video input",
+      "batch size other than one",
+      "non-16000 Hz LMInput PCM",
+      "audio placeholder and encoder output count mismatch"
+    ]
+  },
+  "cache_contract": {
+    "decoder_cache": "One standard grouped-query KV cache per text layer.",
+    "default_prefill_step_tokens": 512,
+    "media_cache_salt": "SHA-256 over audio sample rate, waveform shape, dtype, raw PCM bytes, request semantic scope, and KV policy.",
+    "placeholder_boundary_rule": "A partial hit is rejected and full prefill is used when the remaining suffix still contains audio placeholder token 29.",
+    "same_audio_different_encoding_rule": "Cache identity is based on normalized PCM, not the source file container or optional pre-encoded embedding.",
+    "audex_specific_audio_embedding_cache": "not_implemented",
+    "verified": [
+      "standard text KV multi-turn behavior",
+      "compiled and non-compiled decode parity",
+      "media-salted cache source path"
+    ],
+    "not_yet_verified": [
+      "Audex audio prefix-cache hit counters",
+      "paged KV hit counters",
+      "L2 disk restore counters",
+      "cross-turn reuse of Audex audio encoder embeddings",
+      "long-audio cache restore"
+    ]
+  },
+  "osaurus_integration": {
+    "source_base_commit": "402060bce30e802ab0e19a932e05c6afa9c71c99",
+    "current_vmlx_pin": "f2b184841e98d969e46dec83109f27cd7bb57357",
+    "required_vmlx_pin": "REPLACE_WITH_PUSHED_AUDEX_VMLX_COMMIT",
+    "pin_files": [
+      "Packages/OsaurusCore/Package.swift",
+      "Packages/OsaurusCore/Package.resolved",
+      "osaurus.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+      "App/osaurus.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+    ],
+    "capability_policy": {
+      "name_matches": [
+        "nemotron-labs-audex",
+        "nemotron_labs_audex"
+      ],
+      "bundle_model_type": "nemotron_dense_audex",
+      "result": "audioOnly",
+      "supports_image": false,
+      "supports_video": false,
+      "supports_audio": true,
+      "must_not_mark_as_vlm_for_ui": true,
+      "known_family_overrides_generic_is_vlm_image_fallback": true
+    },
+    "existing_paths_reused": [
+      "ModelRuntime force-links MLXVLM.VLMModelFactory.shared",
+      "ModelRuntime loads through loadModelContainer",
+      "Chat attachment mapping emits input_audio content parts",
+      "WAV payloads decode directly to UserInput.Audio.samples",
+      "other AVFoundation-compatible formats materialize as UserInput.Audio.url",
+      "MLXService performs media capability validation",
+      "FloatingInputCard gates audio picker and drop types from ModelMediaCapabilities"
+    ]
+  },
+  "measured_proof": [
+    {
+      "id": "source_sample_speech",
+      "bundle": "source",
+      "audio": "sample_speech.wav",
+      "result": "pass",
+      "generated_tokens": 48,
+      "tokens_per_second": 45.9,
+      "output_summary": "Accurate stew, turnips, and carrots transcription."
+    },
+    {
+      "id": "quant_sample_speech",
+      "bundle": "4bit_affine",
+      "audio": "sample_speech.wav",
+      "result": "pass",
+      "generated_tokens": 46,
+      "tokens_per_second": 43.6,
+      "output_summary": "Accurate transcription without protocol marker leakage."
+    },
+    {
+      "id": "quant_mlk_speech",
+      "bundle": "4bit_affine",
+      "audio": "mlk_speech.wav",
+      "result": "pass",
+      "generated_tokens": 33,
+      "tokens_per_second": 43.2,
+      "peak_physical_footprint_bytes": 3073313624,
+      "evidence_artifacts": [
+        "docs/internal/live-gates/20260720T_audex_2b_vmlx/quantized_mlk_audio_smoke.log",
+        "docs/internal/live-gates/20260720T_audex_2b_vmlx/quantized_mlk_phys_footprint.txt"
+      ],
+      "output_summary": "Correct language identification and I have a dream transcription."
+    },
+    {
+      "id": "quant_text_multiturn",
+      "bundle": "4bit_affine",
+      "result": "pass",
+      "turn_count": 3,
+      "compiled_decode_modes": [
+        false,
+        true
+      ],
+      "output_summary": "Remembered blue across turns and produced visible coherent answers."
+    },
+    {
+      "id": "osaurus_audex_media_capability",
+      "consumer": "OsaurusCore",
+      "result": "pass",
+      "test_count": 3,
+      "suite_count": 3,
+      "output_summary": "Name detection, bundle model_type detection, and the VLM identity image-fallback guard all preserved audioOnly capability."
+    }
+  ],
+  "promotion_gates": [
+    "Push a vMLX commit containing the Audex runtime and use its exact SHA.",
+    "Update all Osaurus pin surfaces to that exact SHA and resolve from a clean checkout.",
+    "Land the Osaurus audioOnly capability matcher and focused tests.",
+    "Build and launch an isolated development Osaurus app.",
+    "Select the local 4-bit bundle in Dinoki/Chat and attach two real WAV files.",
+    "Record visible answer, TTFT, token/s, and app-process physical footprint.",
+    "Run a second turn that proves the conversation and cache path remain coherent.",
+    "Run the OpenAI-compatible input_audio request and verify streaming and non-streaming behavior.",
+    "Record exact prefix, paged, L2 disk, and media rollback counters rather than inferring cache topology.",
+    "Keep output-audio capabilities hidden until the causal speech decoder and XCodec paths have independent live proof."
+  ]
+}

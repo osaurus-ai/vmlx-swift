@@ -1,0 +1,20 @@
+{
+  "status": "PASS",
+  "bundle": "/Users/eric/models/OsaurusAI/Nemotron-Labs-Audex-2B-8bit",
+  "model_type": "nemotron_dense_audex",
+  "source_model": "nvidia/Nemotron-Labs-Audex-2B",
+  "source_revision": "d43e996bab673833ffb56dcfcc5b658f229f7343",
+  "quantization": {
+    "group_size": 64,
+    "bits": 8,
+    "mode": "affine"
+  },
+  "weight_shards": 4,
+  "weight_bytes": 3692442115,
+  "tensor_count": 1057,
+  "quantized_module_count": 170,
+  "stacked_expert_group_count": 0,
+  "audio_tensor_count": 490,
+  "audio_precision": "source",
+  "audio_source_parity": "PASS"
+}

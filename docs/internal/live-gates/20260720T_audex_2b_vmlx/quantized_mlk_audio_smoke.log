@@ -1,0 +1,7 @@
+[smoke] loading Nemotron-Labs-Audex-2B-4bit-vMLX ...
+[smoke] loaded Nemotron-Labs-Audex-2B-4bit-vMLX in 4.5s (model type: Audex)
+[smoke] processor.prepare: 48 ms, prompt tokens: 776, audio: waveform shape [1, 480000], preEncoded: false
+[smoke] generated 33 tokens in 0.8s (43.2 tok/s)
+[smoke] output:
+The language is English. Transcription: 'I have a dream that one day this nation will rise up and live up the true meaning of its creed.'
+[smoke] PASS

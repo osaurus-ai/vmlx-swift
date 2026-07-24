@@ -1,0 +1,121 @@
+{
+  "date": "2026-07-20",
+  "status": "partial",
+  "harness_product": "Gemma4AudioSmoke",
+  "runtime_surface": "MLXLMCommon.loadModel plus MLXLMCommon.generate",
+  "audio_fixture": "/Users/eric/models/nvidia/Nemotron-Labs-Audex-Space/examples/sample_speech.wav",
+  "prompt": "Transcribe the speech accurately.",
+  "max_tokens": 96,
+  "template_context": {
+    "enable_thinking": false
+  },
+  "bundle_generation_defaults": {
+    "temperature": 0.6,
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0,
+    "repetition_penalty": null
+  },
+  "passing_rows": [
+    {
+      "bundle": "Nemotron-Labs-Audex-2B-4bit",
+      "loaded_type": "Audex",
+      "load_seconds": 4.8,
+      "turn_tokens": [46, 7, 2],
+      "turn_tokens_per_second": [117.1, 119.6, 114.7],
+      "turn_stops": ["stop", "stop", "stop"],
+      "turn_reasoning_characters": [0, 0, 0],
+      "semantic_outputs": ["accurate transcription", "turnips and carrots", "yes"],
+      "current_phys_footprint_gib": 3.868,
+      "peak_sampled_phys_footprint_gib": 6.427,
+      "result": "PASS"
+    },
+    {
+      "bundle": "Nemotron-Labs-Audex-2B-6bit",
+      "loaded_type": "Audex",
+      "load_seconds": 4.6,
+      "turn_tokens": [46, 6, 2],
+      "turn_tokens_per_second": [117.6, 114.9, 113.8],
+      "turn_stops": ["stop", "stop", "stop"],
+      "turn_reasoning_characters": [0, 0, 0],
+      "semantic_outputs": ["accurate transcription", "turnips and carrots", "yes"],
+      "current_phys_footprint_gib": 4.365,
+      "peak_sampled_phys_footprint_gib": 6.413,
+      "result": "PASS"
+    },
+    {
+      "bundle": "Nemotron-Labs-Audex-2B-8bit",
+      "loaded_type": "Audex",
+      "load_seconds": 4.6,
+      "turn_tokens": [46, 7, 2],
+      "turn_tokens_per_second": [121.8, 114.8, 122.1],
+      "turn_stops": ["stop", "stop", "stop"],
+      "turn_reasoning_characters": [0, 0, 0],
+      "semantic_outputs": ["accurate transcription", "turnips and carrots", "yes"],
+      "current_phys_footprint_gib": 4.839,
+      "peak_sampled_phys_footprint_gib": 6.897,
+      "result": "PASS"
+    },
+    {
+      "bundle": "Nemotron-Labs-Audex-30B-A3B-4bit",
+      "loaded_type": "AudexH",
+      "load_seconds": 4.7,
+      "turn_tokens": [44, 6, 2],
+      "turn_tokens_per_second": [50.8, 50.6, 51.3],
+      "turn_stops": ["stop", "stop", "stop"],
+      "turn_reasoning_characters": [0, 0, 0],
+      "semantic_outputs": ["accurate transcription", "turnips and carrots", "yes"],
+      "current_phys_footprint_gib": 20.444,
+      "peak_sampled_phys_footprint_gib": 24.127,
+      "result": "PASS"
+    },
+    {
+      "bundle": "Nemotron-Labs-Audex-30B-A3B-6bit",
+      "loaded_type": "AudexH",
+      "load_seconds": 4.9,
+      "turn_tokens": [44, 6, 2],
+      "turn_tokens_per_second": [50.0, 51.1, 49.8],
+      "turn_stops": ["stop", "stop", "stop"],
+      "turn_reasoning_characters": [0, 0, 0],
+      "semantic_outputs": ["accurate transcription", "turnips and carrots", "yes"],
+      "current_phys_footprint_gib": 27.873,
+      "peak_sampled_phys_footprint_gib": 31.452,
+      "result": "PASS"
+    },
+    {
+      "bundle": "Nemotron-Labs-Audex-30B-A3B-8bit",
+      "loaded_type": "AudexH",
+      "load_seconds": 5.2,
+      "turn_tokens": [45, 14, 10],
+      "turn_tokens_per_second": [49.5, 50.2, 50.2],
+      "turn_stops": ["stop", "stop", "stop"],
+      "turn_reasoning_characters": [0, 0, 0],
+      "semantic_outputs": ["accurate transcription", "turnips and carrots", "yes"],
+      "current_phys_footprint_gib": 35.367,
+      "peak_sampled_phys_footprint_gib": 38.944,
+      "result": "PASS"
+    }
+  ],
+  "failed_rows": [
+    {
+      "bundle": "Nemotron-Labs-Audex-2B-4bit",
+      "template_mode": "bundle_default_thinking",
+      "generated_tokens": 45,
+      "tokens_per_second": 126.4,
+      "stop": "stop",
+      "reasoning_characters": 195,
+      "visible_characters": 0,
+      "result": "FAIL"
+    },
+    {
+      "bundle": "Nemotron-Labs-Audex-30B-A3B-4bit",
+      "template_mode": "bundle_default_thinking",
+      "generated_tokens": 45,
+      "tokens_per_second": 52.5,
+      "stop": "stop",
+      "reasoning_characters": 196,
+      "visible_characters": 0,
+      "result": "FAIL"
+    }
+  ]
+}
