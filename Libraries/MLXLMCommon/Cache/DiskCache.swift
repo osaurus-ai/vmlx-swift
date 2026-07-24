@@ -288,9 +288,19 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Fetch cached arrays for the given token sequence.
     ///
-    /// - Parameter tokens: Token IDs to look up.
+    /// - Parameters:
+    ///   - tokens: Token IDs to look up.
+    ///   - mediaSalt: Optional media fingerprint mixed into the cache key.
+    ///   - touchRecency: Whether a successful fetch refreshes eviction
+    ///     recency. Defaults to `true` for direct callers. CacheCoordinator
+    ///     disables it while validating architecture-specific companion state,
+    ///     then touches only a restore it actually accepts.
     /// - Returns: The cached arrays if found, or `nil` on a miss.
-    public func fetch(tokens: [Int], mediaSalt: String? = nil) -> [String: MLXArray]? {
+    public func fetch(
+        tokens: [Int],
+        mediaSalt: String? = nil,
+        touchRecency: Bool = true
+    ) -> [String: MLXArray]? {
         let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
         let url = safetensorsURL(for: hash)
 
@@ -310,7 +320,9 @@ public final class DiskCache: @unchecked Sendable {
             if let fingerprint = _fileFingerprint(url: url), fingerprint.size > 0 {
                 validatedFiles[hash] = fingerprint
             }
-            _touchEntryLocked(hash: hash)
+            if touchRecency {
+                _touchEntryLocked(hash: hash)
+            }
             hits += 1
             return arrays
         } catch {

@@ -521,7 +521,14 @@ public final class CacheCoordinator: @unchecked Sendable {
             func diskHit(boundary: Int) -> CacheFetchResult? {
                 guard boundary > 0, boundary <= tokens.count else { return nil }
                 let prefix = boundary == tokens.count ? tokens : Array(tokens.prefix(boundary))
-                guard let arrays = diskCache.fetch(tokens: prefix, mediaSalt: mediaSalt) else {
+                // A deserializable KV payload is only a candidate until
+                // architecture-specific companion state is validated below.
+                // Do not make rejected hybrid candidates hot.
+                guard let arrays = diskCache.fetch(
+                    tokens: prefix,
+                    mediaSalt: mediaSalt,
+                    touchRecency: false
+                ) else {
                     return nil
                 }
                 let ssmStates = resolveSSMStates(
@@ -671,11 +678,13 @@ public final class CacheCoordinator: @unchecked Sendable {
         return entry.isComplete ? entry.states : nil
     }
 
-    /// Keep the exact hybrid KV + recurrent companion pair on one recency.
+    /// Refresh an accepted disk restore's eviction recency.
     ///
-    /// The directly served boundary was already touched by `DiskCache.fetch`.
-    /// Hybrid caches need their linked recurrent companion touched with the
-    /// same timestamp before quota can observe the pair. Stable checkpoints are
+    /// Candidate KV payloads are deliberately fetched without a recency touch
+    /// because hybrid validation may reject them for missing or incomplete
+    /// companion state. Dense restores touch KV only after acceptance; hybrid
+    /// restores touch KV and their linked recurrent companion with one
+    /// timestamp so quota observes the pair atomically. Stable checkpoints are
     /// deliberately excluded here because the runtime has not yet proved that
     /// it retained the fetched arrays.
     private func touchSuccessfulDiskRestore(
@@ -683,7 +692,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         matchedBoundary: Int,
         mediaSalt: String?
     ) {
-        guard isHybrid, let diskCache else { return }
+        guard let diskCache else { return }
         let recency = Date()
         CombinedDiskCacheQuotaLock.shared.lock()
         defer { CombinedDiskCacheQuotaLock.shared.unlock() }
@@ -692,11 +701,13 @@ public final class CacheCoordinator: @unchecked Sendable {
             tokens: matchedTokens,
             mediaSalt: mediaSalt,
             at: recency)
-        _ = ssmStateCache.diskStore?.touchRecency(
-            tokens: matchedTokens,
-            boundary: matchedBoundary,
-            mediaSalt: mediaSalt,
-            at: recency)
+        if isHybrid {
+            _ = ssmStateCache.diskStore?.touchRecency(
+                tokens: matchedTokens,
+                boundary: matchedBoundary,
+                mediaSalt: mediaSalt,
+                at: recency)
+        }
     }
 
     /// Refresh only processor-proven stable checkpoints after a caller has

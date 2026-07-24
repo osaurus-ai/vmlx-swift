@@ -30,7 +30,7 @@ import Testing
     }
 }
 
-@Test func diskCacheFetchRefreshesRecencyWithoutRewritingPayload() async throws {
+@Test func diskCacheDefaultFetchRefreshesRecencyWithoutRewritingPayload() async throws {
     try await MLXMetalTestLock.withLock {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("vmlx-disk-fetch-recency-\(UUID())")
@@ -69,6 +69,90 @@ import Testing
             })
         #expect(hotAfter.createdAt > coldAfter.createdAt)
         #expect(try Data(contentsOf: payloadURL) == payloadBefore)
+    }
+}
+
+@Test func rejectedHybridDiskRestoreWithMissingCompanionDoesNotTouchKVRecency() async throws {
+    try await MLXMetalTestLock.withLock {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-rejected-missing-companion-lru-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelKey = "rejected-missing-companion-lru-model"
+        let tokens = [61, 62, 63, 64]
+        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey)
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: 1,
+            diskCacheDir: root,
+            modelKey: modelKey))
+        coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true)
+        let disk = try #require(coordinator.diskCache)
+
+        disk.store(tokens: tokens, arrays: ["data": MLXArray.ones([8])])
+        let before = try #require(
+            disk.quotaEntries().first { $0.hash == hash }).createdAt
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        if case .miss = coordinator.fetch(tokens: tokens) {
+            // Expected: usable hybrid state requires the missing companion.
+        } else {
+            Issue.record("hybrid KV without its recurrent companion must be rejected")
+        }
+
+        let after = try #require(
+            disk.quotaEntries().first { $0.hash == hash }).createdAt
+        #expect(after == before)
+    }
+}
+
+@Test func rejectedHybridDiskRestoreWithIncompleteCompanionDoesNotTouchKVRecency() async throws {
+    try await MLXMetalTestLock.withLock {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-rejected-incomplete-companion-lru-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelKey = "rejected-incomplete-companion-lru-model"
+        let tokens = [71, 72, 73, 74]
+        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey)
+
+        do {
+            let seed = CacheCoordinator(config: CacheCoordinatorConfig(
+                usePagedCache: false,
+                enableDiskCache: true,
+                diskCacheMaxGB: 1,
+                diskCacheDir: root,
+                modelKey: modelKey))
+            seed.setHybrid(true, requiresRecurrentSSMCompanion: true)
+            let disk = try #require(seed.diskCache)
+            disk.store(tokens: tokens, arrays: ["data": MLXArray.ones([8])])
+            seed.ssmStateCache.store(
+                ssmStates: [MLXArray.ones([16])],
+                tokens: tokens,
+                boundary: tokens.count,
+                isComplete: false)
+        }
+
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: 1,
+            diskCacheDir: root,
+            modelKey: modelKey))
+        coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true)
+        let disk = try #require(coordinator.diskCache)
+        let before = try #require(
+            disk.quotaEntries().first { $0.hash == hash }).createdAt
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        if case .miss = coordinator.fetch(tokens: tokens) {
+            // Expected: partial recurrent state is unsafe to extend.
+        } else {
+            Issue.record("hybrid KV with an incomplete recurrent companion must be rejected")
+        }
+
+        let after = try #require(
+            disk.quotaEntries().first { $0.hash == hash }).createdAt
+        #expect(after == before)
     }
 }
 
