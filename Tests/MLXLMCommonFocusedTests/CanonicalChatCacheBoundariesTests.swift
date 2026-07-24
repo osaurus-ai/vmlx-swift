@@ -70,6 +70,69 @@ struct CanonicalChatCacheBoundariesTests {
         }
     }
 
+    private struct ContentBoundaryTokenizer: GenerationPromptControllableTokenizer {
+        var bosToken: String? { nil }
+        var eosToken: String? { nil }
+        var unknownToken: String? { nil }
+
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+        func convertTokenToId(_ token: String) -> Int? { nil }
+        func convertIdToToken(_ id: Int) -> String? { nil }
+
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
+            try applyChatTemplate(
+                messages: messages,
+                tools: tools,
+                additionalContext: additionalContext,
+                addGenerationPrompt: true)
+        }
+
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?,
+            addGenerationPrompt: Bool
+        ) throws -> [Int] {
+            var result = [1]
+            for message in messages {
+                switch message["role"] as? String {
+                case "system":
+                    result.append(10)
+                    result.append(contentsOf: contentTokens(message))
+                case "developer":
+                    result.append(11)
+                    result.append(contentsOf: contentTokens(message))
+                case "user":
+                    result.append(30)
+                    result.append(contentsOf: contentTokens(message))
+                case "assistant":
+                    result.append(40)
+                    result.append(contentsOf: contentTokens(message))
+                default:
+                    result.append(50)
+                    result.append(contentsOf: contentTokens(message))
+                }
+            }
+            if tools?.isEmpty == false {
+                result.append(20)
+            }
+            if addGenerationPrompt {
+                result.append(99)
+            }
+            return result
+        }
+
+        private func contentTokens(_ message: [String: any Sendable]) -> [Int] {
+            let content = message["content"] as? String ?? ""
+            return content.unicodeScalars.map { 1_000 + Int($0.value) }
+        }
+    }
+
     private let tools: [[String: any Sendable]] = [["type": "function"]]
 
     /// Minimal Qwen 3.5-shaped tokenizer: system/tool-only renders are
@@ -232,6 +295,38 @@ struct CanonicalChatCacheBoundariesTests {
         #expect(boundaries.all == [4, 6])
         #expect(Array(prompt.prefix(try #require(boundaries.stable.first)))
             == [1, 10, 20, 30])
+    }
+
+    @Test("static system hint preserves an earlier reusable boundary inside a mutable system message")
+    func staticSystemHintAddsEarlierBoundaryInsideMutableSystemMessage() throws {
+        let tokenizer = ContentBoundaryTokenizer()
+        let staticPrefix = "STATIC PROMPT"
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": staticPrefix + "\nmutable-db-schema-v1"],
+            ["role": "user", "content": "create the next table"],
+        ]
+        let prompt = try tokenizer.applyChatTemplate(
+            messages: messages, tools: tools, additionalContext: nil)
+        let withoutHint = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer,
+            messages: messages,
+            tools: tools,
+            additionalContext: nil,
+            promptTokens: prompt)
+        let withHint = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer,
+            messages: messages,
+            tools: tools,
+            additionalContext: nil,
+            promptTokens: prompt,
+            staticSystemPrefix: staticPrefix)
+
+        let hintedBoundary = try #require(withHint.stable.first)
+        let fullSystemBoundary = try #require(withoutHint.stable.first)
+        #expect(hintedBoundary < fullSystemBoundary)
+        #expect(withHint.stable.contains(fullSystemBoundary))
+        #expect(withHint.all.contains(hintedBoundary))
+        #expect(Array(prompt.prefix(hintedBoundary)).last == 1_010)
     }
 
     @Test("template configuration changes produce a different stable token prefix")

@@ -1556,7 +1556,8 @@ public struct Gemma4Processor: UserInputProcessor {
                 messages: messages,
                 tools: chatTemplateTools,
                 additionalContext: input.additionalContext,
-                promptTokens: tokens)
+                promptTokens: tokens,
+                staticSystemPrefix: input.cacheStableSystemPrefix)
             : CanonicalChatCacheBoundaries(all: [], stable: [])
 
         var processedImage: LMInput.ProcessedImage?

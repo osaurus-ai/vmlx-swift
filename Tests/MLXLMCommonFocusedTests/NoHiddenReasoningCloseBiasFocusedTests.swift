@@ -531,6 +531,23 @@ struct HarmonyParserFocusedTests {
         #expect(!visible.contains("<|tool_call>"))
     }
 
+    @Test("Gemma4 decoded thought-channel opener routes to reasoning")
+    func gemma4DecodedThoughtChannelOpenerRoutesToReasoning() {
+        var parser = ReasoningParser.fromCapabilityName("gemma4")
+        let stream = "pre\u{2B55}thought\nhidden<channel|>answer"
+        var segments: [ReasoningSegment] = []
+        for chunk in chunked(stream, by: 3) {
+            segments.append(contentsOf: parser?.feed(chunk) ?? [])
+        }
+        segments.append(contentsOf: parser?.flush() ?? [])
+
+        let (reasoning, content) = collect(segments)
+        #expect(reasoning == "hidden")
+        #expect(content == "preanswer")
+        #expect(!content.contains("\u{2B55}thought"))
+        #expect(!content.contains("<channel|>"))
+    }
+
     @Test("BatchEngine tool-call live probe supplies tools and rejects empty rows")
     func batchEngineToolCallProbeRequiresBehavioralEvidence() throws {
         let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
@@ -556,13 +573,14 @@ struct HarmonyParserFocusedTests {
         #expect(function.body.contains("Tool schema was supplied, but the generation produced no structured .toolCall event."))
     }
 
-    @Test("Gemma4 VLM processor preserves tools into LMInput schemas")
-    func gemma4VLMProcessorPreservesToolsIntoLMInputSchemas() throws {
+    @Test("Gemma4 VLM processor renders normalized tools and preserves raw schemas")
+    func gemma4VLMProcessorRendersNormalizedToolsAndPreservesRawSchemas() throws {
         let source = try String(
             contentsOfFile: "Libraries/MLXVLM/Models/Gemma4.swift",
             encoding: .utf8)
 
-        #expect(source.contains("tools: input.tools"))
+        #expect(source.contains("normalizedToolsForChatTemplate(input.tools)"))
+        #expect(source.contains("tools: chatTemplateTools"))
         #expect(source.contains("toolSchemas: input.tools"))
     }
 

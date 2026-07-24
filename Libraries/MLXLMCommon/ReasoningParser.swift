@@ -236,7 +236,8 @@ public struct ReasoningParser: Sendable {
         let gptMessage = "<|message|>"
         let gptStartControl = "<|start|>"
         let gptEndTags = ["<|end|>", "<|return|>"]
-        let openerTags = [gemmaStart, gptStart]
+        let gemmaStartTags = [gemmaStart] + startTagAliases
+        let openerTags = gemmaStartTags + [gptStart]
         let holdTags = openerTags + [gptMessage, gptStartControl, endTag] + gptEndTags
 
         var out: [ReasoningSegment] = []
@@ -352,7 +353,7 @@ public struct ReasoningParser: Sendable {
             insideHarmonyChannel = true
             harmonyChannelIsReasoning = true
             harmonyChannelEndTags = [endTag]
-            harmonyChannelShouldStripName = true
+            harmonyChannelShouldStripName = tag == gemmaStart
             harmonyChannelNameBuffer.removeAll(keepingCapacity: false)
             insideReasoning = true
         }
@@ -714,7 +715,16 @@ extension ReasoningParser {
         let normalized = normalizedReasoningAlias(n)
         let compact = compactReasoningAlias(n)
 
-        if compact.hasPrefix("gemma4") || compact.hasPrefix("gptoss") {
+        if compact.hasPrefix("gemma4") {
+            return ReasoningParser(
+                startTag: "<|channel>",
+                endTag: "<channel|>",
+                startInReasoning: false,
+                stripStrayTags: false,
+                startTagAliases: ["\u{2B55}thought\n"])
+        }
+
+        if compact.hasPrefix("gptoss") {
             return ReasoningParser(
                 startTag: "<|channel>",
                 endTag: "<channel|>",
@@ -829,7 +839,8 @@ extension ReasoningParser {
                 // content per the legacy A2/A3 contract. The bare
                 // `<channel|>` close marker is rare enough mid-content
                 // that we don't want to silently strip it.
-                stripStrayTags: false)
+                stripStrayTags: false,
+                startTagAliases: ["\u{2B55}thought\n"])
         case "none", "off", "disabled", "mistral", "gemma":
             return nil
         default:

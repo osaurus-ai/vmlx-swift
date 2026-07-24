@@ -1224,7 +1224,8 @@ private struct LLMUserInputProcessor: UserInputProcessor {
                 messages: messages,
                 tools: input.tools,
                 additionalContext: additionalContext,
-                promptTokens: promptTokens)
+                promptTokens: promptTokens,
+                staticSystemPrefix: input.cacheStableSystemPrefix)
 
             return LMInput(
                 tokens: MLXArray(promptTokens),

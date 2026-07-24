@@ -64,7 +64,8 @@ public func canonicalChatCacheBoundaries(
     messages: [[String: any Sendable]],
     tools: [[String: any Sendable]]?,
     additionalContext: [String: any Sendable]?,
-    promptTokens: [Int]
+    promptTokens: [Int],
+    staticSystemPrefix: String? = nil
 ) -> CanonicalChatCacheBoundaries {
     guard let controllable = tokenizer as? any GenerationPromptControllableTokenizer else {
         return CanonicalChatCacheBoundaries(all: [], stable: [])
@@ -135,6 +136,69 @@ public func canonicalChatCacheBoundaries(
         return boundary
     }
 
+    /// Osaurus composes the reusable static prompt prefix and the mutable
+    /// database/sandbox state as separate manifest sections, then renders them
+    /// into one system message for model compatibility. A changed dynamic
+    /// section therefore invalidates the tokenizer-derived "whole system"
+    /// boundary even though the leading static bytes are still reusable.
+    ///
+    /// Derive that earlier boundary with the same LCP proof used for required
+    /// user templates: replace the current system message with the static
+    /// prefix plus two divergent tails, then keep only token positions shared
+    /// by both probes and the real prompt. This makes the boundary independent
+    /// of the mutable suffix and of BPE merges across the split point.
+    func hintedStaticSystemBoundary(_ staticPrefix: String?) -> Int? {
+        guard let staticPrefix,
+              !staticPrefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let systemIndex = messages.firstIndex(where: { message in
+                  guard let role = message["role"] as? String else { return false }
+                  return role == "system" || role == "developer"
+              }),
+              let originalContent = messages[systemIndex]["content"] as? String,
+              originalContent.hasPrefix(staticPrefix)
+        else {
+            return nil
+        }
+
+        func renderProbe(_ tail: String) -> [Int]? {
+            var probeMessages = Array(messages.prefix(systemIndex + 1))
+            var systemMessage = probeMessages[systemIndex]
+            systemMessage["content"] = staticPrefix + tail
+            probeMessages[systemIndex] = systemMessage
+            return try? controllable.applyChatTemplate(
+                messages: probeMessages,
+                tools: tools,
+                additionalContext: additionalContext,
+                addGenerationPrompt: false)
+        }
+
+        guard let probeA = renderProbe("\n0"),
+              let probeB = renderProbe("\nz"),
+              !probeA.isEmpty,
+              !probeB.isEmpty
+        else {
+            return nil
+        }
+
+        let limit = min(probeA.count, probeB.count, promptTokens.count)
+        var boundary = 0
+        while boundary < limit,
+              probeA[boundary] == probeB[boundary],
+              probeA[boundary] == promptTokens[boundary]
+        {
+            boundary += 1
+        }
+
+        guard boundary > 0,
+              boundary < probeA.count,
+              boundary < probeB.count,
+              boundary < promptTokens.count
+        else {
+            return nil
+        }
+        return boundary
+    }
+
     // Only the leading instruction rail is stable across unrelated chats.
     // Tool schemas remain present because they are a separate template input;
     // this also permits a tool-only stable prefix when a template emits one for
@@ -148,7 +212,12 @@ public func canonicalChatCacheBoundaries(
         ? exactPrefixBoundary(messages: stableMessages)
             ?? probeDerivedStableBoundary(messages: stableMessages)
         : nil
-    let stable = stableBoundary.map { [$0] } ?? []
+    let stable = Array(
+        Set(
+            [stableBoundary, hintedStaticSystemBoundary(staticSystemPrefix)]
+                .compactMap { $0 }
+        )
+    ).sorted()
     let history = exactPrefixBoundary(messages: messages).map { [$0] } ?? []
     let all = Array(Set(stable + history)).sorted()
     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
