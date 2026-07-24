@@ -140,7 +140,41 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
                     of: "</parameter>", range: nameEnd.upperBound ..< paramSection.endIndex)
             else { break }
 
-            var paramValue = String(paramSection[nameEnd.upperBound ..< paramEnd.lowerBound])
+            // A quantized ZAYA row can start the next attribute-style
+            // parameter without closing the current one:
+            //
+            //   <parameter=verb>open
+            //   <parameter=app>TextEdit</parameter>
+            //
+            // The old scan consumed the second opener/value into `verb` and
+            // then skipped `app` entirely. Resynchronize only when the nested
+            // opener names a *different parameter declared by this tool's
+            // schema*. Unknown tag-looking text remains literal, and callers
+            // without a schema keep the strict historical behavior.
+            let nestedParameterStart = paramSection.range(
+                of: "<parameter=", range: nameEnd.upperBound ..< paramEnd.lowerBound)
+            var valueEnd = paramEnd.lowerBound
+            var nextSearchStart: String.Index? = nil
+            if let nestedParameterStart,
+                let nestedNameEnd = paramSection.range(
+                    of: ">",
+                    range: nestedParameterStart.upperBound ..< paramEnd.lowerBound)
+            {
+                let nestedName = String(
+                    paramSection[nestedParameterStart.upperBound ..< nestedNameEnd.lowerBound]
+                ).trimmingCharacters(in: .whitespacesAndNewlines)
+                if nestedName != paramName,
+                    isDeclaredParameter(
+                        nestedName,
+                        functionName: funcName,
+                        tools: tools)
+                {
+                    valueEnd = nestedParameterStart.lowerBound
+                    nextSearchStart = nestedParameterStart.lowerBound
+                }
+            }
+
+            var paramValue = String(paramSection[nameEnd.upperBound ..< valueEnd])
 
             // Trim leading/trailing newlines (matching Python behavior)
             paramValue = trimBoundaryNewlines(paramValue)
@@ -159,7 +193,7 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             arguments[paramName] = convertParameterValue(
                 paramValue, paramName: paramName, funcName: funcName, tools: tools)
 
-            searchRange = paramEnd.upperBound ..< paramSection.endIndex
+            searchRange = (nextSearchStart ?? paramEnd.upperBound) ..< paramSection.endIndex
         }
 
         if let invalidArguments = schemaValidationFailure(
@@ -300,6 +334,20 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             }
         }
         return nil
+    }
+
+    private func isDeclaredParameter(
+        _ parameterName: String,
+        functionName: String,
+        tools: [[String: any Sendable]]?
+    ) -> Bool {
+        guard !parameterName.isEmpty,
+            let tools,
+            let functionSpec = functionSpec(named: functionName, in: tools),
+            let parameters = sendableObject(functionSpec["parameters"]),
+            let properties = sendableObject(parameters["properties"])
+        else { return false }
+        return properties[parameterName] != nil
     }
 
     private func invalidToolArguments(
