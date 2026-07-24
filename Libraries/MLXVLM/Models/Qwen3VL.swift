@@ -146,7 +146,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                 messages: messages,
                 tools: input.tools,
                 additionalContext: input.additionalContext,
-                promptTokens: promptTokens)
+                promptTokens: promptTokens,
+                staticSystemPrefix: input.cacheStableSystemPrefix)
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),

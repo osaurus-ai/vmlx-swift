@@ -209,6 +209,12 @@ public struct UserInput {
 
     /// Additional values provided for the chat template rendering context
     public var additionalContext: [String: any Sendable]?
+
+    /// Runtime-only cache hint for a byte-stable leading system-prompt
+    /// segment. This is deliberately separate from ``additionalContext`` so it
+    /// is never exposed to chat templates or model-visible prompt text.
+    public var cacheStableSystemPrefix: String?
+
     public var processing: Processing = .init()
 
     /// Initialize the `UserInput` with a single text prompt.
@@ -226,13 +232,15 @@ public struct UserInput {
         prompt: String, images: [Image] = [Image](), videos: [Video] = [Video](),
         audios: [Audio] = [Audio](),
         tools: [ToolSpec]? = nil,
-        additionalContext: [String: any Sendable]? = nil
+        additionalContext: [String: any Sendable]? = nil,
+        cacheStableSystemPrefix: String? = nil
     ) {
         self.prompt = .chat([
             .user(prompt, images: images, videos: videos, audios: audios)
         ])
         self.tools = tools
         self.additionalContext = additionalContext
+        self.cacheStableSystemPrefix = cacheStableSystemPrefix
         // Swift init semantics: `didSet` on `prompt` does not fire during
         // initialisation, so the top-level `images` / `videos` properties
         // would otherwise stay empty even though the chat messages carry
@@ -282,7 +290,8 @@ public struct UserInput {
         messages: [Message], images: [Image] = [Image](), videos: [Video] = [Video](),
         audios: [Audio] = [Audio](),
         tools: [ToolSpec]? = nil,
-        additionalContext: [String: any Sendable]? = nil
+        additionalContext: [String: any Sendable]? = nil,
+        cacheStableSystemPrefix: String? = nil
     ) {
         self.prompt = .messages(messages)
         self.images = images
@@ -290,6 +299,7 @@ public struct UserInput {
         self.audios = audios
         self.tools = tools
         self.additionalContext = additionalContext
+        self.cacheStableSystemPrefix = cacheStableSystemPrefix
     }
 
     /// Initialize the `UserInput` with a model agnostic structured context.
@@ -319,7 +329,8 @@ public struct UserInput {
         chat: [Chat.Message],
         processing: Processing = .init(),
         tools: [ToolSpec]? = nil,
-        additionalContext: [String: any Sendable]? = nil
+        additionalContext: [String: any Sendable]? = nil,
+        cacheStableSystemPrefix: String? = nil
     ) {
         self.prompt = .chat(chat)
 
@@ -337,6 +348,7 @@ public struct UserInput {
         self.processing = processing
         self.tools = tools
         self.additionalContext = additionalContext
+        self.cacheStableSystemPrefix = cacheStableSystemPrefix
     }
 
     /// Initialize the `UserInput` with a preconfigured ``Prompt-swift.enum``.
@@ -360,7 +372,8 @@ public struct UserInput {
         videos: [Video] = [Video](),
         audios: [Audio] = [Audio](),
         processing: Processing = .init(),
-        tools: [ToolSpec]? = nil, additionalContext: [String: any Sendable]? = nil
+        tools: [ToolSpec]? = nil, additionalContext: [String: any Sendable]? = nil,
+        cacheStableSystemPrefix: String? = nil
     ) {
         self.prompt = prompt
         switch prompt {
@@ -382,6 +395,7 @@ public struct UserInput {
         self.processing = processing
         self.tools = tools
         self.additionalContext = additionalContext
+        self.cacheStableSystemPrefix = cacheStableSystemPrefix
     }
 }
 
