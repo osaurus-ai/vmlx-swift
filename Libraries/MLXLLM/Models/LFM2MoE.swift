@@ -450,10 +450,15 @@ public class LFM2MoEModel: Module, LLMModel, KVCacheDimensionProvider {
                 }
             }
 
+            // Older LFM checkpoints use w1/w2/w3 module names. Rename the
+            // module path, not only `.weight`: quantized checkpoints carry
+            // sibling `.scales` and `.biases` tensors that must follow the
+            // same destination module or Module.update reports stale
+            // w1/w2/w3 children as unhandled.
             let replacements = [
-                "w1.weight": "gate_proj.weight",
-                "w2.weight": "down_proj.weight",
-                "w3.weight": "up_proj.weight",
+                ".w1.": ".gate_proj.",
+                ".w2.": ".down_proj.",
+                ".w3.": ".up_proj.",
             ]
             var updatedName = name
             for (old, new) in replacements where updatedName.contains(old) {
@@ -472,12 +477,18 @@ public class LFM2MoEModel: Module, LLMModel, KVCacheDimensionProvider {
             }
 
             for name in ["gate_proj", "down_proj", "up_proj"] {
-                let key = "\(expertPrefix).0.\(name).weight"
-                guard sanitized[key] != nil else { continue }
-                let stacked = (0 ..< configuration.numExperts).map { expert -> MLXArray in
-                    sanitized.removeValue(forKey: "\(expertPrefix).\(expert).\(name).weight")!
+                for leaf in ["weight", "scales", "biases"] {
+                    let keys = (0 ..< configuration.numExperts).map {
+                        "\(expertPrefix).\($0).\(name).\(leaf)"
+                    }
+                    guard keys.allSatisfy({ sanitized[$0] != nil }) else {
+                        continue
+                    }
+                    let stacked = keys.map { sanitized.removeValue(forKey: $0)! }
+                    sanitized[
+                        "\(prefix).feed_forward.switch_mlp.\(name).\(leaf)"
+                    ] = MLX.stacked(stacked)
                 }
-                sanitized["\(prefix).feed_forward.switch_mlp.\(name).weight"] = MLX.stacked(stacked)
             }
         }
 
