@@ -926,6 +926,22 @@ enum Qwen35Language {
             super.init()
         }
 
+        /// One-shot (per process) diagnostic for a discarded incompatible
+        /// cache slot — the reset self-heals, but a silent reset would hide
+        /// the upstream restore bug that produced the bad shape.
+        private static let discardedCacheWarningLock = NSLock()
+        private nonisolated(unsafe) static var didWarnDiscardedCache = false
+
+        static func warnDiscardedCacheState(slot: String, shape: [Int]) {
+            discardedCacheWarningLock.lock()
+            defer { discardedCacheWarningLock.unlock() }
+            guard !didWarnDiscardedCache else { return }
+            didWarnDiscardedCache = true
+            print(
+                "[Qwen35] GatedDeltaNet discarded incompatible \(slot) cache state "
+                    + "(shape \(shape)); resetting linear-attention state")
+        }
+
         func callAsFunction(
             _ inputs: MLXArray,
             mask: MLXArray? = nil,
@@ -940,10 +956,21 @@ enum Qwen35Language {
             let b = inProjB(inputs)
             let a = inProjA(inputs)
 
+            // A restored cache (paged/hybrid restore, prefix commit) can hand
+            // back a slot whose shape no longer matches this layer — an
+            // over- or under-rank array here trips the MLXArray subscript
+            // rank precondition below and aborts the app. Discard the slot
+            // and restart from zero state instead: one degraded generation
+            // beats a crash.
             let convState: MLXArray
-            if let cacheState = cache?[0] {
+            if let cacheState = cache?[0],
+                cacheState.ndim == 3, cacheState.dim(0) == B, cacheState.dim(2) == convDim
+            {
                 convState = cacheState
             } else {
+                if let cacheState = cache?[0] {
+                    Self.warnDiscardedCacheState(slot: "conv", shape: cacheState.shape)
+                }
                 convState = MLXArray.zeros(
                     [B, max(0, convKernelSize - 1), convDim], dtype: inputs.dtype)
             }
@@ -966,7 +993,23 @@ enum Qwen35Language {
             let k = split[1].reshaped(B, S, numKHeads, headKDim)
             let v = split[2].reshaped(B, S, numVHeads, headVDim)
 
-            let initialState = cache?[1]
+            // Same defense as the conv slot: a mis-restored recurrent state
+            // with the wrong rank/head dims crashes inside `gatedDeltaUpdate`
+            // subscripts. Expected shape is [B, Hv, Dv, Dk].
+            let initialState: MLXArray?
+            if let cachedState = cache?[1] {
+                if cachedState.ndim == 4, cachedState.dim(0) == B,
+                    cachedState.dim(1) == numVHeads, cachedState.dim(2) == headVDim,
+                    cachedState.dim(3) == headKDim
+                {
+                    initialState = cachedState
+                } else {
+                    Self.warnDiscardedCacheState(slot: "recurrent", shape: cachedState.shape)
+                    initialState = nil
+                }
+            } else {
+                initialState = nil
+            }
             var state = initialState
             let invScale = pow(Float(headKDim), -0.5)
             let qNormed =
