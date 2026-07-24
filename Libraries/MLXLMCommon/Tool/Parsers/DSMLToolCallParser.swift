@@ -109,8 +109,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         return parseInlineJSONToolFallback(in: text, tools: tools)
     }
 
-    public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall]
-    {
+    public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         // DSML can carry multiple invokes within a single
         // <｜DSML｜tool_calls> block, so the default `components(by:
         // startTag)` strategy won't round-trip — each multi-invoke
@@ -211,7 +210,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
                 break
             }
             let paramConfig = parameterSchema(for: funcName, tools: tools)
-            let args = parseParameters(in: body, schema: paramConfig, allowPartialEOF: allowPartialEOF)
+            let args = parseParameters(
+                in: body, schema: paramConfig, allowPartialEOF: allowPartialEOF)
             results.append(
                 ToolCall(function: .init(name: funcName, arguments: args)))
             cursor = nextCursor
@@ -243,8 +243,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
     private func removingCompletedTags(withPrefix prefix: String, from content: String) -> String {
         var text = content
         var searchStart = text.startIndex
-        while
-            let prefixRange = text.range(of: prefix, range: searchStart ..< text.endIndex),
+        while let prefixRange = text.range(of: prefix, range: searchStart ..< text.endIndex),
             let close = text[prefixRange.upperBound...].firstIndex(of: ">")
         {
             let removalEnd = text.index(after: close)
@@ -341,7 +340,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         range: Range<String.Index>
     ) -> String.Index {
         let markers = ["</", Self.dsmlPrefix, Self.dsmlPrefixClose]
-        return markers
+        return
+            markers
             .compactMap { body.range(of: $0, range: range)?.lowerBound }
             .min() ?? range.upperBound
     }
@@ -499,7 +499,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             }
         }
         if let functionRange = text.range(of: #""function""#),
-            let value = firstJSONStringValue(for: "name", in: String(text[functionRange.upperBound...]))
+            let value = firstJSONStringValue(
+                for: "name", in: String(text[functionRange.upperBound...]))
         {
             return value
         }
@@ -507,7 +508,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
     }
 
     private func firstJSONStringValue(for key: String, in text: String) -> String? {
-        let pattern = #""# + NSRegularExpression.escapedPattern(for: key)
+        let pattern =
+            #""# + NSRegularExpression.escapedPattern(for: key)
             + #""\s*:\s*"((?:[^"\\]|\\.)*)""#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
         let range = NSRange(text.startIndex ..< text.endIndex, in: text)
@@ -534,7 +536,12 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             let candidate = firstPythonStyleToolCallCandidate(in: text, tools: tools)
         else { return nil }
 
-        let args = normalizePythonStyleArguments(candidate.arguments)
+        guard
+            let args = normalizePythonStyleArguments(
+                candidate.arguments,
+                funcName: candidate.name,
+                tools: tools)
+        else { return nil }
         if let tools, !tools.isEmpty {
             guard let spec = functionSpec(named: candidate.name, in: tools) else { return nil }
             if let invalidArgs = inlineSchemaValidationFailure(
@@ -564,11 +571,14 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
     ) -> ToolCall? {
         guard
             let invokeStart = text.range(of: "<invoke>"),
-            let invokeEnd = text.range(of: "</invoke>", range: invokeStart.upperBound ..< text.endIndex)
+            let invokeEnd = text.range(
+                of: "</invoke>", range: invokeStart.upperBound ..< text.endIndex)
         else { return nil }
 
         let body = String(text[invokeStart.upperBound ..< invokeEnd.lowerBound])
-        guard let name = firstXMLBody(in: body, tags: [("target_name", "target"), ("target", "target")]),
+        guard
+            let name = firstXMLBody(
+                in: body, tags: [("target_name", "target"), ("target", "target")]),
             !name.isEmpty
         else { return nil }
 
@@ -622,16 +632,17 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
                     offsetBy: name.count,
                     limitedBy: trimmed.endIndex)
             else { continue }
-            guard afterName == trimmed.endIndex
-                || isInlineFallbackWhitespace(trimmed[afterName])
-                || trimmed[afterName] == "{"
-                || trimmed[afterName] == ":"
+            guard
+                afterName == trimmed.endIndex
+                    || isInlineFallbackWhitespace(trimmed[afterName])
+                    || trimmed[afterName] == "{"
+                    || trimmed[afterName] == ":"
             else { continue }
 
             let cursor = bareNameJSONTailObjectStart(in: trimmed, afterName: afterName)
             guard cursor < trimmed.endIndex, trimmed[cursor] == "{" else { continue }
             guard let jsonObject = firstBalancedJSONObject(in: trimmed[cursor...]) else {
-                if (allowMalformedEOF || jsonBracesBalanced(String(trimmed[cursor...]))),
+                if allowMalformedEOF || jsonBracesBalanced(String(trimmed[cursor...])),
                     let tools, !tools.isEmpty,
                     functionSpec(named: name, in: tools) != nil
                 {
@@ -690,7 +701,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         return sawOpen && depth == 0
     }
 
-    private func parseJSONObjectAllowingLiteralInvalidEscapes(_ jsonObject: String) -> [String: Any]? {
+    private func parseJSONObjectAllowingLiteralInvalidEscapes(_ jsonObject: String) -> [String:
+        Any]?
+    {
         if let object = parseJSONObject(jsonObject) {
             return object
         }
@@ -960,7 +973,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         guard text[cursor...].hasPrefix("```") else { return cursor }
 
         var fenceCursor = cursor
-        for _ in 0..<3 {
+        for _ in 0 ..< 3 {
             guard fenceCursor < text.endIndex else { return cursor }
             fenceCursor = text.index(after: fenceCursor)
         }
@@ -976,7 +989,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         return fenceCursor
     }
 
-    private func consumeOptionalJSONLabel(in text: String, at cursor: String.Index) -> String.Index {
+    private func consumeOptionalJSONLabel(in text: String, at cursor: String.Index) -> String.Index
+    {
         guard cursor < text.endIndex, text[cursor] == ":" else { return cursor }
         var labelStart = text.index(after: cursor)
         while labelStart < text.endIndex, isInlineFallbackWhitespace(text[labelStart]) {
@@ -1053,10 +1067,11 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
     }
 
     private func pythonStyleToolNames(from tools: [[String: any Sendable]]?) -> [String] {
-        let schemaNames = tools?.compactMap { tool -> String? in
-            let function = (tool["function"] as? [String: any Sendable]) ?? tool
-            return function["name"] as? String
-        } ?? []
+        let schemaNames =
+            tools?.compactMap { tool -> String? in
+                let function = (tool["function"] as? [String: any Sendable]) ?? tool
+                return function["name"] as? String
+            } ?? []
         if !schemaNames.isEmpty {
             return schemaNames.sorted { $0.count > $1.count }
         }
@@ -1134,7 +1149,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             } else if ch == "}" {
                 depth -= 1
                 if depth == 0 {
-                    return String(text[open...cursor])
+                    return String(text[open ... cursor])
                 }
                 if depth < 0 { return nil }
             }
@@ -1148,7 +1163,11 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         }
     }
 
-    private func normalizePythonStyleArguments(_ arguments: String) -> [String: any Sendable] {
+    private func normalizePythonStyleArguments(
+        _ arguments: String,
+        funcName: String,
+        tools: [[String: any Sendable]]?
+    ) -> [String: any Sendable]? {
         let trimmed = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
         if let data = "{\(trimmed)}".data(using: .utf8),
             let object = try? JSONSerialization.jsonObject(with: data),
@@ -1156,31 +1175,10 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         {
             return normalized
         }
-        return normalizePythonKeywordArguments(trimmed)
-    }
-
-    private func normalizePythonKeywordArguments(_ arguments: String) -> [String: any Sendable] {
-        var result: [String: any Sendable] = [:]
-        let pattern = #"(\w+)\s*=\s*('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^,\)]+)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return result }
-        let range = NSRange(arguments.startIndex ..< arguments.endIndex, in: arguments)
-        for match in regex.matches(in: arguments, range: range) {
-            guard
-                let keyRange = Range(match.range(at: 1), in: arguments),
-                let valueRange = Range(match.range(at: 2), in: arguments)
-            else { continue }
-            let key = String(arguments[keyRange])
-            var value = String(arguments[valueRange]).trimmingCharacters(in: .whitespaces)
-            if (value.hasPrefix("'") && value.hasSuffix("'"))
-                || (value.hasPrefix("\"") && value.hasSuffix("\""))
-            {
-                value = String(value.dropFirst().dropLast())
-                result[key] = value
-            } else {
-                result[key] = decodeJSONValue(value, fallbackString: value)
-            }
-        }
-        return result
+        return PythonicToolCallParser().parseArguments(
+            trimmed,
+            funcName: funcName,
+            tools: tools)
     }
 
     private func fallbackToolName(in object: [String: Any], allowBareName: Bool) -> String? {
@@ -1236,7 +1234,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             let open = "<\(tag.open)>"
             let close = "</\(tag.close)>"
             guard let openRange = text.range(of: open),
-                let closeRange = text.range(of: close, range: openRange.upperBound ..< text.endIndex)
+                let closeRange = text.range(
+                    of: close, range: openRange.upperBound ..< text.endIndex)
             else { continue }
             return String(text[openRange.upperBound ..< closeRange.lowerBound])
         }
