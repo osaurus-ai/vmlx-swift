@@ -385,6 +385,12 @@ import Testing
         default:
             Issue.record("expected growing dense disk restore")
         }
+        coordinator.touchStableDiskCheckpointsAfterRetainedRestore(
+            requestTokens: requestTokens,
+            matchedTokenCount: growingTokens.count,
+            preferredDiskBoundaries: [stableTokens.count],
+            skipExactDiskBoundary: false,
+            mediaSalt: nil)
 
         try await Task.sleep(nanoseconds: 50_000_000)
         disk.store(tokens: newTokens, arrays: arrays)
@@ -506,6 +512,12 @@ import Testing
         default:
             Issue.record("expected growing hybrid disk restore")
         }
+        coordinator.touchStableDiskCheckpointsAfterRetainedRestore(
+            requestTokens: requestTokens,
+            matchedTokenCount: growingTokens.count,
+            preferredDiskBoundaries: [stableBoundary],
+            skipExactDiskBoundary: true,
+            mediaSalt: nil)
 
         try await Task.sleep(nanoseconds: 50_000_000)
         disk.store(tokens: newTokens, arrays: kvArrays)

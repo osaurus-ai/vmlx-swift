@@ -1452,6 +1452,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     let matchedTokens, let remainingTokens, let detail, let blocks,
                     let ssmStates, let diskArrays):
                 var restored = false
+                var retainedDiskRestore = false
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
                     coordinator.release(blocks: blocks)
@@ -1581,6 +1582,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                             inputForPrepare = LMInput(
                                 text: LMInput.Text(tokens: lastToken),
                                 image: nil, video: nil)
+                            retainedDiskRestore = diskArrays != nil
                         } else {
                             Self.logger.info(
                                 "TokenIterator: cache hit rolling back to full prefill (path-dependent full cache hit missing seed-boundary SSM state)"
@@ -1626,6 +1628,16 @@ public struct TokenIterator: TokenIteratorProtocol {
                                 text: LMInput.Text(tokens: remainingArray),
                                 image: nil, video: nil)
                         }
+                        retainedDiskRestore = diskArrays != nil
+                    }
+                    if retainedDiskRestore {
+                        coordinator.touchStableDiskCheckpointsAfterRetainedRestore(
+                            requestTokens: cacheLookupTokenIds,
+                            matchedTokenCount: matchedTokens,
+                            preferredDiskBoundaries: originalInput
+                                .cacheStablePrefixTokenCounts,
+                            skipExactDiskBoundary: requiresDiskBackedRestore,
+                            mediaSalt: mediaSalt)
                     }
                 }
                 case .miss:

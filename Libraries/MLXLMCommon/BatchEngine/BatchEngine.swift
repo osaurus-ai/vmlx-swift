@@ -1669,6 +1669,7 @@ public actor BatchEngine {
                     let ssmStates, let diskArrays) = result
                 {
                     var restored = false
+                    var retainedDiskRestore = false
                     if !blocks.isEmpty {
                         let restoredTokens = restoreLayerData(from: blocks, into: slot.cache)
                         coordinator.release(blocks: blocks)
@@ -1847,6 +1848,7 @@ public actor BatchEngine {
                                 inputForPrepare = LMInput(
                                     text: LMInput.Text(tokens: lastToken),
                                     image: nil, video: nil)
+                                retainedDiskRestore = diskArrays != nil
                             } else {
                                 let slotIDStr = slot.id.description
                                 Self.logger.info(
@@ -1914,6 +1916,7 @@ public actor BatchEngine {
                             inputForPrepare = LMInput(
                                 text: LMInput.Text(tokens: lastToken),
                                 image: nil, video: nil)
+                            retainedDiskRestore = diskArrays != nil
                         } else if remaining.isEmpty {
                             // Defensive fallback: no last token → roll back.
                             slot.cache = context.model.newCache(parameters: slot.parameters)
@@ -1928,6 +1931,16 @@ public actor BatchEngine {
                             inputForPrepare = LMInput(
                                 text: LMInput.Text(tokens: remainingArray),
                                 image: nil, video: nil)
+                            retainedDiskRestore = diskArrays != nil
+                        }
+                        if retainedDiskRestore {
+                            coordinator.touchStableDiskCheckpointsAfterRetainedRestore(
+                                requestTokens: tokenIds,
+                                matchedTokenCount: matchedTokens,
+                                preferredDiskBoundaries: slot.originalInput
+                                    .cacheStablePrefixTokenCounts,
+                                skipExactDiskBoundary: requiresDiskBackedRestore,
+                                mediaSalt: slot.mediaSalt)
                         }
                     }
                 }

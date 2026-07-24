@@ -230,6 +230,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 let matchedTokens, let remainingTokens, _, let blocks,
                 let ssmStates, let diskArrays):
                 var restored = false
+                var retainedDiskRestore = false
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
                     coordinator.release(blocks: blocks)
@@ -288,11 +289,22 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                             let lastToken = MLXArray([Int32(last)])
                                 .expandedDimensions(axis: 0)
                             inputForPrepare = LMInput(text: LMInput.Text(tokens: lastToken))
+                            retainedDiskRestore = diskArrays != nil
                         }
                     } else {
                         let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
                             .expandedDimensions(axis: 0)
                         inputForPrepare = LMInput(text: LMInput.Text(tokens: remainingArray))
+                        retainedDiskRestore = diskArrays != nil
+                    }
+                    if retainedDiskRestore {
+                        coordinator.touchStableDiskCheckpointsAfterRetainedRestore(
+                            requestTokens: cacheLookupTokenIds,
+                            matchedTokenCount: matchedTokens,
+                            preferredDiskBoundaries: originalInput
+                                .cacheStablePrefixTokenCounts,
+                            skipExactDiskBoundary: false,
+                            mediaSalt: mediaSalt)
                     }
                 }
             case .miss:

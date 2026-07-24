@@ -533,9 +533,6 @@ public final class CacheCoordinator: @unchecked Sendable {
                     touchSuccessfulDiskRestore(
                         matchedTokens: prefix,
                         matchedBoundary: boundary,
-                        requestTokens: tokens,
-                        preferredDiskBoundaries: preferredDiskBoundaries,
-                        skipExactDiskBoundary: skipExactDiskBoundary,
                         mediaSalt: mediaSalt)
                     ftrace("HIT disk boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))")
                     return .hit(
@@ -674,54 +671,62 @@ public final class CacheCoordinator: @unchecked Sendable {
         return entry.isComplete ? entry.states : nil
     }
 
-    /// Refresh durable entries that the accepted restore made logically hot.
+    /// Keep the exact hybrid KV + recurrent companion pair on one recency.
     ///
     /// The directly served boundary was already touched by `DiskCache.fetch`.
-    /// Hybrid caches still need their linked recurrent companion touched with
-    /// the same timestamp. A growing tool/chat turn normally restores a newer,
-    /// longer boundary, but its processor-proven stable system/tool prefix is
-    /// also part of every request and is the checkpoint a new chat needs.
-    /// Refresh that stable prefix too so a long tool loop does not fill the
-    /// quota with one-off growing snapshots and evict the reusable warm-start
-    /// checkpoint merely because the longer entry served the current request.
+    /// Hybrid caches need their linked recurrent companion touched with the
+    /// same timestamp before quota can observe the pair. Stable checkpoints are
+    /// deliberately excluded here because the runtime has not yet proved that
+    /// it retained the fetched arrays.
+    private func touchSuccessfulDiskRestore(
+        matchedTokens: [Int],
+        matchedBoundary: Int,
+        mediaSalt: String?
+    ) {
+        guard isHybrid, let diskCache else { return }
+        let recency = Date()
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+
+        _ = diskCache.touchRecency(
+            tokens: matchedTokens,
+            mediaSalt: mediaSalt,
+            at: recency)
+        _ = ssmStateCache.diskStore?.touchRecency(
+            tokens: matchedTokens,
+            boundary: matchedBoundary,
+            mediaSalt: mediaSalt,
+            at: recency)
+    }
+
+    /// Refresh only processor-proven stable checkpoints after a caller has
+    /// retained a disk restore. Calling this before architecture-specific
+    /// restore validation can keep an entry hot even when the runtime rolls
+    /// back to full prefill, so every production caller invokes it only from
+    /// its retained `diskArrays` branch.
     ///
     /// Path-dependent hybrid caches persist the stable checkpoint one token
     /// short, matching the safe-seed rule used by fetch/store. Every touch is
     /// content-addressed with the active model/media namespace and updates only
     /// an existing entry; no missing or incompatible checkpoint is invented.
-    private func touchSuccessfulDiskRestore(
-        matchedTokens: [Int],
-        matchedBoundary: Int,
+    func touchStableDiskCheckpointsAfterRetainedRestore(
         requestTokens: [Int],
+        matchedTokenCount: Int,
         preferredDiskBoundaries: [Int],
         skipExactDiskBoundary: Bool,
         mediaSalt: String?
     ) {
-        guard let diskCache else { return }
+        guard let diskCache,
+              matchedTokenCount > 0,
+              matchedTokenCount <= requestTokens.count
+        else { return }
         let recency = Date()
         CombinedDiskCacheQuotaLock.shared.lock()
         defer { CombinedDiskCacheQuotaLock.shared.unlock() }
 
-        if isHybrid {
-            // `DiskCache.fetch` already touched this row, but that happened
-            // before the coordinator validated the companion topology and
-            // outside the combined quota lock. Re-touch the linked pair with
-            // one timestamp so quota never observes a hot KV row paired with
-            // a stale recurrent companion.
-            _ = diskCache.touchRecency(
-                tokens: matchedTokens,
-                mediaSalt: mediaSalt,
-                at: recency)
-            _ = ssmStateCache.diskStore?.touchRecency(
-                tokens: matchedTokens,
-                boundary: matchedBoundary,
-                mediaSalt: mediaSalt,
-                at: recency)
-        }
-
         let stableBoundaries = Set(preferredDiskBoundaries.compactMap { boundary in
             let storedBoundary = skipExactDiskBoundary ? boundary - 1 : boundary
-            return storedBoundary > 0 && storedBoundary <= matchedBoundary
+            return storedBoundary > 0 && storedBoundary <= matchedTokenCount
                 ? storedBoundary
                 : nil
         })

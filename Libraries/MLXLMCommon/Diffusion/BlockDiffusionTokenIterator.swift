@@ -178,6 +178,15 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
                 {
                     tokensToEncode = remainingTokens
                     prefixCacheRestoredTokens = matchedTokens
+                    if diskArrays != nil {
+                        coordinator.touchStableDiskCheckpointsAfterRetainedRestore(
+                            requestTokens: promptTokenIds,
+                            matchedTokenCount: matchedTokens,
+                            preferredDiskBoundaries: input
+                                .cacheStablePrefixTokenCounts,
+                            skipExactDiskBoundary: false,
+                            mediaSalt: mediaSalt)
+                    }
                     if matchedTokens > 0 {
                         prefillProgressHandler?(
                             PrefillProgress(
