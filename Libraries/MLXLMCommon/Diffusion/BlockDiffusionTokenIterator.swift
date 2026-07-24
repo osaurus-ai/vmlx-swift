@@ -55,6 +55,15 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
     var promptCacheSnapshot: [KVCache]?
     private let cacheInitParameters: GenerateParameters
 
+    /// Per-request PRNG key for the canvas init, renoise, and denoiser draws.
+    /// Split-and-advanced on every draw so generation is deterministic for a
+    /// given `randomSeed`. `nil` when the request carries no seed — the draws
+    /// then fall back to the global RNG (prior behaviour). Without this the
+    /// three `MLX.randInt`/`MLX.categorical` calls below used the global RNG
+    /// unconditionally, so block-diffusion output was non-reproducible even
+    /// with a seed set.
+    private var randomKey: MLXArray?
+
     private var pendingTokens: [Int] = []
     private var pendingIndex = 0
     private var finished = false
@@ -110,6 +119,7 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
         self.promptTokenIds = promptTokenIds
         self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
         self.cacheInitParameters = parameters
+        self.randomKey = parameters.randomSeed.map { MLX.key($0) }
         self.mediaSalt = computeCacheSalt(for: input, parameters: parameters)
         self.stopper = StableConfidentStopper(
             stabilityThreshold: options.stabilityThreshold,
@@ -310,6 +320,15 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
 
     // MARK: - Canvas cycle
 
+    /// Split the request PRNG key, storing the advanced half and returning a
+    /// fresh subkey for one draw. `nil` (no seed) → global RNG, unchanged.
+    private mutating func nextRandomKey() -> MLXArray? {
+        guard let k = randomKey else { return nil }
+        let (advanced, use) = MLX.split(key: k)
+        randomKey = advanced
+        return use
+    }
+
     private mutating func runCanvasCycle() {
         // 1. Commit the previous finalized canvas to the encoder cache.
         if let previous = pendingEncoderCanvas {
@@ -326,7 +345,8 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
         let vocabSize = model.diffusionVocabularySize
 
         // 2. Random canvas, reset self-conditioning and stopping state.
-        var canvas = MLX.randInt(0 ..< Int32(vocabSize), [1, canvasLength])
+        let initKey = nextRandomKey()
+        var canvas = MLX.randInt(0 ..< Int32(vocabSize), [1, canvasLength], key: initKey)
         var selfConditioning: MLXArray? = nil
         var argmaxIds = [Int32](repeating: 0, count: canvasLength)
         stopper.reset()
@@ -347,7 +367,8 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
                 tMin: options.tMin, tMax: options.tMax)
             let processed = logits.asType(.float32) / temperature
 
-            let denoiserCanvas = MLX.categorical(processed).asType(.int32)
+            let denoiserKey = nextRandomKey()
+            let denoiserCanvas = MLX.categorical(processed, key: denoiserKey).asType(.int32)
             let argmaxCanvas = argMax(processed, axis: -1).asType(.int32)
             let entropy = canvasTokenEntropy(processedLogits: processed)
             let acceptMask = entropyBoundAcceptMask(
@@ -355,7 +376,8 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
 
             // Accepted positions adopt the denoiser tokens; rejected
             // positions are renoised with fresh random tokens.
-            let fresh = MLX.randInt(0 ..< Int32(vocabSize), [1, canvasLength])
+            let freshKey = nextRandomKey()
+            let fresh = MLX.randInt(0 ..< Int32(vocabSize), [1, canvasLength], key: freshKey)
             canvas = MLX.which(acceptMask, denoiserCanvas, fresh)
 
             denoisingForwardCount += 1
