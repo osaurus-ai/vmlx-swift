@@ -530,6 +530,12 @@ public final class CacheCoordinator: @unchecked Sendable {
                     diskArrays: arrays,
                     mediaSalt: mediaSalt)
                 if hasRequiredHybridSSM(ssmStates, diskArrays: arrays) {
+                    if isHybrid {
+                        touchSuccessfulHybridDiskRestore(
+                            tokens: prefix,
+                            boundary: boundary,
+                            mediaSalt: mediaSalt)
+                    }
                     ftrace("HIT disk boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))")
                     return .hit(
                         matchedTokens: boundary,
@@ -665,6 +671,34 @@ public final class CacheCoordinator: @unchecked Sendable {
             return nil
         }
         return entry.isComplete ? entry.states : nil
+    }
+
+    /// Refresh the complete persistent hybrid group after the coordinator has
+    /// accepted a disk restore. Combined quota sorts a linked group by the
+    /// older of its KV-row timestamp and companion-file timestamp, so touching
+    /// only whichever tier physically served recurrent state can still evict a
+    /// hot prefix. Hold the quota lock across both metadata updates and use one
+    /// timestamp. This also covers an L1 recurrent-state hit or folded v2
+    /// payload that did not call `SSMCompanionDiskStore.fetch`.
+    private func touchSuccessfulHybridDiskRestore(
+        tokens: [Int],
+        boundary: Int,
+        mediaSalt: String?
+    ) {
+        guard let diskCache else { return }
+        let recency = Date()
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+
+        _ = diskCache.touchRecency(
+            tokens: tokens,
+            mediaSalt: mediaSalt,
+            at: recency)
+        _ = ssmStateCache.diskStore?.touchRecency(
+            tokens: tokens,
+            boundary: boundary,
+            mediaSalt: mediaSalt,
+            at: recency)
     }
 
     // MARK: - Store

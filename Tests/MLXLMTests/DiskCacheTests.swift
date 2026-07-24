@@ -30,6 +30,48 @@ import Testing
     }
 }
 
+@Test func diskCacheFetchRefreshesRecencyWithoutRewritingPayload() async throws {
+    try await MLXMetalTestLock.withLock {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-disk-fetch-recency-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let modelKey = "disk-fetch-recency-model"
+        let hotTokens = [1, 2, 3, 4]
+        let coldTokens = [5, 6, 7, 8]
+        let hotHash = DiskCache.hashTokens(hotTokens, modelKey: modelKey)
+        let cache = DiskCache(
+            cacheDir: tempDir, maxSizeGB: 0.1, modelKey: modelKey)
+        let arrays = ["data": MLXArray.ones([64])]
+
+        cache.store(tokens: hotTokens, arrays: arrays)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        cache.store(tokens: coldTokens, arrays: arrays)
+
+        let hotBefore = try #require(
+            cache.quotaEntries().first { $0.hash == hotHash })
+        let coldBefore = try #require(
+            cache.quotaEntries().first {
+                $0.hash == DiskCache.hashTokens(coldTokens, modelKey: modelKey)
+            })
+        #expect(hotBefore.createdAt < coldBefore.createdAt)
+
+        let payloadURL = tempDir.appendingPathComponent("\(hotHash).safetensors")
+        let payloadBefore = try Data(contentsOf: payloadURL)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        #expect(cache.fetch(tokens: hotTokens) != nil)
+
+        let hotAfter = try #require(
+            cache.quotaEntries().first { $0.hash == hotHash })
+        let coldAfter = try #require(
+            cache.quotaEntries().first {
+                $0.hash == DiskCache.hashTokens(coldTokens, modelKey: modelKey)
+            })
+        #expect(hotAfter.createdAt > coldAfter.createdAt)
+        #expect(try Data(contentsOf: payloadURL) == payloadBefore)
+    }
+}
+
 @Test func diskCacheSkipsRewriteOnlyAfterCurrentProcessValidation() async throws {
     try await MLXMetalTestLock.withLock {
         let tempDir = FileManager.default.temporaryDirectory
@@ -75,6 +117,211 @@ import Testing
         #expect(healedModification != changedDate)
         #expect(warm.snapshotStats().stores == 2)
         #expect(warm.snapshotStats().storeSkips == 1)
+    }
+}
+
+@Test func ssmCompanionFetchRefreshesRecencyWithoutRewritingPayload() async throws {
+    try await MLXMetalTestLock.withLock {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-ssm-fetch-recency-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let modelKey = "ssm-fetch-recency-model"
+        let hotTokens = [11, 12, 13, 14]
+        let coldTokens = [21, 22, 23, 24]
+        let store = try SSMCompanionDiskStore(
+            cacheDir: dir,
+            modelKey: modelKey,
+            maxBytes: 10_000_000)
+        let states = [MLXArray.ones([64])]
+
+        try store.store(
+            ssmStates: states,
+            tokens: hotTokens,
+            boundary: hotTokens.count)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        try store.store(
+            ssmStates: states,
+            tokens: coldTokens,
+            boundary: coldTokens.count)
+
+        let hotHash = SSMCompanionDiskStore.keyFor(
+            tokens: hotTokens,
+            boundary: hotTokens.count,
+            modelKey: modelKey)
+        let coldHash = SSMCompanionDiskStore.keyFor(
+            tokens: coldTokens,
+            boundary: coldTokens.count,
+            modelKey: modelKey)
+        let hotBefore = try #require(
+            store.quotaEntries().first { $0.hash == hotHash })
+        let coldBefore = try #require(
+            store.quotaEntries().first { $0.hash == coldHash })
+        #expect(hotBefore.modifiedAt < coldBefore.modifiedAt)
+
+        let tensorURL = dir.appendingPathComponent("ssm-\(hotHash).safetensors")
+        let sidecarURL = dir.appendingPathComponent("ssm-\(hotHash).json")
+        let tensorBefore = try Data(contentsOf: tensorURL)
+        let sidecarBefore = try Data(contentsOf: sidecarURL)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        #expect(
+            store.fetch(
+                tokens: hotTokens,
+                boundary: hotTokens.count) != nil)
+
+        let hotAfter = try #require(
+            store.quotaEntries().first { $0.hash == hotHash })
+        let coldAfter = try #require(
+            store.quotaEntries().first { $0.hash == coldHash })
+        #expect(hotAfter.modifiedAt > coldAfter.modifiedAt)
+        #expect(try Data(contentsOf: tensorURL) == tensorBefore)
+        #expect(try Data(contentsOf: sidecarURL) == sidecarBefore)
+    }
+}
+
+@Test func successfulHybridDiskRestoreTouchesWholeGroupForLRUEviction() async throws {
+    try await MLXMetalTestLock.withLock {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-hybrid-group-lru-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelKey = "hybrid-group-lru-model"
+        let hotTokens = [31, 32, 33, 34]
+        let coldTokens = [41, 42, 43, 44]
+        let newTokens = [51, 52, 53, 54]
+        let kvArrays = ["data": MLXArray.ones([8])]
+        let ssmStates = [MLXArray.ones([1_024])]
+        let hotKVHash = DiskCache.hashTokens(hotTokens, modelKey: modelKey)
+        let coldKVHash = DiskCache.hashTokens(coldTokens, modelKey: modelKey)
+        let newKVHash = DiskCache.hashTokens(newTokens, modelKey: modelKey)
+        let hotSSMHash = SSMCompanionDiskStore.keyFor(
+            tokens: hotTokens,
+            boundary: hotTokens.count,
+            modelKey: modelKey)
+        let coldSSMHash = SSMCompanionDiskStore.keyFor(
+            tokens: coldTokens,
+            boundary: coldTokens.count,
+            modelKey: modelKey)
+        let newSSMHash = SSMCompanionDiskStore.keyFor(
+            tokens: newTokens,
+            boundary: newTokens.count,
+            modelKey: modelKey)
+
+        var capBytes: Int64 = 0
+        do {
+            let seed = CacheCoordinator(config: CacheCoordinatorConfig(
+                usePagedCache: false,
+                enableDiskCache: true,
+                diskCacheMaxGB: 1,
+                diskCacheDir: root,
+                modelKey: modelKey))
+            seed.setHybrid(true, requiresRecurrentSSMCompanion: true)
+            let disk = try #require(seed.diskCache)
+
+            disk.store(tokens: hotTokens, arrays: kvArrays)
+            seed.ssmStateCache.store(
+                ssmStates: ssmStates,
+                tokens: hotTokens,
+                boundary: hotTokens.count)
+            try await Task.sleep(nanoseconds: 50_000_000)
+            disk.store(tokens: coldTokens, arrays: kvArrays)
+            seed.ssmStateCache.store(
+                ssmStates: ssmStates,
+                tokens: coldTokens,
+                boundary: coldTokens.count)
+
+            let hotKV = try #require(
+                disk.quotaEntries().first { $0.hash == hotKVHash })
+            let coldKV = try #require(
+                disk.quotaEntries().first { $0.hash == coldKVHash })
+            let companion = try #require(seed.ssmStateCache.diskStore)
+            let hotSSM = try #require(
+                companion.quotaEntries().first { $0.hash == hotSSMHash })
+            let coldSSM = try #require(
+                companion.quotaEntries().first { $0.hash == coldSSMHash })
+            let hotGroupBytes = hotKV.bytes + hotSSM.bytes
+            let coldGroupBytes = coldKV.bytes + coldSSM.bytes
+            // A + B fit before the access. Adding C must exceed the cap so
+            // combined quota has to choose exactly one linked group to evict.
+            capBytes = hotGroupBytes + coldGroupBytes
+        }
+
+        let capGB = Float(capBytes) / 1_073_741_824
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: capGB,
+            diskCacheDir: root,
+            modelKey: modelKey))
+        coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true)
+        let disk = try #require(coordinator.diskCache)
+        let companion = try #require(coordinator.ssmStateCache.diskStore)
+
+        // Keep hot recurrent state in L1 so the accepted disk restore does not
+        // call companion.fetch. The coordinator-level group touch must still
+        // refresh the linked on-disk sidecar.
+        coordinator.ssmStateCache.store(
+            ssmStates: ssmStates,
+            tokens: hotTokens,
+            boundary: hotTokens.count,
+            persistToDisk: false)
+
+        let hotTensorURL = root
+            .appendingPathComponent("ssm_companion")
+            .appendingPathComponent("ssm-\(hotSSMHash).safetensors")
+        let hotSidecarURL = root
+            .appendingPathComponent("ssm_companion")
+            .appendingPathComponent("ssm-\(hotSSMHash).json")
+        let hotTensorBefore = try Data(contentsOf: hotTensorURL)
+        let hotSidecarBefore = try Data(contentsOf: hotSidecarURL)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        switch coordinator.fetch(tokens: hotTokens) {
+        case .hit(
+            let matchedTokens,
+            let remainingTokens,
+            .disk,
+            _,
+            let restoredStates,
+            _):
+            #expect(matchedTokens == hotTokens.count)
+            #expect(remainingTokens.isEmpty)
+            #expect(restoredStates?.count == 1)
+        default:
+            Issue.record("expected accepted hybrid disk restore for hot group")
+        }
+
+        let hotKVAfter = try #require(
+            disk.quotaEntries().first { $0.hash == hotKVHash })
+        let coldKVAfter = try #require(
+            disk.quotaEntries().first { $0.hash == coldKVHash })
+        let hotSSMAfter = try #require(
+            companion.quotaEntries().first { $0.hash == hotSSMHash })
+        let coldSSMAfter = try #require(
+            companion.quotaEntries().first { $0.hash == coldSSMHash })
+        let hotGroupRecency = min(
+            hotKVAfter.createdAt, hotSSMAfter.modifiedAt)
+        let coldGroupRecency = min(
+            coldKVAfter.createdAt, coldSSMAfter.modifiedAt)
+        #expect(hotGroupRecency > coldGroupRecency)
+        #expect(try Data(contentsOf: hotTensorURL) == hotTensorBefore)
+        #expect(try Data(contentsOf: hotSidecarURL) == hotSidecarBefore)
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        disk.store(tokens: newTokens, arrays: kvArrays)
+        coordinator.ssmStateCache.store(
+            ssmStates: ssmStates,
+            tokens: newTokens,
+            boundary: newTokens.count)
+        coordinator.enforceCombinedDiskQuota()
+
+        let remainingKV = Set(disk.quotaEntries().map(\.hash))
+        let remainingSSM = Set(companion.quotaEntries().map(\.hash))
+        #expect(remainingKV.contains(hotKVHash))
+        #expect(remainingKV.contains(newKVHash))
+        #expect(!remainingKV.contains(coldKVHash))
+        #expect(remainingSSM.contains(hotSSMHash))
+        #expect(remainingSSM.contains(newSSMHash))
+        #expect(!remainingSSM.contains(coldSSMHash))
     }
 }
 

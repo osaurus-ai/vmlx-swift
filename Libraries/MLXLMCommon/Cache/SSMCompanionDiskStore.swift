@@ -190,34 +190,26 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
            currentSafetensors == validated.safetensors,
            currentSidecar == validated.sidecar
         {
-            let now = Date()
-            do {
-                try FileManager.default.setAttributes(
-                    [.modificationDate: now], ofItemAtPath: safetensorsURL.path)
-                try FileManager.default.setAttributes(
-                    [.modificationDate: now], ofItemAtPath: sidecarURL.path)
-                if let touchedSafetensors = fileFingerprint(at: safetensorsURL),
-                   let touchedSidecar = fileFingerprint(at: sidecarURL)
-                {
-                    validatedEntries[key] = ValidatedEntry(
-                        safetensors: touchedSafetensors,
-                        sidecar: touchedSidecar,
-                        isComplete: isComplete,
-                        numStates: ssmStates.count,
-                        boundary: boundary,
-                        kvHash: kvHash)
-                } else {
-                    validatedEntries.removeValue(forKey: key)
-                }
+            if let touched = touchEntryFilesLocked(
+                safetensorsURL: safetensorsURL,
+                sidecarURL: sidecarURL,
+                at: Date())
+            {
+                validatedEntries[key] = ValidatedEntry(
+                    safetensors: touched.safetensors,
+                    sidecar: touched.sidecar,
+                    isComplete: isComplete,
+                    numStates: ssmStates.count,
+                    boundary: boundary,
+                    kvHash: kvHash)
                 storeSkips += 1
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                     FileHandle.standardError.write(Data(
                         "[vmlx][cache/ssm-store] SKIP validated key=\(key) boundary=\(boundary) states=\(ssmStates.count)\n".utf8))
                 }
                 return
-            } catch {
-                validatedEntries.removeValue(forKey: key)
             }
+            validatedEntries.removeValue(forKey: key)
         }
 
         // Pre-realize on calling thread — same rationale as
@@ -336,6 +328,15 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             states.append(arr)
         }
 
+        // Reads, not only repeated stores, make an entry hot. Refresh both
+        // files to the same timestamp so quota observes the pair as one
+        // recency unit. This changes filesystem metadata only; tensor and JSON
+        // payload bytes remain untouched.
+        let touchedFingerprints = touchEntryFilesLocked(
+            safetensorsURL: safetensorsURL,
+            sidecarURL: sidecarURL,
+            at: Date())
+
         // Legacy sidecars remain readable, but only a complete current-format
         // metadata match is eligible to suppress the next write-through.
         let expectedKVHash = DiskCache.hashTokens(
@@ -348,8 +349,10 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
            storedBoundary == boundary,
            storedKVHash == expectedKVHash,
            storedModelKey == (modelKey ?? ""),
-           let fetchedSafetensors = fileFingerprint(at: safetensorsURL),
-           let fetchedSidecar = fileFingerprint(at: sidecarURL)
+           let fetchedSafetensors = touchedFingerprints?.safetensors
+                ?? fileFingerprint(at: safetensorsURL),
+           let fetchedSidecar = touchedFingerprints?.sidecar
+                ?? fileFingerprint(at: sidecarURL)
         {
             validatedEntries[key] = ValidatedEntry(
                 safetensors: fetchedSafetensors,
@@ -363,6 +366,52 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         }
 
         return SSMStateCache.FetchResult(states: states, isComplete: isComplete)
+    }
+
+    /// Refresh one linked recurrent companion's eviction recency without
+    /// decoding or rewriting either payload. CacheCoordinator calls this with
+    /// the same timestamp as the matching KV row, including when recurrent
+    /// state was satisfied from the in-memory L1 or folded disk payload.
+    @discardableResult
+    func touchRecency(
+        tokens: [Int],
+        boundary: Int,
+        mediaSalt: String? = nil,
+        at date: Date
+    ) -> Bool {
+        guard boundary > 0, boundary <= tokens.count else { return false }
+        let key = Self.keyFor(
+            tokens: tokens,
+            boundary: boundary,
+            mediaSalt: mediaSalt,
+            modelKey: modelKey)
+        let safetensorsURL = self.safetensorsURL(for: key)
+        let sidecarURL = self.sidecarURL(for: key)
+
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let touched = touchEntryFilesLocked(
+            safetensorsURL: safetensorsURL,
+            sidecarURL: sidecarURL,
+            at: date)
+        else {
+            validatedEntries.removeValue(forKey: key)
+            return false
+        }
+
+        if let validated = validatedEntries[key] {
+            validatedEntries[key] = ValidatedEntry(
+                safetensors: touched.safetensors,
+                sidecar: touched.sidecar,
+                isComplete: validated.isComplete,
+                numStates: validated.numStates,
+                boundary: validated.boundary,
+                kvHash: validated.kvHash)
+        }
+        return true
     }
 
     /// Remove all entries for a given model key. Called on model
@@ -435,6 +484,33 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             let modificationDate = values.contentModificationDate
         else { return nil }
         return FileFingerprint(size: size, modificationDate: modificationDate)
+    }
+
+    /// Touch a companion pair without changing either payload. Caller MUST
+    /// hold `lock`; cross-model safetensors serialization is owned by the
+    /// public caller or the already-locked store/fetch path.
+    private func touchEntryFilesLocked(
+        safetensorsURL: URL,
+        sidecarURL: URL,
+        at date: Date
+    ) -> (safetensors: FileFingerprint, sidecar: FileFingerprint)? {
+        guard FileManager.default.fileExists(atPath: safetensorsURL.path),
+              FileManager.default.fileExists(atPath: sidecarURL.path)
+        else { return nil }
+        do {
+            try FileManager.default.setAttributes(
+                [.modificationDate: date],
+                ofItemAtPath: safetensorsURL.path)
+            try FileManager.default.setAttributes(
+                [.modificationDate: date],
+                ofItemAtPath: sidecarURL.path)
+            guard let safetensors = fileFingerprint(at: safetensorsURL),
+                  let sidecar = fileFingerprint(at: sidecarURL)
+            else { return nil }
+            return (safetensors: safetensors, sidecar: sidecar)
+        } catch {
+            return nil
+        }
     }
 
     private struct DiskEntry {

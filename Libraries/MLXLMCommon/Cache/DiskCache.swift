@@ -16,7 +16,8 @@ public struct DiskCacheStats: Sendable {
 }
 
 /// One indexed KV payload used by the coordinator's shared disk-quota pass.
-/// `createdAt` mirrors the existing oldest-entry eviction order.
+/// `createdAt` is the entry's eviction recency timestamp. The SQLite column
+/// retains its historical `created_at` name for on-disk schema compatibility.
 struct DiskCacheQuotaEntry: Sendable {
     let hash: String
     let bytes: Int64
@@ -309,6 +310,7 @@ public final class DiskCache: @unchecked Sendable {
             if let fingerprint = _fileFingerprint(url: url), fingerprint.size > 0 {
                 validatedFiles[hash] = fingerprint
             }
+            _touchEntryLocked(hash: hash)
             hits += 1
             return arrays
         } catch {
@@ -424,6 +426,23 @@ public final class DiskCache: @unchecked Sendable {
                 createdAt: Date(timeIntervalSince1970: unixTime)))
         }
         return entries
+    }
+
+    /// Refresh one indexed payload's eviction recency without reading or
+    /// rewriting its safetensors file. CacheCoordinator uses the explicit
+    /// timestamp form to touch a linked KV + recurrent-companion group under
+    /// one combined-quota critical section.
+    @discardableResult
+    func touchRecency(
+        tokens: [Int],
+        mediaSalt: String? = nil,
+        at date: Date
+    ) -> Bool {
+        let hash = DiskCache.hashTokens(
+            tokens, modelKey: modelKey, mediaSalt: mediaSalt)
+        lock.lock()
+        defer { lock.unlock() }
+        return _touchEntryLocked(hash: hash, at: date)
     }
 
     /// Remove indexed KV payloads selected by the combined quota pass.
@@ -584,21 +603,28 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Refresh the existing eviction timestamp without replacing the row or
     /// rewriting the payload. Caller MUST hold `lock`.
-    private func _touchEntryLocked(hash: String) {
-        guard let db else { return }
+    @discardableResult
+    private func _touchEntryLocked(
+        hash: String,
+        at date: Date = Date()
+    ) -> Bool {
+        guard let db else { return false }
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(
             db,
-            "UPDATE cache_entries SET created_at = julianday('now') WHERE hash = ?",
+            "UPDATE cache_entries SET created_at = ? WHERE hash = ?",
             -1,
             &stmt,
             nil) == SQLITE_OK
-        else { return }
+        else { return false }
         defer { sqlite3_finalize(stmt) }
-        hash.withCString { cStr in
-            sqlite3_bind_text(stmt, 1, cStr, -1, nil)
-            sqlite3_step(stmt)
+        let julianDay = date.timeIntervalSince1970 / 86_400 + 2_440_587.5
+        sqlite3_bind_double(stmt, 1, julianDay)
+        _ = hash.withCString { cStr in
+            sqlite3_bind_text(stmt, 2, cStr, -1, nil)
         }
+        guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+        return sqlite3_changes(db) > 0
     }
 
     /// Delete a single `cache_entries` row by hash. Caller MUST hold `lock`.
