@@ -5,6 +5,17 @@
 import CompilerPluginSupport
 import PackageDescription
 
+// Strict Swift 6 on 6.2+ (which no longer emit the region-isolation over-report
+// noted on the MLXLMCommon target below); .v5 fallback on 6.0/6.1 so the package
+// stays buildable across the full tools-version-6.1 toolchain range.
+let mlxLMCommonSwiftSettings: [SwiftSetting] = {
+    #if compiler(>=6.2)
+    return [.swiftLanguageMode(.v6)]
+    #else
+    return [.swiftLanguageMode(.v5)]
+    #endif
+}()
+
 #if os(Linux)
     let platformExcludes: [String] = [
         // Linux specific excludes
@@ -490,7 +501,7 @@ let package = Package(
             // tools-version-6.1 toolchain range, while every other target
             // (incl. Jinja) stays in Swift 6 mode. No real data race exists:
             // MLXLMCommon compiles cleanly in Swift 6 mode on current compilers.
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            swiftSettings: mlxLMCommonSwiftSettings
         ),
         .target(
             name: "MLXLLM",
