@@ -22,10 +22,16 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
         #expect(lmInput.contains("public let toolSchemas: [ToolSpec]?"))
         #expect(lmInput.contains("public func withToolSchemas"))
         #expect(batchEngine.contains("let toolSchemas = input.toolSchemas"))
-        #expect(batchEngine.contains("let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil"))
-        #expect(batchEngine.contains("ToolCallProcessor(format: toolCallFormat, tools: $0)"))
+        #expect(
+            batchEngine.contains(
+                "let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil"))
+        #expect(batchEngine.contains("if let activeToolSchemas"))
+        #expect(
+            batchEngine.contains(
+                "ToolCallProcessor(format: toolCallFormat, tools: activeToolSchemas)"))
         #expect(evaluate.contains("let activeTools = tools?.isEmpty == false ? tools : nil"))
-        #expect(evaluate.contains("ToolCallProcessor(format: format, tools: $0)"))
+        #expect(evaluate.contains("if let activeTools"))
+        #expect(evaluate.contains("ToolCallProcessor(format: format, tools: activeTools)"))
     }
 
     @Test("decode loop disables tool parser without active schemas")
@@ -45,11 +51,18 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
 
         #expect(routing.contains("through toolCallProcessor: ToolCallProcessor?"))
         #expect(routing.contains("guard let toolCallProcessor else"))
-        #expect(batchEngine.contains("let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil"))
+        #expect(
+            batchEngine.contains(
+                "let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil"))
         #expect(evaluate.contains("let activeTools = tools?.isEmpty == false ? tools : nil"))
-        #expect(specDec.contains("let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil"))
-        #expect(!batchEngine.contains("ToolCallProcessor(format: toolCallFormat, tools: toolSchemas)"))
-        #expect(!evaluate.contains("toolCallProcessor = ToolCallProcessor(format: format, tools: tools)"))
+        #expect(
+            specDec.contains(
+                "let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil"))
+        #expect(
+            !batchEngine.contains("ToolCallProcessor(format: toolCallFormat, tools: toolSchemas)"))
+        #expect(
+            !evaluate.contains(
+                "toolCallProcessor = ToolCallProcessor(format: format, tools: tools)"))
     }
 
     @Test("registered top-level JSON tool fallback is parsed without visible leakage")
@@ -67,7 +80,9 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
         #expect(processor.toolCalls.count == 1)
         #expect(processor.toolCalls.first?.function.name == "file_read")
         #expect(processor.toolCalls.first?.function.arguments["path"] == nil)
-        #expect(processor.toolCalls.first?.function.arguments["_error"] == .string("invalid_tool_arguments"))
+        #expect(
+            processor.toolCalls.first?.function.arguments["_error"]
+                == .string("invalid_tool_arguments"))
         #expect(processor.toolCalls.first?.function.arguments["_field"] == .string("path"))
         #expect(processor.toolCalls.first?.function.arguments["r"] == nil)
         #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -122,7 +137,8 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
 
             #expect(processor.toolCalls.count == 1, "\(toolName) should emit a tool attempt")
             #expect(processor.toolCalls.first?.function.name == toolName)
-            #expect(processor.toolCalls.first?.function.arguments["path"] == .string("mandelbrot.py"))
+            #expect(
+                processor.toolCalls.first?.function.arguments["path"] == .string("mandelbrot.py"))
             #expect(
                 visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                 "\(toolName) JSON tool attempt leaked visible text: \(visible)"
@@ -353,7 +369,8 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
         #expect(call?.function.arguments["start_line"] == .int(33))
         #expect(call?.function.arguments["end_line"] == .int(39))
         #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        #expect(processor.processEOS()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        #expect(
+            processor.processEOS()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         #expect(!visible.contains("file_read"))
         #expect(!visible.contains("```json"))
         #expect(!visible.contains("DSV4_UI_TOUT_OK"))

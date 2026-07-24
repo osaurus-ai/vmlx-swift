@@ -111,9 +111,11 @@ public class ToolCallProcessor {
         guard !registered.isEmpty else { return call }
         let name = call.function.name
         if registered.contains(name) { return call }
-        guard let canonical = registered.first(where: {
-            $0.compare(name, options: .caseInsensitive) == .orderedSame
-        }) else { return call }
+        guard
+            let canonical = registered.first(where: {
+                $0.compare(name, options: .caseInsensitive) == .orderedSame
+            })
+        else { return call }
         return ToolCall(
             id: call.id,
             function: .init(name: canonical, arguments: call.function.arguments))
@@ -301,7 +303,8 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return visibleInlineLeading(leading)
+                return visibleInlineLeading(
+                    leading, afterConfirmedToolCall: state == .normal)
             }
 
             if let pendingIndex = partialInlineActionJSONToolCallStart(in: inlineText) {
@@ -324,7 +327,8 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return visibleInlineLeading(leading)
+                return visibleInlineLeading(
+                    leading, afterConfirmedToolCall: state == .normal)
             }
 
             if let pendingIndex = partialInlineEmbeddedAPIToolJSONStart(in: inlineText) {
@@ -345,7 +349,8 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return visibleInlineLeading(leading)
+                return visibleInlineLeading(
+                    leading, afterConfirmedToolCall: state == .normal)
             }
 
             if let pendingIndex = partialInlinePythonicCallListStart(in: inlineText) {
@@ -366,7 +371,8 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return visibleInlineLeading(leading)
+                return visibleInlineLeading(
+                    leading, afterConfirmedToolCall: state == .normal)
             }
 
             if let pendingIndex = partialInlineFunctionToolCallStart(in: inlineText) {
@@ -389,7 +395,8 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return visibleInlineLeading(leading)
+                return visibleInlineLeading(
+                    leading, afterConfirmedToolCall: state == .normal)
             }
 
             if let pendingIndex = partialInlineRequestToolXMLToolCallStart(in: inlineText) {
@@ -410,7 +417,8 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return visibleInlineLeading(leading)
+                return visibleInlineLeading(
+                    leading, afterConfirmedToolCall: state == .normal)
             }
 
             if let pendingIndex = partialInlineBareNameJSONToolCallStart(in: inlineText) {
@@ -433,7 +441,8 @@ public class ToolCallProcessor {
                     state = .normal
                     suppressingTextAfterInlineToolCall = true
                 }
-                return visibleInlineLeading(leading)
+                return visibleInlineLeading(
+                    leading, afterConfirmedToolCall: state == .normal)
             }
 
             if let pendingIndex = partialInlineBareNameKeyValueToolCallStart(in: inlineText) {
@@ -454,7 +463,7 @@ public class ToolCallProcessor {
                     recordToolCall(toolCall)
                     toolCallBuffer = ""
                     state = .normal
-                    return visibleInlineLeading(leading)
+                    return visibleInlineLeading(leading, afterConfirmedToolCall: true)
                 }
 
                 // Still collecting — check if braces are balanced (would mean parse
@@ -796,7 +805,7 @@ public class ToolCallProcessor {
         var searchStart = text.startIndex
         while let range = text.range(of: "call:", range: searchStart ..< text.endIndex) {
             if isInlineFunctionBoundary(text, before: range.lowerBound),
-               bareCallTailStartsKnownTool(in: text, afterPrefix: range.upperBound)
+                bareCallTailStartsKnownTool(in: text, afterPrefix: range.upperBound)
             {
                 return range.lowerBound
             }
@@ -814,7 +823,7 @@ public class ToolCallProcessor {
             }
         }
         guard let range = text.range(of: prefix),
-              isInlineFunctionBoundary(text, before: range.lowerBound)
+            isInlineFunctionBoundary(text, before: range.lowerBound)
         else {
             return nil
         }
@@ -1087,7 +1096,8 @@ public class ToolCallProcessor {
             if isInlineFunctionBoundary(text, before: cursor) {
                 let suffix = String(text[cursor...])
                 for name in inlineFunctionToolNames() {
-                    if inlineFunctionNamePrefix(suffix, matches: name) && suffix.count < name.count {
+                    if inlineFunctionNamePrefix(suffix, matches: name) && suffix.count < name.count
+                    {
                         best = cursor
                         break
                     }
@@ -1118,7 +1128,7 @@ public class ToolCallProcessor {
         while cursor < text.endIndex, isInlineKeyValueIdentifierCharacter(text[cursor]) {
             cursor = text.index(after: cursor)
         }
-        return (String(text[start..<cursor]), cursor)
+        return (String(text[start ..< cursor]), cursor)
     }
 
     private func minIndex(_ lhs: String.Index?, _ rhs: String.Index) -> String.Index {
@@ -1414,7 +1424,7 @@ public class ToolCallProcessor {
         guard text[cursor...].hasPrefix("```") else { return cursor }
 
         var fenceCursor = cursor
-        for _ in 0..<3 {
+        for _ in 0 ..< 3 {
             guard fenceCursor < text.endIndex else { return cursor }
             fenceCursor = text.index(after: fenceCursor)
         }
@@ -1430,7 +1440,8 @@ public class ToolCallProcessor {
         return fenceCursor
     }
 
-    private func consumeOptionalJSONLabel(in text: String, at cursor: String.Index) -> String.Index {
+    private func consumeOptionalJSONLabel(in text: String, at cursor: String.Index) -> String.Index
+    {
         guard cursor < text.endIndex, text[cursor] == ":" else { return cursor }
         var labelStart = text.index(after: cursor)
         while labelStart < text.endIndex, isInlineWhitespace(text[labelStart]) {
@@ -1467,10 +1478,11 @@ public class ToolCallProcessor {
     }
 
     private func inlineFunctionToolNames() -> [String] {
-        let schemaNames = tools?.compactMap { tool -> String? in
-            let function = (tool["function"] as? [String: any Sendable]) ?? tool
-            return function["name"] as? String
-        } ?? []
+        let schemaNames =
+            tools?.compactMap { tool -> String? in
+                let function = (tool["function"] as? [String: any Sendable]) ?? tool
+                return function["name"] as? String
+            } ?? []
         if !schemaNames.isEmpty {
             return schemaNames.sorted { $0.count > $1.count }
         }
@@ -1487,19 +1499,28 @@ public class ToolCallProcessor {
         ]
     }
 
-    private func visibleInlineLeading(_ leading: String) -> String? {
-        // Emit leading text verbatim. Returning nil only for *empty* leading
-        // (never for whitespace-only) keeps ordinary prose byte-exact: a chunk
-        // like " {" must not lose its leading space when the brace triggers a
-        // (possibly false) inline tool-call probe.
-        leading.isEmpty ? nil : leading
+    private func visibleInlineLeading(
+        _ leading: String,
+        afterConfirmedToolCall: Bool = false
+    ) -> String? {
+        // During an ambiguous inline-tool probe, emit leading text verbatim:
+        // a chunk like " {" must not lose its leading space if the brace later
+        // proves to be ordinary prose. Once a tool call has actually parsed,
+        // whitespace-only leading bytes are envelope formatting rather than a
+        // visible assistant message.
+        if afterConfirmedToolCall,
+            leading.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return nil
+        }
+        return leading.isEmpty ? nil : leading
     }
 
     /// Process chunk for tagged formats.
     private func processTaggedChunk(_ chunk: String, allowInlineFallback: Bool) -> String? {
         let startTags = parser.startTagAliases
         let startTagPrefixes = parser.startTagPrefixes
-        guard (!startTags.isEmpty || !startTagPrefixes.isEmpty),
+        guard !startTags.isEmpty || !startTagPrefixes.isEmpty,
             let startChar = startTagFirstChar
         else {
             return chunk
@@ -1564,14 +1585,15 @@ public class ToolCallProcessor {
                     state = .collectingInlineToolCall
 
                     if shouldAttemptInlineToolParse(toolCallBuffer),
-                       let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
+                        let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
                     {
                         recordToolCall(toolCall)
                         toolCallBuffer = ""
                         state = .normal
                         suppressingTextAfterInlineToolCall = true
                     }
-                    return visibleInlineLeading(leading)
+                    return visibleInlineLeading(
+                        leading, afterConfirmedToolCall: state == .normal)
                 }
                 if let fragmentIndex = partialInlineBareNameJSONToolCallStart(in: candidate) {
                     let leading = String(candidate[..<fragmentIndex])
@@ -1586,14 +1608,15 @@ public class ToolCallProcessor {
                     state = .collectingInlineToolCall
 
                     if shouldAttemptInlineToolParse(toolCallBuffer),
-                       let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
+                        let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
                     {
                         recordToolCall(toolCall)
                         toolCallBuffer = ""
                         state = .normal
                         suppressingTextAfterInlineToolCall = true
                     }
-                    return visibleInlineLeading(leading)
+                    return visibleInlineLeading(
+                        leading, afterConfirmedToolCall: state == .normal)
                 }
                 if let fragmentIndex = partialBareCallToolCallStart(in: candidate) {
                     let leading = String(candidate[..<fragmentIndex])
@@ -1624,7 +1647,8 @@ public class ToolCallProcessor {
             return processInlineChunk(chunk)
         }
 
-        if allowInlineFallback && parser.supportsInlineJSONToolFallback && !hasTaggedStartCandidate {
+        if allowInlineFallback && parser.supportsInlineJSONToolFallback && !hasTaggedStartCandidate
+        {
             switch state {
             case .collectingInlineToolCall:
                 return processInlineChunk(chunk)
@@ -1724,7 +1748,9 @@ public class ToolCallProcessor {
             fallthrough
         case .potentialToolCall:
             if partialMatch(buffer: toolCallBuffer, tags: startTags, prefixes: startTagPrefixes) {
-                if startsWithCompleteTag(buffer: toolCallBuffer, tags: startTags, prefixes: startTagPrefixes) {
+                if startsWithCompleteTag(
+                    buffer: toolCallBuffer, tags: startTags, prefixes: startTagPrefixes)
+                {
                     state = .collectingToolCall
                     fallthrough
                 } else {
@@ -1858,9 +1884,10 @@ public class ToolCallProcessor {
                 if let trailingToken, let startChar = startTagFirstChar,
                     trailingToken.contains(startChar)
                 {
-                    let trailing = processTaggedChunk(
-                        trailingToken,
-                        allowInlineFallback: allowInlineFallback) ?? ""
+                    let trailing =
+                        processTaggedChunk(
+                            trailingToken,
+                            allowInlineFallback: allowInlineFallback) ?? ""
                     let visible = leading + trailing
                     return visible.isEmpty ? nil : visible
                 } else {
@@ -1909,6 +1936,12 @@ public class ToolCallProcessor {
     }
 
     private func visibleLeadingTextBeforeToolCall(parsedToolCalls: [ToolCall]) -> String {
+        if !parsedToolCalls.isEmpty,
+            leadingTextBeforeToolCall
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return ""
+        }
         guard parser.supportsInlineJSONToolFallback,
             let fragment = bareToolMarkerFragment(in: leadingTextBeforeToolCall),
             parsedToolCalls.contains(where: { $0.function.name == fragment })
@@ -1963,7 +1996,9 @@ public class ToolCallProcessor {
 
     private func partialMatch(buffer: String, tags: [String], prefixes: [String]) -> Bool {
         tags.contains { partialMatch(buffer: buffer, tag: $0) }
-            || prefixes.contains { partialMatch(buffer: buffer, tag: $0) || buffer.starts(with: $0) }
+            || prefixes.contains {
+                partialMatch(buffer: buffer, tag: $0) || buffer.starts(with: $0)
+            }
     }
 
     private func partialMatch(buffer: String, tag: String) -> Bool {
@@ -1992,13 +2027,15 @@ public class ToolCallProcessor {
     }
 
     private func firstTag(in text: String, tags: [String], prefixes: [String]) -> String? {
-        let exactMatch = tags
+        let exactMatch =
+            tags
             .compactMap { tag -> (String, Range<String.Index>)? in
                 text.range(of: tag).map { (tag, $0) }
             }
             .min { $0.1.lowerBound < $1.1.lowerBound }
 
-        let prefixedMatch = prefixes
+        let prefixedMatch =
+            prefixes
             .compactMap { prefix -> (String, Range<String.Index>)? in
                 guard
                     let match = completedPrefixedTag(
@@ -2014,11 +2051,11 @@ public class ToolCallProcessor {
         switch (exactMatch, prefixedMatch) {
         case (nil, nil):
             return nil
-        case let (exact?, nil):
+        case (let exact?, nil):
             return exact.0
-        case let (nil, prefixed?):
+        case (nil, let prefixed?):
             return prefixed.0
-        case let (exact?, prefixed?):
+        case (let exact?, let prefixed?):
             return exact.1.lowerBound <= prefixed.1.lowerBound ? exact.0 : prefixed.0
         }
     }
