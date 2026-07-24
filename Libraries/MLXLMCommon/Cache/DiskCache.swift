@@ -428,10 +428,13 @@ public final class DiskCache: @unchecked Sendable {
         return entries
     }
 
-    /// Refresh one indexed payload's eviction recency without reading or
-    /// rewriting its safetensors file. CacheCoordinator uses the explicit
-    /// timestamp form to touch a linked KV + recurrent-companion group under
-    /// one combined-quota critical section.
+    /// Refresh one indexed payload's eviction recency without decoding or
+    /// rewriting its safetensors file. The file must still exist and its size
+    /// and token count must match the index; an orphan or stale row is not
+    /// allowed to become hot merely because its content hash still exists in
+    /// SQLite. CacheCoordinator uses the explicit timestamp form to touch a
+    /// linked KV + recurrent-companion group under one combined-quota critical
+    /// section.
     @discardableResult
     func touchRecency(
         tokens: [Int],
@@ -440,8 +443,20 @@ public final class DiskCache: @unchecked Sendable {
     ) -> Bool {
         let hash = DiskCache.hashTokens(
             tokens, modelKey: modelKey, mediaSalt: mediaSalt)
+        let url = safetensorsURL(for: hash)
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
         defer { lock.unlock() }
+        guard let current = _fileFingerprint(url: url),
+              current.size > 0,
+              let indexed = _entryMetadataLocked(hash: hash),
+              indexed.tokenCount == tokens.count,
+              indexed.fileSize == current.size
+        else {
+            validatedFiles.removeValue(forKey: hash)
+            return false
+        }
         return _touchEntryLocked(hash: hash, at: date)
     }
 

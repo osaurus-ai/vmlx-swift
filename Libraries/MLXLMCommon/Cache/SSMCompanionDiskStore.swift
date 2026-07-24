@@ -393,6 +393,23 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
+        let expectedKVHash = DiskCache.hashTokens(
+            Array(tokens.prefix(boundary)),
+            modelKey: modelKey,
+            mediaSalt: mediaSalt)
+        guard let sidecarData = try? Data(contentsOf: sidecarURL),
+              let sidecar = try? JSONSerialization.jsonObject(with: sidecarData)
+                as? [String: Any],
+              sidecar["is_complete"] as? Bool == true,
+              (sidecar["num_states"] as? Int ?? 0) > 0,
+              sidecar["boundary"] as? Int == boundary,
+              sidecar["kv_hash"] as? String == expectedKVHash,
+              sidecar["model_key"] as? String == (modelKey ?? "")
+        else {
+            validatedEntries.removeValue(forKey: key)
+            return false
+        }
+
         guard let touched = touchEntryFilesLocked(
             safetensorsURL: safetensorsURL,
             sidecarURL: sidecarURL,

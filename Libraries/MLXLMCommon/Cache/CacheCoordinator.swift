@@ -530,12 +530,13 @@ public final class CacheCoordinator: @unchecked Sendable {
                     diskArrays: arrays,
                     mediaSalt: mediaSalt)
                 if hasRequiredHybridSSM(ssmStates, diskArrays: arrays) {
-                    if isHybrid {
-                        touchSuccessfulHybridDiskRestore(
-                            tokens: prefix,
-                            boundary: boundary,
-                            mediaSalt: mediaSalt)
-                    }
+                    touchSuccessfulDiskRestore(
+                        matchedTokens: prefix,
+                        matchedBoundary: boundary,
+                        requestTokens: tokens,
+                        preferredDiskBoundaries: preferredDiskBoundaries,
+                        skipExactDiskBoundary: skipExactDiskBoundary,
+                        mediaSalt: mediaSalt)
                     ftrace("HIT disk boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))")
                     return .hit(
                         matchedTokens: boundary,
@@ -673,16 +674,27 @@ public final class CacheCoordinator: @unchecked Sendable {
         return entry.isComplete ? entry.states : nil
     }
 
-    /// Refresh the complete persistent hybrid group after the coordinator has
-    /// accepted a disk restore. Combined quota sorts a linked group by the
-    /// older of its KV-row timestamp and companion-file timestamp, so touching
-    /// only whichever tier physically served recurrent state can still evict a
-    /// hot prefix. Hold the quota lock across both metadata updates and use one
-    /// timestamp. This also covers an L1 recurrent-state hit or folded v2
-    /// payload that did not call `SSMCompanionDiskStore.fetch`.
-    private func touchSuccessfulHybridDiskRestore(
-        tokens: [Int],
-        boundary: Int,
+    /// Refresh durable entries that the accepted restore made logically hot.
+    ///
+    /// The directly served boundary was already touched by `DiskCache.fetch`.
+    /// Hybrid caches still need their linked recurrent companion touched with
+    /// the same timestamp. A growing tool/chat turn normally restores a newer,
+    /// longer boundary, but its processor-proven stable system/tool prefix is
+    /// also part of every request and is the checkpoint a new chat needs.
+    /// Refresh that stable prefix too so a long tool loop does not fill the
+    /// quota with one-off growing snapshots and evict the reusable warm-start
+    /// checkpoint merely because the longer entry served the current request.
+    ///
+    /// Path-dependent hybrid caches persist the stable checkpoint one token
+    /// short, matching the safe-seed rule used by fetch/store. Every touch is
+    /// content-addressed with the active model/media namespace and updates only
+    /// an existing entry; no missing or incompatible checkpoint is invented.
+    private func touchSuccessfulDiskRestore(
+        matchedTokens: [Int],
+        matchedBoundary: Int,
+        requestTokens: [Int],
+        preferredDiskBoundaries: [Int],
+        skipExactDiskBoundary: Bool,
         mediaSalt: String?
     ) {
         guard let diskCache else { return }
@@ -690,15 +702,45 @@ public final class CacheCoordinator: @unchecked Sendable {
         CombinedDiskCacheQuotaLock.shared.lock()
         defer { CombinedDiskCacheQuotaLock.shared.unlock() }
 
-        _ = diskCache.touchRecency(
-            tokens: tokens,
-            mediaSalt: mediaSalt,
-            at: recency)
-        _ = ssmStateCache.diskStore?.touchRecency(
-            tokens: tokens,
-            boundary: boundary,
-            mediaSalt: mediaSalt,
-            at: recency)
+        if isHybrid {
+            // `DiskCache.fetch` already touched this row, but that happened
+            // before the coordinator validated the companion topology and
+            // outside the combined quota lock. Re-touch the linked pair with
+            // one timestamp so quota never observes a hot KV row paired with
+            // a stale recurrent companion.
+            _ = diskCache.touchRecency(
+                tokens: matchedTokens,
+                mediaSalt: mediaSalt,
+                at: recency)
+            _ = ssmStateCache.diskStore?.touchRecency(
+                tokens: matchedTokens,
+                boundary: matchedBoundary,
+                mediaSalt: mediaSalt,
+                at: recency)
+        }
+
+        let stableBoundaries = Set(preferredDiskBoundaries.compactMap { boundary in
+            let storedBoundary = skipExactDiskBoundary ? boundary - 1 : boundary
+            return storedBoundary > 0 && storedBoundary <= matchedBoundary
+                ? storedBoundary
+                : nil
+        })
+        for boundary in stableBoundaries {
+            let tokens = boundary == requestTokens.count
+                ? requestTokens
+                : Array(requestTokens.prefix(boundary))
+            let touchedKV = diskCache.touchRecency(
+                tokens: tokens,
+                mediaSalt: mediaSalt,
+                at: recency)
+            if touchedKV, isHybrid {
+                _ = ssmStateCache.diskStore?.touchRecency(
+                    tokens: tokens,
+                    boundary: boundary,
+                    mediaSalt: mediaSalt,
+                    at: recency)
+            }
+        }
     }
 
     // MARK: - Store

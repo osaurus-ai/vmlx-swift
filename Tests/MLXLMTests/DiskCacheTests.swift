@@ -302,6 +302,9 @@ import Testing
             hotKVAfter.createdAt, hotSSMAfter.modifiedAt)
         let coldGroupRecency = min(
             coldKVAfter.createdAt, coldSSMAfter.modifiedAt)
+        #expect(
+            abs(hotKVAfter.createdAt.timeIntervalSince(hotSSMAfter.modifiedAt))
+                < 0.01)
         #expect(hotGroupRecency > coldGroupRecency)
         #expect(try Data(contentsOf: hotTensorURL) == hotTensorBefore)
         #expect(try Data(contentsOf: hotSidecarURL) == hotSidecarBefore)
@@ -322,6 +325,206 @@ import Testing
         #expect(remainingSSM.contains(hotSSMHash))
         #expect(remainingSSM.contains(newSSMHash))
         #expect(!remainingSSM.contains(coldSSMHash))
+    }
+}
+
+@Test func growingDenseRestoreKeepsStableCheckpointHotUnderQuota() async throws {
+    try await MLXMetalTestLock.withLock {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-dense-stable-checkpoint-lru-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelKey = "dense-stable-checkpoint-lru-model"
+        let stableTokens = [1, 2, 3, 4]
+        let coldTokens = [21, 22, 23, 24]
+        let growingTokens = [1, 2, 3, 4, 5, 6]
+        let requestTokens = [1, 2, 3, 4, 5, 6, 7]
+        let newTokens = [31, 32, 33, 34]
+        let arrays = ["data": MLXArray.ones([8])]
+
+        func hash(_ tokens: [Int]) -> String {
+            DiskCache.hashTokens(tokens, modelKey: modelKey)
+        }
+
+        var capBytes: Int64 = 0
+        do {
+            let seed = CacheCoordinator(config: CacheCoordinatorConfig(
+                usePagedCache: false,
+                enableDiskCache: true,
+                diskCacheMaxGB: 1,
+                diskCacheDir: root,
+                modelKey: modelKey))
+            let disk = try #require(seed.diskCache)
+            for tokens in [stableTokens, coldTokens, growingTokens] {
+                disk.store(tokens: tokens, arrays: arrays)
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            for tokens in [stableTokens, coldTokens, growingTokens] {
+                capBytes += try #require(
+                    disk.quotaEntries().first { $0.hash == hash(tokens) }).bytes
+            }
+            // Three existing payloads fit; four do not. Leave half an
+            // average entry of rounding headroom for the Float GB setting.
+            capBytes += capBytes / 6
+        }
+
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: Float(capBytes) / 1_073_741_824,
+            diskCacheDir: root,
+            modelKey: modelKey))
+        let disk = try #require(coordinator.diskCache)
+
+        switch coordinator.fetch(
+            tokens: requestTokens,
+            preferredDiskBoundaries: [stableTokens.count])
+        {
+        case .hit(let matched, let remaining, .disk, _, _, _):
+            #expect(matched == growingTokens.count)
+            #expect(remaining == [7])
+        default:
+            Issue.record("expected growing dense disk restore")
+        }
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        disk.store(tokens: newTokens, arrays: arrays)
+        coordinator.enforceCombinedDiskQuota()
+
+        let remaining = Set(disk.quotaEntries().map(\.hash))
+        #expect(remaining.contains(hash(stableTokens)))
+        #expect(remaining.contains(hash(growingTokens)))
+        #expect(remaining.contains(hash(newTokens)))
+        #expect(!remaining.contains(hash(coldTokens)))
+    }
+}
+
+@Test func diskCacheTouchDoesNotRefreshMissingPayloadRow() async throws {
+    try await MLXMetalTestLock.withLock {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-missing-payload-touch-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelKey = "missing-payload-touch-model"
+        let tokens = [41, 42, 43, 44]
+        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey)
+        let disk = DiskCache(cacheDir: root, maxSizeGB: 1, modelKey: modelKey)
+
+        disk.store(tokens: tokens, arrays: ["data": MLXArray.ones([8])])
+        let before = try #require(
+            disk.quotaEntries().first { $0.hash == hash }).createdAt
+        try FileManager.default.removeItem(
+            at: root.appendingPathComponent("\(hash).safetensors"))
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        #expect(!disk.touchRecency(tokens: tokens, at: Date()))
+        let after = try #require(
+            disk.quotaEntries().first { $0.hash == hash }).createdAt
+        #expect(after == before)
+    }
+}
+
+@Test func growingHybridRestoreKeepsStableCheckpointHotUnderQuota() async throws {
+    try await MLXMetalTestLock.withLock {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-stable-checkpoint-lru-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelKey = "stable-checkpoint-lru-model"
+        let stableSeed = [1, 2, 3, 4]
+        let coldTokens = [21, 22, 23, 24]
+        let growingTokens = [1, 2, 3, 4, 5, 6]
+        let requestTokens = [1, 2, 3, 4, 5, 6, 7]
+        let newTokens = [31, 32, 33, 34]
+        let stableBoundary = stableSeed.count + 1
+        let kvArrays = ["data": MLXArray.ones([8])]
+        let ssmStates = [MLXArray.ones([1_024])]
+
+        func kvHash(_ tokens: [Int]) -> String {
+            DiskCache.hashTokens(tokens, modelKey: modelKey)
+        }
+        func ssmHash(_ tokens: [Int]) -> String {
+            SSMCompanionDiskStore.keyFor(
+                tokens: tokens,
+                boundary: tokens.count,
+                modelKey: modelKey)
+        }
+
+        var capBytes: Int64 = 0
+        do {
+            let seed = CacheCoordinator(config: CacheCoordinatorConfig(
+                usePagedCache: false,
+                enableDiskCache: true,
+                diskCacheMaxGB: 1,
+                diskCacheDir: root,
+                modelKey: modelKey))
+            seed.setHybrid(true, requiresRecurrentSSMCompanion: true)
+            let disk = try #require(seed.diskCache)
+            let companion = try #require(seed.ssmStateCache.diskStore)
+
+            for tokens in [stableSeed, coldTokens, growingTokens] {
+                disk.store(tokens: tokens, arrays: kvArrays)
+                seed.ssmStateCache.store(
+                    ssmStates: ssmStates,
+                    tokens: tokens,
+                    boundary: tokens.count)
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+
+            let seededTokens = [stableSeed, coldTokens, growingTokens]
+            for tokens in seededTokens {
+                capBytes += try #require(
+                    disk.quotaEntries().first { $0.hash == kvHash(tokens) }).bytes
+                capBytes += try #require(
+                    companion.quotaEntries().first { $0.hash == ssmHash(tokens) }).bytes
+            }
+            // Leave room for SQLite/Float rounding, but not another linked
+            // cache group. Adding the fourth group must still force eviction.
+            capBytes += 4_096
+        }
+
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: Float(capBytes) / 1_073_741_824,
+            diskCacheDir: root,
+            modelKey: modelKey))
+        coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true)
+        let disk = try #require(coordinator.diskCache)
+        let companion = try #require(coordinator.ssmStateCache.diskStore)
+
+        // The current growing turn restores the longest six-token entry. The
+        // four-token seed is the path-dependent N-1 form of the processor's
+        // five-token stable system/tool boundary. It is not the served entry,
+        // but it is logically reused by this request and must remain hot for a
+        // subsequent new chat.
+        switch coordinator.fetch(
+            tokens: requestTokens,
+            skipExactDiskBoundary: true,
+            preferredDiskBoundaries: [stableBoundary])
+        {
+        case .hit(let matched, let remaining, .disk, _, _, _):
+            #expect(matched == growingTokens.count)
+            #expect(remaining == [7])
+        default:
+            Issue.record("expected growing hybrid disk restore")
+        }
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        disk.store(tokens: newTokens, arrays: kvArrays)
+        coordinator.ssmStateCache.store(
+            ssmStates: ssmStates,
+            tokens: newTokens,
+            boundary: newTokens.count)
+        coordinator.enforceCombinedDiskQuota()
+
+        let remainingKV = Set(disk.quotaEntries().map(\.hash))
+        let remainingSSM = Set(companion.quotaEntries().map(\.hash))
+        #expect(remainingKV.contains(kvHash(stableSeed)))
+        #expect(remainingKV.contains(kvHash(growingTokens)))
+        #expect(remainingKV.contains(kvHash(newTokens)))
+        #expect(!remainingKV.contains(kvHash(coldTokens)))
+        #expect(remainingSSM.contains(ssmHash(stableSeed)))
+        #expect(remainingSSM.contains(ssmHash(growingTokens)))
+        #expect(remainingSSM.contains(ssmHash(newTokens)))
+        #expect(!remainingSSM.contains(ssmHash(coldTokens)))
     }
 }
 
