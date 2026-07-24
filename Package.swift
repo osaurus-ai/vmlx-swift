@@ -106,7 +106,8 @@ import PackageDescription
 #endif
 
 let transformersSwiftSettings: [SwiftSetting] = [
-    .enableExperimentalFeature("StrictConcurrency")
+    .enableExperimentalFeature("StrictConcurrency"),
+    .swiftLanguageMode(.v5),
 ]
 
 let mlxLMCommonExcludedFiles: [String] = [
