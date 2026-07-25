@@ -1827,10 +1827,11 @@ public actor BatchEngine {
                             let seedBoundary = promptLen - 1
                             if seedBoundary > 0,
                                let last = tokenIds.last,
-                               let seedSSM = coordinator.ssmStateCache.fetch(
+                               let seedSSM = coordinator.ssmStateCache.fetchEntry(
                                 tokens: tokenIds,
                                 boundary: seedBoundary,
-                                mediaSalt: slot.mediaSalt)
+                                mediaSalt: slot.mediaSalt,
+                                requireComplete: true)?.states
                             {
                                 let cacheOffset = slot.cache.first?.offset ?? promptLen
                                 let trimNeeded = cacheOffset - seedBoundary

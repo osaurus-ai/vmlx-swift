@@ -103,6 +103,7 @@ import Testing
         let after = try #require(
             disk.quotaEntries().first { $0.hash == hash }).createdAt
         #expect(after == before)
+        #expect(disk.snapshotStats().hits == 0)
     }
 }
 
@@ -140,8 +141,16 @@ import Testing
             modelKey: modelKey))
         coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true)
         let disk = try #require(coordinator.diskCache)
-        let before = try #require(
+        let companion = try #require(coordinator.ssmStateCache.diskStore)
+        let companionHash = SSMCompanionDiskStore.keyFor(
+            tokens: tokens,
+            boundary: tokens.count,
+            modelKey: modelKey)
+        let kvBefore = try #require(
             disk.quotaEntries().first { $0.hash == hash }).createdAt
+        let companionBefore = try #require(
+            companion.quotaEntries().first { $0.hash == companionHash })
+            .modifiedAt
         try await Task.sleep(nanoseconds: 50_000_000)
 
         if case .miss = coordinator.fetch(tokens: tokens) {
@@ -150,9 +159,21 @@ import Testing
             Issue.record("hybrid KV with an incomplete recurrent companion must be rejected")
         }
 
-        let after = try #require(
+        let kvAfter = try #require(
             disk.quotaEntries().first { $0.hash == hash }).createdAt
-        #expect(after == before)
+        let companionAfter = try #require(
+            companion.quotaEntries().first { $0.hash == companionHash })
+            .modifiedAt
+        #expect(kvAfter == kvBefore)
+        #expect(companionAfter == companionBefore)
+        #expect(disk.snapshotStats().hits == 0)
+        let ssmStats = coordinator.ssmStateCache.snapshotStats()
+        #expect(ssmStats.hits == 0)
+        #expect(ssmStats.misses > 0)
+        #expect(
+            !coordinator.ssmStateCache.contains(
+                tokens: tokens,
+                boundary: tokens.count))
     }
 }
 
@@ -373,6 +394,7 @@ import Testing
         default:
             Issue.record("expected accepted hybrid disk restore for hot group")
         }
+        #expect(disk.snapshotStats().hits == 1)
 
         let hotKVAfter = try #require(
             disk.quotaEntries().first { $0.hash == hotKVHash })

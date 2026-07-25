@@ -215,9 +215,17 @@ public final class SSMStateCache: @unchecked Sendable {
     /// Fetch with completeness flag. Returns `FetchResult.isComplete=false`
     /// for partial-prefix entries that callers must NOT extend (re-derive
     /// instead). Mirrors Python's `(states, is_complete)` tuple semantics
-    /// from `vmlx_engine/utils/ssm_companion_cache.py`.
+    /// from `vmlx_engine/utils/ssm_companion_cache.py`. Disk reads refresh
+    /// recency by default; coordinator candidate validation can defer that
+    /// touch until it accepts the linked KV + companion restore. Callers that
+    /// require a reusable prompt boundary can reject incomplete entries before
+    /// they count as hits or hydrate the in-memory LRU.
     public func fetchEntry(
-        tokens: [Int], boundary: Int, mediaSalt: String? = nil
+        tokens: [Int],
+        boundary: Int,
+        mediaSalt: String? = nil,
+        touchDiskRecency: Bool = true,
+        requireComplete: Bool = false
     ) -> FetchResult? {
         let key = Self.makeKey(tokens: tokens, boundary: boundary, mediaSalt: mediaSalt, modelKey: modelKey)
 
@@ -233,7 +241,11 @@ public final class SSMStateCache: @unchecked Sendable {
             // from any lazy graph.
             if let disk = diskStore,
                let result = disk.fetch(
-                   tokens: tokens, boundary: boundary, mediaSalt: mediaSalt)
+                   tokens: tokens,
+                   boundary: boundary,
+                   mediaSalt: mediaSalt,
+                   touchRecency: touchDiskRecency,
+                   requireComplete: requireComplete)
             {
                 // Hydrate into LRU. Subtract the miss we just bumped
                 // because the disk lookup found it — this is a hit
@@ -254,6 +266,14 @@ public final class SSMStateCache: @unchecked Sendable {
         }
 
         let entry = entries[index]
+
+        // An incomplete snapshot is physically present but cannot satisfy a
+        // reusable prompt-boundary lookup. Keep the existing entry in place,
+        // count the attempted restore as a miss, and do not make it hotter.
+        guard !requireComplete || entry.isComplete else {
+            misses += 1
+            return nil
+        }
 
         // Empty states array is treated as a miss (bug fix from osa-jang ba07392)
         guard !entry.states.isEmpty else {

@@ -159,6 +159,49 @@ struct SSMStateCacheTests {
     #expect(saltedMiss == nil)
 }
 
+@Test func incompleteDiskCompanionRejectedAsReusableDoesNotBecomeHot() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ssm-companion-incomplete-reject-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let modelKey = "incomplete-reject-model"
+    let tokens = [11, 22, 33, 44]
+    let disk = try SSMCompanionDiskStore(
+        cacheDir: dir,
+        modelKey: modelKey,
+        maxBytes: 10_000_000)
+    try disk.store(
+        ssmStates: [MLXArray.ones([1, 2])],
+        tokens: tokens,
+        boundary: tokens.count,
+        isComplete: false)
+
+    let entry = try #require(disk.quotaEntries().first)
+    let tensorURL = dir.appendingPathComponent("ssm-\(entry.hash).safetensors")
+    let sidecarURL = dir.appendingPathComponent("ssm-\(entry.hash).json")
+    let coldDate = Date(timeIntervalSince1970: 100)
+    for url in [tensorURL, sidecarURL] {
+        try FileManager.default.setAttributes(
+            [.modificationDate: coldDate],
+            ofItemAtPath: url.path)
+    }
+    let before = try #require(disk.quotaEntries().first).modifiedAt
+
+    let cache = SSMStateCache(maxEntries: 4, modelKey: modelKey)
+    cache.diskStore = disk
+    let rejected = cache.fetchEntry(
+        tokens: tokens,
+        boundary: tokens.count,
+        requireComplete: true)
+
+    #expect(rejected == nil)
+    #expect(cache.hits == 0)
+    #expect(cache.misses == 1)
+    #expect(!cache.contains(tokens: tokens, boundary: tokens.count))
+    let after = try #require(disk.quotaEntries().first).modifiedAt
+    #expect(after == before)
+}
+
 @Test func ssmCompanionDiskStoreSkipsRewriteOnlyAfterValidation() async throws {
     try await MLXMetalTestLock.withLock {
         let dir = FileManager.default.temporaryDirectory

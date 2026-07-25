@@ -527,7 +527,8 @@ public final class CacheCoordinator: @unchecked Sendable {
                 guard let arrays = diskCache.fetch(
                     tokens: prefix,
                     mediaSalt: mediaSalt,
-                    touchRecency: false
+                    touchRecency: false,
+                    countHit: false
                 ) else {
                     return nil
                 }
@@ -644,7 +645,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         if let l1 = fetchCompleteSSMStates(
             tokens: tokens,
             boundary: boundary,
-            mediaSalt: mediaSalt)
+            mediaSalt: mediaSalt,
+            touchDiskRecency: false)
         {
             return l1
         }
@@ -666,12 +668,15 @@ public final class CacheCoordinator: @unchecked Sendable {
     private func fetchCompleteSSMStates(
         tokens: [Int],
         boundary: Int,
-        mediaSalt: String? = nil
+        mediaSalt: String? = nil,
+        touchDiskRecency: Bool = true
     ) -> [MLXArray]? {
         guard let entry = ssmStateCache.fetchEntry(
             tokens: tokens,
             boundary: boundary,
-            mediaSalt: mediaSalt)
+            mediaSalt: mediaSalt,
+            touchDiskRecency: touchDiskRecency,
+            requireComplete: true)
         else {
             return nil
         }
@@ -701,6 +706,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             tokens: matchedTokens,
             mediaSalt: mediaSalt,
             at: recency)
+        diskCache.recordAcceptedHit()
         if isHybrid {
             _ = ssmStateCache.diskStore?.touchRecency(
                 tokens: matchedTokens,

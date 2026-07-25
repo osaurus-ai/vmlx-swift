@@ -1562,10 +1562,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                         let seedBoundary = promptLen - 1
                         if seedBoundary > 0,
                            let last = cacheLookupTokenIds.last,
-                           let seedSSM = coordinator.ssmStateCache.fetch(
+                           let seedSSM = coordinator.ssmStateCache.fetchEntry(
                                 tokens: cacheLookupTokenIds,
                                 boundary: seedBoundary,
-                                mediaSalt: mediaSalt)
+                                mediaSalt: mediaSalt,
+                                requireComplete: true)?.states
                         {
                             let cacheOffset = self.cache.first?.offset ?? promptLen
                             let trimNeeded = cacheOffset - seedBoundary

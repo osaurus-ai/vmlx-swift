@@ -295,11 +295,15 @@ public final class DiskCache: @unchecked Sendable {
     ///     recency. Defaults to `true` for direct callers. CacheCoordinator
     ///     disables it while validating architecture-specific companion state,
     ///     then touches only a restore it actually accepts.
+    ///   - countHit: Whether a successful fetch increments hit telemetry.
+    ///     Defaults to `true` for direct callers. CacheCoordinator disables it
+    ///     for candidate reads and records only an accepted restore.
     /// - Returns: The cached arrays if found, or `nil` on a miss.
     public func fetch(
         tokens: [Int],
         mediaSalt: String? = nil,
-        touchRecency: Bool = true
+        touchRecency: Bool = true,
+        countHit: Bool = true
     ) -> [String: MLXArray]? {
         let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
         let url = safetensorsURL(for: hash)
@@ -323,7 +327,9 @@ public final class DiskCache: @unchecked Sendable {
             if touchRecency {
                 _touchEntryLocked(hash: hash)
             }
-            hits += 1
+            if countHit {
+                hits += 1
+            }
             return arrays
         } catch {
             misses += 1
@@ -348,6 +354,14 @@ public final class DiskCache: @unchecked Sendable {
             _deleteEntryLocked(hash: hash)
             return nil
         }
+    }
+
+    /// Record a deserialized candidate that CacheCoordinator accepted after
+    /// validating any architecture-specific companion state.
+    func recordAcceptedHit() {
+        lock.lock()
+        hits += 1
+        lock.unlock()
     }
 
     /// Whether this process has already proved that the content-addressed

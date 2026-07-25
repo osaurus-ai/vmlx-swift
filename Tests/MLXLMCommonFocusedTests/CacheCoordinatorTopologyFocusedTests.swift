@@ -214,6 +214,8 @@ struct CacheCoordinatorTopologyFocusedTests {
         if case .hit = coordinator.fetch(tokens: tokens + [79]) {
             Issue.record("hybrid paged cache must not extend partial SSM companion state")
         }
+        #expect(coordinator.ssmStateCache.snapshotStats().hits == 0)
+        #expect(coordinator.ssmStateCache.snapshotStats().misses > 0)
         }
     }
 
@@ -493,6 +495,8 @@ struct CacheCoordinatorTopologyFocusedTests {
         if case .hit = coordinator.fetch(tokens: tokens + [85]) {
             Issue.record("hybrid disk cache must not extend partial SSM companion state")
         }
+        #expect(coordinator.ssmStateCache.snapshotStats().hits == 0)
+        #expect(coordinator.ssmStateCache.snapshotStats().misses > 0)
         }
     }
 

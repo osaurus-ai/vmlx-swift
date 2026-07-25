@@ -264,7 +264,12 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     }
 
     /// Look up SSM layer states for a given token prefix + boundary.
-    /// Returns nil on miss / corruption / decode failure.
+    /// Returns nil on miss / corruption / decode failure. Direct reads refresh
+    /// recency by default; CacheCoordinator disables that while it validates a
+    /// candidate and touches the companion only after accepting the restore.
+    /// Reusable-boundary callers can require a complete snapshot; incomplete
+    /// entries are then rejected from sidecar metadata before tensor decode or
+    /// recency mutation.
     ///
     /// Iter 143: `mediaSalt` mirror of the store-side change. Pass the
     /// same salt the L1 store consumed (typically derived from
@@ -272,7 +277,9 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     public func fetch(
         tokens: [Int],
         boundary: Int,
-        mediaSalt: String? = nil
+        mediaSalt: String? = nil,
+        touchRecency: Bool = true,
+        requireComplete: Bool = false
     ) -> SSMStateCache.FetchResult? {
         guard boundary > 0, boundary <= tokens.count else { return nil }
         let key = Self.keyFor(
@@ -305,6 +312,10 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             return nil
         }
 
+        guard !requireComplete || isComplete else {
+            return nil
+        }
+
         // Decode safetensors. A failed deserialize is most often a
         // truncated file (process killed mid-write, rare on sync IO
         // but possible). Treat as miss.
@@ -328,14 +339,18 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             states.append(arr)
         }
 
-        // Reads, not only repeated stores, make an entry hot. Refresh both
-        // files to the same timestamp so quota observes the pair as one
-        // recency unit. This changes filesystem metadata only; tensor and JSON
-        // payload bytes remain untouched.
-        let touchedFingerprints = touchEntryFilesLocked(
-            safetensorsURL: safetensorsURL,
-            sidecarURL: sidecarURL,
-            at: Date())
+        // Accepted/direct reads, not only repeated stores, make an entry hot.
+        // Refresh both files to the same timestamp so quota observes the pair
+        // as one recency unit. Candidate validation disables this and lets the
+        // coordinator touch only an accepted KV + companion group. This
+        // changes filesystem metadata only; tensor and JSON payload bytes
+        // remain untouched.
+        let touchedFingerprints = touchRecency
+            ? touchEntryFilesLocked(
+                safetensorsURL: safetensorsURL,
+                sidecarURL: sidecarURL,
+                at: Date())
+            : nil
 
         // Legacy sidecars remain readable, but only a complete current-format
         // metadata match is eligible to suppress the next write-through.
