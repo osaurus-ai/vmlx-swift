@@ -181,6 +181,59 @@ struct PythonicNestedToolArgumentTests {
         #expect(LFM2ToolCallParser().parse(content: output, tools: databaseTools()) == nil)
     }
 
+    @Test("Explicitly terminated LFM envelope missing only its list closer is quarantined")
+    func explicitlyTerminatedMissingListCloserIsQuarantined() throws {
+        let output =
+            #"<|tool_call_start|>[db_create_table(purpose="Store parser results", name="lfm_parser_probe_three", columns=[{'name': 'label', 'type': 'TEXT'}, {'name': 'value', 'type': 'INTEGER'}])<|tool_call_end|>"#
+        var boundaries = Array(output.indices.dropFirst())
+        boundaries.append(output.endIndex)
+
+        for boundary in boundaries {
+            let processor = ToolCallProcessor(format: .lfm2, tools: liveDatabaseTools())
+            let visible =
+                (processor.processChunk(String(output[..<boundary])) ?? "")
+                + (processor.processChunk(String(output[boundary...])) ?? "")
+                + (processor.processEOS() ?? "")
+
+            #expect(visible.isEmpty)
+            #expect(processor.toolCalls.count == 1)
+            let call = try #require(processor.toolCalls.first)
+            #expect(call.function.name == "db_create_table")
+            #expect(call.function.arguments["_error"] == .string("invalid_tool_arguments"))
+            #expect(call.function.arguments["_tool"] == .string("db_create_table"))
+            #expect(
+                call.function.arguments["_message"]
+                    == .string("malformed native tool envelope: missing closing ]"))
+            #expect(call.function.arguments["_field"] == .string("envelope"))
+            #expect(call.function.arguments["_expected"] == .string("[name(...)]"))
+            #expect(call.function.arguments["columns"] == nil)
+        }
+    }
+
+    @Test("Missing list closer without a native end tag remains non-executable")
+    func missingListCloserWithoutEndTagRemainsRejected() {
+        let output =
+            #"<|tool_call_start|>[db_create_table(purpose="Store parser results", name="lfm_parser_probe_three", columns=[{'name': 'label', 'type': 'TEXT'}, {'name': 'value', 'type': 'INTEGER'}])"#
+        let processor = ToolCallProcessor(format: .lfm2, tools: liveDatabaseTools())
+
+        _ = processor.processChunk(output)
+        _ = processor.processEOS()
+
+        #expect(processor.toolCalls.isEmpty)
+    }
+
+    @Test("Unknown tool missing its list closer remains non-executable")
+    func unknownToolMissingListCloserRemainsRejected() {
+        let output =
+            #"<|tool_call_start|>[invented_database_tool(name='x')<|tool_call_end|>"#
+        let processor = ToolCallProcessor(format: .lfm2, tools: liveDatabaseTools())
+
+        _ = processor.processChunk(output)
+        _ = processor.processEOS()
+
+        #expect(processor.toolCalls.isEmpty)
+    }
+
     @Test("Tagged malformed mixed fields become a retryable invalid call")
     func taggedMalformedMixedKeywordFieldsAreQuarantined() throws {
         let output =

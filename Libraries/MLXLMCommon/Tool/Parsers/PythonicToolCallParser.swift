@@ -121,12 +121,50 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         quarantineMalformedRegisteredAttempts: Bool
     ) -> [ToolCall] {
         var text = content
+        let hasExplicitEndTag = endTag.map { text.contains($0) } ?? false
 
         if let end = endTag, let endRange = text.range(of: end) {
             text = String(text[..<endRange.lowerBound])
         }
 
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // LFM can explicitly terminate its native tool envelope while
+        // omitting only the outer list closer:
+        //
+        //   <|tool_call_start|>[registered_tool(name='x')<|tool_call_end|>
+        //
+        // The function invocation itself is balanced, but executing it would
+        // silently repair model output. Dropping the entire tagged attempt is
+        // also wrong: the agent sees neither a tool result nor a correction
+        // opportunity and may falsely claim success. Quarantine this exact,
+        // observed protocol failure as structured invalid arguments only when
+        // the model emitted BOTH native tags and the completed inner
+        // invocation names a registered tool. Untagged prose, unknown tools,
+        // a missing native end tag, and an unbalanced inner invocation remain
+        // non-executable.
+        if quarantineMalformedRegisteredAttempts,
+            hasExplicitEndTag,
+            text.hasPrefix("["),
+            !text.hasSuffix("]")
+        {
+            let body = String(text.dropFirst())
+            if let invocation = balancedFunctionInvocations(in: body).first,
+                toolNames(tools: tools).contains(invocation.name)
+            {
+                return [
+                    invalidToolCall(
+                        name: invocation.name,
+                        failure: ArgumentFailure(
+                            message: "malformed native tool envelope: missing closing ]",
+                            field: "envelope",
+                            expected: "[name(...)]"
+                        )
+                    )
+                ]
+            }
+            return []
+        }
 
         var results: [ToolCall] = []
         for invocation in balancedFunctionInvocations(in: text) {
