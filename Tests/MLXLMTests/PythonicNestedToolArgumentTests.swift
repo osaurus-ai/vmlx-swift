@@ -26,6 +26,46 @@ struct PythonicNestedToolArgumentTests {
         ]
     }
 
+    private func liveDatabaseTools() -> [ToolSpec] {
+        [
+            [
+                "type": "function",
+                "function": [
+                    "name": "db_query",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "sql": ["type": "string"] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                        "required": ["sql"] as [String],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as ToolSpec,
+            [
+                "type": "function",
+                "function": [
+                    "name": "db_create_table",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "name": ["type": "string"] as [String: any Sendable],
+                            "purpose": ["type": "string"] as [String: any Sendable],
+                            "columns": [
+                                "type": "array",
+                                "items": ["type": "object"] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                            "indexes": [
+                                "type": "array",
+                                "items": ["type": "object"] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "required": ["name", "purpose", "columns"] as [String],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as ToolSpec,
+        ]
+    }
+
     @Test("LFM preserves nested row objects instead of splitting at inner commas")
     func lfmPreservesNestedRows() throws {
         let output =
@@ -265,6 +305,67 @@ struct PythonicNestedToolArgumentTests {
                         "id": .int(71),
                         "label": .string("recovered"),
                     ])
+                ]))
+    }
+
+    @Test("LFM preserves quoted SQL from the live database scenario at every stream boundary")
+    func lfmPreservesQuotedSQLAtEveryStreamBoundary() throws {
+        let sql =
+            "SELECT name, sql, sql_version FROM sqlite_master "
+            + "WHERE type='table' AND name='lfm_parser_probe' LIMIT 1;"
+        let output =
+            "<|tool_call_start|>[db_query(sql=\"\(sql)\")]<|tool_call_end|>"
+        var boundaries = Array(output.indices.dropFirst())
+        boundaries.append(output.endIndex)
+
+        for boundary in boundaries {
+            let processor = ToolCallProcessor(format: .lfm2, tools: liveDatabaseTools())
+            let visible =
+                (processor.processChunk(String(output[..<boundary])) ?? "")
+                + (processor.processChunk(String(output[boundary...])) ?? "")
+                + (processor.processEOS() ?? "")
+
+            #expect(visible.isEmpty)
+            #expect(processor.toolCalls.count == 1)
+            let call = try #require(processor.toolCalls.first)
+            #expect(call.function.name == "db_query")
+            #expect(call.function.arguments["sql"] == .string(sql))
+        }
+    }
+
+    @Test("Independent LFM database calls cannot inherit fields from a prior turn")
+    func independentLFMDatabaseCallsDoNotCrossContaminate() throws {
+        let query =
+            #"<|tool_call_start|>[db_query(sql="SELECT name, sql, sql_version FROM sqlite_master WHERE type='table' AND name='lfm_parser_probe' LIMIT 1;")]<|tool_call_end|>"#
+        let create =
+            #"<|tool_call_start|>[db_create_table(name='lfm_parser_probe', purpose='Stores live parser verification values.', columns=[{'name': 'label', 'type': 'TEXT', 'nullable': False}, {'name': 'value', 'type': 'INTEGER', 'nullable': False}], indexes=[{'name': 'lfm_parser_probe_label_uq', 'columns': ['label'], 'unique': True}])]<|tool_call_end|>"#
+
+        let queryProcessor = ToolCallProcessor(format: .lfm2, tools: liveDatabaseTools())
+        _ = queryProcessor.processChunk(query)
+        _ = queryProcessor.processEOS()
+        let queryCall = try #require(queryProcessor.toolCalls.first)
+        #expect(queryCall.function.arguments.keys.sorted() == ["sql"])
+
+        let createProcessor = ToolCallProcessor(format: .lfm2, tools: liveDatabaseTools())
+        _ = createProcessor.processChunk(create)
+        _ = createProcessor.processEOS()
+        let createCall = try #require(createProcessor.toolCalls.first)
+        #expect(createCall.function.name == "db_create_table")
+        #expect(createCall.function.arguments.keys.sorted() == ["columns", "indexes", "name", "purpose"])
+        #expect(createCall.function.arguments["name"] == .string("lfm_parser_probe"))
+        #expect(
+            createCall.function.arguments["columns"]
+                == .array([
+                    .object([
+                        "name": .string("label"),
+                        "nullable": .bool(false),
+                        "type": .string("TEXT"),
+                    ]),
+                    .object([
+                        "name": .string("value"),
+                        "nullable": .bool(false),
+                        "type": .string("INTEGER"),
+                    ]),
                 ]))
     }
 

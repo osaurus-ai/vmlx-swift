@@ -90,6 +90,24 @@ public class ToolCallProcessor {
         toolCalls.append(contentsOf: calls.map(canonicalizedToolName))
     }
 
+    /// Opt-in diagnostic for attributing malformed native envelopes without
+    /// changing parser behavior. Disabled unless `VMLX_TOOL_CALL_TRACE=1`.
+    private func traceToolEnvelope(
+        phase: String,
+        raw: String,
+        parsed: [ToolCall]
+    ) {
+        guard ProcessInfo.processInfo.environment["VMLX_TOOL_CALL_TRACE"] == "1" else {
+            return
+        }
+        let names = parsed.map(\.function.name).joined(separator: ",")
+        let line =
+            "[vMLX tool-envelope] phase=\(phase) parsed=\(parsed.count)"
+            + " names=\(names.debugDescription) raw=\(raw.debugDescription)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        FileHandle.standardError.write(data)
+    }
+
     /// Registered tool names from the request's tool schemas.
     private func registeredToolNames() -> [String] {
         guard let tools else { return [] }
@@ -230,7 +248,9 @@ public class ToolCallProcessor {
             return nil
         }
 
-        let parsed = parser.parseEOS(toolCallBuffer, tools: tools)
+        let rawEnvelope = toolCallBuffer
+        let parsed = parser.parseEOS(rawEnvelope, tools: tools)
+        traceToolEnvelope(phase: "eos", raw: rawEnvelope, parsed: parsed)
         recordToolCalls(parsed)
         let suppressUnparsedInlineToolIntent =
             parsed.isEmpty
@@ -1872,7 +1892,9 @@ public class ToolCallProcessor {
 
                 // Parse the completed wrapper. Some formats, including Hy3 /
                 // Hunyuan, can carry multiple calls inside one outer block.
-                let parsed = parser.parseEOS(toolCallBuffer, tools: tools)
+                let rawEnvelope = toolCallBuffer
+                let parsed = parser.parseEOS(rawEnvelope, tools: tools)
+                traceToolEnvelope(phase: "tagged-end", raw: rawEnvelope, parsed: parsed)
                 recordToolCalls(parsed)
 
                 state = .normal
