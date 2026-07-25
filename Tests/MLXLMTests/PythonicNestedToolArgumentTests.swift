@@ -181,12 +181,18 @@ struct PythonicNestedToolArgumentTests {
         #expect(LFM2ToolCallParser().parse(content: output, tools: databaseTools()) == nil)
     }
 
-    @Test("Malformed mixed keyword fields do not get silently discarded")
-    func malformedMixedKeywordFieldsAreRejected() {
+    @Test("Tagged malformed mixed fields become a retryable invalid call")
+    func taggedMalformedMixedKeywordFieldsAreQuarantined() throws {
         let output =
             #"<|tool_call_start|>[db_insert(rows=[{'id': 41}], invented positional junk, table='proof_lfm')]<|tool_call_end|>"#
 
-        #expect(LFM2ToolCallParser().parse(content: output, tools: databaseTools()) == nil)
+        let call = try #require(
+            LFM2ToolCallParser().parse(content: output, tools: databaseTools()))
+        #expect(call.function.name == "db_insert")
+        #expect(call.function.arguments["_error"] == .string("invalid_tool_arguments"))
+        #expect(call.function.arguments["_field"] == .string("arguments"))
+        #expect(call.function.arguments["_expected"] == .string("keyword arguments"))
+        #expect(call.function.arguments["rows"] == nil)
     }
 
     @Test("Malformed arguments cannot become an empty call for a no-argument tool")
@@ -274,7 +280,7 @@ struct PythonicNestedToolArgumentTests {
         }
     }
 
-    @Test("Malformed turn does not poison a corrected retry turn")
+    @Test("Malformed tagged turn is quarantined and does not poison a corrected retry")
     func malformedThenCorrectedTurnRecovers() throws {
         let malformed =
             #"<|tool_call_start|>[db_insert(rows=[{'id': 71}], junk, table='proof_retry')]<|tool_call_end|>"#
@@ -286,7 +292,10 @@ struct PythonicNestedToolArgumentTests {
             tools: databaseTools())
         _ = failedTurn.processChunk(malformed)
         _ = failedTurn.processEOS()
-        #expect(failedTurn.toolCalls.isEmpty)
+        #expect(failedTurn.toolCalls.count == 1)
+        #expect(
+            failedTurn.toolCalls.first?.function.arguments["_error"]
+                == .string("invalid_tool_arguments"))
 
         let retryTurn = ToolCallProcessor(
             format: .lfm2,
@@ -367,6 +376,57 @@ struct PythonicNestedToolArgumentTests {
                         "type": .string("INTEGER"),
                     ]),
                 ]))
+    }
+
+    @Test("Live duplicate columns call is rejected without choosing either value")
+    func liveDuplicateColumnsCallIsQuarantined() throws {
+        let output =
+            #"<|tool_call_start|>[db_create_table(name='lfm_parser_probe_two', purpose="Stores live parser verification values", columns=[{'name':'label','type':'TEXT','primary_key':False},{'name':'value','type':'INTEGER','primary_key':False}], columns=[{'name':'label','type':'TEXT'},{'name':'value','type':'INTEGER'}])]<|tool_call_end|>"#
+
+        let call = try #require(
+            LFM2ToolCallParser().parse(content: output, tools: liveDatabaseTools()))
+
+        #expect(call.function.name == "db_create_table")
+        #expect(call.function.arguments["_error"] == .string("invalid_tool_arguments"))
+        #expect(call.function.arguments["_tool"] == .string("db_create_table"))
+        #expect(call.function.arguments["_message"] == .string("duplicate argument: columns"))
+        #expect(call.function.arguments["_field"] == .string("columns"))
+        #expect(
+            call.function.arguments["_expected"]
+                == .string("one value per declared parameter"))
+        #expect(call.function.arguments["columns"] == nil)
+    }
+
+    @Test("Live duplicate columns call is quarantined at every stream boundary")
+    func liveDuplicateColumnsCallIsStableAtEveryStreamBoundary() throws {
+        let output =
+            #"<|tool_call_start|>[db_create_table(name='lfm_parser_probe_two', purpose="Stores live parser verification values", columns=[{'name':'label','type':'TEXT'}], columns=[{'name':'value','type':'INTEGER'}])]<|tool_call_end|>"#
+        var boundaries = Array(output.indices.dropFirst())
+        boundaries.append(output.endIndex)
+
+        for boundary in boundaries {
+            let processor = ToolCallProcessor(format: .lfm2, tools: liveDatabaseTools())
+            let visible =
+                (processor.processChunk(String(output[..<boundary])) ?? "")
+                + (processor.processChunk(String(output[boundary...])) ?? "")
+                + (processor.processEOS() ?? "")
+
+            #expect(visible.isEmpty)
+            #expect(processor.toolCalls.count == 1)
+            let call = try #require(processor.toolCalls.first)
+            #expect(call.function.name == "db_create_table")
+            #expect(call.function.arguments["_error"] == .string("invalid_tool_arguments"))
+            #expect(call.function.arguments["_field"] == .string("columns"))
+            #expect(call.function.arguments["columns"] == nil)
+        }
+    }
+
+    @Test("Unknown tagged functions remain non-executable when malformed")
+    func unknownTaggedMalformedFunctionRemainsRejected() {
+        let output =
+            #"<|tool_call_start|>[invented_database_tool(name='x', name='y')]<|tool_call_end|>"#
+
+        #expect(LFM2ToolCallParser().parse(content: output, tools: liveDatabaseTools()) == nil)
     }
 
     @Test("Ambiguous inline probe keeps ordinary whitespace and prose byte-exact")

@@ -17,6 +17,7 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         var text = content
+        let isExplicitTaggedAttempt = startTag.map { content.contains($0) } ?? false
 
         // Strip tags if present
         if let start = startTag, let startRange = text.range(of: start) {
@@ -44,14 +45,34 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
             return jsonToolCall
         }
 
-        guard let invocation = balancedFunctionInvocations(in: text).first,
-            let arguments = parseArguments(
-                invocation.arguments,
-                funcName: invocation.name,
-                tools: tools)
-        else { return nil }
+        guard let invocation = balancedFunctionInvocations(in: text).first else {
+            return nil
+        }
         let funcName = invocation.name
+        let arguments: [String: any Sendable]
+        switch parseArgumentsResult(
+            invocation.arguments,
+            funcName: funcName,
+            tools: tools)
+        {
+        case .success(let parsed):
+            arguments = parsed
+        case .failure(let failure):
+            guard isExplicitTaggedAttempt, toolNames(tools: tools).contains(funcName) else {
+                return nil
+            }
+            return invalidToolCall(name: funcName, failure: failure)
+        }
         guard acceptsToolCall(name: funcName, arguments: arguments, tools: tools) else {
+            if isExplicitTaggedAttempt,
+                toolNames(tools: tools).contains(funcName),
+                let failure = schemaFailure(
+                    name: funcName,
+                    arguments: arguments,
+                    tools: tools)
+            {
+                return invalidToolCall(name: funcName, failure: failure)
+            }
             return nil
         }
         return ToolCall(function: .init(name: funcName, arguments: arguments))
@@ -69,12 +90,20 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
                 toolCallBuffer
                 .components(separatedBy: startTag)
                 .filter { !$0.isEmpty }
-                .flatMap { parseMultiple(content: $0, tools: tools) }
+                .flatMap {
+                    parseMultiple(
+                        content: $0,
+                        tools: tools,
+                        quarantineMalformedRegisteredAttempts: true)
+                }
             if !calls.isEmpty {
                 return calls
             }
         } else {
-            let calls = parseMultiple(content: toolCallBuffer, tools: tools)
+            let calls = parseMultiple(
+                content: toolCallBuffer,
+                tools: tools,
+                quarantineMalformedRegisteredAttempts: false)
             if !calls.isEmpty {
                 return calls
             }
@@ -86,7 +115,11 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         return []
     }
 
-    private func parseMultiple(content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+    private func parseMultiple(
+        content: String,
+        tools: [[String: any Sendable]]?,
+        quarantineMalformedRegisteredAttempts: Bool
+    ) -> [ToolCall] {
         var text = content
 
         if let end = endTag, let endRange = text.range(of: end) {
@@ -97,16 +130,37 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
 
         var results: [ToolCall] = []
         for invocation in balancedFunctionInvocations(in: text) {
+            let registered = toolNames(tools: tools).contains(invocation.name)
+            let arguments: [String: any Sendable]
+            switch parseArgumentsResult(
+                invocation.arguments,
+                funcName: invocation.name,
+                tools: tools)
+            {
+            case .success(let parsed):
+                arguments = parsed
+            case .failure(let failure):
+                if quarantineMalformedRegisteredAttempts, registered {
+                    results.append(invalidToolCall(name: invocation.name, failure: failure))
+                }
+                continue
+            }
+
             guard
-                let arguments = parseArguments(
-                    invocation.arguments,
-                    funcName: invocation.name,
-                    tools: tools),
                 acceptsToolCall(
                     name: invocation.name,
                     arguments: arguments,
                     tools: tools)
             else {
+                if quarantineMalformedRegisteredAttempts,
+                    registered,
+                    let failure = schemaFailure(
+                        name: invocation.name,
+                        arguments: arguments,
+                        tools: tools)
+                {
+                    results.append(invalidToolCall(name: invocation.name, failure: failure))
+                }
                 continue
             }
             results.append(
@@ -222,8 +276,38 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         funcName: String,
         tools: [[String: any Sendable]]?
     ) -> [String: any Sendable]? {
-        guard let fields = splitTopLevelArguments(argsString) else {
+        guard case .success(let arguments) = parseArgumentsResult(
+            argsString,
+            funcName: funcName,
+            tools: tools)
+        else {
             return nil
+        }
+        return arguments
+    }
+
+    private struct ArgumentFailure {
+        let message: String
+        let field: String
+        let expected: String
+    }
+
+    private enum ArgumentParseResult {
+        case success([String: any Sendable])
+        case failure(ArgumentFailure)
+    }
+
+    private func parseArgumentsResult(
+        _ argsString: String,
+        funcName: String,
+        tools: [[String: any Sendable]]?
+    ) -> ArgumentParseResult {
+        guard let fields = splitTopLevelArguments(argsString) else {
+            return .failure(
+                ArgumentFailure(
+                    message: "malformed or unbalanced argument list",
+                    field: "arguments",
+                    expected: "balanced name=value arguments"))
         }
 
         if fields.count == 1,
@@ -232,21 +316,32 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
             let firstRequiredParameter = requiredParameterNames(funcName: funcName, tools: tools)
                 .first
         {
-            return [
+            return .success([
                 firstRequiredParameter: convertParameterValue(
                     positionalString, paramName: firstRequiredParameter, funcName: funcName,
                     tools: tools)
-            ]
+            ])
         }
 
         var arguments: [String: any Sendable] = [:]
         for field in fields {
-            guard let (key, rawValue) = splitKeywordArgument(field),
-                arguments[key] == nil
-            else {
-                // Do not silently discard malformed or duplicate fields while
-                // returning a superficially valid required-argument set.
-                return nil
+            guard let (key, rawValue) = splitKeywordArgument(field) else {
+                return .failure(
+                    ArgumentFailure(
+                        message: "malformed argument: expected name=value",
+                        field: "arguments",
+                        expected: "keyword arguments"))
+            }
+            guard arguments[key] == nil else {
+                // Do not silently choose the first or last value. The two
+                // values can differ, and executing either would invent model
+                // intent. Explicit native envelopes surface this as a
+                // retryable parser error at the tool boundary.
+                return .failure(
+                    ArgumentFailure(
+                        message: "duplicate argument: \(key)",
+                        field: key,
+                        expected: "one value per declared parameter"))
             }
             arguments[key] = decodeArgumentValue(
                 rawValue,
@@ -254,7 +349,43 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
                 funcName: funcName,
                 tools: tools)
         }
-        return arguments
+        return .success(arguments)
+    }
+
+    private func schemaFailure(
+        name: String,
+        arguments: [String: any Sendable],
+        tools: [[String: any Sendable]]?
+    ) -> ArgumentFailure? {
+        let spec = toolSpec(named: name, tools: tools)
+        if let missing = spec.required?.first(where: { arguments[$0] == nil }) {
+            return ArgumentFailure(
+                message: "missing required argument: \(missing)",
+                field: missing,
+                expected: "required parameter")
+        }
+        if let properties = spec.properties,
+            let unknown = arguments.keys.sorted().first(where: { !properties.contains($0) })
+        {
+            return ArgumentFailure(
+                message: "unknown argument: \(unknown)",
+                field: unknown,
+                expected: "declared parameter")
+        }
+        return nil
+    }
+
+    private func invalidToolCall(name: String, failure: ArgumentFailure) -> ToolCall {
+        ToolCall(
+            function: .init(
+                name: name,
+                arguments: [
+                    "_error": "invalid_tool_arguments",
+                    "_tool": name,
+                    "_message": failure.message,
+                    "_field": failure.field,
+                    "_expected": failure.expected,
+                ]))
     }
 
     /// Split at commas only when outside strings and balanced containers.
