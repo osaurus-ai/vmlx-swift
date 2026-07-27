@@ -1377,6 +1377,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         // misses. Previously image/video bypassed the cache entirely,
         // wasting a full media encoder pass and prefill on every turn.
         var inputForPrepare = input
+        var acceptedCacheRestoreDetail: CacheDetail?
         // SLIDING-1 (2026-04-15): the legacy guard `!hasRotatingCache` was
         // removed once `TQDiskSerializer` v2 + `restoreRotatingLayer` /
         // `restoreFromV2Arrays` learned to round-trip the ring buffer +
@@ -1584,6 +1585,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                                 text: LMInput.Text(tokens: lastToken),
                                 image: nil, video: nil)
                             retainedDiskRestore = diskArrays != nil
+                            acceptedCacheRestoreDetail = detail
                         } else {
                             Self.logger.info(
                                 "TokenIterator: cache hit rolling back to full prefill (path-dependent full cache hit missing seed-boundary SSM state)"
@@ -1630,6 +1632,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                                 image: nil, video: nil)
                         }
                         retainedDiskRestore = diskArrays != nil
+                        acceptedCacheRestoreDetail = detail
                     }
                     if retainedDiskRestore {
                         coordinator.touchStableDiskCheckpointsAfterRetainedRestore(
@@ -1677,6 +1680,13 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Prefill: either full input (cache miss) or remaining tokens (cache hit).
         let remainingPromptUnits = Swift.max(0, inputForPrepare.text.tokens.size)
         let completedBeforePrefill = Swift.max(0, promptTokenCount - remainingPromptUnits)
+        if let acceptedCacheRestoreDetail, completedBeforePrefill > 0 {
+            prefillProgressHandler?(PrefillProgress(
+                stage: .cacheRestore,
+                completedUnitCount: completedBeforePrefill,
+                totalUnitCount: promptTokenCount,
+                detail: acceptedCacheRestoreDetail.rawValue))
+        }
         prefillProgressHandler?(PrefillProgress(
             stage: .prefill,
             completedUnitCount: completedBeforePrefill,
