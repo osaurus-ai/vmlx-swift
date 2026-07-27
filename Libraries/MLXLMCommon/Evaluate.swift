@@ -1218,6 +1218,19 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// a second full prefill. Released once stored.
     var hybridStripSnapshot: [KVCache]?
 
+    /// Absolute `promptTokenIds.count - 1` boundary for text-only
+    /// standalone rotating/SWA cache topologies.
+    ///
+    /// These caches restore through the disk serializer because paged KV does
+    /// not preserve their ring metadata, and a post-prefill snapshot cannot be
+    /// trimmed across every layer when the model mixes full and rotating
+    /// attention. Capturing the seed while prefill crosses it avoids replaying
+    /// the prompt from the generation-completion path.
+    var diskSeedBoundary: Int?
+
+    /// Cache state captured during prefill at ``diskSeedBoundary``.
+    var diskSeedSnapshot: [KVCache]?
+
     /// Stable fingerprint of any request-scope or media content in the input.
     /// `nil` for ordinary text-only inputs. Mixed into cache-coordinator keys
     /// so reasoning-mode and VLM multi-turn conversations can cache-hit without
@@ -1709,6 +1722,12 @@ public struct TokenIterator: TokenIteratorProtocol {
             coordinator: self.cacheCoordinator,
             promptTokenIds: self.promptTokenIds,
             input: input)
+        self.diskSeedBoundary = Self.diskSeedBoundaryIndex(
+            coordinator: self.cacheCoordinator,
+            promptTokenIds: self.promptTokenIds,
+            input: input,
+            cache: self.cache,
+            skipBoundary: self.skipDiskBackedToolPromptSeedBoundary)
         self.promptPrefillTime = try measure {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
                 try PrefillProgressReporter.withHandler(modelPrepareProgressHandler) {
@@ -1814,26 +1833,50 @@ public struct TokenIterator: TokenIteratorProtocol {
         return stripAt
     }
 
-    /// Split `input` at the hybrid strip boundary, or `nil` when the boundary
-    /// cannot be captured from this prefill.
+    /// The prompt-minus-one seed used to make an exact disk restore safe for a
+    /// standalone rotating/SWA cache.
+    static func diskSeedBoundaryIndex(
+        coordinator: CacheCoordinator?,
+        promptTokenIds: [Int],
+        input: LMInput,
+        cache: [KVCache],
+        skipBoundary: Bool
+    ) -> Int? {
+        guard let coordinator,
+            coordinator.canPersistBoundaries,
+            !skipBoundary,
+            promptTokenIds.count > 1,
+            !input.hasMediaContent,
+            !input.requiresPostPrepareCacheKey,
+            cacheHasStandaloneRotatingWindowState(cache)
+        else { return nil }
+        return promptTokenIds.count - 1
+    }
+
+    private enum PrefillBoundaryCapture {
+        case hybridStrip
+        case diskSeed
+    }
+
+    /// Split `input` at an absolute prompt boundary, or `nil` when the
+    /// boundary is not inside the still-unprocessed prompt tail.
     ///
     /// `input` is the prompt tail still to be prefilled — the whole prompt on a
     /// cache miss, or whatever follows the restored prefix on a hit — so the
-    /// boundary's offset within it is `hybridStripBoundary` minus the tokens
-    /// already in the cache.
-    private func hybridStripSplit(
-        of input: LMInput
+    /// boundary's offset within it is the absolute boundary minus the tokens
+    /// already restored.
+    private func boundarySplit(
+        of input: LMInput,
+        at boundary: Int
     ) -> (head: LMInput?, tail: LMInput)? {
-        guard let stripAt = hybridStripBoundary,
-            hybridStripSnapshot == nil,
-            !input.requiresPostPrepareCacheKey,
+        guard !input.requiresPostPrepareCacheKey,
             // DSV4's pool cache is only correct under a single prefill forward;
             // `effectivePrefillWindow` already forces that, so don't split it.
             !cache.contains(where: { $0 is HybridPoolCache })
         else { return nil }
 
         let size = input.text.tokens.size
-        let split = stripAt - (promptTokenIds.count - size)
+        let split = boundary - (promptTokenIds.count - size)
         guard split >= 0, split < size else { return nil }
 
         // The mask, when present, is per-token (`Qwen3VLProcessor` hands the
@@ -1875,18 +1918,31 @@ public struct TokenIterator: TokenIteratorProtocol {
         return (head, tail)
     }
 
+    private func prefillBoundaryCapture(
+        of input: LMInput
+    ) -> (kind: PrefillBoundaryCapture, head: LMInput?, tail: LMInput)? {
+        if let boundary = hybridStripBoundary,
+           hybridStripSnapshot == nil,
+           let split = boundarySplit(of: input, at: boundary)
+        {
+            return (.hybridStrip, split.head, split.tail)
+        }
+        if let boundary = diskSeedBoundary,
+           diskSeedSnapshot == nil,
+           let split = boundarySplit(of: input, at: boundary)
+        {
+            return (.diskSeed, split.head, split.tail)
+        }
+        return nil
+    }
+
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
-        // Prefill the stripped prefix first so the cache state at the hybrid
-        // cross-turn boundary can simply be copied out, then continue with the
-        // tail. Both halves go through `model.prepare`, so this runs exactly the
-        // tokens a single prefill would, in the same order, through the same
-        // forwards — models that consume the whole prompt themselves (Qwen35 and
-        // the other hybrids, which return `.logits`) split just as cleanly as
-        // those that hand back a remainder. The alternative is reconstructing the
-        // boundary afterwards by replaying the entire stripped prefix, which is a
-        // second full prefill; see `storeCacheAfterGeneration`.
-        if let split = hybridStripSplit(of: input) {
-            if let head = split.head {
+        // Prefill to a reusable structural boundary first, copy the exact cache
+        // state, then consume the tail. Both halves run through the model's real
+        // prepare/forward path in order; this avoids a second full prefill after
+        // generation and does not alter sampler or template behavior.
+        if let capture = prefillBoundaryCapture(of: input) {
+            if let head = capture.head {
                 let preparedHead = try MLXPressGenerationProfile.time("prompt.model_prepare") {
                     try model.prepare(head, cache: cache, windowSize: windowSize)
                 }
@@ -1901,9 +1957,15 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
             MLX.eval(cache)
-            hybridStripSnapshot = makePromptBoundaryCacheSnapshot(from: cache)
+            let snapshot = makePromptBoundaryCacheSnapshot(from: cache)
+            switch capture.kind {
+            case .hybridStrip:
+                hybridStripSnapshot = snapshot
+            case .diskSeed:
+                diskSeedSnapshot = snapshot
+            }
             try prepareRemainder(
-                input: split.tail, windowSize: windowSize,
+                input: capture.tail, windowSize: windowSize,
                 promptTokensForProcessor: input.text.tokens)
             return
         }
@@ -2289,19 +2351,28 @@ public struct TokenIterator: TokenIteratorProtocol {
                 if !usesCanonicalHybridBoundary,
                    requiresDiskBackedRestore,
                    !skipDiskBackedToolPromptSeedBoundary,
-                   promptTokenIds.count > 1,
-                   let boundarySnapshot = cacheSnapshotForBoundary(
-                        tokens: Array(promptTokenIds.dropLast()),
-                        promptSnapshot: promptCacheSnapshot)
+                   promptTokenIds.count > 1
                 {
-                    store(
-                        tokens: Array(promptTokenIds.dropLast()),
-                        cache: boundarySnapshot,
-                        kvBits: nil,
-                        kvMode: selectivePromptBoundaryDiskKVMode(
-                            cache: boundarySnapshot,
-                            requested: kvMode))
+                    let seedTokens = Array(promptTokenIds.dropLast())
+                    var seedSnapshot: [KVCache]?
+                    if diskSeedBoundary == seedTokens.count {
+                        seedSnapshot = diskSeedSnapshot
+                    } else {
+                        seedSnapshot = cacheSnapshotForBoundary(
+                            tokens: seedTokens,
+                            promptSnapshot: promptCacheSnapshot)
+                    }
+                    if let seedSnapshot {
+                        store(
+                            tokens: seedTokens,
+                            cache: seedSnapshot,
+                            kvBits: nil,
+                            kvMode: selectivePromptBoundaryDiskKVMode(
+                                cache: seedSnapshot,
+                                requested: kvMode))
+                    }
                 }
+                diskSeedSnapshot = nil
                 // Cross-turn reuse boundary for hybrid-SSM models (qwen3.5 /
                 // ornith GatedDeltaNet, Nemotron-H Mamba-2, LFM2, ZAYA CCA, …):
                 // store the generation-prompt-STRIPPED prompt, ending just before

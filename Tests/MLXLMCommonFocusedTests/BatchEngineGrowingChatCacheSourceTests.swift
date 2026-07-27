@@ -186,6 +186,26 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("Cache \\(detail.rawValue) hit: restored \\(diskRestored) tokens from disk"))
     }
 
+    @Test("solo rotating cache captures the prompt-minus-one disk seed during prefill")
+    func tokenIteratorCapturesRotatingDiskSeedDuringPrefill() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+
+        #expect(source.contains("static func diskSeedBoundaryIndex("))
+        #expect(source.contains("cacheHasStandaloneRotatingWindowState(cache)"))
+        #expect(source.contains("case diskSeed"))
+        #expect(source.contains("diskSeedSnapshot = snapshot"))
+        #expect(source.contains("if diskSeedBoundary == seedTokens.count"))
+        #expect(source.contains("seedSnapshot = diskSeedSnapshot"))
+
+        let prepare = try #require(source.range(of: "if let capture = prefillBoundaryCapture(of: input)"))
+        let capture = try #require(source.range(of: "diskSeedSnapshot = snapshot"))
+        let store = try #require(source.range(of: "seedSnapshot = diskSeedSnapshot"))
+        #expect(prepare.lowerBound < capture.lowerBound)
+        #expect(capture.lowerBound < store.lowerBound)
+    }
+
     @Test("history-boundary rederive skips disk-backed cache topologies after trim miss")
     func historyBoundaryRederiveSkipsDiskBackedTopologiesAfterTrimMiss() throws {
         let helpers = try String(
@@ -215,7 +235,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(!batch.contains("skipped disk-backed fetch for active tool request"))
         #expect(evaluate.contains("skipExactDiskBoundary: requiresDiskBackedRestore"))
         #expect(batch.contains("skipExactDiskBoundary: requiresDiskBackedRestore"))
-        #expect(evaluate.contains(#"tokens: Array(promptTokenIds.dropLast())"#))
+        #expect(evaluate.contains("let seedTokens = Array(promptTokenIds.dropLast())"))
+        #expect(evaluate.contains("tokens: seedTokens"))
         #expect(batch.contains(#"tokens: Array(promptTokens.dropLast())"#))
         #expect(batch.contains(#"label: "disk-backed-safe-prompt-boundary""#))
 
