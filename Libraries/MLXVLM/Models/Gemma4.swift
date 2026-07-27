@@ -1944,6 +1944,18 @@ public struct Gemma4Processor: UserInputProcessor {
 private struct Gemma4MessageGenerator: MessageGenerator {
     func generate(message: Chat.Message) -> MLXLMCommon.Message {
         var dict = defaultMessageDict(for: message)
+        let hasMedia =
+            !message.images.isEmpty
+            || !message.videos.isEmpty
+            || !message.audios.isEmpty
+        // Keep ordinary text-only turns in the canonical scalar form. Gemma 4
+        // bundle templates read the leading system/developer content directly
+        // as a string before their generic per-turn content-parts branch. The
+        // previous unconditional array conversion silently dropped that system
+        // prompt in those real templates, making distinct settings revisions
+        // tokenize identically and allowing an incompatible disk-cache restore.
+        guard hasMedia else { return dict }
+
         var content: [[String: String]] = []
         content.append(contentsOf: message.images.map { _ in ["type": "image"] })
         content.append(contentsOf: message.videos.map { _ in ["type": "video"] })

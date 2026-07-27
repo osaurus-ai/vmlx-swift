@@ -279,6 +279,32 @@ struct ChatMessageToolCallTests {
         #expect(tool["content"] as? [[String: String]] == [["type": "text", "text": "2"]])
     }
 
+    @Test("Gemma4 processor preserves text-only system content as a scalar string")
+    func gemma4ProcessorPreservesTextOnlySystemContent() async throws {
+        let mlxTestLock = lockSerializedMLXTest()
+        _ = mlxTestLock
+        let tokenizer = CapturingGemma4Tokenizer()
+        let processor = Gemma4Processor(
+            Self.gemma4ProcessorConfiguration(),
+            tokenizer: tokenizer
+        )
+        let revision = "REVISION-B-CURRENT-SETTINGS-MUST-WIN"
+
+        _ = try await processor.prepare(input: UserInput(chat: [
+            .system(revision),
+            .user("Reply with exactly CURRENT SETTINGS RESTORED."),
+        ]))
+
+        #expect(tokenizer.capturedMessages.count == 2)
+        #expect(tokenizer.capturedMessages[0]["role"] as? String == "system")
+        #expect(tokenizer.capturedMessages[0]["content"] as? String == revision)
+        #expect(tokenizer.capturedMessages[1]["role"] as? String == "user")
+        #expect(
+            tokenizer.capturedMessages[1]["content"] as? String
+                == "Reply with exactly CURRENT SETTINGS RESTORED."
+        )
+    }
+
     @Test("Gemma4 required tool choice compacts closed prior tool protocol before latest user")
     func gemma4RequiredToolChoiceCompactsClosedToolHistory() async throws {
         let call = ToolCall(
