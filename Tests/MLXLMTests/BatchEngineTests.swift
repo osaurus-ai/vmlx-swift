@@ -644,6 +644,74 @@ class BatchEngineIntegrationTests: XCTestCase {
         XCTAssertEqual(completedCount, 4, "All 4 requests should complete")
     }
 
+    /// The capacity snapshot must capture configured, active, and queued work
+    /// from one actor turn. A third request cannot become active while B=2.
+    func testCapacitySnapshotTracksTwoActiveAndThirdPending() async {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 100_000,
+            maxBatchSize: 2)
+        let params = GenerateParameters(maxTokens: 1_000, temperature: 0)
+
+        var streams = [AsyncStream<BatchGeneration>]()
+        for _ in 0 ..< 3 {
+            let (_, stream) = await engine.submit(
+                input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(8))),
+                parameters: params)
+            streams.append(stream)
+        }
+
+        let snapshot = await waitForCapacitySnapshot(engine) {
+            $0.activeCount == 2 && $0.pendingCount == 1
+        }
+        XCTAssertEqual(snapshot.configuredMaximum, 2)
+        XCTAssertEqual(snapshot.activeCount, 2)
+        XCTAssertEqual(snapshot.pendingCount, 1)
+        XCTAssertEqual(snapshot.nominalAvailableCount, 0)
+        XCTAssertTrue(snapshot.isAcceptingRequests)
+        XCTAssertFalse(snapshot.isShutdown)
+        XCTAssertEqual(snapshot.activeCountHighWatermark, 2)
+        assertCapacitySnapshotInvariants(snapshot)
+
+        await engine.shutdown()
+        _ = streams
+    }
+
+    /// Cancelling a queued request must be visible in the next atomic snapshot
+    /// without disturbing the active request.
+    func testCapacitySnapshotReflectsPendingCancellation() async {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 100_000,
+            maxBatchSize: 1)
+        let params = GenerateParameters(maxTokens: 1_000, temperature: 0)
+
+        let (_, activeStream) = await engine.submit(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(8))),
+            parameters: params)
+        let (pendingID, pendingStream) = await engine.submit(
+            input: LMInput(tokens: MLXArray(Int32(10) ..< Int32(18))),
+            parameters: params)
+
+        let queued = await waitForCapacitySnapshot(engine) {
+            $0.activeCount == 1 && $0.pendingCount == 1
+        }
+        XCTAssertEqual(queued.configuredMaximum, 1)
+        XCTAssertEqual(queued.nominalAvailableCount, 0)
+
+        await engine.cancel(pendingID)
+        let cancelled = await engine.capacitySnapshot
+        XCTAssertEqual(cancelled.activeCount, 1)
+        XCTAssertEqual(cancelled.pendingCount, 0)
+        XCTAssertEqual(cancelled.nominalAvailableCount, 0)
+        XCTAssertEqual(cancelled.activeCountHighWatermark, 1)
+        assertCapacitySnapshotInvariants(cancelled)
+
+        let pendingResult = await collectTokens(from: pendingStream)
+        XCTAssertEqual(pendingResult.info?.stopReason, .cancelled)
+
+        await engine.shutdown()
+        _ = activeStream
+    }
+
     /// Test: runtime maxBatchSize updates immediately admit queued work.
     func testUpdateMaxBatchSizeAdmitsQueuedRequests() async throws {
         let engine = makeEngine(maxBatchSize: 1)
@@ -672,6 +740,41 @@ class BatchEngineIntegrationTests: XCTestCase {
             let result = await collectTokens(from: stream)
             XCTAssertNotNil(result.info, "Resized engine should finish every stream")
         }
+    }
+
+    /// A capacity increase and the resulting queue admission happen on the
+    /// engine actor, so the first post-resize snapshot is internally coherent.
+    func testCapacitySnapshotReflectsAtomicResizeAdmission() async throws {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 100_000,
+            maxBatchSize: 1)
+        let params = GenerateParameters(maxTokens: 1_000, temperature: 0)
+
+        var streams = [AsyncStream<BatchGeneration>]()
+        for _ in 0 ..< 3 {
+            let (_, stream) = await engine.submit(
+                input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(8))),
+                parameters: params)
+            streams.append(stream)
+        }
+
+        let before = await waitForCapacitySnapshot(engine) {
+            $0.activeCount == 1 && $0.pendingCount == 2
+        }
+        XCTAssertEqual(before.configuredMaximum, 1)
+        XCTAssertEqual(before.nominalAvailableCount, 0)
+
+        try await engine.updateMaxBatchSize(3)
+        let after = await engine.capacitySnapshot
+        XCTAssertEqual(after.configuredMaximum, 3)
+        XCTAssertEqual(after.activeCount, 3)
+        XCTAssertEqual(after.pendingCount, 0)
+        XCTAssertEqual(after.nominalAvailableCount, 0)
+        XCTAssertEqual(after.activeCountHighWatermark, 3)
+        assertCapacitySnapshotInvariants(after)
+
+        await engine.shutdown()
+        _ = streams
     }
 
     /// Test: invalid runtime maxBatchSize updates fail without mutating state.
@@ -831,6 +934,32 @@ class BatchEngineIntegrationTests: XCTestCase {
         let activeCount = await engine.activeCount
         XCTAssertTrue(soloActive, "Idle B=1 generate() should use the direct solo fast path")
         XCTAssertEqual(activeCount, 1, "solo fast path should count as active work")
+
+        await engine.shutdown()
+        let result = await collectGenerations(from: stream)
+        XCTAssertEqual(result.info?.stopReason, .cancelled)
+    }
+
+    /// The direct B=1 path is real engine occupancy even though it does not use
+    /// `activeSlots`; both current activity and the high-water mark must count it.
+    func testCapacitySnapshotCountsSoloFastPath() async {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 100_000,
+            maxBatchSize: 1)
+        let stream = await engine.generate(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(8))),
+            parameters: GenerateParameters(maxTokens: 1_000, temperature: 0)
+        )
+
+        let active = await engine.capacitySnapshot
+        XCTAssertEqual(active.configuredMaximum, 1)
+        XCTAssertEqual(active.activeCount, 1)
+        XCTAssertEqual(active.pendingCount, 0)
+        XCTAssertEqual(active.nominalAvailableCount, 0)
+        XCTAssertEqual(active.activeCountHighWatermark, 1)
+        XCTAssertTrue(active.isAcceptingRequests)
+        XCTAssertFalse(active.isShutdown)
+        assertCapacitySnapshotInvariants(active)
 
         await engine.shutdown()
         let result = await collectGenerations(from: stream)
@@ -1140,6 +1269,72 @@ class BatchEngineIntegrationTests: XCTestCase {
         XCTAssertFalse(isRunning)
     }
 
+    /// Shutdown is terminal and must zero nominal availability even though the
+    /// configured maximum remains available for diagnostics.
+    func testCapacitySnapshotAfterShutdownIsNotAccepting() async {
+        let engine = makeEngine(maxBatchSize: 2)
+        let before = await engine.capacitySnapshot
+        XCTAssertEqual(before.configuredMaximum, 2)
+        XCTAssertEqual(before.activeCount, 0)
+        XCTAssertEqual(before.pendingCount, 0)
+        XCTAssertEqual(before.nominalAvailableCount, 2)
+        XCTAssertTrue(before.isAcceptingRequests)
+        XCTAssertFalse(before.isShutdown)
+
+        await engine.shutdown()
+
+        let after = await engine.capacitySnapshot
+        XCTAssertEqual(after.configuredMaximum, 2)
+        XCTAssertEqual(after.activeCount, 0)
+        XCTAssertEqual(after.pendingCount, 0)
+        XCTAssertEqual(after.nominalAvailableCount, 0)
+        XCTAssertFalse(after.isAcceptingRequests)
+        XCTAssertTrue(after.isShutdown)
+        XCTAssertEqual(after.activeCountHighWatermark, 0)
+        assertCapacitySnapshotInvariants(after)
+    }
+
+    /// Under a stable configured limit, repeated concurrent submissions may
+    /// queue but can never make the actor report more active work than capacity.
+    func testCapacitySnapshotNeverExceedsStableConfiguredMaximum() async {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 50_000,
+            maxBatchSize: 2)
+        let params = GenerateParameters(maxTokens: 1_000, temperature: 0)
+
+        var streams = [AsyncStream<BatchGeneration>]()
+        for _ in 0 ..< 8 {
+            let (_, stream) = await engine.submit(
+                input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(8))),
+                parameters: params)
+            streams.append(stream)
+
+            let snapshot = await engine.capacitySnapshot
+            XCTAssertLessThanOrEqual(snapshot.activeCount, snapshot.configuredMaximum)
+            assertCapacitySnapshotInvariants(snapshot)
+        }
+
+        let saturated = await waitForCapacitySnapshot(engine) {
+            $0.activeCount == 2 && $0.pendingCount > 0
+        }
+        XCTAssertEqual(saturated.configuredMaximum, 2)
+        XCTAssertLessThanOrEqual(saturated.activeCount, saturated.configuredMaximum)
+        XCTAssertLessThanOrEqual(
+            saturated.activeCountHighWatermark,
+            saturated.configuredMaximum)
+        assertCapacitySnapshotInvariants(saturated)
+
+        await engine.shutdown()
+        let finished = await engine.capacitySnapshot
+        XCTAssertEqual(finished.activeCount, 0)
+        XCTAssertEqual(finished.pendingCount, 0)
+        XCTAssertLessThanOrEqual(
+            finished.activeCountHighWatermark,
+            finished.configuredMaximum)
+        assertCapacitySnapshotInvariants(finished)
+        _ = streams
+    }
+
     /// Test: high-level text generate() also rejects stale post-shutdown handles.
     func testGenerateAfterShutdownRejectsWithoutRestartingEngine() async throws {
         let engine = makeEngine(maxBatchSize: 2)
@@ -1165,6 +1360,53 @@ class BatchEngineIntegrationTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    private func waitForCapacitySnapshot(
+        _ engine: BatchEngine,
+        attempts: Int = 200,
+        matching predicate: (BatchEngineCapacitySnapshot) -> Bool
+    ) async -> BatchEngineCapacitySnapshot {
+        for _ in 0 ..< attempts {
+            let snapshot = await engine.capacitySnapshot
+            if predicate(snapshot) {
+                return snapshot
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let snapshot = await engine.capacitySnapshot
+        XCTFail(
+            "Timed out waiting for BatchEngine capacity state; "
+                + "configured=\(snapshot.configuredMaximum), "
+                + "active=\(snapshot.activeCount), pending=\(snapshot.pendingCount)")
+        return snapshot
+    }
+
+    private func assertCapacitySnapshotInvariants(
+        _ snapshot: BatchEngineCapacitySnapshot,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertGreaterThan(snapshot.configuredMaximum, 0, file: file, line: line)
+        XCTAssertGreaterThanOrEqual(snapshot.activeCount, 0, file: file, line: line)
+        XCTAssertGreaterThanOrEqual(snapshot.pendingCount, 0, file: file, line: line)
+        XCTAssertGreaterThanOrEqual(
+            snapshot.activeCountHighWatermark,
+            snapshot.activeCount,
+            file: file,
+            line: line)
+        XCTAssertEqual(
+            snapshot.isAcceptingRequests,
+            !snapshot.isShutdown,
+            file: file,
+            line: line)
+        XCTAssertEqual(
+            snapshot.nominalAvailableCount,
+            snapshot.isAcceptingRequests
+                ? max(0, snapshot.configuredMaximum - snapshot.activeCount)
+                : 0,
+            file: file,
+            line: line)
+    }
 
     private func collectTokens(from stream: AsyncStream<BatchGeneration>)
         async -> (tokens: [Int], info: GenerateCompletionInfo?)

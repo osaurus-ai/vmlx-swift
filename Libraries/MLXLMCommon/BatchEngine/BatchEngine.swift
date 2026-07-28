@@ -1144,6 +1144,7 @@ public actor BatchEngine {
         soloFastPathID = fastPathID
         soloFastPathTask = generationTask
         soloFastPathHadMedia = hasMediaContent
+        activeCountHighWatermark = max(activeCountHighWatermark, 1)
 
         continuation.onTermination = { @Sendable _ in
             generationTask.cancel()
@@ -1312,6 +1313,26 @@ public actor BatchEngine {
 
     /// Maximum active-slot count observed since engine creation.
     public var activeCountHighWatermarkForDiagnostics: Int { activeCountHighWatermark }
+
+    /// Actor-consistent admission and capacity diagnostics.
+    ///
+    /// This is a point-in-time observation, not a slot reservation. Consumers
+    /// must still submit through this engine and let its scheduler own
+    /// admission. `nominalAvailableCount` reports configured headroom only;
+    /// per-request cache topology can impose a narrower effective batch.
+    public var capacitySnapshot: BatchEngineCapacitySnapshot {
+        let active = activeCount
+        let accepting = !isShutdown
+        return BatchEngineCapacitySnapshot(
+            configuredMaximum: maxBatchSize,
+            activeCount: active,
+            pendingCount: waitQueue.count,
+            nominalAvailableCount: accepting ? max(0, maxBatchSize - active) : 0,
+            isAcceptingRequests: accepting,
+            isShutdown: isShutdown,
+            activeCountHighWatermark: activeCountHighWatermark
+        )
+    }
 
     /// Number of decode compatibility splits observed since engine creation.
     public var decodeCompatibilitySplitCountForDiagnostics: Int {
