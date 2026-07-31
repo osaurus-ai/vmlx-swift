@@ -220,7 +220,22 @@ class RMSNormGated: Module {
             hiddenStates = hiddenStates * silu(gate)
         }
 
-        hiddenStates = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: varianceEpsilon)
+        // Normalize PER GROUP when nGroups > 1: the reference (HF FalconH1RMSNormGated) reshapes to
+        // (..., nGroups, dim/nGroups) and takes the variance over the last axis, so each group is
+        // normalized by its own RMS. Normalizing across the whole last dim instead mixes the groups
+        // and gives a different result whenever nGroups > 1 (identical only at nGroups == 1, which is
+        // why the shipped Falcon-H1 checkpoints don't expose this).
+        if nGroups > 1 {
+            let shape = hiddenStates.shape
+            let dim = shape[shape.count - 1]
+            let grouped = hiddenStates.reshaped(shape.dropLast() + [nGroups, dim / nGroups])
+            let groupedWeight = weight.reshaped([nGroups, dim / nGroups])
+            hiddenStates = MLXFast.rmsNorm(
+                grouped, weight: groupedWeight, eps: varianceEpsilon
+            ).reshaped(shape)
+        } else {
+            hiddenStates = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: varianceEpsilon)
+        }
 
         if normBeforeGate, let gate {
             hiddenStates = hiddenStates * silu(gate)
