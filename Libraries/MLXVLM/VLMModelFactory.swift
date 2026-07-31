@@ -141,6 +141,8 @@ public enum VLMTypeRegistry {
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
+        "glm4v": create(Glm4vConfiguration.self, Glm4v.init),
+        "glm4v_moe": create(Glm4vMoeConfiguration.self, Glm4vMoe.init),
         // DeepSeek-OCR / Unlimited-OCR (top model_type "deepseek_vl_v2").
         "deepseek_vl_v2": create(DeepseekOCRConfiguration.self, DeepseekOCR.init),
         "deepseekocr": create(DeepseekOCRConfiguration.self, DeepseekOCR.init),
@@ -229,6 +231,8 @@ public enum VLMProcessorTypeRegistry {
         "Lfm2VlProcessor": create(
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
         "Glm46VProcessor": create(
+            GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
+        "Glm4vProcessor": create(   // GLM-4.5V (glm4v_moe) — same QwenVL-style preprocessing as glm_ocr
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
         // DeepSeek-OCR ships `processor_class: "DeepseekVLV2Processor"`. The
         // processor reads only `imageTokenIndex` from the model config, and
