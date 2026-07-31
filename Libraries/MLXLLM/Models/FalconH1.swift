@@ -717,9 +717,13 @@ public class FalconH1Model: Module, LLMModel, KVCacheDimensionProvider {
                 param = param * args.embeddingMultiplier
             } else if name.hasSuffix("lm_head.weight") {
                 param = param * args.lmHeadMultiplier
-            } else if name.hasSuffix("q_proj.weight") || name.hasSuffix("k_proj.weight") {
+            } else if name.hasSuffix("q_proj.weight") {
                 param = param * args.attentionInMultiplier
-            } else if name.hasSuffix("key_proj.weight") {
+            } else if name.hasSuffix("k_proj.weight") || name.hasSuffix("key_proj.weight") {
+                // The key weight is named `k_proj` in Falcon-H1 checkpoints, so it matched the
+                // q_proj/k_proj branch above and never received keyMultiplier — the old `key_proj`
+                // branch was dead. HF applies `key_multiplier` to the key states
+                // (modeling_falcon_h1: `key_states = k_proj(x) * key_multiplier`); fold it here.
                 param = param * args.attentionInMultiplier * args.keyMultiplier
             } else if name.hasSuffix("o_proj.weight") {
                 param = param * args.attentionOutMultiplier
