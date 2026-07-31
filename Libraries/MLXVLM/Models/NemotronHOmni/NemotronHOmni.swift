@@ -61,10 +61,20 @@ public struct NemotronHOmniConfiguration: Codable, Sendable {
         case mxtqSeed = "mxtq_seed"
     }
 
+    enum WrapperKeys: String, CodingKey { case llmConfig = "llm_config" }
+
     public init(from decoder: Decoder) throws {
-        // The bundle's config.json is the LLM config directly. Decode it as
-        // NemotronHConfiguration; multimodal dims are fixed defaults.
-        self.llmConfig = try NemotronHConfiguration(from: decoder)
+        // Two bundle layouts carry the nemotron_h LLM config:
+        //  - OsaurusAI/JANGTQ bundles: config.json IS the LLM config at top level (multimodal dims in
+        //    a sibling config_omni.json), so decode the whole decoder as NemotronHConfiguration.
+        //  - mlx-community conversion: the full omni config.json NESTS the LLM under `llm_config`
+        //    (alongside vision_config/sound_config), so `vocab_size` isn't at top level — decode from
+        //    the `llm_config` sub-container instead. Support both.
+        if let wrapper = try? decoder.container(keyedBy: WrapperKeys.self), wrapper.contains(.llmConfig) {
+            self.llmConfig = try wrapper.decode(NemotronHConfiguration.self, forKey: .llmConfig)
+        } else {
+            self.llmConfig = try NemotronHConfiguration(from: decoder)
+        }
 
         // Hardcoded V3 multimodal dims (match config_omni.json from
         // OsaurusAI/Nemotron-3-Nano-Omni-30B-A3B-{MXFP4,JANGTQ4,JANGTQ2}).
@@ -594,9 +604,14 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
                 // Skip — preprocess applies CLIP norm.
                 continue
             } else {
-                // Treat as LLM weight — strip any leading "language_model." (rare)
-                // and forward to NemotronHModel.sanitize via a fresh dict.
-                llmKeys[k] = v
+                // Treat as LLM weight — strip any leading "language_model." so NemotronHModel.sanitize
+                // sees ROOT-level keys; the single "language_model." segment is re-added below. The
+                // OsaurusAI bundles ship the LLM weights unprefixed (so this is a no-op there), but the
+                // mlx-community conversion prefixes them "language_model.*" — without stripping here that
+                // re-add produced a DOUBLE "language_model.language_model." prefix → unhandledKeys.
+                let stripped = k.hasPrefix("language_model.")
+                    ? String(k.dropFirst("language_model.".count)) : k
+                llmKeys[stripped] = v
             }
         }
 
