@@ -612,14 +612,18 @@ private func createSSMMask(h: MLXArray, cache: ArraysCache?) -> MLXArray? {
 }
 
 private func createAttentionMask(h: MLXArray, cache: [KVCache]?) -> MLXArray? {
-    let N = h.dim(1)
-    // If cache exists and can make masks, use it
-    // Otherwise for single token, no mask needed
-    // For multi-token, SDPA will handle causal mask internally when nil
-    if N == 1 {
-        return nil
+    let n = h.dim(1)
+    // Multi-token prefill MUST get an explicit causal mask. MLX's scaledDotProductAttention
+    // does NOT apply causal masking for a nil MLXArray mask — nil means "no mask" (full,
+    // bidirectional attention). Returning nil here let every prompt token attend to future
+    // tokens, a train/inference mismatch that corrupts the context and produces grammatical
+    // but degenerate output that never emits eos. Single-token decode needs no mask.
+    // Mirrors the shared createAttentionMask(h:cache:) in MLXLMCommon.
+    if n > 1 {
+        let offset = cache?.first?.offset ?? 0
+        return createCausalMask(n: n, offset: offset)
     }
-    return nil  // Will be handled by SDPA internally when nil
+    return nil
 }
 
 // MARK: - Model
