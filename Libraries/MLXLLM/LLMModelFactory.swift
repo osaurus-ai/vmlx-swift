@@ -27,6 +27,7 @@ public enum LLMTypeRegistry {
             "phi": create(PhiConfiguration.self, PhiModel.init),
             "phi3": create(Phi3Configuration.self, Phi3Model.init),
             "phimoe": create(PhiMoEConfiguration.self, PhiMoEModel.init),
+            "mixtral": create(MixtralConfiguration.self, MixtralModel.init),
             "gemma": create(GemmaConfiguration.self, GemmaModel.init),
             "gemma2": create(Gemma2Configuration.self, Gemma2Model.init),
             "gemma3": create(Gemma3TextConfiguration.self, Gemma3TextModel.init),
