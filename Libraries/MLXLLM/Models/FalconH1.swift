@@ -704,6 +704,11 @@ public class FalconH1Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        // Some JANG conversions emit the head under a VLM-style `language_model.lm_head.*` prefix
+        // while the body stays at `model.*`. Absorb it (scoped to the head) BEFORE the conv1d
+        // early-return below — otherwise an already-transposed checkpoint returns unchanged and
+        // fails to bind with "Unhandled keys [language_model]". Cf. Llama.sanitize.
+        let weights = Weights.stripLanguageModelPrefix(weights, only: ["lm_head."])
         let c1d = weights["model.layers.0.mamba.conv1d.weight"]!
         if c1d.dim(-1) <= c1d.dim(1) {
             return weights
