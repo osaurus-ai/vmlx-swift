@@ -190,3 +190,149 @@ func testCacheListCopyIsIndependent() async throws {
         #expect(allClose(orig, saved).item(Bool.self))
     }
 }
+
+private func makeQuantizedAttentionInputs(dtype: DType = .float16) -> (
+    queries: MLXArray, keys: MLXArray, values: MLXArray,
+    quantizedKeys: (MLXArray, MLXArray, MLXArray?),
+    quantizedValues: (MLXArray, MLXArray, MLXArray?)
+) {
+    let headDimension = 32
+    let sequenceLength = 4
+    let queries = MLXArray.zeros([1, 1, sequenceLength, headDimension], dtype: dtype)
+    let keys = MLXArray(0 ..< sequenceLength * headDimension)
+        .reshaped([1, 1, sequenceLength, headDimension]).asType(dtype)
+    var valueData = [Float](repeating: 0, count: sequenceLength * headDimension)
+    for index in 0 ..< sequenceLength {
+        valueData[index * headDimension + index] = 1
+    }
+    let values = MLXArray(valueData, [1, 1, sequenceLength, headDimension]).asType(dtype)
+    let cache = QuantizedKVCache(groupSize: 32, bits: 8)
+    let (quantizedKeys, quantizedValues) = cache.updateQuantized(keys: keys, values: values)
+    return (
+        queries, keys, values,
+        quantizedKeys,
+        quantizedValues
+    )
+}
+
+private func additiveMask(_ mask: MLXArray, dtype: DType) -> MLXArray {
+    MLX.where(
+        mask, MLXArray(0, dtype: dtype),
+        MLXArray(dtype.finfo!.min, dtype: dtype))
+}
+
+@Test(.serialized)
+func testQuantizedAttentionCausalMaskMatchesReference() {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let input = makeQuantizedAttentionInputs()
+    let scale = 1 / sqrt(Float(input.queries.dim(-1)))
+    let output = quantizedScaledDotProductAttention(
+        queries: input.queries,
+        quantizedKeys: input.quantizedKeys,
+        quantizedValues: input.quantizedValues,
+        scale: scale,
+        mask: .causal,
+        groupSize: 32,
+        bits: 8)
+    let reference = MLXFast.scaledDotProductAttention(
+        queries: input.queries,
+        keys: input.keys,
+        values: input.values,
+        scale: scale,
+        mask: .causal)
+    eval(output, reference)
+
+    #expect(output[0, 0, 0, 1 ..< 4].abs().max().item(Float.self) < 1e-3)
+    #expect(allClose(output, reference, rtol: 0.05, atol: 0.01).item(Bool.self))
+}
+
+@Test(.serialized, arguments: [DType.float16, DType.bfloat16])
+func testQuantizedAttentionBooleanArrayMaskMatchesReference(dtype: DType) {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let input = makeQuantizedAttentionInputs(dtype: dtype)
+    let scale = 1 / sqrt(Float(input.queries.dim(-1)))
+    let mask = MLXArray([
+        true, false, false, false,
+        true, true, false, false,
+        true, true, true, false,
+        true, true, true, true,
+    ], [1, 1, 4, 4])
+    let output = quantizedScaledDotProductAttention(
+        queries: input.queries,
+        quantizedKeys: input.quantizedKeys,
+        quantizedValues: input.quantizedValues,
+        scale: scale,
+        mask: .array(mask),
+        groupSize: 32,
+        bits: 8)
+    let reference = MLXFast.scaledDotProductAttention(
+        queries: input.queries,
+        keys: input.keys,
+        values: input.values,
+        scale: scale,
+        mask: .array(additiveMask(mask, dtype: input.queries.dtype)))
+    eval(output, reference)
+
+    // Masked-position weight must sit at the 8-bit dequantization noise floor
+    // (one affine quantum ~= 1/255), not at the ~0.25 softmax mass the old
+    // positive fill produced; bf16 values carry a full quantum of noise.
+    let maskedTolerance: Float = dtype == .bfloat16 ? 5e-3 : 1e-3
+    #expect(output[0, 0, 0, 1 ..< 4].abs().max().item(Float.self) < maskedTolerance)
+    #expect(allClose(output, reference, rtol: 0.05, atol: 0.01).item(Bool.self))
+}
+
+@Test(.serialized)
+func testQuantizedAttentionFullyMaskedRowIsFinite() {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let input = makeQuantizedAttentionInputs()
+    let output = quantizedScaledDotProductAttention(
+        queries: input.queries,
+        quantizedKeys: input.quantizedKeys,
+        quantizedValues: input.quantizedValues,
+        scale: 1 / sqrt(Float(input.queries.dim(-1))),
+        mask: .array(MLXArray.zeros([1, 1, 4, 4], dtype: .bool)),
+        groupSize: 32,
+        bits: 8)
+    eval(output)
+
+    #expect(isFinite(output).all().item(Bool.self))
+}
+
+@Test(.serialized)
+func testQuantizedAttentionAdditiveMaskMatchesReference() {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let input = makeQuantizedAttentionInputs()
+    let scale = 1 / sqrt(Float(input.queries.dim(-1)))
+    let booleanMask = MLXArray([
+        true, false, false, false,
+        true, true, false, false,
+        true, true, true, false,
+        true, true, true, true,
+    ], [1, 1, 4, 4])
+    let mask = additiveMask(booleanMask, dtype: input.queries.dtype)
+    let output = quantizedScaledDotProductAttention(
+        queries: input.queries,
+        quantizedKeys: input.quantizedKeys,
+        quantizedValues: input.quantizedValues,
+        scale: scale,
+        mask: .array(mask),
+        groupSize: 32,
+        bits: 8)
+    let reference = MLXFast.scaledDotProductAttention(
+        queries: input.queries,
+        keys: input.keys,
+        values: input.values,
+        scale: scale,
+        mask: .array(mask))
+    eval(output, reference)
+
+    #expect(allClose(output, reference, rtol: 0.05, atol: 0.01).item(Bool.self))
+}
