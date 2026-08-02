@@ -834,6 +834,7 @@ let package = Package(
                 "CanonicalChatCacheBoundariesTests.swift",
                 "BatchEngineGrowingChatCacheSourceTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
+                "DiskStoreOffsetConsistencyFocusedTests.swift",
                 "VMLXUmbrellaProductTests.swift",
                 "ZayaConfigDecodeFocusedTests.swift",
                 "VLShapeGuardFocusedTests.swift",

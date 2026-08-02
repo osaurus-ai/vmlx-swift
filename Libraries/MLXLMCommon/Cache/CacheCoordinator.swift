@@ -861,6 +861,36 @@ public final class CacheCoordinator: @unchecked Sendable {
         let traceCacheStore =
             ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
 
+        // A boundary entry asserts "this cache covers exactly these tokens".
+        // The paged tier already enforces that for its rotating companion —
+        // `serializePagedRotatingCompanion(expectedOffset:)` returns nil on a
+        // mismatch, observed live as `companion=false rotatingOffsets=[1832]`
+        // under `tokens=1831`. The disk tier had no equivalent guard, so the
+        // very same poisoned snapshot was persisted to SSD.
+        //
+        // A later fetch content-matches the key, restores one more token of
+        // state than the key claims, and the engine re-feeds the boundary
+        // token the cache already contains. Every subsequent position shifts
+        // by one, attention is silently wrong for the whole continuation, and
+        // each following turn stores a new seed derived FROM that corrupted
+        // state — compounding per turn. Live signature: fluent DSV4 agent
+        // turns degenerating into non-converging loops, only with disk L2
+        // enabled.
+        //
+        // Refuse the whole store instead: a skipped entry costs one prefill,
+        // a poisoned entry costs correctness for every later turn.
+        if let cache {
+            let offsets = Set(cache.map(\.offset))
+            if offsets.contains(where: { $0 != totalTokens }) {
+                if traceCacheStore {
+                    FileHandle.standardError.write(Data(
+                        ("[vmlx][cache/store] REFUSED offset/key mismatch"
+                            + " tokens=\(totalTokens) offsets=\(offsets.sorted())\n").utf8))
+                }
+                return
+            }
+        }
+
         // Older generation call sites intentionally supplied an empty paged
         // payload for every cache that also needed typed disk persistence.
         // That was correct for rotating/CCA/pool layouts, but it silently
