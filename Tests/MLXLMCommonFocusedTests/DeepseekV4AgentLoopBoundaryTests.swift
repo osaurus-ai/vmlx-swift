@@ -321,6 +321,196 @@ struct DeepseekV4AgentLoopBoundaryTests {
             "post-answer block (prompt + generated) is not a prefix of the next round's prompt")
     }
 
+    // MARK: - The emit -> parse -> re-render round trip the boundary depends on
+
+    /// Live DSV4 (2026-08-02, `Prefill 4128/6569`): the turn carrying a
+    /// completed `file_write` and its 5311-char artifact published
+    /// `all=[193, 2442]` — the history boundary GONE, where every non-tool turn
+    /// published `all=[193, 2442, 2591]`. The fetch then fell back to an older
+    /// 2592 store and cold-prefilled `remaining=3977`.
+    ///
+    /// The boundary is derived by re-rendering the transcript and demanding an
+    /// exact token prefix, so it survives only if
+    ///
+    ///     model emission -> parser -> arguments JSON -> re-render
+    ///
+    /// is byte-exact. This drives that loop with a realistic HTML payload: the
+    /// characters a real `file_write` carries — newlines, quotes, angle
+    /// brackets, backslashes, unicode — are exactly the ones a JSON round trip
+    /// can alter.
+    @Test("a written-file tool call survives emit -> parse -> re-render")
+    func fileWriteToolCallRoundTripsByteExact() throws {
+        let payload = """
+            <!DOCTYPE html>
+            <html lang="en">
+            <head><meta charset="utf-8"><title>Minesweeper</title></head>
+            <body>
+            <div class="cell" data-x="0" data-y="0"></div>
+            <script>
+            const GRID = 10, MINES = 15;
+            let s = "a\\nb";
+            if (x < 3 && y > 1) { console.log('hi "there"'); }
+            const re = /\\d+/g;
+            </script>
+            </body>
+            </html>
+            """
+        // The MODEL's emission order, not a normalized one. DSV4 writes the
+        // path first and the body second, which is the natural order for
+        // `file_write` — and it is NOT alphabetical ("content" sorts before
+        // "path"). Building this with `.sortedKeys` would silently pre-agree
+        // with a sorted re-render and prove nothing.
+        let encodedPayload = String(
+            data: try JSONSerialization.data(withJSONObject: [payload], options: []),
+            encoding: .utf8)!
+            .dropFirst().dropLast()  // strip the array brackets, keep the JSON string
+        let arguments = "{\"path\":\"/tmp/minesweeper.html\",\"content\":"
+            + encodedPayload + "}"
+
+        // 1. What the encoder puts in history for this call.
+        let rendered = DeepseekV4ChatEncoder.renderToolCallInvoke(
+            name: "file_write", arguments: arguments)
+
+        // 2. Parse it back the way the runtime parses the model's emission.
+        let envelope =
+            "<｜DSML｜tool_calls>\n\(rendered)\n</｜DSML｜tool_calls>"
+        let parser = DSMLToolCallParser()
+        let parsed = parser.parseEOS(envelope, tools: Self.tools())
+        try #require(
+            parsed.count == 1,
+            "parser did not recover the file_write call from its own rendering")
+
+        // 3. Re-render the parsed call — this is what turn N+1 puts in history.
+        //
+        // `rawArgumentsJSON` carries the exact wire spelling, but it is
+        // deliberately excluded from `Codable` ("preserves the public wire
+        // shape"), so it does NOT survive a trip through a serialized message
+        // history. Model the turn-N+1 path faithfully: rebuild the arguments
+        // from the decoded values only, which is what a client that persisted
+        // and reloaded the transcript can supply.
+        let decoded = parsed[0].function.arguments
+        let reRendered = DeepseekV4ChatEncoder.renderToolCallInvoke(
+            name: parsed[0].function.name,
+            params: decoded.mapValues { $0.anyValue })
+
+        guard rendered == reRendered else {
+            let common = zip(rendered, reRendered).prefix { $0 == $1 }.count
+            Issue.record(
+                """
+                tool-call re-render is NOT byte-stable across the parse round trip \
+                — every turn after this call loses its history boundary.
+                diverges at char \(common)
+                  first  : \(String(rendered.dropFirst(common).prefix(160)).debugDescription)
+                  second : \(String(reRendered.dropFirst(common).prefix(160)).debugDescription)
+                """)
+            return
+        }
+
+        // And the recovered payload must be the original, not a mangled copy.
+        #expect(
+            decoded["content"]?.anyValue as? String == payload,
+            "file payload did not survive the DSML round trip intact")
+    }
+
+    // MARK: - Retroactive history rewrites that cost the whole prefix
+
+    /// The encoder decides `effectiveDrop` from whether ANY message still
+    /// carries tools (`encode`, "if any message still carries tools, do NOT
+    /// strip"). `renderOpenAIChat` attaches the request's tool schemas to the
+    /// system message, so that flag tracks THIS REQUEST's tool list.
+    ///
+    /// An agent loop that drops the tool list for a final summarizing turn
+    /// therefore flips `drop_thinking` on for a transcript that was rendered
+    /// with reasoning throughout — rewriting every earlier assistant turn and
+    /// invalidating the entire cached prefix at the worst possible moment.
+    @Test("dropping the tool list mid-conversation rewrites earlier turns")
+    func droppingToolsRewritesHistory() throws {
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "You are a coding agent."],
+            ["role": "user", "content": "Build me a minesweeper game"],
+            Self.assistantToolCall(
+                reasoning: "I will write the file and then explain it.",
+                calls: [(id: "c1", name: "file_write", arguments: #"{"path":"/tmp/m.html","content":"<html/>"}"#)]),
+            ["role": "tool", "tool_call_id": "c1", "content": "{\"ok\":true}"],
+            ["role": "assistant", "content": "Done.", "reasoning_content": "wrote it"],
+            ["role": "user", "content": "Summarize what you did"],
+        ]
+
+        let withTools = try DeepseekV4ChatEncoder.renderOpenAIChat(
+            messages: messages, tools: Self.tools(),
+            additionalContext: Self.thinkingContext(), addGenerationPrompt: true)
+        let withoutTools = try DeepseekV4ChatEncoder.renderOpenAIChat(
+            messages: messages, tools: nil,
+            additionalContext: Self.thinkingContext(), addGenerationPrompt: true)
+
+        let shared = zip(withTools, withoutTools).prefix { $0 == $1 }.count
+        // Characterization: measure how much of the prefix survives the flip.
+        // The tool schemas themselves live in the system block, so some early
+        // divergence is expected and correct; what matters for the cache is
+        // whether ANY meaningful shared prefix remains.
+        #expect(
+            shared > 0,
+            "dropping tools diverges the prompt from byte 0 — no prefix reuse is possible at all")
+    }
+
+    /// `reasoning_effort` is emitted ONLY at index 0 in thinking mode
+    /// (`encoding_dsv4.py`: `if index == 0 and thinking_mode == "thinking"`).
+    /// Changing it between turns therefore shifts byte 0 of the transcript and
+    /// invalidates every cached boundary including the stable system prefix.
+    @Test("changing reasoning effort shifts the transcript from byte zero")
+    func reasoningEffortShiftsFromByteZero() throws {
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "You are a coding agent."],
+            ["role": "user", "content": "Build me a minesweeper game"],
+        ]
+        func render(_ effort: String) throws -> String {
+            try DeepseekV4ChatEncoder.renderOpenAIChat(
+                messages: messages, tools: Self.tools(),
+                additionalContext: ["enable_thinking": true, "reasoning_effort": effort],
+                addGenerationPrompt: true)
+        }
+        let low = try render("low")
+        let high = try render("high")
+
+        // `low` is documented as adding nothing, so low vs high is the real
+        // cache hazard: the high prompt gains a prefix at position 0.
+        #expect(low != high, "reasoning effort had no effect on the prompt at all")
+        let shared = zip(low, high).prefix { $0 == $1 }.count
+        #expect(
+            shared < 32,
+            """
+            expected the effort prompt to land at the very front (shared=\(shared)); \
+            if it lands later this test is measuring the wrong thing
+            """)
+    }
+
+    /// Toggling `enable_thinking` changes BOTH the terminal rail and whether
+    /// every historical assistant turn renders its reasoning — a whole-history
+    /// rewrite, not a tail change.
+    @Test("toggling thinking mode rewrites the whole history")
+    func togglingThinkingRewritesHistory() throws {
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "You are a coding agent."],
+            ["role": "user", "content": "Build me a minesweeper game"],
+            ["role": "assistant", "content": "Done.", "reasoning_content": "a long private plan"],
+            ["role": "user", "content": "Now explain it"],
+        ]
+        func render(_ thinking: Bool) throws -> String {
+            try DeepseekV4ChatEncoder.renderOpenAIChat(
+                messages: messages, tools: Self.tools(),
+                additionalContext: ["enable_thinking": thinking],
+                addGenerationPrompt: true)
+        }
+        let thinking = try render(true)
+        let chat = try render(false)
+        #expect(thinking != chat, "thinking toggle had no effect")
+
+        // The reasoning text must not survive into the chat-mode render.
+        #expect(
+            !chat.contains("a long private plan"),
+            "chat mode leaked reasoning_content into the prompt")
+    }
+
     // MARK: - tool_choice=required injects a message that later rounds drop
 
     @Test("a required-tool reminder does not strand the previous round's prefix")
