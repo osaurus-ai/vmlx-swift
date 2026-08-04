@@ -591,24 +591,61 @@ public func restoreSSMStates(
     into cache: [any KVCache],
     boundary: Int? = nil
 ) {
+    // `extractSSMStates` emits each MambaCache's OCCUPIED slots: full Mamba
+    // layers (Nemotron-H, Jamba) contribute 2 arrays, LFM2/LFM2.5 short-conv
+    // layers contribute exactly 1 (slot 1 is never written). A fresh restore
+    // target has empty state, so the per-layer arity must be recovered from
+    // the list itself: every mamba layer in one companion list shares one
+    // arity, so the total length disambiguates. A list matching neither
+    // layout is refused outright — consuming a best-effort prefix cross-wired
+    // layer N with layer N+1's state and left the tail layers empty.
+    var totalWithTwoSlotMamba = 0
+    var totalWithOneSlotMamba = 0
+    for layer in cache {
+        if layer is MambaCache {
+            totalWithTwoSlotMamba += 2
+            totalWithOneSlotMamba += 1
+        } else if let arrays = layer as? ArraysCache {
+            totalWithTwoSlotMamba += arrays.slotCount
+            totalWithOneSlotMamba += arrays.slotCount
+        } else if let cacheList = layer as? CacheList {
+            for i in 0..<cacheList.count {
+                if cacheList[i] is MambaCache {
+                    totalWithTwoSlotMamba += 2
+                    totalWithOneSlotMamba += 1
+                } else if let arrays = cacheList[i] as? ArraysCache {
+                    totalWithTwoSlotMamba += arrays.slotCount
+                    totalWithOneSlotMamba += arrays.slotCount
+                }
+            }
+        }
+    }
+    let mambaArity: Int
+    if states.count == totalWithTwoSlotMamba {
+        mambaArity = 2
+    } else if states.count == totalWithOneSlotMamba {
+        mambaArity = 1
+    } else {
+        // Unknown companion layout (e.g. a stale entry from a run whose
+        // model layout has drifted). Restoring nothing is safe — the caller
+        // re-prefills; restoring a misaligned prefix is silent corruption.
+        return
+    }
+
     var stateIdx = 0
     for layer in cache {
         if let mamba = layer as? MambaCache {
-            let existingCount = mamba.state.count
-            if existingCount == 0 {
-                // Fresh cache — MambaCache always has 2 slots (conv + hidden)
-                let slotCount = 2
-                if stateIdx + slotCount <= states.count {
-                    mamba.state = Array(states[stateIdx..<(stateIdx + slotCount)])
+            if stateIdx + mambaArity <= states.count {
+                if mambaArity == 2 {
+                    mamba.state = Array(states[stateIdx..<(stateIdx + 2)])
                         .map { $0[.ellipsis] }
-                    if let boundary { mamba.offset = boundary }
-                    stateIdx += slotCount
+                } else {
+                    // Single-slot short-conv layout: keep the 2-slot
+                    // container geometry, occupy only slot 0.
+                    mamba[0] = states[stateIdx][.ellipsis]
                 }
-            } else if stateIdx + existingCount <= states.count {
-                mamba.state = Array(states[stateIdx..<(stateIdx + existingCount)])
-                    .map { $0[.ellipsis] }
                 if let boundary { mamba.offset = boundary }
-                stateIdx += existingCount
+                stateIdx += mambaArity
             }
         } else if let arrays = layer as? ArraysCache {
             // ArraysCache (GatedDeltaNet / linear-attention recurrence, e.g.
@@ -637,12 +674,15 @@ public func restoreSSMStates(
         } else if let cacheList = layer as? CacheList {
             for i in 0..<cacheList.count {
                 if let mamba = cacheList[i] as? MambaCache {
-                    let slotCount = 2
-                    if stateIdx + slotCount <= states.count {
-                        mamba.state = Array(states[stateIdx..<(stateIdx + slotCount)])
-                            .map { $0[.ellipsis] }
+                    if stateIdx + mambaArity <= states.count {
+                        if mambaArity == 2 {
+                            mamba.state = Array(states[stateIdx..<(stateIdx + 2)])
+                                .map { $0[.ellipsis] }
+                        } else {
+                            mamba[0] = states[stateIdx][.ellipsis]
+                        }
                         if let boundary { mamba.offset = boundary }
-                        stateIdx += slotCount
+                        stateIdx += mambaArity
                     }
                 } else if let arrays = cacheList[i] as? ArraysCache {
                     let slotCount = arrays.slotCount
@@ -1400,16 +1440,25 @@ private func restoreMambaLayer(
     _ comp: TQDiskSerializer.MambaLayerComponents,
     into layer: any KVCache
 ) {
-    if let mamba = layer as? MambaCache {
-        mamba.state = [comp.state0, comp.state1]
+    func apply(_ mamba: MambaCache) {
+        if let state1 = comp.state1 {
+            mamba.state = [comp.state0, state1]
+        } else {
+            // Single-slot layout (LFM2/LFM2.5 short-conv): restore into
+            // slot 0 via the subscript so the 2-slot container geometry is
+            // preserved and slot 1 stays genuinely empty.
+            mamba[0] = comp.state0
+        }
         mamba.offset = comp.offset
+    }
+    if let mamba = layer as? MambaCache {
+        apply(mamba)
         return
     }
     if let cacheList = layer as? CacheList {
         for i in 0..<cacheList.count {
             if let mamba = cacheList[i] as? MambaCache {
-                mamba.state = [comp.state0, comp.state1]
-                mamba.offset = comp.offset
+                apply(mamba)
                 return
             }
         }

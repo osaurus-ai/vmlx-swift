@@ -264,4 +264,50 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
         XCTAssertNil(parser,
             "LFM2 must get a nil reasoning parser — any parser that starts in reasoning mode would leak chunks")
     }
+
+    // MARK: - LFM2.5-2.6B (always-thinking dense lfm2 bundle)
+
+    /// LFM2.5-2.6B ships `model_type: "lfm2"` with a JANG capabilities
+    /// stamp of `reasoning_parser: "qwen3"`, `tool_parser: "lfm2"`, and
+    /// `think_in_template: true` — its template unconditionally ends the
+    /// generation prompt with `<|im_start|>assistant\n<think>`. The stamp
+    /// must be honored (NOT demoted the way a `think_in_template: false`
+    /// lfm2 stamp is), the prompt-tail resolution must start the parser
+    /// inside the template-opened think block, and the tool stamp must
+    /// route to the Pythonic LFM2 envelope parser.
+    func testLFM25DenseAlwaysThinkingStampIsHonored() throws {
+        let capabilities = JangCapabilities(
+            reasoningParser: "qwen3",
+            toolParser: "lfm2",
+            thinkInTemplate: true,
+            supportsTools: true,
+            supportsThinking: true,
+            family: "lfm2",
+            cacheType: "hybrid")
+
+        XCTAssertFalse(
+            ParserResolution.shouldIgnoreReasoningStamp(
+                capabilities: capabilities,
+                modelType: "lfm2"),
+            "think_in_template=true must keep the qwen3 reasoning stamp for dense lfm2")
+
+        let resolved = ParserResolution.reasoning(
+            capabilities: capabilities,
+            modelType: "lfm2",
+            chatTemplate: nil)
+        XCTAssertNotNil(resolved.parser)
+        XCTAssertEqual(resolved.source, .jangStamped)
+
+        // The template opens the think block itself; generation starts
+        // INSIDE reasoning with no opening tag in the stream.
+        var parser = try XCTUnwrap(
+            ReasoningParser.forPrompt(
+                stampName: "qwen3",
+                promptTail: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>"))
+        let segments = parser.feed("planning the reply</think>Hello!") + parser.flush()
+        XCTAssertEqual(collect(segments).reasoning, "planning the reply")
+        XCTAssertEqual(collect(segments).content, "Hello!")
+
+        XCTAssertEqual(ToolCallFormat.fromCapabilityName("lfm2"), .lfm2)
+    }
 }

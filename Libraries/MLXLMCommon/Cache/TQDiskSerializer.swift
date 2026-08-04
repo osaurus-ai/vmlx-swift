@@ -419,19 +419,27 @@ public enum TQDiskSerializer {
         }
     }
 
-    /// Serialize a single MambaCache layer's state (conv state + ssm state).
+    /// Serialize a single MambaCache layer's state. Full Mamba layers carry
+    /// two slots (conv state + hidden state); LFM2/LFM2.5 short-conv layers
+    /// occupy only slot 0, and dropping that single slot here (the old
+    /// `count >= 2` guard) meant every disk restore handed the model 22
+    /// zeroed conv windows while still reporting a KV hit.
     private static func serializeMambaLayer(
         _ mamba: MambaCache,
         index i: Int,
         into result: inout [String: MLXArray]
     ) {
         let state = mamba.state
-        guard state.count >= 2 else {
-            // Mamba layer with incomplete state — nothing to persist.
+        guard state.count >= 1 else {
+            // Pre-prefill layer with no state at all — nothing to persist.
+            // Deserialization treats a tagged mamba layer without state as
+            // an atomic required miss.
             return
         }
         result["mamba_\(i)_state0"] = state[0]
-        result["mamba_\(i)_state1"] = state[1]
+        if state.count >= 2 {
+            result["mamba_\(i)_state1"] = state[1]
+        }
         result["__mamba_\(i)_offset__"] = metaInt32(Int32(mamba.offset))
     }
 
@@ -516,9 +524,11 @@ public enum TQDiskSerializer {
 
             if let mamba = sub as? MambaCache {
                 let state = mamba.state
-                if state.count >= 2 {
+                if state.count >= 1 {
                     result["mamba_\(i)_sub_\(j)_state0"] = state[0]
-                    result["mamba_\(i)_sub_\(j)_state1"] = state[1]
+                    if state.count >= 2 {
+                        result["mamba_\(i)_sub_\(j)_state1"] = state[1]
+                    }
                     result["__mamba_\(i)_sub_\(j)_offset__"] =
                         metaInt32(Int32(mamba.offset))
                     result[subKindKey(layer: i, sub: j)] = kindArray(.mamba)
@@ -804,10 +814,14 @@ public enum TQDiskSerializer {
         public let values: MLXArray
     }
 
-    /// Mamba SSM state for a single hybrid layer.
+    /// Mamba SSM state for a single hybrid layer. `state1` is nil for
+    /// single-slot layouts: LFM2/LFM2.5 short-conv layers only ever occupy
+    /// slot 0 of their 2-slot `MambaCache` container
+    /// (`jang_runtime.cache.conv: "arrays_state_size_1"`), while full Mamba
+    /// layers (Nemotron-H, Jamba) persist both conv and hidden state.
     public struct MambaLayerComponents {
         public let state0: MLXArray
-        public let state1: MLXArray
+        public let state1: MLXArray?
         public let offset: Int
     }
 
@@ -1011,9 +1025,9 @@ public enum TQDiskSerializer {
                     out.append(IndexedLayerData(index: i, data: .skip))
                 }
             case .mamba:
-                if let s0 = arrays["mamba_\(i)_state0"],
-                   let s1 = arrays["mamba_\(i)_state1"]
-                {
+                if let s0 = arrays["mamba_\(i)_state0"] {
+                    // `state1` is optional: short-conv (LFM2/LFM2.5) layers
+                    // persist a single slot, full Mamba layers persist two.
                     let offset: Int
                     if let offArr = arrays["__mamba_\(i)_offset__"] {
                         offset = Int(readMetaInt32(offArr))
@@ -1026,14 +1040,19 @@ public enum TQDiskSerializer {
                             data: .mamba(
                                 MambaLayerComponents(
                                     state0: s0,
-                                    state1: s1,
+                                    state1: arrays["mamba_\(i)_state1"],
                                     offset: offset
                                 )
                             )
                         )
                     )
                 } else {
-                    out.append(IndexedLayerData(index: i, data: .skip))
+                    // A tagged mamba layer without persisted state cannot
+                    // degrade to a KV-only hit: recurrent prefix state is
+                    // required, so the whole entry is an atomic miss (this
+                    // also retires pre-fix entries that skipped short-conv
+                    // state while stamping the mamba kind tag).
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
                 }
             case .qkv:
                 if let comp = deserializeQKVLayer(index: i, from: arrays) {
@@ -1323,9 +1342,7 @@ public enum TQDiskSerializer {
                     subs.append(.skip)
                 }
             case .mamba:
-                if let s0 = arrays["mamba_\(i)_sub_\(j)_state0"],
-                   let s1 = arrays["mamba_\(i)_sub_\(j)_state1"]
-                {
+                if let s0 = arrays["mamba_\(i)_sub_\(j)_state0"] {
                     let off: Int
                     if let oa = arrays["__mamba_\(i)_sub_\(j)_offset__"] {
                         off = Int(readMetaInt32(oa))
@@ -1333,7 +1350,11 @@ public enum TQDiskSerializer {
                         off = 0
                     }
                     subs.append(
-                        .mamba(MambaLayerComponents(state0: s0, state1: s1, offset: off)))
+                        .mamba(
+                            MambaLayerComponents(
+                                state0: s0,
+                                state1: arrays["mamba_\(i)_sub_\(j)_state1"],
+                                offset: off)))
                 } else {
                     subs.append(.skip)
                 }

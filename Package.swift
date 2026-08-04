@@ -862,6 +862,8 @@ let package = Package(
                 "DSV4AgenticToolSourceTests.swift",
                 "NoHiddenReasoningCloseBiasFocusedTests.swift",
                 "TokenizerAddedTokenRegexFocusedTests.swift",
+                "LFM2ShortConvCacheRestoreFocusedTests.swift",
+                "LFM25ChatTemplateRenderFocusedTests.swift",
             ]
         ),
         .testTarget(
