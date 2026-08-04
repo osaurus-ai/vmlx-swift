@@ -108,6 +108,40 @@ struct DeepseekV4ReasoningPolicyTests {
         #expect(prompt.hasSuffix(DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart))
     }
 
+    @Test("absent thinking controls default to the bundle's thinking mode")
+    func absentThinkingControlsDefaultToThinking() throws {
+        // DSV4's jang_config declares default_mode="thinking" with
+        // default_effort="low" (which adds no preface). A request that
+        // carries NO enable_thinking and NO reasoning_effort must render
+        // the thinking rail — an open <think> tail — not silently fall to
+        // chat mode while the UI reports the "Low" default. Explicit
+        // enable_thinking=false remains the only path to the chat rail.
+        let prompt = try DeepseekV4ChatEncoder.renderOpenAIChat(
+            messages: [["role": "user", "content": "hi"]],
+            tools: nil,
+            additionalContext: nil,
+            addGenerationPrompt: true
+        )
+        #expect(!prompt.contains("Reasoning Effort:"))
+        #expect(prompt.hasSuffix(DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart))
+
+        let emptyContext = try DeepseekV4ChatEncoder.renderOpenAIChat(
+            messages: [["role": "user", "content": "hi"]],
+            tools: nil,
+            additionalContext: [:],
+            addGenerationPrompt: true
+        )
+        #expect(emptyContext.hasSuffix(DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart))
+
+        let explicitOff = try DeepseekV4ChatEncoder.renderOpenAIChat(
+            messages: [["role": "user", "content": "hi"]],
+            tools: nil,
+            additionalContext: ["enable_thinking": false],
+            addGenerationPrompt: true
+        )
+        #expect(explicitOff.hasSuffix(DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkEnd))
+    }
+
     @Test("force direct environment does not override explicit reasoning request")
     func forceDirectRailEnvironmentDoesNotOverrideRequest() throws {
         let context = try DeepseekV4ReasoningPolicy.normalizedAdditionalContext(

@@ -658,6 +658,19 @@ public enum TQDiskSerializer {
             }
         }
 
+        // A pool with zero rows is the legitimate "no compressed windows
+        // yet" state (prompt shorter than one compress window). Its
+        // canonical on-disk form is ABSENCE — the restore validator
+        // accepts a nil pool and leaves the branch empty. Writing the
+        // zero-row tensor instead produced a record the validator could
+        // never accept, so every short-prompt DSV4 checkpoint stored a
+        // permanently unrestorable entry (observed as the same prompt
+        // cold-prefilling again next session).
+        func normalizedPool(_ pool: MLXArray?) -> MLXArray? {
+            guard let pool, pool.ndim == 3, pool.dim(1) > 0 else { return nil }
+            return pool
+        }
+
         func putQuantizedPool(
             _ stem: String,
             _ segments: [HybridPoolQuantizedSegment]
@@ -682,16 +695,28 @@ public enum TQDiskSerializer {
             return true
         }
 
+        // On a quantized-pool serialization failure (unsupported bit width
+        // or malformed segment), the layer must poison the record as an
+        // atomic miss — stamping `.skip` let sibling .deepseekV4 layers
+        // restore while this one stayed empty (the all-or-nothing
+        // validation only covers layers tagged .deepseekV4). A tagged
+        // DSV4 layer without its keys deserializes as `.requiredMiss`.
+        func poisonAsRequiredMiss() {
+            result.removeValue(forKey: "dsv4_\(i)_keys")
+            result.removeValue(forKey: "dsv4_\(i)_values")
+            result[kindKey(for: i)] = kindArray(.deepseekV4)
+        }
+
         if let quantized = dsv4 as? QuantizedHybridPoolCache,
            let segments = quantized.hybridPoolQuantizedSegments(branch: .compressor)
         {
             putOptional("dsv4_\(i)_pool_comp", nil)
             guard putQuantizedPool("dsv4_\(i)_pool_comp", segments) else {
-                result[kindKey(for: i)] = kindArray(.skip)
+                poisonAsRequiredMiss()
                 return
             }
         } else {
-            putOptional("dsv4_\(i)_pool_comp", dsv4.hybridPool(branch: .compressor))
+            putOptional("dsv4_\(i)_pool_comp", normalizedPool(dsv4.hybridPool(branch: .compressor)))
         }
 
         if let quantized = dsv4 as? QuantizedHybridPoolCache,
@@ -699,11 +724,11 @@ public enum TQDiskSerializer {
         {
             putOptional("dsv4_\(i)_pool_idx", nil)
             guard putQuantizedPool("dsv4_\(i)_pool_idx", segments) else {
-                result[kindKey(for: i)] = kindArray(.skip)
+                poisonAsRequiredMiss()
                 return
             }
         } else {
-            putOptional("dsv4_\(i)_pool_idx", dsv4.hybridPool(branch: .indexer))
+            putOptional("dsv4_\(i)_pool_idx", normalizedPool(dsv4.hybridPool(branch: .indexer)))
         }
         let compBuf = dsv4.hybridBuffers(branch: .compressor)
         putOptional("dsv4_\(i)_buf_comp_kv", compBuf.kv)

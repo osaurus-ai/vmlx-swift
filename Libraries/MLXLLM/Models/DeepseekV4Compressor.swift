@@ -285,6 +285,12 @@ private final class DeepseekV4PoolStorage {
 // entirely (Python mirror: `if v4_cache is None and L < compress_ratio
 // → skip`).
 public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteCountProviding {
+    /// Bit width the pool storage encodes with. The disk serializer's
+    /// quantized-pool schema accepts exactly this width — pinned by
+    /// `DeepseekV4CacheDiskRoundTripTests.serializerBitsMatchPoolStorage`
+    /// so neither constant can drift alone.
+    public static var poolQuantizationBits: Int { DeepseekV4PoolStorage.bits }
+
     /// Expose the inner rotating cache so `TQDiskSerializer` and
     /// `restoreRotatingLayer` can round-trip the sliding-window state.
     /// Compressor/Indexer pool tensors and their incomplete-window

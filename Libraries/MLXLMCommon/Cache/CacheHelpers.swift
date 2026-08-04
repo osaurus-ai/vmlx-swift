@@ -758,9 +758,18 @@ private func restoreFromV2Arrays(
             if case .deepseekV4 = entry.data { return 0 }
             if case .zayaCCA = entry.data { return 0 }
             if case .zayaCCATQ = entry.data { return 0 }
+            if case .qkv = entry.data { return 0 }
             continue
         }
         switch entry.data {
+        case .qkv(let comp):
+            // Quantized-KV layers share the atomic contract: a record whose
+            // group size / bit width no longer matches the runtime cache (or
+            // whose layer class drifted) must refuse BEFORE any live layer is
+            // seated. The apply loop below seeds `totalTokens` from sibling
+            // layers, so skipping just this layer would report a "hit" that
+            // leaves it empty.
+            guard canRestoreQKVLayer(comp, into: cache[entry.index]) else { return 0 }
         case .deepseekV4(let comp):
             let staged = cache[entry.index].copy()
             guard canRestoreDeepseekV4Layer(comp, into: staged),
@@ -856,7 +865,14 @@ private func restoreFromV2Arrays(
             // shapes won't line up). A fresh request starts from
             // KVCacheSimple, so materialize the quantized layer from the
             // disk payload before reporting a hit.
-            guard restoreQKVLayer(comp, into: &cache[i]) else { continue }
+            //
+            // A failed seat (group-size/bits mismatch or drifted layer
+            // class) must refuse the WHOLE record: `totalTokens` is seeded
+            // from sibling layers, so skipping just this layer reported a
+            // "hit" that left it empty — silent attention corruption for
+            // the restored prefix. Same atomic contract as .deepseekV4 /
+            // .zayaCCA below.
+            guard restoreQKVLayer(comp, into: &cache[i]) else { return 0 }
             if totalTokens == 0 {
                 totalTokens = comp.offset
             }
@@ -1133,6 +1149,28 @@ private func restoreKVLayer(
 /// touching state — a mismatch means the model was reconfigured since the
 /// disk entry was written and the qweight shapes will not align, so the
 /// only safe behavior is to no-op and let the caller re-prefill.
+/// Non-mutating twin of `restoreQKVLayer` used by the atomic pre-validation
+/// pass: mirrors exactly the conditions under which the restore would fail,
+/// without seating any state.
+private func canRestoreQKVLayer(
+    _ comp: TQDiskSerializer.QKVLayerComponents,
+    into layer: any KVCache
+) -> Bool {
+    if let qkv = layer as? QuantizedKVCache {
+        return qkv.groupSize == comp.groupSize && qkv.bits == comp.bits
+    }
+    if layer is KVCacheSimple { return true }
+    if let cacheList = layer as? CacheList {
+        for i in 0..<cacheList.count {
+            if let qkv = cacheList[i] as? QuantizedKVCache {
+                return qkv.groupSize == comp.groupSize && qkv.bits == comp.bits
+            }
+            if cacheList[i] is KVCacheSimple { return true }
+        }
+    }
+    return false
+}
+
 private func restoreQKVLayer(
     _ comp: TQDiskSerializer.QKVLayerComponents,
     into layer: inout any KVCache

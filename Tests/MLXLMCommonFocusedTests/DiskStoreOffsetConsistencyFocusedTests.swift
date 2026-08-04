@@ -32,7 +32,7 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import Testing
 
 @Suite("Disk store offset consistency", .serialized)
@@ -124,5 +124,57 @@ struct DiskStoreOffsetConsistencyFocusedTests {
             return
         }
         #expect(matched == 12)
+    }
+
+    // MARK: - Post-answer boundary key alignment (consumed stop token)
+
+    /// The async decode pipeline forwards the consumed stop token while
+    /// computing the never-consumed next step, so at store time every cache
+    /// layer sits ONE token past `prompt + generated`. Keying the store at
+    /// `prompt + generated` desynchronizes key and cache, and the boundary
+    /// guard above (correctly) refuses it — observed live as
+    /// `REFUSED offset/key mismatch tokens=3627 offsets=[3628]`, silently
+    /// costing the post-answer boundary every DSV4 turn. The aligned key
+    /// extends by the pending drained token exactly when the cache is
+    /// uniformly one ahead and the iterator still holds that token.
+    @Test("post-answer boundary key extends by the consumed stop token")
+    func generatedBoundaryKeyExtendsByConsumedStop() {
+        // Exact match: key unchanged.
+        #expect(
+            TokenIterator.generatedBoundaryTokensAligned(
+                promptTokenIds: [1, 2, 3],
+                generatedTokenIds: [4, 5],
+                cacheOffsets: [5, 5],
+                pendingDrainedTokenId: 99) == [1, 2, 3, 4, 5])
+        // Uniformly one ahead with the drained stop token available:
+        // key extends.
+        #expect(
+            TokenIterator.generatedBoundaryTokensAligned(
+                promptTokenIds: [1, 2, 3],
+                generatedTokenIds: [4, 5],
+                cacheOffsets: [6, 6],
+                pendingDrainedTokenId: 99) == [1, 2, 3, 4, 5, 99])
+        // One ahead but the drained token is unavailable: fall back to the
+        // base key so the store guard decides (fail-closed).
+        #expect(
+            TokenIterator.generatedBoundaryTokensAligned(
+                promptTokenIds: [1, 2, 3],
+                generatedTokenIds: [4, 5],
+                cacheOffsets: [6, 6],
+                pendingDrainedTokenId: nil) == [1, 2, 3, 4, 5])
+        // Mixed offsets: no consistent extension; base key for the guard.
+        #expect(
+            TokenIterator.generatedBoundaryTokensAligned(
+                promptTokenIds: [1, 2, 3],
+                generatedTokenIds: [4, 5],
+                cacheOffsets: [5, 6],
+                pendingDrainedTokenId: 99) == [1, 2, 3, 4, 5])
+        // Cache BEHIND the key: no valid store exists.
+        #expect(
+            TokenIterator.generatedBoundaryTokensAligned(
+                promptTokenIds: [1, 2, 3],
+                generatedTokenIds: [4, 5],
+                cacheOffsets: [4, 4],
+                pendingDrainedTokenId: 99) == nil)
     }
 }

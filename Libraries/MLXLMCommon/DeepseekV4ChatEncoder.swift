@@ -221,14 +221,15 @@ public struct DeepseekV4ChatEncoder: Sendable {
 
         let effort = Self.reasoningEffort(from: additionalContext)
         let explicitlyEnabled = additionalContext?["enable_thinking"] as? Bool
-        let thinkingMode: DeepseekV4ThinkingMode
-        if explicitlyEnabled == false {
-            thinkingMode = .chat
-        } else if explicitlyEnabled == true || effort != nil {
-            thinkingMode = .thinking
-        } else {
-            thinkingMode = .chat
-        }
+        // DSV4's bundle contract (jang_config chat.reasoning) declares
+        // default_mode="thinking" with default_effort="low", and "low" adds
+        // no preface. Absent controls therefore mean the thinking rail —
+        // the same default `encode(thinkingMode:)` uses. Only an explicit
+        // enable_thinking=false selects the chat rail; defaulting the
+        // absent case to chat rendered a closed </think> tail while the
+        // UI reported the "Low" thinking default.
+        let thinkingMode: DeepseekV4ThinkingMode =
+            explicitlyEnabled == false ? .chat : .thinking
         let dropEarlierReasoning =
             (additionalContext?["drop_earlier_reasoning"] as? Bool) ?? true
         let (toolChoiceRequired, toolChoiceName) = Self.toolChoice(

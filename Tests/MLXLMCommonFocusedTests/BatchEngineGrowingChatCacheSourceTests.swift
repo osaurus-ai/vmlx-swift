@@ -52,8 +52,14 @@ struct BatchEngineGrowingChatCacheSourceTests {
             contentsOfFile: "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift",
             encoding: .utf8)
 
-        #expect(evaluate.contains(
+        // The solo N-1 disk-seed boundary is published for reusable-prefix
+        // warmups too (same contract as the batched path): a disk-backed
+        // topology's warmup that skips the seed publishes nothing, and the
+        // visible send re-prefills the identical prefix from scratch.
+        #expect(!evaluate.contains(
             "input.cachePromptIntent != .reusablePrefixWarmup"))
+        #expect(evaluate.contains(
+            "Reusable-prefix warmups MUST publish this seed"))
         #expect(evaluate.contains(
             "originalInput.cachePromptIntent == .reusablePrefixWarmup"))
         #expect(batch.contains(
@@ -177,7 +183,13 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("promptTokenIds = effectivePromptTokens"))
         #expect(source.contains("!input.requiresPostPrepareCacheKey"))
         #expect(source.contains("!originalInput.requiresPostPrepareCacheKey"))
-        #expect(source.contains("let generatedBoundaryTokens = promptTokenIds + generatedTokenIds"))
+        // The post-answer boundary key is aligned with what the cache
+        // actually contains: the async decode pipeline forwards the consumed
+        // stop token, so the aligned key may extend by that one drained
+        // token instead of desynchronizing and losing the store to the
+        // boundary-offset guard.
+        #expect(source.contains("Self.generatedBoundaryTokensAligned("))
+        #expect(source.contains("pendingDrainedTokenId:"))
         #expect(source.contains("&& !handler.emittedToolCall"))
         #expect(source.contains("input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)"))
         #expect(source.contains("let requiresDiskBackedRestore ="))

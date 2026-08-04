@@ -1842,13 +1842,19 @@ public struct TokenIterator: TokenIteratorProtocol {
         guard let coordinator,
             coordinator.canPersistBoundaries,
             !skipBoundary,
-            input.cachePromptIntent != .reusablePrefixWarmup,
             promptTokenIds.count > 1,
             !input.hasMediaContent,
             !input.requiresPostPrepareCacheKey,
             (cacheHasStandaloneRotatingWindowState(cache)
                 || cacheRequiresPrefillCapturedDiskSeed(cache))
         else { return nil }
+        // Reusable-prefix warmups MUST publish this seed — same contract as
+        // the batched path. Disk-backed topologies (DSV4) deliberately
+        // reject an exact post-prefill restore, so a warmup that skips the
+        // N-1 capture publishes nothing at all and the immediately following
+        // visible request prefills the identical prefix again from scratch.
+        // Observed live: two warmup prefills plus the real send each ran the
+        // full ~3.5k-token prompt on a cold DSV4 first message.
         return promptTokenIds.count - 1
     }
 
@@ -2381,16 +2387,24 @@ public struct TokenIterator: TokenIteratorProtocol {
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(storageTopologySnapshot)
                 if !usesCanonicalHybridBoundary,
-                   !isReusablePrefixWarmup,
                    requiresDiskBackedRestore,
                    !skipDiskBackedToolPromptSeedBoundary,
                    promptTokenIds.count > 1
                 {
+                    // Reusable-prefix warmups publish this N-1 seed too —
+                    // for a warmup prompt (send-invariant prefix + rail) it
+                    // IS the stable system/tool boundary, and without it a
+                    // disk-backed topology's warmup publishes nothing and
+                    // the visible send re-prefills the identical prefix.
+                    // Warmups only use the seed captured during their own
+                    // prefill: the re-derive fallback costs a full extra
+                    // prefill, which would recreate the very waste the
+                    // warmup exists to remove.
                     let seedTokens = Array(promptTokenIds.dropLast())
                     var seedSnapshot: [KVCache]?
                     if diskSeedBoundary == seedTokens.count {
                         seedSnapshot = capturedDiskSeed
-                    } else {
+                    } else if !isReusablePrefixWarmup {
                         seedSnapshot = cacheSnapshotForBoundary(
                             tokens: seedTokens,
                             storageSnapshot: storageTopologySnapshot,
@@ -2514,10 +2528,45 @@ public struct TokenIterator: TokenIteratorProtocol {
         else { return }
         guard !needsCacheQuantization else { return }
         guard !containsUnprovenZayaTurboQuantDiskState(cache) else { return }
-        let generatedBoundaryTokens = promptTokenIds + generatedTokenIds
-        guard (cache.map(\.offset).max() ?? 0) >= generatedBoundaryTokens.count
-        else { return }
+        // The async decode pipeline forwards the consumed stop token while
+        // computing the never-consumed next step, so at store time every
+        // cache layer can legitimately sit ONE token past
+        // `prompt + generated`. That state is not poison — the next turn's
+        // templated history includes the stop token — but keying it as
+        // `prompt + generated` desynchronizes key and cache and the disk
+        // boundary-offset guard (correctly) refuses the store, silently
+        // costing the post-answer boundary every turn (observed live:
+        // "REFUSED offset/key mismatch tokens=3627 offsets=[3628]").
+        // Extend the key by the pending drained token instead.
+        let generatedBoundaryTokens = Self.generatedBoundaryTokensAligned(
+            promptTokenIds: promptTokenIds,
+            generatedTokenIds: generatedTokenIds,
+            cacheOffsets: cache.map(\.offset),
+            pendingDrainedTokenId: y.tokens.size == 1
+                ? y.tokens.item(Int.self) : nil)
+        guard let generatedBoundaryTokens else { return }
         store(tokens: generatedBoundaryTokens, cache: cache, kvBits: kvBits, kvMode: kvMode)
+    }
+
+    /// Align the post-answer boundary key with what the cache actually
+    /// contains. Returns nil when no consistent key exists (fail-closed —
+    /// the caller skips the store rather than persisting a poisoned entry).
+    static func generatedBoundaryTokensAligned(
+        promptTokenIds: [Int],
+        generatedTokenIds: [Int],
+        cacheOffsets: [Int],
+        pendingDrainedTokenId: Int?
+    ) -> [Int]? {
+        let base = promptTokenIds + generatedTokenIds
+        let uniqueOffsets = Set(cacheOffsets)
+        guard let maxOffset = cacheOffsets.max() else { return nil }
+        if maxOffset == base.count { return base }
+        // Exactly one extra forwarded token, uniform across layers, and the
+        // iterator still holds it: that is the consumed stop token.
+        if uniqueOffsets == Set([base.count + 1]), let pendingDrainedTokenId {
+            return base + [pendingDrainedTokenId]
+        }
+        return maxOffset > base.count ? base : nil
     }
 
     private func cacheSnapshotForBoundary(

@@ -187,6 +187,97 @@ struct DeepseekV4CacheDiskRoundTripTests {
         #expect(restoredSink.metaState == sink.metaState)
     }
 
+    @Test("short-prompt DSV4 cache with an empty pool round-trips restorably")
+    func emptyPoolRoundTripsRestorably() {
+        // A prompt shorter than one compress window leaves the pool with
+        // zero rows. That checkpoint must round-trip: the canonical
+        // on-disk form of an empty pool is absence, and the restore
+        // validator accepts a nil pool. Writing the zero-row tensor made
+        // every short-prompt DSV4 checkpoint permanently unrestorable.
+        let v4 = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
+        Self.fillRotating(v4.local)
+        v4.setPooled(.compressor, value: MLXArray.zeros([1, 0, 8]))
+        let originalOffset = v4.offset
+
+        let encoded = TQDiskSerializer.serialize(cache: [v4])
+        let target = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
+        var restoreTarget: [any KVCache] = [target]
+        let restored = restoreFromDiskArrays(encoded, into: &restoreTarget)
+
+        #expect(restored > 0, "empty-pool DSV4 record must restore, not miss")
+        #expect(target.offset == originalOffset)
+    }
+
+    @Test("qkv group-size mismatch refuses the whole record atomically")
+    func qkvMismatchRefusesWholeRecord() {
+        // A quantized-KV layer whose stored group size / bit width no
+        // longer matches the runtime cache must refuse the entire record
+        // BEFORE any sibling layer is seated: `totalTokens` seeds from
+        // sibling layers, so a per-layer skip reported a "hit" with this
+        // layer left empty.
+        let plain = KVCacheSimple()
+        let keys = MLXArray.ones([1, 1, 6, 64])
+        let values = MLXArray.ones([1, 1, 6, 64]) * 2.0
+        _ = plain.update(keys: keys, values: values)
+        let qkv = QuantizedKVCache(groupSize: 64, bits: 8)
+        _ = qkv.updateQuantized(keys: keys, values: values)
+
+        let encoded = TQDiskSerializer.serialize(cache: [plain, qkv])
+
+        let targetPlain = KVCacheSimple()
+        let targetQKV = QuantizedKVCache(groupSize: 32, bits: 8)
+        var restoreTarget: [any KVCache] = [targetPlain, targetQKV]
+        let restored = restoreFromDiskArrays(encoded, into: &restoreTarget)
+
+        #expect(restored == 0, "mismatched qkv layer must be an atomic whole-record miss")
+        #expect(targetPlain.offset == 0, "no sibling layer may be seated before the refusal")
+
+        // Control: a matching target restores normally.
+        let okPlain = KVCacheSimple()
+        let okQKV = QuantizedKVCache(groupSize: 64, bits: 8)
+        var okTarget: [any KVCache] = [okPlain, okQKV]
+        let okRestored = restoreFromDiskArrays(encoded, into: &okTarget)
+        #expect(okRestored == 6)
+        #expect(okQKV.offset == 6)
+    }
+
+    @Test("non-q8 quantized pool segment poisons the record as an atomic miss")
+    func nonQ8QuantizedPoolPoisonsRecord() {
+        // The disk schema for quantized pools is defined for 8-bit affine
+        // segments. Any other width must not degrade to a silently
+        // skipped layer (sibling .deepseekV4 layers would restore while
+        // this one stayed empty) — the record poisons to a required miss.
+        let v4 = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
+        Self.fillRotating(v4.local)
+        let bogus = HybridPoolQuantizedSegment(
+            codes: MLXArray.zeros([1, 64, 8], dtype: .uint32),
+            scales: MLXArray.zeros([1, 64, 2]),
+            biases: MLXArray.zeros([1, 64, 2]),
+            originalShape: [1, 64, 8],
+            groupSize: 32,
+            bits: 4,
+            originalDType: .float16)
+        v4.setHybridPoolQuantizedSegments(branch: .compressor, segments: [bogus])
+
+        let encoded = TQDiskSerializer.serialize(cache: [v4])
+        #expect(encoded["dsv4_0_keys"] == nil,
+            "poisoned record must not carry restorable keys")
+
+        let target = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
+        var restoreTarget: [any KVCache] = [target]
+        let restored = restoreFromDiskArrays(encoded, into: &restoreTarget)
+        #expect(restored == 0, "non-q8 pool record must be an atomic miss")
+        #expect(target.offset == 0)
+    }
+
+    @Test("serializer q8 contract matches DeepseekV4PoolStorage bits")
+    func serializerBitsMatchPoolStorage() {
+        // The serializer accepts exactly 8-bit pool segments; the pool
+        // storage produces exactly 8-bit segments. Tie the two constants
+        // so one cannot drift without this test going red.
+        #expect(DeepseekV4Cache.poolQuantizationBits == 8)
+    }
+
     private func assertStateEqual(
         _ actual: [MLXArray],
         _ expected: [MLXArray],
