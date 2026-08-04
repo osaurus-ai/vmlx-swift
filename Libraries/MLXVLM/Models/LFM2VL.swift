@@ -391,6 +391,7 @@ private enum Language {
         }
 
         func callAsFunction(_ x: MLXArray, cache: MambaCache?) -> MLXArray {
+            let tokenCount = x.dim(1)
             let BCx = inProj(x)
             let BCxSplit = BCx.split(parts: 3, axis: -1)
             let B = BCxSplit[0]
@@ -409,6 +410,10 @@ private enum Language {
             Bx = concatenated([state!, Bx], axis: -2)
             if let cache {
                 cache[0] = Bx[0..., (Bx.dim(1) - (lCache - 1))..., 0...]
+                // Keep the logical offset in step with the conv window — the
+                // prefix-cache boundary guard vetoes stores when any layer's
+                // offset disagrees with the prompt boundary.
+                cache.offset += tokenCount
             }
 
             let convOut = conv(Bx)

@@ -205,6 +205,7 @@ class LFM2MoEShortConv: Module {
         mask: MLXArray?,
         cache: MambaCache?
     ) -> MLXArray {
+        let tokenCount = x.dim(1)
         let BCx = inProj(x)
         let parts = BCx.split(parts: 3, axis: -1)
         // Bail on a failed split rather than trapping on the subscripts below.
@@ -229,6 +230,10 @@ class LFM2MoEShortConv: Module {
         if let cache {
             let start = Bx.dim(1) - (lCache - 1)
             cache[0] = Bx[0..., start..., 0...]
+            // Keep the logical offset in step with the conv window — the
+            // prefix-cache boundary guard vetoes stores when any layer's
+            // offset disagrees with the prompt boundary.
+            cache.offset += tokenCount
         }
 
         let convOut = conv(Bx)

@@ -210,6 +210,7 @@ class LFM2ShortConv: Module {
     }
 
     public func callAsFunction(_ x: MLXArray, cache: MambaCache?) -> MLXArray {
+        let tokenCount = x.dim(1)
         let BCx = inProj(x)
         let BCxSplit = BCx.split(parts: 3, axis: -1)
         // Bail on a failed split (empty vector from a recorded MLX error)
@@ -231,6 +232,11 @@ class LFM2ShortConv: Module {
         Bx = concatenated([state!, Bx], axis: -2)
         if let cache {
             cache[0] = Bx[0..., (Bx.dim(1) - (lCache - 1))..., 0...]
+            // Advance the logical offset alongside the conv window. The
+            // prefix-cache boundary guard compares every layer's offset to
+            // the prompt boundary; a conv layer left at 0 vetoes every
+            // paged/disk store for the whole model.
+            cache.offset += tokenCount
         }
 
         let convOut = conv(Bx)
