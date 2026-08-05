@@ -326,7 +326,7 @@ public struct ModelRuntimeCapabilitySnapshot: Codable, Sendable, Equatable {
             capabilities: capabilities,
             mtpStatus: configuration.mtpStatus)
         self.supportsVideo = Self.videoSupport(capabilities)
-        self.supportsAudio = Self.audioSupport(capabilities)
+        self.supportsAudio = Self.audioSupport(capabilities, modelType: modelType)
         self.supportsTools = Self.toolSupport(
             capabilities: capabilities,
             toolCallFormat: configuration.toolCallFormat)
@@ -365,7 +365,7 @@ public struct ModelRuntimeCapabilitySnapshot: Codable, Sendable, Equatable {
             capabilities: capabilities,
             mtpStatus: resolvedConfiguration.mtpStatus)
         self.supportsVideo = Self.videoSupport(capabilities)
-        self.supportsAudio = Self.audioSupport(capabilities)
+        self.supportsAudio = Self.audioSupport(capabilities, modelType: modelType)
         self.supportsTools = Self.toolSupport(
             capabilities: capabilities,
             toolCallFormat: resolvedConfiguration.toolCallFormat)
@@ -664,11 +664,19 @@ extension ModelRuntimeCapabilitySnapshot {
             unsupportedTokens: ["text", "audio"])
     }
 
-    fileprivate static func audioSupport(_ capabilities: JangCapabilities?)
+    fileprivate static func audioSupport(
+        _ capabilities: JangCapabilities?,
+        modelType: String?
+    )
         -> ModelRuntimeCapabilitySupport
     {
         if let explicit = ModelRuntimeCapabilitySupport.from(capabilities?.supportsAudio) {
             return explicit
+        }
+        if let modelType = modelType?.lowercased(),
+            ["nemotron_dense_audex", "nemotron_h_audex"].contains(modelType)
+        {
+            return .supported
         }
         return supportFromModality(
             capabilities?.modality,

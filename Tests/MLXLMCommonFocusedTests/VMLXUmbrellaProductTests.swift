@@ -422,6 +422,24 @@ struct VMLXUmbrellaProductTests {
         #expect(!encoded.contains("Gemma4-E2B"))
     }
 
+    @Test(
+        "Audex model types advertise native audio input",
+        arguments: [
+            ("Nemotron-Labs-Audex-2B", "nemotron_dense_audex"),
+            ("Nemotron-Labs-Audex-30B-A3B", "nemotron_h_audex"),
+        ])
+    func audexModelTypeAdvertisesAudio(directoryName: String, modelType: String) {
+        let snapshot = ModelRuntimeCapabilitySnapshot(
+            configuration: ModelConfiguration(
+                directory: URL(fileURLWithPath: "/tmp/\(directoryName)")),
+            modelType: modelType)
+
+        #expect(snapshot.supportsText == .supported)
+        #expect(snapshot.supportsVision == .unknown)
+        #expect(snapshot.supportsVideo == .unknown)
+        #expect(snapshot.supportsAudio == .supported)
+    }
+
     @Test("capability validator can allow unknown lanes while rejecting explicit unsupported lanes")
     func capabilityValidatorCanAllowUnknownLanes() throws {
         let snapshot = ModelRuntimeCapabilitySnapshot(
