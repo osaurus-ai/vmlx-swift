@@ -193,6 +193,11 @@ struct DeepseekV4FP32LMHeadCacheTests {
                 #expect(state.cachedWeight == nil)
                 #expect(state.constructionCount == 0)
                 #expect(state.metadata?.supported == true)
+                #expect(state.cacheIdentity == nil)
+                #expect(state.logicalBytes == 0)
+                #expect(state.events.isEmpty)
+                state.releaseDerivedBuffersForTeardown()
+                #expect(state.events.isEmpty)
             }
 
             try Self.withFeatureFlag("1") {
@@ -231,8 +236,19 @@ struct DeepseekV4FP32LMHeadCacheTests {
                 #expect(state.metadata?.supported == false)
                 #expect(!state.prepared)
                 #expect(state.constructionCount == 0)
+                #expect(state.cacheIdentity == nil)
+                #expect(state.logicalBytes == 0)
+                #expect(state.events.isEmpty)
             }
         }
+    }
+
+    @Test("FP32 output-head logical bytes match the frozen DSV4 shape")
+    func fp32OutputHeadLogicalBytesAreExact() {
+        #expect(
+            DeepseekV4FP32LMHeadCacheState.fp32LogicalBytes(
+                outputDimensions: 129_280, inputDimensions: 4_096)
+                == 2_118_123_520)
     }
 
     @Test("wrapper rejects a loaded head that disagrees with its configuration")
@@ -335,6 +351,10 @@ struct DeepseekV4FP32LMHeadCacheTests {
                     ]),
                     verify: .none)
                 #expect(!parameterUpdateModel.dsv4FP32LMHeadCachePrepared)
+                #expect(parameterUpdateModel.dsv4FP32LMHeadCacheEvents.contains { event in
+                    if case .invalidate = event { return true }
+                    return false
+                })
 
                 let moduleUpdateModel = DeepseekV4JANGTQModel(config)
                 try moduleUpdateModel.update(
@@ -351,6 +371,10 @@ struct DeepseekV4FP32LMHeadCacheTests {
                     ]),
                     verify: .none)
                 #expect(!moduleUpdateModel.dsv4FP32LMHeadCachePrepared)
+                #expect(moduleUpdateModel.dsv4FP32LMHeadCacheEvents.contains { event in
+                    if case .invalidate = event { return true }
+                    return false
+                })
             }
         }
     }
@@ -415,6 +439,72 @@ struct DeepseekV4FP32LMHeadCacheTests {
                     #expect(state.prepared)
                 }
                 #expect(releasedState == nil)
+            }
+        }
+    }
+
+    @Test("release drops cache ownership but preserves a materialized alias")
+    func releasePreservesAliasAndCreatesANewIdentityOnReprepare() throws {
+        try MLXMetalTestLock.withLock {
+            try Self.withFeatureFlag("1") {
+                let state = DeepseekV4FP32LMHeadCacheState()
+                try state.prepare(
+                    lmHead: Self.makeHead(),
+                    expectedInputDimensions: 32,
+                    expectedOutputDimensions: 8)
+
+                let firstIdentity = try #require(state.cacheIdentity)
+                let alias = try #require(state.cachedWeight)
+                MLX.eval(alias)
+                let beforeRelease = Self.rawFP32Bytes(alias)
+
+                state.releaseDerivedBuffersForTeardown()
+                #expect(state.cachedWeight == nil)
+                #expect(state.cacheIdentity == nil)
+                #expect(state.logicalBytes == 0)
+                #expect(state.events.contains { event in
+                    if case let .release(identity, logicalBytes) = event {
+                        return identity == firstIdentity && logicalBytes == 1_024
+                    }
+                    return false
+                })
+                #expect(state.events == [
+                    .logicalBytes(1_024),
+                    .release(identity: firstIdentity, logicalBytes: 1_024),
+                    .logicalBytes(0)
+                ])
+                let eventsAfterFirstRelease = state.events
+
+                state.releaseDerivedBuffersForTeardown()
+                #expect(state.events == eventsAfterFirstRelease)
+
+                MLX.eval(alias)
+                #expect(Self.rawFP32Bytes(alias) == beforeRelease)
+
+                try state.prepare(
+                    lmHead: Self.makeHead(),
+                    expectedInputDimensions: 32,
+                    expectedOutputDimensions: 8)
+                let secondIdentity = try #require(state.cacheIdentity)
+                #expect(secondIdentity != firstIdentity)
+                #expect(state.logicalBytes == 1_024)
+                #expect(state.events.contains { event in
+                    if case let .identityChanged(previous, current) = event {
+                        return previous == firstIdentity && current == secondIdentity
+                    }
+                    return false
+                })
+                #expect(state.events.contains { event in
+                    if case .logicalBytes(1_024) = event { return true }
+                    return false
+                })
+                #expect(state.events == [
+                    .logicalBytes(1_024),
+                    .release(identity: firstIdentity, logicalBytes: 1_024),
+                    .logicalBytes(0),
+                    .identityChanged(previous: firstIdentity, current: secondIdentity),
+                    .logicalBytes(1_024)
+                ])
             }
         }
     }

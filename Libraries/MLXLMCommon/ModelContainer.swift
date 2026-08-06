@@ -468,6 +468,16 @@ public final class ModelContainer: Sendable {
         self.context = .init(context)
     }
 
+    /// Release model-local derived buffers while holding the container's
+    /// existing exclusive access lock. Models without a teardown hook keep
+    /// the default no-op implementation.
+    public func releaseDerivedBuffersForTeardown() async {
+        await context.read { context in
+            (context.model as? any PostLoadModelPreparation)?
+                .releaseDerivedBuffersForTeardown()
+        }
+    }
+
     /// Perform an action on the model and/or tokenizer. Callers _must_ eval any `MLXArray` before returning as
     /// `MLXArray` is not `Sendable`.
     @available(*, deprecated, message: "prefer perform(_:) that uses a ModelContext")

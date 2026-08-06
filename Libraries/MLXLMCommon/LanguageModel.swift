@@ -425,6 +425,16 @@ public protocol VisionLanguageModelProtocol: LanguageModel {}
 /// those buffers.
 public protocol PostLoadModelPreparation: AnyObject {
     func prepareForInferenceAfterLoad() throws
+
+    /// Release model-local buffers that can be recomputed after a later load.
+    ///
+    /// This hook does not unload model parameters or request state. The
+    /// default implementation keeps existing conformers unchanged.
+    func releaseDerivedBuffersForTeardown()
+}
+
+public extension PostLoadModelPreparation {
+    func releaseDerivedBuffersForTeardown() {}
 }
 
 /// Interface for all Language Models (e.g. LLM, VLM).

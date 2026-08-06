@@ -92,6 +92,7 @@ internal struct DeepseekV4FP32LMHeadCacheMetadata: Equatable, Sendable {
     let quantizationBiasesDType: DType?
     let outputBiasShape: [Int]?
     let outputBiasDType: DType?
+    let logicalBytes: Int
 }
 
 internal struct DeepseekV4RawFP32Comparison: Equatable, Sendable {
@@ -190,11 +191,22 @@ internal func deepseekV4CompareRawFP32(
         structuralMismatch: "raw data differed without a word mismatch")
 }
 
+internal enum DeepseekV4FP32LMHeadCacheEvent: Equatable, Sendable {
+    case invalidate(identity: UInt64?)
+    case release(identity: UInt64?, logicalBytes: Int)
+    case identityChanged(previous: UInt64?, current: UInt64)
+    case logicalBytes(Int)
+}
+
 private final class DeepseekV4FP32LMHeadCacheHolder {
     let weight: MLXArray
+    let identity: UInt64
+    let logicalBytes: Int
 
-    init(weight: MLXArray) {
+    init(weight: MLXArray, identity: UInt64, logicalBytes: Int) {
         self.weight = weight
+        self.identity = identity
+        self.logicalBytes = logicalBytes
     }
 }
 
@@ -205,20 +217,21 @@ private enum DeepseekV4FP32LMHeadCacheError: Error {
 /// Owns one model-local, evaluated derived head weight.
 ///
 /// The state is deliberately a reference type that is not an MLX ``Module``.
-/// It keeps the derived ``MLXArray`` behind a non-parameter holder, and the
-/// one-shot preparation flag makes the post-load mutation contract explicit:
-/// the model wrappers invalidate before parameter or child-module updates, then
-/// remain on the baseline path. Module reflection cannot safely observe a
-/// backing-store update after it occurs, so a second preparation attempt throws.
+/// It keeps the derived ``MLXArray`` behind a non-parameter holder. The model
+/// wrappers invalidate before parameter or child-module updates, then remain
+/// on the baseline path. Teardown release is the only path that permits a new
+/// post-load preparation and cache identity.
 final class DeepseekV4FP32LMHeadCacheState {
     private let preparationLock = NSLock()
     private let shadowLock = NSLock()
     private var holder: DeepseekV4FP32LMHeadCacheHolder?
     private var preparationAttempted = false
+    private var lastCacheIdentityStorage: UInt64?
     private var shadowComparisonEnabled = false
     private var preparedStorage = false
     private var constructionCountStorage = 0
     private var metadataStorage: DeepseekV4FP32LMHeadCacheMetadata?
+    private var eventsStorage: [DeepseekV4FP32LMHeadCacheEvent] = []
     private var shadowComparisonCountStorage = 0
     private var shadowComparedWordCountStorage = 0
     private var shadowMismatchCountStorage = 0
@@ -246,6 +259,37 @@ final class DeepseekV4FP32LMHeadCacheState {
         preparationLock.lock()
         defer { preparationLock.unlock() }
         return holder?.weight
+    }
+
+    var cacheIdentity: UInt64? {
+        preparationLock.lock()
+        defer { preparationLock.unlock() }
+        return holder?.identity
+    }
+
+    var logicalBytes: Int {
+        preparationLock.lock()
+        defer { preparationLock.unlock() }
+        return holder?.logicalBytes ?? 0
+    }
+
+    var events: [DeepseekV4FP32LMHeadCacheEvent] {
+        preparationLock.lock()
+        defer { preparationLock.unlock() }
+        return eventsStorage
+    }
+
+    /// The byte count of an evaluated FP32 matrix with the supplied logical
+    /// output-head dimensions. This is logical tensor storage, not a claim
+    /// about allocator pages returned to the operating system.
+    static func fp32LogicalBytes(outputDimensions: Int, inputDimensions: Int) -> Int {
+        guard outputDimensions > 0, inputDimensions > 0 else { return 0 }
+        let (elements, elementOverflow) = outputDimensions
+            .multipliedReportingOverflow(by: inputDimensions)
+        guard !elementOverflow else { return 0 }
+        let (bytes, byteOverflow) = elements
+            .multipliedReportingOverflow(by: MemoryLayout<Float>.size)
+        return byteOverflow ? 0 : bytes
     }
 
     var shadowComparisonCount: Int {
@@ -317,10 +361,20 @@ final class DeepseekV4FP32LMHeadCacheState {
         ).asType(.float32)
         MLX.eval(weight)
 
-        holder = DeepseekV4FP32LMHeadCacheHolder(weight: weight)
+        let identity = UInt64(constructionCountStorage + 1)
+        let logicalBytes = finalMetadata.logicalBytes
+        let previousIdentity = lastCacheIdentityStorage
+        holder = DeepseekV4FP32LMHeadCacheHolder(
+            weight: weight, identity: identity, logicalBytes: logicalBytes)
+        lastCacheIdentityStorage = identity
         constructionCountStorage += 1
         preparedStorage = true
         shadowComparisonEnabled = shadowRequested
+        if let previousIdentity, previousIdentity != identity {
+            eventsStorage.append(.identityChanged(
+                previous: previousIdentity, current: identity))
+        }
+        eventsStorage.append(.logicalBytes(logicalBytes))
     }
 
     func logits(_ hidden: MLXArray, lmHead: Linear) -> MLXArray {
@@ -351,15 +405,42 @@ final class DeepseekV4FP32LMHeadCacheState {
     /// helper path instead of rebuilding a cache from a partly updated model.
     func invalidate() {
         preparationLock.lock()
-        let hadCache = holder != nil
+        let oldHolder = holder
         holder = nil
         preparedStorage = false
         shadowComparisonEnabled = false
+        if oldHolder != nil {
+            eventsStorage.append(.invalidate(identity: oldHolder?.identity))
+            eventsStorage.append(.logicalBytes(0))
+        }
         preparationLock.unlock()
 
-        if hadCache {
+        if oldHolder != nil {
             FileHandle.standardError.write(Data(
                 "[DSV4HeadCache] invalidated after model mutation; using baseline path\n".utf8))
+        }
+    }
+
+    /// Release the evaluated FP32 head for model teardown. Unlike mutation
+    /// invalidation, teardown permits a later post-load preparation to create
+    /// a fresh cache identity. A repeated release is an event-stable no-op.
+    func releaseDerivedBuffersForTeardown() {
+        preparationLock.lock()
+        let oldHolder = holder
+        holder = nil
+        preparedStorage = false
+        shadowComparisonEnabled = false
+        preparationAttempted = false
+        if let oldHolder {
+            eventsStorage.append(.release(
+                identity: oldHolder.identity, logicalBytes: oldHolder.logicalBytes))
+            eventsStorage.append(.logicalBytes(0))
+        }
+        preparationLock.unlock()
+
+        if oldHolder != nil {
+            FileHandle.standardError.write(Data(
+                "[DSV4HeadCache] released derived FP32 output head for teardown\n".utf8))
         }
     }
 
@@ -485,7 +566,10 @@ final class DeepseekV4FP32LMHeadCacheState {
             quantizationBiasesShape: quantizationBiasesShape,
             quantizationBiasesDType: q.biases?.dtype,
             outputBiasShape: outputBiasShape,
-            outputBiasDType: q.bias?.dtype)
+            outputBiasDType: q.bias?.dtype,
+            logicalBytes: Self.fp32LogicalBytes(
+                outputDimensions: expectedOutputDimensions,
+                inputDimensions: expectedInputDimensions))
     }
 }
 

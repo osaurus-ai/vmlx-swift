@@ -205,11 +205,31 @@ public final class DeepseekV4JANGTQModel:
         dsv4FP32LMHeadCache.metadata
     }
 
+    internal var dsv4FP32LMHeadCacheWeight: MLXArray? {
+        dsv4FP32LMHeadCache.cachedWeight
+    }
+
+    internal var dsv4FP32LMHeadCacheIdentity: UInt64? {
+        dsv4FP32LMHeadCache.cacheIdentity
+    }
+
+    internal var dsv4FP32LMHeadCacheLogicalBytes: Int {
+        dsv4FP32LMHeadCache.logicalBytes
+    }
+
+    internal var dsv4FP32LMHeadCacheEvents: [DeepseekV4FP32LMHeadCacheEvent] {
+        dsv4FP32LMHeadCache.events
+    }
+
     public func prepareForInferenceAfterLoad() throws {
         try dsv4FP32LMHeadCache.prepare(
             lmHead: lmHead,
             expectedInputDimensions: config.hiddenSize,
             expectedOutputDimensions: config.vocabSize)
+    }
+
+    public func releaseDerivedBuffersForTeardown() {
+        dsv4FP32LMHeadCache.releaseDerivedBuffersForTeardown()
     }
 
     @discardableResult
