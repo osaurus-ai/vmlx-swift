@@ -417,6 +417,16 @@ public enum PrepareResult {
 /// Use ``ModelContext/isVLM`` or ``ModelContainer/isVLM`` to check at runtime.
 public protocol VisionLanguageModelProtocol: LanguageModel {}
 
+/// A model-specific hook invoked once after ``loadWeights`` has installed and
+/// evaluated the final model parameters.
+///
+/// Implementations must finish any derived-buffer preparation before the model
+/// becomes visible to inference. They own the lifetime and mutation contract of
+/// those buffers.
+public protocol PostLoadModelPreparation: AnyObject {
+    func prepareForInferenceAfterLoad() throws
+}
+
 /// Interface for all Language Models (e.g. LLM, VLM).
 ///
 /// The language model is typically called by the ``TokenIterator`` and it:

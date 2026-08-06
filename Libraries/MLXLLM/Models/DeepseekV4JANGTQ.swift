@@ -175,13 +175,14 @@ public final class DeepseekV4ModelInnerJANGTQ: Module {
 }
 
 public final class DeepseekV4JANGTQModel:
-    Module, LLMModel, KVCacheDimensionProvider, LoRAModel
+    Module, LLMModel, KVCacheDimensionProvider, LoRAModel, PostLoadModelPreparation
 {
     public var kvHeads: [Int]
     let config: DeepseekV4Configuration
     public var model: DeepseekV4ModelInnerJANGTQ
     public var routedExpertBitsByLayer: [Int] { model.routedExpertBitsByLayer }
     @ModuleInfo(key: "lm_head") var lmHead: Linear
+    private let dsv4FP32LMHeadCache = DeepseekV4FP32LMHeadCacheState()
 
     public init(_ config: DeepseekV4Configuration, mxtqBits: Int? = nil, mxtqSeed: Int = 42) {
         self.config = config
@@ -190,6 +191,45 @@ public final class DeepseekV4JANGTQModel:
             config: config, mxtqBits: mxtqBits, mxtqSeed: mxtqSeed)
         self._lmHead.wrappedValue = Linear(
             config.hiddenSize, config.vocabSize, bias: false)
+    }
+
+    internal var dsv4FP32LMHeadCachePrepared: Bool {
+        dsv4FP32LMHeadCache.prepared
+    }
+
+    internal var dsv4FP32LMHeadCacheConstructionCount: Int {
+        dsv4FP32LMHeadCache.constructionCount
+    }
+
+    internal var dsv4FP32LMHeadCacheMetadata: DeepseekV4FP32LMHeadCacheMetadata? {
+        dsv4FP32LMHeadCache.metadata
+    }
+
+    public func prepareForInferenceAfterLoad() throws {
+        try dsv4FP32LMHeadCache.prepare(
+            lmHead: lmHead,
+            expectedInputDimensions: config.hiddenSize,
+            expectedOutputDimensions: config.vocabSize)
+    }
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters,
+        verify: VerifyUpdate,
+        path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        dsv4FP32LMHeadCache.invalidate()
+        return try super.update(
+            parameters: parameters,
+            verify: verify,
+            path: path,
+            modulePath: modulePath)
+    }
+
+    public override func updateModule(key: String, _ value: Any) throws {
+        dsv4FP32LMHeadCache.invalidate()
+        try super.updateModule(key: key, value)
     }
 
     /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass — pure long-context):
@@ -227,7 +267,8 @@ public final class DeepseekV4JANGTQModel:
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
-        DeepseekV4Math.lmHeadFp32(model(inputs, cache: cache), lmHead: lmHead)
+        let h = model(inputs, cache: cache)
+        return dsv4FP32LMHeadCache.logits(h, lmHead: lmHead)
     }
 
     /// Reuse DeepseekV4Model's sanitize — the weight naming contract
