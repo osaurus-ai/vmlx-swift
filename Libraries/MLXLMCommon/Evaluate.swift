@@ -218,6 +218,11 @@ public struct GenerateParameters: Sendable {
     /// `DDTREE-DESIGN.md` for the full spec.
     public var draftStrategy: DraftStrategy? = nil
 
+    /// Opt-in token-ID lineage capture for correctness diagnostics. `nil`
+    /// leaves the existing generation path unchanged and performs no capture
+    /// or artifact write.
+    public var tokenIDTrace: TokenIDTraceConfiguration? = nil
+
     /// Additional text-level stop sequences. When any of these strings
     /// appears in the user-visible assistant output, the library halts
     /// generation, truncates the match and everything after it, and
@@ -946,6 +951,7 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var promptTokenIds: [Int] { get }
     var turboQuantCompressionCount: Int { get }
     var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { get }
+    var tokenIDTraceSession: TokenIDTraceSession? { get }
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool)
@@ -955,6 +961,7 @@ extension TokenIteratorProtocol {
     public var promptTokenIds: [Int] { [] }
     public var turboQuantCompressionCount: Int { 0 }
     public var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { nil }
+    public var tokenIDTraceSession: TokenIDTraceSession? { nil }
 
     public mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
@@ -1169,6 +1176,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     public let maxTokens: Int?
     public private(set) var turboQuantCompressionCount = 0
     public private(set) var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot?
+    public private(set) var tokenIDTraceSession: TokenIDTraceSession? = nil
 
     // Cache quantization parameters
     let kvBits: Int?
@@ -1263,6 +1271,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         prompt: MLXArray, model: any LanguageModel, cache: [KVCache]? = nil,
         parameters: GenerateParameters
     ) throws {
+        let traceSession = try parameters.tokenIDTrace?.begin(
+            pathKind: .direct,
+            promptTokenIds: parameters.tokenIDTrace == nil
+                ? [] : prompt.reshaped(-1).asArray(Int.self),
+            parameters: parameters)
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
         self.model = model
@@ -1287,6 +1300,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.cacheInitParameters = parameters
         self.promptCacheSnapshot = nil
         self.mediaSalt = nil
+        self.tokenIDTraceSession = traceSession
 
         self.promptPrefillTime = try measure {
             let promptInput = LMInput(text: y)
@@ -1318,6 +1332,13 @@ public struct TokenIterator: TokenIteratorProtocol {
         skipDiskBackedToolPromptSeedBoundary: Bool = false,
         prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil
     ) throws {
+        let tracePromptTokenIds =
+            parameters.tokenIDTrace == nil
+            ? [] : input.text.tokens.reshaped(-1).asArray(Int.self)
+        let traceSession = try parameters.tokenIDTrace?.begin(
+            pathKind: .direct,
+            promptTokenIds: tracePromptTokenIds,
+            parameters: parameters)
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
         self.model = model
@@ -1372,6 +1393,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.originalInput = input
         self.cacheInitParameters = effectiveParameters
         self.promptCacheSnapshot = nil
+        self.tokenIDTraceSession = traceSession
 
         // Compute a stable fingerprint of request-scope/media content plus
         // effective cache policy once at init, so both the pre-prepare fetch
@@ -1547,6 +1569,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 if restored {
                     if cacheLookupUsesPostPrepareAlias {
                         self.promptTokenIds = cacheLookupTokenIds
+                        tokenIDTraceSession?.replacePrompt(cacheLookupTokenIds)
                     }
                     let unsafePartial =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
@@ -2017,6 +2040,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         case .logits(let result):
             if let effectivePromptTokens = result.effectivePromptTokens {
                 promptTokenIds = effectivePromptTokens
+                tokenIDTraceSession?.replacePrompt(effectivePromptTokens)
                 if originalInput.requiresPostPrepareCacheKey {
                     cacheCoordinator?.recordPostPrepareCacheKeyAlias(
                         rawTokens: originalInput.text.tokens.reshaped(-1).asArray(Int.self),
@@ -2046,10 +2070,13 @@ public struct TokenIterator: TokenIteratorProtocol {
             let y = sampler.sample(logits: logits)
             processor.didSample(token: y)
             self.processor = processor
+            tokenIDTraceSession?.recordSampled(y.item(Int.self))
             return y
         }
 
-        return sampler.sample(logits: logits)
+        let y = sampler.sample(logits: logits)
+        tokenIDTraceSession?.recordSampled(y.item(Int.self))
+        return y
     }
 
     // Whether cache quantization is needed (skip the function call entirely when not)
@@ -2229,7 +2256,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         return MLXPressGenerationProfile.time("decode.token_item_sync") {
-            previousY.tokens.item(Int.self)
+            let returned = previousY.tokens.item(Int.self)
+            tokenIDTraceSession?.recordIteratorReturned(returned)
+            return returned
         }
     }
 
@@ -2719,6 +2748,9 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         parameters: GenerateParameters,
         numDraftTokens: Int
     ) throws {
+        if let trace = parameters.tokenIDTrace {
+            try trace.rejectProposalPath("speculative iterator")
+        }
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
         self.y = input.text
@@ -3038,6 +3070,7 @@ private func runSynchronousGenerationLoop(
 
     var generatedTokenIds = [Int]()
     var iterator = iterator
+    let tokenTraceSession = iterator.tokenIDTraceSession
     var stopReason: GenerateStopReason?
 
     while let token = iterator.next() {
@@ -3075,6 +3108,17 @@ private func runSynchronousGenerationLoop(
     let generateTime = now - start
 
     Stream().synchronize()
+
+    let traceStopRule: TokenIDTraceStopRule
+    switch stopReason ?? .cancelled {
+    case .stop:
+        traceStopRule = .eos
+    case .length:
+        traceStopRule = .length
+    case .cancelled:
+        traceStopRule = .cancellation
+    }
+    try? tokenTraceSession?.finish(stopRule: traceStopRule)
 
     return SynchronousGenerationLoopResult(
         generatedTokenIds: generatedTokenIds,
@@ -3305,6 +3349,13 @@ public func generate(
 ) throws -> AsyncStream<Generation> {
     _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
+    if let trace = parameters.tokenIDTrace {
+        _ = try trace.begin(
+            pathKind: .direct,
+            promptTokenIds: input.text.tokens.reshaped(-1).asArray(Int.self),
+            parameters: parameters)
+    }
+
     context.jangPressRuntime.recordPromptTokenActivity(
         input.text.tokens.reshaped(-1).asArray(Int.self))
 
@@ -3343,6 +3394,13 @@ public func generate(
     // user temperature/top-p; GenerateParameters.maxTokens still caps
     // output length.
     if let diffusionModel = context.model as? any BlockDiffusionModel {
+        if let trace = parameters.tokenIDTrace {
+            trace.session.recordRuntimeError(
+                "block-diffusion token boundaries are outside the trace contract")
+            try? trace.session.finish(stopRule: .error)
+            throw TokenIDTraceError.invalidConfiguration(
+                "token ID trace does not support block-diffusion token boundaries")
+        }
         let options = diffusionModel.blockDiffusionDefaults
             .resolving(generationConfig: context.configuration.generationDefaults)
             .overriding(parameters: parameters)
@@ -3383,9 +3441,19 @@ public func generate(
     {
         return stream
     }
-    let iterator = try TokenIterator(
-        input: input, model: context.model, cache: cache, parameters: parameters,
-        cacheCoordinator: cacheCoordinator)
+    let iterator: TokenIterator
+    do {
+        iterator = try TokenIterator(
+            input: input, model: context.model, cache: cache, parameters: parameters,
+            cacheCoordinator: cacheCoordinator)
+    } catch {
+        if let trace = parameters.tokenIDTrace {
+            trace.session.discardRuntimeEventsForConstructionFailure()
+            trace.session.recordRuntimeError(error.localizedDescription)
+            try? trace.session.finish(stopRule: .error)
+        }
+        throw error
+    }
     let (stream, _) = generateTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
@@ -3453,6 +3521,9 @@ public func generate(
     numDraftTokens: Int = 2,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
+    if let trace = parameters.tokenIDTrace {
+        try trace.rejectProposalPath("explicit draft model")
+    }
     context.jangPressRuntime.recordPromptTokenActivity(
         input.text.tokens.reshaped(-1).asArray(Int.self))
 
@@ -3535,6 +3606,7 @@ public func generateTask(
     promptTail: String? = nil,
     toolSchemas: [ToolSpec]? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
+    let tokenTraceSession = iterator.tokenIDTraceSession
     let effectivePromptTail =
         promptTail
         ?? _decodePromptTail(
@@ -3555,6 +3627,7 @@ public func generateTask(
         tokenizer: tokenizer,
         makeIterator: { iteratorBox.consume() },
         wiredMemoryTicket: wiredMemoryTicket,
+        tokenIDTraceSession: tokenTraceSession,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
             format: modelConfiguration.toolCallFormat ?? .json,
@@ -3562,7 +3635,8 @@ public func generateTask(
             reasoningParser: ReasoningParser.forPrompt(
                 stampName: modelConfiguration.reasoningParserName,
                 promptTail: effectivePromptTail),
-            stopStringMatcher: StopStringMatcher(stopStrings: effectiveStopStrings)
+            stopStringMatcher: StopStringMatcher(stopStrings: effectiveStopStrings),
+            tokenTrace: tokenTraceSession
         )
     )
 }
@@ -3584,7 +3658,8 @@ public func generateTaskDeferred(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     extraStopStrings: [String] = [],
     promptTail: String? = nil,
-    toolSchemas: [ToolSpec]? = nil
+    toolSchemas: [ToolSpec]? = nil,
+    tokenIDTraceSession: TokenIDTraceSession? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     let effectivePromptTail =
         promptTail
@@ -3602,6 +3677,7 @@ public func generateTaskDeferred(
         tokenizer: tokenizer,
         makeIterator: makeIterator,
         wiredMemoryTicket: wiredMemoryTicket,
+        tokenIDTraceSession: tokenIDTraceSession,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
             format: modelConfiguration.toolCallFormat ?? .json,
@@ -3609,7 +3685,8 @@ public func generateTaskDeferred(
             reasoningParser: ReasoningParser.forPrompt(
                 stampName: modelConfiguration.reasoningParserName,
                 promptTail: effectivePromptTail),
-            stopStringMatcher: StopStringMatcher(stopStrings: effectiveStopStrings)
+            stopStringMatcher: StopStringMatcher(stopStrings: effectiveStopStrings),
+            tokenTrace: tokenIDTraceSession
         )
     )
 }
@@ -3639,12 +3716,29 @@ public func generateTokens(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     cacheCoordinator: CacheCoordinator? = nil
 ) throws -> AsyncStream<TokenGeneration> {
+    if let trace = parameters.tokenIDTrace {
+        _ = try trace.begin(
+            pathKind: .direct,
+            promptTokenIds: input.text.tokens.reshaped(-1).asArray(Int.self),
+            parameters: parameters,
+            includeStopToken: includeStopToken)
+    }
     context.jangPressRuntime.recordPromptTokenActivity(
         input.text.tokens.reshaped(-1).asArray(Int.self))
 
-    let iterator = try TokenIterator(
-        input: input, model: context.model, cache: cache, parameters: parameters,
-        cacheCoordinator: cacheCoordinator)
+    let iterator: TokenIterator
+    do {
+        iterator = try TokenIterator(
+            input: input, model: context.model, cache: cache, parameters: parameters,
+            cacheCoordinator: cacheCoordinator)
+    } catch {
+        if let trace = parameters.tokenIDTrace {
+            trace.session.discardRuntimeEventsForConstructionFailure()
+            trace.session.recordRuntimeError(error.localizedDescription)
+            try? trace.session.finish(stopRule: .error)
+        }
+        throw error
+    }
     let (stream, _) = generateTokenTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
@@ -3684,6 +3778,9 @@ public func generateTokens(
     numDraftTokens: Int = 2,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<TokenGeneration> {
+    if let trace = parameters.tokenIDTrace {
+        try trace.rejectProposalPath("explicit draft model")
+    }
     context.jangPressRuntime.recordPromptTokenActivity(
         input.text.tokens.reshaped(-1).asArray(Int.self))
 
@@ -3734,6 +3831,13 @@ public func generateTokensTask(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     cacheCoordinator: CacheCoordinator? = nil
 ) throws -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
+    if let trace = parameters.tokenIDTrace {
+        _ = try trace.begin(
+            pathKind: .direct,
+            promptTokenIds: input.text.tokens.reshaped(-1).asArray(Int.self),
+            parameters: parameters,
+            includeStopToken: includeStopToken)
+    }
     context.jangPressRuntime.recordPromptTokenActivity(
         input.text.tokens.reshaped(-1).asArray(Int.self))
 
@@ -3760,9 +3864,19 @@ public func generateTokensTask(
             wiredMemoryTicket: wiredMemoryTicket)
     }
 
-    let iterator = try TokenIterator(
-        input: input, model: context.model, cache: cache, parameters: parameters,
-        cacheCoordinator: cacheCoordinator)
+    let iterator: TokenIterator
+    do {
+        iterator = try TokenIterator(
+            input: input, model: context.model, cache: cache, parameters: parameters,
+            cacheCoordinator: cacheCoordinator)
+    } catch {
+        if let trace = parameters.tokenIDTrace {
+            trace.session.discardRuntimeEventsForConstructionFailure()
+            trace.session.recordRuntimeError(error.localizedDescription)
+            try? trace.session.finish(stopRule: .error)
+        }
+        throw error
+    }
     return generateTokenTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
@@ -3797,6 +3911,7 @@ public func generateTokenTask(
     includeStopToken: Bool = false,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
+    let tokenTraceSession = iterator.tokenIDTraceSession
     let iteratorBox = SendableBox(iterator)
     return generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -3805,6 +3920,7 @@ public func generateTokenTask(
         makeIterator: { iteratorBox.consume() },
         wiredMemoryTicket: wiredMemoryTicket,
         includeStopToken: includeStopToken,
+        tokenIDTraceSession: tokenTraceSession,
         handler: RawTokenLoopHandler()
     )
 }
@@ -3816,6 +3932,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     makeIterator: @escaping @Sendable () throws -> any TokenIteratorProtocol,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     includeStopToken: Bool = false,
+    tokenIDTraceSession: TokenIDTraceSession? = nil,
     handler: consuming Handler
 ) -> (AsyncStream<Handler.Output>, Task<Void, Never>) {
 
@@ -3837,8 +3954,29 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             // returned (which happens when the iterator — and therefore the
             // whole prompt prefill — is built eagerly before the loop task).
             var iterator: any TokenIteratorProtocol
+            var activeTokenTrace = tokenIDTraceSession
+            if includeStopToken, let activeTokenTrace {
+                activeTokenTrace.discardRuntimeEventsForConstructionFailure()
+                activeTokenTrace.recordRuntimeError(
+                    "includeStopToken is outside the token-trace matrix")
+                try? activeTokenTrace.finish(stopRule: .error)
+                handler.onGenerationEnd(emit: continuation.yield)
+                _ = continuation.yield(
+                    handler.infoEvent(
+                        GenerateCompletionInfo(
+                            promptTokenCount: promptTokenCount,
+                            generationTokenCount: 0,
+                            promptTime: 0,
+                            generationTime: 0,
+                            stopReason: .cancelled,
+                            toolCallProtocolFailure: handler.toolCallProtocolFailure
+                        )))
+                continuation.finish()
+                return
+            }
             do {
                 iterator = try makeIterator.consume()()
+                activeTokenTrace = iterator.tokenIDTraceSession ?? activeTokenTrace
             } catch is CancellationError {
                 // Client disconnected while the prompt was still prefilling —
                 // the chunked prepare loops bail between chunks. Not an error;
@@ -3855,16 +3993,21 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 // "command encoder is already encoding" / end_encoding races.
                 // The normal completion path below drains twice for the same
                 // reason; the early-exit paths must match it.
+                activeTokenTrace?.discardRuntimeEventsForConstructionFailure()
+                activeTokenTrace?.recordRuntimeError("iterator construction cancelled")
+                try? activeTokenTrace?.finish(stopRule: .cancellation)
                 Stream().synchronize()
                 handler.onGenerationEnd(emit: continuation.yield)
-                _ = continuation.yield(handler.infoEvent(GenerateCompletionInfo(
-                    promptTokenCount: promptTokenCount,
-                    generationTokenCount: 0,
-                    promptTime: 0,
-                    generationTime: 0,
-                    stopReason: .cancelled,
-                    toolCallProtocolFailure: handler.toolCallProtocolFailure
-                )))
+                _ = continuation.yield(
+                    handler.infoEvent(
+                        GenerateCompletionInfo(
+                            promptTokenCount: promptTokenCount,
+                            generationTokenCount: 0,
+                            promptTime: 0,
+                            generationTime: 0,
+                            stopReason: .cancelled,
+                            toolCallProtocolFailure: handler.toolCallProtocolFailure
+                        )))
                 continuation.finish()
                 return
             } catch {
@@ -3872,16 +4015,21 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     "Iterator construction failed: \(error.localizedDescription, privacy: .public)")
                 // Drain any prefill work enqueued before the failure before
                 // closing the stream (see the CancellationError branch above).
+                activeTokenTrace?.discardRuntimeEventsForConstructionFailure()
+                activeTokenTrace?.recordRuntimeError(error.localizedDescription)
+                try? activeTokenTrace?.finish(stopRule: .error)
                 Stream().synchronize()
                 handler.onGenerationEnd(emit: continuation.yield)
-                _ = continuation.yield(handler.infoEvent(GenerateCompletionInfo(
-                    promptTokenCount: promptTokenCount,
-                    generationTokenCount: 0,
-                    promptTime: 0,
-                    generationTime: 0,
-                    stopReason: .cancelled,
-                    toolCallProtocolFailure: handler.toolCallProtocolFailure
-                )))
+                _ = continuation.yield(
+                    handler.infoEvent(
+                        GenerateCompletionInfo(
+                            promptTokenCount: promptTokenCount,
+                            generationTokenCount: 0,
+                            promptTime: 0,
+                            generationTime: 0,
+                            stopReason: .cancelled,
+                            toolCallProtocolFailure: handler.toolCallProtocolFailure
+                        )))
                 continuation.finish()
                 return
             }
@@ -3945,12 +4093,34 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 }
             }
 
+            let stopSequenceHitBeforeGenerationEnd = handler.stopSequenceHit
             handler.onGenerationEnd(emit: continuation.yield)
             // Read AFTER the flush: `onGenerationEnd` pushes the detokenizer's
             // held-back tail through the parser, which is where a close marker
             // stuck in that tail finally lands. Reading before it reported
             // "unclosed" for streams that closed cleanly.
             let unclosedReasoning = handler.unclosedReasoning
+
+            let traceStopRule = tokenIDTraceStopRule(
+                stopReason: stopReason ?? .cancelled,
+                stopSequenceHitBeforeGenerationEnd: stopSequenceHitBeforeGenerationEnd,
+                stopSequenceHitAfterGenerationEnd: handler.stopSequenceHit)
+            if let activeTokenTrace {
+                if traceStopRule == .stopString,
+                    let match = handler.stopStringMatch
+                {
+                    activeTokenTrace.recordStopString(
+                        stop: match.stop,
+                        rangeUTF8: match.rangeUTF8)
+                }
+                do {
+                    try activeTokenTrace.finish(stopRule: traceStopRule)
+                } catch {
+                    Logger(subsystem: "vmlx", category: "TokenIDTrace").error(
+                        "token trace rejected terminal lineage: \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            }
 
             let now = Date.timeIntervalSinceReferenceDate
             let generateTime = now - start
@@ -4032,6 +4202,29 @@ public enum GenerateStopReason: Sendable {
 
     /// Generation stopped due to explicit task cancellation or early stream termination.
     case cancelled
+}
+
+/// Select the trace terminal rule from the runtime reason and the handler's
+/// state on both sides of the final text flush. A stop exposed only by a
+/// cancellation flush must not reclassify that cancellation; normal EOS and
+/// length flushes still allow a held stop string to be authoritative.
+func tokenIDTraceStopRule(
+    stopReason: GenerateStopReason,
+    stopSequenceHitBeforeGenerationEnd: Bool,
+    stopSequenceHitAfterGenerationEnd: Bool
+) -> TokenIDTraceStopRule {
+    if stopSequenceHitBeforeGenerationEnd {
+        return .stopString
+    }
+
+    switch stopReason {
+    case .stop:
+        return stopSequenceHitAfterGenerationEnd ? .stopString : .eos
+    case .length:
+        return stopSequenceHitAfterGenerationEnd ? .stopString : .length
+    case .cancelled:
+        return .cancellation
+    }
 }
 
 /// Represents metadata and statistics related to token generation.
@@ -4398,6 +4591,11 @@ private protocol TokenLoopHandler: Sendable {
     /// text (e.g., the raw-token handler).
     var stopSequenceHit: Bool { get }
 
+    /// Metadata for the first text-level stop match. The generation loop
+    /// records it only after selecting the terminal rule, so a stop exposed by
+    /// a cancellation flush cannot reclassify that cancellation.
+    var stopStringMatch: (stop: String, rangeUTF8: [Int])? { get }
+
     /// True when the handler is still inside a reasoning envelope before
     /// terminal flush. Must be snapshotted before `onGenerationEnd`, because
     /// flushing drains and closes parser state.
@@ -4416,6 +4614,7 @@ private protocol TokenLoopHandler: Sendable {
 
 extension TokenLoopHandler {
     var stopSequenceHit: Bool { false }
+    var stopStringMatch: (stop: String, rangeUTF8: [Int])? { nil }
     var unclosedReasoning: Bool { false }
     var emittedToolCall: Bool { false }
     var toolCallProtocolFailure: ToolCallProtocolFailure? { nil }
@@ -4458,14 +4657,18 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     /// Flipped by `dispatch` when the stop matcher fires, so the loop
     /// task can signal `.stop` in its terminal `.info` event.
     private(set) var stopSequenceHit: Bool = false
+    private(set) var stopStringMatch: (stop: String, rangeUTF8: [Int])?
     private(set) var emittedToolCall: Bool = false
+    let tokenTrace: TokenIDTraceSession?
+    private var traceVisibleText = ""
 
     init(
         tokenizer: Tokenizer,
         format: ToolCallFormat,
         tools: [[String: any Sendable]]? = nil,
         reasoningParser: ReasoningParser? = nil,
-        stopStringMatcher: StopStringMatcher = StopStringMatcher(stopStrings: [])
+        stopStringMatcher: StopStringMatcher = StopStringMatcher(stopStrings: []),
+        tokenTrace: TokenIDTraceSession? = nil
     ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
         let activeTools = tools?.isEmpty == false ? tools : nil
@@ -4484,6 +4687,7 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         }
         self.reasoningParser = reasoningParser
         self.stopStringMatcher = stopStringMatcher
+        self.tokenTrace = tokenTrace
     }
 
     /// Feed a raw decoded chunk through the reasoning parser (if any) and
@@ -4644,6 +4848,7 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         if stopStringMatcher.isEnabled {
             let tail = stopStringMatcher.flush()
             if !tail.isEmpty {
+                tokenTrace?.recordTextEmitted()
                 if case .terminated = emit(.chunk(tail)) {
                     return
                 }
@@ -4677,6 +4882,7 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
                 if stopStringMatcher.isEnabled {
                     let tail = stopStringMatcher.flush()
                     if !tail.isEmpty {
+                        tokenTrace?.recordTextEmitted()
                         if case .terminated = emit(.chunk(tail)) {
                             return false
                         }
@@ -4698,15 +4904,28 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         _ text: String,
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) -> AsyncStream<Generation>.Continuation.YieldResult {
+        if tokenTrace != nil {
+            traceVisibleText.append(text)
+        }
         guard stopStringMatcher.isEnabled else {
+            if !text.isEmpty { tokenTrace?.recordTextEmitted() }
             return emit(.chunk(text))
         }
         switch stopStringMatcher.feed(text) {
         case .streaming(let out):
             if out.isEmpty { return .enqueued(remaining: 0) }
+            tokenTrace?.recordTextEmitted()
             return emit(.chunk(out))
         case .stopped(let out):
             stopSequenceHit = true
+            if tokenTrace != nil,
+                let match = tokenIDTraceFirstStopMatch(
+                    in: traceVisibleText,
+                    stops: stopStringMatcher.stopStrings)
+            {
+                stopStringMatch = match
+            }
+            if !out.isEmpty { tokenTrace?.recordTextEmitted() }
             if out.isEmpty { return .terminated }
             _ = emit(.chunk(out))
             return .terminated

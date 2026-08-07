@@ -273,6 +273,14 @@ public actor BatchEngine {
     /// Requests waiting to be admitted into active slots.
     private var waitQueue: [BatchPendingRequest] = []
 
+    /// Opt-in token lineage sessions keyed by the request ID.  The slot type
+    /// is owned by BatchScheduler.swift and is outside this writer lane, so
+    /// diagnostic state stays at the engine boundary instead of being copied
+    /// into the slot.
+    private var tokenTraceSessions: [BatchRequestID: TokenIDTraceSession] = [:]
+    private var tokenTraceStopOverrides: [BatchRequestID: TokenIDTraceStopRule] = [:]
+    private var deferredTokenTraceRequestIDs: Set<BatchRequestID> = []
+
     /// Active generation slots (max `maxBatchSize`).
     private var activeSlots: [BatchSlot] = []
 
@@ -455,6 +463,22 @@ public actor BatchEngine {
             return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
         }
 
+        let tokenTraceSession: TokenIDTraceSession?
+        if let trace = parameters.tokenIDTrace {
+            do {
+                tokenTraceSession = try trace.begin(
+                    pathKind: .batch,
+                    promptTokenIds: input.text.tokens.reshaped(-1).asArray(Int.self),
+                    parameters: parameters)
+            } catch {
+                trace.session.recordRuntimeError(
+                    "batch diagnostic start rejected: \(error.localizedDescription)")
+                return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
+            }
+        } else {
+            tokenTraceSession = nil
+        }
+
         let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
         let promptTail = _decodePromptTail(
             input: input, tokenizer: context.tokenizer, tokens: 64)
@@ -472,6 +496,9 @@ public actor BatchEngine {
             parameters: parameters,
             continuation: continuation
         )
+        if let tokenTraceSession {
+            tokenTraceSessions[request.id] = tokenTraceSession
+        }
         waitQueue.append(request)
         if soloFastPathTask == nil {
             ensureLoopRunning()
@@ -510,6 +537,17 @@ public actor BatchEngine {
     ) -> AsyncStream<Generation> {
         guard !isShutdown else {
             return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+        }
+
+        if let trace = parameters.tokenIDTrace {
+            do {
+                try trace.validateStart(parameters: parameters)
+            } catch {
+                Self.logger.error(
+                    "Rejected token trace start: \(error.localizedDescription, privacy: .public)"
+                )
+                return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+            }
         }
 
         do {
@@ -610,6 +648,16 @@ public actor BatchEngine {
 
         let promptTokenCount = input.text.tokens.size
         let (requestId, tokenStream) = submit(input: input, parameters: parameters)
+        let tokenTraceSession = tokenTraceSessions[requestId]
+        // `submit` enqueues and starts the scheduler synchronously. This actor
+        // method has not suspended, so mark the request before the scheduler
+        // can execute its first slot step. Raw submit callers never enter this
+        // set, and external adapter traces remain source-finished at the slot.
+        if tokenTraceSession != nil,
+            parameters.tokenIDTrace?.externalAdapterParticipation == false
+        {
+            deferredTokenTraceRequestIDs.insert(requestId)
+        }
 
         // Mirror the canonical `Evaluate.generateLoopTask` pattern: pair
         // `AsyncStream.makeStream()` with an unstructured `Task {}` that
@@ -684,17 +732,37 @@ public actor BatchEngine {
                 promptTail: promptTail)
             var stopMatcher = StopStringMatcher(stopStrings: extraStopStrings)
             var stopMatched = false
+            var traceVisibleText = ""
 
             func emitChunkThroughStop(_ text: String) {
+                if tokenTraceSession != nil {
+                    traceVisibleText.append(text)
+                }
                 guard stopMatcher.isEnabled else {
+                    if !text.isEmpty { tokenTraceSession?.recordTextEmitted() }
                     continuation.yield(.chunk(text))
                     return
                 }
                 switch stopMatcher.feed(text) {
                 case .streaming(let out):
-                    if !out.isEmpty { continuation.yield(.chunk(out)) }
+                    if !out.isEmpty {
+                        tokenTraceSession?.recordTextEmitted()
+                        continuation.yield(.chunk(out))
+                    }
                 case .stopped(let out):
-                    if !out.isEmpty { continuation.yield(.chunk(out)) }
+                    if let tokenTraceSession,
+                        let match = tokenIDTraceFirstStopMatch(
+                            in: traceVisibleText,
+                            stops: stopMatcher.stopStrings)
+                    {
+                        tokenTraceSession.recordStopString(
+                            stop: match.stop,
+                            rangeUTF8: match.rangeUTF8)
+                    }
+                    if !out.isEmpty {
+                        tokenTraceSession?.recordTextEmitted()
+                        continuation.yield(.chunk(out))
+                    }
                     stopMatched = true
                 }
             }
@@ -719,7 +787,10 @@ public actor BatchEngine {
                     // truncation the solo path already fixed.
                     if stopMatcher.isEnabled && !stopMatched {
                         let tail = stopMatcher.flush()
-                        if !tail.isEmpty { continuation.yield(.chunk(tail)) }
+                        if !tail.isEmpty {
+                            tokenTraceSession?.recordTextEmitted()
+                            continuation.yield(.chunk(tail))
+                        }
                     }
                     continuation.yield(event)
                 case .toolCallProgress:
@@ -834,7 +905,10 @@ public actor BatchEngine {
                 // its tail (pre-match prefix) at stop time.
                 if stopMatcher.isEnabled && !stopMatched {
                     let tail = stopMatcher.flush()
-                    if !tail.isEmpty { continuation.yield(.chunk(tail)) }
+                    if !tail.isEmpty {
+                        tokenTraceSession?.recordTextEmitted()
+                        continuation.yield(.chunk(tail))
+                    }
                 }
 
             }
@@ -860,6 +934,7 @@ public actor BatchEngine {
                         // its own `.info`; we transform that info's
                         // stopReason from `.cancelled` to `.stop`
                         // below when it arrives.
+                        await engineRef.markTokenTraceStopString(requestId)
                         await engineRef.cancel(requestId)
                     }
                 case .info(let info):
@@ -897,6 +972,17 @@ public actor BatchEngine {
                         turboQuantCacheTransition: info.turboQuantCacheTransition,
                         unclosedReasoning: unclosed,
                         toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure)
+                    let traceStopRule: TokenIDTraceStopRule = {
+                        if stopMatched { return .stopString }
+                        switch info.stopReason {
+                        case .stop: return .eos
+                        case .length: return .length
+                        case .cancelled: return .cancellation
+                        }
+                    }()
+                    await engineRef.finishDeferredTokenTrace(
+                        requestId,
+                        fallbackStopRule: traceStopRule)
                     terminationState.markCompleted()
                     continuation.yield(.info(finalInfo))
                     // Publish the terminal event before hopping back to the
@@ -927,6 +1013,9 @@ public actor BatchEngine {
                     stopReason: .cancelled,
                     unclosedReasoning: unclosed,
                     toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure)
+                await engineRef.finishDeferredTokenTrace(
+                    requestId,
+                    fallbackStopRule: .cancellation)
                 continuation.yield(.info(finalInfo))
             }
             terminationState.markCompleted()
@@ -1003,6 +1092,28 @@ public actor BatchEngine {
         promptTail: String?
     ) -> AsyncStream<Generation> {
         let promptTokenCount = input.text.tokens.size
+        let tokenTraceSession: TokenIDTraceSession?
+        if let trace = parameters.tokenIDTrace {
+            if context.model is any BlockDiffusionModel {
+                Self.logger.error(
+                    "Rejected token trace for unsupported block-diffusion solo path"
+                )
+                return cancelledGenerationStream(promptTokenCount: promptTokenCount)
+            }
+            do {
+                tokenTraceSession = try trace.begin(
+                    pathKind: .direct,
+                    promptTokenIds: input.text.tokens.reshaped(-1).asArray(Int.self),
+                    parameters: parameters)
+            } catch {
+                Self.logger.error(
+                    "Rejected token trace start: \(error.localizedDescription, privacy: .public)"
+                )
+                return cancelledGenerationStream(promptTokenCount: promptTokenCount)
+            }
+        } else {
+            tokenTraceSession = nil
+        }
         let hasMediaContent = input.hasMediaContent
         let toolSchemas = input.toolSchemas
         let requiresFreshToolSelection =
@@ -1087,7 +1198,8 @@ public actor BatchEngine {
                     makeIterator: makeIterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
-                    toolSchemas: toolSchemas)
+                    toolSchemas: toolSchemas,
+                    tokenIDTraceSession: tokenTraceSession)
             } else if let strategy = soloParameters.draftStrategy,
                 case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
                 soloParameters.canUseNativeMTP(for: input)
@@ -1149,7 +1261,8 @@ public actor BatchEngine {
                     makeIterator: makeIterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
-                    toolSchemas: toolSchemas)
+                    toolSchemas: toolSchemas,
+                    tokenIDTraceSession: tokenTraceSession)
             }
         } catch {
             Self.logger.error(
@@ -1234,6 +1347,29 @@ public actor BatchEngine {
         }
     }
 
+    /// Preserve the text-matcher terminal rule before cancellation closes the
+    /// batch slot.  The matcher runs outside the actor; the override keeps its
+    /// observed stop-string boundary distinct from an external cancellation.
+    private func markTokenTraceStopString(_ id: BatchRequestID) {
+        guard tokenTraceSessions[id] != nil else { return }
+        tokenTraceStopOverrides[id] = .stopString
+    }
+
+    private func finishDeferredTokenTrace(
+        _ id: BatchRequestID,
+        fallbackStopRule: TokenIDTraceStopRule
+    ) {
+        guard deferredTokenTraceRequestIDs.remove(id) != nil else { return }
+        let stopRule = tokenTraceStopOverrides.removeValue(forKey: id) ?? fallbackStopRule
+        guard let trace = tokenTraceSessions.removeValue(forKey: id) else { return }
+        do {
+            try trace.finish(stopRule: stopRule)
+        } catch {
+            Self.logger.error(
+                "token trace rejected terminal lineage: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     /// Cancel a specific request by ID.
     ///
     /// If the request is still in the wait queue, it is removed immediately.
@@ -1245,6 +1381,12 @@ public actor BatchEngine {
         // Check wait queue first
         if let idx = waitQueue.firstIndex(where: { $0.id == id }) {
             let request = waitQueue.remove(at: idx)
+            deferredTokenTraceRequestIDs.remove(id)
+            tokenTraceStopOverrides.removeValue(forKey: id)
+            if let trace = tokenTraceSessions.removeValue(forKey: id) {
+                trace.recordRuntimeError("request cancelled before batch admission")
+                try? trace.finish(stopRule: .cancellation)
+            }
             request.continuation.yield(.info(GenerateCompletionInfo(
                 promptTokenCount: request.input.text.tokens.size,
                 generationTokenCount: 0,
@@ -1295,6 +1437,12 @@ public actor BatchEngine {
 
         // Finish all pending requests
         for request in waitQueue {
+            deferredTokenTraceRequestIDs.remove(request.id)
+            tokenTraceStopOverrides.removeValue(forKey: request.id)
+            if let trace = tokenTraceSessions.removeValue(forKey: request.id) {
+                trace.recordRuntimeError("engine shutdown before batch admission")
+                try? trace.finish(stopRule: .cancellation)
+            }
             request.continuation.yield(.info(GenerateCompletionInfo(
                 promptTokenCount: request.input.text.tokens.size,
                 generationTokenCount: 0,
@@ -2172,6 +2320,9 @@ public actor BatchEngine {
             }
         } catch {
             // Prefill failed (e.g., invalid input) — finish with cancellation
+            tokenTraceSessions[slot.id]?.recordRuntimeError(
+                "batch prefill failed: " + error.localizedDescription)
+            tokenTraceStopOverrides[slot.id] = .error
             finishSlot(&slot, reason: .cancelled)
             slot.isFinished = true
             activeSlots[slotIndex] = slot
@@ -2205,6 +2356,7 @@ public actor BatchEngine {
                !effectivePromptTokens.isEmpty
             {
                 slot.cachePromptTokenIds = effectivePromptTokens
+                tokenTraceSessions[slot.id]?.replacePrompt(effectivePromptTokens)
                 slot.cachePromptUsesPostPrepareKey = true
                 if slot.originalInput.requiresPostPrepareCacheKey {
                     cacheCoordinator?.recordPostPrepareCacheKeyAlias(
@@ -2233,6 +2385,7 @@ public actor BatchEngine {
             from: slot.cache)
 
         let tokenID = firstToken.item(Int.self)
+        tokenTraceSessions[slot.id]?.recordSampled(tokenID)
 
         slot.phase = .decode
         slot.decodeStartTime = Date()
@@ -2243,6 +2396,7 @@ public actor BatchEngine {
             finishSlot(&slot, reason: .stop)
             slot.isFinished = true
         } else {
+            tokenTraceSessions[slot.id]?.recordBatchYielded(tokenID)
             slot.continuation.yield(.token(tokenID))
             slot.generatedTokenCount += 1
             slot.generatedTokenIds.append(tokenID)
@@ -2329,6 +2483,13 @@ public actor BatchEngine {
             Self.logger.error(
                 "Slot \(slot.id.description, privacy: .public): stepCompiledDecode called without nextToken"
             )
+            if let trace = tokenTraceSessions[slot.id] {
+                trace.recordRuntimeError("compiled decode entered without nextToken")
+                tokenTraceStopOverrides[slot.id] = .error
+                finishSlot(&slot, reason: .cancelled)
+                slot.isFinished = true
+                activeSlots[slotIndex] = slot
+            }
             return
         }
 
@@ -2340,6 +2501,14 @@ public actor BatchEngine {
             Self.logger.error(
                 "Slot \(slot.id.description, privacy: .public): compiled forward returned \(result.count) outputs, expected 1"
             )
+            if let trace = tokenTraceSessions[slot.id] {
+                trace.recordRuntimeError(
+                    "compiled forward returned \(result.count) outputs")
+                tokenTraceStopOverrides[slot.id] = .error
+                finishSlot(&slot, reason: .cancelled)
+                slot.isFinished = true
+                activeSlots[slotIndex] = slot
+            }
             return
         }
 
@@ -2351,6 +2520,7 @@ public actor BatchEngine {
         let logits = result[0][0 ..< 1, 0, 0...]
         let token = slot.sampleToken(from: logits)
         let tokenID = token.item(Int.self)
+        tokenTraceSessions[slot.id]?.recordSampled(tokenID)
 
         // Stage 0: per-step KV-quant hook. For compile+TQ this is a no-op
         // because compile requires `.simple` family (TQ compression would
@@ -2364,6 +2534,7 @@ public actor BatchEngine {
             finishSlot(&slot, reason: .stop)
             slot.isFinished = true
         } else {
+            tokenTraceSessions[slot.id]?.recordBatchYielded(tokenID)
             slot.continuation.yield(.token(tokenID))
             slot.generatedTokenCount += 1
             slot.generatedTokenIds.append(tokenID)
@@ -2734,6 +2905,7 @@ public actor BatchEngine {
             // of both the logits and the sampled tokens) — this wait
             // is much shorter than a synchronous eval + sample chain.
             let tokenID = token.item(Int.self)
+            tokenTraceSessions[slot.id]?.recordSampled(tokenID)
 
             // Stage 0: per-step KV-quant compression hook. For slots with
             // short prompts that were below the TQ minimum threshold at
@@ -2749,6 +2921,7 @@ public actor BatchEngine {
                 finishSlot(&slot, reason: .stop)
                 slot.isFinished = true
             } else {
+                tokenTraceSessions[slot.id]?.recordBatchYielded(tokenID)
                 slot.continuation.yield(.token(tokenID))
                 slot.generatedTokenCount += 1
                 slot.generatedTokenIds.append(tokenID)
@@ -2837,7 +3010,26 @@ public actor BatchEngine {
     /// future cache reuse.
     private func finishSlot(_ liveSlot: inout BatchSlot, reason: GenerateStopReason) {
         let slot = liveSlot
+        let tokenTraceSession = tokenTraceSessions[liveSlot.id]
+        let deferTokenTraceFinish = deferredTokenTraceRequestIDs.contains(liveSlot.id)
+        let tokenTraceStopRule: TokenIDTraceStopRule = {
+            if let override = tokenTraceStopOverrides[liveSlot.id] {
+                return override
+            }
+            switch reason {
+            case .stop: return .eos
+            case .length: return .length
+            case .cancelled: return .cancellation
+            }
+        }()
+        if deferTokenTraceFinish, tokenTraceStopOverrides[liveSlot.id] == nil {
+            tokenTraceStopOverrides[liveSlot.id] = tokenTraceStopRule
+        }
         defer {
+            if !deferTokenTraceFinish {
+                tokenTraceSessions.removeValue(forKey: liveSlot.id)
+                tokenTraceStopOverrides.removeValue(forKey: liveSlot.id)
+            }
             // Cache stores are synchronous. Drop the sole retained prompt/seed
             // snapshot as soon as they finish instead of holding it until the
             // scheduler's next completed-slot cleanup pass.
@@ -2847,6 +3039,16 @@ public actor BatchEngine {
         let now = Date()
         let prefillTime = (slot.decodeStartTime ?? now).timeIntervalSince(slot.prefillStartTime)
         let decodeTime = slot.decodeStartTime.map { now.timeIntervalSince($0) } ?? 0
+
+        if let tokenTraceSession, !deferTokenTraceFinish {
+            do {
+                try tokenTraceSession.finish(stopRule: tokenTraceStopRule)
+            } catch {
+                Self.logger.error(
+                    "token trace rejected terminal lineage: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+
         let completionInfo = GenerateCompletionInfo(
             promptTokenCount: slot.promptTokenCount,
             generationTokenCount: slot.generatedTokenCount,

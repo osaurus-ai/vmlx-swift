@@ -77,6 +77,502 @@ private let _compiledDeepseekV4ScoredSwiGLUClamped =
 private let _compiledDeepseekV4ScoredSwiGLUUnclamped =
     compile(shapeless: true, _deepseekV4ScoredSwiGLUUnclampedArrayBody)
 
+internal struct DeepseekV4FP32LMHeadCacheMetadata: Equatable, Sendable {
+    let supported: Bool
+    let mode: QuantizationMode
+    let bits: Int
+    let groupSize: Int
+    let weightShape: [Int]
+    let weightDType: DType
+    let logicalWeightShape: [Int]?
+    let expectedLogicalWeightShape: [Int]
+    let scalesShape: [Int]
+    let scalesDType: DType
+    let quantizationBiasesShape: [Int]?
+    let quantizationBiasesDType: DType?
+    let outputBiasShape: [Int]?
+    let outputBiasDType: DType?
+    let logicalBytes: Int
+}
+
+internal struct DeepseekV4RawFP32Comparison: Equatable, Sendable {
+    let wordCount: Int
+    let firstMismatchWordIndex: Int?
+    let baselineWord: UInt32?
+    let cachedWord: UInt32?
+    let structuralMismatch: String?
+
+    var isEqual: Bool {
+        firstMismatchWordIndex == nil && structuralMismatch == nil
+    }
+}
+
+private func deepseekV4RawFP32Word(_ data: Data, byteOffset: Int) -> UInt32 {
+    data.withUnsafeBytes { rawBuffer in
+        let bytes = rawBuffer.bindMemory(to: UInt8.self)
+        return UInt32(bytes[byteOffset])
+            | UInt32(bytes[byteOffset + 1]) << 8
+            | UInt32(bytes[byteOffset + 2]) << 16
+            | UInt32(bytes[byteOffset + 3]) << 24
+    }
+}
+
+internal func deepseekV4CompareRawFP32(
+    baseline: MLXArray,
+    cached: MLXArray
+) -> DeepseekV4RawFP32Comparison {
+    MLX.eval(baseline, cached)
+
+    guard baseline.dtype == .float32, cached.dtype == .float32 else {
+        return DeepseekV4RawFP32Comparison(
+            wordCount: 0,
+            firstMismatchWordIndex: nil,
+            baselineWord: nil,
+            cachedWord: nil,
+            structuralMismatch:
+                "dtype baseline=\(baseline.dtype) cached=\(cached.dtype)")
+    }
+    guard baseline.shape == cached.shape else {
+        return DeepseekV4RawFP32Comparison(
+            wordCount: 0,
+            firstMismatchWordIndex: nil,
+            baselineWord: nil,
+            cachedWord: nil,
+            structuralMismatch:
+                "shape baseline=\(baseline.shape) cached=\(cached.shape)")
+    }
+
+    let baselineBytes = baseline.asData(access: .copy)
+    let cachedBytes = cached.asData(access: .copy)
+    guard baselineBytes.dType == .float32, cachedBytes.dType == .float32,
+        baselineBytes.data.count == cachedBytes.data.count,
+        baselineBytes.data.count.isMultiple(of: MemoryLayout<UInt32>.size)
+    else {
+        return DeepseekV4RawFP32Comparison(
+            wordCount: 0,
+            firstMismatchWordIndex: nil,
+            baselineWord: nil,
+            cachedWord: nil,
+            structuralMismatch:
+                "rawBytes baseline=\(baselineBytes.data.count) cached=\(cachedBytes.data.count)")
+    }
+
+    let wordCount = baselineBytes.data.count / MemoryLayout<UInt32>.size
+    guard baselineBytes.data != cachedBytes.data else {
+        return DeepseekV4RawFP32Comparison(
+            wordCount: wordCount,
+            firstMismatchWordIndex: nil,
+            baselineWord: nil,
+            cachedWord: nil,
+            structuralMismatch: nil)
+    }
+
+    for wordIndex in 0 ..< wordCount {
+        let byteOffset = wordIndex * MemoryLayout<UInt32>.size
+        let baselineWord = deepseekV4RawFP32Word(
+            baselineBytes.data, byteOffset: byteOffset)
+        let cachedWord = deepseekV4RawFP32Word(
+            cachedBytes.data, byteOffset: byteOffset)
+        if baselineWord != cachedWord {
+            return DeepseekV4RawFP32Comparison(
+                wordCount: wordCount,
+                firstMismatchWordIndex: wordIndex,
+                baselineWord: baselineWord,
+                cachedWord: cachedWord,
+                structuralMismatch: nil)
+        }
+    }
+
+    return DeepseekV4RawFP32Comparison(
+        wordCount: wordCount,
+        firstMismatchWordIndex: nil,
+        baselineWord: nil,
+        cachedWord: nil,
+        structuralMismatch: "raw data differed without a word mismatch")
+}
+
+internal enum DeepseekV4FP32LMHeadCacheEvent: Equatable, Sendable {
+    case invalidate(identity: UInt64?)
+    case release(identity: UInt64?, logicalBytes: Int)
+    case identityChanged(previous: UInt64?, current: UInt64)
+    case logicalBytes(Int)
+}
+
+private final class DeepseekV4FP32LMHeadCacheHolder {
+    let weight: MLXArray
+    let identity: UInt64
+    let logicalBytes: Int
+
+    init(weight: MLXArray, identity: UInt64, logicalBytes: Int) {
+        self.weight = weight
+        self.identity = identity
+        self.logicalBytes = logicalBytes
+    }
+}
+
+private enum DeepseekV4FP32LMHeadCacheError: Error {
+    case preparationAlreadyAttempted
+}
+
+/// Owns one model-local, evaluated derived head weight.
+///
+/// The state is deliberately a reference type that is not an MLX ``Module``.
+/// It keeps the derived ``MLXArray`` behind a non-parameter holder. The model
+/// wrappers invalidate before parameter or child-module updates, then remain
+/// on the baseline path. Teardown release is the only path that permits a new
+/// post-load preparation and cache identity.
+final class DeepseekV4FP32LMHeadCacheState {
+    private let preparationLock = NSLock()
+    private let shadowLock = NSLock()
+    private var holder: DeepseekV4FP32LMHeadCacheHolder?
+    private var preparationAttempted = false
+    private var lastCacheIdentityStorage: UInt64?
+    private var shadowComparisonEnabled = false
+    private var preparedStorage = false
+    private var constructionCountStorage = 0
+    private var metadataStorage: DeepseekV4FP32LMHeadCacheMetadata?
+    private var eventsStorage: [DeepseekV4FP32LMHeadCacheEvent] = []
+    private var shadowComparisonCountStorage = 0
+    private var shadowComparedWordCountStorage = 0
+    private var shadowMismatchCountStorage = 0
+    private var firstShadowMismatch: DeepseekV4RawFP32Comparison?
+
+    var prepared: Bool {
+        preparationLock.lock()
+        defer { preparationLock.unlock() }
+        return preparedStorage
+    }
+
+    var constructionCount: Int {
+        preparationLock.lock()
+        defer { preparationLock.unlock() }
+        return constructionCountStorage
+    }
+
+    var metadata: DeepseekV4FP32LMHeadCacheMetadata? {
+        preparationLock.lock()
+        defer { preparationLock.unlock() }
+        return metadataStorage
+    }
+
+    var cachedWeight: MLXArray? {
+        preparationLock.lock()
+        defer { preparationLock.unlock() }
+        return holder?.weight
+    }
+
+    var cacheIdentity: UInt64? {
+        preparationLock.lock()
+        defer { preparationLock.unlock() }
+        return holder?.identity
+    }
+
+    var logicalBytes: Int {
+        preparationLock.lock()
+        defer { preparationLock.unlock() }
+        return holder?.logicalBytes ?? 0
+    }
+
+    var events: [DeepseekV4FP32LMHeadCacheEvent] {
+        preparationLock.lock()
+        defer { preparationLock.unlock() }
+        return eventsStorage
+    }
+
+    /// The byte count of an evaluated FP32 matrix with the supplied logical
+    /// output-head dimensions. This is logical tensor storage, not a claim
+    /// about allocator pages returned to the operating system.
+    static func fp32LogicalBytes(outputDimensions: Int, inputDimensions: Int) -> Int {
+        guard outputDimensions > 0, inputDimensions > 0 else { return 0 }
+        let (elements, elementOverflow) = outputDimensions
+            .multipliedReportingOverflow(by: inputDimensions)
+        guard !elementOverflow else { return 0 }
+        let (bytes, byteOverflow) = elements
+            .multipliedReportingOverflow(by: MemoryLayout<Float>.size)
+        return byteOverflow ? 0 : bytes
+    }
+
+    var shadowComparisonCount: Int {
+        shadowLock.lock()
+        defer { shadowLock.unlock() }
+        return shadowComparisonCountStorage
+    }
+
+    var shadowComparedWordCount: Int {
+        shadowLock.lock()
+        defer { shadowLock.unlock() }
+        return shadowComparedWordCountStorage
+    }
+
+    var shadowMismatchCount: Int {
+        shadowLock.lock()
+        defer { shadowLock.unlock() }
+        return shadowMismatchCountStorage
+    }
+
+    /// Decide once, after final load evaluation, whether to build the cache.
+    /// Unsupported heads remain on the existing helper path.
+    func prepare(
+        lmHead: Linear,
+        expectedInputDimensions: Int,
+        expectedOutputDimensions: Int
+    ) throws {
+        preparationLock.lock()
+        defer { preparationLock.unlock() }
+
+        guard !preparationAttempted else {
+            throw DeepseekV4FP32LMHeadCacheError.preparationAlreadyAttempted
+        }
+        preparationAttempted = true
+
+        guard let q = lmHead as? QuantizedLinear else {
+            return
+        }
+
+        let finalMetadata = Self.metadata(
+            for: q,
+            expectedInputDimensions: expectedInputDimensions,
+            expectedOutputDimensions: expectedOutputDimensions)
+        metadataStorage = finalMetadata
+
+        let environment = ProcessInfo.processInfo.environment
+        let cacheRequested = environment["VMLX_DSV4_CACHE_FP32_LM_HEAD"] == "1"
+        let shadowRequested = environment["VMLX_DSV4_CACHE_FP32_LM_HEAD_SHADOW"] == "1"
+        if cacheRequested || shadowRequested {
+            FileHandle.standardError.write(Data(
+                "[DSV4HeadCache] requested=\(cacheRequested) shadowRequested=\(shadowRequested) supported=\(finalMetadata.supported) mode=\(finalMetadata.mode) bits=\(finalMetadata.bits) groupSize=\(finalMetadata.groupSize) logicalShape=\(String(describing: finalMetadata.logicalWeightShape)) expectedShape=\(finalMetadata.expectedLogicalWeightShape) scalesDType=\(finalMetadata.scalesDType) biasesDType=\(String(describing: finalMetadata.quantizationBiasesDType))\n"
+                    .utf8))
+        }
+
+        guard cacheRequested, finalMetadata.supported
+        else {
+            return
+        }
+
+        // The existing lmHeadFp32 quantized path relies on dequantized's
+        // default affine mode. The guard above makes that mode explicit for
+        // this cache while preserving the same expression and loaded arrays.
+        let weight = MLX.dequantized(
+            q.weight,
+            scales: q.scales,
+            biases: q.biases,
+            groupSize: q.groupSize,
+            bits: q.bits
+        ).asType(.float32)
+        MLX.eval(weight)
+
+        let identity = UInt64(constructionCountStorage + 1)
+        let logicalBytes = finalMetadata.logicalBytes
+        let previousIdentity = lastCacheIdentityStorage
+        holder = DeepseekV4FP32LMHeadCacheHolder(
+            weight: weight, identity: identity, logicalBytes: logicalBytes)
+        lastCacheIdentityStorage = identity
+        constructionCountStorage += 1
+        preparedStorage = true
+        shadowComparisonEnabled = shadowRequested
+        if let previousIdentity, previousIdentity != identity {
+            eventsStorage.append(.identityChanged(
+                previous: previousIdentity, current: identity))
+        }
+        eventsStorage.append(.logicalBytes(logicalBytes))
+    }
+
+    func logits(_ hidden: MLXArray, lmHead: Linear) -> MLXArray {
+        preparationLock.lock()
+        let cachedWeight = holder?.weight
+        let useShadowComparison = shadowComparisonEnabled
+        preparationLock.unlock()
+
+        guard let cachedWeight else {
+            return DeepseekV4Math.lmHeadFp32(hidden, lmHead: lmHead)
+        }
+
+        let cached = DeepseekV4Math.lmHeadFp32WithCachedWeight(
+            hidden, lmHead: lmHead, weight: cachedWeight)
+        guard useShadowComparison else {
+            return cached
+        }
+
+        let baseline = DeepseekV4Math.lmHeadFp32(hidden, lmHead: lmHead)
+        let comparison = deepseekV4CompareRawFP32(
+            baseline: baseline, cached: cached)
+        recordShadowComparison(comparison)
+        return baseline
+    }
+
+    /// Drop the derived weight before any model parameter or child-module update.
+    /// Preparation remains one-shot: the mutated model uses the established
+    /// helper path instead of rebuilding a cache from a partly updated model.
+    func invalidate() {
+        preparationLock.lock()
+        let oldHolder = holder
+        holder = nil
+        preparedStorage = false
+        shadowComparisonEnabled = false
+        if oldHolder != nil {
+            eventsStorage.append(.invalidate(identity: oldHolder?.identity))
+            eventsStorage.append(.logicalBytes(0))
+        }
+        preparationLock.unlock()
+
+        if oldHolder != nil {
+            FileHandle.standardError.write(Data(
+                "[DSV4HeadCache] invalidated after model mutation; using baseline path\n".utf8))
+        }
+    }
+
+    /// Release the evaluated FP32 head for model teardown. Unlike mutation
+    /// invalidation, teardown permits a later post-load preparation to create
+    /// a fresh cache identity. A repeated release is an event-stable no-op.
+    func releaseDerivedBuffersForTeardown() {
+        preparationLock.lock()
+        let oldHolder = holder
+        holder = nil
+        preparedStorage = false
+        shadowComparisonEnabled = false
+        preparationAttempted = false
+        if let oldHolder {
+            eventsStorage.append(.release(
+                identity: oldHolder.identity, logicalBytes: oldHolder.logicalBytes))
+            eventsStorage.append(.logicalBytes(0))
+        }
+        preparationLock.unlock()
+
+        if oldHolder != nil {
+            FileHandle.standardError.write(Data(
+                "[DSV4HeadCache] released derived FP32 output head for teardown\n".utf8))
+        }
+    }
+
+    private func recordShadowComparison(_ comparison: DeepseekV4RawFP32Comparison) {
+        var comparisonMessage: String
+
+        shadowLock.lock()
+        shadowComparisonCountStorage += 1
+        shadowComparedWordCountStorage += comparison.wordCount
+        let step = shadowComparisonCountStorage
+        if !comparison.isEqual {
+            shadowMismatchCountStorage += 1
+            if firstShadowMismatch == nil {
+                firstShadowMismatch = comparison
+                let baselineWord = comparison.baselineWord.map {
+                    String(format: "0x%08x", $0)
+                } ?? "nil"
+                let cachedWord = comparison.cachedWord.map {
+                    String(format: "0x%08x", $0)
+                } ?? "nil"
+                comparisonMessage =
+                    "[DSV4HeadCacheShadow] firstMismatch step=\(shadowComparisonCountStorage) word=\(String(describing: comparison.firstMismatchWordIndex)) baseline=\(baselineWord) cached=\(cachedWord) structural=\(String(describing: comparison.structuralMismatch))\n"
+            } else {
+                comparisonMessage =
+                    "[DSV4HeadCacheShadow] step=\(step) words=\(comparison.wordCount) equal=false\n"
+            }
+        } else {
+            comparisonMessage =
+                "[DSV4HeadCacheShadow] step=\(step) words=\(comparison.wordCount) equal=true\n"
+        }
+        shadowLock.unlock()
+
+        FileHandle.standardError.write(Data(comparisonMessage.utf8))
+    }
+
+    private static func metadata(
+        for q: QuantizedLinear,
+        expectedInputDimensions: Int,
+        expectedOutputDimensions: Int
+    )
+        -> DeepseekV4FP32LMHeadCacheMetadata
+    {
+        let weightShape = q.weight.shape
+        let scalesShape = q.scales.shape
+        let quantizationBiasesShape = q.biases?.shape
+        let outputBiasShape = q.bias?.shape
+
+        let logicalInputDimensions: Int? = {
+            guard q.bits > 0, weightShape.count == 2, weightShape[1] > 0 else {
+                return nil
+            }
+            let (packedBits, overflow) = weightShape[1].multipliedReportingOverflow(by: 32)
+            guard !overflow, packedBits % q.bits == 0 else {
+                return nil
+            }
+            return packedBits / q.bits
+        }()
+        let logicalWeightShape: [Int]? = {
+            guard let logicalInputDimensions, weightShape.count == 2 else {
+                return nil
+            }
+            return [weightShape[0], logicalInputDimensions]
+        }()
+
+        let expectedGroupCount: Int? = {
+            guard let logicalInputDimensions, q.groupSize > 0,
+                logicalInputDimensions % q.groupSize == 0
+            else {
+                return nil
+            }
+            return logicalInputDimensions / q.groupSize
+        }()
+
+        let supportedSourceDType: (DType) -> Bool = { dtype in
+            dtype == .float16 || dtype == .bfloat16 || dtype == .float32
+        }
+        let outputDimensions = weightShape.count == 2 ? weightShape[0] : -1
+        let expectedLogicalWeightShape = [expectedOutputDimensions, expectedInputDimensions]
+        let weightShapeOK = weightShape.count == 2
+            && outputDimensions > 0
+            && weightShape[1] > 0
+            && expectedInputDimensions > 0
+            && expectedOutputDimensions > 0
+            && logicalWeightShape == expectedLogicalWeightShape
+        let scalesShapeOK: Bool = {
+            guard weightShapeOK, let expectedGroupCount else { return false }
+            return scalesShape == [outputDimensions, expectedGroupCount]
+        }()
+        let quantizationBiasesShapeOK: Bool = {
+            guard let quantizationBiasesShape else { return true }
+            return scalesShapeOK && quantizationBiasesShape == scalesShape
+        }()
+        let outputBiasShapeOK: Bool = {
+            guard let outputBiasShape else { return true }
+            return weightShapeOK && outputBiasShape == [outputDimensions]
+        }()
+
+        let supported = q.mode == .affine
+            && q.bits == 8
+            && q.groupSize == 32
+            && q.weight.dtype == .uint32
+            && supportedSourceDType(q.scales.dtype)
+            && q.biases != nil
+            && q.biases?.dtype == q.scales.dtype
+            && (q.biases.map { supportedSourceDType($0.dtype) } ?? false)
+            && (q.bias.map { supportedSourceDType($0.dtype) } ?? true)
+            && weightShapeOK
+            && scalesShapeOK
+            && quantizationBiasesShapeOK
+            && outputBiasShapeOK
+
+        return DeepseekV4FP32LMHeadCacheMetadata(
+            supported: supported,
+            mode: q.mode,
+            bits: q.bits,
+            groupSize: q.groupSize,
+            weightShape: weightShape,
+            weightDType: q.weight.dtype,
+            logicalWeightShape: logicalWeightShape,
+            expectedLogicalWeightShape: expectedLogicalWeightShape,
+            scalesShape: scalesShape,
+            scalesDType: q.scales.dtype,
+            quantizationBiasesShape: quantizationBiasesShape,
+            quantizationBiasesDType: q.biases?.dtype,
+            outputBiasShape: outputBiasShape,
+            outputBiasDType: q.bias?.dtype,
+            logicalBytes: Self.fp32LogicalBytes(
+                outputDimensions: expectedOutputDimensions,
+                inputDimensions: expectedInputDimensions))
+    }
+}
+
 public enum DeepseekV4Math {
 
     private static let e4m3KVActivationRoundTripKernel = MLXFast.metalKernel(
@@ -791,6 +1287,17 @@ public enum DeepseekV4Math {
     // empirically flips arithmetic-style next-token answers. Mirror
     // that here: dequantize quantized lm_heads to fp32, cast `h` to
     // fp32, then matmul.
+    internal static func lmHeadFp32WithCachedWeight(
+        _ h: MLXArray, lmHead: Linear, weight: MLXArray
+    ) -> MLXArray {
+        let hF32 = h.asType(.float32)
+        var out = hF32.matmul(weight.transposed())
+        if let b = lmHead.bias {
+            out = out + b.asType(.float32)
+        }
+        return out
+    }
+
     public static func lmHeadFp32(_ h: MLXArray, lmHead: Linear) -> MLXArray {
         if let q = lmHead as? QuantizedLinear {
             let wF32 = MLX.dequantized(
