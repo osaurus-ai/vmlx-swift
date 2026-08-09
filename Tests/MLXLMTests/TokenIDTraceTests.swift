@@ -1,5 +1,7 @@
 import CryptoKit
 import Foundation
+import MLX
+import MLXNN
 import Testing
 
 @testable import MLXLMCommon
@@ -60,6 +62,136 @@ private struct TokenIDTraceFixedPieceTokenizer: MLXLMCommon.Tokenizer {
         tools: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?
     ) throws -> [Int] { [] }
+}
+
+private struct TokenIDTracePositionPieceTokenizer: MLXLMCommon.Tokenizer {
+    let pieces: [String]
+
+    var vocabularySize: Int { 8 }
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [0] }
+
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.indices.map { pieces[min($0, pieces.count - 1)] }.joined()
+    }
+
+    func convertTokenToId(_ token: String) -> Int? { pieces.firstIndex(of: token) }
+    func convertIdToToken(_ id: Int) -> String? {
+        pieces.indices.contains(id) ? pieces[id] : nil
+    }
+
+    var bosToken: String? = nil
+    var eosToken: String? = nil
+    var unknownToken: String? = nil
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [0] }
+}
+
+private final class TokenIDTraceBatchModel: Module, LanguageModel,
+    KVCacheDimensionProvider, @unchecked Sendable
+{
+    let vocabularySize = 8
+    var kvHeads: [Int] { [1] }
+
+    func prepare(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize: Int?
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let batch = inputs.shape.first ?? 1
+        let length = inputs.shape.count > 1 ? inputs.shape[1] : inputs.size
+        var values = [Float](
+            repeating: -1,
+            count: batch * length * vocabularySize)
+        for row in 0 ..< batch * length {
+            values[row * vocabularySize] = 0
+        }
+        return MLXArray(values).reshaped(batch, length, vocabularySize)
+    }
+}
+
+private func tokenIDTraceBatchEngine(pieces: [String]) -> BatchEngine {
+    let model = TokenIDTraceBatchModel()
+    let tokenizer = TokenIDTracePositionPieceTokenizer(pieces: pieces)
+    var configuration = ModelConfiguration(id: "token-trace-batch-terminal-ordering")
+    configuration.eosTokenIds = []
+    let processor = TestInputProcessor(
+        tokenizer: tokenizer,
+        configuration: configuration,
+        messageGenerator: DefaultMessageGenerator())
+    let context = ModelContext(
+        configuration: configuration,
+        model: model,
+        processor: processor,
+        tokenizer: tokenizer)
+    return BatchEngine(context: context, maxBatchSize: 2)
+}
+
+private let tokenIDTraceFlushPieces = [
+    "one, ", "two, ", "three, ", "four, ", "five, ",
+]
+
+@Suite("BatchEngine token trace terminal ordering", .serialized)
+struct BatchEngineTokenTraceTerminalOrderingTests {
+    @Test("deferred trace lets a flush-only stop override length")
+    func deferredFlushOnlyStopOverridesLength() async throws {
+        let engine = tokenIDTraceBatchEngine(pieces: tokenIDTraceFlushPieces)
+        let configuration = traceConfiguration()
+        var parameters = GenerateParameters(
+            maxTokens: tokenIDTraceFlushPieces.count,
+            temperature: 0,
+            extraStopStrings: ["five"])
+        parameters.tokenIDTrace = configuration
+
+        let stream = await engine.generate(
+            input: LMInput(tokens: MLXArray([Int32(0)])),
+            parameters: parameters)
+        var completion: GenerateCompletionInfo?
+        for await event in stream {
+            if case .info(let info) = event { completion = info }
+        }
+        await engine.shutdown()
+
+        #expect(completion?.stopReason == .stop)
+        let artifacts = try configuration.artifacts()
+        let sampledSidecar = sidecarText(artifact(artifacts, kind: .sampled))
+        #expect(sampledSidecar.contains(#""stopRule":"stopString""#))
+        #expect(sampledSidecar.contains(#""stopString":"five""#))
+    }
+
+    @Test("external adapter trace remains open through a flush-only stop")
+    func externalAdapterFlushOnlyStopFinalizes() async throws {
+        let engine = tokenIDTraceBatchEngine(pieces: tokenIDTraceFlushPieces)
+        let configuration = traceConfiguration(externalAdapterParticipation: true)
+        var parameters = GenerateParameters(
+            maxTokens: tokenIDTraceFlushPieces.count,
+            temperature: 0,
+            extraStopStrings: ["five"])
+        parameters.tokenIDTrace = configuration
+
+        let stream = await engine.generate(
+            input: LMInput(tokens: MLXArray([Int32(0)])),
+            parameters: parameters)
+        for await _ in stream {}
+        await engine.shutdown()
+
+        #expect(configuration.sourceTerminalRule == .stopString)
+        for ordinal in tokenIDTraceFlushPieces.indices {
+            try configuration.adapterContract.accept(tokenID: 0, ordinal: ordinal)
+        }
+        let artifacts = try configuration.finalizeAdapter()
+        let sampledSidecar = sidecarText(artifact(artifacts, kind: .sampled))
+        #expect(sampledSidecar.contains(#""stopRule":"stopString""#))
+        #expect(sampledSidecar.contains(#""stopString":"five""#))
+    }
 }
 
 @Test("shared encoder writes deterministic little-endian UInt32 bodies")

@@ -666,10 +666,11 @@ public actor BatchEngine {
         // `submit` enqueues and starts the scheduler synchronously. This actor
         // method has not suspended, so mark the request before the scheduler
         // can execute its first slot step. Raw submit callers never enter this
-        // set, and external adapter traces remain source-finished at the slot.
-        if tokenTraceSession != nil,
-            parameters.tokenIDTrace?.externalAdapterParticipation == false
-        {
+        // set. The public generate wrapper owns final text flush and therefore
+        // owns the source terminal rule even when an external adapter will
+        // perform the later acceptance/finalization phase. Raw submit callers
+        // never enter this set and remain source-finished at the slot.
+        if tokenTraceSession != nil {
             deferredTokenTraceRequestIDs.insert(requestId)
         }
 
@@ -747,6 +748,7 @@ public actor BatchEngine {
             var stopMatcher = StopStringMatcher(stopStrings: extraStopStrings)
             var stopMatched = false
             var traceVisibleText = ""
+            var traceStopStringMatch: (stop: String, rangeUTF8: [Int])?
 
             func emitChunkThroughStop(_ text: String) {
                 if tokenTraceSession != nil {
@@ -764,14 +766,12 @@ public actor BatchEngine {
                         continuation.yield(.chunk(out))
                     }
                 case .stopped(let out):
-                    if let tokenTraceSession,
+                    if tokenTraceSession != nil,
                         let match = tokenIDTraceFirstStopMatch(
                             in: traceVisibleText,
                             stops: stopMatcher.stopStrings)
                     {
-                        tokenTraceSession.recordStopString(
-                            stop: match.stop,
-                            rangeUTF8: match.rangeUTF8)
+                        traceStopStringMatch = match
                     }
                     if !out.isEmpty {
                         tokenTraceSession?.recordTextEmitted()
@@ -953,6 +953,7 @@ public actor BatchEngine {
                     }
                 case .info(let info):
                     sawTerminalInfo = true
+                    let stopSequenceHitBeforeGenerationEnd = stopMatched
                     // Snapshot reasoning state BEFORE flush — `flush()`
                     // resets `insideReasoning` to false as part of
                     // draining the buffer. The pre-flush value is what
@@ -986,14 +987,18 @@ public actor BatchEngine {
                         turboQuantCacheTransition: info.turboQuantCacheTransition,
                         unclosedReasoning: unclosed,
                         toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure)
-                    let traceStopRule: TokenIDTraceStopRule = {
-                        if stopMatched { return .stopString }
-                        switch info.stopReason {
-                        case .stop: return .eos
-                        case .length: return .length
-                        case .cancelled: return .cancellation
-                        }
-                    }()
+                    let traceStopRule = tokenIDTraceStopRule(
+                        stopReason: info.stopReason,
+                        stopSequenceHitBeforeGenerationEnd:
+                            stopSequenceHitBeforeGenerationEnd,
+                        stopSequenceHitAfterGenerationEnd: stopMatched)
+                    if traceStopRule == .stopString,
+                        let match = traceStopStringMatch
+                    {
+                        tokenTraceSession?.recordStopString(
+                            stop: match.stop,
+                            rangeUTF8: match.rangeUTF8)
+                    }
                     await engineRef.finishDeferredTokenTrace(
                         requestId,
                         fallbackStopRule: traceStopRule)
@@ -3036,9 +3041,6 @@ public actor BatchEngine {
             case .cancelled: return .cancellation
             }
         }()
-        if deferTokenTraceFinish, tokenTraceStopOverrides[liveSlot.id] == nil {
-            tokenTraceStopOverrides[liveSlot.id] = tokenTraceStopRule
-        }
         defer {
             if !deferTokenTraceFinish {
                 tokenTraceSessions.removeValue(forKey: liveSlot.id)
