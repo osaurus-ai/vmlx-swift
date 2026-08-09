@@ -933,10 +933,23 @@ public struct SuppressTokensProcessor: LogitProcessor {
 /// capped thinking by forcing the close after a budget): a leading-window
 /// mask can only DELAY a token. It never forces, biases toward, or injects
 /// one — see `NoHiddenReasoningCloseBiasFocusedTests`.
+///
+/// Logit processors run before the sampler's `top_p`, so banning a token that
+/// holds nearly all the probability mass renormalizes a nearly flat residual
+/// and nucleus sampling then admits the whole vocabulary tail — live DSV4 runs
+/// turned into token soup from the first reasoning token. The window therefore
+/// also drops survivors that fall below ``survivorRelativeFloor`` of the best
+/// remaining token, which keeps the nucleus as narrow as it was before the ban.
 public struct InitialSuppressTokensProcessor: LogitProcessor {
+    /// Minimum probability a survivor may hold relative to the best remaining
+    /// token while the ban is active. Standard `min_p` territory.
+    static let survivorRelativeFloor: Float = 0.05
+
     private let tokens: [Int]
     private var remaining: Int
     private let negInf = MLXArray(-Float.infinity)
+    private let trace = ProcessInfo.processInfo.environment[
+        "VMLX_REASONING_FLOOR_TRACE"] == "1"
 
     public init(tokens: [Int], count: Int) {
         self.tokens = Array(Set(tokens)).sorted()
@@ -950,12 +963,30 @@ public struct InitialSuppressTokensProcessor: LogitProcessor {
         let vocabSize = logits.dim(-1)
         let valid = tokens.filter { $0 >= 0 && $0 < vocabSize }
         guard !valid.isEmpty else { return logits }
+        if trace {
+            let flat = logits.reshaped(-1)
+            let top = argMax(flat).item(Int.self)
+            let probs = softmax(flat.asType(.float32), axis: -1)
+            let bannedMass = valid.map { probs[$0].item(Float.self) }.reduce(0, +)
+            let line =
+                "[vmlx][reasoning-floor] step remaining=\(remaining) preMaskTop=\(top) "
+                + "bannedMass=\(bannedMass) topMass=\(probs[top].item(Float.self))\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
         logits[0..., MLXArray(valid.map(Int32.init)).asType(.uint32)] = negInf
-        return logits
+        let bestSurvivor = MLX.max(logits, axis: -1, keepDims: true)
+        let cutoff = bestSurvivor + Float(log(Self.survivorRelativeFloor))
+        return MLX.where(logits .< cutoff, negInf, logits)
     }
 
     mutating public func didSample(token: MLXArray) {
-        if remaining > 0 { remaining -= 1 }
+        guard remaining > 0 else { return }
+        if trace {
+            let line =
+                "[vmlx][reasoning-floor] sampled=\(token.reshaped(-1)[0].item(Int.self))\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
+        remaining -= 1
     }
 }
 
@@ -4217,14 +4248,29 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             // drain. Local chat/tool consumers may start a post-tool decode as
             // soon as `.info` closes the stream, so `.info` must not be visible
             // while this generation task can still touch MLX command encoders.
+            // The three phases below run on the request path, so the stream
+            // does not finish until they do. Timed to split "GPU drain" from
+            // "disk store" for the post-output hang: the fix differs by an
+            // order of magnitude depending on which phase owns the wall time.
+            let genTailTrace =
+                ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
+            let tailT0 = Date()
             Stream().synchronize()
+            let tailT1 = Date()
             iterator.storeCacheAfterGeneration(
                 generatedTokenIds: generatedTokenIds,
                 includeGeneratedBoundary: stopReason == .stop
                     && !handler.stopSequenceHit
                     && !handler.emittedToolCall)
-
+            let tailT2 = Date()
             Stream().synchronize()
+            if genTailTrace {
+                let tailT3 = Date()
+                print(
+                    "[vmlx][gen/tail] drain1=\(tailT1.timeIntervalSince(tailT0))s"
+                        + " store=\(tailT2.timeIntervalSince(tailT1))s"
+                        + " drain2=\(tailT3.timeIntervalSince(tailT2))s")
+            }
 
             // Router-advice readback runs on its own Dispatch queue. Drain it
             // after MLX synchronization so short-lived CLI runs and app unload

@@ -44,7 +44,7 @@ Gemma 4). Companion docs: `DSV4-PORT-STATUS.md`, `DSV4-SPEED-CAMPAIGN.md`,
   chat prompts the one canonical reusable boundary is the prompt with the
   trailing generation scaffold removed.
 
-## 3. The multi-turn prefill tax (root cause, unfixed — top backlog item)
+## 3. The multi-turn prefill tax (partial mitigation post-merge — full fix in follow-up PR)
 
 Live trace on DSV4: `HIT disk boundary=3464 remaining=1367` and
 `MISS all tiers tokens=2644`. The stored post-answer snapshot (count=4830) can
@@ -54,9 +54,49 @@ previous prompt's history. Consequence: **every multi-turn send re-prefills
 the entire previous assistant reply** (~1367 tok ≈ 3.4 s at 400 pp/s), and the
 tax grows with conversation length.
 
-Candidate fix (follow-up PR): **speculative next-turn cache warming** — after
-the response is delivered, background-prefill the re-rendered (think-stripped)
-assistant reply so the next turn's prompt hits at its true boundary.
+### Partial fix already in place (osaurus post-response warmup)
+
+`ChatSession.handleWarmupAfterRunCompleted` schedules a `warmupPrefill=true`
+generation with the freshly committed transcript. Debug log confirms it fires
+for DSV4 with wall times 49s (cold post-load) → 12s → 6s → 4s → 2s (hot
+prefix-reuse). Because the warmup renders the SAME re-rendered transcript the
+next send will render, the boundary it stores is a true prefix of turn N+1's
+prompt, so turn N+1 pays only the delta prefill (usually one short user turn).
+
+Bug found 2026-08-09 (this PR): `handleWarmupAfterRunCompleted` scanned
+**every historical turn** for tool activity and cancelled warmup if any was
+found. So one tool call at turn 5 permanently disabled post-response warmup
+for every send from turn 6 onward, leaving those chats paying the full tax.
+Fix: scope the tool-activity check to the CURRENT run (from the last user
+turn forward). Turns before the current run are frozen history — safe to
+warmup against no matter what happened earlier.
+
+### Remaining tax (follow-up PR)
+
+Two paths still pay the tax:
+1. **The current run itself had tool activity** — warmup is still cancelled
+   for that specific turn transition, but the next tool-free run's warmup
+   reheats the prefix. Real fix: prove warming a stable post-tool transcript
+   is byte-safe (tool_call rendering, tool_result rendering) and drop the
+   gate here too.
+2. **Warmup was scheduled but the user's next send raced the 500 ms
+   `scheduleDebounce`.** Rapid-fire testing masks the fix. Real users
+   pause ≥1 s between turns, so this is a harness artifact, not a product
+   bug — but the debounce should be adaptive (skip if a send is imminent).
+
+### Deeper follow-up
+
+The strip-store store (`gen-suffix-stripped` boundary — end of last real user
+turn) is currently hybrid-only in the batched path. Widening to DSV4
+HybridPool / Gemma-4 Rotating / Qwen-base TurboQuant / legacy Quantized KV
+requires **prefill-time capture** at the strip boundary (mirroring the
+existing N-1 disk-seed capture). `boundarySnapshot(forceRederive: true)`
+would work but adds a full model.prepare on the stripped tokens post-
+generation (~7-8 s for a 3000-token DSV4 prompt — worse than the tax it
+saves for typical chats). Prefill-time capture makes it near-free. This
+change is the general mechanism; post-response warmup covers most of the
+same benefit today because it re-renders the whole transcript through the
+model anyway. Kept as task #28 phase 1b for cross-family coverage.
 
 ## 4. Live measurements at merge time (dev osaurus GUI, M5 Max)
 

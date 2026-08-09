@@ -45,6 +45,43 @@ private struct NativeMTPCacheCheckpoint {
     }
 }
 
+/// Process-wide memo of the hybrid safety-warmup verdict, keyed by model
+/// instance. The 16-cycle probe otherwise re-runs on every request even
+/// though its outcome is a property of the model, not the prompt — census
+/// showed 84% of requests burning the probe just to land in AR fallback
+/// again. Only the *warmup* verdict is memoized; adaptive acceptance-ratio
+/// fallbacks stay per-request because they are content-dependent.
+enum NativeMTPHybridWarmupMemo {
+    private struct Entry {
+        weak var model: AnyObject?
+        let passed: Bool
+    }
+
+    private static let lock = NSLock()
+    private static var entries: [ObjectIdentifier: Entry] = [:]
+
+    static func verdict(for model: AnyObject) -> Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = ObjectIdentifier(model)
+        guard let entry = entries[key] else { return nil }
+        // A deallocated model can hand its address to a new instance; the
+        // weak reference detects that and drops the stale verdict rather
+        // than skipping a safety probe the new model never ran.
+        guard entry.model === model else {
+            entries[key] = nil
+            return nil
+        }
+        return entry.passed
+    }
+
+    static func record(_ passed: Bool, for model: AnyObject) {
+        lock.lock()
+        defer { lock.unlock() }
+        entries[ObjectIdentifier(model)] = Entry(model: model, passed: passed)
+    }
+}
+
 struct NativeMTPTokenIterator: TokenIteratorProtocol {
     let model: any NativeMTPModel
     var cache: [KVCache]
@@ -168,8 +205,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.sampler = effectiveParameters.sampler()
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
         self.maxTokens = effectiveParameters.maxTokens
-        self.depth = requestedDepth
-        self.currentDepth = requestedDepth
+        // Python-vmlx policy parity: depths > 1 only ever won on a
+        // deterministic counting prompt (the 1.83x artifact); on real prose
+        // depth-3 measured 14% slower than AR. Cap at 1 unless a benchmark
+        // explicitly raises it via VMLX_MTP_DEPTH_CAP.
+        let depthCap =
+            ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
+            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 1
+        self.depth = Swift.min(requestedDepth, depthCap)
+        self.currentDepth = Swift.min(requestedDepth, depthCap)
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode
         let promptTokenStart = Date.timeIntervalSinceReferenceDate
         let promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
@@ -180,6 +224,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.cacheInitParameters = effectiveParameters
         self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters)
         self.materializeSyncTime += promptTokenElapsed
+
+        if usesHybridMambaCache,
+            let remembered = NativeMTPHybridWarmupMemo.verdict(for: model)
+        {
+            if remembered {
+                hybridSafetyWarmupComplete = true
+            } else {
+                forceAutoregressiveFallback = true
+                adaptiveFallbackReason = "hybrid_warmup_memo"
+            }
+        }
 
         let requestsAffineKV: Bool = {
             if effectiveParameters.kvBits != nil { return true }
@@ -1135,7 +1190,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let averageAccepted = Double(acceptedTokens) / Double(Swift.max(verifyCalls, 1))
             if averageAccepted >= Self.hybridWarmupMinimumAverageAccepted {
                 hybridSafetyWarmupComplete = true
+                NativeMTPHybridWarmupMemo.record(true, for: model)
             } else {
+                NativeMTPHybridWarmupMemo.record(false, for: model)
                 enableAutoregressiveFallback(
                     reason: String(
                         format: "hybrid_warmup_avg_accept=%.2f",

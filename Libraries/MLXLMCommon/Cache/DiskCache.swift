@@ -231,7 +231,9 @@ public final class DiskCache: @unchecked Sendable {
         let tokenCount = tokens.count
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             FileHandle.standardError.write(Data(
-                "[vmlx][cache/disk-store] count=\(tokenCount) keys=\(arrays.keys.sorted().prefix(6))\n".utf8))
+                ("[vmlx][cache/disk-store] count=\(tokenCount) hash=\(hash.prefix(12)) "
+                    + "modelKey=\(modelKey ?? "nil") salt=\(mediaSalt.map { String($0.prefix(12)) } ?? "nil") "
+                    + "keys=\(arrays.keys.sorted().prefix(6))\n").utf8))
         }
 
         // Iter 61: the full write path (realize + save + SQLite insert)
@@ -368,6 +370,15 @@ public final class DiskCache: @unchecked Sendable {
         guard FileManager.default.fileExists(atPath: url.path) else {
             validatedFiles.removeValue(forKey: hash)
             misses += 1
+            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                // A miss with a row/file present under a DIFFERENT hash is a
+                // key-input mismatch (modelKey or salt), invisible without
+                // printing what this lookup actually hashed.
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][cache/disk-fetch] noFile count=\(tokens.count) "
+                        + "hash=\(hash.prefix(12)) modelKey=\(modelKey ?? "nil") "
+                        + "salt=\(mediaSalt.map { String($0.prefix(12)) } ?? "nil")\n").utf8))
+            }
             return nil
         }
 

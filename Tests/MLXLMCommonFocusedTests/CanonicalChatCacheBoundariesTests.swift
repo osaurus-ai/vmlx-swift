@@ -488,4 +488,117 @@ struct CanonicalChatCacheBoundariesTests {
         #expect(Array(enabledPrompt.prefix(enabledBoundary))
             != Array(disabledPrompt.prefix(disabledBoundary)))
     }
+
+    /// Builds a long alternating transcript: one 600-scalar system message
+    /// plus `turns` further 600-scalar messages. `ContentBoundaryTokenizer`
+    /// emits one token per scalar, so each message is ~601 tokens — wide
+    /// enough to clear the ladder's 512-token minimum gap.
+    private func longTranscript(turns: Int) -> [[String: any Sendable]] {
+        var messages: [[String: any Sendable]] = [
+            ["role": "system", "content": String(repeating: "s", count: 600)]
+        ]
+        for index in 0..<turns {
+            messages.append([
+                "role": index.isMultiple(of: 2) ? "user" : "assistant",
+                "content": String(repeating: index.isMultiple(of: 2) ? "u" : "a", count: 600)
+                    + String(index),
+            ])
+        }
+        return messages
+    }
+
+    /// Every published boundary must be reproducible as the exact token
+    /// render of some message prefix. This is the invariant the ladder must
+    /// not weaken: more rungs, but never a rung that isn't byte-identical.
+    private func assertEveryBoundaryIsAnExactMessagePrefix(
+        _ boundaries: CanonicalChatCacheBoundaries,
+        tokenizer: some GenerationPromptControllableTokenizer,
+        messages: [[String: any Sendable]],
+        promptTokens: [Int]
+    ) {
+        for boundary in boundaries.all {
+            #expect(boundary > 0)
+            #expect(boundary < promptTokens.count)
+            let matchesSomeMessagePrefix = (0...messages.count).contains { count in
+                guard let rendered = try? tokenizer.applyChatTemplate(
+                    messages: Array(messages.prefix(count)), tools: nil,
+                    additionalContext: nil, addGenerationPrompt: false),
+                    rendered.count == boundary
+                else { return false }
+                return promptTokens.prefix(boundary).elementsEqual(rendered)
+            }
+            #expect(
+                matchesSomeMessagePrefix,
+                "a published boundary is not an exact render of any message prefix")
+        }
+    }
+
+    @Test("intermediate history rungs are published between the stable prefix and the newest turn")
+    func historyLadderFillsTheGapAboveTheStablePrefix() throws {
+        // Live DSV4 published all=[1114, 2643, 5434] for a 5436-token prompt:
+        // a 2.8k-token span with no stored entry. Two sends in that session
+        // fell back to the frozen 2643 stable prefix and re-prefilled 1948 and
+        // 2044 tokens that were still valid prefixes.
+        let tokenizer = ContentBoundaryTokenizer()
+        let messages = longTranscript(turns: 10)
+        let promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: nil, additionalContext: nil,
+            addGenerationPrompt: true)
+
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer,
+            messages: messages,
+            tools: nil,
+            additionalContext: nil,
+            promptTokens: promptTokens)
+
+        let stableFloor = try #require(boundaries.stable.last)
+        let history = boundaries.all.filter { !boundaries.stable.contains($0) }
+        let historyTop = try #require(history.max())
+
+        // The regression: a single history boundary leaves the whole span
+        // between the stable floor and the newest turn uncovered.
+        #expect(
+            history.count > 1,
+            "only one history boundary published; a mid-transcript divergence still falls back to the stable prefix")
+
+        let rungs = history.filter { $0 != historyTop }.sorted()
+        #expect(rungs.count <= 3, "ladder must stay bounded: extra rungs cost a disk store each")
+        for (index, rung) in rungs.enumerated() {
+            #expect(rung - stableFloor >= 512)
+            let nextHigher = index + 1 < rungs.count ? rungs[index + 1] : historyTop
+            #expect(nextHigher - rung >= 512, "rungs must be spaced to be worth their store")
+        }
+
+        assertEveryBoundaryIsAnExactMessagePrefix(
+            boundaries, tokenizer: tokenizer, messages: messages,
+            promptTokens: promptTokens)
+    }
+
+    @Test("a short transcript publishes no extra rungs")
+    func historyLadderStaysOffWhenTheGapIsSmall() throws {
+        // The rungs are only worth their disk store when they skip real
+        // prefill; a two-turn chat must keep the old single-boundary shape.
+        let tokenizer = ContentBoundaryTokenizer()
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "instructions"],
+            ["role": "user", "content": "hello"],
+        ]
+        let promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: nil, additionalContext: nil,
+            addGenerationPrompt: true)
+
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer,
+            messages: messages,
+            tools: nil,
+            additionalContext: nil,
+            promptTokens: promptTokens)
+
+        let history = boundaries.all.filter { !boundaries.stable.contains($0) }
+        #expect(history.count <= 1)
+        assertEveryBoundaryIsAnExactMessagePrefix(
+            boundaries, tokenizer: tokenizer, messages: messages,
+            promptTokens: promptTokens)
+    }
 }

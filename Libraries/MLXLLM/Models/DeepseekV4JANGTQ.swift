@@ -38,7 +38,6 @@ final class DeepseekV4MoEJANGTQ: Module, UnaryLayer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: TurboQuantSwitchGLU
     var gate: DeepseekV4MoEGate
     @ModuleInfo(key: "shared_experts") var sharedExperts: DeepseekV4MLP
-    var currentInputIds: MLXArray? = nil
 
     init(config: DeepseekV4Configuration, layerIdx: Int, mxtqBits: Int, mxtqSeed: Int) {
         self.config = config
@@ -76,7 +75,12 @@ final class DeepseekV4MoEJANGTQ: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let (indices, scores) = gate(x, inputIds: currentInputIds)
+        callAsFunction(x, inputIds: nil)
+    }
+
+    // See `DeepseekV4MoE`: request-scoped, must not be parked on `self`.
+    func callAsFunction(_ x: MLXArray, inputIds: MLXArray?) -> MLXArray {
+        let (indices, scores) = gate(x, inputIds: gate.isHashLayer ? inputIds : nil)
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var y: MLXArray
         if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
@@ -124,9 +128,7 @@ final class DeepseekV4DecoderLayerJANGTQ: Module {
         let hA = attnHC.expand(blockOut: attnOut, residual: residualA, post: postA, comb: combA)
         let residualF = hA
         let (xF, postF, combF) = ffnHC.collapse(hA)
-        mlp.currentInputIds = inputIds
-        let ffnOut = mlp(postAttentionLayerNorm(xF))
-        mlp.currentInputIds = nil
+        let ffnOut = mlp(postAttentionLayerNorm(xF), inputIds: inputIds)
         return ffnHC.expand(blockOut: ffnOut, residual: residualF, post: postF, comb: combF)
     }
 }

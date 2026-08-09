@@ -620,6 +620,31 @@ final class DeepseekV4FP32LMHeadCacheState {
     }
 }
 
+typealias DeepseekV4CompiledRegion = @Sendable ([MLXArray]) -> [MLXArray]
+
+/// Resolve a per-instance compiled decode region, building it once.
+///
+/// The modules holding these caches live on the shared model object, so two
+/// concurrent requests reach the same uninitialised slot together. Without the
+/// lock both threads write the property at once; a closure is a (function,
+/// context) pair, and a torn read pairs one thread's function with the other's
+/// context. The lock is held across the build so the region is compiled once —
+/// that happens on the first decode step of a layer and never again, while the
+/// *call* stays outside the lock so decode is never serialised.
+@inline(__always)
+func deepseekV4CachedRegion(
+    _ lock: NSLock,
+    _ storage: inout DeepseekV4CompiledRegion?,
+    build: () -> DeepseekV4CompiledRegion
+) -> DeepseekV4CompiledRegion {
+    lock.lock()
+    defer { lock.unlock() }
+    if let cached = storage { return cached }
+    let built = build()
+    storage = built
+    return built
+}
+
 public enum DeepseekV4Math {
 
     private static let e4m3KVActivationRoundTripKernel = MLXFast.metalKernel(
@@ -891,6 +916,55 @@ public enum DeepseekV4Math {
         return raw != "0" && raw != "false" && raw != "off" && raw != "no"
     }()
 
+    /// `VMLX_DSV4_LAYER_TRACE=1` reports the last position's magnitude after
+    /// every decoder layer. Diagnostic only.
+    public static let layerTraceEnabled: Bool = {
+        ProcessInfo.processInfo.environment["VMLX_DSV4_LAYER_TRACE"] == "1"
+    }()
+
+    /// `absmax`/`absmean` of the final position of `h`, as an *unevaluated*
+    /// scalar pair. Both statistics are needed: a NaN/Inf blowup moves `absmax`
+    /// alone, while a routing or weight fault that keeps the state finite but
+    /// wrong moves `absmean`.
+    ///
+    /// Deliberately lazy. Reading these per layer would insert a barrier into
+    /// exactly the lazy cross-layer graph under suspicion, so a laziness or
+    /// concurrency fault could vanish under its own instrumentation. Collect
+    /// here; evaluate once at the end of the forward pass.
+    public static func layerStat(_ tag: String, _ h: MLXArray) -> (String, MLXArray)? {
+        guard layerTraceEnabled, h.ndim >= 2 else { return nil }
+        let last = MLX.take(h, MLXArray([Int32(h.dim(1) - 1)]), axis: 1)
+        let a = MLX.abs(last.asType(.float32))
+        return (tag, MLX.stacked([a.max(), a.mean()]))
+    }
+
+    public static func flushLayerStats(_ stats: [(String, MLXArray)], length: Int) {
+        guard layerTraceEnabled, !stats.isEmpty else { return }
+        MLX.eval(stats.map(\.1))
+        for (tag, stat) in stats {
+            let v = stat.asArray(Float.self)
+            print("[vmlx][dsv4/layer] \(tag) L=\(length) absmax=\(v[0]) absmean=\(v[1])")
+        }
+    }
+
+    /// `VMLX_DSV4_WEIGHT_CHECKSUM=1` fingerprints layers 14-16 weight tensors
+    /// once per process, after the first forward. Separates "weights corrupted
+    /// at load" from "weights fine, compute path corrupted" on a souped boot.
+    public static let weightChecksumEnabled: Bool = {
+        ProcessInfo.processInfo.environment["VMLX_DSV4_WEIGHT_CHECKSUM"] == "1"
+    }()
+
+    private static let weightChecksumOnceLock = NSLock()
+    nonisolated(unsafe) private static var weightChecksumDone = false
+
+    public static func runWeightChecksumOnce(_ body: () -> Void) {
+        weightChecksumOnceLock.lock()
+        let shouldRun = !weightChecksumDone
+        weightChecksumDone = true
+        weightChecksumOnceLock.unlock()
+        if shouldRun { body() }
+    }
+
     /// Python `_dsv4_attn_subchunk_tokens` parity: attention sub-chunk length
     /// for wide-chunk prefill. SWA/CSA attention cost grows super-linearly
     /// with chunk width while MoE gather_qmm throughput grows with batch, so
@@ -1150,6 +1224,9 @@ public enum DeepseekV4Math {
         qNormOnesLock.lock(); defer { qNormOnesLock.unlock() }
         if let w = qNormOnesCache[key] { return w }
         let w = MLXArray.ones([headDim], dtype: dtype)
+        // `ones` is a pending `full` node; publishing it unevaluated would let
+        // two concurrent requests drive `eval` on the same array_desc.
+        w.eval()
         qNormOnesCache[key] = w
         return w
     }

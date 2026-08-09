@@ -197,7 +197,21 @@ public func computeCacheSalt(for input: LMInput, parameters: GenerateParameters)
     hasher.update(data: Data("policy:".utf8))
     hasher.update(data: Data(policy.utf8))
     let digest = hasher.finalize()
-    return digest.map { String(format: "%02x", $0) }.joined()
+    let salt = digest.map { String(format: "%02x", $0) }.joined()
+    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+        // The salt is a component of the disk-cache content hash. A warmup
+        // that stores under one salt and a send that fetches under another
+        // can never hit, with identical token bytes — and the aggregate
+        // trace shows only "noRow". Printing the raw pre-hash components
+        // names the differing field directly instead of leaving two opaque
+        // digests to stare at.
+        let scopeDesc = input.cacheScopeSalt ?? "nil"
+        let mediaDesc = computeMediaSalt(for: input).map { String($0.prefix(12)) } ?? "nil"
+        FileHandle.standardError.write(Data(
+            ("[vmlx][cache/salt] salt=\(salt.prefix(12)) policy={\(policy)} "
+                + "scope=\(scopeDesc) media=\(mediaDesc)\n").utf8))
+    }
+    return salt
 }
 
 private func cachePolicySalt(for parameters: GenerateParameters) -> String {

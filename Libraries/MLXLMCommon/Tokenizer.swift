@@ -250,8 +250,51 @@ public func canonicalChatCacheBoundaries(
         return exactPrefixBoundary(messages: Array(messages.dropLast()))
     }
 
-    let history = (exactPrefixBoundary(messages: messages)
-        ?? trailingContinuationBoundary()).map { [$0] } ?? []
+    /// Intermediate turn-aligned rungs between the stable prefix and the
+    /// newest history boundary.
+    ///
+    /// Only ONE history boundary used to be published, so the entire span
+    /// between the frozen system/tool prefix and the newest turn held no
+    /// stored entry. Because entries are stored AT published boundaries, any
+    /// divergence in that span dropped reuse all the way back to the system
+    /// prefix. Live DSV4 row: `all=[1114, 2643, 5434]`, and two sends in that
+    /// same session fell back to 2643 and re-prefilled 1948 and 2044 tokens
+    /// that were still byte-identical prefixes.
+    ///
+    /// Exactness is unchanged: a rung is admitted only by `exactPrefixBoundary`,
+    /// which requires the rendered message prefix to equal the real prompt
+    /// token-for-token. Rungs are cut at message boundaries so they re-render
+    /// identically on later turns, and spaced by `minimumGap` so the extra
+    /// disk stores each buy a worthwhile amount of skipped prefill.
+    func historyLadder(below top: Int) -> [Int] {
+        guard ProcessInfo.processInfo.environment["VMLX_CACHE_BOUNDARY_LADDER"] != "0"
+        else { return [] }
+        let maximumRungs = 3
+        let minimumGap = 512
+        let floor = stable.last ?? 0
+        guard top - floor >= minimumGap * 2 else { return [] }
+
+        var rungs: [Int] = []
+        var nextHigher = top
+        // Exponential backoff from the tail: recent turns are re-rendered most
+        // often, so granularity is worth more there than deep in the history.
+        for drop in [1, 2, 4, 8, 16] {
+            if rungs.count == maximumRungs { break }
+            guard messages.count - drop > stableMessages.count else { break }
+            guard let rung = exactPrefixBoundary(
+                messages: Array(messages.dropLast(drop))),
+                rung - floor >= minimumGap,
+                nextHigher - rung >= minimumGap
+            else { continue }
+            rungs.append(rung)
+            nextHigher = rung
+        }
+        return rungs
+    }
+
+    let historyTop = exactPrefixBoundary(messages: messages)
+        ?? trailingContinuationBoundary()
+    let history = historyTop.map { [$0] + historyLadder(below: $0) } ?? []
     let all = Array(Set(stable + history)).sorted()
     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
         // Token counts alone cannot distinguish two prompts of equal length, so
@@ -272,6 +315,14 @@ public func canonicalChatCacheBoundaries(
         }
         let headDigest = digest(promptTokens.prefix(256))
         let stableDigest = stable.first.map { digest(promptTokens.prefix($0)) } ?? "-"
+        // Only the *first* stable boundary was digested, but the boundary that
+        // actually gets stored is the last one. A divergence between the two —
+        // an injected reasoning preface, a reordered tool block, a date — moves
+        // the stored key while leaving `head`/`stable0` identical, which reads
+        // in the trace as a cache bug rather than a changed prompt.
+        let stableDigests = stable
+            .map { "\($0):\(digest(promptTokens.prefix($0)))" }
+            .joined(separator: ",")
         // `head`/`stable0` both sit inside the system prefix, so when they match
         // across a store and a failing re-warm they only prove the system region
         // is stable — the first live capture showed exactly that, and the
@@ -281,7 +332,8 @@ public func canonicalChatCacheBoundaries(
         let historyDigest = all.last.map { digest(promptTokens.prefix($0)) } ?? "-"
         FileHandle.standardError.write(Data(
             ("[vmlx][cache/boundaries] prompt=\(promptTokens.count) stable=\(stable) all=\(all)"
-                + " head=\(headDigest) stable0=\(stableDigest) hist=\(historyDigest)\n").utf8
+                + " head=\(headDigest) stable0=\(stableDigest) hist=\(historyDigest)"
+                + " stableDigests=[\(stableDigests)]\n").utf8
         ))
     }
     return CanonicalChatCacheBoundaries(all: all, stable: stable)

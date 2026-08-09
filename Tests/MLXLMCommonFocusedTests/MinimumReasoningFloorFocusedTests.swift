@@ -41,6 +41,48 @@ struct MinimumReasoningFloorFocusedTests {
         }
     }
 
+    @Test("masking a near-certain token must not open the nucleus to the vocab tail")
+    func maskedWindowKeepsNucleusClosed() throws {
+        try FocusedMLXTestSupport.withLock {
+            // Logit processors run BEFORE the sampler's top_p, so banning a token
+            // that holds most of the mass renormalizes a nearly flat residual and
+            // nucleus sampling then admits thousands of junk tokens. Unmasked,
+            // top_p would have kept the close token alone.
+            //
+            // This is a property of the processor, not an explanation of the live
+            // DSV4 token soup — that reproduces at temperature 0, where this whole
+            // path is argmax and the min_p floor cannot matter. The commit that
+            // added this test claimed otherwise; see
+            // Docs/Internal/DSV4-TOKEN-SOUP-ROOT-CAUSE-2026-08-09.md.
+            let vocab = 4000
+            let banned = 7
+            let plausible: Set<Int> = [1, 2, 3]
+            var values = [Float](repeating: 0, count: vocab)
+            values[banned] = 12
+            values[1] = 5.0
+            values[2] = 4.7
+            values[3] = 4.5
+            let logits = MLXArray(values).reshaped(1, vocab)
+
+            var processor = InitialSuppressTokensProcessor(
+                tokens: [banned], count: 512)
+            let sampler = TopPSampler(temperature: 0.6, topP: 0.95, randomSeed: 42)
+
+            var junk = 0
+            let draws = 200
+            for _ in 0..<draws {
+                let token = sampler.sample(logits: processor.process(logits: logits))
+                let id = token.reshaped(-1)[0].item(Int.self)
+                #expect(id != banned, "the ban itself must hold")
+                if !plausible.contains(id) { junk += 1 }
+                processor.didSample(token: token)
+            }
+
+            let summary = "masked window leaked \(junk)/\(draws) samples into the tail"
+            #expect(junk == 0, "\(summary) — the floor must not widen the nucleus")
+        }
+    }
+
     @Test("floor arms on every enforced-effort thinking rail and nowhere else")
     func railMatchingIsExact() {
         let lowHead = DeepseekV4ChatEncoder.reasoningEffortLowPreface + "You are helpful."

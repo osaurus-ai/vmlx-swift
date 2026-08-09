@@ -455,6 +455,110 @@ struct DeepseekV4PoolQuantizationTests {
         }
     }
 
+    @Test("heads16 matches reference at cold-prefill production shape")
+    func heads16ColdPrefillProductionShapeParity() {
+        let mlxLock = lockSerializedMLXTest()
+        defer { mlxLock.unlock() }
+
+        // The other heads16 cases all run offset > 0 with a pool that is
+        // almost entirely causally visible, and shapes (seq <= 24, window
+        // <= 32) far below anything DSV4-Flash decodes. A cold prefill is
+        // the opposite regime: offset == 0, window 128 from the bundle, and
+        // early queries where EVERY selected pool row is causally invisible
+        // so the kernel's threadgroup-uniform `continue` carries the result.
+        let seqLen = 512
+        let rows = 512
+        let poolRows = 128
+        let k = 96
+        let window = 128
+        let ratio = 4
+        let scale = Float(pow(Double(512), -0.5))
+        var topkValues = [Int32]()
+        for t in 0..<seqLen {
+            for i in 0..<k {
+                topkValues.append(Int32((t * 13 + i * 11) % poolRows))
+            }
+        }
+        let topk2d = MLXArray(topkValues).reshaped(seqLen, k)
+        let sinks32 = Self.heads16Values(64, frequency: 0.61, phase: 0.3)
+        for offset in [0, 2048] {
+            let q = Self.heads16Values(
+                64 * seqLen * 512, frequency: 0.29, phase: 0.7
+            ).reshaped(1, 64, seqLen, 512).asType(.bfloat16)
+            let kv2d = Self.heads16Values(
+                rows * 512, frequency: 0.47, phase: 1.3
+            ).reshaped(rows, 512).asType(.bfloat16)
+            let pool2d = Self.heads16Values(
+                poolRows * 512, frequency: 0.73, phase: 2.1
+            ).reshaped(poolRows, 512).asType(.bfloat16)
+            let got = DeepseekV4Math.heads16RunKernel(
+                q: q, kv2d: kv2d, pool2d: pool2d, topk2d: topk2d,
+                sinks32: sinks32,
+                offset: offset, window: window, ratio: ratio, scale: scale
+            ).asType(.float32)
+            let ref = DeepseekV4Math.heads16Reference(
+                q: q, kv2d: kv2d, pool2d: pool2d, topk2d: topk2d,
+                sinks32: sinks32,
+                offset: offset, window: window, ratio: ratio, scale: scale
+            ).asType(.float32)
+            MLX.eval(got, ref)
+            let denom = max(MLX.abs(ref).max().item(Float.self), Float(1e-6))
+            let rel = MLX.abs(got - ref).max().item(Float.self) / denom
+            #expect(rel.isFinite && rel <= 2.5e-2, "rel \(rel) offset \(offset)")
+        }
+    }
+
+    @Test("heads16 is bit-stable across repeated runs at production shape")
+    func heads16RepeatedRunsAreStable() {
+        let mlxLock = lockSerializedMLXTest()
+        defer { mlxLock.unlock() }
+
+        // Live DSV4 produced token soup on one cold prefill and clean prose
+        // on the next with an identical prompt and build. MLX ops are
+        // deterministic, so a run-to-run difference here would localize that
+        // to the kernel's threadgroup staging rather than to sampling.
+        let seqLen = 512
+        let rows = 512
+        let poolRows = 128
+        let k = 96
+        var topkValues = [Int32]()
+        for t in 0..<seqLen {
+            for i in 0..<k {
+                topkValues.append(Int32((t * 13 + i * 11) % poolRows))
+            }
+        }
+        let topk2d = MLXArray(topkValues).reshaped(seqLen, k)
+        let sinks32 = Self.heads16Values(64, frequency: 0.61, phase: 0.3)
+        let q = Self.heads16Values(
+            64 * seqLen * 512, frequency: 0.29, phase: 0.7
+        ).reshaped(1, 64, seqLen, 512).asType(.bfloat16)
+        let kv2d = Self.heads16Values(
+            rows * 512, frequency: 0.47, phase: 1.3
+        ).reshaped(rows, 512).asType(.bfloat16)
+        let pool2d = Self.heads16Values(
+            poolRows * 512, frequency: 0.73, phase: 2.1
+        ).reshaped(poolRows, 512).asType(.bfloat16)
+
+        func run() -> MLXArray {
+            DeepseekV4Math.heads16RunKernel(
+                q: q, kv2d: kv2d, pool2d: pool2d, topk2d: topk2d,
+                sinks32: sinks32,
+                offset: 0, window: 128, ratio: 4,
+                scale: Float(pow(Double(512), -0.5)))
+        }
+        let baseline = run()
+        MLX.eval(baseline)
+        for attempt in 1...8 {
+            let again = run()
+            MLX.eval(again)
+            let identical = MLX.all(again .== baseline)
+            MLX.eval(identical)
+            #expect(
+                identical.item(Bool.self),
+                "attempt \(attempt) diverged from the first run")
+        }
+    }
+
     @Test("heads16 entry path reshapes/casts correctly and matches reference")
     func heads16EntryMatchesReference() {
         let mlxLock = lockSerializedMLXTest()

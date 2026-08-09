@@ -1282,8 +1282,9 @@ public final class DeepseekV4Compressor: Module {
 
     @ModuleInfo(key: "wkv") var wkv: Linear
     @ModuleInfo(key: "wgate") var wgate: Linear
-    private var frontOverlapRegion: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
-    private var frontRegion: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+    private let regionLock = NSLock()
+    private var frontOverlapRegion: DeepseekV4CompiledRegion? = nil
+    private var frontRegion: DeepseekV4CompiledRegion? = nil
     /// APE: (compress_ratio, out_dim) learned positional bias inside
     /// each pool window.
     @ParameterInfo(key: "ape") var ape: MLXArray
@@ -1397,12 +1398,9 @@ public final class DeepseekV4Compressor: Module {
         var gate: MLXArray
         var apeFolded = false
         if useCompiledFront, overlap {
-            let region: @Sendable ([MLXArray]) -> [MLXArray]
-            if let cached = frontOverlapRegion {
-                region = cached
-            } else {
-                let ratio = Int32(compressRatio)
-                region = vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
+            let ratio = Int32(compressRatio)
+            let region = deepseekV4CachedRegion(regionLock, &frontOverlapRegion) {
+                vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
                     CompiledDecodeTrace.withActive {
                         // Official 0731 stages the compressor projections in
                         // fp32 — the cast must precede the linears.
@@ -1413,7 +1411,6 @@ public final class DeepseekV4Compressor: Module {
                         return [kvOut, gateOut + apeRows.expandedDimensions(axis: 0)]
                     }
                 }
-                frontOverlapRegion = region
             }
             let pos = MLXArray(Int32(startPos)..<Int32(startPos + L))
             let outs = region([x, pos])
@@ -1427,17 +1424,13 @@ public final class DeepseekV4Compressor: Module {
                 gate = wgate(projectionInput)
             }
         } else if useCompiledFront {
-            let region: @Sendable ([MLXArray]) -> [MLXArray]
-            if let cached = frontRegion {
-                region = cached
-            } else {
-                region = vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
+            let region = deepseekV4CachedRegion(regionLock, &frontRegion) {
+                vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
                     CompiledDecodeTrace.withActive {
                         let x32 = args[0].asType(.float32)
                         return [self.wkv(x32), self.wgate(x32)]
                     }
                 }
-                frontRegion = region
             }
             let outs = region([x])
             if outs.count == 2 {

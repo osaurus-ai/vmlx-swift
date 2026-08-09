@@ -98,3 +98,7 @@ iOSInjectionProject/
 
 # VS Code
 .vscode/
+
+# Internal engineering notes — root-cause writeups, live-proof logs, campaign
+# state. Local only; never published.
+Docs/Internal/

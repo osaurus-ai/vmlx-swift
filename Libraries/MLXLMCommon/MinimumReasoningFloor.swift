@@ -39,8 +39,21 @@ enum MinimumReasoningFloor {
         let tokenCount: Int
     }
 
+    static let defaultTokenCount = 16
+
     /// Leading sampled-token window during which `</think>` stays masked.
-    static let tokenCount = 16
+    ///
+    /// `VMLX_DSV4_REASONING_FLOOR` overrides the window (`0` disables the
+    /// floor entirely) so a build can be A/B'd against an unfloored run
+    /// without a rebuild.
+    static var tokenCount: Int {
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "VMLX_DSV4_REASONING_FLOOR"],
+            let parsed = Int(raw.trimmingCharacters(in: .whitespaces))
+        else { return defaultTokenCount }
+        return max(0, parsed)
+    }
 
     /// First lines of the enforced-effort prefaces — the arming markers.
     /// Derived from the encoder constants so a preface reword can never
@@ -77,6 +90,8 @@ enum MinimumReasoningFloor {
         guard let closeID = tokenizer.convertTokenToId("</think>"),
             tokenizer.convertIdToToken(closeID) == "</think>"
         else { return nil }
-        return Armed(closeTokenID: closeID, tokenCount: Self.tokenCount)
+        let window = Self.tokenCount
+        guard window > 0 else { return nil }
+        return Armed(closeTokenID: closeID, tokenCount: window)
     }
 }

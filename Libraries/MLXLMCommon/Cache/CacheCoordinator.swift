@@ -566,6 +566,13 @@ public final class CacheCoordinator: @unchecked Sendable {
                     touchRecency: false,
                     countHit: false
                 ) else {
+                    // A miss here means the content-addressed key over this
+                    // prefix found no row; a rejection below means the row
+                    // existed but its companion state was refused. Only the
+                    // aggregate "MISS all tiers" was ever traced, which cannot
+                    // tell those apart — and a silent companion veto has
+                    // already cost a whole family (LFM2.5) its cache once.
+                    ftrace("probe boundary=\(boundary) noRow")
                     return nil
                 }
                 let ssmStates = resolveSSMStates(
@@ -588,6 +595,9 @@ public final class CacheCoordinator: @unchecked Sendable {
                         diskArrays: arrays
                     )
                 }
+                ftrace(
+                    "probe boundary=\(boundary) rowFound but companion REJECTED "
+                        + "ssm=\(ssmStates?.count ?? -1)")
                 return nil
             }
 

@@ -606,6 +606,19 @@ struct Bench {
             return
         }
 
+        // BENCH_SOLO_LONGFORM=1: single long-form generation through
+        // `BatchEngine.generate` (solo path) with the real chat template.
+        // For block-diffusion models the [BlockDiffusion] stderr line
+        // reports canvases / denoising forwards / tokens-per-forward —
+        // the honest long-form throughput metric. BENCH_PROMPT overrides
+        // the default essay prompt. Runs before the multi-turn load below:
+        // it loads its own context, and a 100GB-class bundle cannot be
+        // resident twice.
+        if (env["BENCH_SOLO_LONGFORM"] ?? "0") == "1" {
+            try await runSoloLongform(modelPath: modelPath, maxNew: maxNew)
+            return
+        }
+
         print("=== vmlx-swift-lm — \(modelDir.lastPathComponent) MULTI-TURN ===")
         print("Tokens: \(tokensPath)")
         print("Loading...")
@@ -716,16 +729,6 @@ struct Bench {
             return
         }
 
-        // BENCH_SOLO_LONGFORM=1: single long-form generation through
-        // `BatchEngine.generate` (solo path) with the real chat template.
-        // For block-diffusion models the [BlockDiffusion] stderr line
-        // reports canvases / denoising forwards / tokens-per-forward —
-        // the honest long-form throughput metric. BENCH_PROMPT overrides
-        // the default essay prompt.
-        if (env["BENCH_SOLO_LONGFORM"] ?? "0") == "1" {
-            try await runSoloLongform(modelPath: modelPath, maxNew: maxNew)
-            return
-        }
         if (env["BENCH_GROWING_CHAT_CACHE"] ?? "0") == "1" {
             do {
                 try await runGrowingChatCacheReuse(modelPath: modelPath, maxNew: maxNew)
@@ -2376,10 +2379,66 @@ func runSoloLongform(modelPath: String, maxNew: Int) async throws {
     let input = try await context.processor.prepare(input: UserInput(prompt: prompt))
     let promptTokens = input.text.tokens.size
     nonisolated(unsafe) let ctx = context
-    let engine = BatchEngine(context: ctx, maxBatchSize: 1)
+    // BENCH_SOLO_COORDINATOR=1 reproduces the shipping Osaurus cache config
+    // (paged OFF, SSD L2 ON). It is the only way this bench reaches the
+    // prompt-minus-one disk-seed prefill split, which a coordinator-less run
+    // never takes.
+    var coordinator: CacheCoordinator? = nil
+    if (ProcessInfo.processInfo.environment["BENCH_SOLO_COORDINATOR"] ?? "0") == "1" {
+        var cfg = CacheCoordinatorConfig()
+        cfg.usePagedCache = false
+        cfg.enableDiskCache = true
+        cfg.diskCacheDir = URL(fileURLWithPath:
+            ProcessInfo.processInfo.environment["BENCH_SOLO_DISK_DIR"]
+                ?? "/tmp/bench_solo_disk_cache")
+        cfg.modelKey = modelDir.lastPathComponent
+        coordinator = CacheCoordinator(config: cfg)
+        print("  [Coord] paged=false disk=true dir=\(cfg.diskCacheDir?.path ?? "-")")
+    }
+    let engine = BatchEngine(
+        context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
     nonisolated(unsafe) let sendable = input
+    var warmupTask: Task<Void, Never>? = nil
+
+    // BENCH_SOLO_WARMUP=1 sends a throwaway request through the same engine
+    // first, the way Osaurus's chat warmup does. A slot's DSV4 pool state that
+    // survives request teardown would only ever be visible in this ordering.
+    if (ProcessInfo.processInfo.environment["BENCH_SOLO_WARMUP"] ?? "0") == "1" {
+        let warmText = ProcessInfo.processInfo.environment["BENCH_SOLO_WARMUP_PROMPT"]
+            ?? "Say OK."
+        let warmInput = try await context.processor.prepare(
+            input: UserInput(prompt: warmText))
+        nonisolated(unsafe) let warmSendable = warmInput
+        var warmParams = GenerateParameters(
+            maxTokens: Int(
+                ProcessInfo.processInfo.environment["BENCH_SOLO_WARMUP_TOKENS"] ?? "1") ?? 1,
+            temperature: 0, prefillStepSize: 512)
+        warmParams.extraStopStrings = []
+        // BENCH_SOLO_WARMUP_CONCURRENT=1 lets the warmup prefill overlap the
+        // visible request instead of completing first. That overlap is what
+        // Osaurus actually does, and it is the only ordering under which two
+        // requests share process-wide model memos mid-forward.
+        let overlap =
+            (ProcessInfo.processInfo.environment["BENCH_SOLO_WARMUP_CONCURRENT"] ?? "0") == "1"
+        let warm = Task {
+            let warmStream = await engine.generate(
+                input: warmSendable, parameters: warmParams)
+            var warmTokens = 0
+            for await event in warmStream {
+                if case .info(let info) = event { warmTokens = info.generationTokenCount }
+            }
+            print("  [Warmup] prompt=\(warmInput.text.tokens.size) genTokens=\(warmTokens)")
+        }
+        if overlap {
+            warmupTask = warm
+            print("  [Warmup] overlapping the visible request")
+        } else {
+            await warm.value
+        }
+    }
 
     var text = ""
+    var reasoning = ""
     var generationTokens = 0
     var firstChunkAt: Double? = nil
     let t0 = CFAbsoluteTimeGetCurrent()
@@ -2389,6 +2448,9 @@ func runSoloLongform(modelPath: String, maxNew: Int) async throws {
         case .chunk(let chunk):
             if firstChunkAt == nil { firstChunkAt = CFAbsoluteTimeGetCurrent() - t0 }
             text += chunk
+        case .reasoning(let chunk):
+            if firstChunkAt == nil { firstChunkAt = CFAbsoluteTimeGetCurrent() - t0 }
+            reasoning += chunk
         case .info(let info):
             generationTokens = info.generationTokenCount
         default:
@@ -2396,15 +2458,21 @@ func runSoloLongform(modelPath: String, maxNew: Int) async throws {
         }
     }
     let wall = CFAbsoluteTimeGetCurrent() - t0
+    await warmupTask?.value
     await engine.shutdown()
 
     let charCount = text.count
     print(String(format:
-        "  prompt=%d genTokens=%d wall=%.2fs TTFT=%.2fs wallTokPerSec=%.1f chars=%d",
+        "  prompt=%d genTokens=%d wall=%.2fs TTFT=%.2fs wallTokPerSec=%.1f chars=%d reasoningChars=%d",
         promptTokens, generationTokens, wall, firstChunkAt ?? 0,
-        Double(generationTokens) / max(wall, 0.001), charCount))
+        Double(generationTokens) / max(wall, 0.001), charCount, reasoning.count))
     let preview = text.count > 700 ? String(text.prefix(700)) + "…" : text
     print("  TEXT:\n\(preview)")
+    if !reasoning.isEmpty {
+        let rPreview =
+            reasoning.count > 700 ? String(reasoning.prefix(700)) + "…" : reasoning
+        print("  REASONING:\n\(rPreview)")
+    }
     print("\n=== Solo long-form done ===")
 }
 
