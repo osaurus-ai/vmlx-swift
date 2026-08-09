@@ -1280,7 +1280,7 @@ func runBatchEngineTurn(
             reasoning += r
             chunkCount += 1
             if chunkCount > maxNew * 2 { break }
-        case .prefillProgress, .info, .toolCall, .toolCallProgress:
+        case .prefillProgress, .info, .toolCall, .toolCallProgress, .tokenID:
             break
         }
     }
@@ -1409,6 +1409,8 @@ func runBatchEngineToolCall(modelPath: String, maxNew: Int) async throws {
             break
         case .prefillProgress:
 
+            break
+        case .tokenID:
             break
         case .info(let i):
             info = i
@@ -2223,6 +2225,8 @@ func runBatchEngineCacheHit(modelPath: String, maxNew: Int) async throws {
                 break
             case .prefillProgress:
 
+                break
+            case .tokenID:
                 break
             case .info(let info):
                 completionInfo = info
@@ -4218,7 +4222,7 @@ func runHarmonyReasoningCheck(modelPath: String, maxNew: Int) async throws {
             case .reasoning(let r):
                 reasoningText += r
                 reasoningCount += 1
-            case .prefillProgress, .toolCall, .info, .toolCallProgress:
+            case .tokenID, .prefillProgress, .toolCall, .info, .toolCallProgress:
                 break
             }
         }
@@ -4314,7 +4318,7 @@ func runQwenThinkingReasoningCheck(modelPath: String, maxNew: Int) async throws 
                     reasoningCount += 1
                 case .info(let info):
                     completionInfo = info
-                case .prefillProgress, .toolCall, .toolCallProgress:
+                case .tokenID, .prefillProgress, .toolCall, .toolCallProgress:
                     break
                 }
             }
@@ -5818,6 +5822,8 @@ func runThinkingLoopProbe(modelPath: String, maxNew: Int) async throws {
             case .prefillProgress:
 
                 break
+            case .tokenID:
+                break
             case .info(let info):
                 rawTokenCount = max(rawTokenCount, info.generationTokenCount)
                 switch info.stopReason {
@@ -6027,6 +6033,8 @@ func runLagunaLoopProbe(modelPath: String, maxNew: Int) async throws {
                 break
             case .prefillProgress:
 
+                break
+            case .tokenID:
                 break
             case .info(let info):
                 result.genTokens = info.generationTokenCount
@@ -6346,6 +6354,8 @@ func runNoGuardSamplingProbe(modelPath: String, maxNew: Int) async throws {
                 break
             case .prefillProgress:
 
+                break
+            case .tokenID:
                 break
             case .info(let info):
                 result.genTokens = info.generationTokenCount
@@ -7722,6 +7732,8 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
             case .prefillProgress:
 
                 break
+            case .tokenID:
+                break
             case .info:
                 break
             }
@@ -7968,7 +7980,7 @@ func runOrnithReportedReplay(modelPath: String, maxNew: Int) async throws {
             case .reasoning(let chunk): reasoning += chunk
             case .toolCall: toolCallCount += 1
             case .info(let completion): info = completion
-            case .toolCallProgress, .prefillProgress: break
+            case .toolCallProgress, .prefillProgress, .tokenID: break
             }
         }
         let wall = CFAbsoluteTimeGetCurrent() - start
@@ -8479,6 +8491,8 @@ func runPerfBench(
                     case .prefillProgress:
 
                         break
+                    case .tokenID:
+                        break
                     case .info(let info):
                         result.genTokens = info.generationTokenCount
                         result.promptSec = info.promptTime
@@ -8534,6 +8548,8 @@ func runPerfBench(
                         break
                     case .prefillProgress:
 
+                        break
+                    case .tokenID:
                         break
                     case .info(let info):
                         result.genTokens = info.generationTokenCount
@@ -9089,6 +9105,8 @@ func runCrashFuzzV2(modelPath: String, maxNew: Int) async throws {
             case .prefillProgress:
 
                 break
+            case .tokenID:
+                break
             case .info: break
             }
         }
@@ -9315,6 +9333,8 @@ func runOfficialMultiTurn(modelPath: String, maxNew: Int) async throws {
                 break
             case .prefillProgress:
 
+                break
+            case .tokenID:
                 break
             case .info: break
             }
@@ -9703,6 +9723,8 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
                 break
             case .prefillProgress:
 
+                break
+            case .tokenID:
                 break
             case .info(let info):
                 r.promptSec = info.promptTime

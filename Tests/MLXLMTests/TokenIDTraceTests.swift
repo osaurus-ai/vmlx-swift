@@ -118,7 +118,10 @@ private final class TokenIDTraceBatchModel: Module, LanguageModel,
     }
 }
 
-private func tokenIDTraceBatchEngine(pieces: [String]) -> BatchEngine {
+private func tokenIDTraceBatchEngine(
+    pieces: [String],
+    maxBatchSize: Int = 2
+) -> BatchEngine {
     let model = TokenIDTraceBatchModel()
     let tokenizer = TokenIDTracePositionPieceTokenizer(pieces: pieces)
     var configuration = ModelConfiguration(id: "token-trace-batch-terminal-ordering")
@@ -132,7 +135,7 @@ private func tokenIDTraceBatchEngine(pieces: [String]) -> BatchEngine {
         model: model,
         processor: processor,
         tokenizer: tokenizer)
-    return BatchEngine(context: context, maxBatchSize: 2)
+    return BatchEngine(context: context, maxBatchSize: maxBatchSize)
 }
 
 private let tokenIDTraceFlushPieces = [
@@ -141,6 +144,75 @@ private let tokenIDTraceFlushPieces = [
 
 @Suite("BatchEngine token trace terminal ordering", .serialized)
 struct BatchEngineTokenTraceTerminalOrderingTests {
+    @Test("direct and batched high-level streams expose diagnostic IDs to an adapter")
+    func highLevelStreamsExposeDiagnosticIDs() async throws {
+        for maxBatchSize in [1, 2] {
+            let engine = tokenIDTraceBatchEngine(
+                pieces: tokenIDTraceFlushPieces,
+                maxBatchSize: maxBatchSize)
+            let configuration = traceConfiguration(externalAdapterParticipation: true)
+            var parameters = GenerateParameters(
+                maxTokens: tokenIDTraceFlushPieces.count,
+                temperature: 0)
+            parameters.tokenIDTrace = configuration
+
+            let stream = await engine.generate(
+                input: LMInput(tokens: MLXArray([Int32(0)])),
+                parameters: parameters)
+            var observed = [TokenIDTraceToken]()
+            var sawTerminalInfo = false
+            for await event in stream {
+                switch event {
+                case .tokenID(let id, let ordinal):
+                    observed.append(TokenIDTraceToken(id: id, ordinal: ordinal))
+                    try configuration.adapterContract.accept(tokenID: id, ordinal: ordinal)
+                case .info:
+                    sawTerminalInfo = true
+                default:
+                    break
+                }
+            }
+            await engine.shutdown()
+
+            #expect(sawTerminalInfo)
+            #expect(observed.count == tokenIDTraceFlushPieces.count)
+            #expect(observed.map(\.ordinal) == Array(tokenIDTraceFlushPieces.indices))
+            #expect(observed.allSatisfy { $0.id == 0 })
+            #expect(configuration.sourceTerminalRule == .length)
+            let artifacts = try configuration.finalizeAdapter()
+            let expectedSourceKind: TokenIDTraceStreamKind =
+                maxBatchSize == 1 ? .iteratorReturned : .batchYielded
+            let unexpectedSourceKind: TokenIDTraceStreamKind =
+                maxBatchSize == 1 ? .batchYielded : .iteratorReturned
+            #expect(artifacts.contains { $0.streamKind == expectedSourceKind })
+            #expect(!artifacts.contains { $0.streamKind == unexpectedSourceKind })
+            #expect(
+                artifact(artifacts, kind: .adapterAccepted).body
+                    == artifact(artifacts, kind: expectedSourceKind).body
+            )
+        }
+    }
+
+    @Test("trace-off high-level streams emit no diagnostic IDs")
+    func traceOffStreamsEmitNoDiagnosticIDs() async {
+        for maxBatchSize in [1, 2] {
+            let engine = tokenIDTraceBatchEngine(
+                pieces: tokenIDTraceFlushPieces,
+                maxBatchSize: maxBatchSize)
+            let stream = await engine.generate(
+                input: LMInput(tokens: MLXArray([Int32(0)])),
+                parameters: GenerateParameters(
+                    maxTokens: tokenIDTraceFlushPieces.count,
+                    temperature: 0))
+            var diagnosticIDCount = 0
+            for await event in stream {
+                if case .tokenID = event { diagnosticIDCount += 1 }
+            }
+            await engine.shutdown()
+            #expect(diagnosticIDCount == 0)
+        }
+    }
+
     @Test("deferred trace lets a flush-only stop override length")
     func deferredFlushOnlyStopOverridesLength() async throws {
         let engine = tokenIDTraceBatchEngine(pieces: tokenIDTraceFlushPieces)

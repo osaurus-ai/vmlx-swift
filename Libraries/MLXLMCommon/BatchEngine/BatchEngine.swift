@@ -787,6 +787,10 @@ public actor BatchEngine {
                     emitChunkThroughStop(text)
                 case .reasoning:
                     continuation.yield(event)
+                case .tokenID:
+                    // Raw-ID diagnostics are emitted directly from the token
+                    // loop and never pass through text/tool routing.
+                    break
                 case .prefillProgress:
                     continuation.yield(event)
                 case .toolCall:
@@ -936,6 +940,9 @@ public actor BatchEngine {
                 case .prefillProgress(let progress):
                     continuation.yield(.prefillProgress(progress))
                 case .token(let id):
+                    if parameters.tokenIDTrace?.externalAdapterParticipation == true {
+                        continuation.yield(.tokenID(id: id, ordinal: generatedTokenCount))
+                    }
                     generatedTokenCount += 1
                     detokenizer.append(token: id)
                     if let text = detokenizer.next() {

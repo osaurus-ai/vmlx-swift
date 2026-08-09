@@ -200,6 +200,9 @@ struct MLXPressCLI {
                         fflush(stdout)
                     case .reasoning(let text):
                         reasoningText += text
+                    case .tokenID:
+                        // Diagnostic-only adapter evidence is never CLI text.
+                        break
                     case .prefillProgress:
                         break
                     case .toolCall:

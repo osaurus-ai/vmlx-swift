@@ -175,7 +175,8 @@ public final class DeepseekV4ModelInnerJANGTQ: Module {
 }
 
 public final class DeepseekV4JANGTQModel:
-    Module, LLMModel, KVCacheDimensionProvider, LoRAModel, PostLoadModelPreparation
+    Module, LLMModel, KVCacheDimensionProvider, LoRAModel, PostLoadModelPreparation,
+    ModelContainerDiagnosticSnapshotProvider
 {
     public var kvHeads: [Int]
     let config: DeepseekV4Configuration
@@ -219,6 +220,15 @@ public final class DeepseekV4JANGTQModel:
 
     internal var dsv4FP32LMHeadCacheEvents: [DeepseekV4FP32LMHeadCacheEvent] {
         dsv4FP32LMHeadCache.events
+    }
+
+    public func modelContainerDiagnosticSnapshot() -> ModelContainerDiagnosticSnapshot {
+        dsv4FP32LMHeadCache.diagnosticSnapshot(
+            modelType: "deepseek_v4_jangtq",
+            lmHead: lmHead,
+            expectedInputDimensions: config.hiddenSize,
+            expectedOutputDimensions: config.vocabSize
+        )
     }
 
     public func prepareForInferenceAfterLoad() throws {

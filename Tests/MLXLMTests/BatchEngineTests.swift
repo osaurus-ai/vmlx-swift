@@ -1006,6 +1006,8 @@ class BatchEngineIntegrationTests: XCTestCase {
                 progress.append(p)
             case .chunk, .reasoning, .toolCall, .toolCallProgress, .info:
                 sawChunkOrInfo = true
+            case .tokenID:
+                break
             }
         }
 

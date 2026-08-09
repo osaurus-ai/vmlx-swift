@@ -228,9 +228,12 @@ private enum DeepseekV4FP32LMHeadCacheError: Error {
 final class DeepseekV4FP32LMHeadCacheState {
     private let preparationLock = NSLock()
     private let shadowLock = NSLock()
+    private let configuredLMHeadModeStorage: String
     private var holder: DeepseekV4FP32LMHeadCacheHolder?
     private var preparationAttempted = false
     private var lastCacheIdentityStorage: UInt64?
+    private var cacheRequestedStorage = false
+    private var shadowRequestedStorage = false
     private var shadowComparisonEnabled = false
     private var preparedStorage = false
     private var constructionCountStorage = 0
@@ -240,6 +243,13 @@ final class DeepseekV4FP32LMHeadCacheState {
     private var shadowComparedWordCountStorage = 0
     private var shadowMismatchCountStorage = 0
     private var firstShadowMismatch: DeepseekV4RawFP32Comparison?
+
+    init() {
+        // The decode dispatcher reads the same process configuration. Capture
+        // it once so later environment changes cannot make this observation
+        // disagree with the path selected by the model instance.
+        configuredLMHeadModeStorage = DeepseekV4Math.lmHeadMode
+    }
 
     var prepared: Bool {
         preparationLock.lock()
@@ -314,6 +324,35 @@ final class DeepseekV4FP32LMHeadCacheState {
         return shadowMismatchCountStorage
     }
 
+    func diagnosticSnapshot(
+        modelType: String,
+        lmHead: Linear,
+        expectedInputDimensions: Int,
+        expectedOutputDimensions: Int
+    ) -> ModelContainerDiagnosticSnapshot {
+        let sourceQuantized = lmHead is QuantizedLinear
+        let sourceSupported = (lmHead as? QuantizedLinear).map {
+            Self.metadata(
+                for: $0,
+                expectedInputDimensions: expectedInputDimensions,
+                expectedOutputDimensions: expectedOutputDimensions
+            ).supported
+        } ?? false
+        preparationLock.lock()
+        let snapshot = ModelContainerDiagnosticSnapshot(
+            modelType: modelType,
+            cacheRequested: cacheRequestedStorage,
+            shadowRequested: shadowRequestedStorage,
+            sourceQuantized: sourceQuantized,
+            sourceSupported: sourceSupported,
+            prepared: preparedStorage,
+            cacheIdentity: holder?.identity,
+            logicalBytes: holder?.logicalBytes ?? 0,
+            configuredLMHeadMode: configuredLMHeadModeStorage)
+        preparationLock.unlock()
+        return snapshot
+    }
+
     /// Decide once, after final load evaluation, whether to build the cache.
     /// Unsupported heads remain on the existing helper path.
     func prepare(
@@ -329,6 +368,11 @@ final class DeepseekV4FP32LMHeadCacheState {
         }
         preparationAttempted = true
 
+        let environment = ProcessInfo.processInfo.environment
+        let cacheRequested = environment["VMLX_DSV4_CACHE_FP32_LM_HEAD"] == "1"
+        let shadowRequested = environment["VMLX_DSV4_CACHE_FP32_LM_HEAD_SHADOW"] == "1"
+        cacheRequestedStorage = cacheRequested
+        shadowRequestedStorage = shadowRequested
         guard let q = lmHead as? QuantizedLinear else {
             return
         }
@@ -338,10 +382,6 @@ final class DeepseekV4FP32LMHeadCacheState {
             expectedInputDimensions: expectedInputDimensions,
             expectedOutputDimensions: expectedOutputDimensions)
         metadataStorage = finalMetadata
-
-        let environment = ProcessInfo.processInfo.environment
-        let cacheRequested = environment["VMLX_DSV4_CACHE_FP32_LM_HEAD"] == "1"
-        let shadowRequested = environment["VMLX_DSV4_CACHE_FP32_LM_HEAD_SHADOW"] == "1"
         if cacheRequested || shadowRequested {
             FileHandle.standardError.write(Data(
                 "[DSV4HeadCache] requested=\(cacheRequested) shadowRequested=\(shadowRequested) supported=\(finalMetadata.supported) mode=\(finalMetadata.mode) bits=\(finalMetadata.bits) groupSize=\(finalMetadata.groupSize) logicalShape=\(String(describing: finalMetadata.logicalWeightShape)) expectedShape=\(finalMetadata.expectedLogicalWeightShape) scalesDType=\(finalMetadata.scalesDType) biasesDType=\(String(describing: finalMetadata.quantizationBiasesDType))\n"

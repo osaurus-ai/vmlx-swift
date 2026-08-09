@@ -1298,7 +1298,8 @@ public class DeepseekV4ModelInner: Module {
 // MARK: - Outer model
 
 public class DeepseekV4Model:
-    Module, LLMModel, KVCacheDimensionProvider, LoRAModel, PostLoadModelPreparation
+    Module, LLMModel, KVCacheDimensionProvider, LoRAModel, PostLoadModelPreparation,
+    ModelContainerDiagnosticSnapshotProvider
 {
     public var kvHeads: [Int]
     var config: DeepseekV4Configuration
@@ -1342,6 +1343,15 @@ public class DeepseekV4Model:
 
     internal var dsv4FP32LMHeadCacheEvents: [DeepseekV4FP32LMHeadCacheEvent] {
         dsv4FP32LMHeadCache.events
+    }
+
+    public func modelContainerDiagnosticSnapshot() -> ModelContainerDiagnosticSnapshot {
+        dsv4FP32LMHeadCache.diagnosticSnapshot(
+            modelType: "deepseek_v4",
+            lmHead: lmHead,
+            expectedInputDimensions: config.hiddenSize,
+            expectedOutputDimensions: config.vocabSize
+        )
     }
 
     public func prepareForInferenceAfterLoad() throws {

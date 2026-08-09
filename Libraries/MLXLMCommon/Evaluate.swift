@@ -4137,6 +4137,14 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     break
                 }
 
+                if activeTokenTrace?.emitsExternalAdapterEvents == true,
+                    let event = handler.tokenIDEvent(token, ordinal: tokenCount),
+                    case .terminated = continuation.yield(event)
+                {
+                    stopReason = .cancelled
+                    break
+                }
+
                 tokenCount += 1
                 if !handler.onToken(token, emit: continuation.yield) {
                     // Distinguish "downstream consumer terminated the
@@ -4453,6 +4461,8 @@ public struct PrefillProgress: Sendable, Equatable {
 ///   runtime has an active `ReasoningParser` stamped on the model configuration.
 /// - `.prefillProgress`: Real prompt-processing progress before first token.
 /// - `.toolCall`: A tool call parsed from the generated output.
+/// - `.tokenID`: A diagnostic-only raw ID handoff for an explicitly
+///   participating external adapter.
 /// - `.info`: Metadata and performance statistics about the generation process.
 public enum Generation: Sendable {
     /// A generated text chunk as a String.
@@ -4475,6 +4485,13 @@ public enum Generation: Sendable {
     /// long reasoning block typically produces many small deltas. No
     /// `.chunk` event is ever emitted for the same bytes.
     case reasoning(String)
+
+    /// One raw token ID and its accepted-source ordinal.
+    ///
+    /// This event is emitted only when token tracing is enabled with external
+    /// adapter participation. High-level adapters must consume it as trace
+    /// evidence and must not forward it to text, tool, or wire consumers.
+    case tokenID(id: Int, ordinal: Int)
 
     /// Completion information summarizing token counts and performance metrics.
     case info(GenerateCompletionInfo)
@@ -4503,6 +4520,7 @@ public enum Generation: Sendable {
         switch self {
         case .chunk(let string): string
         case .reasoning: nil
+        case .tokenID: nil
         case .info: nil
         case .prefillProgress: nil
         case .toolCall: nil
@@ -4515,6 +4533,7 @@ public enum Generation: Sendable {
         switch self {
         case .chunk: nil
         case .reasoning(let string): string
+        case .tokenID: nil
         case .info: nil
         case .prefillProgress: nil
         case .toolCall: nil
@@ -4527,6 +4546,7 @@ public enum Generation: Sendable {
         switch self {
         case .chunk: nil
         case .reasoning: nil
+        case .tokenID: nil
         case .info(let info): info
         case .prefillProgress: nil
         case .toolCall: nil
@@ -4539,6 +4559,7 @@ public enum Generation: Sendable {
         switch self {
         case .chunk: nil
         case .reasoning: nil
+        case .tokenID: nil
         case .info: nil
         case .prefillProgress(let progress): progress
         case .toolCall: nil
@@ -4551,6 +4572,7 @@ public enum Generation: Sendable {
         switch self {
         case .chunk: nil
         case .reasoning: nil
+        case .tokenID: nil
         case .info: nil
         case .prefillProgress: nil
         case .toolCall(let toolCall): toolCall
@@ -4563,6 +4585,7 @@ public enum Generation: Sendable {
         switch self {
         case .chunk: nil
         case .reasoning: nil
+        case .tokenID: nil
         case .info: nil
         case .prefillProgress: nil
         case .toolCall: nil
@@ -4650,6 +4673,9 @@ private protocol TokenLoopHandler: Sendable {
 
     func infoEvent(_ info: GenerateCompletionInfo) -> Output
 
+    /// Diagnostic-only raw token event for an external adapter.
+    func tokenIDEvent(_ token: Int, ordinal: Int) -> Output?
+
     /// True when the last `onToken` returned false because a text-level
     /// stop sequence matched — the generation loop uses this to set
     /// `stopReason = .stop` rather than `.cancelled` on the terminal
@@ -4679,6 +4705,7 @@ private protocol TokenLoopHandler: Sendable {
 }
 
 extension TokenLoopHandler {
+    func tokenIDEvent(_ token: Int, ordinal: Int) -> Output? { nil }
     var stopSequenceHit: Bool { false }
     var stopStringMatch: (stop: String, rangeUTF8: [Int])? { nil }
     var unclosedReasoning: Bool { false }
@@ -4933,7 +4960,7 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
                 return false
             }
             return !stopSequenceHit
-        case .reasoning, .prefillProgress, .toolCall, .toolCallProgress, .info:
+        case .reasoning, .tokenID, .prefillProgress, .toolCall, .toolCallProgress, .info:
             if case .toolCall = event {
                 // Drain the stop-string matcher BEFORE the call event goes
                 // out. Text still held there for disambiguation precedes the
@@ -5000,6 +5027,10 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
 
     func infoEvent(_ info: GenerateCompletionInfo) -> Generation {
         .info(info)
+    }
+
+    func tokenIDEvent(_ token: Int, ordinal: Int) -> Generation? {
+        .tokenID(id: token, ordinal: ordinal)
     }
 
     var unclosedReasoning: Bool {

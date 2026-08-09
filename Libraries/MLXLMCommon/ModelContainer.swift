@@ -359,6 +359,18 @@ public final class ModelContainer: Sendable {
         }
     }
 
+    /// Read the model-owned diagnostic state captured during load.
+    ///
+    /// This is a side-effect-free observation: it does not create MLX arrays,
+    /// allocate request caches, or parse process output. Models that do not
+    /// provide this optional diagnostic surface return `nil`.
+    public func diagnosticSnapshot() async -> ModelContainerDiagnosticSnapshot? {
+        await context.read { ctx in
+            (ctx.model as? any ModelContainerDiagnosticSnapshotProvider)?
+                .modelContainerDiagnosticSnapshot()
+        }
+    }
+
     /// Disable caching and release all cached state.
     public func disableCaching() {
         _cacheCoordinator.withLock { coordinator in

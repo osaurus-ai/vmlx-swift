@@ -580,6 +580,10 @@ public final class TokenIDTraceSession: @unchecked Sendable {
         TokenIDTraceAdapterContract(session: self)
     }
 
+    var emitsExternalAdapterEvents: Bool {
+        externalAdapterParticipation
+    }
+
     var sourceTerminalRule: TokenIDTraceStopRule? {
         lock.lock()
         defer { lock.unlock() }

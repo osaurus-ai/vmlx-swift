@@ -232,6 +232,8 @@ public enum ChatSessionTests {
                 responseText += text
             case .reasoning:
                 break
+            case .tokenID:
+                break
             case .toolCall(let toolCall):
                 toolCalls.append(toolCall)
             case .toolCallProgress:
@@ -678,7 +680,7 @@ public enum BatchEngineIntegrationTests {
             case .prefillProgress:
 
                 break
-            case .info, .toolCall, .toolCallProgress, .reasoning:
+            case .info, .toolCall, .toolCallProgress, .reasoning, .tokenID:
                 break
             }
         }
@@ -912,7 +914,7 @@ public enum ToolCallTests {
                     text += chunk
                 case .toolCall(let toolCall):
                     toolCalls.append(toolCall)
-                case .reasoning, .prefillProgress, .toolCallProgress, .info:
+                case .reasoning, .tokenID, .prefillProgress, .toolCallProgress, .info:
                     break
                 }
             }
