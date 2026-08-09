@@ -56,7 +56,7 @@ struct DeepseekV4ChatEncoderTests {
         #expect(!prompt.contains("Reasoning Effort: Absolute maximum"))
     }
 
-    @Test("reasoning_effort=high uses its distinct prefix; low and nil add none")
+    @Test("reasoning_effort=high uses its distinct prefix; low and nil enforce the low preface")
     func reasoningEffortHighLowAndDefaultPrefixes() {
         let encoder = DeepseekV4ChatEncoder()
         let promptHigh = encoder.encode(
@@ -72,9 +72,30 @@ struct DeepseekV4ChatEncoderTests {
             thinkingMode: .thinking)
         #expect(promptHigh.contains("Reasoning Effort: Absolute maximum"))
         #expect(!promptHigh.contains("Reasoning Effort: Beyond maximum"))
-        #expect(!promptLow.contains("Reasoning Effort:"))
-        #expect(!promptNil.contains("Reasoning Effort: Absolute"))
-        #expect(!promptNil.contains("Reasoning Effort: Beyond"))
+        #expect(!promptHigh.contains("Reasoning Effort: Low"))
+        #expect(promptLow.contains("Reasoning Effort: Low"),
+            "low must inject the enforcement preface — official empty-string low left think depth to the model")
+        #expect(promptNil == promptLow,
+            "absent effort is the official low default and must render byte-identically to explicit low")
+        #expect(!promptLow.contains("Reasoning Effort: Absolute"))
+        #expect(!promptLow.contains("Reasoning Effort: Beyond"))
+    }
+
+    @Test("low preface sits at prompt index 0 (right after BOS) and never on the chat rail")
+    func lowPrefacePlacementAndChatRailClean() {
+        let encoder = DeepseekV4ChatEncoder()
+        let thinking = encoder.encode(
+            messages: [Msg(role: .user, content: "hi")],
+            thinkingMode: .thinking,
+            reasoningEffort: .low)
+        #expect(thinking.hasPrefix(DeepseekV4Tokens.bos + "Reasoning Effort: Low"),
+            "low preface must be the first bytes after <｜begin▁of▁sentence｜>")
+        let chat = encoder.encode(
+            messages: [Msg(role: .user, content: "hi")],
+            thinkingMode: .chat,
+            reasoningEffort: .low)
+        #expect(!chat.contains("Reasoning Effort:"),
+            "chat rail must never carry a reasoning-effort preface")
     }
 
     // MARK: - Multi-turn drop_earlier_reasoning

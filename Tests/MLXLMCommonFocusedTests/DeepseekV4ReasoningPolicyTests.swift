@@ -86,7 +86,7 @@ struct DeepseekV4ReasoningPolicyTests {
         }
     }
 
-    @Test("thinking true without effort preserves the official low rail")
+    @Test("thinking true without effort renders the enforced low rail")
     func thinkingTrueWithoutEffortRemainsLow() throws {
         let context = try DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
             ["enable_thinking": true],
@@ -104,15 +104,18 @@ struct DeepseekV4ReasoningPolicyTests {
             additionalContext: context,
             addGenerationPrompt: true
         )
-        #expect(!prompt.contains("Reasoning Effort:"))
+        #expect(prompt.contains("Reasoning Effort: Low"),
+            "absent effort is the low default and must carry the enforcement preface")
+        #expect(!prompt.contains("Reasoning Effort: Absolute"))
+        #expect(!prompt.contains("Reasoning Effort: Beyond"))
         #expect(prompt.hasSuffix(DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart))
     }
 
     @Test("absent thinking controls default to the bundle's thinking mode")
     func absentThinkingControlsDefaultToThinking() throws {
         // DSV4's jang_config declares default_mode="thinking" with
-        // default_effort="low" (which adds no preface). A request that
-        // carries NO enable_thinking and NO reasoning_effort must render
+        // default_effort="low" (now enforced via the low preface). A request
+        // that carries NO enable_thinking and NO reasoning_effort must render
         // the thinking rail — an open <think> tail — not silently fall to
         // chat mode while the UI reports the "Low" default. Explicit
         // enable_thinking=false remains the only path to the chat rail.
@@ -122,7 +125,7 @@ struct DeepseekV4ReasoningPolicyTests {
             additionalContext: nil,
             addGenerationPrompt: true
         )
-        #expect(!prompt.contains("Reasoning Effort:"))
+        #expect(prompt.contains("Reasoning Effort: Low"))
         #expect(prompt.hasSuffix(DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart))
 
         let emptyContext = try DeepseekV4ChatEncoder.renderOpenAIChat(

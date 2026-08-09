@@ -130,7 +130,8 @@ struct DeepseekV4FP32LMHeadCacheTests {
                     scales: head.scales,
                     biases: head.biases,
                     groupSize: head.groupSize,
-                    bits: head.bits
+                    bits: head.bits,
+                    mode: head.mode
                 ).asType(.float32)
                 MLX.eval(currentWeight, cachedWeight)
                 #expect(Self.rawFP32Bytes(currentWeight) == Self.rawFP32Bytes(cachedWeight))
@@ -144,7 +145,7 @@ struct DeepseekV4FP32LMHeadCacheTests {
                     }
                 }
                 let hidden = MLXArray(hiddenValues, [1, 1, 32]).asType(.bfloat16)
-                let current = DeepseekV4Math.lmHeadFp32(hidden, lmHead: head)
+                let current = DeepseekV4Math.lmHeadExactFp32(hidden, lmHead: head)
                 let cached = DeepseekV4Math.lmHeadFp32WithCachedWeight(
                     hidden, lmHead: head, weight: cachedWeight)
                 MLX.eval(current, cached)
@@ -392,7 +393,7 @@ struct DeepseekV4FP32LMHeadCacheTests {
                         expectedOutputDimensions: 8)
                     let hidden = MLXArray((0 ..< 32).map(Float.init), [1, 1, 32])
                         .asType(.bfloat16)
-                    let expected = DeepseekV4Math.lmHeadFp32(hidden, lmHead: head)
+                    let expected = DeepseekV4Math.lmHeadExactFp32(hidden, lmHead: head)
                     let first = state.logits(hidden, lmHead: head)
                     let second = state.logits(hidden, lmHead: head)
                     MLX.eval(expected, first, second)

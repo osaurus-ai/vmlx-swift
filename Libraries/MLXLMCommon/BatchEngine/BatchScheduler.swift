@@ -189,7 +189,8 @@ extension BatchSlot {
         self.sampler = request.parameters.sampler()
         self.processor = request.parameters.processor()
         self.stopTokenIDs = stopTokenIDs
-        self.maxTokens = request.parameters.maxTokens
+        self.maxTokens = MetalLiveBufferGuard.clampedMaxTokens(
+            requested: request.parameters.maxTokens, cache: cache)
         self.cache = cache
         self.promptCacheSnapshot = nil
         self.diskSeedSnapshot = nil

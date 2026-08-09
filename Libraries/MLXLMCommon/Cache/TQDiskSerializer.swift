@@ -1473,7 +1473,11 @@ public enum TQDiskSerializer {
                 guard let dtype = dsv4PoolDType(values[3 + ndim]),
                       shape[0] > 0,
                       shape[1] > 0,
-                      shape[1] <= 64,
+                      // Legacy writers emitted 64-row segments. Current DSV4
+                      // writers losslessly compact adjacent q8 rows into
+                      // bounded 16K slabs so near-1M restore/decode does not
+                      // traverse thousands of tiny tensors.
+                      shape[1] <= 16 * 1024,
                       shape[2] > 0,
                       groupSize > 0,
                       shape[2] % groupSize == 0,

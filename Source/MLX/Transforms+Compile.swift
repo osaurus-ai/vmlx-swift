@@ -16,6 +16,19 @@ private func mlxSwiftCompileAllowedByPolicy() -> Bool {
     return raw == "1" || raw.lowercased() == "true"
 }
 
+// `ProcessInfo.environment` rebuilds the whole dictionary on every access —
+// far too expensive for a check that runs on every compiled-function call
+// (86×/token in DSV4 decode). The flags are process-lifetime constants.
+private let mlxSwiftCompileAllowed: Bool = mlxSwiftCompileAllowedByPolicy()
+
+/// `MLX_DISABLE_COMPILE` is a hard kill switch: it also disables trusted
+/// compiled regions and turns the backend compile mode off globally, once.
+private let mlxSwiftCompileHardDisabled: Bool = {
+    let disabled = ProcessInfo.processInfo.environment["MLX_DISABLE_COMPILE"] != nil
+    if disabled { mlx_disable_compile() }
+    return disabled
+}()
+
 // Note: this is all immutable state -- the `id` property is only set at init time
 final class CompiledFunction: @unchecked (Sendable) {
 
@@ -33,25 +46,46 @@ final class CompiledFunction: @unchecked (Sendable) {
 
     let shapeless: Bool
 
+    /// Trusted functions bypass the opt-in compile policy (they were validated
+    /// for compiled execution by their author) but still honor the
+    /// `MLX_DISABLE_COMPILE` hard kill switch.
+    let trusted: Bool
+
     init(
         inputs: [any Updatable], outputs: [any Updatable], shapeless: Bool,
+        trusted: Bool = false,
         _ f: @escaping ([MLXArray]) -> [MLXArray]
     ) {
         self.f = f
         self.inputs = inputs
         self.outputs = outputs
         self.shapeless = shapeless
+        self.trusted = trusted
         self.id = UInt(bitPattern: Unmanaged.passUnretained(self).toOpaque())
     }
 
+    /// Cached backend closures for state-free functions. The C-side compiled
+    /// closure keeps its own retrace-on-shape-change logic, so reusing it is
+    /// safe; rebuilding it per call costs a Swift trampoline allocation plus a
+    /// `mlx_detail_compile` map lookup on every invocation. Only valid while
+    /// `inputs`/`outputs` are empty (the inner trampoline then captures
+    /// nothing mutable) and the argument count is unchanged. Guarded by `lock`.
+    private var cachedInnerClosure: mlx_closure? = nil
+    private var cachedCompiledClosure: mlx_closure? = nil
+    private var cachedArgumentCount: Int = -1
+
     deinit {
+        if let cached = cachedCompiledClosure { mlx_closure_free(cached) }
+        if let cached = cachedInnerClosure { mlx_closure_free(cached) }
         // remove the compiled structure from the back end
         mlx_detail_compile_erase(id)
     }
 
     func call(_ arguments: [MLXArray]) -> [MLXArray] {
-        if !mlxSwiftCompileAllowedByPolicy() {
-            mlx_disable_compile()
+        // Never call `mlx_disable_compile()` per call here: it mutates the
+        // backend compile mode *globally*, which would degrade every trusted
+        // compiled closure in the process to eager at apply time.
+        if mlxSwiftCompileHardDisabled || (!trusted && !mlxSwiftCompileAllowed) {
             return f(arguments)
         }
 
@@ -61,8 +95,17 @@ final class CompiledFunction: @unchecked (Sendable) {
     }
 
     func innerCall(_ arguments: [MLXArray]) -> [MLXArray] {
+        // Bind properties to locals so `inner` captures values, never `self`.
+        // The trampoline below is stored in `cachedInnerClosure`/
+        // `cachedCompiledClosure` (via the C closure payload): an implicit
+        // `self` capture there forms a self-retain cycle, `deinit` never runs,
+        // and `mlx_detail_compile_erase` never frees the backend cache entry —
+        // which retains every traced constant (model weights) forever.
+        let f = self.f
+        let outputs = self.outputs
         let stateInputs = inputs.flatMap { $0.innerState() }
         let argumentsCount = arguments.count
+        let stateFree = stateInputs.isEmpty && outputs.isEmpty
 
         // inner function to hande the compilation.  this is called
         // once per compile (typically once overall, but can be called
@@ -99,17 +142,37 @@ final class CompiledFunction: @unchecked (Sendable) {
             return result + stateOutputTracers
         }
 
-        let innerClosure = new_mlx_closure(inner(tracers:))
-        defer { mlx_closure_free(innerClosure) }
-
-        // note: this will use the cached compile (via the id)
-        // but will be able to re-evaluate with fresh state if needed
         evalLock.lock()
-        var compiled = mlx_closure_new()
-        mlx_detail_compile(&compiled, innerClosure, id, shapeless, [], 0)
+        defer { evalLock.unlock() }
+
+        let compiled: mlx_closure
+        var transient: (inner: mlx_closure, compiled: mlx_closure)? = nil
+        if stateFree, cachedArgumentCount == argumentsCount,
+            let cached = cachedCompiledClosure
+        {
+            compiled = cached
+        } else {
+            // note: this will use the cached compile (via the id)
+            // but will be able to re-evaluate with fresh state if needed
+            let innerClosure = new_mlx_closure(inner(tracers:))
+            var newCompiled = mlx_closure_new()
+            mlx_detail_compile(&newCompiled, innerClosure, id, shapeless, [], 0)
+            if stateFree {
+                if let old = cachedCompiledClosure { mlx_closure_free(old) }
+                if let old = cachedInnerClosure { mlx_closure_free(old) }
+                cachedInnerClosure = innerClosure
+                cachedCompiledClosure = newCompiled
+                cachedArgumentCount = argumentsCount
+            } else {
+                transient = (inner: innerClosure, compiled: newCompiled)
+            }
+            compiled = newCompiled
+        }
         defer {
-            mlx_closure_free(compiled)
-            evalLock.unlock()
+            if let transient {
+                mlx_closure_free(transient.compiled)
+                mlx_closure_free(transient.inner)
+            }
         }
 
         let innerInputs = arguments + stateInputs
@@ -227,6 +290,44 @@ public func compile(
     -> @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray
 {
     let compileState = CompiledFunction(inputs: inputs, outputs: outputs, shapeless: shapeless) {
+        [f($0[0], $0[1], $0[2])]
+    }
+
+    return { a, b, c in
+        compileState.call([a, b, c]).first ?? .mlxNone
+    }
+}
+
+/// Variant of ``compile(inputs:outputs:shapeless:_:)-([Updatable],[Updatable],Bool,([MLXArray])->[MLXArray])``
+/// for functions whose compiled execution has been validated by the caller.
+///
+/// Trusted functions compile even when the opt-in policy
+/// (`VMLX_ENABLE_UNSAFE_COMPILE`) is not set, so validated hot paths keep
+/// their compiled fast path in production processes. `MLX_DISABLE_COMPILE`
+/// still disables them.
+public func vmlxTrustedCompile(
+    inputs: [any Updatable] = [], outputs: [any Updatable] = [], shapeless: Bool = false,
+    _ f: @escaping ([MLXArray]) -> [MLXArray]
+) -> @Sendable ([MLXArray]) -> [MLXArray] {
+    let compileState = CompiledFunction(
+        inputs: inputs, outputs: outputs, shapeless: shapeless, trusted: true, f)
+
+    return { arrays in
+        compileState.call(arrays)
+    }
+}
+
+/// Overload of ``vmlxTrustedCompile(inputs:outputs:shapeless:_:)-([Updatable],[Updatable],Bool,([MLXArray])->[MLXArray])``
+/// that takes three ``MLXArray`` and produces a single ``MLXArray``.
+public func vmlxTrustedCompile(
+    inputs: [any Updatable] = [], outputs: [any Updatable] = [], shapeless: Bool = false,
+    _ f: @Sendable @escaping (MLXArray, MLXArray, MLXArray) -> MLXArray
+)
+    -> @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray
+{
+    let compileState = CompiledFunction(
+        inputs: inputs, outputs: outputs, shapeless: shapeless, trusted: true
+    ) {
         [f($0[0], $0[1], $0[2])]
     }
 

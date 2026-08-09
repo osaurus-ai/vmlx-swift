@@ -204,6 +204,19 @@ public struct GenerateParameters: Sendable {
     /// `generation_config.json`'s `suppress_tokens` field.
     public var suppressTokens: [Int]
 
+    /// Token ids masked only while the first ``initialSuppressCount`` sampled
+    /// tokens are produced; the ban lifts afterward. Engine-internal: armed by
+    /// `MinimumReasoningFloor` on the DSV4 enforced-low thinking rail so the
+    /// think block cannot close before a short visible reasoning floor lands.
+    /// Unlike ``suppressTokens`` this is a leading window, not a
+    /// whole-generation ban, and it can only ever DELAY a token — it never
+    /// forces or biases toward one.
+    public var initialSuppressTokens: [Int] = []
+
+    /// Number of leading sampled tokens for which ``initialSuppressTokens``
+    /// stay masked. Zero disables the window.
+    public var initialSuppressCount: Int = 0
+
     /// Speculative-decoding strategy (opt-in). `nil` preserves the existing
     /// autoregressive decode path byte-for-byte — callers who don't set this
     /// see no behaviour change.
@@ -392,8 +405,14 @@ public struct GenerateParameters: Sendable {
         let suppressContext =
             suppressTokens.isEmpty ? nil : SuppressTokensProcessor(tokens: suppressTokens)
 
+        let initialSuppressContext: InitialSuppressTokensProcessor? =
+            (initialSuppressTokens.isEmpty || initialSuppressCount <= 0)
+            ? nil
+            : InitialSuppressTokensProcessor(
+                tokens: initialSuppressTokens, count: initialSuppressCount)
+
         if repetitionContext == nil && presenceContext == nil && frequencyContext == nil
-            && suppressContext == nil
+            && suppressContext == nil && initialSuppressContext == nil
         {
             return nil
         }
@@ -402,7 +421,8 @@ public struct GenerateParameters: Sendable {
             repetitionContext: repetitionContext,
             presenceContext: presenceContext,
             frequencyContext: frequencyContext,
-            suppressContext: suppressContext
+            suppressContext: suppressContext,
+            initialSuppressContext: initialSuppressContext
         )
     }
 
@@ -414,6 +434,9 @@ public struct GenerateParameters: Sendable {
             && (repetitionPenalty == nil || repetitionPenalty == 0 || repetitionPenalty == 1)
             && (presencePenalty == nil || presencePenalty == 0)
             && (frequencyPenalty == nil || frequencyPenalty == 0)
+            // The minimum reasoning floor masks logits per sampled token;
+            // drafted MTP tokens would bypass it, so fall back to AR.
+            && initialSuppressTokens.isEmpty
     }
 
     public func canUseNativeMTP(for input: LMInput) -> Bool {
@@ -900,23 +923,62 @@ public struct SuppressTokensProcessor: LogitProcessor {
     mutating public func didSample(token: MLXArray) {}
 }
 
+/// Masks a fixed token set for only the first N sampled tokens, then
+/// releases the ban. Powers the DSV4 enforced-low minimum reasoning floor
+/// (see `MinimumReasoningFloor`): the enforced-low thinking rail must open
+/// with a short visible think block, so `</think>` is unavailable for the
+/// first few sampled tokens and the model closes naturally afterward.
+///
+/// This is the inverse of the removed hidden "reasoning close bias" (which
+/// capped thinking by forcing the close after a budget): a leading-window
+/// mask can only DELAY a token. It never forces, biases toward, or injects
+/// one — see `NoHiddenReasoningCloseBiasFocusedTests`.
+public struct InitialSuppressTokensProcessor: LogitProcessor {
+    private let tokens: [Int]
+    private var remaining: Int
+    private let negInf = MLXArray(-Float.infinity)
+
+    public init(tokens: [Int], count: Int) {
+        self.tokens = Array(Set(tokens)).sorted()
+        self.remaining = max(0, count)
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {}
+
+    public func process(logits: MLXArray) -> MLXArray {
+        guard remaining > 0 else { return logits }
+        let vocabSize = logits.dim(-1)
+        let valid = tokens.filter { $0 >= 0 && $0 < vocabSize }
+        guard !valid.isEmpty else { return logits }
+        logits[0..., MLXArray(valid.map(Int32.init)).asType(.uint32)] = negInf
+        return logits
+    }
+
+    mutating public func didSample(token: MLXArray) {
+        if remaining > 0 { remaining -= 1 }
+    }
+}
+
 /// Processor that composes generation-config logits processors.
 public struct PenaltyProcessor: LogitProcessor {
     var repetitionContext: RepetitionContext?
     var presenceContext: PresencePenaltyContext?
     var frequencyContext: FrequencyPenaltyContext?
     var suppressContext: SuppressTokensProcessor?
+    var initialSuppressContext: InitialSuppressTokensProcessor?
 
     public init(
         repetitionContext: RepetitionContext?,
         presenceContext: PresencePenaltyContext?,
         frequencyContext: FrequencyPenaltyContext?,
-        suppressContext: SuppressTokensProcessor? = nil
+        suppressContext: SuppressTokensProcessor? = nil,
+        initialSuppressContext: InitialSuppressTokensProcessor? = nil
     ) {
         self.repetitionContext = repetitionContext
         self.presenceContext = presenceContext
         self.frequencyContext = frequencyContext
         self.suppressContext = suppressContext
+        self.initialSuppressContext = initialSuppressContext
     }
 
     mutating public func prompt(_ prompt: MLXArray) {
@@ -924,6 +986,7 @@ public struct PenaltyProcessor: LogitProcessor {
         presenceContext?.prompt(prompt)
         frequencyContext?.prompt(prompt)
         suppressContext?.prompt(prompt)
+        initialSuppressContext?.prompt(prompt)
     }
 
     public func process(logits: MLXArray) -> MLXArray {
@@ -932,6 +995,7 @@ public struct PenaltyProcessor: LogitProcessor {
         logits = presenceContext?.process(logits: logits) ?? logits
         logits = frequencyContext?.process(logits: logits) ?? logits
         logits = suppressContext?.process(logits: logits) ?? logits
+        logits = initialSuppressContext?.process(logits: logits) ?? logits
         return logits
     }
 
@@ -940,6 +1004,7 @@ public struct PenaltyProcessor: LogitProcessor {
         presenceContext?.didSample(token: token)
         frequencyContext?.didSample(token: token)
         suppressContext?.didSample(token: token)
+        initialSuppressContext?.didSample(token: token)
     }
 }
 
@@ -1376,7 +1441,8 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.processor = effectiveParameters.processor()
         self.sampler = effectiveParameters.sampler()
-        self.maxTokens = effectiveParameters.maxTokens
+        self.maxTokens = MetalLiveBufferGuard.clampedMaxTokens(
+            requested: effectiveParameters.maxTokens, cache: self.cache)
 
         self.kvBits = effectiveParameters.kvBits
         self.kvGroupSize = effectiveParameters.kvGroupSize

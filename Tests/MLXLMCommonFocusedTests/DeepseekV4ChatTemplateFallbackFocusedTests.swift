@@ -77,7 +77,9 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         let high = try template.renderDSV4(highContext)
         let max = try template.renderDSV4(maxContext)
 
-        #expect(!low.contains("Reasoning Effort:"))
+        #expect(low.contains("Reasoning Effort: Low — minimal thinking only."))
+        #expect(!low.contains("Reasoning Effort: Absolute"))
+        #expect(!low.contains("Reasoning Effort: Beyond"))
         #expect(high.contains("Reasoning Effort: Absolute maximum with no shortcuts permitted."))
         #expect(!high.contains("Reasoning Effort: Beyond maximum"))
         #expect(max.contains("Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising."))

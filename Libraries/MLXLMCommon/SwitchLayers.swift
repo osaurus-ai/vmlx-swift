@@ -255,6 +255,9 @@ public class SwitchGLU: Module, SwitchGLULayer {
         return 512 * 1024 * 1024
     }
 
+    private static let fusedGateUpDecodeThreshold: Int =
+        Int(ProcessInfo.processInfo.environment["BENCH_FUSED_GATE_UP_THRESHOLD"] ?? "32") ?? 32
+
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         callAsFunction(x, indices, preDownScores: nil)
     }
@@ -280,8 +283,9 @@ public class SwitchGLU: Module, SwitchGLULayer {
         // threshold (32 by default) admits single-token + a few prompt
         // tokens as "decode-shaped" and bounces large prefill chunks to
         // the two-call path. Override via BENCH_FUSED_GATE_UP_THRESHOLD.
-        let decodeThreshold: Int =
-            Int(ProcessInfo.processInfo.environment["BENCH_FUSED_GATE_UP_THRESHOLD"] ?? "32") ?? 32
+        // (Read once: `ProcessInfo.environment` rebuilds its dictionary on
+        // every access — too costly for a per-layer forward path.)
+        let decodeThreshold = SwitchGLU.fusedGateUpDecodeThreshold
         let useFused =
             (fusedGateUpWeight != nil)
             && (indices.size <= decodeThreshold)

@@ -486,12 +486,13 @@ struct DeepseekV4AgentLoopBoundaryTests {
         let low = try render("low")
         let high = try render("high")
 
-        // `low` is documented as adding nothing, so low vs high is the real
-        // cache hazard: the high prompt gains a prefix at position 0.
+        // Every effort rail (including the enforced low preface) injects at
+        // position 0, so low vs high diverges immediately after the shared
+        // BOS + "Reasoning Effort: " stem (39 characters).
         #expect(low != high, "reasoning effort had no effect on the prompt at all")
         let shared = zip(low, high).prefix { $0 == $1 }.count
         #expect(
-            shared < 32,
+            shared < 64,
             """
             expected the effort prompt to land at the very front (shared=\(shared)); \
             if it lands later this test is measuring the wrong thing

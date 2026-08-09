@@ -61,6 +61,63 @@ struct Bench {
             return
         }
 
+        // BENCH_HCPRE_MICRO=1: no-model micro-bench for the DSV4 mHC-pre
+        // region. Times 86 chained collapse calls per synthetic "token"
+        // (43 layers × attn+ffn), eager graph vs shared compiled region,
+        // to isolate host graph-build + CompiledFunction wrapper overhead.
+        if (env["BENCH_HCPRE_MICRO"] ?? "0") == "1" {
+            let tokens = Int(env["BENCH_HCPRE_TOKENS"] ?? "50") ?? 50
+            let callsPerToken = 86
+            let hcMult = 4, hidden = 4096, iters = 20
+            let eps: Float = 1e-6
+
+            func synth(_ shape: [Int], scale: Float) -> MLXArray {
+                let n = shape.reduce(1, *)
+                return (sin(MLXArray(0 ..< n).asType(.float32) * 0.37) * scale)
+                    .reshaped(shape)
+            }
+            let h0 = synth([1, 1, hcMult, hidden], scale: 0.5).asType(.bfloat16)
+            let fnW = synth([(2 + hcMult) * hcMult, hcMult * hidden], scale: 0.02)
+                .asType(.bfloat16)
+            let scaleW = synth([3], scale: 0.1)
+            let baseW = synth([(2 + hcMult) * hcMult], scale: 0.1)
+            eval(h0, fnW, scaleW, baseW)
+
+            func runToken(compiled: Bool) {
+                var h = h0
+                for _ in 0 ..< callsPerToken {
+                    let out = compiled
+                        ? DeepseekV4Math.hcPreCompiled(
+                            h, fn: fnW, scale: scaleW, base: baseW,
+                            hcMult: hcMult, hiddenSize: hidden, iters: iters, eps: eps)
+                        : DeepseekV4Math.hcPreGraph(
+                            h, fn: fnW, scale: scaleW, base: baseW,
+                            hcMult: hcMult, hiddenSize: hidden, iters: iters, eps: eps)
+                    // Keep all three outputs live and chain the next call on
+                    // them so per-call work cannot collapse or run ahead.
+                    h = (h0
+                        + 0.001 * out.x.expandedDimensions(axis: 2)
+                        + 0.0001 * out.post.expandedDimensions(axis: -1)
+                        + 0.0001 * out.comb.sum(axis: -1, keepDims: true))
+                        .asType(.bfloat16)
+                }
+                eval(h)
+            }
+
+            for (label, compiled) in [("eager", false), ("compiled", true)] {
+                for _ in 0 ..< 3 { runToken(compiled: compiled) }  // warmup
+                let start = Date()
+                for _ in 0 ..< tokens { runToken(compiled: compiled) }
+                let total = Date().timeIntervalSince(start)
+                let msPerToken = total * 1000 / Double(tokens)
+                let usPerCall = total * 1_000_000 / Double(tokens * callsPerToken)
+                print(String(
+                    format: "HCPRE_MICRO %@ tokens=%d ms/token=%.3f us/call=%.1f",
+                    label, tokens, msPerToken, usPerCall))
+            }
+            return
+        }
+
         // BENCH_JANGPRESS=1 activates the JangPress cold-weight tier
         // (axis E) for THIS bench run. Holds the runtime alive for
         // the full bench so the controller's failsafe state machine
@@ -918,6 +975,8 @@ struct Bench {
             // store on completion), subsequent runs should hit the paged
             // cache for the prefix and only prefill the remainder.
             let runs = Int(env["BENCH_RUNS"] ?? "1") ?? 1
+            let decodeWindowTokens = max(
+                0, Int(env["BENCH_DECODE_WINDOW_TOKENS"] ?? "0") ?? 0)
             let tokenIds = (0..<promptLen).map { Int($0 % 4096 + 1) }
             for runIdx in 0..<runs {
                 print("\n[Simple run \(runIdx + 1)/\(runs)] \(maxNew) tokens from \(promptLen)-token prompt (prefillStep=\(sp.prefillStepSize))")
@@ -929,13 +988,40 @@ struct Bench {
                 var firstTokT: Double = 0
                 var count = 0
                 var generated: [Int] = []
+                var decodeWindowStart: Double = 0
+                var decodeWindowStartCount = 1
                 while let tok = sIter.next() {
                     count += 1
-                    if count == 1 { firstTokT = CFAbsoluteTimeGetCurrent() - t0 }
+                    if count == 1 {
+                        let now = CFAbsoluteTimeGetCurrent()
+                        firstTokT = now - t0
+                        decodeWindowStart = now
+                    } else if decodeWindowTokens > 0,
+                        (count - 1) % decodeWindowTokens == 0
+                    {
+                        let now = CFAbsoluteTimeGetCurrent()
+                        let windowCount = count - decodeWindowStartCount
+                        let elapsed = max(now - decodeWindowStart, 0.001)
+                        print(String(format:
+                            "  decode window %d...%d | context %d | %.1f tok/s",
+                            decodeWindowStartCount + 1, count,
+                            promptLen + count, Double(windowCount) / elapsed))
+                        decodeWindowStart = now
+                        decodeWindowStartCount = count
+                    }
                     generated.append(tok)
                 }
                 let tot = CFAbsoluteTimeGetCurrent() - t0
                 let decodeTime = max(tot - firstTokT, 0.001)
+                if decodeWindowTokens > 0, count > decodeWindowStartCount {
+                    let windowCount = count - decodeWindowStartCount
+                    let elapsed = max(
+                        CFAbsoluteTimeGetCurrent() - decodeWindowStart, 0.001)
+                    print(String(format:
+                        "  decode window %d...%d | context %d | %.1f tok/s",
+                        decodeWindowStartCount + 1, count,
+                        promptLen + count, Double(windowCount) / elapsed))
+                }
                 print(String(format:
                     "  generated %d tokens | TTFT %.0fms | decode %.1f tok/s | total %.2fs",
                     count, firstTokT * 1000, Double(count - 1) / decodeTime, tot))

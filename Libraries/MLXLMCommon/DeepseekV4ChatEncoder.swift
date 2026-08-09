@@ -73,9 +73,25 @@ public struct DeepseekV4ChatEncoder: Sendable {
 
     public init() {}
 
-    // Verbatim 0731 `REASONING_EFFORT_PROMPTS` values. `low` is the
-    // default and intentionally adds no prefix. These strings are part of
-    // the model's prompt contract and must not be reworded or interchanged.
+    // `high`/`max` are verbatim 0731 `REASONING_EFFORT_PROMPTS` values —
+    // part of the model's prompt contract; never reword or interchange them.
+    //
+    // The official contract defines `low` as the EMPTY STRING: no directive
+    // is injected and the model self-modulates think depth, so hard first
+    // prompts still produce long reasoning on the "Low" rail. That is
+    // unacceptable for surfaces whose default promises low reasoning, so
+    // vmlx deliberately deviates: `.low` (and absent effort, which the
+    // official DEFAULT_REASONING_EFFORT maps to low) injects a style-matched
+    // enforcement preface. nil ≡ .low by construction so warmup and send
+    // renders can never diverge.
+    static let reasoningEffortLowPreface = """
+        Reasoning Effort: Low — minimal thinking only.
+        Begin with a very short thinking block: one or two sentences confirming your approach, never more.
+        Then close your thinking and give only the final answer — clean and direct, without restating your reasoning.
+
+
+        """
+
     static let reasoningEffortHighPreface = """
         Reasoning Effort: Absolute maximum with no shortcuts permitted.
         You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.
@@ -98,8 +114,10 @@ public struct DeepseekV4ChatEncoder: Sendable {
     /// - Parameters:
     ///   - messages: conversation history, OpenAI-style roles + fields.
     ///   - thinkingMode: `.chat` or `.thinking` (DSV4 has these two).
-    ///   - reasoningEffort: nil / `.high` / `.max`. Only applies in
-    ///     `.thinking` mode.
+    ///   - reasoningEffort: nil ≡ `.low` / `.high` / `.max`. Only applies
+    ///     in `.thinking` mode; every rail injects its preface at index 0
+    ///     (low is a deliberate vmlx enforcement extension — official
+    ///     contract leaves it empty).
     ///   - dropEarlierReasoning: strip `reasoning_content` from prior
     ///     assistant turns. Forced `false` whenever any message still
     ///     carries `tools` (mid-trajectory agent turns need full CoT).
@@ -222,12 +240,12 @@ public struct DeepseekV4ChatEncoder: Sendable {
         let effort = Self.reasoningEffort(from: additionalContext)
         let explicitlyEnabled = additionalContext?["enable_thinking"] as? Bool
         // DSV4's bundle contract (jang_config chat.reasoning) declares
-        // default_mode="thinking" with default_effort="low", and "low" adds
-        // no preface. Absent controls therefore mean the thinking rail —
-        // the same default `encode(thinkingMode:)` uses. Only an explicit
-        // enable_thinking=false selects the chat rail; defaulting the
-        // absent case to chat rendered a closed </think> tail while the
-        // UI reported the "Low" thinking default.
+        // default_mode="thinking" with default_effort="low". Absent controls
+        // therefore mean the thinking rail on the low preface (nil ≡ .low
+        // in the encoder) — the same default `encode(thinkingMode:)` uses.
+        // Only an explicit enable_thinking=false selects the chat rail;
+        // defaulting the absent case to chat rendered a closed </think>
+        // tail while the UI reported the "Low" thinking default.
         let thinkingMode: DeepseekV4ThinkingMode =
             explicitlyEnabled == false ? .chat : .thinking
         let dropEarlierReasoning =
@@ -450,12 +468,13 @@ public struct DeepseekV4ChatEncoder: Sendable {
         let lastUserIdx = Self.findLastUserIndex(messages)
         var out = ""
 
-        // Reasoning-effort preface only at index 0 in thinking mode. Nil is
-        // the official low/default rail and therefore adds no text.
+        // Reasoning-effort preface only at index 0 in thinking mode. Every
+        // rail injects its preface — including low (nil ≡ .low), which the
+        // official contract leaves empty; see reasoningEffortLowPreface.
         if index == 0 && thinkingMode == .thinking {
             switch reasoningEffort ?? .low {
             case .low:
-                break
+                out += Self.reasoningEffortLowPreface
             case .high:
                 out += Self.reasoningEffortHighPreface
             case .max:

@@ -562,6 +562,18 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 "Weights (\(facts.totalSafetensorsBytes / 1_073_741_824) GiB) approach physical memory; loading materialized instead of mmap so pages stay resident."
             )
         }
+        // Plain affine DSV4 must advertise the same limits the loader will
+        // actually apply: `loadModel` re-resolves through the bundle facts and
+        // drops the decode-throttling MLX memory limit (RAM admission is the
+        // owning safety gate). Without this, the plan surface shows a
+        // fraction cap the engine then ignores, and hosts reason about the
+        // wrong budget.
+        if let facts = bundleFacts {
+            loadConfiguration.memoryLimit = facts.resolveMLXMemoryLimit(
+                requested: loadConfiguration.memoryLimit)
+            loadConfiguration.useMmapSafetensors = facts.resolveMmapSafetensors(
+                requested: loadConfiguration.useMmapSafetensors)
+        }
         var blockingIssues: [VMLXServerSettingsIssue] = []
 
         if case .diagnosticDangerous = memorySafety.mode {
