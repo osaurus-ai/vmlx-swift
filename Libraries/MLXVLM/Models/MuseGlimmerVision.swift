@@ -34,7 +34,27 @@ public struct MuseGlimmerVisionConfiguration: Codable, Sendable {
 
     /// The reference derives the attention window from the position-embedding
     /// grid: `pos_emb_height * patch_size` pixels.
-    public var windowSize: Int { posEmbHeight * patchSize }
+    /// **Not in the checkpoint.** `config.json` declares `layer_types` with 39
+    /// `window_attention` layers but never states the window size, so this is
+    /// inferred: the position table covers a 32x32 patch grid, i.e. 448px, the
+    /// model's native resolution.
+    ///
+    /// That inference is suspect — at 448 a native-resolution image is a single
+    /// window, which makes those 39 layers behave as full attention and defeats
+    /// the point of having them. A sweep against the six-trial shape battery
+    /// (see MuseGlimmer_PROOF_MATRIX.md) found 448 and 224 give a constant
+    /// answer (3/6, chance) while 112 discriminates the shapes but reports them
+    /// inverted (0/6, which chance produces once in 64). None is correct, so
+    /// the value is left at the inferred default and overridable for the next
+    /// investigation rather than changed to one that scores worse.
+    public var windowSize: Int {
+        if let raw = ProcessInfo.processInfo.environment["VMLX_MUSE_VISION_WINDOW"],
+            let value = Int(raw), value > 0
+        {
+            return value
+        }
+        return posEmbHeight * patchSize
+    }
 
     enum CodingKeys: String, CodingKey {
         case hiddenSize = "hidden_size"

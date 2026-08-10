@@ -264,6 +264,30 @@ a 32x32 grid both reduce to exact identity; the window partition is a single
 window at that size; the attention block, rotary pairing and masks all match the
 reference.
 
+### The probe, properly calibrated
+
+The six-trial battery (three circles, three squares, varying size and position)
+is the yardstick, and it took two corrections before it measured anything:
+scoring required the opposite word to be *absent*, which threw away "a square,
+not a circle"; and `maxTokens` was low enough to truncate the model's thinking,
+which returned an empty visible answer indistinguishable from a refusal. Both
+were caught because the **control** failed, not the subject.
+
+| model | score |
+|---|---|
+| Qwen3.6-27B (control) | **6/6** |
+| Muse Glimmer, window 448 (default) | 3/6 — constant "circle", i.e. chance |
+| Muse Glimmer, window 224 | 3/6 — constant "circle" |
+| Muse Glimmer, window 112 | **0/6 — every answer inverted** |
+| Muse Glimmer, window 56 | 3/6 — mixed |
+
+The 0/6 is the interesting row: a clean inversion on six trials happens by
+chance once in 64, so at 112 the shape information is reaching the model
+reliably and coming out with the labels swapped, while at 448 and 224 nothing
+reaches it at all. That is a lead, not an answer — 112 was not adopted, because
+a setting that scores 0/6 is worse than the one that scores at chance, and
+colour stays wrong at every window size tested.
+
 ### Still unknown
 
 The defective operation has not been located. There is no reference
