@@ -309,4 +309,33 @@ struct MuseGlimmerLongPrefillTests {
                 "layer \(i) should have consumed all \(total) tokens")
         }
     }
+
+    @Test("a prefill chunk wider than the cache's growth step still fits")
+    func chunkWiderThanDefaultGrowthStep() throws {
+        // The live crash: RotatingKVCache allocates `step` rows (256 by
+        // default) and updateInPlace writes the whole incoming chunk into that
+        // block, so a 512-token chunk ran off the end. newCache now sizes the
+        // step to the window, so a full-window chunk is writable in one go.
+        let json = """
+            {
+              "model_type": "muse_glimmer_text",
+              "hidden_size": 32, "num_hidden_layers": 4,
+              "intermediate_size": 64, "num_attention_heads": 2,
+              "head_dim": 16, "num_key_value_heads": 1,
+              "vocab_size": 64, "sliding_window": 512
+            }
+            """
+        let config = try JSONDecoder().decode(
+            MuseGlimmerTextConfiguration.self, from: Data(json.utf8))
+        let model = MuseGlimmerTextModel(config)
+        let cache = model.newCache()
+
+        // One 512-token chunk — twice the old 256 default growth step.
+        let chunk = MLXArray((0 ..< 512).map { Int32($0 % 64) }).reshaped(1, 512)
+        let out = model(chunk, cache: cache)
+        eval(out)
+
+        #expect(out.dim(2) == config.vocabularySize)
+        #expect(cache[0].offset == 512)
+    }
 }

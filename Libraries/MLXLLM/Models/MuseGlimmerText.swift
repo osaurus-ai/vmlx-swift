@@ -431,7 +431,15 @@ public class MuseGlimmerTextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
         (0 ..< config.hiddenLayers).map { i in
             if config.isSliding(i) {
-                return RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
+                // `step` is how many rows the cache allocates at a time, and
+                // `updateInPlace` writes the whole incoming chunk into that
+                // block — so a prefill chunk larger than `step` runs off the
+                // end of the freshly allocated region and trips a precondition
+                // inside the MLX scatter. Sizing the step to the window means
+                // any chunk the prefill loop can produce (it is capped to the
+                // window) always fits.
+                return RotatingKVCache(
+                    maxSize: config.slidingWindow, keep: 0, step: config.slidingWindow)
             }
             let cache = StandardKVCache()
             cache.step = 1024

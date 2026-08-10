@@ -152,7 +152,9 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         // policy bug. `LLMModel.prepare()` chunks for exactly this reason;
         // VLMs that skip the chunking (Qwen2.5-VL) only get away with it
         // because their caches are non-rotating.
-        let step = max(1, windowSize ?? 512)
+        // Capped to the sliding window: a chunk wider than the window cannot
+        // be written into a rotating cache in one go.
+        let step = max(1, min(windowSize ?? 512, config.textConfiguration.slidingWindow))
         let total = embeddings.dim(1)
         var offset = 0
         var hidden: MLXArray?
