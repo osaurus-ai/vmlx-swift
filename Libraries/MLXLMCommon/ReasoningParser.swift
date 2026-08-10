@@ -844,15 +844,31 @@ extension ReasoningParser {
         case "none", "off", "disabled", "mistral", "gemma":
             return nil
         case "muse_glimmer", "muse-glimmer", "muse", "atem":
-            // Muse Glimmer has NO reasoning tags and no reasoning channel. Its
-            // bundles stamp `reasoning_parser: "muse_glimmer"`, but the effort
-            // control is a plain sentence rendered into the *system prefix*
-            // ("Reasoning strength: high|medium|low."), so there is nothing in
-            // the output stream to segment. Returning nil is correct; it is
-            // spelled out here rather than left to `default` so a future pass
-            // does not "fix" the missing case by inventing a tag parser and
-            // start swallowing real content as reasoning.
-            return nil
+            // Muse Glimmer's turn is a recipient-channel envelope, observed
+            // live off the real bundle:
+            //
+            //   <|start|>assistant to=self<|message|>THINKING<|eom|>
+            //   <|start|>assistant to=user<|message|>ANSWER<|eot|>
+            //
+            // `to=self` segments are the model's reasoning; `to=user` carries
+            // the visible answer. The mapping onto the tag machinery is chosen
+            // so the header junk between channels lands *inside* a reasoning
+            // segment instead of leaking to chat:
+            //
+            // - `to=self<|message|>` opens reasoning; `<|eom|>` closes it.
+            // - `<|start|>assistant` also OPENS reasoning: after an `<|eom|>`
+            //   the follow-on header (` to=user`) is thereby swallowed until…
+            // - `to=user<|message|>` closes reasoning (end alias), so the
+            //   answer streams as content. Outside reasoning the same spelling
+            //   is a stray tag and is stripped — which also removes the bare
+            //   `to=user<|message|>` some turns emit before any thinking.
+            return ReasoningParser(
+                startTag: "to=self<|message|>",
+                endTag: "<|eom|>",
+                startInReasoning: false,
+                stripStrayTags: true,
+                startTagAliases: [" to=self<|message|>", "<|start|>assistant"],
+                endTagAliases: ["to=user<|message|>", " to=user<|message|>"])
         default:
             return nil
         }
