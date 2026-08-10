@@ -142,7 +142,7 @@ public struct MuseGlimmerProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = DefaultMessageGenerator().generate(from: input)
+        let messages = MuseGlimmerMessageGenerator().generate(from: input)
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
@@ -214,5 +214,40 @@ public struct MuseGlimmerProcessor: UserInputProcessor {
             image: processedImage,
             video: processedVideo,
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
+    }
+}
+
+
+/// Emits structured content parts so the chat template renders the media
+/// placeholders.
+///
+/// `DefaultMessageGenerator` sets `content` to a plain string, and the Muse
+/// template's `render_content` short-circuits on `content is string` — so the
+/// `part['type'] == 'image'` branch that writes `<|patch|>` (and `'video'` →
+/// `<|video|>`) is never reached and the prompt ends up with zero
+/// placeholders. The processor then fails the count check with
+/// "Number of placeholder tokens (0) does not match number of frames (1)",
+/// which reads like a processor bug but is really a message-shape bug.
+///
+/// Media parts come first: the template walks the parts in order, so putting
+/// them ahead of the text reproduces the training-time layout where the image
+/// precedes the question about it.
+public struct MuseGlimmerMessageGenerator: MessageGenerator {
+    public init() {}
+
+    public func generate(message: Chat.Message) -> MLXLMCommon.Message {
+        var dict = defaultMessageDict(for: message)
+        var parts: [[String: String]] = []
+        parts += message.images.map { _ in ["type": "image"] }
+        parts += message.videos.map { _ in ["type": "video"] }
+        if !message.content.isEmpty {
+            parts.append(["type": "text", "text": message.content])
+        }
+        // A message with no media keeps the plain-string shape the template
+        // handles most directly.
+        if !parts.isEmpty, !(message.images.isEmpty && message.videos.isEmpty) {
+            dict["content"] = parts
+        }
+        return dict
     }
 }
