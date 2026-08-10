@@ -230,6 +230,40 @@ Also ruled out by measurement, before the metric itself was invalidated:
 disabling rope entirely and switching to the interleaved rope pairing. Neither
 repaired the end-to-end behaviour.
 
+### One confirmed defect, fixed: the patch vector layout
+
+`patch_embedding.weight` is `(1536, 1176)` and 1176 = 3 channels x 2 temporal x
+14 x 14. Nothing states the order of those factors and both candidates have the
+same width, so every shape check passes either way. The weights settle it — a
+still image duplicates the frame, so the two temporal slots always see identical
+pixels and their weights co-adapt:
+
+| pairing | temporal-pair cosine |
+|---|---|
+| `[channel][temporal]` (what the port fed) | 0.492 |
+| **`[temporal][channel]`** | **0.990** |
+| unrelated-slice baseline | 0.740 |
+
+Under the assumed order the "pairs" correlate *below* the unrelated baseline.
+`temporalMajor` now reorders patchify's output before the projection, and
+`MuseGlimmerPatchLayout` fails if that evidence ever flips.
+
+Note what this fix does **not** do: it did not change the end-to-end answers.
+Colour is still misnamed. That is consistent — the reorder only matters when the
+channels differ, and greyscale (the circle/square probe) is untouched by it — so
+at least one further defect remains.
+
+Also tested and rejected, by running it: removing the adapter's trailing GELU
+(the Qwen reference has no trailing activation) left the shape probe at 1/2
+unchanged, so it was reverted rather than kept on style grounds.
+
+Checked and correct, so not the cause: `image_token_id` 200092 / `video_token_id`
+200091 both decode and match the rendered placeholders; position interpolation
+and merge-block reordering agree with the working Qwen3VL implementation, and at
+a 32x32 grid both reduce to exact identity; the window partition is a single
+window at that size; the attention block, rotary pairing and masks all match the
+reference.
+
 ### Still unknown
 
 The defective operation has not been located. There is no reference

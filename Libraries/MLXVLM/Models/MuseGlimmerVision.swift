@@ -107,8 +107,14 @@ private class MuseGlimmerPatchEmbedder: Module {
     @ModuleInfo(key: "position_embedding_table") var positionTable: Embedding
 
     let side: Int
+    let channels: Int
+    let temporal: Int
+    let patchSize: Int
 
     init(_ config: MuseGlimmerVisionConfiguration) {
+        self.channels = config.inChannels
+        self.temporal = config.patchTemporal
+        self.patchSize = config.patchSize
         let patchDim =
             config.patchTemporal * config.inChannels * config.patchSize * config.patchSize
         self._patchEmbedding.wrappedValue = Linear(patchDim, config.hiddenSize, bias: false)
@@ -120,9 +126,30 @@ private class MuseGlimmerPatchEmbedder: Module {
     }
 
     func callAsFunction(_ patches: MLXArray, frames: [THW], mergeSize: Int) -> MLXArray {
-        let embeddings = patchEmbedding(patches)
+        let embeddings = patchEmbedding(temporalMajor(patches))
         let positions = interpolatedPositions(frames: frames, mergeSize: mergeSize)
         return embeddings + positions.asType(embeddings.dtype)
+    }
+
+    /// `QwenVL.patchify` lays each patch vector out as `[channel][temporal][h][w]`,
+    /// but this checkpoint's `patch_embedding` was trained on
+    /// `[temporal][channel][h][w]`. Both orders have the same width, so the
+    /// mistake is invisible in every shape check, and it is invisible again in
+    /// greyscale — a still image duplicates the frame, so for equal channels
+    /// the two orders permute identical blocks and produce the same vector.
+    /// It only shows up in colour, where it interleaves the channels across the
+    /// temporal slots.
+    ///
+    /// The weights identify the true order: under `[temporal][channel]` the two
+    /// temporal slices of a channel have cosine 0.99 — they co-adapt because
+    /// still images always feed them the same pixels — against 0.49 under the
+    /// other reading, which is below the 0.74 baseline for unrelated slices.
+    private func temporalMajor(_ patches: MLXArray) -> MLXArray {
+        let spatial = patchSize * patchSize
+        guard patches.dim(-1) == channels * temporal * spatial else { return patches }
+        return patches.reshaped(patches.dim(0), channels, temporal, spatial)
+            .transposed(0, 2, 1, 3)
+            .reshaped(patches.dim(0), -1)
     }
 
     /// Four gathers plus a weighted sum — the explicit form of a bilinear
