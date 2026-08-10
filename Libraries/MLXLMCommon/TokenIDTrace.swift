@@ -188,17 +188,21 @@ public struct TokenIDTraceEncodedArtifact: Sendable, Equatable {
     /// The stem is not included in either artifact, so the sidecar remains
     /// byte-for-byte deterministic for the same lineage and attestations.
     public func write(to stem: URL) throws {
-        let suffix = streamKind.rawValue
+        let urls = outputURLs(to: stem)
         do {
-            try body.write(
-                to: stem.appendingPathExtension("\(suffix).ids"),
-                options: .atomic)
-            try sidecar.write(
-                to: stem.appendingPathExtension("\(suffix).json"),
-                options: .atomic)
+            try body.write(to: urls[0], options: .atomic)
+            try sidecar.write(to: urls[1], options: .atomic)
         } catch {
             throw TokenIDTraceError.writeFailed(error.localizedDescription)
         }
+    }
+
+    fileprivate func outputURLs(to stem: URL) -> [URL] {
+        let suffix = streamKind.rawValue
+        return [
+            stem.appendingPathExtension("\(suffix).ids"),
+            stem.appendingPathExtension("\(suffix).json"),
+        ]
     }
 }
 
@@ -548,6 +552,9 @@ public final class TokenIDTraceSession: @unchecked Sendable {
     private let settingsHash: String
     private let outputStem: URL?
     private let externalAdapterParticipation: Bool
+    private let artifactWriter:
+        (TokenIDTraceEncodedArtifact, URL) throws -> Void
+    private let artifactRemover: (URL) throws -> Void
 
     private var pathKind: TokenIDTracePathKind?
     private var prompt = [Int]()
@@ -568,12 +575,21 @@ public final class TokenIDTraceSession: @unchecked Sendable {
         attestations: TokenIDTraceAttestations,
         settingsHash: String,
         outputStem: URL?,
-        externalAdapterParticipation: Bool
+        externalAdapterParticipation: Bool,
+        artifactWriter: @escaping (TokenIDTraceEncodedArtifact, URL) throws -> Void = {
+            artifact, stem in
+            try artifact.write(to: stem)
+        },
+        artifactRemover: @escaping (URL) throws -> Void = { url in
+            try FileManager.default.removeItem(at: url)
+        }
     ) {
         self.attestations = attestations
         self.settingsHash = settingsHash
         self.outputStem = outputStem
         self.externalAdapterParticipation = externalAdapterParticipation
+        self.artifactWriter = artifactWriter
+        self.artifactRemover = artifactRemover
     }
 
     var adapterContract: TokenIDTraceAdapterContract {
@@ -886,10 +902,10 @@ public final class TokenIDTraceSession: @unchecked Sendable {
             pathKind: pathKind,
             stopRule: stopRule)
         if let outputStem {
+            let outputURLs = artifacts.flatMap { $0.outputURLs(to: outputStem) }
+            let snapshots: [ArtifactSnapshot]
             do {
-                for artifact in artifacts {
-                    try artifact.write(to: outputStem)
-                }
+                snapshots = try snapshotOutputURLs(outputURLs)
             } catch {
                 let traceError =
                     (error as? TokenIDTraceError)
@@ -897,9 +913,82 @@ public final class TokenIDTraceSession: @unchecked Sendable {
                 failure = traceError
                 throw traceError
             }
+            do {
+                for artifact in artifacts {
+                    try artifactWriter(artifact, outputStem)
+                }
+            } catch {
+                let traceError =
+                    (error as? TokenIDTraceError)
+                    ?? .writeFailed(error.localizedDescription)
+                let rollbackFailures = rollbackArtifacts(snapshots)
+                guard rollbackFailures.isEmpty else {
+                    let writeDetail: String
+                    if case let .writeFailed(detail) = traceError {
+                        writeDetail = detail
+                    } else {
+                        writeDetail = traceError.localizedDescription
+                    }
+                    let rollbackError = TokenIDTraceError.writeFailed(
+                        "\(writeDetail); artifact rollback failed: "
+                            + rollbackFailures.joined(separator: "; "))
+                    failure = rollbackError
+                    throw rollbackError
+                }
+                failure = traceError
+                throw traceError
+            }
         }
         finalizedArtifacts = artifacts
         return artifacts
+    }
+
+    private struct ArtifactSnapshot {
+        let url: URL
+        let contents: Data?
+    }
+
+    private func snapshotOutputURLs(
+        _ outputURLs: [URL]
+    ) throws -> [ArtifactSnapshot] {
+        try outputURLs.map { url in
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                return ArtifactSnapshot(url: url, contents: nil)
+            }
+            do {
+                return ArtifactSnapshot(
+                    url: url,
+                    contents: try Data(contentsOf: url))
+            } catch {
+                throw TokenIDTraceError.writeFailed(
+                    "could not snapshot \(url.path): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func rollbackArtifacts(
+        _ snapshots: [ArtifactSnapshot]
+    ) -> [String] {
+        var failures = [String]()
+        for snapshot in snapshots.reversed() {
+            do {
+                if let contents = snapshot.contents {
+                    try contents.write(to: snapshot.url, options: .atomic)
+                } else if FileManager.default.fileExists(
+                    atPath: snapshot.url.path)
+                {
+                    try artifactRemover(snapshot.url)
+                }
+            } catch {
+                let action = snapshot.contents == nil
+                    ? "cleanup"
+                    : "restoration"
+                failures.append(
+                    "\(snapshot.url.path): \(action) failed: "
+                        + error.localizedDescription)
+            }
+        }
+        return failures
     }
 
     private func makeArtifactsLocked(

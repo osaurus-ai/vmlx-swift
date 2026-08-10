@@ -509,4 +509,66 @@ struct DeepseekV4FP32LMHeadCacheTests {
             }
         }
     }
+
+    @Test("identity intervention separates same-owner reprepare from a new owner")
+    func identityInterventionKeepsHeadAndConfigurationFixed() throws {
+        try MLXMetalTestLock.withLock {
+            try Self.withFeatureFlag("1") {
+                let head = Self.makeHead()
+                let firstOwner = DeepseekV4FP32LMHeadCacheState()
+                try firstOwner.prepare(
+                    lmHead: head,
+                    expectedInputDimensions: 32,
+                    expectedOutputDimensions: 8)
+                let firstIdentity = try #require(firstOwner.cacheIdentity)
+
+                firstOwner.releaseDerivedBuffersForTeardown()
+                try firstOwner.prepare(
+                    lmHead: head,
+                    expectedInputDimensions: 32,
+                    expectedOutputDimensions: 8)
+                let reprepareIdentity = try #require(firstOwner.cacheIdentity)
+
+                let newOwner = DeepseekV4FP32LMHeadCacheState()
+                try newOwner.prepare(
+                    lmHead: head,
+                    expectedInputDimensions: 32,
+                    expectedOutputDimensions: 8)
+                let newOwnerIdentity = try #require(newOwner.cacheIdentity)
+
+                #expect(reprepareIdentity != firstIdentity)
+                #expect(newOwnerIdentity != firstIdentity)
+                #expect(newOwner.events == [.logicalBytes(1_024)])
+            }
+        }
+    }
+
+    @Test("concurrent owners receive distinct process-wide identities")
+    func concurrentOwnersReceiveDistinctIdentities() throws {
+        try MLXMetalTestLock.withLock {
+            try Self.withFeatureFlag("1") {
+                let head = Self.makeHead()
+                let boxes = (0 ..< 8).map { _ in
+                    ConcurrentPreparationBox(head: head)
+                }
+                DispatchQueue.concurrentPerform(iterations: boxes.count) { index in
+                    do {
+                        try boxes[index].state.prepare(
+                            lmHead: boxes[index].head,
+                            expectedInputDimensions: 32,
+                            expectedOutputDimensions: 8)
+                        boxes[index].recordSuccess()
+                    } catch {
+                        boxes[index].recordFailure()
+                    }
+                }
+
+                #expect(boxes.allSatisfy { $0.successes == 1 && $0.failures == 0 })
+                let identities = try boxes.map {
+                    try #require($0.state.cacheIdentity)
+                }
+                #expect(Set(identities).count == boxes.count)
+            }
+        }
+    }
 }

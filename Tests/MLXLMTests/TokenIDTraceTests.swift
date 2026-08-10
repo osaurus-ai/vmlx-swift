@@ -719,6 +719,111 @@ func artifactWriteFailureFailsClosed() throws {
     }
 }
 
+@Test("later artifact write failure rolls back new finalize output")
+func laterArtifactWriteRollsBackNewArtifacts() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("vmlx-token-trace-write-intervention-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let stem = root.appendingPathComponent("trace")
+    let preexistingPromptIDs = stem.appendingPathExtension("prompt.ids")
+    try Data([0xde, 0xad]).write(to: preexistingPromptIDs)
+    let before = Set(try FileManager.default.contentsOfDirectory(
+        at: root,
+        includingPropertiesForKeys: nil).map(\.lastPathComponent))
+
+    var writtenKinds = [TokenIDTraceStreamKind]()
+    let session = TokenIDTraceSession(
+        attestations: traceAttestations,
+        settingsHash: traceSettingsHash,
+        outputStem: stem,
+        externalAdapterParticipation: false,
+        artifactWriter: { artifact, stem in
+            writtenKinds.append(artifact.streamKind)
+            guard artifact.streamKind != .sampled else {
+                throw TokenIDTraceError.writeFailed(
+                    "injected later artifact write failure")
+            }
+            try artifact.write(to: stem)
+        })
+    try session.begin(pathKind: .direct, promptTokenIds: [10])
+    session.recordSampled(100)
+    session.recordSampled(101)
+    session.recordIteratorReturned(100)
+
+    var writeFailed = false
+    do {
+        _ = try session.finish(stopRule: .length)
+    } catch let error as TokenIDTraceError {
+        if case .writeFailed = error { writeFailed = true }
+    }
+    #expect(writeFailed)
+
+    let after = Set(try FileManager.default.contentsOfDirectory(
+        at: root,
+        includingPropertiesForKeys: nil).map(\.lastPathComponent))
+    let createdByFinalize = after.subtracting(before)
+    #expect(createdByFinalize.isEmpty)
+    #expect(writtenKinds == [.prompt, .sampled])
+    #expect(FileManager.default.fileExists(atPath: preexistingPromptIDs.path))
+    #expect(try Data(contentsOf: preexistingPromptIDs) == Data([0xde, 0xad]))
+    #expect(!FileManager.default.fileExists(
+        atPath: stem.appendingPathExtension("prompt.json").path))
+}
+
+@Test("artifact rollback failure is included in the surfaced write error")
+func artifactRollbackFailureIsObservable() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("vmlx-token-trace-cleanup-intervention-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let stem = root.appendingPathComponent("trace")
+    var removalAttempts = [URL]()
+    let session = TokenIDTraceSession(
+        attestations: traceAttestations,
+        settingsHash: traceSettingsHash,
+        outputStem: stem,
+        externalAdapterParticipation: false,
+        artifactWriter: { artifact, stem in
+            guard artifact.streamKind != .sampled else {
+                throw TokenIDTraceError.writeFailed(
+                    "injected later artifact write failure")
+            }
+            try artifact.write(to: stem)
+        },
+        artifactRemover: { url in
+            removalAttempts.append(url)
+            throw TokenIDTraceError.writeFailed("injected cleanup failure")
+        })
+    try session.begin(
+        pathKind: .direct,
+        promptTokenIds: [10])
+    session.recordSampled(100)
+    session.recordSampled(101)
+    session.recordIteratorReturned(100)
+
+    var surfacedDetail: String?
+    do {
+        _ = try session.finish(stopRule: .length)
+    } catch let error as TokenIDTraceError {
+        if case let .writeFailed(detail) = error {
+            surfacedDetail = detail
+        }
+    }
+    let detail = try #require(surfacedDetail)
+    #expect(detail.contains("injected later artifact write failure"))
+    #expect(detail.contains("artifact rollback failed"))
+    #expect(detail.contains("trace.prompt.ids"))
+    #expect(detail.contains("trace.prompt.json"))
+    #expect(removalAttempts.count == 2)
+    #expect(FileManager.default.fileExists(
+        atPath: stem.appendingPathExtension("prompt.ids").path))
+    #expect(FileManager.default.fileExists(
+        atPath: stem.appendingPathExtension("prompt.json").path))
+}
+
 @Test("tracing remains opt-in and defaults to no external adapter")
 func tracingDefaultsAreDisabled() {
     #expect(GenerateParameters().tokenIDTrace == nil)

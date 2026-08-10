@@ -216,7 +216,28 @@ private final class DeepseekV4FP32LMHeadCacheHolder {
 
 private enum DeepseekV4FP32LMHeadCacheError: Error {
     case preparationAlreadyAttempted
+    case cacheIdentityExhausted
 }
+
+/// Allocates identities for evaluated DSV4 head caches across every owner in
+/// this process. The allocator retains no model or cache state.
+private final class DeepseekV4FP32LMHeadCacheIdentityAllocator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nextIdentity: UInt64 = 0
+
+    func allocate() throws -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        guard nextIdentity < UInt64.max else {
+            throw DeepseekV4FP32LMHeadCacheError.cacheIdentityExhausted
+        }
+        nextIdentity += 1
+        return nextIdentity
+    }
+}
+
+private let deepseekV4FP32LMHeadCacheIdentityAllocator =
+    DeepseekV4FP32LMHeadCacheIdentityAllocator()
 
 /// Owns one model-local, evaluated derived head weight.
 ///
@@ -405,7 +426,7 @@ final class DeepseekV4FP32LMHeadCacheState {
         ).asType(.float32)
         MLX.eval(weight)
 
-        let identity = UInt64(constructionCountStorage + 1)
+        let identity = try deepseekV4FP32LMHeadCacheIdentityAllocator.allocate()
         let logicalBytes = finalMetadata.logicalBytes
         let previousIdentity = lastCacheIdentityStorage
         holder = DeepseekV4FP32LMHeadCacheHolder(

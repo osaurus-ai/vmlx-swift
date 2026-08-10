@@ -120,6 +120,7 @@ struct DeepseekV4DerivedBufferTeardownTests {
                 let jangTQ = try Self.makeJANGTQModel()
                 try jangTQ.prepareForInferenceAfterLoad()
                 let jangFirstIdentity = try #require(jangTQ.dsv4FP32LMHeadCacheIdentity)
+                #expect(jangFirstIdentity != affineFirstIdentity)
                 #expect(jangTQ.dsv4FP32LMHeadCacheLogicalBytes == 1_024)
 
                 jangTQ.releaseDerivedBuffersForTeardown()
@@ -141,6 +142,27 @@ struct DeepseekV4DerivedBufferTeardownTests {
                     }
                     return false
                 })
+            }
+        }
+    }
+
+    @Test("diagnostic snapshots expose distinct identities for two owners")
+    func diagnosticSnapshotsExposeDistinctIdentities() throws {
+        try MLXMetalTestLock.withLock {
+            try Self.withFeatureFlag("1") {
+                let first = try Self.makeAffineModel()
+                let second = try Self.makeAffineModel()
+                try first.prepareForInferenceAfterLoad()
+                try second.prepareForInferenceAfterLoad()
+
+                let firstSnapshot = first.modelContainerDiagnosticSnapshot()
+                let secondSnapshot = second.modelContainerDiagnosticSnapshot()
+                let firstIdentity = try #require(firstSnapshot.cacheIdentity)
+                let secondIdentity = try #require(secondSnapshot.cacheIdentity)
+
+                #expect(firstSnapshot.prepared)
+                #expect(secondSnapshot.prepared)
+                #expect(firstIdentity != secondIdentity)
             }
         }
     }
