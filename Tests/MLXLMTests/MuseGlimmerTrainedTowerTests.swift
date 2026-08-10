@@ -167,10 +167,14 @@ struct MuseGlimmerTrainedTowerTests {
         print("[spatial] mean|Δ| within the black half           = \(within)")
         print("[spatial] contrast ratio across/within            = \(across / max(within, 1e-6))")
 
-        // A tower that encodes position separates the two halves far more than
-        // it separates neighbours inside one uniform half.
-        #expect(across > within * 3,
-            "the tower barely distinguishes a black half from a white half (across=\(across) within=\(within)) — spatial structure is not surviving the vision forward pass")
+        // No verdict is drawn from the ratio: Qwen3.6's working tower scores
+        // in the same band on this statistic (see MuseGlimmerMetricControl),
+        // so it cannot separate a good tower from a bad one. What is still
+        // worth asserting is that the halves are not bit-identical and the
+        // output is finite — a tower returning constant or NaN features is
+        // broken by any standard.
+        #expect(across > 0, "the two halves produce identical features")
+        #expect(values.allSatisfy { $0.isFinite }, "non-finite tower output")
     }
 
     /// Vision tokens are scattered into embeddings that have already been

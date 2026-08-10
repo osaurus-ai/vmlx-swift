@@ -173,28 +173,35 @@ cache entry, and two that render the same line must not miss.
 and grep for `Reasoning strength:` — count the occurrences and read the value.
 That single check settles 1–3.
 
-## VISION IS NOT WORKING — confirmed 2026-08-10, after the "vision fixed" merge
+## VISION IS NOT WORKING — confirmed against a positive control, 2026-08-10
 
 The merged claim that the vision path works is **wrong**, and the test that
 supported it was too weak to catch this. That test asserted only that the answer
 was non-empty and contained a word from a list including "image", "colour" and
-"band" — a model that cannot see at all satisfies every one of those while
-answering from the prompt's own wording.
+"band" — a model that cannot see satisfies every one of those by echoing the
+prompt's own wording.
 
-Three end-to-end probes on the real bundles, all failing, none of which depend
-on any internal metric:
+### The evidence, with a control
 
-| Probe | Truth | JANG_6M answer |
+Each probe uses stimuli whose ground truth is known exactly and which the prompt
+never names, and each is scored as a **matched opposite pair** so a constant
+answer scores 1/2 rather than 1/1. The same probes were then run unchanged
+against Qwen3.6-27B — a working VL model in this same runtime — to prove the
+probes are passable:
+
+| Probe | Muse Glimmer 30B (JANG_6M) | Qwen3.6-27B (control) |
 |---|---|---|
-| solid field (230,20,20) | red | **green** |
-| solid field (20,20,230) | blue | **green** |
-| black circle on white | circle | circle ✓ |
-| black square on white | square | **circle** |
-| two different photographs | two scenes | "mottled texture", "abstract shape", zero scene vocabulary |
+| solid red field / solid blue field | "green" / "green" — **0/2** | **2/2** |
+| black circle / black square | "circle" / "circle" — **1/2** | **2/2** |
 
-Constant answers across opposite stimuli are the signature of a model answering
-from its text prior. Telling a circle from a square is the easiest task a vision
-model is ever given.
+A working model passes both trivially. Telling a square from a circle is the
+easiest task a vision model is ever given.
+
+(A third probe on two macOS desktop-picture *thumbnails* returned "mottled
+texture" and "abstract shape". That one is **not** evidence: those files come
+from a hidden `.thumbnails` directory and their actual content was never
+verified, so a vague description may well be accurate. It is recorded here only
+so it is not mistaken for a finding later.)
 
 ### What is verified CORRECT (so the fault is not here)
 
@@ -205,39 +212,33 @@ model is ever given.
 - adapter and projection are `bias: false`, matching a checkpoint with no bias
 - geometry: 256 `<|patch|>` placeholders for 256 vision tokens, 221 for 221
 - projected vision tokens sit at RMS 0.83 against normed text tokens at 1.0
-- patch content enters ~56x stronger than the position term
+- patch content enters the embedder ~56x stronger than the position term
 
-### Where it breaks
+### A dead end, recorded so it is not repeated
 
-The picture is destroyed inside the 50 vision blocks. Feeding a half-black /
-half-white field and measuring how strongly the two halves stay separated:
+Feeding a half-black / half-white field and measuring how strongly the two
+halves stay separated against the spread inside one uniform half looked
+damning — the ratio falls from 46 after the embedder to 0.13 by layer 49, with
+the position-driven spread growing from 0.014 to 15.6.
 
-| stage | content contrast | spread within one uniform half | ratio |
-|---|---|---|---|
-| after embedder | 0.667 | 0.014 | **46.5** |
-| after `ln_pre` | 0.658 | 0.019 | 34.2 |
-| after layer 0 | 0.707 | 0.055 | 12.8 |
-| after layer 5 | 0.766 | 0.371 | 2.07 |
-| after layer 10 | 0.746 | 0.715 | 1.04 |
-| after layer 25 | 1.074 | 1.078 | 1.00 |
-| after layer 49 | 2.027 | 15.56 | **0.13** |
+**That measurement proves nothing.** Qwen3.6's working tower scores **0.515** on
+the identical statistic — the same low band. The metric cannot separate a good
+tower from a bad one, so no verdict can be drawn from it. `MuseGlimmerMetricControl`
+pins this down permanently.
 
-The content signal does not collapse — the position-driven spread *explodes*,
-from 0.014 to 15.6, and swamps it. Tokens with identical content but different
-positions end up further apart than tokens with opposite content.
+Also ruled out by measurement, before the metric itself was invalidated:
+disabling rope entirely and switching to the interleaved rope pairing. Neither
+repaired the end-to-end behaviour.
 
-Ruled out by measurement, not by reading: disabling rope entirely (ratio 0.13 →
-0.59) and switching to the interleaved rope pairing (0.13 → 0.18) both help but
-neither repairs it, so the rope pairing alone is not the defect.
+### Still unknown
 
-**Still unknown:** the exact operation. There is no reference implementation on
-this machine — the bundles ship no `modeling_*.py` and transformers has no
-`muse_glimmer` — so the remaining work needs either a reference to diff
-activations against, or a control run of this same measurement through a
-known-good tower (Qwen3.6's is present) to confirm the metric itself is sound.
+The defective operation has not been located. There is no reference
+implementation on this machine — the bundles ship no `modeling_*.py` and
+transformers has no `muse_glimmer` — so locating it needs a reference to diff
+activations against, layer by layer, rather than another whole-tower statistic.
 
 Text-only Muse Glimmer is unaffected: reasoning strengths, ATEM tool parsing,
-EOS and the prefix cache were all proven separately and do not involve the tower.
+EOS and the prefix cache were proven separately and do not involve the tower.
 
 ## Post-merge live evidence (2026-08-10 session, merged build)
 
