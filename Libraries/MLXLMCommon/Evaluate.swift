@@ -2713,7 +2713,14 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // these tokens, so when it says yes the write it replaces
                     // is byte-for-byte the same entry — skipping is free
                     // correctness-wise and removes the repeat cost outright.
-                    if coordinator.hasValidatedDiskEntry(
+                    // `hasDurable…`, not `hasValidated…`: the latter trusts
+                    // only what this process wrote, so after a restart — or on
+                    // any turn that restored from cache, where prefill never
+                    // crosses the earlier boundaries — an entry already on disk
+                    // is rebuilt anyway. That rebuild replays the prefix through
+                    // the model and is cancellable; a Stop mid-turn killed it as
+                    // `rederive-failed ... CancellationError()`.
+                    if coordinator.hasDurableDiskEntry(
                         tokens: boundaryTokens,
                         mediaSalt: mediaSalt)
                     {

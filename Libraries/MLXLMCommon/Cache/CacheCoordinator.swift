@@ -699,6 +699,25 @@ public final class CacheCoordinator: @unchecked Sendable {
         return true
     }
 
+    /// Whether this boundary is already durable on disk, whoever wrote it.
+    ///
+    /// Used to decide whether a boundary needs producing at all, as opposed to
+    /// whether a rewrite can be skipped. See `DiskCache.hasDurableEntry`.
+    public func hasDurableDiskEntry(
+        tokens: [Int],
+        mediaSalt: String? = nil
+    ) -> Bool {
+        guard diskCache?.hasDurableEntry(tokens: tokens, mediaSalt: mediaSalt) == true
+        else { return false }
+        if isHybrid, requiresRecurrentSSMCompanion {
+            return ssmStateCache.hasValidatedCompleteDiskEntry(
+                tokens: tokens,
+                boundary: tokens.count,
+                mediaSalt: mediaSalt)
+        }
+        return true
+    }
+
     /// Resolve SSM companion state for a disk-cache hit on a hybrid model.
     ///
     /// The in-memory SSM cache is tried first. If it misses, the unified
