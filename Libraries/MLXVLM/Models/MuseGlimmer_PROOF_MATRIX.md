@@ -288,6 +288,46 @@ reaches it at all. That is a lead, not an answer — 112 was not adopted, becaus
 a setting that scores 0/6 is worse than the one that scores at chance, and
 colour stays wrong at every window size tested.
 
+### The sharpest finding: vertical works, horizontal does not
+
+Bars filling only one quarter of the frame, each forced choice scored against
+its opposite, with Qwen3.6 as the control:
+
+| probe | Muse Glimmer | Qwen3.6 (control) |
+|---|---|---|
+| bar in the top quarter | top | top |
+| bar in the bottom quarter | bottom | bottom |
+| bar on the left | **right** | left |
+| bar on the right | right | right |
+
+Vertical is correct. Horizontal is a constant answer — the two opposite images
+are indistinguishable to the model.
+
+That split is a clue, not a curiosity. The vision tokens arrive raster-ordered,
+so **row** position is recoverable from token order alone even with no
+positional signal at all, while **column** position can only reach the language
+model through the vision position embedding. Losing exactly the axis that
+depends on that embedding, and keeping the one that does not, points at it
+directly.
+
+The magnitudes agree, against the control:
+
+| | content : position magnitude |
+|---|---|
+| Qwen3.6 (resolves both axes) | **4.8** |
+| Muse Glimmer | **55.8** |
+
+Muse's position term is roughly 11.5x weaker relative to patch content than the
+working reference — small enough to be effectively invisible. Whether the cause
+is a missing scale factor, the wrong insertion point relative to `ln_pre`, or a
+table that is genuinely small in a tower that also carries rope, is not yet
+settled; the tower's own vertical/horizontal asymmetry is mild (1.33x against
+the control's 0.91x), so the loss is not a gross scrambling inside the blocks.
+
+The model's own words match. Asked to describe a centred black circle it
+reports "an amorphous, irregular blob", "muted yellow-olive", "sits in the lower
+part of the frame" — a picture read without usable position.
+
 ### Still unknown
 
 The defective operation has not been located. There is no reference

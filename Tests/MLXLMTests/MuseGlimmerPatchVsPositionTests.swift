@@ -68,6 +68,35 @@ struct MuseGlimmerPatchVsPositionTests {
         // If a full black-to-white swing moves the embedding far less than the
         // position term already varies, position dominates the sum and the
         // picture cannot survive it.
+        // Control: the same two magnitudes from Qwen3.6, whose tower resolves
+        // both axes. Horizontal position can only reach the language model
+        // through this embedding — vertical survives without it, because token
+        // order already encodes rows — so its scale relative to content is the
+        // thing to compare.
+        let qwen = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("models/dealign.ai/Qwen3.6-27B-JANG_4M-CRACK")
+        if FileManager.default.fileExists(atPath: qwen.appendingPathComponent("config.json").path) {
+            var qPatch: MLXArray?
+            var qPos: MLXArray?
+            for f in try FileManager.default.contentsOfDirectory(
+                at: qwen, includingPropertiesForKeys: nil)
+            where f.pathExtension == "safetensors" {
+                guard let arrays = try? MLX.loadArrays(url: f) else { continue }
+                for (k, v) in arrays {
+                    if k.hasSuffix("vision_tower.patch_embed.proj.weight") { qPatch = v.asType(.float32) }
+                    if k.hasSuffix("vision_tower.pos_embed.weight") { qPos = v.asType(.float32) }
+                }
+            }
+            if let qPatch, let qPos {
+                let flatPatch = qPatch.reshaped(qPatch.dim(0), -1)
+                let ones = MLXArray.full([flatPatch.dim(1)], values: MLXArray(Float(1)))
+                let qGap = rms(flatPatch.matmul(ones)) * 2
+                let qPosRMS = rms(qPos)
+                print("[mag] CONTROL Qwen content gap=\(qGap) position RMS=\(qPosRMS) ratio=\(qGap / qPosRMS)")
+                print("[mag] Muse ratio for comparison = \(contentGap / posRMS)")
+            }
+        }
+
         #expect(contentGap > posRMS * 0.1,
             "a black→white swing (\(contentGap)) is tiny next to the position table (\(posRMS)) — content is swamped in patch_embedding + position")
     }
