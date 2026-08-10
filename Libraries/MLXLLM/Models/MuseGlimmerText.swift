@@ -332,7 +332,7 @@ private class MuseGlimmerDecoderLayer: Module {
 // MARK: - Model
 
 public class MuseGlimmerModelInner: Module {
-    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
     fileprivate let layers: [MuseGlimmerDecoderLayer]
     fileprivate let norm: MuseGlimmerCenteredRMSNorm
 
@@ -383,7 +383,7 @@ public class MuseGlimmerModelInner: Module {
 
 public class MuseGlimmerTextModel: Module, LLMModel, KVCacheDimensionProvider {
     @ModuleInfo public var model: MuseGlimmerModelInner
-    @ModuleInfo(key: "lm_head") var lmHead: Linear
+    @ModuleInfo(key: "lm_head") public var lmHead: Linear
 
     public let config: MuseGlimmerTextConfiguration
     public var vocabularySize: Int { config.vocabularySize }
@@ -402,7 +402,7 @@ public class MuseGlimmerTextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     /// `lm_head(h) * output_multiplier`, then Gemma-style tanh softcapping.
-    static func applyLogitTail(_ logits: MLXArray, config: MuseGlimmerTextConfiguration)
+    public static func applyLogitTail(_ logits: MLXArray, config: MuseGlimmerTextConfiguration)
         -> MLXArray
     {
         var out = logits * config.outputMultiplier
