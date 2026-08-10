@@ -696,6 +696,21 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             idx = keep
         }
 
+        // The write below indexes `idx ..< idx + S` into the buffer, but `idx`
+        // and the buffer width can legitimately disagree: a cache restored
+        // from disk carries an `offset` from its metadata while `idx` is
+        // whatever the restore left behind, and `updateConcat` sets `idx` to
+        // the full buffer width. Either way the next in-place write can start
+        // at or past the end, and the failure surfaces as an opaque
+        // precondition trap inside the MLX scatter rather than anything that
+        // names the cache. Rotate to `keep` when the window cannot take the
+        // write, which is what the rotation below the trim would have done had
+        // `idx` matched.
+        let capacity = self.keys!.dim(2)
+        if idx + S > capacity {
+            idx = keep
+        }
+
         // Assign
         self.keys![.ellipsis, idx ..< (idx + S), 0...] = keys
         self.values![.ellipsis, idx ..< (idx + S), 0...] = values
