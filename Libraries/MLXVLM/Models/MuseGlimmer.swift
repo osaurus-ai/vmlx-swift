@@ -74,6 +74,10 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "vision_projection") private var visionProjection: Linear
     @ModuleInfo(key: "language_model") private var languageModel: MuseGlimmerTextModel
 
+    /// `RotatingKVCache`'s stock allocation step. Prefill chunks must not
+    /// exceed it — see the note in `prepare`.
+    static let rotatingCacheGrowthStep = 256
+
     public let config: MuseGlimmerConfiguration
 
     public var vocabularySize: Int { config.textConfiguration.vocabularySize }
@@ -152,9 +156,20 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         // policy bug. `LLMModel.prepare()` chunks for exactly this reason;
         // VLMs that skip the chunking (Qwen2.5-VL) only get away with it
         // because their caches are non-rotating.
-        // Capped to the sliding window: a chunk wider than the window cannot
-        // be written into a rotating cache in one go.
-        let step = max(1, min(windowSize ?? 512, config.textConfiguration.slidingWindow))
+        // Capped to `rotatingCacheGrowthStep`, NOT to the sliding window.
+        //
+        // `RotatingKVCache.updateInPlace` allocates `step` rows at a time and
+        // writes the whole incoming chunk into that block, so the chunk must
+        // fit the cache's growth step. Sizing the step in `newCache` is not
+        // enough: the host's cache coordinator builds these caches itself from
+        // the model topology and uses the stock 256 default, so the only value
+        // this path can rely on is the default.
+        let step = max(
+            1,
+            min(
+                windowSize ?? MuseGlimmer.rotatingCacheGrowthStep,
+                MuseGlimmer.rotatingCacheGrowthStep,
+                config.textConfiguration.slidingWindow))
         let total = embeddings.dim(1)
         var offset = 0
         var hidden: MLXArray?
