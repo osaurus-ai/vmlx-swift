@@ -142,7 +142,34 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
             inputIds: input.text.tokens, pixelValues: allPixels,
             frames: allFrames.isEmpty ? nil : allFrames)
 
-        let hidden = languageModel.model(nil, inputEmbedding: embeddings, cache: cache)
+        // Prefill has to be chunked, not fed in one pass.
+        //
+        // 39 of the 52 layers hold a `RotatingKVCache` bounded by the 2048
+        // sliding window. A single forward pass carrying a prompt longer than
+        // that window overruns the cache's in-place write and trips a
+        // precondition inside the MLX scatter — the crash is in the indexing
+        // layer, which makes it look like a shape bug rather than a prefill
+        // policy bug. `LLMModel.prepare()` chunks for exactly this reason;
+        // VLMs that skip the chunking (Qwen2.5-VL) only get away with it
+        // because their caches are non-rotating.
+        let step = max(1, windowSize ?? 512)
+        let total = embeddings.dim(1)
+        var offset = 0
+        var hidden: MLXArray?
+
+        while offset < total {
+            let end = min(offset + step, total)
+            let chunk = embeddings[0..., offset ..< end, 0...]
+            hidden = languageModel.model(nil, inputEmbedding: chunk, cache: cache)
+            // Keep the graph from growing across the whole prompt.
+            eval(cache)
+            offset = end
+        }
+
+        guard let hidden else {
+            throw VLMError.processing("MuseGlimmer: empty prompt")
+        }
+
         let logits = MuseGlimmerTextModel.applyLogitTail(
             languageModel.lmHead(hidden), config: config.textConfiguration)
         return .logits(LMOutput(logits: logits))

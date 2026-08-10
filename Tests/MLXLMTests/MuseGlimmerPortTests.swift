@@ -250,3 +250,63 @@ struct MuseGlimmerPortTests {
         }
     }
 }
+
+/// The unit tests above all use short prompts, so none of them ever pushes a
+/// rotating cache past its window — which is exactly how a prefill that
+/// overran the 2048-token sliding window reached a live run and crashed inside
+/// the MLX scatter. This suite prefills *past* the window on purpose.
+@Suite("Muse Glimmer long prefill")
+struct MuseGlimmerLongPrefillTests {
+
+    @Test("prefilling past the sliding window does not overrun a rotating cache")
+    func prefillLongerThanSlidingWindow() throws {
+        // Window 8 with 24 layers: enough to hit the rotating path repeatedly
+        // without allocating a real model.
+        let json = """
+            {
+              "model_type": "muse_glimmer_text",
+              "hidden_size": 64,
+              "num_hidden_layers": 8,
+              "intermediate_size": 128,
+              "num_attention_heads": 4,
+              "head_dim": 16,
+              "num_key_value_heads": 2,
+              "vocab_size": 128,
+              "sliding_window": 8
+            }
+            """
+        let config = try JSONDecoder().decode(
+            MuseGlimmerTextConfiguration.self, from: Data(json.utf8))
+        let model = MuseGlimmerTextModel(config)
+        let cache = model.newCache()
+
+        // 40 tokens through an 8-token window — five windows' worth. Fed in
+        // window-sized chunks, the way `prepare` now does it.
+        let total = 40
+        let step = config.slidingWindow
+        var offset = 0
+        var out: MLXArray?
+        while offset < total {
+            let end = min(offset + step, total)
+            let chunk = MLXArray((offset ..< end).map { Int32($0 % 128) })
+                .reshaped(1, end - offset)
+            out = model(chunk, cache: cache)
+            eval(out!)
+            offset = end
+        }
+
+        // Reaching here at all is the regression guard: feeding this prompt in
+        // one pass overran the rotating cache's in-place write and tripped a
+        // precondition inside the MLX scatter.
+        #expect(out != nil)
+        #expect(out!.dim(2) == config.vocabularySize)
+
+        // `offset` is the logical token position, not the buffer size, so it
+        // advances to the full prompt length on every layer — rotating caches
+        // bound their *storage*, not their position counter.
+        for i in 0 ..< config.hiddenLayers {
+            #expect(cache[i].offset == total,
+                "layer \(i) should have consumed all \(total) tokens")
+        }
+    }
+}
