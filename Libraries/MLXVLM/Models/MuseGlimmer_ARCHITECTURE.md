@@ -89,10 +89,33 @@ LayerNorm (not RMSNorm) with bias: `norm1`/`norm2`, plus `ln_pre`/`ln_post`.
 Attention has q/k/v/proj **with bias**. Pre-norm residual:
 `h += attn(norm1(h)); h += mlp(norm2(h))`.
 
-Projector: `vision_adapter.fc1 → gelu → fc2`, then `vision_projection` into
-`out_hidden_size` 6144 … note the text tower is 6656-wide, so the projection
-target and the LM width differ — verify against the real weight shapes at load
-rather than trusting `out_hidden_size`.
+### Confirmed pipeline (read off the JANG_6M weight shapes, not the config)
+
+```
+pixels → patch_embedding      [1536, 1176]   1176 = 14*14 * 2(temporal) * 3(ch), no bias
+      + position_embedding_table [1024, 1536]  learned 32*32 grid
+      → ln_pre                 LayerNorm(1536) with bias
+      → 50 × block             attn q/k/v/proj [1536,1536] all WITH bias,
+                               norm1/norm2 LayerNorm(1536) with bias,
+                               mlp fc1 [8960,1536] / fc2 [1536,8960] with bias,
+                               pre-norm residual: h += attn(norm1(h)); h += mlp(norm2(h))
+      → ln_post                LayerNorm(1536) with bias
+      → spatial merge 2×2      4 × 1536 = 6144  ← this is where out_hidden_size comes from
+      → vision_adapter.fc1     [4096, 6144] no bias → gelu
+      → vision_adapter.fc2     [4096, 4096] no bias → gelu   (act applied TWICE:
+                                                              act(fc2(act(fc1(x)))))
+      → vision_projection      [6656, 4096] → text width 6656
+      → scatter into the embedding sequence at <|patch|> / <|video|> positions
+```
+
+Vision attention is **non-causal**, 16 heads → head_dim 96, windowed via
+`cu_seqlens` with every 4th layer full — the Qwen2-VL shape, so
+`QwenVL.VisionRotaryEmbedding`, `QwenVL.PatchEmbed`, `QwenVL.patchify` and
+`QwenVL.mergeInputIdsWithImageFeatures` are the right building blocks.
+
+The vision tower is **not quantized** in the JANG bundles — every vision tensor
+is plain F16 with no `.scales`/`.biases` siblings. A loader that assumes the
+whole checkpoint is quantized will look for scales that do not exist.
 
 Placeholders: `image_token_id` 200092 (`<|patch|>`), `video_token_id` 200091
 (`<|video|>`); features are scattered into the embedding sequence at those
