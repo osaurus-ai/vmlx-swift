@@ -201,6 +201,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// `<zyphra_tool_call>...</zyphra_tool_call>`.
     case zayaXml = "zaya_xml"
 
+    /// "Onyx ATEM" dialect used by Muse Glimmer. Example:
+    /// `<atem:function_calls><atem:invoke name="f"><atem:parameter name="k">v</atem:parameter></atem:invoke></atem:function_calls>`.
+    /// One envelope may carry several `<atem:invoke>` blocks.
+    case atem
+
     /// Tencent Hunyuan / Hy3 XML-like tool-call wrapper.
     /// Example:
     /// `<tool_calls><tool_call>f<tool_sep><arg_key>k</arg_key><arg_value>v</arg_value></tool_call></tool_calls>`.
@@ -254,6 +259,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
                 endTag: "</zyphra_tool_call>",
                 decodesHTMLLineBreaks: true,
                 unwrapJSONQuotedStringParameters: true)
+        case .atem:
+            return ATEMToolCallParser()
         case .hunyuan:
             return HunyuanToolCallParser()
         }
@@ -676,6 +683,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // ZAYA / Zyphra XML wrapper around the standard XML function body.
         case "zaya", "zaya_xml", "zyphra", "zyphra_xml":
             return .zayaXml
+        // Muse Glimmer's "Onyx ATEM" envelope. The `muse_glimmer` aliases
+        // catch bundles that stamp the model family rather than the parser.
+        case "atem", "onyx_atem", "muse_glimmer", "muse-glimmer", "muse":
+            return .atem
         // Tencent Hunyuan / Hy3 parser aliases. JANG stamps "hunyuan";
         // vLLM ecosystem examples use "hy_v3"; SGLang uses "hunyuan".
         case "hunyuan", "tencent", "hy3", "hy_v3", "hy-v3":
