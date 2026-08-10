@@ -4,6 +4,7 @@ import MLXLMCommon
 import Testing
 
 @testable import MLXVLM
+import MLXLLM
 
 /// The vision tower's risky parts are the ones with no shape check to catch
 /// them: the window permutation (a wrong index silently scrambles which patch
@@ -149,5 +150,58 @@ struct MuseGlimmerVisionTests {
         // gelu(0) == 0, so an all-zero input must stay all-zero through both
         // activations — a stray bias or a swapped layer breaks this.
         #expect(out.asArray(Float.self).allSatisfy { abs($0) < 1e-6 })
+    }
+
+    @Test("prepare produces 3-D logits for every prompt length and shape")
+    func prepareLogitsAreThreeDimensional() throws {
+        // The live failure chain that unit tests missed: inputEmbeddings added
+        // .newAxis to already-2D ids, giving 4-D embeddings; the prefill chunk
+        // slice then cut a size-1 axis; the forward pass still ran; and the
+        // only symptom was convertToToken indexing `logits[0..., -1, 0...]` on
+        // a non-3-D tensor. Assert the contract at the seam instead.
+        let json = """
+            {
+              "model_type": "muse_glimmer",
+              "text_config": {
+                "model_type": "muse_glimmer_text",
+                "hidden_size": 32, "num_hidden_layers": 4,
+                "intermediate_size": 64, "num_attention_heads": 2,
+                "head_dim": 16, "num_key_value_heads": 1,
+                "vocab_size": 64, "sliding_window": 64
+              },
+              "vision_config": {
+                "hidden_size": 32, "num_hidden_layers": 4,
+                "intermediate_size": 64, "num_attention_heads": 2,
+                "patch_size": 14, "patch_temporal": 2, "merge_size": 2,
+                "pos_emb_height": 4, "pos_emb_width": 4
+              },
+              "projector_hidden_size": 16
+            }
+            """
+        let config = try JSONDecoder().decode(
+            MuseGlimmerConfiguration.self, from: Data(json.utf8))
+        let model = MuseGlimmer(config)
+
+        // Lengths that straddle the chunk boundary, including the k*step + 1
+        // shape that previously crashed, and 1 token.
+        for length in [1, 2, 63, 64, 65, 129, 257] {
+            let ids = MLXArray((0 ..< length).map { Int32($0 % 64) }).reshaped(1, length)
+            let input = LMInput(tokens: ids, tokenIds: (0 ..< length).map { $0 % 64 })
+            let result = try model.prepare(input, cache: model.newCache(), windowSize: 64)
+            guard case .logits(let out) = result else {
+                Issue.record("prepare did not return logits for length \(length)")
+                continue
+            }
+            eval(out.logits)
+            #expect(out.logits.ndim == 3,
+                "length \(length): logits must be 3-D, got \(out.logits.ndim)")
+            #expect(out.logits.dim(0) == 1, "length \(length): batch must be 1")
+            #expect(out.logits.dim(2) == 64, "length \(length): vocab mismatch")
+            // convertToToken does exactly this; make the test fail here rather
+            // than in the engine.
+            let last = out.logits[0..., -1, 0...]
+            eval(last)
+            #expect(last.ndim == 2)
+        }
     }
 }

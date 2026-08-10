@@ -106,7 +106,14 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         inputIds: MLXArray, pixelValues: MLXArray?, frames: [THW]?
     ) -> MLXArray {
         guard let pixelValues, let frames, !frames.isEmpty else {
-            return languageModel.model.embedTokens(inputIds[.newAxis, .ellipsis])
+            // `input.text.tokens` already arrives as `(1, T)` on this path.
+            // Adding `.newAxis` unconditionally (as the Qwen VLMs do, where the
+            // ids are 1-D) yields `(1, 1, T, hidden)`, and then the prefill
+            // chunk slice cuts axis 1 — a size-1 axis — instead of the token
+            // axis. The forward pass still runs, so the only symptom is a
+            // non-3-D logits tensor blowing up later in `convertToToken`.
+            let ids = inputIds.ndim == 1 ? inputIds[.newAxis, .ellipsis] : inputIds
+            return languageModel.model.embedTokens(ids)
         }
 
         let inputEmbeds = languageModel.model.embedTokens(inputIds)
