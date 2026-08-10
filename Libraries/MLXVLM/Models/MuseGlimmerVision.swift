@@ -145,9 +145,9 @@ private class MuseGlimmerPatchEmbedder: Module {
         super.init()
     }
 
-    func callAsFunction(_ patches: MLXArray, frames: [THW], mergeSize: Int) -> MLXArray {
+    func callAsFunction(_ patches: MLXArray, frames: [THW]) -> MLXArray {
         let embeddings = patchEmbedding(temporalMajor(patches))
-        let positions = interpolatedPositions(frames: frames, mergeSize: mergeSize)
+        let positions = interpolatedPositions(frames: frames)
         return embeddings + positions.asType(embeddings.dtype)
     }
 
@@ -174,7 +174,7 @@ private class MuseGlimmerPatchEmbedder: Module {
 
     /// Four gathers plus a weighted sum — the explicit form of a bilinear
     /// sample over the `side × side` table.
-    private func interpolatedPositions(frames: [THW], mergeSize: Int) -> MLXArray {
+    private func interpolatedPositions(frames: [THW]) -> MLXArray {
         var cornerIndices: [[Int32]] = [[], [], [], []]
         var cornerWeights: [[Float]] = [[], [], [], []]
 
@@ -233,25 +233,13 @@ private class MuseGlimmerPatchEmbedder: Module {
                 }
             }
 
-            // Patches arrive grouped by merge block, so the position rows have
-            // to be walked in the same order or every embedding lands on the
-            // wrong patch.
-            var reorder: [Int] = []
-            reorder.reserveCapacity(h * w)
-            for hb in 0 ..< (h / mergeSize) {
-                for wb in 0 ..< (w / mergeSize) {
-                    for di in 0 ..< mergeSize {
-                        for dj in 0 ..< mergeSize {
-                            reorder.append((hb * mergeSize + di) * w + (wb * mergeSize + dj))
-                        }
-                    }
-                }
-            }
-
+            // Raster order. The tower runs over individual patches, not over
+            // merge blocks — the 2x2 merge happens at the very end — so the
+            // position rows are walked straight down the grid.
             for _ in 0 ..< t {
                 for corner in 0 ..< 4 {
-                    cornerIndices[corner].append(contentsOf: reorder.map { idx[corner][$0] })
-                    cornerWeights[corner].append(contentsOf: reorder.map { wgt[corner][$0] })
+                    cornerIndices[corner].append(contentsOf: idx[corner])
+                    cornerWeights[corner].append(contentsOf: wgt[corner])
                 }
             }
         }
@@ -425,7 +413,10 @@ public class MuseGlimmerVisionModel: Module {
     public func callAsFunction(
         _ patches: MLXArray, frames: [THW], probe: ((String, MLXArray) -> Void)?
     ) -> MLXArray {
-        var h = patchEmbedder(patches, frames: frames, mergeSize: config.mergeSize)
+        // `QwenVL.patchify` groups its rows by merge block; this tower is
+        // defined over the raster grid, so the rows are ungrouped first and
+        // regrouped at the end by `pixelShuffle`.
+        var h = patchEmbedder(rasterOrder(patches, frames: frames), frames: frames)
         probe?("embedder", h)
         h = lnPre(h)
         probe?("ln_pre", h)
@@ -444,52 +435,110 @@ public class MuseGlimmerVisionModel: Module {
         let windowMask = blockDiagonalMask(
             sequenceLength: seqLen, cuSeqlens: cuWindowSeqlens)
 
-        // Permute into window order, carrying the rotary rows with it.
-        h = h.reshaped(seqLen / mergeUnit, mergeUnit, -1)[MLXArray(windowIndex), 0..., 0...]
-            .reshaped(seqLen, -1)
-        var rot = rotaryEmb.reshaped(seqLen / mergeUnit, mergeUnit, -1)
-        rot = rot[MLXArray(windowIndex), 0..., 0...].reshaped(seqLen, -1)
+        // Permute into window order, carrying the rotary rows with it. Both are
+        // per-patch, so the permutation indexes rows directly.
+        let order = MLXArray(windowIndex)
+        h = h[order, 0...]
+        let rot = rotaryEmb[order, 0...]
 
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: config.isWindowed(i) ? windowMask : fullMask, rotary: rot)
             probe?("layer\(i)", h)
         }
 
+        // Undo the window permutation first, so `ln_post` and the merge both
+        // run on raster-ordered patches.
+        h = h[argSort(order, axis: 0), 0...]
         h = lnPost(h)
+        return pixelShuffle(h, frames: frames)
+    }
 
-        // Merge each mergeSize² block into one token, then undo the window
-        // permutation so the features line up with the placeholder positions.
-        h = h.reshaped(seqLen / mergeUnit, mergeUnit * config.hiddenSize)
-        let reverse = argSort(MLXArray(windowIndex), axis: 0)
-        return h[reverse, 0...]
+    /// `QwenVL.patchify` emits rows grouped as `(hb, wb, di, dj)`; this returns
+    /// them in raster order `(row, col)`, which is the order the tower's
+    /// positions, rotary coordinates and window partition are all defined over.
+    private func rasterOrder(_ patches: MLXArray, frames: [THW]) -> MLXArray {
+        let merge = config.mergeSize
+        var gather: [Int32] = []
+        var base = 0
+        for frame in frames {
+            let (t, h, w) = frame.values
+            for _ in 0 ..< t {
+                for row in 0 ..< h {
+                    for col in 0 ..< w {
+                        let block = (row / merge) * (w / merge) + (col / merge)
+                        let within = (row % merge) * merge + (col % merge)
+                        gather.append(Int32(base + block * merge * merge + within))
+                    }
+                }
+                base += h * w
+            }
+        }
+        guard gather.count == patches.dim(0) else { return patches }
+        return patches[MLXArray(gather), 0...]
+    }
+
+    /// Groups each `mergeSize x mergeSize` block of raster-ordered patches into
+    /// one token. The concatenation is **feature-major** — all `mergeUnit`
+    /// values of feature 0, then of feature 1, and so on — not one patch vector
+    /// after another. Both orderings have the same width, so getting it wrong
+    /// still feeds the adapter a correctly shaped, permuted vector.
+    private func pixelShuffle(_ h: MLXArray, frames: [THW]) -> MLXArray {
+        let merge = config.mergeSize
+        let dim = h.dim(-1)
+        var out: [MLXArray] = []
+        var base = 0
+        for frame in frames {
+            let (t, gh, gw) = frame.values
+            var gather: [Int32] = []
+            for f in 0 ..< t {
+                let frameBase = base + f * gh * gw
+                for hb in 0 ..< (gh / merge) {
+                    for wb in 0 ..< (gw / merge) {
+                        for di in 0 ..< merge {
+                            for dj in 0 ..< merge {
+                                gather.append(
+                                    Int32(frameBase + (hb * merge + di) * gw + (wb * merge + dj)))
+                            }
+                        }
+                    }
+                }
+            }
+            let cells = t * (gh / merge) * (gw / merge)
+            let grouped = h[MLXArray(gather), 0...].reshaped(cells, merge * merge, dim)
+            out.append(grouped.transposed(0, 2, 1).reshaped(cells, dim * merge * merge))
+            base += t * gh * gw
+        }
+        return out.count == 1 ? out[0] : concatenated(out, axis: 0)
     }
 
     // MARK: Position / window bookkeeping
 
+    /// Rotary coordinates, in raster order, as `(column, row)` — **not**
+    /// `(row, column)`. The checkpoint interleaves its head dimension as
+    /// `[w, h, w, h]`, so feeding `(row, column)` transposes every patch's
+    /// coordinates: the tower still produces well-formed features, but rows and
+    /// columns are exchanged, which is invisible on a symmetric picture and
+    /// scrambles everything else.
+    ///
+    /// Coordinates are 1-based; the trained offset is 1, not 0.
     private func rotaryPositionEmbedding(_ frames: [THW]) -> MLXArray {
         var positionIds = [MLXArray]()
-        let merge = config.mergeSize
 
         for frame in frames {
             let (t, h, w) = frame.values
 
-            var hpos = expandedDimensions(MLXArray(0 ..< h), axis: 1)
-            hpos = repeated(hpos, count: w, axis: 1)
-            hpos =
-                hpos.reshaped(h / merge, merge, w / merge, merge)
-                .transposed(0, 2, 1, 3).flattened()
+            var rows = expandedDimensions(MLXArray(0 ..< h), axis: 1)
+            rows = repeated(rows, count: w, axis: 1).flattened() + 1
 
-            var wpos = expandedDimensions(MLXArray(0 ..< w), axis: 0)
-            wpos = repeated(wpos, count: h, axis: 0)
-            wpos =
-                wpos.reshaped(h / merge, merge, w / merge, merge)
-                .transposed(0, 2, 1, 3).flattened()
+            var cols = expandedDimensions(MLXArray(0 ..< w), axis: 0)
+            cols = repeated(cols, count: h, axis: 0).flattened() + 1
 
-            positionIds.append(tiled(stacked([hpos, wpos], axis: -1), repetitions: [t, 1]))
+            positionIds.append(tiled(stacked([cols, rows], axis: -1), repetitions: [t, 1]))
         }
 
         let indices = concatenated(positionIds, axis: 0)
-        let maxSide = frames.lazy.map { max($0.h, $0.w) }.max() ?? 0
+        // +2 so the 1-based coordinates stay inside the table.
+        let maxSide = (frames.lazy.map { max($0.h, $0.w) }.max() ?? 0) + 2
         return rotary(sequenceLength: maxSide)[indices].reshaped(indices.dim(0), -1)
     }
 
@@ -500,13 +549,14 @@ public class MuseGlimmerVisionModel: Module {
         var windowIndex: [Int32] = []
         var cuWindowSeqlens = [0]
         var offset = 0
-        let merge = config.mergeSize
-        let windowCells = config.windowSize / merge / config.patchSize
+        // The partition is over individual patches: the 2x2 merge happens after
+        // the encoder, so nothing here is expressed in merged cells.
+        let windowCells = config.windowSize / config.patchSize
 
         for frame in frames {
             let (t, gridH, gridW) = frame.values
-            let llmH = gridH / merge
-            let llmW = gridW / merge
+            let llmH = gridH
+            let llmW = gridW
 
             let padH = (windowCells - llmH % windowCells) % windowCells
             let padW = (windowCells - llmW % windowCells) % windowCells
@@ -529,7 +579,7 @@ public class MuseGlimmerVisionModel: Module {
                             }
                         }
                         if count > 0 {
-                            cuWindowSeqlens.append(cuWindowSeqlens.last! + count * mergeUnit)
+                            cuWindowSeqlens.append(cuWindowSeqlens.last! + count)
                         }
                     }
                 }

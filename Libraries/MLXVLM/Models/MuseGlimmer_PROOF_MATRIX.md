@@ -173,192 +173,69 @@ cache entry, and two that render the same line must not miss.
 and grep for `Reasoning strength:` — count the occurrences and read the value.
 That single check settles 1–3.
 
-## VISION IS NOT WORKING — confirmed against a positive control, 2026-08-10
+## Vision: broken, then fixed — 2026-08-10
 
-The merged claim that the vision path works is **wrong**, and the test that
-supported it was too weak to catch this. That test asserted only that the answer
-was non-empty and contained a word from a list including "image", "colour" and
-"band" — a model that cannot see satisfies every one of those by echoing the
-prompt's own wording.
+Vision did not work, and the test that said otherwise accepted any non-empty
+answer containing a word from a list the prompt itself supplied. Rebuilt around
+matched opposite stimuli — so a constant answer scores half, not full — and run
+against Qwen3.6-27B as a positive control, because a probe no model passes
+measures the probe.
 
-### The evidence, with a control
+| probe (scored as opposite pairs) | before | after | Qwen3.6 control |
+|---|---|---|---|
+| six-trial shape battery | 3/6 (constant "circle" = chance) | **6/6** | 6/6 |
+| solid red field / solid blue field | "green" / "green" | **red / blue** | 2/2 |
+| bar top / bottom | top / bottom | top / bottom | top / bottom |
+| bar left / right | "right" / "right" | **left / right** | left / right |
 
-Each probe uses stimuli whose ground truth is known exactly and which the prompt
-never names, and each is scored as a **matched opposite pair** so a constant
-answer scores 1/2 rather than 1/1. The same probes were then run unchanged
-against Qwen3.6-27B — a working VL model in this same runtime — to prove the
-probes are passable:
+Both quants pass: JANG_6M and JANG_4M each score 6/6 on shapes and name both
+solid fields correctly.
 
-| Probe | Muse Glimmer 30B (JANG_6M) | Qwen3.6-27B (control) |
-|---|---|---|
-| solid red field / solid blue field | "green" / "green" — **0/2** | **2/2** |
-| black circle / black square | "circle" / "circle" — **1/2** | **2/2** |
+The model's own description of a centred black circle, before and after:
 
-A working model passes both trivially. Telling a square from a circle is the
-easiest task a vision model is ever given.
+> before: "an amorphous, irregular blob… muted yellow-olive… sits in the lower
+> part of the frame"
+>
+> after: "a perfectly round disc, filled in solid… the disc is black… centred in
+> the frame with a roughly even margin on all four sides"
 
-(A third probe on two macOS desktop-picture *thumbnails* returned "mottled
-texture" and "abstract shape". That one is **not** evidence: those files come
-from a hidden `.thumbnails` directory and their actual content was never
-verified, so a vague description may well be accurate. It is recorded here only
-so it is not mistaken for a finding later.)
+### What was actually wrong
 
-### What is verified CORRECT (so the fault is not here)
+Four defects, all invisible to shape checks because every one of them preserves
+tensor dimensions:
 
-- all 809 vision tensors load and match the checkpoint bit for bit (`verify: .all`)
-- channel order: channel 0 carries the red value, checked against raw PNG pixels
-- normalization matches `processor_config.json` exactly (mean/std 0.5, 1/255)
-- quantization correctly skips the vision tower (no `.scales` in the checkpoint)
-- adapter and projection are `bias: false`, matching a checkpoint with no bias
-- geometry: 256 `<|patch|>` placeholders for 256 vision tokens, 221 for 221
-- projected vision tokens sit at RMS 0.83 against normed text tokens at 1.0
-- patch content enters the embedder ~56x stronger than the position term
+1. **RoPE axis order.** The checkpoint interleaves its head dimension as
+   `[w, h, w, h]`; the port built `[h, w, h, w]`. Every patch had its row and
+   column coordinates exchanged. This is what produced the diagnostic signature
+   — vertical position readable, horizontal not — because vision tokens arrive
+   raster-ordered, so rows survive in token order even when the positional
+   signal is wrong, while columns have no such backup.
+2. **RoPE coordinate offset.** Coordinates are 1-based, not 0-based.
+3. **Grid order.** The encoder runs over the raster grid, not over merge blocks.
+   `QwenVL.patchify` groups its rows by merge block, so the rows are ungrouped
+   on entry and regrouped at the end.
+4. **The 2x2 merge is feature-major.** The merged vector is all `mergeUnit`
+   values of feature 0, then feature 1, and so on — not one patch vector
+   concatenated after another. Same width either way.
 
-### A dead end, recorded so it is not repeated
+Plus the patch vector layout fixed earlier: `[temporal][channel][h][w]`, not
+`[channel][temporal][h][w]`, identified from the weights (temporal-pair cosine
+0.990 against 0.492) before the reference confirmed it.
 
-Feeding a half-black / half-white field and measuring how strongly the two
-halves stay separated against the spread inside one uniform half looked
-damning — the ratio falls from 46 after the embedder to 0.13 by layer 49, with
-the position-driven spread growing from 0.014 to 15.6.
+The window size inferred as `pos_emb_height * patch_size` turned out to match
+the reference; the adapter's trailing activation, removed at one point on the
+strength of a Qwen analogy and then restored, is also correct.
 
-**That measurement proves nothing.** Qwen3.6's working tower scores **0.515** on
-the identical statistic — the same low band. The metric cannot separate a good
-tower from a bad one, so no verdict can be drawn from it. `MuseGlimmerMetricControl`
-pins this down permanently.
+### Dead ends worth not repeating
 
-Also ruled out by measurement, before the metric itself was invalidated:
-disabling rope entirely and switching to the interleaved rope pairing. Neither
-repaired the end-to-end behaviour.
+Two internal metrics looked like proof and were withdrawn once controlled:
+the layerwise contrast collapse (46 to 0.13 through the stack — Qwen's working
+tower scores 0.515 on the same statistic) and a gradient row-order correlation
+(Muse 0.42, Qwen **-0.07**, i.e. Muse scored better). Neither could separate a
+working tower from a broken one. `MuseGlimmerMetricControl` keeps that closed.
 
-### One confirmed defect, fixed: the patch vector layout
-
-`patch_embedding.weight` is `(1536, 1176)` and 1176 = 3 channels x 2 temporal x
-14 x 14. Nothing states the order of those factors and both candidates have the
-same width, so every shape check passes either way. The weights settle it — a
-still image duplicates the frame, so the two temporal slots always see identical
-pixels and their weights co-adapt:
-
-| pairing | temporal-pair cosine |
-|---|---|
-| `[channel][temporal]` (what the port fed) | 0.492 |
-| **`[temporal][channel]`** | **0.990** |
-| unrelated-slice baseline | 0.740 |
-
-Under the assumed order the "pairs" correlate *below* the unrelated baseline.
-`temporalMajor` now reorders patchify's output before the projection, and
-`MuseGlimmerPatchLayout` fails if that evidence ever flips.
-
-Note what this fix does **not** do: it did not change the end-to-end answers.
-Colour is still misnamed. That is consistent — the reorder only matters when the
-channels differ, and greyscale (the circle/square probe) is untouched by it — so
-at least one further defect remains.
-
-Also tested and rejected, by running it: removing the adapter's trailing GELU
-(the Qwen reference has no trailing activation) left the shape probe at 1/2
-unchanged, so it was reverted rather than kept on style grounds.
-
-Checked and correct, so not the cause: `image_token_id` 200092 / `video_token_id`
-200091 both decode and match the rendered placeholders; position interpolation
-and merge-block reordering agree with the working Qwen3VL implementation, and at
-a 32x32 grid both reduce to exact identity; the window partition is a single
-window at that size; the attention block, rotary pairing and masks all match the
-reference.
-
-### The probe, properly calibrated
-
-The six-trial battery (three circles, three squares, varying size and position)
-is the yardstick, and it took two corrections before it measured anything:
-scoring required the opposite word to be *absent*, which threw away "a square,
-not a circle"; and `maxTokens` was low enough to truncate the model's thinking,
-which returned an empty visible answer indistinguishable from a refusal. Both
-were caught because the **control** failed, not the subject.
-
-| model | score |
-|---|---|
-| Qwen3.6-27B (control) | **6/6** |
-| Muse Glimmer, window 448 (default) | 3/6 — constant "circle", i.e. chance |
-| Muse Glimmer, window 224 | 3/6 — constant "circle" |
-| Muse Glimmer, window 112 | **0/6 — every answer inverted** |
-| Muse Glimmer, window 56 | 3/6 — mixed |
-
-The 0/6 is the interesting row: a clean inversion on six trials happens by
-chance once in 64, so at 112 the shape information is reaching the model
-reliably and coming out with the labels swapped, while at 448 and 224 nothing
-reaches it at all. That is a lead, not an answer — 112 was not adopted, because
-a setting that scores 0/6 is worse than the one that scores at chance, and
-colour stays wrong at every window size tested.
-
-### The sharpest finding: vertical works, horizontal does not
-
-Bars filling only one quarter of the frame, each forced choice scored against
-its opposite, with Qwen3.6 as the control:
-
-| probe | Muse Glimmer | Qwen3.6 (control) |
-|---|---|---|
-| bar in the top quarter | top | top |
-| bar in the bottom quarter | bottom | bottom |
-| bar on the left | **right** | left |
-| bar on the right | right | right |
-
-Vertical is correct. Horizontal is a constant answer — the two opposite images
-are indistinguishable to the model.
-
-That split is a clue, not a curiosity. The vision tokens arrive raster-ordered,
-so **row** position is recoverable from token order alone even with no
-positional signal at all, while **column** position can only reach the language
-model through the vision position embedding. Losing exactly the axis that
-depends on that embedding, and keeping the one that does not, points at it
-directly.
-
-The magnitudes agree, against the control:
-
-| | content : position magnitude |
-|---|---|
-| Qwen3.6 (resolves both axes) | **4.8** |
-| Muse Glimmer | **55.8** |
-
-Muse's position term is roughly 11.5x weaker relative to patch content than the
-working reference — small enough to be effectively invisible. Whether the cause
-is a missing scale factor, the wrong insertion point relative to `ln_pre`, or a
-table that is genuinely small in a tower that also carries rope, is not yet
-settled; the tower's own vertical/horizontal asymmetry is mild (1.33x against
-the control's 0.91x), so the loss is not a gross scrambling inside the blocks.
-
-The model's own words match. Asked to describe a centred black circle it
-reports "an amorphous, irregular blob", "muted yellow-olive", "sits in the lower
-part of the frame" — a picture read without usable position.
-
-### Scaling the position term: it moves the needle, but is not the fix
-
-`ln_pre` follows the sum, and LayerNorm is scale-invariant, so only the
-content:position **ratio** matters — multiplying the position term by k is the
-same as dividing content by k. Tested live:
-
-| position x | top bar | bottom bar | left bar | right bar |
-|---|---|---|---|---|
-| x1 (shipped) | top | bottom | right | right |
-| x12 (ratio ~4.7, matching the control) | bottom | top | left | left |
-| x30 (ratio ~1.9) | bottom | bottom | **left** | **right** |
-
-At x30 horizontal becomes correct for the first time — the axis that had been
-unreadable at every window size. So the position term genuinely does carry
-column information and is simply too faint to be used at the shipped ratio.
-
-But every amplification breaks vertical, which was correct at x1, so a uniform
-scale is not the answer: it trades one axis for the other rather than fixing
-either. Something about how the two terms are combined is wrong in a way a
-single multiplier cannot express, and the knob was removed rather than shipped
-at a value that scores well on one probe and badly on another.
-
-### Still unknown
-
-The defective operation has not been located. There is no reference
-implementation on this machine — the bundles ship no `modeling_*.py` and
-transformers has no `muse_glimmer` — so locating it needs a reference to diff
-activations against, layer by layer, rather than another whole-tower statistic.
-
-Text-only Muse Glimmer is unaffected: reasoning strengths, ATEM tool parsing,
-EOS and the prefix cache were proven separately and do not involve the tower.
+Rejected by running them: disabling rope, the interleaved rope pairing,
+removing the adapter's trailing activation, and window sizes 224/112/56.
 
 ## Post-merge live evidence (2026-08-10 session, merged build)
 
