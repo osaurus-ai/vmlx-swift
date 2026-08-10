@@ -141,6 +141,54 @@ public struct MuseGlimmerProcessor: UserInputProcessor {
             temporalPatchSize: config.temporalPatchSize)
     }
 
+    /// Expand each media placeholder into one placeholder per merged token.
+    ///
+    /// `QwenVL.replacePaddingTokens` cannot be reused here: it searches for
+    /// `<|vision_start|>PLACEHOLDER<|vision_end|>` and re-emits that wrapper.
+    /// Those two tokens are Qwen-only — Muse's template writes a bare
+    /// `<|patch|>` / `<|video|>` — so the search matched nothing, every prompt
+    /// reported "0 placeholders", and no image could ever be attached. Had the
+    /// search somehow matched, the replacement would have injected two tokens
+    /// this vocabulary does not define.
+    ///
+    /// Matching is done on the placeholder's token id rather than on text, so
+    /// a placeholder adjacent to other characters cannot be missed.
+    static func expandPlaceholders(
+        in promptTokens: [Int], frames: [THW], placeholder: String,
+        mergeSize: Int, tokenizer: any Tokenizer
+    ) throws -> [Int] {
+        let encoded = tokenizer.encode(text: placeholder, addSpecialTokens: false)
+        guard encoded.count == 1, let placeholderId = encoded.first else {
+            throw VLMError.processing(
+                "\(placeholder) is not a single token (got \(encoded.count)); "
+                    + "the bundle's tokenizer does not declare it as special")
+        }
+
+        let positions = promptTokens.indices.filter { promptTokens[$0] == placeholderId }
+        guard positions.count == frames.count else {
+            throw VLMError.processing(
+                "Number of \(placeholder) placeholders (\(positions.count)) does not match "
+                    + "number of frames (\(frames.count))")
+        }
+
+        let mergeLength = mergeSize * mergeSize
+        var result: [Int] = []
+        result.reserveCapacity(promptTokens.count)
+        var cursor = promptTokens.startIndex
+        for (position, frame) in zip(positions, frames) {
+            result.append(contentsOf: promptTokens[cursor ..< position])
+            // One placeholder per merged vision token: this count must equal
+            // the rows the tower emits, or the scatter silently misaligns.
+            let count = frame.product / mergeLength
+            result.append(contentsOf: Array(repeating: placeholderId, count: count))
+            cursor = promptTokens.index(after: position)
+        }
+        if cursor < promptTokens.endIndex {
+            result.append(contentsOf: promptTokens[cursor...])
+        }
+        return result
+    }
+
     public func prepare(input: UserInput) async throws -> LMInput {
         let messages = MuseGlimmerMessageGenerator().generate(from: input)
 
@@ -164,11 +212,8 @@ public struct MuseGlimmerProcessor: UserInputProcessor {
                 pixels: concatenated(pixelsAndFrames.map { $0.0 }),
                 frames: pixelsAndFrames.map { $0.1 })
             if let frames = processedImage?.frames {
-                // The template emits a single `<|patch|>`; it has to become one
-                // placeholder per merged token or the scatter and the feature
-                // count disagree.
-                promptTokens = try QwenVL.replacePaddingTokens(
-                    in: promptTokens, frames: frames, paddingToken: "<|patch|>",
+                promptTokens = try Self.expandPlaceholders(
+                    in: promptTokens, frames: frames, placeholder: "<|patch|>",
                     mergeSize: config.mergeSize, tokenizer: tokenizer)
             }
         }
@@ -201,8 +246,8 @@ public struct MuseGlimmerProcessor: UserInputProcessor {
                 pixels: concatenated(pixelsAndFrames.map { $0.0 }),
                 frames: pixelsAndFrames.map { $0.1 })
             if let frames = processedVideo?.frames {
-                promptTokens = try QwenVL.replacePaddingTokens(
-                    in: promptTokens, frames: frames, paddingToken: "<|video|>",
+                promptTokens = try Self.expandPlaceholders(
+                    in: promptTokens, frames: frames, placeholder: "<|video|>",
                     mergeSize: config.mergeSize, tokenizer: tokenizer)
             }
         }
