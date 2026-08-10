@@ -727,9 +727,29 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return (self.keys!, self.values!)
     }
 
+    /// True when a single-token in-place write is guaranteed to land inside the
+    /// existing buffer.
+    ///
+    /// `updateInPlace` writes `idx ..< idx + S` and can only grow the buffer
+    /// when `offset` has caught up with its width. A cache restored from disk
+    /// takes `offset` from metadata while `idx` comes from wherever the restore
+    /// left it, and `updateConcat` sets `idx` to the full width — so the two can
+    /// disagree and the write lands past the end. `updateConcat` has no such
+    /// assumption, so route to it whenever the fast path is not provably safe.
+    private func canUpdateInPlace(_ S: Int) -> Bool {
+        guard let currentKeys = self.keys else { return true }
+        let capacity = currentKeys.dim(2)
+        // The in-place path may grow by one step when offset has reached the
+        // current width; account for that before deciding.
+        let grown = offset >= capacity && capacity < maxCacheSize
+        let effective = grown ? min(capacity + step, maxCacheSize) : capacity
+        let start = (idx >= effective) ? keep : idx
+        return start + S <= effective
+    }
+
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let result =
-            if keys.dim(2) == 1 {
+            if keys.dim(2) == 1 && canUpdateInPlace(keys.dim(2)) {
                 updateInPlace(keys: keys, values: values)
             } else {
                 updateConcat(keys: keys, values: values)
