@@ -355,16 +355,28 @@ public class MuseGlimmerModelInner: Module {
         super.init()
     }
 
+    /// The checkpoint's embedding is a *normed* embedding: a scaleless RMSNorm
+    /// applied on top of the raw table lookup (`MuseGlimmerTextNormedEmbedding`
+    /// in the reference — kept out of the weight matrix on purpose, so it can
+    /// never be folded in). Skipping it feeds layer 0 activations at the wrong
+    /// magnitude and the model emits fluent-looking token soup across random
+    /// scripts. This is the divergence in place of Gemma's sqrt(hidden) scale,
+    /// not the absence of one.
+    public func embed(_ inputs: MLXArray) -> MLXArray {
+        MuseGlimmerMath.scalelessRMSNorm(embedTokens(inputs), eps: config.rmsNormEps)
+    }
+
     public func callAsFunction(
         _ inputs: MLXArray?, inputEmbedding: MLXArray? = nil, cache: [KVCache?]? = nil
     ) -> MLXArray {
-        // No embedding normalizer here — Muse Glimmer does not scale the input
-        // embeddings by sqrt(hidden_size) the way Gemma does.
         var h: MLXArray
         if let inputEmbedding {
+            // Callers pass already-normed embeddings (see `embed`); vision
+            // features scattered into that stream stay raw, matching the
+            // reference's masked_scatter over the normed lookup.
             h = inputEmbedding
         } else if let inputs {
-            h = embedTokens(inputs)
+            h = embed(inputs)
         } else {
             fatalError("MuseGlimmer: one of inputs or inputEmbedding must be provided")
         }

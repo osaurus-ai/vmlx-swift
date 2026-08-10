@@ -113,10 +113,11 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
             // axis. The forward pass still runs, so the only symptom is a
             // non-3-D logits tensor blowing up later in `convertToToken`.
             let ids = inputIds.ndim == 1 ? inputIds[.newAxis, .ellipsis] : inputIds
-            return languageModel.model.embedTokens(ids)
+            // `embed`, not `embedTokens`: the checkpoint's embedding is normed.
+            return languageModel.model.embed(ids)
         }
 
-        let inputEmbeds = languageModel.model.embedTokens(inputIds)
+        let inputEmbeds = languageModel.model.embed(inputIds)
         var features = visionFeatures(pixelValues, frames: frames)
         if features.ndim == 2 {
             features = features[.newAxis, 0..., 0...]
