@@ -2094,18 +2094,36 @@ public struct TokenIterator: TokenIteratorProtocol {
             // The head we just prefilled ends exactly at a boundary the store
             // loop will ask for later. Keep it so that loop can use it instead
             // of replaying the prefix through the model.
+            var capturedHeadCount = 0
             if let head = capture.head {
-                let headCount = head.text.tokenIds?.count ?? head.text.tokens.size
-                if headCount > 0 {
-                    stableBoundarySnapshots[headCount] = snapshot
+                capturedHeadCount = head.text.tokenIds?.count ?? head.text.tokens.size
+                if capturedHeadCount > 0 {
+                    stableBoundarySnapshots[capturedHeadCount] = snapshot
                 }
+            }
+            // Keep going through the stable boundaries that sit AFTER this
+            // one instead of returning. Returning here left them to the
+            // post-generation reconstruction, which is cancellable: a Stop
+            // mid-turn produced `rederive-failed tokens=1062/2591
+            // CancellationError()` for exactly the seeds this pass exists to
+            // make cheap.
+            if try prepareCapturingStableBoundaries(
+                input: capture.tail,
+                windowSize: windowSize,
+                alreadyConsumed: capturedHeadCount,
+                promptTokensForProcessor: input.text.tokens)
+            {
+                return
             }
             try prepareRemainder(
                 input: capture.tail, windowSize: windowSize,
                 promptTokensForProcessor: input.text.tokens)
             return
         }
-        if try prepareCapturingStableBoundaries(input: input, windowSize: windowSize) {
+        if try prepareCapturingStableBoundaries(
+            input: input, windowSize: windowSize, alreadyConsumed: 0,
+            promptTokensForProcessor: input.text.tokens)
+        {
             return
         }
         try prepareRemainder(
@@ -2133,19 +2151,25 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Returns false when there is nothing worth splitting, leaving the caller
     /// on the untouched single-prefill path.
     private mutating func prepareCapturingStableBoundaries(
-        input: LMInput, windowSize: Int?
+        input: LMInput, windowSize: Int?, alreadyConsumed: Int,
+        promptTokensForProcessor: MLXArray
     ) throws -> Bool {
-        let promptCount = input.text.tokenIds?.count ?? input.text.tokens.size
+        // Boundaries are absolute positions in the whole prompt, while `input`
+        // may already start partway through it when an earlier capture split
+        // it. Everything below works in absolute terms and subtracts
+        // `alreadyConsumed` only when slicing.
+        let promptCount =
+            alreadyConsumed + (input.text.tokenIds?.count ?? input.text.tokens.size)
         // Store shifts stable boundaries one token short for disk-backed
         // restores, so capture N-1 as well and let the loop find either.
         let wanted = Set(
-            input.cacheStablePrefixTokenCounts
-                .filter { $0 > 0 && $0 < promptCount }
+            originalInput.cacheStablePrefixTokenCounts
+                .filter { $0 > alreadyConsumed && $0 < promptCount }
                 .flatMap { [$0, $0 - 1] }
-        ).filter { $0 > 0 }.sorted()
+        ).filter { $0 > alreadyConsumed }.sorted()
         guard !wanted.isEmpty else { return false }
 
-        var consumed = 0
+        var consumed = alreadyConsumed
         var remaining = input
         for boundary in wanted {
             guard boundary > consumed,
@@ -2169,10 +2193,10 @@ public struct TokenIterator: TokenIteratorProtocol {
             remaining = split.tail
             consumed = boundary
         }
-        guard consumed > 0 else { return false }
+        guard consumed > alreadyConsumed else { return false }
         try prepareRemainder(
             input: remaining, windowSize: windowSize,
-            promptTokensForProcessor: input.text.tokens)
+            promptTokensForProcessor: promptTokensForProcessor)
         return true
     }
 
