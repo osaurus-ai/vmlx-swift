@@ -35,6 +35,62 @@ private func loadSafetensorsHeaderNamesForBaseLoad(_ url: URL) throws -> [String
     return header.keys.filter { $0 != "__metadata__" }
 }
 
+/// A bundle whose shard files are shorter than their headers declare.
+public struct TruncatedSafetensorsError: LocalizedError {
+    public let description: String
+    public var errorDescription: String? { description }
+}
+
+/// Bytes a safetensors file is short of what its own header declares, or nil
+/// when the file is complete (or its header cannot be parsed).
+///
+/// Weights are memory-mapped, so a shard truncated by an interrupted download
+/// does NOT fail to load: the tensors whose data falls past end-of-file map to
+/// pages that read as zeros on most boots and as leftover garbage on some, with
+/// the outcome fixed for the lifetime of the mapping. A model in that state
+/// produces subtly degraded output most of the time and complete token soup the
+/// rest, deterministically per launch — which reads exactly like a
+/// nondeterministic runtime/concurrency bug and is nearly impossible to
+/// attribute from the output alone. Concrete case: a DeepSeek-V4-Flash bundle
+/// with 8 of 102 shards short by ~301 MB total spent days looking like a race
+/// in the MoE routing path; ~20% of launches produced gibberish from the first
+/// sampled token, and the other 80% silently dropped a shared-expert
+/// contribution. Checking the length is cheap and turns that whole class into
+/// one obvious message at load.
+func safetensorsMissingByteCount(_ url: URL) -> Int64? {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+    defer { try? handle.close() }
+    guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8
+    else { return nil }
+    var headerLength: UInt64 = 0
+    for (index, byte) in lengthData.enumerated() {
+        headerLength |= UInt64(byte) << UInt64(index * 8)
+    }
+    guard headerLength > 0, headerLength <= 64 * 1024 * 1024,
+        let headerData = try? handle.read(upToCount: Int(headerLength)),
+        headerData.count == Int(headerLength),
+        let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any]
+    else { return nil }
+
+    var maxEnd: UInt64 = 0
+    for (name, value) in header where name != "__metadata__" {
+        guard let entry = value as? [String: Any],
+            let offsets = entry["data_offsets"] as? [Any],
+            offsets.count == 2,
+            let end = (offsets[1] as? NSNumber)?.uint64Value
+        else { continue }
+        maxEnd = max(maxEnd, end)
+    }
+    guard maxEnd > 0 else { return nil }
+
+    let declared = Int64(8 + headerLength + maxEnd)
+    guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size]
+        as? NSNumber
+    else { return nil }
+    let actual = size.int64Value
+    return actual < declared ? declared - actual : nil
+}
+
 private func modelIndexContainsPreservedMTPWeight(at modelDirectory: URL) -> Bool? {
     let indexURL = modelDirectory.appendingPathComponent("model.safetensors.index.json")
     guard let data = try? Data(contentsOf: indexURL),
@@ -209,6 +265,41 @@ public func loadWeights(
                     "-of-\(String(format: "%05d", completeTotal)).safetensors")
             }
         }
+        // Fail loudly on a truncated bundle BEFORE mapping any of it. See
+        // `safetensorsMissingByteCount` — mapping past end-of-file is silent,
+        // so without this the only symptom is degraded or garbage output that
+        // looks like a runtime bug. `VMLX_ALLOW_TRUNCATED_SHARDS=1` downgrades
+        // this to a warning for deliberate partial-bundle experiments.
+        var truncatedShards: [(String, Int64)] = []
+        for url in allShardURLs {
+            if let missing = safetensorsMissingByteCount(url) {
+                truncatedShards.append((url.lastPathComponent, missing))
+            }
+        }
+        if !truncatedShards.isEmpty {
+            let total = truncatedShards.reduce(Int64(0)) { $0 + $1.1 }
+            let detail = truncatedShards
+                .sorted { $0.0 < $1.0 }
+                .map { "  \($0.0): missing \($0.1) bytes" }
+                .joined(separator: "\n")
+            let message =
+                "\(truncatedShards.count) of \(allShardURLs.count) safetensors "
+                + "shard(s) in \(modelDirectory.path) are shorter than their own "
+                + "header declares (\(total) bytes missing in total) — the download "
+                + "is incomplete or the files were truncated. Weights are "
+                + "memory-mapped, so loading anyway yields zeros or uninitialized "
+                + "memory for the affected tensors and produces degraded or "
+                + "garbage output that varies per launch. Re-download the bundle.\n"
+                + detail
+            if ProcessInfo.processInfo.environment["VMLX_ALLOW_TRUNCATED_SHARDS"] == "1" {
+                FileHandle.standardError.write(Data(
+                    "[loadWeights] WARNING (VMLX_ALLOW_TRUNCATED_SHARDS=1): \(message)\n".utf8))
+            } else {
+                FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                throw TruncatedSafetensorsError(description: message)
+            }
+        }
+
         // Canonical loader entry. On patched osaurus mlx-swift pins,
         // `loadArraysAndMetadata(url:)` honors the safetensors mmap
         // environment set by `ModelFactory.withMmapSafetensorsEnv`,
@@ -421,6 +512,38 @@ public func loadWeights(
             let g = inferred.quantization?.groupSize ?? -1
             FileHandle.standardError.write(
                 Data("[Load] JANG shape walk produced \(inferred.perLayerQuantization.count) per-layer quant override(s) over default (bits=\(b), gs=\(g))\n".utf8))
+        }
+        if ProcessInfo.processInfo.environment["VMLX_LOAD_QUANT_TRACE"] == "1" {
+            // DSV4-Flash boots read `layers.15.ffn.shared_experts.*` and
+            // `layers.16.attn.indexer.wq_b.*` as all-zero (~80% of boots) or
+            // garbage (~20%) in module space, while the bundle holds sane
+            // values — so either the resolved (bits, gs) for exactly these
+            // tensors is wrong, or their load is dropped. Print what THIS
+            // boot resolved and what the source tensors look like, per
+            // suspect path, so one boot names the failing step.
+            for probe in [
+                "layers.14.ffn.shared_experts.w1", "layers.15.ffn.shared_experts.w1",
+                "layers.15.ffn.shared_experts.w2", "layers.16.attn.indexer.wq_b",
+                "layers.14.attn.indexer.wq_b",
+            ] {
+                let scales = weights[probe + ".scales"]
+                let weightArr = weights[probe + ".weight"]
+                let override = inferred.perLayerQuantization[probe]
+                let desc: String
+                if let scales, let weightArr {
+                    let s = MLX.abs(scales.asType(.float32)).mean()
+                    MLX.eval(s)
+                    desc =
+                        "present wShape=\(weightArr.shape) sShape=\(scales.shape) "
+                        + "sAbsmean=\(s.item(Float.self)) override=\(String(describing: override))"
+                } else {
+                    desc =
+                        "MISSING (weight=\(weightArr != nil) scales=\(scales != nil)) "
+                        + "override=\(String(describing: override))"
+                }
+                FileHandle.standardError.write(
+                    Data("[Load][quant-trace] \(probe): \(desc)\n".utf8))
+            }
         }
         func variants(_ key: String) -> [String] {
             var seen = Set<String>()

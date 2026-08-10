@@ -933,6 +933,8 @@ public actor BatchEngine {
 
             var sawTerminalInfo = false
             var generatedTokenCount = 0
+            var lastTokenAt: Date?
+            var lastPumpAt: Date?
             let streamStartedAt = Date()
 
             for await event in tokenStream {
@@ -944,9 +946,11 @@ public actor BatchEngine {
                         continuation.yield(.tokenID(id: id, ordinal: generatedTokenCount))
                     }
                     generatedTokenCount += 1
+                    lastTokenAt = Date()
                     detokenizer.append(token: id)
                     if let text = detokenizer.next() {
                         pump(text)
+                        lastPumpAt = Date()
                     }
                     if stopMatched {
                         // Tell the BatchEngine actor to halt this slot
@@ -1010,6 +1014,21 @@ public actor BatchEngine {
                         requestId,
                         fallbackStopRule: traceStopRule)
                     terminationState.markCompleted()
+                    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                        // Hosts report the visible answer finishing seconds
+                        // before the turn finalizes. Deltas and `.info` are
+                        // both produced here, so timing the gap between the
+                        // last token, the last emitted text, and `.info`
+                        // separates "still decoding invisible tokens" from
+                        // "decode done, terminal event delayed".
+                        let now = Date()
+                        let sinceToken = lastTokenAt.map { now.timeIntervalSince($0) } ?? -1
+                        let sincePump = lastPumpAt.map { now.timeIntervalSince($0) } ?? -1
+                        FileHandle.standardError.write(Data(
+                            ("[vmlx][gen/info-gap] sinceLastToken=\(sinceToken)s "
+                                + "sinceLastEmittedText=\(sincePump)s "
+                                + "tokens=\(generatedTokenCount)\n").utf8))
+                    }
                     continuation.yield(.info(finalInfo))
                     // Publish the terminal event before hopping back to the
                     // engine actor for diagnostics. If finishSlot is still
