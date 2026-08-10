@@ -181,7 +181,7 @@ public enum SpecDecStream {
     /// Drafter loading happens asynchronously inside the stream's Task,
     /// so the dispatch site stays synchronous and doesn't block on
     /// disk I/O.
-    public static func streamViaStrategy(
+    internal static func streamViaStrategyTask(
         strategy: DraftStrategy,
         inputIds: MLXArray,
         context: ModelContext,
@@ -190,7 +190,7 @@ public enum SpecDecStream {
         temperature: Float = 0,
         toolSchemas: [ToolSpec]? = nil,
         resolver: SpecDecDrafterResolver = .shared
-    ) -> AsyncStream<Generation>? {
+    ) -> (stream: AsyncStream<Generation>, task: Task<Void, Never>)? {
         guard strategy.usesBlockDiffusion else { return nil }
         guard let targetCheck = context.model
             as? any (HiddenStateCaptureModel & TokenEmbedderModel)
@@ -221,15 +221,19 @@ public enum SpecDecStream {
         let box = _SpecDecDispatchBox(
             inputIds: inputIds, target: targetCheck)
 
-        Task { @Sendable in
+        let task = Task { @Sendable in
+            defer {
+                Stream().synchronize()
+                continuation.finish()
+            }
             do {
                 let resolved: ResolvedDrafter
                 do {
                     resolved = try await resolver.resolve(strategy: strategy)
                 } catch {
-                    continuation.finish()
                     return
                 }
+                try Task.checkCancellation()
                 let startTime = Date()
                 let promptTokenCount = box.inputIds.dim(1)
                 var detokenizer = NaiveStreamingDetokenizer(
@@ -272,7 +276,9 @@ public enum SpecDecStream {
                         stopTokenIDs: stopTokenIDs,
                         temperature: temperature)
                     let r = try SpecDecRuntimeLinear.run(
-                        args, onCommitted: onCommitted)
+                        args,
+                        onCommitted: onCommitted,
+                        cancellationCheck: { try Task.checkCancellation() })
                     resultCount = r.tokenIds.count
                 case .ddtree(_, let branchingBudget, _):
                     let args = DDTreeArgs(
@@ -286,10 +292,11 @@ public enum SpecDecStream {
                         temperature: temperature,
                         branchingBudget: branchingBudget)
                     let r = try SpecDecRuntimeDDTree.run(
-                        args, onCommitted: onCommitted)
+                        args,
+                        onCommitted: onCommitted,
+                        cancellationCheck: { try Task.checkCancellation() })
                     resultCount = r.tokenIds.count
                 default:
-                    continuation.finish()
                     return
                 }
 
@@ -307,12 +314,46 @@ public enum SpecDecStream {
                     generationTime: elapsed,
                     stopReason: .length)
                 continuation.yield(.info(info))
-                continuation.finish()
-            } catch {
-                continuation.finish()
-            }
+            } catch { }
         }
-        return stream
+        installTerminationHandler(continuation: continuation, task: task)
+        return (stream: stream, task: task)
+    }
+
+    internal static func installTerminationHandler(
+        continuation: AsyncStream<Generation>.Continuation,
+        task: Task<Void, Never>
+    ) {
+        continuation.onTermination = { @Sendable [task] termination in
+            guard case .cancelled = termination else { return }
+            task.cancel()
+        }
+    }
+
+    /// Preserve the original stream-only SpecDec dispatch API. Consumer
+    /// cancellation is wired to the exact producer task; normal stream
+    /// completion does not cancel that task. The request-scoped BatchEngine
+    /// path uses ``streamViaStrategyTask`` so it can also drain that same
+    /// producer cooperatively.
+    public static func streamViaStrategy(
+        strategy: DraftStrategy,
+        inputIds: MLXArray,
+        context: ModelContext,
+        maxNewTokens: Int,
+        stopTokenIDs: Set<Int32> = [],
+        temperature: Float = 0,
+        toolSchemas: [ToolSpec]? = nil,
+        resolver: SpecDecDrafterResolver = .shared
+    ) -> AsyncStream<Generation>? {
+        streamViaStrategyTask(
+            strategy: strategy,
+            inputIds: inputIds,
+            context: context,
+            maxNewTokens: maxNewTokens,
+            stopTokenIDs: stopTokenIDs,
+            temperature: temperature,
+            toolSchemas: toolSchemas,
+            resolver: resolver)?.stream
     }
 
     // MARK: - Internals
