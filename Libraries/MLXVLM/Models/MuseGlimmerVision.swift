@@ -322,13 +322,15 @@ enum MuseGlimmerVisionRoPE {
     }
 
     /// `freqs` is `(L, headDim/2)`; duplicated to `(L, headDim)` and applied
-    /// per head.
+    /// per head. This is the split-half (NeoX/Qwen) pairing: element `i` is
+    /// rotated against element `i + headDim/2`.
     static func apply(_ x: MLXArray, freqs: MLXArray) -> MLXArray {
         let doubled = concatenated([freqs, freqs], axis: -1).expandedDimensions(axis: 1)
         let cosT = cos(doubled).asType(x.dtype)
         let sinT = sin(doubled).asType(x.dtype)
         return (x * cosT) + (rotateHalf(x) * sinT)
     }
+
 }
 
 // MARK: - Vision model
@@ -366,8 +368,20 @@ public class MuseGlimmerVisionModel: Module {
     /// for the adapter. Reordering back to raster order happens here so the
     /// caller never sees window order.
     public func callAsFunction(_ patches: MLXArray, frames: [THW]) -> MLXArray {
+        callAsFunction(patches, frames: frames, probe: nil)
+    }
+
+    /// `probe` is called with the running activation after the embedder, after
+    /// `ln_pre`, and after every block. A tower can produce well-shaped output
+    /// that carries no usable picture, and that failure is only localizable by
+    /// watching the signal layer by layer — there is no other seam to measure.
+    public func callAsFunction(
+        _ patches: MLXArray, frames: [THW], probe: ((String, MLXArray) -> Void)?
+    ) -> MLXArray {
         var h = patchEmbedder(patches, frames: frames, mergeSize: config.mergeSize)
+        probe?("embedder", h)
         h = lnPre(h)
+        probe?("ln_pre", h)
 
         let seqLen = h.dim(0)
         let rotaryEmb = rotaryPositionEmbedding(frames)
@@ -391,6 +405,7 @@ public class MuseGlimmerVisionModel: Module {
 
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: config.isWindowed(i) ? windowMask : fullMask, rotary: rot)
+            probe?("layer\(i)", h)
         }
 
         h = lnPost(h)

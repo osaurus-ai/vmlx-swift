@@ -173,6 +173,72 @@ cache entry, and two that render the same line must not miss.
 and grep for `Reasoning strength:` — count the occurrences and read the value.
 That single check settles 1–3.
 
+## VISION IS NOT WORKING — confirmed 2026-08-10, after the "vision fixed" merge
+
+The merged claim that the vision path works is **wrong**, and the test that
+supported it was too weak to catch this. That test asserted only that the answer
+was non-empty and contained a word from a list including "image", "colour" and
+"band" — a model that cannot see at all satisfies every one of those while
+answering from the prompt's own wording.
+
+Three end-to-end probes on the real bundles, all failing, none of which depend
+on any internal metric:
+
+| Probe | Truth | JANG_6M answer |
+|---|---|---|
+| solid field (230,20,20) | red | **green** |
+| solid field (20,20,230) | blue | **green** |
+| black circle on white | circle | circle ✓ |
+| black square on white | square | **circle** |
+| two different photographs | two scenes | "mottled texture", "abstract shape", zero scene vocabulary |
+
+Constant answers across opposite stimuli are the signature of a model answering
+from its text prior. Telling a circle from a square is the easiest task a vision
+model is ever given.
+
+### What is verified CORRECT (so the fault is not here)
+
+- all 809 vision tensors load and match the checkpoint bit for bit (`verify: .all`)
+- channel order: channel 0 carries the red value, checked against raw PNG pixels
+- normalization matches `processor_config.json` exactly (mean/std 0.5, 1/255)
+- quantization correctly skips the vision tower (no `.scales` in the checkpoint)
+- adapter and projection are `bias: false`, matching a checkpoint with no bias
+- geometry: 256 `<|patch|>` placeholders for 256 vision tokens, 221 for 221
+- projected vision tokens sit at RMS 0.83 against normed text tokens at 1.0
+- patch content enters ~56x stronger than the position term
+
+### Where it breaks
+
+The picture is destroyed inside the 50 vision blocks. Feeding a half-black /
+half-white field and measuring how strongly the two halves stay separated:
+
+| stage | content contrast | spread within one uniform half | ratio |
+|---|---|---|---|
+| after embedder | 0.667 | 0.014 | **46.5** |
+| after `ln_pre` | 0.658 | 0.019 | 34.2 |
+| after layer 0 | 0.707 | 0.055 | 12.8 |
+| after layer 5 | 0.766 | 0.371 | 2.07 |
+| after layer 10 | 0.746 | 0.715 | 1.04 |
+| after layer 25 | 1.074 | 1.078 | 1.00 |
+| after layer 49 | 2.027 | 15.56 | **0.13** |
+
+The content signal does not collapse — the position-driven spread *explodes*,
+from 0.014 to 15.6, and swamps it. Tokens with identical content but different
+positions end up further apart than tokens with opposite content.
+
+Ruled out by measurement, not by reading: disabling rope entirely (ratio 0.13 →
+0.59) and switching to the interleaved rope pairing (0.13 → 0.18) both help but
+neither repairs it, so the rope pairing alone is not the defect.
+
+**Still unknown:** the exact operation. There is no reference implementation on
+this machine — the bundles ship no `modeling_*.py` and transformers has no
+`muse_glimmer` — so the remaining work needs either a reference to diff
+activations against, or a control run of this same measurement through a
+known-good tower (Qwen3.6's is present) to confirm the metric itself is sound.
+
+Text-only Muse Glimmer is unaffected: reasoning strengths, ATEM tool parsing,
+EOS and the prefix cache were all proven separately and do not involve the tower.
+
 ## Post-merge live evidence (2026-08-10 session, merged build)
 
 - **SSD prefix HIT proven**: `HIT disk boundary=2819 remaining=7786 tokens=10605`
