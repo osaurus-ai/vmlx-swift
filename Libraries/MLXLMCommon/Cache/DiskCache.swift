@@ -304,12 +304,28 @@ public final class DiskCache: @unchecked Sendable {
         // while the default GPU stream still has a committed command buffer
         // can trip Metal's `_status < MTLCommandBufferStatusCommitted`
         // assertion. Sync before materializing, then again before/after save.
+        let phaseTrace =
+            ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
+        let tStart = Date()
         Stream.gpu.synchronize()
         MLX.eval(Array(arrays.values))
         Stream.gpu.synchronize()
+        let tEval = Date()
         do {
             try save(arrays: arrays, metadata: ["format": "mlx"], url: url)
             Stream.gpu.synchronize()
+            if phaseTrace {
+                // A 27B ternary model spent ~25 s storing a single ~357 MB
+                // boundary — about 14 MB/s, which is far too slow to be the
+                // write itself, so the cost is either materializing the cache
+                // or serializing it. Splitting the two says which, instead of
+                // leaving it to inference.
+                let tSave = Date()
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][cache/store-phase] count=\(tokenCount) "
+                        + "eval=\(tEval.timeIntervalSince(tStart))s "
+                        + "save=\(tSave.timeIntervalSince(tEval))s\n").utf8))
+            }
 
             let fileSize: Int
             if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
