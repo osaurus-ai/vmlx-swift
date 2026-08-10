@@ -131,3 +131,44 @@ Blocked on: vision tower (legs A2/A7), osaurus integration + repin.
 
 Out of scope for this pass: speculative decoding via the `-assistant` bundle,
 and the JANG_2L quant.
+
+## Suspected reasoning-effort wiring defects — UNCONFIRMED, must be checked
+
+Muse Glimmer's official contract: **reasoning strength is part of the system
+prompt**, written as `Reasoning strength: <value>`, with four levels —
+**low / medium / high / xhigh** (`high`/`xhigh` intended for complex problem
+solving, coding, and agentic work). The shipped template's `render_reasoning()`
+defaults to `high` when `reasoning_strength` is undefined.
+
+Note the level set is **four**, not three. Anything in osaurus that models
+effort as low/medium/high only cannot express `xhigh`, and a UI that maps its
+top setting to `high` silently caps the model below its intended ceiling for
+exactly the agentic work this model is meant for.
+
+Four suspected defects, none verified yet:
+
+1. **Card and template can disagree.** Selecting "low" in the reasoning card may
+   coexist with a template-injected "high", leaving two conflicting
+   `Reasoning strength:` statements in one system prompt. Check the rendered
+   prompt for a duplicate — and note whichever the model honours is then a
+   coin-flip that also changes the cache prefix.
+2. **`enable_thinking=false` may be dead on this path.** Muse has no think tags,
+   so a flag written for tag-gated families likely has nothing to switch off.
+   If it is inert, turning reasoning "off" in the UI would not actually reduce
+   reasoning — it would just look like it did.
+3. **`reasoning_effort` may be dead too.** The template reads
+   `reasoning_strength`. If osaurus sends `reasoning_effort`, the template never
+   sees it and silently falls back to its `high` default — so every turn reasons
+   at high regardless of the setting.
+4. **Low reasoning may cut reasoning mass materially.** If (1)–(3) are wrong and
+   the level does land, confirm the output difference is intended rather than a
+   collapse in answer quality.
+
+Why this matters beyond correctness: every one of these changes the **system
+prefix**, so a defect here is simultaneously a cache-key defect. Two turns that
+look identical in the UI but render different strength lines must not share a
+cache entry, and two that render the same line must not miss.
+
+**How to check:** dump the fully rendered system prompt for each card setting
+and grep for `Reasoning strength:` — count the occurrences and read the value.
+That single check settles 1–3.

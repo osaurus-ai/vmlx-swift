@@ -175,7 +175,18 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         var hidden: MLXArray?
 
         while offset < total {
-            let end = min(offset + step, total)
+            var end = min(offset + step, total)
+            // Never leave a trailing 1-token chunk.
+            //
+            // `RotatingKVCache.update` routes `S == 1` to `updateInPlace` and
+            // everything else to `updateConcat`. After a concat, `idx` equals
+            // the full buffer width; a following single-token in-place write
+            // then targets `idx ..< idx+1`, which is one row past the end
+            // whenever the buffer has not also grown. A disk-restored cache
+            // reaches exactly that state, so a prompt of length `k*step + 1`
+            // crashes while `k*step + 2` is fine. Absorbing the stray token
+            // into the previous chunk keeps every write on the concat path.
+            if total - end == 1 { end = total }
             let chunk = embeddings[0..., offset ..< end, 0...]
             hidden = languageModel.model(nil, inputEmbedding: chunk, cache: cache)
             // Keep the graph from growing across the whole prompt.
