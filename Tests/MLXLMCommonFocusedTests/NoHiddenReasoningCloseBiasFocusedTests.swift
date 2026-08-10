@@ -231,7 +231,7 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
             contentsOfFile: "Libraries/MLXLMCommon/LanguageModel.swift",
             encoding: .utf8)
         let processor = try String(
-            contentsOfFile: "Libraries/MLXLLM/LLMModelFactory.swift",
+            contentsOfFile: "Libraries/MLXLMCommon/ModelContainer.swift",
             encoding: .utf8)
         let engine = try String(
             contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
@@ -251,7 +251,7 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(tokenizer.contains("GenerationPromptControllableTokenizer"))
         #expect(input.contains("cachePrefixTokenCounts"))
         #expect(processor.contains("addGenerationPrompt: false"))
-        #expect(engine.contains("label: \"history-boundary\""))
+        #expect(engine.contains(": \"history-boundary\")"))
         #expect(!engine.contains("effectivePrefillWindow("))
         #expect(!evaluate.contains("effectivePrefillWindow("))
         #expect(evaluate.contains("cacheSnapshotForBoundary("))
@@ -283,9 +283,9 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         let engine = try String(
             contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
             encoding: .utf8)
-        guard let start = engine.range(of: "func boundarySnapshot(tokens: [Int]) -> [KVCache]?"),
+        guard let start = engine.range(of: "func boundarySnapshot(tokens: [Int]"),
               let end = engine.range(
-                of: "\n            storeCacheEntry(",
+                of: "storeCacheEntry(",
                 range: start.upperBound..<engine.endIndex)
         else {
             Issue.record("Could not locate BatchEngine.finishSlot boundarySnapshot helper")
@@ -1938,17 +1938,17 @@ struct Gemma4VLMFocusedSourceContractsTests {
 
         #expect(overload.contains("ChatTemplateFallbacks.gemma4Minimal"))
         #expect(overload.contains("ChatTemplateFallbacks.gemma4WithTools"))
-        #expect(overload.contains("ChatTemplateFallbacks.dsv4Minimal"))
+        #expect(overload.contains("let dsv4Bos ="))
         #expect(overload.contains("ChatTemplateFallbacks.nemotronMinimal"))
         #expect(overload.contains("let hasGemma4NativeToolSentinels ="))
-        #expect(overload.contains("upstream.convertTokenToId(\"<|tool_call>\") != nil"))
-        #expect(overload.contains("upstream.convertTokenToId(\"<|turn>\") != nil"))
+        #expect(overload.contains("upstream.convertTokenToId(\"<|tool_call>\").flatMap { upstream.convertIdToToken($0) } == \"<|tool_call>\""))
+        #expect(overload.contains("upstream.convertTokenToId(\"<|turn>\").flatMap { upstream.convertIdToToken($0) } == \"<|turn>\""))
         #expect(overload.contains("!(chatTemplateTools?.isEmpty ?? true)"))
         #expect(overload.contains("upstream.bosToken == \"<bos>\" || hasGemma4NativeToolSentinels"))
         #expect(overload.contains("upstream.bosToken == \"<s>\""))
-        #expect(overload.contains("upstream.convertTokenToId(\"<|im_end|>\") != nil"))
-        #expect(!overload.contains("upstream.convertTokenToId(\"[AVAILABLE_TOOLS]\") != nil"))
-        #expect(!overload.contains("upstream.convertTokenToId(\"<tool_response>\") != nil"))
+        #expect(overload.contains("upstream.convertTokenToId(\"<|im_end|>\").flatMap { upstream.convertIdToToken($0) } == \"<|im_end|>\""))
+        #expect(!overload.contains("upstream.convertTokenToId(\"[AVAILABLE_TOOLS]\")"))
+        #expect(!overload.contains("upstream.convertTokenToId(\"<tool_response>\")"))
         #expect(overload.contains("addGenerationPrompt: addGenerationPrompt"))
     }
 
@@ -1968,7 +1968,7 @@ struct Gemma4VLMFocusedSourceContractsTests {
         #expect(source.contains("languageModel(llmTokens, inputEmbedding: emb, cache: paddedCache)"))
         #expect(!source.contains("prefixShape: input.text.tokens.shape"))
         #expect(!source.contains("languageModel(input.text.tokens, inputEmbedding: emb, cache: paddedCache)"))
-        #expect(source.contains("Gemma4 raw audio feature extraction is not implemented"))
+        #expect(source.contains("Gemma4 raw audio for this bundle declares feature_extractor_type "))
         #expect(!source.contains("Gemma4 unified image inputs are not production-supported yet"))
         #expect(!source.contains("Use text-only for this bundle until the unified media encoder is implemented and proven."))
         #expect(source.contains("featuresList.append(embedVision(unifiedVisionEmbedder(singleImage)))"))
