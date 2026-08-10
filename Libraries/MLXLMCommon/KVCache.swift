@@ -706,9 +706,19 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         // names the cache. Rotate to `keep` when the window cannot take the
         // write, which is what the rotation below the trim would have done had
         // `idx` matched.
-        let capacity = self.keys!.dim(2)
+        var capacity = self.keys!.dim(2)
         if idx + S > capacity {
             idx = keep
+            capacity = self.keys!.dim(2)
+        }
+        if idx + S > capacity {
+            // Still cannot fit even after rotating to `keep`. Rather than
+            // compute a cleverer index, hand the write to `updateConcat`,
+            // which owns its own buffer and therefore cannot overrun. Reaching
+            // here means `idx`/`offset`/width disagree — the state a
+            // disk-restored cache arrives in — and every arithmetic fix
+            // attempted at this site missed some combination of them.
+            return updateConcat(keys: keys, values: values)
         }
 
         // Assign
