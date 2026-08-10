@@ -328,6 +328,28 @@ The model's own words match. Asked to describe a centred black circle it
 reports "an amorphous, irregular blob", "muted yellow-olive", "sits in the lower
 part of the frame" — a picture read without usable position.
 
+### Scaling the position term: it moves the needle, but is not the fix
+
+`ln_pre` follows the sum, and LayerNorm is scale-invariant, so only the
+content:position **ratio** matters — multiplying the position term by k is the
+same as dividing content by k. Tested live:
+
+| position x | top bar | bottom bar | left bar | right bar |
+|---|---|---|---|---|
+| x1 (shipped) | top | bottom | right | right |
+| x12 (ratio ~4.7, matching the control) | bottom | top | left | left |
+| x30 (ratio ~1.9) | bottom | bottom | **left** | **right** |
+
+At x30 horizontal becomes correct for the first time — the axis that had been
+unreadable at every window size. So the position term genuinely does carry
+column information and is simply too faint to be used at the shipped ratio.
+
+But every amplification breaks vertical, which was correct at x1, so a uniform
+scale is not the answer: it trades one axis for the other rather than fixing
+either. Something about how the two terms are combined is wrong in a way a
+single multiplier cannot express, and the knob was removed rather than shipped
+at a value that scores well on one probe and badly on another.
+
 ### Still unknown
 
 The defective operation has not been located. There is no reference
