@@ -172,3 +172,19 @@ cache entry, and two that render the same line must not miss.
 **How to check:** dump the fully rendered system prompt for each card setting
 and grep for `Reasoning strength:` — count the occurrences and read the value.
 That single check settles 1–3.
+
+## Post-merge live evidence (2026-08-10 session, merged build)
+
+- **SSD prefix HIT proven**: `HIT disk boundary=2819 remaining=7786 tokens=10605`
+  — a 10.6k-token prompt restored 2,819 tokens from disk and prefilled only the
+  remainder. 74 disk stores this session, 0 `rederive-failed`.
+- **Reasoning strengths live**: `strength=high ×6, low ×3, medium ×3` in the
+  scope salts, distinct salt per strength.
+- **Two refused stores, benign**: `REFUSED offset/key mismatch tokens=N
+  offsets=[N, N+1]` twice. The hybrid 13-standard/39-rotating topology left
+  layer offsets one apart at a store boundary and the guard declined to write
+  the inconsistent entry. Correctness preserved (that is the guard's job — the
+  LFM2.5 per-layer-offset lesson); cost is one missed store opportunity per
+  occurrence. Root-causing the off-by-one belongs to the optimization pass:
+  suspect the first post-prompt sampled token advancing standard and rotating
+  caches asymmetrically.
