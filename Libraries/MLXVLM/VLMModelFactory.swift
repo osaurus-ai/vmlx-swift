@@ -209,6 +209,8 @@ public enum VLMProcessorTypeRegistry {
 
     /// Shared instance with default processor types.
     public static let shared: ProcessorTypeRegistry = .init(creators: [
+        "MuseGlimmerProcessor": create(
+            MuseGlimmerProcessorConfiguration.self, MuseGlimmerProcessor.init),
         "PaliGemmaProcessor": create(
             PaliGemmaProcessorConfiguration.self, PaliGemmaProcessor.init),
         "Qwen2VLProcessor": create(
