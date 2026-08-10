@@ -1612,6 +1612,15 @@ public actor BatchEngine {
             generationTask.cancel()
         }
         Task.detached { [engineRef] in
+            // Hosts report the visible answer finishing seconds before the turn
+            // finalizes, and `maxBatchSize == 1` means every real request takes
+            // THIS path — the batched loop's probe never fires. Time the gap
+            // between the last text event and the terminal `.info` here, where
+            // it can actually be observed.
+            let gapTrace =
+                ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
+            var lastTextAt: Date?
+            var textEvents = 0
             for await generation in sourceStream {
                 if case .info(let info) = generation, info.turboQuantCompressions > 0 {
                     await engineRef.recordTurboQuantDiagnostics(
@@ -1628,6 +1637,20 @@ public actor BatchEngine {
                 if case .info(let info) = generation {
                     terminationState.markTerminalInfoKnown()
                     await lifecycle.recordTerminalInfo(info)
+                }
+                switch generation {
+                case .chunk, .reasoning:
+                    lastTextAt = Date()
+                    textEvents += 1
+                case .info:
+                    if gapTrace {
+                        let gap = lastTextAt.map { Date().timeIntervalSince($0) } ?? -1
+                        FileHandle.standardError.write(Data(
+                            ("[vmlx][solo/info-gap] sinceLastText=\(gap)s "
+                                + "textEvents=\(textEvents)\n").utf8))
+                    }
+                default:
+                    break
                 }
                 continuation.yield(generation)
             }

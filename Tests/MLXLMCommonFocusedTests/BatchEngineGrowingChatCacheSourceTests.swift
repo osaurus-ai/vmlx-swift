@@ -622,7 +622,11 @@ struct BatchEngineGrowingChatCacheSourceTests {
             contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
             encoding: .utf8)
 
-        #expect(engine.contains("Task.detached {\n            var detokenizer"))
+        #expect(
+            engine.contains("Task.detached {\n            var detokenizer")
+                || engine.contains(
+                    "Task.detached { [engineRef] in\n            var detokenizer")
+        )
         #expect(engine.contains("continuation.yield(.info(finalInfo))"))
         #expect(engine.contains("await engineRef.recordTurboQuantDiagnostics("))
         let terminalYield = try #require(

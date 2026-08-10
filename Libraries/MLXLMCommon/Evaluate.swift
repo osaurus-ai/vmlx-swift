@@ -2617,13 +2617,22 @@ public struct TokenIterator: TokenIteratorProtocol {
                         ? boundary - 1
                         : boundary
                     let boundaryTokens = Array(promptTokenIds.prefix(storeBoundary))
-                    if isStableBoundary,
-                       coordinator.hasValidatedDiskEntry(
+                    // Applies to EVERY boundary, not just the stable ones. The
+                    // ladder republishes the same rungs each turn, so a chat
+                    // rewrote the identical seeds turn after turn — and this
+                    // work is on the request path: the whole post-answer stall
+                    // is this loop (measured 12.4 s for one DSV4-Flash turn
+                    // writing five boundaries, against a 1.2 ms GPU drain).
+                    // `hasValidatedDiskEntry` is content-addressed over exactly
+                    // these tokens, so when it says yes the write it replaces
+                    // is byte-for-byte the same entry — skipping is free
+                    // correctness-wise and removes the repeat cost outright.
+                    if coordinator.hasValidatedDiskEntry(
                         tokens: boundaryTokens,
                         mediaSalt: mediaSalt)
                     {
                         Self.logger.debug(
-                            "TokenIterator: skipped already-validated stable system/tool cache boundary at \(boundary, privacy: .public) tokens"
+                            "TokenIterator: skipped already-durable cache boundary at \(boundary, privacy: .public) tokens (stable=\(isStableBoundary, privacy: .public))"
                         )
                         continue
                     }

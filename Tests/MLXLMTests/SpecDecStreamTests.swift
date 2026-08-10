@@ -144,7 +144,6 @@ struct SpecDecStreamTests {
 
     @Test("DFlash stream yields .info + tokens matching the non-streaming run")
     func testDflashStreamYieldsTokens() async throws {
-        MLXRandom.seed(0x1010)
         let target = Qwen3Model(targetConfig())
         let drafter = DFlashDraftModel(drafterConfig())
         let prompt: [Int32] = [1, 2, 3, 4]
@@ -160,9 +159,10 @@ struct SpecDecStreamTests {
         let bulk = try SpecDecRuntimeLinear.run(args)
 
         // Stream with the decimal tokenizer.
-        MLXRandom.seed(0x1010)
         let target2 = Qwen3Model(targetConfig())
         let drafter2 = DFlashDraftModel(drafterConfig())
+        target2.update(parameters: target.parameters())
+        drafter2.update(parameters: drafter.parameters())
         let args2 = DFlashLinearArgs(
             target: target2, drafter: drafter2,
             targetBlockIDs: Self.targetBlockIDs,
@@ -201,7 +201,6 @@ struct SpecDecStreamTests {
 
     @Test("DDTree stream yields .info + tokens matching non-streaming run")
     func testDDTreeStreamYieldsTokens() async throws {
-        MLXRandom.seed(0x2020)
         let target = Qwen3Model(targetConfig())
         let drafter = DFlashDraftModel(drafterConfig())
         let prompt: [Int32] = [7, 8, 9]
@@ -215,9 +214,10 @@ struct SpecDecStreamTests {
 
         let bulk = try SpecDecRuntimeDDTree.run(args)
 
-        MLXRandom.seed(0x2020)
         let target2 = Qwen3Model(targetConfig())
         let drafter2 = DFlashDraftModel(drafterConfig())
+        target2.update(parameters: target.parameters())
+        drafter2.update(parameters: drafter.parameters())
         let args2 = DDTreeArgs(
             target: target2, drafter: drafter2,
             targetBlockIDs: Self.targetBlockIDs,
