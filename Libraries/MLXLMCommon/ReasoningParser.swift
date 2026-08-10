@@ -843,6 +843,16 @@ extension ReasoningParser {
                 startTagAliases: ["\u{2B55}thought\n"])
         case "none", "off", "disabled", "mistral", "gemma":
             return nil
+        case "muse_glimmer", "muse-glimmer", "muse", "atem":
+            // Muse Glimmer has NO reasoning tags and no reasoning channel. Its
+            // bundles stamp `reasoning_parser: "muse_glimmer"`, but the effort
+            // control is a plain sentence rendered into the *system prefix*
+            // ("Reasoning strength: high|medium|low."), so there is nothing in
+            // the output stream to segment. Returning nil is correct; it is
+            // spelled out here rather than left to `default` so a future pass
+            // does not "fix" the missing case by inventing a tag parser and
+            // start swallowing real content as reasoning.
+            return nil
         default:
             return nil
         }
