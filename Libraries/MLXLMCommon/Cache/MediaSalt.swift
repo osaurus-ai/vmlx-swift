@@ -144,6 +144,16 @@ public func cacheScopeSalt(from additionalContext: [String: any Sendable]?) -> S
             parts.append("effort=\(normalized)")
         }
     }
+    // Muse Glimmer's control is `reasoning_strength` (a system-prompt sentence
+    // rendered by the template), not the pair above. It changes the prompt
+    // prefix, so it must change the key: without this, two strengths produce
+    // different prefixes under one salt and the fetch serves the wrong KV.
+    if let strength = additionalContext["reasoning_strength"] as? String {
+        let normalized = strength.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !normalized.isEmpty {
+            parts.append("strength=\(normalized)")
+        }
+    }
     return parts.isEmpty ? nil : parts.joined(separator: "|")
 }
 
