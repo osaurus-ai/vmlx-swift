@@ -305,7 +305,10 @@ struct NemotronLightningMTPBenchTests {
                         if let mamba = c as? MambaCache {
                             _ = mamba.commitRecordedPrefix(length: 1)
                         } else {
-                            c.offset -= 1
+                            // `offset` is get-only on the protocol; `trim` is
+                            // the supported rewind and reports what it could
+                            // actually drop.
+                            _ = c.trim(1)
                         }
                     }
                     pending = v0
