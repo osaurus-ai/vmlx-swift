@@ -176,6 +176,27 @@ model — or a faster 4-bit GEMV kernel, since the current one reaches only 55-8
 of fp16 bandwidth. Measure before attempting either: thermals move these numbers
 ~11% run to run, so any claim needs ABAB attribution.
 
+### Prefill is healthy — it is decode that is short
+
+Measured on the same contended machine, so these are also lower bounds:
+
+| prompt | wall | rate |
+|---|---|---|
+| 256 tokens | 0.641s | **400 tok/s** |
+| 1024 tokens | 1.804s | **568 tok/s** |
+| 4096 tokens | 7.988s | **513 tok/s** |
+
+The backlog's ~400 pp/s target is already met, and exceeded at the chunk sizes
+that matter. That is the expected shape: prefill amortizes each weight read
+across the whole chunk, so it is compute-bound and lands far above the
+bandwidth-bound decode rate. The mild falloff from 568 to 513 at 4096 is the
+only thing here worth a second look, and it is not on the critical path.
+
+Consequence for TTFT: a ~1.2k-token prompt costs ~2.1s of prefill, and the live
+app measured 4.83s TTFT including image encode and sampling. So TTFT is not a
+prefill problem either. **Every remaining second on this family is decode**, and
+decode is capped by the 4-bit GEMV kernel (see above), not by this port.
+
 **No speculative decoding.** The `-assistant` draft bundle is out of scope for
 now, so 25 tok/s has to come from the base decode path alone. Budget: ~30B
 dense at 4-bit is ~17–18 GB of weight reads per token, which puts 25 tok/s at

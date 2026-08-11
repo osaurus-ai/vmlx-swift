@@ -65,4 +65,34 @@ struct MuseGlimmerDecodePerfTests {
 
         #expect(rate > 0, "no forward throughput measured")
     }
+
+    /// Prefill is the other half of the latency the user feels: TTFT is
+    /// dominated by it on a cold prompt. Unlike decode, prefill is compute-
+    /// bound rather than bandwidth-bound — every weight read is amortized over
+    /// the whole chunk — so it should reach a far higher effective rate, and
+    /// the interesting number is tokens/second at realistic chunk sizes.
+    @Test("prefill throughput at several prompt lengths", .enabled(if: enabled))
+    func prefillThroughput() async throws {
+        let context = try await MLXLLM.LLMModelFactory.shared.load(
+            from: Self.bundle, using: NoOpTokenizerLoader())
+        let model = context.model
+
+        for length in [256, 1024, 4096] {
+            let cache = model.newCache(parameters: nil)
+            let ids = MLXArray((0 ..< length).map { Int32(1000 + ($0 % 5000)) })[
+                .newAxis, .ellipsis]
+            // Warm once at this shape so kernel selection is not timed.
+            let warmCache = model.newCache(parameters: nil)
+            let warm = model(ids, cache: warmCache)
+            eval(warm)
+
+            let start = DispatchTime.now().uptimeNanoseconds
+            let out = model(ids, cache: cache)
+            eval(out)
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9
+            let pps = Double(length) / elapsed
+            print("[prefill] \(length) tokens: \(String(format: "%.3f", elapsed))s -> \(String(format: "%.0f", pps)) tok/s")
+        }
+        print("[prefill] target in the backlog is ~400 pp/s")
+    }
 }
