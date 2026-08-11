@@ -606,7 +606,7 @@ public enum NativeMTPActivation {
     ) throws -> Bool {
         guard isExplicitlyRequested else { return false }
         let modelTypes = modelTypes(in: configData, fallback: baseModelType)
-        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else {
+        guard modelTypes.contains(where: isSupportedNativeMTPModelType) else {
             throw NativeMTPActivationError.requestedForUnsupportedModel(modelTypes)
         }
         guard status?.hasCompleteMTPArtifact == true else {
@@ -659,12 +659,22 @@ public enum NativeMTPActivation {
         return Array(result).sorted()
     }
 
-    private static func isSupportedQwenMTPModelType(_ value: String) -> Bool {
+    /// Model types with a real native-MTP implementation in this runtime.
+    ///
+    /// Still fail-closed and still an allowlist — a bundle only reaches the
+    /// artifact and tuning checks if the runtime can actually drive its head.
+    /// `nemotron_h` joined Qwen once `NemotronHModel` gained `NativeMTPModel`
+    /// conformance; before that, a host asking for MTP on a Nemotron bundle was
+    /// rejected here as "unsupported", so the Settings control had nothing to
+    /// act on no matter which mode the user picked.
+    static func isSupportedNativeMTPModelType(_ value: String) -> Bool {
         switch normalize(value) {
         case "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
              "qwen3_6", "qwen3_6_text", "qwen3_6_moe", "qwen3_6_moe_text",
              "qwen35", "qwen35_text", "qwen35_moe", "qwen35_moe_text",
              "qwen36", "qwen36_text", "qwen36_moe", "qwen36_moe_text":
+            return true
+        case "nemotron_h", "nemotronh", "nemotron_h_text", "nemotronh_text":
             return true
         default:
             return false

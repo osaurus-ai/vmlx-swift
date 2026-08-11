@@ -116,13 +116,31 @@ private let nemotronHWeightedMoEFastPathFlag =
 /// So this must never switch itself on. Enabling it is an explicit,
 /// per-machine decision, and any speed claim has to be re-measured on the
 /// bundle in question first.
-private let nemotronHNativeMTPFlag =
-    nemotronHEnvFlag("VMLX_NEMOTRON_MTP")
-    && !nemotronHEnvFlag("VMLX_DISABLE_NEMOTRON_MTP")
+private let nemotronHNativeMTPEnvFlag = nemotronHEnvFlag("VMLX_NEMOTRON_MTP")
+private let nemotronHNativeMTPKillSwitch = nemotronHEnvFlag("VMLX_DISABLE_NEMOTRON_MTP")
 
 /// Whether the Nemotron native MTP head should be instantiated and its weights
 /// admitted by `sanitize`.
-internal func nemotronHNativeMTPEnabled() -> Bool { nemotronHNativeMTPFlag }
+///
+/// This used to be a process-level `let` reading only `VMLX_NEMOTRON_MTP`,
+/// which meant the host's Speculative Decoding setting could not reach it at
+/// all: Off / Auto / Force-On all produced the same headless model, so the
+/// control was inert for this family and no restart could change that within a
+/// session.
+///
+/// It now follows ``NativeMTPActivation/isExplicitlyRequested`` — the same
+/// per-load task-local the host sets from `LoadConfiguration.nativeMTP` — so
+/// the decision travels with the load that asked for it. The env var stays as a
+/// per-machine opt-in for benchmarking, and the kill switch still wins over
+/// everything.
+///
+/// Still fail-closed by default: with no host request and no env var this is
+/// `false`, so the head is never built and costs nothing, which is the D1
+/// behaviour the measurements above call for.
+internal func nemotronHNativeMTPEnabled() -> Bool {
+    if nemotronHNativeMTPKillSwitch { return false }
+    return NativeMTPActivation.isExplicitlyRequested || nemotronHNativeMTPEnvFlag
+}
 
 private let nemotronHLayerProfileFlag =
     nemotronHEnvFlag("VMLX_NEMOTRON_LAYER_PROFILE")
