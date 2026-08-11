@@ -21,12 +21,31 @@ public struct GLM4ToolCallParser: ToolCallParser, Sendable {
         }
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // Extract function name (everything before first <arg_key>)
-        guard let argKeyStart = text.range(of: "<arg_key>") else { return nil }
-        let funcName = String(text[..<argKeyStart.lowerBound]).trimmingCharacters(
-            in: .whitespacesAndNewlines)
+        // Extract function name (everything before first <arg_key>).
+        //
+        // A tool that declares no parameters is invoked with the bare name —
+        // `<tool_call>list_mailboxes</tool_call>` — so a missing `<arg_key>`
+        // is a zero-argument call, not a malformed one. Treating it as a
+        // parse failure dropped the call silently: the surface saw a turn with
+        // no text and no tool work, nudged the model, got the same correct
+        // call again, and after the retry budget told the user the model had
+        // "returned empty output after tool execution".
+        //
+        // With no `<arg_key>` to bound it, the name is the entire body, so it
+        // has to earn acceptance: prose wrapped in `<tool_call>` would
+        // otherwise be promoted to a call named after the prose. Calls that do
+        // carry arguments keep the original, laxer rule — their name is
+        // already delimited, and tightening it here would reject spellings
+        // that parse today.
+        let nameEnd = text.range(of: "<arg_key>")?.lowerBound
+        let funcName = String(text[..<(nameEnd ?? text.endIndex)])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        guard !funcName.isEmpty else { return nil }
+        if nameEnd == nil {
+            guard Self.isFunctionNameShaped(funcName) else { return nil }
+        } else {
+            guard !funcName.isEmpty else { return nil }
+        }
 
         var arguments: [String: any Sendable] = [:]
 
@@ -68,5 +87,17 @@ public struct GLM4ToolCallParser: ToolCallParser, Sendable {
         }
 
         return ToolCall(function: .init(name: funcName, arguments: arguments))
+    }
+
+    /// Whether a bare `<tool_call>` body reads as a function identifier
+    /// rather than as text the model happened to wrap in the envelope.
+    /// Deliberately narrow: OpenAI-compatible tool names are
+    /// `[A-Za-z0-9_.-]{1,64}`, and every name reaching this parser came from
+    /// a schema that had to satisfy that.
+    static func isFunctionNameShaped(_ name: String) -> Bool {
+        guard (1 ... 64).contains(name.count) else { return false }
+        return name.allSatisfy {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "-")
+        }
     }
 }
