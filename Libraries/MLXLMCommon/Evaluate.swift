@@ -435,7 +435,17 @@ public struct GenerateParameters: Sendable {
     }
 
     public func canUseNativeMTP(for input: LMInput) -> Bool {
-        isNativeMTPLosslessGreedyEligible && !input.hasMediaContent
+        isNativeMTPLosslessGreedyEligible
+            && !input.hasMediaContent
+            // A bounded KV window makes attention slots `RotatingKVCache`, a
+            // ring buffer that OVERWRITES evicted positions. Once rotation
+            // wraps, a rejected draft cannot be un-written — rolling back by
+            // decrementing `offset` silently restores nothing. Hybrid stacks
+            // make it worse: Mamba state is updated in place and has no offset
+            // at all. Speculation therefore requires an unbounded window, and
+            // the honest response to a bounded one is to decline rather than
+            // emit subtly wrong text.
+            && maxKVSize == nil
     }
 }
 

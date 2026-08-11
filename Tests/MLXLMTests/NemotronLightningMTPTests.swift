@@ -170,3 +170,170 @@ struct NemotronLightningMTPTests {
         #expect(maxV - minV > 1.0, "draft distribution is flat — the head likely bound wrong")
     }
 }
+
+/// Speculation must decline a bounded KV window. `RotatingKVCache` overwrites
+/// evicted positions, so a rejected draft cannot be un-written once rotation
+/// wraps — and on a hybrid stack the Mamba state has no offset to rewind at
+/// all. Declining is the only sound answer; the alternative is subtly wrong
+/// text that no test would catch.
+@Suite("Native MTP requires an unbounded KV window")
+struct NativeMTPWindowGuardTests {
+
+    private func greedy(maxKVSize: Int?) -> GenerateParameters {
+        GenerateParameters(maxTokens: 32, maxKVSize: maxKVSize, temperature: 0)
+    }
+
+    @Test("an unbounded window is eligible")
+    func unboundedIsEligible() {
+        #expect(greedy(maxKVSize: nil).canUseNativeMTP(for: LMInput(tokens: MLXArray([Int32(1)]))))
+    }
+
+    @Test(arguments: [512, 4096, 262_144])
+    func boundedWindowDeclines(_ size: Int) {
+        #expect(!greedy(maxKVSize: size).canUseNativeMTP(for: LMInput(tokens: MLXArray([Int32(1)]))),
+            "maxKVSize \(size) must decline speculation")
+    }
+}
+
+/// D1 vs D2 on the real bundle: accept rate, throughput, and whether the
+/// speculative path stays token-identical to plain autoregressive.
+///
+/// The spec measured D2 at 0.84x (16 % slower, 72.4 % accept) and D3 at 0.48x
+/// in Python and instructs both runtimes to re-measure rather than inherit the
+/// number. This is that measurement for Swift. It decides whether the toggle is
+/// worth anything on this family — it does NOT decide the default, which stays
+/// off either way.
+///
+/// `NEMO_LIGHTNING_LIVE=1 VMLX_NEMOTRON_MTP=1`.
+@Suite("Nemotron Lightning MTP throughput", .serialized)
+struct NemotronLightningMTPBenchTests {
+
+    static var enabled: Bool {
+        NemotronLightningMTPTests.enabled
+            && ProcessInfo.processInfo.environment["VMLX_NEMOTRON_MTP"] != nil
+    }
+
+    @Test("D1 vs D2: accept rate, tok/s, token identity", .enabled(if: enabled))
+    func d1VersusD2() async throws {
+        let context = try await MLXLLM.LLMModelFactory.shared.load(
+            from: NemotronLightningMTPTests.bundle, using: NoOpTokenizerLoader())
+        let model = try #require(context.model as? any NativeMTPModel)
+        #expect(model.nativeMTPAvailable)
+
+        let steps = Int(ProcessInfo.processInfo.environment["NEMO_BENCH_TOKENS"] ?? "80") ?? 80
+        let prompt = MLXArray((0 ..< 32).map { Int32(1000 + $0) })[.newAxis, .ellipsis]
+
+        // ---- D1: plain autoregressive, greedy ----
+        func runD1() -> (tokens: [Int], seconds: Double) {
+            let cache = context.model.newCache(parameters: nil)
+            var out: [Int] = []
+            var next = prompt
+            let start = CFAbsoluteTimeGetCurrent()
+            for _ in 0 ..< steps {
+                let logits = context.model(next, cache: cache)
+                let last = logits[0..., (logits.dim(1) - 1)..., 0...]
+                let token = argMax(last, axis: -1)
+                eval(token)
+                let id = token.item(Int.self)
+                out.append(id)
+                next = MLXArray([Int32(id)])[.newAxis, .ellipsis]
+            }
+            return (out, CFAbsoluteTimeGetCurrent() - start)
+        }
+
+        // ---- D2: one MTP draft per step, verified in a 2-wide batch ----
+        func runD2() -> (tokens: [Int], seconds: Double, proposed: Int, accepted: Int) {
+            let cache = context.model.newCache(parameters: nil)
+            let mtpCache = model.makeNativeMTPCache()
+            var out: [Int] = []
+            var proposed = 0, accepted = 0
+            let start = CFAbsoluteTimeGetCurrent()
+
+            var seed = model.nativeBackboneForward(prompt, cache: cache)
+            var lastHidden = seed.hiddenStates[0..., (seed.hiddenStates.dim(1) - 1)..., 0...]
+            var pending = argMax(
+                seed.logits[0..., (seed.logits.dim(1) - 1)..., 0...], axis: -1)
+            eval(pending)
+
+            while out.count < steps {
+                let committed = pending.item(Int.self)
+
+                // draft t+2 from (h_i, t_{i+1})
+                let draft = model.nativeMTPForward(
+                    hiddenStates: lastHidden,
+                    nextTokenIds: MLXArray([Int32(committed)])[.newAxis, .ellipsis],
+                    cache: mtpCache)
+                let draftToken = argMax(draft.logits[0..., 0..., 0...], axis: -1)
+                eval(draftToken)
+                let d1 = draftToken.item(Int.self)
+                proposed += 1
+
+                // Snapshot Mamba state BEFORE the verify forward. The
+                // recurrence absorbs the draft token in place, so once the
+                // verify runs there is no offset to rewind — the state is
+                // simply gone. Attention slots are position-addressed and only
+                // need their offset decremented.
+                for c in cache {
+                    if let mamba = c as? MambaCache {
+                        mamba.recordPrefixCommitState(
+                            length: 1, arrays: mamba.state, offset: mamba.offset)
+                    }
+                }
+
+                // verify both positions in ONE backbone pass
+                let verifyInput = MLXArray([Int32(committed), Int32(d1)])[.newAxis, .ellipsis]
+                let verified = model.nativeBackboneMTPVerifyForward(verifyInput, cache: cache)
+                let v0 = argMax(verified.logits[0..., 0..., 0...], axis: -1)
+                eval(v0)
+                let truth = v0.item(Int.self)
+
+                out.append(committed)
+                if truth == d1 {
+                    accepted += 1
+                    if out.count < steps { out.append(d1) }
+                    let v1 = argMax(verified.logits[0..., 1..., 0...], axis: -1)
+                    eval(v1)
+                    for c in cache {
+                        (c as? MambaCache)?.clearRecordedPrefixes()
+                    }
+                    pending = v1
+                    lastHidden = verified.hiddenStates[0..., 1..., 0...]
+                } else {
+                    // Rejected: the caches now hold a bogus entry for d1.
+                    // Rewind the attention slots and restore Mamba state.
+                    for c in cache {
+                        if let mamba = c as? MambaCache {
+                            _ = mamba.commitRecordedPrefix(length: 1)
+                        } else {
+                            c.offset -= 1
+                        }
+                    }
+                    pending = v0
+                    lastHidden = verified.hiddenStates[0..., 0..., 0...]
+                }
+            }
+            return (out, CFAbsoluteTimeGetCurrent() - start, proposed, accepted)
+        }
+
+        let d1 = runD1()
+        let d2 = runD2()
+
+        let d1Rate = Double(d1.tokens.count) / d1.seconds
+        let d2Rate = Double(d2.tokens.count) / d2.seconds
+        let acceptRate = d2.proposed > 0 ? Double(d2.accepted) / Double(d2.proposed) : 0
+
+        print("[nemo/bench] D1  \(d1.tokens.count) tok in \(String(format: "%.2f", d1.seconds))s = \(String(format: "%.1f", d1Rate)) tok/s")
+        print("[nemo/bench] D2  \(d2.tokens.count) tok in \(String(format: "%.2f", d2.seconds))s = \(String(format: "%.1f", d2Rate)) tok/s")
+        print("[nemo/bench] accept \(d2.accepted)/\(d2.proposed) = \(String(format: "%.1f", acceptRate * 100))%")
+        print("[nemo/bench] speedup \(String(format: "%.2f", d2Rate / max(d1Rate, 0.0001)))x")
+
+        let common = min(d1.tokens.count, d2.tokens.count)
+        let identical = Array(d1.tokens.prefix(common)) == Array(d2.tokens.prefix(common))
+        print("[nemo/bench] token-identical to D1: \(identical)")
+
+        // Correctness is the assertion. Speed is reported, never demanded —
+        // the spec's own numbers say D2 loses on this model.
+        #expect(identical, "D2 diverged from greedy D1 — speculation must be lossless")
+        #expect(acceptRate > 0, "no drafts accepted at all — the head is likely mis-bound")
+    }
+}
