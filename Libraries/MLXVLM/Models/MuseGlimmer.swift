@@ -231,6 +231,14 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
             }
             out[rehomed] = value
         }
+        // The VLM does not route through `MuseGlimmerTextModel.sanitize`, so the
+        // centered-norm fold has to happen here too. Without it the text tower
+        // loads unfolded gains into a forward that no longer adds the `+1`,
+        // which leaves every one of its norms at zero gain — the model still
+        // loads and still emits text, and only a behavioural probe catches it.
+        for (key, value) in out where MuseGlimmerTextModel.isCenteredNormWeight(key) {
+            out[key] = value + 1
+        }
         return out
     }
 }

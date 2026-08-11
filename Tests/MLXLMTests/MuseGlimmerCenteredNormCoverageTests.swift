@@ -47,6 +47,19 @@ struct MuseGlimmerCenteredNormCoverageTests {
         #expect(missed.isEmpty,
             "these centered norms are not folded and will run without their +1: \(Set(missed.prefix(5)))")
 
+        // The VLM loads with the `language_model.` prefix intact and uses its
+        // own sanitize, so the same key list has to match that form too — the
+        // first fold missed the final norm there and left the whole text tower
+        // at zero gain on the vision path only.
+        let vlmForm = keys.filter {
+            $0.hasPrefix("language_model.") && $0.contains("norm") && $0.hasSuffix(".weight")
+                && !$0.contains("qk_norm")
+        }
+        let vlmMissed = vlmForm.filter { !MuseGlimmerTextModel.isCenteredNormWeight($0) }
+        print("[norms] VLM-form norms: \(vlmForm.count), not folded: \(vlmMissed.count)")
+        #expect(vlmMissed.isEmpty,
+            "VLM-form keys not folded: \(Set(vlmMissed.prefix(5)))")
+
         // And nothing outside the text tower may be folded.
         let visionNorms = keys.filter { $0.hasPrefix("model.vision_tower.") && $0.hasSuffix("norm.weight") }
         for v in visionNorms {

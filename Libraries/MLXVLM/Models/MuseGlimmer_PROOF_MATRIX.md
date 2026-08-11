@@ -107,7 +107,26 @@ Press Stop mid-generation, then send another turn in the same chat.
 - TTFT on a warm prefix vs cold
 - prefill pp/s at short and long context
 
-### The 25 tok/s gate is not reachable at 4-bit — measured, 2026-08-10
+### Decode ceiling — measured 2026-08-10, UNDER GPU CONTENTION
+
+**Read this first: every absolute number below was taken while an unrelated
+inference workload was running on the same GPU.** They are therefore *lower
+bounds*, not ceilings, and the "25 tok/s is unreachable" conclusion is NOT
+established — it needs a re-measure on an idle machine before anyone acts on it.
+
+What does survive the contention is everything expressed as a ratio, because
+those pairs were measured minutes apart under the same load:
+
+- the full model runs at **~100% of what its own bare quantized kernel reaches**,
+  so there is no overhead left in the surrounding port;
+- **compiled decode adds 3.7%** here, against +72% on a dispatch-bound model —
+  this family is not dispatch-bound;
+- the **4-bit path reaches 55-80% of fp16** bandwidth on the same shape, so
+  dequantization is a real cost and a faster GEMV is the lever that matters.
+
+The absolute figures, as a contended-machine baseline:
+
+### The 25 tok/s gate at 4-bit — contended measurement, 2026-08-10
 
 Live app: **12-13 tok/s**. Isolated forward pass, no sampler/detokenizer/cache/UI:
 **12.2-13.6 tok/s**, so the serving stack costs essentially nothing and the
@@ -148,8 +167,11 @@ there is no surrounding overhead left to reclaim. Two things follow:
    cap at 342/17.85 = **19 tok/s**. At the quantized kernel's real rate the cap
    is **~15 tok/s**, and 12-13 measured is 80-89% of that.
 
-So the gate cannot be met by optimizing this port. It needs fewer bytes per
-token — the 2-bit JANG_2D bundle (~9 GB/token, implying ~30 tok/s) or a smaller
+So on this measurement the gate is not met by optimizing the port — but the
+absolute rates were taken under GPU contention, so re-measure idle before
+concluding the gate is unreachable. What the ratios do establish is that the
+remaining headroom is in the quantized kernel, not in the port. Beyond that it
+needs fewer bytes per token — the 2-bit JANG_2D bundle (~9 GB/token, implying ~30 tok/s) or a smaller
 model — or a faster 4-bit GEMV kernel, since the current one reaches only 55-80%
 of fp16 bandwidth. Measure before attempting either: thermals move these numbers
 ~11% run to run, so any claim needs ABAB attribution.

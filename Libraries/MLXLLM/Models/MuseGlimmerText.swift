@@ -465,7 +465,10 @@ public class MuseGlimmerTextModel: Module, LLMModel, KVCacheDimensionProvider {
             || key.hasSuffix("post_attention_layernorm.weight")
             || key.hasSuffix("pre_feedforward_layernorm.weight")
             || key.hasSuffix("post_feedforward_layernorm.weight")
-            || key == "model.norm.weight"
+            // Dotted suffix so the VLM's `language_model.model.norm.weight`
+            // matches too, while `...layernorm.weight` (no dot before `norm`)
+            // does not double-match through this branch.
+            || key.hasSuffix(".norm.weight")
             || key == "norm.weight"
     }
 
