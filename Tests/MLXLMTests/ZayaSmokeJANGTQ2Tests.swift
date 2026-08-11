@@ -396,7 +396,7 @@ struct ZayaSmokeJANGTQ2Tests {
                     result.toolCalls += 1
                 case .info(let info):
                     result.info = info
-                case .toolCallProgress, .prefillProgress:
+                case .toolCallProgress, .prefillProgress, .tokenID:
                     break
                 }
             }
@@ -582,7 +582,7 @@ struct ZayaSmokeJANGTQ2Tests {
                 reasoning += chunk
             case .toolCall:
                 toolCalls += 1
-            case .toolCallProgress:
+            case .toolCallProgress, .tokenID:
                 break
             case .prefillProgress:
 

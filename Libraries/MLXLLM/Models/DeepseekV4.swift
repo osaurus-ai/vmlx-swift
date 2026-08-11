@@ -1331,11 +1331,15 @@ public class DeepseekV4ModelInner: Module {
 
 // MARK: - Outer model
 
-public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel {
+public class DeepseekV4Model:
+    Module, LLMModel, KVCacheDimensionProvider, LoRAModel, PostLoadModelPreparation,
+    ModelContainerDiagnosticSnapshotProvider
+{
     public var kvHeads: [Int]
     var config: DeepseekV4Configuration
     public var model: DeepseekV4ModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
+    private let dsv4FP32LMHeadCache = DeepseekV4FP32LMHeadCacheState()
 
     public init(_ config: DeepseekV4Configuration) {
         self.config = config
@@ -1345,6 +1349,74 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         self.model = DeepseekV4ModelInner(config: config)
         self._lmHead.wrappedValue = Linear(
             config.hiddenSize, config.vocabSize, bias: false)
+    }
+
+    internal var dsv4FP32LMHeadCachePrepared: Bool {
+        dsv4FP32LMHeadCache.prepared
+    }
+
+    internal var dsv4FP32LMHeadCacheConstructionCount: Int {
+        dsv4FP32LMHeadCache.constructionCount
+    }
+
+    internal var dsv4FP32LMHeadCacheMetadata: DeepseekV4FP32LMHeadCacheMetadata? {
+        dsv4FP32LMHeadCache.metadata
+    }
+
+    internal var dsv4FP32LMHeadCacheWeight: MLXArray? {
+        dsv4FP32LMHeadCache.cachedWeight
+    }
+
+    internal var dsv4FP32LMHeadCacheIdentity: UInt64? {
+        dsv4FP32LMHeadCache.cacheIdentity
+    }
+
+    internal var dsv4FP32LMHeadCacheLogicalBytes: Int {
+        dsv4FP32LMHeadCache.logicalBytes
+    }
+
+    internal var dsv4FP32LMHeadCacheEvents: [DeepseekV4FP32LMHeadCacheEvent] {
+        dsv4FP32LMHeadCache.events
+    }
+
+    public func modelContainerDiagnosticSnapshot() -> ModelContainerDiagnosticSnapshot {
+        dsv4FP32LMHeadCache.diagnosticSnapshot(
+            modelType: "deepseek_v4",
+            lmHead: lmHead,
+            expectedInputDimensions: config.hiddenSize,
+            expectedOutputDimensions: config.vocabSize
+        )
+    }
+
+    public func prepareForInferenceAfterLoad() throws {
+        try dsv4FP32LMHeadCache.prepare(
+            lmHead: lmHead,
+            expectedInputDimensions: config.hiddenSize,
+            expectedOutputDimensions: config.vocabSize)
+    }
+
+    public func releaseDerivedBuffersForTeardown() {
+        dsv4FP32LMHeadCache.releaseDerivedBuffersForTeardown()
+    }
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters,
+        verify: VerifyUpdate,
+        path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        dsv4FP32LMHeadCache.invalidate()
+        return try super.update(
+            parameters: parameters,
+            verify: verify,
+            path: path,
+            modulePath: modulePath)
+    }
+
+    public override func updateModule(key: String, _ value: Any) throws {
+        dsv4FP32LMHeadCache.invalidate()
+        try super.updateModule(key: key, value)
     }
 
     /// Build per-layer caches.
@@ -1415,7 +1487,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         let h = model(inputs, cache: cache)
-        let logits = DeepseekV4Math.lmHeadFp32(h, lmHead: lmHead)
+        let logits = dsv4FP32LMHeadCache.logits(h, lmHead: lmHead)
         // Separated from the hidden-state stats on purpose: a normal `norm`
         // followed by an abnormal `logits` isolates the fused quantized head
         // (VMLX_DSV4_LM_HEAD_MODE) rather than the transformer stack.

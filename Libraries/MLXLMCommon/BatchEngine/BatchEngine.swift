@@ -21,10 +21,127 @@ public enum BatchEngineConfigurationError: Error, LocalizedError, Sendable {
     }
 }
 
+actor BatchGenerationLifecycle {
+    private var terminalInfo: GenerateCompletionInfo?
+    private var isComplete: Bool
+    private var waiters: [CheckedContinuation<GenerateCompletionInfo?, Never>] = []
+
+    init(completedWith terminalInfo: GenerateCompletionInfo? = nil) {
+        self.terminalInfo = terminalInfo
+        self.isComplete = terminalInfo != nil
+    }
+
+    func recordTerminalInfo(_ info: GenerateCompletionInfo) {
+        guard !isComplete else { return }
+        terminalInfo = info
+    }
+
+    func complete() {
+        guard !isComplete else { return }
+        isComplete = true
+        let waiters = self.waiters
+        self.waiters.removeAll()
+        for waiter in waiters {
+            waiter.resume(returning: terminalInfo)
+        }
+    }
+
+    func waitUntilComplete() async -> GenerateCompletionInfo? {
+        if isComplete { return terminalInfo }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
+actor BatchGenerationControl {
+    weak var engine: BatchEngine?
+    let requestID: BatchRequestID
+    let lifecycle: BatchGenerationLifecycle
+    private var cancellationTask: Task<GenerateCompletionInfo?, Never>?
+    private var cancellationResult: GenerateCompletionInfo?
+    private var hasCancellationResult = false
+
+    init(
+        engine: BatchEngine?,
+        requestID: BatchRequestID,
+        lifecycle: BatchGenerationLifecycle
+    ) {
+        self.engine = engine
+        self.requestID = requestID
+        self.lifecycle = lifecycle
+        self.cancellationResult = nil
+        self.hasCancellationResult = false
+    }
+
+    func cancelAndWait() async -> GenerateCompletionInfo? {
+        if hasCancellationResult { return cancellationResult }
+        if cancellationTask == nil {
+            let requestID = self.requestID
+            let lifecycle = self.lifecycle
+            let engine = self.engine
+            cancellationTask = Task.detached {
+                if let engine {
+                    await engine.cancel(requestID)
+                }
+                // An absent engine does not prove that the producer drained.
+                // The bridge owns the completion latch and must still close it.
+                return await lifecycle.waitUntilComplete()
+            }
+        }
+        // This task is deliberately unstructured and detached. A caller may
+        // already be cancelled when it asks for the producer drain; that must
+        // not cancel the drain itself or strand the lifecycle waiters.
+        let task = cancellationTask!
+        let result = await task.value
+        if !hasCancellationResult {
+            cancellationResult = result
+            hasCancellationResult = true
+            cancellationTask = nil
+            engine = nil
+        }
+        return result
+    }
+}
+
+/// A request-scoped high-level generation stream and its cancellation drain.
+public struct BatchGenerationHandle: Sendable {
+    /// The transformed generation events for this request.
+    public let stream: AsyncStream<Generation>
+
+    private let control: BatchGenerationControl
+
+    fileprivate init(
+        stream: AsyncStream<Generation>,
+        control: BatchGenerationControl
+    ) {
+        self.stream = stream
+        self.control = control
+    }
+
+    /// Cancel only this request and wait for its complete producer/bridge drain.
+    ///
+    /// Repeated and concurrent calls share one cancellation operation and return
+    /// the same transformed terminal info. The outward stream remains owned by
+    /// its producer and is not finished by this method.
+    @discardableResult
+    public func cancelAndWait() async -> GenerateCompletionInfo? {
+        await control.cancelAndWait()
+    }
+}
+
+private final class SpecDecTaskRecord: @unchecked Sendable {
+    let task: Task<Void, Never>
+
+    init(task: Task<Void, Never>) {
+        self.task = task
+    }
+}
+
 private func cancelledBatchStream(
-    promptTokenCount: Int
+    promptTokenCount: Int,
+    id: BatchRequestID = BatchRequestID()
 ) -> (id: BatchRequestID, stream: AsyncStream<BatchGeneration>) {
-    let id = BatchRequestID()
     let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
     continuation.yield(.info(GenerateCompletionInfo(
         promptTokenCount: promptTokenCount,
@@ -35,21 +152,6 @@ private func cancelledBatchStream(
     )))
     continuation.finish()
     return (id, stream)
-}
-
-private func cancelledGenerationStream(
-    promptTokenCount: Int
-) -> AsyncStream<Generation> {
-    let (stream, continuation) = AsyncStream<Generation>.makeStream()
-    continuation.yield(.info(GenerateCompletionInfo(
-        promptTokenCount: promptTokenCount,
-        generationTokenCount: 0,
-        promptTime: 0,
-        generationTime: 0,
-        stopReason: .cancelled
-    )))
-    continuation.finish()
-    return stream
 }
 
 private final class PrefillProgressAccumulator: @unchecked Sendable {
@@ -153,17 +255,24 @@ private func debugDumpReasoningPrompt(
 
 private final class BatchStreamTerminationState: @unchecked Sendable {
     private let lock = NSLock()
-    private var completed = false
+    private var terminalInfoKnown = false
+    private var fullyCompleted = false
 
-    func markCompleted() {
+    func markTerminalInfoKnown() {
         lock.lock()
-        completed = true
+        terminalInfoKnown = true
+        lock.unlock()
+    }
+
+    func markFullyCompleted() {
+        lock.lock()
+        fullyCompleted = true
         lock.unlock()
     }
 
     func shouldCancelOnTermination() -> Bool {
         lock.lock()
-        let shouldCancel = !completed
+        let shouldCancel = !terminalInfoKnown && !fullyCompleted
         lock.unlock()
         return shouldCancel
     }
@@ -273,6 +382,14 @@ public actor BatchEngine {
     /// Requests waiting to be admitted into active slots.
     private var waitQueue: [BatchPendingRequest] = []
 
+    /// Opt-in token lineage sessions keyed by the request ID.  The slot type
+    /// is owned by BatchScheduler.swift and is outside this writer lane, so
+    /// diagnostic state stays at the engine boundary instead of being copied
+    /// into the slot.
+    private var tokenTraceSessions: [BatchRequestID: TokenIDTraceSession] = [:]
+    private var tokenTraceStopOverrides: [BatchRequestID: TokenIDTraceStopRule] = [:]
+    private var deferredTokenTraceRequestIDs: Set<BatchRequestID> = []
+
     /// Active generation slots (max `maxBatchSize`).
     private var activeSlots: [BatchSlot] = []
 
@@ -300,6 +417,11 @@ public actor BatchEngine {
     /// Background scheduling loop task handle.
     private var loopTask: Task<Void, Never>?
 
+    /// Producer tasks for request-scoped SpecDec generations. They are kept
+    /// separate from the shared batch loop so cancellation never drains or
+    /// cancels unrelated batched requests.
+    private var specDecTasks: [BatchRequestID: SpecDecTaskRecord] = [:]
+
     /// Direct single-request generation task for `generate(...)` when the
     /// engine is configured as B=1 and no queued/active batch work exists.
     ///
@@ -307,12 +429,17 @@ public actor BatchEngine {
     /// `TokenIterator` loop as `ModelContainer.generate(...)`, while keeping
     /// `submit(...)` and maxBatchSize > 1 on the continuous-batching scheduler.
     private var soloFastPathTask: Task<Void, Never>?
-    private var soloFastPathID: UUID?
+    private var soloFastPathID: BatchRequestID?
     private var soloFastPathHadMedia = false
 
     /// Terminal lifecycle flag. Once shutdown begins, stale engine handles
     /// reject future submissions instead of restarting GPU work.
     public private(set) var isShutdown: Bool = false
+
+    /// Shared completion gate for every concurrent shutdown caller. The gate
+    /// opens only after producer drains and the final command-buffer fence.
+    private var shutdownDrainComplete = false
+    private var shutdownDrainWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// Total decode steps since last memory purge.
     private var stepsSinceMemoryPurge: Int = 0
@@ -435,8 +562,21 @@ public actor BatchEngine {
         input: consuming sending LMInput,
         parameters: GenerateParameters
     ) -> (id: BatchRequestID, stream: AsyncStream<BatchGeneration>) {
+        enqueueBatchRequest(
+            input: input,
+            parameters: parameters,
+            requestID: nil)
+    }
+
+    private func enqueueBatchRequest(
+        input: consuming sending LMInput,
+        parameters: GenerateParameters,
+        requestID: BatchRequestID?
+    ) -> (id: BatchRequestID, stream: AsyncStream<BatchGeneration>) {
         guard !isShutdown else {
-            return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
+            return cancelledBatchStream(
+                promptTokenCount: input.text.tokens.size,
+                id: requestID ?? BatchRequestID())
         }
 
         do {
@@ -445,14 +585,36 @@ public actor BatchEngine {
             Self.logger.error(
                 "Rejected acceleration request: \(error.localizedDescription, privacy: .public)"
             )
-            return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
+            return cancelledBatchStream(
+                promptTokenCount: input.text.tokens.size,
+                id: requestID ?? BatchRequestID())
         }
 
         if parameters.draftStrategy?.usesNativeMTP == true {
             Self.logger.error(
                 "Rejected BatchEngine.submit native MTP request: raw batched native-MTP scheduling is not implemented; use BatchEngine.generate or Evaluate.generate for the exclusive native-MTP path."
             )
-            return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
+            return cancelledBatchStream(
+                promptTokenCount: input.text.tokens.size,
+                id: requestID ?? BatchRequestID())
+        }
+
+        let tokenTraceSession: TokenIDTraceSession?
+        if let trace = parameters.tokenIDTrace {
+            do {
+                tokenTraceSession = try trace.begin(
+                    pathKind: .batch,
+                    promptTokenIds: input.text.tokens.reshaped(-1).asArray(Int.self),
+                    parameters: parameters)
+            } catch {
+                trace.session.recordRuntimeError(
+                    "batch diagnostic start rejected: \(error.localizedDescription)")
+                return cancelledBatchStream(
+                    promptTokenCount: input.text.tokens.size,
+                    id: requestID ?? BatchRequestID())
+            }
+        } else {
+            tokenTraceSession = nil
         }
 
         let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
@@ -477,8 +639,12 @@ public actor BatchEngine {
         let request = BatchPendingRequest(
             input: input,
             parameters: parameters,
-            continuation: continuation
+            continuation: continuation,
+            id: requestID
         )
+        if let tokenTraceSession {
+            tokenTraceSessions[request.id] = tokenTraceSession
+        }
         waitQueue.append(request)
         if soloFastPathTask == nil {
             ensureLoopRunning()
@@ -486,18 +652,40 @@ public actor BatchEngine {
         return (request.id, stream)
     }
 
-    /// Generate text from prepared input — drop-in replacement for `ModelContainer.generate()`.
+    private func makeCompletedGenerationHandle(
+        promptTokenCount: Int,
+        requestID: BatchRequestID,
+        stopReason: GenerateStopReason = .cancelled
+    ) -> BatchGenerationHandle {
+        let info = GenerateCompletionInfo(
+            promptTokenCount: promptTokenCount,
+            generationTokenCount: 0,
+            promptTime: 0,
+            generationTime: 0,
+            stopReason: stopReason)
+        let (stream, continuation) = AsyncStream<Generation>.makeStream()
+        continuation.yield(.info(info))
+        continuation.finish()
+        let lifecycle = BatchGenerationLifecycle(completedWith: info)
+        let control = BatchGenerationControl(
+            engine: self,
+            requestID: requestID,
+            lifecycle: lifecycle)
+        return BatchGenerationHandle(stream: stream, control: control)
+    }
+
+    /// Start text generation from prepared input.
     ///
-    /// Returns the same `AsyncStream<Generation>` type as the existing single-sequence
-    /// API, with `.chunk(String)` for decoded text and `.info(GenerateCompletionInfo)`
-    /// for completion metrics. Handles detokenization internally.
+    /// Returns a request-scoped ``BatchGenerationHandle`` whose `stream` yields
+    /// `.chunk(String)` text and `.info(GenerateCompletionInfo)` metrics.
+    /// Handles detokenization internally.
     ///
     /// ## Example
     /// ```swift
     /// let engine = BatchEngine(context: modelContext)
     /// let input = try await modelContext.processor.prepare(input: userInput)
-    /// let stream = await engine.generate(input: input, parameters: params)
-    /// for await generation in stream {
+    /// let handle = await engine.startGeneration(input: input, parameters: params)
+    /// for await generation in handle.stream {
     ///     switch generation {
     ///     case .chunk(let text): print(text, terminator: "")
     ///     case .reasoning: break    // route to a think-pane if you render CoT
@@ -510,13 +698,31 @@ public actor BatchEngine {
     /// - Parameters:
     ///   - input: Prepared model input.
     ///   - parameters: Generation parameters for this request.
-    /// - Returns: An `AsyncStream<Generation>` yielding text chunks and completion info.
-    public func generate(
+    /// - Returns: A ``BatchGenerationHandle`` yielding text chunks and completion info.
+    public func startGeneration(
         input: consuming sending LMInput,
         parameters: GenerateParameters
-    ) -> AsyncStream<Generation> {
+    ) -> BatchGenerationHandle {
+        let requestID = BatchRequestID()
+        let lifecycle = BatchGenerationLifecycle()
+        let promptTokenCount = input.text.tokens.size
         guard !isShutdown else {
-            return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+            return makeCompletedGenerationHandle(
+                promptTokenCount: promptTokenCount,
+                requestID: requestID)
+        }
+
+        if let trace = parameters.tokenIDTrace {
+            do {
+                try trace.validateStart(parameters: parameters)
+            } catch {
+                Self.logger.error(
+                    "Rejected token trace start: \(error.localizedDescription, privacy: .public)"
+                )
+                return makeCompletedGenerationHandle(
+                    promptTokenCount: promptTokenCount,
+                    requestID: requestID)
+            }
         }
 
         do {
@@ -525,7 +731,9 @@ public actor BatchEngine {
             Self.logger.error(
                 "Rejected acceleration request: \(error.localizedDescription, privacy: .public)"
             )
-            return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+            return makeCompletedGenerationHandle(
+                promptTokenCount: promptTokenCount,
+                requestID: requestID)
         }
 
         // Block-diffusion speculative decoding dispatch. When
@@ -536,7 +744,7 @@ public actor BatchEngine {
         // fall through to the batched-decode path below.
         if let strategy = parameters.draftStrategy,
             strategy.usesBlockDiffusion,
-            let stream = SpecDecStream.streamViaStrategy(
+            let source = SpecDecStream.streamViaStrategyTask(
                 strategy: strategy,
                 inputIds: input.text.tokens,
                 context: context,
@@ -545,7 +753,10 @@ public actor BatchEngine {
                 temperature: parameters.temperature,
                 toolSchemas: input.toolSchemas)
         {
-            return stream
+            return startSpecDecGeneration(
+                requestID: requestID,
+                source: source,
+                lifecycle: lifecycle)
         }
 
         let tokenizer = context.tokenizer
@@ -574,7 +785,7 @@ public actor BatchEngine {
         debugLogReasoningPromptTail(
             modelName: context.configuration.name,
             promptTail: promptTail,
-            path: "BatchEngine.generate")
+            path: "BatchEngine.startGeneration")
         debugDumpReasoningPrompt(
             input: input,
             tokenizer: tokenizer,
@@ -592,12 +803,16 @@ public actor BatchEngine {
                 Self.logger.error(
                     "Rejected BatchEngine.generate native MTP request: native MTP is an exclusive solo path until batched/paged native-MTP scheduling lands."
                 )
-                return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+                return makeCompletedGenerationHandle(
+                    promptTokenCount: promptTokenCount,
+                    requestID: requestID)
             }
             return startSoloFastPath(
                 input: input,
                 parameters: parameters,
-                promptTail: promptTail)
+                promptTail: promptTail,
+                requestID: requestID,
+                lifecycle: lifecycle)
         }
         // Block-diffusion models (e.g. diffusion_gemma) generate whole
         // canvases via denoising and cannot share batched decode slots.
@@ -608,22 +823,41 @@ public actor BatchEngine {
                 Self.logger.error(
                     "Rejected BatchEngine.generate block-diffusion request: block diffusion is an exclusive solo path until batched canvas scheduling lands."
                 )
-                return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+                return makeCompletedGenerationHandle(
+                    promptTokenCount: promptTokenCount,
+                    requestID: requestID)
             }
             return startSoloFastPath(
                 input: input,
                 parameters: parameters,
-                promptTail: promptTail)
+                promptTail: promptTail,
+                requestID: requestID,
+                lifecycle: lifecycle)
         }
         if canStartSoloFastPath {
             return startSoloFastPath(
                 input: input,
                 parameters: parameters,
-                promptTail: promptTail)
+                promptTail: promptTail,
+                requestID: requestID,
+                lifecycle: lifecycle)
         }
 
-        let promptTokenCount = input.text.tokens.size
-        let (requestId, tokenStream) = submit(input: input, parameters: parameters)
+        let (requestId, tokenStream) = enqueueBatchRequest(
+            input: input,
+            parameters: parameters,
+            requestID: requestID)
+        let tokenTraceSession = tokenTraceSessions[requestId]
+        // `submit` enqueues and starts the scheduler synchronously. This actor
+        // method has not suspended, so mark the request before the scheduler
+        // can execute its first slot step. Raw submit callers never enter this
+        // set. The public generate wrapper owns final text flush and therefore
+        // owns the source terminal rule even when an external adapter will
+        // perform the later acceptance/finalization phase. Raw submit callers
+        // never enter this set and remain source-finished at the slot.
+        if tokenTraceSession != nil {
+            deferredTokenTraceRequestIDs.insert(requestId)
+        }
 
         // Mirror the canonical `Evaluate.generateLoopTask` pattern: pair
         // `AsyncStream.makeStream()` with an unstructured `Task {}` that
@@ -660,10 +894,10 @@ public actor BatchEngine {
         // Reported 2026-04-27 by osaurus integrator with the smoking-gun
         // diagnosis pointing at this exact missing handler.
         continuation.onTermination = {
-            @Sendable [requestId, engineRef, terminationState] _ in
+            @Sendable [requestId, weak engineRef, terminationState] _ in
             guard terminationState.shouldCancelOnTermination() else { return }
-            Task {
-                await engineRef.cancel(requestId)
+            Task.detached {
+                await engineRef?.cancel(requestId)
             }
         }
 
@@ -675,7 +909,7 @@ public actor BatchEngine {
         // info remain buffered and the cache-store time is incorrectly added to
         // user-visible TTFT. Keep the store serialized on the actor, but consume
         // and detokenize its stream on an independent executor.
-        Task.detached {
+        Task.detached { [engineRef] in
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
             let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil
             let toolCallProcessor: ToolCallProcessor? = {
@@ -698,17 +932,36 @@ public actor BatchEngine {
                 promptTail: promptTail)
             var stopMatcher = StopStringMatcher(stopStrings: extraStopStrings)
             var stopMatched = false
+            var traceVisibleText = ""
+            var traceStopStringMatch: (stop: String, rangeUTF8: [Int])?
 
             func emitChunkThroughStop(_ text: String) {
+                if tokenTraceSession != nil {
+                    traceVisibleText.append(text)
+                }
                 guard stopMatcher.isEnabled else {
+                    if !text.isEmpty { tokenTraceSession?.recordTextEmitted() }
                     continuation.yield(.chunk(text))
                     return
                 }
                 switch stopMatcher.feed(text) {
                 case .streaming(let out):
-                    if !out.isEmpty { continuation.yield(.chunk(out)) }
+                    if !out.isEmpty {
+                        tokenTraceSession?.recordTextEmitted()
+                        continuation.yield(.chunk(out))
+                    }
                 case .stopped(let out):
-                    if !out.isEmpty { continuation.yield(.chunk(out)) }
+                    if tokenTraceSession != nil,
+                        let match = tokenIDTraceFirstStopMatch(
+                            in: traceVisibleText,
+                            stops: stopMatcher.stopStrings)
+                    {
+                        traceStopStringMatch = match
+                    }
+                    if !out.isEmpty {
+                        tokenTraceSession?.recordTextEmitted()
+                        continuation.yield(.chunk(out))
+                    }
                     stopMatched = true
                 }
             }
@@ -719,6 +972,10 @@ public actor BatchEngine {
                     emitChunkThroughStop(text)
                 case .reasoning:
                     continuation.yield(event)
+                case .tokenID:
+                    // Raw-ID diagnostics are emitted directly from the token
+                    // loop and never pass through text/tool routing.
+                    break
                 case .prefillProgress:
                     continuation.yield(event)
                 case .toolCall:
@@ -733,7 +990,10 @@ public actor BatchEngine {
                     // truncation the solo path already fixed.
                     if stopMatcher.isEnabled && !stopMatched {
                         let tail = stopMatcher.flush()
-                        if !tail.isEmpty { continuation.yield(.chunk(tail)) }
+                        if !tail.isEmpty {
+                            tokenTraceSession?.recordTextEmitted()
+                            continuation.yield(.chunk(tail))
+                        }
                     }
                     continuation.yield(event)
                 case .toolCallProgress:
@@ -848,7 +1108,10 @@ public actor BatchEngine {
                 // its tail (pre-match prefix) at stop time.
                 if stopMatcher.isEnabled && !stopMatched {
                     let tail = stopMatcher.flush()
-                    if !tail.isEmpty { continuation.yield(.chunk(tail)) }
+                    if !tail.isEmpty {
+                        tokenTraceSession?.recordTextEmitted()
+                        continuation.yield(.chunk(tail))
+                    }
                 }
 
             }
@@ -864,6 +1127,9 @@ public actor BatchEngine {
                 case .prefillProgress(let progress):
                     continuation.yield(.prefillProgress(progress))
                 case .token(let id):
+                    if parameters.tokenIDTrace?.externalAdapterParticipation == true {
+                        continuation.yield(.tokenID(id: id, ordinal: generatedTokenCount))
+                    }
                     generatedTokenCount += 1
                     lastTokenAt = Date()
                     detokenizer.append(token: id)
@@ -878,10 +1144,12 @@ public actor BatchEngine {
                         // its own `.info`; we transform that info's
                         // stopReason from `.cancelled` to `.stop`
                         // below when it arrives.
+                        await engineRef.markTokenTraceStopString(requestId)
                         await engineRef.cancel(requestId)
                     }
                 case .info(let info):
                     sawTerminalInfo = true
+                    let stopSequenceHitBeforeGenerationEnd = stopMatched
                     // Snapshot reasoning state BEFORE flush — `flush()`
                     // resets `insideReasoning` to false as part of
                     // draining the buffer. The pre-flush value is what
@@ -915,7 +1183,21 @@ public actor BatchEngine {
                         turboQuantCacheTransition: info.turboQuantCacheTransition,
                         unclosedReasoning: unclosed,
                         toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure)
-                    terminationState.markCompleted()
+                    let traceStopRule = tokenIDTraceStopRule(
+                        stopReason: info.stopReason,
+                        stopSequenceHitBeforeGenerationEnd:
+                            stopSequenceHitBeforeGenerationEnd,
+                        stopSequenceHitAfterGenerationEnd: stopMatched)
+                    if traceStopRule == .stopString,
+                        let match = traceStopStringMatch
+                    {
+                        tokenTraceSession?.recordStopString(
+                            stop: match.stop,
+                            rangeUTF8: match.rangeUTF8)
+                    }
+                    await engineRef.finishDeferredTokenTrace(
+                        requestId,
+                        fallbackStopRule: traceStopRule)
                     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                         // Hosts report the visible answer finishing seconds
                         // before the turn finalizes. Deltas and `.info` are
@@ -931,6 +1213,8 @@ public actor BatchEngine {
                                 + "sinceLastEmittedText=\(sincePump)s "
                                 + "tokens=\(generatedTokenCount)\n").utf8))
                     }
+                    terminationState.markTerminalInfoKnown()
+                    await lifecycle.recordTerminalInfo(finalInfo)
                     continuation.yield(.info(finalInfo))
                     // Publish the terminal event before hopping back to the
                     // engine actor for diagnostics. If finishSlot is still
@@ -960,12 +1244,89 @@ public actor BatchEngine {
                     stopReason: .cancelled,
                     unclosedReasoning: unclosed,
                     toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure)
+                await engineRef.finishDeferredTokenTrace(
+                    requestId,
+                    fallbackStopRule: .cancellation)
+                terminationState.markTerminalInfoKnown()
+                await lifecycle.recordTerminalInfo(finalInfo)
                 continuation.yield(.info(finalInfo))
             }
-            terminationState.markCompleted()
+            terminationState.markFullyCompleted()
             continuation.finish()
+            await lifecycle.complete()
         }
-        return outStream
+        let control = BatchGenerationControl(
+            engine: self,
+            requestID: requestId,
+            lifecycle: lifecycle)
+        return BatchGenerationHandle(stream: outStream, control: control)
+    }
+
+    /// Source-compatible stream-only entry point. The request lifecycle and
+    /// dispatch path are owned by ``startGeneration(input:parameters:)``.
+    public func generate(
+        input: consuming sending LMInput,
+        parameters: GenerateParameters
+    ) -> AsyncStream<Generation> {
+        startGeneration(input: input, parameters: parameters).stream
+    }
+
+    private func startSpecDecGeneration(
+        requestID: BatchRequestID,
+        source: (stream: AsyncStream<Generation>, task: Task<Void, Never>),
+        lifecycle: BatchGenerationLifecycle
+    ) -> BatchGenerationHandle {
+        let (outStream, continuation) = AsyncStream<Generation>.makeStream()
+        let terminationState = BatchStreamTerminationState()
+        let engineRef = self
+        let taskRecord = SpecDecTaskRecord(task: source.task)
+        specDecTasks[requestID] = taskRecord
+        activeCountHighWatermark = max(activeCountHighWatermark, 1)
+
+        continuation.onTermination = {
+            @Sendable [requestID, weak engineRef, terminationState] _ in
+            guard terminationState.shouldCancelOnTermination() else { return }
+            Task.detached {
+                await engineRef?.cancel(requestID)
+            }
+        }
+
+        Task.detached { [engineRef, taskRecord] in
+            for await event in source.stream {
+                if case .info(let info) = event {
+                    terminationState.markTerminalInfoKnown()
+                    await lifecycle.recordTerminalInfo(info)
+                }
+                continuation.yield(event)
+            }
+
+            // SpecDec's producer closes its raw stream only after its
+            // cancellation-aware runtime task has reached its fence. The
+            // stream can wake this bridge at `continuation.finish()` before
+            // the producer task itself has returned, so wait for that task
+            // value before releasing request ownership.
+            await taskRecord.task.value
+            await engineRef.finishSpecDecGeneration(
+                id: requestID,
+                expected: taskRecord)
+            terminationState.markFullyCompleted()
+            continuation.finish()
+            await lifecycle.complete()
+        }
+
+        let control = BatchGenerationControl(
+            engine: self,
+            requestID: requestID,
+            lifecycle: lifecycle)
+        return BatchGenerationHandle(stream: outStream, control: control)
+    }
+
+    private func finishSpecDecGeneration(
+        id: BatchRequestID,
+        expected: SpecDecTaskRecord
+    ) {
+        guard specDecTasks[id] === expected else { return }
+        specDecTasks.removeValue(forKey: id)
     }
 
     private var canStartSoloFastPath: Bool {
@@ -974,6 +1335,7 @@ public actor BatchEngine {
             activeSlots.isEmpty &&
             loopTask == nil &&
             soloFastPathTask == nil &&
+            specDecTasks.isEmpty &&
             !isShutdown
     }
 
@@ -982,6 +1344,7 @@ public actor BatchEngine {
             activeSlots.isEmpty &&
             loopTask == nil &&
             soloFastPathTask == nil &&
+            specDecTasks.isEmpty &&
             !isShutdown
     }
 
@@ -1033,9 +1396,37 @@ public actor BatchEngine {
     private func startSoloFastPath(
         input: consuming sending LMInput,
         parameters: GenerateParameters,
-        promptTail: String?
-    ) -> AsyncStream<Generation> {
+        promptTail: String?,
+        requestID: BatchRequestID,
+        lifecycle: BatchGenerationLifecycle
+    ) -> BatchGenerationHandle {
         let promptTokenCount = input.text.tokens.size
+        let tokenTraceSession: TokenIDTraceSession?
+        if let trace = parameters.tokenIDTrace {
+            if context.model is any BlockDiffusionModel {
+                Self.logger.error(
+                    "Rejected token trace for unsupported block-diffusion solo path"
+                )
+                return makeCompletedGenerationHandle(
+                    promptTokenCount: promptTokenCount,
+                    requestID: requestID)
+            }
+            do {
+                tokenTraceSession = try trace.begin(
+                    pathKind: .direct,
+                    promptTokenIds: input.text.tokens.reshaped(-1).asArray(Int.self),
+                    parameters: parameters)
+            } catch {
+                Self.logger.error(
+                    "Rejected token trace start: \(error.localizedDescription, privacy: .public)"
+                )
+                return makeCompletedGenerationHandle(
+                    promptTokenCount: promptTokenCount,
+                    requestID: requestID)
+            }
+        } else {
+            tokenTraceSession = nil
+        }
         let hasMediaContent = input.hasMediaContent
         let toolSchemas = input.toolSchemas
         let requiresFreshToolSelection =
@@ -1045,7 +1436,7 @@ public actor BatchEngine {
             || shouldSkipDiskBackedToolPromptSeedBoundary(
                 toolSchemas: toolSchemas,
                 disablesGeneratedCacheBoundary: false)
-        let fastPathID = UUID()
+        let fastPathID = requestID
         var soloParameters = parameters
         soloParameters.extraStopStrings = mergeStopStrings(
             soloParameters.extraStopStrings,
@@ -1066,6 +1457,7 @@ public actor BatchEngine {
             input.text.tokens.reshaped(-1).asArray(Int.self))
 
         let (outStream, continuation) = AsyncStream<Generation>.makeStream()
+        let terminationState = BatchStreamTerminationState()
         // Monotonic gate: a prompt-processing counter must never tick backward.
         // Partial / diverging-prefix cache restores (e.g. reasoning-strip
         // templates that shorten history) can compute a `completedBeforePrefill`
@@ -1120,7 +1512,8 @@ public actor BatchEngine {
                     makeIterator: makeIterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
-                    toolSchemas: toolSchemas)
+                    toolSchemas: toolSchemas,
+                    tokenIDTraceSession: tokenTraceSession)
             } else if let strategy = soloParameters.draftStrategy,
                 case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
                 soloParameters.canUseNativeMTP(for: input)
@@ -1182,21 +1575,30 @@ public actor BatchEngine {
                     makeIterator: makeIterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
-                    toolSchemas: toolSchemas)
+                    toolSchemas: toolSchemas,
+                    tokenIDTraceSession: tokenTraceSession)
             }
         } catch {
             Self.logger.error(
                 "Solo fast path setup failed: \(error.localizedDescription, privacy: .public)"
             )
-            continuation.yield(.info(GenerateCompletionInfo(
+            let info = GenerateCompletionInfo(
                 promptTokenCount: promptTokenCount,
                 generationTokenCount: 0,
                 promptTime: 0,
                 generationTime: 0,
-                stopReason: .cancelled
-            )))
+                stopReason: .cancelled)
+            continuation.yield(.info(info))
             continuation.finish()
-            return outStream
+            Task.detached {
+                await lifecycle.recordTerminalInfo(info)
+                await lifecycle.complete()
+            }
+            let control = BatchGenerationControl(
+                engine: self,
+                requestID: requestID,
+                lifecycle: lifecycle)
+            return BatchGenerationHandle(stream: outStream, control: control)
         }
 
         soloFastPathID = fastPathID
@@ -1204,10 +1606,12 @@ public actor BatchEngine {
         soloFastPathHadMedia = hasMediaContent
         activeCountHighWatermark = max(activeCountHighWatermark, 1)
 
-        continuation.onTermination = { @Sendable _ in
+        let engineRef = self
+        continuation.onTermination = { @Sendable [generationTask, terminationState] _ in
+            guard terminationState.shouldCancelOnTermination() else { return }
             generationTask.cancel()
         }
-        Task {
+        Task.detached { [engineRef] in
             // Hosts report the visible answer finishing seconds before the turn
             // finalizes, and `maxBatchSize == 1` means every real request takes
             // THIS path — the batched loop's probe never fires. Time the gap
@@ -1219,12 +1623,20 @@ public actor BatchEngine {
             var textEvents = 0
             for await generation in sourceStream {
                 if case .info(let info) = generation, info.turboQuantCompressions > 0 {
-                    turboQuantCompressionCount += info.turboQuantCompressions
+                    await engineRef.recordTurboQuantDiagnostics(
+                        compressions: info.turboQuantCompressions,
+                        transition: nil)
                 }
                 if case .info(let info) = generation,
                    let transition = info.turboQuantCacheTransition
                 {
-                    lastTurboQuantCacheTransition = transition
+                    await engineRef.recordTurboQuantDiagnostics(
+                        compressions: 0,
+                        transition: transition)
+                }
+                if case .info(let info) = generation {
+                    terminationState.markTerminalInfoKnown()
+                    await lifecycle.recordTerminalInfo(info)
                 }
                 switch generation {
                 case .chunk, .reasoning:
@@ -1242,14 +1654,23 @@ public actor BatchEngine {
                 }
                 continuation.yield(generation)
             }
-            self.finishSoloFastPath(id: fastPathID)
+            // AsyncStream can wake the bridge at source `finish()` before the
+            // source task has returned from its final cache/Metal drain.
+            await generationTask.value
+            await engineRef.finishSoloFastPath(id: fastPathID)
+            terminationState.markFullyCompleted()
             continuation.finish()
+            await lifecycle.complete()
         }
 
-        return outStream
+        let control = BatchGenerationControl(
+            engine: self,
+            requestID: requestID,
+            lifecycle: lifecycle)
+        return BatchGenerationHandle(stream: outStream, control: control)
     }
 
-    private func finishSoloFastPath(id: UUID) {
+    private func finishSoloFastPath(id: BatchRequestID) {
         guard soloFastPathID == id else { return }
         Stream().synchronize()
         let shouldPurgeMediaWorkingSet = soloFastPathHadMedia
@@ -1290,6 +1711,29 @@ public actor BatchEngine {
         }
     }
 
+    /// Preserve the text-matcher terminal rule before cancellation closes the
+    /// batch slot.  The matcher runs outside the actor; the override keeps its
+    /// observed stop-string boundary distinct from an external cancellation.
+    private func markTokenTraceStopString(_ id: BatchRequestID) {
+        guard tokenTraceSessions[id] != nil else { return }
+        tokenTraceStopOverrides[id] = .stopString
+    }
+
+    private func finishDeferredTokenTrace(
+        _ id: BatchRequestID,
+        fallbackStopRule: TokenIDTraceStopRule
+    ) {
+        guard deferredTokenTraceRequestIDs.remove(id) != nil else { return }
+        let stopRule = tokenTraceStopOverrides.removeValue(forKey: id) ?? fallbackStopRule
+        guard let trace = tokenTraceSessions.removeValue(forKey: id) else { return }
+        do {
+            try trace.finish(stopRule: stopRule)
+        } catch {
+            Self.logger.error(
+                "token trace rejected terminal lineage: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     /// Cancel a specific request by ID.
     ///
     /// If the request is still in the wait queue, it is removed immediately.
@@ -1301,6 +1745,12 @@ public actor BatchEngine {
         // Check wait queue first
         if let idx = waitQueue.firstIndex(where: { $0.id == id }) {
             let request = waitQueue.remove(at: idx)
+            deferredTokenTraceRequestIDs.remove(id)
+            tokenTraceStopOverrides.removeValue(forKey: id)
+            if let trace = tokenTraceSessions.removeValue(forKey: id) {
+                trace.recordRuntimeError("request cancelled before batch admission")
+                try? trace.finish(stopRule: .cancellation)
+            }
             request.continuation.yield(.info(GenerateCompletionInfo(
                 promptTokenCount: request.input.text.tokens.size,
                 generationTokenCount: 0,
@@ -1315,9 +1765,46 @@ public actor BatchEngine {
         // Check active slots
         if let idx = activeSlots.firstIndex(where: { $0.id == id }) {
             var slot = activeSlots[idx]
+            guard !slot.isFinished else { return }
             finishSlot(&slot, reason: .cancelled)
             slot.isFinished = true
             activeSlots[idx] = slot
+            return
+        }
+
+        // SpecDec owns a request-local producer task. Never touch the shared
+        // batch loop when cancelling this path.
+        if let record = specDecTasks[id] {
+            record.task.cancel()
+            return
+        }
+
+        // The direct B=1 path has the same request identity as its handle.
+        // Equality is the stale-handle guard: an old solo handle cannot cancel
+        // the newer solo task that reused the B=1 engine.
+        if soloFastPathID == id {
+            soloFastPathTask?.cancel()
+        }
+    }
+
+    private func waitForShutdownDrain() async {
+        if shutdownDrainComplete { return }
+        await withCheckedContinuation { continuation in
+            if shutdownDrainComplete {
+                continuation.resume()
+            } else {
+                shutdownDrainWaiters.append(continuation)
+            }
+        }
+    }
+
+    private func completeShutdownDrain() {
+        guard !shutdownDrainComplete else { return }
+        shutdownDrainComplete = true
+        let waiters = shutdownDrainWaiters
+        shutdownDrainWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
         }
     }
 
@@ -1336,11 +1823,15 @@ public actor BatchEngine {
     /// segfaults inside the Metal encoder (osaurus cold-load disconnect
     /// crash: disconnect → unload raced the dropped request's prefill).
     public func shutdown() async {
-        guard !isShutdown else { return }
+        if isShutdown {
+            await waitForShutdownDrain()
+            return
+        }
         isShutdown = true
 
         let drainLoopTask = loopTask
         let drainSoloTask = soloFastPathTask
+        let drainSpecDecTasks = Array(specDecTasks)
         let shouldPurgeSoloMediaWorkingSet = soloFastPathHadMedia
         loopTask?.cancel()
         loopTask = nil
@@ -1348,9 +1839,18 @@ public actor BatchEngine {
         soloFastPathTask = nil
         soloFastPathID = nil
         soloFastPathHadMedia = false
+        for (_, record) in drainSpecDecTasks {
+            record.task.cancel()
+        }
 
         // Finish all pending requests
         for request in waitQueue {
+            deferredTokenTraceRequestIDs.remove(request.id)
+            tokenTraceStopOverrides.removeValue(forKey: request.id)
+            if let trace = tokenTraceSessions.removeValue(forKey: request.id) {
+                trace.recordRuntimeError("engine shutdown before batch admission")
+                try? trace.finish(stopRule: .cancellation)
+            }
             request.continuation.yield(.info(GenerateCompletionInfo(
                 promptTokenCount: request.input.text.tokens.size,
                 generationTokenCount: 0,
@@ -1376,6 +1876,10 @@ public actor BatchEngine {
         // suspension see `isShutdown == true` and fail closed.
         await drainSoloTask?.value
         await drainLoopTask?.value
+        for (id, record) in drainSpecDecTasks {
+            await record.task.value
+            finishSpecDecGeneration(id: id, expected: record)
+        }
 
         // Final fence: producers submit via `asyncEval`, so their last
         // command buffers may still be in flight when the tasks return.
@@ -1384,13 +1888,18 @@ public actor BatchEngine {
             Memory.clearCache()
             stepsSinceMemoryPurge = 0
         }
+        completeShutdownDrain()
     }
 
     /// The number of requests currently waiting in the queue.
     public var pendingCount: Int { waitQueue.count }
 
     /// The number of sequences currently being generated.
-    public var activeCount: Int { activeSlots.count + (soloFastPathTask == nil ? 0 : 1) }
+    public var activeCount: Int {
+        activeSlots.count
+            + (soloFastPathTask == nil ? 0 : 1)
+            + specDecTasks.count
+    }
 
     /// Maximum active-slot count observed since engine creation.
     public var activeCountHighWatermarkForDiagnostics: Int { activeCountHighWatermark }
@@ -1444,7 +1953,9 @@ public actor BatchEngine {
     }
 
     /// Whether the engine is currently running (has active or pending work).
-    public var isRunning: Bool { loopTask != nil || soloFastPathTask != nil }
+    public var isRunning: Bool {
+        loopTask != nil || soloFastPathTask != nil || !specDecTasks.isEmpty
+    }
 
     var isSoloFastPathActiveForTesting: Bool { soloFastPathTask != nil }
 
@@ -2228,6 +2739,9 @@ public actor BatchEngine {
             }
         } catch {
             // Prefill failed (e.g., invalid input) — finish with cancellation
+            tokenTraceSessions[slot.id]?.recordRuntimeError(
+                "batch prefill failed: " + error.localizedDescription)
+            tokenTraceStopOverrides[slot.id] = .error
             finishSlot(&slot, reason: .cancelled)
             slot.isFinished = true
             activeSlots[slotIndex] = slot
@@ -2261,6 +2775,7 @@ public actor BatchEngine {
                !effectivePromptTokens.isEmpty
             {
                 slot.cachePromptTokenIds = effectivePromptTokens
+                tokenTraceSessions[slot.id]?.replacePrompt(effectivePromptTokens)
                 slot.cachePromptUsesPostPrepareKey = true
                 if slot.originalInput.requiresPostPrepareCacheKey {
                     cacheCoordinator?.recordPostPrepareCacheKeyAlias(
@@ -2289,6 +2804,7 @@ public actor BatchEngine {
             from: slot.cache)
 
         let tokenID = firstToken.item(Int.self)
+        tokenTraceSessions[slot.id]?.recordSampled(tokenID)
 
         slot.phase = .decode
         slot.decodeStartTime = Date()
@@ -2299,6 +2815,7 @@ public actor BatchEngine {
             finishSlot(&slot, reason: .stop)
             slot.isFinished = true
         } else {
+            tokenTraceSessions[slot.id]?.recordBatchYielded(tokenID)
             slot.continuation.yield(.token(tokenID))
             slot.generatedTokenCount += 1
             slot.generatedTokenIds.append(tokenID)
@@ -2385,6 +2902,13 @@ public actor BatchEngine {
             Self.logger.error(
                 "Slot \(slot.id.description, privacy: .public): stepCompiledDecode called without nextToken"
             )
+            if let trace = tokenTraceSessions[slot.id] {
+                trace.recordRuntimeError("compiled decode entered without nextToken")
+                tokenTraceStopOverrides[slot.id] = .error
+                finishSlot(&slot, reason: .cancelled)
+                slot.isFinished = true
+                activeSlots[slotIndex] = slot
+            }
             return
         }
 
@@ -2396,6 +2920,14 @@ public actor BatchEngine {
             Self.logger.error(
                 "Slot \(slot.id.description, privacy: .public): compiled forward returned \(result.count) outputs, expected 1"
             )
+            if let trace = tokenTraceSessions[slot.id] {
+                trace.recordRuntimeError(
+                    "compiled forward returned \(result.count) outputs")
+                tokenTraceStopOverrides[slot.id] = .error
+                finishSlot(&slot, reason: .cancelled)
+                slot.isFinished = true
+                activeSlots[slotIndex] = slot
+            }
             return
         }
 
@@ -2407,6 +2939,7 @@ public actor BatchEngine {
         let logits = result[0][0 ..< 1, 0, 0...]
         let token = slot.sampleToken(from: logits)
         let tokenID = token.item(Int.self)
+        tokenTraceSessions[slot.id]?.recordSampled(tokenID)
 
         // Stage 0: per-step KV-quant hook. For compile+TQ this is a no-op
         // because compile requires `.simple` family (TQ compression would
@@ -2420,6 +2953,7 @@ public actor BatchEngine {
             finishSlot(&slot, reason: .stop)
             slot.isFinished = true
         } else {
+            tokenTraceSessions[slot.id]?.recordBatchYielded(tokenID)
             slot.continuation.yield(.token(tokenID))
             slot.generatedTokenCount += 1
             slot.generatedTokenIds.append(tokenID)
@@ -2790,6 +3324,7 @@ public actor BatchEngine {
             // of both the logits and the sampled tokens) — this wait
             // is much shorter than a synchronous eval + sample chain.
             let tokenID = token.item(Int.self)
+            tokenTraceSessions[slot.id]?.recordSampled(tokenID)
 
             // Stage 0: per-step KV-quant compression hook. For slots with
             // short prompts that were below the TQ minimum threshold at
@@ -2805,6 +3340,7 @@ public actor BatchEngine {
                 finishSlot(&slot, reason: .stop)
                 slot.isFinished = true
             } else {
+                tokenTraceSessions[slot.id]?.recordBatchYielded(tokenID)
                 slot.continuation.yield(.token(tokenID))
                 slot.generatedTokenCount += 1
                 slot.generatedTokenIds.append(tokenID)
@@ -2893,7 +3429,23 @@ public actor BatchEngine {
     /// future cache reuse.
     private func finishSlot(_ liveSlot: inout BatchSlot, reason: GenerateStopReason) {
         let slot = liveSlot
+        let tokenTraceSession = tokenTraceSessions[liveSlot.id]
+        let deferTokenTraceFinish = deferredTokenTraceRequestIDs.contains(liveSlot.id)
+        let tokenTraceStopRule: TokenIDTraceStopRule = {
+            if let override = tokenTraceStopOverrides[liveSlot.id] {
+                return override
+            }
+            switch reason {
+            case .stop: return .eos
+            case .length: return .length
+            case .cancelled: return .cancellation
+            }
+        }()
         defer {
+            if !deferTokenTraceFinish {
+                tokenTraceSessions.removeValue(forKey: liveSlot.id)
+                tokenTraceStopOverrides.removeValue(forKey: liveSlot.id)
+            }
             // Cache stores are synchronous. Drop the sole retained prompt/seed
             // snapshot as soon as they finish instead of holding it until the
             // scheduler's next completed-slot cleanup pass.
@@ -2903,6 +3455,16 @@ public actor BatchEngine {
         let now = Date()
         let prefillTime = (slot.decodeStartTime ?? now).timeIntervalSince(slot.prefillStartTime)
         let decodeTime = slot.decodeStartTime.map { now.timeIntervalSince($0) } ?? 0
+
+        if let tokenTraceSession, !deferTokenTraceFinish {
+            do {
+                try tokenTraceSession.finish(stopRule: tokenTraceStopRule)
+            } catch {
+                Self.logger.error(
+                    "token trace rejected terminal lineage: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+
         let completionInfo = GenerateCompletionInfo(
             promptTokenCount: slot.promptTokenCount,
             generationTokenCount: slot.generatedTokenCount,

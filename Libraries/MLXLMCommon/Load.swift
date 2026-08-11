@@ -943,6 +943,9 @@ public func loadWeights(
     }
 
     eval(model)
+    if let postLoadPreparation = model as? PostLoadModelPreparation {
+        try postLoadPreparation.prepareForInferenceAfterLoad()
+    }
     MLX.Memory.clearCache()
 }
 

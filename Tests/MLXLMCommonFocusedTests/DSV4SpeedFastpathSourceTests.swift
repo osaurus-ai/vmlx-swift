@@ -32,6 +32,13 @@ struct DSV4SpeedFastpathSourceTests {
         // fp32 accumulation is the correctness half of the contract: the
         // fused path must feed fp32 activations, not bf16.
         #expect(helpers.contains("let hF32 = h.asType(.float32)"))
+        // The opt-in cache and its shadow rail must retain an explicit exact
+        // path instead of treating qmm's expected rounding delta as a cache
+        // mismatch.
+        #expect(helpers.contains("lmHeadExactFp32"))
+        #expect(
+            helpers.contains(
+                "let baseline = DeepseekV4Math.lmHeadExactFp32(hidden, lmHead: lmHead)"))
     }
 
     @Test("RoPE cos/sin tables are shared across equal-frequency instances")

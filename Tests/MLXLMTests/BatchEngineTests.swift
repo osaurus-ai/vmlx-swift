@@ -417,9 +417,12 @@ class BatchEngineIntegrationTests: XCTestCase {
 
     private func makeSlowPrefillEngine(
         prefillDelayMicroseconds: UInt32 = 800_000,
-        maxBatchSize: Int = 2
+        maxBatchSize: Int = 2,
+        prefillGate: ShutdownPrefillGate? = nil
     ) -> BatchEngine {
-        let model = SlowPrefillLanguageModel(prefillDelayMicroseconds: prefillDelayMicroseconds)
+        let model = SlowPrefillLanguageModel(
+            prefillDelayMicroseconds: prefillDelayMicroseconds,
+            prefillGate: prefillGate)
         let tokenizer = TestTokenizer(vocabularySize: model.vocabularySize)
         let processor = TestInputProcessor(
             tokenizer: tokenizer,
@@ -1006,6 +1009,8 @@ class BatchEngineIntegrationTests: XCTestCase {
                 progress.append(p)
             case .chunk, .reasoning, .toolCall, .toolCallProgress, .info:
                 sawChunkOrInfo = true
+            case .tokenID:
+                break
             }
         }
 
@@ -1359,6 +1364,729 @@ class BatchEngineIntegrationTests: XCTestCase {
         XCTAssertFalse(isRunning)
     }
 
+    // MARK: - BatchGenerationLifecycle semantic tests
+
+    func testBatchGenerationLifecycleWaitsForCompleteAfterRecordingInfo() async {
+        let lifecycle = BatchGenerationLifecycle()
+        let expected = GenerateCompletionInfo(
+            promptTokenCount: 7,
+            generationTokenCount: 3,
+            promptTime: 1.25,
+            generationTime: 2.5,
+            stopReason: .length,
+            turboQuantCompressions: 4,
+            unclosedReasoning: true)
+        let latch = BatchGenerationLifecycleWaiterLatch()
+
+        let waiter = Task { @Sendable in
+            await latch.markStarted()
+            let result = await lifecycle.waitUntilComplete()
+            await latch.markCompleted(result)
+        }
+
+        var started = false
+        for _ in 0 ..< 100 {
+            let state = await latch.snapshot()
+            if state.started {
+                started = true
+                break
+            }
+            await Task.yield()
+        }
+        XCTAssertTrue(started, "waiter did not reach the lifecycle seam")
+
+        await lifecycle.recordTerminalInfo(expected)
+
+        var completedAfterRecord = false
+        for _ in 0 ..< 100 {
+            if await latch.snapshot().completed {
+                completedAfterRecord = true
+                break
+            }
+            await Task.yield()
+        }
+        XCTAssertFalse(
+            completedAfterRecord,
+            "recordTerminalInfo must not release a full-drain waiter")
+
+        await lifecycle.complete()
+
+        var completedAfterComplete = false
+        var observed: GenerateCompletionInfo?
+        for _ in 0 ..< 100 {
+            let state = await latch.snapshot()
+            if state.completed {
+                completedAfterComplete = true
+                observed = state.info
+                break
+            }
+            await Task.yield()
+        }
+        XCTAssertTrue(completedAfterComplete, "complete must release the waiter")
+        await waiter.value
+
+        guard let observed else {
+            XCTFail("completed lifecycle waiter returned no terminal info")
+            return
+        }
+        XCTAssertEqual(observed.promptTokenCount, expected.promptTokenCount)
+        XCTAssertEqual(observed.generationTokenCount, expected.generationTokenCount)
+        XCTAssertEqual(observed.promptTime, expected.promptTime)
+        XCTAssertEqual(observed.generateTime, expected.generateTime)
+        XCTAssertTrue(
+            sameGenerateStopReason(observed.stopReason, expected.stopReason),
+            "stop reason did not match")
+        XCTAssertEqual(observed.turboQuantCompressions, expected.turboQuantCompressions)
+        XCTAssertEqual(observed.turboQuantCacheTransition, expected.turboQuantCacheTransition)
+        XCTAssertEqual(observed.unclosedReasoning, expected.unclosedReasoning)
+        XCTAssertEqual(observed.toolCallProtocolFailure, expected.toolCallProtocolFailure)
+    }
+
+    func testBatchGenerationLifecycleCompleteWithoutInfoReturnsNil() async {
+        let lifecycle = BatchGenerationLifecycle()
+        let latch = BatchGenerationLifecycleWaiterLatch()
+
+        await lifecycle.complete()
+
+        let waiter = Task { @Sendable in
+            await latch.markStarted()
+            let result = await lifecycle.waitUntilComplete()
+            await latch.markCompleted(result)
+        }
+
+        var completed = false
+        var observed: GenerateCompletionInfo?
+        for _ in 0 ..< 100 {
+            let state = await latch.snapshot()
+            if state.completed {
+                completed = true
+                observed = state.info
+                break
+            }
+            await Task.yield()
+        }
+        XCTAssertTrue(completed, "already-complete lifecycle must release immediately")
+        XCTAssertNil(observed)
+        await waiter.value
+    }
+
+    func testBatchGenerationHandleCancelAndWaitPublishesAfterConsumerInfo() async {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 100_000,
+            maxBatchSize: 1)
+        let handle = await engine.startGeneration(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(8))),
+            parameters: GenerateParameters(maxTokens: 1_000, temperature: 0))
+
+        let firstInfo = BatchGenerationLifecycleWaiterLatch()
+        let duplicateInfo = BatchGenerationLifecycleWaiterLatch()
+        let consumerDone = BatchGenerationLifecycleWaiterLatch()
+        let consumer = Task { @Sendable in
+            var infoCount = 0
+            for await event in handle.stream {
+                if case .info(let info) = event {
+                    infoCount += 1
+                    if infoCount == 1 {
+                        await firstInfo.markCompleted(info)
+                    } else {
+                        await duplicateInfo.markCompleted(info)
+                    }
+                }
+            }
+            await consumerDone.markStarted()
+        }
+
+        let active = await waitForCapacitySnapshot(engine) { $0.activeCount == 1 }
+        XCTAssertEqual(active.activeCount, 1)
+        let soloActive = await engine.isSoloFastPathActiveForTesting
+        XCTAssertTrue(soloActive)
+
+        let infoBeforeCancelPublication = BatchGenerationLifecycleWaiterLatch()
+        let soloInactive = BatchGenerationLifecycleWaiterLatch()
+        let cancelPublished = BatchGenerationLifecycleWaiterLatch()
+        let cancelTask = Task { @Sendable in
+            let returned = await handle.cancelAndWait()
+            let receipt = await firstInfo.snapshot()
+            if receipt.completed {
+                await infoBeforeCancelPublication.markStarted()
+            }
+            if !(await engine.isSoloFastPathActiveForTesting) {
+                await soloInactive.markStarted()
+            }
+            await cancelPublished.markCompleted(returned)
+        }
+
+        let publishedState = await waitForBatchGenerationLifecycleLatch(cancelPublished)
+        XCTAssertTrue(publishedState.completed, "cancelAndWait result was not published")
+
+        let consumerState = await waitForBatchGenerationLifecycleLatch(consumerDone)
+        XCTAssertTrue(consumerState.started, "consumer did not finish after cancellation")
+
+        let streamed = await firstInfo.snapshot()
+        let duplicate = await duplicateInfo.snapshot()
+        let publication = await cancelPublished.snapshot()
+        let receiptBeforePublication = await infoBeforeCancelPublication.snapshot()
+        let inactive = await soloInactive.snapshot()
+        XCTAssertTrue(streamed.completed, "consumer did not record terminal info")
+        XCTAssertFalse(duplicate.completed, "cancellation streamed more than one info")
+        XCTAssertTrue(receiptBeforePublication.started)
+        XCTAssertTrue(inactive.started)
+
+        guard let streamedInfo = streamed.info, let returnedInfo = publication.info else {
+            XCTFail("cancelAndWait and the stream must both return terminal info")
+            await cancelTask.value
+            await consumer.value
+            await engine.shutdown()
+            return
+        }
+        XCTAssertEqual(streamedInfo.stopReason, .cancelled)
+        XCTAssertEqual(returnedInfo.promptTokenCount, streamedInfo.promptTokenCount)
+        XCTAssertEqual(returnedInfo.generationTokenCount, streamedInfo.generationTokenCount)
+        XCTAssertEqual(returnedInfo.promptTime, streamedInfo.promptTime)
+        XCTAssertEqual(returnedInfo.generateTime, streamedInfo.generateTime)
+        XCTAssertTrue(sameGenerateStopReason(returnedInfo.stopReason, streamedInfo.stopReason))
+        XCTAssertEqual(
+            returnedInfo.turboQuantCompressions,
+            streamedInfo.turboQuantCompressions)
+        XCTAssertEqual(
+            returnedInfo.turboQuantCacheTransition,
+            streamedInfo.turboQuantCacheTransition)
+        XCTAssertEqual(returnedInfo.unclosedReasoning, streamedInfo.unclosedReasoning)
+        XCTAssertEqual(
+            returnedInfo.toolCallProtocolFailure,
+            streamedInfo.toolCallProtocolFailure)
+        await cancelTask.value
+        await consumer.value
+        await engine.shutdown()
+    }
+
+    func testBatchGenerationHandleNaturalCompletionIsIdempotentAndCannotCancelLaterRequest() async {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 100_000,
+            maxBatchSize: 1)
+        let handleA = await engine.startGeneration(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(8))),
+            parameters: GenerateParameters(maxTokens: 2, temperature: 0))
+
+        let infoA = BatchGenerationLifecycleWaiterLatch()
+        let duplicateInfoA = BatchGenerationLifecycleWaiterLatch()
+        let consumerDoneA = BatchGenerationLifecycleWaiterLatch()
+        let consumerA = Task { @Sendable in
+            var infoCount = 0
+            for await event in handleA.stream {
+                if case .info(let info) = event {
+                    infoCount += 1
+                    if infoCount == 1 {
+                        await infoA.markCompleted(info)
+                    } else {
+                        await duplicateInfoA.markCompleted(info)
+                    }
+                }
+            }
+            await consumerDoneA.markStarted()
+        }
+
+        let stateA = await waitForBatchGenerationLifecycleLatch(infoA)
+        guard stateA.completed else {
+            XCTFail("request A did not publish terminal info before its deadline")
+            await engine.shutdown()
+            await consumerA.value
+            return
+        }
+        let doneStateA = await waitForBatchGenerationLifecycleLatch(consumerDoneA)
+        guard doneStateA.started else {
+            XCTFail("request A stream did not drain before its deadline")
+            await engine.shutdown()
+            await consumerA.value
+            return
+        }
+        await consumerA.value
+
+        let duplicateStateA = await duplicateInfoA.snapshot()
+        XCTAssertFalse(duplicateStateA.completed, "request A published more than one terminal info")
+        guard let terminalA = stateA.info else {
+            XCTFail("request A did not provide terminal info")
+            await engine.shutdown()
+            return
+        }
+        switch terminalA.stopReason {
+        case .cancelled:
+            XCTFail("request A must complete naturally before cancellation is attempted")
+        case .stop, .length:
+            break
+        }
+
+        func assertSameCompletionInfo(
+            _ lhs: GenerateCompletionInfo,
+            _ rhs: GenerateCompletionInfo,
+            label: String
+        ) {
+            XCTAssertEqual(lhs.promptTokenCount, rhs.promptTokenCount, "\(label): promptTokenCount")
+            XCTAssertEqual(
+                lhs.generationTokenCount,
+                rhs.generationTokenCount,
+                "\(label): generationTokenCount")
+            XCTAssertEqual(lhs.promptTime, rhs.promptTime, "\(label): promptTime")
+            XCTAssertEqual(lhs.generateTime, rhs.generateTime, "\(label): generateTime")
+            XCTAssertTrue(
+                sameGenerateStopReason(lhs.stopReason, rhs.stopReason),
+                "\(label): stopReason")
+            XCTAssertEqual(
+                lhs.turboQuantCompressions,
+                rhs.turboQuantCompressions,
+                "\(label): turboQuantCompressions")
+            XCTAssertEqual(
+                lhs.turboQuantCacheTransition,
+                rhs.turboQuantCacheTransition,
+                "\(label): turboQuantCacheTransition")
+            XCTAssertEqual(lhs.unclosedReasoning, rhs.unclosedReasoning, "\(label): unclosedReasoning")
+            XCTAssertEqual(
+                lhs.toolCallProtocolFailure,
+                rhs.toolCallProtocolFailure,
+                "\(label): toolCallProtocolFailure")
+        }
+
+        let firstCancel = BatchGenerationLifecycleWaiterLatch()
+        let firstCancelTask = Task { @Sendable in
+            let returned = await handleA.cancelAndWait()
+            await firstCancel.markCompleted(returned)
+        }
+        let firstCancelState = await waitForBatchGenerationLifecycleLatch(firstCancel)
+        guard firstCancelState.completed else {
+            XCTFail("cancelAndWait did not return for naturally completed request A")
+            await engine.shutdown()
+            await firstCancelTask.value
+            return
+        }
+        guard let firstCancelInfo = firstCancelState.info else {
+            XCTFail("cancelAndWait returned no info for naturally completed request A")
+            await engine.shutdown()
+            await firstCancelTask.value
+            return
+        }
+        assertSameCompletionInfo(firstCancelInfo, terminalA, label: "first cancelAndWait")
+        await firstCancelTask.value
+
+        let handleB = await engine.startGeneration(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(32))),
+            parameters: GenerateParameters(maxTokens: 1_000, temperature: 0))
+        let infoB = BatchGenerationLifecycleWaiterLatch()
+        let duplicateInfoB = BatchGenerationLifecycleWaiterLatch()
+        let consumerDoneB = BatchGenerationLifecycleWaiterLatch()
+        let consumerB = Task { @Sendable in
+            var infoCount = 0
+            for await event in handleB.stream {
+                if case .info(let info) = event {
+                    infoCount += 1
+                    if infoCount == 1 {
+                        await infoB.markCompleted(info)
+                    } else {
+                        await duplicateInfoB.markCompleted(info)
+                    }
+                }
+            }
+            await consumerDoneB.markStarted()
+        }
+
+        let activeB = await waitForCapacitySnapshot(engine) { $0.activeCount == 1 }
+        XCTAssertEqual(activeB.activeCount, 1)
+
+        let staleCancel = BatchGenerationLifecycleWaiterLatch()
+        let staleCancelTask = Task { @Sendable in
+            let returned = await handleA.cancelAndWait()
+            await staleCancel.markCompleted(returned)
+        }
+        let staleCancelState = await waitForBatchGenerationLifecycleLatch(staleCancel)
+        guard staleCancelState.completed else {
+            XCTFail("stale cancelAndWait did not return before its deadline")
+            await engine.shutdown()
+            await staleCancelTask.value
+            await consumerB.value
+            return
+        }
+        guard let staleCancelInfo = staleCancelState.info else {
+            XCTFail("stale cancelAndWait returned no info for request A")
+            await engine.shutdown()
+            await staleCancelTask.value
+            await consumerB.value
+            return
+        }
+        assertSameCompletionInfo(staleCancelInfo, terminalA, label: "stale cancelAndWait")
+        let activeAfterStaleCancel = await engine.capacitySnapshot
+        XCTAssertEqual(
+            activeAfterStaleCancel.activeCount,
+            1,
+            "stale request A cancellation must not remove live request B")
+        await staleCancelTask.value
+
+        let stateB = await waitForBatchGenerationLifecycleLatch(infoB)
+        guard stateB.completed else {
+            XCTFail("request B did not publish terminal info before its deadline")
+            await engine.shutdown()
+            await consumerB.value
+            return
+        }
+        let doneStateB = await waitForBatchGenerationLifecycleLatch(consumerDoneB)
+        guard doneStateB.started else {
+            XCTFail("request B stream did not drain before its deadline")
+            await engine.shutdown()
+            await consumerB.value
+            return
+        }
+        await consumerB.value
+
+        let duplicateStateB = await duplicateInfoB.snapshot()
+        XCTAssertFalse(duplicateStateB.completed, "request B published more than one terminal info")
+        guard let terminalB = stateB.info else {
+            XCTFail("request B did not provide terminal info")
+            await engine.shutdown()
+            return
+        }
+        switch terminalB.stopReason {
+        case .cancelled:
+            XCTFail("stale request A cancellation must not cancel request B")
+        case .stop, .length:
+            break
+        }
+
+        await engine.shutdown()
+    }
+
+    func testBatchGenerationHandleConcurrentCancelAndWaitIsSingleTerminalAndConsistent() async {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 500_000,
+            maxBatchSize: 1)
+        let handle = await engine.startGeneration(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(8))),
+            parameters: GenerateParameters(maxTokens: 1_000, temperature: 0))
+
+        let streamInfo = BatchGenerationLifecycleWaiterLatch()
+        let duplicateStreamInfo = BatchGenerationLifecycleWaiterLatch()
+        let streamDone = BatchGenerationLifecycleWaiterLatch()
+        let consumer = Task { @Sendable in
+            var infoCount = 0
+            for await event in handle.stream {
+                if case .info(let info) = event {
+                    infoCount += 1
+                    if infoCount == 1 {
+                        await streamInfo.markCompleted(info)
+                    } else {
+                        await duplicateStreamInfo.markCompleted(info)
+                    }
+                }
+            }
+            await streamDone.markStarted()
+        }
+
+        let active = await waitForCapacitySnapshot(engine) { $0.activeCount == 1 }
+        guard active.activeCount == 1 else {
+            XCTFail("solo request did not become active before its deadline")
+            await engine.shutdown()
+            await consumer.value
+            return
+        }
+        let soloActive = await engine.isSoloFastPathActiveForTesting
+        XCTAssertTrue(soloActive)
+
+        let receipt1 = BatchGenerationLifecycleWaiterLatch()
+        let receipt2 = BatchGenerationLifecycleWaiterLatch()
+        let receipt3 = BatchGenerationLifecycleWaiterLatch()
+        let receipt4 = BatchGenerationLifecycleWaiterLatch()
+        let cancelledCallerObserved = BatchGenerationLifecycleWaiterLatch()
+
+        let caller4 = Task { @Sendable in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            let wasCancelled = Task.isCancelled
+            XCTAssertTrue(wasCancelled, "cancelled caller must observe cancellation before calling")
+            if wasCancelled {
+                await cancelledCallerObserved.markStarted()
+            }
+            let returned = await handle.cancelAndWait()
+            await receipt4.markCompleted(returned)
+        }
+        caller4.cancel()
+
+        let caller1 = Task { @Sendable in
+            let returned = await handle.cancelAndWait()
+            await receipt1.markCompleted(returned)
+        }
+        let caller2 = Task { @Sendable in
+            let returned = await handle.cancelAndWait()
+            await receipt2.markCompleted(returned)
+        }
+        let caller3 = Task { @Sendable in
+            let returned = await handle.cancelAndWait()
+            await receipt3.markCompleted(returned)
+        }
+
+        func shutdownAndJoin() async {
+            await engine.shutdown()
+            await consumer.value
+            await caller1.value
+            await caller2.value
+            await caller3.value
+            await caller4.value
+        }
+
+        let cancelledState = await waitForBatchGenerationLifecycleLatch(cancelledCallerObserved)
+        guard cancelledState.started else {
+            XCTFail("cancelled caller did not observe its cancellation before its deadline")
+            await shutdownAndJoin()
+            return
+        }
+
+        let receiptState1 = await waitForBatchGenerationLifecycleLatch(receipt1)
+        guard receiptState1.completed else {
+            XCTFail("cancelAndWait caller 1 did not return before its deadline")
+            await shutdownAndJoin()
+            return
+        }
+        let receiptState2 = await waitForBatchGenerationLifecycleLatch(receipt2)
+        guard receiptState2.completed else {
+            XCTFail("cancelAndWait caller 2 did not return before its deadline")
+            await shutdownAndJoin()
+            return
+        }
+        let receiptState3 = await waitForBatchGenerationLifecycleLatch(receipt3)
+        guard receiptState3.completed else {
+            XCTFail("cancelAndWait caller 3 did not return before its deadline")
+            await shutdownAndJoin()
+            return
+        }
+        let receiptState4 = await waitForBatchGenerationLifecycleLatch(receipt4)
+        guard receiptState4.completed else {
+            XCTFail("cancelAndWait caller 4 did not return before its deadline")
+            await shutdownAndJoin()
+            return
+        }
+
+        let streamInfoState = await waitForBatchGenerationLifecycleLatch(streamInfo)
+        guard streamInfoState.completed else {
+            XCTFail("stream did not publish terminal info before its deadline")
+            await shutdownAndJoin()
+            return
+        }
+        let streamDoneState = await waitForBatchGenerationLifecycleLatch(streamDone)
+        guard streamDoneState.started else {
+            XCTFail("stream did not finish before its deadline")
+            await shutdownAndJoin()
+            return
+        }
+
+        await consumer.value
+        await caller1.value
+        await caller2.value
+        await caller3.value
+        await caller4.value
+
+        let duplicateState = await duplicateStreamInfo.snapshot()
+        XCTAssertFalse(duplicateState.completed, "the stream published more than one terminal info")
+        guard let streamedInfo = streamInfoState.info,
+            let returnedInfo1 = receiptState1.info,
+            let returnedInfo2 = receiptState2.info,
+            let returnedInfo3 = receiptState3.info,
+            let returnedInfo4 = receiptState4.info
+        else {
+            XCTFail("stream and all cancelAndWait callers must return terminal info")
+            await engine.shutdown()
+            return
+        }
+
+        XCTAssertEqual(streamedInfo.stopReason, .cancelled)
+        func assertSameCompletionInfo(
+            _ lhs: GenerateCompletionInfo,
+            _ rhs: GenerateCompletionInfo,
+            label: String
+        ) {
+            XCTAssertEqual(lhs.promptTokenCount, rhs.promptTokenCount, "\(label): promptTokenCount")
+            XCTAssertEqual(
+                lhs.generationTokenCount,
+                rhs.generationTokenCount,
+                "\(label): generationTokenCount")
+            XCTAssertEqual(lhs.promptTime, rhs.promptTime, "\(label): promptTime")
+            XCTAssertEqual(lhs.generateTime, rhs.generateTime, "\(label): generateTime")
+            XCTAssertTrue(
+                sameGenerateStopReason(lhs.stopReason, rhs.stopReason),
+                "\(label): stopReason")
+            XCTAssertEqual(
+                lhs.turboQuantCompressions,
+                rhs.turboQuantCompressions,
+                "\(label): turboQuantCompressions")
+            XCTAssertEqual(
+                lhs.turboQuantCacheTransition,
+                rhs.turboQuantCacheTransition,
+                "\(label): turboQuantCacheTransition")
+            XCTAssertEqual(lhs.unclosedReasoning, rhs.unclosedReasoning, "\(label): unclosedReasoning")
+            XCTAssertEqual(
+                lhs.toolCallProtocolFailure,
+                rhs.toolCallProtocolFailure,
+                "\(label): toolCallProtocolFailure")
+        }
+        assertSameCompletionInfo(returnedInfo1, streamedInfo, label: "caller 1")
+        assertSameCompletionInfo(returnedInfo2, streamedInfo, label: "caller 2")
+        assertSameCompletionInfo(returnedInfo3, streamedInfo, label: "caller 3")
+        assertSameCompletionInfo(returnedInfo4, streamedInfo, label: "caller 4")
+
+        await engine.shutdown()
+    }
+
+    func testBatchGenerationHandleCancellationPreservesSiblingAndEngineUsability() async {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 20_000,
+            maxBatchSize: 2)
+        let handleA = await engine.startGeneration(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(8))),
+            parameters: GenerateParameters(maxTokens: 1_000, temperature: 0))
+        let handleB = await engine.startGeneration(
+            input: LMInput(tokens: MLXArray(Int32(10) ..< Int32(18))),
+            parameters: GenerateParameters(maxTokens: 3, temperature: 0))
+
+        let infoA = BatchGenerationLifecycleWaiterLatch()
+        let infoB = BatchGenerationLifecycleWaiterLatch()
+        let consumerA = Task { @Sendable in
+            for await event in handleA.stream {
+                if case .info(let info) = event {
+                    await infoA.markCompleted(info)
+                }
+            }
+        }
+        let consumerB = Task { @Sendable in
+            for await event in handleB.stream {
+                if case .info(let info) = event {
+                    await infoB.markCompleted(info)
+                }
+            }
+        }
+
+        let active = await waitForCapacitySnapshot(engine) { $0.activeCount == 2 }
+        XCTAssertEqual(active.activeCount, 2)
+
+        let cancelPublished = BatchGenerationLifecycleWaiterLatch()
+        let cancelTask = Task { @Sendable in
+            let returned = await handleA.cancelAndWait()
+            await cancelPublished.markCompleted(returned)
+        }
+
+        let stateA = await waitForBatchGenerationLifecycleLatch(infoA)
+        let stateB = await waitForBatchGenerationLifecycleLatch(infoB)
+        let cancelState = await waitForBatchGenerationLifecycleLatch(cancelPublished)
+        XCTAssertTrue(
+            stateA.completed && stateB.completed && cancelState.completed,
+            "A and B did not both reach terminal info")
+
+        let terminalA = stateA.info
+        let terminalB = stateB.info
+        guard let terminalA, let terminalB else {
+            XCTFail("sibling requests must publish terminal info")
+            await cancelTask.value
+            await consumerA.value
+            await consumerB.value
+            await engine.shutdown()
+            return
+        }
+        XCTAssertEqual(terminalA.stopReason, .cancelled)
+        switch terminalB.stopReason {
+        case .cancelled:
+            XCTFail("cancelling A must not cancel sibling B")
+        case .stop, .length:
+            break
+        }
+
+        let handleC = await engine.startGeneration(
+            input: LMInput(tokens: MLXArray(Int32(20) ..< Int32(28))),
+            parameters: GenerateParameters(maxTokens: 2, temperature: 0))
+        let infoC = BatchGenerationLifecycleWaiterLatch()
+        let consumerC = Task { @Sendable in
+            for await event in handleC.stream {
+                if case .info(let info) = event {
+                    await infoC.markCompleted(info)
+                }
+            }
+        }
+
+        let stateC = await waitForBatchGenerationLifecycleLatch(infoC)
+        XCTAssertTrue(stateC.completed, "engine did not admit a third request")
+        if let terminalC = stateC.info {
+            switch terminalC.stopReason {
+            case .cancelled:
+                XCTFail("third request must complete normally")
+            case .stop, .length:
+                break
+            }
+        }
+
+        await cancelTask.value
+        await consumerA.value
+        await consumerB.value
+        await consumerC.value
+        await engine.shutdown()
+    }
+
+    func testBatchEngineConcurrentShutdownWaitsForFullDrain() async {
+        let gate = ShutdownPrefillGate()
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 0,
+            maxBatchSize: 1,
+            prefillGate: gate)
+        let handle = await engine.startGeneration(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(8))),
+            parameters: GenerateParameters(maxTokens: 1_000, temperature: 0))
+        let consumerDone = BatchGenerationLifecycleWaiterLatch()
+        let consumer = Task { @Sendable in
+            for await _ in handle.stream { }
+            await consumerDone.markStarted()
+        }
+
+        XCTAssertTrue(gate.waitUntilEntered(), "producer did not enter prefill")
+
+        let firstReturned = BatchGenerationLifecycleWaiterLatch()
+        let secondReturned = BatchGenerationLifecycleWaiterLatch()
+        let firstShutdown = Task { @Sendable in
+            await engine.shutdown()
+            await firstReturned.markStarted()
+        }
+        let secondShutdown = Task { @Sendable in
+            await engine.shutdown()
+            await secondReturned.markStarted()
+        }
+
+        let secondBeforeRelease = await waitForBatchGenerationLifecycleLatch(secondReturned)
+        XCTAssertFalse(
+            secondBeforeRelease.started,
+            "a concurrent shutdown must wait for the first caller's drain")
+
+        gate.release()
+        XCTAssertTrue(gate.waitUntilReturned(), "producer did not leave prefill")
+
+        let firstState = await waitForBatchGenerationLifecycleLatch(firstReturned)
+        let secondState = await waitForBatchGenerationLifecycleLatch(secondReturned)
+        XCTAssertTrue(firstState.started, "first shutdown did not return after drain")
+        XCTAssertTrue(secondState.started, "second shutdown did not return after drain")
+        let consumerState = await waitForBatchGenerationLifecycleLatch(consumerDone)
+        XCTAssertTrue(consumerState.started, "consumer did not finish before teardown")
+        await firstShutdown.value
+        await secondShutdown.value
+        await consumer.value
+
+        let beforeLaterCallRunning = await engine.isRunning
+        XCTAssertFalse(beforeLaterCallRunning)
+        let laterReturned = BatchGenerationLifecycleWaiterLatch()
+        let laterShutdown = Task { @Sendable in
+            await engine.shutdown()
+            await laterReturned.markStarted()
+        }
+        let laterState = await waitForBatchGenerationLifecycleLatch(laterReturned)
+        XCTAssertTrue(laterState.started, "post-complete shutdown was not immediate")
+        await laterShutdown.value
+
+        let afterLaterCallRunning = await engine.isRunning
+        let activeCount = await engine.activeCount
+        let pendingCount = await engine.pendingCount
+        XCTAssertFalse(afterLaterCallRunning)
+        XCTAssertEqual(activeCount, 0)
+        XCTAssertEqual(pendingCount, 0)
+    }
+
     // MARK: - Helpers
 
     private func waitForCapacitySnapshot(
@@ -1459,15 +2187,21 @@ private final class SlowPrefillLanguageModel: Module, LanguageModel,
     KVCacheDimensionProvider, @unchecked Sendable
 {
     let prefillDelayMicroseconds: UInt32
+    let prefillGate: ShutdownPrefillGate?
     let vocabularySize = 32
     var kvHeads: [Int] { [1] }
 
-    init(prefillDelayMicroseconds: UInt32) {
+    init(
+        prefillDelayMicroseconds: UInt32,
+        prefillGate: ShutdownPrefillGate? = nil
+    ) {
         self.prefillDelayMicroseconds = prefillDelayMicroseconds
+        self.prefillGate = prefillGate
     }
 
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
         usleep(prefillDelayMicroseconds)
+        prefillGate?.waitUntilReleased()
         return .tokens(input.text)
     }
 
@@ -1475,5 +2209,86 @@ private final class SlowPrefillLanguageModel: Module, LanguageModel,
         let batch = inputs.shape.first ?? 1
         let length = inputs.shape.count > 1 ? inputs.shape[1] : inputs.size
         return MLXArray.zeros([batch, length, vocabularySize], dtype: .float32)
+    }
+}
+
+private final class ShutdownPrefillGate: @unchecked Sendable {
+    private let entered = DispatchSemaphore(value: 0)
+    private let releaseSignal = DispatchSemaphore(value: 0)
+    private let returned = DispatchSemaphore(value: 0)
+
+    func waitUntilEntered() -> Bool {
+        entered.wait(timeout: DispatchTime.now() + .seconds(1)) == .success
+    }
+
+    func waitUntilReleased() {
+        entered.signal()
+        releaseSignal.wait()
+        returned.signal()
+    }
+
+    func release() {
+        releaseSignal.signal()
+    }
+
+    func waitUntilReturned() -> Bool {
+        returned.wait(timeout: DispatchTime.now() + .seconds(1)) == .success
+    }
+}
+
+private struct BatchGenerationLifecycleWaiterState: Sendable {
+    let started: Bool
+    let completed: Bool
+    let info: GenerateCompletionInfo?
+}
+
+private actor BatchGenerationLifecycleWaiterLatch {
+    private var didStart = false
+    private var didComplete = false
+    private var terminalInfo: GenerateCompletionInfo?
+
+    func markStarted() {
+        didStart = true
+    }
+
+    func markCompleted(_ info: GenerateCompletionInfo?) {
+        terminalInfo = info
+        didComplete = true
+    }
+
+    func snapshot() -> BatchGenerationLifecycleWaiterState {
+        BatchGenerationLifecycleWaiterState(
+            started: didStart,
+            completed: didComplete,
+            info: terminalInfo)
+    }
+}
+
+private func waitForBatchGenerationLifecycleLatch(
+    _ latch: BatchGenerationLifecycleWaiterLatch
+) async -> BatchGenerationLifecycleWaiterState {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(1))
+
+    while clock.now < deadline {
+        let state = await latch.snapshot()
+        if state.started || state.completed {
+            return state
+        }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+
+    return await latch.snapshot()
+}
+
+private func sameGenerateStopReason(
+    _ lhs: GenerateStopReason,
+    _ rhs: GenerateStopReason
+) -> Bool {
+    switch (lhs, rhs) {
+    case (.stop, .stop), (.length, .length), (.cancelled, .cancelled):
+        return true
+    default:
+        return false
     }
 }

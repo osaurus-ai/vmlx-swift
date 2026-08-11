@@ -119,9 +119,10 @@ struct BatchPendingRequest {
     init(
         input: LMInput,
         parameters: GenerateParameters,
-        continuation: AsyncStream<BatchGeneration>.Continuation
+        continuation: AsyncStream<BatchGeneration>.Continuation,
+        id: BatchRequestID? = nil
     ) {
-        self.id = BatchRequestID()
+        self.id = id ?? BatchRequestID()
         self.input = input
         self.parameters = parameters
         self.continuation = continuation

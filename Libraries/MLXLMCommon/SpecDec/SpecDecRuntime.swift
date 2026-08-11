@@ -118,8 +118,10 @@ public enum SpecDecRuntimeLinear {
     ///   without changing the bulk-return API.
     public static func run(
         _ args: DFlashLinearArgs,
-        onCommitted: ((_ newTokens: [Int32]) -> Void)? = nil
+        onCommitted: ((_ newTokens: [Int32]) -> Void)? = nil,
+        cancellationCheck: (() throws -> Void)? = nil
     ) throws -> DFlashLinearResult {
+        try cancellationCheck?()
         let blockSize = args.drafter.config.blockSize
         precondition(blockSize >= 2, "DFlash block_size must be >= 2")
         precondition(args.inputIds.ndim == 2 && args.inputIds.dim(0) == 1,
@@ -177,10 +179,13 @@ public enum SpecDecRuntimeLinear {
 
         var bonus: Int32 = sampleArgmax(prefillLogits, temperature: args.temperature)
         tokens.append(bonus)
+        try cancellationCheck?()
         onCommitted?([bonus])
+        try cancellationCheck?()
 
         // 2. Decode loop.
         while tokens.count < maxLen {
+            try cancellationCheck?()
             // Stop-token check on the generated suffix. Truncate at the
             // first stop token so we don't leak tokens committed after
             // the stop in the same round.
@@ -285,7 +290,9 @@ public enum SpecDecRuntimeLinear {
             bonus = posterior[acceptanceLength]
             tokens.append(bonus)
             thisRoundTokens.append(bonus)
+            try cancellationCheck?()
             onCommitted?(thisRoundTokens)
+            try cancellationCheck?()
 
             // Accumulate hidden for committed-this-round positions.
             //   Fast path: `verifyHidden` has shape (1, bs, *). Slice
@@ -436,8 +443,10 @@ public enum SpecDecRuntimeDDTree {
     ///   ``SpecDecRuntimeLinear/run(_:onCommitted:)``.
     public static func run(
         _ args: DDTreeArgs,
-        onCommitted: ((_ newTokens: [Int32]) -> Void)? = nil
+        onCommitted: ((_ newTokens: [Int32]) -> Void)? = nil,
+        cancellationCheck: (() throws -> Void)? = nil
     ) throws -> DDTreeResult {
+        try cancellationCheck?()
         let blockSize = args.drafter.config.blockSize
         precondition(blockSize >= 2, "DFlash block_size must be >= 2")
         precondition(args.inputIds.ndim == 2 && args.inputIds.dim(0) == 1,
@@ -465,9 +474,12 @@ public enum SpecDecRuntimeDDTree {
 
         var bonus: Int32 = sampleArgmax(prefillLogits, temperature: args.temperature)
         tokens.append(bonus)
+        try cancellationCheck?()
         onCommitted?([bonus])
+        try cancellationCheck?()
 
         while tokens.count < maxLen {
+            try cancellationCheck?()
             // Stop-token check on generated suffix. Truncate at first
             // stop token so round-commits after the stop don't leak out.
             if !args.stopTokenIDs.isEmpty {
@@ -517,7 +529,9 @@ public enum SpecDecRuntimeDDTree {
                 materialize(nextLogits)
                 bonus = sampleArgmax(nextLogits, temperature: args.temperature)
                 tokens.append(bonus)
+                try cancellationCheck?()
                 onCommitted?([bonus])
+                try cancellationCheck?()
                 targetHidden = extractContextFeature(
                     captured: nextHidden, targetLayerIDs: args.targetBlockIDs)
                 materialize(targetHidden)
@@ -558,7 +572,9 @@ public enum SpecDecRuntimeDDTree {
             bonus = bonusToken
             tokens.append(bonus)
             thisRoundTokens.append(bonus)
+            try cancellationCheck?()
             onCommitted?(thisRoundTokens)
+            try cancellationCheck?()
 
             // Update target_hidden: re-prefill on the committed sequence
             // and pass ALL committed positions (drafter has no KV cache

@@ -43,6 +43,38 @@ private struct DecimalTokenizer: MLXLMCommon.Tokenizer {
     ) throws -> [Int] { [] }
 }
 
+private actor SpecDecTerminationProbe {
+    private var events: [String] = []
+
+    func record(_ event: String) {
+        events.append(event)
+    }
+
+    func contains(_ event: String) -> Bool {
+        events.contains(event)
+    }
+
+    func snapshot() -> [String] {
+        events
+    }
+}
+
+private func waitForTerminationProbe(
+    _ probe: SpecDecTerminationProbe,
+    event: String,
+    timeout: Duration = .seconds(2)
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while clock.now < deadline {
+        if await probe.contains(event) {
+            return true
+        }
+        try? await Task.sleep(for: .milliseconds(1))
+    }
+    return await probe.contains(event)
+}
+
 @Suite("SpecDec stream — Phase 4 iter 10", .serialized)
 struct SpecDecStreamTests {
 
@@ -112,7 +144,6 @@ struct SpecDecStreamTests {
 
     @Test("DFlash stream yields .info + tokens matching the non-streaming run")
     func testDflashStreamYieldsTokens() async throws {
-        MLXRandom.seed(0x1010)
         let target = Qwen3Model(targetConfig())
         let drafter = DFlashDraftModel(drafterConfig())
         let prompt: [Int32] = [1, 2, 3, 4]
@@ -128,9 +159,10 @@ struct SpecDecStreamTests {
         let bulk = try SpecDecRuntimeLinear.run(args)
 
         // Stream with the decimal tokenizer.
-        MLXRandom.seed(0x1010)
         let target2 = Qwen3Model(targetConfig())
         let drafter2 = DFlashDraftModel(drafterConfig())
+        target2.update(parameters: target.parameters())
+        drafter2.update(parameters: drafter.parameters())
         let args2 = DFlashLinearArgs(
             target: target2, drafter: drafter2,
             targetBlockIDs: Self.targetBlockIDs,
@@ -169,7 +201,6 @@ struct SpecDecStreamTests {
 
     @Test("DDTree stream yields .info + tokens matching non-streaming run")
     func testDDTreeStreamYieldsTokens() async throws {
-        MLXRandom.seed(0x2020)
         let target = Qwen3Model(targetConfig())
         let drafter = DFlashDraftModel(drafterConfig())
         let prompt: [Int32] = [7, 8, 9]
@@ -183,9 +214,10 @@ struct SpecDecStreamTests {
 
         let bulk = try SpecDecRuntimeDDTree.run(args)
 
-        MLXRandom.seed(0x2020)
         let target2 = Qwen3Model(targetConfig())
         let drafter2 = DFlashDraftModel(drafterConfig())
+        target2.update(parameters: target.parameters())
+        drafter2.update(parameters: drafter.parameters())
         let args2 = DDTreeArgs(
             target: target2, drafter: drafter2,
             targetBlockIDs: Self.targetBlockIDs,
@@ -214,5 +246,100 @@ struct SpecDecStreamTests {
         let expectedGenerated = bulk.tokenIds.suffix(bulk.tokenIds.count - prompt.count)
         let expectedText = expectedGenerated.map { String($0) }.joined(separator: "|") + (expectedGenerated.isEmpty ? "" : "|")
         #expect(streamedText == expectedText)
+    }
+
+    @Test("consumer cancellation cancels the exact producer without cancelling normal finish")
+    func testTerminationWiresExactProducerAndPreservesNormalFinish() async {
+        let cancellationProbe = SpecDecTerminationProbe()
+        let (cancelStream, cancelContinuation) = AsyncStream<Generation>.makeStream()
+        let cancellationProducer = Task { @Sendable in
+            await cancellationProbe.record("alive")
+            do {
+                try await Task.sleep(for: .seconds(2))
+                await cancellationProbe.record("timed-out")
+            } catch {
+                if Task.isCancelled {
+                    await cancellationProbe.record("cancel-observed")
+                    await cancellationProbe.record("final-drain")
+                } else {
+                    await cancellationProbe.record("unexpected-error")
+                }
+            }
+            cancelContinuation.finish()
+        }
+        SpecDecStream.installTerminationHandler(
+            continuation: cancelContinuation,
+            task: cancellationProducer)
+
+        let cancellationConsumer = Task { @Sendable in
+            await cancellationProbe.record("consumer-started")
+            var infoCount = 0
+            for await event in cancelStream {
+                if case .info = event {
+                    infoCount += 1
+                }
+            }
+            return infoCount
+        }
+
+        #expect(await waitForTerminationProbe(cancellationProbe, event: "alive"))
+        #expect(await waitForTerminationProbe(cancellationProbe, event: "consumer-started"))
+        cancellationConsumer.cancel()
+
+        #expect(await waitForTerminationProbe(cancellationProbe, event: "final-drain"))
+        let cancellationInfoCount = await cancellationConsumer.value
+        await cancellationProducer.value
+        await cancellationProbe.record("task-value-returned")
+
+        let cancellationEvents = await cancellationProbe.snapshot()
+        #expect(cancellationProducer.isCancelled)
+        #expect(cancellationInfoCount == 0)
+        #expect(cancellationEvents.contains("cancel-observed"))
+        #expect(cancellationEvents.contains("final-drain"))
+        #expect(!cancellationEvents.contains("timed-out"))
+        #expect(cancellationEvents.last == "task-value-returned")
+
+        let normalProbe = SpecDecTerminationProbe()
+        let (normalStream, normalContinuation) = AsyncStream<Generation>.makeStream()
+        let (releaseStream, releaseContinuation) = AsyncStream<Void>.makeStream()
+        let normalProducer = Task { @Sendable in
+            await normalProbe.record("alive")
+            var releaseIterator = releaseStream.makeAsyncIterator()
+            _ = await releaseIterator.next()
+            normalContinuation.yield(.info(GenerateCompletionInfo(
+                promptTokenCount: 0,
+                generationTokenCount: 1,
+                promptTime: 0,
+                generationTime: 0,
+                stopReason: .length)))
+            normalContinuation.finish()
+        }
+        SpecDecStream.installTerminationHandler(
+            continuation: normalContinuation,
+            task: normalProducer)
+
+        let normalConsumer = Task { @Sendable in
+            await normalProbe.record("consumer-started")
+            var infoCount = 0
+            for await event in normalStream {
+                if case .info = event {
+                    infoCount += 1
+                }
+            }
+            return infoCount
+        }
+
+        #expect(await waitForTerminationProbe(normalProbe, event: "alive"))
+        #expect(await waitForTerminationProbe(normalProbe, event: "consumer-started"))
+        releaseContinuation.yield(())
+        releaseContinuation.finish()
+
+        let normalInfoCount = await normalConsumer.value
+        await normalProducer.value
+        await normalProbe.record("task-value-returned")
+        let normalEvents = await normalProbe.snapshot()
+        #expect(!normalProducer.isCancelled)
+        #expect(normalInfoCount == 1)
+        #expect(normalEvents.last == "task-value-returned")
     }
 }

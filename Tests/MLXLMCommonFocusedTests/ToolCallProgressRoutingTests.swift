@@ -209,7 +209,7 @@ struct ToolCallProgressRoutingTests {
             case .toolCallProgress: progressDeltas += 1
             case .toolCall: calls += 1
             case .info(let info): infos.append(info)
-            case .reasoning, .prefillProgress: break
+            case .reasoning, .prefillProgress, .tokenID: break
             }
         }
         await engine.shutdown()
