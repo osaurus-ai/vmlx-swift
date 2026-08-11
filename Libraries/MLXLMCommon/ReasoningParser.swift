@@ -105,6 +105,18 @@ public struct ReasoningParser: Sendable {
     /// Gemma-4 channel parser behaviour — A2/A3 tests).
     public let stripStrayTags: Bool
 
+    /// Consume `to=<recipient><|message|>` channel headers whose recipient is
+    /// neither `self` nor `user`.
+    ///
+    /// Muse Glimmer's turn is a recipient-channel envelope. `to=self` and
+    /// `to=user` are handled by the tag/alias lists, but a TOOL call names the
+    /// tool as the recipient — `to=underwriting_daily_summary<|message|>` —
+    /// which matches no spelling and streamed through verbatim into the
+    /// reasoning rail, consistently at the end of the first think block. The
+    /// header is protocol, not prose: it is consumed without changing
+    /// reasoning/content mode.
+    public let consumesRecipientHeaders: Bool
+
     // MARK: State
 
     /// Text not yet emitted because it might be a partial tag prefix.
@@ -158,12 +170,14 @@ public struct ReasoningParser: Sendable {
         startInReasoning: Bool = false,
         stripStrayTags: Bool = true,
         startTagAliases: [String] = [],
-        endTagAliases: [String] = []
+        endTagAliases: [String] = [],
+        consumesRecipientHeaders: Bool = false
     ) {
         self.startTag = startTag
         self.endTag = endTag
         self.insideReasoning = startInReasoning
         self.stripStrayTags = stripStrayTags
+        self.consumesRecipientHeaders = consumesRecipientHeaders
         self.startTagAliases = startTagAliases.filter { !$0.isEmpty && $0 != startTag }
         self.endTagAliases = endTagAliases.filter { !$0.isEmpty && $0 != endTag }
     }
@@ -577,6 +591,64 @@ public struct ReasoningParser: Sendable {
         return best
     }
 
+
+    /// What to do about a `to=<recipient><|message|>` header in the buffer.
+    private enum RecipientHeaderAction {
+        /// A complete tool-recipient header occupies this range.
+        case consume(Range<String.Index>)
+        /// A header may still be assembling from this index onward.
+        case holdFrom(String.Index)
+        case none
+    }
+
+    /// Recipients the tag/alias lists already own; consuming them here would
+    /// stop reasoning from opening or, worse, from ever closing.
+    private static let reservedRecipients: Set<String> = ["self", "user"]
+
+    /// Recipient names are tool identifiers, so anything outside this alphabet
+    /// (or absurdly long) means `to=` was ordinary prose, not a header.
+    static func isRecipientName(_ name: String) -> Bool {
+        guard (1 ... 128).contains(name.count) else { return false }
+        return name.allSatisfy {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "-")
+        }
+    }
+
+    private func recipientHeaderAction() -> RecipientHeaderAction {
+        let marker = "to="
+        let terminator = "<|message|>"
+        var search = buffer.startIndex ..< buffer.endIndex
+        while let start = buffer.range(of: marker, range: search) {
+            guard let end = buffer.range(
+                of: terminator, range: start.upperBound ..< buffer.endIndex)
+            else {
+                // No terminator yet: either a header still arriving, or prose
+                // that merely contains "to=". Hold only while what follows
+                // still reads as a recipient name optionally trailed by a
+                // partial terminator — `to=daily<|mess` is a header mid-flight,
+                // and treating that trailing fragment as part of the name
+                // would reject it and leak the header.
+                let sofar = String(buffer[start.upperBound...])
+                let name = sofar.prefix { ch in
+                    Self.isRecipientName(String(ch))
+                }
+                let rest = String(sofar.dropFirst(name.count))
+                let restIsPartialTerminator = terminator.hasPrefix(rest)
+                let nameOK = name.isEmpty || Self.isRecipientName(String(name))
+                return nameOK && restIsPartialTerminator
+                    ? .holdFrom(start.lowerBound) : .none
+            }
+            let recipient = String(buffer[start.upperBound ..< end.lowerBound])
+            if Self.isRecipientName(recipient),
+                !Self.reservedRecipients.contains(recipient.lowercased())
+            {
+                return .consume(start.lowerBound ..< end.upperBound)
+            }
+            search = end.upperBound ..< buffer.endIndex
+        }
+        return .none
+    }
+
     private mutating func drain(allowPartialTagAtEnd: Bool = true)
         -> [ReasoningSegment]
     {
@@ -624,6 +696,37 @@ public struct ReasoningParser: Sendable {
                     couldGrowIntoLongerSpelling(
                         $0, among: firstTagIsOpener ? openerSpellings : closerSpellings)
                 } == true
+
+            // A tool-recipient channel header is protocol that no tag spelling
+            // covers, so it is resolved against the tag search by position:
+            // whichever starts first wins. Running it unconditionally first
+            // would emit a `<|start|>assistant` opener as reasoning text,
+            // because that tag precedes the header it introduces.
+            if consumesRecipientHeaders {
+                let tagStart = pendingLongerSpelling ? nil : firstTagRange?.lowerBound
+                switch recipientHeaderAction() {
+                case .consume(let range)
+                where tagStart.map({ range.lowerBound < $0 }) ?? true:
+                    let before = String(buffer[..<range.lowerBound])
+                    if !before.isEmpty {
+                        out.append(insideReasoning ? .reasoning(before) : .content(before))
+                    }
+                    buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+                    continue
+                case .holdFrom(let index)
+                where allowPartialTagAtEnd && (tagStart.map { index < $0 } ?? true):
+                    // A header may still be arriving. Emit only what precedes
+                    // it so no fragment leaks, and wait for the rest.
+                    let safe = String(buffer[..<index])
+                    if !safe.isEmpty {
+                        out.append(insideReasoning ? .reasoning(safe) : .content(safe))
+                        buffer = String(buffer[index...])
+                    }
+                    return out
+                case .consume, .holdFrom, .none:
+                    break
+                }
+            }
 
             if let range = firstTagRange, !pendingLongerSpelling {
                 // Emit everything before the tag in the current mode.
@@ -868,7 +971,8 @@ extension ReasoningParser {
                 startInReasoning: false,
                 stripStrayTags: true,
                 startTagAliases: [" to=self<|message|>", "<|start|>assistant"],
-                endTagAliases: ["to=user<|message|>", " to=user<|message|>"])
+                endTagAliases: ["to=user<|message|>", " to=user<|message|>"],
+                consumesRecipientHeaders: true)
         default:
             return nil
         }
