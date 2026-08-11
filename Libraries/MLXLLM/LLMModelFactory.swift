@@ -226,16 +226,6 @@ public enum LLMTypeRegistry {
             "step3p7": dispatchStep3p5,
             "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
             "nemotron_h": dispatchNemotronH,
-            // Audex is a Nemotron-H text tower with an audio encoder bolted on:
-            // same 52 layers, hidden 2688, 32 heads / 2 KV heads, intermediate
-            // 1856, n_groups 8, ssm_state 128, 64 mamba heads at head_dim 64 —
-            // identical to Lightning apart from a larger vocab for the sound
-            // tokens. Without this entry the bundle failed to load at all
-            // ("Unsupported model type: nemotron_h_audex"), which left the text
-            // tower unreachable even though this runtime can drive it. `sanitize`
-            // drops `audio_encoder.*` / `audio_projector.*`, so it loads
-            // text-only; audio input is not claimed or supported.
-            "nemotron_h_audex": dispatchNemotronH,
             "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
             "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
             "mistral3": dispatchMistral3LLM,
