@@ -167,4 +167,38 @@ final class NemotronChatTemplateFallbackTests: XCTestCase {
             rendered.debugDescription)
         XCTAssertTrue(rendered.contains("</tool_call><|im_end|>\n"), rendered.debugDescription)
     }
+
+    /// The `tool_choice: required` instruction is injected after the last user
+    /// message. That block was rewritten alongside the separators, so pin that
+    /// it still lands, still sits inside the user turn, and still leaves the
+    /// `<|im_end|>` boundary correct.
+    func testRequiredToolChoiceInstructionStaysInsideTheUserTurn() throws {
+        let rendered = try render([
+            "messages": [["role": "user", "content": "book it"]],
+            "add_generation_prompt": true,
+            "enable_thinking": true,
+            "tool_choice": "required",
+            "tools": [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "book_flight",
+                        "description": "Book a flight",
+                        "parameters": ["type": "object", "properties": [:], "required": ["city"]],
+                    ],
+                ]
+            ],
+        ])
+        XCTAssertTrue(rendered.contains("MUST be a tool call"), rendered.debugDescription)
+        XCTAssertTrue(rendered.contains("book it\n\n"), rendered.debugDescription)
+        // The instruction belongs to the user turn, so the turn's `<|im_end|>`
+        // must come after it, and the generation prompt after that.
+        let endMarker = rendered.range(of: "<|im_end|>\n<|im_start|>assistant\n<think>\n")
+        let instruction = rendered.range(of: "MUST be a tool call")
+        XCTAssertNotNil(endMarker, rendered.debugDescription)
+        if let endMarker, let instruction {
+            XCTAssertTrue(instruction.lowerBound < endMarker.lowerBound, "instruction escaped the user turn")
+        }
+        XCTAssertFalse(rendered.contains("<|im_end|><|im_start|>"), rendered.debugDescription)
+    }
 }
