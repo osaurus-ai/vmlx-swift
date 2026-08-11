@@ -614,9 +614,19 @@ public struct ReasoningParser: Sendable {
         }
     }
 
+    /// The header terminator as it actually arrives.
+    ///
+    /// Live Muse output ends the header at `<|message|` — the closing `>` is
+    /// not part of what reaches this parser, because the tool-call envelope
+    /// that follows is consumed downstream. Requiring the full `<|message|>`
+    /// meant the header never matched and leaked verbatim, which is exactly
+    /// what shipped and had to be re-fixed. Match the open form and swallow a
+    /// trailing `>` when it is there.
+    private static let recipientHeaderTerminator = "<|message|"
+
     private func recipientHeaderAction() -> RecipientHeaderAction {
         let marker = "to="
-        let terminator = "<|message|>"
+        let terminator = Self.recipientHeaderTerminator
         var search = buffer.startIndex ..< buffer.endIndex
         while let start = buffer.range(of: marker, range: search) {
             guard let end = buffer.range(
@@ -642,7 +652,12 @@ public struct ReasoningParser: Sendable {
             if Self.isRecipientName(recipient),
                 !Self.reservedRecipients.contains(recipient.lowercased())
             {
-                return .consume(start.lowerBound ..< end.upperBound)
+                // Swallow the closing `>` when the full spelling did arrive.
+                var stop = end.upperBound
+                if stop < buffer.endIndex, buffer[stop] == ">" {
+                    stop = buffer.index(after: stop)
+                }
+                return .consume(start.lowerBound ..< stop)
             }
             search = end.upperBound ..< buffer.endIndex
         }
@@ -714,13 +729,23 @@ public struct ReasoningParser: Sendable {
                     buffer.removeSubrange(buffer.startIndex..<range.upperBound)
                     continue
                 case .holdFrom(let index)
-                where allowPartialTagAtEnd && (tagStart.map { index < $0 } ?? true):
-                    // A header may still be arriving. Emit only what precedes
-                    // it so no fragment leaks, and wait for the rest.
+                where tagStart.map({ index < $0 }) ?? true:
                     let safe = String(buffer[..<index])
                     if !safe.isEmpty {
                         out.append(insideReasoning ? .reasoning(safe) : .content(safe))
+                    }
+                    if allowPartialTagAtEnd {
+                        // A header may still be arriving. Emit only what
+                        // precedes it so no fragment leaks, and wait.
                         buffer = String(buffer[index...])
+                    } else {
+                        // End of stream: no more tokens are coming, so the
+                        // held text will never complete. It is a header either
+                        // way — DROP it rather than flushing it as reasoning.
+                        // A turn that ends on its tool-call header does exactly
+                        // this, and emitting here is what leaked
+                        // `to=get_current_time<|message|` into the rail.
+                        buffer.removeAll(keepingCapacity: false)
                     }
                     return out
                 case .consume, .holdFrom, .none:

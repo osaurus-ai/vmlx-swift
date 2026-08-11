@@ -102,3 +102,7 @@ iOSInjectionProject/
 # Internal engineering notes — root-cause writeups, live-proof logs, campaign
 # state. Local only; never published.
 Docs/Internal/
+
+# session-local scratch build paths
+.build-rep/
+.build-rp2/

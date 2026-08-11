@@ -146,4 +146,47 @@ struct MuseRecipientHeaderTests {
             #expect(!ReasoningParser.isRecipientName(bad), "accepted \(bad.debugDescription)")
         }
     }
+
+    // MARK: - The shapes that actually ship
+
+    /// Live Muse output ends the header at `<|message|` with no closing `>`,
+    /// because the tool-call envelope after it is consumed downstream.
+    /// Requiring the full spelling meant the header never matched — this is
+    /// the exact text that leaked in production.
+    @Test("the open `<|message|` terminator is enough")
+    func openTerminatorIsConsumed() throws {
+        var p = try parser()
+        let out = run(&p, [
+            "<|start|>assistant to=self<|message|>Let's call it. ",
+            "to=get_current_time<|message|",
+        ])
+        #expect(!out.reasoning.contains("to=get_current_time"))
+        #expect(!out.reasoning.contains("<|message|"))
+        #expect(out.reasoning.contains("Let's call it."))
+    }
+
+    /// And when the turn simply ends on the header, flush must DROP it rather
+    /// than emit what it was holding.
+    @Test("a header held at end-of-stream is dropped, not flushed")
+    func heldHeaderIsDroppedOnFlush() throws {
+        var p = try parser()
+        let out = run(&p, [
+            "<|start|>assistant to=self<|message|>thinking about it. ",
+            "to=some_tool",
+        ])
+        #expect(!out.reasoning.contains("to=some_tool"))
+        #expect(out.reasoning.contains("thinking about it."))
+        #expect(out.content.isEmpty)
+    }
+
+    @Test("the closing `>` is swallowed when it does arrive")
+    func closingBracketIsSwallowed() throws {
+        var p = try parser()
+        let out = run(&p, [
+            "<|start|>assistant to=self<|message|>a. ",
+            "to=tool_x<|message|>body<|eom|>",
+        ])
+        #expect(!out.reasoning.contains(">body"), "leaked the closing bracket")
+        #expect(out.reasoning.contains("body"))
+    }
 }
