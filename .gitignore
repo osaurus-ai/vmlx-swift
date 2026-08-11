@@ -106,3 +106,4 @@ Docs/Internal/
 # session-local scratch build paths
 .build-rep/
 .build-rp2/
+.build-tmpl/

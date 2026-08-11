@@ -454,53 +454,47 @@ value_1
 <|im_end|>
 {% for message in loop_messages -%}
 {%- if message['role'] == 'user' -%}
-<|im_start|>user
-{{ message['content'] }}
-{%- if required_tool_choice and loop.last %}
-
-{{ render_required_tool_choice_instruction(message['content']) }}
-{%- endif %}
-<|im_end|>
-{%- elif message['role'] == 'assistant' -%}
-<|im_start|>assistant
-{%- if message['content'] -%}
-{{ message['content'] }}
-{%- endif %}
-{%- if message['tool_calls'] is defined and message['tool_calls'] %}
-{%- for tc in message['tool_calls'] %}
-<tool_call>
-<function={{ tc['function']['name'] }}>
-{%- if tc['function']['arguments'] is mapping %}
-{%- for k, v in tc['function']['arguments'] | dictsort %}
-<parameter={{ k }}>
-{{ v }}
-</parameter>
-{%- endfor %}
-{%- elif tc['function']['arguments'] is string -%}
-{{ tc['function']['arguments'] }}
-{%- endif %}
-</function>
-</tool_call>
-{%- endfor %}
-{%- endif %}
-<|im_end|>
-{%- elif message['role'] == 'tool' -%}
-<|im_start|>user
-<tool_response>
-{{ message['content'] }}
-</tool_response>
-<|im_end|>
+{{- '<|im_start|>user\n' -}}
+{{- message['content'] -}}
+{%- if required_tool_choice and loop.last -%}
+{{- '\n\n' -}}
+{{- render_required_tool_choice_instruction(message['content']) -}}
 {%- endif -%}
-
+{{- '<|im_end|>\n' -}}
+{%- elif message['role'] == 'assistant' -%}
+{{- '<|im_start|>assistant\n' -}}
+{%- if message['content'] -%}
+{{- message['content'] -}}
+{%- endif -%}
+{%- if message['tool_calls'] is defined and message['tool_calls'] -%}
+{%- for tc in message['tool_calls'] -%}
+{{- '\n<tool_call>\n<function=' + tc['function']['name'] + '>\n' -}}
+{%- if tc['function']['arguments'] is mapping -%}
+{%- for k, v in tc['function']['arguments'] | dictsort -%}
+{{- '<parameter=' + k + '>\n' -}}
+{{- v -}}
+{{- '\n</parameter>\n' -}}
+{%- endfor -%}
+{%- elif tc['function']['arguments'] is string -%}
+{{- tc['function']['arguments'] -}}
+{%- endif -%}
+{{- '</function>\n</tool_call>' -}}
+{%- endfor -%}
+{%- endif -%}
+{{- '<|im_end|>\n' -}}
+{%- elif message['role'] == 'tool' -%}
+{{- '<|im_start|>user\n<tool_response>\n' -}}
+{{- message['content'] -}}
+{{- '\n</tool_response>\n<|im_end|>\n' -}}
+{%- endif -%}
 {% endfor -%}
-{%- if add_generation_prompt %}
-<|im_start|>assistant
-{%- if enable_thinking %}
-<think>
-{%- else %}
-<think></think>
-{%- endif %}
-{%- endif %}
+{%- if add_generation_prompt -%}
+{%- if enable_thinking -%}
+{{- '<|im_start|>assistant\n<think>\n' -}}
+{%- else -%}
+{{- '<|im_start|>assistant\n<think></think>' -}}
+{%- endif -%}
+{%- endif -%}
 """#
 
     /// DeepSeek-V4 minimal template. DSV4-Flash bundles ship NO
