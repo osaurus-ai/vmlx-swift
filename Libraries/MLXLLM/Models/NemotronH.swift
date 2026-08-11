@@ -43,6 +43,18 @@ internal enum NemotronHBlockType {
         }
     }
 
+    /// `mtp_layers_block_type` names the blocks in words rather than the
+    /// single letters `hybrid_override_pattern` uses.
+    init(fromName name: String) {
+        switch name.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "mamba": self = .mamba
+        case "attention": self = .attention
+        case "mlp": self = .mlp
+        case "moe": self = .moe
+        default: fatalError("Unknown NemotronH block type name: \(name)")
+        }
+    }
+
     var profileName: String {
         switch self {
         case .mamba: return "mamba"
@@ -91,6 +103,27 @@ private let nemotronHActivationBF16RetentionFlag =
 private let nemotronHWeightedMoEFastPathFlag =
     nemotronHEnvFlag("JANGTQ_ENABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH")
     && !nemotronHEnvFlag("JANGTQ_DISABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH")
+/// Native MTP for Nemotron-H, **default OFF**.
+///
+/// The head is implemented for correctness and parity, not for speed. Measured
+/// on Lightning 30B-A3B (JANG_4M, 200 tokens x 3): D2 runs at 0.84x — 16 %
+/// SLOWER than plain autoregressive — at a 72.4 % accept rate, and D3 at 0.48x
+/// with 54.3 % accept, while staying token-identical to D1. A 3 B-active model
+/// is small enough that the forward is not purely bandwidth-bound, so the
+/// two-token verify batch costs +46 % rather than ~0 %: 1.72 tokens for 1.46x
+/// the work is a loss once per-step overhead lands.
+///
+/// So this must never switch itself on. Enabling it is an explicit,
+/// per-machine decision, and any speed claim has to be re-measured on the
+/// bundle in question first.
+private let nemotronHNativeMTPFlag =
+    nemotronHEnvFlag("VMLX_NEMOTRON_MTP")
+    && !nemotronHEnvFlag("VMLX_DISABLE_NEMOTRON_MTP")
+
+/// Whether the Nemotron native MTP head should be instantiated and its weights
+/// admitted by `sanitize`.
+internal func nemotronHNativeMTPEnabled() -> Bool { nemotronHNativeMTPFlag }
+
 private let nemotronHLayerProfileFlag =
     nemotronHEnvFlag("VMLX_NEMOTRON_LAYER_PROFILE")
     || nemotronHEnvFlag("VMLINUX_NEMOTRON_LAYER_PROFILE")
@@ -987,6 +1020,138 @@ internal class NemotronHBlock: Module {
     }
 }
 
+// MARK: - MTP (multi-token prediction head)
+
+/// One block of the Nemotron MTP head.
+///
+/// The shipped weights are the ordinary `NemotronHBlock` shape (`norm` +
+/// `mixer`) with two extras that only the first block carries:
+///
+///     mtp.layers.0   enorm | hnorm | eh_proj | norm | mixer.{q,k,v,o}_proj
+///     mtp.layers.1   norm | mixer.gate | mixer.experts.N | shared_experts
+///                    | final_layernorm
+///
+/// so the block is composed rather than reimplemented — the mixer is the same
+/// `NemotronHAttention` / `NemotronHMoE` used by the backbone, and every tensor
+/// binds on the path the bundle already uses.
+internal class NemotronHMTPBlock: Module {
+    @ModuleInfo(key: "enorm") var enorm: RMSNorm?
+    @ModuleInfo(key: "hnorm") var hnorm: RMSNorm?
+    @ModuleInfo(key: "eh_proj") var ehProj: Linear?
+    @ModuleInfo(key: "norm") var norm: RMSNorm
+    @ModuleInfo(key: "mixer") var mixer: Module
+    @ModuleInfo(key: "final_layernorm") var finalLayerNorm: RMSNorm?
+
+    let blockType: NemotronHBlockType
+
+    /// - Parameters:
+    ///   - fuses: this block owns the embedding/hidden fusion (`mtp.layers.0`).
+    ///   - finalNorm: this block owns the head's output norm (`mtp.layers.1`).
+    init(
+        _ args: NemotronHConfiguration,
+        blockType: NemotronHBlockType,
+        fuses: Bool,
+        finalNorm: Bool,
+        layerIdx: Int,
+        jangtq: NemotronHJANGTQContext?
+    ) {
+        self.blockType = blockType
+        self._norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
+        switch blockType {
+        case .attention: _mixer.wrappedValue = NemotronHAttention(args)
+        case .moe: _mixer.wrappedValue = NemotronHMoE(args, layerIdx: layerIdx, jangtq: jangtq)
+        case .mlp: _mixer.wrappedValue = NemotronHMLP(args)
+        case .mamba: _mixer.wrappedValue = NemotronHMamba2Mixer(args)
+        }
+        if fuses {
+            self._enorm.wrappedValue = RMSNorm(
+                dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
+            self._hnorm.wrappedValue = RMSNorm(
+                dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
+            // Concatenated [embedding, hidden] -> hidden.
+            self._ehProj.wrappedValue = Linear(
+                args.hiddenSize * 2, args.hiddenSize, bias: false)
+        }
+        if finalNorm {
+            self._finalLayerNorm.wrappedValue = RMSNorm(
+                dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
+        }
+        super.init()
+    }
+
+    /// Fuse the next-token embedding with the backbone hidden state. Only the
+    /// fusing block implements this; the rest pass through.
+    func fuse(embeddings: MLXArray, hiddenStates: MLXArray) -> MLXArray {
+        guard let enorm, let hnorm, let ehProj else { return hiddenStates }
+        return ehProj(concatenated([enorm(embeddings), hnorm(hiddenStates)], axis: -1))
+    }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray {
+        let mixerFunc = mixer as! NemotronHMixer
+        return x + mixerFunc(norm(x), attentionMask: attentionMask, ssmMask: nil, cache: cache)
+    }
+}
+
+/// The Nemotron MTP head: a short stack described by `mtp_layers_block_type`.
+///
+/// Depth beyond the shipped head count is produced by re-entering this same
+/// stack with the previously drafted token, which is what makes d2/d3 possible
+/// on a bundle that ships `num_nextn_predict_layers: 1`.
+internal class NemotronHMTP: Module {
+    @ModuleInfo(key: "layers") var layers: [NemotronHMTPBlock]
+
+    init(_ args: NemotronHConfiguration, jangtq: NemotronHJANGTQContext?) {
+        let kinds = args.mtpLayersBlockType
+        _layers.wrappedValue = kinds.enumerated().map { index, name in
+            NemotronHMTPBlock(
+                args,
+                blockType: NemotronHBlockType(fromName: name),
+                fuses: index == 0,
+                finalNorm: index == kinds.count - 1,
+                layerIdx: index,
+                jangtq: jangtq)
+        }
+        super.init()
+    }
+
+    /// Only attention blocks consume KV cache; the MoE/MLP blocks are
+    /// stateless, so the cache array is positional and holds a placeholder for
+    /// them. That keeps indices aligned with `layers` without allocating state
+    /// nothing reads.
+    func makeCache() -> [KVCache] {
+        layers.map { _ in KVCacheSimple() as KVCache }
+    }
+
+    /// Run the head and return the hidden state BEFORE `final_layernorm`.
+    ///
+    /// The MTP contract hands the iterator pre-final-norm hidden (so the next
+    /// recursive draft step fuses on the same footing the backbone provides)
+    /// and takes logits from the normed value. Applying the norm inside the
+    /// block would make the two indistinguishable and silently bias depth ≥2.
+    func preNormHidden(
+        embeddings: MLXArray,
+        hiddenStates: MLXArray,
+        cache: [KVCache]?
+    ) -> MLXArray {
+        guard !layers.isEmpty else { return hiddenStates }
+        var h = layers[0].fuse(embeddings: embeddings, hiddenStates: hiddenStates)
+        let mask = createAttentionMask(h: h, cache: cache?.first)
+        for (index, layer) in layers.enumerated() {
+            h = layer(h, attentionMask: mask, cache: cache?[index])
+        }
+        return h
+    }
+
+    /// `mtp.layers.<last>.final_layernorm`, applied only on the way to logits.
+    func finalNorm(_ x: MLXArray) -> MLXArray {
+        layers.last?.finalLayerNorm.map { $0(x) } ?? x
+    }
+}
+
 // MARK: - Backbone (matches Python's NemotronHModel which is stored as self.backbone)
 
 internal class NemotronHBackbone: Module {
@@ -1053,6 +1218,15 @@ internal class NemotronHBackbone: Module {
 
     /// Forward starting from a pre-computed embedding tensor (for multimodal splice).
     func forwardFromEmbeddings(_ inputsEmbeds: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        normF(preNormFromEmbeddings(inputsEmbeds, cache: cache))
+    }
+
+    /// The layer stack, stopping before `norm_f`.
+    ///
+    /// Native MTP fuses the PRE-final-norm hidden with the next-token
+    /// embedding; handing it the normed value instead makes depth >= 2 drift.
+    /// Both callers share this single copy of the loop.
+    func preNormFromEmbeddings(_ inputsEmbeds: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var hidden = inputsEmbeds
 
         // Create attention mask using the first attention layer's cache
@@ -1089,13 +1263,21 @@ internal class NemotronHBackbone: Module {
             hidden = layer(hidden, attentionMask: attentionMask, ssmMask: ssmMask, cache: c)
         }
 
-        return normF(hidden)
+        return hidden
     }
+
+    /// Pre-final-norm hidden from token ids.
+    func preNorm(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        preNormFromEmbeddings(embeddings(inputs), cache: cache)
+    }
+
 }
 
 // MARK: - Main Model (matches Python's Model class)
 
-public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAModel {
+public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAModel,
+    TokenEmbedderModel, NativeMTPModel
+{
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -1104,6 +1286,10 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     public let jangtqContext: NemotronHJANGTQContext?
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
+    /// Native multi-token-prediction head. Present only when the bundle
+    /// declares `mtp_layers_block_type`; absent everywhere else, which is what
+    /// makes `nativeMTPAvailable` honest rather than aspirational.
+    @ModuleInfo(key: "mtp") var mtp: NemotronHMTP?
 
     public var loraLayers: [Module] {
         backbone.layers
@@ -1125,6 +1311,9 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         }
 
         self._backbone.wrappedValue = NemotronHBackbone(args, jangtq: nil)
+        if nemotronHNativeMTPEnabled(), !args.mtpLayersBlockType.isEmpty {
+            self._mtp.wrappedValue = NemotronHMTP(args, jangtq: nil)
+        }
 
         if !args.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
@@ -1149,6 +1338,9 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             return nil
         }
         self._backbone.wrappedValue = NemotronHBackbone(args, jangtq: jangtqContext)
+        if nemotronHNativeMTPEnabled(), !args.mtpLayersBlockType.isEmpty {
+            self._mtp.wrappedValue = NemotronHMTP(args, jangtq: jangtqContext)
+        }
         if !args.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
         }
@@ -1199,6 +1391,68 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         return out
     }
 
+    // MARK: - Native MTP
+
+    /// The head exists only when the bundle shipped one, so speculation can
+    /// never engage on a Nemotron build without MTP weights.
+    public var nativeMTPAvailable: Bool { mtp != nil }
+
+    /// Per-request cache for the head alone. Never prefix, paged or L2 state —
+    /// the draft must not be able to contaminate the base cache.
+    public func makeNativeMTPCache() -> [KVCache] {
+        mtp?.makeCache() ?? []
+    }
+
+    /// `TokenEmbedderModel`: the same embedding the backbone's own forward
+    /// uses as its first-layer input. `embedTokens` already exists on this type
+    /// for other callers, so this is a rename rather than a second path.
+    public func embed(_ tokenIds: MLXArray) -> MLXArray {
+        embedTokens(tokenIds)
+    }
+
+    public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead { return lmHead(hidden) }
+        return backbone.embeddings.asLinear(hidden)
+    }
+
+    public func nativeBackboneForward(
+        _ inputs: MLXArray,
+        cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        let hidden = backbone.preNorm(inputs, cache: cache)
+        return NativeMTPForwardResult(
+            logits: projectToLogits(backbone.normF(hidden)),
+            hiddenStates: hidden)
+    }
+
+    /// Nemotron's hybrid stack carries Mamba convolution/SSM state that cannot
+    /// be trimmed after the fact, so the verifier forward is the same forward.
+    /// The iterator decides the accepted prefix from the returned logits; any
+    /// rollback is the cache layer's job, not this method's.
+    public func nativeBackboneMTPVerifyForward(
+        _ inputs: MLXArray,
+        cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        nativeBackboneForward(inputs, cache: cache)
+    }
+
+    public func nativeMTPForward(
+        hiddenStates: MLXArray,
+        nextTokenIds: MLXArray,
+        cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        guard let mtp else {
+            fatalError("NemotronH nativeMTPForward called without an MTP head")
+        }
+        let hidden = mtp.preNormHidden(
+            embeddings: embedTokens(nextTokenIds),
+            hiddenStates: hiddenStates,
+            cache: cache)
+        return NativeMTPForwardResult(
+            logits: projectToLogits(mtp.finalNorm(hidden)),
+            hiddenStates: hidden)
+    }
+
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         // 2026-05-01: honor `parameters.maxKVSize` for the attention slots.
         // Audit found NemotronH previously ignored maxKVSize, leaving the
@@ -1227,9 +1481,14 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
 
         for (key, value) in weights {
             // Nemotron-H bundles can ship MTP speculative-decoding heads
-            // (`mtp.*`). The normal causal runtime does not instantiate
-            // or use them; Python/JANG loaders drop the same keys.
-            if key.hasPrefix("mtp.") || key.hasSuffix(".importance") {
+            // (`mtp.*`). They are dropped unless native MTP is switched on,
+            // because instantiating the head is what makes the weights
+            // bindable — admitting them while no module exists would fail
+            // `verify` instead of being ignored.
+            if key.hasPrefix("mtp.") {
+                if !nemotronHNativeMTPEnabled() || mtp == nil { continue }
+            }
+            if key.hasSuffix(".importance") {
                 continue
             }
             if key.hasPrefix("vision_model.")
@@ -1412,6 +1671,15 @@ public struct NemotronHConfiguration: Codable, Sendable {
     public var timeStepLimitMin: Float
     public var timeStepLimitMax: Float
 
+    /// Number of next-token-prediction heads the bundle ships. Nemotron 3.5
+    /// Lightning ships 1; depth beyond that is produced by re-entering the same
+    /// head, exactly as the DeepSeek-style MTP module does.
+    public var numNextnPredictLayers: Int
+    /// Block kinds inside the MTP head, e.g. `["attention", "moe"]`. Mapped
+    /// through the same letters as `hybridOverridePattern` so the head reuses
+    /// `NemotronHBlock` and the weights land on their shipped key paths.
+    public var mtpLayersBlockType: [String]
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case vocabSize = "vocab_size"
@@ -1434,6 +1702,8 @@ public struct NemotronHConfiguration: Codable, Sendable {
         case nSharedExperts = "n_shared_experts"
         case numExpertsPerTok = "num_experts_per_tok"
         case hybridOverridePattern = "hybrid_override_pattern"
+        case numNextnPredictLayers = "num_nextn_predict_layers"
+        case mtpLayersBlockType = "mtp_layers_block_type"
         case layerNormEpsilon = "layer_norm_epsilon"
         case mlpBias = "mlp_bias"
         case useBias = "use_bias"
@@ -1495,6 +1765,13 @@ public struct NemotronHConfiguration: Codable, Sendable {
         normTopkProb = try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? true
         routedScalingFactor =
             try container.decodeIfPresent(Float.self, forKey: .routedScalingFactor) ?? 1.0
+
+        // Absent on every non-MTP Nemotron bundle, so both default to "no head"
+        // and the model simply reports `nativeMTPAvailable == false`.
+        numNextnPredictLayers =
+            try container.decodeIfPresent(Int.self, forKey: .numNextnPredictLayers) ?? 0
+        mtpLayersBlockType =
+            try container.decodeIfPresent([String].self, forKey: .mtpLayersBlockType) ?? []
 
         // Handle hybrid_override_pattern - can be string or array of strings.
         // Nemotron 3 Ultra instead ships mlx-lm's `layers_block_type`
@@ -1619,5 +1896,9 @@ public struct NemotronHConfiguration: Codable, Sendable {
         self.routedScalingFactor = routedScalingFactor
         self.timeStepLimitMin = timeStepLimitMin
         self.timeStepLimitMax = timeStepLimitMax
+        // Memberwise callers are non-MTP fixtures; the head stays absent
+        // unless a bundle's JSON declares it.
+        self.numNextnPredictLayers = 0
+        self.mtpLayersBlockType = []
     }
 }
