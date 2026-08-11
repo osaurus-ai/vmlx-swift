@@ -1123,7 +1123,15 @@ extension ReasoningParser {
             // would give prompt-resolved Hunyuan parsers a narrower tag set
             // than stamp-resolved ones.
             startTagAliases: base.startTagAliases,
-            endTagAliases: base.endTagAliases)
+            endTagAliases: base.endTagAliases,
+            // And the recipient-header policy. This rebuild is field-by-field,
+            // so every capability the family configured has to be carried
+            // explicitly — a default here silently downgrades the live parser
+            // relative to the stamp-resolved one. Muse lost header consumption
+            // exactly this way: the flag was set by `fromCapabilityName`,
+            // dropped here, and the generation loop only ever uses this path,
+            // so three correct parser fixes changed nothing on the app.
+            consumesRecipientHeaders: base.consumesRecipientHeaders)
         if startInReasoning && parser.isHarmonyChannelParser {
             parser.insideHarmonyChannel = true
             parser.harmonyChannelIsReasoning = true

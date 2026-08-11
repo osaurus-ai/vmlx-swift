@@ -219,3 +219,53 @@ struct MuseReasoningStampTests {
         #expect(reasoningStampFromModelType("llama") == "none")
     }
 }
+
+/// `forPrompt` is the only constructor the generation loop uses, and it
+/// rebuilds the parser field by field. Anything the family configured that is
+/// not carried across is silently lost at runtime while every stamp-resolved
+/// unit test still passes — which is exactly how the Muse header leak survived
+/// three correct parser fixes.
+@Suite("forPrompt preserves family capabilities")
+struct ForPromptCarryOverTests {
+
+    @Test("recipient-header consumption survives the rebuild")
+    func carriesRecipientHeaderFlag() throws {
+        let base = try #require(ReasoningParser.fromCapabilityName("muse_glimmer"))
+        #expect(base.consumesRecipientHeaders)
+
+        for tail in ["", "<|start|>assistant to=self<|message|>", "some prompt tail"] {
+            let live = try #require(
+                ReasoningParser.forPrompt(stampName: "muse_glimmer", promptTail: tail))
+            #expect(live.consumesRecipientHeaders,
+                "lost the flag for promptTail: \(tail.debugDescription)")
+        }
+    }
+
+    /// The behaviour, not just the flag: a parser built the way the loop
+    /// builds it must actually swallow the header.
+    @Test("a prompt-resolved parser consumes the header")
+    func promptResolvedParserConsumesHeader() throws {
+        var p = try #require(
+            ReasoningParser.forPrompt(
+                stampName: "muse_glimmer",
+                promptTail: "<|start|>assistant to=self<|message|>"))
+        var reasoning = ""
+        for segment in p.feed("thinking. to=get_current_time<|message|") + p.flush() {
+            if case .reasoning(let t) = segment { reasoning += t }
+        }
+        #expect(!reasoning.contains("to=get_current_time"), "leaked: \(reasoning)")
+        #expect(!reasoning.contains("<|message|"))
+        #expect(reasoning.contains("thinking."))
+    }
+
+    /// The other carried fields stay carried.
+    @Test("stray-tag policy and aliases still survive")
+    func carriesExistingFields() throws {
+        let base = try #require(ReasoningParser.fromCapabilityName("muse_glimmer"))
+        let live = try #require(
+            ReasoningParser.forPrompt(stampName: "muse_glimmer", promptTail: "x"))
+        #expect(live.stripStrayTags == base.stripStrayTags)
+        #expect(live.startTagAliases == base.startTagAliases)
+        #expect(live.endTagAliases == base.endTagAliases)
+    }
+}
