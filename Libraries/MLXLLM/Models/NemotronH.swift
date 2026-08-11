@@ -1512,6 +1512,13 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             if key.hasPrefix("vision_model.")
                 || key.hasPrefix("sound_encoder.")
                 || key.hasPrefix("sound_projection.")
+                // Audex bundles name their audio tower `audio_encoder.*` /
+                // `audio_projector.*` rather than the `sound_*` spelling above.
+                // Its 487 encoder tensors and 3 projector tensors have no
+                // module to bind to in this text runtime, so drop them the same
+                // way and keep the `backbone.*` / `lm_head.*` text tower.
+                || key.hasPrefix("audio_encoder.")
+                || key.hasPrefix("audio_projector.")
                 || key.hasPrefix("mlp1.")
             {
                 continue
