@@ -159,8 +159,13 @@ class MuseGlimmerCenteredRMSNorm: Module, UnaryLayer {
         self.eps = eps
     }
 
+    /// The checkpoint stores zero-centered gains, so the mathematical weight is
+    /// `1 + w`. That `+1` is folded into the tensor once during `sanitize`
+    /// rather than recomputed here: this runs 2x per layer across 52 layers, so
+    /// doing it per token adds 104 tensor allocations and dispatches to every
+    /// single decode step for a value that never changes after load.
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        MLXFast.rmsNorm(x, weight: 1.0 + self.weight, eps: self.eps)
+        MLXFast.rmsNorm(x, weight: self.weight, eps: self.eps)
     }
 }
 
@@ -437,7 +442,31 @@ public class MuseGlimmerTextModel: Module, LLMModel, KVCacheDimensionProvider {
                 out[key] = value
             }
         }
+        // Fold the centered-norm `+1` in once. Every norm this model uses is
+        // zero-centered, and the vision tower's LayerNorms are excluded above,
+        // so the transform applies to exactly the text tower's RMSNorm gains.
+        for (key, value) in out where Self.isCenteredNormWeight(key) {
+            out[key] = value + 1
+        }
         return out
+    }
+
+    /// Zero-centered RMSNorm gains in the text tower. Matched by suffix because
+    /// the layer index varies; `qk_norm` carries no weight and the vision
+    /// tower's `norm1`/`norm2` are ordinary LayerNorms that must not be shifted.
+    ///
+    /// Every one of the decoder layer's FOUR norms is centered. Missing any of
+    /// them leaves those layers without their `+1` entirely, which shifts unit
+    /// gain to zero gain — the model still runs and still emits fluent text, so
+    /// `MuseGlimmerCenteredNormCoverage` pins the list against the checkpoint.
+    public static func isCenteredNormWeight(_ key: String) -> Bool {
+        guard key.hasSuffix(".weight") else { return false }
+        return key.hasSuffix("input_layernorm.weight")
+            || key.hasSuffix("post_attention_layernorm.weight")
+            || key.hasSuffix("pre_feedforward_layernorm.weight")
+            || key.hasSuffix("post_feedforward_layernorm.weight")
+            || key == "model.norm.weight"
+            || key == "norm.weight"
     }
 
     public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {

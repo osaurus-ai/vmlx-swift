@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXNN
 import MLXLMCommon
 import Testing
 
@@ -103,12 +104,20 @@ struct MuseGlimmerPortTests {
 
     // MARK: - Divergence 1: centered RMSNorm
 
-    @Test("centered RMSNorm uses (1 + weight), so zero weights are unit gain")
+    @Test("a zero-weight centered norm is unit gain once the load-time fold runs")
     func centeredNormIsUnitGainAtZeroWeight() throws {
-        // A fresh norm holds zero weights, which under the centered form means
-        // gain 1 — a plain RMS normalization. Dropping the `1 +` scales the
-        // output to zero instead, so assert on magnitude, not just finiteness.
+        // The checkpoint stores zero-centered gains, so the effective weight is
+        // `1 + w`. That `+1` is folded into the tensor in `sanitize` rather than
+        // applied per token, so the contract spans both halves and has to be
+        // tested that way: fold the weight the way the loader does, then run the
+        // module. Testing the module alone would now assert the wrong thing.
         let norm = MuseGlimmerCenteredRMSNorm(dimensions: 64, eps: 1e-5)
+        let folded = MLXArray.zeros([64]) + 1
+        try norm.update(
+            parameters: ModuleParameters.unflattened(["weight": folded]),
+            verify: Module.VerifyUpdate.all)
+        eval(norm)
+
         let input: [Float] = (0 ..< 64).map { Float($0 % 7) - 3.0 }
         let normed = norm(MLXArray(input).reshaped(1, 1, 64))
         eval(normed)
@@ -118,7 +127,13 @@ struct MuseGlimmerPortTests {
             "expected unit-RMS output, got \(Self.rms(out))")
 
         let maxAbs = out.map { abs($0) }.max() ?? 0
-        #expect(maxAbs > 0.1, "norm collapsed toward zero — missing the (1 + w) term")
+        #expect(maxAbs > 0.1, "norm collapsed toward zero — the fold did not reach this weight")
+
+        // And the fold itself must select this key: an unfolded zero weight
+        // would silently zero the layer's gain.
+        #expect(MuseGlimmerTextModel.isCenteredNormWeight("model.layers.7.input_layernorm.weight"))
+        #expect(MuseGlimmerTextModel.isCenteredNormWeight("model.layers.7.pre_feedforward_layernorm.weight"))
+        #expect(!MuseGlimmerTextModel.isCenteredNormWeight("vision_tower.layers.3.norm1.weight"))
     }
 
     // MARK: - Divergence 2: Q-only qk scale
