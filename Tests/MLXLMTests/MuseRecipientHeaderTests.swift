@@ -190,3 +190,32 @@ struct MuseRecipientHeaderTests {
         #expect(out.reasoning.contains("body"))
     }
 }
+
+/// The parser above is only useful if the Muse bundle actually selects it.
+/// `muse_glimmer` had no entry in `reasoningStampFromModelType`, so it fell
+/// through to "none" and the recipient-channel parser was never reached — the
+/// header kept leaking through two rounds of parser fixes.
+@Suite("Muse reasoning stamp resolution")
+struct MuseReasoningStampTests {
+
+    @Test(arguments: ["muse_glimmer", "muse-glimmer", "MUSE_GLIMMER", "muse_glimmer_vl"])
+    func museResolvesToItsOwnParser(_ modelType: String) {
+        #expect(reasoningStampFromModelType(modelType) == "muse_glimmer",
+            "\(modelType) resolved to \(reasoningStampFromModelType(modelType))")
+    }
+
+    @Test("the resolved stamp builds the recipient-channel parser")
+    func stampBuildsTheRightParser() throws {
+        let stamp = reasoningStampFromModelType("muse_glimmer")
+        let parser = try #require(ReasoningParser.fromCapabilityName(stamp))
+        #expect(parser.consumesRecipientHeaders)
+    }
+
+    /// Neighbouring families must be untouched.
+    @Test func otherFamiliesUnchanged() {
+        #expect(reasoningStampFromModelType("gemma4") == "harmony")
+        #expect(reasoningStampFromModelType("qwen3") == "think_xml")
+        #expect(reasoningStampFromModelType("deepseek_v4") == "think_xml")
+        #expect(reasoningStampFromModelType("llama") == "none")
+    }
+}

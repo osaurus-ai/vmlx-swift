@@ -1219,6 +1219,17 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
         return "hy_v3"
     }
 
+    // Muse Glimmer's recipient-channel envelope
+    // (`<|start|>assistant to=self<|message|>…<|eom|>`). Without this entry
+    // `muse_glimmer` fell through to the final "none", so the parser that
+    // understands `to=self` / `to=user` — and consumes tool-recipient headers
+    // — was never selected for the bundle that needs it, and
+    // `to=<tool><|message|` leaked into the rail on every tool call. The
+    // parser was fixed twice before anyone checked it was being reached.
+    if compact.hasPrefix("museglimmer") || compact == "muse" || compact == "atem" {
+        return "muse_glimmer"
+    }
+
     // Gemma-4 harmony channel envelope: `<|channel>thought\n…<channel|>`.
     // Distinct from `<think>` XML.
     if compact.hasPrefix("gemma4") {
