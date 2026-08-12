@@ -58,7 +58,10 @@ enum NativeMTPHybridWarmupMemo {
     }
 
     private static let lock = NSLock()
-    private static var entries: [ObjectIdentifier: Entry] = [:]
+    // `nonisolated(unsafe)` because the invariant is MANUAL, not static: every read and write below
+    // is bracketed by `lock`. Swift 6 strict concurrency cannot see an NSLock discipline, so without
+    // the annotation this is an error rather than the correctly-synchronised code it is.
+    nonisolated(unsafe) private static var entries: [ObjectIdentifier: Entry] = [:]
 
     static func verdict(for model: AnyObject) -> Bool? {
         lock.lock()
