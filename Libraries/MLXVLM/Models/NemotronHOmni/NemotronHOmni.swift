@@ -259,7 +259,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         var imageEmbedCount = 0
         var videoRetention: (keepIndices: [Int], totalTokens: Int)? = nil
         if let pixelValues = input.image?.pixels {
-            visualEmbeds = extractImageEmbeds(pixelValues: pixelValues)
+            visualEmbeds = extractImageEmbeds(pixelValues: pixelValues, frames: input.image?.frames)
             imageEmbedCount = visualEmbeds?.dim(0) ?? 0
         }
         if let video = input.video {
@@ -340,7 +340,39 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
 
     /// Run RADIO + mlp1 on a (B, 3, H, W) pixel tensor (already CLIP-normalized).
     /// Returns flat (totalTokens, llmHidden) embeddings in tile-row-major order.
-    public func extractImageEmbeds(pixelValues: MLXArray, video: Bool = false) -> MLXArray {
+    /// Embed images, one per `frames` entry.
+    ///
+    /// `frames` is what makes ragged input work. The grid below is derived from
+    /// `pixelValues.dim(2/3)` — ONE grid for the whole tensor — which is only correct when every
+    /// image shares a shape, or when there is exactly one image. So when `frames` describes several
+    /// images, each is sliced out of the flat buffer, embedded alone, and the flat
+    /// `(tokens, hidden)` results are concatenated. Identical output to the old batched path for
+    /// uniform images; correct output for images of differing aspect ratio, which the old path
+    /// refused outright.
+    ///
+    /// Cost is N tower calls instead of one batched call. MMMU's multi-image items hold 2-5 images,
+    /// and 95% of items hold exactly one (N == 1, so no change at all).
+    public func extractImageEmbeds(pixelValues: MLXArray, frames: [THW]? = nil,
+                                   video: Bool = false) -> MLXArray {
+        // A 4-D tensor is the rectangular layout: uniform images (or one image, or a video clip).
+        // Unchanged path, unchanged numbers. Only a FLAT buffer means ragged, and only then does
+        // `frames` become load-bearing.
+        guard pixelValues.ndim == 1, let frames, !frames.isEmpty else {
+            return extractImageEmbedsUniform(pixelValues: pixelValues, video: video)
+        }
+        var offset = 0
+        var perImage: [MLXArray] = []
+        perImage.reserveCapacity(frames.count)
+        for f in frames {
+            let count = 3 * f.h * f.w
+            let one = pixelValues[offset ..< (offset + count)].reshaped([1, 3, f.h, f.w])
+            perImage.append(extractImageEmbedsUniform(pixelValues: one, video: video))
+            offset += count
+        }
+        return MLX.concatenated(perImage, axis: 0)
+    }
+
+    private func extractImageEmbedsUniform(pixelValues: MLXArray, video: Bool = false) -> MLXArray {
         var feats = radioModel(pixelValues, video: video)
         // Strip cls/register tokens (first numClsTokens)
         feats = feats[0..., config.visionNumClsTokens..., 0...]
@@ -696,8 +728,11 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
     }
 
     /// Tile-preprocess images into (totalTiles, 3, H, W) MLX pixel values.
-    public func preprocess(images: [CIImage]) throws -> (MLXArray, [Int]) {
-        let (pixels, tokenCounts) = try nemotronOmniPreprocessImages(
+    /// Returns flat-concatenated pixels, per-image token counts, and each image's own (H, W).
+    /// The dims are what make ragged images work: every image keeps its aspect-preserving
+    /// resolution, and the consumer slices them apart rather than requiring one rectangular batch.
+    public func preprocess(images: [CIImage]) throws -> (MLXArray, [Int], [(h: Int, w: Int)]) {
+        let (pixels, tokenCounts, dims) = try nemotronOmniPreprocessImages(
             images,
             imageSize: config.imageSize,
             minNum: config.minNumPatches,
@@ -706,7 +741,7 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             patchSize: config.patchSize,
             downsampleRatio: config.downsampleRatio,
             maxModelLen: config.maxModelLen)
-        return (pixels, tokenCounts)
+        return (pixels, tokenCounts, dims)
     }
 
     /// Decode + resample audio resources into 16 kHz mono Float32 PCM
@@ -816,10 +851,13 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
 
         if !input.images.isEmpty {
             let ciImages = try input.images.map { try $0.asCIImage() }
-            let (pixels, tokenCounts) = try preprocess(images: ciImages)
+            let (pixels, tokenCounts, dims) = try preprocess(images: ciImages)
+            // Each frame carries its OWN (h, w). This used to stamp every frame with the batch's
+            // single shape — harmless while all images were forced to match, and exactly the
+            // information that had to exist for them not to be.
             processedImage = LMInput.ProcessedImage(
                 pixels: pixels,
-                frames: tokenCounts.map { _ in THW(1, pixels.dim(2), pixels.dim(3)) })
+                frames: dims.map { THW(1, $0.h, $0.w) })
             totalImageTokens = tokenCounts.reduce(0, +)
         }
 

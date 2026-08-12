@@ -104,7 +104,9 @@ enum OmniBench {
             } else {
                 image = try synthesiseGradient(side: 224)
             }
-            let (pixels, tokenCounts) = try processor.preprocess(images: [image])
+            // Third element is the per-image (h, w); a single image stays rectangular, so the
+            // `pixels.dim(2)/dim(3)` reads below are unaffected.
+            let (pixels, tokenCounts, _) = try processor.preprocess(images: [image])
             MLX.eval(pixels)
             let values = pixels.asArray(Float.self)
             let height = pixels.dim(2)

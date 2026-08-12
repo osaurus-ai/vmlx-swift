@@ -252,7 +252,7 @@ public func nemotronOmniPreprocessImages(
     patchSize: Int = 16,
     downsampleRatio: Float = 0.5,
     maxModelLen: Int = 16384
-) throws -> (pixelValues: MLXArray, tokenCounts: [Int]) {
+) throws -> (pixelValues: MLXArray, tokenCounts: [Int], dims: [(h: Int, w: Int)]) {
     var allImages: [MLXArray] = []
     var tokenCounts: [Int] = []
     let downsampleFactor = max(1, Int(round(1.0 / Double(downsampleRatio))))
@@ -284,17 +284,34 @@ public func nemotronOmniPreprocessImages(
                 / (downsampleFactor * downsampleFactor))
     }
     if allImages.isEmpty {
-        return (MLXArray.zeros([0, 3, imageSize, imageSize]), [])
+        return (MLXArray.zeros([0, 3, imageSize, imageSize]), [], [])
     }
+    // Rasters are (3, H, W) — which is exactly why `stacked(axis: 0)` below yields (N, 3, H, W).
+    // Index from the END so this holds whether or not a leading batch axis is ever added.
+    let dims = allImages.map { (h: $0.dim($0.ndim - 2), w: $0.dim($0.ndim - 1)) }
+
+    // UNIFORM images keep the original rectangular (N, 3, H, W) layout — byte-for-byte the previous
+    // behaviour, so every existing consumer (and the 95% of items that hold a single image) is
+    // untouched.
+    //
+    // RAGGED images are concatenated FLAT, with `dims` carrying each image's (H, W) so the consumer
+    // can slice them back apart. That is the layout `LMInput.ProcessedImage` already documents —
+    // "concatenated pixels from one or more images", with `frames` describing each — and it was
+    // always representable; only the stacking here forced uniformity.
+    //
+    // Stacking was never required by the model. `extractImageEmbeds` derives its patch grid from
+    // `pixelValues.dim(2/3)`, ONE grid for the whole tensor, which is correct exactly when the
+    // images match or when there is a single image. Feeding the tower one image at a time is
+    // therefore exact, and its flat (tokens, hidden) return concatenates cleanly.
+    //
+    // This previously threw for any item whose images differed in aspect ratio — 42 of MMMU's 847
+    // items (5%), and a hard blocker for document analysis, where image count and shape are whatever
+    // the document happens to contain.
     let referenceShape = allImages[0].shape
-    guard allImages.allSatisfy({ $0.shape == referenceShape }) else {
-        throw NSError(
-            domain: "NemotronHOmni", code: -12,
-            userInfo: [NSLocalizedDescriptionKey:
-                "Nemotron Omni image batches with mixed dynamic resolutions are not yet supported"])
+    if allImages.allSatisfy({ $0.shape == referenceShape }) {
+        return (MLX.stacked(allImages, axis: 0), tokenCounts, dims)   // (N, 3, H, W)
     }
-    let stacked = MLX.stacked(allImages, axis: 0) // (N, 3, H, W)
-    return (stacked, tokenCounts)
+    return (MLX.concatenated(allImages.map { $0.reshaped([-1]) }, axis: 0), tokenCounts, dims)
 }
 
 // MARK: - Audio preprocessing (parakeet mel STFT)
