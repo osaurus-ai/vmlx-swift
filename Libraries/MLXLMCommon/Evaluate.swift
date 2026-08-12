@@ -4200,7 +4200,9 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     // stream" from "library-internal stop-sequence
                     // match" — the latter should report `stopReason =
                     // .stop`, not `.cancelled`.
-                    stopReason = handler.stopSequenceHit ? .stop : .cancelled
+                    stopReason =
+                        (handler.stopSequenceHit || handler.haltedOnRepetition)
+                        ? .stop : .cancelled
                     break
                 }
                 generatedTokenIds.append(token)
@@ -4684,6 +4686,15 @@ private protocol TokenLoopHandler: Sendable {
     /// text (e.g., the raw-token handler).
     var stopSequenceHit: Bool { get }
 
+    /// True when the last `onToken` returned false because the degenerate-
+    /// repetition guard fired. Reported like a stop sequence — `.stop`, not
+    /// `.cancelled` — because it is a deliberate library-internal halt, not a
+    /// consumer abort. Without this the collapse the guard exists to bound
+    /// still ends the turn, but arrives indistinguishable from the user
+    /// pressing stop, which is precisely the "no usable stop reason" symptom
+    /// that motivated the guard.
+    var haltedOnRepetition: Bool { get }
+
     /// True when the handler is still inside a reasoning envelope before
     /// terminal flush. Must be snapshotted before `onGenerationEnd`, because
     /// flushing drains and closes parser state.
@@ -4702,6 +4713,7 @@ private protocol TokenLoopHandler: Sendable {
 
 extension TokenLoopHandler {
     var stopSequenceHit: Bool { false }
+    var haltedOnRepetition: Bool { false }
     var unclosedReasoning: Bool { false }
     var emittedToolCall: Bool { false }
     var toolCallProtocolFailure: ToolCallProtocolFailure? { nil }
@@ -4751,6 +4763,7 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     private(set) var stopSequenceHit: Bool = false
     /// The cycle that halted generation, when the repetition guard fired.
     private(set) var repetitionCycle: RepetitionCycleDetector.Cycle?
+    var haltedOnRepetition: Bool { repetitionCycle != nil }
     private(set) var emittedToolCall: Bool = false
 
     init(

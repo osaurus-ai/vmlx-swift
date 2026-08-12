@@ -698,15 +698,38 @@ public actor BatchEngine {
                 promptTail: promptTail)
             var stopMatcher = StopStringMatcher(stopStrings: extraStopStrings)
             var stopMatched = false
+            // Degenerate-repetition guard, mirroring `TextToolTokenLoopHandler`.
+            // The solo path has had this since the Raptor collapse; batch is a
+            // parallel implementation of the same pipeline, so without its own
+            // copy the guard simply never ran for hosts that generate through
+            // `BatchEngine` — which is the path the chat app uses. Same
+            // `.fromEnvironment()` construction, so `VMLX_REPETITION_STOP=0`
+            // disables both consistently.
+            var repetitionDetector = RepetitionCycleDetector.fromEnvironment()
+            var repetitionCycle: RepetitionCycleDetector.Cycle?
+
+            /// Feed already-emitted visible text to the repetition guard.
+            /// Text is emitted first and never withheld: the guard bounds how
+            /// much MORE arrives, it does not edit what already went out.
+            func noteForRepetition(_ emitted: String) {
+                guard repetitionCycle == nil, !emitted.isEmpty else { return }
+                if let cycle = repetitionDetector.feed(emitted) {
+                    repetitionCycle = cycle
+                }
+            }
 
             func emitChunkThroughStop(_ text: String) {
                 guard stopMatcher.isEnabled else {
                     continuation.yield(.chunk(text))
+                    noteForRepetition(text)
                     return
                 }
                 switch stopMatcher.feed(text) {
                 case .streaming(let out):
-                    if !out.isEmpty { continuation.yield(.chunk(out)) }
+                    if !out.isEmpty {
+                        continuation.yield(.chunk(out))
+                        noteForRepetition(out)
+                    }
                 case .stopped(let out):
                     if !out.isEmpty { continuation.yield(.chunk(out)) }
                     stopMatched = true
@@ -871,7 +894,7 @@ public actor BatchEngine {
                         pump(text)
                         lastPumpAt = Date()
                     }
-                    if stopMatched {
+                    if stopMatched || repetitionCycle != nil {
                         // Tell the BatchEngine actor to halt this slot
                         // on its next scheduling tick. The actor's
                         // `cancel(id:)` flips `isFinished` and emits
@@ -900,7 +923,12 @@ public actor BatchEngine {
                     // .chunk, show "answer trapped in thinking" banner,
                     // etc.) without instrumenting the parser themselves.
                     let finalStop: GenerateStopReason
-                    if stopMatched {
+                    if stopMatched || repetitionCycle != nil {
+                        // A repetition halt is a deliberate stop, not a
+                        // cancellation and not exhaustion. Reporting `.stop`
+                        // is what lets a host classify the turn at all: the
+                        // collapse this guards against previously ran to the
+                        // token cap and recorded no stop reason whatsoever.
                         finalStop = .stop
                     } else {
                         finalStop = info.stopReason
@@ -952,12 +980,20 @@ public actor BatchEngine {
                     terminalInsideReasoning ?? (reasoningParser?.isInsideReasoning ?? false)
                 detokenizer.startNewSegment()
                 let elapsed = Date().timeIntervalSince(streamStartedAt)
+                // A stop string or repetition halt cancels the slot deliberately,
+                // and cancelling is exactly what can close the token stream before
+                // it emits its own `.info` — so this repair path, not the branch
+                // above, is where those turns usually land. Reporting `.cancelled`
+                // here would erase the classification and leave the collapse
+                // indistinguishable from a user abort.
+                let repairedStop: GenerateStopReason =
+                    (stopMatched || repetitionCycle != nil) ? .stop : .cancelled
                 let finalInfo = GenerateCompletionInfo(
                     promptTokenCount: promptTokenCount,
                     generationTokenCount: generatedTokenCount,
                     promptTime: 0,
                     generationTime: elapsed,
-                    stopReason: .cancelled,
+                    stopReason: repairedStop,
                     unclosedReasoning: unclosed,
                     toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure)
                 continuation.yield(.info(finalInfo))
