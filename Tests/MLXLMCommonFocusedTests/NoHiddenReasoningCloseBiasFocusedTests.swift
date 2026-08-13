@@ -83,7 +83,10 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(model.contains("minNumPatches"))
         #expect(model.contains("maxNumPatches"))
         #expect(model.contains("maxModelLen"))
-        #expect(model.contains("tokenCounts.map { _ in THW(1, pixels.dim(2), pixels.dim(3)) }"))
+        // Per-image dims, not one shape reused for the whole batch. The
+        // earlier form (`tokenCounts.map { _ in THW(1, pixels.dim(2), ...) }`)
+        // could only describe a batch whose images all shared a resolution.
+        #expect(model.contains("dims.map { THW(1, $0.h, $0.w) }"))
         #expect(model.contains("totalImageTokens = tokenCounts.reduce(0, +)"))
 
         #expect(preprocessors.contains("private func nemotronOmniSourceTargetPatches("))
@@ -91,8 +94,17 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(preprocessors.contains("private func rasterizeImage("))
         #expect(preprocessors.contains("width: Int"))
         #expect(preprocessors.contains("height: Int"))
-        #expect(preprocessors.contains("throws -> (pixelValues: MLXArray, tokenCounts: [Int])"))
-        #expect(preprocessors.contains("Nemotron Omni image batches with mixed dynamic resolutions are not yet supported"))
+        // The signature carries per-image dims alongside the token counts,
+        // which is what lets a batch mix resolutions.
+        #expect(
+            preprocessors.contains(
+                "throws -> (pixelValues: MLXArray, tokenCounts: [Int], dims: [(h: Int, w: Int)])"))
+        // Mixed dynamic resolutions are SUPPORTED now, so the old refusal must
+        // be gone. Asserting its absence keeps the capability from silently
+        // regressing back into a thrown error.
+        #expect(
+            !preprocessors.contains(
+                "Nemotron Omni image batches with mixed dynamic resolutions are not yet supported"))
         #expect(!preprocessors.contains("rasterizeTile("))
     }
 
