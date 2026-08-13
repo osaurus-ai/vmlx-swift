@@ -647,7 +647,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 // so store it to enable growing-turn reuse under MTP. Clean SSM
                 // comes from `store`'s re-derive (enableSSMReDerive).
                 if ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
-                   coordinator.capturesTurnStartBoundary,
+                   coordinator.isHybrid,
                    !originalInput.hasMediaContent,
                    let stripAt = sharedPromptStripBoundary
                 {

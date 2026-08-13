@@ -3310,7 +3310,7 @@ public actor BatchEngine {
                 // `cachePrefixTokenCounts` entry — gating on it silently disables
                 // the store entirely (the re-derive here is the only writer).
                 if ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
-                   coordinator.capturesTurnStartBoundary,
+                   coordinator.isHybrid,
                    let stripAt = sharedPromptStripBoundary
                 {
                     let strippedTokens = Array(promptTokens.prefix(stripAt))
