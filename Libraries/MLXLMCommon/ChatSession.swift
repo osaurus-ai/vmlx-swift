@@ -453,6 +453,30 @@ public final class ChatSession {
                                 iterator: iterator,
                                 toolSchemas: input.toolSchemas
                             )
+                        } else if let strategy = generateParameters.draftStrategy,
+                            case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
+                            generateParameters.canUseNativeMTP(for: input)
+                        {
+                            // Native model-owned MTP speculative decode. `generate(...)` and
+                            // `generateTokensTask(...)` already dispatch on `draftStrategy`, but
+                            // `ChatSession` did not — so a caller using the high-level chat API got
+                            // plain autoregressive decode no matter what it set, with no error and
+                            // no log line to say so. Eligibility is `canUseNativeMTP` (greedy-only,
+                            // no media, unbounded KV), so this cannot change what text is produced.
+                            guard let nativeModel = model as? any NativeMTPModel else {
+                                throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
+                            }
+                            let iterator = try NativeMTPTokenIterator(
+                                input: input, model: nativeModel, cache: kvCache,
+                                parameters: generateParameters, depth: depth,
+                                cacheCoordinator: cacheCoordinator)
+                            (stream, task) = MLXLMCommon.generateTask(
+                                promptTokenCount: input.text.tokens.size,
+                                modelConfiguration: modelConfiguration,
+                                tokenizer: tokenizer,
+                                iterator: iterator,
+                                toolSchemas: input.toolSchemas
+                            )
                         } else {
                             let iterator = try TokenIterator(
                                 input: input, model: model, cache: kvCache,
