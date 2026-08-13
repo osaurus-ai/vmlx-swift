@@ -67,6 +67,30 @@ public enum DFlashDrafterLoader {
 
         // 3. Instantiate + apply weights
         let model = DFlashDraftModel(config)
+
+        // Published DFlash drafters are frequently QUANTIZED — the community MLX conversions of
+        // z-lab's bf16 release ship 4-bit and 8-bit variants. Those safetensors carry `.scales` and
+        // `.biases` beside each packed `.weight`, and an unquantized `Linear` has no parameter slots
+        // for them, so the strict `.noUnusedKeys` verify below rejects the whole bundle with
+        // `unhandledKeys(keys: ["biases", "scales"])`. Converting the modules to their quantized
+        // form first is what makes those bundles loadable at all.
+        //
+        // The filter is driven by which paths ACTUALLY carry scales in the file rather than by
+        // assuming every `Linear` is quantized: real bundles leave selected layers in full
+        // precision, and blanket-quantizing those would fail the same verify from the other side
+        // (a quantized module whose weights arrive unpacked).
+        if let root = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+            let q = root["quantization"] as? [String: Any],
+            let groupSize = q["group_size"] as? Int,
+            let bits = q["bits"] as? Int
+        {
+            let mode = (q["mode"] as? String)
+                .flatMap(QuantizationMode.init(rawValue:)) ?? .affine
+            quantize(
+                model: model, groupSize: groupSize, bits: bits, mode: mode,
+                filter: { path, _ in weights["\(path).scales"] != nil })
+        }
+
         do {
             let parameters = ModuleParameters.unflattened(weights)
             try model.update(parameters: parameters, verify: [.noUnusedKeys])
