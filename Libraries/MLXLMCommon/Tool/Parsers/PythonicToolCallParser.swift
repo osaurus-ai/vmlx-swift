@@ -853,9 +853,25 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         guard text.hasPrefix("{") else { return nil }
         guard let object = parseJSONObjectWithOptionalEOFBrace(text) else { return nil }
         guard object.count == 2 || object.count == 3 else { return nil }
-        guard let name = object["name"] as? String,
+        // `name`/`arguments` is the common spelling, but the same bundle family
+        // will also emit `function`/`parameters` for the identical call —
+        // measured on LFM2.5-VL-3B, where JANG_2L produced
+        // `{"name": "get_weather", "arguments": {…}}` (recovered) while
+        // JANG_4M, JANG_6M and MXFP8 produced
+        // `{"function": "get_weather", "parameters": {…}}` (not recovered, so
+        // the call leaked to the user as prose with `toolCalls=0`).
+        //
+        // `function` is only a NAME here when it is a string; the nested
+        // `{"function": {"name": …}}` envelope is a different shape handled
+        // elsewhere, and reading it as a name would be wrong.
+        //
+        // Every downstream guard is unchanged — the name must still be an
+        // offered tool, required parameters must all be present, and unknown
+        // keys are still rejected — so accepting the alias cannot admit a call
+        // the strict spelling would have refused.
+        guard let name = (object["name"] as? String) ?? (object["function"] as? String),
             toolNames(tools: tools).contains(name),
-            let rawArguments = object["arguments"],
+            let rawArguments = object["arguments"] ?? object["parameters"],
             let args = firstArgumentObject(from: rawArguments)
         else { return nil }
 

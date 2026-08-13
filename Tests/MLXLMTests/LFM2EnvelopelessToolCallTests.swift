@@ -146,6 +146,47 @@ struct LFM2EnvelopelessToolCallTests {
         #expect(processor.toolCalls.first?.function.name == "get_weather")
     }
 
+    /// The spelling the OTHER three quants emit for the identical call. JANG_2L
+    /// produced `{"name": …, "arguments": …}` while JANG_4M, JANG_6M and MXFP8
+    /// produced `{"function": …, "parameters": …}` — same intent, different
+    /// keys, and only the first was recovered.
+    @Test("the function/parameters spelling is parsed like name/arguments")
+    func recoversFunctionParametersSpelling() {
+        let weatherTools: [[String: any Sendable]] = [[
+            "type": "function",
+            "function": [
+                "name": "get_weather",
+                "parameters": [
+                    "type": "object",
+                    "properties": ["location": ["type": "string"]],
+                    "required": ["location"],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]]
+        for text in [
+            "{\"function\": \"get_weather\", \"parameters\": {\"location\": \"Tokyo\"}}",
+            "{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Tokyo\"}}",
+        ] {
+            let processor = ToolCallProcessor(format: .lfm2, tools: weatherTools)
+            var visible = ""
+            for ch in text { if let out = processor.processChunk(String(ch)) { visible += out } }
+            if let tail = processor.processEOS() { visible += tail }
+            #expect(processor.toolCalls.count == 1, "leaked as text: \(visible)")
+            #expect(processor.toolCalls.first?.function.name == "get_weather")
+            #expect(
+                processor.toolCalls.first?.function.arguments["location"]?.anyValue as? String
+                    == "Tokyo")
+        }
+    }
+
+    /// The alias must not loosen the schema gate: an unoffered name in the
+    /// `function` slot is still not a call.
+    @Test("the function spelling still requires an offered tool")
+    func functionSpellingStillChecksSchema() {
+        let (_, calls) = run("{\"function\": \"rm_rf\", \"parameters\": {\"path\": \"/\"}}")
+        #expect(calls.isEmpty)
+    }
+
     // MARK: - Must stay prose
 
     /// An answer that merely mentions a tool must not become a call. This is the

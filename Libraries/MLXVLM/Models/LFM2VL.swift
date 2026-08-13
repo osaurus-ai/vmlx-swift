@@ -782,9 +782,20 @@ public struct LFM2VLProcessor: UserInputProcessor {
 
         // Text-only input
         if input.images.isEmpty {
+            // `toolSchemas` has to ride along or the engine never learns the tool
+            // NAMES. BatchEngine reads them from `LMInput.toolSchemas` (callers
+            // pass tools through `UserInput` -> processor, not as a separate
+            // submit argument), and with none it builds a strip-only
+            // `ToolCallProcessor`; the inline fallbacks then match against a
+            // hard-coded default name list instead of the offered tools, so a
+            // call emitted without the native envelope leaks to the user as
+            // prose with `toolCalls=0`. Tagged formats hide this because their
+            // envelope is self-identifying. Peers already do this — see
+            // Gemma4.swift:1676 and Qwen3VL.swift:156/239.
             return LMInput(
                 tokens: MLXArray(promptTokens),
-                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+                toolSchemas: input.tools)
         }
 
         // Process images
@@ -870,7 +881,8 @@ public struct LFM2VLProcessor: UserInputProcessor {
                 pixels: pixelValuesConcatenated,
                 frames: frames
             ),
-            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+            toolSchemas: input.tools
         )
     }
 }

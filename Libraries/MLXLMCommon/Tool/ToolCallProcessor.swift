@@ -787,6 +787,12 @@ public class ToolCallProcessor {
             return inlineFunctionToolNames().contains { name in
                 compact.contains(#""tool":"\#(name)""#)
                     || compact.contains(#""tool_name":"\#(name)""#)
+                    // `"function"` carrying the NAME directly, rather than a
+                    // nested object. LFM2.5-VL-3B JANG_4M/JANG_6M/MXFP8 emit
+                    // `{"function": "get_weather", "parameters": {…}}`; without
+                    // this the buffer is never treated as tool intent and the
+                    // call leaks to the user as prose.
+                    || compact.contains(#""function":"\#(name)""#)
                     || compact.contains(#""function":{"name":"\#(name)""#)
                     || compact.contains(#""function":{"#)
                         && compact.contains(#""name":"\#(name)""#)
