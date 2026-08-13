@@ -2266,7 +2266,15 @@ public struct JangLoader: Sendable {
             let (bits, inferredGroupSize): (Int, Int)
             let declaredForLayer = declaredQuantization(for: basePath)
             let explicitForLayer: BaseConfiguration.Quantization? = {
-                guard let explicit = declaredPerLayerQuantization?
+                guard let declaredPerLayerQuantization else { return nil }
+                // Contradictory aliases (one spelling `.quantize`, another
+                // `.skip`) make the declaration a coin flip decided by candidate
+                // order. Set it aside so the packed width is resolved from the
+                // tensors instead — see `declaresSkipForAnyAlias`.
+                guard !declaredPerLayerQuantization
+                    .declaresSkipForAnyAlias(of: basePath)
+                else { return nil }
+                guard let explicit = declaredPerLayerQuantization
                     .explicitQuantizationOption(layer: basePath)
                 else { return nil }
                 guard case .quantize(let quantization) = explicit else { return nil }

@@ -99,6 +99,25 @@ public struct BaseConfiguration: Codable, Sendable {
             return nil
         }
 
+        /// True when ANY spelling of `layer` is declared `.skip`.
+        ///
+        /// A bundle that declares one spelling `.quantize` and another `.skip`
+        /// for the same tensor is self-contradictory. `explicitQuantizationOption`
+        /// resolves that by candidate ORDER, which silently makes the answer a
+        /// property of the alias list rather than of the bundle. Callers that use
+        /// a declaration to disambiguate an otherwise-ambiguous packed width ask
+        /// this first, so contradictory metadata is set aside and the width is
+        /// derived from the tensors instead — geometry cannot go stale, and a
+        /// declaration that disagrees with itself has already proven it can.
+        func declaresSkipForAnyAlias(of layer: String) -> Bool {
+            for candidate in Self.layerPathCandidates(layer) {
+                if case .skip? = perLayerQuantization[candidate] {
+                    return true
+                }
+            }
+            return false
+        }
+
         /// The quantization to apply for the given layer name or nil for no quantization.
         public func quantization(layer: String) -> Quantization? {
             if let perLayer = explicitQuantizationOption(layer: layer) {
