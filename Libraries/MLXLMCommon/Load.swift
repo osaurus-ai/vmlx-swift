@@ -84,7 +84,13 @@ func safetensorsMissingByteCount(_ url: URL) -> Int64? {
     guard maxEnd > 0 else { return nil }
 
     let declared = Int64(8 + headerLength + maxEnd)
-    guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size]
+    // Resolve symlinks before stat-ing. `attributesOfItem(atPath:)` does NOT follow links, so a
+    // symlinked shard reports the length of the TARGET PATH STRING (a few dozen bytes) rather than
+    // the file's real size. The bundle then looks catastrophically truncated and the caller is told
+    // to re-download it — advice that is both wrong and expensive, since symlinking shards is a
+    // normal way to share one set of weights between config variants.
+    guard let size = (try? FileManager.default.attributesOfItem(
+        atPath: url.resolvingSymlinksInPath().path))?[.size]
         as? NSNumber
     else { return nil }
     let actual = size.int64Value
