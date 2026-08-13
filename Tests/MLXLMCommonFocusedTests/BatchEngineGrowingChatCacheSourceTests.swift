@@ -66,7 +66,14 @@ struct BatchEngineGrowingChatCacheSourceTests {
             "slot.originalInput.cachePromptIntent == .reusablePrefixWarmup"))
         #expect(mtp.contains(
             "originalInput.cachePromptIntent == .reusablePrefixWarmup"))
-        #expect(mtp.contains("originalInput.canCaptureHybridStripBoundary("))
+        // `ec1bc597` (#249) replaced the MTP iterator's inline
+        // `originalInput.canCaptureHybridStripBoundary(...)` with the shared
+        // `TokenIterator.hybridStripBoundaryIndex(...)`, which performs that same check
+        // internally (`Evaluate.swift:1990`) along with the coordinator/hybrid/strip-index
+        // guards. Assert the shared helper so all three paths are pinned to ONE
+        // implementation instead of three drifting copies.
+        #expect(mtp.contains("TokenIterator.hybridStripBoundaryIndex("))
+        #expect(evaluate.contains("input.canCaptureHybridStripBoundary("))
         #expect(evaluate.contains("shouldPersistExactPromptBoundary("))
         #expect(batch.contains("shouldPersistExactPromptBoundary("))
         #expect(mtp.contains("shouldPersistExactPromptBoundary("))
@@ -216,10 +223,18 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(storageSnapshot)"))
         #expect(source.contains("TokenIterator: skipped history-boundary cache rederive after trim miss"))
         #expect(source.contains("cacheStablePrefixTokenCounts.contains(boundary)"))
-        #expect(source.contains(
-            "allowDiskBackedRederive: shouldForceStableBoundaryRederive("))
+        // The gate is now bound to a local before use rather than passed as an
+        // `allowDiskBackedRederive:` argument; the predicate itself is unchanged.
+        #expect(source.contains("shouldForceStableBoundaryRederive("))
         #expect(source.contains("let storeBoundary = isStableBoundary"))
-        #expect(source.contains("coordinator.hasValidatedDiskEntry("))
+        // `hasValidatedDiskEntry` → `hasDurableDiskEntry` was a deliberate fix, not a rename.
+        // `hasValidated…` trusts only entries this process wrote, so after a restart — or on any
+        // turn that restored from cache, where prefill never crosses the earlier boundaries — an
+        // entry already on disk was rebuilt anyway. That rebuild replays the prefix through the
+        // model and is cancellable, so a Stop mid-turn killed it as `rederive-failed …
+        // CancellationError()`. Pin the durable form so the process-local check cannot return.
+        #expect(source.contains("coordinator.hasDurableDiskEntry("))
+        #expect(!source.contains("coordinator.hasValidatedDiskEntry("))
         #expect(!source.contains("let unsafePartial = !remainingTokens.isEmpty &&\n                        (hasMediaContent || hasSSMLayer)"))
     }
 

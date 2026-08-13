@@ -890,11 +890,15 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             "enable_thinking": false,
         ])
 
-        #expect(rendered.contains("Available functions:"))
-        #expect(rendered.contains("- line_count:"))
-        #expect(rendered.contains("required arguments: text"))
-        #expect(!rendered.contains("List of tools:"))
-        #expect(!rendered.contains("\"name\":\"line_count\""))
+        // LFM2 is trained on the FULL JSON tool schemas under `List of tools: [...]`, not a
+        // name/description summary. `46973d1` ("Remove LFM tool schema markup") replaced the
+        // schemas with a summary and silently broke auto tool-calling for every lfm2/lfm2_moe
+        // model; restoring the native list is what lets the model emit <|tool_call_start|>.
+        // These assertions used to require the summary, i.e. they pinned the regression.
+        #expect(rendered.contains("List of tools:"))
+        #expect(rendered.contains("\"name\":\"line_count\""))
+        #expect(!rendered.contains("Available functions:"))
+        #expect(!rendered.contains("required arguments: text"))
         #expect(!rendered.contains("<tools>"))
         #expect(!rendered.contains("</tool_call>"))
         #expect(rendered.contains("<|tool_call_start|>") == false)
@@ -938,8 +942,9 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.contains("Do not double any line break."))
         #expect(!rendered.contains("argument value"))
         #expect(!rendered.contains("..."))
-        #expect(!rendered.contains("List of tools:"))
-        #expect(!rendered.contains("\"name\":\"line_count\""))
+        // Native JSON schemas are REQUIRED for LFM2 tool calling (see 46973d1 note above).
+        #expect(rendered.contains("List of tools:"))
+        #expect(rendered.contains("\"name\":\"line_count\""))
         #expect(!rendered.contains("<tools>"))
         #expect(rendered.contains("Do not write reasoning, XML-style tool tags, markdown, or prose."))
         #expect(rendered.contains("Copy the `text` value exactly from the current user request."))
@@ -1025,9 +1030,17 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             let rendered = try Template(templateSource).renderDSV4(context)
 
             #expect(rendered.contains("Required call shape for the current request:"))
-            #expect(rendered.contains(#"<|tool_call>call:line_count{text:<|"|>alpha\nbeta\ngamma<|"|>}<tool_call|>"#))
-            #expect(rendered.contains(#"Do not replace \n with a physical newline, do not insert a space after it"#))
-            #expect(!rendered.contains(#"alpha\nbeta\n gamma"#))
+            // `a87d3012` ("Fix Gemma4 required tool multiline prompt") removed the
+            // `replace("\n", "\\n")` from `exact_escaped` AND the paired "Do not replace \n with a
+            // physical newline…" instruction: the grounded value is now carried through with REAL
+            // newlines rather than escape sequences the model then had to un-escape. Backslashes
+            // and tabs are still escaped. Assert the shipped shape.
+            #expect(
+                rendered.contains(
+                    "<|tool_call>call:line_count{text:<|\"|>alpha\nbeta\ngamma<|\"|>}<tool_call|>"))
+            #expect(!rendered.contains(#"Do not replace \n with a physical newline"#))
+            // The grounded value must still be exact — no stray space after a line break.
+            #expect(!rendered.contains("alpha\nbeta\n gamma"))
             #expect(rendered.hasSuffix("<|turn>model\n"))
         }
     }
@@ -1085,7 +1098,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(beforeFinalUser.contains("Do not double any line break."))
         #expect(beforeFinalUser.contains("Do not add a blank line, leading space, trailing newline, or any other character to the copied value."))
         #expect(beforeFinalUser.contains("Do not invent placeholders, summaries, ellipsis, or prior-turn text."))
-        #expect(!beforeFinalUser.contains("List of tools:"))
+        // The tool list stays in the rendered history — removing it broke tool calling.
+        #expect(beforeFinalUser.contains("List of tools:"))
         #expect(!beforeFinalUser.contains("<tools>"))
         #expect(!beforeFinalUser.contains("<|tool_call_start|>[line_count(text='red\\ngreen\\nblue')]<|tool_call_end|>"))
         #expect(!afterFinalUser.contains("<real string value>"))
@@ -1200,8 +1214,18 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
 
         #expect(source.contains(#"upstream.bosToken == "<|startoftext|>""#))
         #expect(source.contains(#"upstream.eosToken == "<|im_end|>""#))
-        #expect(source.contains(#"upstream.convertTokenToId("<|tool_call_start|>") != nil"#))
-        #expect(source.contains(#"upstream.convertTokenToId("<|tool_call_end|>") != nil"#))
+        // `d4dcb4d3` replaced the bare `!= nil` existence checks with round-trips.
+        // That was a real fix, not a refactor: `convertTokenToId` returns the UNK id for an
+        // unknown token, so `!= nil` says yes for every vocabulary and mis-detected LFM2.
+        // Assert the round-trip form so the weaker check cannot come back.
+        #expect(
+            source.contains(
+                #"upstream.convertTokenToId("<|tool_call_start|>").flatMap { upstream.convertIdToToken($0) } == "<|tool_call_start|>""#
+            ))
+        #expect(
+            source.contains(
+                #"upstream.convertTokenToId("<|tool_call_end|>").flatMap { upstream.convertIdToToken($0) } == "<|tool_call_end|>""#
+            ))
         #expect(source.contains("MLXLMCommon.ChatTemplateFallbacks.lfm2ToolMinimal"))
         #expect(source.contains("[vmlx] chat-template tools -> LFM2ToolMinimal fallback engaged"))
     }
