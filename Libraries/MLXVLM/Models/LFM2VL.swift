@@ -675,6 +675,25 @@ public struct LFM2VLProcessor: UserInputProcessor {
         self.tokenizer = tokenizer
     }
 
+    /// The `<image>` placeholder id for THIS bundle's vocabulary.
+    ///
+    /// LFM2-VL-1.6B uses 396; LFM2.5-VL-3B uses 124907, and in the 3B vocabulary
+    /// 396 is the ordinary text token `"ab"`. Resolving from the tokenizer keeps
+    /// the processor's id and the model's `imageTokenIndex` (which reads
+    /// `image_token_id` from `config.json`) in agreement on any bundle.
+    ///
+    /// `convertTokenToId` returns the *unknown-token* id rather than nil for a
+    /// token the vocabulary lacks, so the round-trip through `convertIdToToken`
+    /// is what makes this an existence test rather than a lookup that always
+    /// "succeeds".
+    static func resolveImageTokenId(tokenizer: any Tokenizer) -> Int {
+        let legacyLFM2VL16B = 396
+        guard let candidate = tokenizer.convertTokenToId("<image>"),
+            tokenizer.convertIdToToken(candidate) == "<image>"
+        else { return legacyLFM2VL16B }
+        return candidate
+    }
+
     /// Preprocess a single image
     func preprocess(image: CIImage, targetSize: CGSize) -> CIImage {
         image
@@ -791,9 +810,22 @@ public struct LFM2VLProcessor: UserInputProcessor {
             totalImageTokens += h * w
         }
 
-        // Replace image placeholder tokens with the correct count
-        // image_token_id is 396 for LFM2 VL models
-        let imageTokenId = 396
+        // Replace image placeholder tokens with the correct count.
+        //
+        // This id used to be the literal `396`, which is only right for
+        // LFM2-VL-1.6B. LFM2.5-VL-3B declares `image_token_id: 124907`, and in
+        // ITS vocabulary 396 is the ordinary text token `"ab"` — so the scan
+        // below matched nothing, no expansion happened, and the model fataled
+        // with `Image features and image tokens do not match: tokens: 1,
+        // features 256`. (The mirror hazard is worse: on a bundle where 396 is
+        // real text, every prompt containing that subword would have had it
+        // expanded into image tokens.)
+        //
+        // Resolve from the tokenizer instead, which is the same `<image>` the
+        // chat template emits. `convertTokenToId` answers with the unknown-token
+        // id rather than nil for a token the vocabulary lacks, so round-trip the
+        // result before trusting it.
+        let imageTokenId = Self.resolveImageTokenId(tokenizer: tokenizer)
         var newPromptTokens = [Int]()
         var imageIdx = 0
         var i = 0
