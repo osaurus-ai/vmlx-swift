@@ -461,7 +461,12 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) ->
     #expect(source.contains("exp.append(contentsOf: Array(repeating: audioId, count: tokenCount))"))
     #expect(source.contains("audio: processedAudio"))
     #expect(source.contains("preEncodedEmbedding: embedding"))
-    #expect(source.contains("Gemma4 raw audio feature extraction is not implemented"))
+    // Raw audio is IMPLEMENTED now (35a4f5a7, unified raw-waveform chunking), so the old
+    // "not implemented" bail no longer exists. What must still hold is that an unrecognised
+    // feature_extractor_type is rejected by NAME rather than silently mis-decoded — assert the
+    // replacement diagnostic instead of pinning a state the runtime has moved past.
+    #expect(source.contains("which has no Swift pipeline"))
+    #expect(source.contains("Gemma4UnifiedAudioFeatureExtractor"))
     #expect(!source.contains("pre-encoded 640-dim"))
 }
 

@@ -229,7 +229,19 @@ struct Gemma4PLECoherenceTests {
         #expect(split.allSatisfy { $0.shape == [1, tokenCount, width] })
     }
 
-    @Test("Gemma4 E-series scaled projection initializes JANG affine biases slot")
+    /// Originally this pinned `self._biases.wrappedValue = MLXArray.mlxNone` in a hand-rolled
+    /// scaled projection: the slot had to be explicitly emptied or MLX would try to load into an
+    /// uninitialized `biases` parameter.
+    ///
+    /// `c7613dcc` ("Fix Gemma4 QAT loading") deleted that projection entirely — along with its
+    /// `@ParameterInfo(key: "biases")` declaration — and moved Gemma4 onto plain `bias: false`
+    /// projections, with JANG affine biases resolved by the loader instead. Re-asserting the old
+    /// line would demand the return of a design that was removed on purpose.
+    ///
+    /// So the assertion is inverted to pin the outcome that still matters: neither file
+    /// re-introduces a hand-rolled `biases` parameter slot, which is what made the original bug
+    /// possible.
+    @Test("Gemma4 declares no hand-rolled JANG affine biases parameter slot")
     func eSeriesScaledProjectionInitializesAffineBiasSlot() throws {
         let repo = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -243,7 +255,13 @@ struct Gemma4PLECoherenceTests {
             encoding: .utf8)
 
         for source in [textSource, vlmSource] {
-            #expect(source.contains("self._biases.wrappedValue = MLXArray.mlxNone"))
+            #expect(
+                !source.contains("@ParameterInfo(key: \"biases\")"),
+                """
+                Gemma4 re-declared a `biases` parameter slot. If that is intentional, the slot must \
+                be explicitly initialized to `MLXArray.mlxNone`, or loading a JANG affine bundle \
+                will attempt to populate an uninitialized parameter.
+                """)
         }
     }
 
