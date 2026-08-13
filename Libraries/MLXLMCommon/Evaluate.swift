@@ -231,6 +231,9 @@ public struct GenerateParameters: Sendable {
     /// the open tag. Empty means the prompt already opened reasoning.
     public var reasoningBudgetStartTokenIDs: [Int] = []
 
+    /// All open-tag ids, banned after the ceiling so reasoning cannot reopen.
+    public var reasoningBudgetOpenTokenIDs: [Int] = []
+
     /// Speculative-decoding strategy (opt-in). `nil` preserves the existing
     /// autoregressive decode path byte-for-byte — callers who don't set this
     /// see no behaviour change.
@@ -426,7 +429,8 @@ public struct GenerateParameters: Sendable {
             else { return nil }
             return ReasoningBudgetProcessor(
                 closeTokenID: closeID, tokenCount: budget,
-                startTokenIDs: reasoningBudgetStartTokenIDs)
+                startTokenIDs: reasoningBudgetStartTokenIDs,
+                openTokenIDs: reasoningBudgetOpenTokenIDs)
         }()
 
         if repetitionContext == nil && presenceContext == nil && frequencyContext == nil

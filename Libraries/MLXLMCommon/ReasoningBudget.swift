@@ -58,6 +58,9 @@ public enum ReasoningBudget {
         /// Empty when the prompt already opened reasoning (count immediately).
         /// Otherwise the ids whose appearance starts the count.
         public let startTokenIDs: [Int]
+        /// All open-tag ids in this vocab, so the ceiling can ban reopening
+        /// even when the prompt primed the block (startTokenIDs empty).
+        public let openTokenIDs: [Int]
     }
 
     /// Close-tag spellings across the shipped families, most specific first.
@@ -129,7 +132,9 @@ public enum ReasoningBudget {
         // Not primed and no open tag in vocab: nothing could ever start a
         // reasoning block, so stay inert rather than counting plain output.
         guard primed || !openIDs.isEmpty else { return nil }
-        return Armed(closeTokenID: closeID, tokenCount: budget, startTokenIDs: openIDs)
+        return Armed(
+            closeTokenID: closeID, tokenCount: budget, startTokenIDs: openIDs,
+            openTokenIDs: openTokenIDs(tokenizer: tokenizer))
     }
 
     /// True when the rendered prompt ends with an opened, unclosed reasoning
@@ -153,6 +158,8 @@ public struct ReasoningBudgetProcessor: LogitProcessor {
     /// Empty means the prompt already opened reasoning, so counting starts on
     /// the first sampled token. Otherwise counting waits for one of these.
     private let startTokenIDs: Set<Int>
+    /// Every open-tag id, banned after the ceiling so the block cannot reopen.
+    private let openTokenIDs: [Int]
     private var started: Bool
     private var remaining: Int
     private var spent = false
@@ -164,9 +171,13 @@ public struct ReasoningBudgetProcessor: LogitProcessor {
     /// the block was capped rather than closed by the model.
     public private(set) var didForceClose = false
 
-    public init(closeTokenID: Int, tokenCount: Int, startTokenIDs: [Int] = []) {
+    public init(
+        closeTokenID: Int, tokenCount: Int, startTokenIDs: [Int] = [],
+        openTokenIDs: [Int] = []
+    ) {
         self.closeTokenID = closeTokenID
         self.startTokenIDs = Set(startTokenIDs)
+        self.openTokenIDs = openTokenIDs.isEmpty ? startTokenIDs : openTokenIDs
         self.started = startTokenIDs.isEmpty
         self.remaining = max(0, tokenCount)
     }
@@ -174,18 +185,41 @@ public struct ReasoningBudgetProcessor: LogitProcessor {
     public mutating func prompt(_ prompt: MLXArray) {}
 
     public func process(logits: MLXArray) -> MLXArray {
-        // Not reasoning yet, budget unspent, or already enforced: never
-        // touch the distribution.
-        guard started, !spent, remaining <= 0 else { return logits }
+        // Ceiling already enforced: the block was closed, so the only thing
+        // still masked is REOPENING it. Without this the model simply emits a
+        // fresh `<think>` and keeps reasoning, which is exactly what a live
+        // A/B showed — think length did not track the budget at all until
+        // reopening was banned.
+        if spent {
+            guard !openTokenIDs.isEmpty else { return logits }
+            let vocabSize = logits.dim(-1)
+            let valid = openTokenIDs.filter { $0 >= 0 && $0 < vocabSize }
+            guard !valid.isEmpty else { return logits }
+            // Same out-of-place rule as above: never write into a logits
+            // buffer that the caller still owns.
+            let ids = MLXArray(Int32(0) ..< Int32(vocabSize))
+            var banned = ids .== MLXArray(Int32(valid[0]))
+            for id in valid.dropFirst() {
+                banned = banned .|| (ids .== MLXArray(Int32(id)))
+            }
+            return MLX.where(banned, negInf, logits)
+        }
+        // Not reasoning yet, or budget unspent: never touch the distribution.
+        guard started, remaining <= 0 else { return logits }
         let vocabSize = logits.dim(-1)
         guard closeTokenID >= 0, closeTokenID < vocabSize else { return logits }
         if trace {
             let line = "[vmlx][reasoning-budget] requiring close id=\(closeTokenID)\n"
             FileHandle.standardError.write(Data(line.utf8))
         }
-        var forced = MLX.full(logits.shape, values: negInf).asType(logits.dtype)
-        forced[0..., MLXArray(Int32(closeTokenID))] = logits[0..., MLXArray(Int32(closeTokenID))]
-        return forced
+        // Build the mask OUT OF PLACE. `MLXArray` is a class and subscript
+        // assignment aliases its buffer, so writing one column into a `full`
+        // array is not a safe way to keep a single logit — a live A/B showed
+        // the close never actually winning, which is why raising the budget
+        // produced MORE thinking rather than less.
+        let ids = MLXArray(Int32(0) ..< Int32(vocabSize))
+        let keep = ids .== MLXArray(Int32(closeTokenID))
+        return MLX.where(keep, logits, negInf)
     }
 
     public mutating func didSample(token: MLXArray) {

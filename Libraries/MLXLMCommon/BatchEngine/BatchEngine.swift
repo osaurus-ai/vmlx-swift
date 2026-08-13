@@ -482,6 +482,7 @@ public actor BatchEngine {
             parameters.reasoningBudgetTokens = budget.tokenCount
             parameters.reasoningBudgetCloseTokenID = budget.closeTokenID
             parameters.reasoningBudgetStartTokenIDs = budget.startTokenIDs
+            parameters.reasoningBudgetOpenTokenIDs = budget.openTokenIDs
         }
         let request = BatchPendingRequest(
             input: input,
