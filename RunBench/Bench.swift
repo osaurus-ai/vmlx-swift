@@ -3283,9 +3283,26 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             remaining.count,
             diskArraySummary(diskArrays)))
         coordinator.release(blocks: blocks)
-        let expectedPromptBoundary = promptCommon < promptTokens.count
+        // A hybrid topology with a canonical strip boundary DELIBERATELY suppresses every
+        // other boundary (`usesCanonicalHybridBoundary` in BatchEngine/TokenIterator):
+        // persisting the exact prompt and post-answer snapshots as well measured several
+        // almost-identical full serializations per turn — hundreds of MB each on Bonsai — for
+        // reuse the next turn does not need. So for those models the reachable boundary is the
+        // stored history boundary, NOT the full prompt, even when the turn-2 template does not
+        // diverge.
+        //
+        // Without this cap the gate asked hybrids for a boundary the shipped policy never
+        // stores, and it passed or failed by accident: Bonsai's template diverges (21 < 23) so
+        // it took the relaxed branch, while Ornith-1.0-9B shares its whole prompt (25/25),
+        // took the strict branch, and failed at `matched=18, expected at least 25` — same
+        // policy, opposite verdicts, decided by a template detail rather than by cache health.
+        let canonicalHybridCeiling = coordinator.isHybrid ? cachePrefixTokenCounts.max() : nil
+        let unclampedPromptBoundary = promptCommon < promptTokens.count
             ? (cachePrefixTokenCounts.max() ?? promptTokens.count)
             : promptTokens.count
+        let expectedPromptBoundary = canonicalHybridCeiling.map {
+            Swift.min(unclampedPromptBoundary, $0)
+        } ?? unclampedPromptBoundary
         let expectedPostAnswerBoundary = promptTokens.count + r1.tokens.count
         if matched < expectedPromptBoundary {
             throw NSError(domain: "BENCH_GROWING_CHAT_CACHE", code: 4,
