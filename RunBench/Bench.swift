@@ -897,6 +897,16 @@ struct Bench {
             return
         }
 
+        // BENCH_VL_VARIATING=1: the variating pattern — one conversation walked
+        // across reasoning on/off x text/image x no-tools/tools, with a
+        // coordinator probe before EVERY turn. Applies to any model, not just VL:
+        // a single happy-path multiturn says nothing about whether prefix reuse
+        // survives a change in the SHAPE of the turn.
+        if (env["BENCH_VL_VARIATING"] ?? "0") == "1" {
+            try await VLBench.runVariatingPattern(modelPath: modelPath, maxNewTokens: maxNew)
+            return
+        }
+
         // BENCH_VL_CHAT_CACHE=1: structured-chat VL cache matrix.
         // Uses UserInput(chat:) with an image-bearing first turn and a
         // text follow-up, then verifies same-media replay hits and
