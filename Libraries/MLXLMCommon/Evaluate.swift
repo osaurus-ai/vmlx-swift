@@ -1091,6 +1091,7 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var promptTokenIds: [Int] { get }
     var turboQuantCompressionCount: Int { get }
     var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { get }
+    var nativeMTPStats: NativeMTPGenerationStats? { get }
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool)
@@ -1100,6 +1101,7 @@ extension TokenIteratorProtocol {
     public var promptTokenIds: [Int] { [] }
     public var turboQuantCompressionCount: Int { 0 }
     public var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { nil }
+    public var nativeMTPStats: NativeMTPGenerationStats? { nil }
 
     public mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
@@ -4269,17 +4271,6 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             MLXPressGenerationProfile.dumpAndReset(
                 reason: "generation-end tokens=\(tokenCount)")
 
-            let info = GenerateCompletionInfo(
-                promptTokenCount: promptTokenCount,
-                generationTokenCount: tokenCount,
-                promptTime: promptTime + iterator.promptPrefillTime,
-                generationTime: generateTime,
-                stopReason: stopReason ?? .cancelled,
-                turboQuantCompressions: iterator.turboQuantCompressionCount,
-                turboQuantCacheTransition: iterator.lastTurboQuantCacheTransition,
-                unclosedReasoning: unclosedReasoning,
-                toolCallProtocolFailure: handler.toolCallProtocolFailure
-            )
             // Multi-tier cache: drain the final async token eval before cache
             // snapshot/store, then keep completion info behind the cache-store
             // drain. Local chat/tool consumers may start a post-tool decode as
@@ -4300,6 +4291,30 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     && !handler.stopSequenceHit
                     && !handler.emittedToolCall)
             let tailT2 = Date()
+
+            // Build completion info only after `storeCacheAfterGeneration`
+            // returns: the native-MTP iterator snapshots `nativeMTPStats`
+            // there, from the same source values its `[NativeMTP]` stderr
+            // summary line prints for the corresponding keys (`outputTokens`
+            // depends on `generatedTokenIds`, which the iterator only sees
+            // in that call). `.info` is yielded
+            // further below, after the cache-store drain, exactly as before —
+            // only the construction moved — and no iterator mutates
+            // `turboQuantCompressionCount` or `promptPrefillTime` during the
+            // cache store, so every existing field is unchanged.
+            let info = GenerateCompletionInfo(
+                promptTokenCount: promptTokenCount,
+                generationTokenCount: tokenCount,
+                promptTime: promptTime + iterator.promptPrefillTime,
+                generationTime: generateTime,
+                stopReason: stopReason ?? .cancelled,
+                turboQuantCompressions: iterator.turboQuantCompressionCount,
+                turboQuantCacheTransition: iterator.lastTurboQuantCacheTransition,
+                unclosedReasoning: unclosedReasoning,
+                nativeMTPStats: iterator.nativeMTPStats,
+                toolCallProtocolFailure: handler.toolCallProtocolFailure
+            )
+
             Stream().synchronize()
             if genTailTrace {
                 let tailT3 = Date()
@@ -4417,6 +4432,15 @@ public struct GenerateCompletionInfo: Sendable {
     /// observed. This is independent of ``stopReason``: the model may have
     /// reached EOS normally while still producing malformed tool syntax.
     public let toolCallProtocolFailure: ToolCallProtocolFailure?
+    /// Structured native-MTP speculative-decoding diagnostics for this
+    /// generation: the headline counters of the `[NativeMTP]` summary line
+    /// written to stderr, assigned from the same source values at the same
+    /// lifecycle point. Representation differs where
+    /// ``NativeMTPGenerationStats`` says so (rounding, `nil` vs `none`,
+    /// dense histogram), and the stderr line carries additional keys the
+    /// struct omits. `nil` for any generation that did not run the
+    /// native-MTP iterator.
+    public let nativeMTPStats: NativeMTPGenerationStats?
 
     /// The number of tokens processed per second during the prompt phase.
     ///
@@ -4448,6 +4472,7 @@ public struct GenerateCompletionInfo: Sendable {
         turboQuantCompressions: Int = 0,
         turboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? = nil,
         unclosedReasoning: Bool = false,
+        nativeMTPStats: NativeMTPGenerationStats? = nil,
         toolCallProtocolFailure: ToolCallProtocolFailure? = nil
     ) {
         self.promptTokenCount = promptTokenCount
@@ -4459,6 +4484,7 @@ public struct GenerateCompletionInfo: Sendable {
         self.turboQuantCacheTransition = turboQuantCacheTransition
         self.unclosedReasoning = unclosedReasoning
         self.toolCallProtocolFailure = toolCallProtocolFailure
+        self.nativeMTPStats = nativeMTPStats
     }
 
     public func summary() -> String {
