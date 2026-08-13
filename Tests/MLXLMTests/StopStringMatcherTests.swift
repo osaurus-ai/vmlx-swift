@@ -341,4 +341,96 @@ struct StopStringMatcherTests {
         emitted += matcher.flush()
         #expect(emitted == input)
     }
+
+    // MARK: - generation_config.json eos is authoritative (harmony / gpt-oss)
+
+    /// The motivating case, proven rather than asserted. gpt-oss (OpenAI harmony) declares
+    /// `eos_token_id: [200002 <|return|>, 199999, 200012 <|call|>]` and deliberately EXCLUDES
+    /// 200007 `<|end|>`, which is a CHANNEL SEPARATOR, not a stop: the model emits
+    /// `<|end|>` to close the `analysis` channel before opening `final`. The hard-coded
+    /// `commonEndTokenStrings` blanket used to inject `<|end|>` anyway, so generation halted at
+    /// the end of the reasoning channel and the visible answer was empty.
+    @Test("declared generation_config eos suppresses the blanket (harmony <|end|> is not a stop)")
+    func harmonyDeclaredEOSKeepsChannelSeparatorOutOfStops() throws {
+        let harmonyGenerationConfig = """
+        { "eos_token_id": [200002, 199999, 200012], "do_sample": true, "temperature": 1.0 }
+        """
+        let defaults = try JSONDecoder.json5().decode(
+            GenerationConfigFile.self, from: Data(harmonyGenerationConfig.utf8))
+        let declaredEOS = try #require(defaults.eosTokenIds?.values)
+        #expect(declaredEOS == [200002, 199999, 200012])
+        #expect(!declaredEOS.contains(200007))
+
+        let resolved = resolveStopSequences(
+            modelConfiguration: ModelConfiguration(id: "gpt-oss-20b", generationDefaults: defaults),
+            tokenizer: HarmonyTokenizer())
+
+        // 200007 <|end|> must NOT become a stop: the declaration is authoritative.
+        #expect(!resolved.tokenIDs.contains(200007))
+        #expect(!resolved.textStopStrings.contains("<|end|>"))
+        // ...while the model's own declared stops are honored.
+        #expect(resolved.tokenIDs.contains(200002))
+    }
+
+    /// The other side of the gate — the failure mode that would actually hurt. A model that
+    /// declares its eos must STILL stop; the gate only suppresses the hard-coded blanket, it
+    /// must never suppress the declaration itself or the tokenizer eos.
+    @Test("a declared-eos model still stops (Qwen <|im_end|>)")
+    func declaredEOSModelStillStops() throws {
+        let qwenGenerationConfig = """
+        { "eos_token_id": [151645, 151643] }
+        """
+        let defaults = try JSONDecoder.json5().decode(
+            GenerationConfigFile.self, from: Data(qwenGenerationConfig.utf8))
+
+        let resolved = resolveStopSequences(
+            modelConfiguration: ModelConfiguration(
+                id: "qwen3", extraEOSTokens: ["<|im_end|>"], generationDefaults: defaults),
+            tokenizer: QwenImEndTokenizer())
+
+        // <|im_end|> resolves (id 151645 via the tokenizer) and the declared ids are kept.
+        #expect(resolved.tokenIDs.contains(151645))
+        #expect(!resolved.tokenIDs.isEmpty)
+    }
+
+    /// Tokenizer stub: knows harmony's specials, so <|end|> (200007) IS resolvable —
+    /// proving the gate (not an unresolvable token) is what keeps it out of the stop set.
+    private struct HarmonyTokenizer: Tokenizer {
+        var bosToken: String? { nil }
+        var eosToken: String? { "<|return|>" }
+        var unknownToken: String? { nil }
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+        func convertTokenToId(_ token: String) -> Int? {
+            switch token {
+            case "<|end|>": return 200007
+            case "<|return|>": return 200002
+            case "<|call|>": return 200012
+            default: return nil
+            }
+        }
+        func convertIdToToken(_ id: Int) -> String? { nil }
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] { [] }
+    }
+
+    /// Tokenizer stub for a Qwen-style bundle: <|im_end|> resolves to its real id.
+    private struct QwenImEndTokenizer: Tokenizer {
+        var bosToken: String? { nil }
+        var eosToken: String? { "<|im_end|>" }
+        var unknownToken: String? { nil }
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+        func convertTokenToId(_ token: String) -> Int? { token == "<|im_end|>" ? 151645 : nil }
+        func convertIdToToken(_ id: Int) -> String? { nil }
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] { [] }
+    }
+
 }
