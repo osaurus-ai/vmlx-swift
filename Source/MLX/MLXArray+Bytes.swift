@@ -177,9 +177,20 @@ extension MLXArray {
 
     /// return a copy of the backing in contiguous layout
     internal func asDataCopy() -> MLXArrayData {
+        // An array with no elements has no backing buffer. `physicalSize` is
+        // derived from the strides and stays non-zero for a shape like
+        // [1, 0, 3, 448], so the null base would pair with a non-zero count —
+        // which `UnsafeRawBufferPointer` traps on.
+        guard let base = mlx_array_data_uint8(self.ctx) else {
+            return MLXArrayData(
+                data: Data(),
+                shape: self.shape, strides: contiguousStrides(shape: self.shape),
+                dType: self.dtype)
+        }
+
         // point into the possibly non-contiguous backing
         let source = UnsafeRawBufferPointer(
-            start: mlx_array_data_uint8(self.ctx), count: physicalSize * itemSize)
+            start: base, count: physicalSize * itemSize)
 
         var data = Data(count: self.nbytes)
         data.withUnsafeMutableBytes { destination in
@@ -217,8 +228,20 @@ extension MLXArray {
         case .noCopyIfContiguous:
             if self.contiguousToDimension() == 0 {
                 // the backing is contiguous, we can provide a wrapper
-                // for the contents without a copy
-                let source = UnsafeMutableRawPointer(mutating: mlx_array_data_uint8(self.ctx))!
+                // for the contents without a copy.
+                //
+                // An array with no elements has no backing buffer, so
+                // `mlx_array_data_uint8` returns null. There are no bytes to
+                // wrap, and `Data(bytesNoCopy:)` may not take a null base, so
+                // hand back empty `Data` rather than trapping. A zero-element
+                // pixel tensor reaches here through `computeMediaSalt`.
+                guard let source = UnsafeMutableRawPointer(mutating: mlx_array_data_uint8(self.ctx))
+                else {
+                    return MLXArrayData(
+                        data: Data(),
+                        shape: self.shape, strides: contiguousStrides(shape: self.shape),
+                        dType: self.dtype)
+                }
                 let data = Data(
                     bytesNoCopy: source, count: size * itemSize,
                     deallocator: .none)
@@ -234,10 +257,14 @@ extension MLXArray {
             }
 
         case .noCopy:
-            let source = UnsafeMutableRawPointer(mutating: mlx_array_data_uint8(self.ctx))!
-            let data = Data(
-                bytesNoCopy: source, count: nbytes,
-                deallocator: .none)
+            // Same null backing as `.noCopyIfContiguous` above: no elements
+            // means no buffer to reference.
+            let data: Data
+            if let source = UnsafeMutableRawPointer(mutating: mlx_array_data_uint8(self.ctx)) {
+                data = Data(bytesNoCopy: source, count: nbytes, deallocator: .none)
+            } else {
+                data = Data()
+            }
 
             let strides: [Int]
             if ndim == 0 {

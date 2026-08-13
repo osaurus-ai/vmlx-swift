@@ -207,6 +207,32 @@ final class CacheCoordinatorMediaSaltTests: XCTestCase {
         XCTAssertNotNil(s1)
     }
 
+    /// 2026-08-12: live SIGTRAP. An image turn reached `computeMediaSalt`
+    /// with a zero-element pixel tensor; `asData` force-unwrapped the null
+    /// backing pointer and killed the app mid-conversation. Hashing an empty
+    /// tensor must produce a salt, not a trap.
+    func testComputeMediaSaltOnEmptyPixelsDoesNotTrap() {
+        let empty = MLXArray(Array<Float>(), [1, 0, 3, 448])
+        realize(empty)
+        let input = LMInput(
+            text: .init(tokens: MLXArray([Int32(1)])),
+            image: .init(pixels: empty))
+        let salt = computeMediaSalt(for: input)
+        XCTAssertNotNil(salt, "An image-bearing input must still salt its cache scope.")
+        XCTAssertEqual(salt, computeMediaSalt(for: input), "Salt must stay deterministic.")
+    }
+
+    /// An empty pixel tensor must not collide with a populated one, or a
+    /// blind turn would reuse a sighted turn's KV cache.
+    func testEmptyPixelsSaltDiffersFromPopulatedPixels() {
+        let empty = MLXArray(Array<Float>(), [1, 0, 3, 448])
+        let full = MLXArray((0..<48).map { Float($0) }).reshaped([1, 3, 4, 4])
+        realize(empty, full)
+        let a = LMInput(text: .init(tokens: MLXArray([Int32(1)])), image: .init(pixels: empty))
+        let b = LMInput(text: .init(tokens: MLXArray([Int32(1)])), image: .init(pixels: full))
+        XCTAssertNotEqual(computeMediaSalt(for: a), computeMediaSalt(for: b))
+    }
+
     func testComputeMediaSaltDiffersForDifferentPixels() {
         let p1 = MLXArray((0..<48).map { Float($0) }).reshaped([1, 3, 4, 4])
         let p2 = MLXArray((0..<48).map { Float($0 + 1) }).reshaped([1, 3, 4, 4])
