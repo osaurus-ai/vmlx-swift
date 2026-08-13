@@ -496,6 +496,9 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     let addedTokens: Set<String>
     let specialTokens: [String: Int]
     let addedTokensRegex: NSRegularExpression?
+    /// Fast path for the regex above. Non-nil only when no added token uses lstrip/rstrip, so the
+    /// match is purely literal. See AddedTokenTrie for why this exists.
+    let addedTokensTrie: AddedTokenTrie?
 
     private let preTokenizer: PreTokenizer?
     private let normalizer: Normalizer?
@@ -553,6 +556,17 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             return "\(prefix)(\(token))\(suffix)"
         }.joined(separator: "|")
         addedTokensRegex = try? NSRegularExpression(pattern: addedTokensRegexString, options: [])
+        // Literal-only bundles get the trie; lstrip/rstrip mean the pattern is not a literal set,
+        // so those keep the regex. Built once, like the regex — the per-request cost is the SCAN.
+        // `SWIFT_TRANSFORMERS_NO_ADDED_TOKEN_TRIE=1` forces the old regex path. This is the CONTROL
+        // ARM: "the trie is N times faster" is only a measurement if the same binary can also run
+        // the other way, and it lets a suspected tokenization difference be bisected in one run.
+        let trieDisabled = ["1", "true", "yes"].contains(
+            (ProcessInfo.processInfo.environment["SWIFT_TRANSFORMERS_NO_ADDED_TOKEN_TRIE"] ?? "")
+                .lowercased())
+        addedTokensTrie = (!trieDisabled && unwrappedAddedTokens.allSatisfy { !$0.prefix && !$0.suffix })
+            ? AddedTokenTrie(tokens: unwrappedAddedTokens.map(\.content))
+            : nil
 
         self.specialTokens = specialTokens
         self.addedTokens = Set(addedTokens.keys)
@@ -662,7 +676,9 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     public func tokenize(text: String) -> [String] {
         // Take care of special tokens first
         let sections: [String] =
-            if let regex = addedTokensRegex {
+            if let trie = addedTokensTrie {
+                trie.split(text)
+            } else if let regex = addedTokensRegex {
                 text.split(by: regex)
             } else {
                 [text]
