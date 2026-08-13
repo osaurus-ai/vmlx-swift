@@ -15,36 +15,32 @@ enum FocusedMLXTestSupport {
         return try body()
     }
 
+    /// Acquires the process-wide MLX lock without blocking a cooperative
+    /// thread.
+    ///
+    /// The previous shape parked a thread on `done.wait()` while a nested
+    /// `Task` ran `body()`. That task needs a cooperative-pool thread, and
+    /// under pool starvation it never gets one, so the wait never returns and
+    /// the semaphore is never signalled. Every later `withLock` — including
+    /// the SYNCHRONOUS one used by the Hy3 sanitizer tests — then blocks
+    /// forever at 0% CPU, hanging the whole test target and holding the
+    /// SwiftPM `.build` lock with it.
+    ///
+    /// Now only the private serial queue's own thread blocks while waiting for
+    /// the semaphore; `body()` is awaited normally by the caller, so no task
+    /// is ever waited on from inside a blocked thread.
     static func withLock<T: Sendable>(
         _ body: @Sendable @escaping () async throws -> T
     ) async throws -> T {
         _ = metallibPrepared
-        return try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<T, Error>) in
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             queue.async {
                 semaphore.wait()
-                defer { semaphore.signal() }
-                let done = DispatchSemaphore(value: 0)
-                nonisolated(unsafe) var output: Result<T, Error>?
-                Task { @Sendable in
-                    do {
-                        output = .success(try await body())
-                    } catch {
-                        output = .failure(error)
-                    }
-                    done.signal()
-                }
-                done.wait()
-                switch output {
-                case .success(let value):
-                    continuation.resume(returning: value)
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                case .none:
-                    continuation.resume(throwing: CocoaError(.userCancelled))
-                }
+                continuation.resume()
             }
         }
+        defer { semaphore.signal() }
+        return try await body()
     }
 
     private static let repoRoot = URL(fileURLWithPath: #filePath)
@@ -100,25 +96,66 @@ enum FocusedMLXTestSupport {
 }
 
 private final class ProcessWideMLXTestSemaphore: @unchecked Sendable {
-    private let pointer: UnsafeMutablePointer<sem_t>
+    private static let name = "/vmlx_mlx_lock"
+
+    /// How long to wait for the current holder before treating the semaphore
+    /// as abandoned. Real MLX sections here are well under a second; minutes
+    /// mean the holder is gone.
+    private static let staleAfter: TimeInterval = 90
+
+    private var pointer: UnsafeMutablePointer<sem_t>
 
     init() {
-        let name = "/vmlx_mlx_lock"
+        pointer = Self.open()
+    }
+
+    private static func open() -> UnsafeMutablePointer<sem_t> {
         guard let sem = sem_open(name, O_CREAT, 0o600, 1), sem != SEM_FAILED else {
             fatalError("Unable to create MLX Metal test semaphore")
         }
-        pointer = sem
+        return sem
     }
 
     deinit {
         sem_close(pointer)
     }
 
+    /// Acquire, recovering from a holder that died without signalling.
+    ///
+    /// This is a NAMED POSIX semaphore, so its count outlives the process. A
+    /// test run killed mid-section (Ctrl-C, a CI timeout, a crash) leaves the
+    /// count at zero permanently, and every later run on that machine then
+    /// blocks forever at 0% CPU — including runs that only touch unrelated
+    /// tests, because the whole target shares this lock. Recovering that state
+    /// previously required knowing to call `sem_unlink` by hand.
+    ///
+    /// Poll instead of blocking outright: if nobody releases within
+    /// ``staleAfter``, unlink the abandoned semaphore and reopen a fresh one.
+    /// Unlinking only detaches the name — a live holder keeps its own handle
+    /// and its `signal()` stays valid — so the worst case for a false positive
+    /// is two runs briefly sharing MLX, not a corrupted lock.
     func wait() {
-        while sem_wait(pointer) == -1 {
-            if errno != EINTR {
+        let deadline = Date().addingTimeInterval(Self.staleAfter)
+        while true {
+            if sem_trywait(pointer) == 0 { return }
+            if errno != EAGAIN && errno != EINTR {
                 fatalError("Unable to wait on MLX Metal test semaphore")
             }
+            if Date() >= deadline {
+                FileHandle.standardError.write(
+                    Data(
+                        """
+                        [vmlx-tests] MLX lock \(Self.name) held for >\(Int(Self.staleAfter))s; \
+                        assuming a killed run abandoned it and resetting.
+
+                        """.utf8))
+                sem_unlink(Self.name)
+                sem_close(pointer)
+                pointer = Self.open()
+                if sem_trywait(pointer) == 0 { return }
+                fatalError("Unable to recover abandoned MLX Metal test semaphore")
+            }
+            usleep(20_000)
         }
     }
 
