@@ -842,23 +842,27 @@ public struct LFM2VLProcessor: UserInputProcessor {
         var i = 0
         while i < promptTokens.count {
             if promptTokens[i] == imageTokenId {
-                // Count consecutive image tokens
-                var count = 0
-                while i + count < promptTokens.count && promptTokens[i + count] == imageTokenId {
-                    count += 1
-                }
-                // Replace with correct number for this image
+                // ONE placeholder == ONE image.
+                //
+                // This used to collapse a RUN of consecutive placeholders into a
+                // single expansion, which is wrong the moment a turn carries more
+                // than one image: the template emits one `<image>` per image and
+                // they land adjacent, so the run was expanded for image 0 only
+                // while image 1 still contributed its own features. The merge then
+                // asserted `Image features and image tokens do not match`.
+                //
+                // Caught by attaching two images in the app — SIGTRAP in
+                // `mergeInputIdsWithImageFeatures`. The single-image harness rows
+                // could not see it.
                 if imageIdx < allSpatialShapes.count {
                     let shape = allSpatialShapes[imageIdx]
                     let h = shape.0 / downsampleFactor
                     let w = shape.1 / downsampleFactor
-                    let numTokens = h * w
-                    for _ in 0 ..< numTokens {
-                        newPromptTokens.append(imageTokenId)
-                    }
+                    newPromptTokens.append(
+                        contentsOf: repeatElement(imageTokenId, count: h * w))
                     imageIdx += 1
                 }
-                i += count
+                i += 1
             } else {
                 newPromptTokens.append(promptTokens[i])
                 i += 1

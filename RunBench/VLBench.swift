@@ -1420,6 +1420,26 @@ enum VLBench {
                     "tools are rendered for a text turn but DROPPED for an image turn"])
         }
 
+        // 5b. TWO images in ONE turn. The app crashed here with SIGTRAP in
+        //     `mergeInputIdsWithImageFeatures` because the placeholder expansion
+        //     collapsed a RUN of consecutive `<image>` tokens into a single
+        //     image's worth, leaving the second image's features unbound. Every
+        //     single-image row passed while this crashed, which is why it is now
+        //     its own row.
+        let imageB = try synthesiseGradientImage(side: 224, invert: true)
+        let twoImageChat: [Chat.Message] = [
+            system,
+            .user("How many images did I send? Answer with the digit only.",
+                  images: [.ciImage(image), .ciImage(imageB)]),
+        ]
+        let t5b = try await turn(
+            "5b two images one turn", chat: twoImageChat, thinking: false, tools: nil)
+        guard !t5b.text.isEmpty else {
+            throw NSError(domain: "VLBench.variating", code: 87,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "two images in one turn produced no output"])
+        }
+
         // 6+7. CONTROL: two turns of IDENTICAL shape (no tools, thinking off),
         //      growing only by the appended turn. Every probe above missed with
         //      `noRow` — content divergence, not a missing boundary — because
