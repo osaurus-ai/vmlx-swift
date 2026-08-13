@@ -1420,6 +1420,31 @@ enum VLBench {
                     "tools are rendered for a text turn but DROPPED for an image turn"])
         }
 
+        // 6+7. CONTROL: two turns of IDENTICAL shape (no tools, thinking off),
+        //      growing only by the appended turn. Every probe above missed with
+        //      `noRow` — content divergence, not a missing boundary — because
+        //      tools and reasoning render into the SYSTEM prompt at the HEAD, so
+        //      changing either rewrites the prefix a prefix-cache depends on.
+        //      That is correct behaviour, not a caching defect, and this control
+        //      is what distinguishes the two: with the head held constant the
+        //      growing conversation MUST hit.
+        var growChat: [Chat.Message] = [system, .user("Name a primary colour.")]
+        let g1 = try await turn("6 grow A", chat: growChat, thinking: false, tools: nil)
+        growChat.append(.assistant(g1.text.isEmpty ? "Red." : g1.text))
+        growChat.append(.user("Name another one."))
+        let beforeGrowHits = coordinator.snapshotStats().diskStats?.hits ?? 0
+        _ = try await turn("7 grow B (same shape)", chat: growChat, thinking: false, tools: nil)
+        let afterGrowHits = coordinator.snapshotStats().diskStats?.hits ?? 0
+        if afterGrowHits <= beforeGrowHits {
+            throw NSError(domain: "VLBench.variating", code: 86,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "a growing conversation with an UNCHANGED head did not reuse its "
+                    + "prefix — that is a real cache defect, unlike the head-rewriting "
+                    + "turns above"])
+        }
+        print("      grow-control reused the prefix (disk hits \(beforeGrowHits) -> "
+            + "\(afterGrowHits))")
+
         // 5. Replay turn 1 verbatim: its prefix is still the head of this
         //    conversation, so the boundary must still be reachable after every
         //    shape change above.
