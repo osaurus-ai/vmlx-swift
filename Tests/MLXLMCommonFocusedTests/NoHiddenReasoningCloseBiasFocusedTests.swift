@@ -1976,7 +1976,14 @@ struct Gemma4VLMFocusedSourceContractsTests {
         #expect(overload.contains("upstream.convertTokenToId(\"<|tool_call>\").flatMap { upstream.convertIdToToken($0) } == \"<|tool_call>\""))
         #expect(overload.contains("upstream.convertTokenToId(\"<|turn>\").flatMap { upstream.convertIdToToken($0) } == \"<|turn>\""))
         #expect(overload.contains("!(chatTemplateTools?.isEmpty ?? true)"))
-        #expect(overload.contains("upstream.bosToken == \"<bos>\" || hasGemma4NativeToolSentinels"))
+        // The Gemma-4 tool fallback keys on the SENTINELS only. `<bos>` alone used to be
+        // sufficient here, which hijacked any ChatML bundle sharing that bos — ZAYA1-VL-8B
+        // received Gemma's `<|turn>`/`<turn|>` markers on every tool turn, echoed them back as
+        // literal text and emitted no tool call. Assert the narrow form, and assert the weak
+        // disjunct cannot come back.
+        #expect(overload.contains("&& hasGemma4NativeToolSentinels"))
+        #expect(
+            !overload.contains("upstream.bosToken == \"<bos>\" || hasGemma4NativeToolSentinels"))
         #expect(overload.contains("upstream.bosToken == \"<s>\""))
         #expect(overload.contains("upstream.convertTokenToId(\"<|im_end|>\").flatMap { upstream.convertIdToToken($0) } == \"<|im_end|>\""))
         #expect(!overload.contains("upstream.convertTokenToId(\"[AVAILABLE_TOOLS]\")"))

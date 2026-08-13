@@ -211,9 +211,22 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 tools: chatTemplateTools,
                                 additionalContext: additionalContext)
                         }
+                        // Route on Gemma-4's OWN tool sentinels, never on `<bos>` alone.
+                        //
+                        // `<bos>` is not a Gemma marker — ZAYA1-VL-8B also uses it while being a
+                        // ChatML model (`<bos><|im_start|>system …`). The bare bos disjunct
+                        // therefore swapped Zaya onto the Gemma-4 turn-marker template the moment
+                        // tools were offered, so the prompt arrived as `<|turn>model … <turn|>`
+                        // instead of `<|im_start|>assistant`. The model echoed that alien format
+                        // back as literal text (`<|turn>user`) and emitted no tool call at all —
+                        // on BOTH shipped quants, and only ever on tool turns.
+                        //
+                        // `hasGemma4NativeToolSentinels` round-trips `<|tool_call>` and `<|turn>`
+                        // through the vocabulary. Every shipped Gemma-4 bundle carries both; Zaya
+                        // carries neither, so it separates them cleanly where `<bos>` cannot.
                         let gemmaToolSchemasPresent =
                             !(chatTemplateTools?.isEmpty ?? true)
-                            && (upstream.bosToken == "<bos>" || hasGemma4NativeToolSentinels)
+                            && hasGemma4NativeToolSentinels
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
                         if gemmaToolSchemasPresent {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
@@ -621,9 +634,22 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 tools: chatTemplateTools,
                                 additionalContext: additionalContext)
                         }
+                        // Route on Gemma-4's OWN tool sentinels, never on `<bos>` alone.
+                        //
+                        // `<bos>` is not a Gemma marker — ZAYA1-VL-8B also uses it while being a
+                        // ChatML model (`<bos><|im_start|>system …`). The bare bos disjunct
+                        // therefore swapped Zaya onto the Gemma-4 turn-marker template the moment
+                        // tools were offered, so the prompt arrived as `<|turn>model … <turn|>`
+                        // instead of `<|im_start|>assistant`. The model echoed that alien format
+                        // back as literal text (`<|turn>user`) and emitted no tool call at all —
+                        // on BOTH shipped quants, and only ever on tool turns.
+                        //
+                        // `hasGemma4NativeToolSentinels` round-trips `<|tool_call>` and `<|turn>`
+                        // through the vocabulary. Every shipped Gemma-4 bundle carries both; Zaya
+                        // carries neither, so it separates them cleanly where `<bos>` cannot.
                         let gemmaToolSchemasPresent =
                             !(chatTemplateTools?.isEmpty ?? true)
-                            && (upstream.bosToken == "<bos>" || hasGemma4NativeToolSentinels)
+                            && hasGemma4NativeToolSentinels
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
                         if gemmaToolSchemasPresent {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
