@@ -170,6 +170,28 @@ let commonEndTokenStrings: [String] = [
     "<|EOT|>",          // Uppercase EOT variants in some shipped templates
 ]
 
+/// The one `commonEndTokenStrings` entry whose meaning is not universal.
+private let harmonyChannelSeparator = "<|end|>"
+
+/// Tokens that, taken together, identify the OpenAI **harmony** channel format
+/// (gpt-oss). No other shipped family carries all three.
+private let harmonyVocabularyMarkers = ["<|channel|>", "<|message|>", "<|return|>"]
+
+/// True when this bundle's vocabulary is harmony-shaped.
+///
+/// Detected from the VOCABULARY rather than `reasoningParserName`, because the
+/// capability stamp is optional: a locally converted gpt-oss bundle that was
+/// never stamped still needs the right stop set. `convertTokenToId` returns the
+/// unk id for unknown tokens, so id existence alone proves nothing — every
+/// marker is checked against unk.
+private func vocabularyIsHarmonyChannelFormat(_ tokenizer: Tokenizer) -> Bool {
+    harmonyVocabularyMarkers.allSatisfy { marker in
+        guard let id = tokenizer.convertTokenToId(marker) else { return false }
+        if let unknownID = tokenizer.unknownTokenId, id == unknownID { return false }
+        return true
+    }
+}
+
 func mergeStopStrings(_ explicit: [String], _ defaults: [String]) -> [String] {
     var seen = Set<String>()
     var merged: [String] = []
@@ -202,7 +224,31 @@ func resolveStopSequences(
             textStopStrings: &textStopStrings,
             allowExactTextFallback: true)
     }
+    // `<|end|>` is carried by `commonEndTokenStrings` for Phi-3/Phi-4, where it genuinely ends
+    // the turn. In the harmony channel format it means the opposite: the model closes its
+    // `analysis` channel with `<|end|>` and then OPENS `final`, so treating it as a stop halts
+    // generation at the end of the reasoning channel and the visible answer is empty. gpt-oss
+    // says so itself — its `generation_config.json` declares `<|return|>` / `<|call|>` /
+    // `<|endoftext|>` as eos and deliberately omits `<|end|>`.
+    //
+    // Suppress it only on TWO pieces of positive evidence: the vocabulary is harmony-shaped, and
+    // the model's own declaration excludes it. Anything less keeps today's behaviour. In
+    // particular the blanket is NOT skipped wholesale for every declaring bundle: bundles that
+    // declare an incomplete eos are common (VibeThinker-3B declares only `<|endoftext|>` while
+    // its template ends turns with `<|im_end|>`), and the blanket is their only turn boundary.
+    // See `UnderDeclaredEOSStopTests`, which fails against that broader gate.
+    let declaredEOS = Set(modelConfiguration.generationDefaults?.eosTokenIds?.values ?? [])
+    let suppressedHarmonyEnd: Int? = {
+        guard !declaredEOS.isEmpty, vocabularyIsHarmonyChannelFormat(tokenizer),
+            let endID = tokenizer.convertTokenToId(harmonyChannelSeparator),
+            tokenizer.unknownTokenId != endID,
+            !declaredEOS.contains(endID)
+        else { return nil }
+        return endID
+    }()
+
     for token in commonEndTokenStrings {
+        if suppressedHarmonyEnd != nil, token == harmonyChannelSeparator { continue }
         resolveStopTokenString(
             token,
             tokenizer: tokenizer,
