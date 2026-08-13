@@ -44,14 +44,24 @@ final class CacheCoordinatorRotatingGuardTests: XCTestCase {
         let (coord, dir) = makeCoordWithDisk()
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        // Build a small cache list: one KVCacheSimple + one prefilled
-        // RotatingKVCache. Both must serialize.
+        // Build a small cache list: one KVCacheSimple + one RotatingKVCache,
+        // BOTH prefilled to the same offset as the boundary key.
+        //
+        // This fixture predates #208 ("Refuse disk-cache stores whose cache
+        // offset disagrees with the boundary key"), which is why it left `kv`
+        // at offset 0 while `rot` sat at 8 and the store was — correctly —
+        // refused, leaving this suite red on main. A real cache list advances
+        // every layer together; a mismatched one is the poisoned-snapshot shape
+        // that #208 exists to reject, and is pinned separately by
+        // ``testStoreIsRefusedWhenLayerOffsetsDisagreeWithTheKey``.
         let kv = KVCacheSimple()
         let rot = RotatingKVCache(maxSize: 1024, keep: 0)
-        // Prefill the rotating layer so it has actual state to capture.
         let k = MLXArray.ones([1, 4, 8, 16], dtype: .bfloat16)
         let v = MLXArray.ones([1, 4, 8, 16], dtype: .bfloat16) * Float(0.5)
+        _ = kv.update(keys: k, values: v)
         _ = rot.update(keys: k, values: v)
+        XCTAssertEqual(kv.offset, 8)
+        XCTAssertEqual(rot.offset, 8)
 
         coord.storeAfterGeneration(
             promptTokens: [1, 2, 3, 4, 5, 6, 7, 8],
@@ -91,6 +101,43 @@ final class CacheCoordinatorRotatingGuardTests: XCTestCase {
                 arrays.keys.contains("__rot_1_meta__"),
                 "5-tuple metaState must be present at __rot_1_meta__.")
         }
+    }
+
+    /// The other half of the contract, and the reason the fixture above had to
+    /// be repaired rather than the guard relaxed: a cache list whose layers do
+    /// not all sit at the boundary key's token count must be refused outright.
+    ///
+    /// #208's rationale, verbatim from the call site: a poisoned entry
+    /// content-matches the key on a later fetch, restores one more token of
+    /// state than the key claims, and the engine re-feeds a token the cache
+    /// already holds — every later position shifts by one and each following
+    /// turn stores a seed derived from the corrupted state. A skipped entry
+    /// costs one prefill; a poisoned one costs correctness for the rest of the
+    /// conversation. Nothing pinned that behaviour until now.
+    func testStoreIsRefusedWhenLayerOffsetsDisagreeWithTheKey() {
+        let (coord, dir) = makeCoordWithDisk()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let kv = KVCacheSimple()
+        let rot = RotatingKVCache(maxSize: 1024, keep: 0)
+        let k = MLXArray.ones([1, 4, 8, 16], dtype: .bfloat16)
+        let v = MLXArray.ones([1, 4, 8, 16], dtype: .bfloat16) * Float(0.5)
+        // Only the rotating layer advances: offsets are {0, 8} against a
+        // boundary key that claims 8.
+        _ = rot.update(keys: k, values: v)
+
+        coord.storeAfterGeneration(
+            promptTokens: [1, 2, 3, 4, 5, 6, 7, 8],
+            perLayerData: [],
+            ssmStates: nil,
+            cache: [kv, rot],
+            mediaSalt: nil
+        )
+
+        XCTAssertNil(
+            coord.diskCache?.fetch(tokens: [1, 2, 3, 4, 5, 6, 7, 8], mediaSalt: nil),
+            "a cache list whose offsets disagree with the boundary key must not "
+                + "reach disk — the entry would restore more state than its key claims")
     }
 
     /// SLIDING-1 edge case: `CacheList` wrapping a `RotatingKVCache`

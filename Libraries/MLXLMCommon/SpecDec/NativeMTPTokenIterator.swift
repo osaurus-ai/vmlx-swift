@@ -515,19 +515,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
            !promptTokenIds.isEmpty,
            let promptCacheSnapshot
         {
-            let sharedPromptStripBoundary: Int? = {
-                guard ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
-                    coordinator.isHybrid,
-                    let turnStartToken = coordinator.genPromptSuffixTokens.first,
-                    let stripAt = promptTokenIds.lastIndex(of: turnStartToken),
-                    stripAt > 0,
-                    stripAt < promptTokenIds.count - 1,
-                    originalInput.canCaptureHybridStripBoundary(
-                        promptTokenIds: promptTokenIds,
-                        boundary: stripAt)
-                else { return nil }
-                return stripAt
-            }()
+            // Shared with the solo and batched engines — see the note there.
+            let sharedPromptStripBoundary = TokenIterator.hybridStripBoundaryIndex(
+                coordinator: coordinator,
+                promptTokenIds: promptTokenIds,
+                input: originalInput)
             let isReusablePrefixWarmup =
                 originalInput.cachePromptIntent == .reusablePrefixWarmup
             let shouldPersistExactWarmupPrompt = shouldPersistExactPromptBoundary(
@@ -655,7 +647,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 // so store it to enable growing-turn reuse under MTP. Clean SSM
                 // comes from `store`'s re-derive (enableSSMReDerive).
                 if ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
-                   coordinator.isHybrid,
+                   coordinator.capturesTurnStartBoundary,
                    !originalInput.hasMediaContent,
                    let stripAt = sharedPromptStripBoundary
                 {

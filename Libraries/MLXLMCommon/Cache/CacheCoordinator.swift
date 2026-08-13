@@ -244,6 +244,30 @@ public final class CacheCoordinator: @unchecked Sendable {
         (pagedCache != nil && !isPagedIncompatible) || diskCache != nil
     }
 
+    /// Whether the turn-start ("generation-suffix stripped") boundary is worth
+    /// storing for this model.
+    ///
+    /// This was `isHybrid` for as long as capturing the boundary meant either
+    /// retaining an extra cache copy or replaying the prefix through the model:
+    /// only SSM hybrids, whose companion state makes the post-answer snapshot
+    /// unusable, could earn that price back.
+    ///
+    /// Two things changed. Capture became prefill-time, so the boundary now
+    /// costs a snapshot taken on the way past rather than a second prefill. And
+    /// the assumption that dense and rotating models reuse via the post-answer
+    /// boundary turned out to be false for every reasoning model: hosts strip
+    /// think blocks when they re-render history, so the post-answer snapshot can
+    /// never be a prefix of the next turn's prompt. Measured on DSV4
+    /// (`DSV4-FINDINGS-AND-CROSSFAMILY-BACKLOG-2026-08-09.md` §3) — `HIT disk
+    /// boundary=3464 remaining=1367` then `MISS all tiers tokens=2644`: every
+    /// multi-turn send re-prefills the whole previous reply, and the tax grows
+    /// with the conversation.
+    ///
+    /// So the gate is now simply "is there a tier to land in". A model that does
+    /// reuse via the post-answer boundary keeps doing so; it just also stores the
+    /// turn-start one, which costs disk rather than time.
+    public var capturesTurnStartBoundary: Bool { canPersistBoundaries }
+
     /// 2026-05-04: mark the model as paged-incompatible (DSV4 hybrid pool
     /// caches). Forces the coordinator's fetch + store paths to skip the
     /// paged tier so the disk tier (`TQDiskSerializer`) is the only

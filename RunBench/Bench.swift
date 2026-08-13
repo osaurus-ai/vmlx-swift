@@ -2891,9 +2891,37 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         diskCacheDir: cacheDir,
         ssmMaxEntries: 64,
         modelKey: modelName))
+    // Mirror `ModelContainer.swift:310`. Without this the coordinator's
+    // generation-prompt suffix is EMPTY, `hybridStripBoundaryIndex` returns nil,
+    // and the turn-start boundary — the whole cross-turn reuse mechanism this row
+    // exists to measure — never fires. The row still passed, because paged
+    // post-answer reuse carried it; a `VMLX_HYBRID_STRIPPED_STORE` A/B through
+    // here printed byte-identical numbers in both arms and looked like "no
+    // effect" when it was really "never ran".
+    let genPromptSuffixTokens: [Int] = {
+        guard let gp = context.tokenizer as? GenerationPromptControllableTokenizer
+        else { return [] }
+        let dummy: [[String: any Sendable]] = [["role": "user", "content": "x"]]
+        guard
+            let withGen = try? gp.applyChatTemplate(
+                messages: dummy, tools: nil, additionalContext: nil,
+                addGenerationPrompt: true),
+            let withoutGen = try? gp.applyChatTemplate(
+                messages: dummy, tools: nil, additionalContext: nil,
+                addGenerationPrompt: false)
+        else { return [] }
+        var common = 0
+        let maxCommon = min(withGen.count, withoutGen.count)
+        while common < maxCommon, withGen[common] == withoutGen[common] { common += 1 }
+        let suffix = Array(withGen[common...])
+        guard (1...64).contains(suffix.count) else { return [] }
+        return suffix
+    }()
+    coordinator.setGenPromptSuffixTokens(genPromptSuffixTokens)
     print(
         "Cache policy: paged=\(usePagedCache) disk=\(enableDiskCache) "
-            + "blockSize=64 maxBlocks=512")
+            + "blockSize=64 maxBlocks=512 "
+            + "genPromptSuffix=\(genPromptSuffixTokens.count) tokens")
 
     let budget = max(maxNew, 48)
     var params: GenerateParameters

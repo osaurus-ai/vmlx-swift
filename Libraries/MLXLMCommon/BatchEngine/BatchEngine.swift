@@ -2976,19 +2976,15 @@ public actor BatchEngine {
                 cache.map(\.offset).max() ?? 0 >= tokenCount
             }
 
-            let sharedPromptStripBoundary: Int? = {
-                guard ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
-                    coordinator.isHybrid,
-                    let turnStartToken = coordinator.genPromptSuffixTokens.first,
-                    let stripAt = promptTokens.lastIndex(of: turnStartToken),
-                    stripAt > 0,
-                    stripAt < promptTokens.count - 1,
-                    slot.originalInput.canCaptureHybridStripBoundary(
-                        promptTokenIds: promptTokens,
-                        boundary: stripAt)
-                else { return nil }
-                return stripAt
-            }()
+            // One predicate for all three engines. Three inline copies used to
+            // drift: this one and the MTP one rejected `stripAt ==
+            // promptTokens.count - 1` while the solo TokenIterator accepted it,
+            // so a template whose generation prompt is a single token got a
+            // cross-turn checkpoint on one engine and none on the other two.
+            let sharedPromptStripBoundary = TokenIterator.hybridStripBoundaryIndex(
+                coordinator: coordinator,
+                promptTokenIds: promptTokens,
+                input: slot.originalInput)
             var sharedPromptRederivedStates: [Int: [MLXArray]]?
             let sharedPromptAdditionalBoundaries = Array(Set(
                 slot.originalInput.cachePrefixTokenCounts
@@ -3005,6 +3001,8 @@ public actor BatchEngine {
             // required by the next turn.  Dense/rotating, media-unsafe, raw,
             // and non-chat prompts have no proven strip boundary and keep the
             // existing prompt/post-answer policy.
+            // Still `isHybrid` on purpose — see the note in Evaluate.swift. This
+            // suppresses every other boundary; only an SSM hybrid can afford that.
             let usesCanonicalHybridBoundary =
                 coordinator.isHybrid && sharedPromptStripBoundary != nil
             let isReusablePrefixWarmup =
@@ -3312,7 +3310,7 @@ public actor BatchEngine {
                 // `cachePrefixTokenCounts` entry — gating on it silently disables
                 // the store entirely (the re-derive here is the only writer).
                 if ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
-                   coordinator.isHybrid,
+                   coordinator.capturesTurnStartBoundary,
                    let stripAt = sharedPromptStripBoundary
                 {
                     let strippedTokens = Array(promptTokens.prefix(stripAt))

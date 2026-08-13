@@ -1941,8 +1941,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     ) -> Int? {
         guard ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
             let coordinator,
-            coordinator.isHybrid,
-            coordinator.canPersistBoundaries,
+            coordinator.capturesTurnStartBoundary,
             let turnStartTok = coordinator.genPromptSuffixTokens.first,
             let stripAt = promptTokenIds.lastIndex(of: turnStartTok),
             stripAt > 0, stripAt < promptTokenIds.count,
@@ -2472,6 +2471,16 @@ public struct TokenIterator: TokenIteratorProtocol {
         // post-answer snapshots are both larger and not the boundary the next
         // templated turn is guaranteed to contain.  Prompts without this
         // processor-proven boundary keep the existing storage policy.
+        // Deliberately still `isHybrid`, NOT `capturesTurnStartBoundary`. This flag
+        // does not mean "capture the turn-start boundary" — it means "the turn-start
+        // boundary is the ONLY one worth storing", and it suppresses the exact prompt
+        // store, the N-1 disk seed and the non-stable prefix boundaries below. That is
+        // right for an SSM hybrid, whose post-answer snapshot is unusable. It is wrong
+        // for everyone else: measured on gemma-4-E2B (rotating SWA), widening this too
+        // dropped disk stores 4 -> 2 and moved the pre-turn-2 match from 991/1015 to
+        // 982/1015 — exactly the generation-prompt suffix length, i.e. the stripped
+        // boundary REPLACED the better post-answer one instead of joining it.
+        // Non-hybrids now ADD the turn-start boundary and keep the rest.
         let usesCanonicalHybridBoundary =
             coordinator.isHybrid && hybridStripBoundary != nil
         let isReusablePrefixWarmup =
