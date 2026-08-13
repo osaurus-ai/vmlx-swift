@@ -1379,6 +1379,47 @@ enum VLBench {
                 userInfo: [NSLocalizedDescriptionKey: "turn 4 (image+tools) produced nothing"])
         }
 
+        // 4b. Same image+tools turn, but phrased as a single tool instruction.
+        //     Turn 4 asks for two things at once ("look at this image, THEN get
+        //     the weather"); this isolates whether the tool is lost because an
+        //     image is present at all, or only because the instruction is split.
+        var directChat = chat
+        directChat.removeLast()
+        directChat.append(.user(
+            "Get the weather in Tokyo.", images: [.ciImage(image)]))
+        let t4b = try await turn(
+            "4b image+tools direct", chat: directChat, thinking: false, tools: [weatherTool])
+        if t4.toolCalls.isEmpty && t4b.toolCalls.isEmpty {
+            print("      NOTE: image+tools produced no call under EITHER phrasing")
+        } else if t4.toolCalls.isEmpty {
+            print("      NOTE: image+tools works with a direct instruction; the "
+                + "split \"look at image, then use tool\" phrasing is what loses it")
+        }
+
+        // Does the tools block actually reach the prompt when an image is in the
+        // same turn? Render the identical chat with and without tools and compare
+        // token counts — if they match, the tools were dropped before the model
+        // ever saw them, which is a rendering bug rather than model behaviour.
+        let withTools = try await prepare(directChat, thinking: false, tools: [weatherTool])
+        let withoutTools = try await prepare(directChat, thinking: false, tools: nil)
+        let nWith = withTools.text.tokens.reshaped(-1).size
+        let nWithout = withoutTools.text.tokens.reshaped(-1).size
+        print("  [render probe] image turn: with tools=\(nWith) tok, "
+            + "without tools=\(nWithout) tok, delta=\(nWith - nWithout)")
+        // Same comparison on a text-only turn, as the control.
+        let textOnly: [Chat.Message] = [system, .user("Get the weather in Tokyo.")]
+        let textWith = try await prepare(textOnly, thinking: false, tools: [weatherTool])
+        let textWithout = try await prepare(textOnly, thinking: false, tools: nil)
+        let tWith = textWith.text.tokens.reshaped(-1).size
+        let tWithout = textWithout.text.tokens.reshaped(-1).size
+        print("  [render probe] text turn:  with tools=\(tWith) tok, "
+            + "without tools=\(tWithout) tok, delta=\(tWith - tWithout)")
+        if nWith == nWithout && tWith != tWithout {
+            throw NSError(domain: "VLBench.variating", code: 85,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "tools are rendered for a text turn but DROPPED for an image turn"])
+        }
+
         // 5. Replay turn 1 verbatim: its prefix is still the head of this
         //    conversation, so the boundary must still be reachable after every
         //    shape change above.
