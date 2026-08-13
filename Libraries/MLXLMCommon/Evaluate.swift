@@ -217,6 +217,20 @@ public struct GenerateParameters: Sendable {
     /// stay masked. Zero disables the window.
     public var initialSuppressCount: Int = 0
 
+    /// Explicit ceiling on reasoning-block length, in sampled tokens. `nil`
+    /// (the default everywhere) leaves generation completely untouched.
+    /// Paired with ``reasoningBudgetCloseTokenID``; see `ReasoningBudget`,
+    /// which also documents why this is not the banned automatic close bias.
+    public var reasoningBudgetTokens: Int? = nil
+
+    /// Close token required once ``reasoningBudgetTokens`` is spent. Resolved
+    /// per family by round-tripping candidate spellings through the tokenizer.
+    public var reasoningBudgetCloseTokenID: Int? = nil
+
+    /// Ids that start the count for families whose model, not template, emits
+    /// the open tag. Empty means the prompt already opened reasoning.
+    public var reasoningBudgetStartTokenIDs: [Int] = []
+
     /// Speculative-decoding strategy (opt-in). `nil` preserves the existing
     /// autoregressive decode path byte-for-byte — callers who don't set this
     /// see no behaviour change.
@@ -406,8 +420,18 @@ public struct GenerateParameters: Sendable {
             : InitialSuppressTokensProcessor(
                 tokens: initialSuppressTokens, count: initialSuppressCount)
 
+        let reasoningBudgetContext: ReasoningBudgetProcessor? = {
+            guard let budget = reasoningBudgetTokens, budget > 0,
+                let closeID = reasoningBudgetCloseTokenID
+            else { return nil }
+            return ReasoningBudgetProcessor(
+                closeTokenID: closeID, tokenCount: budget,
+                startTokenIDs: reasoningBudgetStartTokenIDs)
+        }()
+
         if repetitionContext == nil && presenceContext == nil && frequencyContext == nil
             && suppressContext == nil && initialSuppressContext == nil
+            && reasoningBudgetContext == nil
         {
             return nil
         }
@@ -417,7 +441,8 @@ public struct GenerateParameters: Sendable {
             presenceContext: presenceContext,
             frequencyContext: frequencyContext,
             suppressContext: suppressContext,
-            initialSuppressContext: initialSuppressContext
+            initialSuppressContext: initialSuppressContext,
+            reasoningBudgetContext: reasoningBudgetContext
         )
     }
 
@@ -430,8 +455,11 @@ public struct GenerateParameters: Sendable {
             && (presencePenalty == nil || presencePenalty == 0)
             && (frequencyPenalty == nil || frequencyPenalty == 0)
             // The minimum reasoning floor masks logits per sampled token;
-            // drafted MTP tokens would bypass it, so fall back to AR.
+            // drafted MTP tokens would bypass it, so fall back to AR. A
+            // reasoning budget is the same story: a drafted token could sail
+            // past the ceiling unchecked.
             && initialSuppressTokens.isEmpty
+            && reasoningBudgetTokens == nil
     }
 
     public func canUseNativeMTP(for input: LMInput) -> Bool {
@@ -1002,19 +1030,23 @@ public struct PenaltyProcessor: LogitProcessor {
     var frequencyContext: FrequencyPenaltyContext?
     var suppressContext: SuppressTokensProcessor?
     var initialSuppressContext: InitialSuppressTokensProcessor?
+    /// Runs LAST so a required close is not undone by a penalty stage.
+    var reasoningBudgetContext: ReasoningBudgetProcessor?
 
     public init(
         repetitionContext: RepetitionContext?,
         presenceContext: PresencePenaltyContext?,
         frequencyContext: FrequencyPenaltyContext?,
         suppressContext: SuppressTokensProcessor? = nil,
-        initialSuppressContext: InitialSuppressTokensProcessor? = nil
+        initialSuppressContext: InitialSuppressTokensProcessor? = nil,
+        reasoningBudgetContext: ReasoningBudgetProcessor? = nil
     ) {
         self.repetitionContext = repetitionContext
         self.presenceContext = presenceContext
         self.frequencyContext = frequencyContext
         self.suppressContext = suppressContext
         self.initialSuppressContext = initialSuppressContext
+        self.reasoningBudgetContext = reasoningBudgetContext
     }
 
     mutating public func prompt(_ prompt: MLXArray) {
@@ -1023,6 +1055,7 @@ public struct PenaltyProcessor: LogitProcessor {
         frequencyContext?.prompt(prompt)
         suppressContext?.prompt(prompt)
         initialSuppressContext?.prompt(prompt)
+        reasoningBudgetContext?.prompt(prompt)
     }
 
     public func process(logits: MLXArray) -> MLXArray {
@@ -1032,6 +1065,7 @@ public struct PenaltyProcessor: LogitProcessor {
         logits = frequencyContext?.process(logits: logits) ?? logits
         logits = suppressContext?.process(logits: logits) ?? logits
         logits = initialSuppressContext?.process(logits: logits) ?? logits
+        logits = reasoningBudgetContext?.process(logits: logits) ?? logits
         return logits
     }
 
@@ -1041,6 +1075,7 @@ public struct PenaltyProcessor: LogitProcessor {
         frequencyContext?.didSample(token: token)
         suppressContext?.didSample(token: token)
         initialSuppressContext?.didSample(token: token)
+        reasoningBudgetContext?.didSample(token: token)
     }
 }
 

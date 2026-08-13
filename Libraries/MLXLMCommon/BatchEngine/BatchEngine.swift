@@ -474,6 +474,15 @@ public actor BatchEngine {
             parameters.initialSuppressTokens = [floor.closeTokenID]
             parameters.initialSuppressCount = floor.tokenCount
         }
+        // Upper bound. Inert unless VMLX_REASONING_BUDGET names a token count,
+        // so this changes nothing for callers who do not ask for it.
+        if let budget = ReasoningBudget.armIfNeeded(
+            tokenizer: context.tokenizer, promptTail: promptTail)
+        {
+            parameters.reasoningBudgetTokens = budget.tokenCount
+            parameters.reasoningBudgetCloseTokenID = budget.closeTokenID
+            parameters.reasoningBudgetStartTokenIDs = budget.startTokenIDs
+        }
         let request = BatchPendingRequest(
             input: input,
             parameters: parameters,
