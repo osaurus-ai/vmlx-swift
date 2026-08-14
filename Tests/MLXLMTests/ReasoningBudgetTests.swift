@@ -113,4 +113,80 @@ class ReasoningBudgetTests: XCTestCase {
             p.isNativeMTPLosslessGreedyEligible,
             "A drafted token could sail past the ceiling unchecked.")
     }
+
+    func testMTPIsRefusedWhileARequestedBudgetIsPending() {
+        var p = GenerateParameters(temperature: 0, topP: 1.0, topK: 0)
+        XCTAssertTrue(p.isNativeMTPLosslessGreedyEligible)
+        p.requestedReasoningBudgetTokens = 32
+        XCTAssertFalse(
+            p.isNativeMTPLosslessGreedyEligible,
+            "The requested form arms at submit — after this check — so it must disqualify MTP here."
+        )
+    }
+
+    // MARK: - Per-request arming (requestedReasoningBudgetTokens)
+
+    /// Fixed-vocab stub whose think tags genuinely round-trip, unlike the
+    /// random-vocab `TestTokenizer`.
+    private struct ThinkVocabTokenizer: MLXLMCommon.Tokenizer {
+        let vocab: [String: Int] = ["<think>": 10, "</think>": 11, "hello": 12]
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { [12] }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "hello" }
+        func convertTokenToId(_ token: String) -> Int? { vocab[token] }
+        func convertIdToToken(_ id: Int) -> String? {
+            vocab.first { $0.value == id }?.key
+        }
+        var bosToken: String? { nil }
+        var eosToken: String? { "</s>" }
+        var unknownToken: String? { nil }
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] { [12] }
+    }
+
+    func testRequestedCountArmsOnAPrimedTail() {
+        let armed = ReasoningBudget.arm(
+            tokenizer: ThinkVocabTokenizer(),
+            promptTail: "…assistant<think>",
+            tokenCount: 96
+        )
+        XCTAssertEqual(armed?.tokenCount, 96)
+        XCTAssertEqual(armed?.closeTokenID, 11)
+        XCTAssertEqual(
+            armed?.startTokenIDs, [],
+            "A primed tail counts immediately — waiting for an open tag that was already rendered would leave the ceiling inert."
+        )
+        XCTAssertEqual(armed?.openTokenIDs, [10])
+    }
+
+    func testRequestedCountArmsForASelfOpeningFamily() {
+        let armed = ReasoningBudget.arm(
+            tokenizer: ThinkVocabTokenizer(),
+            promptTail: "…assistant\n",
+            tokenCount: 64
+        )
+        XCTAssertEqual(
+            armed?.startTokenIDs, [10],
+            "Un-primed families start the count only when the model opens reasoning itself."
+        )
+    }
+
+    func testANonPositiveRequestedCountStaysInert() {
+        XCTAssertNil(
+            ReasoningBudget.arm(
+                tokenizer: ThinkVocabTokenizer(), promptTail: "<think>", tokenCount: 0))
+        XCTAssertNil(
+            ReasoningBudget.arm(
+                tokenizer: ThinkVocabTokenizer(), promptTail: "<think>", tokenCount: -5))
+    }
+
+    func testEnvArmedPathStillDelegatesToTheSameResolution() {
+        // Without VMLX_REASONING_BUDGET in the environment the legacy entry
+        // point must stay nil even though the vocab could arm.
+        XCTAssertNil(
+            ReasoningBudget.armIfNeeded(
+                tokenizer: ThinkVocabTokenizer(), promptTail: "<think>"))
+    }
 }

@@ -223,6 +223,15 @@ public struct GenerateParameters: Sendable {
     /// which also documents why this is not the banned automatic close bias.
     public var reasoningBudgetTokens: Int? = nil
 
+    /// Caller-requested reasoning ceiling, resolved by the engine at submit
+    /// time via `ReasoningBudget.arm(tokenizer:promptTail:tokenCount:)` —
+    /// unlike the four resolved fields below/above, this one needs no token
+    /// ids from the caller, so a serving layer can bound a single request
+    /// (an OpenAI-compatible client with a finite `max_tokens` that reads
+    /// only `content`) without the process-global `VMLX_REASONING_BUDGET`
+    /// env. The env, when set, wins. `nil` (the default) changes nothing.
+    public var requestedReasoningBudgetTokens: Int? = nil
+
     /// Close token required once ``reasoningBudgetTokens`` is spent. Resolved
     /// per family by round-tripping candidate spellings through the tokenizer.
     public var reasoningBudgetCloseTokenID: Int? = nil
@@ -481,6 +490,11 @@ public struct GenerateParameters: Sendable {
             // past the ceiling unchecked.
             && initialSuppressTokens.isEmpty
             && reasoningBudgetTokens == nil
+            // The requested form resolves into `reasoningBudgetTokens` only
+            // at submit time — after this eligibility check runs — so it
+            // must disqualify MTP here too or a drafted token could sail
+            // past the ceiling before the budget arms.
+            && requestedReasoningBudgetTokens == nil
     }
 
     public func canUseNativeMTP(for input: LMInput) -> Bool {

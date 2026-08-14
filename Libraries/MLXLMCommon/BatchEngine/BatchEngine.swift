@@ -474,10 +474,16 @@ public actor BatchEngine {
             parameters.initialSuppressTokens = [floor.closeTokenID]
             parameters.initialSuppressCount = floor.tokenCount
         }
-        // Upper bound. Inert unless VMLX_REASONING_BUDGET names a token count,
-        // so this changes nothing for callers who do not ask for it.
+        // Upper bound. Armed by the process-global VMLX_REASONING_BUDGET env
+        // (which wins) or a caller's per-request
+        // `requestedReasoningBudgetTokens`; inert when neither asks, so this
+        // changes nothing for callers who do not opt in.
         if let budget = ReasoningBudget.armIfNeeded(
             tokenizer: context.tokenizer, promptTail: promptTail)
+            ?? parameters.requestedReasoningBudgetTokens.flatMap({
+                ReasoningBudget.arm(
+                    tokenizer: context.tokenizer, promptTail: promptTail, tokenCount: $0)
+            })
         {
             parameters.reasoningBudgetTokens = budget.tokenCount
             parameters.reasoningBudgetCloseTokenID = budget.closeTokenID
@@ -601,8 +607,14 @@ public actor BatchEngine {
         // (via `startSoloFastPath`), so arming only in `submit` left the
         // ceiling inert for every GUI turn — verified live: env set on the
         // process, sampling trace writing, and zero budget trace lines.
+        // Same env-then-request resolution as `submit` so a caller's
+        // per-request ceiling holds on whichever path serves the request.
         if let budget = ReasoningBudget.armIfNeeded(
             tokenizer: tokenizer, promptTail: promptTail)
+            ?? parameters.requestedReasoningBudgetTokens.flatMap({
+                ReasoningBudget.arm(
+                    tokenizer: tokenizer, promptTail: promptTail, tokenCount: $0)
+            })
         {
             parameters.reasoningBudgetTokens = budget.tokenCount
             parameters.reasoningBudgetCloseTokenID = budget.closeTokenID

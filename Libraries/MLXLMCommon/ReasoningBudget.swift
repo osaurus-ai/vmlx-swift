@@ -126,6 +126,24 @@ public enum ReasoningBudget {
         promptTail: String?
     ) -> Armed? {
         guard let budget = configuredTokenCount else { return nil }
+        return arm(tokenizer: tokenizer, promptTail: promptTail, tokenCount: budget)
+    }
+
+    /// Arm with an explicitly requested token count — the per-request form of
+    /// the env-armed `armIfNeeded`, for serving layers that must bound
+    /// reasoning on SOME requests without a process-global setting. The
+    /// canonical case: an OpenAI-compatible client sends a finite
+    /// `max_tokens` and reads only `content` — a think block that spends the
+    /// whole cap returns an empty answer to a client that cannot see
+    /// `reasoning_content` at all. Same opt-in discipline as the env path:
+    /// the caller names a positive count, nothing arms by default, and the
+    /// primed-vs-self-opening resolution is identical.
+    public static func arm(
+        tokenizer: any Tokenizer,
+        promptTail: String?,
+        tokenCount: Int
+    ) -> Armed? {
+        guard tokenCount > 0 else { return nil }
         guard let closeID = closeTokenID(tokenizer: tokenizer) else { return nil }
         let primed = promptTail.map(promptTailOpensReasoning) ?? false
         let openIDs = primed ? [] : openTokenIDs(tokenizer: tokenizer)
@@ -133,7 +151,7 @@ public enum ReasoningBudget {
         // reasoning block, so stay inert rather than counting plain output.
         guard primed || !openIDs.isEmpty else { return nil }
         return Armed(
-            closeTokenID: closeID, tokenCount: budget, startTokenIDs: openIDs,
+            closeTokenID: closeID, tokenCount: tokenCount, startTokenIDs: openIDs,
             openTokenIDs: openTokenIDs(tokenizer: tokenizer))
     }
 
