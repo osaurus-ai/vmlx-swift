@@ -320,7 +320,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         guard effectiveParameters.canUseNativeMTP(for: input) else {
             throw NativeMTPRuntimeError.unsupportedSampling(
-                "native MTP is enabled only for text-only greedy requests with temperature=0, top_p>=1, top_k=0, min_p=0, and no active penalties")
+                "native MTP is enabled only for text-only requests with no active penalties, no suppress/reasoning-budget processors, and an unbounded KV window; sampled requests run the exact-pq accept path")
         }
 
         self.model = model
@@ -331,13 +331,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.sampler = effectiveParameters.sampler()
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
         self.maxTokens = effectiveParameters.maxTokens
-        // Python-vmlx policy parity: depths > 1 only ever won on a
-        // deterministic counting prompt (the 1.83x artifact); on real prose
-        // depth-3 measured 14% slower than AR. Cap at 1 unless a benchmark
-        // explicitly raises it via VMLX_MTP_DEPTH_CAP.
+        // Depth policy: D2 is the ceiling (Nemotron measured D3 at 0.48x; the
+        // Python-vmlx depth-3 prose figure was 14% SLOWER than AR — depths
+        // past 2 only ever won on a deterministic counting prompt, the 1.83x
+        // artifact). The cap used to be 1, which silently clamped a host that
+        // requested the measured bestDepth=2 from vmlx_mtp_tuning.json back to
+        // D1 — auto-launch D2 could never actually run. Hosts only request
+        // depth > 1 when a measured artifact says so, and benchmarks can still
+        // override via VMLX_MTP_DEPTH_CAP.
         let depthCap =
             ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
-            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 1
+            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 2
         self.depth = Swift.min(requestedDepth, depthCap)
         self.currentDepth = Swift.min(requestedDepth, depthCap)
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode

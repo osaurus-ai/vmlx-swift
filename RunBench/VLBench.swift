@@ -1246,13 +1246,39 @@ enum VLBench {
         print("=== VLBench variating pattern (reasoning x image x tools) ===")
         print("model: \(modelDir.lastPathComponent)")
 
+        // `BENCH_VL_NATIVE_MTP_DEPTH` runs the SAME variating shapes with the
+        // native MTP head live: text turns engage speculative decode, media
+        // turns fall back to AR inside the same conversation (canUseNativeMTP
+        // excludes media), and the cache probes prove the boundary survives
+        // the alternation. This is the crossed axis for the MTP PR — a linear
+        // MTP row cannot show reuse surviving an MTP->AR->MTP shape change.
+        let nativeMTPDepth = ProcessInfo.processInfo
+            .environment["BENCH_VL_NATIVE_MTP_DEPTH"].flatMap(Int.init)
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await loadProductionContext(from: modelDir)
+        let context: ModelContext
+        if nativeMTPDepth != nil {
+            let loaded = try await MLXLMCommon.loadModel(
+                from: modelDir,
+                using: #huggingFaceTokenizerLoader(),
+                loadConfiguration: LoadConfiguration(
+                    jangPress: .disabled,
+                    maxResidentBytes: .unlimited,
+                    memoryLimit: .unlimited,
+                    useMmapSafetensors: true,
+                    nativeMTP: true))
+            context = loaded.0
+        } else {
+            context = try await loadProductionContext(from: modelDir)
+        }
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
+        print("Native MTP depth: \(nativeMTPDepth.map(String.init) ?? "off")")
 
-        let params = GenerateParameters(
+        var params = GenerateParameters(
             maxTokens: maxNewTokens, temperature: 0, prefillStepSize: 512)
+        if let nativeMTPDepth {
+            params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
+        }
         let coordinator = makeProofCoordinator(
             modelDir: modelDir, context: context, parameters: params, label: "variating")
         nonisolated(unsafe) let ctx = context

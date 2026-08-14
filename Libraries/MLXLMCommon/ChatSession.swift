@@ -461,8 +461,9 @@ public final class ChatSession {
                             // `generateTokensTask(...)` already dispatch on `draftStrategy`, but
                             // `ChatSession` did not — so a caller using the high-level chat API got
                             // plain autoregressive decode no matter what it set, with no error and
-                            // no log line to say so. Eligibility is `canUseNativeMTP` (greedy-only,
-                            // no media, unbounded KV), so this cannot change what text is produced.
+                            // no log line to say so. Eligibility is `canUseNativeMTP` (penalty-free,
+                            // no media, unbounded KV; greedy verifies token-identical, sampled runs
+                            // the exact-pq accept path), so this cannot change the output law.
                             guard let nativeModel = model as? any NativeMTPModel else {
                                 throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
                             }

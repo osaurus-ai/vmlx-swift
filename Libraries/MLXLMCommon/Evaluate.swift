@@ -455,7 +455,24 @@ public struct GenerateParameters: Sendable {
             && topP >= 1
             && topK == 0
             && minP == 0
-            && (repetitionPenalty == nil || repetitionPenalty == 0 || repetitionPenalty == 1)
+            && isNativeMTPPenaltyFree
+    }
+
+    /// Sampled requests are also native-MTP eligible: the iterator's exact-pq
+    /// accept path (`SpeculativeSamplingController`) applies the verifier's own
+    /// temperature/top-p/top-k/min-p filter chain, accepts drafts with
+    /// probability min(1, p/q), and samples the residual distribution on
+    /// reject — the output distribution is the target sampler's, token for
+    /// token. What stays ineligible is anything whose logits depend on the
+    /// SAMPLED HISTORY (penalties, suppress lists, reasoning budgets): a
+    /// drafted token would bypass the per-token processor.
+    ///
+    /// This is the gate that used to silently exclude every real chat session:
+    /// bundles default to temperature 1.0, so "MTP on" produced plain AR decode
+    /// with no error and no log line — the exact shape of the "MTP barely does
+    /// anything" reports.
+    public var isNativeMTPPenaltyFree: Bool {
+        (repetitionPenalty == nil || repetitionPenalty == 0 || repetitionPenalty == 1)
             && (presencePenalty == nil || presencePenalty == 0)
             && (frequencyPenalty == nil || frequencyPenalty == 0)
             // The minimum reasoning floor masks logits per sampled token;
@@ -467,7 +484,7 @@ public struct GenerateParameters: Sendable {
     }
 
     public func canUseNativeMTP(for input: LMInput) -> Bool {
-        isNativeMTPLosslessGreedyEligible
+        isNativeMTPPenaltyFree
             && !input.hasMediaContent
             // A bounded KV window makes attention slots `RotatingKVCache`, a
             // ring buffer that OVERWRITES evicted positions. Once rotation

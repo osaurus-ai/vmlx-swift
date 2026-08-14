@@ -599,6 +599,20 @@ public enum NativeMTPActivation {
         }
     }
 
+    /// Tuning-measurement mode: an explicitly requested load may instantiate the
+    /// MTP head WITHOUT a usable `vmlx_mtp_tuning.json`, because the artifact's
+    /// baseline/best numbers can only come from running that head. Without this
+    /// escape hatch the tuning file is impossible to create legitimately: the
+    /// load gate demands the artifact, and the artifact demands a measured run.
+    /// Auto-launch (no explicit request) is unaffected — it still requires
+    /// measured tuning, so no user-facing path gets an unmeasured MTP session.
+    public static var isTuningMeasurementRun: Bool {
+        let raw = ProcessInfo.processInfo.environment["VMLX_MTP_TUNING_MEASUREMENT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? "0"
+        return ["1", "true", "yes", "on"].contains(raw)
+    }
+
     public static func shouldLoadNativeMTPWeights(
         configData: Data,
         baseModelType: String,
@@ -611,6 +625,9 @@ public enum NativeMTPActivation {
         }
         guard status?.hasCompleteMTPArtifact == true else {
             throw NativeMTPActivationError.requestedButMissingArtifact(status)
+        }
+        if isTuningMeasurementRun {
+            return true
         }
         guard status?.canAutoLaunchMTP == true else {
             throw NativeMTPActivationError.requestedWithoutUsableTuning(status)
