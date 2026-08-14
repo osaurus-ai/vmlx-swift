@@ -214,8 +214,12 @@ public final class ZayaCCACache: KVCache {
             convChannels: convChannels,
             hiddenSize: hiddenSize)
         dup.kv = kv.copy()
-        dup.convState = convState[.ellipsis]
-        dup.prevHS = prevHS[.ellipsis]
+        // Owned copies, not `[.ellipsis]` views — a retained slot-lane
+        // snapshot built from views keeps the live CCA buffers
+        // multiply-referenced and blocks in-place-update donation
+        // (see `ownedStateCopy`).
+        dup.convState = ownedStateCopy(convState)
+        dup.prevHS = ownedStateCopy(prevHS)
         return dup
     }
 

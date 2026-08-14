@@ -76,6 +76,31 @@ public protocol KVCache: Evaluatable, Updatable {
     func copy() -> any KVCache
 }
 
+/// Materialize an OWNED copy of a cache state array for `copy()`.
+///
+/// The previous idiom, `x[.ellipsis]`, is a slice — and `Slice::eval` shares
+/// the source buffer (`copy_shared_buffer` in
+/// `mlx/backend/common/slicing.cpp`), so a retained cache copy built from
+/// slices keeps the LIVE cache's buffers multiply-referenced. That blocks
+/// MLX's buffer donation on the per-token in-place update
+/// (`keys[..., offset ..< offset+1, ...] = newKeys`), which degrades every
+/// decode step into a full-capacity buffer copy. Measured on Qwen3.6-27B at a
+/// 13,823-token prompt: TokenIterator (no retained copy) decoded at 32 tok/s
+/// while the BatchEngine slot lane — which retains exactly such a copy as
+/// `promptCacheSnapshot` — fell to 6.1 tok/s with the coordinator off and
+/// 1.5 tok/s with paged+disk on. Short prompts hide the cost because the
+/// copied capacity is tiny.
+///
+/// `* 1` is the same materializing idiom `ArraysCache.copy()` already uses:
+/// a real elementwise op whose output cannot alias a multiply-referenced
+/// input, so once evaluated the copy owns its buffer and the live cache is
+/// uniquely referenced again. The stale-read protection callers rely on is
+/// preserved — it becomes a guarantee of the owned buffer rather than an
+/// accident of blocked donation.
+func ownedStateCopy(_ x: MLXArray) -> MLXArray {
+    x * 1
+}
+
 /// Protocol for caches that support efficient quantized operations
 ///
 /// **Usage Example:**
@@ -560,7 +585,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         new.step = self.step
         let s = self.state
         if !s.isEmpty {
-            new.state = s.map { $0[.ellipsis] }
+            new.state = s.map(ownedStateCopy)
         }
         return new
     }
@@ -903,7 +928,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         let new = RotatingKVCache(maxSize: maxCacheSize, keep: keep, step: step)
         let s = self.state
         if !s.isEmpty {
-            new.state = s.map { $0[.ellipsis] }
+            new.state = s.map(ownedStateCopy)
         }
         new.metaState = self.metaState
         return new
@@ -1158,7 +1183,7 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         let new = QuantizedKVCache(groupSize: groupSize, bits: bits, mode: mode)
         let s = self.state
         if !s.isEmpty {
-            new.state = s.map { $0[.ellipsis] }
+            new.state = s.map(ownedStateCopy)
         }
         new.metaState = self.metaState
         return new
@@ -1258,7 +1283,7 @@ public class ChunkedKVCache: KVCacheSimple {
         new.step = self.step
         let s = self.state
         if !s.isEmpty {
-            new.state = s.map { $0[.ellipsis] }
+            new.state = s.map(ownedStateCopy)
         }
         new.metaState = self.metaState
         return new

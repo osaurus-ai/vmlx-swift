@@ -14,16 +14,24 @@ import MLX
 /// valid while carrying generated-token state under a prompt-only key.
 func makePromptBoundaryCacheSnapshot(from cache: [any KVCache]) -> [any KVCache] {
     let snapshot = cache.map { $0.copy() }
-    // ArraysCache/MambaCache update their recurrent tensors in place. Their
-    // copy implementations create independent `* 1` graph nodes; materialize
-    // the whole list before decode mutates the live cache so the prompt
-    // snapshot cannot inherit later tool/output state. One batched eval keeps
-    // this substantially cheaper than synchronizing every recurrent layer.
-    if snapshot.contains(where: {
-        $0 is HybridPoolCache || cacheContainsPathDependentState([$0])
-    }) {
-        MLX.eval(snapshot)
-    }
+    // Materialize the whole list unconditionally, for two reasons:
+    //
+    // 1. ArraysCache/MambaCache update their recurrent tensors in place;
+    //    the snapshot must be sealed before decode mutates the live cache so
+    //    the prompt boundary cannot inherit later tool/output state.
+    // 2. Every copy() now builds owned `* 1` nodes (`ownedStateCopy`), but an
+    //    UNEVALUATED node still holds a graph reference to the live cache's
+    //    buffers. A snapshot retained lazily through decode (the slot lane's
+    //    `promptCacheSnapshot`) keeps those buffers multiply-referenced,
+    //    which blocks buffer donation on the per-token in-place KV update and
+    //    turns each decode step into a full-capacity copy — measured 32 -> 6.1
+    //    tok/s on a 13.8k prompt. Evaluating here pays one boundary-sized
+    //    copy per turn and releases the live buffers back to unique ownership
+    //    before the first decode step.
+    //
+    // One batched eval keeps this substantially cheaper than synchronizing
+    // every layer separately.
+    MLX.eval(snapshot)
     return snapshot
 }
 
