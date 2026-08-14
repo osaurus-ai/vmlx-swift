@@ -1338,7 +1338,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 partial + item.key * item.value
             }
             let averageAccepted = Double(acceptedTokens) / Double(Swift.max(verifyCalls, 1))
-            if averageAccepted >= Self.hybridWarmupMinimumAverageAccepted {
+            let warmupFloor =
+                Self.hybridWarmupMinimumAverageAcceptedPerDraft * Double(currentDepth)
+            if averageAccepted >= warmupFloor {
                 hybridSafetyWarmupComplete = true
                 NativeMTPHybridWarmupMemo.record(true, for: model)
             } else {
@@ -1372,7 +1374,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        if currentDepth <= 2, acceptanceRatio < Self.depthTwoMinimumAcceptanceRatio {
+        if currentDepth == 2, acceptanceRatio < Self.depthTwoMinimumAcceptanceRatio {
+            // A failing D2 downshifts to D1 first — D1's breakeven is far
+            // lower, so "D2 doesn't pay" is not evidence that speculation
+            // itself doesn't.
+            currentDepth = 1
+            adaptiveDepthDownshiftCount += 1
+            adaptiveWindow.removeAll(keepingCapacity: true)
+            mtpCache = model.makeNativeMTPCache()
+            mtpCacheRefreshCount += 1
+            return
+        }
+
+        if currentDepth == 1, acceptanceRatio < Self.depthOneMinimumAcceptanceRatio {
             enableAutoregressiveFallback(
                 reason: String(
                     format: "adaptive_accept_ratio=%.2f_depth=%d",
@@ -1738,8 +1752,27 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static let adaptiveMinimumSamplesPerDepth = 6
     private static let depthThreeMinimumAcceptanceRatio = 0.85
     private static let depthTwoMinimumAcceptanceRatio = 0.75
+    /// D1 breakeven is far below D2's. A depth-1 cycle costs one 2-position
+    /// verify forward (≈ one decode forward on a bandwidth-bound dense
+    /// backbone) plus a 1-layer MTP head forward, and emits 1 + accept
+    /// tokens — so speculation pays for itself well below 0.75 acceptance.
+    /// The flat ≤2 floor of 0.75 was measured killing a profitable D1 on
+    /// Qwen3.6-27B prose: accept ratio 0.67 (avgCommittedPerVerify 1.67)
+    /// tripped `adaptive_accept_ratio` at exactly window size 12, before the
+    /// 16-cycle hybrid warmup could ever complete, so every hybrid run paid
+    /// 12 sequential-priced cycles and then fell back to AR — 29.9 tok/s vs
+    /// 34.0 AR, the precise shape of the "MTP is slower" reports.
+    private static let depthOneMinimumAcceptanceRatio = 0.5
     private static let hybridWarmupCycleCount = 16
-    private static let hybridWarmupMinimumAverageAccepted = 2.75
+    /// Per-DRAFT warmup floor. The old absolute floor (2.75 average accepted
+    /// drafts per cycle) is unreachable below depth 3 — depth 1 caps at 1.0
+    /// and depth 2 at 2.0 — so hybrids running the shipped D1/D2 policy could
+    /// never complete warmup, never reach the chunk verifier, and (worse)
+    /// recorded a permanent negative `NativeMTPHybridWarmupMemo` for the
+    /// model. 0.55 × depth keeps the same strictness the 2.75 value expressed
+    /// at its native depth (2.75/3 ≈ 0.92 was Nemotron-D3-era calibration,
+    /// deliberately relaxed here to the D1-breakeven scale).
+    private static let hybridWarmupMinimumAverageAcceptedPerDraft = 0.55
 
     private static func nativeMTPHybridVerifySetting(_ verifierMode: String? = nil) -> String? {
         let env = ProcessInfo.processInfo.environment
