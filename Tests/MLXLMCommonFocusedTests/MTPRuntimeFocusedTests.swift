@@ -680,6 +680,91 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
+    @Test("tuning-measurement mode loads the head without tuning; auto stays gated")
+    func tuningMeasurementModeLoadsHeadWithoutTuning() async throws {
+        // The measured artifact's baseline/best numbers can only come from
+        // running the head — without this mode the file is impossible to
+        // create legitimately (the load gate demands the artifact, and the
+        // artifact demands a measured run).
+        setenv("VMLX_MTP_TUNING_MEASUREMENT", "1", 1)
+        defer { unsetenv("VMLX_MTP_TUNING_MEASUREMENT") }
+
+        let config = """
+        {
+          "model_type": "qwen3_5_moe",
+          "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "mtp_num_hidden_layers": 1
+          }
+        }
+        """.data(using: .utf8)!
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 42,
+            visionTensorCount: 333,
+            mode: .preservedEnabled)
+
+        // Explicit request + measurement mode: the head loads with no tuning.
+        let shouldLoad = try await NativeMTPActivation.withExplicitRequest(true) {
+            try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                configData: config,
+                baseModelType: "qwen3_5_moe",
+                status: status)
+        }
+        #expect(shouldLoad)
+
+        // No explicit request: measurement mode alone never activates MTP.
+        let unrequested = try await NativeMTPActivation.withExplicitRequest(false) {
+            try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                configData: config,
+                baseModelType: "qwen3_5_moe",
+                status: status)
+        }
+        #expect(!unrequested)
+
+        // Auto-launch policy still refuses without measured tuning even in
+        // measurement mode — only the weight LOAD is unlocked.
+        #expect(NativeMTPAutoDecodePolicy.recommendation(
+            configData: config,
+            jangConfig: nil,
+            status: status,
+            requireVerifiedRuntime: true) == nil)
+    }
+
+    @Test("stamp-style unmeasured tuning stub refuses auto-launch by design")
+    func stampStyleUnmeasuredTuningStubRefusesAutoLaunch() {
+        // The bundle team stamps a recommendation-only sidecar (best_depth=1,
+        // blocked=false, deliberately NO validated/output_equivalent/tok_s).
+        // usableBestDepth must refuse it until a real sweep writes measured
+        // values — a recommendation that can never masquerade as data.
+        let stub = NativeMTPTuning(
+            bestDepth: 1,
+            blocked: false,
+            artifact: "Qwen3.6-27B-JANG_2D",
+            quantizationMode: "affine",
+            quantizationBits: 2,
+            modelTypes: ["qwen3_5"],
+            note: "Conservative UNMEASURED default: 1 draft/step.",
+            reason: "stamped by stamp_qwen36_27b; recommendation, not measurement")
+        #expect(stub.usableBestDepth == nil)
+
+        // The same sidecar with measured values becomes usable.
+        let measured = NativeMTPTuning(
+            bestDepth: 1,
+            validated: true,
+            outputEquivalent: true,
+            blocked: false,
+            artifact: "Qwen3.6-27B-JANG_2D (measured)",
+            baselineTokensPerSecond: 21.4,
+            bestTokensPerSecond: 24.0,
+            speedupVsBaseline: 1.12,
+            quantizationMode: "affine",
+            quantizationBits: 2,
+            modelTypes: ["qwen3_5"])
+        #expect(measured.usableBestDepth == 1)
+    }
+
     @Test("native MTP activation can be requested task-locally without process env")
     func nativeMTPActivationSupportsTaskLocalRequest() async throws {
         let config = """
@@ -1233,8 +1318,8 @@ struct MTPRuntimeFocusedTests {
         #expect(overrideSwitch.lowerBound < stochasticMambaFallback.lowerBound)
     }
 
-    @Test("native MTP request eligibility is greedy text-only")
-    func nativeMTPRequestEligibilityIsGreedyTextOnly() {
+    @Test("native MTP request eligibility is penalty-free text-only")
+    func nativeMTPRequestEligibilityIsPenaltyFreeTextOnly() {
         let text = LMInput.Text(tokens: MLXArray([Int32(3), 5, 7]))
         let textOnly = LMInput(text: text)
         let pixels = MLXArray((0..<48).map { Float($0) }).reshaped([1, 3, 4, 4])
@@ -1242,16 +1327,31 @@ struct MTPRuntimeFocusedTests {
 
         #expect(GenerateParameters(maxTokens: 4, temperature: 0)
             .canUseNativeMTP(for: textOnly))
-        #expect(!GenerateParameters(maxTokens: 4, temperature: 0.7)
+        // Sampled requests are eligible: the exact-pq accept path preserves
+        // the target sampler's distribution. Bundle defaults are T=1.0, so
+        // the old greedy-only gate silently excluded every real chat session.
+        #expect(GenerateParameters(maxTokens: 4, temperature: 0.7)
             .canUseNativeMTP(for: textOnly))
-        #expect(!GenerateParameters(maxTokens: 4, temperature: 0, topP: 0.9)
+        #expect(GenerateParameters(maxTokens: 4, temperature: 1.0, topP: 0.95, topK: 20)
             .canUseNativeMTP(for: textOnly))
-        #expect(!GenerateParameters(maxTokens: 4, temperature: 0, topK: 40)
-            .canUseNativeMTP(for: textOnly))
+        // Anything whose logits depend on sampled history stays ineligible —
+        // a drafted token would bypass the per-token processor.
         #expect(!GenerateParameters(maxTokens: 4, temperature: 0, repetitionPenalty: 1.05)
             .canUseNativeMTP(for: textOnly))
+        #expect(!GenerateParameters(maxTokens: 4, temperature: 0.7, repetitionPenalty: 1.05)
+            .canUseNativeMTP(for: textOnly))
+        // Media and bounded KV windows stay ineligible regardless of sampling.
         #expect(!GenerateParameters(maxTokens: 4, temperature: 0)
             .canUseNativeMTP(for: imageInput))
+        #expect(!GenerateParameters(maxTokens: 4, temperature: 0.7)
+            .canUseNativeMTP(for: imageInput))
+        var bounded = GenerateParameters(maxTokens: 4, temperature: 0.7)
+        bounded.maxKVSize = 1024
+        #expect(!bounded.canUseNativeMTP(for: textOnly))
+        // The greedy-lossless flag itself still means greedy: it gates the
+        // token-identical parity contract, not general eligibility.
+        #expect(!GenerateParameters(maxTokens: 4, temperature: 0.7)
+            .isNativeMTPLosslessGreedyEligible)
     }
 
     @Test("BatchEngine.generate rejects native MTP without an active MTP head")
@@ -1399,10 +1499,11 @@ struct MTPRuntimeFocusedTests {
             let info = try #require(completionInfo)
             let stats = try #require(info.nativeMTPStats)
             // Requested depth 3, but the iterator clamps to VMLX_MTP_DEPTH_CAP
-            // (default 1) — depths above 1 only won on a deterministic counting
-            // prompt and were slower on prose. `depth` reports the EFFECTIVE
-            // depth, so surfacing this gap is exactly what the stats are for.
-            #expect(stats.depth == 1)
+            // (default 2 — the D2 ceiling; depths past 2 only won on a
+            // deterministic counting prompt, and Nemotron measured D3 at
+            // 0.48x on real prose). `depth` reports the EFFECTIVE depth, so
+            // surfacing this gap is exactly what the stats are for.
+            #expect(stats.depth == 2)
             #expect(stats.verifyCalls >= 1)
             // No stop token fires with the zero-logit probe target, so the
             // info's emitted-token count and the iterator's
