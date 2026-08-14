@@ -199,7 +199,8 @@ public func captureCleanSSMStateInline(
     liveCache: [KVCache],
     promptTokenIds: [Int],
     genPromptLen: Int,
-    enableSSMReDerive: Bool
+    enableSSMReDerive: Bool,
+    mediaSalt: String? = nil
 ) {
     func log(_ status: String) {
         let line = "[vmlx][cache/ssm-rederive] inline-capture/\(status) hybrid=\(coordinator.isHybrid) genGP=\(genPromptLen) promptLen=\(promptTokenIds.count) enabled=\(enableSSMReDerive)\n"
@@ -219,10 +220,15 @@ public func captureCleanSSMStateInline(
     let states = extractSSMStates(from: liveCache)
     guard !states.isEmpty else { log("skip/no-ssm-states"); return }
 
+    // Store under the SAME salt the post-answer store path probes with —
+    // a nil-salt capture against a salted store key is a silent miss that
+    // sends the store straight back to the full-prompt replay this capture
+    // exists to avoid.
     coordinator.ssmStateCache.store(
         ssmStates: states,
         tokens: stripped,
         boundary: stripped.count,
+        mediaSalt: mediaSalt,
         persistToDisk: false
     )
     coordinator.ssmStateCache.markReDeriveFired()
@@ -454,6 +460,7 @@ public func reDeriveAndStoreSSMStatesAtPromptBoundaries(
     if promptTokenIds.count > 1 {
         boundaries.insert(promptTokenIds.count - 1)
     }
+    let primaryBoundaries = boundaries
 
     if coordinator.pagedCache != nil, !coordinator.isPagedIncompatible {
         let blockSize = max(1, coordinator.config.pagedBlockSize)
@@ -468,24 +475,94 @@ public func reDeriveAndStoreSSMStatesAtPromptBoundaries(
         let maximumRetainedTokens = retainedCapacity.overflow
             ? Int.max
             : retainedCapacity.partialValue
+        var blockBoundaries: [Int] = []
         var boundary = blockSize
         while boundary < promptTokenIds.count,
               boundary <= maximumRetainedTokens
         {
-            boundaries.insert(boundary)
+            blockBoundaries.append(boundary)
             boundary += blockSize
         }
+        // The companion cache holds at most `ssmMaxEntries` states — deriving
+        // more block boundaries than it can retain is pure LRU churn: a 13.8k
+        // prompt produced 216 per-block derive pauses feeding a 64-entry
+        // cache, and the excess evicted on arrival. Keep the LARGEST
+        // boundaries (closest to the strip/prompt boundaries, where every
+        // observed cross-turn hit actually lands); shorter-prefix restores
+        // fall back to the nearest retained boundary.
+        let reservedNonBlockEntries = 4
+        let retainableBlockStates = max(
+            0, coordinator.config.ssmMaxEntries - reservedNonBlockEntries)
+        if blockBoundaries.count > retainableBlockStates {
+            blockBoundaries = Array(blockBoundaries.suffix(retainableBlockStates))
+        }
+        boundaries.formUnion(blockBoundaries)
+    }
+    let blockOnlyBoundaries = boundaries.subtracting(primaryBoundaries)
+
+    // Probe-and-skip: a boundary whose companion state already sits in the
+    // SSM cache (e.g. captured inline during this turn's own prefill, or
+    // stored by an earlier turn) must not cost a fresh prompt replay. The
+    // measured failure shape without this: a 13.8k growing-chat turn spent
+    // ~18-22s AFTER its answer re-deriving a strip boundary whose state the
+    // prefill had already computed — the stream stayed open the whole time,
+    // which read as "decode collapsed to 1-6 tok/s" until the wall was
+    // decomposed. Re-derive now runs only for boundaries that are actually
+    // missing; present ones are re-stored from memory when the caller wants
+    // disk persistence (fetch + store is tensor-copy cheap, forward-free).
+    var presentByBoundary: [Int: [MLXArray]] = [:]
+    var missing: [Int] = []
+    for boundary in boundaries.sorted() {
+        if coordinator.ssmStateCache.contains(
+            tokens: promptTokenIds, boundary: boundary, mediaSalt: mediaSalt)
+        {
+            if let states = coordinator.ssmStateCache.fetch(
+                tokens: promptTokenIds, boundary: boundary, mediaSalt: mediaSalt),
+                !states.isEmpty
+            {
+                presentByBoundary[boundary] = states
+                if persistCapturedStatesToDisk {
+                    coordinator.ssmStateCache.store(
+                        ssmStates: states,
+                        tokens: promptTokenIds,
+                        boundary: boundary,
+                        mediaSalt: mediaSalt,
+                        persistToDisk: true)
+                }
+                continue
+            }
+        }
+        missing.append(boundary)
+    }
+    // Per-block companion boundaries ride along free: they improve
+    // partial-prefix restore granularity, but they never justify a
+    // whole-prompt replay by THEMSELVES. When every primary boundary (the
+    // prompt end, its N-1 sibling, and the caller-supplied strip boundaries)
+    // is already captured — the inline prefill capture makes that the common
+    // case — skip the forward outright. Cross-turn reuse in the growing-chat
+    // proof hits the strip boundary every time; the per-block states only
+    // matter for a DIFFERENT future prompt sharing a partial prefix, and that
+    // caller pays for its own prefill anyway.
+    let primaryMissing = missing.filter { !blockOnlyBoundaries.contains($0) }
+    if primaryMissing.isEmpty {
+        trace(
+            "primary-boundaries-present skip-forward present=\(presentByBoundary.count) blockOnlySkipped=\(missing.count)")
+        return presentByBoundary
+    }
+    if missing.isEmpty {
+        trace("all-boundaries-present skip-forward count=\(presentByBoundary.count)")
+        return presentByBoundary
     }
 
     do {
         let statesByBoundary = try reDeriveSSMStatesAtBoundaries(
             model: model,
             tokens: promptTokenIds,
-            boundaries: Array(boundaries).sorted(),
+            boundaries: missing,
             prefillStepSize: prefillStepSize)
-        trace("statesByBoundary=\(statesByBoundary.keys.sorted())")
+        trace("statesByBoundary=\(statesByBoundary.keys.sorted()) reused=\(presentByBoundary.keys.sorted())")
 
-        for boundary in boundaries.sorted() {
+        for boundary in missing.sorted() {
             guard let states = statesByBoundary[boundary], !states.isEmpty else {
                 continue
             }
@@ -500,7 +577,7 @@ public func reDeriveAndStoreSSMStatesAtPromptBoundaries(
         if !statesByBoundary.isEmpty {
             coordinator.ssmStateCache.markReDeriveFired()
         }
-        return statesByBoundary
+        return statesByBoundary.merging(presentByBoundary) { derived, _ in derived }
     } catch {
         let line = "[vmlx][cache/ssm-rederive] prompt-boundaries/fail \(error) promptLen=\(promptTokenIds.count)\n"
         FileHandle.standardError.write(Data(line.utf8))

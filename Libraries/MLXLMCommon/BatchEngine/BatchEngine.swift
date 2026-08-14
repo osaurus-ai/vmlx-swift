@@ -2123,7 +2123,18 @@ public actor BatchEngine {
     ) -> (head: LMInput?, tail: LMInput)? {
         let size = input.text.tokens.size
         guard size > 0 else { return nil }
-        let split = size - 1
+        return splitPrefillInput(input, at: size - 1)
+    }
+
+    /// Split the still-unprocessed prompt at an arbitrary index. Same metadata
+    /// contract as ``splitPrefillInputBeforeFinalToken`` — the head keeps
+    /// request metadata, the tail is text-only, and callers admit this path
+    /// only for non-media inputs.
+    private func splitPrefillInput(
+        _ input: LMInput, at split: Int
+    ) -> (head: LMInput?, tail: LMInput)? {
+        let size = input.text.tokens.size
+        guard size > 0, split >= 0, split < size else { return nil }
 
         var flatMask: MLXArray? = nil
         if let mask = input.text.mask {
@@ -2275,6 +2286,90 @@ public actor BatchEngine {
                         completedInPrepare: remainingPromptUnits - 1)
                     return try context.model.prepare(
                         split.tail,
+                        cache: slot.cache,
+                        windowSize: slot.prefillStepSize)
+                }
+
+                // Hybrid-SSM strip-boundary capture during prefill (§440 /
+                // Python #109). The post-answer store needs GDN companion
+                // state at the turn-start strip boundary, and recurrent state
+                // cannot rewind — so without a checkpoint captured HERE, the
+                // store path replays the whole prompt after the answer
+                // finishes. Measured on a 13,823-token growing turn: ~18-22s
+                // of post-answer re-derive with the stream still open, which
+                // presented as "decode collapsed to 1-6 tok/s" until the wall
+                // was decomposed. Splitting the prefill at the boundary and
+                // capturing the live state makes the turn's own forward pass
+                // the only forward pass.
+                let hybridBoundarySplit: Int? = {
+                    guard cacheCoordinator?.isHybrid == true,
+                          !slot.originalInput.hasMediaContent,
+                          slot.diskSeedSnapshot == nil
+                    else { return nil }
+                    let fullLen = slot.cachePromptTokenIds.count
+                    let remainingLen = inputForPrepare.text.tokens.size
+                    let processed = fullLen - remainingLen
+                    guard processed >= 0 else { return nil }
+                    guard let boundary = slot.originalInput.cachePrefixTokenCounts
+                        .filter({ $0 > processed && $0 < fullLen })
+                        .max()
+                    else { return nil }
+                    let split = boundary - processed
+                    return (split > 0 && split < remainingLen) ? split : nil
+                }()
+                // The store path derives companion state at BOTH the strip
+                // boundary and its N-1 sibling (the boundary set mirrors the
+                // KV N-1 restore pattern), so capture both: pause one token
+                // before the boundary, capture, advance the single boundary
+                // token, capture again, then continue the tail. Missing the
+                // N-1 sibling costs a full post-answer prompt replay for a
+                // boundary one token away from state we already computed.
+                if let splitAt = hybridBoundarySplit,
+                   splitAt > 1,
+                   let coordinator = cacheCoordinator,
+                   let split = splitPrefillInput(inputForPrepare, at: splitAt - 1),
+                   let head = split.head,
+                   let boundaryTokenSplit = splitPrefillInput(split.tail, at: 1)
+                {
+                    let fullLen = slot.cachePromptTokenIds.count
+                    let remainingLen = inputForPrepare.text.tokens.size
+                    let boundary = (fullLen - remainingLen) + splitAt
+
+                    func completePrefill(_ input: LMInput) throws {
+                        let result = try context.model.prepare(
+                            input,
+                            cache: slot.cache,
+                            windowSize: slot.prefillStepSize)
+                        if case .tokens(let remainingTail) = result {
+                            _ = context.model(
+                                remainingTail[text: .newAxis],
+                                cache: slot.cache,
+                                state: nil)
+                        }
+                        MLX.eval(slot.cache)
+                    }
+
+                    try completePrefill(head)
+                    captureCleanSSMStateInline(
+                        coordinator: coordinator,
+                        liveCache: slot.cache,
+                        promptTokenIds: slot.cachePromptTokenIds,
+                        genPromptLen: fullLen - (boundary - 1),
+                        enableSSMReDerive: true,
+                        mediaSalt: slot.mediaSalt)
+                    if let boundaryHead = boundaryTokenSplit.head {
+                        try completePrefill(boundaryHead)
+                    }
+                    captureCleanSSMStateInline(
+                        coordinator: coordinator,
+                        liveCache: slot.cache,
+                        promptTokenIds: slot.cachePromptTokenIds,
+                        genPromptLen: fullLen - boundary,
+                        enableSSMReDerive: true,
+                        mediaSalt: slot.mediaSalt)
+                    progressAccumulator.report(completedInPrepare: splitAt)
+                    return try context.model.prepare(
+                        boundaryTokenSplit.tail,
                         cache: slot.cache,
                         windowSize: slot.prefillStepSize)
                 }
@@ -3142,6 +3237,46 @@ public actor BatchEngine {
                 {
                     MLX.eval(trimmed)
                     return trimmed
+                }
+
+                // Hybrid fast path: only the recurrent layers make the trim
+                // fail — the KV layers trim fine. When the companion state for
+                // this exact boundary is already in the SSM cache (captured
+                // inline during this turn's prefill, or stored by an earlier
+                // turn), rebuild the boundary as trimmed-KV + restored-SSM
+                // instead of falling through to the fresh full prefill below.
+                // That replay is a whole-prompt forward that runs synchronously
+                // in finishSlot — measured ~21s at a 13.8k prompt, a fixed tail
+                // every turn paid AFTER its answer, which presented as "decode
+                // collapsed at depth" until the wall was decomposed.
+                if let coordinator = cacheCoordinator,
+                   coordinator.isHybrid,
+                   let states = coordinator.ssmStateCache.fetch(
+                       tokens: tokens,
+                       boundary: tokens.count,
+                       mediaSalt: slot.mediaSalt),
+                   !states.isEmpty
+                {
+                    let rebuilt = storageTopologySnapshot.map { $0.copy() }
+                    let nonTrimmableAreRecurrent = rebuilt.allSatisfy { layer in
+                        layer.isTrimmable || layer is MambaCache
+                            || layer is ArraysCache
+                    }
+                    if nonTrimmableAreRecurrent {
+                        var trimmedAll = true
+                        for layer in rebuilt where layer.isTrimmable {
+                            if layer.trim(trimCount) != trimCount {
+                                trimmedAll = false
+                                break
+                            }
+                        }
+                        if trimmedAll {
+                            restoreSSMStates(
+                                states, into: rebuilt, boundary: tokens.count)
+                            MLX.eval(rebuilt)
+                            return rebuilt
+                        }
+                    }
                 }
 
                 // `forceRederive` bypasses the disk-backed skip-guard for the
