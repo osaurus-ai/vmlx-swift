@@ -1213,6 +1213,31 @@ private func readValidInDims(at modelDirectory: URL) -> Set<Int> {
     add(config["hidden_size"])
     add(config["intermediate_size"])
     add(config["moe_intermediate_size"])
+
+    // Vision-tower widths. Without these, a bundle whose vision modules carry
+    // EXPLICIT per-module quant metadata fails the declared-entry validInDims
+    // gate below (vision dims are not text dims), and the shape walk re-stamps
+    // them with a shape-identical wrong reading — (4,128) and (8,64) unpack the
+    // same packed+scales geometry but halve the effective width. Text stays
+    // exact (its dims ARE in the set); the vision tower then crashes at first
+    // image: Qwen3.6-27B patch embeds came out (N,576) against (N,1152)
+    // positional embeddings.
+    if let vision = top["vision_config"] as? [String: Any] {
+        add(vision["hidden_size"])
+        add(vision["intermediate_size"])
+        add(vision["out_hidden_size"])
+        if let hidden = vision["hidden_size"] as? Int,
+           let merge = vision["spatial_merge_size"] as? Int,
+           hidden > 0, merge > 0
+        {
+            dims.insert(hidden * merge * merge)
+        }
+        if let patch = vision["patch_size"] as? Int, patch > 0 {
+            let channels = (vision["in_channels"] as? Int) ?? 3
+            let temporal = (vision["temporal_patch_size"] as? Int) ?? 1
+            dims.insert(channels * temporal * patch * patch)
+        }
+    }
     add(config["expert_intermediate_size"])
     add(config["shared_expert_intermediate_size"])
     add(config["hidden_size_per_layer_input"])

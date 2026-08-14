@@ -1168,6 +1168,9 @@ struct Bench {
 
             print(String(format: "  Turn %d: total prompt=%d, NEW=%d | prefill %.0f tok/s (%.0fms TTFT) | decode %.1f tok/s (%d tokens, %.3fs)",
                          turnIdx + 1, nPrompt, newTokens.count, prefillTps, firstTokenTime * 1000, decodeTps, count, decodeTime))
+            // Greedy parity gates diff these ids against the Python runtime's
+            // output on the identical prompt tokens (temp is pinned 0.0 above).
+            print("    first tokens: \(Array(generated.prefix(20)))")
 
             // After this turn: cache contains [prev_context + new_tokens + decoded_response].
             // Next turn's "already cached" = current turnTokens.count + assistant stub length
