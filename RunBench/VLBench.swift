@@ -1279,6 +1279,19 @@ enum VLBench {
         if let nativeMTPDepth {
             params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
         }
+        // `BENCH_REQUESTED_REASONING_BUDGET` runs the SAME variating shapes
+        // with the per-request reasoning ceiling armed on every turn — the
+        // crossed axis for the answer-reserve feature: a think close forced
+        // by the ceiling must coexist with image turns, tool calls, the
+        // grow-turn cache reuse, and the verbatim replay, not just with the
+        // single text shape the live A/B measured.
+        let requestedReasoningBudget = ProcessInfo.processInfo
+            .environment["BENCH_REQUESTED_REASONING_BUDGET"].flatMap(Int.init)
+        if let requestedReasoningBudget {
+            params.requestedReasoningBudgetTokens = requestedReasoningBudget
+        }
+        print(
+            "Requested reasoning budget: \(requestedReasoningBudget.map(String.init) ?? "off")")
         let coordinator = makeProofCoordinator(
             modelDir: modelDir, context: context, parameters: params, label: "variating")
         nonisolated(unsafe) let ctx = context
