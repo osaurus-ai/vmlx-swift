@@ -1040,8 +1040,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         let requested = [primary] + drafts
+        // ONE batched materialization for every id this cycle needs. The old
+        // per-element `.item()` map cost one full pipeline drain per token,
+        // and the replay/audit/pending paths below each re-materialized the
+        // same ids again — 6-9 drains per verify cycle, which the sustained-D1
+        // measurement showed dominating the whole cycle cost (5.4s of
+        // materialize sync against 3.1s of actual forwards over 154 cycles).
         let requestedInputIds = recordMaterializeSync {
-            requested.map { Int32($0.item(Int.self)) }
+            stacked(requested.map { $0.reshaped(-1) }).asArray(Int32.self)
         }
         let input = MLXArray(requestedInputIds).reshaped(1, requested.count)
         let replayChunkCommit = Self.requiresChunkTokenReplayRepair(
@@ -1079,6 +1085,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         guard let verifyDecision = Self.verifyDrafts(
             logits: verifier.logits,
             drafts: drafts,
+            draftTokenIds: requestedInputIds.dropFirst().map(Int.init),
             draftProbabilities: draftProbabilities,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
@@ -1112,9 +1119,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
 
             func replayPrefix(count: Int) -> NativeMTPForwardResult {
-                let acceptedInputIds = recordMaterializeSync {
-                    requested.prefix(count).map { Int32($0.item(Int.self)) }
-                }
+                // Host ids already materialized once at cycle start.
+                let acceptedInputIds = Array(requestedInputIds.prefix(count))
                 let acceptedInput = MLXArray(acceptedInputIds).reshaped(1, count)
                 let replayStart = Date.timeIntervalSinceReferenceDate
                 let repaired = model.nativeBackboneForward(acceptedInput, cache: cache)
@@ -1141,9 +1147,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
                 var auditedAccepted = 0
                 while auditedAccepted < accepted {
-                    let draftID = recordMaterializeSync {
-                        requested[auditedAccepted + 1].item(Int.self)
-                    }
+                    let draftID = Int(requestedInputIds[auditedAccepted + 1])
                     guard audited.tokenIds[auditedAccepted] == draftID else { break }
                     auditedAccepted += 1
                 }
@@ -1195,9 +1199,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             FileHandle.standardError.write(Data(line.utf8))
         }
 
-        for token in drafts.prefix(accepted) {
+        for (index, token) in drafts.prefix(accepted).enumerated() {
             processor?.didSample(token: token)
-            pendingTokens.append(recordMaterializeSync { token.item(Int.self) })
+            pendingTokens.append(Int(requestedInputIds[1 + index]))
         }
 
         if requiresSequentialRepair && accepted > 0 {
@@ -1208,9 +1212,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             checkpoint.restore(into: &cache)
             cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - restoreStart
 
-            let acceptedInputIds = recordMaterializeSync {
-                requested.prefix(accepted + 1).map { Int32($0.item(Int.self)) }
-            }
+            let acceptedInputIds = Array(requestedInputIds.prefix(accepted + 1))
             let acceptedInput = MLXArray(acceptedInputIds).reshaped(1, accepted + 1)
             let replayStart = Date.timeIntervalSinceReferenceDate
             let repaired = model.nativeBackboneForward(acceptedInput, cache: cache)
@@ -1629,6 +1631,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static func verifyDrafts(
         logits: MLXArray,
         drafts: [MLXArray],
+        draftTokenIds: [Int],
         draftProbabilities: [MLXArray],
         sampler: LogitSampler,
         speculativeSampler: SpeculativeSamplingController,
@@ -1672,11 +1675,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
             var accepted = 0
             while accepted < drafts.count {
-                let targetID = sampledIDs[accepted]
-                let syncStart = Date.timeIntervalSinceReferenceDate
-                let draftID = drafts[accepted].item(Int.self)
-                materializeSyncTime += Date.timeIntervalSinceReferenceDate - syncStart
-                guard targetID == draftID else { break }
+                // Draft ids were materialized once at cycle start — no
+                // per-draft pipeline drain here.
+                guard sampledIDs[accepted] == draftTokenIds[accepted] else { break }
                 accepted += 1
             }
 
