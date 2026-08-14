@@ -158,9 +158,21 @@ public enum ReasoningBudget {
     /// True when the rendered prompt ends with an opened, unclosed reasoning
     /// block. Mirrors the floor's `…<think>` test but covers the other
     /// families' open spellings too.
+    ///
+    /// Trailing whitespace is ignored before the suffix check: Qwen 3.x
+    /// templates prime `<think>\n` — with the literal newline — so a strict
+    /// `hasSuffix("<think>")` classified those prompts as un-primed, the
+    /// counter waited for an open tag the model never emits, and the ceiling
+    /// stayed silently inert on exactly the family that needed it (verified
+    /// live on Qwen3.8: a 300-token cap produced 300 reasoning tokens and an
+    /// empty answer with a budget requested).
     public static func promptTailOpensReasoning(_ tail: String) -> Bool {
         let openers = ["<think>", "<thinking>", "<|think|>", "<|start_thought|>"]
-        return openers.contains { tail.hasSuffix($0) }
+        var trimmed = Substring(tail)
+        while let last = trimmed.last, last.isWhitespace || last.isNewline {
+            trimmed = trimmed.dropLast()
+        }
+        return openers.contains { trimmed.hasSuffix($0) }
     }
 }
 

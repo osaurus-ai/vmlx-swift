@@ -99,6 +99,10 @@ class ReasoningBudgetTests: XCTestCase {
     func testOnlyAnOpenReasoningTailArms() {
         XCTAssertTrue(ReasoningBudget.promptTailOpensReasoning("…assistant<think>"))
         XCTAssertTrue(ReasoningBudget.promptTailOpensReasoning("<thinking>"))
+        // Qwen 3.x primes with a trailing newline; the strict suffix check
+        // classified that as un-primed and left the ceiling silently inert.
+        XCTAssertTrue(ReasoningBudget.promptTailOpensReasoning("…assistant\n<think>\n"))
+        XCTAssertTrue(ReasoningBudget.promptTailOpensReasoning("<think>  \n"))
         XCTAssertFalse(
             ReasoningBudget.promptTailOpensReasoning("…</think>"),
             "The chat rail (already-closed tail) must never arm a budget.")
