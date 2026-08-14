@@ -1018,10 +1018,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             throw NativeMTPRuntimeError.verifierProducedNoTokens
         }
 
+        // An EXPLICIT verifier mode (per-request, tuning artifact, or env) is
+        // the operator's decision — warmup exists to pick a safety mode
+        // automatically when nobody chose one. A measured tuning artifact
+        // ships `verifier_mode` validated in that mode, so forcing 16
+        // sequential-priced cycles in front of it only re-creates the
+        // "MTP is slower" overhead the artifact already paid to rule out.
         let shouldUseHybridSafetyWarmup = usesHybridMambaCache
             && speculativeSampler.isGreedy
             && processor == nil
             && !hybridSafetyWarmupComplete
+            && Self.nativeMTPHybridVerifySetting(verifierModeSetting) == nil
 
         if shouldUseHybridSafetyWarmup || Self.requiresSequentialVerifierRepair(
             cache,
@@ -1322,7 +1329,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
     }
 
+    /// Measurement-only escape hatch: `VMLX_NATIVE_MTP_DISABLE_ADAPTIVE=1`
+    /// keeps the adaptive controller from bailing or downshifting, so a bench
+    /// can measure SUSTAINED speculation cost at a fixed depth. The shipped
+    /// artifacts' floors are calibrated from exactly these runs; without the
+    /// hatch, every hybrid leg measured "12 cycles of trying, then AR" and the
+    /// steady-state number did not exist.
+    private static let adaptiveDisabledForMeasurement =
+        ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_DISABLE_ADAPTIVE"] == "1"
+
     private mutating func recordAdaptiveCycle(accepted: Int) {
+        if Self.adaptiveDisabledForMeasurement { return }
         adaptiveWindow.append(AdaptiveCycle(depth: currentDepth, accepted: accepted))
         if adaptiveWindow.count > Self.adaptiveWindowSize {
             adaptiveWindow.removeFirst(adaptiveWindow.count - Self.adaptiveWindowSize)
