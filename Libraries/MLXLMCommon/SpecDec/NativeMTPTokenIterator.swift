@@ -106,12 +106,12 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
     /// Draft depth actually in effect at the start of generation (`depth=`).
     ///
     /// This is the REQUESTED depth after the policy cap, not the raw request:
-    /// the iterator clamps to `VMLX_MTP_DEPTH_CAP` (default `1`) because depths
-    /// above 1 only ever won on a deterministic counting prompt, and measured
-    /// 14% slower than plain autoregressive decode on real prose. A host that
-    /// asks for `.nativeMTP(depth: 3)` therefore sees `depth == 1` here — which
-    /// is the point of surfacing it, since that gap is otherwise invisible
-    /// without reading stderr.
+    /// the iterator clamps to `VMLX_MTP_DEPTH_CAP` (default `2` — the D2
+    /// ceiling; depths past 2 only ever won on a deterministic counting
+    /// prompt, and Nemotron measured D3 at 0.48x on real prose). A host that
+    /// asks for `.nativeMTP(depth: 3)` therefore sees `depth == 2` here —
+    /// which is the point of surfacing it, since that gap is otherwise
+    /// invisible without reading stderr.
     public let depth: Int
 
     /// Draft depth in effect at end of generation, after any adaptive
