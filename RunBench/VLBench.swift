@@ -1241,6 +1241,274 @@ enum VLBench {
     ///   2. reasoning off, image
     ///   3. reasoning off, tools
     ///   4. reasoning off, image AND tools
+    /// Text-only variating pattern, for families with NO vision tower
+    /// (Raptor/Laguna, DSV4, Ornith-text…). The stock `runVariatingPattern`
+    /// leans on image rows; running it against a text-only bundle would either
+    /// crash or, worse, "pass" while silently skipping half its axes — so the
+    /// applicable axes are crossed here instead of faking media ones:
+    ///
+    ///   reasoning ON -> OFF -> ON,  tools none -> offered -> called -> none,
+    ///   reasoning-ON *and* tools in the SAME turn (the analogue of the
+    ///   image+tools cell that caught real defects on VL families),
+    ///   a growing-conversation cache control, and a verbatim replay.
+    ///
+    /// The reasoning axis is the one that matters for this family, not a
+    /// checkbox: Raptor's bundle ships `enable_thinking=true` while osaurus's
+    /// agent surfaces flip it OFF, so the on<->off boundary is exactly where a
+    /// leaked/unclosed `<think>` shows up — and a single-shape run walks past it.
+    static func runVariatingTextPattern(modelPath: String, maxNewTokens: Int) async throws {
+        let modelDir = URL(fileURLWithPath: modelPath)
+        print("=== VLBench variating TEXT pattern (reasoning x tools) ===")
+        print("model: \(modelDir.lastPathComponent)")
+
+        let loadStart = CFAbsoluteTimeGetCurrent()
+        let context = try await loadProductionContext(from: modelDir)
+        print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
+        print("Model: \(type(of: context.model))")
+
+        var params = GenerateParameters(
+            maxTokens: maxNewTokens, temperature: 0, prefillStepSize: 512)
+        if let budget = ProcessInfo.processInfo
+            .environment["BENCH_REQUESTED_REASONING_BUDGET"].flatMap(Int.init)
+        {
+            params.requestedReasoningBudgetTokens = budget
+        }
+        let coordinator = makeProofCoordinator(
+            modelDir: modelDir, context: context, parameters: params, label: "variating-text")
+        nonisolated(unsafe) let ctx = context
+        let engine = BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
+
+        let weatherTool: ToolSpec = [
+            "type": "function",
+            "function": [
+                "name": "get_weather",
+                "description": "Get the current weather for a city",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "location": ["type": "string", "description": "City name"]
+                    ],
+                    "required": ["location"],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+
+        func prepare(
+            _ chat: [Chat.Message], thinking: Bool, tools: [ToolSpec]?
+        ) async throws -> LMInput {
+            var input = UserInput(chat: chat, tools: tools)
+            input.additionalContext = ["enable_thinking": thinking]
+            return try await context.processor.prepare(input: input)
+        }
+
+        func probe(_ input: LMInput, label: String) {
+            let tokens = input.text.tokens.reshaped(-1).asArray(Int.self)
+            let salt = computeCacheSalt(for: input, parameters: params)
+            switch coordinator.fetch(tokens: tokens, mediaSalt: salt) {
+            case .hit(let matched, _, let detail, _, _, _):
+                let pct = tokens.isEmpty ? 0 : matched * 100 / tokens.count
+                print("  [\(label)] cache probe: HIT \(detail.rawValue) "
+                    + "\(matched)/\(tokens.count) (\(pct)% reused)")
+            case .miss:
+                print("  [\(label)] cache probe: MISS tokens=\(tokens.count)")
+            }
+        }
+
+        func turn(
+            _ label: String, chat: [Chat.Message], thinking: Bool, tools: [ToolSpec]?
+        ) async throws -> (text: String, reasoning: String, toolCalls: [ToolCall]) {
+            let input = try await prepare(chat, thinking: thinking, tools: tools)
+            probe(input, label: label)
+            nonisolated(unsafe) let sendable = input
+            let stream = await engine.generate(input: sendable, parameters: params)
+            var text = ""
+            var reasoning = ""
+            var calls: [ToolCall] = []
+            for await event in stream {
+                switch event {
+                case .chunk(let c): text += c
+                case .reasoning(let r): reasoning += r
+                case .toolCall(let call): calls.append(call)
+                default: break
+                }
+            }
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let preview = text.count > 110 ? String(text.prefix(110)) + "..." : text
+            print("  [\(label)] think=\(thinking) tools=\(tools?.count ?? 0) "
+                + "reasoning=\(reasoning.count)ch toolCalls=\(calls.count) "
+                + "text=\"\(preview)\"")
+            for call in calls {
+                print("      -> \(call.function.name)(\(call.function.arguments))")
+            }
+            // Parser health: a leaked control marker means the turn was
+            // mis-parsed even when it reads fine to a human. Laguna/Raptor
+            // spellings included alongside the shared ones.
+            for marker in [
+                "<think>", "</think>", "<|tool_call_start|>", "<|tool_call_end|>",
+                "<tool_call>", "</tool_call>", "<|im_start|>", "<|im_end|>",
+            ] {
+                if text.contains(marker) {
+                    throw NSError(
+                        domain: "VLBench.variatingText", code: 90,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "\(label): leaked \(marker) into visible text"])
+                }
+            }
+            // Reasoning must not arrive as visible prose when thinking is ON:
+            // that is the unclosed-<think> class, which shows up as a huge
+            // answer with an EMPTY reasoning channel.
+            if thinking, reasoning.isEmpty, text.count > 400 {
+                print("      NOTE: thinking ON but reasoning channel empty on a "
+                    + "\(text.count)ch answer — check the reasoning parser for this family")
+            }
+            return (text, reasoning, calls)
+        }
+
+        let system = Chat.Message.system("Answer briefly.")
+
+        // 1. reasoning ON, no tools.
+        var chat: [Chat.Message] = [system, .user("Name the capital of France in one word.")]
+        let t1 = try await turn("1 think, no tools", chat: chat, thinking: true, tools: nil)
+        guard !t1.text.isEmpty || !t1.reasoning.isEmpty else {
+            throw NSError(domain: "VLBench.variatingText", code: 91,
+                userInfo: [NSLocalizedDescriptionKey: "turn 1 produced nothing"])
+        }
+
+        // 2. reasoning OFF mid-conversation — the boundary osaurus's agent
+        //    policy actually crosses on every tool surface.
+        chat.append(.assistant(t1.text.isEmpty ? "Paris." : t1.text))
+        chat.append(.user("Name the capital of Japan in one word."))
+        let t2 = try await turn("2 nothink, no tools", chat: chat, thinking: false, tools: nil)
+        guard !t2.text.isEmpty else {
+            throw NSError(domain: "VLBench.variatingText", code: 92,
+                userInfo: [NSLocalizedDescriptionKey: "turn 2 (thinking off) produced no text"])
+        }
+        if !t2.reasoning.isEmpty {
+            print("      NOTE: thinking was OFF but \(t2.reasoning.count)ch of reasoning "
+                + "still arrived — the template/policy disagree for this family")
+        }
+
+        // 3. tools offered with reasoning OFF.
+        chat.append(.assistant(t2.text))
+        chat.append(.user("What is the weather in Tokyo? Use the tool."))
+        let t3 = try await turn(
+            "3 nothink+tools", chat: chat, thinking: false, tools: [weatherTool])
+        guard !t3.toolCalls.isEmpty else {
+            throw NSError(domain: "VLBench.variatingText", code: 93,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "turn 3 offered a tool but produced no structured tool call"])
+        }
+
+        // 4. reasoning ON *and* tools in the same turn — the cell that catches
+        //    families whose tool grammar and think grammar collide.
+        chat.append(.assistant("Checked the weather."))
+        chat.append(.user("Now get the weather in Paris with the tool."))
+        let t4 = try await turn(
+            "4 think+tools SAME turn", chat: chat, thinking: true, tools: [weatherTool])
+        if t4.toolCalls.isEmpty {
+            print("      NOTE: think+tools in one turn produced NO structured call "
+                + "(text=\(t4.text.count)ch reasoning=\(t4.reasoning.count)ch) — "
+                + "the combination, not either alone, is what failed")
+        }
+
+        // 5. tool RESULT fed back, tools still offered: the agent-loop shape.
+        if let call = t3.toolCalls.first ?? t4.toolCalls.first {
+            var resultChat = chat
+            resultChat.append(.assistant("", toolCalls: [call]))
+            resultChat.append(.tool("{\"temp_c\": 21, \"conditions\": \"clear\"}"))
+            let t5 = try await turn(
+                "5 tool result -> answer", chat: resultChat, thinking: false,
+                tools: [weatherTool])
+            guard !t5.text.isEmpty || !t5.toolCalls.isEmpty else {
+                throw NSError(domain: "VLBench.variatingText", code: 94,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "a satisfied tool result produced neither an answer nor a "
+                        + "follow-up call — the agent loop would stall here"])
+            }
+            if !t5.toolCalls.isEmpty {
+                print("      NOTE: re-called a tool that was already satisfied "
+                    + "(\(t5.toolCalls.count) call(s)) — the non-converging-loop class")
+            }
+        }
+
+        // 6. tools withdrawn again, reasoning back ON: the full round trip.
+        chat.append(.assistant("It is 21C and clear."))
+        chat.append(.user("Summarise our conversation in one sentence."))
+        let t6 = try await turn("6 think, tools withdrawn", chat: chat, thinking: true, tools: nil)
+        guard !t6.text.isEmpty else {
+            throw NSError(domain: "VLBench.variatingText", code: 95,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "turn 6 (tools withdrawn, thinking back on) produced no text"])
+        }
+
+        // Render probe: does the tool block actually reach the prompt, and does
+        // the thinking flag actually change the render?
+        let probeChat: [Chat.Message] = [system, .user("Get the weather in Tokyo.")]
+        let withTools = try await prepare(probeChat, thinking: false, tools: [weatherTool])
+        let withoutTools = try await prepare(probeChat, thinking: false, tools: nil)
+        let thinkOn = try await prepare(probeChat, thinking: true, tools: nil)
+        // Compare token IDS, not counts. Raptor/Laguna primes the generation
+        // tail as `<assistant><think>` vs `<assistant></think>` — one token
+        // either way, so a COUNT delta reads 0 and would look exactly like
+        // "the flag was ignored" when the render genuinely changed.
+        let withToolsIDs = withTools.text.tokens.reshaped(-1).asArray(Int.self)
+        let withoutToolsIDs = withoutTools.text.tokens.reshaped(-1).asArray(Int.self)
+        let thinkOnIDs = thinkOn.text.tokens.reshaped(-1).asArray(Int.self)
+        let toolsChanged = withToolsIDs != withoutToolsIDs
+        let thinkingChanged = thinkOnIDs != withoutToolsIDs
+        print("  [render probe] tools: changed=\(toolsChanged) "
+            + "delta=\(withToolsIDs.count - withoutToolsIDs.count) tok | "
+            + "thinking: changed=\(thinkingChanged) "
+            + "delta=\(thinkOnIDs.count - withoutToolsIDs.count) tok")
+        if !toolsChanged {
+            throw NSError(domain: "VLBench.variatingText", code: 96,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "tool schemas did not change the rendered prompt at all — the tools "
+                    + "block is being dropped before the model sees it"])
+        }
+        if !thinkingChanged {
+            print("      NOTE: enable_thinking did not change the rendered prompt — for "
+                + "this family the flag is inert and the model decides on its own")
+        } else if thinkOnIDs.count == withoutToolsIDs.count {
+            print("      (thinking changes the render in-place: same length, different "
+                + "tokens — a count-only probe would have missed it)")
+        }
+
+        // 7+8. Growing-conversation control with an UNCHANGED head: tools and
+        //      reasoning render into the head, so those turns legitimately miss;
+        //      this row is what proves reuse still works when the head holds.
+        var growChat: [Chat.Message] = [system, .user("Name a primary colour.")]
+        let g1 = try await turn("7 grow A", chat: growChat, thinking: false, tools: nil)
+        growChat.append(.assistant(g1.text.isEmpty ? "Red." : g1.text))
+        growChat.append(.user("Name another one."))
+        let beforeGrowHits = coordinator.snapshotStats().diskStats?.hits ?? 0
+        _ = try await turn("8 grow B (same shape)", chat: growChat, thinking: false, tools: nil)
+        let afterGrowHits = coordinator.snapshotStats().diskStats?.hits ?? 0
+        if afterGrowHits <= beforeGrowHits {
+            throw NSError(domain: "VLBench.variatingText", code: 97,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "a growing conversation with an UNCHANGED head did not reuse its prefix"])
+        }
+        print("      grow-control reused the prefix (disk hits \(beforeGrowHits) -> "
+            + "\(afterGrowHits))")
+
+        // 9. Verbatim replay of turn 1 after every shape change above.
+        let replayChat: [Chat.Message] = [system, .user("Name the capital of France in one word.")]
+        _ = try await turn("9 replay turn1", chat: replayChat, thinking: true, tools: nil)
+
+        let stats = coordinator.snapshotStats()
+        let paged = stats.pagedStats
+        let disk = stats.diskStats
+        let pagedHits: Int = paged?.cacheHits ?? 0
+        let pagedMisses: Int = paged?.cacheMisses ?? 0
+        let diskHits: Int = disk?.hits ?? 0
+        let diskMisses: Int = disk?.misses ?? 0
+        let diskStores: Int = disk?.stores ?? 0
+        print("  final cache stats: paged{hits=\(pagedHits),misses=\(pagedMisses)} "
+            + "disk{hits=\(diskHits),misses=\(diskMisses),stores=\(diskStores)}")
+        print("=== VLBench variating TEXT pattern: passed ===")
+    }
+
     static func runVariatingPattern(modelPath: String, maxNewTokens: Int) async throws {
         let modelDir = URL(fileURLWithPath: modelPath)
         print("=== VLBench variating pattern (reasoning x image x tools) ===")

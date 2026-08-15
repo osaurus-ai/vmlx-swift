@@ -907,6 +907,18 @@ struct Bench {
             return
         }
 
+        // BENCH_TEXT_VARIATING=1: the same crossed discipline for families with
+        // NO vision tower (Raptor/Laguna, DSV4, text-only Ornith). Rows the
+        // family cannot have are not faked; the axes it DOES have — reasoning
+        // on/off/on, tools none/offered/called/withdrawn, reasoning+tools in
+        // one turn, tool-result feedback, grow control, verbatim replay — are
+        // all crossed.
+        if (env["BENCH_TEXT_VARIATING"] ?? "0") == "1" {
+            try await VLBench.runVariatingTextPattern(
+                modelPath: modelPath, maxNewTokens: maxNew)
+            return
+        }
+
         // BENCH_VL_CHAT_CACHE=1: structured-chat VL cache matrix.
         // Uses UserInput(chat:) with an image-bearing first turn and a
         // text follow-up, then verifies same-media replay hits and
