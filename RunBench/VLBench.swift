@@ -26,7 +26,7 @@ enum VLBench {
     /// The plain `loadModel(from:using:)` overload bypasses that policy and
     /// copies safetensors into anonymous storage, which makes VL memory gates
     /// measure a harness-only residency spike instead of the host runtime.
-    private static func loadProductionContext(from modelDir: URL) async throws -> ModelContext {
+    static func loadProductionContext(from modelDir: URL) async throws -> ModelContext {
         let loaded = try await MLXLMCommon.loadModel(
             from: modelDir,
             using: #huggingFaceTokenizerLoader(),
