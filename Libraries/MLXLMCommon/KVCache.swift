@@ -1431,6 +1431,49 @@ public class MambaCache: ArraysCache {
         prefixCommitStates.removeAll(keepingCapacity: true)
     }
 
+    // MARK: - Verify-input stash (DFlash 2 lazy rollback)
+
+    /// Per-layer inputs of the LAST speculative verify forward, stashed by
+    /// the owning recurrent layer so a rejected block can be rolled back
+    /// with ONE replay kernel over the accepted rows.
+    ///
+    /// This replaces per-prefix state recording for block speculation.
+    /// Recording cost was measured at 48 layers × 7 prefixes = 336 extra
+    /// scan launches AND 336 `MLX.eval` flushes per cycle — the dominant
+    /// term of a 5.1×-a-decode-step verify. The stash is pure references
+    /// (MLX arrays are immutable buffers), so it costs nothing until a
+    /// rejection actually happens; the reference implementation's
+    /// `_GDNStateCapture` uses the same design.
+    ///
+    /// Owned and interpreted by the layer that wrote it. The cache only
+    /// stores; `arrays` layout is layer-private.
+    public struct VerifyInputStash {
+        public let arrays: [MLXArray]
+        /// Cache offset BEFORE the verify forward advanced it.
+        public let baseOffset: Int
+        /// Recurrent state BEFORE the verify forward, `nil` on a cold start.
+        public let initialState: MLXArray?
+        /// Conv state (`cache[0]`) before the verify forward, if the layer
+        /// carries one.
+        public let initialConvState: MLXArray?
+
+        public init(
+            arrays: [MLXArray], baseOffset: Int,
+            initialState: MLXArray?, initialConvState: MLXArray?
+        ) {
+            self.arrays = arrays
+            self.baseOffset = baseOffset
+            self.initialState = initialState
+            self.initialConvState = initialConvState
+        }
+    }
+
+    public var verifyInputStash: VerifyInputStash?
+
+    public func clearVerifyInputStash() {
+        verifyInputStash = nil
+    }
+
     public override func copy() -> any KVCache {
         let new = MambaCache()
         let s = self.state

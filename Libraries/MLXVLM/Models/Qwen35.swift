@@ -1062,12 +1062,74 @@ enum Qwen35Language {
                         mask: mask,
                         baseOffset: cache.offset)
                 }
+                // DFlash 2 lazy rollback: references only, replayed once
+                // on rejection. See the LLM twin for the measured cost of
+                // the per-prefix recording this replaces.
+                if S > 1, mask == nil,
+                    NativeMTPVerifierStatePolicy.shouldStashVerifyInputs
+                {
+                    cache.verifyInputStash = MambaCache.VerifyInputStash(
+                        arrays: [qNormed, kNormed, v, a, b, convInput],
+                        baseOffset: cache.offset,
+                        initialState: initialState.map { $0 * 1 },
+                        initialConvState: nil)
+                }
                 cache[1] = finalState
                 cache.offset += S
             }
 
             out = norm(out, gate: z)
             return outProj(out.reshaped(B, S, -1))
+        }
+
+        /// One-shot lazy rollback — see the LLM twin for rationale.
+        func commitVerifyStash(cache: MambaCache, acceptedInputs: Int) -> Bool {
+            guard let stash = cache.verifyInputStash, stash.arrays.count == 6 else { return false }
+            defer { cache.clearVerifyInputStash() }
+            let q = stash.arrays[0]
+            let k = stash.arrays[1]
+            let v = stash.arrays[2]
+            let a = stash.arrays[3]
+            let b = stash.arrays[4]
+            let convInput = stash.arrays[5]
+            let blockLength = q.dim(1)
+            guard acceptedInputs > 0, acceptedInputs <= blockLength else { return false }
+            if acceptedInputs == blockLength { return true }
+
+            let n = acceptedInputs
+            let audit = ProcessInfo.processInfo.environment["VMLX_DFLASH2_ROLLBACK_AUDIT"] == "1"
+            let (_, prefixState) = gatedDeltaUpdate(
+                q: q[0..., ..<n, 0..., 0...],
+                k: k[0..., ..<n, 0..., 0...],
+                v: v[0..., ..<n, 0..., 0...],
+                a: a[0..., ..<n, 0...],
+                b: b[0..., ..<n, 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: stash.initialState,
+                mask: nil)
+            let convEnd = convInput.dim(1) - blockLength + n
+            let convStart = max(0, convEnd - max(0, convKernelSize - 1))
+            if audit {
+                var chained: MLXArray? = stash.initialState
+                for step in 0 ..< n {
+                    let r = step ..< (step + 1)
+                    let (_, s) = gatedDeltaUpdate(
+                        q: q[0..., r, 0..., 0...], k: k[0..., r, 0..., 0...],
+                        v: v[0..., r, 0..., 0...], a: a[0..., r, 0...], b: b[0..., r, 0...],
+                        aLog: aLog, dtBias: dtBias, state: chained, mask: nil)
+                    chained = s
+                }
+                let diff = abs(prefixState - chained!).max().item(Float.self)
+                let scale = abs(chained!).max().item(Float.self)
+                FileHandle.standardError.write(Data(String(
+                    format: "[rollback-audit] n=%d replay-vs-chained maxdiff=%.3e scale=%.3e\n",
+                    n, diff, scale).utf8))
+            }
+            cache[1] = prefixState
+            cache[0] = convInput[0..., convStart ..< convEnd, 0...]
+            cache.offset = stash.baseOffset + n
+            return true
         }
 
         private func recordPrefixCommitStates(
@@ -1513,7 +1575,8 @@ enum Qwen35Language {
             inputsEmbeds: MLXArray? = nil,
             cache: [KVCache?]? = nil,
             positionIds: MLXArray? = nil,
-            captureLayerIDs: Set<Int>
+            captureLayerIDs: Set<Int>,
+            recordPrefixCommitStates: Bool = false
         ) -> (MLXArray, [Int: MLXArray]) {
             var hiddenStates: MLXArray
             if let inputsEmbeds {
@@ -1547,7 +1610,8 @@ enum Qwen35Language {
                     attentionMask: faMask,
                     ssmMask: layerSSMMask,
                     cache: cacheArray?[index],
-                    positionIds: positionIds
+                    positionIds: positionIds,
+                    recordPrefixCommitStates: recordPrefixCommitStates
                 )
                 if captureLayerIDs.contains(index) {
                     captured[index] = hiddenStates
@@ -1730,13 +1794,28 @@ enum Qwen35Language {
         func textOnlyForwardCapturing(
             _ inputs: MLXArray,
             cache: [KVCache]?,
-            captureLayerIDs: Set<Int>
+            captureLayerIDs: Set<Int>,
+            recordPrefixCommitStates: Bool = false
         ) -> (MLXArray, [Int: MLXArray]) {
             let cacheOpt: [KVCache?]? = cache?.map { $0 as KVCache? }
+            // Reuse the media-aware RoPE bookkeeping the native-MTP path
+            // established: after a VLM prefill the position indices are
+            // offset by `ropeDeltas`, and drafting text on top of an
+            // image turn has to continue from those, not from zero.
+            let positionIds = resolvedPositionIds(
+                inputs: inputs,
+                cache: cacheOpt,
+                mask: nil,
+                providedPositionIds: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil,
+                resetForMedia: false)
             let (hidden, captured) = model.callAsFunctionCapturing(
                 inputs,
                 cache: cacheOpt,
-                captureLayerIDs: captureLayerIDs)
+                positionIds: positionIds,
+                captureLayerIDs: captureLayerIDs,
+                recordPrefixCommitStates: recordPrefixCommitStates)
             let logits: MLXArray
             if let lmHead {
                 logits = lmHead(hidden)
@@ -1852,7 +1931,7 @@ enum Qwen35Language {
 
 // MARK: - Model
 
-public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel {
+public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel, DFlash2VerifyRollbackModel {
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
@@ -2084,6 +2163,33 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
         languageModel.textOnlyForwardCapturing(
             inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+    }
+
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        captureLayerIDs: Set<Int>,
+        recordPrefixCommitStates: Bool
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        languageModel.textOnlyForwardCapturing(
+            inputs, cache: cache, captureLayerIDs: captureLayerIDs,
+            recordPrefixCommitStates: recordPrefixCommitStates)
+    }
+
+    /// The GatedDeltaNet layers record their per-step state, so DFlash 2
+    /// can roll a rejected block back without replaying the prefix.
+    public var supportsCapturingPrefixCommitRecording: Bool { true }
+
+    // MARK: - DFlash2VerifyRollbackModel
+
+    public func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool {
+        for (index, layer) in languageModel.model.layers.enumerated() where layer.isLinear {
+            guard index < cache.count, let mamba = cache[index] as? MambaCache,
+                let gdn = layer.linearAttn,
+                gdn.commitVerifyStash(cache: mamba, acceptedInputs: acceptedInputs)
+            else { return false }
+        }
+        return true
     }
 
     /// `TokenEmbedderModel` conformance — exposes the target's shared

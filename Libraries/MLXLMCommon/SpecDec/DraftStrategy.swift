@@ -85,6 +85,26 @@ public enum DraftStrategy: @unchecked Sendable {
     ///     the drafter's training value.
     case ddtree(drafterPath: URL, branchingBudget: Int, blockSize: Int)
 
+    /// DFlash 2 — block-diffusion drafter with a candidate-path selector.
+    ///
+    /// One drafter forward emits candidates for every position in the
+    /// block; a low-rank bigram selector traces one coherent path through
+    /// them, and the target verifies that path in a single forward.
+    ///
+    /// This is mutually exclusive with ``nativeMTP(depth:verifierMode:)``:
+    /// when a drafter is selected it replaces the model's own MTP head
+    /// rather than running alongside it. The dispatch in
+    /// `Evaluate.generate` enforces that ordering.
+    ///
+    /// - Parameters:
+    ///   - drafterPath: directory holding a `z-lab/<model>-DFlash2`
+    ///     snapshot (`config.json` + `model.safetensors`).
+    ///   - blockSize: positions per drafter forward, `nil` to use the
+    ///     checkpoint's trained `dflash_config.block_size`. The block
+    ///     spends one position on the anchor, so `block_size: 8` drafts
+    ///     seven tokens per verification step.
+    case dflash2(drafterPath: URL, blockSize: Int? = nil)
+
     /// Native model-owned MTP draft/verify.
     ///
     /// This path is intentionally explicit. The model must have been loaded
@@ -100,6 +120,7 @@ public enum DraftStrategy: @unchecked Sendable {
         case .autoregressive: return "autoregressive"
         case .dflash: return "dflash"
         case .ddtree: return "ddtree"
+        case .dflash2: return "dflash2"
         case .nativeMTP: return "native_mtp"
         }
     }
@@ -110,8 +131,27 @@ public enum DraftStrategy: @unchecked Sendable {
     public var usesBlockDiffusion: Bool {
         switch self {
         case .dflash, .ddtree: return true
-        case .none, .autoregressive, .nativeMTP: return false
+        case .none, .autoregressive, .nativeMTP, .dflash2: return false
         }
+    }
+
+    /// True when this strategy runs the DFlash 2 decode loop
+    /// (`DFlash2TokenIterator`).
+    public var usesDFlash2: Bool {
+        if case .dflash2 = self { return true }
+        return false
+    }
+
+    /// Drafter directory for the DFlash 2 strategy.
+    public var dflash2DrafterPath: URL? {
+        if case .dflash2(let path, _) = self { return path }
+        return nil
+    }
+
+    /// Requested block size, `nil` to use the checkpoint's own.
+    public var dflash2BlockSize: Int? {
+        if case .dflash2(_, let blockSize) = self { return blockSize }
+        return nil
     }
 
     public var usesNativeMTP: Bool {

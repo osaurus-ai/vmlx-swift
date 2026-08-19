@@ -448,6 +448,12 @@ public actor BatchEngine {
             return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
         }
 
+        if parameters.draftStrategy?.usesDFlash2 == true {
+            Self.logger.error(
+                "Rejected BatchEngine.submit DFlash 2 request: batched block-diffusion scheduling is not implemented; use BatchEngine.generate for the exclusive path."
+            )
+            return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
+        }
         if parameters.draftStrategy?.usesNativeMTP == true {
             Self.logger.error(
                 "Rejected BatchEngine.submit native MTP request: raw batched native-MTP scheduling is not implemented; use BatchEngine.generate or Evaluate.generate for the exclusive native-MTP path."
@@ -625,6 +631,27 @@ public actor BatchEngine {
             guard canStartExclusiveSoloPath else {
                 Self.logger.error(
                     "Rejected BatchEngine.generate native MTP request: native MTP is an exclusive solo path until batched/paged native-MTP scheduling lands."
+                )
+                return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+            }
+            return startSoloFastPath(
+                input: input,
+                parameters: parameters,
+                promptTail: promptTail)
+        }
+        // DFlash 2 is exclusive for the same reason native MTP is: it owns
+        // the target's cache across a draft/verify/rollback cycle, which a
+        // shared batched slot cannot express. Without this branch the
+        // strategy reaches `parameters` and is then silently ignored by the
+        // batched decode path — the request still succeeds, just without
+        // any speculation, which is the worst kind of failure because it
+        // looks exactly like success.
+        if parameters.draftStrategy?.usesDFlash2 == true,
+            DFlash2TokenIterator.unservableReason(parameters) == nil
+        {
+            guard canStartExclusiveSoloPath else {
+                Self.logger.error(
+                    "Rejected BatchEngine.generate DFlash 2 request: block-diffusion drafting is an exclusive solo path until batched scheduling lands."
                 )
                 return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
             }
@@ -1188,6 +1215,32 @@ public actor BatchEngine {
                     tokenizer: context.tokenizer,
                     promptTokenIds: promptTokenIdsForTail,
                     makeIterator: makeIterator,
+                    extraStopStrings: soloParameters.extraStopStrings,
+                    promptTail: promptTail,
+                    toolSchemas: toolSchemas)
+            } else if let strategy = soloParameters.draftStrategy,
+                let drafterPath = strategy.dflash2DrafterPath,
+                DFlash2TokenIterator.unservableReason(soloParameters) == nil
+            {
+                guard let dflashTarget = context.model as? any DFlash2Target else {
+                    throw DFlash2RuntimeError.drafterTargetMismatch(
+                        "\(type(of: context.model)) does not expose per-layer hidden states and a shared LM head"
+                    )
+                }
+                let drafter = try DFlash2DrafterResolver.shared.drafter(at: drafterPath)
+                let iterator = try DFlash2TokenIterator(
+                    input: input,
+                    target: dflashTarget,
+                    drafter: drafter,
+                    blockSize: strategy.dflash2BlockSize,
+                    cache: nil,
+                    parameters: soloParameters,
+                    cacheCoordinator: cacheCoordinator)
+                (sourceStream, generationTask) = generateTask(
+                    promptTokenCount: promptTokenCount,
+                    modelConfiguration: context.configuration,
+                    tokenizer: context.tokenizer,
+                    iterator: iterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
                     toolSchemas: toolSchemas)

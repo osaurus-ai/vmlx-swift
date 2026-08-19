@@ -422,12 +422,51 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             configData: configData,
             jangConfig: jangConfig,
             status: status)
+        // DFlash 2 wins when the user selected a drafter that fits this
+        // model. It is checked BEFORE the native-MTP launch decision
+        // because the two are alternatives, not layers: a selected
+        // drafter means "draft with this", not "draft with this as well".
+        // Note this is deliberately independent of `mtp.mode` — a user
+        // who downloads a drafter and points the runtime at it has asked
+        // for speculation, and making them also flip Mode to Auto would
+        // be a second switch for one decision.
+        if let selection = resolvedDFlash2Selection(configData: configData) {
+            return .dflash2(
+                drafterPath: URL(fileURLWithPath: selection.path),
+                blockSize: mtp.dflash2BlockSize)
+        }
         guard launch.launchMode == .speculative,
               let depth = launch.recommendation?.depth
         else {
             return nil
         }
         return .nativeMTP(depth: depth, verifierMode: launch.recommendation?.verifierMode)
+    }
+
+    /// The selected DFlash 2 drafter, if one is set and fits the bundle
+    /// described by `configData`. `nil` otherwise — including when the
+    /// folder has gone missing, which must degrade to ordinary decoding
+    /// rather than failing the request.
+    public func resolvedDFlash2Selection(configData: Data?) -> VMLXDFlash2DrafterInfo? {
+        guard let path = mtp.dflash2DrafterPath, !path.isEmpty else { return nil }
+        guard let info = VMLXDFlash2DrafterInfo.read(at: URL(fileURLWithPath: path)) else {
+            return nil
+        }
+        guard info.mismatchReason(configData: configData) == nil else { return nil }
+        return info
+    }
+
+    /// Why the selected drafter is not being used for this bundle, for
+    /// display. `nil` when it IS being used or when none is selected.
+    public func dflash2RejectionReason(configData: Data?) -> String? {
+        guard let path = mtp.dflash2DrafterPath, !path.isEmpty else { return nil }
+        let url = URL(fileURLWithPath: path)
+        guard let info = VMLXDFlash2DrafterInfo.read(at: url) else {
+            return FileManager.default.fileExists(atPath: path)
+                ? "\(url.lastPathComponent) is not a DFlash 2 drafter."
+                : "Drafter folder no longer exists at \(path)."
+        }
+        return info.mismatchReason(configData: configData)
     }
 
     /// Resolve the load-time switch that preserves native-MTP sidecar weights.
@@ -1265,16 +1304,48 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     public var keepDraftCacheSeparate: Bool
     public var acceptedTokensOnlyEnterBaseCache: Bool
 
+    /// Folder holding a downloaded DFlash 2 drafter, or `nil` for none.
+    ///
+    /// Setting this REPLACES native MTP for models the drafter fits — the
+    /// two are mutually exclusive speculative paths and running both
+    /// would mean drafting twice per step. Models the drafter does not
+    /// fit are unaffected and keep whatever `mode` says.
+    public var dflash2DrafterPath: String?
+
+    /// Positions per drafter forward, `nil` to use the checkpoint's
+    /// trained `block_size`. One position is the anchor, so a block of 8
+    /// drafts seven tokens per verification step.
+    public var dflash2BlockSize: Int?
+
     public init(
         mode: VMLXMTPServerMode = .auto,
         draftTokenLimit: Int? = nil,
         keepDraftCacheSeparate: Bool = true,
-        acceptedTokensOnlyEnterBaseCache: Bool = true
+        acceptedTokensOnlyEnterBaseCache: Bool = true,
+        dflash2DrafterPath: String? = nil,
+        dflash2BlockSize: Int? = nil
     ) {
         self.mode = mode
         self.draftTokenLimit = draftTokenLimit
         self.keepDraftCacheSeparate = keepDraftCacheSeparate
         self.acceptedTokensOnlyEnterBaseCache = acceptedTokensOnlyEnterBaseCache
+        self.dflash2DrafterPath = dflash2DrafterPath
+        self.dflash2BlockSize = dflash2BlockSize
+    }
+
+    /// Decodes settings written before DFlash 2 existed — both new keys
+    /// are absent there and must default to "no drafter" rather than
+    /// failing the whole settings load.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.mode = try c.decodeIfPresent(VMLXMTPServerMode.self, forKey: .mode) ?? .auto
+        self.draftTokenLimit = try c.decodeIfPresent(Int.self, forKey: .draftTokenLimit)
+        self.keepDraftCacheSeparate =
+            try c.decodeIfPresent(Bool.self, forKey: .keepDraftCacheSeparate) ?? true
+        self.acceptedTokensOnlyEnterBaseCache =
+            try c.decodeIfPresent(Bool.self, forKey: .acceptedTokensOnlyEnterBaseCache) ?? true
+        self.dflash2DrafterPath = try c.decodeIfPresent(String.self, forKey: .dflash2DrafterPath)
+        self.dflash2BlockSize = try c.decodeIfPresent(Int.self, forKey: .dflash2BlockSize)
     }
 }
 

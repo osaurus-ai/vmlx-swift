@@ -1114,6 +1114,12 @@ public enum NativeMTPVerifierStatePolicy {
         case captureCommit = "capture_commit"
         case strictCapture = "strict_capture"
         case lazyRepair = "lazy_repair"
+        /// DFlash 2's rollback mode: recurrent layers stash their verify
+        /// INPUTS (references, zero cost) instead of recording a state per
+        /// prefix length (which re-runs the scan per prefix and flushes
+        /// the graph per record). Rollback replays only the accepted rows,
+        /// one kernel per layer, only when a rejection happens.
+        case inputCapture = "input_capture"
     }
 
     @TaskLocal public static var requestVerifierMode: String?
@@ -1142,6 +1148,8 @@ public enum NativeMTPVerifierStatePolicy {
             return .captureCommit
         case "chunk_lazy_repair", "lazy_repair", "lazy", "fast_lazy":
             return .lazyRepair
+        case "input_capture", "verify_input_capture":
+            return .inputCapture
         case "chunk_fast", "fast", "capture_commit", "chunk_commit":
             return .captureCommit
         case "sequential", "sequential_repair", "strict", "strict_capture":
@@ -1159,10 +1167,21 @@ public enum NativeMTPVerifierStatePolicy {
     }
 
     public static var shouldRecordAcceptedPrefixStates: Bool {
-        mode != .lazyRepair
+        mode != .lazyRepair && mode != .inputCapture
+    }
+
+    /// Whether recurrent layers should stash their verify inputs for the
+    /// one-shot lazy rollback (DFlash 2).
+    public static var shouldStashVerifyInputs: Bool {
+        mode == .inputCapture
     }
 
     public static var shouldRoundGDNStateEachVerifierStep: Bool {
+        // strictCapture only. inputCapture deliberately does NOT round:
+        // recurrent state is float32 end-to-end, so a T=n scan is
+        // bit-identical to n chained T=1 scans (audited at 0.0 maxdiff on
+        // JANG_6D), and per-step rounding would CHANGE verify numerics
+        // relative to the plain decode path instead of matching it.
         mode == .strictCapture
     }
 }

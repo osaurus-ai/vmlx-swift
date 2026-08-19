@@ -3653,6 +3653,42 @@ public func generate(
 
     let promptTail = _decodePromptTail(
         input: input, tokenizer: context.tokenizer, tokens: 64)
+    // DFlash 2 is dispatched BEFORE native MTP on purpose. The two are
+    // mutually exclusive speculative paths, and when the user has pointed
+    // the runtime at a drafter that is the one they asked for — the
+    // model's own MTP head does not also run. Ordering here is the
+    // backstop; hosts are expected to send only one strategy.
+    if let strategy = parameters.draftStrategy, let drafterPath = strategy.dflash2DrafterPath,
+        DFlash2TokenIterator.unservableReason(parameters) == nil
+    {
+        guard let dflashTarget = context.model as? any DFlash2Target else {
+            throw DFlash2RuntimeError.drafterTargetMismatch(
+                "\(type(of: context.model)) does not expose per-layer hidden states and a shared LM head"
+            )
+        }
+        // Vocabulary agreement is checked inside the iterator against the
+        // first real logits row rather than here: `vocabularySize` lives on
+        // the per-family model protocols, which this module cannot see.
+        let drafter = try DFlash2DrafterResolver.shared.drafter(at: drafterPath)
+        let iterator = try DFlash2TokenIterator(
+            input: input,
+            target: dflashTarget,
+            drafter: drafter,
+            blockSize: strategy.dflash2BlockSize,
+            cache: cache,
+            parameters: parameters,
+            cacheCoordinator: cacheCoordinator)
+        let (stream, _) = generateTask(
+            promptTokenCount: input.text.tokens.size,
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer,
+            iterator: iterator,
+            wiredMemoryTicket: wiredMemoryTicket,
+            extraStopStrings: parameters.extraStopStrings,
+            promptTail: promptTail,
+            toolSchemas: input.toolSchemas)
+        return stream
+    }
     if let strategy = parameters.draftStrategy,
         case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
         parameters.canUseNativeMTP(for: input)
@@ -4080,6 +4116,33 @@ public func generateTokensTask(
     context.jangPressRuntime.recordPromptTokenActivity(
         input.text.tokens.reshaped(-1).asArray(Int.self))
 
+    // Same ordering rule as `generate`: a selected DFlash 2 drafter
+    // replaces native MTP rather than stacking with it.
+    if let strategy = parameters.draftStrategy, let drafterPath = strategy.dflash2DrafterPath,
+        DFlash2TokenIterator.unservableReason(parameters) == nil
+    {
+        guard let dflashTarget = context.model as? any DFlash2Target else {
+            throw DFlash2RuntimeError.drafterTargetMismatch(
+                "\(type(of: context.model)) does not expose per-layer hidden states and a shared LM head"
+            )
+        }
+        let drafter = try DFlash2DrafterResolver.shared.drafter(at: drafterPath)
+        let iterator = try DFlash2TokenIterator(
+            input: input,
+            target: dflashTarget,
+            drafter: drafter,
+            blockSize: strategy.dflash2BlockSize,
+            cache: cache,
+            parameters: parameters,
+            cacheCoordinator: cacheCoordinator)
+        return generateTokenTask(
+            promptTokenCount: input.text.tokens.size,
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer,
+            iterator: iterator,
+            includeStopToken: includeStopToken,
+            wiredMemoryTicket: wiredMemoryTicket)
+    }
     if let strategy = parameters.draftStrategy,
         case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
         parameters.canUseNativeMTP(for: input)

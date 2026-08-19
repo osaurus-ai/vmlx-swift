@@ -49,6 +49,31 @@ public protocol HiddenStateCaptureModel: LanguageModel {
         cache: [KVCache]?,
         captureLayerIDs: Set<Int>
     ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray])
+
+    /// Capturing forward that additionally asks recurrent layers to record
+    /// their state after every step of this forward.
+    ///
+    /// Speculative decoding over a hybrid target has to be able to undo a
+    /// rejected suffix. Attention layers just trim; recurrent layers
+    /// cannot, because their state is path-dependent. Recording per-step
+    /// states during the verify forward turns the rollback into a lookup
+    /// (``MambaCache/commitRecordedPrefix(length:)``) instead of a replay
+    /// of the accepted prefix through the whole model.
+    ///
+    /// Implementations that have no recurrent state — or that have not
+    /// wired recording — may ignore the flag; they must then report
+    /// ``supportsCapturingPrefixCommitRecording`` as `false` so callers
+    /// with a non-trimmable cache refuse the path instead of silently
+    /// corrupting it.
+    func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        captureLayerIDs: Set<Int>,
+        recordPrefixCommitStates: Bool
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray])
+
+    /// Whether `recordPrefixCommitStates: true` is actually honoured.
+    var supportsCapturingPrefixCommitRecording: Bool { get }
 }
 
 extension HiddenStateCaptureModel {
@@ -58,6 +83,19 @@ extension HiddenStateCaptureModel {
             inputs, cache: cache, captureLayerIDs: [])
         return logits
     }
+
+    /// Default: ignore the recording request. Correct only for models
+    /// whose caches are all trimmable — hence the companion flag below.
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        captureLayerIDs: Set<Int>,
+        recordPrefixCommitStates: Bool
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        callAsFunction(inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+    }
+
+    public var supportsCapturingPrefixCommitRecording: Bool { false }
 }
 
 /// Given a target model that conforms to ``HiddenStateCaptureModel``,
@@ -86,4 +124,27 @@ public func extractContextFeature(
         return h
     }
     return concatenated(tensors, axis: -1)
+}
+
+/// Target models that can roll a speculative verify block back to an
+/// accepted prefix using layer inputs stashed under
+/// `NativeMTPVerifierStatePolicy.Mode.inputCapture`.
+///
+/// The contract: during a verify forward run under `.inputCapture`, each
+/// recurrent layer stashes its own inputs on its cache (references only —
+/// no copies, no evals). On a partial accept the runtime calls
+/// ``commitVerifiedBlock(cache:acceptedInputs:)`` and each recurrent
+/// layer replays JUST the accepted rows in one kernel to rebuild its
+/// state. Attention layers are rolled back by ordinary trimming before
+/// this is called.
+///
+/// This replaces per-prefix state recording, which was measured at 336
+/// extra scan launches and 336 graph flushes per verify cycle on
+/// Qwen3.8-27B (48 GDN layers × 7 prefixes) — the dominant term of a
+/// verify forward costing 5.1× a decode step.
+public protocol DFlash2VerifyRollbackModel: AnyObject {
+    /// Rebuild every recurrent layer's state at `acceptedInputs` rows of
+    /// the last verify block. Returns false when a layer has no stash
+    /// (the caller must then treat the cache as unrecoverable).
+    func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool
 }
