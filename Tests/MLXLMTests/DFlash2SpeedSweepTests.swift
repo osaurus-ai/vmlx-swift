@@ -78,6 +78,9 @@ final class DFlash2SpeedSweepTests: XCTestCase {
             p.topP = 1
             p.topK = 0
             p.minP = 0
+            if ProcessInfo.processInfo.environment["VMLX_SWEEP_COMPILED_DECODE"] == "1" {
+                p.enableCompiledDecode = true
+            }
             return p
         }
 
@@ -127,6 +130,13 @@ final class DFlash2SpeedSweepTests: XCTestCase {
 
         let baseline = try XCTUnwrap(lastRound["baseline"])
         XCTAssertFalse(baseline.text.isEmpty)
+        // Cross-run correctness diffing (compiled vs plain decode): dump the
+        // baseline arm's greedy text so two invocations can be compared.
+        if let dumpPath = ProcessInfo.processInfo.environment["VMLX_SWEEP_DUMP"] {
+            try baseline.text.write(
+                toFile: dumpPath, atomically: true, encoding: .utf8)
+            print("[sweep] baseline text dumped to \(dumpPath)")
+        }
         for arm in arms where arm.name != "baseline" {
             let result = try XCTUnwrap(lastRound[arm.name])
             // Bit-equality with the baseline holds on bf16 targets (proven

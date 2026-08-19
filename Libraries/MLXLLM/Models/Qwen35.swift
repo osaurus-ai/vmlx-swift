@@ -17,7 +17,10 @@ private let compiledSigmoidGate: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (gateOutput: MLXArray, expertOutput: MLXArray) -> MLXArray in
         sigmoid(gateOutput) * expertOutput
     }
-    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+    guard HardwareInfo.isCompiledDecodeSupported else { return body }
+    let compiled = compile(shapeless: true, body)
+    // Plain body inside the outer compiled-decode trace — nested compile is illegal.
+    return { g, e in CompiledDecodeTrace.isActive ? body(g, e) : compiled(g, e) }
 }()
 
 

@@ -22,14 +22,21 @@ import MLXNN
 /// every decode step, so the trace cache hits 100% of the time and there is no prefill
 /// stall to worry about. Python's mlx_lm reference compiles this exact function and
 /// gets ~17 tok/s more on Qwen 3.5-35B vs Swift's eager path.
+private let _computeGBody: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+    (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
+    let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
+    return decay
+}
+
 private let _compiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
-    compile(shapeless: true) { (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
-        let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-        return decay
-    }
+    compile(shapeless: true, _computeGBody)
 
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
-    _compiledComputeG(aLog, a, dtBias)
+    // Plain body inside the outer compiled-decode trace — nested compile is
+    // illegal (see `safeGeluApproximate` in SwitchLayers).
+    CompiledDecodeTrace.isActive
+        ? _computeGBody(aLog, a, dtBias)
+        : _compiledComputeG(aLog, a, dtBias)
 }
 
 // MARK: - Metal Kernel

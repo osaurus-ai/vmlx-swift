@@ -1356,6 +1356,15 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     private var compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])?
 
+    /// Host-side offset bookkeeping for recurrent caches under compiled
+    /// decode. `MambaCache.offset` is a plain Int advanced inside the model
+    /// forward — the trace records that increment ONCE and replays never run
+    /// Swift again, so without this the offsets freeze at their trace-time
+    /// values and downstream bookkeeping (strip boundaries, cache stores)
+    /// reads stale positions. Compilable attention caches advance in-graph.
+    private var compiledMambaOffsets: [(index: Int, base: Int)] = []
+    private var compiledStepCount = 0
+
     // Multi-tier cache coordinator (skeleton integration)
     let cacheCoordinator: CacheCoordinator?
 
@@ -1941,8 +1950,15 @@ public struct TokenIterator: TokenIteratorProtocol {
             from: self.cache)
 
         if effectiveParameters.enableCompiledDecode && !Self.compiledDecodeDenied(for: model) {
+            // The Compilable caches are FIXED-size buffers with no overflow
+            // path — a run that outgrows them would clamp writes silently.
+            // The iterator knows the whole run's extent here, so size the
+            // buffer to fit it; an explicit compiledMaxCacheLength wins.
+            let promptOffset = self.cache.map(\.offset).max() ?? 0
+            let neededLength = effectiveParameters.maxTokens.map { promptOffset + $0 + 8 }
             try setupCompiledDecode(
-                maxCacheLength: effectiveParameters.compiledMaxCacheLength ?? 4096)
+                maxCacheLength: effectiveParameters.compiledMaxCacheLength
+                    ?? Swift.max(4096, neededLength ?? 4096))
         }
     }
 
@@ -2420,12 +2436,30 @@ public struct TokenIterator: TokenIteratorProtocol {
             //                      captures at trace-build time and then
             //                      reuses for later tokens)
             //   RotatingKVCache -> CompilableRotatingKVCache
+            //   MambaCache      -> passed through UNPROMOTED. Recurrent
+            //                      state is fixed-shape, already exposed via
+            //                      `innerState()` (so the compile transform
+            //                      tracks it as implicit input/output), and
+            //                      updated in place through the same
+            //                      `_updateInternal` mechanism the state
+            //                      tracker relies on. Requiring promotability
+            //                      of every layer silently disabled compiled
+            //                      decode for the hybrid GDN families
+            //                      (Qwen 3.5/3.6/3.8, Ornith) — measured on
+            //                      Qwen3.8-27B as 19 ms/token of per-token
+            //                      graph rebuild, the whole gap between this
+            //                      runtime (16.6 tok/s) and mlx-lm (24.6) on
+            //                      the identical bundle.
             let allPromotable = cache.allSatisfy { layer in
                 layer is KVCacheSimple
                     || (layer is RotatingKVCache && !(layer is CompilableRotatingKVCache))
+                    || layer is MambaCache
             }
             guard allPromotable else { return }
             promoted = cache.map { layer in
+                if layer is MambaCache {
+                    return layer
+                }
                 if let rotating = layer as? RotatingKVCache {
                     return CompilableRotatingKVCache(from: rotating) as KVCache
                 }
@@ -2434,6 +2468,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
         MLX.eval(promoted)
         self.cache = promoted
+        self.compiledMambaOffsets = promoted.enumerated().compactMap { index, layer in
+            (layer as? MambaCache).map { (index, $0.offset) }
+        }
+        self.compiledStepCount = 0
 
         let capturedModel = model
         let cacheRef = promoted
@@ -2466,6 +2504,12 @@ public struct TokenIterator: TokenIteratorProtocol {
 
             if result.count > 0 {
                 self.state = nil
+                // Replays skip the `cache.offset += 1` the trace recorded once;
+                // rewrite the recurrent-cache offsets from the step counter.
+                compiledStepCount += 1
+                for (index, base) in compiledMambaOffsets {
+                    (cache[index] as? MambaCache)?.offset = base + compiledStepCount
+                }
                 if shouldQuantizeAfterStep {
                     MLXPressGenerationProfile.time("decode.kv_quantize") {
                         maybeQuantizeCacheForStep()

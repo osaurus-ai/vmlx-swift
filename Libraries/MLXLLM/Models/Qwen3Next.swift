@@ -18,7 +18,11 @@ private let _compiledSigmoidMultiply: @Sendable (MLXArray, MLXArray) -> MLXArray
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (x: MLXArray, gate: MLXArray) -> MLXArray in
         x * sigmoid(gate)
     }
-    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+    guard HardwareInfo.isCompiledDecodeSupported else { return body }
+    let compiled = compile(shapeless: true, body)
+    // Plain body inside the outer compiled-decode trace — nested compile is
+    // illegal (see `safeGeluApproximate` in SwitchLayers).
+    return { x, g in CompiledDecodeTrace.isActive ? body(x, g) : compiled(x, g) }
 }()
 
 func sigmoidMultiply(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
@@ -36,7 +40,10 @@ private let _compiledPreciseSwiGLU: @Sendable (MLXArray, MLXArray, MLXArray) -> 
         let xF32 = x.asType(.float32)
         return (gateF32 * xF32).asType(h.dtype)
     }
-    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+    guard HardwareInfo.isCompiledDecodeSupported else { return body }
+    let compiled = compile(shapeless: true, body)
+    // Plain body inside the outer compiled-decode trace — nested compile is illegal.
+    return { h, g, x in CompiledDecodeTrace.isActive ? body(h, g, x) : compiled(h, g, x) }
 }()
 
 // MARK: - Model Components
@@ -46,7 +53,10 @@ private let _compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (gate: MLXArray, x: MLXArray) -> MLXArray in
         silu(gate) * x
     }
-    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+    guard HardwareInfo.isCompiledDecodeSupported else { return body }
+    let compiled = compile(shapeless: true, body)
+    // Plain body inside the outer compiled-decode trace — nested compile is illegal.
+    return { g, x in CompiledDecodeTrace.isActive ? body(g, x) : compiled(g, x) }
 }()
 
 final class Qwen3NextRMSNormGated: Module {

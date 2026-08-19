@@ -18,7 +18,12 @@ private let compiledSigmoidMultiply: @Sendable (MLXArray, MLXArray) -> MLXArray 
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (x: MLXArray, gate: MLXArray) -> MLXArray in
         x * sigmoid(gate)
     }
-    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+    guard HardwareInfo.isCompiledDecodeSupported else { return body }
+    let compiled = compile(shapeless: true, body)
+    // Inside the outer compiled-decode trace a separately-compiled function is
+    // an illegal nested compile (see `safeGeluApproximate` in SwitchLayers);
+    // run the plain body there — its ops fuse into the outer graph anyway.
+    return { x, g in CompiledDecodeTrace.isActive ? body(x, g) : compiled(x, g) }
 }()
 
 /// Compiled shared expert gate: sigmoid(gate_output) * expert_output → 1 fused op.
@@ -26,7 +31,10 @@ private let compiledSigmoidGate: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (gateOutput: MLXArray, expertOutput: MLXArray) -> MLXArray in
         sigmoid(gateOutput) * expertOutput
     }
-    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+    guard HardwareInfo.isCompiledDecodeSupported else { return body }
+    let compiled = compile(shapeless: true, body)
+    // Plain body inside the outer compiled-decode trace — nested compile is illegal.
+    return { g, e in CompiledDecodeTrace.isActive ? body(g, e) : compiled(g, e) }
 }()
 
 private enum Qwen35VLError: Error {
@@ -41,7 +49,10 @@ private let _vlmCompiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> ML
         let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
         return decay
     }
-    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+    guard HardwareInfo.isCompiledDecodeSupported else { return body }
+    let compiled = compile(shapeless: true, body)
+    // Plain body inside the outer compiled-decode trace — nested compile is illegal.
+    return { l, a, d in CompiledDecodeTrace.isActive ? body(l, a, d) : compiled(l, a, d) }
 }()
 
 /// Compiled swiglu: silu(gate) * x → 1 fused Metal dispatch instead of 2.
@@ -52,7 +63,9 @@ private let _vlmCompiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         (gate: MLXArray, x: MLXArray) -> MLXArray in
         silu(gate) * x
     }
-    return compile(shapeless: true, body)
+    let compiled = compile(shapeless: true, body)
+    // Plain body inside the outer compiled-decode trace — nested compile is illegal.
+    return { g, x in CompiledDecodeTrace.isActive ? body(g, x) : compiled(g, x) }
 }()
 
 /// Compiled precise swiglu: casts to float32, does silu+mul, casts back.
@@ -65,7 +78,9 @@ private let _vlmCompiledPreciseSwiGLU: @Sendable (MLXArray, MLXArray, MLXArray) 
         let xF32 = x.asType(.float32)
         return (gateF32 * xF32).asType(h.dtype)
     }
-    return compile(shapeless: true, body)
+    let compiled = compile(shapeless: true, body)
+    // Plain body inside the outer compiled-decode trace — nested compile is illegal.
+    return { h, g, x in CompiledDecodeTrace.isActive ? body(h, g, x) : compiled(h, g, x) }
 }()
 
 private func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray)
@@ -808,6 +823,13 @@ enum Qwen35Language {
             var kvSeqLen = keys.dim(-2)
             var positionIds = positionIds
 
+            // A Compilable cache (compiled decode) returns the FULL static
+            // buffer from `update` and its `makeMask` already covers it, so
+            // the kvSeqLen mask slice must not run — and reading `.offset`
+            // (Int) is an illegal `.item()` inside the compile trace.
+            let fullBufferCache = !(cache is BatchKVCache)
+                && graphOffsetArray(for: cache) != nil
+
             if positionIds == nil {
                 // Build position IDs from cache offset. For batched decode with
                 // BatchKVCache, use per-sequence offsets for correct positional encoding.
@@ -818,6 +840,11 @@ enum Qwen35Language {
                     // Shape: [3, B, 1] — 3 for the 3D rope dimensions
                     let base = offsets.reshaped(1, B, 1)
                     positionIds = tiled(base, repetitions: [3, 1, L])
+                } else if fullBufferCache, let graphOffset = graphOffsetArray(for: cache) {
+                    var base = graphOffset.reshaped([]).asType(.int32)
+                        + MLXArray(0 ..< L).asType(.int32)
+                    base = tiled(base[.newAxis, 0...], repetitions: [B, 1])
+                    positionIds = tiled(base[.newAxis, 0..., 0...], repetitions: [3, 1, 1])
                 } else {
                     let offset = cache?.offset ?? 0
                     kvSeqLen += offset + 1
@@ -826,7 +853,7 @@ enum Qwen35Language {
                     positionIds = base[.newAxis, 0..., 0...]
                     positionIds = tiled(positionIds!, repetitions: [3, 1, 1])
                 }
-            } else if let cache {
+            } else if let cache, !fullBufferCache {
                 kvSeqLen += cache.offset + 1
             }
 
@@ -836,7 +863,10 @@ enum Qwen35Language {
 
             let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
             if let mask {
-                attentionMask = .array(mask[.ellipsis, 0 ..< kvSeqLen])
+                // Full-buffer (Compilable) caches: mask and K/V both span the
+                // whole static buffer — pass through unsliced.
+                attentionMask = fullBufferCache
+                    ? .array(mask) : .array(mask[.ellipsis, 0 ..< kvSeqLen])
             } else {
                 attentionMask = .none
             }
@@ -1676,9 +1706,19 @@ enum Qwen35Language {
                 ropeDeltas = nil
             }
 
+            // Compiled decode: the promoted caches keep their offset as an
+            // MLXArray. Reading `.offset` (Int) forces `.item()` — illegal
+            // inside the compile trace and, worse, would bake the trace-time
+            // offset into the graph as a constant for every later token.
+            // Build the positions from the graph offset instead.
             var cacheOffset = 0
+            var graphOffset: MLXArray? = nil
             if let cache, let faCache = cache[model.faIdx] {
-                cacheOffset = faCache.offset
+                if let g = graphOffsetArray(for: faCache) {
+                    graphOffset = g
+                } else {
+                    cacheOffset = faCache.offset
+                }
             }
 
             var ropeMask = mask
@@ -1687,6 +1727,36 @@ enum Qwen35Language {
             }
 
             var positionIds = providedPositionIds
+            if positionIds == nil, let graphOffset,
+                ropeMask == nil || ropeMask?.ndim == 2
+            {
+                // Graph-visible twin of the `else` (delta) branch below. A
+                // Compilable cache only exists after prefill, so the offset
+                // is non-zero and text positions are offset + arange —
+                // shifted by ropeDeltas when the prompt carried media.
+                let batchSize = inputs.dim(0)
+                let seqLength = inputs.dim(1)
+
+                var delta = graphOffset.reshaped([]).asType(.int32)
+                if let ropeDeltas {
+                    delta = delta + ropeDeltas.asType(.int32)
+                }
+
+                var base = MLXArray(0 ..< seqLength).asType(.int32)
+                base = broadcast(base[.newAxis, 0...], to: [batchSize, seqLength])
+
+                if delta.ndim == 0 {
+                    delta = broadcast(delta, to: [batchSize])
+                } else if delta.dim(0) < batchSize {
+                    delta = repeated(delta, count: batchSize, axis: 0)
+                } else if delta.dim(0) > batchSize {
+                    delta = delta[0 ..< batchSize]
+                }
+
+                base = base + delta[0..., .newAxis]
+                return broadcast(
+                    base[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
+            }
             if positionIds == nil && (ropeMask == nil || ropeMask?.ndim == 2) {
                 if (cache != nil && cache?[model.faIdx] != nil && cacheOffset == 0)
                     || ropeDeltas == nil
