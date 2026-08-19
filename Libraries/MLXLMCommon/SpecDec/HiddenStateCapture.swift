@@ -148,3 +148,21 @@ public protocol DFlash2VerifyRollbackModel: AnyObject {
     /// (the caller must then treat the cache as unrecoverable).
     func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool
 }
+
+/// Target models whose verify forward can run under
+/// `NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged` — the
+/// compile-compatible rollback. During a staged verify, recurrent layers
+/// write their inputs and final state into fixed cache staging slots and
+/// leave the committed state and offset UNTOUCHED; the runtime calls
+/// ``commitStagedVerifiedBlock(cache:acceptedInputs:blockLength:)`` after
+/// acceptance on EVERY cycle (a full accept copies the staged final state,
+/// a partial accept replays the accepted rows from the untouched
+/// pre-verify state — which is still sitting in the cache, so no
+/// pre-forward snapshotting or aliasing pins are needed).
+public protocol DFlash2StagedVerifyRollbackModel: DFlash2VerifyRollbackModel {
+    /// Commit `acceptedInputs` rows of the last staged verify block of
+    /// `blockLength` rows. Returns false when a layer has no staged data
+    /// (caller must treat the cache as unrecoverable).
+    func commitStagedVerifiedBlock(
+        cache: [KVCache], acceptedInputs: Int, blockLength: Int) -> Bool
+}

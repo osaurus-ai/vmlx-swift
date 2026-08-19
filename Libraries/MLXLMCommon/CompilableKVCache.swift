@@ -96,7 +96,10 @@ public class CompilableKVCache: BaseKVCache {
             offsetArray[0].item(Int.self)
         }
         set {
-            offsetArray = MLXArray([Int32(newValue)])
+            // In place, NEVER a rebind: compile() state tracking captured
+            // this exact object — replacing it silently detaches every
+            // compiled function that references the cache.
+            offsetArray._updateInternal(MLXArray([Int32(newValue)]))
         }
     }
 
@@ -222,9 +225,13 @@ public class CompilableKVCache: BaseKVCache {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        // The static buffer needs no data movement to trim — rewinding the
+        // offset re-exposes the rows to the next update()/makeMask(). The
+        // rewind MUST keep `offsetArray`'s object identity (in-place update,
+        // no rebind) or compiled functions tracking this cache detach.
         let current: Int = offsetArray[0].item(Int.self)
         let trimmed = min(current, n)
-        offsetArray = MLXArray([Int32(current - trimmed)])
+        offsetArray._updateInternal(MLXArray([Int32(current - trimmed)]))
         super.offset = current - trimmed
         return trimmed
     }

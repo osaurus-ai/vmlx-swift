@@ -1120,6 +1120,16 @@ public enum NativeMTPVerifierStatePolicy {
         /// the graph per record). Rollback replays only the accepted rows,
         /// one kernel per layer, only when a rejection happens.
         case inputCapture = "input_capture"
+        /// Compile-compatible variant of `inputCapture`: recurrent layers
+        /// write their verify inputs into FIXED staging slots on the cache
+        /// (in place, so `compile()` tracks them as state outputs) and do
+        /// NOT touch their committed state or offset. A host-side commit
+        /// applies the accepted prefix after acceptance — replaying n rows
+        /// from the untouched pre-verify state, or copying the staged final
+        /// state on a full accept. `inputCapture`'s host-struct stash cannot
+        /// survive a compiled trace: the assignment runs once at trace time
+        /// and would pin trace tracers forever.
+        case inputCaptureStaged = "input_capture_staged"
     }
 
     @TaskLocal public static var requestVerifierMode: String?
@@ -1150,6 +1160,8 @@ public enum NativeMTPVerifierStatePolicy {
             return .lazyRepair
         case "input_capture", "verify_input_capture":
             return .inputCapture
+        case "input_capture_staged", "verify_input_capture_staged":
+            return .inputCaptureStaged
         case "chunk_fast", "fast", "capture_commit", "chunk_commit":
             return .captureCommit
         case "sequential", "sequential_repair", "strict", "strict_capture":
@@ -1167,13 +1179,20 @@ public enum NativeMTPVerifierStatePolicy {
     }
 
     public static var shouldRecordAcceptedPrefixStates: Bool {
-        mode != .lazyRepair && mode != .inputCapture
+        mode != .lazyRepair && mode != .inputCapture && mode != .inputCaptureStaged
     }
 
     /// Whether recurrent layers should stash their verify inputs for the
     /// one-shot lazy rollback (DFlash 2).
     public static var shouldStashVerifyInputs: Bool {
         mode == .inputCapture
+    }
+
+    /// Whether recurrent layers should write verify inputs + final state
+    /// into the cache's fixed staging slots and leave committed state
+    /// untouched (compiled DFlash 2 verify).
+    public static var shouldStageVerifyInputs: Bool {
+        mode == .inputCaptureStaged
     }
 
     public static var shouldRoundGDNStateEachVerifierStep: Bool {

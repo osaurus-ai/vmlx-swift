@@ -1474,6 +1474,38 @@ public class MambaCache: ArraysCache {
         verifyInputStash = nil
     }
 
+    // MARK: - Verify staging (compiled DFlash 2 verify)
+
+    /// Fixed staging slots for `input_capture_staged` verify forwards.
+    ///
+    /// `verifyInputStash` cannot survive a `compile()` trace: the host
+    /// struct assignment runs once at trace time and would pin the trace's
+    /// tracer arrays forever. These slots instead hold PERSISTENT MLXArrays
+    /// that the layer updates IN PLACE (`_updateInternal`) — they are part
+    /// of `innerState()`, so the compile transform tracks them as state
+    /// outputs and every replay leaves this call's real values here.
+    ///
+    /// Layout is layer-private (the owning layer writes and reads it).
+    /// Slots are allocated by the first staged verify, which must run
+    /// EAGERLY — `compile()` needs the objects to exist before the trace.
+    public var verifyStagingSlots: [MLXArray?] = Array(repeating: nil, count: 8)
+
+    public var verifyStagingReady: Bool {
+        !verifyStagingSlots.contains(where: { $0 == nil })
+    }
+
+    public func stageVerifySlot(_ index: Int, _ value: MLXArray) {
+        if let existing = verifyStagingSlots[index] {
+            existing._updateInternal(value)
+        } else {
+            verifyStagingSlots[index] = value
+        }
+    }
+
+    public override func innerState() -> [MLXArray] {
+        super.innerState() + verifyStagingSlots.compactMap { $0 }
+    }
+
     public override func copy() -> any KVCache {
         let new = MambaCache()
         let s = self.state

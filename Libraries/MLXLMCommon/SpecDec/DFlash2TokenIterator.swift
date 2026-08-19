@@ -143,6 +143,18 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private var lastToken: Int
     private var stats = DFlash2GenerationStats()
 
+    // MARK: compiled verify (input_capture_staged)
+
+    /// Whether full-size blocks run the staged verify (attention caches
+    /// promoted to Compilable buffers; GDN commits from staging slots).
+    private var useStagedVerify = false
+    /// The first staged cycle runs EAGERLY to allocate the staging slots;
+    /// `compile()` needs those objects to exist before the trace.
+    private var stagedVerifyWarm = false
+    /// The compiled S = 1+block verify forward. Fixed shape — tail blocks
+    /// and the AR fallback keep the eager path.
+    private var compiledVerify: (@Sendable ([MLXArray]) -> [MLXArray])?
+
     private static let traceEnabled =
         ProcessInfo.processInfo.environment["VMLX_DFLASH2_TRACE"] == "1"
 
@@ -411,6 +423,32 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.pendingIndex = 0
         self.stats.emittedTokens = 1
         self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
+
+        // MARK: compiled verify promotion
+        //
+        // The verify forward is a FIXED shape (1 anchor + block drafts), so
+        // it can be compiled exactly like plain decode — killing the
+        // per-cycle CPU graph rebuild. Attention caches become static
+        // Compilable buffers (graph-visible offset, trim = offset rewind);
+        // recurrent layers run `input_capture_staged` and are committed
+        // host-side from their staging slots. Promotion happens AFTER the
+        // snapshots above so stored prefix-cache entries stay plain.
+        if HardwareInfo.isCompiledDecodeSupported,
+            ProcessInfo.processInfo.environment["VMLX_DFLASH2_COMPILED_VERIFY"] != "0",
+            target is DFlash2StagedVerifyRollbackModel
+        {
+            let promptOffset = self.cache.map(\.offset).max() ?? self.promptTokenIds.count
+            let bufferLength = promptOffset + (self.maxTokens ?? 4096)
+                + effectiveBlockSize + 8
+            self.cache = self.cache.map { layer in
+                if !(layer is CompilableKVCache), layer is KVCacheSimple {
+                    return CompilableKVCache(from: layer, maxLength: bufferLength)
+                }
+                return layer
+            }
+            MLX.eval(self.cache)
+            self.useStagedVerify = true
+        }
     }
 
     // MARK: - Prefill
@@ -600,20 +638,56 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // that cost 5.1× a decode step.
         let usesInputCapture = hasRecurrentState && target is DFlash2VerifyRollbackModel
             && ProcessInfo.processInfo.environment["VMLX_DFLASH2_INPUT_CAPTURE"] != "0"
-        let verifierMode = usesInputCapture
-            ? "input_capture"
-            : (hasRecurrentState ? "capture_commit" : "input_capture")
+        // Full-size blocks take the compiled staged verify; tail blocks
+        // (shrunken bs near the budget) keep the eager path — compiling is
+        // only worth it for the shape that runs hundreds of times.
+        let stagedCycle = useStagedVerify && bs == blockSize
         let verifyStart = Date.timeIntervalSinceReferenceDate
-        let (logits, captured) = NativeMTPVerifierStatePolicy.withVerifierMode(verifierMode) {
-            target.callAsFunction(
-                verifyInput, cache: cache, captureLayerIDs: captureLayerIDs,
-                recordPrefixCommitStates: hasRecurrentState && !usesInputCapture)
+        var logits: MLXArray
+        var greedyTargetIds: MLXArray? = nil
+        let newHidden: MLXArray
+        if stagedCycle {
+            if !stagedVerifyWarm {
+                // Eager warm-up under the staged mode: allocates the
+                // fixed staging slots the compile trace will track.
+                let (l, captured) = NativeMTPVerifierStatePolicy.withVerifierMode(
+                    "input_capture_staged")
+                {
+                    target.callAsFunction(
+                        verifyInput, cache: cache, captureLayerIDs: captureLayerIDs,
+                        recordPrefixCommitStates: false)
+                }
+                logits = l
+                newHidden = extractContextFeature(
+                    captured: captured, targetLayerIDs: orderedLayerIDs)
+                stagedVerifyWarm = true
+            } else {
+                if compiledVerify == nil { buildCompiledVerify() }
+                let outs = compiledVerify!([verifyInput])
+                logits = outs[0]
+                if isGreedy { greedyTargetIds = outs[0] }
+                // Captured hiddens come back in `orderedLayerIDs` order —
+                // the same order extractContextFeature concatenates.
+                newHidden = concatenated(Array(outs[1...]), axis: -1)
+            }
+        } else {
+            let verifierMode = usesInputCapture
+                ? "input_capture"
+                : (hasRecurrentState ? "capture_commit" : "input_capture")
+            let (l, captured) = NativeMTPVerifierStatePolicy.withVerifierMode(verifierMode) {
+                target.callAsFunction(
+                    verifyInput, cache: cache, captureLayerIDs: captureLayerIDs,
+                    recordPrefixCommitStates: hasRecurrentState && !usesInputCapture)
+            }
+            logits = l
+            newHidden = extractContextFeature(
+                captured: captured, targetLayerIDs: orderedLayerIDs)
         }
-        let newHidden = extractContextFeature(
-            captured: captured, targetLayerIDs: orderedLayerIDs)
         // Greedy target ids join the same flush as the hidden states, so
         // the argmax never costs its own graph submission.
-        let greedyTargetIds = isGreedy ? argMax(logits, axis: -1) : nil
+        if isGreedy, greedyTargetIds == nil {
+            greedyTargetIds = argMax(logits, axis: -1)
+        }
         if let greedyTargetIds {
             asyncEval(greedyTargetIds, newHidden)
         } else {
@@ -653,7 +727,31 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let commitStart = Date.timeIntervalSinceReferenceDate
         let committedInputs = accepted + 1
         let rejected = verifyInput.dim(1) - committedInputs
-        if rejected > 0 {
+        if stagedCycle {
+            // Staged verify left the recurrent state and offsets untouched;
+            // EVERY cycle commits from the staging slots (a full accept
+            // adopts the staged final state, no replay). Attention caches
+            // advanced in-graph and just rewind their offset.
+            if rejected > 0 {
+                for layer in cache where layer.isTrimmable {
+                    _ = layer.trim(rejected)
+                }
+            }
+            let committed = (target as? DFlash2StagedVerifyRollbackModel)?
+                .commitStagedVerifiedBlock(
+                    cache: cache, acceptedInputs: committedInputs,
+                    blockLength: verifyInput.dim(1)) ?? false
+            guard committed else {
+                stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
+                FileHandle.standardError.write(
+                    Data(
+                        ("[DFlash2] ABORTED at cycle \(stats.verifyCalls): staged verify "
+                            + "commit failed for \(committedInputs) of "
+                            + "\(verifyInput.dim(1)) rows. The turn is TRUNCATED at "
+                            + "\(stats.emittedTokens) tokens.\n").utf8))
+                return false
+            }
+        } else if rejected > 0 {
             let committed: Bool
             if usesInputCapture, let rollback = target as? DFlash2VerifyRollbackModel {
                 for layer in cache where layer.isTrimmable {
@@ -706,6 +804,35 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             FileHandle.standardError.write(Data(line.utf8))
         }
         return true
+    }
+
+    /// Compile the fixed-shape staged verify forward. Built AFTER the
+    /// eager warm-up cycle so the staging slots exist as persistent
+    /// objects the trace's state tracking can capture.
+    private mutating func buildCompiledVerify() {
+        let capturedTarget = target
+        let cacheRef = cache
+        let capIDs = captureLayerIDs
+        let ids = orderedLayerIDs
+        let greedy = isGreedy
+        self.compiledVerify = compile(
+            inputs: cacheRef, outputs: cacheRef
+        ) { (args: [MLXArray]) -> [MLXArray] in
+            CompiledDecodeTrace.withActive {
+                NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+                    let (logits, captured) = capturedTarget.callAsFunction(
+                        args[0], cache: cacheRef, captureLayerIDs: capIDs,
+                        recordPrefixCommitStates: false)
+                    var outs: [MLXArray] = [greedy ? argMax(logits, axis: -1) : logits]
+                    for id in ids { outs.append(captured[id]!) }
+                    return outs
+                }
+            }
+        }
+        if Self.traceEnabled {
+            FileHandle.standardError.write(Data(
+                "[DFlash2] compiled verify built (S=\(blockSize))\n".utf8))
+        }
     }
 
     /// Single-token target step. Used when the remaining budget cannot
