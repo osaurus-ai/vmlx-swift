@@ -207,3 +207,55 @@ python -m venv venv && venv/bin/pip install mlx mlx-lm numpy
 git clone https://github.com/z-lab/dflash.git
 venv/bin/python dflash2_reference_dump.py   # scratchpad script
 ```
+
+## Compiled decode on the hybrid target
+
+The plain-decode arm of every table above was CPU-bound, not GPU-bound:
+19 ms/token of per-token graph rebuild that never overlapped the GPU —
+the entire gap between this runtime (17.3 tok/s) and python mlx-lm
+(24.6) on the identical JANG_4D bundle. The generic compiled-decode
+path (`enableCompiledDecode` + `VMLX_ENABLE_UNSAFE_COMPILE=1`) now
+works for the hybrid GDN families and closes most of it:
+
+| arm (greedy, 192 tok, hot) | plain build | compiled build |
+| --- | --- | --- |
+| baseline | 17.32 tok/s | **23.13 tok/s (+33%)** |
+| dflash2-b4 | 22.84 | 22.89 (own iterator — unaffected) |
+
+The compiled baseline's greedy text is **byte-identical** to plain
+decode (dump both with `VMLX_SWEEP_DUMP` and diff).
+
+What had to change, and why (each of these is a class, not a one-off —
+audit any new hybrid the same way before enabling compile):
+
+1. **`MambaCache` passes through `setupCompiledDecode` unpromoted.**
+   Fixed-shape state, `innerState()`-tracked, `_updateInternal` in-place
+   updates — exactly the compile state-tracker contract. Requiring
+   promotability of every layer silently disabled compiled decode for
+   the families that needed it most.
+2. **No host `.offset` reads inside the traced forward.** A promoted
+   cache's `offset` getter is `.item()` — fatal during the trace, and
+   conceptually a constant-bake even where it wouldn't crash. Positions
+   come from `graphOffsetArray(for:)`; masks come from the cache's own
+   `makeMask` (already graph-visible).
+3. **The kvSeqLen mask slice must not run** against a Compilable cache:
+   `update()` returns the FULL static buffer and `makeMask` spans it.
+4. **No nested `compile()`.** The per-layer micrographs (sigmoid-multiply,
+   swiglu, precise-swiglu, compute_g) fall back to their plain body under
+   `CompiledDecodeTrace.isActive`; the ops fuse into the outer graph.
+5. **Recurrent offsets are host bookkeeping.** `cache.offset += S` runs
+   once at trace time and never again; `TokenIterator` rewrites
+   `MambaCache` offsets from a step counter after each compiled call.
+6. **The static buffers are sized from `promptOffset + maxTokens`**
+   (explicit `compiledMaxCacheLength` wins) so a long run cannot outgrow
+   them silently.
+
+Debugging note: when the trace aborts with "[eval] … during function
+transformations", lldb on the fatal shows only the ErrorHandler frame.
+Break at `ErrorHandler.dispatch`'s *entry* line instead — dispatch is
+synchronous, so the full Swift stack up through the offending `.item()`
+is visible there.
+
+DFlash 2's own iterator still builds its graphs eagerly; compiling the
+fixed-shape S=1+b verify forward the same way is the remaining lever
+(the draft loop's shapes vary with context length and do not trace).
