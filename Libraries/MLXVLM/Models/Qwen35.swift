@@ -1798,18 +1798,26 @@ enum Qwen35Language {
             recordPrefixCommitStates: Bool = false
         ) -> (MLXArray, [Int: MLXArray]) {
             let cacheOpt: [KVCache?]? = cache?.map { $0 as KVCache? }
-            // Reuse the media-aware RoPE bookkeeping the native-MTP path
-            // established: after a VLM prefill the position indices are
-            // offset by `ropeDeltas`, and drafting text on top of an
-            // image turn has to continue from those, not from zero.
-            let positionIds = resolvedPositionIds(
-                inputs: inputs,
-                cache: cacheOpt,
-                mask: nil,
-                providedPositionIds: nil,
-                imageGridTHW: nil,
-                videoGridTHW: nil,
-                resetForMedia: false)
+            // Media-aware RoPE continuation ONLY when this process actually
+            // ran a media prefill (`ropeDeltas` exists). Forcing position
+            // resolution without that state is wrong twice on a
+            // cache-restored text path: `resolvedPositionIds` computes a
+            // table from the CHUNK's own rows starting at position 0 —
+            // ignoring the restored offset — and the next chunk then
+            // slices past the end of that short table
+            // (measured: restored offset 1375, chunk 33, slice [1408..<1412]
+            // → broadcast abort). `nil` positions make attention derive
+            // them from the cache offset, exactly like the plain forward.
+            let positionIds: MLXArray? = ropeDeltas != nil
+                ? resolvedPositionIds(
+                    inputs: inputs,
+                    cache: cacheOpt,
+                    mask: nil,
+                    providedPositionIds: nil,
+                    imageGridTHW: nil,
+                    videoGridTHW: nil,
+                    resetForMedia: false)
+                : nil
             let (hidden, captured) = model.callAsFunctionCapturing(
                 inputs,
                 cache: cacheOpt,

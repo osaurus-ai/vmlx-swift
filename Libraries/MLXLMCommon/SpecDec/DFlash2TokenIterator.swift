@@ -312,6 +312,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                         restored = true
                     }
                 }
+                if restored, Self.traceEnabled {
+                    let offsets = Set(self.cache.map(\.offset)).sorted()
+                    let kvLens = self.cache.compactMap { ($0 as? KVCacheSimple)?.state.first?.dim(2) }
+                    FileHandle.standardError.write(Data(
+                        "[DFlash2 restore] matched=\(matchedTokens) remaining=\(remainingTokens.count) offsets=\(offsets) kvLens=\(Set(kvLens).sorted())\n"
+                            .utf8))
+                }
                 if restored {
                     if input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens) {
                         self.cache = target.newCache(parameters: effectiveParameters)
