@@ -143,6 +143,50 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private var lastToken: Int
     private var stats = DFlash2GenerationStats()
 
+    // MARK: verify prefetch
+    //
+    // A cycle's forwards take ~50-140ms of GPU; emitting its 3-7 accepted
+    // tokens then costs the HOST several ms each in detokenize/stream/
+    // stats, during which the GPU has nothing to do. Submitting the NEXT
+    // cycle's draft+verify the moment this cycle's decision lands overlaps
+    // that gap — same forwards, zero extra compute. The Python engine
+    // measured the identical change at +65% on this model.
+    //
+    // Only safe under the STAGED verify: a staged forward leaves committed
+    // recurrent state and offsets untouched, so an in-flight verify that
+    // is never accepted has advanced ONLY the trimmable attention caches,
+    // and abandoning it is a trim. Under eager input-capture the recurrent
+    // state has already moved and there is no zero-accept rollback.
+    private struct InFlightVerify {
+        let blockSize: Int
+        let proposal: DFlash2Proposal
+        let draftTokens: MLXArray
+        let verifyRows: Int
+        let logits: MLXArray
+        let greedyTargetIds: MLXArray?
+        let newHidden: MLXArray
+        let stagedCycle: Bool
+        let usesInputCapture: Bool
+        let hasRecurrentState: Bool
+        let verifySeconds: Double
+    }
+
+    private var inFlight: InFlightVerify?
+
+    /// OPT-IN (`VMLX_DFLASH2_VERIFY_PREFETCH=1`), and measured as a
+    /// non-win on this runtime: through the real `generate()` path on
+    /// Qwen3.8-27B-JANG_4D it is neutral-to-negative (think ON 25.95 vs
+    /// 25.87 tok/s, think OFF 20.02 vs 21.22). The Python engine measured
+    /// the same change at +65%, but it was closing a 10-18 ms/cycle host
+    /// gap that this loop does not have: draft and verify are already
+    /// dispatched with `asyncEval` and the cycle pays exactly one host
+    /// sync, so there is little idle GPU to fill and the speculative
+    /// block is pure cost whenever it is abandoned.
+    private var prefetchEnabled: Bool {
+        useStagedVerify
+            && ProcessInfo.processInfo.environment["VMLX_DFLASH2_VERIFY_PREFETCH"] == "1"
+    }
+
     // MARK: compiled verify (input_capture_staged)
 
     /// Whether full-size blocks run the staged verify (attention caches
@@ -491,9 +535,17 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // copy's table does not release them, and the process segfaults at
         // exit. Reproduce: run DFlash2LosslessSmokeTests with this ON
         // (tests pass, process exits with signal 11) versus OFF (clean).
-        if HardwareInfo.isCompiledDecodeSupported,
-            ProcessInfo.processInfo.environment["VMLX_DFLASH2_COMPILED_VERIFY"] == "1",
-            target is DFlash2StagedVerifyRollbackModel
+        // Staged verify is independent of compiling it: staging is what
+        // makes the commit lazy and an in-flight verify abandonable, so it
+        // is what verify prefetch needs. Compiling the traced forward is a
+        // separate opt-in below.
+        if target is DFlash2StagedVerifyRollbackModel,
+            ProcessInfo.processInfo.environment["VMLX_DFLASH2_STAGED_VERIFY"] != "0"
+        {
+            self.useStagedVerify = true
+        }
+        if useStagedVerify, HardwareInfo.isCompiledDecodeSupported,
+            ProcessInfo.processInfo.environment["VMLX_DFLASH2_COMPILED_VERIFY"] == "1"
         {
             let promptOffset = self.cache.map(\.offset).max() ?? self.promptTokenIds.count
             let bufferLength = promptOffset + (self.maxTokens ?? 4096)
@@ -611,6 +663,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             // VMLX_DFLASH2_COMPILED_VERIFY=0, SIGSEGV after the last test
             // with it on) — the same capture-cycle class as the compiled
             // decode trampoline that once pinned unloaded weights.
+            abandonInFlightVerify()
             releaseCompiledVerify()
             return nil
         }
@@ -636,12 +689,32 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let budget = maxTokens.map { $0 - tokenCount } ?? Int.max
         guard budget > 0 else { return false }
 
+        // A prefetched verify is already on the GPU — consume it, provided
+        // it still fits the remaining budget.
+        if let prefetched = inFlight, prefetched.blockSize <= budget + 1 {
+            inFlight = nil
+            return completeVerify(prefetched)
+        }
+        // Anything else in flight was speculated against a budget or block
+        // size we can no longer use; roll its rows back before proceeding.
+        abandonInFlightVerify()
+
         // The block spends one position on the anchor, so a block of size
         // `bs` yields at most `bs` new tokens (bs-1 drafts + 1 bonus).
         let bs = Swift.min(adaptiveBlockSize ?? blockSize, budget + 1)
         if bs <= 1 {
             return runAutoregressiveStep()
         }
+        return completeVerify(issueVerify(bs: bs))
+    }
+
+    /// Build one cycle's draft + verify graphs and DISPATCH them, without
+    /// reading anything back. Returns the handles the accept phase needs.
+    ///
+    /// Split out from the accept phase so the next cycle's forwards can be
+    /// submitted while the host is still detokenizing and streaming this
+    /// cycle's tokens — see `prefetchNextVerify`.
+    private mutating func issueVerify(bs: Int) -> InFlightVerify {
 
         // MARK: draft
 
@@ -762,6 +835,34 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         stats.verifySeconds += cycleVerifySeconds
         stats.verifyCalls += 1
 
+        return InFlightVerify(
+            blockSize: bs,
+            proposal: proposal,
+            draftTokens: draftTokens,
+            verifyRows: verifyInput.dim(1),
+            logits: logits,
+            greedyTargetIds: greedyTargetIds,
+            newHidden: newHidden,
+            stagedCycle: stagedCycle,
+            usesInputCapture: usesInputCapture,
+            hasRecurrentState: hasRecurrentState,
+            verifySeconds: cycleVerifySeconds)
+    }
+
+    /// Read back one dispatched cycle, accept its longest agreeing prefix,
+    /// commit the cache, and queue the emitted tokens.
+    private mutating func completeVerify(_ flight: InFlightVerify) -> Bool {
+        let bs = flight.blockSize
+        let proposal = flight.proposal
+        let draftTokens = flight.draftTokens
+        let logits = flight.logits
+        let greedyTargetIds = flight.greedyTargetIds
+        let newHidden = flight.newHidden
+        let stagedCycle = flight.stagedCycle
+        let usesInputCapture = flight.usesInputCapture
+        let cycleVerifySeconds = flight.verifySeconds
+        let budget = maxTokens.map { $0 - tokenCount } ?? Int.max
+
         // MARK: accept — the cycle's single host sync happens on the first
         // asArray below, after both forwards are already in flight.
 
@@ -792,7 +893,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
 
         let commitStart = Date.timeIntervalSinceReferenceDate
         let committedInputs = accepted + 1
-        let rejected = verifyInput.dim(1) - committedInputs
+        let rejected = flight.verifyRows - committedInputs
         if stagedCycle {
             // Staged verify left the recurrent state and offsets untouched;
             // EVERY cycle commits from the staging slots (a full accept
@@ -806,14 +907,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             let committed = (target as? DFlash2StagedVerifyRollbackModel)?
                 .commitStagedVerifiedBlock(
                     cache: cache, acceptedInputs: committedInputs,
-                    blockLength: verifyInput.dim(1)) ?? false
+                    blockLength: flight.verifyRows) ?? false
             guard committed else {
                 stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
                 FileHandle.standardError.write(
                     Data(
                         ("[DFlash2] ABORTED at cycle \(stats.verifyCalls): staged verify "
                             + "commit failed for \(committedInputs) of "
-                            + "\(verifyInput.dim(1)) rows. The turn is TRUNCATED at "
+                            + "\(flight.verifyRows) rows. The turn is TRUNCATED at "
                             + "\(stats.emittedTokens) tokens.\n").utf8))
                 return false
             }
@@ -842,7 +943,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     Data(
                         ("[DFlash2] ABORTED at cycle \(stats.verifyCalls): no recorded "
                             + "recurrent state for the accepted prefix (\(committedInputs) of "
-                            + "\(verifyInput.dim(1))). The turn is TRUNCATED at "
+                            + "\(flight.verifyRows)). The turn is TRUNCATED at "
                             + "\(stats.emittedTokens) tokens.\n").utf8))
                 return false
             }
@@ -867,6 +968,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             updateAdaptiveBlockSize(
                 emitted: emitted.count, verifySeconds: cycleVerifySeconds)
         }
+        // The cache, contextHidden and lastToken now describe exactly the
+        // committed prefix, so the next cycle can be built and dispatched
+        // right here — it runs on the GPU while the caller detokenizes and
+        // streams the tokens queued above.
+        prefetchNextVerify()
 
         if Self.traceEnabled {
             let line =
@@ -874,6 +980,48 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             FileHandle.standardError.write(Data(line.utf8))
         }
         return true
+    }
+
+    /// Dispatch the next cycle's forwards, if one is worth having.
+    private mutating func prefetchNextVerify() {
+        guard prefetchEnabled, inFlight == nil else { return }
+        // Budget left AFTER the tokens queued by the cycle that just
+        // completed — they have not been consumed by `next()` yet.
+        let remaining = maxTokens.map { $0 - tokenCount - pendingTokens.count } ?? Int.max
+        guard remaining > 1 else { return }
+        let bs = Swift.min(adaptiveBlockSize ?? blockSize, remaining + 1)
+        guard bs > 1 else { return }
+        inFlight = issueVerify(bs: bs)
+    }
+
+    /// Undo a dispatched-but-unaccepted verify. Under the staged verify it
+    /// advanced only the trimmable attention caches, so the rollback is a
+    /// trim plus dropping the staging slots; the recurrent state and its
+    /// offset were never touched. Must run before ANY path that persists
+    /// or reuses the cache, or unverified draft positions leak into a
+    /// stored prefix.
+    private mutating func abandonInFlightVerify() {
+        guard let flight = inFlight else { return }
+        inFlight = nil
+        for layer in cache where layer.isTrimmable {
+            _ = layer.trim(flight.verifyRows)
+        }
+        for layer in cache { (layer as? MambaCache)?.clearVerifyStaging() }
+        stagedWarmedSizes.removeAll(keepingCapacity: true)
+        // The drafter cache also advanced for the abandoned block.
+        let expectedDraftOffset = promptTokenIds.count + stats.emittedTokens - 1
+        for c in draftCache where c.offset > expectedDraftOffset {
+            let excess = c.offset - expectedDraftOffset
+            if c.isTrimmable {
+                _ = c.trim(excess)
+            } else {
+                c.offsetForDFlash2 = Swift.max(0, c.offset - excess)
+            }
+        }
+        if Self.traceEnabled {
+            FileHandle.standardError.write(Data(
+                "[DFlash2] abandoned in-flight verify (\(flight.verifyRows) rows)\n".utf8))
+        }
     }
 
     /// Compile the fixed-shape staged verify forward. Built AFTER the
@@ -1006,6 +1154,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Single-token target step. Used when the remaining budget cannot
     /// fill a block and as the safety valve when acceptance cannot run.
     private mutating func runAutoregressiveStep() -> Bool {
+        // A plain step reads and advances the same cache an in-flight
+        // verify has already speculatively extended.
+        abandonInFlightVerify()
         let input = MLXArray([Int32(lastToken)]).reshaped(1, 1)
         let (logits, captured) = target.callAsFunction(
             input, cache: cache, captureLayerIDs: captureLayerIDs,
@@ -1059,6 +1210,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
+        // Never persist a cache that still carries unverified draft rows.
+        abandonInFlightVerify()
         guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else { return }
         defer {
             promptCacheSnapshot = nil
