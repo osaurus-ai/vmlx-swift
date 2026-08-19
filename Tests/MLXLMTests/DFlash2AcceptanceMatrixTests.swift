@@ -66,6 +66,16 @@ final class DFlash2AcceptanceMatrixTests: XCTestCase {
         var params = GenerateParameters(maxTokens: maxTokens, temperature: 0)
         params.prefillStepSize = 1024
 
+        // Block size is a real tuning axis, not a constant: acceptance can
+        // SATURATE the block (coding at b8 accepts 5.71 of a max 8), and
+        // the quantized matmul cost is nearly flat from M=8 to M=16, so a
+        // wider block can buy tokens almost for free. Overridable so the
+        // sweep can be widened without an edit.
+        let blockSizes: [Int] =
+            ProcessInfo.processInfo.environment["VMLX_DFLASH2_BLOCKS"]
+            .map { $0.split(separator: ",").compactMap { Int($0) } }
+            ?? [8, 4]
+
         print("[accept-matrix] prompt   effort  arm      tok    s    tok/s  accLen  acc%  cycles  ar")
         for (pName, pText) in prompts {
             for (eName, thinking, effort) in efforts {
@@ -85,11 +95,13 @@ final class DFlash2AcceptanceMatrixTests: XCTestCase {
                         (pName as NSString).utf8String!, (eName as NSString).utf8String!,
                         tokens, secs, Double(tokens) / max(secs, 0.001)))
                 }
-                for bs in [8, 4] {
+                for bs in blockSizes {
                     let input = try await prepare(pText, thinking: thinking, effort: effort)
+                    // 0 means "let the adaptive controller pick" — a nil
+                    // block size is how a real request arrives.
                     var iterator = try DFlash2TokenIterator(
                         input: input, target: ctx.model as! any DFlash2Target,
-                        drafter: drafter, blockSize: bs, parameters: params,
+                        drafter: drafter, blockSize: bs == 0 ? nil : bs, parameters: params,
                         cacheCoordinator: nil)
                     var produced = 0
                     let start = Date()
@@ -99,9 +111,10 @@ final class DFlash2AcceptanceMatrixTests: XCTestCase {
                     let accRate = s.draftedTokens > 0
                         ? Double(s.acceptedTokens) / Double(s.draftedTokens) * 100 : 0
                     print(String(
-                        format: "[accept-matrix] %-8s %-7s b%d      %4d %5.2f  %6.2f   %5.2f  %4.0f  %6d  %2d",
+                        format: "[accept-matrix] %-8s %-7s %-7s  %4d %5.2f  %6.2f   %5.2f  %4.0f  %6d  %2d",
                         (pName as NSString).utf8String!, (eName as NSString).utf8String!,
-                        bs, produced, secs, Double(produced) / max(secs, 0.001),
+                        ((bs == 0 ? "adaptive" : "b\(bs)") as NSString).utf8String!,
+                        produced, secs, Double(produced) / max(secs, 0.001),
                         s.acceptanceLength, accRate, s.verifyCalls,
                         s.autoregressiveFallbackTokens))
                     XCTAssertGreaterThan(produced, 0)

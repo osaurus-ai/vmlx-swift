@@ -50,7 +50,7 @@ final class QuantizedVerifyShapeBenchTests: XCTestCase {
                 let w = MLXRandom.normal([n, k]).asType(.bfloat16)
                 let (wq, scales, biases) = quantized(w, groupSize: groupSize, bits: bits)
                 var base = 0.0
-                for m in [1, 4, 8, 16] {
+                for m in [1, 4, 8, 9, 10, 11, 12, 13, 16] {
                     let x = MLXRandom.normal([1, m, k]).asType(.bfloat16)
                     let ms = bench {
                         quantizedMatmul(

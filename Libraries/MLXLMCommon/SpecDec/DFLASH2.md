@@ -259,3 +259,59 @@ is visible there.
 DFlash 2's own iterator still builds its graphs eagerly; compiling the
 fixed-shape S=1+b verify forward the same way is the remaining lever
 (the draft loop's shapes vary with context length and do not trace).
+
+## Block size is the dominant tuning knob (and 8 was the wrong default)
+
+Acceptance is a property of the CONTENT DOMAIN, not just the target's
+quant, and the block size that maximises throughput follows it. Measured
+on Qwen3.8-27B-JANG_4D, greedy, 160 tokens, settled machine (PhysMem
+logged per leg; a loaded box swings these by 30%, so re-measure before
+trusting any single cell):
+
+| prompt | effort | plain | b4 | b8 | b15 |
+| --- | --- | --- | --- | --- | --- |
+| general | xhigh | 17.2 | **32.8** | 21.4 | 23.9 |
+| general | medium | 17.3 | **29.0** | 22.4 | 25.5 |
+| general | off | 17.3 | **29.9** | 21.8 | 22.5 |
+| coding | xhigh | 16.9 | 34.5 | 27.1 | **34.2** |
+| coding | medium | 17.2 | 35.6 | 33.3 | **43.3** |
+| coding | off | 17.2 | 34.0 | 30.5 | **36.7** |
+
+Acceptance length rises monotonically with the block (coding/medium:
+5.71 at b8, 6.96 at b12, 7.27 at b15) because the drafter saturates a
+narrow block — at b8 it was already landing 5.71 of a possible 8. The
+quantized matmul cost grows sublinearly over the same range, so wide
+blocks pay for themselves on high-acceptance content and cost more than
+they return on low-acceptance content.
+
+**b8 — the drafter config's own default — was the worst of the three in
+6 of 6 cells.** Prose wants b4, code wants b15. Reasoning effort matters
+too: `medium` drafts better than `xhigh` on code (accLen 5.71 vs 4.71),
+because tighter reasoning is more predictable.
+
+### Adaptive block size (opt-in: `VMLX_DFLASH2_ADAPTIVE_BLOCK=1`)
+
+A controller that probes each ladder size and settles on the measured
+best (tokens per verify-second) lands within 3-4% of the per-domain
+oracle on code and BEATS every fixed size on prose. It is opt-in because
+switching size mid-turn still interacts badly with the compiled staged
+verify — both the staging slots and the trace are shaped by the block
+length, and a switch can crash the process.
+
+Note for anyone re-deriving this: an acceptance-RATE threshold looks like
+the natural control signal and is wrong. The rate falls mechanically as
+the block widens (more drafts to get right), so fixed thresholds
+equilibrate mid-ladder — measured at 34.5 tok/s where fixed b15 gave
+41.9. Measure throughput, do not infer it.
+
+### Compiled verify status (opt-in: `VMLX_DFLASH2_COMPILED_VERIFY=1`)
+
+Proven token-identical (per-cycle emitted and drafted ids hash-identical
+to the eager path across b8/b6/b4 and both rounds) and materially
+faster. NOT yet default: the compiled traces capture the cache array and
+`DFlash2TokenIterator` is a struct, so copies retain traces
+independently and releasing one copy's table does not free them — the
+process segfaults at exit. Reproduce with `DFlash2LosslessSmokeTests`:
+tests pass either way, the process exits with signal 11 only when the
+compiled verify is on. Fixing it likely means moving the trace table
+into a reference-typed box owned by the run.

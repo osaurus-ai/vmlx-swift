@@ -151,9 +151,46 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// The first staged cycle runs EAGERLY to allocate the staging slots;
     /// `compile()` needs those objects to exist before the trace.
     private var stagedVerifyWarm = false
-    /// The compiled S = 1+block verify forward. Fixed shape — tail blocks
-    /// and the AR fallback keep the eager path.
-    private var compiledVerify: (@Sendable ([MLXArray]) -> [MLXArray])?
+    /// Compiled S = 1+block verify forwards, keyed by block size. Each is
+    /// a fixed shape; the adaptive controller below moves between a small
+    /// set of sizes, so at most a handful of traces are ever built. Tail
+    /// blocks and the AR fallback keep the eager path.
+    private var compiledVerify: [Int: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+    private var stagedWarmedSizes: Set<Int> = []
+
+    // MARK: adaptive block size
+    //
+    // The right block size is a property of the CONTENT, not the model: on
+    // Qwen3.8-27B-JANG_4D, code accepts 70-83% of drafts and wants a wide
+    // block (b15: 7.27 accepted/cycle, 38.4 tok/s), while free prose
+    // accepts 37-44% and is fastest narrow (b4: ~26 tok/s; b15 gives 22).
+    // A fixed default cannot serve both — measured at 28.5 tok/s for code
+    // at the old fixed b8, versus 38.4 at its own optimum.
+    //
+    // So track the acceptance RATE (accepted / drafted, which is
+    // block-size independent) and widen or narrow within the ladder.
+    /// Two entries, not a fine ladder: the measured surface is bimodal.
+    /// Narrow blocks win on prose (b4 beats b8 in every measured cell),
+    /// wide blocks win on code (b15: 43.3 tok/s vs b8's 33.3), and b8 —
+    /// the drafter config's own default — was the WORST of the three in
+    /// 6 of 6 cells. Probing costs real cycles, so probe only the two
+    /// sizes that can actually win.
+    private static let blockLadder = [4, 15]
+    /// On unless the caller pinned a block size explicitly (a pinned size
+    /// is a measurement request — honour it) or the kill switch is set.
+    private let adaptiveBlockSizeEnabled: Bool
+    private var adaptiveBlockSize: Int?
+    /// Per-ladder-size observed throughput: emitted tokens and the verify
+    /// seconds that produced them. Throughput is measured, not predicted —
+    /// an acceptance-RATE rule looks principled and is wrong, because the
+    /// rate falls mechanically as the block widens (more drafts to get
+    /// right), so rate thresholds equilibrate mid-ladder instead of at the
+    /// optimum. Measured on JANG_4D: a rate-threshold controller settled
+    /// on b12 and produced 34.5 tok/s where fixed b15 produced 41.9.
+    private var adaptiveTokens: [Int: Int] = [:]
+    private var adaptiveSeconds: [Int: Double] = [:]
+    private var adaptiveCyclesAtSize = 0
+    private var adaptiveSettled = false
 
     private static let traceEnabled =
         ProcessInfo.processInfo.environment["VMLX_DFLASH2_TRACE"] == "1"
@@ -253,6 +290,20 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.topK = effectiveParameters.topK
         self.isGreedy = effectiveParameters.temperature <= 0
         self.blockSize = effectiveBlockSize
+        // A caller-pinned block size is a measurement request — honour it
+        // exactly. Only the bundle default adapts.
+        // OPT-IN, not default. The probe measurably finds the right size
+        // (see DFLASH2.md's block-size table), but switching size mid-turn
+        // still interacts badly with the compiled staged verify: the
+        // staging slots and the trace are both shaped by the block length,
+        // and a switch can crash the process (SIGSEGV in
+        // DFlash2LosslessSmokeTests) and perturb greedy output. Until that
+        // is closed, callers get a fixed size and the tuning table.
+        self.adaptiveBlockSizeEnabled =
+            requestedBlockSize == nil
+            && ProcessInfo.processInfo.environment["VMLX_DFLASH2_ADAPTIVE_BLOCK"] == "1"
+        self.adaptiveBlockSize =
+            self.adaptiveBlockSizeEnabled ? Self.recallLearnedBlockSize() : nil
         self.maskTokenID = config.maskTokenId
         self.maxTokens = effectiveParameters.maxTokens
         self.promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
@@ -433,8 +484,15 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // recurrent layers run `input_capture_staged` and are committed
         // host-side from their staging slots. Promotion happens AFTER the
         // snapshots above so stored prefix-cache entries stay plain.
+        // OPT-IN until the teardown crash is closed. The path is proven
+        // token-identical and materially faster (see DFLASH2.md), but the
+        // compiled traces capture the cache array and the iterator is a
+        // STRUCT — copies retain traces independently, so clearing one
+        // copy's table does not release them, and the process segfaults at
+        // exit. Reproduce: run DFlash2LosslessSmokeTests with this ON
+        // (tests pass, process exits with signal 11) versus OFF (clean).
         if HardwareInfo.isCompiledDecodeSupported,
-            ProcessInfo.processInfo.environment["VMLX_DFLASH2_COMPILED_VERIFY"] != "0",
+            ProcessInfo.processInfo.environment["VMLX_DFLASH2_COMPILED_VERIFY"] == "1",
             target is DFlash2StagedVerifyRollbackModel
         {
             let promptOffset = self.cache.map(\.offset).max() ?? self.promptTokenIds.count
@@ -547,6 +605,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     stats.autoregressiveFallbackTokens)
                 FileHandle.standardError.write(Data(line.utf8))
             }
+            // Release the compiled traces at end of generation. They
+            // capture the cache array, and letting them outlive the run
+            // segfaults at process teardown (measured: clean with
+            // VMLX_DFLASH2_COMPILED_VERIFY=0, SIGSEGV after the last test
+            // with it on) — the same capture-cycle class as the compiled
+            // decode trampoline that once pinned unloaded weights.
+            releaseCompiledVerify()
             return nil
         }
         if pendingIndex >= pendingTokens.count {
@@ -573,7 +638,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
 
         // The block spends one position on the anchor, so a block of size
         // `bs` yields at most `bs` new tokens (bs-1 drafts + 1 bonus).
-        let bs = Swift.min(blockSize, budget + 1)
+        let bs = Swift.min(adaptiveBlockSize ?? blockSize, budget + 1)
         if bs <= 1 {
             return runAutoregressiveStep()
         }
@@ -641,13 +706,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // Full-size blocks take the compiled staged verify; tail blocks
         // (shrunken bs near the budget) keep the eager path — compiling is
         // only worth it for the shape that runs hundreds of times.
-        let stagedCycle = useStagedVerify && bs == blockSize
+        let stagedCycle = useStagedVerify && bs == (adaptiveBlockSize ?? blockSize)
         let verifyStart = Date.timeIntervalSinceReferenceDate
         var logits: MLXArray
         var greedyTargetIds: MLXArray? = nil
         let newHidden: MLXArray
         if stagedCycle {
-            if !stagedVerifyWarm {
+            if !stagedWarmedSizes.contains(bs) {
                 // Eager warm-up under the staged mode: allocates the
                 // fixed staging slots the compile trace will track.
                 let (l, captured) = NativeMTPVerifierStatePolicy.withVerifierMode(
@@ -660,10 +725,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 logits = l
                 newHidden = extractContextFeature(
                     captured: captured, targetLayerIDs: orderedLayerIDs)
-                stagedVerifyWarm = true
+                stagedWarmedSizes.insert(bs)
             } else {
-                if compiledVerify == nil { buildCompiledVerify() }
-                let outs = compiledVerify!([verifyInput])
+                if compiledVerify[bs] == nil { buildCompiledVerify(blockLength: bs) }
+                let outs = compiledVerify[bs]!([verifyInput])
                 logits = outs[0]
                 if isGreedy { greedyTargetIds = outs[0] }
                 // Captured hiddens come back in `orderedLayerIDs` order —
@@ -693,7 +758,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         } else {
             asyncEval(logits, newHidden)
         }
-        stats.verifySeconds += Date.timeIntervalSinceReferenceDate - verifyStart
+        let cycleVerifySeconds = Date.timeIntervalSinceReferenceDate - verifyStart
+        stats.verifySeconds += cycleVerifySeconds
         stats.verifyCalls += 1
 
         // MARK: accept — the cycle's single host sync happens on the first
@@ -797,6 +863,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         lastToken = last
         pendingTokens = emitted
         stats.emittedTokens += emitted.count
+        if adaptiveBlockSizeEnabled, stagedCycle {
+            updateAdaptiveBlockSize(
+                emitted: emitted.count, verifySeconds: cycleVerifySeconds)
+        }
 
         if Self.traceEnabled {
             let line =
@@ -809,13 +879,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Compile the fixed-shape staged verify forward. Built AFTER the
     /// eager warm-up cycle so the staging slots exist as persistent
     /// objects the trace's state tracking can capture.
-    private mutating func buildCompiledVerify() {
+    private mutating func buildCompiledVerify(blockLength: Int) {
         let capturedTarget = target
         let cacheRef = cache
         let capIDs = captureLayerIDs
         let ids = orderedLayerIDs
         let greedy = isGreedy
-        self.compiledVerify = compile(
+        self.compiledVerify[blockLength] = compile(
             inputs: cacheRef, outputs: cacheRef
         ) { (args: [MLXArray]) -> [MLXArray] in
             CompiledDecodeTrace.withActive {
@@ -831,8 +901,106 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
         if Self.traceEnabled {
             FileHandle.standardError.write(Data(
-                "[DFlash2] compiled verify built (S=\(blockSize))\n".utf8))
+                "[DFlash2] compiled verify built (S=\(blockLength))\n".utf8))
         }
+    }
+
+    /// Move the block size along the ladder from the observed acceptance
+    /// RATE (accepted / drafted — independent of the block size that
+    /// produced it, so it stays comparable across a change).
+    ///
+    /// Thresholds come from the measured matrix on Qwen3.8-27B-JANG_4D:
+    /// code sits at 0.70-0.83 and is fastest at b15; prose sits at
+    /// 0.37-0.44 and is fastest at b4. The band between them is flat
+    /// enough that hysteresis matters more than the exact cut points —
+    /// hence the dwell requirement before any move.
+    private mutating func updateAdaptiveBlockSize(
+        emitted: Int, verifySeconds: Double
+    ) {
+        let current = adaptiveBlockSize ?? blockSize
+        adaptiveTokens[current, default: 0] += emitted
+        adaptiveSeconds[current, default: 0] += verifySeconds
+        adaptiveCyclesAtSize += 1
+        guard !adaptiveSettled, adaptiveCyclesAtSize >= Self.adaptiveProbeCycles else { return }
+
+        // Probe every ladder size once, then settle on the measured best
+        // and stay there. Verify seconds (not wall time) is the comparison
+        // base: it is the term block size actually moves, and it excludes
+        // the drafter and host work that would add noise without signal.
+        adaptiveCyclesAtSize = 0
+        if let unprobed = Self.blockLadder.first(where: { adaptiveTokens[$0] == nil }) {
+            changeBlockSize(from: current, to: unprobed, settled: false)
+            return
+        }
+        let best = Self.blockLadder.max { a, b in
+            throughput(of: a) < throughput(of: b)
+        }
+        adaptiveSettled = true
+        if let best {
+            Self.rememberLearnedBlockSize(best)
+            if best != current {
+                changeBlockSize(from: current, to: best, settled: true)
+            }
+        }
+    }
+
+    private static let adaptiveProbeCycles = 4
+
+    /// Last size the probe settled on, remembered process-wide so the
+    /// second and later turns of a session start where the first one
+    /// finished instead of paying the probe again. Purely a starting
+    /// hint — every turn still re-probes and can move away from it.
+    private nonisolated(unsafe) static var learnedBlockSize: Int?
+    private static let learnedBlockLock = NSLock()
+
+    private static func rememberLearnedBlockSize(_ size: Int) {
+        learnedBlockLock.lock()
+        defer { learnedBlockLock.unlock() }
+        learnedBlockSize = size
+    }
+
+    private static func recallLearnedBlockSize() -> Int? {
+        learnedBlockLock.lock()
+        defer { learnedBlockLock.unlock() }
+        return learnedBlockSize
+    }
+
+    private func throughput(of blockSize: Int) -> Double {
+        let seconds = adaptiveSeconds[blockSize] ?? 0
+        guard seconds > 0 else { return 0 }
+        return Double(adaptiveTokens[blockSize] ?? 0) / seconds
+    }
+
+    /// Switch the verify block length. The staging slots and every
+    /// compiled trace are shaped by that length, so both must be dropped:
+    /// a trace built for one row count cannot be replayed against slots
+    /// holding another (it crashes the process, not just the numbers).
+    /// The next cycle re-warms eagerly and rebuilds one trace.
+    /// Drop every compiled verify trace and the staging slots they were
+    /// built against. Safe at any point — the next staged cycle re-warms.
+    mutating func releaseCompiledVerify() {
+        guard !compiledVerify.isEmpty || !stagedWarmedSizes.isEmpty else { return }
+        compiledVerify.removeAll(keepingCapacity: false)
+        stagedWarmedSizes.removeAll(keepingCapacity: false)
+        for layer in cache { (layer as? MambaCache)?.clearVerifyStaging() }
+    }
+
+    private mutating func changeBlockSize(from: Int, to: Int, settled: Bool) {
+        adaptiveBlockSize = to
+        for layer in cache { (layer as? MambaCache)?.clearVerifyStaging() }
+        compiledVerify.removeAll(keepingCapacity: true)
+        stagedWarmedSizes.removeAll(keepingCapacity: true)
+        traceBlockChange(from: from, to: to, settled: settled)
+    }
+
+    private func traceBlockChange(from: Int, to: Int, settled: Bool) {
+        guard Self.traceEnabled else { return }
+        let rates = Self.blockLadder
+            .map { String(format: "b%d=%.1f", $0, throughput(of: $0)) }
+            .joined(separator: " ")
+        FileHandle.standardError.write(Data(
+            "[DFlash2] block \(from) -> \(to)\(settled ? " (settled)" : "") tok/verify-s: \(rates)\n"
+                .utf8))
     }
 
     /// Single-token target step. Used when the remaining budget cannot

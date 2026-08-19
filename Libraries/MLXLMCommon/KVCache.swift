@@ -1495,11 +1495,23 @@ public class MambaCache: ArraysCache {
     }
 
     public func stageVerifySlot(_ index: Int, _ value: MLXArray) {
-        if let existing = verifyStagingSlots[index] {
+        // In place ONLY while the shape is stable — the slots are tracked
+        // compile state, and `_updateInternal` with a different shape
+        // corrupts a trace built against the old one. The block size
+        // changes the row count, so the runtime must call
+        // `clearVerifyStaging()` (and drop its compiled traces) first;
+        // this rebinds defensively rather than corrupting silently.
+        if let existing = verifyStagingSlots[index], existing.shape == value.shape {
             existing._updateInternal(value)
         } else {
             verifyStagingSlots[index] = value
         }
+    }
+
+    /// Drop the staging slots so the next staged verify reallocates them.
+    /// Required whenever the verify block length changes.
+    public func clearVerifyStaging() {
+        verifyStagingSlots = Array(repeating: nil, count: verifyStagingSlots.count)
     }
 
     public override func innerState() -> [MLXArray] {
