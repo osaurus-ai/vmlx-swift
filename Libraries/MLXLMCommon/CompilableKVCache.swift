@@ -238,9 +238,18 @@ public class CompilableKVCache: BaseKVCache {
 
     public override func copy() -> any KVCache {
         let c = CompilableKVCache(maxLength: maxLength, step: step)
-        c.keys = keys
-        c.values = values
-        c.offsetArray = offsetArray
+        // Pin every buffer with a `* 1` graph node instead of sharing the
+        // reference. This cache mutates IN PLACE — `update()` has always
+        // done so for keys/values (compile() captures the objects and
+        // expects them to be mutated), and the offset now does too — so a
+        // shared reference is not a snapshot, it is a live view that
+        // follows the cache. `copy()` feeds the prefix-cache store path,
+        // where that would persist whatever the cache happened to hold
+        // later rather than what was captured. Same reason ArraysCache
+        // copies its slots.
+        c.keys = keys.map { $0 * 1 }
+        c.values = values.map { $0 * 1 }
+        c.offsetArray = offsetArray * 1
         return c
     }
 
