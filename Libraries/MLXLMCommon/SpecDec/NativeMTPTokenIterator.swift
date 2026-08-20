@@ -309,6 +309,27 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var stagedVerifierCommitCount = 0
     private(set) var targetVerifyTime: TimeInterval = 0
     private(set) var verifyGpuWaitTime: TimeInterval = 0
+
+    // MARK: compiled staged verify
+    //
+    // The staged verify forward is a fixed shape (1 primary + depth
+    // drafts), so it compiles exactly like plain decode: attention caches
+    // become Compilable static buffers with a graph-visible offset, GDN
+    // layers write their fixed staging slots in place (the staged mode was
+    // designed for this — committed state is untouched inside the trace),
+    // and the host-side staged commit runs outside the trace unchanged.
+    // OPT-IN (`VMLX_MTP_COMPILED_VERIFY=1`): this iterator is a struct and
+    // compiled traces capture the cache array, so copies retain traces —
+    // the same teardown hazard DFlash2's compiled verify documents.
+    /// Compiled verify forwards keyed by row count (depth+1). The adaptive
+    /// controller moves between at most three depths, so at most three
+    /// traces are ever built.
+    private var compiledVerify: [Int: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+    /// Row counts whose first staged cycle already ran eagerly. compile()
+    /// needs the staging slots to exist as persistent objects before the
+    /// trace, so the first cycle at each shape warms them.
+    private var compiledVerifyWarmedSizes: Set<Int> = []
+    private var compiledVerifyEnabled = false
     private(set) var mtpDraftTime: TimeInterval = 0
     private(set) var samplingTime: TimeInterval = 0
     private(set) var cacheCommitTime: TimeInterval = 0
@@ -660,6 +681,26 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
         self.mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
+
+        // MARK: compiled verify promotion — after prefill and the boundary
+        // snapshot, so stored prefix-cache entries stay plain.
+        if speculativeSampler.isGreedy, self.processor == nil,
+            usesHybridMambaCache,
+            model is DFlash2StagedVerifyRollbackModel,
+            HardwareInfo.isCompiledDecodeSupported,
+            ProcessInfo.processInfo.environment["VMLX_MTP_COMPILED_VERIFY"] == "1"
+        {
+            let promptOffset = self.cache.map(\.offset).max() ?? promptTokenIds.count
+            let bufferLength = promptOffset + (self.maxTokens ?? 4096) + self.depth + 8
+            self.cache = self.cache.map { layer in
+                if !(layer is CompilableKVCache), layer is KVCacheSimple {
+                    return CompilableKVCache(from: layer, maxLength: bufferLength)
+                }
+                return layer
+            }
+            MLX.eval(self.cache)
+            self.compiledVerifyEnabled = true
+        }
     }
 
     mutating func next() -> Int? {
@@ -692,6 +733,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
+        // Compiled traces capture the cache array; they must not outlive
+        // the generation they were built for.
+        releaseCompiledVerify()
         if let coordinator = cacheCoordinator,
            !promptTokenIds.isEmpty,
            let promptCacheSnapshot
@@ -988,6 +1032,34 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         FileHandle.standardError.write(Data(line.utf8))
     }
 
+    /// Compile the fixed-shape staged verify forward. Built AFTER the
+    /// eager warm-up cycle at this row count, so the staging slots exist
+    /// as persistent objects the trace's state tracking can capture.
+    private mutating func buildCompiledVerify(rows: Int) {
+        let capturedModel = model
+        let cacheRef = cache
+        compiledVerify[rows] = compile(
+            inputs: cacheRef, outputs: cacheRef
+        ) { (args: [MLXArray]) -> [MLXArray] in
+            CompiledDecodeTrace.withActive {
+                NativeMTPVerifierStatePolicy.withVerifierMode(
+                    NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue
+                ) {
+                    let out = capturedModel.nativeBackboneMTPVerifyForward(
+                        args[0], cache: cacheRef)
+                    return [out.logits, out.hiddenStates]
+                }
+            }
+        }
+    }
+
+    /// Drop the compiled verify traces. Mirrors DFlash2's release: traces
+    /// capture the cache array, so they must not outlive the generation.
+    mutating func releaseCompiledVerify() {
+        compiledVerify.removeAll(keepingCapacity: false)
+        compiledVerifyWarmedSizes.removeAll(keepingCapacity: false)
+    }
+
     @inline(__always)
     private mutating func recordMaterializeSync<T>(_ body: () -> T) -> T {
         let start = Date.timeIntervalSinceReferenceDate
@@ -1156,8 +1228,22 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let forwardVerifierMode = stagedVerify
             ? NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue
             : verifierModeSetting
-        let verifier = NativeMTPVerifierStatePolicy.withVerifierMode(forwardVerifierMode) {
-            model.nativeBackboneMTPVerifyForward(input, cache: cache)
+        let verifier: NativeMTPForwardResult
+        if stagedVerify, compiledVerifyEnabled,
+            compiledVerifyWarmedSizes.contains(requested.count)
+        {
+            if compiledVerify[requested.count] == nil {
+                buildCompiledVerify(rows: requested.count)
+            }
+            let outs = compiledVerify[requested.count]!([input])
+            verifier = NativeMTPForwardResult(logits: outs[0], hiddenStates: outs[1])
+        } else {
+            verifier = NativeMTPVerifierStatePolicy.withVerifierMode(forwardVerifierMode) {
+                model.nativeBackboneMTPVerifyForward(input, cache: cache)
+            }
+            if stagedVerify, compiledVerifyEnabled {
+                compiledVerifyWarmedSizes.insert(requested.count)
+            }
         }
         let verifyElapsed = Date.timeIntervalSinceReferenceDate - verifyStart
         targetVerifyTime += verifyElapsed

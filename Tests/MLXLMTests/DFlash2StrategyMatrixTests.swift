@@ -40,13 +40,20 @@ final class DFlash2StrategyMatrixTests: XCTestCase {
             .appendingPathComponent("models/Qwen3.8-27B-DFlash2")
     }
 
-    // VMLX_DFLASH2_MATRIX_PROMPT=code swaps in a code-generation prompt —
-    // structured output accepts drafts far better than prose (the same
-    // domain split every MTP stack reports).
-    private static let prompt: String =
-        ProcessInfo.processInfo.environment["VMLX_DFLASH2_MATRIX_PROMPT"] == "code"
-        ? "Write a Swift function that parses a CSV line into fields, handling quoted fields with embedded commas. Code only, no explanation."
-        : "List the first eight prime numbers, then explain in two sentences why 1 is not prime."
+    // VMLX_DFLASH2_MATRIX_PROMPT=code|prose swaps the prompt — structured
+    // output accepts drafts far better than free prose (the same domain
+    // split every MTP stack reports), and the prose prompt runs long
+    // enough to fill a 320-token budget instead of stopping at 94.
+    private static let prompt: String = {
+        switch ProcessInfo.processInfo.environment["VMLX_DFLASH2_MATRIX_PROMPT"] {
+        case "code":
+            return "Write a Swift function that parses a CSV line into fields, handling quoted fields with embedded commas. Code only, no explanation."
+        case "prose":
+            return "Write a detailed explanation of how tides work, covering the moon's role, spring and neap tides, and why some coasts see larger tides than others."
+        default:
+            return "List the first eight prime numbers, then explain in two sentences why 1 is not prime."
+        }
+    }()
 
     func testMatrix() async throws {
         guard let targetPath = Self.targetPath else {
@@ -68,7 +75,8 @@ final class DFlash2StrategyMatrixTests: XCTestCase {
         if let mtpModel = ctx.model as? any NativeMTPModel {
             print("[matrix] nativeMTPAvailable=\(mtpModel.nativeMTPAvailable)")
         }
-        let maxTokens = 160
+        let maxTokens = ProcessInfo.processInfo.environment["VMLX_DFLASH2_MATRIX_MAXTOKENS"]
+            .flatMap(Int.init) ?? 160
 
         struct Arm { let name: String; let strategy: DraftStrategy? }
         let allArms: [Arm] = [
