@@ -607,7 +607,14 @@ public struct TopPSampler: LogitSampler {
         guard topK < vocabularySize else { return logprobs }
         // O(V) partition on negated logprobs so top-k land at [0, topK).
         // Indices at [topK, V) are the tokens to mask out.
-        let maskIndices = argPartition(-logprobs, kth: topK - 1, axis: -1)[0..., topK...]
+        //
+        // Slice the LAST axis by name, not `[0..., topK...]`: that form
+        // binds positionally, so a 3D [1, 1, vocab] row — what the DFlash 2
+        // iterator samples — had its size-1 MIDDLE axis sliced from topK,
+        // producing a zero-size axis that crashed `categorical`'s internal
+        // argmax and took the whole host app down (2026-08-20).
+        let maskIndices = argPartition(-logprobs, kth: topK - 1, axis: -1)[
+            .ellipsis, topK ..< vocabularySize]
         return putAlong(logprobs, maskIndices, values: negInf, axis: -1)
     }
 }

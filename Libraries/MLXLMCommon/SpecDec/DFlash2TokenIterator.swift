@@ -479,6 +479,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             stripAt > restoredCount ? stripAt - restoredCount : nil
         }
 
+        if Self.traceEnabled {
+            let promptCount = promptTokenIds.count
+            let prefillCount = tokensToPrefill.count
+            let offsets: [Int] = self.cache.prefix(3).map { $0.offset }
+            let line = "[DFlash2Init] prompt=\(promptCount) toPrefill=\(prefillCount)"
+                + " restored=\(restoredCount) offsets=\(offsets)\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
         let prefill = try Self.prefill(
             tokens: tokensToPrefill,
             target: target,
@@ -488,6 +496,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             hiddenLimit: hiddenLimit,
             stepSize: effectiveParameters.prefillStepSize,
             captureBoundaryAt: captureAt)
+        if Self.traceEnabled {
+            let logitsShape = prefill.lastLogits.shape
+            let hiddenShape = prefill.hidden.shape
+            let line = "[DFlash2Init] lastLogits=\(logitsShape) hidden=\(hiddenShape)\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
         self.hybridStripSnapshot = prefill.boundarySnapshot
         // Vocabulary agreement, checked against the first real logits row.
         // The drafter borrows the target's LM head, so a mismatch here
@@ -512,6 +526,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
 
         let first = self.sampler.sample(logits: prefill.lastLogits)
         MLX.eval(first)
+        if Self.traceEnabled {
+            let firstShape = first.shape
+            let firstDtype = first.dtype
+            let samplerKind = String(describing: type(of: self.sampler))
+            let line = "[DFlash2Init] first=\(firstShape) dtype=\(firstDtype) sampler=\(samplerKind)\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
         let firstToken = first.reshaped(-1)[0].item(Int.self)
         self.lastToken = firstToken
         self.pendingTokens = [firstToken]

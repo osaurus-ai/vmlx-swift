@@ -158,11 +158,20 @@ public enum TQDiskSerializer {
     /// Read a 1-element Int32 metadata array. Tolerates both 0-dim
     /// (legacy entries written before the round-trip fix) and 1D
     /// shape-[1] (current).
-    private static func readMetaInt32(_ arr: MLXArray) -> Int32 {
+    ///
+    /// Returns nil for anything else: a disk entry is untrusted input,
+    /// and a truncated or mixed-up key set must read as a cache MISS,
+    /// never crash the host. Observed live 2026-08-20: a DFlash 2 restore
+    /// of a stored hybrid entry found a non-scalar under a metadata key
+    /// and the unconditional `item()` precondition took the whole app
+    /// down inside `DFlash2TokenIterator.init`.
+    private static func readMetaInt32(_ arr: MLXArray) -> Int32? {
         if arr.shape.isEmpty {
             // Legacy 0-dim — Int32-typed scalar.
+            guard arr.dtype == .int32 else { return nil }
             return arr.item(Int32.self)
         }
+        guard arr.ndim == 1, arr.dim(0) == 1, arr.dtype == .int32 else { return nil }
         return arr[0].item(Int32.self)
     }
 
@@ -208,8 +217,8 @@ public enum TQDiskSerializer {
     /// (pre-v2 entries). Returns `0` for dicts that don't come from this
     /// module at all.
     public static func formatVersion(of arrays: [String: MLXArray]) -> Int32 {
-        if let v = arrays[formatVersionKey] {
-            return readMetaInt32(v)
+        if let v = arrays[formatVersionKey], let version = readMetaInt32(v) {
+            return version
         }
         if arrays.keys.contains(legacyMarkerKey) {
             return 1
@@ -995,8 +1004,10 @@ public enum TQDiskSerializer {
     /// - Returns: The ordered `[MLXArray]` captured at serialize time, or
     ///   `nil` if the dict has no SSM entries.
     public static func ssmStates(from arrays: [String: MLXArray]) -> [MLXArray]? {
-        guard let countArr = arrays["__ssm_count__"] else { return nil }
-        let count = Int(readMetaInt32(countArr))
+        guard let countArr = arrays["__ssm_count__"],
+            let countValue = readMetaInt32(countArr)
+        else { return nil }
+        let count = Int(countValue)
         guard count > 0 else { return nil }
         var out: [MLXArray] = []
         out.reserveCapacity(count)
@@ -1016,8 +1027,9 @@ public enum TQDiskSerializer {
             guard key.hasPrefix("__layer_kind_") && key.hasSuffix("__") else { continue }
             let body = key.dropFirst("__layer_kind_".count).dropLast(2)
             guard let idx = Int(body) else { continue }
-            guard let kindArr = arrays[key] else { continue }
-            let raw = readMetaInt32(kindArr)
+            guard let kindArr = arrays[key],
+                let raw = readMetaInt32(kindArr)
+            else { continue }
             if let kind = LayerKind(rawValue: raw) {
                 kindsByIndex[idx] = kind
             }
@@ -1055,7 +1067,14 @@ public enum TQDiskSerializer {
                     // persist a single slot, full Mamba layers persist two.
                     let offset: Int
                     if let offArr = arrays["__mamba_\(i)_offset__"] {
-                        offset = Int(readMetaInt32(offArr))
+                        guard let off = readMetaInt32(offArr) else {
+                            // A recurrent state with an unreadable offset
+                            // cannot be trusted at any position — atomic miss,
+                            // same rule as an incomplete TQ payload.
+                            out.append(IndexedLayerData(index: i, data: .requiredMiss))
+                            continue
+                        }
+                        offset = Int(off)
                     } else {
                         offset = 0
                     }
@@ -1191,13 +1210,18 @@ public enum TQDiskSerializer {
             return nil
         }
 
+        guard let ckIndexBitsValue = readMetaInt32(ckIndexBitsArr),
+            let ckSeedValue = readMetaInt32(ckSeedArr),
+            let cvIndexBitsValue = readMetaInt32(cvIndexBitsArr),
+            let cvSeedValue = readMetaInt32(cvSeedArr)
+        else { return nil }
         let ckShape = ckShapeArr.asArray(Int32.self).map { Int($0) }
-        let ckIndexBits = Int(readMetaInt32(ckIndexBitsArr))
-        let ckSeed = Int(readMetaInt32(ckSeedArr))
+        let ckIndexBits = Int(ckIndexBitsValue)
+        let ckSeed = Int(ckSeedValue)
 
         let cvShape = cvShapeArr.asArray(Int32.self).map { Int($0) }
-        let cvIndexBits = Int(readMetaInt32(cvIndexBitsArr))
-        let cvSeed = Int(readMetaInt32(cvSeedArr))
+        let cvIndexBits = Int(cvIndexBitsValue)
+        let cvSeed = Int(cvSeedValue)
 
         let ckSink = arrays["tq_\(i)_ck_sink"]
         let ckTail = arrays["tq_\(i)_ck_tail"]
@@ -1228,7 +1252,8 @@ public enum TQDiskSerializer {
 
         let offset: Int
         if let offArr = arrays["__tq_\(i)_offset__"] {
-            offset = Int(readMetaInt32(offArr))
+            guard let off = readMetaInt32(offArr) else { return nil }
+            offset = Int(off)
         } else {
             // Legacy entries that pre-date __tq_*_offset__ default to the
             // sequence length implied by the compressed key shape.
@@ -1282,7 +1307,8 @@ public enum TQDiskSerializer {
         else {
             return nil
         }
-        let count = Int(readMetaInt32(countArr))
+        guard let countValue = readMetaInt32(countArr) else { return nil }
+        let count = Int(countValue)
         guard count == 4 || count == 6 else { return nil }
 
         var stateArrays: [MLXArray] = []
@@ -1292,11 +1318,15 @@ public enum TQDiskSerializer {
             stateArrays.append(arr)
         }
 
+        guard let offValue = readMetaInt32(offArr),
+            let gsValue = readMetaInt32(gsArr),
+            let bitsValue = readMetaInt32(bitsArr)
+        else { return nil }
         return QKVLayerComponents(
             stateArrays: stateArrays,
-            offset: Int(readMetaInt32(offArr)),
-            groupSize: Int(readMetaInt32(gsArr)),
-            bits: Int(readMetaInt32(bitsArr))
+            offset: Int(offValue),
+            groupSize: Int(gsValue),
+            bits: Int(bitsValue)
         )
     }
 
@@ -1341,10 +1371,12 @@ public enum TQDiskSerializer {
         index i: Int,
         from arrays: [String: MLXArray]
     ) -> [LayerData] {
-        guard let countArr = arrays["__cache_list_\(i)_count__"] else {
+        guard let countArr = arrays["__cache_list_\(i)_count__"],
+            let countValue = readMetaInt32(countArr)
+        else {
             return []
         }
-        let count = Int(readMetaInt32(countArr))
+        let count = Int(countValue)
         guard count > 0 else { return [] }
 
         var subs: [LayerData] = []
@@ -1352,7 +1384,8 @@ public enum TQDiskSerializer {
         for j in 0..<count {
             let kindKey = "__cache_list_\(i)_sub_\(j)_kind__"
             guard let kindArr = arrays[kindKey],
-                  let kind = LayerKind(rawValue: readMetaInt32(kindArr))
+                  let kindRaw = readMetaInt32(kindArr),
+                  let kind = LayerKind(rawValue: kindRaw)
             else {
                 subs.append(.skip)
                 continue
@@ -1370,7 +1403,11 @@ public enum TQDiskSerializer {
                 if let s0 = arrays["mamba_\(i)_sub_\(j)_state0"] {
                     let off: Int
                     if let oa = arrays["__mamba_\(i)_sub_\(j)_offset__"] {
-                        off = Int(readMetaInt32(oa))
+                        guard let offValue = readMetaInt32(oa) else {
+                            subs.append(.skip)
+                            continue
+                        }
+                        off = Int(offValue)
                     } else {
                         off = 0
                     }
@@ -1451,8 +1488,10 @@ public enum TQDiskSerializer {
 
 
         func quantizedPool(_ stem: String) -> [HybridPoolQuantizedSegment]? {
-            guard let countArray = arrays["__\(stem)_qcount__"] else { return nil }
-            let count = Int(readMetaInt32(countArray))
+            guard let countArray = arrays["__\(stem)_qcount__"],
+                let countValue = readMetaInt32(countArray)
+            else { return nil }
+            let count = Int(countValue)
             guard count > 0 else { return nil }
             var segments: [HybridPoolQuantizedSegment] = []
             segments.reserveCapacity(count)
