@@ -884,6 +884,7 @@ let package = Package(
                 "MTPRuntimeFocusedTests.swift",
                 "QuantizedSmallMScalingBenchTests.swift",
                 "TopPSamplerShapeFocusedTests.swift",
+                "MTPLaunchPlanProbeTests.swift",
                 "DFlash2ReferenceParityTests.swift",
                 "DFlash2StageProbeTests.swift",
                 "DFlash2DrafterSelectionTests.swift",
