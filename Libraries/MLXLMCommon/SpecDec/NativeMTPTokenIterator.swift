@@ -243,6 +243,54 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var prefixCommitCount = 0
     private(set) var rollbackRepairCount = 0
     private(set) var mtpCacheRefreshCount = 0
+
+    // MARK: - Aligned head cache
+    //
+    // The MTP head drafts best when its KV holds exactly the pairs it was
+    // trained on: (backbone_hidden_i, token_{i+1}) for every CONFIRMED
+    // token, in order. This loop previously gave it neither. On accept it
+    // retained a cache with a HOLE at every bonus token — the bonus never
+    // passed through the head, so the next draft conditioned on a history
+    // missing a token. On reject it threw the cache away entirely and
+    // re-drafted from a single fused pair. Both starve the head of context.
+    //
+    // Aligned mode commits every token confirmed this cycle through the
+    // head in the SAME forward that drafts the next one: `makeDrafts`
+    // already samples from the LAST position, so a multi-token commit is
+    // free — no extra head call. Drafts from deeper levels are appended
+    // speculatively, so they are trimmed before each commit; one of them
+    // may carry a rejected token, and they are built from the head's own
+    // post-norm hidden rather than the backbone's.
+    //
+    // Ported from the Python engine, which measured acceptance 74.8% ->
+    // 92.0% and 22.1 -> 36.1 tok/s on Qwen3.8-27B with no kernel work.
+    // `VMLX_MTP_ALIGNED_HEAD_CACHE=0` restores the old behaviour.
+    static let alignedHeadCacheEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["VMLX_MTP_ALIGNED_HEAD_CACHE"]?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    /// `VMLX_MTP_PHASE_TIMERS=1` adds a forced eval of the verify logits so
+    /// the `targetVerifySec` span splits into host graph-build vs GPU wait
+    /// (`verifyGpuWaitSec`). Attribution-only: the extra sync point changes
+    /// pipelining, so totals from a timed run overstate the untimed cost.
+    static let phaseTimersEnabled =
+        ProcessInfo.processInfo.environment["VMLX_MTP_PHASE_TIMERS"] == "1"
+
+    /// Head-cache rows appended by deeper draft levels last cycle. Trimmed
+    /// before the next commit so an unverified draft can never persist.
+    private var headChainPairs = 0
+
+    /// Static so callers can trim without holding a mutating borrow on
+    /// `self` across the surrounding expression (the caches are reference
+    /// types, so the rows really are dropped).
+    private static func trimHeadChain(_ cache: [KVCache], rows: Int) {
+        guard rows > 0 else { return }
+        for layer in cache where layer.isTrimmable {
+            _ = layer.trim(rows)
+        }
+    }
     private(set) var chunkVerifierCount = 0
     private(set) var sequentialVerifierCount = 0
     private(set) var targetForwardCount = 0
@@ -258,7 +306,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var seedMainForwardTime: TimeInterval = 0
     private(set) var verifyMainForwardTime: TimeInterval = 0
     private(set) var replayMainForwardTime: TimeInterval = 0
+    private(set) var stagedVerifierCommitCount = 0
     private(set) var targetVerifyTime: TimeInterval = 0
+    private(set) var verifyGpuWaitTime: TimeInterval = 0
     private(set) var mtpDraftTime: TimeInterval = 0
     private(set) var samplingTime: TimeInterval = 0
     private(set) var cacheCommitTime: TimeInterval = 0
@@ -331,17 +381,21 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.sampler = effectiveParameters.sampler()
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
         self.maxTokens = effectiveParameters.maxTokens
-        // Depth policy: D2 is the ceiling (Nemotron measured D3 at 0.48x; the
-        // Python-vmlx depth-3 prose figure was 14% SLOWER than AR — depths
-        // past 2 only ever won on a deterministic counting prompt, the 1.83x
-        // artifact). The cap used to be 1, which silently clamped a host that
-        // requested the measured bestDepth=2 from vmlx_mtp_tuning.json back to
-        // D1 — auto-launch D2 could never actually run. Hosts only request
-        // depth > 1 when a measured artifact says so, and benchmarks can still
+        // Depth policy: D3 is the ceiling. The old D2 cap was calibrated on
+        // the lazy-repair/sequential verifier, where every rejection cost a
+        // checkpoint restore + full replay forward (Nemotron D3 0.48x, the
+        // Python depth-3 prose figure 14% slower than AR). Under the staged
+        // verifier those numbers no longer describe this code: 2026-08-19 on
+        // Qwen3.8-27B-JANG_4D, D3 measured 28.4 tok/s vs D2 27.5 vs plain
+        // 16.5, byte-identical output, 3.13 committed tokens per verify.
+        // A default cap below what a measured tuning artifact requests is a
+        // silent clamp on the host's explicit choice — the same bug this
+        // comment already records for the cap=1 era. The adaptive controller
+        // still downshifts unprofitable depth at runtime; benchmarks can
         // override via VMLX_MTP_DEPTH_CAP.
         let depthCap =
             ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
-            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 2
+            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 3
         self.depth = Swift.min(requestedDepth, depthCap)
         self.currentDepth = Swift.min(requestedDepth, depthCap)
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode
@@ -850,7 +904,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         if chunkVerifierCount > 0 && sequentialVerifierCount > 0 {
             verifierMode = "mixed"
         } else if chunkVerifierCount > 0 {
-            verifierMode = chunkReplayRepairCount > 0
+            verifierMode = stagedVerifierCommitCount > 0
+                ? "input_capture_staged"
+                : chunkReplayRepairCount > 0
                 ? "chunk_repair"
                 : NativeMTPVerifierStatePolicy.mode(for: verifierModeSetting) == .lazyRepair
                 ? "chunk_lazy_repair"
@@ -888,7 +944,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             cacheMode: "private-mtp+verifier-prefix-commit")
         let line = String(
             format:
-                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",
+                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",
             depth,
             currentDepth,
             verifyCalls,
@@ -913,6 +969,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveDepthDownshiftCount,
             adaptiveFallback,
             targetVerifyTime,
+            verifyGpuWaitTime,
             seedMainForwardTime,
             verifyMainForwardTime,
             replayMainForwardTime,
@@ -1018,22 +1075,46 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             throw NativeMTPRuntimeError.verifierProducedNoTokens
         }
 
+        // Staged verify (the DFlash 2 rollback machinery): GDN layers write
+        // verify inputs + final state into fixed cache staging slots and
+        // leave committed state and offset untouched; after acceptance the
+        // host commits exactly the accepted rows. No checkpoint restore, no
+        // full-model replay forward on partial accepts — the lazy-repair tax
+        // that grows with depth (17 replay forwards over 32 cycles at D3).
+        // The mode string is passed task-locally around the verify forward
+        // ONLY; it must never leak into prefill/seed/sequential forwards.
+        let explicitHybridMode = Self.nativeMTPHybridVerifySetting(verifierModeSetting)
+        let stagedCapable = usesHybridMambaCache
+            && speculativeSampler.isGreedy
+            && processor == nil
+            && model is DFlash2StagedVerifyRollbackModel
+        let stagedVerify = stagedCapable
+            && (explicitHybridMode == nil
+                || NativeMTPVerifierStatePolicy.mode(for: explicitHybridMode)
+                    == .inputCaptureStaged)
+
         // An EXPLICIT verifier mode (per-request, tuning artifact, or env) is
         // the operator's decision — warmup exists to pick a safety mode
         // automatically when nobody chose one. A measured tuning artifact
         // ships `verifier_mode` validated in that mode, so forcing 16
         // sequential-priced cycles in front of it only re-creates the
         // "MTP is slower" overhead the artifact already paid to rule out.
+        // Staged verify skips warmup entirely: an unaccepted row can never
+        // reach committed state, so the corruption class warmup guards
+        // against is structurally gone, and the adaptive controller still
+        // bails to AR when acceptance is hopeless.
         let shouldUseHybridSafetyWarmup = usesHybridMambaCache
             && speculativeSampler.isGreedy
             && processor == nil
             && !hybridSafetyWarmupComplete
-            && Self.nativeMTPHybridVerifySetting(verifierModeSetting) == nil
+            && explicitHybridMode == nil
+            && !stagedVerify
 
-        if shouldUseHybridSafetyWarmup || Self.requiresSequentialVerifierRepair(
-            cache,
-            speculativeSampler: speculativeSampler,
-            verifierMode: verifierModeSetting)
+        if !stagedVerify,
+            shouldUseHybridSafetyWarmup || Self.requiresSequentialVerifierRepair(
+                cache,
+                speculativeSampler: speculativeSampler,
+                verifierMode: verifierModeSetting)
         {
             try verifyCycleSequential(primary: primary)
             return
@@ -1050,12 +1131,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             stacked(requested.map { $0.reshaped(-1) }).asArray(Int32.self)
         }
         let input = MLXArray(requestedInputIds).reshaped(1, requested.count)
-        let replayChunkCommit = Self.requiresChunkTokenReplayRepair(
-            cache,
-            verifierMode: verifierModeSetting)
-        let lazyChunkRepair = Self.requiresLazyChunkRepair(
-            cache,
-            verifierMode: verifierModeSetting)
+        let replayChunkCommit = !stagedVerify
+            && Self.requiresChunkTokenReplayRepair(
+                cache,
+                verifierMode: verifierModeSetting)
+        let lazyChunkRepair = !stagedVerify
+            && Self.requiresLazyChunkRepair(
+                cache,
+                verifierMode: verifierModeSetting)
         let canCommitVerifierCache = Self.canCommitVerifierCache(cache)
         let requiresSequentialRepair = Self.requiresSequentialVerifierRepair(
             cache,
@@ -1070,12 +1153,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             : NativeMTPCacheCheckpoint(cache)
         cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - checkpointStart
         let verifyStart = Date.timeIntervalSinceReferenceDate
-        let verifier = NativeMTPVerifierStatePolicy.withVerifierMode(verifierModeSetting) {
+        let forwardVerifierMode = stagedVerify
+            ? NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue
+            : verifierModeSetting
+        let verifier = NativeMTPVerifierStatePolicy.withVerifierMode(forwardVerifierMode) {
             model.nativeBackboneMTPVerifyForward(input, cache: cache)
         }
         let verifyElapsed = Date.timeIntervalSinceReferenceDate - verifyStart
         targetVerifyTime += verifyElapsed
         verifyMainForwardTime += verifyElapsed
+        if Self.phaseTimersEnabled {
+            let gpuStart = Date.timeIntervalSinceReferenceDate
+            MLX.eval(verifier.logits)
+            verifyGpuWaitTime += Date.timeIntervalSinceReferenceDate - gpuStart
+        }
         targetForwardCount += 1
         verifyMainForwardCount += 1
         verifyInputTokenCount += requested.count
@@ -1095,6 +1186,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 let restoreStart = Date.timeIntervalSinceReferenceDate
                 checkpoint.restore(into: &cache)
                 cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - restoreStart
+            }
+            if stagedVerify {
+                for layer in cache { (layer as? MambaCache)?.clearVerifyStaging() }
             }
             try verifyCycleSequential(primary: primary)
             return
@@ -1238,14 +1332,38 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         let committedInputCount = accepted + 1
         let commitStart = Date.timeIntervalSinceReferenceDate
-        let committedCache = repairedHiddenForNextMTP != nil
-            ? true
-            : canCommitVerifierCache
-            ? Self.commitVerifierCache(
-                &cache,
-                committedInputCount: committedInputCount,
-                totalInputCount: requested.count)
-            : false
+        let committedCache: Bool
+        if stagedVerify {
+            // Staged verify left recurrent state and offsets untouched;
+            // EVERY cycle commits from the staging slots (a full accept
+            // adopts the staged final state — no replay forward, ever).
+            // Attention caches advanced in-graph and just rewind.
+            let rejectedRows = requested.count - committedInputCount
+            if rejectedRows > 0 {
+                for layer in cache where layer.isTrimmable {
+                    _ = layer.trim(rejectedRows)
+                }
+            }
+            guard let stagedModel = model as? DFlash2StagedVerifyRollbackModel,
+                stagedModel.commitStagedVerifiedBlock(
+                    cache: cache,
+                    acceptedInputs: committedInputCount,
+                    blockLength: requested.count)
+            else {
+                throw NativeMTPRuntimeError.verifierCacheCommitFailed
+            }
+            committedCache = true
+            stagedVerifierCommitCount += 1
+        } else {
+            committedCache = repairedHiddenForNextMTP != nil
+                ? true
+                : canCommitVerifierCache
+                ? Self.commitVerifierCache(
+                    &cache,
+                    committedInputCount: committedInputCount,
+                    totalInputCount: requested.count)
+                : false
+        }
         cacheCommitTime += Date.timeIntervalSinceReferenceDate - commitStart
         if committedCache {
             prefixCommitCount += 1
@@ -1253,14 +1371,39 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         let nextToken: MLXArray
         let hiddenForNextMTP: MLXArray
+        // Aligned mode feeds the head EVERY token confirmed this cycle, so
+        // it needs the confirmed tokens as a sequence rather than just the
+        // final one. Built below in each branch and consumed by makeDrafts.
+        var alignedCommitTokens: MLXArray?
+        var alignedCommitHidden: MLXArray?
         if accepted == drafts.count {
             bonusCount += 1
             let bonus = nextVerifiedToken
             processor?.didSample(token: bonus)
-            pendingTokens.append(recordMaterializeSync { bonus.item(Int.self) })
+            // verifyDrafts already materialized every sampled id in ONE
+            // batched readback; calling .item() here drains the pipeline a
+            // second time for a value we are holding. At ~10ms a drain on a
+            // 27B that was a quarter of the cycle.
+            pendingTokens.append(verifyDecision.targetTokenIds[drafts.count])
             nextToken = bonus
             hiddenForNextMTP = repairedHiddenForNextMTP
                 ?? verifier.hiddenStates[0..., drafts.count ..< (drafts.count + 1), 0...]
+            // Full accept: commit (h0,d1) … (h_{k-1},dk), (hk,bonus). The
+            // bonus pair is the one the old retained cache always dropped.
+            if Self.alignedHeadCacheEnabled, repairedHiddenForNextMTP == nil {
+                Self.trimHeadChain(mtpCache, rows: headChainPairs)
+                headChainPairs = 0
+                // Copy out of `self` first: recordMaterializeSync is
+                // mutating, so a closure reading self.drafts overlaps it.
+                // Draft ids were materialized once at cycle start
+                // (requestedInputIds) and the bonus id came back with the
+                // batched target sample — no extra drain needed here.
+                let ids = requestedInputIds.dropFirst().map { $0 }
+                    + [Int32(verifyDecision.targetTokenIds[drafts.count])]
+                alignedCommitTokens = MLXArray(ids).reshaped(1, ids.count)
+                alignedCommitHidden =
+                    verifier.hiddenStates[0..., 0 ..< ids.count, 0...]
+            }
         } else {
             rejectedCount += 1
             if !speculativeSampler.isGreedy {
@@ -1269,7 +1412,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
             let correction = nextVerifiedToken
             processor?.didSample(token: correction)
-            pendingTokens.append(recordMaterializeSync { correction.item(Int.self) })
+            pendingTokens.append(verifyDecision.targetTokenIds[accepted])
             nextToken = correction
 
             if let repairedHiddenForNextMTP {
@@ -1300,8 +1443,24 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     repaired.hiddenStates[0..., accepted ..< (accepted + 1), 0...]
             }
 
-            mtpCache = model.makeNativeMTPCache()
-            mtpCacheRefreshCount += 1
+            // Partial accept: the confirmed prefix is (h0,d1) … (h_{a-1},da)
+            // followed by (ha, correction). Trim the speculative chain — one
+            // of those rows carries the REJECTED draft — then commit the
+            // confirmed pairs with backbone hiddens. Recreating the cache
+            // here is what the old path did, and it is exactly the context
+            // loss that held acceptance down.
+            if Self.alignedHeadCacheEnabled, repairedHiddenForNextMTP == nil, committedCache {
+                Self.trimHeadChain(mtpCache, rows: headChainPairs)
+                headChainPairs = 0
+                let ids = Array(requestedInputIds.dropFirst().prefix(accepted))
+                    + [Int32(verifyDecision.targetTokenIds[accepted])]
+                alignedCommitTokens = MLXArray(ids).reshaped(1, ids.count)
+                alignedCommitHidden =
+                    verifier.hiddenStates[0..., 0 ..< ids.count, 0...]
+            } else {
+                mtpCache = model.makeNativeMTPCache()
+                mtpCacheRefreshCount += 1
+            }
         }
 
         guard !pendingTokens.isEmpty else {
@@ -1317,8 +1476,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let draftStart = Date.timeIntervalSinceReferenceDate
         let draftBatch = Self.makeDrafts(
             model: model,
-            hidden: hiddenForNextMTP,
-            nextToken: nextToken,
+            hidden: alignedCommitHidden ?? hiddenForNextMTP,
+            nextToken: alignedCommitTokens ?? nextToken,
             mtpCache: mtpCache,
             depth: currentDepth,
             sampler: sampler,
@@ -1326,6 +1485,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             processor: processor)
         drafts = draftBatch.tokens
         draftProbabilities = draftBatch.probabilities
+        // Levels beyond the first append speculative rows to the head
+        // cache; record how many so the next cycle trims them before
+        // committing confirmed pairs over the top.
+        headChainPairs = Self.alignedHeadCacheEnabled
+            ? Swift.max(0, draftBatch.tokens.count - 1) : 0
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
         mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
@@ -1341,7 +1505,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_DISABLE_ADAPTIVE"] == "1"
 
     private mutating func recordAdaptiveCycle(accepted: Int) {
-        if Self.adaptiveDisabledForMeasurement { return }
+        if Self.adaptiveDisabledForMeasurement {
+            // The hatch must not leave the safety warmup permanently
+            // incomplete: that silently priced EVERY cycle as a sequential
+            // per-token verify and fabricated "MTP got slower with the
+            // aligned cache" (2026-08-19). The hatch's whole point is
+            // steady-state cost, so complete warmup by cycle count alone.
+            if !hybridSafetyWarmupComplete, verifyCalls >= Self.hybridWarmupCycleCount {
+                hybridSafetyWarmupComplete = true
+            }
+            return
+        }
         adaptiveWindow.append(AdaptiveCycle(depth: currentDepth, accepted: accepted))
         if adaptiveWindow.count > Self.adaptiveWindowSize {
             adaptiveWindow.removeFirst(adaptiveWindow.count - Self.adaptiveWindowSize)
@@ -1384,7 +1558,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         guard possibleDraftTokens > 0 else { return }
 
         let acceptanceRatio = Double(acceptedTokens) / Double(possibleDraftTokens)
-        if currentDepth >= 3, acceptanceRatio < Self.depthThreeMinimumAcceptanceRatio {
+        // Staged verify changes the economics the legacy floors were tuned
+        // for: a rejection no longer costs a checkpoint restore + full
+        // replay forward, just an attention trim + fused staged commit.
+        // Break-even per-draft acceptance from the 2026-08-19 staged cycle
+        // costs (d1 82ms, d2 92ms, d3 110ms vs 59ms plain step on
+        // Qwen3.8-27B): d1 0.39, d2 0.44, d3 0.52 — the floors below keep
+        // a safety margin above break-even. Measured d3 ran 0.72 at
+        // equal-or-better wall speed than d2; the legacy 0.85 floor would
+        // have downshifted it.
+        let staged = stagedVerifierCommitCount > 0
+        let depthThreeFloor = staged ? 0.60 : Self.depthThreeMinimumAcceptanceRatio
+        let depthTwoFloor = staged ? 0.50 : Self.depthTwoMinimumAcceptanceRatio
+        let depthOneFloor = staged ? 0.40 : Self.depthOneMinimumAcceptanceRatio
+        if currentDepth >= 3, acceptanceRatio < depthThreeFloor {
             currentDepth = 2
             adaptiveDepthDownshiftCount += 1
             adaptiveWindow.removeAll(keepingCapacity: true)
@@ -1393,7 +1580,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        if currentDepth == 2, acceptanceRatio < Self.depthTwoMinimumAcceptanceRatio {
+        if currentDepth == 2, acceptanceRatio < depthTwoFloor {
             // A failing D2 downshifts to D1 first — D1's breakeven is far
             // lower, so "D2 doesn't pay" is not evidence that speculation
             // itself doesn't.
@@ -1405,7 +1592,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        if currentDepth == 1, acceptanceRatio < Self.depthOneMinimumAcceptanceRatio {
+        if currentDepth == 1, acceptanceRatio < depthOneFloor {
             enableAutoregressiveFallback(
                 reason: String(
                     format: "adaptive_accept_ratio=%.2f_depth=%d",
@@ -1830,8 +2017,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 sampler: sampler,
                 speculativeSampler: speculativeSampler,
                 processor: &draftProcessor)
+            // Dispatch, do not drain: the verify forward consumes these
+            // on-graph and the NEXT cycle reads every draft id in one
+            // batched readback. A per-level MLX.eval here stalled the whole
+            // pipeline once per draft for a value nobody reads yet.
             let syncStart = Date.timeIntervalSinceReferenceDate
-            MLX.eval(draft.token, out.hiddenStates)
+            asyncEval(draft.token, out.hiddenStates)
             materializeSyncTime += Date.timeIntervalSinceReferenceDate - syncStart
             tokens.append(draft.token)
             if !speculativeSampler.isGreedy {

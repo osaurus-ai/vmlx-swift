@@ -1498,12 +1498,12 @@ struct MTPRuntimeFocusedTests {
 
             let info = try #require(completionInfo)
             let stats = try #require(info.nativeMTPStats)
-            // Requested depth 3, but the iterator clamps to VMLX_MTP_DEPTH_CAP
-            // (default 2 — the D2 ceiling; depths past 2 only won on a
-            // deterministic counting prompt, and Nemotron measured D3 at
-            // 0.48x on real prose). `depth` reports the EFFECTIVE depth, so
-            // surfacing this gap is exactly what the stats are for.
-            #expect(stats.depth == 2)
+            // Requested depth 3 is honoured: the D2 cap was calibrated on the
+            // lazy-repair verifier, and under the staged verifier D3 measured
+            // 28.4 tok/s vs D2 27.5 vs plain 16.5 on Qwen3.8-27B-JANG_4D
+            // (2026-08-19, byte-identical output). `depth` reports the
+            // EFFECTIVE depth after VMLX_MTP_DEPTH_CAP (default 3).
+            #expect(stats.depth == 3)
             #expect(stats.verifyCalls >= 1)
             // No stop token fires with the zero-logit probe target, so the
             // info's emitted-token count and the iterator's

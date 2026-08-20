@@ -882,6 +882,7 @@ let package = Package(
                 "NemotronHOmniPreEncodedAudioTests.swift",
                 "NemotronHJANGTQDispatchFocusedTests.swift",
                 "MTPRuntimeFocusedTests.swift",
+                "QuantizedSmallMScalingBenchTests.swift",
                 "DFlash2ReferenceParityTests.swift",
                 "DFlash2StageProbeTests.swift",
                 "DFlash2DrafterSelectionTests.swift",
