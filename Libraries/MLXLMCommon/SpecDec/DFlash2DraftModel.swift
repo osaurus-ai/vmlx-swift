@@ -243,11 +243,17 @@ final class GroupedDynamicCausalConv: Module {
     /// dynamic kernel that ``finish(_:dynamic:)`` will apply to the
     /// sublayer's output.
     func prepare(_ hidden: MLXArray) -> (MLXArray, MLXArray) {
+        // Degraded husk (#123): propagate instead of dying on host-side
+        // dim reads; the iterator rejects the degenerate proposal.
+        guard hidden.ndim == 3 else { return (hidden, hidden) }
         let groups = hidden.dim(-1) / groupSize
         let b = hidden.dim(0)
         let l = hidden.dim(1)
         let dynamic = kernelProjection(hidden)
             .reshaped(b, l, 2, kernelSize, groups)
+        // A failed projection/reshape degrades to a husk (#123); slicing
+        // it with five axes is a host precondition crash. Propagate.
+        guard dynamic.ndim == 5 else { return (dynamic, dynamic) }
         let convolved = Self.convolve(
             hidden: hidden,
             dynamic: dynamic[0..., 0..., 0, 0..., 0...],
@@ -274,6 +280,12 @@ final class GroupedDynamicCausalConv: Module {
                 + " base=\(base.shape) groupSize=\(groupSize)\n"
             FileHandle.standardError.write(Data(line.utf8))
         }
+        // A degraded upstream result (an MLX error inside an earlier op
+        // collapses to a 0-dim husk, #123) must flow OUT of the drafter
+        // so the iterator can fall back to AR — dying here on a dim()
+        // precondition took the whole host down (observed live
+        // 2026-08-20).
+        guard hidden.ndim == 3, dynamic.ndim >= 3 else { return hidden }
         let batch = hidden.dim(0)
         let length = hidden.dim(1)
         let hiddenSize = hidden.dim(2)
@@ -359,6 +371,9 @@ final class DFlash2Attention: Module {
     func callAsFunction(
         _ x: MLXArray, context: MLXArray, rope: RoPE, cache: KVCache
     ) -> MLXArray {
+        // Degraded husk (#123): propagate instead of dying on host-side
+        // dim reads; the iterator rejects the degenerate proposal.
+        guard x.ndim == 3, context.ndim == 3 else { return x }
         let b = x.dim(0)
         let l = x.dim(1)
         var xCtx = context
@@ -456,7 +471,35 @@ extension KVCache {
     var offsetForDFlash2: Int {
         get { offset }
         nonmutating set {
-            if let base = self as? BaseKVCache {
+            // A rotating cache keeps a separate ring cursor (`idx`).
+            // Rewinding `offset` alone desyncs the two once the ring has
+            // wrapped, and `temporalOrder` slices `keep ..< idx`, so a
+            // cursor that lands below `keep` builds a negative-width slice
+            // ("[full] Negative dimensions not allowed" — observed live
+            // 2026-08-20 in the drafter attention after a fully-rejected
+            // block past the drafter's 2048-token window, taking the whole
+            // host down through a degraded-husk cascade). Rewind the cursor
+            // within the ROTATING span [keep, width). The slots the
+            // rejected rows overwrote stand in for the window's oldest rows
+            // — bounded staleness that can only cost draft acceptance,
+            // never output correctness: the target verifies every token.
+            if let rotating = self as? RotatingKVCache {
+                let delta = rotating.offset - newValue
+                if delta > 0 {
+                    let ringWidth = rotating.keys?.dim(2) ?? 0
+                    if ringWidth > 0, rotating.offset >= ringWidth {
+                        let rotSpan = ringWidth - rotating.keep
+                        if rotSpan > 0 {
+                            var rel = (rotating.idx - rotating.keep - delta) % rotSpan
+                            if rel < 0 { rel += rotSpan }
+                            rotating.idx = rotating.keep + rel
+                        }
+                    } else {
+                        rotating.idx = Swift.max(0, rotating.idx - delta)
+                    }
+                }
+                rotating.offset = newValue
+            } else if let base = self as? BaseKVCache {
                 base.offset = newValue
             }
         }
@@ -495,6 +538,10 @@ final class DFlash2DecoderLayer: Module {
     func callAsFunction(
         _ x: MLXArray, context: MLXArray, rope: RoPE, cache: KVCache
     ) -> MLXArray {
+        // Short-circuit a degraded husk (#123) through the stack instead
+        // of dying on a host-side dim() read; the iterator detects the
+        // degenerate proposal and falls back to AR.
+        guard x.ndim == 3 else { return x }
         var residual = x
         var (h, kernel) = attentionConv.prepare(inputLayerNorm(x))
         h = residual
@@ -691,6 +738,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         for (layer, c) in zip(layers, cache) {
             h = layer(h, context: context, rope: rope, cache: c)
         }
+        // A degraded husk (#123) from the layer stack must flow out to
+        // the caller's rank check, not die in a 3-axis slice here.
+        guard h.ndim == 3 else { return h }
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]
         }
@@ -792,6 +842,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let hidden = hiddenStates(
             inputs: inputs, targetHidden: targetHidden, cache: cache,
             embedder: embedder, logitsStart: logitsStart)
+        // A degraded husk (#123) from the backbone must reach the caller's
+        // rank check as a degenerate proposal, not die in the selector's
+        // host-side slicing. The iterator falls back to AR for the turn.
+        guard hidden.ndim == 3 else {
+            return DFlash2Proposal(
+                tokens: hidden, candidates: hidden, probabilities: nil)
+        }
         let logits = computeLogits(hidden, embedder: embedder)
         return candidateSelector.select(
             hidden: hidden, logits: logits, anchorIds: inputs[0..., 0],

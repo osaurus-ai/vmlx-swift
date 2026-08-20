@@ -173,6 +173,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
 
     private var inFlight: InFlightVerify?
 
+    /// Set when a drafter forward degenerates mid-turn (an MLX error in
+    /// its layer stack degraded to a husk). The rest of the turn decodes
+    /// autoregressively — a drafter can only cost acceptance, never
+    /// correctness, so its failure must never end the turn.
+    private var drafterDisabled = false
+
     /// OPT-IN (`VMLX_DFLASH2_VERIFY_PREFETCH=1`), and measured as a
     /// non-win on this runtime: through the real `generate()` path on
     /// Qwen3.8-27B-JANG_4D it is neutral-to-negative (think ON 25.95 vs
@@ -723,10 +729,27 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // The block spends one position on the anchor, so a block of size
         // `bs` yields at most `bs` new tokens (bs-1 drafts + 1 bonus).
         let bs = Swift.min(adaptiveBlockSize ?? blockSize, budget + 1)
-        if bs <= 1 {
+        if bs <= 1 || drafterDisabled {
             return runAutoregressiveStep()
         }
-        return completeVerify(issueVerify(bs: bs))
+        guard let flight = issueVerify(bs: bs) else {
+            // The drafter forward produced a degenerate result — an MLX
+            // error inside its layer stack degraded to a scalar husk
+            // (#123). A drafter can only ever cost acceptance, never
+            // correctness, so the failure must never take the turn (or
+            // the host) down: disable speculation for the REST of this
+            // turn and decode autoregressively. Observed live 2026-08-20
+            // after a fully-rejected block once the context passed the
+            // drafter's 2048-token sliding window.
+            drafterDisabled = true
+            FileHandle.standardError.write(Data(
+                ("[DFlash2] drafter forward degenerated at cycle "
+                    + "\(stats.verifyCalls) (ctx=\(promptTokenIds.count + stats.emittedTokens)); "
+                    + "speculation disabled for the rest of the turn, "
+                    + "continuing autoregressively.\n").utf8))
+            return runAutoregressiveStep()
+        }
+        return completeVerify(flight)
     }
 
     /// Build one cycle's draft + verify graphs and DISPATCH them, without
@@ -735,7 +758,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Split out from the accept phase so the next cycle's forwards can be
     /// submitted while the host is still detokenizing and streaming this
     /// cycle's tokens — see `prefetchNextVerify`.
-    private mutating func issueVerify(bs: Int) -> InFlightVerify {
+    private mutating func issueVerify(bs: Int) -> InFlightVerify? {
 
         // MARK: draft
 
@@ -744,13 +767,33 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         blockIds.append(contentsOf: Array(repeating: Int32(maskTokenID), count: bs - 1))
         let block = MLXArray(blockIds).reshaped(1, bs)
 
-        let proposal = drafter.propose(
-            inputs: block,
-            targetHidden: contextHidden,
-            cache: draftCache,
-            embedder: target,
-            temperature: isGreedy ? 0 : temperature,
-            logitsStart: 1)
+        // The drafter runs inside its own error scope: a real MLX error in
+        // its layer stack (observed live after a fully-rejected block past
+        // the drafter's sliding window) must surface as a caught error and
+        // an AR fallback, never as a degraded husk that dies on the next
+        // host-side shape read.
+        let proposal: DFlash2Proposal
+        do {
+            proposal = try withError {
+                drafter.propose(
+                    inputs: block,
+                    targetHidden: contextHidden,
+                    cache: draftCache,
+                    embedder: target,
+                    temperature: isGreedy ? 0 : temperature,
+                    logitsStart: 1)
+            }
+        } catch {
+            FileHandle.standardError.write(Data(
+                "[DFlash2] drafter forward error: \(error)\n".utf8))
+            return nil
+        }
+        // Host-side metadata check, no sync: a degraded drafter forward
+        // (#123 husk) surfaces here as a token tensor with the wrong rank
+        // or an empty draft row. The caller falls back to AR.
+        guard proposal.tokens.ndim == 2, proposal.tokens.dim(1) == bs - 1 else {
+            return nil
+        }
         // Dispatch, don't sync: the verify graph below consumes the draft
         // tokens ON-GRAPH, so the GPU runs the drafter while the CPU is
         // still building the verify forward. The reference does the same
