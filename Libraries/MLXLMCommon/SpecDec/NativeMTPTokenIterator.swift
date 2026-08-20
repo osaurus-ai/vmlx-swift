@@ -1650,7 +1650,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 hybridSafetyWarmupComplete = true
                 NativeMTPHybridWarmupMemo.record(true, for: model)
             } else {
-                NativeMTPHybridWarmupMemo.record(false, for: model)
+                // The memo's contract is "a property of the model, not the
+                // prompt" — but this floor is an acceptance criterion, and
+                // acceptance is content. Memoize the failure only when it is
+                // catastrophic (below even the depth-1 floor), which is the
+                // broken/mismatched-head case the memo exists for. A miss
+                // above that line means THIS prompt drafted badly (prose
+                // warms up around 1.0, code above 3.0 on the same model);
+                // fall back for this request and let the next one re-probe,
+                // or a prose first turn locks every later code turn out of
+                // MTP for the whole residency.
+                if Self.warmupFailureIsModelProperty(averageAccepted: averageAccepted) {
+                    NativeMTPHybridWarmupMemo.record(false, for: model)
+                }
                 enableAutoregressiveFallback(
                     reason: String(
                         format: "hybrid_warmup_avg_accept=%.2f",
@@ -2121,6 +2133,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// at its native depth (2.75/3 ≈ 0.92 was Nemotron-D3-era calibration,
     /// deliberately relaxed here to the D1-breakeven scale).
     private static let hybridWarmupMinimumAverageAcceptedPerDraft = 0.55
+
+    /// Whether a warmup miss is bad enough to blame the MODEL rather than the
+    /// prompt — i.e. safe to memoize in `NativeMTPHybridWarmupMemo`. Below the
+    /// depth-1 floor no depth could ever clear warmup, which only a broken or
+    /// mismatched MTP head produces; anything above is content variance and
+    /// must stay per-request.
+    static func warmupFailureIsModelProperty(averageAccepted: Double) -> Bool {
+        averageAccepted < hybridWarmupMinimumAverageAcceptedPerDraft
+    }
 
     private static func nativeMTPHybridVerifySetting(_ verifierMode: String? = nil) -> String? {
         let env = ProcessInfo.processInfo.environment
