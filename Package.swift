@@ -857,6 +857,7 @@ let package = Package(
                 "ToolCallProgressRoutingTests.swift",
                 "FocusedMLXTestSupport.swift",
                 "CanonicalChatCacheBoundariesTests.swift",
+                "RotatingKVCachePhysicalGrowthTests.swift",
                 "BatchEngineGrowingChatCacheSourceTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
                 "DiskStoreOffsetConsistencyFocusedTests.swift",

@@ -76,6 +76,31 @@ public enum DFlash2Loader {
             throw DFlash2LoadError.weightUpdateFailed(error)
         }
 
+        // The bf16 release runs quantized in the reference runtime: the
+        // oMLX recipe's "Draft quantization enabled" is `nn.quantize(draft,
+        // group_size=64, bits=4)`, and the 60+ t/s contract was measured
+        // with it (acceptance held ~88%). Quantize AFTER the weights land
+        // so the bf16 tensors load into the still-bf16 modules first.
+        // `VMLX_DFLASH2_NO_DRAFT_QUANT=1` keeps a bf16 A/B arm for benching.
+        let alreadyQuantized = root["quantization"] != nil
+        let quantOptOut =
+            ProcessInfo.processInfo.environment["VMLX_DFLASH2_NO_DRAFT_QUANT"] == "1"
+        if !alreadyQuantized && !quantOptOut {
+            // Same predicate as Python's nn.quantize default: only modules
+            // whose weight's last dim divides the group size.
+            quantize(
+                model: model, groupSize: 64, bits: 4,
+                filter: { _, module in
+                    if let linear = module as? Linear {
+                        return linear.weight.dim(-1) % 64 == 0
+                    }
+                    if let embedding = module as? Embedding {
+                        return embedding.weight.dim(-1) % 64 == 0
+                    }
+                    return true
+                })
+        }
+
         MLX.eval(model)
         return model
     }

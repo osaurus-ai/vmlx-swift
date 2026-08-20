@@ -312,6 +312,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
 
         let config = drafter.config
+        // The bundle's trained block width is the only output-neutral
+        // default: a narrower runtime width (the Python engine's width-5
+        // contract) measured ~2% faster here but DIVERGED from plain decode
+        // at temp 0 (sharedPrefix 429/1209 vs 1209/1209 at the trained
+        // width) — this runtime's packing is not width-neutral. A
+        // caller-pinned size still wins; it is a measurement request.
         let effectiveBlockSize = requestedBlockSize ?? config.blockSize
         guard effectiveBlockSize >= 2 else {
             throw DFlash2RuntimeError.blockSizeTooSmall(effectiveBlockSize)

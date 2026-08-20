@@ -687,11 +687,17 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         let vHeadDim = values.dim(3)
         let prev = offset
 
-        // May not have hit the max size yet, so potentially keep growing the cache
-        if self.keys == nil
-            || (prev >= self.keys!.dim(2) && self.keys!.dim(2) < maxCacheSize)
-        {
-            let newSize = min(step, maxCacheSize - prev)
+        // May not have hit the max size yet, so potentially keep growing the
+        // cache. Growth MUST key on the buffer's physical fill, never the
+        // logical `offset`: restore paths legitimately force a large absolute
+        // offset onto a fresh (or short) buffer for RoPE-position continuity,
+        // and sizing from `maxCacheSize - offset` then goes negative — the
+        // "[full] Negative dimensions not allowed" drafter failure past the
+        // sliding window. In the healthy path physical fill and offset agree,
+        // so this is behavior-identical there.
+        let physicalFill = self.keys?.dim(2) ?? 0
+        if self.keys == nil || (prev >= physicalFill && physicalFill < maxCacheSize) {
+            let newSize = min(step, maxCacheSize - physicalFill)
 
             let kShape = [B, nKVHeads, newSize, kHeadDim]
             let vShape = [B, nKVHeads, newSize, vHeadDim]
@@ -705,7 +711,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
                 self.keys = newK
                 self.values = newV
             }
-            idx = prev
+            idx = physicalFill
         }
 
         // Trim if needed

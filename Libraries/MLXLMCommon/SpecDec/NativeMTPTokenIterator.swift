@@ -1255,6 +1255,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             verifier = NativeMTPVerifierStatePolicy.withVerifierMode(forwardVerifierMode) {
                 model.nativeBackboneMTPVerifyForward(input, cache: cache)
             }
+            // Same submit-now rule the compiled branch measured (21.2-23.8
+            // tok/s draining in one lump vs 26.4+ dispatching here): without
+            // this, the whole verify graph sits unscheduled until the
+            // acceptance readback inside `verifyDrafts` forces it, and the
+            // GPU idles through all the host-side branch setup in between.
+            asyncEval(verifier.logits, verifier.hiddenStates)
             if stagedVerify, compiledVerifyEnabled {
                 compiledVerifyWarmedSizes.insert(requested.count)
             }

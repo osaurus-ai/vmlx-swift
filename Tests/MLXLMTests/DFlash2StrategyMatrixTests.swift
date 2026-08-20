@@ -87,6 +87,8 @@ final class DFlash2StrategyMatrixTests: XCTestCase {
             Arm(name: "mtp-d4", strategy: .nativeMTP(depth: 4)),
             Arm(name: "dflash2-b8", strategy: .dflash2(drafterPath: Self.drafterURL, blockSize: 8)),
             Arm(name: "dflash2-b4", strategy: .dflash2(drafterPath: Self.drafterURL, blockSize: 4)),
+            // nil = the runtime default (width 5 since the speed-recipe port).
+            Arm(name: "dflash2-auto", strategy: .dflash2(drafterPath: Self.drafterURL, blockSize: nil)),
         ]
         // VMLX_DFLASH2_MATRIX_ARMS=plain,mtp-d3 runs a subset;
         // VMLX_DFLASH2_MATRIX_THINK=on|off runs one leg.
