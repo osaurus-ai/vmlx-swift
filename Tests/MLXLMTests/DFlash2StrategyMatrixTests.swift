@@ -84,6 +84,7 @@ final class DFlash2StrategyMatrixTests: XCTestCase {
             Arm(name: "mtp-d1", strategy: .nativeMTP(depth: 1)),
             Arm(name: "mtp-d2", strategy: .nativeMTP(depth: 2)),
             Arm(name: "mtp-d3", strategy: .nativeMTP(depth: 3)),
+            Arm(name: "mtp-d4", strategy: .nativeMTP(depth: 4)),
             Arm(name: "dflash2-b8", strategy: .dflash2(drafterPath: Self.drafterURL, blockSize: 8)),
             Arm(name: "dflash2-b4", strategy: .dflash2(drafterPath: Self.drafterURL, blockSize: 4)),
         ]

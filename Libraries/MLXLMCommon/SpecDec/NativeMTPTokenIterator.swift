@@ -1041,7 +1041,16 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         compiledVerify[rows] = compile(
             inputs: cacheRef, outputs: cacheRef
         ) { (args: [MLXArray]) -> [MLXArray] in
-            CompiledDecodeTrace.withActive {
+            // This body runs ONLY while MLX records a trace; each execution
+            // is one (re)trace. A healthy compiled verify traces once per
+            // (rows) shape — a line per cycle means captured state is being
+            // rebound somewhere and every replay silently degrades to a
+            // rebuild.
+            if ProcessInfo.processInfo.environment["VMLX_MTP_PHASE_TIMERS"] == "1" {
+                FileHandle.standardError.write(
+                    Data("[NativeMTP] compiled verify TRACE build rows=\(rows)\n".utf8))
+            }
+            return CompiledDecodeTrace.withActive {
                 NativeMTPVerifierStatePolicy.withVerifierMode(
                     NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue
                 ) {
@@ -1237,6 +1246,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
             let outs = compiledVerify[requested.count]!([input])
             verifier = NativeMTPForwardResult(logits: outs[0], hiddenStates: outs[1])
+            // Dispatch the replayed graph NOW instead of letting it drain in
+            // one lump at the acceptance readback: measured 21.2-23.8 tok/s
+            // without this dispatch vs 26.4-27.6 with a (blocking) eval here
+            // — the submit is what mattered, so use the non-blocking form.
+            asyncEval(verifier.logits, verifier.hiddenStates)
         } else {
             verifier = NativeMTPVerifierStatePolicy.withVerifierMode(forwardVerifierMode) {
                 model.nativeBackboneMTPVerifyForward(input, cache: cache)

@@ -33,11 +33,30 @@ struct QuantizedSmallMScalingBenchTests {
                 ("ffn 5120x17408", 5120, 17408),
                 ("lm_head 5120x248320", 5120, 248320),
             ]
-            let ms = [1, 2, 4, 8, 9, 16]
+            let ms = [1, 2, 4, 8, 9, 16, 32, 64]
             for (name, k, n) in shapes {
                 let w = MLXRandom.normal([n, k]).asType(.bfloat16)
                 let (wq, scales, biases) = MLX.quantized(w, groupSize: 64, bits: 4)
                 MLX.eval(wq, scales)
+
+                // Correctness gate: a multi-row dispatch must produce exactly
+                // what the single-row kernel produces for each row.
+                let xc = MLXRandom.normal([4, k]).asType(.bfloat16)
+                MLX.eval(xc)
+                let multi = MLX.quantizedMM(
+                    xc, wq, scales: scales, biases: biases,
+                    transpose: true, groupSize: 64, bits: 4)
+                let rows = (0 ..< 4).map { r in
+                    MLX.quantizedMM(
+                        xc[r ..< (r + 1), 0...], wq, scales: scales,
+                        biases: biases, transpose: true, groupSize: 64, bits: 4)
+                }
+                let stackedRows = concatenated(rows, axis: 0)
+                let maxDiff = MLX.abs(
+                    multi.asType(.float32) - stackedRows.asType(.float32)
+                ).max().item(Float.self)
+                print("[qmm-bench] \(name) M=4 vs per-row maxDiff=\(maxDiff)")
+                #expect(maxDiff == 0, "\(name): multi-row result diverged")
                 var perM: [Int: Double] = [:]
                 for m in ms {
                     let x = MLXRandom.normal([m, k]).asType(.bfloat16)
