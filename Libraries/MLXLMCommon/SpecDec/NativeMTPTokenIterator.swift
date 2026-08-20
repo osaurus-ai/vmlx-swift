@@ -218,6 +218,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     let maxTokens: Int?
     let depth: Int
     private var currentDepth: Int
+    /// True when this iterator warm-started from restored cache rows. The
+    /// aligned head cache starts cold in that state, so early acceptance
+    /// windows under-read — the adaptive controller widens its first
+    /// judgment window 4× (the Python engine's restore-aware gate).
+    private var restoredPrefixStart: Bool = false
+    private var adaptiveDepthPromotionCount = 0
     let verifierModeSetting: String?
     var promptTokenIds: [Int]
     let cachePrefixTokenCounts: [Int]
@@ -425,6 +431,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let promptTokenElapsed = Date.timeIntervalSinceReferenceDate - promptTokenStart
         self.promptTokenIds = promptTokenIds
         self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
+        self.restoredPrefixStart = input.cachePrefixTokenCounts.contains { $0 > 0 }
         self.originalInput = input
         self.cacheInitParameters = effectiveParameters
         self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters)
@@ -1677,7 +1684,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let depthThreeFloor = staged ? 0.60 : Self.depthThreeMinimumAcceptanceRatio
         let depthTwoFloor = staged ? 0.50 : Self.depthTwoMinimumAcceptanceRatio
         let depthOneFloor = staged ? 0.40 : Self.depthOneMinimumAcceptanceRatio
-        if currentDepth >= 3, acceptanceRatio < depthThreeFloor {
+        // A restored prefix arrives with a cold aligned-head cache; its first
+        // windows under-read acceptance and a demote here sticks (see re-arm
+        // below, but avoid the churn entirely): give restored sessions 4×
+        // the sample budget before any demote judgment.
+        let inRestoredGraceWindow =
+            restoredPrefixStart && verifyCalls < 4 * Self.adaptiveWindowSize
+        if currentDepth >= 3, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
             currentDepth = 2
             adaptiveDepthDownshiftCount += 1
             adaptiveWindow.removeAll(keepingCapacity: true)
@@ -1686,7 +1699,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        if currentDepth == 2, acceptanceRatio < depthTwoFloor {
+        if currentDepth == 2, acceptanceRatio < depthTwoFloor, !inRestoredGraceWindow {
             // A failing D2 downshifts to D1 first — D1's breakeven is far
             // lower, so "D2 doesn't pay" is not evidence that speculation
             // itself doesn't.
@@ -1698,12 +1711,32 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        if currentDepth == 1, acceptanceRatio < depthOneFloor {
+        if currentDepth == 1, acceptanceRatio < depthOneFloor, !inRestoredGraceWindow {
             enableAutoregressiveFallback(
                 reason: String(
                     format: "adaptive_accept_ratio=%.2f_depth=%d",
                     acceptanceRatio,
                     currentDepth))
+            return
+        }
+
+        // Re-arm. The controller could historically only demote, so a single
+        // cold window — a restored prefix arriving with a cold aligned-head
+        // cache — pinned the whole session below its configured depth. When a
+        // full window at the CURRENT depth clears the floor of the depth
+        // above with margin, promote one level; the window reset re-prices
+        // the new depth on fresh samples.
+        if currentDepth < depth {
+            let nextFloor: Double
+            switch currentDepth {
+            case 1: nextFloor = depthTwoFloor
+            default: nextFloor = depthThreeFloor
+            }
+            if acceptanceRatio >= nextFloor + Self.adaptivePromotionMargin {
+                currentDepth += 1
+                adaptiveDepthPromotionCount += 1
+                adaptiveWindow.removeAll(keepingCapacity: true)
+            }
         }
     }
 
@@ -2060,6 +2093,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     private static let adaptiveWindowSize = 12
+    /// Extra acceptance a lower depth must show over the higher depth's floor
+    /// before the controller re-arms upward — enough hysteresis that a
+    /// borderline window doesn't flap between depths.
+    private static let adaptivePromotionMargin = 0.10
     private static let adaptiveMinimumSamplesPerDepth = 6
     private static let depthThreeMinimumAcceptanceRatio = 0.85
     private static let depthTwoMinimumAcceptanceRatio = 0.75
