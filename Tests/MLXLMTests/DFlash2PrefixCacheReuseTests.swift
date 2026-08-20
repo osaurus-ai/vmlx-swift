@@ -324,4 +324,46 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
             "a different reasoning-effort scope must prefill from scratch, not inherit the other scope's cache"
         )
     }
+
+    /// The osaurus live-gate crash recipe: a SAMPLED (non-greedy) dFlash-2
+    /// turn generates, stores its cache, and a follow-on request on the
+    /// same coordinator builds a second iterator. The app died inside the
+    /// second `DFlash2TokenIterator.init` with an `MLXArray.item`
+    /// precondition (2026-08-20). Greedy variants of this flow are covered
+    /// above and never crashed — the bundle's real defaults
+    /// (temp 1.0, top_p 0.95, top_k 20) are what users actually run.
+    func testSampledTurnThenRestoreDoesNotCrash() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+
+        let target = RecordingDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
+        let drafter = try makeDrafter()
+        let coordinator = makeCoordinator()
+
+        var sampled = GenerateParameters(maxTokens: 6, temperature: 1.0)
+        sampled.topP = 0.95
+        sampled.topK = 20
+        sampled.prefillStepSize = 4
+
+        // Turn 1: sampled generation, then store.
+        let turn1 = turn1User + genPromptSuffix
+        var first = try DFlash2TokenIterator(
+            input: input(turn1), target: target, drafter: drafter, blockSize: nil,
+            parameters: sampled, cacheCoordinator: coordinator)
+        var generated: [Int] = []
+        while let token = first.next(), generated.count < 6 {
+            generated.append(token)
+        }
+        first.storeCacheAfterGeneration(
+            generatedTokenIds: generated, includeGeneratedBoundary: false)
+
+        // Follow-on request (the app's auto-title or next turn): same
+        // coordinator, extended prompt, same sampled params. Must build —
+        // a poisoned stored entry has to read as a miss, never crash.
+        let turn2 = turn1User + generated + turn2Extra + genPromptSuffix
+        var second = try DFlash2TokenIterator(
+            input: input(turn2), target: target, drafter: drafter, blockSize: nil,
+            parameters: sampled, cacheCoordinator: coordinator)
+        XCTAssertNotNil(second.next(), "follow-on turn must produce a token")
+    }
 }

@@ -263,9 +263,17 @@ final class GroupedDynamicCausalConv: Module {
 
     /// `_grouped_dynamic_convolve`. `base` is `(kernel_size, hidden)`,
     /// `dynamic` is `(B, L, kernel_size, groups)`.
+    static let convTraceEnabled =
+        ProcessInfo.processInfo.environment["VMLX_DFLASH2_TRACE"] == "1"
+
     static func convolve(
         hidden: MLXArray, dynamic: MLXArray, base: MLXArray, groupSize: Int
     ) -> MLXArray {
+        if convTraceEnabled {
+            let line = "[DFlash2Conv] hidden=\(hidden.shape) dynamic=\(dynamic.shape)"
+                + " base=\(base.shape) groupSize=\(groupSize)\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
         let batch = hidden.dim(0)
         let length = hidden.dim(1)
         let hiddenSize = hidden.dim(2)
@@ -282,6 +290,13 @@ final class GroupedDynamicCausalConv: Module {
             let values: MLXArray
             if offset == 0 {
                 values = blocks
+            } else if offset >= length {
+                // Every tap reaches before the block start — all zeros.
+                // Without this clamp the shift slice below has a NEGATIVE
+                // upper bound and dies in a subscript precondition; observed
+                // live 2026-08-20 as a whole-app crash in the second turn of
+                // a dFlash-2 chat (GroupedDynamicCausalConv.finish).
+                values = MLXArray.zeros(like: blocks)
             } else {
                 let shifted = blocks[0..., ..<(length - offset), 0..., 0...]
                 let pad = MLXArray.zeros(
