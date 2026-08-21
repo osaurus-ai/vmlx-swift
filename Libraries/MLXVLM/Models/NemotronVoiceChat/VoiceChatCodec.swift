@@ -312,6 +312,51 @@ public class VoiceChatCodec: Module {
         self._prvq.wrappedValue = VoiceChatPRVQ(config)
     }
 
+    /// (B, samples) or (B, 1, samples) waveform → (B, T, D) latents.
+    ///
+    /// Needed for BOTH the silent speaker-prompt lead-in and, later, cloning a
+    /// custom voice: making a voice means audio → latent, so the ENCODER ships
+    /// and is used, not just the decoder.
+    public func encodeLatents(_ waveform: MLXArray) -> MLXArray {
+        var wave = waveform
+        if wave.ndim == 3 {
+            precondition(wave.dim(1) == 1, "only mono waveforms are supported")
+            wave = wave[0..., 0, 0...]
+        }
+        precondition(wave.ndim == 2, "waveform must be (batch, samples)")
+        precondition(wave.dim(-1) > 0, "waveform must contain at least one sample")
+
+        // STFT with the same centring convention as the decoder's iSTFT.
+        let nFFT = config.nFFT
+        let hop = config.hopLength
+        let padLeft = (nFFT - hop) / 2
+        let padRight = nFFT - hop - padLeft
+        var padded = MLX.padded(
+            wave.asType(.float32), widths: [.init((0, 0)), .init((padLeft, padRight))])
+        if padded.dim(-1) < nFFT {
+            padded = MLX.padded(
+                padded, widths: [.init((0, 0)), .init((0, nFFT - padded.dim(-1)))])
+        }
+        let window = voiceChatHann(nFFT)
+        let frames = (padded.dim(-1) - nFFT) / hop + 1
+        var slices = [MLXArray]()
+        slices.reserveCapacity(frames)
+        for f in 0 ..< frames {
+            let start = f * hop
+            slices.append(padded[0..., start ..< (start + nFFT)] * window.reshaped([1, nFFT]))
+        }
+        let framed = MLX.stacked(slices, axis: 1)  // (B, frames, nFFT)
+        let spectrum = MLXFFT.rfft(framed, axis: -1)  // (B, frames, bins)
+        let features = MLX.concatenated(
+            [spectrum.realPart(), spectrum.imaginaryPart()], axis: -1)
+        return encoder(features)
+    }
+
+    /// (B, samples) waveform → (B, Q, T) code ids.
+    public func encode(_ waveform: MLXArray) -> MLXArray {
+        prvq.encode(encodeLatents(waveform))
+    }
+
     /// (B, Q, T) codes → (B, 1, samples) waveform at 22.05 kHz.
     public func decode(
         _ codes: MLXArray, cache: VoiceChatCausalConv1dCache? = nil, flush: Bool = false

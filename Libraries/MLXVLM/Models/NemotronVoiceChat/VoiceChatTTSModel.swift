@@ -259,6 +259,55 @@ public class VoiceChatRVQEARTTSModel: Module {
         return cond
     }
 
+    /// Prime the transformer with the speaker prompt so the first generated
+    /// frame already sounds like the voice.
+    ///
+    /// Frames before the audio BOS carry the PROMPT LATENT (`Aria`) instead of
+    /// code embeddings — that is where speaker identity enters, and it is why
+    /// a custom voice is an 83 KiB latent rather than a retrain.
+    public func warmup(
+        code: MLXArray,
+        subwordIds: MLXArray,
+        subwordMask: MLXArray,
+        audioMask: MLXArray,
+        audioPromptLatent: MLXArray?,
+        guidance: Bool = true,
+        cache: [KVCache]? = nil
+    ) -> (MLXArray, [KVCache]) {
+        let shifted = MLX.concatenated(
+            [MLXArray.zeros(like: code[0..., 0 ..< 1, 0...]), code[0..., ..<(code.dim(1) - 1), 0...]],
+            axis: 1)
+        var codeEmbed = embedCode(depthSumEmbedding(shifted))
+
+        let previousAudio = MLX.concatenated(
+            [
+                MLXArray.zeros(like: audioMask[0..., 0 ..< 1]),
+                audioMask[0..., ..<(audioMask.dim(1) - 1)],
+            ], axis: 1)
+        let bosMask = MLX.logicalAnd(audioMask, MLX.logicalNot(previousAudio))
+        let preBOS = MLX.cumsum(bosMask.asType(.int32), axis: 1) .== MLXArray(Int32(0))
+
+        var projectedPrompt = MLX.matmul(codeEmbed, audioPromptProjectionW)
+        if let audioPromptLatent {
+            projectedPrompt = audioPromptLatent.asType(codeEmbed.dtype)
+        }
+        codeEmbed = MLX.where(preBOS.expandedDimensions(axis: -1), projectedPrompt, codeEmbed)
+        codeEmbed = codeEmbed + bosMask.expandedDimensions(axis: -1).asType(codeEmbed.dtype)
+            * bosEmb.asType(codeEmbed.dtype)
+
+        let batchSize = code.dim(0)
+        if guidance {
+            codeEmbed = MLX.concatenated([codeEmbed, codeEmbed], axis: 0)
+        }
+        let cond = condition(
+            subwordIds: subwordIds, subwordMask: subwordMask, batchSize: batchSize,
+            guidance: guidance)
+        let inputs = gatedFusion(audio: codeEmbed, text: cond)
+        let resolvedCache = cache ?? makeCache()
+        let hidden = backbone(inputs, cache: resolvedCache)
+        return (hidden, resolvedCache)
+    }
+
     /// One decode step over a single frame of codes.
     public func step(
         code: MLXArray, subwordIds: MLXArray, subwordMask: MLXArray?, cache: [KVCache],
