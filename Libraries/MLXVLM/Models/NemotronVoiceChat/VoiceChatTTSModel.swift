@@ -126,6 +126,14 @@ public class VoiceChatTTSBackbone: Module {
     @ModuleInfo(key: "layers") var layers: [VoiceChatTTSBlock]
     @ModuleInfo(key: "norm") var norm: VoiceChatOffsetRMSNorm
 
+    /// `VOICECHAT_LAYER_DUMP=<dir>` writes each layer's single-step output for
+    /// stage-by-stage comparison against the reference implementation.
+    static let layerDumpDirectory = ProcessInfo.processInfo.environment["VOICECHAT_LAYER_DUMP"]
+
+    /// Diagnostic arm: use a plain cache for the sliding layers too.
+    static let useSimpleCacheEverywhere =
+        ProcessInfo.processInfo.environment["VOICECHAT_SIMPLE_CACHE"] == "1"
+
     public init(_ config: VoiceChatTTSConfiguration) {
         self.config = config
         let pattern = config.slidingWindowPattern ?? 6
@@ -166,6 +174,15 @@ public class VoiceChatTTSBackbone: Module {
         for (i, layer) in layers.enumerated() {
             let isGlobal = (i % slidingWindowPattern == slidingWindowPattern - 1)
             h = layer(h, mask: isGlobal ? globalMask : slidingMask, cache: cache?[i])
+            if let dir = Self.layerDumpDirectory, isSingleStep {
+                MLX.eval(h)
+                let flat = h.asType(.float32).reshaped([-1]).asArray(Float.self)
+                flat.withUnsafeBufferPointer {
+                    try? Data(buffer: $0).write(
+                        to: URL(fileURLWithPath: dir).appendingPathComponent(
+                            String(format: "mine-layer-%02d.f32", i)))
+                }
+            }
         }
         return norm(h)
     }
@@ -174,7 +191,13 @@ public class VoiceChatTTSBackbone: Module {
     /// 7500-frame rotating window (`keep: 0` — no attention sink here).
     public func makeCache() -> [KVCache] {
         (0 ..< config.numHiddenLayers).map { idx in
-            (idx + 1) % slidingWindowPattern == 0
+            // A turn is a few hundred frames against a 7500-frame window, so
+            // the rotating buffer never actually rotates and a plain cache is
+            // behaviourally identical — except that the rotating cache's
+            // single-step read was measured to diverge from the reference
+            // (layer 0 cosine 0.9992, layer 1 0.8863) while whole-sequence
+            // prefill through the same code was exact.
+            (idx + 1) % slidingWindowPattern == 0 || Self.useSimpleCacheEverywhere
                 ? KVCacheSimple()
                 : RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
         }
