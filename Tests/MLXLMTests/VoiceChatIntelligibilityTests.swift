@@ -156,17 +156,70 @@ public class VoiceChatIntelligibilityTests: XCTestCase {
         return (text, tokens.count)
     }
 
-    /// Fraction of `expected`'s letters that appear, in order, in `actual`.
-    /// Robust to ASR slips in a way exact equality is not.
+    /// Longest common subsequence of letters, as a fraction of `expected`.
+    ///
+    /// 🚨 This is an LCS and not a single forward walk, because the walk
+    /// produces FALSE FAILURES. It only allowed skips in `actual`, so one
+    /// missing letter early stalled the pointer for the rest of the string:
+    /// a run whose speech was plainly correct — "That sounds delicious. I'd be
+    /// happy to help you make some peanut butter cookies", 32 tokens — scored
+    /// 11% purely because the ASR dropped a leading "Oh,". The same flaw scored
+    /// a correct clip at 30% over the single letter difference between
+    /// "favourite" and "favorite".
+    ///
+    /// An LCS allows skips on BOTH sides, so a dropped or altered word costs
+    /// only that word. Everything downstream trusts this number, so it must not
+    /// invent failures.
     static func inOrderLetterOverlap(expected: String, actual: String) -> Double {
         let a = Array(expected.lowercased().filter { $0.isLetter })
         let b = Array(actual.lowercased().filter { $0.isLetter })
-        guard !a.isEmpty else { return 0 }
-        var i = 0
-        for ch in b where i < a.count {
-            if ch == a[i] { i += 1 }
+        guard !a.isEmpty, !b.isEmpty else { return 0 }
+        var previous = [Int](repeating: 0, count: b.count + 1)
+        var current = previous
+        for i in 1 ... a.count {
+            current[0] = 0
+            for j in 1 ... b.count {
+                current[j] =
+                    a[i - 1] == b[j - 1]
+                    ? previous[j - 1] + 1
+                    : Swift.max(previous[j], current[j - 1])
+            }
+            swap(&previous, &current)
         }
-        return Double(i) / Double(a.count)
+        return Double(previous[b.count]) / Double(a.count)
+    }
+
+    /// The gate's own yardstick, pinned. Runs without a bundle.
+    ///
+    /// Both cases below were observed scoring as failures on speech that was
+    /// plainly correct, which is the worst thing this harness can do: it sends
+    /// you hunting a runtime bug that does not exist.
+    func testOverlapMetricDoesNotInventFailures() {
+        let dropped = Self.inOrderLetterOverlap(
+            expected: "Oh, that sounds delicious! I'd be happy to help you make some peanut butter cookies.",
+            actual: "That sounds delicious. I'd be happy to help you make some peanut butter cookies")
+        XCTAssertGreaterThan(
+            dropped, 0.9,
+            "a dropped leading word must cost only that word — the forward-walk "
+                + "version scored this exact pair at 11%")
+
+        let spelling = Self.inOrderLetterOverlap(
+            expected: "You're my favourite friend in the whole world.",
+            actual: "You're my favorite friend in the whole world")
+        XCTAssertGreaterThan(
+            spelling, 0.9, "one letter of spelling drift must not fail a clip (scored 30%)")
+
+        // It still has to reject the thing it exists to catch.
+        XCTAssertLessThan(
+            Self.inOrderLetterOverlap(
+                expected: "Oh, that sounds delicious! I'd be happy to help you make one.",
+                actual: ""),
+            0.01, "silence must score zero")
+        XCTAssertLessThan(
+            Self.inOrderLetterOverlap(
+                expected: "Bye bye! Come back and play with me soon.",
+                actual: "quartz vex hjkl zwq"),
+            0.5, "unrelated words must not pass")
     }
 
     func testGeneratedSpeechTranscribesBackToWhatTheAgentSaid() throws {
@@ -266,6 +319,78 @@ public class VoiceChatIntelligibilityTests: XCTestCase {
             overlap, 0.5,
             "the generated speech does not say what the agent said "
                 + "(text: \"\(saidText.prefix(60))\" vs heard: \"\(heard.text.prefix(60))\")")
+    }
+
+    /// What is the text channel actually deciding, frame by frame?
+    ///
+    /// A turn that emits only PAD looks identical whether the backbone is
+    /// broken (garbage or flat logits) or merely degraded (confidently choosing
+    /// silence, which is by far the most common target in duplex training).
+    /// This prints the top candidates and their probabilities so the two can be
+    /// told apart instead of guessed at.
+    func testTextChannelLogitDiagnostic() throws {
+        guard Self.enabled else { throw XCTSkip("set VOICECHAT_QUANT_PROOF=1") }
+        let bundle = URL(fileURLWithPath: Self.bundlePath)
+        guard VoiceChatLoader.looksLikeVoiceChatBundle(at: bundle) else {
+            throw XCTSkip("no VoiceChat bundle")
+        }
+        let (model, config) = try VoiceChatLoader.load(from: bundle)
+        let data = try Data(contentsOf: bundle.appendingPathComponent("tokenizer.json"))
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let vocab = try XCTUnwrap((json?["model"] as? [String: Any])?["vocab"] as? [String: Int])
+        var idToToken = [Int: String]()
+        for (token, id) in vocab { idToToken[id] = token }
+        try model.setVocabulary(vocab)
+
+        let user = try readMono(
+            Self.fixtureURL, targetRate: Double(config.inputSampleRate),
+            seconds: Self.fixtureSeconds, offset: Self.fixtureOffset)
+        let mel = voiceChatLogMelSpectrogram(user, config: config.audioConfig.preprocessor)
+        let (audioEmbeds, _) = model.sttModel.perception(mel)
+
+        let padId = config.padTokenId
+        let cache = model.sttModel.makeCache()
+        var previousText = padId
+        var previousFunction = padId
+        var padWins = 0
+        var frames = 0
+
+        for time in 0 ..< audioEmbeds.dim(1) {
+            let fused =
+                model.sttModel.embed(MLXArray([Int32(previousText)]).reshaped([1, 1]))
+                + audioEmbeds[0..., time ..< (time + 1), 0...]
+                + config.functionChannelWeight
+                * model.sttModel.embed(MLXArray([Int32(previousFunction)]).reshaped([1, 1]))
+            let output = model.sttModel(inputsEmbeds: fused, cache: cache)
+            let logits = output.textLogits[0..., -1].asType(.float32)
+            MLX.eval(logits)
+
+            let probs = MLX.softmax(logits, axis: -1)
+            let top = MLX.argSort(logits, axis: -1)[0..., (-5)...].asArray(Int32.self).reversed()
+            let probValues = probs.asArray(Float.self)
+            let best = Int(top.first ?? 0)
+            previousText = best
+            previousFunction = output.functionLogits[0..., -1].argMax().item(Int.self)
+            frames += 1
+            if best == padId { padWins += 1 }
+
+            if time % 20 == 0 || (best != padId && frames < 200) {
+                let candidates = top.prefix(5).map { id -> String in
+                    let name = Int(id) == padId ? "<PAD>" : (idToToken[Int(id)] ?? "?\(id)")
+                    return String(format: "%@ %.3f", name, probValues[Int(id)])
+                }
+                let allValues = logits.asArray(Float.self)
+                print(
+                    String(
+                        format: "[logits] f%03d max %+.2f mean %+.2f finite=%@ | ",
+                        time, allValues.max() ?? 0,
+                        allValues.reduce(0, +) / Float(allValues.count),
+                        allValues.allSatisfy { $0.isFinite } ? "yes" : "NO")
+                        + candidates.joined(separator: "  "))
+            }
+            if time > 60 { break }
+        }
+        print("[logits] PAD won \(padWins)/\(frames) frames")
     }
 
     /// Render chosen sentences with the speech tower and prove each one says
