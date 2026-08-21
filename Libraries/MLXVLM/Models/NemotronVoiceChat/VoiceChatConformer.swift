@@ -31,7 +31,6 @@
 
 import Foundation
 import MLX
-import MLXFast
 import MLXNN
 
 /// Transformer-XL relative positional encoding (no learned parameters).

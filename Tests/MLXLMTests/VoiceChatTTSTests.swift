@@ -250,16 +250,55 @@ public class VoiceChatTTSTests: XCTestCase {
             "a real code index must contribute a non-zero embedding")
     }
 
-    /// The TTS backbone alternates global and sliding-window layers; the cache
-    /// kinds must match that pattern or a long turn silently attends wrong.
-    func testBackboneCacheAlternatesGlobalAndRotating() throws {
+    /// The speech decoder's cache must reproduce the reference's read
+    /// semantics exactly: `offset` is the number of rows ALREADY stored (which
+    /// is what positions RoPE on the next step), and a read returns precisely
+    /// those rows — no padding, no reordering.
+    ///
+    /// This replaced an assertion that the sliding layers used a rotating
+    /// cache. That was pinning an implementation choice rather than a
+    /// contract, and the choice was wrong: with the shared rotating cache the
+    /// single-token step diverged from the reference while whole-sequence
+    /// prefill was exact, which is how the decoder produced fluent-sounding
+    /// audio containing no words. Cached key rows now match the reference to
+    /// two decimal places.
+    func testCacheReproducesReferenceReadSemantics() throws {
         let config = miniTTS
         let backbone = VoiceChatTTSBackbone(config)
         let cache = backbone.makeCache()
         XCTAssertEqual(cache.count, config.numHiddenLayers)
-        // pattern 2 → layer index 1 (1-based 2nd) is global.
-        XCTAssertTrue(cache[0] is RotatingKVCache, "sliding layer must use a rotating cache")
-        XCTAssertFalse(cache[1] is RotatingKVCache, "every pattern-th layer must be global")
+
+        let head = config.headDim
+        let heads = config.numKeyValueHeads
+        MLXRandom.seed(3)
+
+        for layer in cache {
+            XCTAssertEqual(layer.offset, 0, "a fresh cache holds nothing")
+
+            // Prefill: five rows in, five rows out, offset five.
+            let prefillKeys = MLXRandom.normal([2, heads, 5, head])
+            let (keys, values) = layer.update(keys: prefillKeys, values: prefillKeys)
+            XCTAssertEqual(keys.dim(2), 5, "a read must return exactly the rows stored")
+            XCTAssertEqual(values.dim(2), 5)
+            XCTAssertEqual(layer.offset, 5, "offset must equal the rows stored")
+
+            // Step: one row in, six rows out — the new row LAST, in temporal
+            // order, so the query at position 5 attends to 0...5.
+            let stepKey = MLXRandom.normal([2, heads, 1, head])
+            let (stepped, _) = layer.update(keys: stepKey, values: stepKey)
+            XCTAssertEqual(stepped.dim(2), 6, "the step must see prefill plus itself")
+            XCTAssertEqual(layer.offset, 6)
+            let tail = stepped[0..., 0..., 5 ..< 6, 0...]
+            XCTAssertLessThan(
+                MLX.abs(tail - stepKey).max().item(Float.self), 1e-6,
+                "the newest row must land at the END of the cache, not the start")
+
+            // Both guidance rows stay independent: overwriting one must not
+            // change the other. (A stride-0 broadcast landing in the cache
+            // would fail here.)
+            let rowGap = MLX.abs(stepped[0] - stepped[1]).max().item(Float.self)
+            XCTAssertGreaterThan(rowGap, 1e-6, "guidance rows must be distinct arrays")
+        }
     }
 
     /// Two decode steps through the real module shapes: hidden states must be

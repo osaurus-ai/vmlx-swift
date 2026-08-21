@@ -191,15 +191,9 @@ public class VoiceChatTTSBackbone: Module {
     /// 7500-frame rotating window (`keep: 0` — no attention sink here).
     public func makeCache() -> [KVCache] {
         (0 ..< config.numHiddenLayers).map { idx in
-            // A turn is a few hundred frames against a 7500-frame window, so
-            // the rotating buffer never actually rotates and a plain cache is
-            // behaviourally identical — except that the rotating cache's
-            // single-step read was measured to diverge from the reference
-            // (layer 0 cosine 0.9992, layer 1 0.8863) while whole-sequence
-            // prefill through the same code was exact.
-            (idx + 1) % slidingWindowPattern == 0 || Self.useSimpleCacheEverywhere
-                ? KVCacheSimple()
-                : RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
+            // Both kinds are the same cache here: see VoiceChatKVCache for
+            // why, and for the measurement that forced it.
+            VoiceChatConcatKVCache()
         }
     }
 }
@@ -286,8 +280,18 @@ public class VoiceChatRVQEARTTSModel: Module {
     ) -> MLXArray {
         var cond = embedSubword(subwordIds, mask: subwordMask)
         if guidance {
-            let null = MLX.broadcast(nullEmb.asType(cond.dtype), to: cond.shape)
-            cond = MLX.concatenated([cond, null], axis: 0)
+            // Built exactly as the reference does — double, then overwrite the
+            // second half — rather than concatenating a broadcast view onto the
+            // original. A broadcast is a stride-0 VIEW, and taking it straight
+            // into the concatenated batch is where the unconditional row can
+            // stop being independent of the conditional one. The guidance
+            // subtraction (cond + s·(cond − uncond)) then amplifies whatever is
+            // wrong there, which is why the conditional half matched at every
+            // layer while the unconditional half collapsed.
+            cond = MLX.concatenated([cond, cond], axis: 0)
+            let nullShape = [batchSize, cond.dim(1), cond.dim(2)]
+            let null = MLX.broadcast(nullEmb.asType(cond.dtype), to: nullShape)
+            cond = MLX.concatenated([cond[0 ..< batchSize], null], axis: 0)
         }
         return cond
     }
@@ -355,6 +359,14 @@ public class VoiceChatRVQEARTTSModel: Module {
             subwordIds: subwordIds, subwordMask: subwordMask, batchSize: batchSize,
             guidance: guidance)
         let inputs = gatedFusion(audio: codeEmbed, text: cond)
+        if let dir = VoiceChatTTSBackbone.layerDumpDirectory {
+            MLX.eval(inputs)
+            let flat = inputs.asType(.float32).reshaped([-1]).asArray(Float.self)
+            flat.withUnsafeBufferPointer {
+                try? Data(buffer: $0).write(
+                    to: URL(fileURLWithPath: dir).appendingPathComponent("mine-step-input.f32"))
+            }
+        }
         let hidden = backbone(inputs, cache: cache)
         return VoiceChatTTSStepOutput(
             codes: generateCodes(hidden), hiddenStates: hidden)

@@ -89,6 +89,12 @@ public class VoiceChatTTSParityTests: XCTestCase {
                 format: "[tts-parity] warm mine mean %.6f std %.6f · ref mean %.6f std %.6f "
                     + "· cosine %.4f",
                 mw.mean, mw.std, rw.mean, rw.std, cosine(mineWarm, refWarm)))
+        let halfW = min(mineWarm.count, refWarm.count) / 2
+        print(
+            String(
+                format: "[tts-parity] warm halves: cond %.5f · uncond %.5f",
+                cosine(Array(mineWarm[0 ..< halfW]), Array(refWarm[0 ..< halfW])),
+                cosine(Array(mineWarm[halfW...]), Array(refWarm[halfW...]))))
         XCTAssertEqual(
             mineWarm.count, refWarm.count, "warmup hidden shape differs from the reference")
         XCTAssertGreaterThan(
@@ -100,6 +106,24 @@ public class VoiceChatTTSParityTests: XCTestCase {
             "[tts-parity] cache offsets after warmup: "
                 + "rotating[0]=\(cache[0].offset) global[\(model.ttsModel.ttsModel.backbone.slidingWindowPattern - 1)]="
                 + "\(cache[model.ttsModel.ttsModel.backbone.slidingWindowPattern - 1].offset)")
+
+        // Are the two guidance rows in the cache actually distinct?
+        for layerIndex in [0, 1] {
+            let stored = cache[layerIndex].state
+            if let k = stored.first, k.dim(0) == 2 {
+                MLX.eval(k)
+                let row0 = MLX.sum(k[0].asType(.float32) * k[0].asType(.float32)).item(Float.self)
+                    .squareRoot()
+                let row1 = MLX.sum(k[1].asType(.float32) * k[1].asType(.float32)).item(Float.self)
+                    .squareRoot()
+                let diff = MLX.abs(k[0].asType(.float32) - k[1].asType(.float32)).max()
+                    .item(Float.self)
+                print(
+                    String(
+                        format: "[tts-parity] cache[%d] keys: cond|n|=%.2f uncond|n|=%.2f maxdiff=%.4f",
+                        layerIndex, row0, row1, diff))
+            }
+        }
 
         // First decode step, identical inputs.
         let prev = prompt.codes[0..., (prompt.codes.dim(1) - 1)..., 0...]
