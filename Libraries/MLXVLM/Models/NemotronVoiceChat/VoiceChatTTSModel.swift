@@ -324,7 +324,28 @@ public class VoiceChatRVQEARTTSModel: Module {
         let bosMask = MLX.logicalAnd(audioMask, MLX.logicalNot(previousAudio))
         let preBOS = MLX.cumsum(bosMask.asType(.int32), axis: 1) .== MLXArray(Int32(0))
 
-        var projectedPrompt = MLX.matmul(codeEmbed, audioPromptProjectionW)
+        // 🚨 The frozen prompt projection carries NO fan-in scaling, so it must
+        // be normalised here or cloning is unusable.
+        //
+        // `audio_prompt_projection_W` is 1152x1152 with std 1.000149 — an
+        // unscaled random normal, not a trained matrix (a trained one would
+        // carry roughly 1/sqrt(1152) = 0.029). Applied raw it amplifies by
+        // ~sqrt(hidden): measured against the checkpoint, a prompt frame comes
+        // out at RMS 39.74 while the shipped `audio_prompt_latents.Aria` frames
+        // it replaces sit at 1.69 — 23.5x hot. The backbone then gets prompt
+        // conditioning far outside anything it saw in training, which is why
+        // cloned voices changed timbre but stopped forming words.
+        //
+        // 1/sqrt(hidden) is the norm-preserving scale for a random projection
+        // and lands prompt frames at RMS ~1.17, the same order as Aria. The
+        // reference never reaches this branch (it always supplies the Aria
+        // latent), so there is no upstream behaviour to match here — the scale
+        // is justified by measurement, and `VMLX_VOICECHAT_PROMPT_SCALE`
+        // overrides it for anyone re-deriving that.
+        let promptScale =
+            ProcessInfo.processInfo.environment["VMLX_VOICECHAT_PROMPT_SCALE"]
+            .flatMap(Float.init) ?? (1.0 / Foundation.sqrt(Float(codeEmbed.dim(-1))))
+        var projectedPrompt = MLX.matmul(codeEmbed, audioPromptProjectionW) * promptScale
         if let audioPromptLatent {
             projectedPrompt = audioPromptLatent.asType(codeEmbed.dtype)
         }

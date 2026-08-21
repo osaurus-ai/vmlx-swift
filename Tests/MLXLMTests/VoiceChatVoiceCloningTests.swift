@@ -145,6 +145,70 @@ public class VoiceChatVoiceCloningTests: XCTestCase {
 
     // MARK: - The test
 
+    /// Calibrate the frozen prompt projection against the shipped Aria latent.
+    ///
+    /// `audio_prompt_latents.Aria` is what the model uses for its own voice, and
+    /// the projection branch is supposed to produce the SAME kind of thing from
+    /// a reference recording. So projecting a recording of Aria's own voice is a
+    /// ground truth: it says both what scale the projection needs and whether
+    /// the projection is trained at all.
+    ///
+    /// Prints, per frame, the projected prompt's RMS against Aria's and their
+    /// cosine similarity. Diagnostic only — it asserts nothing about the
+    /// checkpoint, it reports what the checkpoint contains.
+    func testProjectedPromptAgainstShippedAriaLatent() throws {
+        guard Self.enabled else { throw XCTSkip("set VOICECHAT_QUANT_PROOF=1") }
+        guard let ariaAudio = ProcessInfo.processInfo.environment["VOICECHAT_ARIA_REFERENCE"]
+        else { throw XCTSkip("set VOICECHAT_ARIA_REFERENCE to a wav of the built-in voice") }
+        let bundle = URL(fileURLWithPath: Self.bundlePath)
+        guard VoiceChatLoader.looksLikeVoiceChatBundle(at: bundle) else {
+            throw XCTSkip("no VoiceChat bundle")
+        }
+        let (model, config) = try VoiceChatLoader.load(from: bundle)
+        let tts = model.ttsModel.ttsModel
+
+        let reference = try readMono(
+            URL(fileURLWithPath: ariaAudio), targetRate: Double(config.codecConfig.sampleRate),
+            seconds: Double(config.ttsConfig.audioPromptDuration ?? 3.0), offset: 0.4)
+        let prompt = model.ttsPrompt(voice: .reference(reference))
+        MLX.eval(prompt.codes)
+
+        // Reproduce warmup's shift, so these are the frames warmup would use.
+        let shifted = MLX.concatenated(
+            [
+                MLXArray.zeros(like: prompt.codes[0..., 0 ..< 1, 0...]),
+                prompt.codes[0..., ..<(prompt.codes.dim(1) - 1), 0...],
+            ], axis: 1)
+        let codeEmbed = tts.embedCode(tts.depthSumEmbedding(shifted)).asType(.float32)
+        let raw = MLX.matmul(codeEmbed, tts.audioPromptProjectionW.asType(.float32))
+        let aria = model.ttsModel.audioPromptLatents.aria.asType(.float32)
+        MLX.eval(raw, aria)
+
+        func rms(_ a: MLXArray) -> Float { MLX.sqrt(MLX.mean(a * a)).item(Float.self) }
+        let rawRMS = rms(raw), ariaRMS = rms(aria)
+        print(String(format: "[prompt-cal] raw projection RMS  %.4f", rawRMS))
+        print(String(format: "[prompt-cal] shipped Aria RMS    %.4f", ariaRMS))
+        print(String(format: "[prompt-cal] RMS-matching scale  %.6f", ariaRMS / rawRMS))
+        print(
+            String(
+                format: "[prompt-cal] 1/sqrt(hidden) scale  %.6f",
+                1.0 / Foundation.sqrt(Float(codeEmbed.dim(-1)))))
+
+        // Direction is what says whether the projection is TRAINED: a scale can
+        // always be fixed, an unrelated direction cannot.
+        let frames = Swift.min(raw.dim(1), aria.dim(1))
+        let a = raw[0, ..<frames, 0...], b = aria[0, ..<frames, 0...]
+        let cos =
+            MLX.sum(a * b, axis: -1)
+            / (MLX.sqrt(MLX.sum(a * a, axis: -1)) * MLX.sqrt(MLX.sum(b * b, axis: -1)) + 1e-9)
+        let cosValues = cos.asArray(Float.self)
+        let meanCos = cosValues.reduce(0, +) / Float(cosValues.count)
+        print(
+            String(
+                format: "[prompt-cal] per-frame cosine to Aria: mean %+.4f  min %+.4f  max %+.4f",
+                meanCos, cosValues.min() ?? 0, cosValues.max() ?? 0))
+    }
+
     func testReferenceVoicesChangeTheAgentVoice() throws {
         guard Self.enabled else {
             throw XCTSkip("set VOICECHAT_QUANT_PROOF=1 to run the voice-cloning proof")

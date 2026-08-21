@@ -225,13 +225,22 @@ public class NemotronVoiceChatModel: Module {
         var functionTokens = [Int](repeating: padId, count: timelineFrames)
         let sttCache = sttModel.makeCache()
 
-        // `VMLX_VOICECHAT_NO_GUIDANCE=1` runs the speech decoder without
-        // classifier-free guidance. The guidance branch is where this port
-        // still diverges from the reference (conditional half exact at every
-        // layer, unconditional half wrong), so this arm answers whether the
-        // rest of the stack can already speak.
-        let useGuidance =
-            ProcessInfo.processInfo.environment["VMLX_VOICECHAT_NO_GUIDANCE"] != "1"
+        // 🚨 Classifier-free guidance is OFF by default, and that is a
+        // deliberate, measured choice rather than a missing feature.
+        //
+        // The guidance branch of this port diverges from the reference: split
+        // by guidance half, a decode step is exact on the CONDITIONAL half at
+        // all 28 layers (cosine 0.99995+) and collapses on the UNCONDITIONAL
+        // half (0.998 → 0.334 → 0.224 …; layer 1 norm 93.26 vs 65.99). With
+        // guidance on, the decoder emits audio that passes every energy
+        // statistic and contains NO WORDS. With it off, the same stack is
+        // intelligible — the model's own ASR reads its speech back verbatim
+        // (100% in-order letter overlap).
+        //
+        // The reference runs guidance_scale 0.2, so the quality this gives up
+        // is small next to the difference between speaking and not. Set
+        // `VMLX_VOICECHAT_GUIDANCE=1` to run the guided path while fixing it.
+        let useGuidance = ProcessInfo.processInfo.environment["VMLX_VOICECHAT_GUIDANCE"] == "1"
 
         let prompt = ttsPrompt(voice: voice)
         // 🚨 Materialise the prompt BEFORE the warmup graph is built. The
@@ -323,6 +332,110 @@ public class NemotronVoiceChatModel: Module {
             sampleRate: config.outputSampleRate,
             asrEmbeddings: asrEmbeds[0..., ..<audioFrames, 0...],
             audioFrames: audioFrames)
+    }
+
+    /// Render a chosen sentence with the speech tower alone — text to speech,
+    /// with no user audio and no language model in the loop.
+    ///
+    /// The duplex turn loop always speaks whatever the backbone decided to say.
+    /// An avatar also needs the other direction: say EXACTLY this. The speech
+    /// tower already supports it, because `step` is driven by one subword token
+    /// per 0.08 s frame and does not care whether that token came from
+    /// `lm_head` or from a caller.
+    ///
+    /// - Parameter frameTokens: the subword id active on each frame, in order.
+    ///   `padTokenId` means "no new subword this frame" and is what creates
+    ///   natural pacing — in a real turn most frames are PAD. Build the
+    ///   schedule at roughly one content token every 3 frames (about 4 per
+    ///   second, which is the rate the model's own text channel runs at) and
+    ///   leave trailing PAD frames so the last word is not cut off.
+    public func synthesize(frameTokens: [Int], voice: Voice = .builtIn)
+        -> (audio: MLXArray, codes: MLXArray, sampleRate: Int)
+    {
+        precondition(!frameTokens.isEmpty, "frameTokens must not be empty")
+        let useGuidance = ProcessInfo.processInfo.environment["VMLX_VOICECHAT_GUIDANCE"] == "1"
+
+        let prompt = ttsPrompt(voice: voice)
+        MLX.eval(prompt.codes, prompt.subwords, prompt.subwordMask, prompt.audioMask)
+        if let latent = prompt.latent { MLX.eval(latent) }
+
+        var (warmHidden, ttsCache) = ttsModel.ttsModel.warmup(
+            code: prompt.codes,
+            subwordIds: prompt.subwords,
+            subwordMask: prompt.subwordMask,
+            audioMask: prompt.audioMask,
+            audioPromptLatent: prompt.latent,
+            guidance: useGuidance)
+        MLX.eval(warmHidden)
+
+        var previousCode = MLXArray(
+            prompt.codes[0..., (prompt.codes.dim(1) - 1)..., 0...].asType(.int32)
+                .asArray(Int32.self)
+        ).reshaped([1, 1, config.ttsConfig.numQuantizers])
+
+        var frames = [MLXArray]()
+        frames.reserveCapacity(frameTokens.count)
+        for id in frameTokens {
+            let current = MLXArray([Int32(id)]).reshaped([1, 1])
+            if id == config.eosTokenId {
+                previousCode = MLX.broadcast(
+                    ttsModel.codecSilenceTokens.reshaped([1, 1, -1]), to: previousCode.shape)
+            }
+            let out = ttsModel.ttsModel.step(
+                code: previousCode,
+                subwordIds: current,
+                subwordMask: MLXArray.ones(current.shape, dtype: .bool),
+                cache: ttsCache,
+                guidance: useGuidance)
+            previousCode = out.codes
+            frames.append(previousCode)
+            MLX.eval(previousCode)
+        }
+
+        var codes = MLX.concatenated(frames, axis: 1)
+        codes = replacingControlCodes(codes)
+        let decoded = ttsModel.audioCodec.decode(codes.transposed(0, 2, 1))
+        MLX.eval(decoded)
+        return (decoded[0, 0], codes[0], config.outputSampleRate)
+    }
+
+    /// Lay a token sequence onto a frame schedule for ``synthesize(frameTokens:voice:)``.
+    ///
+    /// 🚨 The text channel delivers a sentence as a BURST, not spread out over
+    /// the time it takes to say it. Dumping the model's own per-frame schedule
+    /// for "Hello! How can I help you today?" gives, across 76 frames:
+    ///
+    ///     ......... | .................................. <s> Hello ! -How
+    ///     -can -I -help -you -today ? ....................
+    ///
+    /// — nine content tokens on nine CONSECUTIVE frames after `<s>`, then PAD
+    /// for the rest of the turn. The speech tower reads the burst out over
+    /// those trailing PAD frames, so the audio runs far longer than the burst.
+    ///
+    /// Spacing tokens out instead (one every 3-7 frames, which is what "about
+    /// four tokens a second" suggests) is out of distribution and degrades
+    /// after the first word or two: at 3 frames per token "Hi there! I'm so
+    /// happy to see you today." came back as "Hi, I think there are MKane".
+    /// So `framesPerToken` defaults to 1 and the tail carries the speaking
+    /// time.
+    public func frameSchedule(
+        subwordIds: [Int], framesPerToken: Int = 1, leadFrames: Int = 4,
+        tailFrames: Int? = nil, includeBOS: Bool = true
+    ) -> [Int] {
+        let pad = config.padTokenId
+        var schedule = [Int](repeating: pad, count: Swift.max(0, leadFrames))
+        if includeBOS { schedule.append(config.bosTokenId) }
+        for id in subwordIds {
+            schedule.append(id)
+            schedule.append(
+                contentsOf: [Int](repeating: pad, count: Swift.max(0, framesPerToken - 1)))
+        }
+        // The model left ~2.5 frames of speaking time per content token after
+        // its own burst. Too few clips the last words; extra PAD is just
+        // trailing silence and is trimmed by the caller.
+        let tail = tailFrames ?? (Int(Double(subwordIds.count) * 2.5) + 16)
+        schedule.append(contentsOf: [Int](repeating: pad, count: Swift.max(0, tail)))
+        return schedule
     }
 
     /// Greedy RNN-T transcription of the user's own audio for this turn.
