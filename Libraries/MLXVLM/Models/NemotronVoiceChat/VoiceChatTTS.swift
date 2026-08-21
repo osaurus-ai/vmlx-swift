@@ -132,6 +132,18 @@ public class VoiceChatMoGHead: Module {
     /// `VMLX_VOICECHAT_MOG_ARGMAX=1` replaces the Gumbel draw with an argmax
     /// over the mixture logits — a diagnostic arm for isolating sampling bugs
     /// from head bugs.
+    ///
+    /// 🚨 DIAGNOSTIC ONLY. It does not make generation "deterministic but
+    /// fine"; it destroys speech outright. Measured over six runs per bundle,
+    /// the model's own ASR read back 0% of what the agent said on BOTH JANG_3
+    /// and JANG_4 — every run, no exceptions.
+    ///
+    /// So the stochastic mixture draw is load-bearing, not noise to be tidied
+    /// away, and reaching for this flag to cure run-to-run variation makes
+    /// things strictly worse. That variation is real (a 3-bit build read back
+    /// 33 / nothing / 8 / 33 / 32 tokens across five live turns while its TEXT
+    /// channel was identical every time), but the fix is a better-quantised
+    /// bundle, not a deterministic head.
     static let deterministicComponent =
         ProcessInfo.processInfo.environment["VMLX_VOICECHAT_MOG_ARGMAX"] == "1"
 
