@@ -89,3 +89,79 @@ import Testing
     let config = settings.cacheCoordinatorConfig(modelKey: "auto-disk-unset")
     #expect(Double(config.diskCacheMaxGB) >= VMLXServerRuntimeSettings.autoDiskCacheFloorGB)
 }
+
+// MARK: - Existing-install migration
+//
+// Auto only fills in for a NIL size. Every install that had already persisted
+// the literal 10.0 would therefore have kept 10 GB forever after updating, and
+// only fresh installs would have benefited. These pin the one-shot that moves
+// those users to auto — and, just as importantly, that it does not run twice.
+
+@Test func legacyTenGigabyteSettingMigratesToAuto() {
+    var settings = VMLXServerRuntimeSettings()
+    settings.cache.blockDisk.maxSizeGB = 10.0
+    settings.schemaVersion = nil  // written before versioning existed
+
+    settings.migrateToCurrentSchema()
+
+    #expect(settings.cache.blockDisk.maxSizeGB == nil, "legacy 10 GB must become auto")
+    #expect(settings.schemaVersion == VMLXServerRuntimeSettings.contractVersion)
+}
+
+@Test func migrationLeavesADeliberateNonDefaultSizeAlone() {
+    var settings = VMLXServerRuntimeSettings()
+    settings.cache.blockDisk.maxSizeGB = 40.0
+    settings.schemaVersion = nil
+
+    settings.migrateToCurrentSchema()
+
+    #expect(settings.cache.blockDisk.maxSizeGB == 40.0)
+}
+
+@Test func migrationDoesNotRunTwiceOnADeliberateTenGigabyteChoice() {
+    // The dangerous case: a user who has ALREADY been migrated and then
+    // deliberately picks 10 GB. A blanket "rewrite any 10.0" would silently
+    // undo that on every launch.
+    var settings = VMLXServerRuntimeSettings()
+    settings.cache.blockDisk.maxSizeGB = 10.0
+    settings.schemaVersion = VMLXServerRuntimeSettings.contractVersion
+
+    settings.migrateToCurrentSchema()
+
+    #expect(
+        settings.cache.blockDisk.maxSizeGB == 10.0,
+        "a post-migration choice of 10 GB belongs to the user and must survive")
+}
+
+@Test func migrationIsIdempotent() {
+    var settings = VMLXServerRuntimeSettings()
+    settings.cache.blockDisk.maxSizeGB = 10.0
+    settings.schemaVersion = nil
+
+    settings.migrateToCurrentSchema()
+    let afterFirst = settings
+    settings.migrateToCurrentSchema()
+
+    #expect(settings == afterFirst)
+}
+
+@Test func migratedSettingsResolveToTheAutoSizeThroughTheCoordinator() {
+    // End to end: a legacy install ends up with a cap at least the floor,
+    // rather than the 10 GB it was pinned to before.
+    var settings = VMLXServerRuntimeSettings()
+    settings.cache.blockDisk.enabled = true
+    settings.cache.blockDisk.maxSizeGB = 10.0
+    settings.schemaVersion = nil
+
+    settings.migrateToCurrentSchema()
+    let config = settings.cacheCoordinatorConfig(modelKey: "auto-disk-migrated")
+
+    #expect(Double(config.diskCacheMaxGB) >= VMLXServerRuntimeSettings.autoDiskCacheFloorGB)
+}
+
+@Test func aFreshSettingsValueIsAlreadyAtTheCurrentSchema() {
+    var settings = VMLXServerRuntimeSettings()
+    settings.migrateToCurrentSchema()
+    #expect(settings.schemaVersion == 2)
+    #expect(settings.cache.blockDisk.maxSizeGB == nil)
+}
