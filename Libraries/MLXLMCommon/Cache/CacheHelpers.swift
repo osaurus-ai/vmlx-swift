@@ -857,7 +857,13 @@ private func restoreFromV2Arrays(
             // coordinator resolved a TurboQuant KV policy. Materialize the
             // TQ layer from the disk payload before reporting a cache hit;
             // otherwise the caller would seed decode from an empty cache.
-            guard restoreTQLayer(comp, into: &cache[i]) else { continue }
+            // A failed seat must refuse the WHOLE record, exactly as the
+            // .qkv / .deepseekV4 / .zayaCCA paths below already do. `continue`
+            // left this layer empty while sibling layers seeded `totalTokens`,
+            // so the caller was told the entry hit and then decoded against an
+            // empty TQ layer -- the silent attention corruption the .qkv case
+            // documents. A miss costs a re-prefill; this cost a wrong answer.
+            guard restoreTQLayer(comp, into: &cache[i]) else { return 0 }
             // TQ layers don't expose a sequence-dim tensor in the same way
             // as KV layers, so they can't drive `totalTokens`. The
             // attention sequence length is sourced from the .standard

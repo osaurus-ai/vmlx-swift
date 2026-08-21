@@ -1036,8 +1036,27 @@ public enum TQDiskSerializer {
         }
 
         var out: [IndexedLayerData] = []
-        for i in kindsByIndex.keys.sorted() {
-            guard let kind = kindsByIndex[i] else { continue }
+        // Walk the CONTIGUOUS index range, not just the tags that happen to be
+        // present. `serialize` writes a `__layer_kind_i__` for every layer --
+        // `.skip` included -- so a GAP means the payload was truncated, not that
+        // the model had nothing there.
+        //
+        // Iterating `kindsByIndex.keys` skipped those gaps entirely, so a
+        // damaged record silently became a smaller well-formed one: the
+        // surviving layers restored, `totalTokens` was seeded from them, and the
+        // caller was told the entry hit while the missing layer sat at offset 0.
+        // That is the "silent attention corruption" the `.qkv` restore path
+        // already warns about, and it produces coherent-but-wrong text instead
+        // of an honest re-prefill.
+        //
+        // A gap now becomes `.requiredMiss`, which both restore paths already
+        // treat as "refuse the whole record" (`return 0`).
+        let highestIndex = kindsByIndex.keys.max() ?? -1
+        for i in 0...max(highestIndex, 0) where highestIndex >= 0 {
+            guard let kind = kindsByIndex[i] else {
+                out.append(IndexedLayerData(index: i, data: .requiredMiss))
+                continue
+            }
             switch kind {
             case .tq:
                 if let components = deserializeTQLayer(index: i, from: arrays) {
@@ -1059,7 +1078,16 @@ public enum TQDiskSerializer {
                         )
                     )
                 } else {
-                    out.append(IndexedLayerData(index: i, data: .skip))
+                    // The kind tag is AUTHORITATIVE: it says this layer has
+                    // content, so a payload we cannot rebuild is DAMAGE, not an
+                    // intentionally empty layer. Emitting `.skip` here claimed
+                    // the latter, so the layer stayed at offset 0 while sibling
+                    // layers seeded `totalTokens` and the caller was told the
+                    // entry hit -- decode then ran against an empty layer.
+                    // `.requiredMiss` refuses the whole record, which costs a
+                    // re-prefill instead of a wrong answer. Matches what the
+                    // deepseekV4 / zayaCCA / mamba branches already do.
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
                 }
             case .mamba:
                 if let s0 = arrays["mamba_\(i)_state0"] {
@@ -1102,13 +1130,31 @@ public enum TQDiskSerializer {
                 if let comp = deserializeQKVLayer(index: i, from: arrays) {
                     out.append(IndexedLayerData(index: i, data: .qkv(comp)))
                 } else {
-                    out.append(IndexedLayerData(index: i, data: .skip))
+                    // The kind tag is AUTHORITATIVE: it says this layer has
+                    // content, so a payload we cannot rebuild is DAMAGE, not an
+                    // intentionally empty layer. Emitting `.skip` here claimed
+                    // the latter, so the layer stayed at offset 0 while sibling
+                    // layers seeded `totalTokens` and the caller was told the
+                    // entry hit -- decode then ran against an empty layer.
+                    // `.requiredMiss` refuses the whole record, which costs a
+                    // re-prefill instead of a wrong answer. Matches what the
+                    // deepseekV4 / zayaCCA / mamba branches already do.
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
                 }
             case .rotating:
                 if let comp = deserializeRotatingLayer(index: i, from: arrays) {
                     out.append(IndexedLayerData(index: i, data: .rotating(comp)))
                 } else {
-                    out.append(IndexedLayerData(index: i, data: .skip))
+                    // The kind tag is AUTHORITATIVE: it says this layer has
+                    // content, so a payload we cannot rebuild is DAMAGE, not an
+                    // intentionally empty layer. Emitting `.skip` here claimed
+                    // the latter, so the layer stayed at offset 0 while sibling
+                    // layers seeded `totalTokens` and the caller was told the
+                    // entry hit -- decode then ran against an empty layer.
+                    // `.requiredMiss` refuses the whole record, which costs a
+                    // re-prefill instead of a wrong answer. Matches what the
+                    // deepseekV4 / zayaCCA / mamba branches already do.
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
                 }
             case .deepseekV4:
                 if let comp = deserializeDeepseekV4Layer(index: i, from: arrays) {
