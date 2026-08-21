@@ -160,6 +160,57 @@ public struct VoiceChatAudioConfiguration: Codable, Sendable {
     }
 }
 
+/// Mixture-of-Gaussians refinement head (nested in `tts_config.mog_head`).
+public struct VoiceChatMoGConfiguration: Codable, Sendable {
+    public let intermediateSize: Int?
+    public let lowRank: Int?
+    public let minLogStd: Float?
+    public let numLayers: Int?
+    public let numPredictions: Int?
+    public let eps: Float?
+
+    enum CodingKeys: String, CodingKey {
+        case intermediateSize = "intermediate_size"
+        case lowRank = "low_rank"
+        case minLogStd = "min_log_std"
+        case numLayers = "num_layers"
+        case numPredictions = "num_predictions"
+        case eps
+    }
+}
+
+/// Character-aware subword encoder (nested in `tts_config.character_encoder`).
+/// Values the bundle omits fall back to the reference dataclass defaults —
+/// notably `attn_logit_softcapping 50.0` and `char_vocab_size 257`, which are
+/// NOT in the shipped JSON but are load-bearing for the encoder math.
+public struct VoiceChatCharacterEncoderConfiguration: Codable, Sendable {
+    public let hiddenSize: Int?
+    public let intermediateSize: Int?
+    public let numHiddenLayers: Int?
+    public let numAttentionHeads: Int?
+    public let numKeyValueHeads: Int?
+    public let headDim: Int?
+    public let rmsNormEps: Float?
+    public let queryPreAttnScalar: Float?
+    public let attnLogitSoftcapping: Float?
+    public let ropeBase: Float?
+    public let charVocabSize: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case hiddenSize = "hidden_size"
+        case intermediateSize = "intermediate_size"
+        case numHiddenLayers = "num_hidden_layers"
+        case numAttentionHeads = "num_attention_heads"
+        case numKeyValueHeads = "num_key_value_heads"
+        case headDim = "head_dim"
+        case rmsNormEps = "rms_norm_eps"
+        case queryPreAttnScalar = "query_pre_attn_scalar"
+        case attnLogitSoftcapping = "attn_logit_softcapping"
+        case ropeBase = "rope_base"
+        case charVocabSize = "char_vocab_size"
+    }
+}
+
 /// Speech-generation transformer + mixture-of-Gaussians head.
 public struct VoiceChatTTSConfiguration: Codable, Sendable {
     public let hiddenSize: Int
@@ -179,6 +230,16 @@ public struct VoiceChatTTSConfiguration: Codable, Sendable {
     public let topP: Float?
     public let noiseScale: Float?
     public let audioPromptDuration: Float?
+    public let characterEncoder: VoiceChatCharacterEncoderConfiguration?
+    public let mogHead: VoiceChatMoGConfiguration?
+    /// Reference-dataclass defaults the shipped JSON omits entirely.
+    public let rmsNormEps: Float?
+    public let queryPreAttnScalar: Float?
+    public let slidingWindowPattern: Int?
+    public let ropeGlobalBaseFreq: Float?
+    public let ropeLocalBaseFreq: Float?
+    public let numIterations: Int?
+    public let exponent: Float?
 
     enum CodingKeys: String, CodingKey {
         case hiddenSize = "hidden_size"
@@ -198,6 +259,15 @@ public struct VoiceChatTTSConfiguration: Codable, Sendable {
         case topP = "top_p"
         case noiseScale = "noise_scale"
         case audioPromptDuration = "audio_prompt_duration"
+        case characterEncoder = "character_encoder"
+        case mogHead = "mog_head"
+        case rmsNormEps = "rms_norm_eps"
+        case queryPreAttnScalar = "query_pre_attn_scalar"
+        case slidingWindowPattern = "sliding_window_pattern"
+        case ropeGlobalBaseFreq = "rope_global_base_freq"
+        case ropeLocalBaseFreq = "rope_local_base_freq"
+        case numIterations = "num_iterations"
+        case exponent
     }
 }
 
