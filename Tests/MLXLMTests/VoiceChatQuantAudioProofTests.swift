@@ -53,7 +53,7 @@ public class VoiceChatQuantAudioProofTests: XCTestCase {
     }
 
     /// Left channel (the user) of the stereo fixture, resampled to 16 kHz mono.
-    private func loadUserChannel(seconds: Double) throws -> [Float] {
+    private func loadUserChannel(seconds: Double, offset: Double = 0) throws -> [Float] {
         let file = try AVAudioFile(forReading: Self.fixtureURL)
         let format = file.processingFormat
         guard
@@ -73,10 +73,11 @@ public class VoiceChatQuantAudioProofTests: XCTestCase {
         let sourceRate = format.sampleRate
         let targetRate = 16000.0
         let wanted = Int(seconds * targetRate)
+        let startSample = offset * sourceRate
         var out = [Float]()
         out.reserveCapacity(wanted)
         for i in 0 ..< wanted {
-            let position = Double(i) * sourceRate / targetRate
+            let position = startSample + Double(i) * sourceRate / targetRate
             let index = Int(position)
             guard index + 1 < left.count else { break }
             let frac = Float(position - Double(index))
@@ -215,5 +216,64 @@ public class VoiceChatQuantAudioProofTests: XCTestCase {
         for line in summaries { print("[voicechat-proof] \(line)") }
         XCTAssertEqual(
             summaries.count, Self.quantPaths.count, "not every quant produced a proof leg")
+    }
+
+    /// 🚨 The check that separates "renders audio" from "renders THIS audio".
+    ///
+    /// A model that ignored its input would still pass every measurement in
+    /// the test above — RMS, dynamic range, zero-crossing rate all stay
+    /// speech-like for a fixed canned response. This is the word-list lesson
+    /// from the VLM work: score OPPOSITE inputs and require them to differ.
+    /// Two different windows of the fixture must produce materially different
+    /// speech, transcripts, or both.
+    func testOutputDependsOnTheInputAudio() throws {
+        guard Self.enabled else {
+            throw XCTSkip("set VOICECHAT_QUANT_PROOF=1 to run the per-quant audio proof")
+        }
+        guard FileManager.default.fileExists(atPath: Self.fixtureURL.path) else {
+            throw XCTSkip("fixture missing at \(Self.fixtureURL.path)")
+        }
+        guard let (name, path) = Self.quantPaths.first(where: {
+            VoiceChatLoader.looksLikeVoiceChatBundle(at: URL(fileURLWithPath: $0.path))
+        }) else { throw XCTSkip("no VoiceChat bundle present") }
+
+        let (model, config) = try VoiceChatLoader.load(from: URL(fileURLWithPath: path))
+        let vocabURL = URL(fileURLWithPath: path).appendingPathComponent("tokenizer.json")
+        let data = try Data(contentsOf: vocabURL)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let vocab = (json?["model"] as? [String: Any])?["vocab"] as? [String: Int]
+        try model.setVocabulary(try XCTUnwrap(vocab))
+
+        func turn(offsetSeconds: Double) throws -> (audio: [Float], text: [Int], asr: [Int]) {
+            let samples = try loadUserChannel(seconds: 2.0, offset: offsetSeconds)
+            let mel = voiceChatLogMelSpectrogram(
+                samples, config: config.audioConfig.preprocessor)
+            let (projected, encoded) = model.sttModel.perception(mel)
+            let result = model.generateTurn(audioEmbeds: projected, asrEmbeds: encoded)
+            return (
+                result.audio.asType(.float32).asArray(Float.self),
+                result.textTokens,
+                model.transcribeUser(result)
+            )
+        }
+
+        // Two windows several seconds apart in the same conversation.
+        let early = try turn(offsetSeconds: 1.0)
+        let late = try turn(offsetSeconds: 18.0)
+
+        XCTAssertEqual(early.audio.count, late.audio.count, "same duration in, same out")
+        let differing = zip(early.audio, late.audio).filter { abs($0 - $1) > 1e-4 }.count
+        let fraction = Float(differing) / Float(Swift.max(early.audio.count, 1))
+        print(
+            String(
+                format:
+                    "[voicechat-proof] %@ input-dependence: %.1f%% of samples differ · "
+                    + "text %d vs %d tok · asr %d vs %d tok",
+                name, fraction * 100, early.text.count, late.text.count,
+                early.asr.count, late.asr.count))
+
+        XCTAssertGreaterThan(
+            fraction, 0.10,
+            "different input audio produced near-identical output — the model is not listening")
     }
 }
