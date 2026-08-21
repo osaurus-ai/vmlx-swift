@@ -92,13 +92,22 @@ def report(path):
     tr = f0_track(x, sr)
     f0 = float(np.median([t[0] for t in tr])) if tr else float("nan")
     am, am_hz = am_artifact(x, sr)
+    # Pitch dynamism, in semitones: how far the pitch actually MOVES. A flat
+    # read sits near 1-2 st and reads as "person talking"; an animated
+    # character read is 3+. Pitch HEIGHT is not what makes a character — this
+    # is.
+    if len(tr) > 2:
+        semis = 12.0 * np.log2(np.array([t[0] for t in tr]) / f0)
+        dyn = float(np.percentile(semis, 90) - np.percentile(semis, 10))
+    else:
+        dyn = 0.0
     return dict(name=path.split("/")[-1], sr=sr, dur=len(x) / sr, f0=f0,
-                hnr=hnr_db(tr), voiced=len(tr), am=am, am_hz=am_hz)
+                hnr=hnr_db(tr), voiced=len(tr), am=am, am_hz=am_hz, dyn=dyn)
 
 
 if __name__ == "__main__":
-    print(f"{'file':<30}{'dur':>6}{'f0 Hz':>8}{'HNR dB':>8}{'AM':>8}{'AM Hz':>8}")
+    print(f"{'file':<30}{'dur':>6}{'f0 Hz':>8}{'dyn st':>8}{'HNR dB':>8}{'AM':>8}{'AM Hz':>8}")
     for p in sys.argv[1:]:
         r = report(p)
-        print(f"{r['name']:<30}{r['dur']:>6.2f}{r['f0']:>8.1f}"
+        print(f"{r['name']:<30}{r['dur']:>6.2f}{r['f0']:>8.1f}{r['dyn']:>8.1f}"
               f"{r['hnr']:>8.1f}{r['am']:>8.3f}{r['am_hz']:>8.1f}")
