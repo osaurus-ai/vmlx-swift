@@ -394,12 +394,13 @@ public class VoiceChatRVQEARTTSModel: Module {
     /// hidden state. `hiddenStates` must carry conditional and unconditional
     /// halves (classifier-free guidance).
     public func generateCodes(_ hiddenStates: MLXArray) -> MLXArray {
-        precondition(
-            hiddenStates.dim(0) % 2 == 0,
-            "guided generation expects conditional/unconditional pairs")
-        let half = hiddenStates.dim(0) / 2
-        let conditional = hiddenStates[0 ..< half]
-        let unconditional = hiddenStates[half...]
+        // With guidance off the caller passes a single conditional batch; the
+        // refinement below is written against a cond/uncond pair, so the same
+        // hidden serves as both and the guidance term cancels to zero.
+        let guided = hiddenStates.dim(0) % 2 == 0 && hiddenStates.dim(0) > 1
+        let half = guided ? hiddenStates.dim(0) / 2 : hiddenStates.dim(0)
+        let conditional = guided ? hiddenStates[0 ..< half] : hiddenStates
+        let unconditional = guided ? hiddenStates[half...] : hiddenStates
 
         let iterations = config.numIterations ?? 8
         let exponent = Double(config.exponent ?? 3.0)
@@ -420,11 +421,16 @@ public class VoiceChatRVQEARTTSModel: Module {
         var completed = 0
         for count in counts where count != 0 {
             let embedded = embedCode(depthSumEmbedding(code))
-            let mogInput = MLX.concatenated(
-                [embedded + conditional, embedded + unconditional], axis: 0)
+            // Guided: the head needs a cond/uncond pair to difference. Not
+            // guided: a single batch, or the pair would double the batch while
+            // `code` stays single and the RVQ re-encode below cannot stack.
+            let mogInput =
+                guided
+                ? MLX.concatenated([embedded + conditional, embedded + unconditional], axis: 0)
+                : embedded + conditional
             let (mu, logs) = mogHead.infer(
                 mogInput,
-                guidanceScale: config.guidanceScale ?? 0.2,
+                guidanceScale: guided ? (config.guidanceScale ?? 0.2) : 0,
                 topP: config.topP ?? 0.95)
             let residual =
                 mu + MLX.exp(logs) * MLXRandom.normal(mu.shape) * (config.noiseScale ?? 0.001)

@@ -225,6 +225,14 @@ public class NemotronVoiceChatModel: Module {
         var functionTokens = [Int](repeating: padId, count: timelineFrames)
         let sttCache = sttModel.makeCache()
 
+        // `VMLX_VOICECHAT_NO_GUIDANCE=1` runs the speech decoder without
+        // classifier-free guidance. The guidance branch is where this port
+        // still diverges from the reference (conditional half exact at every
+        // layer, unconditional half wrong), so this arm answers whether the
+        // rest of the stack can already speak.
+        let useGuidance =
+            ProcessInfo.processInfo.environment["VMLX_VOICECHAT_NO_GUIDANCE"] != "1"
+
         let prompt = ttsPrompt(voice: voice)
         // 🚨 Materialise the prompt BEFORE the warmup graph is built. The
         // speaker enters the turn only through these frames, and leaving them
@@ -240,7 +248,7 @@ public class NemotronVoiceChatModel: Module {
             subwordMask: prompt.subwordMask,
             audioMask: prompt.audioMask,
             audioPromptLatent: prompt.latent,
-            guidance: true)
+            guidance: useGuidance)
         // Force the warmup itself. Its hidden state is not otherwise consumed
         // — the speaker is carried in the KV cache it writes — so without this
         // the whole warmup can stay an unevaluated graph whose effect on the
@@ -295,7 +303,7 @@ public class NemotronVoiceChatModel: Module {
                 subwordIds: current,
                 subwordMask: MLXArray.ones(current.shape, dtype: .bool),
                 cache: ttsCache,
-                guidance: true)
+                guidance: useGuidance)
             previousCode = ttsOutput.codes
             generatedFrames.append(previousCode)
             MLX.eval(previousCode, output.textLogits, output.functionLogits)
