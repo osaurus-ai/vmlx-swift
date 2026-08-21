@@ -103,27 +103,46 @@ public class VoiceChatPredictNetwork: Module {
     }
 }
 
-/// NeMo `RNNTJoint` — enc/pred projections plus the output projection at
-/// `joint_net.2` (indices 0/1 are the activation and a dropout placeholder,
-/// which carry no parameters — the array shape preserves checkpoint keys).
+/// NeMo `RNNTJoint` — enc/pred projections plus the output projection stored
+/// at `joint_net.2`.
+///
+/// 🚨 Indices 0 and 1 of NeMo's `joint_net` are the activation and a dropout
+/// placeholder and carry NO parameters, so the checkpoint ships ONLY index 2.
+/// Modelling that as a Swift `[Module]` works for plain weight loading (MLX
+/// pads the missing indices with `.none`) but breaks `quantize`, which builds
+/// a module-children update keyed `{"2": …}` and cannot merge it into an
+/// array — a quantized bundle then dies at load. The slot is therefore named
+/// `out` and `VoiceChatRNNT.sanitized` rewrites `joint_net.2.…` onto it, with
+/// the activation applied inline: same math, same checkpoint tensors.
 public class VoiceChatJointNetwork: Module {
+    public class JointNet: Module {
+        @ModuleInfo(key: "out") var output: Linear
+
+        init(jointHidden: Int, numClasses: Int) {
+            self._output.wrappedValue = Linear(jointHidden, numClasses)
+        }
+    }
+
     public let numClassesWithBlank: Int
+    let activation: (MLXArray) -> MLXArray
 
     @ModuleInfo(key: "enc") var enc: Linear
     @ModuleInfo(key: "pred") var pred: Linear
-    @ModuleInfo(key: "joint_net") var jointNet: [Module]
+    @ModuleInfo(key: "joint_net") var jointNet: JointNet
 
     public init(config: VoiceChatRNNTJointConfiguration) {
         let jointHidden = config.jointHidden ?? 640
         let numClasses = (config.numClasses ?? 1024) + 1  // + blank
         self.numClassesWithBlank = numClasses
+        switch (config.activation ?? "relu").lowercased() {
+        case "sigmoid": self.activation = { MLX.sigmoid($0) }
+        case "tanh": self.activation = { MLX.tanh($0) }
+        default: self.activation = { relu($0) }
+        }
         self._enc.wrappedValue = Linear(config.encoderHidden ?? 1024, jointHidden)
         self._pred.wrappedValue = Linear(config.predHidden ?? 640, jointHidden)
-        self._jointNet.wrappedValue = [
-            ReLU(),
-            Identity(),
-            Linear(jointHidden, numClasses),
-        ]
+        self._jointNet.wrappedValue = JointNet(
+            jointHidden: jointHidden, numClasses: numClasses)
     }
 
     /// `encFrame` (B, T, encHidden) × `predOut` (B, U, predHidden)
@@ -131,11 +150,7 @@ public class VoiceChatJointNetwork: Module {
     public func callAsFunction(_ encFrame: MLXArray, _ predOut: MLXArray) -> MLXArray {
         let e = enc(encFrame).expandedDimensions(axis: 2)
         let p = pred(predOut).expandedDimensions(axis: 1)
-        var x = e + p
-        for layer in jointNet {
-            x = (layer as! UnaryLayer)(x)
-        }
-        return x
+        return jointNet.output(activation(e + p))
     }
 }
 
@@ -221,7 +236,12 @@ public enum VoiceChatRNNT {
         var converted = [String: MLXArray]()
         var biasParts = [String: [MLXArray]]()
 
-        for (key, value) in weights {
+        for (rawKey, value) in weights {
+            // NeMo's parameter-free joint_net indices 0/1 never ship; index 2
+            // is the output projection and lands on the named `out` slot (see
+            // VoiceChatJointNetwork).
+            let key = rawKey.replacingOccurrences(
+                of: ".joint_net.2.", with: ".joint_net.out.")
             guard key.contains(".dec_rnn.lstm.") else {
                 converted[key] = value
                 continue

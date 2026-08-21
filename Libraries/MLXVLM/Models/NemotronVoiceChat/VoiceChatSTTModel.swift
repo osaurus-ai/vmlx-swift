@@ -134,10 +134,14 @@ public class VoiceChatSTTModel: Module {
             var key = key
             var value = value
 
-            if key == "embed_tokens.weight" {
-                key = "llm.backbone.embeddings.weight"
-            } else if key == "lm_head.weight" {
-                key = "llm.lm_head.weight"
+            // Prefix (not exact `.weight`) matches: a QUANTIZED bundle ships
+            // `.scales` and `.biases` beside every packed `.weight`, and
+            // matching only the weight leaves those two behind as unhandled
+            // keys — the load then fails on the strict update.
+            if key.hasPrefix("embed_tokens.") {
+                key = "llm.backbone.embeddings." + key.dropFirst("embed_tokens.".count)
+            } else if key.hasPrefix("lm_head.") {
+                key = "llm.lm_head." + key.dropFirst("lm_head.".count)
             } else if key.hasPrefix("llm.") {
                 key = "llm.backbone." + key.dropFirst("llm.".count)
             }
