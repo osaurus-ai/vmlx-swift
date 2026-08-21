@@ -513,7 +513,13 @@ let package = Package(
         .target(
             name: "MLXVLM",
             // MLXFFT: the VoiceChat codec's STFT/iSTFT vocoder head.
-            dependencies: ["MLXLMCommon", "MLXLLM", "MLX", "MLXFFT", "MLXNN", "MLXOptimizers"],
+            // MLXFast: VoiceChatConcatKVCache builds a ScaledDotProductAttention
+            // mask mode. It resolved transitively under `swift test`, so the
+            // missing dependency only surfaced when the app was built against
+            // this package — "unable to resolve module dependency: 'MLXFast'".
+            dependencies: [
+                "MLXLMCommon", "MLXLLM", "MLX", "MLXFFT", "MLXFast", "MLXNN", "MLXOptimizers",
+            ],
             path: "Libraries/MLXVLM",
             exclude: ["README.md"]
         ),
