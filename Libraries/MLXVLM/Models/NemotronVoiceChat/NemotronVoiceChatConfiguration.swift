@@ -298,6 +298,14 @@ public struct VoiceChatCodecConfiguration: Codable, Sendable {
         case numQuantizers = "num_quantizers"
         case codebookSize = "codebook_size"
     }
+
+    /// Real + imaginary rFFT bins the codec consumes/produces: 18 at n_fft 16.
+    public var stftChannels: Int { (nFFT / 2 + 1) * 2 }
+
+    /// Waveform samples per codec frame — hop × product of the stage strides.
+    public var waveformToTokenRatio: Int {
+        downsampleRates.reduce(hopLength, *)
+    }
 }
 
 public struct NemotronVoiceChatConfiguration: Codable, Sendable {
