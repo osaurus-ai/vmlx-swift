@@ -512,7 +512,8 @@ let package = Package(
         ),
         .target(
             name: "MLXVLM",
-            dependencies: ["MLXLMCommon", "MLXLLM", "MLX", "MLXNN", "MLXOptimizers"],
+            // MLXFFT: the VoiceChat codec's STFT/iSTFT vocoder head.
+            dependencies: ["MLXLMCommon", "MLXLLM", "MLX", "MLXFFT", "MLXNN", "MLXOptimizers"],
             path: "Libraries/MLXVLM",
             exclude: ["README.md"]
         ),

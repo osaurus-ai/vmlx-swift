@@ -101,24 +101,64 @@ public class NemotronVoiceChatModel: Module {
         return MLX.where(mask, silence, codes)
     }
 
-    /// Build the silent speaker-prompt warmup inputs for the TTS model.
+    /// Which voice the agent speaks in.
+    public enum Voice {
+        /// The bundle's shipped speaker latent (`audio_prompt_latents.Aria`).
+        case builtIn
+        /// Clone the voice in a reference recording: 16 kHz-agnostic mono
+        /// samples at the CODEC's rate (22.05 kHz), about
+        /// `audio_prompt_duration` seconds.
+        ///
+        /// 🚨 This is not a separate feature bolted on — it is the path the
+        /// reference runtime takes whenever no explicit latent is supplied:
+        /// the prompt frames become `embed_code(depthSum(codes)) @
+        /// audio_prompt_projection_W`, i.e. the frozen projection consumes the
+        /// prompt audio's own CODEC CODE EMBEDDINGS. Feeding it a real
+        /// recording instead of silence is what makes the speaker that
+        /// recording's speaker. (This also settles the open question in the
+        /// wiring spec: the projection consumes codec-derived embeddings, not
+        /// raw mel.)
+        case reference([Float])
+    }
+
+    /// Build the speaker-prompt warmup inputs for the TTS model.
     ///
-    /// The prompt is the Aria latent plus a codec-encoded silent lead-in; its
-    /// last two positions carry the mask sentinel so the model starts speaking
-    /// from a clean state rather than continuing the silence codes.
-    func ttsPrompt(batchSize: Int = 1) -> (
+    /// The prompt is a codec-encoded lead-in — silence for the built-in voice,
+    /// the reference recording when cloning — whose last two positions carry
+    /// the mask sentinel so the model starts speaking from a clean state
+    /// rather than continuing the prompt's own codes.
+    func ttsPrompt(batchSize: Int = 1, voice: Voice = .builtIn) -> (
         codes: MLXArray, subwords: MLXArray, subwordMask: MLXArray, audioMask: MLXArray,
-        latent: MLXArray
+        latent: MLXArray?
     ) {
         let ttsConfig = config.ttsConfig
         let frames = ttsModel.audioPromptLatents.aria.dim(1)
         let total = frames + 1
         let promptSamples = total * config.codecConfig.waveformToTokenRatio
-        let silentCodes = ttsModel.audioCodec.encode(
-            MLXArray.zeros([batchSize, 1, promptSamples], dtype: .float32)
-        ).transposed(0, 2, 1)
 
-        var pieces = (0 ..< total).map { silentCodes[0..., $0] }
+        // The prompt waveform: silence for the built-in latent (which is
+        // supplied separately), or the reference recording when cloning —
+        // padded or trimmed to exactly the prompt length the model expects.
+        let promptWaveform: MLXArray
+        switch voice {
+        case .builtIn:
+            promptWaveform = MLXArray.zeros([batchSize, 1, promptSamples], dtype: .float32)
+        case .reference(let samples):
+            var fitted = samples
+            if fitted.count > promptSamples {
+                // Keep the TAIL: the end of a clip is more likely to be settled
+                // speech than the attack at the start.
+                fitted = Array(fitted.suffix(promptSamples))
+            } else if fitted.count < promptSamples {
+                fitted += [Float](repeating: 0, count: promptSamples - fitted.count)
+            }
+            promptWaveform = MLXArray(fitted).reshaped([1, 1, promptSamples])
+                .asType(.float32)
+        }
+
+        let promptCodes = ttsModel.audioCodec.encode(promptWaveform).transposed(0, 2, 1)
+
+        var pieces = (0 ..< total).map { promptCodes[0..., $0] }
         let maskCodes = MLXArray.full(
             [batchSize, ttsConfig.numQuantizers], values: MLXArray(Int32(ttsConfig.codebookSize)))
         pieces[0] = maskCodes
@@ -132,9 +172,19 @@ public class NemotronVoiceChatModel: Module {
             [batchSize, 2], dtype: .bool)
         var audioMask = MLXArray.zeros([batchSize, frames], dtype: .bool)
         audioMask[0..., (frames - 1)...] = MLXArray.ones([batchSize, 1], dtype: .bool)
-        let latent = MLX.broadcast(
-            ttsModel.audioPromptLatents.aria[0 ..< 1],
-            to: [batchSize, frames, ttsConfig.hiddenSize])
+
+        // Built-in voice: hand the shipped latent over directly. Cloning:
+        // pass nil so `warmup` derives the speaker from the prompt codes
+        // through the frozen projection.
+        let latent: MLXArray?
+        switch voice {
+        case .builtIn:
+            latent = MLX.broadcast(
+                ttsModel.audioPromptLatents.aria[0 ..< 1],
+                to: [batchSize, frames, ttsConfig.hiddenSize])
+        case .reference:
+            latent = nil
+        }
 
         return (codes[0..., ..<(total - 1), 0...], subwords, subwordMask, audioMask, latent)
     }
@@ -151,7 +201,8 @@ public class NemotronVoiceChatModel: Module {
         audioEmbeds: MLXArray,
         asrEmbeds: MLXArray,
         promptEmbeds: MLXArray? = nil,
-        maxFrames: Int? = nil
+        maxFrames: Int? = nil,
+        voice: Voice = .builtIn
     ) -> VoiceChatTurnResult {
         var audioEmbeds = audioEmbeds
         var audioFrames = audioEmbeds.dim(1)
@@ -174,15 +225,35 @@ public class NemotronVoiceChatModel: Module {
         var functionTokens = [Int](repeating: padId, count: timelineFrames)
         let sttCache = sttModel.makeCache()
 
-        let prompt = ttsPrompt()
-        var (_, ttsCache) = ttsModel.ttsModel.warmup(
+        let prompt = ttsPrompt(voice: voice)
+        // 🚨 Materialise the prompt BEFORE the warmup graph is built. The
+        // speaker enters the turn only through these frames, and leaving them
+        // lazy made cloning intermittent: the same reference recording changed
+        // the voice on one run and produced byte-identical audio to the
+        // built-in speaker on the next.
+        MLX.eval(prompt.codes, prompt.subwords, prompt.subwordMask, prompt.audioMask)
+        if let latent = prompt.latent { MLX.eval(latent) }
+
+        var (warmHidden, ttsCache) = ttsModel.ttsModel.warmup(
             code: prompt.codes,
             subwordIds: prompt.subwords,
             subwordMask: prompt.subwordMask,
             audioMask: prompt.audioMask,
             audioPromptLatent: prompt.latent,
             guidance: true)
-        var previousCode = prompt.codes[0..., (prompt.codes.dim(1) - 1)..., 0...]
+        // Force the warmup itself. Its hidden state is not otherwise consumed
+        // — the speaker is carried in the KV cache it writes — so without this
+        // the whole warmup can stay an unevaluated graph whose effect on the
+        // cache never lands before the first step.
+        MLX.eval(warmHidden)
+
+        // A slice of an MLXArray aliases its parent, and this value is
+        // reassigned every frame; copy it so the prompt's own codes cannot be
+        // written through later.
+        var previousCode = MLXArray(
+            prompt.codes[0..., (prompt.codes.dim(1) - 1)..., 0...].asType(.int32)
+                .asArray(Int32.self)
+        ).reshaped([1, 1, config.ttsConfig.numQuantizers])
 
         var generatedFrames = [MLXArray]()
         generatedFrames.reserveCapacity(timelineFrames)
