@@ -321,6 +321,71 @@ public class VoiceChatIntelligibilityTests: XCTestCase {
                 + "(text: \"\(saidText.prefix(60))\" vs heard: \"\(heard.text.prefix(60))\")")
     }
 
+    /// Does a character system prompt stop the base model refusing innocent
+    /// childlike lines?
+    ///
+    /// Observed live: "I'm not sleepy. I promise I'm not sleepy." drew a
+    /// refusal about sexual content and innuendo; "Don't worry, little one.
+    /// I'll keep you safe." drew one about child-protection resources. For an
+    /// avatar, that register IS the product, so this checks whether the turn
+    /// loop's `promptEmbeds` prefix — which nothing currently supplies —
+    /// actually suppresses it. Runs the SAME user audio both ways.
+    func testCharacterPromptSuppressesRefusals() throws {
+        guard Self.enabled else { throw XCTSkip("set VOICECHAT_QUANT_PROOF=1") }
+        guard let script = ProcessInfo.processInfo.environment["VOICECHAT_TTS_SCRIPT"] else {
+            throw XCTSkip("set VOICECHAT_TTS_SCRIPT to JSON holding the system prompt ids")
+        }
+        let bundle = URL(fileURLWithPath: Self.bundlePath)
+        guard VoiceChatLoader.looksLikeVoiceChatBundle(at: bundle) else {
+            throw XCTSkip("no VoiceChat bundle")
+        }
+        let (model, config) = try VoiceChatLoader.load(from: bundle)
+        let data = try Data(contentsOf: bundle.appendingPathComponent("tokenizer.json"))
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let vocab = try XCTUnwrap((json?["model"] as? [String: Any])?["vocab"] as? [String: Int])
+        var idToToken = [Int: String]()
+        for (token, id) in vocab { idToToken[id] = token }
+        try model.setVocabulary(vocab)
+
+        struct Line: Decodable { let name: String; let text: String; let ids: [Int] }
+        let lines = try JSONDecoder().decode(
+            [Line].self, from: try Data(contentsOf: URL(fileURLWithPath: script)))
+        let systemIds = try XCTUnwrap(lines.first).ids
+
+        let user = try readMono(
+            Self.fixtureURL, targetRate: Double(config.inputSampleRate),
+            seconds: Self.fixtureSeconds, offset: Self.fixtureOffset)
+        let mel = voiceChatLogMelSpectrogram(user, config: config.audioConfig.preprocessor)
+        let (projected, encoded) = model.sttModel.perception(mel)
+        MLX.eval(projected, encoded)
+
+        func say(_ result: VoiceChatTurnResult) -> String {
+            let special: Set<Int> = [
+                config.padTokenId, config.silenceTokenId, config.bosTokenId, config.eosTokenId,
+            ]
+            return result.textTokens.filter { !special.contains($0) }
+                .compactMap { idToToken[$0] }.joined()
+                .replacingOccurrences(of: "\u{2581}", with: " ")
+                .replacingOccurrences(of: "\u{0120}", with: " ")
+                .trimmingCharacters(in: .whitespaces)
+        }
+
+        let plain = model.generateTurn(audioEmbeds: projected, asrEmbeds: encoded)
+        print("[prompt] WITHOUT: \"\(say(plain).prefix(200))\"")
+
+        // The prefix rides the user-audio channel, so it is the text embedding
+        // of the system prompt placed in that slot.
+        let promptTokens = MLXArray(systemIds.map { Int32($0) }).reshaped([1, systemIds.count])
+        let promptEmbeds = model.sttModel.embed(promptTokens)
+        MLX.eval(promptEmbeds)
+        let guided = model.generateTurn(
+            audioEmbeds: projected, asrEmbeds: encoded, promptEmbeds: promptEmbeds)
+        print("[prompt] WITH   : \"\(say(guided).prefix(200))\"")
+
+        XCTAssertFalse(
+            say(guided).isEmpty, "the character prompt silenced the agent entirely")
+    }
+
     /// What is the text channel actually deciding, frame by frame?
     ///
     /// A turn that emits only PAD looks identical whether the backbone is
