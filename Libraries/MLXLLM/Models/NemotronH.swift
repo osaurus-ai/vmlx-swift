@@ -1388,6 +1388,16 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         backbone.embeddings(tokens)
     }
 
+    /// Final-normed hidden states from pre-computed embeddings, with NO head
+    /// applied. VoiceChat runs TWO heads over the same hidden state (`lm_head`
+    /// and the tool-call `function_head`), so it needs the hidden itself
+    /// rather than the logits `callAsFunction(inputsEmbeds:cache:)` returns.
+    public func hiddenStatesFromEmbeddings(
+        _ inputsEmbeds: MLXArray, cache: [KVCache]?
+    ) -> MLXArray {
+        backbone.forwardFromEmbeddings(inputsEmbeds, cache: cache)
+    }
+
     /// Forward starting from pre-computed embeddings (for multimodal splice).
     /// Returns logits in the same shape as ``callAsFunction(_:cache:)``.
     public func callAsFunction(inputsEmbeds: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -1759,14 +1769,21 @@ public struct NemotronHConfiguration: Codable, Sendable {
         convKernel = try container.decode(Int.self, forKey: .convKernel)
         nGroups = try container.decode(Int.self, forKey: .nGroups)
         intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
-        moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)
+        // DENSE nemotron_h (e.g. Nemotron-Nano-9B-v2, the VoiceChat backbone)
+        // ships NO MoE keys at all. The pattern for those bundles contains only
+        // M / - / * and never `E`, so no MoE layer is constructed and these
+        // values are unused. Defaulting to 0 is strictly widening: any config
+        // that DOES carry them decodes exactly as before; only configs that
+        // previously THREW now load, as dense.
+        moeIntermediateSize =
+            try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 0
         moeLatentSize = try container.decodeIfPresent(Int.self, forKey: .moeLatentSize)
-        moeSharedExpertIntermediateSize = try container.decode(
-            Int.self, forKey: .moeSharedExpertIntermediateSize)
-        nRoutedExperts = try container.decode(Int.self, forKey: .nRoutedExperts)
+        moeSharedExpertIntermediateSize =
+            try container.decodeIfPresent(Int.self, forKey: .moeSharedExpertIntermediateSize) ?? 0
+        nRoutedExperts = try container.decodeIfPresent(Int.self, forKey: .nRoutedExperts) ?? 0
         nSharedExperts = try container.decodeIfPresent(Int.self, forKey: .nSharedExperts)
         numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK(
-            currentTopK: try container.decode(Int.self, forKey: .numExpertsPerTok),
+            currentTopK: try container.decodeIfPresent(Int.self, forKey: .numExpertsPerTok) ?? 0,
             modelType: modelType,
             field: CodingKeys.numExpertsPerTok.rawValue)
         layerNormEpsilon =
