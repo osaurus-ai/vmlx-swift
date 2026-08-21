@@ -15,7 +15,6 @@
 
 import Foundation
 import MLX
-import MLXFast
 import MLXLMCommon
 import MLXNN
 import MLXRandom
@@ -145,13 +144,24 @@ public class VoiceChatTTSBackbone: Module {
         // mask sized to the rotating cache. Masks are built from the matching
         // cache kind so an offset from a rotating buffer cannot be applied to
         // a full one.
-        let globalMask = createAttentionMask(
-            h: h, cache: cache.map { $0[slidingWindowPattern - 1] } ?? nil)
+        //
+        // 🚨 A SINGLE-token step needs NO mask at all: the one new query may
+        // attend to every cached key (the rotating buffer is itself the
+        // window). Asking for a causal mask here is not a harmless extra — it
+        // misaligns the query against a cache that already holds the history,
+        // and the result is a hidden state that is close to right and
+        // therefore renders as fluent-sounding babble instead of words. The
+        // whole-sequence warmup path was exact while this step was not.
+        let isSingleStep = h.dim(1) == 1
+        let globalMask: MLXFast.ScaledDotProductAttentionMaskMode =
+            isSingleStep
+            ? .none
+            : createAttentionMask(h: h, cache: cache.map { $0[slidingWindowPattern - 1] } ?? nil)
         let slidingMask: MLXFast.ScaledDotProductAttentionMaskMode =
-            slidingWindowPattern > 1
-            ? createAttentionMask(
+            isSingleStep || slidingWindowPattern <= 1
+            ? .none
+            : createAttentionMask(
                 h: h, cache: cache?.first, windowSize: config.slidingWindow)
-            : .none
 
         for (i, layer) in layers.enumerated() {
             let isGlobal = (i % slidingWindowPattern == slidingWindowPattern - 1)

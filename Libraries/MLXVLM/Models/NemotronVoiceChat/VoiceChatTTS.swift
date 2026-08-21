@@ -18,7 +18,6 @@
 
 import Foundation
 import MLX
-import MLXFast
 import MLXLMCommon
 import MLXNN
 import MLXRandom
@@ -130,6 +129,12 @@ public class VoiceChatMoGHead: Module {
         self._lowMat.wrappedValue = MLXArray.zeros([predictions, outSize, rank])
     }
 
+    /// `VMLX_VOICECHAT_MOG_ARGMAX=1` replaces the Gumbel draw with an argmax
+    /// over the mixture logits — a diagnostic arm for isolating sampling bugs
+    /// from head bugs.
+    static let deterministicComponent =
+        ProcessInfo.processInfo.environment["VMLX_VOICECHAT_MOG_ARGMAX"] == "1"
+
     /// - Returns: (sampled latent residual mean, log-std)
     public func infer(
         _ input: MLXArray, guidanceScale: Float, topP: Float
@@ -149,10 +154,18 @@ public class VoiceChatMoGHead: Module {
 
         let b = x.dim(0), t = x.dim(1)
         let logits = voiceChatTopPLogits(projLogits(x), topP: topP)
-        let uniform = MLXRandom.uniform(low: 0.0, high: 1.0, logits.shape)
-        let gumbel = -MLX.log(-MLX.log(uniform + 1e-8) + 1e-8)
-        let component = MLX.argMax(
-            MLX.log(MLX.softmax(logits.asType(.float32), axis: -1)) + gumbel, axis: -1)
+        let component: MLXArray
+        if Self.deterministicComponent {
+            // Diagnostic arm: pick the most likely mixture component instead of
+            // sampling one. If speech becomes intelligible only here, the fault
+            // is in the nucleus filter or the Gumbel draw, not in the head.
+            component = MLX.argMax(logits.asType(.float32), axis: -1)
+        } else {
+            let uniform = MLXRandom.uniform(low: 0.0, high: 1.0, logits.shape)
+            let gumbel = -MLX.log(-MLX.log(uniform + 1e-8) + 1e-8)
+            component = MLX.argMax(
+                MLX.log(MLX.softmax(logits.asType(.float32), axis: -1)) + gumbel, axis: -1)
+        }
 
         let flatX = x.reshaped([-1, x.dim(-1)])
         let flatComponent = component.reshaped([-1])
