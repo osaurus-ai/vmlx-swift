@@ -1388,6 +1388,16 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         backbone.embeddings(tokens)
     }
 
+    /// Final-normed hidden states from pre-computed embeddings, with NO head
+    /// applied. VoiceChat runs TWO heads over the same hidden state (`lm_head`
+    /// and the tool-call `function_head`), so it needs the hidden itself
+    /// rather than the logits `callAsFunction(inputsEmbeds:cache:)` returns.
+    public func hiddenStatesFromEmbeddings(
+        _ inputsEmbeds: MLXArray, cache: [KVCache]?
+    ) -> MLXArray {
+        backbone.forwardFromEmbeddings(inputsEmbeds, cache: cache)
+    }
+
     /// Forward starting from pre-computed embeddings (for multimodal splice).
     /// Returns logits in the same shape as ``callAsFunction(_:cache:)``.
     public func callAsFunction(inputsEmbeds: MLXArray, cache: [KVCache]?) -> MLXArray {

@@ -64,6 +64,7 @@ public struct VoiceChatEncoderConfiguration: Codable, Sendable {
     public let useBias: Bool?
     public let untieBiases: Bool?
     public let xscaling: Bool?
+    public let posEmbMaxLen: Int?
 
     enum CodingKeys: String, CodingKey {
         case dModel = "d_model"
@@ -83,6 +84,7 @@ public struct VoiceChatEncoderConfiguration: Codable, Sendable {
         case useBias = "use_bias"
         case untieBiases = "untie_biases"
         case xscaling
+        case posEmbMaxLen = "pos_emb_max_len"
     }
 
     /// True when the encoder must run causally/chunked rather than offline.
@@ -112,11 +114,15 @@ public struct VoiceChatRNNTDecoderConfiguration: Codable, Sendable {
     public let predHidden: Int?
     public let predRNNLayers: Int?
     public let vocabSize: Int?
+    /// `true` on the shipped bundle: the embedding table carries one extra row
+    /// (1025 = vocab + blank) so the blank id can be fed as a start pad.
+    public let blankAsPad: Bool?
 
     enum CodingKeys: String, CodingKey {
         case predHidden = "pred_hidden"
         case predRNNLayers = "pred_rnn_layers"
         case vocabSize = "vocab_size"
+        case blankAsPad = "blank_as_pad"
     }
 }
 
@@ -124,10 +130,16 @@ public struct VoiceChatRNNTDecoderConfiguration: Codable, Sendable {
 public struct VoiceChatRNNTJointConfiguration: Codable, Sendable {
     public let jointHidden: Int?
     public let numClasses: Int?
+    public let encoderHidden: Int?
+    public let predHidden: Int?
+    public let activation: String?
 
     enum CodingKeys: String, CodingKey {
         case jointHidden = "joint_hidden"
         case numClasses = "num_classes"
+        case encoderHidden = "encoder_hidden"
+        case predHidden = "pred_hidden"
+        case activation
     }
 }
 
