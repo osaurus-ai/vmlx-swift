@@ -97,24 +97,26 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             }
         }
         if stored < 3 {
-            // The control is now a PERCENT of the disk, because a GB figure
-            // that suits one machine starves another. An install that chose an
-            // explicit GB size keeps exactly the cap it chose — the value is
-            // converted to the equivalent share of its own volume, so the
-            // number in the field changes but the amount of disk used does
-            // not. Nobody's cache silently shrinks or grows on update.
-            if cache.blockDisk.maxSizePercent == nil,
-                let gb = cache.blockDisk.maxSizeGB, gb > 0,
-                let capacity = Self.cacheVolumeCapacityGB(
-                    for: Self.resolvedDirectory(cache.blockDisk.directory)),
-                capacity > 0
-            {
-                cache.blockDisk.maxSizePercent = (gb / capacity) * 100.0
-                cache.blockDisk.maxSizeGB = nil
-            }
-            // A volume we cannot measure keeps its GB value untouched rather
-            // than being converted against a guessed capacity. The resolver
-            // still honours it, so such an install simply keeps working.
+            // ONE-TIME: every updating install lands on 10% of its own disk.
+            //
+            // This is a deliberate reset, not a unit conversion. The setting
+            // is a share of the disk now, and the whole point is that every
+            // machine ends up correctly sized for itself — so an install
+            // carrying a stale number from the flat-10-GB era, or any other
+            // hand-set figure, is moved onto the share rather than kept.
+            //
+            // For essentially everyone this RAISES the cap: the old default
+            // was a flat 10 GB, which is 10% of a 100 GB disk and a rounding
+            // error on a 4 TB one. A 27B stores ~256 KiB per token, so a
+            // 222k-token conversation needs ~54 GB and the old cap could not
+            // hold even one of them.
+            //
+            // Version-gated, so it happens exactly once. A size the user
+            // chooses AFTER updating is theirs and survives every later
+            // launch — same shape as the v2 migration and the MTP-Off fix.
+            cache.blockDisk.maxSizePercent = Self.autoDiskCacheFraction * 100.0
+            cache.blockDisk.maxSizeGB = nil
+            cache.legacyDisk.maxSizeGB = nil
         }
         schemaVersion = Self.contractVersion
     }
