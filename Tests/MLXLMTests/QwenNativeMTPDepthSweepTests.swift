@@ -198,9 +198,22 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
         let verifier = ProcessInfo.processInfo.environment["VMLX_MTP_SWEEP_VERIFIER"]
             .flatMap { $0.isEmpty ? nil : $0 }
 
-        struct Arm { let name: String; let depth: Int? }
-        let arms: [Arm] = [Arm(name: "baseline", depth: nil)]
-            + Self.depths.map { Arm(name: "mtp-d\($0)", depth: $0) }
+        // DFlash 2 block sizes, so the same prompt-class and context axes that
+        // decided the MTP depths can decide the block size too. The
+        // checkpoint's own trained block_size is what ships when the user
+        // leaves the setting blank, so "is the default the right value" is a
+        // question the harness has to be able to answer.
+        let dflashPath = ProcessInfo.processInfo.environment["VMLX_MTP_SWEEP_DFLASH2"]
+            .map { URL(fileURLWithPath: NSString(string: $0).expandingTildeInPath) }
+        let dflashBlocks = (ProcessInfo.processInfo.environment["VMLX_MTP_SWEEP_DFLASH2_BLOCKS"]
+            ?? "4,6,8").split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+
+        struct Arm { let name: String; let depth: Int?; let dflashBlock: Int? }
+        var arms: [Arm] = [Arm(name: "baseline", depth: nil, dflashBlock: nil)]
+        arms += Self.depths.map { Arm(name: "mtp-d\($0)", depth: $0, dflashBlock: nil) }
+        if dflashPath != nil {
+            arms += dflashBlocks.map { Arm(name: "dflash-b\($0)", depth: nil, dflashBlock: $0) }
+        }
 
         func run(_ arm: Arm) async throws
             -> (text: String, seconds: Double, tokens: Int, mtp: String)
@@ -224,7 +237,13 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
             p.topP = 1
             p.topK = 0
             p.minP = 0
-            p.draftStrategy = arm.depth.map { DraftStrategy.nativeMTP(depth: $0, verifierMode: verifier) }
+            if let block = arm.dflashBlock, let dflashPath {
+                p.draftStrategy = .dflash2(drafterPath: dflashPath, blockSize: block)
+            } else {
+                p.draftStrategy = arm.depth.map {
+                    DraftStrategy.nativeMTP(depth: $0, verifierMode: verifier)
+                }
+            }
 
             var text = ""
             var tokens = 0
@@ -287,7 +306,7 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
                      baselineTPS, samples["baseline"]?.count ?? 0))
 
         var best: (depth: Int, tps: Double, equivalent: Bool)?
-        for arm in arms where arm.depth != nil {
+        for arm in arms where arm.depth != nil || arm.dflashBlock != nil {
             let tps = median(samples[arm.name] ?? [])
             let text = lastText[arm.name] ?? ""
             let equivalent = text == baselineText
@@ -308,8 +327,8 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
                 try? baselineText.write(toFile: dir + "/baseline.txt", atomically: true, encoding: .utf8)
                 try? text.write(toFile: dir + "/\(arm.name).txt", atomically: true, encoding: .utf8)
             }
-            if best == nil || tps > best!.tps {
-                best = (arm.depth!, tps, equivalent)
+            if let d = arm.depth, best == nil || tps > best!.tps {
+                best = (d, tps, equivalent)
             }
         }
 

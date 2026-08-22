@@ -126,3 +126,45 @@ struct MTPTuningFileShapeTests {
         #expect(t?.usableBestDepth == nil)
     }
 }
+
+@Suite("DFlash 2 default block size")
+struct DFlash2DefaultBlockSizeTests {
+
+    /// Blank used to mean "use the checkpoint's trained block_size", which is 8
+    /// — the worst value measured in every condition, and on prose slower than
+    /// not drafting at all:
+    ///
+    ///     condition       b4      b6      b8
+    ///     code, short     1.430   1.337   1.239
+    ///     prose, short    1.244   1.016   0.837  <- below baseline
+    ///     long ~7k        1.225   1.156   1.093
+    @Test("a blank setting no longer inherits the trained block size of 8")
+    func blankDefaultsToTheThroughputOptimum() {
+        #expect(VMLXServerRuntimeSettings.throughputOptimalDFlash2Block(trained: 8) == 4)
+        #expect(VMLXServerRuntimeSettings.throughputOptimalDFlash2Block(trained: 16) == 4)
+    }
+
+    /// Never ask a drafter to draft more positions than it was trained with.
+    @Test("a drafter trained smaller than the optimum is not overdriven")
+    func smallTrainedBlockIsNotExceeded() {
+        #expect(VMLXServerRuntimeSettings.throughputOptimalDFlash2Block(trained: 2) == 2)
+        #expect(VMLXServerRuntimeSettings.throughputOptimalDFlash2Block(trained: 3) == 3)
+    }
+
+    /// A nonsense value must not produce a zero or negative block.
+    @Test("a non-positive trained block falls back to the optimum")
+    func nonPositiveTrainedBlockFallsBack() {
+        #expect(VMLXServerRuntimeSettings.throughputOptimalDFlash2Block(trained: 0) == 4)
+        #expect(VMLXServerRuntimeSettings.throughputOptimalDFlash2Block(trained: -1) == 4)
+    }
+
+    /// An explicit user choice still wins — this changed the blank default only.
+    @Test("an explicit user block size is still honoured")
+    func explicitUserChoiceStillWins() {
+        var s = VMLXServerRuntimeSettings()
+        s.mtp.dflash2BlockSize = 8
+        #expect(s.mtp.dflash2BlockSize == 8)
+        s.mtp.dflash2BlockSize = nil
+        #expect(s.mtp.dflash2BlockSize == nil)
+    }
+}
