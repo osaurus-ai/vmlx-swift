@@ -336,6 +336,37 @@ public final class DiskCache: @unchecked Sendable {
                 fileSize = 0
             }
 
+            // A payload larger than the entire quota cannot survive the pass
+            // below, and trying takes the rest of the cache with it. The pass
+            // evicts oldest-first until the total is back under `maxSizeBytes`:
+            // with `excess = others + E - C`, evicting every other entry only
+            // accumulates `others`, and `others < excess` exactly when `E > C`,
+            // so the loop continues and deletes `E` too. Net result was the
+            // worst of both — the oversized file written and immediately
+            // removed, AND every previously cached boundary removed with it.
+            // At a small share of a small disk that is a full cache wipe on
+            // every turn.
+            //
+            // Decided on the MEASURED file size rather than an estimate from
+            // `nbytes`: the serializer may quantize or compress, so an estimate
+            // could drop a store that would in fact have fit. This costs one
+            // write that was going to happen anyway and leaves the cache
+            // intact. It is not a cap on what the user may do — the request has
+            // already produced its output, and an entry that the existing quota
+            // pass would delete microseconds later is not being taken away from
+            // anyone.
+            if enforceQuota, fileSize > maxSizeBytes {
+                try? FileManager.default.removeItem(at: url)
+                validatedFiles.removeValue(forKey: hash)
+                storeSkips += 1
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    FileHandle.standardError.write(Data(
+                        ("[vmlx][cache/disk-store] SKIP oversized hash=\(hash.prefix(12)) "
+                            + "bytes=\(fileSize) cap=\(maxSizeBytes) count=\(tokenCount)\n").utf8))
+                }
+                return
+            }
+
             _insertEntryLocked(hash: hash, tokenCount: tokenCount, fileSize: fileSize)
             if let fingerprint = _fileFingerprint(url: url), fingerprint.size > 0 {
                 validatedFiles[hash] = fingerprint

@@ -217,3 +217,69 @@ private func makeCacheDir() -> URL {
         #expect(late >= 0.75, "cache never reached the warning threshold; got \(late)")
     }
 }
+
+/// One boundary bigger than the whole cap must not take the cache down with it.
+///
+/// It used to. The store path writes the payload, indexes it, and only then
+/// runs the quota pass, which evicts oldest-first until the total is back under
+/// the cap. Work the arithmetic for a single entry `E` larger than the cap `C`,
+/// with `others` already resident: `excess = others + E - C`. Evicting every
+/// other entry accumulates only `others`, and `others < excess` exactly when
+/// `E > C` — so the loop kept going and evicted `E` as well.
+///
+/// The result was the worst of both: the oversized payload written to the SSD
+/// and immediately deleted, AND every previously-cached boundary deleted with
+/// it. Measured before the fix: two 70 KB entries under a 300 KB cap, then one
+/// 430 KB store — `currentEntryCount` went 2 → 0.
+///
+/// The store now measures the written file and drops just that file when it
+/// cannot possibly survive. The sizes here deliberately do not divide evenly
+/// into the cap.
+@Test func aSingleOversizedEntryDoesNotWipeTheRestOfTheCache() throws {
+    try MLXMetalTestLock.withLock {
+        let dir = makeCacheDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let cap = 300_000
+        let cache = DiskCache(cacheDir: dir, maxSizeBytes: cap, modelKey: "oversize")
+
+        // Two entries that comfortably coexist under the cap.
+        store(cache, tokens: [1, 1, 1], approximateBytes: 70_000)
+        store(cache, tokens: [2, 2, 2], approximateBytes: 70_000)
+
+        let before = cache.snapshotStats()
+        #expect(before.currentEntryCount == 2, "setup did not land two entries")
+
+        // One boundary larger than the entire cap — a long context on a model
+        // whose KV does not fit the configured share.
+        store(cache, tokens: [3, 3, 3], approximateBytes: 430_000)
+
+        let after = cache.snapshotStats()
+
+        // The oversized entry still cannot be resident; nothing it could evict
+        // makes room for it. That was never the defect.
+        #expect(
+            !cache.hasDurableEntry(tokens: [3, 3, 3]),
+            "an entry larger than the cap must not be left resident")
+
+        // The defect: the two innocent entries must survive.
+        #expect(
+            cache.hasDurableEntry(tokens: [1, 1, 1]),
+            "the oldest entry was evicted for a store that could never survive")
+        #expect(
+            cache.hasDurableEntry(tokens: [2, 2, 2]),
+            "an entry was evicted for a store that could never survive")
+        #expect(after.currentEntryCount == 2, "the cache was wiped by a doomed store")
+
+        // And no file was left behind on disk for the skipped payload.
+        #expect(
+            after.currentPayloadBytes <= cap,
+            "payload \(after.currentPayloadBytes) exceeded cap \(cap)")
+
+        // Nothing was evicted at all: the doomed write is dropped before the
+        // quota pass ever runs, so it cannot cost an existing boundary.
+        #expect(
+            after.evictions == before.evictions,
+            "a doomed store must not trigger eviction")
+    }
+}
