@@ -153,6 +153,19 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
         // explicitly makes "none / paged / disk" a controlled comparison rather
         // than an unstated condition -- and every number measured before this
         // axis existed was a no-cache number.
+        // MLX's buffer cache regrows after every clearCache, and on a box that
+        // is already sharing RAM with another large process that overhead is
+        // what pushes free memory to ~1GB and makes timings untrustworthy
+        // (a 16GB model was consuming ~29GB resident). Capping it applies
+        // EQUALLY to every arm, so the speedup ratio stays a valid comparison
+        // while the run actually fits.
+        if let mb = ProcessInfo.processInfo.environment["VMLX_MTP_SWEEP_CACHE_MB"],
+            let bytes = Int(mb).map({ $0 * 1_048_576 })
+        {
+            MLX.GPU.set(cacheLimit: bytes)
+            print("[mtpsweep] MLX cache limit = \(mb) MB")
+        }
+
         let cacheTier = ProcessInfo.processInfo.environment["VMLX_MTP_SWEEP_CACHE"]?
             .lowercased() ?? "none"
         let (context, _) = try await MLXLMCommon.loadModel(
