@@ -258,6 +258,8 @@ public struct MuseGlimmerProcessor: UserInputProcessor {
             text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
             image: processedImage,
             video: processedVideo,
+            mediaTokenIds: MediaTokenIds.resolve(
+                tokenizer: tokenizer, tokens: ["<|patch|>", "<|video|>"]),
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }

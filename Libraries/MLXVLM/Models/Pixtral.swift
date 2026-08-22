@@ -1154,6 +1154,8 @@ public struct PixtralProcessor: UserInputProcessor {
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask),
                 image: .init(pixels: pixels, frames: [THW(1, paddedHeight, paddedWidth)]),
+                mediaTokenIds: MediaTokenIds.resolve(
+                    tokenizer: tokenizer, tokens: ["[IMG]", "[IMG_BREAK]", "[IMG_END]"]),
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
             )
         }

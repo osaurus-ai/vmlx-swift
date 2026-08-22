@@ -89,12 +89,10 @@ struct VLMediaTokenDeclarationReachabilityTests {
 
     /// The reachability claim itself: which processors feed the mechanism.
     ///
-    /// The three Qwen VL processors were added here — they share the
-    /// `<|image_pad|>` / `<|video_pad|>` scheme and resolve their ids through
-    /// `QwenVL.mediaTokenIds`. Every other family still declares nothing and
-    /// still takes the blanket rollback.
-    @Test("the declaring set is the three original processors plus Qwen VL")
-    func declaringSetIsTheThreeOriginalsPlusQwenVL() throws {
+    /// Every processor whose placeholder tokens could be established now
+    /// declares them, through the shared `MediaTokenIds.resolve`.
+    @Test("every processor with knowable placeholder tokens declares them")
+    func declaringSetCoversEveryKnowableProcessor() throws {
         let declaring =
             try Self.vlmSources()
             .filter { $0.text.contains("mediaTokenIds:") }
@@ -103,28 +101,83 @@ struct VLMediaTokenDeclarationReachabilityTests {
 
         #expect(
             declaring == [
-                "Audex.swift", "DeepseekOCRProcessor.swift", "NemotronHOmni.swift",
-                "Qwen25VL.swift", "Qwen2VL.swift", "Qwen3VL.swift",
+                "Audex.swift", "DeepseekOCRProcessor.swift", "FastVLM.swift",
+                "Gemma4.swift", "LFM2VL.swift", "Mistral3.swift",
+                "MuseGlimmerProcessor.swift", "NemotronHOmni.swift", "Pixtral.swift",
+                "Qwen25VL.swift", "Qwen2VL.swift", "Qwen3VL.swift", "SmolVLM2.swift",
+                "Zaya1VL.swift",
             ],
             "declaring processors changed: \(declaring)")
     }
 
-    /// Named individually so the failure message says WHICH family regained or
-    /// lost the declaration, instead of only that a count moved.
-    @Test("the families that were not converted still declare nothing")
-    func unconvertedFamiliesDeclareNothing() throws {
+    /// The remaining three carry their placeholder only as a numeric config id
+    /// the processor cannot see, so there is no string to round-trip. They keep
+    /// the conservative blanket rollback rather than a guessed id — a WRONG id
+    /// is worse than none, because it would wave through a suffix that really
+    /// does carry a placeholder.
+    @Test("config-id-only families are deliberately left undeclared")
+    func configIdOnlyFamiliesRemainUndeclared() throws {
         let sources = try Self.vlmSources()
-        let mainstream = [
-            "Gemma4.swift", "Gemma3.swift", "MuseGlimmerProcessor.swift",
-            "LFM2VL.swift", "Mistral3.swift", "Glm4v.swift", "Zaya1VL.swift",
-            "Idefics3.swift", "Pixtral.swift", "SmolVLM2.swift", "FastVLM.swift",
-        ]
-
-        for name in mainstream {
+        for name in ["Gemma3.swift", "Glm4v.swift", "Idefics3.swift"] {
             guard let file = sources.first(where: { $0.name == name }) else { continue }
             #expect(
                 !file.text.contains("mediaTokenIds:"),
-                "\(name) now declares mediaTokenIds — update the reuse table in the audit")
+                "\(name) declared ids — verify the token string round-trips first")
+        }
+    }
+
+    /// A family that emits more than one KIND of placeholder must declare all
+    /// of them. Declaring only some is the dangerous direction: a suffix
+    /// carrying the undeclared kind matches nothing, reads as media-free, and
+    /// resumes onto the wrong media.
+    @Test("multi-modality families declare every placeholder kind they emit")
+    func multiModalityFamiliesDeclareEveryKind() throws {
+        let sources = try Self.vlmSources()
+
+        func text(_ name: String) -> String {
+            sources.first(where: { $0.name == name })?.text ?? ""
+        }
+
+        // Gemma 4 builds an LMInput carrying image AND audio.
+        let gemma4 = text("Gemma4.swift")
+        #expect(gemma4.contains(#""<|image|>""#))
+        #expect(gemma4.contains(#""<|audio|>""#))
+
+        // Muse Glimmer expands `<|patch|>` for stills and `<|video|>` for clips.
+        let muse = text("MuseGlimmerProcessor.swift")
+        #expect(muse.contains(#""<|patch|>""#))
+        #expect(muse.contains(#""<|video|>""#))
+
+        // Qwen VL: image and video pads.
+        for name in ["Qwen3VL.swift", "Qwen25VL.swift", "Qwen2VL.swift"] {
+            #expect(text(name).contains(#""<|image_pad|>", "<|video_pad|>""#), "\(name)")
+        }
+
+        // Mistral/Pixtral repeat [IMG] and separate spans with BREAK/END.
+        for name in ["Mistral3.swift", "Pixtral.swift"] {
+            let t = text(name)
+            #expect(t.contains(#""[IMG]""#), "\(name)")
+            #expect(t.contains(#""[IMG_BREAK]""#), "\(name)")
+            #expect(t.contains(#""[IMG_END]""#), "\(name)")
+        }
+    }
+
+    /// Named individually so the failure message says WHICH family regained or
+    /// lost the declaration, instead of only that a count moved.
+    /// Resolution goes through the one shared helper, so the round-trip and
+    /// nil-not-empty guarantees hold everywhere rather than per copy.
+    @Test("every declaration resolves through the shared helper")
+    func everyDeclarationUsesTheSharedResolver() throws {
+        let declaring = try Self.vlmSources().filter { $0.text.contains("mediaTokenIds:") }
+
+        for file in declaring {
+            #expect(
+                file.text.contains("MediaTokenIds.resolve")
+                    || file.text.contains("QwenVL.mediaTokenIds")
+                    || file.name == "Audex.swift"
+                    || file.name == "DeepseekOCRProcessor.swift"
+                    || file.name == "NemotronHOmni.swift",
+                "\(file.name) hand-rolls its ids instead of using MediaTokenIds.resolve")
         }
     }
 
