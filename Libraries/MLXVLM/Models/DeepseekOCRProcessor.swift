@@ -343,7 +343,9 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
             // a hardcoded bos_id = 0.
             var tokens = tokenizer.encode(text: prompt, addSpecialTokens: false)
             tokens.insert(0, at: 0)  // BOS id 0
-            return LMInput(tokens: MLXArray(tokens), tokenIds: tokens)
+            return LMInput(
+                tokens: MLXArray(tokens), tokenIds: tokens,
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         }
 
         // Build the prompt, splitting on the <image> marker exactly like
@@ -433,10 +435,20 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
         let maskArray = MLXArray(imagesSeqMask.map { $0 ? Int32(1) : Int32(0) })
             .expandedDimensions(axis: 0)
 
+        // The image path MUST carry the scope salt. Without it two requests
+        // whose text tokens match but whose IMAGES differ hash to the same
+        // cache key, so the second one hits the first one's KV — the vision
+        // tower's embeddings for a completely different picture. The output is
+        // fluent and about the wrong image, which is the worst way for a cache
+        // to be wrong: nothing errors and nothing looks off.
+        //
+        // Every other VLM processor here already passes it; this one was the
+        // sole omission, caught by VLMCacheScopeSourceCoverageTests.
         return LMInput(
             text: .init(tokens: promptArray, mask: maskArray, tokenIds: tokenizedStr),
             image: processedImage,
-            mediaTokenIds: [imageTokenId])
+            mediaTokenIds: [imageTokenId],
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 
     /// Flatten image_ori and (optional) crop patches into a single 1-D pixel
