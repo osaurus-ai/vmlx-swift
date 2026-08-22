@@ -928,9 +928,23 @@ public struct PresencePenaltyContext: LogitProcessor {
         self.ring = TokenRing(capacity: presenceContextSize)
     }
 
-    mutating public func prompt(_ prompt: MLXArray) {
-        ring.loadPrompt(prompt)
-    }
+    /// DELIBERATELY EMPTY: the presence penalty applies to GENERATED tokens only.
+    ///
+    /// `presence_penalty` is OpenAI's parameter, and vLLM — the reference implementation most
+    /// published values are measured against — computes it from `output_tokens` alone:
+    ///
+    ///     output_bin_counts, output_mask = get_token_bin_counts_and_mask(output_tokens_tensor, …)
+    ///     logits -= presence_penalties.unsqueeze(dim=1) * output_mask
+    ///
+    /// Seeding the ring with the prompt penalises tokens the model never chose. With a long prompt the
+    /// window can be ENTIRELY prompt at the first decode step, so the opening tokens are penalised for
+    /// the user's wording. Qwen publishes `presence_penalty: 1.5` for non-thinking operation against
+    /// that definition; applying it to prompt tokens measures something its authors did not specify.
+    ///
+    /// NOTE the contrast with `RepetitionContext`, which SHOULD keep seeding the prompt: HuggingFace's
+    /// `repetition_penalty` is defined over `input_ids`, prompt included. The parameters differ in
+    /// scope, so they differ here.
+    mutating public func prompt(_ prompt: MLXArray) {}
 
     public func process(logits: MLXArray) -> MLXArray {
         guard let indices = ring.validTokens?.asType(.uint32) else { return logits }
@@ -956,9 +970,10 @@ public struct FrequencyPenaltyContext: LogitProcessor {
         self.ring = TokenRing(capacity: frequencyContextSize)
     }
 
-    mutating public func prompt(_ prompt: MLXArray) {
-        ring.loadPrompt(prompt)
-    }
+    /// DELIBERATELY EMPTY, for the same reason as `PresencePenaltyContext.prompt`: `frequency_penalty`
+    /// is OpenAI's parameter and vLLM counts occurrences in `output_tokens` only. Counting prompt
+    /// occurrences would scale the penalty by how often the USER said a word.
+    mutating public func prompt(_ prompt: MLXArray) {}
 
     public func process(logits: MLXArray) -> MLXArray {
         guard let validTokens = ring.validTokens else { return logits }
