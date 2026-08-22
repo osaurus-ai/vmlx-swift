@@ -162,6 +162,10 @@ import Testing
 @Test func aFreshSettingsValueIsAlreadyAtTheCurrentSchema() {
     var settings = VMLXServerRuntimeSettings()
     settings.migrateToCurrentSchema()
-    #expect(settings.schemaVersion == 2)
+    // Against `contractVersion` rather than a literal: the assertion is that a
+    // fresh value needs no migration, which stays true at every schema bump.
+    // Pinning the number made adding a migration look like a regression.
+    #expect(settings.schemaVersion == VMLXServerRuntimeSettings.contractVersion)
     #expect(settings.cache.blockDisk.maxSizeGB == nil)
+    #expect(settings.cache.blockDisk.maxSizePercent == nil, "fresh installs use the default share")
 }

@@ -15,7 +15,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     /// 2: disk-cache size default moved from a flat 10 GB to auto (10% of the
     ///    cache volume). Installs that had already written the literal 10.0
     ///    must move to auto, otherwise only fresh installs benefit.
-    public static let contractVersion = 2
+    public static let contractVersion = 3
 
     public var network: VMLXServerNetworkSettings
     public var concurrency: VMLXServerConcurrencySettings
@@ -95,6 +95,26 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             if let legacy = cache.legacyDisk.maxSizeGB, legacy == 10.0 {
                 cache.legacyDisk.maxSizeGB = nil
             }
+        }
+        if stored < 3 {
+            // The control is now a PERCENT of the disk, because a GB figure
+            // that suits one machine starves another. An install that chose an
+            // explicit GB size keeps exactly the cap it chose — the value is
+            // converted to the equivalent share of its own volume, so the
+            // number in the field changes but the amount of disk used does
+            // not. Nobody's cache silently shrinks or grows on update.
+            if cache.blockDisk.maxSizePercent == nil,
+                let gb = cache.blockDisk.maxSizeGB, gb > 0,
+                let capacity = Self.cacheVolumeCapacityGB(
+                    for: Self.resolvedDirectory(cache.blockDisk.directory)),
+                capacity > 0
+            {
+                cache.blockDisk.maxSizePercent = (gb / capacity) * 100.0
+                cache.blockDisk.maxSizeGB = nil
+            }
+            // A volume we cannot measure keeps its GB value untouched rather
+            // than being converted against a guessed capacity. The resolver
+            // still honours it, so such an install simply keeps working.
         }
         schemaVersion = Self.contractVersion
     }
@@ -864,32 +884,44 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         let reuseEnabled = cache.prefix.enabled
         let diskEnabled: Bool
         let diskMaxSizeGB: Double?
+        let diskMaxSizePercent: Double?
         let diskDirectory: String?
         if reuseEnabled, cache.pagedKV.enabled {
             diskEnabled = cache.blockDisk.enabled
+            diskMaxSizePercent = cache.blockDisk.maxSizePercent
             diskMaxSizeGB = cache.blockDisk.maxSizeGB
             diskDirectory = cache.blockDisk.directory
         } else if reuseEnabled, cache.blockDisk.enabled {
             diskEnabled = true
+            diskMaxSizePercent = cache.blockDisk.maxSizePercent
             diskMaxSizeGB = cache.blockDisk.maxSizeGB
             diskDirectory = cache.blockDisk.directory
         } else if reuseEnabled {
             diskEnabled = cache.legacyDisk.enabled
+            // The legacy disk cache has no percent control of its own; it
+            // follows the block-disk percentage so one setting governs the
+            // whole cache root, which is what the quota actually enforces.
+            diskMaxSizePercent = cache.blockDisk.maxSizePercent
             diskMaxSizeGB = cache.legacyDisk.maxSizeGB
             diskDirectory = cache.legacyDisk.directory
         } else {
             diskEnabled = false
+            diskMaxSizePercent = nil
             diskMaxSizeGB = nil
             diskDirectory = nil
         }
         let diskDir = diskCacheDirectory
             ?? VMLXServerRuntimeSettings.resolvedDirectory(diskDirectory)
-        // Unset means AUTO — a share of the cache volume, not a flat constant.
-        // Applies to every model because the cap governs the whole cache root
-        // (`CacheCoordinator.enforceSharedDiskQuota`), not one bundle.
+        // The cap is a PERCENT of the cache volume, not a flat constant: KV
+        // cost scales with the model, so one GB figure is wrong for every
+        // machine at once. Applies to every model because the quota governs
+        // the whole cache root (`CacheCoordinator.enforceSharedDiskQuota`),
+        // not one bundle.
         let diskMaxGB = Float(
-            diskMaxSizeGB
-                ?? VMLXServerRuntimeSettings.autoDiskCacheMaxGB(for: diskDir))
+            VMLXServerRuntimeSettings.resolveDiskCacheMaxGB(
+                percent: diskMaxSizePercent,
+                legacyGB: diskMaxSizeGB,
+                directory: diskDir))
 
         return CacheCoordinatorConfig(
             usePagedCache: reuseEnabled && cache.pagedKV.enabled,
@@ -930,6 +962,56 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     ///
     /// This ADVISES a larger cap; it never refuses or blocks. If the volume's
     /// capacity cannot be read it returns the floor rather than guessing small.
+    /// Total capacity of the volume holding `directory`, in GB, or nil when it
+    /// cannot be read.
+    ///
+    /// Separated from the cap arithmetic so the UI can show a user what their
+    /// percentage actually resolves to ("10% of 3.7 TB ≈ 372 GB") using the
+    /// same number the runtime enforces, rather than a second estimate that
+    /// can disagree with it.
+    public static func cacheVolumeCapacityGB(for directory: URL?) -> Double? {
+        guard let directory else { return nil }
+        // Walk up to the nearest existing ancestor: the cache dir itself may not
+        // exist yet on first run, and `resourceValues` needs a real path.
+        var probe = directory
+        while !FileManager.default.fileExists(atPath: probe.path) {
+            let parent = probe.deletingLastPathComponent()
+            guard parent.path != probe.path else { return nil }
+            probe = parent
+        }
+        guard
+            let capacity = try? probe.resourceValues(
+                forKeys: [.volumeTotalCapacityKey]
+            ).volumeTotalCapacity
+        else { return nil }
+        return Double(capacity) / 1_073_741_824.0
+    }
+
+    /// Resolve the effective cap from the user's settings.
+    ///
+    /// Order is percent, then the legacy GB value, then the default share. The
+    /// percent is what the UI edits; the GB value only survives so an install
+    /// that already had an explicit number keeps exactly that number until it
+    /// is migrated.
+    ///
+    /// Like `autoDiskCacheMaxGB`, this ADVISES upward and never downward: a
+    /// volume whose capacity cannot be read falls back to the floor rather
+    /// than guessing small, and nothing here refuses or blocks.
+    public static func resolveDiskCacheMaxGB(
+        percent: Double?,
+        legacyGB: Double?,
+        directory: URL?
+    ) -> Double {
+        if let percent, percent > 0 {
+            guard let capacity = cacheVolumeCapacityGB(for: directory) else {
+                return autoDiskCacheFloorGB
+            }
+            return Swift.max(autoDiskCacheFloorGB, capacity * percent / 100.0)
+        }
+        if let legacyGB, legacyGB > 0 { return legacyGB }
+        return autoDiskCacheMaxGB(for: directory)
+    }
+
     public static func autoDiskCacheMaxGB(for directory: URL?) -> Double {
         guard let directory else { return autoDiskCacheFloorGB }
         // Walk up to the nearest existing ancestor: the cache dir itself may not
@@ -1275,11 +1357,35 @@ public struct VMLXDiskCacheSettings: Codable, Sendable, Equatable {
 
 public struct VMLXBlockDiskCacheSettings: Codable, Sendable, Equatable {
     public var enabled: Bool
+
+    /// Cap as a PERCENT OF THE CACHE VOLUME (e.g. 10 means 10%).
+    ///
+    /// This is the setting users actually see, and it is a percent rather than
+    /// a byte count because the right cap is a property of the machine, not a
+    /// number anyone can pick. KV cost scales with the model — a 27B stores
+    /// ~256 KiB per token, so a 222k window needs ~54 GB — which means a fixed
+    /// GB figure that suits one Mac starves another. A share of the disk is
+    /// correct on every machine at once.
+    ///
+    /// `nil` means "use the default share" (`autoDiskCacheFraction`).
+    public var maxSizePercent: Double?
+
+    /// Legacy explicit cap in GB. No longer surfaced as a control — it exists
+    /// so an install that already had an explicit number keeps exactly the cap
+    /// it had until migration converts it to the equivalent percent. Ignored
+    /// whenever `maxSizePercent` is set.
     public var maxSizeGB: Double?
+
     public var directory: String?
 
-    public init(enabled: Bool = true, maxSizeGB: Double? = nil, directory: String? = nil) {
+    public init(
+        enabled: Bool = true,
+        maxSizePercent: Double? = nil,
+        maxSizeGB: Double? = nil,
+        directory: String? = nil
+    ) {
         self.enabled = enabled
+        self.maxSizePercent = maxSizePercent
         self.maxSizeGB = maxSizeGB
         self.directory = directory
     }
