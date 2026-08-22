@@ -301,6 +301,8 @@ public struct SmolVLMProcessor: UserInputProcessor {
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask),
                 image: .init(pixels: pixels),
+                mediaTokenIds: MediaTokenIds.resolve(
+                    tokenizer: tokenizer, tokens: ["<image>", "<fake_token_around_image>"]),
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
             )
         } else {
@@ -383,6 +385,8 @@ public struct SmolVLMProcessor: UserInputProcessor {
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask),
                 image: .init(pixels: transposedFrames, frames: thwFrames),
+                mediaTokenIds: MediaTokenIds.resolve(
+                    tokenizer: tokenizer, tokens: ["<image>", "<fake_token_around_image>"]),
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
             )
         }

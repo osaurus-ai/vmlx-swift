@@ -228,6 +228,16 @@ public struct QwenVL {
         return result
     }
 
+    /// Placeholder token ids for `LMInput.mediaTokenIds`, resolved from the
+    /// tokenizer rather than a model config the processor cannot see.
+    ///
+    /// Thin wrapper over ``MediaTokenIds/resolve(tokenizer:tokens:)`` — see
+    /// there for why a token must round-trip and why this returns `nil` rather
+    /// than `[]`.
+    static func mediaTokenIds(tokenizer: any Tokenizer, tokens: [String]) -> [Int]? {
+        MediaTokenIds.resolve(tokenizer: tokenizer, tokens: tokens)
+    }
+
     static func paddingPlaceholderRanges(
         in promptTokens: [Int],
         paddingToken: String,

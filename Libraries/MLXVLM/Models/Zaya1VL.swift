@@ -1754,6 +1754,8 @@ public struct Zaya1VLProcessor: UserInputProcessor {
         return LMInput(
             text: LMInput.Text(tokens: MLXArray(promptTokens), tokenIds: promptTokens),
             image: processedImage,
+            mediaTokenIds: MediaTokenIds.resolve(
+                tokenizer: tokenizer, tokens: ["<image>"]),
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }

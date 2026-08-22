@@ -1027,6 +1027,8 @@ public struct FastVLMProcessor: UserInputProcessor {
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
             image: .init(pixels: pixels),
+            mediaTokenIds: MediaTokenIds.resolve(
+                tokenizer: tokenizer, tokens: ["<image>"]),
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
         )
     }

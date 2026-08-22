@@ -1296,6 +1296,8 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
             image: .init(pixels: preprocessResult.pixels, frames: preprocessResult.frames),
+            mediaTokenIds: MediaTokenIds.resolve(
+                tokenizer: tokenizer, tokens: ["[IMG]", "[IMG_BREAK]", "[IMG_END]"]),
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
         )
     }

@@ -1680,6 +1680,8 @@ public struct Gemma4Processor: UserInputProcessor {
             text: .init(tokens: pa, mask: ones(like: pa).asType(.int8), tokenIds: tokens),
             image: processedImage,
             audio: processedAudio,
+            mediaTokenIds: MediaTokenIds.resolve(
+                tokenizer: tokenizer, tokens: ["<|image|>", "<|audio|>"]),
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
             cachePrefixTokenCounts: cacheBoundaries.all,
             cacheStablePrefixTokenCounts: cacheBoundaries.stable,

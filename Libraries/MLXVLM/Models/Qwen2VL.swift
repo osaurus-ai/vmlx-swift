@@ -637,6 +637,8 @@ public struct Qwen2VLProcessor: UserInputProcessor {
             text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
             image: processedImage,
             video: processedVideo,
+            mediaTokenIds: QwenVL.mediaTokenIds(
+                tokenizer: tokenizer, tokens: ["<|image_pad|>", "<|video_pad|>"]),
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }

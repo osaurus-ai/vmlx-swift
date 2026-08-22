@@ -885,6 +885,8 @@ public struct LFM2VLProcessor: UserInputProcessor {
                 pixels: pixelValuesConcatenated,
                 frames: frames
             ),
+            mediaTokenIds: MediaTokenIds.resolve(
+                tokenizer: tokenizer, tokens: ["<image>"]),
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
             toolSchemas: input.tools
         )
