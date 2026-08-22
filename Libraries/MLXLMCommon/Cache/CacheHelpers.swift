@@ -754,6 +754,24 @@ private func restoreFromV2Arrays(
     let indexed = TQDiskSerializer.deserializeIndexed(arrays)
     guard !indexed.isEmpty else { return 0 }
 
+    // A record that describes FEWER layers than the runtime cache has is a
+    // truncated record, and must miss.
+    //
+    // `deserializeIndexed` detects a GAP in the layer-kind tags, but a gap
+    // requires a tag on both sides of it. Losing the TRAILING tags — which is
+    // what a partially-flushed write actually leaves behind — creates no gap:
+    // the contiguous walk simply ends early, and the damaged payload becomes a
+    // smaller well-formed one. The surviving layers then restore, seed
+    // `totalTokens`, and the caller is told the entry hit while the tail
+    // layers sit at offset 0. Attention runs against empty layers and the
+    // model produces confident wrong text instead of re-prefilling.
+    //
+    // The serializer writes a tag for EVERY layer, `.skip` included, so a
+    // well-formed record always describes exactly `cache.count` layers. Only
+    // the restore path knows that count, which is why this check cannot live
+    // in the deserializer. Refusing costs one re-prefill.
+    guard indexed.count >= cache.count else { return 0 }
+
     // ZAYA disk records are an all-or-nothing prompt-boundary snapshot. Restore
     // every typed layer into a private copy first, including encoded TQ state,
     // so a corrupt later CCA layer cannot leave the caller's cache half-seated.

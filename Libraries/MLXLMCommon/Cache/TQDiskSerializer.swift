@@ -1104,7 +1104,18 @@ public enum TQDiskSerializer {
                         }
                         offset = Int(off)
                     } else {
-                        offset = 0
+                        // MISSING is damage, not "position zero".
+                        //
+                        // `serializeMambaLayer` writes `__mamba_i_offset__`
+                        // unconditionally whenever it writes `state0`, so a
+                        // payload carrying recurrent state without its offset
+                        // was truncated. Defaulting to 0 seated real state at
+                        // the wrong position and let the record report a hit —
+                        // the sibling branch two lines up already refuses an
+                        // UNREADABLE offset for exactly this reason, and a
+                        // missing one is no more trustworthy.
+                        out.append(IndexedLayerData(index: i, data: .requiredMiss))
+                        continue
                     }
                     out.append(
                         IndexedLayerData(
