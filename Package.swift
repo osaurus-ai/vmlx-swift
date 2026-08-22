@@ -881,6 +881,7 @@ let package = Package(
                 "Gemma4ThoughtChannelParserFocusedTests.swift",
                 "Gemma3nTextSanitizeFocusedTests.swift",
                 "MediaCachePlaceholderTests.swift",
+                "VLGrowingConversationReuseTests.swift",
                 "NemotronHOmniPreEncodedAudioTests.swift",
                 "NemotronHJANGTQDispatchFocusedTests.swift",
                 "MTPRuntimeFocusedTests.swift",
