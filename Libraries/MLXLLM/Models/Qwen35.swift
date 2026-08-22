@@ -1263,11 +1263,69 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
         sanitize(weights: weights, normConvention: nil)
     }
 
+    /// Stack per-expert MTP MoE weights into the fused `switch_mlp` layout.
+    ///
+    /// The quantizer fuses the MAIN layers' experts but not the MTP block's.
+    /// Measured on `Ornith-1.5-35B-A3B-JANG_4M`:
+    ///
+    ///     language_model.model.layers.N.mlp.switch_mlp.gate_proj.weight   (360 keys, fused)
+    ///     mtp.layers.N.mlp.experts.N.gate_proj.weight                     (2304 keys, NOT fused)
+    ///
+    /// `Qwen35SparseMoeBlock` only has a `switch_mlp` (`SwitchGLU`) slot, so the
+    /// unfused keys had nowhere to land and the load died with
+    /// `unhandledKeys(path: [... "mtp","layers","0","mlp"], keys: ["experts"])`.
+    /// The weights were present and correct the whole time; nothing could map
+    /// them. That is why every Ornith-1.5-35B bundle ships with no MTP tuning
+    /// file — the head could not be loaded, so it could never be measured.
+    ///
+    /// `SwitchGLU` expects each projection stacked on a leading expert axis, so
+    /// `weight`, `scales` and `biases` are each stacked in expert order. Bundles
+    /// that already ship fused are untouched: without an `.experts.` key this is
+    /// a no-op.
+    static func fusingMTPExpertWeights(
+        _ weights: [String: MLXArray],
+        numExperts: Int
+    ) -> [String: MLXArray] {
+        guard numExperts > 0 else { return weights }
+
+        // group[(prefix, projection, component)][expertIndex] = value
+        var groups: [String: [Int: MLXArray]] = [:]
+        var consumed: Set<String> = []
+        for (key, value) in weights {
+            guard let range = key.range(of: ".mlp.experts.") else { continue }
+            guard key.contains("mtp.") else { continue }
+            let prefix = String(key[key.startIndex ..< range.lowerBound])
+            let tail = String(key[range.upperBound...])
+            let parts = tail.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2, let expert = Int(parts[0]) else { continue }
+            groups["\(prefix).mlp.switch_mlp.\(parts[1])", default: [:]][expert] = value
+            consumed.insert(key)
+        }
+        guard !groups.isEmpty else { return weights }
+
+        var out = weights
+        for key in consumed { out[key] = nil }
+        for (fusedKey, byExpert) in groups {
+            // Every expert must be present, or the stack would silently encode
+            // the wrong routing. Drop the group rather than guess.
+            let indices = byExpert.keys.sorted()
+            guard indices.count == numExperts,
+                  indices.first == 0,
+                  indices.last == numExperts - 1
+            else { continue }
+            out[fusedKey] = stacked(indices.map { byExpert[$0]! }, axis: 0)
+        }
+        return out
+    }
+
     private func sanitize(weights: [String: MLXArray], normConvention: String?) -> [String:
         MLXArray]
     {
         let loadNativeMTP = configuration.mtpNumHiddenLayers > 0
         var weights = loadNativeMTP ? weights : weights.filter { !Self.isMTPWeightKey($0.key) }
+        if loadNativeMTP {
+            weights = Self.fusingMTPExpertWeights(weights, numExperts: configuration.numExperts)
+        }
         // Resolve the (1 + weight) RMSNorm shift via the shared resolver: a per-bundle
         // metadata/config declaration wins; otherwise (this arch uses the convention) the
         // order-independent majority vote decides raw (→ shift) vs already-shifted (→ leave it).

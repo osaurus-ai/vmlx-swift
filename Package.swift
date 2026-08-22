@@ -884,6 +884,7 @@ let package = Package(
                 "ReasoningEffortSaltScopeTests.swift",
                 "QwenMTPShippedDepthProbeTests.swift",
                 "MTPTuningFileShapeTests.swift",
+                "MTPExpertFusionTests.swift",
                 "NemotronHOmniPreEncodedAudioTests.swift",
                 "NemotronHJANGTQDispatchFocusedTests.swift",
                 "MTPRuntimeFocusedTests.swift",
