@@ -96,6 +96,32 @@ struct MTPExpertFusionTests {
         #expect(out["mtp.layers.0.mlp.switch_mlp.gate_proj.weight"] == nil)
     }
 
+    /// MXFP8 ships no `biases`. Measured across the four Ornith-1.5-35B
+    /// bundles: JANG_2L/4M/6M each carry 2304 unfused MTP expert keys
+    /// (256 experts x 3 projections x weight/scales/biases) while MXFP8 carries
+    /// 1536 (256 x 3 x weight/scales). Fusing must therefore group per
+    /// (projection, component) rather than assuming a fixed component set --
+    /// otherwise the quant that ships two components silently fuses nothing.
+    @Test("an MXFP8-shaped expert set with no biases still fuses")
+    func mxfp8ShapeWithoutBiasesFuses() {
+        var w: [String: MLXArray] = [:]
+        for e in 0..<4 {
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                for comp in ["weight", "scales"] {  // no biases, as MXFP8 ships
+                    w["mtp.layers.0.mlp.experts.\(e).\(proj).\(comp)"] =
+                        MLXArray([Float(e)]).reshaped([1, 1])
+                }
+            }
+        }
+        let out = Qwen35TextModel.fusingMTPExpertWeights(w, numExperts: 4)
+
+        #expect(out["mtp.layers.0.mlp.switch_mlp.gate_proj.weight"]?.shape[0] == 4)
+        #expect(out["mtp.layers.0.mlp.switch_mlp.gate_proj.scales"]?.shape[0] == 4)
+        // Must not invent a biases tensor the checkpoint never shipped.
+        #expect(out["mtp.layers.0.mlp.switch_mlp.gate_proj.biases"] == nil)
+        #expect(out.keys.contains { $0.contains(".mlp.experts.") } == false)
+    }
+
     /// Multiple MTP layers each fuse independently.
     @Test("each MTP layer fuses separately")
     func multipleLayersFuseIndependently() {
