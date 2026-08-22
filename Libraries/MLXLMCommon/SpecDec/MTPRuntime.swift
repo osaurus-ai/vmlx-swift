@@ -1504,11 +1504,41 @@ public enum MTPBundleInspector {
         }
     }
 
+    /// Read `vmlx_mtp_tuning.json` in either shape it is written in.
+    ///
+    /// Two producers disagree, and the reader only understood one of them.
+    /// PR #278's sweep writes the measurement NESTED under `native_mtp`;
+    /// `stamp_qwen38_27b` writes the same keys FLAT at the top level. Only the
+    /// nested form decoded, so every flat file was silently ignored — the
+    /// bundle looked to the runtime exactly like one with no tuning file at
+    /// all, and `rejectionReason` said so, which sent anyone reading it after
+    /// the wrong thing.
+    ///
+    /// Measured across `~/models` on 2026-08-22: of 15 bundles carrying a
+    /// complete MTP artifact, exactly ONE launched. Five Qwen3.8-27B bundles
+    /// carried a flat `best_depth: 1` stamp that the runtime could not see.
+    ///
+    /// Nested is tried first so a file containing both keys keeps the sweep's
+    /// value. This does NOT loosen the launch gate: `usableBestDepth` still
+    /// demands `validated`, `output_equivalent` and a real speedup, so an
+    /// unmeasured flat stamp still refuses to launch — it just refuses for the
+    /// true reason instead of pretending the file is absent.
+    /// Test seam for the two-shape reader above. Exercising it through a full
+    /// `inspect` would need a whole synthetic bundle (config, tensor index,
+    /// safetensors headers) just to reach one JSON decode.
+    static func nativeMTPTuningForTesting(from directory: URL) throws -> NativeMTPTuning? {
+        try loadNativeMTPTuning(from: directory)
+    }
+
     private static func loadNativeMTPTuning(from directory: URL) throws -> NativeMTPTuning? {
         let url = directory.appendingPathComponent(NativeMTPTuning.fileName)
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode(NativeMTPTuningDocument.self, from: data).nativeMTP
+        let decoder = JSONDecoder()
+        if let nested = try? decoder.decode(NativeMTPTuningDocument.self, from: data).nativeMTP {
+            return nested
+        }
+        return try decoder.decode(NativeMTPTuning.self, from: data)
     }
 
     private static func safetensorsHeaderNames(_ url: URL) throws -> [String] {

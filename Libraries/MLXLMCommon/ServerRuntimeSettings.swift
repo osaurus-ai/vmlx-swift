@@ -502,7 +502,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         if let selection = resolvedDFlash2Selection(configData: configData) {
             return .dflash2(
                 drafterPath: URL(fileURLWithPath: selection.path),
-                blockSize: mtp.dflash2BlockSize)
+                blockSize: mtp.dflash2BlockSize
+                    ?? Self.throughputOptimalDFlash2Block(trained: selection.blockSize))
         }
         guard launch.launchMode == .speculative,
               let depth = launch.recommendation?.depth
@@ -510,6 +511,36 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             return nil
         }
         return .nativeMTP(depth: depth, verifierMode: launch.recommendation?.verifierMode)
+    }
+
+    /// Block size to draft with when the user has not chosen one.
+    ///
+    /// Leaving the setting blank used to mean "use the checkpoint's trained
+    /// `block_size`", which is 8 — and 8 is the WORST value measured, in every
+    /// condition tested. A user who selected a drafter and changed nothing got
+    /// the weakest possible result, and on prose got a result slower than not
+    /// using the drafter at all.
+    ///
+    /// Measured 2026-08-22 on Qwen3.8-27B-JANG_4D, ABAB, round 1 discarded,
+    /// median, quiet box, against the same axes that decided the MTP depths:
+    ///
+    ///     condition        b4      b6      b8 (trained default)
+    ///     code, short      1.430   1.337   1.239
+    ///     prose, short     1.244   1.016   0.837   <- slower than baseline
+    ///     long ~7k ctx     1.225   1.156   1.093
+    ///
+    /// b4 dominates in all three with no crossover. This matches z-lab/dflash#151,
+    /// which measured the shipped block_size well above the Apple-Silicon
+    /// throughput optimum: smaller blocks win despite LOWER acceptance, because a
+    /// quantized verify forward's cost grows faster with row count than acceptance
+    /// does.
+    ///
+    /// Clamped rather than hardcoded, so a future drafter trained with a block
+    /// SMALLER than 4 is never asked to draft more positions than it has. An
+    /// explicit user setting still wins — this only replaces the blank default.
+    static func throughputOptimalDFlash2Block(trained: Int) -> Int {
+        guard trained > 0 else { return 4 }
+        return Swift.min(trained, 4)
     }
 
     /// The selected DFlash 2 drafter, if one is set and fits the bundle

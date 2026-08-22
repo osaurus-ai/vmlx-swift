@@ -149,7 +149,23 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
             return XCTFail("expected .dflash2, got \(String(describing: strategy?.kindName))")
         }
         XCTAssertEqual(path.path, dir.path)
-        XCTAssertNil(blockSize, "block size should default to the checkpoint's own")
+        // A blank setting used to inherit the checkpoint's trained block_size.
+        // That value is 8, and 8 measured WORST in every condition tested --
+        // on prose it was 0.837x, i.e. slower than not drafting at all:
+        //
+        //     condition      b4      b6      b8
+        //     code, short    1.430   1.337   1.239
+        //     prose, short   1.244   1.016   0.837
+        //     long ~7k       1.225   1.156   1.093
+        //
+        // (Qwen3.8-27B-JANG_4D, ABAB, round 1 discarded, median, quiet box,
+        // 2026-08-22.) This file's sibling DFlash2SpeedSweepTests already cited
+        // z-lab/dflash#151 for the same conclusion -- the shipped block_size sits
+        // well above the Apple-Silicon throughput optimum -- so the old default
+        // contradicted a finding the repo had already written down.
+        XCTAssertEqual(
+            blockSize, 4,
+            "a blank setting must resolve to the throughput optimum, not the trained block")
     }
 
     func testDrafterIsUsedEvenWhenMTPModeIsOff() throws {
