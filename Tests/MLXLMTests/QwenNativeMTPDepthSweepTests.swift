@@ -57,11 +57,32 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
     /// Prose, deliberately. A counting/deterministic prompt once produced a
     /// 1.83x MTP figure that did not survive contact with real text — an
     /// artifact of a prompt the drafter could trivially predict.
-    private static let prompt = """
-        Explain, in three well-developed paragraphs, how a write-ahead log lets a \
-        database survive a crash without losing committed transactions. Cover \
-        durability, recovery, and the trade-off against write amplification.
-        """
+    /// Prompt class is an axis, not a constant. The JANG_4D artifact records
+    /// prose 1.43x and code 1.80x — acceptance differs enough by content that
+    /// measuring one and generalising is how a 1.83x MTP number once got
+    /// published off a counting prompt.
+    private static var promptClass: String {
+        ProcessInfo.processInfo.environment["VMLX_MTP_SWEEP_PROMPT"]?.lowercased() ?? "prose"
+    }
+
+    private static var prompt: String {
+        switch promptClass {
+        case "code":
+            return """
+                Write a complete Swift implementation of a thread-safe LRU cache \
+                with a fixed capacity. Include the node type, the doubly-linked \
+                list operations, get and put, and a brief comment on why the lock \
+                is held where it is.
+                """
+        default:
+            return """
+                Explain, in three well-developed paragraphs, how a write-ahead log \
+                lets a database survive a crash without losing committed \
+                transactions. Cover durability, recovery, and the trade-off \
+                against write amplification.
+                """
+        }
+    }
 
     private func freeMemoryGB() -> Double {
         var stats = vm_statistics64_data_t()
