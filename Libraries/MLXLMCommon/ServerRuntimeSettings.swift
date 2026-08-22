@@ -1008,7 +1008,15 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             guard let capacity = cacheVolumeCapacityGB(for: directory) else {
                 return autoDiskCacheFloorGB
             }
-            return Swift.max(autoDiskCacheFloorGB, capacity * percent / 100.0)
+            // NO FLOOR on an explicit share.
+            //
+            // The floor exists so that resolving AUTO can only ever raise the
+            // cap — nobody loses cache they had before by not choosing. Applying
+            // it to a number the user typed inverts that: someone who sets 1% on
+            // a 500 GB disk means 5 GB, and clamping them up to 10 GB is an
+            // invented limit overriding an explicit choice. Their machine,
+            // their call.
+            return capacity * percent / 100.0
         }
         if let legacyGB, legacyGB > 0 { return legacyGB }
         return autoDiskCacheMaxGB(for: directory)

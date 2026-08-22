@@ -17,6 +17,7 @@
 // change how much disk the user actually gets.
 
 import Foundation
+import MLX
 
 @testable import MLXLMCommon
 import Testing
@@ -84,16 +85,30 @@ struct DiskCacheSizePercentTests {
         }
     }
 
-    /// Advises upward, never downward — the rule the whole auto-sizing change
-    /// was built on.
-    @Test("the resolved cap never drops below the historical default")
-    func neverResolvesBelowTheFloor() {
+    /// The floor guards AUTO, and only auto.
+    ///
+    /// Resolving an unset value must never lower anyone's cap — that is what
+    /// the floor is for. But clamping a share the USER typed is an invented
+    /// limit overriding an explicit choice: 1% of a 500 GB disk means 5 GB,
+    /// and silently making it 10 GB is us deciding we know better.
+    @Test("the floor applies to auto, never to a share the user chose")
+    func floorAppliesToAutoNotToAnExplicitShare() {
         let dir = tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
-        // 0.0001% of any real volume is far under the floor.
-        let resolved = VMLXServerRuntimeSettings.resolveDiskCacheMaxGB(
+
+        // Auto: floored.
+        let auto = VMLXServerRuntimeSettings.resolveDiskCacheMaxGB(
+            percent: nil, legacyGB: nil, directory: dir)
+        #expect(auto >= VMLXServerRuntimeSettings.autoDiskCacheFloorGB)
+
+        // Explicit tiny share: honoured exactly, not clamped up.
+        let explicit = VMLXServerRuntimeSettings.resolveDiskCacheMaxGB(
             percent: 0.0001, legacyGB: nil, directory: dir)
-        #expect(resolved >= VMLXServerRuntimeSettings.autoDiskCacheFloorGB)
+        #expect(
+            explicit < VMLXServerRuntimeSettings.autoDiskCacheFloorGB,
+            "an explicit share was clamped up to the floor — that overrides the user")
+        let capacity = try! #require(VMLXServerRuntimeSettings.cacheVolumeCapacityGB(for: dir))
+        #expect(abs(explicit - capacity * 0.000001) < 0.0001)
     }
 
     // MARK: - Migration
@@ -275,6 +290,109 @@ struct DiskCacheSizePercentTests {
         #expect(
             settings.cache.blockDisk.maxSizePercent == 33,
             "the one-time reset ran again and overwrote a deliberate choice")
+    }
+
+    // MARK: - End-to-end enforcement
+    //
+    // The wiring tests above prove the number ARRIVES at
+    // `CacheCoordinatorConfig`. This proves the arriving number is actually
+    // ENFORCED: a real DiskCache, real payloads written past the cap, and the
+    // janitor trimming them. A cap that is plumbed correctly and never acted
+    // on looks identical from the settings side.
+
+    @Test("a percent-derived cap is enforced by the disk janitor")
+    func percentDerivedCapIsEnforced() throws {
+        try MLXMetalTestLock.withLock {
+            let dir = tempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+
+            // Choose a share that lands on a small, fillable cap for THIS
+            // volume, so the test works on any machine rather than assuming a
+            // disk size. Possible only because an explicit share is not
+            // floored — the whole point of that fix.
+            let capacity = try #require(
+                VMLXServerRuntimeSettings.cacheVolumeCapacityGB(for: dir))
+            let targetCapBytes = 400_000.0
+            let percent = (targetCapBytes / 1_073_741_824.0) / capacity * 100.0
+
+            var settings = VMLXServerRuntimeSettings()
+            settings.schemaVersion = VMLXServerRuntimeSettings.contractVersion
+            settings.cache.blockDisk.enabled = true
+            settings.cache.blockDisk.directory = dir.path
+            settings.cache.blockDisk.maxSizePercent = percent
+
+            // Through the real config path the engine uses.
+            let config = settings.cacheCoordinatorConfig(modelKey: "percent-enforced")
+            let capBytes = Int(Double(config.diskCacheMaxGB) * 1_073_741_824.0)
+            #expect(
+                abs(Double(capBytes) - targetCapBytes) < 50_000,
+                "settings resolved to \(capBytes) bytes, expected ~\(Int(targetCapBytes))")
+
+            let cache = DiskCache(
+                cacheDir: dir, maxSizeBytes: capBytes, modelKey: "percent-enforced")
+
+            for i in 0..<12 {
+                let count = Swift.max(1, 80_000 / 4)
+                cache.store(
+                    tokens: [i, i + 1, i + 2], arrays: ["k": MLXArray.zeros([count])])
+            }
+
+            let final = cache.snapshotStats()
+            #expect(
+                final.currentPayloadBytes <= capBytes,
+                "payload \(final.currentPayloadBytes) exceeded the percent-derived cap \(capBytes)")
+            // A cache that refused every write would also satisfy the line
+            // above, so the janitor has to have actually run.
+            #expect(final.evictions > 0, "nothing was evicted — the cap was not enforced")
+            #expect(final.currentEntryCount > 0, "everything was evicted")
+        }
+    }
+
+    /// Changing the share changes what gets evicted. This is the "toggle the
+    /// setting and watch it take effect" case, end to end.
+    @Test("raising the share lets the cache keep more, lowering it evicts")
+    func changingTheShareChangesWhatSurvives() throws {
+        try MLXMetalTestLock.withLock {
+            let dir = tempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let capacity = try #require(
+                VMLXServerRuntimeSettings.cacheVolumeCapacityGB(for: dir))
+
+            func capBytes(forTargetBytes target: Double) -> Int {
+                var s = VMLXServerRuntimeSettings()
+                s.schemaVersion = VMLXServerRuntimeSettings.contractVersion
+                s.cache.blockDisk.enabled = true
+                s.cache.blockDisk.directory = dir.path
+                s.cache.blockDisk.maxSizePercent =
+                    (target / 1_073_741_824.0) / capacity * 100.0
+                return Int(
+                    Double(s.cacheCoordinatorConfig(modelKey: "resize").diskCacheMaxGB)
+                        * 1_073_741_824.0)
+            }
+
+            // Fill under a roomy share first.
+            let roomy = DiskCache(
+                cacheDir: dir, maxSizeBytes: capBytes(forTargetBytes: 2_000_000),
+                modelKey: "resize")
+            for i in 0..<8 {
+                roomy.store(tokens: [i, i + 1], arrays: ["k": MLXArray.zeros([20_000])])
+            }
+            let beforeBytes = roomy.snapshotStats().currentPayloadBytes
+            #expect(beforeBytes > 400_000, "setup did not fill the cache")
+
+            // Now tighten the share. The next store must enforce the new cap.
+            let tightCap = capBytes(forTargetBytes: 250_000)
+            let tightened = DiskCache(
+                cacheDir: dir, maxSizeBytes: tightCap, modelKey: "resize")
+            tightened.store(tokens: [99, 100], arrays: ["k": MLXArray.zeros([20_000])])
+
+            let after = tightened.snapshotStats()
+            #expect(
+                after.currentPayloadBytes <= tightCap,
+                "lowering the share did not take effect: \(after.currentPayloadBytes) > \(tightCap)")
+            #expect(after.currentPayloadBytes < beforeBytes, "nothing was trimmed")
+            #expect(after.evictions > 0)
+        }
     }
 
     // MARK: - Capacity readout
