@@ -228,6 +228,37 @@ public struct QwenVL {
         return result
     }
 
+    /// Placeholder token ids for `LMInput.mediaTokenIds`, resolved from the
+    /// tokenizer rather than a model config the processor cannot see.
+    ///
+    /// Declaring these is what lets a cache hit resume. Without them
+    /// `cacheHitSuffixContainsMediaPlaceholder` takes its
+    /// `guard let mediaTokenIds else { return true }` branch and rolls back on
+    /// ANY non-empty suffix — so a text follow-up about the same picture
+    /// re-prefills the whole prompt, vision tower included. The rollback still
+    /// fires when the suffix genuinely carries a placeholder; it just stops
+    /// firing when it does not.
+    ///
+    /// Returns `nil` unless a token round-trips to exactly itself. A tokenizer
+    /// without these specials encodes `<|image_pad|>` to several ordinary
+    /// pieces, or to a single `<unk>` — and `<unk>` would be a *real* id
+    /// appearing throughout ordinary text, which would suppress reuse far more
+    /// aggressively than declaring nothing. Encoding to one token is therefore
+    /// necessary but not sufficient; the decode check is what rules out unk.
+    /// See the `convertTokenToId` unk pitfall.
+    static func mediaTokenIds(tokenizer: any Tokenizer, tokens: [String]) -> [Int]? {
+        var ids: [Int] = []
+        for token in tokens {
+            let encoded = tokenizer.encode(text: token, addSpecialTokens: false)
+            guard encoded.count == 1, let id = encoded.first else { continue }
+            guard tokenizer.decode(tokenIds: [id], skipSpecialTokens: false) == token else {
+                continue
+            }
+            ids.append(id)
+        }
+        return ids.isEmpty ? nil : ids
+    }
+
     static func paddingPlaceholderRanges(
         in promptTokens: [Int],
         paddingToken: String,
