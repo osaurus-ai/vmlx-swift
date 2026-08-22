@@ -125,11 +125,38 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
         // baseline ran at 18.66 tok/s and all three MTP arms threw.
         var loadConfiguration = LoadConfiguration.default
         loadConfiguration.nativeMTP = true
+
+        // Cache tier is an axis. A bare `ModelContext` has NO coordinator at
+        // all -- `CacheCoordinatorConfig.enableDiskCache` defaults to false and
+        // the coordinator normally lives on `ModelContainer`. So a sweep that
+        // loads a context and calls `generate` measures the engine with ZERO
+        // caching, which is NOT what the app runs. Passing a coordinator
+        // explicitly makes "none / paged / disk" a controlled comparison rather
+        // than an unstated condition -- and every number measured before this
+        // axis existed was a no-cache number.
+        let cacheTier = ProcessInfo.processInfo.environment["VMLX_MTP_SWEEP_CACHE"]?
+            .lowercased() ?? "none"
         let (context, _) = try await MLXLMCommon.loadModel(
             from: dir,
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: loadConfiguration)
         nonisolated(unsafe) let ctx = context
+
+        let coordinator: CacheCoordinator?
+        switch cacheTier {
+        case "paged":
+            coordinator = CacheCoordinator(
+                config: CacheCoordinatorConfig(
+                    enableDiskCache: false, modelKey: dir.lastPathComponent))
+        case "disk":
+            coordinator = CacheCoordinator(
+                config: CacheCoordinatorConfig(
+                    enableDiskCache: true, modelKey: dir.lastPathComponent))
+        default:
+            coordinator = nil
+        }
+        nonisolated(unsafe) let coord = coordinator
+        print("[mtpsweep] cache tier = \(cacheTier)")
         let maxTokens = 256
 
         // The verifier mode is part of the measurement, not a detail. The
@@ -146,8 +173,16 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
         func run(_ arm: Arm) async throws
             -> (text: String, seconds: Double, tokens: Int, mtp: String)
         {
+            // Reasoning is an axis too. With thinking on, a large share of the
+            // generated tokens are hidden reasoning, and the acceptance the
+            // controller reads is acceptance on THAT text — not on the answer
+            // the user waits for.
+            var context: [String: any Sendable]? = nil
+            if let r = ProcessInfo.processInfo.environment["VMLX_MTP_SWEEP_REASONING"] {
+                context = ["enable_thinking": !(["0", "off", "false", "no"].contains(r.lowercased()))]
+            }
             let input = try await ctx.processor.prepare(
-                input: UserInput(chat: [.user(Self.prompt)]))
+                input: UserInput(chat: [.user(Self.prompt)], additionalContext: context))
             var p = GenerateParameters(
                 generationConfig: ctx.configuration.generationDefaults,
                 fallback: GenerateParameters(maxTokens: maxTokens, prefillStepSize: 1024))
@@ -169,7 +204,7 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
             var mtpNote = "-"
             let start = Date()
             for await item in try MLXLMCommon.generate(
-                input: input, parameters: p, context: ctx)
+                input: input, parameters: p, context: ctx, cacheCoordinator: coord)
             {
                 switch item {
                 case .chunk(let c): text += c
@@ -237,6 +272,10 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
                 shared, 80,
                 "\(arm.name) diverged from baseline almost immediately — broken forward, not a near-tie")
 
+            if let dir = ProcessInfo.processInfo.environment["VMLX_MTP_SWEEP_DUMP"] {
+                try? baselineText.write(toFile: dir + "/baseline.txt", atomically: true, encoding: .utf8)
+                try? text.write(toFile: dir + "/\(arm.name).txt", atomically: true, encoding: .utf8)
+            }
             if best == nil || tps > best!.tps {
                 best = (arm.depth!, tps, equivalent)
             }
