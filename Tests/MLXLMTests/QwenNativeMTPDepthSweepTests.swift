@@ -84,7 +84,7 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
                 """
             return "Read the following notes, then write a detailed design "
                 + "review of the recovery protocol they describe.\n\n"
-                + Array(repeating: para, count: 40).joined(separator: "\n\n")
+                + Array(repeating: para, count: Int(ProcessInfo.processInfo.environment["VMLX_MTP_SWEEP_LONG_REPEAT"] ?? "40") ?? 40).joined(separator: "\n\n")
                 + "\n\nNow write the design review."
         case "code":
             return """
