@@ -67,6 +67,25 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
 
     private static var prompt: String {
         switch promptClass {
+        case "long":
+            // A realistic long conversation, not a short probe. The 56-token
+            // boundary measured earlier stored 124 MB in 27ms; DiskCache's own
+            // note records a ~357MB boundary taking ~25s, so the store cost has
+            // to be measured at depth before "SSD caching is free" can be said
+            // about real chats rather than about short prompts.
+            let para = """
+                The write-ahead log appends every mutation to durable storage \
+                before the corresponding page is modified in the buffer pool, so \
+                a crash can always be reconciled by replaying the log forward \
+                from the last checkpoint. Recovery proceeds in three phases: \
+                analysis rebuilds the dirty page table, redo reapplies committed \
+                work, and undo rolls back transactions that never reached a \
+                commit record.
+                """
+            return "Read the following notes, then write a detailed design "
+                + "review of the recovery protocol they describe.\n\n"
+                + Array(repeating: para, count: 40).joined(separator: "\n\n")
+                + "\n\nNow write the design review."
         case "code":
             return """
                 Write a complete Swift implementation of a thread-safe LRU cache \
