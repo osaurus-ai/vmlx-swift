@@ -28,7 +28,16 @@ struct QwenMTPShippedDepthProbeTests {
             let configData = try? Data(contentsOf: dir.appendingPathComponent("config.json"))
             let jang = try? JangLoader.loadConfig(at: dir)
             let status = try? MTPBundleInspector.inspect(modelDirectory: dir, jangConfig: jang)
-            guard let status, status.hasCompleteMTPArtifact else { continue }
+            guard let status else { continue }
+            let declaresMTP = (try? Data(contentsOf: url))
+                .flatMap { String(data: $0, encoding: .utf8) }?
+                .contains("\"mtp\"") ?? false
+            guard status.hasCompleteMTPArtifact || declaresMTP else { continue }
+            if !status.hasCompleteMTPArtifact {
+                print("MTPPROBE \(dir.path.replacingOccurrences(of: root.path + "/", with: "")) "
+                    + "-> DECLARES mtp BUT ARTIFACT INCOMPLETE: \(status.statusLine ?? "no status")")
+                continue
+            }
             let tuning = status.nativeMTPTuning
             let rec = NativeMTPAutoDecodePolicy.recommendation(
                 configData: configData, jangConfig: jang, status: status)
