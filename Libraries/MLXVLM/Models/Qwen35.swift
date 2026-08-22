@@ -2110,8 +2110,30 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     }
 
 
+    /// Scatters vision features onto their placeholder positions.
+    ///
+    /// Image and video features are scattered SEPARATELY, each onto its own
+    /// placeholder kind. Pooling `imageMask .|| videoMask` into one scatter is
+    /// only correct while the feature rows happen to appear in the same order
+    /// as the placeholders, and they do not: `prepare` always concatenates
+    /// image pixels before video pixels, while the placeholders appear in
+    /// conversation order. A chat whose earlier turn carried a video and whose
+    /// current turn carries an image therefore has video pads FIRST and image
+    /// pads second, so a pooled scatter lays the image's rows onto the video's
+    /// pads and vice versa — the two blocks swap.
+    ///
+    /// That failed silently rather than loudly: the total element count still
+    /// matches, so the size guard passes and the model simply answers about
+    /// the wrong medium. Measured on Qwen3.8 27B — a red "3" image sent after
+    /// a video turn was described as the video's last frame, twice, with and
+    /// without tools in the turn.
+    ///
+    /// Splitting by kind is correct for any interleaving of the two kinds:
+    /// `LMInput` carries one image batch and one video batch, so within a kind
+    /// the rows are already in placeholder order.
     private func mergeInputIdsWithImageFeatures(
         imageFeatures: MLXArray,
+        imageRowCount: Int,
         inputEmbeds: MLXArray,
         inputIds: MLXArray,
         imageTokenIndex: Int,
@@ -2119,37 +2141,58 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     ) throws -> (MLXArray, MLXArray) {
         let imageMask = (inputIds .== MLXArray(imageTokenIndex))
         let videoMask = (inputIds .== MLXArray(videoTokenIndex))
-        var specialMask = imageMask .|| videoMask
+        let specialMask = imageMask .|| videoMask
 
         let nImageTokens = specialMask.sum().item(Int.self)
+        let nFeatureRows = imageFeatures.dim(0)
 
-        specialMask = expandedDimensions(specialMask, axis: -1)
-        let maskExpanded = broadcast(specialMask, to: inputEmbeds.shape)
-
-        let nImageFeatures = imageFeatures.dim(0)
-        let nImageMaskElements = maskExpanded.sum().item(Int.self)
-        let imageFeatureSize = imageFeatures.size
-
-        guard nImageMaskElements == imageFeatureSize else {
-            throw Qwen35VLError.featureTokenMismatch(expected: nImageTokens, actual: nImageFeatures)
+        // Total-count check stays: a genuine mismatch must still fail loudly.
+        guard nImageTokens == nFeatureRows else {
+            throw Qwen35VLError.featureTokenMismatch(expected: nImageTokens, actual: nFeatureRows)
         }
 
         let originalShape = inputEmbeds.shape
-        let flattenedEmbeds = inputEmbeds.flattened()
-        let flattenedFeatures = imageFeatures.flattened()
-        let flattenedMask = maskExpanded.flattened()
+        var result = inputEmbeds.flattened()
+        let width = inputEmbeds.dim(-1)
 
-        let indices = nonZero(flattenedMask.asType(.bool))
+        // Rows [0, imageRowCount) belong to the image batch, the remainder to
+        // the video batch — the order `prepare` concatenated them in.
+        func scatter(mask: MLXArray, rows: MLXArray) throws {
+            let positions = nonZero(mask.flattened().asType(.bool))
+            guard !positions.isEmpty else { return }
+            guard positions.count == rows.dim(0) else {
+                throw Qwen35VLError.featureTokenMismatch(
+                    expected: positions.count, actual: rows.dim(0))
+            }
+            var flatIndices: [UInt32] = []
+            flatIndices.reserveCapacity(positions.count * width)
+            for position in positions {
+                let base = position * width
+                for offset in 0 ..< width { flatIndices.append(UInt32(base + offset)) }
+            }
+            result[MLXArray(flatIndices)] = rows.flattened()
+        }
 
-        var result = flattenedEmbeds
-        if !indices.isEmpty && indices.count == flattenedFeatures.size {
-            let indexArray = MLXArray(indices.map { UInt32($0) })
-            result[indexArray] = flattenedFeatures
+        if imageRowCount > 0 {
+            try scatter(mask: imageMask, rows: imageFeatures[0 ..< imageRowCount])
+        }
+        if nFeatureRows > imageRowCount {
+            try scatter(mask: videoMask, rows: imageFeatures[imageRowCount ..< nFeatureRows])
         }
 
         result = result.reshaped(originalShape)
-        let visualMask = specialMask.squeezed(axis: -1).asType(.bool)
+        let visualMask = specialMask.asType(.bool)
         return (result, visualMask)
+    }
+
+    /// Number of merged vision rows a frame list contributes, matching the
+    /// vision tower's output rows: each `THW` frame yields
+    /// `t*h*w / spatialMergeSize^2` rows.
+    private func mergedRowCount(for frames: [THW]?) -> Int {
+        guard let frames else { return 0 }
+        let merge = config.visionConfiguration.spatialMergeSize
+        let divisor = max(1, merge * merge)
+        return frames.reduce(0) { $0 + $1.product / divisor }
     }
 
     private func nonZero(_ mask: MLXArray) -> [Int] {
@@ -2207,6 +2250,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
 
             let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
                 imageFeatures: visionFeatures,
+                imageRowCount: mergedRowCount(for: imageFrames),
                 inputEmbeds: textEmbeds,
                 inputIds: inputIds,
                 imageTokenIndex: config.imageTokenIndex,
