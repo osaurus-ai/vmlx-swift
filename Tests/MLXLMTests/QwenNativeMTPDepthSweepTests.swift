@@ -226,6 +226,16 @@ final class QwenNativeMTPDepthSweepTests: XCTestCase {
             if let r = ProcessInfo.processInfo.environment["VMLX_MTP_SWEEP_REASONING"] {
                 context = ["enable_thinking": !(["0", "off", "false", "no"].contains(r.lowercased()))]
             }
+            // Reasoning EFFORT is its own axis. A prior measurement found b15
+            // best on code at effort `medium` while the default effort here is
+            // xhigh -- so "which block size wins" may be conditioned on how
+            // predictable the model's own output is.
+            if let e = ProcessInfo.processInfo.environment["VMLX_MTP_SWEEP_EFFORT"] {
+                var c = context ?? [:]
+                c["enable_thinking"] = true
+                c["reasoning_effort"] = e
+                context = c
+            }
             let input = try await ctx.processor.prepare(
                 input: UserInput(chat: [.user(Self.prompt)], additionalContext: context))
             var p = GenerateParameters(
