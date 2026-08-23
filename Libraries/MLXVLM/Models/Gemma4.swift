@@ -1653,6 +1653,8 @@ public struct Gemma4Processor: UserInputProcessor {
         }
 
         var processedAudio: LMInput.ProcessedAudio?
+        NSLog("[gemma4-audio] input.audios=%d extractor=%@", input.audios.count,
+              config.audioFeatureExtractorType ?? "<nil>")
         if !input.audios.isEmpty {
             let prepared = try Self.processedAudio(from: input.audios, config: config)
             processedAudio = prepared.audio
@@ -1665,6 +1667,7 @@ public struct Gemma4Processor: UserInputProcessor {
             for t in tokens {
                 if t == audioId {
                     let tokenCount = audioTokenIterator.next() ?? config.audioSeqLength
+                    NSLog("[gemma4-audio] expanding placeholder -> %d tokens", tokenCount)
                     if let beginAudioId { exp.append(beginAudioId) }
                     exp.append(contentsOf: Array(repeating: audioId, count: tokenCount))
                     if let endAudioId { exp.append(endAudioId) }
