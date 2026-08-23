@@ -218,6 +218,34 @@ struct VLMediaTokenDeclarationReachabilityTests {
         #expect(source.contains("expandMediaPlaceholders: QwenVL.mediaPlaceholderExpander"))
     }
 
+    /// Qwen3-VL is the family this was proven on live, so it is the only one
+    /// changed. The others are NOT fine — Qwen2.5-VL and Qwen2-VL publish no
+    /// boundaries on EITHER branch, and Gemma 4 publishes them on text only,
+    /// exactly the gap just closed for Qwen3-VL. They share
+    /// `QwenVL.replacePaddingTokens`, so the same expander applies; what they
+    /// lack is a live proof, and shipping unproven reuse is how a wrong cache
+    /// hit becomes a wrong answer.
+    ///
+    /// This is a worklist, not an approval. When a family is wired and proven,
+    /// update its expected count deliberately.
+    @Test("families still missing media-path boundaries are pinned, not forgotten")
+    func siblingFamiliesStillLackMediaPathBoundaries() throws {
+        func boundaryDeclarations(in file: String) throws -> Int {
+            let source = try String(
+                contentsOf: Self.repoRoot()
+                    .appendingPathComponent("Libraries/MLXVLM/Models/\(file)"),
+                encoding: .utf8)
+            return source.components(separatedBy: "cachePrefixTokenCounts:").count - 1
+        }
+
+        #expect(try boundaryDeclarations(in: "Qwen25VL.swift") == 0)
+        #expect(try boundaryDeclarations(in: "Qwen2VL.swift") == 0)
+        // Gemma 4 declares on its text path only.
+        #expect(try boundaryDeclarations(in: "Gemma4.swift") == 1)
+        // Qwen3-VL is the one that is done: text AND media.
+        #expect(try boundaryDeclarations(in: "Qwen3VL.swift") == 2)
+    }
+
     /// The expander is what makes a post-image boundary reachable, so pin the
     /// behaviour rather than only its call site: a prefix render carrying FEWER
     /// placeholders than the conversation has frames must still expand, using
