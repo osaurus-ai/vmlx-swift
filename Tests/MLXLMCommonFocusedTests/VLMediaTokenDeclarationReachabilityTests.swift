@@ -188,28 +188,63 @@ struct VLMediaTokenDeclarationReachabilityTests {
     /// that declares no boundaries has nothing for the coordinator to probe,
     /// so the rollback above is never even reached — there is no candidate hit
     /// to roll back.
-    @Test("Qwen3-VL declares cache boundaries on the text path but not the media path")
-    func qwen3VLMediaPathDeclaresNoBoundaries() throws {
+    /// Now inverted: BOTH paths publish boundaries. The media path additionally
+    /// hands `canonicalChatCacheBoundaries` an expander, because its
+    /// `promptTokens` have had one placeholder blown up into one pad per merged
+    /// patch — a boundary re-render that skips that expansion cannot match the
+    /// real prompt past the first image, so every candidate was dropped.
+    @Test("Qwen3-VL declares cache boundaries on BOTH the text and media paths")
+    func qwen3VLBothPathsDeclareBoundaries() throws {
         let source = try String(
             contentsOf: Self.repoRoot()
                 .appendingPathComponent("Libraries/MLXVLM/Models/Qwen3VL.swift"),
             encoding: .utf8)
 
-        // The text-only branch is the one that carries boundaries.
-        #expect(source.contains("cachePrefixTokenCounts: cacheBoundaries.all"))
-        #expect(source.contains("cacheStablePrefixTokenCounts: cacheBoundaries.stable"))
-
-        // Exactly one construction site does, and it is not the media one.
         let boundaryDeclarations = source.components(
             separatedBy: "cachePrefixTokenCounts: cacheBoundaries.all"
         ).count - 1
         #expect(
-            boundaryDeclarations == 1,
-            "expected the single text-path declaration, found \(boundaryDeclarations)")
+            boundaryDeclarations == 2,
+            "expected a declaration on the text AND media paths, found \(boundaryDeclarations)")
 
-        // The media construction passes image/video and stops there.
+        let stableDeclarations = source.components(
+            separatedBy: "cacheStablePrefixTokenCounts: cacheBoundaries.stable"
+        ).count - 1
+        #expect(stableDeclarations == 2, "found \(stableDeclarations) stable declarations")
+
+        // The media construction still carries its media, and now the expander.
         #expect(source.contains("image: processedImage"))
         #expect(source.contains("video: processedVideo"))
+        #expect(source.contains("expandMediaPlaceholders: QwenVL.mediaPlaceholderExpander"))
+    }
+
+    /// The expander is what makes a post-image boundary reachable, so pin the
+    /// behaviour rather than only its call site: a prefix render carrying FEWER
+    /// placeholders than the conversation has frames must still expand, using
+    /// the leading frames.
+    @Test("the expander expands a prefix render that holds only the leading media")
+    func expanderHandlesPartialPrefix() throws {
+        let tokenizer = ScriptedTokenizer(
+            table: [
+                "<|vision_start|><|image_pad|><|vision_end|>": [10, 11, 12],
+                "<|vision_start|><|image_pad|><|image_pad|><|vision_end|>": [10, 11, 11, 12],
+            ],
+            reverse: [10: "<|vision_start|>", 11: "<|image_pad|>", 12: "<|vision_end|>"])
+
+        // One frame whose product/mergeLength is 2 -> one pad becomes two.
+        let expand = QwenVL.mediaPlaceholderExpander(
+            imageFrames: [THW(1, 2, 4)],
+            videoFrames: nil,
+            mergeSize: 2,
+            tokenizer: tokenizer)
+
+        // A prefix render with one placeholder, surrounded by ordinary tokens.
+        #expect(expand([7, 10, 11, 12, 8]) == [7, 10, 11, 11, 12, 8])
+
+        // No placeholder at all (a boundary before any image) is left alone —
+        // that case must keep working, it is the only boundary that used to
+        // survive.
+        #expect(expand([7, 8, 9]) == [7, 8, 9])
     }
 }
 

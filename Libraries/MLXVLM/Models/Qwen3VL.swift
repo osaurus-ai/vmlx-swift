@@ -231,6 +231,24 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
 
+        // The media branch used to publish NO boundaries, and `UserInput`
+        // flattens media across every message — so once a conversation held one
+        // image, even a pure-text follow-up came through here and offered the
+        // coordinator no candidate to probe. Nothing to hit meant the whole
+        // transcript re-prefilled, vision tower included, on every later turn.
+        let cacheBoundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer,
+            messages: messages,
+            tools: input.tools,
+            additionalContext: input.additionalContext,
+            promptTokens: promptTokens,
+            staticSystemPrefix: input.cacheStableSystemPrefix,
+            expandMediaPlaceholders: QwenVL.mediaPlaceholderExpander(
+                imageFrames: processedImage?.frames,
+                videoFrames: processedVideo?.frames,
+                mergeSize: config.mergeSize,
+                tokenizer: tokenizer))
+
         return LMInput(
             text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
             image: processedImage,
@@ -238,6 +256,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             mediaTokenIds: QwenVL.mediaTokenIds(
                 tokenizer: tokenizer, tokens: ["<|image_pad|>", "<|video_pad|>"]),
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+            cachePrefixTokenCounts: cacheBoundaries.all,
+            cacheStablePrefixTokenCounts: cacheBoundaries.stable,
             toolSchemas: input.tools)
     }
 }

@@ -65,20 +65,39 @@ public func canonicalChatCacheBoundaries(
     tools: [[String: any Sendable]]?,
     additionalContext: [String: any Sendable]?,
     promptTokens: [Int],
-    staticSystemPrefix: String? = nil
+    staticSystemPrefix: String? = nil,
+    expandMediaPlaceholders: (([Int]) -> [Int])? = nil
 ) -> CanonicalChatCacheBoundaries {
     guard let controllable = tokenizer as? any GenerationPromptControllableTokenizer else {
         return CanonicalChatCacheBoundaries(all: [], stable: [])
     }
 
-    func exactPrefixBoundary(
-        messages boundaryMessages: [[String: any Sendable]]
-    ) -> Int? {
+    /// A VL prompt's `promptTokens` have had each media placeholder expanded
+    /// into one pad per merged patch, but a boundary re-render has not. Without
+    /// applying the same expansion here, every boundary at or past the first
+    /// image fails the exact-prefix check and is dropped — which is why a VL
+    /// conversation published no boundaries at all and re-prefilled the whole
+    /// transcript, vision tower included, on every turn.
+    ///
+    /// This only ever ADDS candidates: the `elementsEqual` gate below still
+    /// proves token identity against the real prompt, so an expansion that
+    /// disagrees yields no boundary rather than a wrong one.
+    func render(_ boundaryMessages: [[String: any Sendable]]) -> [Int]? {
         guard let tokens = try? controllable.applyChatTemplate(
             messages: boundaryMessages,
             tools: tools,
             additionalContext: additionalContext,
-            addGenerationPrompt: false),
+            addGenerationPrompt: false)
+        else {
+            return nil
+        }
+        return expandMediaPlaceholders?(tokens) ?? tokens
+    }
+
+    func exactPrefixBoundary(
+        messages boundaryMessages: [[String: any Sendable]]
+    ) -> Int? {
+        guard let tokens = render(boundaryMessages),
             !tokens.isEmpty,
             tokens.count < promptTokens.count,
             promptTokens.prefix(tokens.count).elementsEqual(tokens)
@@ -102,11 +121,7 @@ public func canonicalChatCacheBoundaries(
         func renderProbe(_ content: String) -> [Int]? {
             var probeMessages = stableMessages
             probeMessages.append(["role": "user", "content": content])
-            return try? controllable.applyChatTemplate(
-                messages: probeMessages,
-                tools: tools,
-                additionalContext: additionalContext,
-                addGenerationPrompt: false)
+            return render(probeMessages)
         }
 
         guard let probeA = renderProbe("0"),
@@ -165,11 +180,7 @@ public func canonicalChatCacheBoundaries(
             var systemMessage = probeMessages[systemIndex]
             systemMessage["content"] = staticPrefix + tail
             probeMessages[systemIndex] = systemMessage
-            return try? controllable.applyChatTemplate(
-                messages: probeMessages,
-                tools: tools,
-                additionalContext: additionalContext,
-                addGenerationPrompt: false)
+            return render(probeMessages)
         }
 
         guard let probeA = renderProbe("\n0"),

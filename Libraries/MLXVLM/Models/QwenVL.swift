@@ -228,6 +228,45 @@ public struct QwenVL {
         return result
     }
 
+    /// Expands media placeholders in a *boundary re-render* the same way
+    /// ``replacePaddingTokens(in:frames:paddingToken:mergeSize:tokenizer:)``
+    /// expanded the real prompt, so `canonicalChatCacheBoundaries` can validate
+    /// a boundary that sits AFTER an image instead of dropping it.
+    ///
+    /// A boundary render covers a PREFIX of the conversation, so it holds only
+    /// the leading media — the frame lists are trimmed to the placeholders each
+    /// render actually contains rather than requiring the full count. Anything
+    /// that still does not line up returns the render untouched, which costs a
+    /// boundary and never produces a wrong one.
+    static func mediaPlaceholderExpander(
+        imageFrames: [THW]?,
+        videoFrames: [THW]?,
+        mergeSize: Int,
+        tokenizer: any Tokenizer
+    ) -> ([Int]) -> [Int] {
+        { rendered in
+            var tokens = rendered
+            for (frames, paddingToken) in [
+                (imageFrames, "<|image_pad|>"), (videoFrames, "<|video_pad|>"),
+            ] {
+                guard let frames, !frames.isEmpty else { continue }
+                let present = paddingPlaceholderRanges(
+                    in: tokens, paddingToken: paddingToken, tokenizer: tokenizer
+                ).count
+                guard present > 0, present <= frames.count else { continue }
+                guard let expanded = try? replacePaddingTokens(
+                    in: tokens,
+                    frames: Array(frames.prefix(present)),
+                    paddingToken: paddingToken,
+                    mergeSize: mergeSize,
+                    tokenizer: tokenizer)
+                else { continue }
+                tokens = expanded
+            }
+            return tokens
+        }
+    }
+
     /// Placeholder token ids for `LMInput.mediaTokenIds`, resolved from the
     /// tokenizer rather than a model config the processor cannot see.
     ///
