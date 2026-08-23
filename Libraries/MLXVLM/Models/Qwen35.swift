@@ -2128,6 +2128,18 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     /// a video turn was described as the video's last frame, twice, with and
     /// without tools in the turn.
     ///
+    /// Confirmed by an A/B on the live app, same model, byte-identical files,
+    /// same prompts: turn 1 a 4-frame video (7 blue, 3 red, 5 green, 9 gold),
+    /// turn 2 a purple "4" — a digit/colour pair in no frame, so a leak is
+    /// unambiguous. Before this change the answer was "the digit 9 … on a
+    /// solid orange/amber (golden) background" (the video's LAST frame);
+    /// after, "the digit 4 on a blue (indigo) background".
+    ///
+    /// Note the bug needs media split ACROSS turns. Within one message
+    /// `Qwen3VLMessageGenerator` emits image content before video content, so
+    /// pads and rows agree and a single mixed turn cannot expose it — a
+    /// combined-attachment turn passes either way and proves nothing.
+    ///
     /// Splitting by kind is correct for any interleaving of the two kinds:
     /// `LMInput` carries one image batch and one video batch, so within a kind
     /// the rows are already in placeholder order.
