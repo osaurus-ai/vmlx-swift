@@ -1262,8 +1262,11 @@ private struct LLMUserInputProcessor: UserInputProcessor {
     }
 
     func prepare(input: UserInput) throws -> LMInput {
-        let additionalContext = Hy3ReasoningTemplateContext.apply(
-            additionalContext: try mergedAdditionalContext(input.additionalContext),
+        let additionalContext = MuseGlimmerReasoningTemplateContext.apply(
+            additionalContext: Hy3ReasoningTemplateContext.apply(
+                additionalContext: try mergedAdditionalContext(input.additionalContext),
+                modelType: modelType
+            ),
             modelType: modelType
         )
         let bailingMessages = BailingThinkingTemplateContext.apply(
