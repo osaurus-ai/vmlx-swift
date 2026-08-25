@@ -1379,7 +1379,11 @@ public enum MTPBundleInspector {
         let tensorNames = try loadTensorNames(from: modelDirectory)
         let mtpNames = tensorNames.filter { isMTPName($0, mtpLayerPrefixes: mtpLayerPrefixes) }
         let visionNames = tensorNames.filter(isVisionName)
-        let nativeMTPTuning = try loadNativeMTPTuning(from: modelDirectory)
+        let tuningLoad = loadNativeMTPTuning(from: modelDirectory)
+        let nativeMTPTuning: NativeMTPTuning? = {
+            if case .loaded(let t) = tuningLoad { return t }
+            return nil
+        }()
 
         let runtimeMode = jangConfig?.runtime.mtpMode ?? .none
         let runtimeBundleHasMTP = jangConfig?.runtime.bundleHasMTP ?? false
@@ -1404,7 +1408,15 @@ public enum MTPBundleInspector {
             statusEvidence.append("tuning.output_equivalent=\(nativeMTPTuning.outputEquivalent)")
             statusEvidence.append("tuning.blocked=\(nativeMTPTuning.blocked)")
         } else if metadataClaimsMTP || bundleHasMTP {
-            statusEvidence.append("tuning_file_missing=\(NativeMTPTuning.fileName)")
+            // "missing" and "present but unreadable" are different problems and
+            // point at different fixes. Reporting both as missing sent the
+            // diagnosis after a file that was already on disk.
+            switch tuningLoad {
+            case .unreadable:
+                statusEvidence.append("tuning_file_unreadable=\(NativeMTPTuning.fileName)")
+            case .absent, .loaded:
+                statusEvidence.append("tuning_file_missing=\(NativeMTPTuning.fileName)")
+            }
         }
 
         let mode: MTPRuntimeMode
@@ -1504,11 +1516,43 @@ public enum MTPBundleInspector {
         }
     }
 
-    private static func loadNativeMTPTuning(from directory: URL) throws -> NativeMTPTuning? {
+    /// Distinguishes "no tuning file" from "a tuning file this could not read".
+    /// They looked identical before, and the difference is the whole diagnosis.
+    enum NativeMTPTuningLoad {
+        case absent
+        case loaded(NativeMTPTuning)
+        case unreadable
+    }
+
+    /// Test seam for the on-disk shape handling. The load path is private and
+    /// the inspector needs a whole bundle, but the shape question is worth
+    /// pinning on its own — it is what made the artifact invisible.
+    static func tuningForTesting(at directory: URL) -> NativeMTPTuning? {
+        if case .loaded(let tuning) = loadNativeMTPTuning(from: directory) { return tuning }
+        return nil
+    }
+
+    private static func loadNativeMTPTuning(from directory: URL) -> NativeMTPTuningLoad {
         let url = directory.appendingPathComponent(NativeMTPTuning.fileName)
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode(NativeMTPTuningDocument.self, from: data).nativeMTP
+        guard FileManager.default.fileExists(atPath: url.path) else { return .absent }
+        guard let data = try? Data(contentsOf: url) else { return .unreadable }
+        // The published schema nests the row under `native_mtp`. Some bundles
+        // ship the row FLAT at the top level instead — every Qwen3.8-27B one
+        // does. `nativeMTP` is optional, so a flat file decoded "successfully"
+        // to nil and was then reported as `tuning_file_missing`: the artifact
+        // was invisible to the runtime, MTP could never auto-launch, and the
+        // status blamed a file that was sitting right there. Accept both.
+        if let nested = try? JSONDecoder().decode(NativeMTPTuningDocument.self, from: data),
+            let tuning = nested.nativeMTP
+        {
+            return .loaded(tuning)
+        }
+        if let flat = try? JSONDecoder().decode(NativeMTPTuning.self, from: data),
+            flat.bestDepth != nil
+        {
+            return .loaded(flat)
+        }
+        return .unreadable
     }
 
     private static func safetensorsHeaderNames(_ url: URL) throws -> [String] {
