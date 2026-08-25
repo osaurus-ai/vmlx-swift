@@ -864,6 +864,7 @@ let package = Package(
                 "DFlash2UnusableBlockWidthTests.swift",
                 "NativeMTPTuningShapeTests.swift",
                 "JangDeclaredMTPDepthTests.swift",
+                "NativeMTPActivationErrorTextTests.swift",
                 "BatchEngineGrowingChatCacheSourceTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
                 "DiskStoreOffsetConsistencyFocusedTests.swift",
