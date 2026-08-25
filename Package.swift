@@ -861,6 +861,7 @@ let package = Package(
                 "NativeMTPWarmupMemoScopeTests.swift",
                 "NormConventionResolverTests.swift",
                 "TestSourcesAreRegisteredTests.swift",
+                "DFlash2UnusableBlockWidthTests.swift",
                 "BatchEngineGrowingChatCacheSourceTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
                 "DiskStoreOffsetConsistencyFocusedTests.swift",

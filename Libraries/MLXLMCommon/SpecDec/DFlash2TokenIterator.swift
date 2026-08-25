@@ -259,6 +259,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// per step. A block is drafted before any of those could have seen
     /// the tokens inside it, so accepting under them would emit a
     /// distribution the caller did not ask for.
+    /// Fewest positions a drafted block can carry. One position is the
+    /// anchor, so a block of 2 drafts a single speculative token; below that
+    /// there is nothing to draft.
+    static let minimumBlockSize = 2
+
     static func unservableReason(_ parameters: GenerateParameters) -> String? {
         // A penalty of exactly 1.0 (repetition) or 0 (presence/frequency)
         // is the identity. Bundles ship those as explicit defaults —
@@ -286,6 +291,20 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
         if let maxTokens = parameters.maxTokens, maxTokens <= 1 {
             return "maxTokens \(maxTokens) is too small for a drafted block"
+        }
+        // Mirrors the `blockSizeTooSmall` guard in `init`. Without this the
+        // width reaches the initializer and THROWS, and BatchEngine's
+        // solo-fast-path catch turns any throw into a zero-token stream
+        // stamped `.cancelled` — so a user who pins Draft Tokens Per Step to 1
+        // gets "I wasn't able to generate a response to that. Please try
+        // rephrasing your request." on every turn, with the real cause logged
+        // only to os_log. Reported here instead, this reads as "DFlash 2
+        // cannot serve this request", the caller skips the drafter, and the
+        // turn decodes normally. Same shape as the `maxTokens` rule above.
+        if let requested = parameters.draftStrategy?.dflash2BlockSize,
+            requested < minimumBlockSize
+        {
+            return "block size \(requested) is below the minimum of \(minimumBlockSize)"
         }
         return nil
     }
@@ -319,7 +338,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // width) — this runtime's packing is not width-neutral. A
         // caller-pinned size still wins; it is a measurement request.
         let effectiveBlockSize = requestedBlockSize ?? config.blockSize
-        guard effectiveBlockSize >= 2 else {
+        guard effectiveBlockSize >= Self.minimumBlockSize else {
             throw DFlash2RuntimeError.blockSizeTooSmall(effectiveBlockSize)
         }
 
