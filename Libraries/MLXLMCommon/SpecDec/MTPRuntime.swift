@@ -740,7 +740,22 @@ public enum NativeMTPAutoDecodePolicy {
         requireVerifiedRuntime: Bool = true
     ) -> NativeMTPAutoDecodeRecommendation? {
         guard let status, status.hasCompleteMTPArtifact else { return nil }
-        guard !requireVerifiedRuntime || status.canAutoLaunchMTP else { return nil }
+        // A bundle may declare its own speculative depth in jang_config even
+        // when it ships no measured tuning row. That declaration is the
+        // PUBLISHER's claim, not a measurement taken here, so it is admitted
+        // only when the runtime could speculatively decode anyway — and the
+        // recommendation it produces says where the number came from.
+        let declaredDepth: Int? = {
+            guard status.nativeMTPTuning?.usableBestDepth == nil,
+                status.runtimeCanSpeculativelyDecodeMTP,
+                let declared = jangConfig?.runtime.mtpDeclaredSpeculativeTokens,
+                declared > 0
+            else { return nil }
+            return declared
+        }()
+        if requireVerifiedRuntime, !status.canAutoLaunchMTP, declaredDepth == nil {
+            return nil
+        }
 
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
@@ -811,10 +826,35 @@ public enum NativeMTPAutoDecodePolicy {
                 evidence: tuningEvidence)
         }
 
-        // Qwen native MTP is tuning-file driven. A complete tensor artifact
-        // without `vmlx_mtp_tuning.json` is loadable, but it does not receive
-        // automatic speculative launch because depth must come from measured
-        // artifact-local proof, not from path/name/profile assumptions.
+        // No measured row. The original rule was that depth must come from
+        // measured artifact-local proof rather than "path/name/profile
+        // assumptions" — and that still holds: nothing below infers a depth
+        // from a filename, a directory or a quantization profile.
+        //
+        // What IS admitted is an explicit number the bundle publishes about
+        // itself (`runtime.mtp_num_speculative_tokens`, alias
+        // `mtp.recommended_num_drafts`). Qwen3.8-27B ships it alongside a
+        // status string that reads "MEASURED: depth 2 = 41.39 tok/s (1.07x
+        // over depth 1); depth 3 is slower than depth 1."
+        //
+        // It is weaker evidence than `vmlx_mtp_tuning.json`, which is measured
+        // on THIS machine's runtime, so the measured row wins wherever it is
+        // usable and the reason string keeps the two distinguishable.
+        if let declaredDepth {
+            return NativeMTPAutoDecodeRecommendation(
+                depth: declaredDepth,
+                // No measured row means no measured verifier choice either;
+                // take the same default `NativeMTPTuning.resolvedVerifierMode`
+                // falls back to.
+                reason:
+                    "Qwen native MTP uses the depth this bundle declares in "
+                    + "jang_config (\(declaredDepth)); no measured "
+                    + "\(NativeMTPTuning.fileName) row was usable.",
+                evidence: evidence + [
+                    "jang_config.mtp_declared_speculative_tokens=\(declaredDepth)",
+                    "depth_source=jang_config_declaration",
+                ])
+        }
         return nil
     }
 

@@ -863,6 +863,7 @@ let package = Package(
                 "TestSourcesAreRegisteredTests.swift",
                 "DFlash2UnusableBlockWidthTests.swift",
                 "NativeMTPTuningShapeTests.swift",
+                "JangDeclaredMTPDepthTests.swift",
                 "BatchEngineGrowingChatCacheSourceTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
                 "DiskStoreOffsetConsistencyFocusedTests.swift",

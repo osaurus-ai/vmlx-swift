@@ -127,19 +127,27 @@ public struct JangRuntime: Sendable, Equatable {
     public let bundleHasMTP: Bool
     public let mtpLayers: Int
     public let mtpMode: MTPRuntimeMode
+    /// Speculative positions the PUBLISHER declares for this bundle
+    /// (`runtime.mtp_num_speculative_tokens`, alias
+    /// `mtp.recommended_num_drafts`). This is the bundle's own claim, not a
+    /// measurement taken on this machine — `vmlx_mtp_tuning.json` is that, and
+    /// it wins wherever it is usable. Nil when the bundle declares nothing.
+    public let mtpDeclaredSpeculativeTokens: Int?
 
     public init(
         totalWeightBytes: Int = 0,
         totalWeightGB: Float = 0,
         bundleHasMTP: Bool = false,
         mtpLayers: Int = 0,
-        mtpMode: MTPRuntimeMode = .none
+        mtpMode: MTPRuntimeMode = .none,
+        mtpDeclaredSpeculativeTokens: Int? = nil
     ) {
         self.totalWeightBytes = totalWeightBytes
         self.totalWeightGB = totalWeightGB
         self.bundleHasMTP = bundleHasMTP
         self.mtpLayers = mtpLayers
         self.mtpMode = mtpMode
+        self.mtpDeclaredSpeculativeTokens = mtpDeclaredSpeculativeTokens
     }
 }
 
@@ -1707,7 +1715,19 @@ public struct JangLoader: Sendable {
                 totalWeightGB: floatValue(rDict["total_weight_gb"]) ?? 0,
                 bundleHasMTP: rDict["bundle_has_mtp"] as? Bool ?? false,
                 mtpLayers: rDict["mtp_layers"] as? Int ?? 0,
-                mtpMode: MTPRuntimeMode(rawMode: rDict["mtp_mode"] as? String)
+                mtpMode: MTPRuntimeMode(rawMode: rDict["mtp_mode"] as? String),
+                // Qwen3.8-27B writes both spellings; other publishers may write
+                // either. Read the runtime block first, then the top-level
+                // `mtp` object, and take the first positive value.
+                mtpDeclaredSpeculativeTokens: {
+                    let mtpDict = json["mtp"] as? [String: Any]
+                    let candidates: [Int?] = [
+                        rDict["mtp_num_speculative_tokens"] as? Int,
+                        mtpDict?["recommended_num_drafts"] as? Int,
+                        mtpDict?["upstream_num_speculative_tokens"] as? Int,
+                    ]
+                    return candidates.compactMap { $0 }.first { $0 > 0 }
+                }()
             )
         } else {
             runtime = JangRuntime()
