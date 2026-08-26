@@ -206,3 +206,34 @@ struct BailingMoeV3Tests {
         }
     }
 }
+
+@Suite("per_tensor quantization map decode")
+struct PerTensorQuantizationDecodeTests {
+    /// The JANG stamper writes per-tensor overrides as ONE `per_tensor` map.
+    /// The dynamic key scan used to parse the map itself as a single
+    /// Quantization and threw "Missing field 'quantization.per_tensor.bits'",
+    /// blocking every load of Ling-3.0-tiny-JANG_6M.
+    @Test("Ling 6M quantization dict decodes; entries become per-layer overrides")
+    func perTensorMapDecodes() throws {
+        let json = """
+            {
+              "model_type": "bailing_hybrid",
+              "quantization": {
+                "group_size": 64,
+                "bits": 8,
+                "per_tensor": {
+                  "lm_head": {"mode": "affine", "bits": 8, "group_size": 64},
+                  "model.layers.0.attention.k_proj": {"mode": "affine", "bits": 6, "group_size": 64}
+                }
+              }
+            }
+            """.data(using: .utf8)!
+        let config = try JSONDecoder().decode(BaseConfiguration.self, from: json)
+        #expect(config.quantization?.bits == 8)
+        let lmHead = config.perLayerQuantization?.quantization(layer: "lm_head")
+        #expect(lmHead?.bits == 8)
+        let kProj = config.perLayerQuantization?.quantization(
+            layer: "model.layers.0.attention.k_proj")
+        #expect(kProj?.bits == 6)
+    }
+}

@@ -286,6 +286,26 @@ public struct BaseConfiguration: Codable, Sendable {
                     "norms_residual_bits":
                     continue
 
+                // 2026-08-26 (Ling 3.0 tiny): JANG stampers can write the
+                // per-tensor overrides as one `per_tensor` MAP
+                // ({tensor: {mode, bits, group_size}}) instead of loose
+                // sibling keys. Left unlisted, the override decoder parsed
+                // the map itself as a single Quantization and threw
+                // "Missing field 'quantization.per_tensor.bits'", blocking
+                // every load of the bundle. Decode its ENTRIES as the
+                // per-layer overrides they are.
+                case "per_tensor":
+                    let nested = try container.nestedContainer(
+                        keyedBy: _DictionaryCodingKey.self, forKey: key)
+                    for layerKey in nested.allKeys {
+                        perLayerQuantization[layerKey.stringValue] = .quantize(
+                            try Self.decodeLayerQuantization(
+                                from: nested,
+                                key: layerKey,
+                                defaultGroupSize: quantization.groupSize))
+                    }
+                    continue
+
                 default:
                     if let f = try? container.decode(Bool.self, forKey: key) {
                         if !f {
