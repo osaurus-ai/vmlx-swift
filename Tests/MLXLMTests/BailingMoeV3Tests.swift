@@ -237,3 +237,26 @@ struct PerTensorQuantizationDecodeTests {
         #expect(kProj?.bits == 6)
     }
 }
+
+extension BailingMoeV3Tests {
+    /// Zero disk-cache stores, measured live: the eligibility gate requires
+    /// every layer's offset to advance, and the KDA layers stayed at 0.
+    @Test("KDA forward advances the MambaCache offset by the segment length")
+    func kdaAdvancesOffset() throws {
+        try MLXMetalTestLock.withLock {
+            let config = try JSONDecoder().decode(
+                BailingMoeV3Configuration.self, from: Self.v3ConfigJSON)
+            let model = BailingMoeV3Model(config)
+            MLX.eval(model.parameters())
+            let cache = model.newCache(parameters: nil)
+            _ = model(MLXArray([1, 2, 3, 4, 5].map(Int32.init)).reshaped(1, 5), cache: cache)
+            for (i, c) in cache.enumerated() {
+                #expect(c.offset == 5, "layer \(i) offset \(c.offset) != 5")
+            }
+            _ = model(MLXArray([7].map(Int32.init)).reshaped(1, 1), cache: cache)
+            for (i, c) in cache.enumerated() {
+                #expect(c.offset == 6, "layer \(i) offset \(c.offset) != 6 after decode step")
+            }
+        }
+    }
+}

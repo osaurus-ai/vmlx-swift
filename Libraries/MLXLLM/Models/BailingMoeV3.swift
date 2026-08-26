@@ -330,7 +330,14 @@ final class BailingV3KDAAttention: Module {
             aLog: aLog, dtBias: dtBias,
             safeGate: safeGate, lowerBound: lowerBound,
             state: cache?[1], mask: mask)
-        if let cache { cache[1] = newState }
+        if let cache {
+            cache[1] = newState
+            // The disk-L2 eligibility gate requires every layer's offset to
+            // advance in step; a KDA layer stuck at 0 silently vetoed every
+            // store for the whole model (zero kv_v2 entries, measured live).
+            // Same contract as Qwen35's GatedDeltaNet (`cache.offset += S`).
+            cache.offset += T
+        }
 
         let gate: MLXArray
         if let gProj {
