@@ -137,6 +137,24 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
         return bestDepth
     }
 
+    /// The verifier mode the artifact EXPLICITLY specifies, or nil when it is
+    /// silent. Silent must stay nil: the iterator selects
+    /// `input_capture_staged` itself whenever the model is staged-capable, and
+    /// an invented "chunk_lazy_repair" here overrode that — measured live on
+    /// Qwen3.8-27B-JANG_4D, lazy-repair collapsed acceptance (48/155 verifies
+    /// accepted zero drafts), thrashed the head cache (69 rollback repairs, 72
+    /// refreshes), tripped the adaptive controller down to depth 1, and pushed
+    /// 706 of 1002 tokens onto AR fallback: 18.6 tok/s where the iterator's
+    /// own choice runs 36.9.
+    public var explicitVerifierMode: String? {
+        let normalized = verifierMode?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        guard let normalized, !normalized.isEmpty else { return nil }
+        return normalized
+    }
+
     public var resolvedVerifierMode: String {
         let normalized = verifierMode?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -713,13 +731,14 @@ public enum NativeMTPActivation {
 
 public struct NativeMTPAutoDecodeRecommendation: Codable, Sendable, Equatable {
     public let depth: Int
-    public let verifierMode: String
+    /// Nil means "the artifact did not specify one — let the iterator decide".
+    public let verifierMode: String?
     public let reason: String
     public let evidence: [String]
 
     public init(
         depth: Int,
-        verifierMode: String = "chunk_lazy_repair",
+        verifierMode: String? = nil,
         reason: String,
         evidence: [String] = []
     ) {
@@ -782,7 +801,7 @@ public enum NativeMTPAutoDecodePolicy {
                 "tuning.output_equivalent=\(tuning.outputEquivalent)",
                 "tuning.blocked=\(tuning.blocked)",
                 "tuning.best_depth=\(depth)",
-                "tuning.verifier_mode=\(tuning.resolvedVerifierMode)",
+                "tuning.verifier_mode=\(tuning.explicitVerifierMode ?? "iterator_default")",
             ]
             if let quantizationMode = tuning.quantizationMode {
                 tuningEvidence.append("tuning.quantization_mode=\(normalize(quantizationMode))")
@@ -811,7 +830,7 @@ public enum NativeMTPAutoDecodePolicy {
             }
             return NativeMTPAutoDecodeRecommendation(
                 depth: depth,
-                verifierMode: tuning.resolvedVerifierMode,
+                verifierMode: tuning.explicitVerifierMode,
                 reason: "Qwen native MTP uses \(NativeMTPTuning.fileName) best_depth=\(depth).",
                 evidence: tuningEvidence)
         }

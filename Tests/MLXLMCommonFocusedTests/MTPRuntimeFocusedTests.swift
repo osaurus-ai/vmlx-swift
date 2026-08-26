@@ -182,7 +182,8 @@ struct MTPRuntimeFocusedTests {
             status: status)
 
         #expect(recommendation?.depth == 2)
-        #expect(recommendation?.verifierMode == "chunk_lazy_repair")
+        // Silent artifact: the iterator decides (input_capture_staged when capable).
+        #expect(recommendation?.verifierMode == nil)
         #expect(recommendation?.evidence.contains("tuning_file=vmlx_mtp_tuning.json") == true)
         #expect(recommendation?.evidence.contains("tuning.quantization_mode=mxfp4") == true)
         #expect(recommendation?.evidence.contains("tuning.quantization_bits=4") == true)
@@ -1064,7 +1065,8 @@ struct MTPRuntimeFocusedTests {
             jangConfig: nil,
             status: preserved)
         #expect(denseAuto?.depth == 3)
-        #expect(denseAuto?.verifierMode == "chunk_lazy_repair")
+        // Silent artifact: the iterator decides (input_capture_staged when capable).
+        #expect(denseAuto?.verifierMode == nil)
         #expect(denseAuto?.evidence.contains("tuning_file=vmlx_mtp_tuning.json") == true)
         #expect(NativeMTPAutoDecodePolicy.recommendation(
             configData: denseMXFP8Config,
@@ -1082,14 +1084,16 @@ struct MTPRuntimeFocusedTests {
             status: preserved,
             requireVerifiedRuntime: false)
         #expect(denseReporting?.depth == 3)
-        #expect(denseReporting?.verifierMode == "chunk_lazy_repair")
+        // Silent artifact: the iterator decides (input_capture_staged when capable).
+        #expect(denseReporting?.verifierMode == nil)
 
         let moeVerified = NativeMTPAutoDecodePolicy.recommendation(
             configData: moeMXFP8Config,
             jangConfig: nil,
             status: verified)
         #expect(moeVerified?.depth == 3)
-        #expect(moeVerified?.verifierMode == "chunk_lazy_repair")
+        // Silent artifact: the iterator decides (input_capture_staged when capable).
+        #expect(moeVerified?.verifierMode == nil)
 
         let qwen36Verified = NativeMTPAutoDecodePolicy.recommendation(
             configData: qwen36MXFP8Config,

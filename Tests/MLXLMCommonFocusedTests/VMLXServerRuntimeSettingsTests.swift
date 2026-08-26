@@ -314,7 +314,10 @@ struct VMLXServerRuntimeSettingsTests {
             status: tuned)
         {
             #expect(depth == 3)
-            #expect(verifierMode == "chunk_lazy_repair")
+            // A silent artifact must yield NO verifier mode: the iterator picks
+            // input_capture_staged itself when staged-capable, and the old
+            // "chunk_lazy_repair" filler overrode that and collapsed acceptance.
+            #expect(verifierMode == nil)
         } else {
             Issue.record("Default server settings should auto-resolve tuned native MTP")
         }
@@ -407,7 +410,7 @@ struct VMLXServerRuntimeSettingsTests {
 
         #expect(launch.launchMode == .speculative)
         #expect(launch.recommendation?.depth == 2)
-        #expect(launch.recommendation?.verifierMode == "chunk_lazy_repair")
+        #expect(launch.recommendation?.verifierMode == nil)
         #expect(launch.recommendation?.evidence.contains("server_draft_token_limit=2") == true)
         if case .nativeMTP(depth: let depth, verifierMode: let verifierMode)? = settings.resolvedMTPDraftStrategy(
             configData: config,
@@ -415,7 +418,10 @@ struct VMLXServerRuntimeSettingsTests {
             status: verified)
         {
             #expect(depth == 2)
-            #expect(verifierMode == "chunk_lazy_repair")
+            // A silent artifact must yield NO verifier mode: the iterator picks
+            // input_capture_staged itself when staged-capable, and the old
+            // "chunk_lazy_repair" filler overrode that and collapsed acceptance.
+            #expect(verifierMode == nil)
         } else {
             Issue.record("Resolved MTP draft strategy did not carry the capped native depth")
         }
@@ -506,7 +512,7 @@ struct VMLXServerRuntimeSettingsTests {
             status: preserved)
 
         #expect(candidate?.depth == 3)
-        #expect(candidate?.verifierMode == "chunk_lazy_repair")
+        #expect(candidate?.verifierMode == nil)
         #expect(settings.effectiveMTPLaunchMode(for: preserved) == .speculative)
         #expect(launch.launchMode == .speculative)
         #expect(loadConfiguration.nativeMTP)
@@ -516,7 +522,10 @@ struct VMLXServerRuntimeSettingsTests {
             status: preserved)
         {
             #expect(depth == 3)
-            #expect(verifierMode == "chunk_lazy_repair")
+            // A silent artifact must yield NO verifier mode: the iterator picks
+            // input_capture_staged itself when staged-capable, and the old
+            // "chunk_lazy_repair" filler overrode that and collapsed acceptance.
+            #expect(verifierMode == nil)
         } else {
             Issue.record("Tensor-proven Qwen MTP should resolve a native-MTP draft strategy")
         }
