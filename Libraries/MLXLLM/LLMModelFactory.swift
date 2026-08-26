@@ -218,7 +218,7 @@ public enum LLMTypeRegistry {
             "olmo2": create(Olmo2Configuration.self, Olmo2Model.init),
             "olmo3": create(Olmo3Configuration.self, Olmo3Model.init),
             "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
-            "bailing_hybrid": create(BailingHybridConfiguration.self, BailingHybridModel.init),
+            "bailing_hybrid": dispatchBailingHybrid,
             "bailing_moe_v2_5": create(BailingHybridConfiguration.self, BailingHybridModel.init),
             "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
             "step": dispatchStep3p5,
@@ -383,6 +383,39 @@ public enum LLMTypeRegistry {
             context = nil
         }
         return ZayaModel(config, moe: context)
+    }
+
+    /// Ling 2.6 and Ling 3.0 both declare `model_type = "bailing_hybrid"`,
+    /// but they are different architectures: 2.6 is Lightning/GLA linear
+    /// attention (`BailingHybridModel`), 3.0 is KDA + MLA + V3 MoE
+    /// (`BailingMoeV3Model`, `architectures = ["BailingMoeV3ForCausalLM"]`).
+    /// The `architectures` list is the discriminator; a KDA marker key is the
+    /// fallback for configs that omit it.
+    private static func dispatchBailingHybrid(data: Data) throws -> any LanguageModel {
+        struct Probe: Decodable {
+            var architectures: [String]?
+            var linearAttention: String?
+            var kdaLowerBound: Float?
+
+            enum CodingKeys: String, CodingKey {
+                case architectures
+                case linearAttention = "linear_attention"
+                case kdaLowerBound = "kda_lower_bound"
+            }
+        }
+        let probe = try? JSONDecoder().decode(Probe.self, from: data)
+        let isV3 =
+            probe?.architectures?.contains(where: { $0.contains("MoeV3") }) == true
+            || probe?.linearAttention == "kda"
+            || probe?.kdaLowerBound != nil
+        if isV3 {
+            let configuration = try JSONDecoder().decode(
+                BailingMoeV3Configuration.self, from: data)
+            return BailingMoeV3Model(configuration)
+        }
+        let configuration = try JSONDecoder().decode(
+            BailingHybridConfiguration.self, from: data)
+        return BailingHybridModel(configuration)
     }
 
     private static func dispatchNemotronH(data: Data) throws -> any LanguageModel {
