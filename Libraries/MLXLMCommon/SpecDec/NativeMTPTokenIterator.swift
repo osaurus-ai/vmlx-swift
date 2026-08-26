@@ -1660,7 +1660,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 // fall back for this request and let the next one re-probe,
                 // or a prose first turn locks every later code turn out of
                 // MTP for the whole residency.
-                if Self.warmupFailureIsModelProperty(averageAccepted: averageAccepted) {
+                if Self.warmupFailureIsModelProperty(
+                    averageAccepted: averageAccepted, depth: currentDepth
+                ) {
                     NativeMTPHybridWarmupMemo.record(false, for: model)
                 }
                 enableAutoregressiveFallback(
@@ -2139,8 +2141,21 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// depth-1 floor no depth could ever clear warmup, which only a broken or
     /// mismatched MTP head produces; anything above is content variance and
     /// must stay per-request.
-    static func warmupFailureIsModelProperty(averageAccepted: Double) -> Bool {
-        averageAccepted < hybridWarmupMinimumAverageAcceptedPerDraft
+    /// Catastrophic means "the head is broken or mismatched" — a verdict that
+    /// really is a property of the model and safe to memoize for the whole
+    /// residency. The pass floor scales with depth (`0.55 * depth`), so the
+    /// catastrophic line must scale too: it is HALF the depth's own floor,
+    /// which at depth 2 is the historical 0.55 exactly. The old bare constant
+    /// made EVERY depth-1 warmup miss "catastrophic" (floor 0.55, line 0.55),
+    /// so one depth-1 probe at 0.44 — an ordinary content miss — recorded a
+    /// failed-model verdict and hard-disabled MTP at every depth until the
+    /// container died. Observed live: `adaptiveFallback=hybrid_warmup_memo`,
+    /// `verifyCalls=0` on every subsequent turn including depth 2.
+    static func warmupFailureIsModelProperty(
+        averageAccepted: Double, depth: Int
+    ) -> Bool {
+        averageAccepted
+            < hybridWarmupMinimumAverageAcceptedPerDraft * Double(Swift.max(depth, 1)) / 2
     }
 
     private static func nativeMTPHybridVerifySetting(_ verifierMode: String? = nil) -> String? {
