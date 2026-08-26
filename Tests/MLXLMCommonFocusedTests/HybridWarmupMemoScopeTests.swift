@@ -41,6 +41,17 @@ struct HybridWarmupMemoScopeTests {
             averageAccepted: 0.56, depth: 2))
     }
 
+    /// A marginal depth-2 miss (accepted >= the depth-1 floor 0.55) must NOT
+    /// be catastrophic: the iterator downshifts to depth 1 and keeps
+    /// speculating. This is the exact live case — acceptance dips to
+    /// ~0.94-1.06 after a plain-decoded span and self-recovers.
+    @Test func aMarginalDepthTwoMissIsNeitherCatastrophicNorFatal() {
+        #expect(!NativeMTPTokenIterator.warmupFailureIsModelProperty(
+            averageAccepted: 0.94, depth: 2))
+        #expect(!NativeMTPTokenIterator.warmupFailureIsModelProperty(
+            averageAccepted: 1.06, depth: 2))
+    }
+
     /// The line must sit strictly BELOW each depth's pass floor, or a plain
     /// failure and a catastrophic one are the same thing again.
     @Test func catastrophicIsStrictlyBelowThePassFloorAtEveryDepth() {

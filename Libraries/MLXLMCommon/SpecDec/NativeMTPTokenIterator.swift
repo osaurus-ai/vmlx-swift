@@ -1665,6 +1665,26 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 ) {
                     NativeMTPHybridWarmupMemo.record(false, for: model)
                 }
+                // A marginal miss at depth >= 2 that clears the DEPTH-1 floor
+                // proves depth-1 speculation is safe — downshift and keep
+                // speculating rather than AR-flooding the whole turn. The
+                // floor was an amplifier: after any plain-decoded span the
+                // measured acceptance dips to ~0.94-1.06 (healthy is
+                // 1.24-1.7, and it self-recovers over a few MTP turns), which
+                // sat just under the depth-2 floor of 1.10 — so a modest,
+                // transient dip turned into 1300 tokens of AR fallback at
+                // 14-16 tok/s, SLOWER than MTP Off. Depth 1 at that same
+                // acceptance commits ~1.9 per verify (~30 tok/s).
+                if currentDepth > 1,
+                    averageAccepted >= Self.hybridWarmupMinimumAverageAcceptedPerDraft
+                {
+                    currentDepth = 1
+                    hybridSafetyWarmupComplete = true
+                    adaptiveFallbackReason = String(
+                        format: "hybrid_warmup_downshift_d1_avg_accept=%.2f",
+                        averageAccepted)
+                    return
+                }
                 enableAutoregressiveFallback(
                     reason: String(
                         format: "hybrid_warmup_avg_accept=%.2f",
