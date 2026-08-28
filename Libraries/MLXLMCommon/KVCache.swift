@@ -2140,6 +2140,15 @@ public func maybeQuantizeKVCache(
         guard hasEligibleLayer else { return }
 
         for i in 0..<cache.count {
+            if cache[i] is QSAKVCache {
+                // TurboQuant promotion would replace the QSAKVCache with a
+                // cache that has no indexer lane (and `fromSimpleCache`
+                // refuses 3-array state, yielding an EMPTY cache) — the
+                // qwen4_exp sparse selector then diverges (osaurus#2525).
+                FileHandle.standardError.write(Data(
+                    "[kv quant] skipping QSA layer \(i): TurboQuant promotion would drop the indexer lane.\n".utf8))
+                continue
+            }
             if let simpleCache = cache[i] as? KVCacheSimple {
                 guard simpleCache.offset > tqMinStart,
                       TurboQuantKVCache.hasCompressibleMiddle(tokenCount: simpleCache.offset)
@@ -2169,6 +2178,7 @@ public func maybeQuantizeKVCache(
         else { return }
 
         for i in 0..<cache.count {
+            if cache[i] is QSAKVCache { continue }  // osaurus#2525: keep the indexer lane
             if let simpleCache = cache[i] as? KVCacheSimple {
                 cache[i] = simpleCache.toQuantized(groupSize: groupSize, bits: bits)
             }
@@ -2189,6 +2199,7 @@ public func maybeQuantizeKVCache(
     }
 
     for i in 0..<cache.count {
+        if cache[i] is QSAKVCache { continue }  // osaurus#2525: keep the indexer lane
         if let simpleCache = cache[i] as? KVCacheSimple {
             cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
         }

@@ -862,10 +862,57 @@ private func restoreFromV2Arrays(
                     "[disk cache] restore SKIPPED: layer \(i) has incompatible shape (k=\(keys.shape) v=\(values.shape)). Need >= 3D. Falling back to fresh prefill.\n".utf8))
                 return 0
             }
+            // A plain 2-array KV record seated into a QSAKVCache leaves
+            // `offset` large with an EMPTY indexer lane; the sparse
+            // selector then sizes its mask from the post-restore suffix and
+            // SDPA fatals on the shape mismatch (osaurus#2525). Any such
+            // record predates the `.qsaKV` kind — refuse the whole entry
+            // (one re-prefill) instead of diverging.
+            guard !(cache[i] is QSAKVCache) else {
+                FileHandle.standardError.write(Data(
+                    "[disk cache] restore SKIPPED: layer \(i) is a QSA layer but the stored record has no indexer lane (pre-qsaKV entry). Falling back to fresh prefill.\n".utf8))
+                return 0
+            }
             if totalTokens == 0 {
                 totalTokens = keys.dim(2)
             }
             restoreKVLayer(keys: keys, values: values, into: cache[i])
+
+        case .qsaKV(let comp):
+            var keys = comp.keys
+            var values = comp.values
+            var indexer = comp.indexerKeys
+            if keys.dtype == .float16 {
+                keys = keys.asType(.bfloat16)
+                values = values.asType(.bfloat16)
+            }
+            if indexer.dtype == .float16 {
+                indexer = indexer.asType(.bfloat16)
+            }
+            guard keys.shape.count >= 3, values.shape.count >= 3,
+                indexer.shape.count >= 3
+            else {
+                FileHandle.standardError.write(Data(
+                    "[disk cache] restore SKIPPED: QSA layer \(i) has incompatible shape (k=\(keys.shape) v=\(values.shape) idx=\(indexer.shape)). Falling back to fresh prefill.\n".utf8))
+                return 0
+            }
+            guard let qsa = cache[i] as? QSAKVCache else {
+                FileHandle.standardError.write(Data(
+                    "[disk cache] restore SKIPPED: stored QSA record for layer \(i) but the live cache is \(type(of: cache[i])). Falling back to fresh prefill.\n".utf8))
+                return 0
+            }
+            // The indexer lane must cover exactly the restored offset —
+            // `state`'s setter derives offset from keys, and a shorter lane
+            // would recreate the divergence this record exists to prevent.
+            guard indexer.dim(1) == keys.dim(2) else {
+                FileHandle.standardError.write(Data(
+                    "[disk cache] restore SKIPPED: QSA layer \(i) indexer lane length \(indexer.dim(1)) != KV offset \(keys.dim(2)). Falling back to fresh prefill.\n".utf8))
+                return 0
+            }
+            qsa.state = [keys, values, indexer]
+            if totalTokens == 0 {
+                totalTokens = keys.dim(2)
+            }
 
         case .mamba(let comp):
             // Mamba state arrays are cumulative — no sequence dim to
@@ -1004,10 +1051,11 @@ private func restoreFromV2Arrays(
                     }
 
                 case .tq, .qkv, .deepseekV4, .zayaCCA, .zayaCCATQ, .cacheList,
-                     .requiredMiss, .skip:
+                     .qsaKV, .requiredMiss, .skip:
                     // .skip is a per-sub no-op (sub-cache had no
-                    // persistable state). The other cases are not
-                    // currently emitted as sub-cache kinds — see
+                    // persistable state). The other cases (incl. .qsaKV —
+                    // no model nests a QSAKVCache inside a CacheList) are
+                    // not currently emitted as sub-cache kinds — see
                     // TQDiskSerializer.deserializeCacheListLayer.
                     continue
                 }
@@ -1132,6 +1180,17 @@ private func restoreKVLayer(
     values restoredValues: MLXArray,
     into layer: any KVCache
 ) {
+    if layer is QSAKVCache {
+        // A 2-array seat into a QSA cache erases the indexer lane and
+        // diverges the sparse selector (osaurus#2525). The v2 `.standard`
+        // restore refuses the whole record before reaching here; legacy v1
+        // entries predate qwen4_exp and CacheList never wraps QSA, so this
+        // is a defense-in-depth backstop for future call sites. Loud no-op:
+        // the layer stays empty rather than becoming inconsistent.
+        FileHandle.standardError.write(Data(
+            "[disk cache] restoreKVLayer REFUSED: 2-array record for a QSAKVCache (would drop the indexer lane).\n".utf8))
+        return
+    }
     if let simple = layer as? KVCacheSimple {
         simple.state = [restoredKeys, restoredValues]
     } else if let quantizedCache = layer as? QuantizedKVCache {

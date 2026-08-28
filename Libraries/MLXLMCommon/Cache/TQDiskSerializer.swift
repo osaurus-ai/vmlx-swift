@@ -129,6 +129,16 @@ public enum TQDiskSerializer {
         /// state are one atomic prompt-boundary record; restoring either half
         /// alone would be a false cache hit.
         case zayaCCATQ = 10
+        /// `QSAKVCache` (qwen4_exp QSA full-attention layers) — the standard
+        /// KV pair PLUS the raw indexer-keys lane (`state[2]`,
+        /// `[B, T, indexerHeadDim]`). The sparse block selector sizes its
+        /// attention mask from this lane, so restoring KV without it leaves
+        /// `offset` large while the lane restarts at the post-restore suffix
+        /// — the broadcast_shapes crash of osaurus#2525. The three arrays
+        /// are one atomic record; a QSA layer written as plain `.kv` (any
+        /// pre-fix entry) must be refused on restore, never seated.
+        /// Added 2026-08-28.
+        case qsaKV = 11
         /// Cache type we don't know how to persist. On restore, treated as
         /// a forced miss for the affected layer only.
         case skip = 4
@@ -284,6 +294,23 @@ public enum TQDiskSerializer {
                 serializeQKVLayer(qkv, index: i, into: &result)
                 // serializeQKVLayer sets the kind tag itself so it can mark
                 // empty caches as `.skip` instead of `.qkv`.
+            } else if let qsa = layer as? QSAKVCache {
+                // MUST precede the generic KVCacheSimple branch: QSAKVCache
+                // IS a KVCacheSimple, and writing it as a 2-array `.kv`
+                // record silently drops the indexer lane (osaurus#2525).
+                let state = qsa.state
+                if state.count >= 3 {
+                    result["kv_\(i)_keys"] = state[0]
+                    result["kv_\(i)_values"] = state[1]
+                    result["kv_\(i)_indexer_keys"] = state[2]
+                    result[kindKey(for: i)] = kindArray(.qsaKV)
+                } else {
+                    // A QSA layer whose indexer lane is missing cannot be
+                    // restored faithfully — the selector would mis-size its
+                    // mask. Record skip (forced miss) instead of a lossy
+                    // `.kv` record. Also covers the empty pre-prefill case.
+                    result[kindKey(for: i)] = kindArray(.skip)
+                }
             } else if layer is KVCacheSimple || layer is TurboQuantKVCache {
                 // KVCacheSimple always, plus TurboQuantKVCache in fill phase.
                 // A compressed TQ layer restored from paged decoded KV also
@@ -848,6 +875,15 @@ public enum TQDiskSerializer {
         public let values: MLXArray
     }
 
+    /// Standard KV pair plus the raw QSA indexer-keys lane for one
+    /// qwen4_exp full-attention layer. The three arrays are one atomic
+    /// record — see `LayerKind.qsaKV`.
+    public struct QSAKVLayerComponents {
+        public let keys: MLXArray
+        public let values: MLXArray
+        public let indexerKeys: MLXArray
+    }
+
     /// Mamba SSM state for a single hybrid layer. `state1` is nil for
     /// single-slot layouts: LFM2/LFM2.5 short-conv layers only ever occupy
     /// slot 0 of their 2-slot `MambaCache` container
@@ -942,6 +978,7 @@ public enum TQDiskSerializer {
     public indirect enum LayerData {
         case tq(TQLayerComponents)
         case standard(KVLayerComponents)
+        case qsaKV(QSAKVLayerComponents)
         case mamba(MambaLayerComponents)
         case qkv(QKVLayerComponents)
         case rotating(RotatingLayerComponents)
@@ -1065,6 +1102,24 @@ public enum TQDiskSerializer {
                     // A typed TQ layer is required state. Treat an incomplete
                     // payload as an atomic miss so a rotating companion cannot
                     // turn it into a false mixed-topology hit.
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
+                }
+            case .qsaKV:
+                if let keys = arrays["kv_\(i)_keys"],
+                   let values = arrays["kv_\(i)_values"],
+                   let indexer = arrays["kv_\(i)_indexer_keys"]
+                {
+                    out.append(
+                        IndexedLayerData(
+                            index: i,
+                            data: .qsaKV(
+                                QSAKVLayerComponents(
+                                    keys: keys, values: values, indexerKeys: indexer))
+                        )
+                    )
+                } else {
+                    // The kind tag promised a 3-array QSA record; anything
+                    // less is damage — refuse the whole entry, same as .kv.
                     out.append(IndexedLayerData(index: i, data: .requiredMiss))
                 }
             case .kv:
@@ -1503,12 +1558,12 @@ public enum TQDiskSerializer {
                 }
             case .skip, .unknown:
                 subs.append(.skip)
-            case .tq, .qkv, .deepseekV4, .cacheList, .zayaCCA, .zayaCCATQ:
+            case .tq, .qkv, .deepseekV4, .cacheList, .zayaCCA, .zayaCCATQ, .qsaKV:
                 // Not currently emitted as sub-cache types — see
-                // serializeCacheListLayer. If a future bundle ships
-                // these we'll need to extend serialize too. Skip for
-                // now so old readers don't crash on a tag they can't
-                // round-trip.
+                // serializeCacheListLayer (no model nests a QSAKVCache
+                // inside a CacheList). If a future bundle ships these
+                // we'll need to extend serialize too. Skip for now so
+                // old readers don't crash on a tag they can't round-trip.
                 subs.append(.skip)
             }
         }

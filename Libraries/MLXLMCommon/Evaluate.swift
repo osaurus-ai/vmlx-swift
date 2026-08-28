@@ -2562,7 +2562,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             //                      The compilable form also preserves Qwen3.8
             //                      PLE companion slots 2...5.
             let allPromotable = cache.allSatisfy { layer in
-                layer is KVCacheSimple
+                // QSAKVCache IS a KVCacheSimple, but promotion to
+                // CompilableKVCache erases the type — the qwen4_exp
+                // indexer's `as? QSAKVCache` then fails and the sparse
+                // selector runs cacheless (osaurus#2525 secondary hazard).
+                (layer is KVCacheSimple && !(layer is QSAKVCache))
                     || (layer is RotatingKVCache && !(layer is CompilableRotatingKVCache))
                     || (layer is MambaCache && !(layer is CompilableMambaCache))
             }

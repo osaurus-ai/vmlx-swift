@@ -700,7 +700,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let promptOffset = self.cache.map(\.offset).max() ?? promptTokenIds.count
             let bufferLength = promptOffset + (self.maxTokens ?? 4096) + self.depth + 8
             self.cache = self.cache.map { layer in
-                if !(layer is CompilableKVCache), layer is KVCacheSimple {
+                // Never promote QSAKVCache: the qwen4_exp indexer needs the
+                // concrete type for its raw-key lane (osaurus#2525).
+                if !(layer is CompilableKVCache), layer is KVCacheSimple,
+                    !(layer is QSAKVCache)
+                {
                     return CompilableKVCache(from: layer, maxLength: bufferLength)
                 }
                 return layer
