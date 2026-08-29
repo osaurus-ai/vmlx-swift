@@ -795,6 +795,54 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!rendered.contains("enable_thinking"))
     }
 
+    @Test("ZAYA1-VL fallback preserves nested spawn-batch item schema")
+    func zayaVLFallbackPreservesNestedSpawnBatchSchema() throws {
+        let template = try Template(ChatTemplateFallbacks.zayaVLVisionToolMinimal)
+        let rendered = try template.renderDSV4([
+            "messages": [
+                ["role": "user", "content": "Delegate both jobs."]
+                    as [String: any Sendable],
+            ],
+            "tools": [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "spawn_batch",
+                        "description": "Run a batch of delegated jobs.",
+                        "parameters": [
+                            "type": "object",
+                            "properties": [
+                                "jobs": [
+                                    "type": "array",
+                                    "description": "Jobs to launch.",
+                                    "items": [
+                                        "type": "object",
+                                        "properties": [
+                                            "agent": ["type": "string"],
+                                            "task": ["type": "string"],
+                                            "job_id": ["type": "string"],
+                                        ] as [String: any Sendable],
+                                        "required": ["agent", "task"],
+                                    ] as [String: any Sendable],
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                            "required": ["jobs"],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ],
+            "bos_token": "<bos>",
+            "add_generation_prompt": true,
+            "tool_choice": "required",
+            "tool_choice_name": "spawn_batch",
+        ])
+
+        #expect(rendered.contains("<name>jobs</name>"))
+        #expect(rendered.contains("\"items\""), "Rendered schema dropped array item shape: \(rendered)")
+        #expect(rendered.contains("\"agent\""), "Rendered schema dropped nested agent property: \(rendered)")
+        #expect(rendered.contains("\"task\""), "Rendered schema dropped nested task property: \(rendered)")
+    }
+
     @Test("ZAYA1-VL required tool choice repeats at current turn after no-tool history")
     func zayaVLRequiredToolChoiceRepeatsAfterNoToolHistory() throws {
         let template = try Template(ChatTemplateFallbacks.zayaVLVisionToolMinimal)

@@ -1243,6 +1243,7 @@ value_1
                     {%- if param['description'] is defined -%}
                         {{- '\n<description>' ~ (param['description'] | trim) ~ '</description>' -}}
                     {%- endif -%}
+                    {{- '\n<schema>' ~ (param | tojson | safe) ~ '</schema>' -}}
                     {{- '\n</parameter>' -}}
                 {%- endfor -%}
                 {%- if tool['parameters']['required'] is defined -%}
