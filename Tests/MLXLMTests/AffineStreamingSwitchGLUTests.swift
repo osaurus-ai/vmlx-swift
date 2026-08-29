@@ -412,8 +412,8 @@ struct AffineStreamingSwitchGLUTests {
         let last = try catalog.loadExpert(layer: 42, expert: 255)
         #expect(first.gate.weight.shape[0] == 2048)
         #expect(first.down.weight.shape[0] == 4096)
-        #expect([1, 2, 3, 4, 5, 6, 8].contains(first.gate.bits))
-        #expect([1, 2, 3, 4, 5, 6, 8].contains(last.down.bits))
+        #expect([2, 3, 4, 5, 6, 8].contains(first.gate.bits))
+        #expect([2, 3, 4, 5, 6, 8].contains(last.down.bits))
         #expect(first.gate.groupSize > 0)
         #expect(last.down.groupSize > 0)
     }

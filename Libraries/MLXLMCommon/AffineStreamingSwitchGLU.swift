@@ -263,7 +263,7 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
             // width set below. DSV4 uses it per projection (including 3-bit
             // gate tensors), so the catalog validates each expert tensor's
             // exact geometry rather than imposing one bundle-wide width.
-            guard [1, 2, 3, 4, 5, 6, 8].contains(bits),
+            guard [2, 3, 4, 5, 6, 8].contains(bits),
                 inFeatures % scales.shape.last! == 0
             else {
                 throw AffineStreamingExpertError.invalidTensor(
