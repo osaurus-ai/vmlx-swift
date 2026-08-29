@@ -18,6 +18,15 @@ public extension SafetensorsLoadKeyExcluding {
     var requiresResidentSafetensorsWeights: Bool { false }
 }
 
+/// Lets a model configure file-backed runtime components before the generic
+/// safetensors loader decides which tensor keys to map into the model graph.
+/// Configuration is part of loading, not an optional post-load optimization:
+/// a model that excludes tensors must have a complete model-owned reader ready
+/// before those tensors are skipped.
+public protocol SafetensorsModelDirectoryConfigurable: AnyObject {
+    func configureSafetensorsModelDirectory(_ modelDirectory: URL) throws
+}
+
 private func isPreservedMTPWeightKey(_ key: String) -> Bool {
     let lower = key.lowercased()
     return lower.hasPrefix("mtp.")
@@ -170,6 +179,9 @@ public func loadWeights(
 
     // Resolve symlinks (mlxstudio uses symlinked model directories)
     let modelDirectory = modelDirectory.resolvingSymlinksInPath()
+    if let configurable = model as? any SafetensorsModelDirectoryConfigurable {
+        try configurable.configureSafetensorsModelDirectory(modelDirectory)
+    }
 
     // JANGTQ-native detection: `weight_format: "mxtq"` means the bundle
     // ships tq_packed/tq_norms tensors that should be consumed RAW by
