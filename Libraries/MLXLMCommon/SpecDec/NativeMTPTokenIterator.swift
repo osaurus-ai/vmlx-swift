@@ -348,6 +348,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var adaptiveWindow: [AdaptiveCycle] = []
     private var adaptiveFallbackReason: String?
     private(set) var nativeMTPStats: NativeMTPGenerationStats?
+    private var generationStatsFinalized = false
     private let iteratorStartTime = Date.timeIntervalSinceReferenceDate
 
     private var usesHybridMambaCache: Bool {
@@ -938,6 +939,18 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
         }
 
+        finalizeGenerationStats(generatedTokenIds: generatedTokenIds)
+    }
+
+    /// CPU-only stats snapshot + stderr summary, split out of
+    /// `storeCacheAfterGeneration` so the generate loop can emit `.info`
+    /// (and the host can stop its spinner) BEFORE the GPU drain and cache
+    /// persistence. Touches only accumulated counters — no Metal work.
+    /// Idempotent: `storeCacheAfterGeneration` calls it as a backstop for
+    /// callers that never ran the loop's early-finalize step.
+    mutating func finalizeGenerationStats(generatedTokenIds: [Int]) {
+        guard !generationStatsFinalized else { return }
+        generationStatsFinalized = true
         let accepted = acceptedByDepth
             .sorted { $0.key < $1.key }
             .map { "\($0.key):\($0.value)" }

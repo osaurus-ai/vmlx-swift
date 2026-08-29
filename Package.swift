@@ -854,6 +854,7 @@ let package = Package(
                 "DeepseekV4ToolHistoryPrefixBoundaryTests.swift",
                 "DeepseekV4DropThinkingCacheTests.swift",
                 "DeepseekV4AgentLoopBoundaryTests.swift",
+                "EarlyCompletionBeforeCachePersistTests.swift",
                 "ToolCallProgressRoutingTests.swift",
                 "FocusedMLXTestSupport.swift",
                 "CanonicalChatCacheBoundariesTests.swift",

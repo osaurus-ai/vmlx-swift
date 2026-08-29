@@ -1233,6 +1233,15 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var turboQuantCompressionCount: Int { get }
     var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { get }
     var nativeMTPStats: NativeMTPGenerationStats? { get }
+    /// CPU-only end-of-generation bookkeeping needed to BUILD the completion
+    /// info (e.g. the native-MTP stats snapshot). Split from
+    /// `storeCacheAfterGeneration` so the generate loop can emit `.info` —
+    /// the user-visible "generation finished" signal — BEFORE the expensive
+    /// GPU drain + cache persistence, instead of holding the spinner hostage
+    /// to a multi-second KV serialization. Must not touch Metal encoders and
+    /// must be idempotent (`storeCacheAfterGeneration` may call it again as
+    /// a backstop for callers that skip the loop's ordering).
+    mutating func finalizeGenerationStats(generatedTokenIds: [Int])
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool)
@@ -1243,6 +1252,8 @@ extension TokenIteratorProtocol {
     public var turboQuantCompressionCount: Int { 0 }
     public var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { nil }
     public var nativeMTPStats: NativeMTPGenerationStats? { nil }
+
+    public mutating func finalizeGenerationStats(generatedTokenIds: [Int]) {}
 
     public mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
@@ -4539,37 +4550,23 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             MLXPressGenerationProfile.dumpAndReset(
                 reason: "generation-end tokens=\(tokenCount)")
 
-            // Multi-tier cache: drain the final async token eval before cache
-            // snapshot/store, then keep completion info behind the cache-store
-            // drain. Local chat/tool consumers may start a post-tool decode as
-            // soon as `.info` closes the stream, so `.info` must not be visible
-            // while this generation task can still touch MLX command encoders.
-            // The three phases below run on the request path, so the stream
-            // does not finish until they do. Timed to split "GPU drain" from
-            // "disk store" for the post-output hang: the fix differs by an
-            // order of magnitude depending on which phase owns the wall time.
-            let genTailTrace =
-                ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
-            let tailT0 = Date()
-            Stream().synchronize()
-            let tailT1 = Date()
-            iterator.storeCacheAfterGeneration(
-                generatedTokenIds: generatedTokenIds,
-                includeGeneratedBoundary: stopReason == .stop
-                    && !handler.stopSequenceHit
-                    && !handler.emittedToolCall)
-            let tailT2 = Date()
-
-            // Build completion info only after `storeCacheAfterGeneration`
-            // returns: the native-MTP iterator snapshots `nativeMTPStats`
-            // there, from the same source values its `[NativeMTP]` stderr
-            // summary line prints for the corresponding keys (`outputTokens`
-            // depends on `generatedTokenIds`, which the iterator only sees
-            // in that call). `.info` is yielded
-            // further below, after the cache-store drain, exactly as before —
-            // only the construction moved — and no iterator mutates
-            // `turboQuantCompressionCount` or `promptPrefillTime` during the
-            // cache store, so every existing field is unchanged.
+            // Completion contract (rewritten for the end-of-output hang):
+            // `.info` is the USER-VISIBLE end of generation and is emitted
+            // as soon as the last token has flushed and the CPU-only stats
+            // are finalized — BEFORE the GPU drain, cache snapshot/store,
+            // and advisor drain that used to hold it back for seconds on
+            // large models. Safety is preserved by the STREAM END, not by
+            // `.info` ordering: `continuation.finish()` still runs only
+            // after both Metal drains, the cache persistence, and the
+            // advisor drain, so any consumer that serializes on stream
+            // termination (the osaurus adapter holds its model lease and
+            // Metal gate until the producer completes) cannot start a new
+            // decode while this task can still touch MLX command encoders.
+            // Consumers acting on `.info` alone get exactly the intended
+            // early spinner-off; they cannot reach the model without the
+            // lease. No per-family special case: this is the shared
+            // terminal path for every local model.
+            iterator.finalizeGenerationStats(generatedTokenIds: generatedTokenIds)
             let info = GenerateCompletionInfo(
                 promptTokenCount: promptTokenCount,
                 generationTokenCount: tokenCount,
@@ -4582,25 +4579,44 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 nativeMTPStats: iterator.nativeMTPStats,
                 toolCallProtocolFailure: handler.toolCallProtocolFailure
             )
+            _ = continuation.yield(handler.infoEvent(info))
 
+            // Post-completion cleanup, still on the request path so the
+            // stream does not FINISH until it is done. Timed to split
+            // "GPU drain" from "disk store" from "advisor" for the
+            // post-output tail: the fix differs by an order of magnitude
+            // depending on which phase owns the wall time.
+            let genTailTrace =
+                ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
+            let tailT0 = Date()
             Stream().synchronize()
-            if genTailTrace {
-                let tailT3 = Date()
-                print(
-                    "[vmlx][gen/tail] drain1=\(tailT1.timeIntervalSince(tailT0))s"
-                        + " store=\(tailT2.timeIntervalSince(tailT1))s"
-                        + " drain2=\(tailT3.timeIntervalSince(tailT2))s")
-            }
+            let tailT1 = Date()
+            iterator.storeCacheAfterGeneration(
+                generatedTokenIds: generatedTokenIds,
+                includeGeneratedBoundary: stopReason == .stop
+                    && !handler.stopSequenceHit
+                    && !handler.emittedToolCall)
+            let tailT2 = Date()
+            Stream().synchronize()
+            let tailT3 = Date()
 
             // Router-advice readback runs on its own Dispatch queue. Drain it
             // after MLX synchronization so short-lived CLI runs and app unload
             // paths do not tear down runtime state while the advisor is still
             // applying mmap page advice.
             MLXPressCanonicalExpertAdvisor.shared.waitUntilIdle()
+            if genTailTrace {
+                let tailT4 = Date()
+                print(
+                    "[vmlx][gen/tail] infoEmitted=early"
+                        + " drain1=\(tailT1.timeIntervalSince(tailT0))s"
+                        + " store=\(tailT2.timeIntervalSince(tailT1))s"
+                        + " drain2=\(tailT3.timeIntervalSince(tailT2))s"
+                        + " advisor=\(tailT4.timeIntervalSince(tailT3))s")
+            }
 
-            _ = continuation.yield(handler.infoEvent(info))
-
-            // Finalize the stream
+            // Finalize the stream — the serialization point for the next
+            // generation.
             continuation.finish()
         }
 
