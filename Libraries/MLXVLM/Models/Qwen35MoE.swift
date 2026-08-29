@@ -58,7 +58,49 @@ public final class Qwen35MoE: Qwen35 {
             }
         }
 
+        for layer in 0 ..< config.textConfiguration.mtpNumHiddenLayers {
+            for prefix in [
+                "mtp.layers.\(layer).mlp",
+                "model.mtp_layers.\(layer).mlp",
+            ] {
+                stackAffineExpertsIfNeeded(prefix: prefix, weights: &remapped)
+            }
+        }
+
         return remapped
+    }
+
+    /// Some Qwen3.5-MoE checkpoints keep the base routed experts pre-stacked
+    /// but preserve the MTP head in Hugging Face's per-expert affine layout:
+    /// `mtp.layers.L.mlp.experts.E.{gate,up,down}_proj.{weight,scales,biases}`.
+    /// The runtime module is a `SwitchGLU`, so those tensors must become one
+    /// materialized expert bank per projection. Materializing at load avoids a
+    /// lazy stack retaining every source mmap through the first decode.
+    private func stackAffineExpertsIfNeeded(
+        prefix: String,
+        weights: inout [String: MLXArray]
+    ) {
+        for projection in ["gate_proj", "up_proj", "down_proj"] {
+            for suffix in ["weight", "scales", "biases"] {
+                let target = "\(prefix).switch_mlp.\(projection).\(suffix)"
+                if weights[target] != nil { continue }
+
+                let sourceKeys = (0 ..< config.textConfiguration.numExperts).map {
+                    "\(prefix).experts.\($0).\(projection).\(suffix)"
+                }
+                guard sourceKeys.first.flatMap({ weights[$0] }) != nil else { continue }
+                let tensors = sourceKeys.compactMap { weights[$0] }
+                guard tensors.count == config.textConfiguration.numExperts else {
+                    // Leave the incomplete source layout intact so strict model
+                    // update fails closed and reports the unsupported payload.
+                    continue
+                }
+                for key in sourceKeys {
+                    weights.removeValue(forKey: key)
+                }
+                weights[target] = loadTimeMaterializedStacked(tensors)
+            }
+        }
     }
 
     private func stackTurboQuantExpertsIfNeeded(
