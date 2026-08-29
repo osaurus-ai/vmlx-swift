@@ -838,7 +838,9 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         ])
 
         #expect(rendered.contains("<name>jobs</name>"))
-        #expect(rendered.contains("\"items\""), "Rendered schema dropped array item shape: \(rendered)")
+        #expect(rendered.contains("<items>"), "Rendered schema used the wrong ZAYA tag: \(rendered)")
+        #expect(!rendered.contains("<schema>"), "Rendered schema used a synthetic wrapper: \(rendered)")
+        #expect(rendered.contains("\"properties\""), "Rendered items dropped object shape: \(rendered)")
         #expect(rendered.contains("\"agent\""), "Rendered schema dropped nested agent property: \(rendered)")
         #expect(rendered.contains("\"task\""), "Rendered schema dropped nested task property: \(rendered)")
     }

@@ -527,8 +527,9 @@ struct Zaya1VLRegistrationTests {
         let decoded = tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
 
         #expect(decoded.contains("<name>jobs</name>"), "decoded prompt: \(decoded)")
-        #expect(decoded.contains("<schema>"), "decoded prompt: \(decoded)")
-        #expect(decoded.contains("\"items\""), "decoded prompt: \(decoded)")
+        #expect(decoded.contains("<items>"), "decoded prompt: \(decoded)")
+        #expect(!decoded.contains("<schema>"), "decoded prompt: \(decoded)")
+        #expect(decoded.contains("\"properties\""), "decoded prompt: \(decoded)")
         #expect(decoded.contains("\"agent\""), "decoded prompt: \(decoded)")
         #expect(decoded.contains("\"task\""), "decoded prompt: \(decoded)")
         #expect(decoded.contains("\"job_id\""), "decoded prompt: \(decoded)")
