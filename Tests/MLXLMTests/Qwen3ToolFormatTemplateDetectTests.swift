@@ -77,4 +77,72 @@ struct Qwen3ToolFormatTemplateDetectTests {
         #expect(r.format == nil)
         #expect(r.source == .none)
     }
+
+    // MARK: - Mis-stamped `tool_parser: "hermes"` recovery (2026-08-28)
+    //
+    // A batch of published Qwen 3.8 JANG bundles was accidentally stamped
+    // `capabilities.tool_parser = "hermes"` (a vLLM parser name) instead of
+    // `"qwen"`. The whole safety story rests on "hermes" being UNRECOGNISED:
+    // the stamp resolves nil, so the ladder falls through to model_type /
+    // chat-template detection instead of trusting a wrong format. These pin
+    // that recovery so a future "hermes" alias can never silently flip it
+    // into an authoritative-but-wrong `.json` stamp for coder-style bundles.
+
+    @Test("'hermes' is not a recognised capability alias")
+    func hermesStampIsUnrecognised() {
+        #expect(ToolCallFormat.fromCapabilityName("hermes") == nil)
+        #expect(ToolCallFormat.fromCapabilityName("Hermes") == nil)
+        #expect(ToolCallFormat.fromCapabilityName("hermes_json") == nil)
+    }
+
+    @Test("hermes-stamped qwen3_5 bundle recovers .xmlFunction via model_type")
+    func hermesStampedQwen35Recovers() {
+        // Qwen3.8-27B bundles: model_type=qwen3_5. The bad stamp must fall
+        // through to the model_type heuristic, which knows the family.
+        let r = ParserResolution.toolCall(
+            capabilities: JangCapabilities(toolParser: "hermes"),
+            modelType: "qwen3_5",
+            chatTemplate: qwen3CoderTemplate)
+        #expect(r.format == .xmlFunction)
+        #expect(r.source == .modelTypeHeuristic)
+    }
+
+    @Test("hermes-stamped qwen4_exp bundle recovers .xmlFunction via template")
+    func hermesStampedQwen4ExpRecovers() {
+        // Qwen3.8 Flash-Next bundles: model_type=qwen4_exp, which the
+        // heuristic does not know — the bundle's own chat template (real
+        // envelope: <function=/<parameter=) is the ground truth.
+        let r = ParserResolution.toolCall(
+            capabilities: JangCapabilities(toolParser: "hermes"),
+            modelType: "qwen4_exp",
+            chatTemplate: qwen3CoderTemplate)
+        #expect(r.format == .xmlFunction)
+        #expect(r.source == .chatTemplate)
+    }
+
+    @Test("hermes-stamped genuine Hermes-style instruct still lands .json")
+    func hermesStampedInstructStillJson() {
+        // A bundle whose template actually IS the Hermes bare-JSON envelope
+        // (plain Qwen3 instruct): the wrong stamp does no harm there either.
+        let r = ParserResolution.toolCall(
+            capabilities: JangCapabilities(toolParser: "hermes"),
+            modelType: "qwen3",
+            chatTemplate: qwen3InstructTemplate)
+        #expect(r.format == .json)
+        #expect(r.source == .chatTemplate)
+    }
+
+    @Test("the CORRECTED stamps resolve .xmlFunction authoritatively")
+    func correctedStampsResolve() {
+        // The repo fix restamps `qwen` (and converter-era bundles carry
+        // `qwen3_coder`) — both must resolve directly, template not needed.
+        for stamp in ["qwen", "qwen3_coder", "qwen3_5"] {
+            let r = ParserResolution.toolCall(
+                capabilities: JangCapabilities(toolParser: stamp),
+                modelType: "qwen3_5",
+                chatTemplate: nil)
+            #expect(r.format == .xmlFunction, "stamp '\(stamp)' must resolve")
+            #expect(r.source == .jangStamped)
+        }
+    }
 }
