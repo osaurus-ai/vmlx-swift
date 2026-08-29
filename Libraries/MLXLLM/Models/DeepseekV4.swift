@@ -1404,9 +1404,11 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     public func configureSafetensorsModelDirectory(_ modelDirectory: URL) throws {
         try affineExpertCatalog.configure(
             modelDirectory: modelDirectory, layerCount: config.numHiddenLayers)
-        for (layerIndex, layer) in model.layers.enumerated() {
+        var moduleUpdates: [(String, Module)] = []
+        moduleUpdates.reserveCapacity(model.layers.count)
+        for layerIndex in model.layers.indices {
             let limit = config.swigluLimit
-            layer.mlp.switchMLP = AffineStreamingSwitchGLU(
+            let streamingSwitch = AffineStreamingSwitchGLU(
                 inputDims: config.hiddenSize,
                 hiddenDims: config.moeIntermediateSize,
                 numExperts: config.nRoutedExperts,
@@ -1421,7 +1423,19 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                     DeepseekV4Math.dsv4ScoredSwiGLU(
                         gate: gate, up: up, scores: scores, limit: limit)
                 })
+            moduleUpdates.append((
+                "model.layers.\(layerIndex).mlp.switch_mlp",
+                streamingSwitch
+            ))
         }
+        // `switchMLP` is registered through `@ModuleInfo`; direct assignment
+        // after construction violates MLXNN's module-tree invariants and
+        // process-fatals in `ModuleInfo.set`. Replace the registered children
+        // through the supported tree update API before generic weight loading.
+        try update(
+            modules: ModuleChildren.unflattened(moduleUpdates),
+            verify: .none
+        )
         FileHandle.standardError.write(
             Data(
                 ("[DSV4AffineExperts] production path=exact-mmap-region "
