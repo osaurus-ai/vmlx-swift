@@ -33,7 +33,9 @@ the DSV4 one-sequence architecture cap and separate from cache size.
 - Exclude only exact DSV4 affine routed keys; shared experts, router,
   attention, cache, MTP, and JANGTQ tensors remain on their existing paths.
 - Map only the selected experts' exact file regions.
-- Preserve mixed 1/2/3/4/5/6/8-bit affine geometry per projection.
+- Preserve the MLX-native mixed 2/3/4/5/6/8-bit affine geometry per
+  projection. Reject 1-bit descriptors fail-closed; MLX's native affine
+  kernels do not support that width.
 - Preserve DSV4's required score-before-quantized-down ordering and fp32
   limited-SwiGLU operation.
 - Bound the mapping cache per layer; do not install a permanent stacked
