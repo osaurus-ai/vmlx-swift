@@ -350,7 +350,14 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
 
-        return newWeights.isEmpty ? sanitizedWeights : newWeights
+        // No empty-result fallback here, deliberately. `newWeights` can only be empty if EVERY
+        // key was an orphan `weight_scale_inv` or an `activation_scale` — the third branch above
+        // catches everything else — which is a tensor set carrying no weights at all, not a model.
+        // The fallback that used to sit here would, in that impossible case, have returned the
+        // orphan scale tensors themselves: keys the module tree has no destination for, i.e. a
+        // worse failure than the empty result. The other three implementations of this loop
+        // (Mistral3TextJANGTQ, Mistral3, Mistral3VLMJANGTQ) never had it.
+        return newWeights
     }
 
     /// Create appropriate caches for each layer type.
