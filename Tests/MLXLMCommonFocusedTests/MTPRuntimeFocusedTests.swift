@@ -454,6 +454,35 @@ struct MTPRuntimeFocusedTests {
         #expect(fasterThanBaseline.usableBestDepth == 3)
     }
 
+    @Test("prompt-scoped MTP tuning cannot authorize global auto launch")
+    func promptScopedTuningIsNotGloballyUsable() {
+        func tuning(promptClass: String?) -> NativeMTPTuning {
+            NativeMTPTuning(
+                bestDepth: 1,
+                validated: true,
+                outputEquivalent: true,
+                promptClass: promptClass,
+                baselineTokensPerSecond: 20,
+                bestTokensPerSecond: 24,
+                speedupVsBaseline: 1.2)
+        }
+
+        #expect(tuning(promptClass: "code").usableBestDepth == nil)
+        #expect(tuning(promptClass: "prose_greedy_200tok_seed42").usableBestDepth == nil)
+        #expect(tuning(promptClass: "general").usableBestDepth == 1)
+        #expect(tuning(promptClass: "mixed").usableBestDepth == 1)
+        #expect(tuning(promptClass: nil).usableBestDepth == 1)
+
+        let scopedStatus = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 10,
+            mode: .speculativeVerified,
+            nativeMTPTuning: tuning(promptClass: "code"))
+        #expect(!scopedStatus.canAutoLaunchMTP)
+        #expect(scopedStatus.requiresNativeMTPTuningBeforeAutoLaunch)
+    }
+
     @Test("MTP config without tensors is reported as metadata-only")
     func configOnlyMTPIsMetadataOnlyMissingWeights() throws {
         let root = try makeTemporaryBundle(name: "qwen-mtp-missing-weights")

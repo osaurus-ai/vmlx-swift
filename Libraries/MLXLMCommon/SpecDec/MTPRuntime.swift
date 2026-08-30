@@ -123,6 +123,7 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
         guard !blocked,
               validated,
               outputEquivalent,
+              isWorkloadGeneral,
               let bestDepth,
               bestDepth > 0,
               let baselineTokensPerSecond,
@@ -135,6 +136,23 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
             return nil
         }
         return bestDepth
+    }
+
+    /// Auto is a global product policy, so a tuning row measured only for one
+    /// prompt class must not silently govern unrelated chat, tool, or coding
+    /// requests. A caller can still explicitly select a manual depth for a
+    /// diagnostic run. Missing prompt metadata remains accepted for legacy
+    /// tuning files; newly scoped rows must declare a workload-general class.
+    public var isWorkloadGeneral: Bool {
+        guard let promptClass else { return true }
+        let normalized = promptClass
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+        if normalized.isEmpty { return true }
+        return ["all", "general", "general_mixed", "mixed", "representative"].contains(
+            normalized)
     }
 
     /// The verifier mode the artifact EXPLICITLY specifies, or nil when it is
