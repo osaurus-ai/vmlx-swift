@@ -68,6 +68,7 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
     public let validated: Bool
     public let outputEquivalent: Bool
     public let blocked: Bool
+    public let manualBlocked: Bool
     public let cacheMode: String?
     public let promptClass: String?
     public let measuredAt: String?
@@ -87,6 +88,7 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
         validated: Bool = false,
         outputEquivalent: Bool = false,
         blocked: Bool = false,
+        manualBlocked: Bool = false,
         cacheMode: String? = nil,
         promptClass: String? = nil,
         measuredAt: String? = nil,
@@ -105,6 +107,7 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
         self.validated = validated
         self.outputEquivalent = outputEquivalent
         self.blocked = blocked
+        self.manualBlocked = manualBlocked
         self.cacheMode = cacheMode
         self.promptClass = promptClass
         self.measuredAt = measuredAt
@@ -121,6 +124,7 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
 
     public var usableBestDepth: Int? {
         guard !blocked,
+              !manualBlocked,
               validated,
               outputEquivalent,
               isWorkloadGeneral,
@@ -192,6 +196,7 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
             validated: try c.decodeIfPresent(Bool.self, forKey: .validated) ?? false,
             outputEquivalent: try c.decodeIfPresent(Bool.self, forKey: .outputEquivalent) ?? false,
             blocked: try c.decodeIfPresent(Bool.self, forKey: .blocked) ?? false,
+            manualBlocked: try c.decodeIfPresent(Bool.self, forKey: .manualBlocked) ?? false,
             cacheMode: try c.decodeIfPresent(String.self, forKey: .cacheMode),
             promptClass: try c.decodeIfPresent(String.self, forKey: .promptClass),
             measuredAt: try c.decodeIfPresent(String.self, forKey: .measuredAt),
@@ -214,6 +219,7 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
         case validated
         case outputEquivalent = "output_equivalent"
         case blocked
+        case manualBlocked = "manual_blocked"
         case cacheMode = "cache_mode"
         case promptClass = "prompt_class"
         case measuredAt = "measured_at"
@@ -237,6 +243,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
     public let validated: Bool
     public let outputEquivalent: Bool
     public let blocked: Bool
+    public let manualBlocked: Bool
     public let cacheMode: String?
     public let promptClass: String?
     public let measuredAt: String?
@@ -258,6 +265,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
         validated: Bool,
         outputEquivalent: Bool,
         blocked: Bool,
+        manualBlocked: Bool = false,
         cacheMode: String? = nil,
         promptClass: String? = nil,
         measuredAt: String? = nil,
@@ -278,6 +286,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
         self.validated = validated
         self.outputEquivalent = outputEquivalent
         self.blocked = blocked
+        self.manualBlocked = manualBlocked
         self.cacheMode = cacheMode
         self.promptClass = promptClass
         self.measuredAt = measuredAt
@@ -300,6 +309,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
         case validated
         case outputEquivalent = "output_equivalent"
         case blocked
+        case manualBlocked = "manual_blocked"
         case cacheMode = "cache_mode"
         case promptClass = "prompt_class"
         case measuredAt = "measured_at"
@@ -407,6 +417,7 @@ extension NativeMTPTuning {
             validated: validated,
             outputEquivalent: outputEquivalent,
             blocked: blocked,
+            manualBlocked: manualBlocked,
             cacheMode: cacheMode,
             promptClass: promptClass,
             measuredAt: measuredAt,
@@ -492,6 +503,9 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
     public var statusLine: String {
         let base = "mtp: \(mode.rawValue), layers=\(configuredLayers), tensors=\(tensorCount)"
         let tuned = nativeMTPTuning?.usableBestDepth.map { ", tuning=d\($0)" } ?? ""
+        if nativeMTPTuning?.manualBlocked == true {
+            return "\(base), speculative=off, manual=blocked"
+        }
         if speculativeDecodeEnabled {
             return "\(base)\(tuned), speculative=on"
         }
@@ -590,6 +604,7 @@ public extension NativeMTPModel {
 public enum NativeMTPActivationError: Error, LocalizedError, CustomStringConvertible {
     case requestedButMissingArtifact(MTPBundleStatus?)
     case requestedWithoutUsableTuning(MTPBundleStatus?)
+    case requestedWithBlockedTuning(MTPBundleStatus?)
     case requestedForUnsupportedModel([String])
     case invalidConfigData
 
@@ -604,6 +619,9 @@ public enum NativeMTPActivationError: Error, LocalizedError, CustomStringConvert
             return "native MTP was requested but this bundle does not have complete MTP tensor evidence: \(status?.statusLine ?? "no status")"
         case .requestedWithoutUsableTuning(let status):
             return "native MTP was requested but this bundle does not have usable \(NativeMTPTuning.fileName) metadata: \(status?.statusLine ?? "no status")"
+        case .requestedWithBlockedTuning(let status):
+            let reason = status?.nativeMTPTuning?.reason ?? "no block reason recorded"
+            return "native MTP was requested but this bundle explicitly blocks it: \(reason) (\(status?.statusLine ?? "no status"))"
         case .requestedForUnsupportedModel(let types):
             return "native MTP was requested for unsupported model type(s): \(types.joined(separator: ", "))"
         case .invalidConfigData:
@@ -689,6 +707,9 @@ public enum NativeMTPActivation {
         }
         if isTuningMeasurementRun {
             return true
+        }
+        guard status?.nativeMTPTuning?.manualBlocked != true else {
+            throw NativeMTPActivationError.requestedWithBlockedTuning(status)
         }
         // Manual-depth activation: the user pressed an explicit depth button.
         // Like measurement mode, a complete tensor artifact loads without a
@@ -807,10 +828,11 @@ public struct NativeMTPAutoDecodeRecommendation: Codable, Sendable, Equatable {
 public enum NativeMTPAutoDecodePolicy {
     /// Manual-depth recommendation: validates the same family/tensor evidence
     /// as the auto path but takes the user's explicit depth instead of a
-    /// measured tuning artifact. A tuning file, when present, contributes only
-    /// its explicit verifier mode; a blocked or unusable artifact does not
-    /// veto a deliberate user activation. Callers must pair this with
-    /// enforced greedy sampling for the model+session.
+    /// measured tuning artifact. A tuning file, when present, contributes its
+    /// explicit verifier mode. An explicitly blocked artifact vetoes manual
+    /// activation too: `blocked` is the bundle owner's safety decision, not a
+    /// missing-measurement condition. Callers must pair every accepted manual
+    /// activation with greedy sampling for the model+session.
     public static func manualRecommendation(
         depth: Int,
         configData: Data?,
@@ -819,6 +841,7 @@ public enum NativeMTPAutoDecodePolicy {
     ) -> NativeMTPAutoDecodeRecommendation? {
         guard (1...3).contains(depth) else { return nil }
         guard let status, status.hasCompleteMTPArtifact else { return nil }
+        guard status.nativeMTPTuning?.manualBlocked != true else { return nil }
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
@@ -1532,6 +1555,7 @@ public enum MTPBundleInspector {
             statusEvidence.append("tuning.validated=\(nativeMTPTuning.validated)")
             statusEvidence.append("tuning.output_equivalent=\(nativeMTPTuning.outputEquivalent)")
             statusEvidence.append("tuning.blocked=\(nativeMTPTuning.blocked)")
+            statusEvidence.append("tuning.manual_blocked=\(nativeMTPTuning.manualBlocked)")
         } else if metadataClaimsMTP || bundleHasMTP {
             // "missing" and "present but unreadable" are different problems and
             // point at different fixes. Reporting both as missing sent the

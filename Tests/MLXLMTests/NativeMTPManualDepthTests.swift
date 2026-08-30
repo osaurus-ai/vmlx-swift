@@ -34,6 +34,38 @@ struct NativeMTPManualDepthTests {
             nativeMTPTuning: nil)
     }
 
+    /// A complete head whose bundle owner recorded a production safety block.
+    private static var blockedStatus: MTPBundleStatus {
+        MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 57,
+            mode: .preservedEnabled,
+            nativeMTPTuning: NativeMTPTuning(
+                bestDepth: 1,
+                validated: true,
+                outputEquivalent: true,
+                blocked: true,
+                manualBlocked: true,
+                reason: "live workload regressed versus autoregressive decode"))
+    }
+
+    /// Auto has no winning depth, but manual diagnostics remain permitted.
+    /// This is the existing Flash-Next 4M shape and must not be changed by the
+    /// Ornith-specific `manual_blocked` contract.
+    private static var autoOnlyBlockedStatus: MTPBundleStatus {
+        MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 57,
+            mode: .preservedEnabled,
+            nativeMTPTuning: NativeMTPTuning(
+                bestDepth: 0,
+                blocked: true,
+                manualBlocked: false,
+                reason: "no automatic depth beat autoregressive decode"))
+    }
+
     private static func settings(
         mode: VMLXMTPServerMode, explicitDepth: Int? = nil
     ) -> VMLXServerRuntimeSettings {
@@ -124,6 +156,67 @@ struct NativeMTPManualDepthTests {
                     configData: Self.config(),
                     baseModelType: "qwen4_exp",
                     status: Self.completeUntunedStatus)
+            }
+        }
+    }
+
+    @Test("a blocked tuning row vetoes manual depth and names the reason")
+    func blockedTuningVetoesManualDepth() throws {
+        let settings = Self.settings(mode: .forceOn, explicitDepth: 1)
+        #expect(settings.effectiveMTPLaunchMode(for: Self.blockedStatus) == .blocked)
+        #expect(
+            settings.validationIssues(mtpStatus: Self.blockedStatus)
+                .contains { $0.field == "mtp.mode" && $0.message.contains("explicitly blocked") })
+        let launch = settings.resolvedMTPLaunch(
+            configData: Self.config(),
+            jangConfig: nil,
+            status: Self.blockedStatus)
+        #expect(launch.launchMode == .blocked)
+        #expect(launch.recommendation == nil)
+        #expect(launch.reason.contains("explicitly blocked"))
+
+        try NativeMTPActivation.$explicitRequestOverride.withValue(true) {
+            try NativeMTPActivation.$manualDepthOverride.withValue(1) {
+                #expect(throws: NativeMTPActivationError.self) {
+                    _ = try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                        configData: Self.config(),
+                        baseModelType: "qwen4_exp",
+                        status: Self.blockedStatus)
+                }
+                do {
+                    _ = try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                        configData: Self.config(),
+                        baseModelType: "qwen4_exp",
+                        status: Self.blockedStatus)
+                    Issue.record("blocked tuning unexpectedly loaded")
+                } catch let error as NativeMTPActivationError {
+                    #expect(error.description.contains("explicitly blocks"))
+                    #expect(error.description.contains("regressed versus autoregressive"))
+                }
+            }
+        }
+    }
+
+    @Test("an Auto-only block does not disable explicit diagnostics")
+    func autoOnlyBlockStillAllowsManualDepth() throws {
+        let settings = Self.settings(mode: .forceOn, explicitDepth: 2)
+        #expect(
+            settings.effectiveMTPLaunchMode(for: Self.autoOnlyBlockedStatus)
+                == .speculative)
+        let launch = settings.resolvedMTPLaunch(
+            configData: Self.config(),
+            jangConfig: nil,
+            status: Self.autoOnlyBlockedStatus)
+        #expect(launch.launchMode == .speculative)
+        #expect(launch.recommendation?.depth == 2)
+
+        try NativeMTPActivation.$explicitRequestOverride.withValue(true) {
+            try NativeMTPActivation.$manualDepthOverride.withValue(2) {
+                let allowed = try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                    configData: Self.config(),
+                    baseModelType: "qwen4_exp",
+                    status: Self.autoOnlyBlockedStatus)
+                #expect(allowed)
             }
         }
     }

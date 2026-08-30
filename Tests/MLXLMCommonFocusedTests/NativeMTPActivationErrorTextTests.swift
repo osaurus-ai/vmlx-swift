@@ -23,6 +23,7 @@ struct NativeMTPActivationErrorTextTests {
         let cases: [NativeMTPActivationError] = [
             .requestedButMissingArtifact(nil),
             .requestedWithoutUsableTuning(nil),
+            .requestedWithBlockedTuning(nil),
             .requestedForUnsupportedModel(["gemma4"]),
             .invalidConfigData,
         ]

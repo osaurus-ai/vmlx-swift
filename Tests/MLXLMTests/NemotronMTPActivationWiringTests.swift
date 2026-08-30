@@ -86,7 +86,8 @@ struct NemotronMTPActivationWiringTests {
                 switch error {
                 case .requestedForUnsupportedModel(let types):
                     Issue.record("still rejected as an unsupported family: \(types)")
-                case .requestedButMissingArtifact, .requestedWithoutUsableTuning:
+                case .requestedButMissingArtifact, .requestedWithoutUsableTuning,
+                    .requestedWithBlockedTuning:
                     break  // correct: the family is accepted, the evidence is not
                 case .invalidConfigData:
                     Issue.record("unexpected config error")

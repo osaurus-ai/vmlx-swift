@@ -363,8 +363,14 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 if mtp.explicitDepth != nil {
                     // Manual depth is a deliberate user activation: it needs
                     // tensor-complete evidence for a supported runtime, not a
-                    // measured tuning artifact — the user IS the measurement.
-                    if !status.hasCompleteMTPArtifact {
+                    // measured tuning artifact. An explicit bundle safety
+                    // block still wins; a user request is not permission to
+                    // bypass a known-bad production result.
+                    if status.nativeMTPTuning?.manualBlocked == true {
+                        issues.append(.error(
+                            field: "mtp.mode",
+                            message: "MTP is explicitly blocked by this bundle's tuning metadata: \(status.nativeMTPTuning?.reason ?? "no reason recorded")"))
+                    } else if !status.hasCompleteMTPArtifact {
                         issues.append(.error(
                             field: "mtp.mode",
                             message: "MTP manual depth requires complete MTP tensor evidence in the bundle (this bundle's artifact is absent or incomplete)."))
@@ -430,9 +436,10 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             return (status?.canAutoLaunchMTP == true) ? .speculative : .off
         case .forceOn:
             if mtp.explicitDepth != nil {
-                // Manual depth: tensor evidence alone activates; tuning is
-                // an Auto-mode requirement only.
-                return (status?.hasCompleteMTPArtifact == true) ? .speculative : .blocked
+                // Manual depth can bypass missing measurement, never an
+                // explicit bundle safety block.
+                return (status?.hasCompleteMTPArtifact == true
+                    && status?.nativeMTPTuning?.manualBlocked != true) ? .speculative : .blocked
             }
             return (status?.canAutoLaunchMTP == true) ? .speculative : .blocked
         }
@@ -469,6 +476,12 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                     launchMode: .blocked,
                     recommendation: nil,
                     reason: "MTP explicit depth must be 1, 2, or 3 (got \(depth)).")
+            }
+            if status?.nativeMTPTuning?.manualBlocked == true {
+                return .init(
+                    launchMode: .blocked,
+                    recommendation: nil,
+                    reason: "MTP is explicitly blocked by this bundle's tuning metadata: \(status?.nativeMTPTuning?.reason ?? "no reason recorded")")
             }
             guard let manual = NativeMTPAutoDecodePolicy.manualRecommendation(
                 depth: depth,

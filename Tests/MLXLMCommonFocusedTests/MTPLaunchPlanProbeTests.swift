@@ -31,10 +31,23 @@ struct MTPLaunchPlanProbeTests {
 
         let configData = try? Data(
             contentsOf: dir.appendingPathComponent("config.json"))
-        let settings = VMLXServerRuntimeSettings()
+        var settings = VMLXServerRuntimeSettings()
+        if let rawDepth = ProcessInfo.processInfo.environment["VMLX_MTP_PROBE_MANUAL_DEPTH"],
+            let depth = Int(rawDepth)
+        {
+            settings.mtp.mode = .forceOn
+            settings.mtp.explicitDepth = depth
+            print("[probe] requestedManualDepth=\(depth)")
+        }
         let launch = settings.resolvedMTPLaunch(
             configData: configData, jangConfig: nil, status: status)
         print("[probe] launchMode=\(launch.launchMode) reason=\(launch.reason)")
+        if settings.mtp.mode == .forceOn,
+            status.nativeMTPTuning?.manualBlocked == true
+        {
+            #expect(launch.launchMode == .blocked)
+            #expect(launch.recommendation == nil)
+        }
         let strategy = settings.resolvedMTPDraftStrategy(
             configData: configData, jangConfig: nil, status: status)
         print("[probe] strategy=\(String(describing: strategy))")
