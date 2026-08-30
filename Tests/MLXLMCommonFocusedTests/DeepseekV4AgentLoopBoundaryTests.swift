@@ -340,19 +340,11 @@ struct DeepseekV4AgentLoopBoundaryTests {
     /// can alter.
     @Test("a written-file tool call survives emit -> parse -> re-render")
     func fileWriteToolCallRoundTripsByteExact() throws {
-        // KNOWN DEFECT, deliberately recorded rather than deleted or weakened.
-        //
-        // The re-render is NOT byte-stable once `rawArgumentsJSON` is lost:
-        // the sorted-key dict path emits `content` before `path`, diverging at
-        // char 56 from the model's own emission order. Fixing it means keeping
-        // the raw member order across a serialized transcript, which changes
-        // `ToolCall.Function`'s Codable surface — a public wire-shape change
-        // that does not belong in a tests-only change.
-        //
-        // `withKnownIssue` keeps CI green while the assertion stays live: if
-        // the ordering is ever fixed, this FAILS as an unexpected pass and
-        // whoever fixed it gets told to delete this wrapper.
-        try withKnownIssue("tool-call re-render loses the model's argument order") {
+        // Was a KNOWN DEFECT: the re-render was not byte-stable once `rawArgumentsJSON` was lost,
+        // because the dictionary path sorts and the model had emitted `path` before `content`.
+        // Fixed by carrying `ToolCall.Function.argumentOrder` — the names only, not the raw text —
+        // through `Codable`, so the order survives a serialized transcript and
+        // `renderToolCallInvoke(name:params:order:)` can reproduce the original spelling.
         let payload = """
             <!DOCTYPE html>
             <html lang="en">
@@ -401,10 +393,14 @@ struct DeepseekV4AgentLoopBoundaryTests {
         // history. Model the turn-N+1 path faithfully: rebuild the arguments
         // from the decoded values only, which is what a client that persisted
         // and reloaded the transcript can supply.
+        // Turn N+1 supplies the decoded values AND the order, which now survives `Codable` as
+        // `argumentOrder` — `rawArgumentsJSON` deliberately does not, and without either the
+        // re-render fell back to SORTED order and changed the bytes.
         let decoded = parsed[0].function.arguments
         let reRendered = DeepseekV4ChatEncoder.renderToolCallInvoke(
             name: parsed[0].function.name,
-            params: decoded.mapValues { $0.anyValue })
+            params: decoded.mapValues { $0.anyValue },
+            order: parsed[0].function.argumentOrder)
 
         guard rendered == reRendered else {
             let common = zip(rendered, reRendered).prefix { $0 == $1 }.count
@@ -417,7 +413,6 @@ struct DeepseekV4AgentLoopBoundaryTests {
                   second : \(String(reRendered.dropFirst(common).prefix(160)).debugDescription)
                 """)
             return
-        }
 
         // And the recovered payload must be the original, not a mangled copy.
         #expect(

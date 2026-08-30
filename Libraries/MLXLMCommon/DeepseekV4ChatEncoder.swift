@@ -896,6 +896,42 @@ public struct DeepseekV4ChatEncoder: Sendable {
             "<\(DeepseekV4Tokens.dsml)invoke name=\"\(name)\">\n\(inner)\n</\(DeepseekV4Tokens.dsml)invoke>"
     }
 
+    /// Render with the model's own argument order when it is known.
+    ///
+    /// The `params:` overload sorts, which is stable but is NOT what the model emitted; re-rendering
+    /// a parsed call that way changes the bytes and breaks prefix reuse for every turn after it.
+    /// `ToolCall.Function.argumentOrder` survives a serialized history, so a caller that has one
+    /// can reproduce the original spelling. Names absent from `order` are appended in sorted order
+    /// so an incomplete order can never silently drop a parameter.
+    public static func renderToolCallInvoke(
+        name: String, params: [String: Any], order: [String]?
+    ) -> String {
+        guard let order, !order.isEmpty else {
+            return renderToolCallInvoke(name: name, params: params)
+        }
+        let ordered = order.filter { params[$0] != nil }
+        let remainder = params.keys.filter { !ordered.contains($0) }.sorted()
+        return renderToolCallInvoke(
+            name: name,
+            orderedParameters: (ordered + remainder).compactMap { key in
+                guard let v = params[key] else { return nil }
+                // Same value spelling as the sorted path below; only the ORDER differs.
+                let isString = v is String
+                let value: String
+                if isString, let str = v as? String {
+                    value = str
+                } else {
+                    value =
+                        (try? String(
+                            data: JSONSerialization.data(
+                                withJSONObject: v,
+                                options: [.fragmentsAllowed, .withoutEscapingSlashes]),
+                            encoding: .utf8)) ?? "\(v)"
+                }
+                return OrderedJSONParameter(name: key, value: value, isString: isString)
+            })
+    }
+
     public static func renderToolCallInvoke(name: String, params: [String: Any]) -> String {
         var paramBlocks: [String] = []
         // Encode each param — string params carry `string="true"` and
