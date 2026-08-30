@@ -1217,7 +1217,14 @@ class BatchEngineIntegrationTests: XCTestCase {
 
         let stream = await engine.generate(
             input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(5))),
-            parameters: GenerateParameters(maxTokens: 1_000, temperature: 0)
+            // 32, not 1000. `SlowPrefillLanguageModel` returns all-zero logits, so argmax is the
+            // same token every step and the decoded text is one letter repeated. Since
+            // `RepetitionCycleDetector` landed, that is halted as degeneration and reported as
+            // `.stop`, making `.length` unreachable at any cap above its floor — the test was
+            // asserting against a guard doing its job. This test is about the scheduler not being
+            // woken during the solo fast path, which the 20 ms prefill delay governs; the token
+            // count is scaffolding, so keep it under the floor rather than weaken the assertion.
+            parameters: GenerateParameters(maxTokens: 32, temperature: 0)
         )
         let soloActiveBeforeSubmit = await engine.isSoloFastPathActiveForTesting
         XCTAssertTrue(soloActiveBeforeSubmit)
