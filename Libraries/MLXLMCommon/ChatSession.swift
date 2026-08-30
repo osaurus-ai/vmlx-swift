@@ -247,16 +247,18 @@ public final class ChatSession {
     ///   - prompt: the user prompt
     ///   - images: list of images (for use with VLMs)
     ///   - videos: list of videos (for use with VLMs)
+    ///   - audios: list of audio clips (for use with models that accept them)
     /// - Returns: the model's response
     public func respond(
         to prompt: String,
         role: Chat.Message.Role = .user,
         images: consuming [UserInput.Image],
-        videos: consuming [UserInput.Video]
+        videos: consuming [UserInput.Video],
+        audios: consuming [UserInput.Audio] = []
     ) async throws -> String {
         var output = ""
         for try await chunk in streamResponse(
-            to: prompt, role: role, images: images, videos: videos
+            to: prompt, role: role, images: images, videos: videos, audios: audios
         ) {
             output += chunk
         }
@@ -269,18 +271,21 @@ public final class ChatSession {
     ///   - prompt: the user prompt
     ///   - image: optional image (for use with VLMs)
     ///   - video: optional video (for use with VLMs)
+    ///   - audio: optional audio (for use with models that accept it)
     /// - Returns: the model's response
     public func respond(
         to prompt: String,
         role: Chat.Message.Role = .user,
         image: UserInput.Image? = nil,
-        video: UserInput.Video? = nil
+        video: UserInput.Video? = nil,
+        audio: UserInput.Audio? = nil
     ) async throws -> String {
         try await respond(
             to: prompt,
             role: role,
             images: image.map { [$0] } ?? [],
-            videos: video.map { [$0] } ?? []
+            videos: video.map { [$0] } ?? [],
+            audios: audio.map { [$0] } ?? []
         )
     }
 
@@ -290,14 +295,16 @@ public final class ChatSession {
     ///   - prompt: the user prompt
     ///   - images: list of images (for use with VLMs)
     ///   - videos: list of videos (for use with VLMs)
+    ///   - audios: list of audio clips (for use with models that accept them)
     /// - Returns: a stream of string chunks from the model
     public func streamResponse(
         to prompt: String,
         role: Chat.Message.Role = .user,
         images: consuming [UserInput.Image],
-        videos: consuming [UserInput.Video]
+        videos: consuming [UserInput.Video],
+        audios: consuming [UserInput.Audio] = []
     ) -> AsyncThrowingStream<String, Error> {
-        streamMap(to: prompt, role: role, images: images, videos: videos) {
+        streamMap(to: prompt, role: role, images: images, videos: videos, audios: audios) {
             $0.chunk
         }
     }
@@ -308,14 +315,16 @@ public final class ChatSession {
     ///   - prompt: the user prompt
     ///   - images: list of images (for use with VLMs)
     ///   - videos: list of videos (for use with VLMs)
+    ///   - audios: list of audio clips (for use with models that accept them)
     /// - Returns: a stream of `Generation` from the model
     public func streamDetails(
         to prompt: String,
         role: Chat.Message.Role = .user,
         images: consuming [UserInput.Image],
-        videos: consuming [UserInput.Video]
+        videos: consuming [UserInput.Video],
+        audios: consuming [UserInput.Audio] = []
     ) -> AsyncThrowingStream<Generation, Error> {
-        streamMap(to: prompt, role: role, images: images, videos: videos) {
+        streamMap(to: prompt, role: role, images: images, videos: videos, audios: audios) {
             $0
         }
     }
@@ -327,12 +336,14 @@ public final class ChatSession {
     ///   - prompt: the user prompt
     ///   - images: list of images (for use with VLMs)
     ///   - videos: list of videos (for use with VLMs)
+    ///   - audios: list of audio clips (for use with models that accept them)
     /// - Returns: a stream of transformed values from the model
     private func streamMap<R: Sendable>(
         to prompt: String,
         role: Chat.Message.Role,
         images: consuming [UserInput.Image],
         videos: consuming [UserInput.Video],
+        audios: consuming [UserInput.Audio],
         transform: @Sendable @escaping (Generation) -> R?
     ) -> AsyncThrowingStream<R, Error> {
         let (stream, continuation) = AsyncThrowingStream<R, Error>.makeStream()
@@ -340,7 +351,7 @@ public final class ChatSession {
         // images and videos are not Sendable (MLXArray) but they are consumed
         // and are only being sent to the inner async
         let message = SendableBox<Chat.Message>(
-            .init(role: role, content: prompt, images: images, videos: videos)
+            .init(role: role, content: prompt, images: images, videos: videos, audios: audios)
         )
 
         let task = Task {
@@ -562,16 +573,19 @@ public final class ChatSession {
     ///   - prompt: the user prompt
     ///   - image: optional image (for use with VLMs)
     ///   - video: optional video (for use with VLMs)
+    ///   - audio: optional audio (for use with models that accept it)
     /// - Returns: a stream of string chunks from the model
     public func streamResponse(
         to prompt: String,
         image: UserInput.Image? = nil,
-        video: UserInput.Video? = nil
+        video: UserInput.Video? = nil,
+        audio: UserInput.Audio? = nil
     ) -> AsyncThrowingStream<String, Error> {
         streamResponse(
             to: prompt,
             images: image.map { [$0] } ?? [],
-            videos: video.map { [$0] } ?? []
+            videos: video.map { [$0] } ?? [],
+            audios: audio.map { [$0] } ?? []
         )
     }
 
