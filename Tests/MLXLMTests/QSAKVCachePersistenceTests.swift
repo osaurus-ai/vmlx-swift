@@ -136,3 +136,26 @@ private func makeQSACache(
         #expect((cache[0] as? QSAKVCache)?.indexerKeys != nil)
     }
 }
+
+@Test func qsaDerivedPooledBlocksReuseAndInvalidateSafely() {
+    MLXMetalTestLock.withLock {
+        let cache = makeQSACache(tokens: 16)
+        let first = MLXArray.ones([1, 4, 8]).asType(.bfloat16)
+        cache.storePooledIndexerKeys(first, compressRatio: 4)
+        #expect(cache.cachedPooledIndexerKeys(
+            compressRatio: 4, completeBlocks: 4)?.dim(1) == 4)
+        #expect(cache.cachedPooledIndexerKeys(
+            compressRatio: 4, completeBlocks: 5)?.dim(1) == 4)
+        #expect(cache.cachedPooledIndexerKeys(
+            compressRatio: 2, completeBlocks: 8) == nil)
+
+        _ = cache.trim(1)
+        #expect(cache.cachedPooledIndexerKeys(
+            compressRatio: 4, completeBlocks: 3) == nil)
+
+        cache.storePooledIndexerKeys(first, compressRatio: 4)
+        cache.state = cache.state
+        #expect(cache.cachedPooledIndexerKeys(
+            compressRatio: 4, completeBlocks: 4) == nil)
+    }
+}

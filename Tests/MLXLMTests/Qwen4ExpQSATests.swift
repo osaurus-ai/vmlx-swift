@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 import Testing
 
 @testable import MLXVLM
@@ -32,8 +33,9 @@ struct Qwen4ExpQSATests {
         let maxCompleteBlocks = keyLen / compressRatio
         guard maxCompleteBlocks > blockTopK else { return nil }
 
-        var scores = matmul(query, pooled.transposed(0, 1, 3, 2))
-        scores = maximum(scores.asType(.float32), MLXArray(Float(0))).sum(axis: 1)
+        var scores = matmul(
+            query.asType(.float32), pooled.asType(.float32).transposed(0, 1, 3, 2))
+        scores = maximum(scores, MLXArray(Float(0))).sum(axis: 1)
         scores = scores / sqrt(Float(query.dim(3)))
         let queryEnds = MLXArray((0 ..< seqLen).map { Int32(pastLen + $0 + 1) })
         let completeCounts = floorDivide(queryEnds, MLXArray(Int32(compressRatio)))
@@ -164,6 +166,94 @@ struct Qwen4ExpQSATests {
             #expect(mask.shape == [1, 1, seqLen, seqLen])
             MLX.eval(mask)
             #expect(mask[0, 0, seqLen - 1].sum().item(Int.self) >= blockTopK * compressRatio)
+        }
+    }
+
+    @Test("chunked gathered prefill matches the exact sparse-mask reference")
+    func gatheredPrefillParity() throws {
+        try MLXMetalTestLock.withLock {
+            MLXRandom.seed(31)
+            let seqLen = 7, keyLen = 35, pastLen = keyLen - seqLen
+            let ratio = 4, topK = 2, scale: Float = 1 / sqrt(8)
+            let queries = MLXRandom.normal([1, 4, seqLen, 8])
+            let keys = MLXRandom.normal([1, 2, keyLen, 8])
+            let values = MLXRandom.normal([1, 2, keyLen, 8])
+            let indexQueries = MLXRandom.normal([1, 3, seqLen, 8])
+            let pooled = MLXRandom.normal([1, keyLen / ratio, 8])
+            let mask = try #require(Qwen4ExpQSA.selectedTokenMask(
+                query: indexQueries,
+                pooledKeys: expandedDimensions(pooled, axis: 1),
+                pastLen: pastLen,
+                compressRatio: ratio,
+                blockTopK: topK,
+                keyLen: keyLen))
+            let reference = MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values,
+                scale: scale, mask: .array(mask))
+            let gathered = Qwen4ExpQSA.gatheredAttention(
+                queries: queries, keys: keys, values: values,
+                indexQueries: indexQueries, pooledIndexKeys: pooled,
+                pastLen: pastLen, compressRatio: ratio, blockTopK: topK,
+                scale: scale, queryChunk: 3)
+
+            MLX.eval(reference, gathered)
+            #expect(gathered.shape == reference.shape)
+            #expect(MLX.allClose(gathered, reference, rtol: 1e-3, atol: 1e-3).item(Bool.self))
+        }
+    }
+
+    @Test("chunked gathered singleton decode matches the exact sparse-mask reference")
+    func gatheredDecodeParity() throws {
+        try MLXMetalTestLock.withLock {
+            MLXRandom.seed(37)
+            let keyLen = 35, ratio = 4, topK = 2
+            let scale: Float = 1 / sqrt(8)
+            let queries = MLXRandom.normal([1, 4, 1, 8])
+            let keys = MLXRandom.normal([1, 2, keyLen, 8])
+            let values = MLXRandom.normal([1, 2, keyLen, 8])
+            let indexQueries = MLXRandom.normal([1, 3, 1, 8])
+            let pooled = MLXRandom.normal([1, keyLen / ratio, 8])
+            let mask = try #require(Qwen4ExpQSA.selectedTokenMask(
+                query: indexQueries,
+                pooledKeys: expandedDimensions(pooled, axis: 1),
+                pastLen: keyLen - 1,
+                compressRatio: ratio,
+                blockTopK: topK,
+                keyLen: keyLen))
+            let reference = MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values,
+                scale: scale, mask: .array(mask))
+            let gathered = Qwen4ExpQSA.gatheredAttention(
+                queries: queries, keys: keys, values: values,
+                indexQueries: indexQueries, pooledIndexKeys: pooled,
+                pastLen: keyLen - 1, compressRatio: ratio, blockTopK: topK,
+                scale: scale)
+
+            MLX.eval(reference, gathered)
+            #expect(MLX.allClose(gathered, reference, rtol: 1e-3, atol: 1e-3).item(Bool.self))
+        }
+    }
+
+    @Test("18K production-budget gathered attention evaluates without a quadratic mask")
+    func gatheredLongContextIsBounded() throws {
+        try MLXMetalTestLock.withLock {
+            let keyLen = 18_432, seqLen = 128, ratio = 4, topK = 512
+            MLXRandom.seed(41)
+            let queries = MLXRandom.normal([1, 24, seqLen, 16]).asType(.float16)
+            let keys = MLXRandom.normal([1, 2, keyLen, 16]).asType(.float16)
+            let values = MLXRandom.normal([1, 2, keyLen, 16]).asType(.float16)
+            let indexQueries = MLXRandom.normal([1, 4, seqLen, 8]).asType(.float16)
+            let pooled = MLXRandom.normal([1, keyLen / ratio, 8]).asType(.float16)
+            let output = Qwen4ExpQSA.gatheredAttention(
+                queries: queries, keys: keys, values: values,
+                indexQueries: indexQueries, pooledIndexKeys: pooled,
+                pastLen: keyLen - seqLen,
+                compressRatio: ratio, blockTopK: topK,
+                scale: 1 / sqrt(16))
+
+            MLX.eval(output)
+            #expect(output.shape == [1, 24, seqLen, 16])
+            #expect(MLX.isFinite(output).all().item(Bool.self))
         }
     }
 }

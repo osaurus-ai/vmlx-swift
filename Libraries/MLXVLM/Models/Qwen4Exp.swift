@@ -894,7 +894,9 @@ private final class Qwen4ExpQSAIndexer: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray, cache: QSAKVCache?) -> MLXArray? {
+    func prepare(_ x: MLXArray, cache: QSAKVCache?) -> (
+        query: MLXArray, pooledKeys: MLXArray, past: Int, total: Int
+    )? {
         let B = x.dim(0), S = x.dim(1)
         precondition(B == 1, "qwen4_exp QSA currently supports batch size 1")
         let past = cache?.offset ?? 0
@@ -915,26 +917,50 @@ private final class Qwen4ExpQSAIndexer: Module {
             .transposed(0, 2, 1, 3)
         let blocks = total / extras.indexerCompressRatio
         guard blocks > 0 else { return nil }
-        var pooled = allKeys[0..., ..<(blocks * extras.indexerCompressRatio), 0...]
-            .reshaped(B, blocks, extras.indexerCompressRatio, extras.indexerHeadDim)
-            .asType(.float32).mean(axis: 2).asType(allKeys.dtype)
-        pooled = kNorm(pooled)
+        let ratio = extras.indexerCompressRatio
+        let cachedPooled = cache?.cachedPooledIndexerKeys(
+            compressRatio: ratio, completeBlocks: blocks)
+        let cachedBlocks = cachedPooled?.dim(1) ?? 0
+        var pooled: MLXArray
+        if cachedBlocks == blocks, let cachedPooled {
+            pooled = cachedPooled
+        } else {
+            let rawStart = cachedBlocks * ratio
+            let rawStop = blocks * ratio
+            var appended = allKeys[0..., rawStart ..< rawStop, 0...]
+                .reshaped(B, blocks - cachedBlocks, ratio, extras.indexerHeadDim)
+                .asType(.float32).mean(axis: 2).asType(allKeys.dtype)
+            appended = kNorm(appended)
+            let appended4 = expandedDimensions(appended, axis: 1)
+            let appendedPositions = MLXArray(stride(
+                from: rawStart, to: rawStop, by: ratio))
+                .asType(.int32).reshaped(1, blocks - cachedBlocks)
+            let (appendedCos, appendedSin) = rotary(
+                x: appended4, positionIds: appendedPositions)
+            appended = Qwen35Language.applyMultimodalRotaryPosEmb(
+                q: appended4, k: appended4,
+                cos: appendedCos, sin: appendedSin).0[0..., 0, 0..., 0...]
+            pooled = cachedPooled.map { concatenated([$0, appended], axis: 1) }
+                ?? appended
+            cache?.storePooledIndexerKeys(pooled, compressRatio: ratio)
+        }
         let qPositions = MLXArray(past ..< (past + S)).asType(.int32).reshaped(1, S)
-        let blockPositions = MLXArray(stride(
-            from: 0, to: blocks * extras.indexerCompressRatio,
-            by: extras.indexerCompressRatio)).asType(.int32).reshaped(1, blocks)
         let (qCos, qSin) = rotary(x: query, positionIds: qPositions)
         query = Qwen35Language.applyMultimodalRotaryPosEmb(
             q: query, k: query, cos: qCos, sin: qSin).0
-        let pooled4 = expandedDimensions(pooled, axis: 1)
-        let (kCos, kSin) = rotary(x: pooled4, positionIds: blockPositions)
-        pooled = Qwen35Language.applyMultimodalRotaryPosEmb(
-            q: pooled4, k: pooled4, cos: kCos, sin: kSin).0[0..., 0, 0..., 0...]
-        return Qwen4ExpQSA.selectedTokenMask(
-            query: query, pooledKeys: expandedDimensions(pooled, axis: 1),
-            pastLen: past, compressRatio: extras.indexerCompressRatio,
+        return (query, pooled, past, total)
+    }
+
+    func mask(from prepared: (
+        query: MLXArray, pooledKeys: MLXArray, past: Int, total: Int
+    )) -> MLXArray? {
+        Qwen4ExpQSA.selectedTokenMask(
+            query: prepared.query,
+            pooledKeys: expandedDimensions(prepared.pooledKeys, axis: 1),
+            pastLen: prepared.past,
+            compressRatio: extras.indexerCompressRatio,
             blockTopK: extras.indexerBudget / extras.indexerCompressRatio,
-            keyLen: total)
+            keyLen: prepared.total)
     }
 }
 
@@ -974,7 +1000,7 @@ private final class Qwen4ExpAttention: Module {
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let past = cache?.offset ?? 0
-        let sparseMask = indexer(x, cache: cache)
+        let qsa = indexer.prepare(x, cache: cache)
         let headDim = text.headDim ?? (text.hiddenSize / text.attentionHeads)
         let qg = qProj(x).reshaped(B, S, text.attentionHeads, headDim * 2)
             .split(parts: 2, axis: -1)
@@ -992,6 +1018,29 @@ private final class Qwen4ExpAttention: Module {
         let (cos, sin) = rotary(x: value, positionIds: positions)
         (query, key) = Qwen35Language.applyMultimodalRotaryPosEmb(
             q: query, k: key, cos: cos, sin: sin)
+
+        // Batch-one contiguous text uses exact gathered QSA. Both indexer
+        // scoring and main attention are query-chunked, so neither prefill nor
+        // decode can create a prompt-squared mask. Media/M-RoPE, offset-shifted,
+        // cacheless, and unsupported layouts fail closed to the official mask
+        // path below.
+        if let qsa, let cache, B == 1, explicitPositions == nil, positionOffset == 0 {
+            let (cachedKeys, cachedValues) = cache.update(keys: key, values: value)
+            let output = Qwen4ExpQSA.gatheredAttention(
+                queries: query,
+                keys: cachedKeys,
+                values: cachedValues,
+                indexQueries: qsa.query,
+                pooledIndexKeys: qsa.pooledKeys,
+                pastLen: qsa.past,
+                compressRatio: indexer.extras.indexerCompressRatio,
+                blockTopK: indexer.extras.indexerBudget / indexer.extras.indexerCompressRatio,
+                scale: scale)
+                .transposed(0, 2, 1, 3).reshaped(B, S, -1)
+            return oProj(output * sigmoid(gate))
+        }
+
+        let sparseMask = qsa.flatMap { indexer.mask(from: $0) }
 
         // Pass an explicit pre-update causal mask. Falling through to
         // `attentionWithCacheUpdate`'s cache-derived mask asks the cache for

@@ -607,13 +607,39 @@ public class QSAKVCache: KVCacheSimple {
     /// `updateIndexerKeys` BEFORE `update(keys:values:)` advances `offset`,
     /// matching the reference forward order.
     public private(set) var indexerKeys: MLXArray?
+    /// Derived, normalized, RoPE-applied completed index blocks. This is an
+    /// in-memory decode accelerator only: raw indexer keys remain the durable
+    /// state, so disk/cache restoration can always rebuild it exactly.
+    private var pooledIndexerKeys: MLXArray?
+    private var pooledIndexerCompressRatio: Int?
+
+    public func cachedPooledIndexerKeys(
+        compressRatio: Int, completeBlocks: Int
+    ) -> MLXArray? {
+        guard pooledIndexerCompressRatio == compressRatio,
+            let pooledIndexerKeys,
+            pooledIndexerKeys.dim(1) <= completeBlocks
+        else { return nil }
+        return pooledIndexerKeys
+    }
+
+    public func storePooledIndexerKeys(_ keys: MLXArray, compressRatio: Int) {
+        pooledIndexerKeys = keys
+        pooledIndexerCompressRatio = compressRatio
+    }
+
+    private func invalidatePooledIndexerKeys() {
+        pooledIndexerKeys = nil
+        pooledIndexerCompressRatio = nil
+    }
 
     public func updateIndexerKeys(_ rawKeys: MLXArray) -> MLXArray {
         if let existing = indexerKeys, existing.dim(1) > 0 {
             // Stale rows beyond `offset` (a trim/rollback that happened
             // between forwards) must not survive into the concat.
-            let valid = existing.dim(1) > offset
-                ? existing[0..., ..<offset, 0...] : existing
+            let hadStaleRows = existing.dim(1) > offset
+            let valid = hadStaleRows ? existing[0..., ..<offset, 0...] : existing
+            if hadStaleRows { invalidatePooledIndexerKeys() }
             indexerKeys = concatenated([valid, rawKeys], axis: 1)
         } else {
             indexerKeys = rawKeys
@@ -636,6 +662,7 @@ public class QSAKVCache: KVCacheSimple {
             return s
         }
         set {
+            invalidatePooledIndexerKeys()
             if newValue.count == 3 {
                 super.state = Array(newValue[0 ..< 2])
                 indexerKeys = newValue[2]
@@ -649,6 +676,7 @@ public class QSAKVCache: KVCacheSimple {
     @discardableResult
     public override func trim(_ n: Int) -> Int {
         let trimmed = super.trim(n)
+        if trimmed > 0 { invalidatePooledIndexerKeys() }
         if trimmed > 0, let existing = indexerKeys, existing.dim(1) > offset {
             indexerKeys = existing[0..., ..<offset, 0...]
         }
