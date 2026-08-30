@@ -859,6 +859,7 @@ let package = Package(
                 "FocusedMLXTestSupport.swift",
                 "CanonicalChatCacheBoundariesTests.swift",
                 "RotatingKVCachePhysicalGrowthTests.swift",
+                "Mistral3ScalarEosDecodeTests.swift",
                 "NativeMTPWarmupMemoScopeTests.swift",
                 "NormConventionResolverTests.swift",
                 "TestSourcesAreRegisteredTests.swift",

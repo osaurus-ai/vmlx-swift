@@ -83,7 +83,11 @@ public struct Mistral3VLMConfiguration: Codable, Sendable {
     public var vocabSize: Int { _vocabSize ?? 32000 }
     public var spatialMergeSize: Int { _spatialMergeSize ?? 2 }
     public var multimodalProjectorBias: Bool { _multimodalProjectorBias ?? false }
-    public var eosTokenId: [Int]? { _eosTokenId }
+    /// Bundles spell this either way — `2` and `[2, 7]` are both real. `IntOrIntArray` is
+    /// MLXLMCommon's existing decoder for exactly that, and `BaseConfiguration.eosTokenIds`
+    /// already uses it; this type was the outlier, and a scalar made the whole config
+    /// undecodable (Devstral-Small-2-24B ships `eos_token_id: 2`).
+    public var eosTokenId: [Int]? { _eosTokenId?.values }
 
     /// JANGTQ runtime knobs. Set to non-nil by the VLMModelFactory
     /// `mistral3` closure when `weight_format == "mxtq"` so the
@@ -101,7 +105,7 @@ public struct Mistral3VLMConfiguration: Codable, Sendable {
     private let _vocabSize: Int?
     private let _spatialMergeSize: Int?
     private let _multimodalProjectorBias: Bool?
-    private let _eosTokenId: [Int]?
+    private let _eosTokenId: IntOrIntArray?
     private let _weightFormat: String?
     private let _mxtqBits: Int?
     private let _mxtqSeed: Int?
