@@ -29,7 +29,7 @@ private struct PromptTailTestTokenizer: Tokenizer {
 @Suite("Prompt-tail decode for low-level generation")
 struct PromptTailDecodeTests {
     @Test("token-id prompt tail without think tags starts in content")
-    func tokenIDTailWithoutThinkTagsStartsInContent() {
+    func tokenIDTailWithoutThinkTagsStartsInContent() throws {
         let tokenizer = PromptTailTestTokenizer(pieces: [
             1: "<role>HUMAN</role>Hello",
             2: "<role>ASSISTANT</role>",
@@ -37,19 +37,19 @@ struct PromptTailDecodeTests {
         let tail = _decodePromptTail(
             tokenIds: [1, 2], tokenizer: tokenizer, tokens: 64)
 
-        var parser = ReasoningParser.forPrompt(
+        var optionalParser = ReasoningParser.forPrompt(
             stampName: "deepseek_r1", promptTail: tail)
-        #expect(parser != nil)
+        var parser = try #require(optionalParser)
 
         var content = ""
         var reasoning = ""
-        for segment in parser!.feed("Visible answer.") {
+        for segment in parser.feed("Visible answer.") {
             switch segment {
             case .content(let text): content += text
             case .reasoning(let text): reasoning += text
             }
         }
-        for segment in parser!.flush() {
+        for segment in parser.flush() {
             switch segment {
             case .content(let text): content += text
             case .reasoning(let text): reasoning += text
@@ -61,7 +61,7 @@ struct PromptTailDecodeTests {
     }
 
     @Test("token-id prompt tail with open think starts in reasoning")
-    func tokenIDTailWithOpenThinkStartsInReasoning() {
+    func tokenIDTailWithOpenThinkStartsInReasoning() throws {
         let tokenizer = PromptTailTestTokenizer(pieces: [
             1: "<|im_start|>assistant\n",
             2: "<think>\n",
@@ -69,15 +69,15 @@ struct PromptTailDecodeTests {
         let tail = _decodePromptTail(
             tokenIds: [1, 2], tokenizer: tokenizer, tokens: 64)
 
-        var parser = ReasoningParser.forPrompt(
+        var optionalParser = ReasoningParser.forPrompt(
             stampName: "qwen3_6", promptTail: tail)
-        #expect(parser != nil)
+        var parser = try #require(optionalParser)
 
         var reasoning = ""
-        for segment in parser!.feed("hidden thought") {
+        for segment in parser.feed("hidden thought") {
             if case .reasoning(let text) = segment { reasoning += text }
         }
-        for segment in parser!.flush() {
+        for segment in parser.flush() {
             if case .reasoning(let text) = segment { reasoning += text }
         }
 
@@ -85,7 +85,7 @@ struct PromptTailDecodeTests {
     }
 
     @Test("input token array tail with nil tokenIds keeps closed think content-visible")
-    func inputTokenArrayTailWithNilTokenIdsKeepsClosedThinkContentVisible() {
+    func inputTokenArrayTailWithNilTokenIdsKeepsClosedThinkContentVisible() throws {
         let tokenizer = PromptTailTestTokenizer(pieces: [
             1: "<|im_start|>assistant\n",
             2: "<think></think>",
@@ -93,18 +93,24 @@ struct PromptTailDecodeTests {
         let input = LMInput(tokens: MLXArray([1, 2]))
         let tail = _decodePromptTail(input: input, tokenizer: tokenizer, tokens: 64)
 
-        var parser = ReasoningParser.forPrompt(stampName: "mimo", promptTail: tail)
-        #expect(parser != nil)
+        // `"mimo"` is a MODEL TYPE, not a capability stamp: `reasoningStampFromModelType` maps it
+        // to `"think_xml"`, and that is what `fromCapabilityName` accepts — as
+        // `MiMoV2FlashRuntimeTests` asserts directly. Passing the model type here resolved nil, so
+        // this test force-unwrapped nil and took the whole process down with it. Go through the
+        // mapping, which is what the runtime does.
+        var optionalParser = ReasoningParser.forPrompt(
+            stampName: reasoningStampFromModelType("mimo"), promptTail: tail)
+        var parser = try #require(optionalParser)
 
         var content = ""
         var reasoning = ""
-        for segment in parser!.feed("Blue.") {
+        for segment in parser.feed("Blue.") {
             switch segment {
             case .content(let text): content += text
             case .reasoning(let text): reasoning += text
             }
         }
-        for segment in parser!.flush() {
+        for segment in parser.flush() {
             switch segment {
             case .content(let text): content += text
             case .reasoning(let text): reasoning += text
