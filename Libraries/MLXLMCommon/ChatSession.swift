@@ -375,19 +375,24 @@ public final class ChatSession {
                     // are distinct.  In particular the KVCache cannot
                     // be shared and that is the lock that is held here.
 
-                    let cacheCoordinator = model.cacheCoordinator
+
+                    // Read from the CONTAINER before `model` is shadowed by the LanguageModel below.
+                    let containerCacheCoordinator = model.cacheCoordinator
 
                     let model = await model.perform { context in
                         SendableBox(context.model)
                     }.consume()
 
                     var kvCache: [KVCache]
+                    // Whether this session already carries conversation state the caller depends on.
+                    var kvCacheIsPopulated = false
                     switch cache {
                     case .empty:
                         kvCache = model.newCache(parameters: generateParameters)
                         cache = .kvcache(kvCache)
 
                     case .kvcache(let array):
+                        kvCacheIsPopulated = array.contains { $0.offset > 0 }
                         // Reuse the live cache across ChatSession turns.
                         // Bailing/Ling ArraysCache used to be reset here as
                         // a workaround for a Bailing MLA double-update bug.
@@ -402,6 +407,25 @@ public final class ChatSession {
                         cache = .kvcache(kvCache)
                         messages.append(contentsOf: history)
                     }
+
+                    // Hand the coordinator over only while the session's own cache is EMPTY.
+                    //
+                    // This session is append-only: after the first turn it submits just the new
+                    // message and relies on the live KV cache to carry the conversation. The
+                    // coordinator keys its lookup on the FULL prompt, so once that divergence starts
+                    // it can never match — and `populatedCacheRequiresResetAfterCoordinatorMiss`
+                    // reads a miss on a populated cache as proof the caller's state is unverified and
+                    // resets it, then "full-prefills" `input`. For an append-only caller `input` is
+                    // one message, so the reset does not restore what it discarded: the conversation
+                    // is gone. Observed as a model denying, one turn later, that it had ever been
+                    // shown an image or told a name — on two unrelated architectures.
+                    //
+                    // The reset itself is right, and the reasoning behind it (an Off→On reasoning
+                    // change made Ornith replay a stale tool call) still holds. What is wrong is
+                    // pairing it with a caller that cannot satisfy the re-prefill. So the coordinator
+                    // is offered the first turn, where its key IS the whole prompt and a disk hit can
+                    // seed the session, and withheld once the live cache is authoritative.
+                    let cacheCoordinator = kvCacheIsPopulated ? nil : containerCacheCoordinator
 
                     // prepare the input
                     messages.append(message.consume())
