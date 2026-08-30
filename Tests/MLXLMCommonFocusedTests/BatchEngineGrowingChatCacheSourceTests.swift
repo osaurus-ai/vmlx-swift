@@ -263,8 +263,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("coordinator.hasValidatedDiskEntry("))
     }
 
-    @Test("token iterator drains MLX around cache store before completion info")
-    func tokenIteratorDrainsMLXAroundCacheStoreBeforeCompletionInfo() throws {
+    @Test("token iterator surfaces completion before serialized cache cleanup")
+    func tokenIteratorSurfacesCompletionBeforeSerializedCacheCleanup() throws {
         let source = try String(
             contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
             encoding: .utf8)
@@ -273,31 +273,65 @@ struct BatchEngineGrowingChatCacheSourceTests {
 
         let onEnd = try #require(task.range(of: "handler.onGenerationEnd(emit: continuation.yield)"))
         let store = try #require(task.range(of: "iterator.storeCacheAfterGeneration("))
+        let info = try #require(task.range(
+            of: "handler.infoEvent(info)",
+            range: onEnd.upperBound..<store.lowerBound))
         let preStoreSync = try #require(task.range(
             of: "Stream().synchronize()",
-            range: onEnd.upperBound..<store.lowerBound))
+            range: info.upperBound..<store.lowerBound))
         let postStoreSync = try #require(task.range(
             of: "Stream().synchronize()",
             range: store.upperBound..<task.endIndex))
         let advisorDrain = try #require(task.range(
             of: "MLXPressCanonicalExpertAdvisor.shared.waitUntilIdle()",
             range: postStoreSync.upperBound..<task.endIndex))
-        let info = try #require(task.range(
-            of: "handler.infoEvent(info)",
-            range: advisorDrain.upperBound..<task.endIndex))
         let finish = try #require(task.range(
             of: "continuation.finish()",
-            range: info.upperBound..<task.endIndex))
+            range: advisorDrain.upperBound..<task.endIndex))
 
-        #expect(onEnd.lowerBound < preStoreSync.lowerBound)
+        #expect(onEnd.lowerBound < info.lowerBound)
+        #expect(info.lowerBound < preStoreSync.lowerBound)
         #expect(preStoreSync.lowerBound < store.lowerBound)
         #expect(store.lowerBound < postStoreSync.lowerBound)
         #expect(postStoreSync.lowerBound < advisorDrain.lowerBound)
-        #expect(advisorDrain.lowerBound < info.lowerBound)
-        #expect(info.lowerBound < finish.lowerBound)
-        #expect(task.range(
-            of: "handler.infoEvent(info)",
-            range: onEnd.upperBound..<store.lowerBound) == nil)
+        #expect(advisorDrain.lowerBound < finish.lowerBound)
+    }
+
+    @Test("cancelled generation cannot persist a generated output boundary")
+    func cancelledGenerationCannotPersistGeneratedOutputBoundary() throws {
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+        let taskRange = try #require(evaluate.range(of: "private func generateLoopTask"))
+        let task = String(evaluate[taskRange.lowerBound...])
+        let store = try #require(task.range(of: "iterator.storeCacheAfterGeneration("))
+        let includeBoundary = try #require(task.range(
+            of: "includeGeneratedBoundary: stopReason == .stop",
+            range: store.lowerBound..<task.endIndex))
+        #expect(store.lowerBound < includeBoundary.lowerBound)
+
+        let batch = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let finishSlot = try #require(batch.range(of: "private func finishSlot("))
+        let finishBody = String(batch[finishSlot.lowerBound...])
+        #expect(finishBody.contains(
+            "if reason != .cancelled, let coordinator = cacheCoordinator"))
+    }
+
+    @Test("solo cancellation drains the producer before ownership is released")
+    func soloCancellationDrainsProducerBeforeOwnershipRelease() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let cancel = try #require(source.range(
+            of: "public func cancelActiveSoloGenerationAndWait() async"))
+        let body = String(source[cancel.lowerBound...])
+        let taskCancel = try #require(body.range(of: "task.cancel()"))
+        let taskWait = try #require(body.range(of: "await task.value"))
+        let release = try #require(body.range(of: "finishSoloFastPath(id: id)"))
+        #expect(taskCancel.lowerBound < taskWait.lowerBound)
+        #expect(taskWait.lowerBound < release.lowerBound)
     }
 
     @Test("token iterator materializes disk cache restores before prefill")
