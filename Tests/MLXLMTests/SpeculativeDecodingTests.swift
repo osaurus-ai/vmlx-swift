@@ -82,4 +82,38 @@ struct SpeculativeDecodingTests {
         #expect(!speculativeTokens.isEmpty)
         #expect(normalTokens == speculativeTokens)
     }
+    /// Isolates WHICH penalty breaks speculative equivalence.
+    ///
+    /// `RepetitionContext` holds a `TokenRing`, whose `append` REASSIGNS its `MLXArray` buffer, so a
+    /// struct copy is genuinely independent. `PresencePenaltyContext` and `FrequencyPenaltyContext`
+    /// hold `GeneratedTokenCounts`, which is a `final class` mutated in place by `record`. The
+    /// speculative verifier copies the processor per round and walks it across all `numDraft + 1`
+    /// positions — including drafts it then REJECTS — so with a shared counts object those rejected
+    /// tokens are counted into the real processor, and accepted ones are counted twice.
+    @Test(arguments: ["repetition", "presence", "frequency"])
+    func whichPenaltyBreaksSpeculativeEquivalence(which: String) async throws {
+        let modelInput = LMInput(tokens: MLXArray([3, 5, 7, 11, 13, 17, 19, 23]))
+        let parameters = GenerateParameters(
+            maxTokens: 32,
+            temperature: 0.0,
+            repetitionPenalty: which == "repetition" ? 1.5 : nil,
+            presencePenalty: which == "presence" ? 0.5 : nil,
+            frequencyPenalty: which == "frequency" ? 0.2 : nil,
+        )
+        var normal: [Int] = []
+        for await g in try generateTokens(
+            input: modelInput, parameters: parameters, context: mainContext)
+        {
+            if let t = g.token { normal.append(t) }
+        }
+        var speculative: [Int] = []
+        for await g in try generateTokens(
+            input: modelInput, parameters: parameters, context: mainContext,
+            draftModel: draftContext.model, numDraftTokens: 8)
+        {
+            if let t = g.token { speculative.append(t) }
+        }
+        #expect(normal == speculative, "\(which) penalty diverges under speculative decoding")
+    }
+
 }

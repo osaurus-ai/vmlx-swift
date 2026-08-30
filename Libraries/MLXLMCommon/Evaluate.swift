@@ -40,6 +40,15 @@ public protocol LogitProcessor {
     /// Called to visit and possibly modify the logits
     func process(logits: MLXArray) -> MLXArray
 
+    /// A copy whose mutable state is INDEPENDENT of the receiver's.
+    ///
+    /// Speculative decoding runs a throwaway processor over drafted positions and then advances the
+    /// real one over accepted tokens only. A processor whose state is all value types gets that from
+    /// an ordinary `var` copy; one holding a reference type does NOT — the copy shares the object,
+    /// so rejected drafts get recorded into the real processor and accepted ones recorded twice.
+    /// Default is the value copy, which is correct for the value-only case.
+    func independentCopy() -> Self
+
     /// Called to provide the sampled token
     mutating func didSample(token: MLXArray)
 }
@@ -911,6 +920,10 @@ struct TokenRing {
 }
 
 /// Processor that implements a `repetitionPenalty`.
+extension LogitProcessor {
+    public func independentCopy() -> Self { self }
+}
+
 public struct RepetitionContext: LogitProcessor {
     private var ring: TokenRing
     let repetitionPenalty: Float
@@ -955,18 +968,47 @@ public struct RepetitionContext: LogitProcessor {
 final class GeneratedTokenCounts {
     private var counts: MLXArray?
 
+    /// Tokens recorded before the vocabulary size was known, folded in by `vector`.
+    ///
+    /// `record` cannot allocate: it is handed a token, not the logits, so it does not know the
+    /// vocabulary size. It used to simply DROP those tokens. On the ordinary decode path that never
+    /// showed, because `process` runs before every `didSample` and allocates on the first step. On
+    /// the speculative path the real processor is advanced with `didSample` while only its
+    /// throwaway copies see logits, so it can be handed many tokens before it ever sees any — 64 of
+    /// them in `SpeculativeDecodingTests` — and every one was discarded.
+    private var pendingBeforeFirstLogits: [MLXArray] = []
+
     /// Counts as a `[vocabSize]` Float32 vector, allocating on first sight of the logits.
     func vector(vocabSize: Int) -> MLXArray {
         if let counts, counts.dim(0) == vocabSize { return counts }
-        let fresh = MLXArray.zeros([vocabSize], type: Float32.self)
-        counts = fresh
+        counts = MLXArray.zeros([vocabSize], type: Float32.self)
+        let deferred = pendingBeforeFirstLogits
+        pendingBeforeFirstLogits.removeAll()
+        for token in deferred { record(token) }
+        return counts!
+    }
+
+    /// A counts object that shares nothing with the receiver.
+    ///
+    /// Both halves matter: a new class instance, AND a new `MLXArray`, because `record` writes
+    /// through an indexed assignment, which updates the array in place — copying only the class
+    /// would still leave both objects pointing at one buffer.
+    func independentCopy() -> GeneratedTokenCounts {
+        let fresh = GeneratedTokenCounts()
+        if let counts { fresh.counts = counts + MLXArray(Float(0)) }
+        fresh.pendingBeforeFirstLogits = pendingBeforeFirstLogits
         return fresh
     }
 
     /// Record one sampled token. O(1): a one-element gather and a one-element scatter, NOT a
     /// vocab-sized rebuild.
     func record(_ token: MLXArray) {
-        guard let counts else { return }   // no logits seen yet, so nothing to count into
+        guard let counts else {
+            // No logits seen yet, so the vocabulary size is unknown. HOLD the token rather than
+            // dropping it; `vector` folds these in the moment it can size the buffer.
+            pendingBeforeFirstLogits.append(token)
+            return
+        }
         let idx = token.asType(.int32).reshaped(-1)
         counts[idx] = counts[idx] + MLXArray(Float(1))
     }
@@ -979,7 +1021,18 @@ final class GeneratedTokenCounts {
 public struct PresencePenaltyContext: LogitProcessor {
     /// Exactly one of these is non-nil: `ring` for the windowed mode, `counts` for the unbounded one.
     private var ring: TokenRing?
-    private let counts: GeneratedTokenCounts?
+    /// `var`, not `let`: `independentCopy()` must be able to replace it. `TokenRing` needs no
+    /// such treatment — its `append` REASSIGNS the buffer rather than writing through it.
+    private var counts: GeneratedTokenCounts?
+
+    /// `GeneratedTokenCounts` is a class, so the ordinary value copy of this struct SHARES it.
+    /// Speculative decoding relies on a throwaway copy; without this the drafted tokens it records —
+    /// including the rejected ones — land in the real processor.
+    public func independentCopy() -> Self {
+        var copy = self
+        copy.counts = counts?.independentCopy()
+        return copy
+    }
     let presencePenalty: Float
 
     /// `presenceContextSize == nil` selects the UNBOUNDED mode, which is the published semantics.
@@ -1038,7 +1091,17 @@ public struct PresencePenaltyContext: LogitProcessor {
 public struct FrequencyPenaltyContext: LogitProcessor {
     /// Exactly one of these is non-nil: `ring` for the windowed mode, `counts` for the unbounded one.
     private var ring: TokenRing?
-    private let counts: GeneratedTokenCounts?
+    /// See `PresencePenaltyContext.counts`.
+    private var counts: GeneratedTokenCounts?
+
+    /// `GeneratedTokenCounts` is a class, so the ordinary value copy of this struct SHARES it.
+    /// Speculative decoding relies on a throwaway copy; without this the drafted tokens it records —
+    /// including the rejected ones — land in the real processor.
+    public func independentCopy() -> Self {
+        var copy = self
+        copy.counts = counts?.independentCopy()
+        return copy
+    }
     let frequencyPenalty: Float
 
     /// `frequencyContextSize == nil` selects the UNBOUNDED mode. Note this is the mode that is also
@@ -1170,6 +1233,16 @@ public struct InitialSuppressTokensProcessor: LogitProcessor {
 
 /// Processor that composes generation-config logits processors.
 public struct PenaltyProcessor: LogitProcessor {
+
+    /// Propagates to the two members that hold reference-typed state. Without this the aggregate
+    /// silently satisfies the protocol via the value-copy default and the deep copy never happens.
+    public func independentCopy() -> Self {
+        var copy = self
+        copy.presenceContext = presenceContext?.independentCopy()
+        copy.frequencyContext = frequencyContext?.independentCopy()
+        return copy
+    }
+
     var repetitionContext: RepetitionContext?
     var presenceContext: PresencePenaltyContext?
     var frequencyContext: FrequencyPenaltyContext?
@@ -3320,7 +3393,11 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         // Draft generation: autoregressive loop with draft model
-        var draftProcessor = processor  // Copy to discard later
+        // `independentCopy`, not a plain `var` copy: the draft loop below records every proposed
+        // token, and a shared counts object would push all of them — including the ones about to be
+        // rejected — into the real processor. "Copy to discard later" only discards if the copy
+        // owns its state.
+        var draftProcessor = processor?.independentCopy()
         var draftTokens = [MLXArray]()
         for _ in 0 ..< numDraft {
             let draftResult = draftModel(draftY[text: .newAxis], cache: draftCache, state: nil)
@@ -3342,7 +3419,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         mainState = mainResult.state
 
         let mainTokens: MLXArray
-        if var verifyProcessor = processor {
+        if var verifyProcessor = processor?.independentCopy() {
             // Process each position sequentially so that the processor sees tokens sampled at earlier positions
             var sampled = [MLXArray]()
             for i in 0 ..< (numDraft + 1) {

@@ -913,6 +913,7 @@ let package = Package(
                 "TokenizerAddedTokenRegexFocusedTests.swift",
                 "LFM2ShortConvCacheRestoreFocusedTests.swift",
                 "LFM25ChatTemplateRenderFocusedTests.swift",
+                "LogitProcessorIndependentCopyTests.swift",
             ]
         ),
         .testTarget(
