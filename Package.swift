@@ -891,6 +891,7 @@ let package = Package(
                 "MediaCachePlaceholderTests.swift",
                 "VLGrowingConversationReuseTests.swift",
                 "VLMediaTokenDeclarationReachabilityTests.swift",
+                "Apertus1p5PrefixNormalisationTests.swift",
                 "NemotronHOmniPreEncodedAudioTests.swift",
                 "NemotronHJANGTQDispatchFocusedTests.swift",
                 "MTPRuntimeFocusedTests.swift",

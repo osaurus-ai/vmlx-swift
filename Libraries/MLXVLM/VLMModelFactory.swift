@@ -141,6 +141,7 @@ public enum VLMTypeRegistry {
         // both keys to the same dispatch.
         "ministral3": dispatchMistral3VLM,
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
+            "apertus1p5": create(Apertus1p5Configuration.self, Apertus1p5.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
         "glm4v": create(Glm4vConfiguration.self, Glm4v.init),
@@ -236,6 +237,8 @@ public enum VLMProcessorTypeRegistry {
             Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
         "Lfm2VlProcessor": create(
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
+        "Apertus1p5Processor": create(
+            Apertus1p5ProcessorConfiguration.self, Apertus1p5Processor.init),
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
         "Glm4vProcessor": create(   // GLM-4.5V (glm4v_moe) — same QwenVL-style preprocessing as glm_ocr

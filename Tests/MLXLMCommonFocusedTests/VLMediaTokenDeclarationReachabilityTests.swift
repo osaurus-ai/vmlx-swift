@@ -101,6 +101,7 @@ struct VLMediaTokenDeclarationReachabilityTests {
 
         #expect(
             declaring == [
+                "Apertus1p5.swift",
                 "Audex.swift", "DeepseekOCRProcessor.swift", "FastVLM.swift",
                 "Gemma4.swift", "LFM2VL.swift", "Mistral3.swift",
                 "MuseGlimmerProcessor.swift", "NemotronHOmni.swift", "Pixtral.swift",
