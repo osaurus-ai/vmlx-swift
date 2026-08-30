@@ -38,6 +38,8 @@ struct Qwen4ExpFusedAffineMoETests {
         Combo(label: "2L_down_g32", gate: (2, 64), up: (2, 64), down: (2, 32)),
         Combo(label: "6S_down_q6", gate: (4, 64), up: (4, 64), down: (6, 64)),
         Combo(label: "6S_up_down_q6", gate: (4, 64), up: (6, 64), down: (6, 64)),
+        Combo(label: "Ornith_late_gate_up_q5", gate: (5, 64), up: (5, 64), down: (4, 64)),
+        Combo(label: "q5_all_projections", gate: (5, 64), up: (5, 64), down: (5, 64)),
     ]
 
     private static func makeProjection(
@@ -87,8 +89,9 @@ struct Qwen4ExpFusedAffineMoETests {
                 inputDims: Self.expertDims, outputDims: Self.inputDims,
                 bits: combo.down.bits, groupSize: combo.down.group, seed: seedBase + 2)
 
-            guard let reducer = Qwen4ExpFusedAffineMoE.makeReducer(
-                gate: gate, up: up, down: down)
+            guard
+                let reducer = Qwen4ExpFusedAffineMoE.makeReducer(
+                    gate: gate, up: up, down: down)
             else {
                 Issue.record("construction rejected for \(combo.label)")
                 continue
@@ -159,6 +162,64 @@ struct Qwen4ExpFusedAffineMoETests {
                 fusedError < max(4 * eagerError, 0.01),
                 "combo \(combo.label): fused \(fusedError) far above eager \(eagerError)")
         }
+    }
+
+    @Test("Ornith 2048x512 top-8 q5 contract matches eager quantized math")
+    func ornith35ShapeParity() throws {
+        let inputDims = 2048
+        let expertDims = 512
+        let topK = 8
+        let seed: UInt64 = 9001
+        let (gate, _) = Self.makeProjection(
+            inputDims: inputDims, outputDims: expertDims,
+            bits: 5, groupSize: 64, seed: seed)
+        let (up, _) = Self.makeProjection(
+            inputDims: inputDims, outputDims: expertDims,
+            bits: 5, groupSize: 64, seed: seed + 1)
+        let (down, _) = Self.makeProjection(
+            inputDims: expertDims, outputDims: inputDims,
+            bits: 4, groupSize: 64, seed: seed + 2)
+
+        let reducer = try #require(
+            Qwen4ExpFusedAffineMoE.makeReducer(
+                gate: gate, up: up, down: down))
+        let x = MLXRandom.uniform(
+            low: -1.0, high: 1.0, [1, 1, inputDims],
+            key: MLXRandom.key(seed + 3)
+        ).asType(.bfloat16)
+        let indexValues: [UInt32] = [0, 2, 4, 6, 9, 11, 13, 15]
+        let indices = MLXArray(indexValues, [1, 1, topK])
+        let scores = MLX.softmax(
+            MLXRandom.uniform(
+                low: 0.0, high: 1.0, [1, 1, topK],
+                key: MLXRandom.key(seed + 4)
+            ).asType(.float32), axis: -1)
+        let fused = try #require(reducer(x, indices, scores))
+
+        let xb = x.reshaped([1, inputDims])
+        var eager = MLXArray.zeros([inputDims], dtype: .float32)
+        for (k, expert) in indexValues.enumerated() {
+            let e = Int(expert)
+            let g = quantizedMM(
+                xb, gate.weight[e], scales: gate.scales[e], biases: gate.biases?[e],
+                transpose: true, groupSize: 64, bits: 5, mode: .affine)
+            let u = quantizedMM(
+                xb, up.weight[e], scales: up.scales[e], biases: up.biases?[e],
+                transpose: true, groupSize: 64, bits: 5, mode: .affine)
+            let activation = (g * MLX.sigmoid(g)) * u
+            let projected = quantizedMM(
+                activation, down.weight[e], scales: down.scales[e],
+                biases: down.biases?[e], transpose: true,
+                groupSize: 64, bits: 4, mode: .affine)
+            eager =
+                eager
+                + scores.reshaped(-1)[k].asType(.float32)
+                * projected.asType(.float32).reshaped(-1)
+        }
+
+        let error = Self.relativeError(fused, eager)
+        print("[FusedMoEParity] combo=ornith35_q5q5q4_g64_top8 fused_vs_eager=\(error)")
+        #expect(error < 0.01, "Ornith fused/eager relative error \(error)")
     }
 
     @Test("construction rejects unsupported metadata and group sizes")

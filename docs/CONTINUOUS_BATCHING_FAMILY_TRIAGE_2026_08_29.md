@@ -231,3 +231,44 @@ as a substitute for rendered app behavior.
 - Release-app visual confirmation before calling user-facing behavior fixed.
 
 Anything missing is `PARTIAL` or `BLOCKED`, with the artifact and reason named.
+
+## Ornith 1.5 35B decode-performance follow-up
+
+The MTP-MoE load fix did not explain the reported roughly 25 tok/s decode
+rate.  On merged vMLX `aee2a8e0`, the production Qwen3.5-VL decoder left its
+existing compiled GDN and MoE decode regions disabled for this exact
+architecture.  Enabling those regions only for the measured model topology,
+while retaining an explicit environment opt-out, is the causal speed change.
+The policy is based on the decoded architecture fields rather than a bundle
+name, so neighboring Qwen3.5, Qwen3.8, Gemma, Laguna, and DSV4 configurations
+do not inherit it.
+
+Current unmerged proof from `fix/ornith35-fused-affine-moe`:
+
+- Release, 128 generated tokens: median **94.0 tok/s**
+  (`94.2/94.0/92.7`), TTFT 164-169 ms, peak physical footprint 27,393 MiB;
+- Release, 512 generated tokens: median **91.5 tok/s**
+  (`90.9/91.5/91.5`), TTFT 168-169 ms, peak physical footprint 27,315 MiB;
+- output was coherent and byte-stable across each greedy three-run row, with
+  no loop, unclosed reasoning, or protocol-marker leak;
+- the three-turn tool row produced a structured `xmlFunction` call, consumed
+  its result, summarized it, and recalled the launch ID on the next turn;
+- hybrid cache telemetry recorded paged hit 1, SSM hits 2/re-derives 2, and
+  seven disk stores;
+- cross-session disk restore matched 138/138 prompt tokens and reduced prompt
+  processing from 501 ms cold to 29 ms warm;
+- focused numerical tests pass for both SiLU/sigmoid compiled GDN tails and
+  the real q5/q5/q4 Ornith expert topology.
+
+Artifacts:
+
+- `/private/tmp/ornith35-final-release-default-128.log`
+- `/private/tmp/ornith35-final-release-default-512.log`
+- `/private/tmp/ornith35-final-agentic-tool.log`
+- `/private/tmp/ornith35-final-disk-restore.log`
+- `/private/tmp/ornith35-compiled-policy-tests2.log`
+- `/private/tmp/ornith35-fused-moe-tests-final.log`
+
+This lane remains `PARTIAL` until the focused branch is reviewed in its own PR
+and current-head CI passes.  The rows above are engine/runtime proof, not a
+Release Osaurus UI proof.

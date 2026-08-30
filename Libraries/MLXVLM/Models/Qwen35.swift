@@ -15,7 +15,8 @@ import MLXNN
 /// Compiled sigmoid multiply: fuses x * sigmoid(gate) into one Metal dispatch.
 /// Used in GatedDeltaNet output projection (per-layer, ~30 layers per forward).
 private let compiledSigmoidMultiply: @Sendable (MLXArray, MLXArray) -> MLXArray = {
-    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (x: MLXArray, gate: MLXArray) -> MLXArray in
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (x: MLXArray, gate: MLXArray) -> MLXArray in
         x * sigmoid(gate)
     }
     guard HardwareInfo.isCompiledDecodeSupported else { return body }
@@ -28,7 +29,8 @@ private let compiledSigmoidMultiply: @Sendable (MLXArray, MLXArray) -> MLXArray 
 
 /// Compiled shared expert gate: sigmoid(gate_output) * expert_output → 1 fused op.
 private let compiledSigmoidGate: @Sendable (MLXArray, MLXArray) -> MLXArray = {
-    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (gateOutput: MLXArray, expertOutput: MLXArray) -> MLXArray in
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (gateOutput: MLXArray, expertOutput: MLXArray) -> MLXArray in
         sigmoid(gateOutput) * expertOutput
     }
     guard HardwareInfo.isCompiledDecodeSupported else { return body }
@@ -45,7 +47,8 @@ private enum Qwen35VLError: Error {
 
 /// Compiled compute_g — fuses exp+softplus+mul into 1 Metal dispatch.
 private let _vlmCompiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
-    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = { (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+        (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
         let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
         return decay
     }
@@ -87,11 +90,12 @@ private let _vlmCompiledPreciseSwiGLU: @Sendable (MLXArray, MLXArray, MLXArray) 
 /// linear-attention layer.  Pass each layer's packed affine tensors as graph
 /// inputs so one trusted BF16 decode graph can be reused without retaining
 /// layer-specific weight constants.
-private enum Qwen4ExpCompiledGDNInputs {
+enum Qwen4ExpCompiledGDNInputs {
     typealias Region = @Sendable ([MLXArray]) -> [MLXArray]
 
     private static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["VMLINUX_QWEN4_EXP_COMPILE_GDN"]
+        let value =
+            ProcessInfo.processInfo.environment["VMLINUX_QWEN4_EXP_COMPILE_GDN"]
             ?? "1"
         return value != "0" && value.lowercased() != "false"
     }()
@@ -118,12 +122,15 @@ private enum Qwen4ExpCompiledGDNInputs {
         let metadataDType = scales.dtype
         guard enabled, !CompiledDecodeTrace.isActive, input.dim(1) == 1,
             input.dtype == .bfloat16,
-            (metadataDType == .bfloat16 || metadataDType == .float16),
+            metadataDType == .bfloat16 || metadataDType == .float16,
             biases.dtype == metadataDType
         else { return nil }
 
-        let key = ([String(describing: metadataDType), String(groupSize),
-            String(bits), String(describing: mode)]
+        let key =
+            ([
+                String(describing: metadataDType), String(groupSize),
+                String(bits), String(describing: mode),
+            ]
             + splitIndices.map(String.init)).joined(separator: "|")
         lock.lock()
         var region = regions[key]
@@ -138,8 +145,10 @@ private enum Qwen4ExpCompiledGDNInputs {
         }
         if !didReport {
             didReport = true
-            FileHandle.standardError.write(Data(
-                "[Qwen4Exp] compiled_gdn_input_projection=active shared_weight_inputs=true input=bfloat16 metadata=\(metadataDType)\n".utf8))
+            FileHandle.standardError.write(
+                Data(
+                    "[Qwen4Exp] compiled_gdn_input_projection=active shared_weight_inputs=true input=bfloat16 metadata=\(metadataDType)\n"
+                        .utf8))
         }
         lock.unlock()
 
@@ -167,7 +176,8 @@ private enum Qwen4ExpCompiledGDNInputs {
         headVDim: Int
     ) -> [MLXArray]? {
         let metadataDType = scales.dtype
-        let supported = enabled && !CompiledDecodeTrace.isActive && input.dim(1) == 1
+        let supported =
+            enabled && !CompiledDecodeTrace.isActive && input.dim(1) == 1
             && input.dtype == .bfloat16
             && (convState.dtype == .bfloat16 || convState.dtype == .float32)
             && (metadataDType == .bfloat16 || metadataDType == .float16)
@@ -177,26 +187,28 @@ private enum Qwen4ExpCompiledGDNInputs {
             lock.lock()
             if !didReportFrontRejection {
                 didReportFrontRejection = true
-                FileHandle.standardError.write(Data(
-                    ("[Qwen4Exp] compiled_gdn_front=rejected"
-                        + " enabled=\(enabled) trace=\(CompiledDecodeTrace.isActive)"
-                        + " input=\(input.shape):\(input.dtype)"
-                        + " conv_state=\(convState.shape):\(convState.dtype)"
-                        + " scales=\(metadataDType) biases=\(biases.dtype)"
-                        + " conv_weight=\(convWeight.dtype)\n").utf8))
+                FileHandle.standardError.write(
+                    Data(
+                        ("[Qwen4Exp] compiled_gdn_front=rejected"
+                            + " enabled=\(enabled) trace=\(CompiledDecodeTrace.isActive)"
+                            + " input=\(input.shape):\(input.dtype)"
+                            + " conv_state=\(convState.shape):\(convState.dtype)"
+                            + " scales=\(metadataDType) biases=\(biases.dtype)"
+                            + " conv_weight=\(convWeight.dtype)\n").utf8))
             }
             lock.unlock()
             return nil
         }
 
-        let key = ([
-            "front", String(describing: metadataDType), String(groupSize),
-            String(bits), String(describing: mode),
-            String(describing: convState.dtype),
-            String(convDim), String(convKernelSize), String(keyDim),
-            String(numKHeads), String(headKDim), String(numVHeads),
-            String(headVDim),
-        ] + splitIndices.map(String.init)).joined(separator: "|")
+        let key =
+            ([
+                "front", String(describing: metadataDType), String(groupSize),
+                String(bits), String(describing: mode),
+                String(describing: convState.dtype),
+                String(convDim), String(convKernelSize), String(keyDim),
+                String(numKHeads), String(headKDim), String(numVHeads),
+                String(headVDim),
+            ] + splitIndices.map(String.init)).joined(separator: "|")
         lock.lock()
         var region = regions[key]
         if region == nil {
@@ -215,17 +227,20 @@ private enum Qwen4ExpCompiledGDNInputs {
                 let convEnd = convInput.dim(1)
                 let convTail = convInput[
                     0..., (convEnd - (convKernelSize - 1)) ..< convEnd, 0...]
-                let convOut = silu(conv1d(
-                    convInput, args[5], stride: 1, padding: 0,
-                    dilation: 1, groups: convDim))
+                let convOut = silu(
+                    conv1d(
+                        convInput, args[5], stride: 1, padding: 0,
+                        dilation: 1, groups: convDim))
                 let qkv = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
                 let q = qkv[0].reshaped(B, S, numKHeads, headKDim)
                 let k = qkv[1].reshaped(B, S, numKHeads, headKDim)
                 let v = qkv[2].reshaped(B, S, numVHeads, headVDim)
                 let invScale = pow(Float(headKDim), -0.5)
-                let qNormed = MLXArray(pow(invScale, 2), dtype: q.dtype)
+                let qNormed =
+                    MLXArray(pow(invScale, 2), dtype: q.dtype)
                     * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-                let kNormed = MLXArray(invScale, dtype: k.dtype)
+                let kNormed =
+                    MLXArray(invScale, dtype: k.dtype)
                     * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
                 return [
                     z, projections[2], projections[3], qNormed, kNormed, v,
@@ -236,8 +251,10 @@ private enum Qwen4ExpCompiledGDNInputs {
         }
         if !didReport {
             didReport = true
-            FileHandle.standardError.write(Data(
-                "[Qwen4Exp] compiled_gdn_front=active shared_weight_inputs=true input=bfloat16 metadata=\(metadataDType) conv_state=\(convState.dtype) recurrence=float32\n".utf8))
+            FileHandle.standardError.write(
+                Data(
+                    "[Qwen4Exp] compiled_gdn_front=active shared_weight_inputs=true input=bfloat16 metadata=\(metadataDType) conv_state=\(convState.dtype) recurrence=float32\n"
+                        .utf8))
         }
         lock.unlock()
 
@@ -250,6 +267,7 @@ private enum Qwen4ExpCompiledGDNInputs {
     static func callTail(
         output: MLXArray,
         gate: MLXArray,
+        sigmoidGate: Bool,
         normWeight: MLXArray,
         outWeight: MLXArray,
         outScales: MLXArray,
@@ -260,7 +278,8 @@ private enum Qwen4ExpCompiledGDNInputs {
         mode: QuantizationMode
     ) -> MLXArray? {
         let metadataDType = outScales.dtype
-        let supported = enabled && !CompiledDecodeTrace.isActive && output.dim(1) == 1
+        let supported =
+            enabled && !CompiledDecodeTrace.isActive && output.dim(1) == 1
             && (output.dtype == .bfloat16
                 || (output.dtype == .float32 && allowFP32Tail))
             && (gate.dtype == .bfloat16 || gate.dtype == .float32)
@@ -272,12 +291,13 @@ private enum Qwen4ExpCompiledGDNInputs {
             lock.lock()
             if output.dim(1) == 1, !didReportTailRejection {
                 didReportTailRejection = true
-                FileHandle.standardError.write(Data(
-                    ("[Qwen4Exp] compiled_gdn_tail=rejected"
-                        + " enabled=\(enabled) trace=\(CompiledDecodeTrace.isActive)"
-                        + " output=\(output.shape):\(output.dtype)"
-                        + " gate=\(gate.shape):\(gate.dtype) norm=\(normWeight.dtype)"
-                        + " scales=\(metadataDType) biases=\(outBiases.dtype)\n").utf8))
+                FileHandle.standardError.write(
+                    Data(
+                        ("[Qwen4Exp] compiled_gdn_tail=rejected"
+                            + " enabled=\(enabled) trace=\(CompiledDecodeTrace.isActive)"
+                            + " output=\(output.shape):\(output.dtype)"
+                            + " gate=\(gate.shape):\(gate.dtype) norm=\(normWeight.dtype)"
+                            + " scales=\(metadataDType) biases=\(outBiases.dtype)\n").utf8))
             }
             lock.unlock()
             return nil
@@ -285,6 +305,7 @@ private enum Qwen4ExpCompiledGDNInputs {
 
         let key = [
             "tail", String(output.dim(-1)), String(gate.dim(-1)),
+            sigmoidGate ? "sigmoid" : "silu",
             String(describing: output.dtype),
             String(describing: gate.dtype),
             String(describing: metadataDType),
@@ -295,8 +316,12 @@ private enum Qwen4ExpCompiledGDNInputs {
         if region == nil {
             region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
                 let normalized = MLXFast.rmsNorm(args[0], weight: args[2], eps: eps)
-                let gated = (normalized.asType(.float32)
-                    * sigmoid(args[1].asType(.float32))).asType(args[0].dtype)
+                let gate =
+                    sigmoidGate
+                    ? sigmoid(args[1].asType(.float32))
+                    : silu(args[1].asType(.float32))
+                let gated = (normalized.asType(.float32) * gate)
+                    .asType(args[0].dtype)
                 let projected = quantizedMM(
                     gated.reshaped(gated.dim(0), gated.dim(1), -1),
                     args[3], scales: args[4], biases: args[5],
@@ -307,8 +332,10 @@ private enum Qwen4ExpCompiledGDNInputs {
         }
         if !didReportTail {
             didReportTail = true
-            FileHandle.standardError.write(Data(
-                "[Qwen4Exp] compiled_gdn_tail=active recurrence_output=\(output.dtype) gate=\(gate.dtype) metadata=\(metadataDType) shared_weight_inputs=true\n".utf8))
+            FileHandle.standardError.write(
+                Data(
+                    "[Qwen4Exp] compiled_gdn_tail=active gate_mode=\(sigmoidGate ? "sigmoid" : "silu") recurrence_output=\(output.dtype) gate=\(gate.dtype) metadata=\(metadataDType) shared_weight_inputs=true\n"
+                        .utf8))
         }
         lock.unlock()
 
@@ -322,7 +349,8 @@ private enum Qwen4ExpCompiledMoE {
     typealias Region = @Sendable ([MLXArray]) -> [MLXArray]
 
     static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["VMLINUX_QWEN4_EXP_COMPILE_MOE"]
+        let value =
+            ProcessInfo.processInfo.environment["VMLINUX_QWEN4_EXP_COMPILE_MOE"]
             ?? "1"
         return value != "0" && value.lowercased() != "false"
     }()
@@ -365,8 +393,10 @@ private enum Qwen4ExpCompiledMoE {
         }
         if !didReportRouter {
             didReportRouter = true
-            FileHandle.standardError.write(Data(
-                "[Qwen4Exp] compiled_moe_router=active shared_weight_inputs=true dtype=bfloat16\n".utf8))
+            FileHandle.standardError.write(
+                Data(
+                    "[Qwen4Exp] compiled_moe_router=active shared_weight_inputs=true dtype=bfloat16\n"
+                        .utf8))
         }
         lock.unlock()
         let outputs = region!([x, weight, scales, biases])
@@ -401,8 +431,10 @@ private enum Qwen4ExpCompiledMoE {
         }
         if !didReportRouter {
             didReportRouter = true
-            FileHandle.standardError.write(Data(
-                "[Qwen4Exp] compiled_moe_router=active kind=dense shared_weight_inputs=true dtype=bfloat16\n".utf8))
+            FileHandle.standardError.write(
+                Data(
+                    "[Qwen4Exp] compiled_moe_router=active kind=dense shared_weight_inputs=true dtype=bfloat16\n"
+                        .utf8))
         }
         lock.unlock()
         let outputs = region!([x, weight])
@@ -420,10 +452,12 @@ private enum Qwen4ExpCompiledMoE {
     ) -> MLXArray? {
         guard enabled, !CompiledDecodeTrace.isActive, x.dim(1) == 1,
             x.dtype == .bfloat16,
-            [gateScales, gateBiases, upScales, upBiases, downScales,
-             downBiases]
-                .allSatisfy({ $0.dtype == .bfloat16 })
-            && sharedGateWeight.dtype == .bfloat16
+            [
+                gateScales, gateBiases, upScales, upBiases, downScales,
+                downBiases,
+            ]
+            .allSatisfy({ $0.dtype == .bfloat16 })
+                && sharedGateWeight.dtype == .bfloat16
         else { return nil }
         let key = "shared|\(x.dim(-1))|\(gateWeight.dim(0))|\(groupSize)|\(bits)|\(mode)"
         lock.lock()
@@ -447,8 +481,10 @@ private enum Qwen4ExpCompiledMoE {
         }
         if !didReportShared {
             didReportShared = true
-            FileHandle.standardError.write(Data(
-                "[Qwen4Exp] compiled_moe_shared_expert=active shared_weight_inputs=true dtype=bfloat16\n".utf8))
+            FileHandle.standardError.write(
+                Data(
+                    "[Qwen4Exp] compiled_moe_shared_expert=active shared_weight_inputs=true dtype=bfloat16\n"
+                        .utf8))
         }
         lock.unlock()
         let outputs = region!([
@@ -592,7 +628,8 @@ private func gatedDeltaOps(
             mask: maskT
         )
         ys.append(y)
-        state = roundStateEachStep
+        state =
+            roundStateEachStep
             ? newState.asType(q.dtype).asType(.float32)
             : newState
     }
@@ -613,7 +650,8 @@ private func makeVLMGatedDeltaKernel(
     roundStateEachStep: Bool = false
 ) -> MLXFast.MLXFastKernel? {
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
-    let stepRoundSource = roundStateEachStep
+    let stepRoundSource =
+        roundStateEachStep
         ? """
                 for (int i = 0; i < n_per_t; ++i) {
                   state[i] = static_cast<float>(static_cast<InT>(state[i]));
@@ -833,8 +871,10 @@ private enum QwenGatedDeltaDTypeTrace {
         defer { lock.unlock() }
         guard !didReport else { return }
         didReport = true
-        FileHandle.standardError.write(Data(
-            "[QwenGDN] live_dtype_boundaries q=\(q.dtype) k=\(k.dtype) v=\(v.dtype) a=\(a.dtype) b=\(b.dtype) beta=fused_from_\(b.dtype) decay=\(decay.dtype) recurrent_state=\(state.dtype) output=\(q.dtype)\n".utf8))
+        FileHandle.standardError.write(
+            Data(
+                "[QwenGDN] live_dtype_boundaries q=\(q.dtype) k=\(k.dtype) v=\(v.dtype) a=\(a.dtype) b=\(b.dtype) beta=fused_from_\(b.dtype) decay=\(decay.dtype) recurrent_state=\(state.dtype) output=\(q.dtype)\n"
+                    .utf8))
     }
 }
 
@@ -1067,6 +1107,25 @@ public struct Qwen35Configuration: Codable, Sendable {
 // MARK: - Language
 
 enum Qwen35Language {
+    static func shouldCompileDecodeRegions(
+        _ args: Qwen35Configuration.TextConfiguration,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        if let override = environment["VMLINUX_QWEN35_COMPILE_DECODE_REGIONS"] {
+            return override != "0" && override.lowercased() != "false"
+        }
+        return args.modelType == "qwen3_5_moe_text"
+            && args.hiddenSize == 2048
+            && args.hiddenLayers == 40
+            && args.fullAttentionInterval == 4
+            && args.numExperts == 256
+            && args.numExpertsPerTok == 8
+            && args.moeIntermediateSize == 512
+            && args.linearNumKeyHeads == 16
+            && args.linearNumValueHeads == 32
+            && args.linearKeyHeadDim == 128
+            && args.linearValueHeadDim == 128
+    }
 
     final class RotaryEmbedding {
         private let invFreq: MLXArray
@@ -1254,7 +1313,8 @@ enum Qwen35Language {
             // buffer from `update` and its `makeMask` already covers it, so
             // the kvSeqLen mask slice must not run — and reading `.offset`
             // (Int) is an illegal `.item()` inside the compile trace.
-            let fullBufferCache = !(cache is BatchKVCache)
+            let fullBufferCache =
+                !(cache is BatchKVCache)
                 && graphOffsetArray(for: cache) != nil
 
             if positionIds == nil {
@@ -1268,7 +1328,8 @@ enum Qwen35Language {
                     let base = offsets.reshaped(1, B, 1)
                     positionIds = tiled(base, repetitions: [3, 1, L])
                 } else if fullBufferCache, let graphOffset = graphOffsetArray(for: cache) {
-                    var base = graphOffset.reshaped([]).asType(.int32)
+                    var base =
+                        graphOffset.reshaped([]).asType(.int32)
                         + MLXArray(0 ..< L).asType(.int32)
                     base = tiled(base[.newAxis, 0...], repetitions: [B, 1])
                     positionIds = tiled(base[.newAxis, 0..., 0...], repetitions: [3, 1, 1])
@@ -1292,7 +1353,8 @@ enum Qwen35Language {
             if let mask {
                 // Full-buffer (Compilable) caches: mask and K/V both span the
                 // whole static buffer — pass through unsliced.
-                attentionMask = fullBufferCache
+                attentionMask =
+                    fullBufferCache
                     ? .array(mask) : .array(mask[.ellipsis, 0 ..< kvSeqLen])
             } else {
                 attentionMask = .none
@@ -1419,7 +1481,8 @@ enum Qwen35Language {
         private func ensureFusedDecodeInputProjection(
             _ inputs: MLXArray
         ) -> FusedDecodeInputProjection? {
-            guard ProcessInfo.processInfo.environment[
+            guard
+                ProcessInfo.processInfo.environment[
                     "VMLINUX_QWEN4_EXP_FUSE_DECODE_INPUTS"] != "0",
                 fuseDecodeInputProjections, inputs.dim(1) == 1,
                 !CompiledDecodeTrace.isActive
@@ -1456,8 +1519,10 @@ enum Qwen35Language {
                 Self.fusionDiagnosticLock.lock()
                 if !Self.didReportDecodeInputFusion {
                     Self.didReportDecodeInputFusion = true
-                    FileHandle.standardError.write(Data(
-                        "[Qwen4Exp] fused_gdn_decode_input_projections=active dtype=\(inputs.dtype)\n".utf8))
+                    FileHandle.standardError.write(
+                        Data(
+                            "[Qwen4Exp] fused_gdn_decode_input_projections=active dtype=\(inputs.dtype)\n"
+                                .utf8))
                 }
                 Self.fusionDiagnosticLock.unlock()
             }
@@ -1511,13 +1576,14 @@ enum Qwen35Language {
         }
 
         private func compiledDecodeTail(_ output: MLXArray, gate: MLXArray) -> MLXArray? {
-            guard norm.sigmoidGate,
+            guard fuseDecodeInputProjections,
                 let quantized = outProj as? QuantizedLinear,
                 let biases = quantized.biases,
                 quantized.bias == nil
             else { return nil }
             return Qwen4ExpCompiledGDNInputs.callTail(
-                output: output, gate: gate, normWeight: norm.weight,
+                output: output, gate: gate, sigmoidGate: norm.sigmoidGate,
+                normWeight: norm.weight,
                 outWeight: quantized.weight, outScales: quantized.scales,
                 outBiases: biases, eps: norm.eps,
                 groupSize: quantized.groupSize, bits: quantized.bits,
@@ -1571,7 +1637,8 @@ enum Qwen35Language {
             // Staged verify (compiled DFlash 2): committed cache slots and
             // offset stay UNTOUCHED for the whole forward; everything the
             // post-acceptance commit needs goes into fixed staging slots.
-            let stageVerify = cache != nil && S > 1 && mask == nil
+            let stageVerify =
+                cache != nil && S > 1 && mask == nil
                 && NativeMTPVerifierStatePolicy.shouldStageVerifyInputs
             let front = compiledDecodeFront(inputs, convState: convState)
             let z: MLXArray
@@ -1620,9 +1687,11 @@ enum Qwen35Language {
                 let k = split[1].reshaped(B, S, numKHeads, headKDim)
                 v = split[2].reshaped(B, S, numVHeads, headVDim)
                 let invScale = pow(Float(headKDim), -0.5)
-                qNormed = MLXArray(pow(invScale, 2), dtype: q.dtype)
+                qNormed =
+                    MLXArray(pow(invScale, 2), dtype: q.dtype)
                     * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-                kNormed = MLXArray(invScale, dtype: k.dtype)
+                kNormed =
+                    MLXArray(invScale, dtype: k.dtype)
                     * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
             }
 
@@ -1682,7 +1751,8 @@ enum Qwen35Language {
                     // commitVerifyStaged after acceptance.
                 } else {
                     if recordPrefixCommitStates, S > 1,
-                       NativeMTPVerifierStatePolicy.shouldRecordAcceptedPrefixStates {
+                        NativeMTPVerifierStatePolicy.shouldRecordAcceptedPrefixStates
+                    {
                         self.recordPrefixCommitStates(
                             cache: cache,
                             convInput: convInput,
@@ -1804,9 +1874,13 @@ enum Qwen35Language {
                 }
                 let diff = abs(prefixState - chained!).max().item(Float.self)
                 let scale = abs(chained!).max().item(Float.self)
-                FileHandle.standardError.write(Data(String(
-                    format: "[rollback-audit] n=%d replay-vs-chained maxdiff=%.3e scale=%.3e\n",
-                    n, diff, scale).utf8))
+                FileHandle.standardError.write(
+                    Data(
+                        String(
+                            format:
+                                "[rollback-audit] n=%d replay-vs-chained maxdiff=%.3e scale=%.3e\n",
+                            n, diff, scale
+                        ).utf8))
             }
             cache[1] = prefixState
             cache[0] = convInput[0..., convStart ..< convEnd, 0...]
@@ -2029,7 +2103,8 @@ enum Qwen35Language {
             if let eagerCombined, let shared = compiledSharedExpert(x) {
                 return eagerCombined + shared
             }
-            let combined = eagerCombined
+            let combined =
+                eagerCombined
                 ?? (routed! * scores[.ellipsis, .newAxis]).sum(axis: -2)
             let sharedY = sharedExpert(x)
             let gatedSharedY = compiledSigmoidGate(sharedExpertGate(x), sharedY)
@@ -2051,15 +2126,21 @@ enum Qwen35Language {
 
         init(_ args: Qwen35Configuration.TextConfiguration, layerIdx: Int) {
             self.isLinear = (layerIdx + 1) % args.fullAttentionInterval != 0
+            let compiledDecodeRegions = shouldCompileDecodeRegions(args)
 
             if isLinear {
-                _linearAttn.wrappedValue = GatedDeltaNet(args)
+                _linearAttn.wrappedValue = GatedDeltaNet(
+                    args,
+                    fuseDecodeInputProjections: compiledDecodeRegions)
             } else {
                 _selfAttn.wrappedValue = Attention(args)
             }
 
             if args.numExperts > 0 {
-                _mlp.wrappedValue = SparseMoeBlock(args, layerIdx: layerIdx)
+                _mlp.wrappedValue = SparseMoeBlock(
+                    args,
+                    layerIdx: layerIdx,
+                    compileDecodeRegions: compiledDecodeRegions)
             } else {
                 _mlp.wrappedValue = MLP(
                     dimensions: args.hiddenSize, hiddenDimensions: args.intermediateSize)
@@ -2153,11 +2234,13 @@ enum Qwen35Language {
             cache: KVCache?,
             positionIds: MLXArray?
         ) -> MLXArray {
-            let h = x + selfAttn(
-                inputLayerNorm(x),
-                mask: attentionMask,
-                cache: cache,
-                positionIds: positionIds)
+            let h =
+                x
+                + selfAttn(
+                    inputLayerNorm(x),
+                    mask: attentionMask,
+                    cache: cache,
+                    positionIds: positionIds)
             return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
         }
     }
@@ -2189,10 +2272,11 @@ enum Qwen35Language {
             cache: [KVCache]?
         ) -> MLXArray {
             let embeds = embedTokens(nextTokenIds)
-            let fusedInput = concatenated([
-                preFCNormEmbedding(embeds),
-                preFCNormHidden(hiddenStates),
-            ], axis: -1)
+            let fusedInput = concatenated(
+                [
+                    preFCNormEmbedding(embeds),
+                    preFCNormHidden(hiddenStates),
+                ], axis: -1)
             var hiddenStates = fc(fusedInput)
 
             var cacheArray = cache
@@ -2224,11 +2308,12 @@ enum Qwen35Language {
             embedTokens: Embedding,
             cache: [KVCache]?
         ) -> MLXArray {
-            norm(preNormHidden(
-                hiddenStates: hiddenStates,
-                nextTokenIds: nextTokenIds,
-                embedTokens: embedTokens,
-                cache: cache))
+            norm(
+                preNormHidden(
+                    hiddenStates: hiddenStates,
+                    nextTokenIds: nextTokenIds,
+                    embedTokens: embedTokens,
+                    cache: cache))
         }
 
         func makeCache() -> [KVCache] {
@@ -2611,7 +2696,8 @@ enum Qwen35Language {
             // (measured: restored offset 1375, chunk 33, slice [1408..<1412]
             // → broadcast abort). `nil` positions make attention derive
             // them from the cache offset, exactly like the plain forward.
-            let positionIds: MLXArray? = ropeDeltas != nil
+            let positionIds: MLXArray? =
+                ropeDeltas != nil
                 ? resolvedPositionIds(
                     inputs: inputs,
                     cache: cacheOpt,
@@ -2742,7 +2828,9 @@ enum Qwen35Language {
 
 // MARK: - Model
 
-public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel, DFlash2StagedVerifyRollbackModel {
+public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel,
+    DFlash2StagedVerifyRollbackModel
+{
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
@@ -2764,7 +2852,6 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         languageModel.makeCache(maxKVSize: parameters?.maxKVSize)
     }
-
 
     /// Scatters vision features onto their placeholder positions.
     ///
@@ -3161,7 +3248,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
             weights: weights,
             probeSuffixes: [".input_layernorm.weight", ".post_attention_layernorm.weight"],
             fallbackWhenNoProbe: { !Self.isMLXFormatLike(weights) })
-        let shouldShiftMTPNormWeights = loadNativeMTP
+        let shouldShiftMTPNormWeights =
+            loadNativeMTP
             && (shouldShiftNormWeights || Self.mtpNormWeightsNeedShift(weights))
 
         if config.textConfiguration.tieWordEmbeddings {
@@ -3172,7 +3260,9 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         if isMLXFormat && !hasUnsanitizedConv1d && !shouldShiftNormWeights
             && !shouldShiftMTPNormWeights
         {
-            let needsRemap = weights.keys.contains { $0.contains("model.language_model") || $0.contains("model.visual") }
+            let needsRemap = weights.keys.contains {
+                $0.contains("model.language_model") || $0.contains("model.visual")
+            }
             if !needsRemap {
                 return weights
             }
@@ -3216,11 +3306,13 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
             if key.contains("conv1d.weight") && value.dim(-1) != 1 {
                 value = value.movedAxis(source: 2, destination: 1)
             }
-            let isMTPNorm = loadNativeMTP
+            let isMTPNorm =
+                loadNativeMTP
                 && Self.isMTPWeightKey(key)
                 && key.hasSuffix(".weight")
                 && (key.contains("norm") || key.contains("q_norm") || key.contains("k_norm"))
-            let shouldShiftBaseNorm = shouldShiftNormWeights
+            let shouldShiftBaseNorm =
+                shouldShiftNormWeights
                 && normKeys.contains(where: { key.hasSuffix($0) })
             let shouldShiftMTPNorm = isMTPNorm && shouldShiftMTPNormWeights
             if (shouldShiftBaseNorm || shouldShiftMTPNorm) && value.ndim == 1 {
