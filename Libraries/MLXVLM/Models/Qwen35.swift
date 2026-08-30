@@ -187,14 +187,19 @@ enum Qwen4ExpCompiledGDNInputs {
             lock.lock()
             if !didReportFrontRejection {
                 didReportFrontRejection = true
-                FileHandle.standardError.write(
-                    Data(
-                        ("[Qwen4Exp] compiled_gdn_front=rejected"
-                            + " enabled=\(enabled) trace=\(CompiledDecodeTrace.isActive)"
-                            + " input=\(input.shape):\(input.dtype)"
-                            + " conv_state=\(convState.shape):\(convState.dtype)"
-                            + " scales=\(metadataDType) biases=\(biases.dtype)"
-                            + " conv_weight=\(convWeight.dtype)\n").utf8))
+                // Built piecewise on purpose. As a single `+` chain with eight interpolations
+                // wrapped in `Data(...).utf8`, this expression exceeds the type checker's budget and
+                // the file does not compile: "unable to type-check this expression in reasonable
+                // time" (Swift 6.4, swiftlang-6.4.0.33.1). Reproduced with trivial stand-in types,
+                // so it is the shape of the expression rather than anything about MLXArray. Same
+                // output; 11s-then-failure becomes 0.15s.
+                var diag = "[Qwen4Exp] compiled_gdn_front=rejected"
+                diag += " enabled=\(enabled) trace=\(CompiledDecodeTrace.isActive)"
+                diag += " input=\(input.shape):\(input.dtype)"
+                diag += " conv_state=\(convState.shape):\(convState.dtype)"
+                diag += " scales=\(metadataDType) biases=\(biases.dtype)"
+                diag += " conv_weight=\(convWeight.dtype)\n"
+                FileHandle.standardError.write(Data(diag.utf8))
             }
             lock.unlock()
             return nil
