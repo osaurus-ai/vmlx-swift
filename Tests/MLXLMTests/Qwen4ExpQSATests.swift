@@ -12,6 +12,20 @@ import Testing
 @Suite("qwen4_exp QSA block selection", .serialized)
 struct Qwen4ExpQSATests {
 
+    @Test("gathered routing preserves fast decode and bounds large prefill")
+    func gatheredRoutingThreshold() {
+        #expect(!Qwen4ExpQSA.shouldUseGatheredAttention(
+            queryTokens: 1, keyTokens: 262_144))
+        #expect(!Qwen4ExpQSA.shouldUseGatheredAttention(
+            queryTokens: 4, keyTokens: 131_072))
+        #expect(!Qwen4ExpQSA.shouldUseGatheredAttention(
+            queryTokens: 32, keyTokens: 32))
+        #expect(Qwen4ExpQSA.shouldUseGatheredAttention(
+            queryTokens: 128, keyTokens: 18_432))
+        #expect(Qwen4ExpQSA.shouldUseGatheredAttention(
+            queryTokens: 18_432, keyTokens: 18_432))
+    }
+
     private func makeMask(
         pastLen: Int, seqLen: Int, keyLen: Int,
         compressRatio: Int = 4, blockTopK: Int = 2, heads: Int = 2, dim: Int = 8

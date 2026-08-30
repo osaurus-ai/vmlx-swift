@@ -1019,12 +1019,16 @@ private final class Qwen4ExpAttention: Module {
         (query, key) = Qwen35Language.applyMultimodalRotaryPosEmb(
             q: query, k: key, cos: cos, sin: sin)
 
-        // Batch-one contiguous text uses exact gathered QSA. Both indexer
-        // scoring and main attention are query-chunked, so neither prefill nor
-        // decode can create a prompt-squared mask. Media/M-RoPE, offset-shifted,
-        // cacheless, and unsupported layouts fail closed to the official mask
-        // path below.
-        if let qsa, let cache, B == 1, explicitPositions == nil, positionOffset == 0 {
+        // Large batch-one contiguous prefill uses exact gathered QSA. Both
+        // indexer scoring and main attention are query-chunked, so prefill
+        // cannot create a prompt-squared mask. Short decode and native-MTP
+        // verification keep the faster exact mask path because their
+        // `[B,T,keyLen]` mask stays bounded. Media/M-RoPE, offset-shifted,
+        // cacheless, and unsupported layouts also use the official path.
+        if let qsa, let cache, B == 1, explicitPositions == nil, positionOffset == 0,
+            Qwen4ExpQSA.shouldUseGatheredAttention(
+                queryTokens: S, keyTokens: qsa.total)
+        {
             let (cachedKeys, cachedValues) = cache.update(keys: key, values: value)
             let output = Qwen4ExpQSA.gatheredAttention(
                 queries: query,

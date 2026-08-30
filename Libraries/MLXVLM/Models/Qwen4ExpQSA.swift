@@ -14,6 +14,22 @@ import Foundation
 import MLX
 
 enum Qwen4ExpQSA {
+    /// Use the gathered implementation only once the exact sparse mask would
+    /// become materially large. Singleton decode and native-MTP verification
+    /// use one to four query rows, so their `[B,T,keyLen]` masks remain small
+    /// even at long context and are substantially faster than gathering K/V.
+    /// Large prefill crosses this bound and stays on the query-chunked path.
+    static func shouldUseGatheredAttention(
+        queryTokens: Int,
+        keyTokens: Int,
+        maxMaskElements: Int = 1_048_576
+    ) -> Bool {
+        guard queryTokens > 0, keyTokens > 0, maxMaskElements >= 0 else {
+            return false
+        }
+        return queryTokens > maxMaskElements / keyTokens
+    }
+
     /// Keep the portable gathered path bounded without turning every prompt
     /// into dozens of tiny dispatches.
     static func queryChunkSize(keyLen: Int) -> Int {
