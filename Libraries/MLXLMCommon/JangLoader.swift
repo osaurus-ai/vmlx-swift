@@ -725,14 +725,55 @@ public struct JangChatToolCalling: Sendable, Equatable {
 public struct JangChatSamplingDefaults: Sendable, Equatable {
     public let temperature: Float?
     public let topP: Float?
+    public let topK: Int?
+    public let minP: Float?
+    public let repetitionPenalty: Float?
+    public let presencePenalty: Float?
+
+    /// The generation length cap. Bundles spell this `max_tokens`; `max_new_tokens` is accepted as
+    /// an alias because this type has always named it that, though no bundle observed uses it.
     public let maxNewTokens: Int?
 
     public init(
-        temperature: Float? = nil, topP: Float? = nil, maxNewTokens: Int? = nil
+        temperature: Float? = nil, topP: Float? = nil, topK: Int? = nil, minP: Float? = nil,
+        repetitionPenalty: Float? = nil, presencePenalty: Float? = nil, maxNewTokens: Int? = nil
     ) {
         self.temperature = temperature
         self.topP = topP
+        self.topK = topK
+        self.minP = minP
+        self.repetitionPenalty = repetitionPenalty
+        self.presencePenalty = presencePenalty
         self.maxNewTokens = maxNewTokens
+    }
+
+    /// True when the block carried nothing this runtime can act on — provenance keys only.
+    public var isEmpty: Bool {
+        temperature == nil && topP == nil && topK == nil && minP == nil
+            && repetitionPenalty == nil && presencePenalty == nil && maxNewTokens == nil
+    }
+
+    /// Overlay these defaults onto `parameters`, replacing only what the bundle declares.
+    ///
+    /// This is deliberately something a CALLER invokes rather than something the loader applies:
+    /// which knobs a caller has already set is not visible from here (`GenerateParameters` stores
+    /// non-optional sampler fields, so "unset" and "set to the default value" are the same value),
+    /// and applying silently would change generation for every bundle carrying the block.
+    ///
+    /// Partial application is the trap worth naming. Every observed bundle that sets `temperature`
+    /// also sets `top_k`; a runtime that honoured the first and dropped the second would produce a
+    /// sampler configuration the vendor never specified and nobody validated — arguably worse than
+    /// honouring none of it. That is why the fields above track what bundles actually carry.
+    public func applied(to parameters: GenerateParameters) -> GenerateParameters {
+        var p = parameters
+        if let temperature { p.temperature = temperature }
+        if let topP { p.topP = topP }
+        if let topK { p.topK = topK }
+        if let minP { p.minP = minP }
+        if let repetitionPenalty { p.repetitionPenalty = repetitionPenalty }
+        if let presencePenalty { p.presencePenalty = presencePenalty }
+        if let maxNewTokens { p.maxTokens = maxNewTokens }
+        return p
     }
 }
 
@@ -1823,10 +1864,20 @@ public struct JangLoader: Sendable {
             // sampling_defaults subblock
             let sampling: JangChatSamplingDefaults?
             if let sDict = chDict["sampling_defaults"] as? [String: Any] {
+                // Every key here has a destination in `GenerateParameters`. Decoding only
+                // temperature and top_p discarded `top_k`, which EVERY observed bundle carrying a
+                // sampling block also sets, plus min_p / repetition_penalty / presence_penalty.
+                // Non-sampling keys in the block (`source`, `mode`, `temperature_note`, and the
+                // generation_config residue some bundles copy in wholesale) are ignored by
+                // omission, as before.
                 sampling = JangChatSamplingDefaults(
                     temperature: floatValue(sDict["temperature"]),
                     topP: floatValue(sDict["top_p"]),
-                    maxNewTokens: sDict["max_new_tokens"] as? Int
+                    topK: sDict["top_k"] as? Int,
+                    minP: floatValue(sDict["min_p"]),
+                    repetitionPenalty: floatValue(sDict["repetition_penalty"]),
+                    presencePenalty: floatValue(sDict["presence_penalty"]),
+                    maxNewTokens: (sDict["max_tokens"] as? Int) ?? (sDict["max_new_tokens"] as? Int)
                 )
             } else { sampling = nil }
 
