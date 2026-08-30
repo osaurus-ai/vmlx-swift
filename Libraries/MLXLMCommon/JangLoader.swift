@@ -2455,6 +2455,30 @@ public struct JangLoader: Sendable {
                       let exact = inferExactQuantization(expectedInDim: hiddenSize)
             {
                 (bits, inferredGroupSize) = exact
+            } else if isExpertDownProjection,
+                      let expertIntermediateSize = expertIntermediateSizeHint,
+                      expertIntermediateSize > 0
+            {
+                // MOVED above the declaration fallback below, deliberately.
+                //
+                // A MoE expert's down projection takes the INTERMEDIATE width as input, so
+                // `hiddenSizeHint` cannot validate it the way it validates the gate/up siblings —
+                // which is why those two resolve correctly and this one did not. The packed width
+                // is frequently ambiguous: on Mistral-Small-4-119B, packed=256 with numGroups=32
+                // satisfies BOTH (bits=4, gs=64) and (bits=8, gs=32).
+                //
+                // While this sat BELOW the declaration branch, a self-consistent-but-WRONG
+                // declaration won every time, because self-consistency is exactly what an
+                // ambiguous width guarantees. The bundle declared 8-bit, the tensors were 4-bit,
+                // and gather_qmm died on a 1024-wide matrix fed a 2048-wide input. Every other
+                // tensor-derived hint already sits above the declaration; this one was on the
+                // wrong side of that line.
+                (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
+                    packedDim: packedDim,
+                    numGroups: numGroups,
+                    knownGroupSize: moduleGroupSize,
+                    bitWidthsUsed: bitWidthsUsed,
+                    expectedInDim: expertIntermediateSize)
             } else if let dq = explicitForLayer,
                dq.bits > 0, numGroups > 0, (packedDim * 32) % dq.bits == 0,
                case let declaredInputDim = (packedDim * 32) / dq.bits,
@@ -2542,16 +2566,6 @@ public struct JangLoader: Sendable {
                     knownGroupSize: moduleGroupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: hiddenSize)
-            } else if isExpertDownProjection,
-                      let expertIntermediateSize = expertIntermediateSizeHint,
-                      expertIntermediateSize > 0
-            {
-                (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
-                    packedDim: packedDim,
-                    numGroups: numGroups,
-                    knownGroupSize: moduleGroupSize,
-                    bitWidthsUsed: bitWidthsUsed,
-                    expectedInDim: expertIntermediateSize)
             } else if let picked = inferFromUniqueValidInDim() {
                 (bits, inferredGroupSize) = picked
             } else if isExpertDownProjection && !validInDims.isEmpty {
