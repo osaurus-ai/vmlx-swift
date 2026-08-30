@@ -117,19 +117,41 @@ public struct LoRAContainer: ModelAdapter, @unchecked Sendable {
     }
 
     /// Loads a `LoRAContainer` from a directory containing adapter weights and configuration.
+    ///
+    /// Accepts BOTH layouts: MLX's own (`fine_tune_type` + `adapters.safetensors`) and
+    /// HuggingFace PEFT's (`peft_type` + `adapter_model.safetensors`), which is what essentially
+    /// every published adapter is. PEFT weights are translated on load rather than by an offline
+    /// converter, so an adapter downloaded from the Hub works directly — see `PEFTAdapter`.
     public static func from(directory: URL) throws -> LoRAContainer {
         let configurationURL = directory.appending(component: "adapter_config.json")
         let configurationData = try Data(contentsOf: configurationURL)
-        let configuration = try JSONDecoder()
-            .decode(LoRAConfiguration.self, from: configurationData)
 
-        let weightsURL = directory.appending(component: "adapters.safetensors")
-        let weights = try MLX.loadArrays(url: weightsURL)
-        let parameters = ModuleParameters.unflattened(weights)
+        func loadWeights() throws -> [String: MLXArray] {
+            for name in PEFTAdapter.weightsFilenames {
+                let url = directory.appending(component: name)
+                if FileManager.default.fileExists(atPath: url.path) {
+                    return try MLX.loadArrays(url: url)
+                }
+            }
+            // Preserve the original error surface when neither spelling is present.
+            return try MLX.loadArrays(url: directory.appending(component: "adapters.safetensors"))
+        }
+
+        let raw = try loadWeights()
+        let configuration: LoRAConfiguration
+        let weights: [String: MLXArray]
+        if let peft = PEFTAdapter.detect(configuration: configurationData) {
+            weights = PEFTAdapter.translate(weights: raw)
+            configuration = PEFTAdapter.configuration(from: peft, weights: weights)
+        } else {
+            configuration = try JSONDecoder()
+                .decode(LoRAConfiguration.self, from: configurationData)
+            weights = raw
+        }
 
         return LoRAContainer(
             configuration: configuration,
-            parameters: parameters
+            parameters: ModuleParameters.unflattened(weights)
         )
     }
 
@@ -144,13 +166,22 @@ public struct LoRAContainer: ModelAdapter, @unchecked Sendable {
         }
 
         let layers = lora.loraLayers.suffix(configuration.numLayers)
-        let keys = configuration.loraParameters.keys ?? lora.loraDefaultKeys
+        // PEFT names LEAVES ("out_proj"); replaceLayers matches full child keys
+        // ("linear_attn.out_proj"). Expand against the live layers, or nothing is replaced.
+        let keys = PEFTAdapter.expandTargetKeys(
+            configuration.loraParameters.keys ?? lora.loraDefaultKeys, in: layers)
         replaceLayers(layers: layers, keys: keys) { (layer: Module) in
             createReplacementLayer(target: layer, configuration: configuration)
         }
 
+        // The adapter records CHECKPOINT paths; the tree uses MODULE paths. Re-key against the
+        // live tree — after `replaceLayers`, so the lora_a/lora_b slots exist to match against.
+        let modelKeys = model.parameters().flattened().map(\.0)
+        let rekeyed = try PEFTAdapter.rekey(
+            Dictionary(uniqueKeysWithValues: parameters.flattened()), toModelKeys: modelKeys)
+
         try model.update(
-            parameters: parameters,
+            parameters: ModuleParameters.unflattened(rekeyed),
             verify: .noUnusedKeys
         )
     }

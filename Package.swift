@@ -871,6 +871,7 @@ let package = Package(
                 "CacheCoordinatorTopologyFocusedTests.swift",
                 "DiskStoreOffsetConsistencyFocusedTests.swift",
                 "VMLXUmbrellaProductTests.swift",
+                "PEFTAdapterTranslationTests.swift",
                 "ZayaConfigDecodeFocusedTests.swift",
                 "VLShapeGuardFocusedTests.swift",
                 "JANGTQStreamingExpertDescriptorTests.swift",
