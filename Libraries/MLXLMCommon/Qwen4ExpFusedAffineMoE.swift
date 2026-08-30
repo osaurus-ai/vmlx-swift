@@ -235,14 +235,18 @@ enum Qwen4ExpFusedAffineMoE {
         defer { reportLock.unlock() }
         let label = "\(shape.inputDimensions)x\(shape.expertDimensions):topk\(shape.routes):rows\(rows)"
         guard reportedShapes.insert(label).inserted else { return }
-        FileHandle.standardError.write(
-            Data(
-                ("[Qwen4Exp] fused_affine_moe_decode=active rows=\(rows)"
-                    + " shape=\(shape.inputDimensions)x\(shape.expertDimensions) topk=\(shape.routes)"
-                    + " mixed_q2_q3_q4_q5_q6_g32_g64 input=bfloat16 output=bfloat16"
-                    + " affine_metadata=bf16_or_f16 router_scores=bf16_or_f32"
-                    + " accumulator=float32"
-                    + " weighted_down=true\n").utf8))
+        // Built piecewise on purpose, for the reason already recorded above the
+        // `compiled_gdn_front=rejected` diagnostic in Qwen35.swift: as a single `+` chain with
+        // interpolations wrapped in `Data(...).utf8`, this exceeds the type checker's budget and the
+        // file does not compile on Swift 6.4 (swiftlang-6.4.0.33.1) — "unable to type-check this
+        // expression in reasonable time". Identical output.
+        var diag = "[Qwen4Exp] fused_affine_moe_decode=active rows=\(rows)"
+        diag += " shape=\(shape.inputDimensions)x\(shape.expertDimensions) topk=\(shape.routes)"
+        diag += " mixed_q2_q3_q4_q5_q6_g32_g64 input=bfloat16 output=bfloat16"
+        diag += " affine_metadata=bf16_or_f16 router_scores=bf16_or_f32"
+        diag += " accumulator=float32"
+        diag += " weighted_down=true\n"
+        FileHandle.standardError.write(Data(diag.utf8))
     }
 
     private static func supports(_ projection: QuantizedSwitchLinear) -> Bool {
