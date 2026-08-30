@@ -24,6 +24,47 @@ struct Qwen4ExpQSATests {
             compressRatio: compressRatio, blockTopK: blockTopK, keyLen: keyLen)
     }
 
+    private func makeReferenceMask(
+        query: MLXArray, pooled: MLXArray,
+        pastLen: Int, compressRatio: Int, blockTopK: Int, keyLen: Int
+    ) -> MLXArray? {
+        let seqLen = query.dim(2)
+        let maxCompleteBlocks = keyLen / compressRatio
+        guard maxCompleteBlocks > blockTopK else { return nil }
+
+        var scores = matmul(query, pooled.transposed(0, 1, 3, 2))
+        scores = maximum(scores.asType(.float32), MLXArray(Float(0))).sum(axis: 1)
+        scores = scores / sqrt(Float(query.dim(3)))
+        let queryEnds = MLXArray((0 ..< seqLen).map { Int32(pastLen + $0 + 1) })
+        let completeCounts = floorDivide(queryEnds, MLXArray(Int32(compressRatio)))
+        let blockIdx = MLXArray((0 ..< maxCompleteBlocks).map(Int32.init))
+        let validBlocks = MLX.less(
+            blockIdx.reshaped(1, 1, maxCompleteBlocks),
+            completeCounts.reshaped(1, seqLen, 1))
+        scores = MLX.where(validBlocks, scores, MLXArray(-Float.infinity))
+        let selectedBlocks = argPartition(scores, kth: -blockTopK, axis: -1)[
+            .ellipsis, (-blockTopK)...]
+        let tokenIdx = MLXArray((0 ..< keyLen).map(Int32.init))
+        let tokenBlocks = floorDivide(tokenIdx, MLXArray(Int32(compressRatio)))
+        let selectedTokens = MLX.any(
+            MLX.equal(
+                tokenBlocks.reshaped(1, 1, 1, keyLen),
+                expandedDimensions(selectedBlocks, axis: -1)),
+            axis: 2)
+        let tailStarts = completeCounts * Int32(compressRatio)
+        let tokenRow = tokenIdx.reshaped(1, 1, keyLen)
+        let beforeQueryEnd = MLX.less(tokenRow, queryEnds.reshaped(1, seqLen, 1))
+        let tail = MLX.logicalAnd(
+            MLX.greaterEqual(tokenRow, tailStarts.reshaped(1, seqLen, 1)),
+            beforeQueryEnd)
+        let useSparse = MLX.greater(completeCounts, MLXArray(Int32(blockTopK)))
+        let mask = MLX.where(
+            useSparse.reshaped(1, seqLen, 1),
+            MLX.logicalOr(selectedTokens, tail),
+            beforeQueryEnd)
+        return expandedDimensions(mask, axis: 1)
+    }
+
     @Test("below the sparse threshold returns nil (dense fallback)")
     func denseFallback() throws {
         try MLXMetalTestLock.withLock {
@@ -87,6 +128,42 @@ struct Qwen4ExpQSATests {
             }
             // 32 % 4 == 0 → no tail; exactly blockTopK complete blocks attend.
             #expect(selectedComplete == blockTopK, "selected \(selectedComplete)")
+        }
+    }
+
+    @Test("block-axis scatter is exactly equivalent to the reference membership mask")
+    func blockAxisScatterParity() throws {
+        try MLXMetalTestLock.withLock {
+            MLXRandom.seed(17)
+            let seqLen = 7, keyLen = 35, compressRatio = 4, blockTopK = 2
+            let query = MLXRandom.normal([1, 3, seqLen, 8])
+            let pooled = MLXRandom.normal([1, 1, keyLen / compressRatio, 8])
+            let actual = try #require(Qwen4ExpQSA.selectedTokenMask(
+                query: query, pooledKeys: pooled, pastLen: keyLen - seqLen,
+                compressRatio: compressRatio, blockTopK: blockTopK, keyLen: keyLen))
+            let reference = try #require(makeReferenceMask(
+                query: query, pooled: pooled, pastLen: keyLen - seqLen,
+                compressRatio: compressRatio, blockTopK: blockTopK, keyLen: keyLen))
+
+            #expect(actual.shape == reference.shape)
+            #expect(actual.asArray(Bool.self) == reference.asArray(Bool.self))
+        }
+    }
+
+    @Test("4K sparse prefill materializes without a topK-expanded token tensor")
+    func longPrefillMembershipIsBounded() throws {
+        try MLXMetalTestLock.withLock {
+            let seqLen = 4_096, compressRatio = 4, blockTopK = 512
+            MLXRandom.seed(23)
+            let query = MLXRandom.normal([1, 4, seqLen, 8])
+            let pooled = MLXRandom.normal([1, 1, seqLen / compressRatio, 8])
+            let mask = try #require(Qwen4ExpQSA.selectedTokenMask(
+                query: query, pooledKeys: pooled, pastLen: 0,
+                compressRatio: compressRatio, blockTopK: blockTopK, keyLen: seqLen))
+
+            #expect(mask.shape == [1, 1, seqLen, seqLen])
+            MLX.eval(mask)
+            #expect(mask[0, 0, seqLen - 1].sum().item(Int.self) >= blockTopK * compressRatio)
         }
     }
 }

@@ -58,16 +58,33 @@ enum Qwen4ExpQSA {
             .ellipsis, (-blockTopK)...]
         // selectedBlocks: [B, T, blockTopK]
 
-        let tokenIdx = MLXArray((0 ..< keyLen).map(Int32.init))  // [keyLen]
-        let tokenBlocks = floorDivide(tokenIdx, MLXArray(Int32(compressRatio)))
-        let selectedTokens = MLX.any(
-            MLX.equal(
-                tokenBlocks.reshaped(1, 1, 1, keyLen),
-                expandedDimensions(selectedBlocks, axis: -1)),
-            axis: 2)
+        // Mark winners on the compressed block axis, then widen each block to
+        // its raw tokens. Comparing every raw token against every selected
+        // block materializes [B,T,blockTopK,keyLen]: at an 18k prompt with the
+        // production top-k of 512 that exceeds MLX's maximum buffer size.
+        // `putAlong` keeps the largest intermediate at [B,T,keyLen] while
+        // producing the exact same membership mask.
+        let batch = query.dim(0)
+        let blockHits = putAlong(
+            MLXArray.zeros([batch, seqLen, maxCompleteBlocks], dtype: .bool),
+            selectedBlocks,
+            values: MLXArray(true),
+            axis: -1)
+        var selectedTokens = repeated(blockHits, count: compressRatio, axis: -1)
+        let completeKeyLen = maxCompleteBlocks * compressRatio
+        if completeKeyLen < keyLen {
+            selectedTokens = concatenated(
+                [
+                    selectedTokens,
+                    MLXArray.zeros(
+                        [batch, seqLen, keyLen - completeKeyLen], dtype: .bool),
+                ],
+                axis: -1)
+        }
         // selectedTokens: [B, T, keyLen]
 
         // The incomplete tail block up to each query position always attends.
+        let tokenIdx = MLXArray((0 ..< keyLen).map(Int32.init))  // [keyLen]
         let tailStarts = completeCounts * Int32(compressRatio)  // [T]
         let tokenRow = tokenIdx.reshaped(1, 1, keyLen)
         let beforeQueryEnd = MLX.less(tokenRow, queryEnds.reshaped(1, seqLen, 1))
