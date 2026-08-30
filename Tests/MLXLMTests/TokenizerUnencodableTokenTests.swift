@@ -52,8 +52,22 @@ struct TokenizerUnencodableTokenTests {
     func unencodableTokenIsNotSilentlyDropped() throws {
         let src = try Self.source(Self.tokenizerPath)
 
-        guard let start = src.range(of: "public func encodeThrowing(text: String") else {
-            Issue.record("encodeThrowing not found")
+        // `encodeThrowing` is declared TWICE: a default in `extension Tokenizer` that simply
+        // delegates, and `PreTrainedTokenizer`'s override that does the token→id lookup. The guard
+        // belongs in the override — that is the type which force-unwraps, as the source comment
+        // above the default says outright. Searching from the top of the file finds the DEFAULT and
+        // then asserts the guard is missing from a body that is not supposed to have it, so this
+        // failed while the real implementation was correct all along. Anchor on the class.
+        guard let classStart = src.range(of: "public class PreTrainedTokenizer") else {
+            Issue.record("PreTrainedTokenizer not found")
+            return
+        }
+        guard
+            let start = src.range(
+                of: "public func encodeThrowing(text: String",
+                range: classStart.upperBound ..< src.endIndex)
+        else {
+            Issue.record("PreTrainedTokenizer.encodeThrowing not found")
             return
         }
         let body = String(src[start.lowerBound...].prefix(600))
