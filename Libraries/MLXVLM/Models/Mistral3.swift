@@ -1010,7 +1010,8 @@ public struct Mistral3VLMProcessorConfiguration: Codable, Sendable {
         self.imageEndToken =
             try c.decodeIfPresent(String.self, forKey: .imageEndToken) ?? "[IMG_END]"
         self.patchSize =
-            try c.decodeIfPresent(Int.self, forKey: .patchSize) ?? imageProcessor.patchSize
+            try c.decodeIfPresent(IntOrSquareSize.self, forKey: .patchSize)?.value
+            ?? imageProcessor.patchSize
         self.spatialMergeSize = try c.decodeIfPresent(Int.self, forKey: .spatialMergeSize)
     }
 
@@ -1018,7 +1019,9 @@ public struct Mistral3VLMProcessorConfiguration: Codable, Sendable {
         public let imageMean: [CGFloat]
         public let imageStd: [CGFloat]
         public let size: ProcessorSize
-        public let patchSize: Int
+        /// Accepts both spellings; see `IntOrSquareSize`.
+        private let _patchSize: IntOrSquareSize
+        public var patchSize: Int { _patchSize.value }
         public let doNormalize: Bool?
         public let doRescale: Bool?
         public let doResize: Bool?
@@ -1048,7 +1051,7 @@ public struct Mistral3VLMProcessorConfiguration: Codable, Sendable {
             case imageMean = "image_mean"
             case imageStd = "image_std"
             case size
-            case patchSize = "patch_size"
+            case _patchSize = "patch_size"
             case doNormalize = "do_normalize"
             case doRescale = "do_rescale"
             case doResize = "do_resize"

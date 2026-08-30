@@ -146,3 +146,61 @@ public enum StringOrNumber: Codable, Equatable, Sendable {
         }
     }
 }
+
+/// A patch dimension that bundles spell either as a bare number or as a `{"height": h, "width": w}`
+/// pair. Both forms are real and appear within the same model family: Devstral-Small-2-24B ships
+/// `"patch_size": 16`, Magistral-Small-2509 ships `"patch_size": {"height": 14, "width": 14}`.
+/// Before this existed the dict form made the processor configuration undecodable, so the model
+/// could not load at all.
+///
+/// A NON-SQUARE pair throws rather than picking an axis. Every caller uses the value for both
+/// dimensions — `((width + patch - 1) / patch) * patch` and the same for height — so silently
+/// keeping one number would compute a wrong patch grid rather than an approximate one.
+public struct IntOrSquareSize: Codable, Sendable, Equatable {
+    public let value: Int
+
+    public init(_ value: Int) {
+        self.value = value
+    }
+
+    private enum SizeKeys: String, CodingKey {
+        case height
+        case width
+    }
+
+    public init(from decoder: Decoder) throws {
+        if let single = try? decoder.singleValueContainer().decode(Int.self) {
+            self.value = single
+            return
+        }
+        let keyed = try decoder.container(keyedBy: SizeKeys.self)
+        let height = try keyed.decodeIfPresent(Int.self, forKey: .height)
+        let width = try keyed.decodeIfPresent(Int.self, forKey: .width)
+        switch (height, width) {
+        case let (h?, w?) where h == w:
+            self.value = h
+        case let (h?, nil):
+            self.value = h
+        case let (nil, w?):
+            self.value = w
+        case let (h?, w?):
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription:
+                        "non-square patch size \(h)x\(w); the patch grid math assumes one "
+                        + "dimension for both axes, so this cannot be honoured"))
+        default:
+            throw DecodingError.typeMismatch(
+                IntOrSquareSize.self,
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "expected a number or a {height, width} object"))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(value)
+    }
+}
