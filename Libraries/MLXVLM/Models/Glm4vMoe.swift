@@ -1107,6 +1107,11 @@ public class Glm4vMoe: Module, VLMModel, KVCacheDimensionProvider {
             allFrames.append(contentsOf: imageFrames)
         }
 
+        // Establish the grid invariant here, where throwing is allowed, so the non-throwing
+        // forward path below can rely on it instead of trapping deep inside a reshape.
+        try Glm4SharedVision.validateGrid(
+            allFrames, spatialMergeSize: config.visionConfiguration.spatialMergeSize)
+
         let inputEmbeddings = self.inputEmbeddings(
             inputIds: input.text.tokens, pixelValues: allPixels,
             frames: allFrames.isEmpty ? nil : allFrames)

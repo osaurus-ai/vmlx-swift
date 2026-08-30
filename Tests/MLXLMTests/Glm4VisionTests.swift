@@ -10,8 +10,13 @@ import Testing
 /// Two of these anchors are independent ground truth (they hold for any cubic-convolution constant
 /// `A`, so they'd survive a wrong kernel): sampling exactly on a pixel center returns that pixel, and
 /// a constant field stays constant (the weights partition to 1). The fractional-interior values are
-/// the `A`-sensitive ones; they're pinned to a numpy reimplementation of PyTorch's Keys `A = -0.75`
-/// coefficients (a torch cross-check is noted in the PR).
+/// the `A`-sensitive ones. They were originally pinned to a reimplementation of PyTorch's Keys
+/// `A = -0.75` coefficients — an oracle written from the same reading of the spec as the code, so
+/// a misreading would have satisfied both. Cross-checked against real `torch.nn.functional`
+/// (2.13.0) on 2026-08-28: worst deviation 3.8e-06 against a 1e-3 tolerance.
+///
+/// They earn their place: recomputing the first point with `A = -0.5` (PIL's constant) gives
+/// 5.282 against 5.087 — 195x the tolerance — so a wrong cubic constant does not slip past them.
 @Suite("Glm4SharedVision.gridSampleBicubic")
 struct Glm4VisionTests {
 

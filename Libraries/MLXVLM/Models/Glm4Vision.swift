@@ -10,6 +10,7 @@
 
 import Foundation
 import MLX
+import MLXLMCommon
 
 enum Glm4SharedVision {
 
@@ -101,4 +102,31 @@ enum Glm4SharedVision {
         func conv2(_ x: MLXArray) -> MLXArray { ((a * x - 5 * a) * x + 8 * a) * x - 4 * a }
         return [conv2(t + 1), conv1(t), conv1(1 - t), conv2(2 - t)]
     }
+    /// Validate the grid invariants the vision path relies on, at a point where throwing is
+    /// allowed.
+    ///
+    /// The forward path reshapes each frame to `(h / merge, merge, w / merge, merge)`. If `h` or
+    /// `w` is not divisible by the merge size the element count does not match and MLX traps; if
+    /// the merge size is zero it divides by zero. Both are configuration mistakes with no
+    /// recovery, but a trap takes the process down with a message about shapes rather than about
+    /// the bundle.
+    ///
+    /// Checking once here rather than guarding each site is deliberate: `rotaryPositionEmbedding`
+    /// and the rope-index walk are NOT throwing, and making them so would change signatures across
+    /// the tower to restate an invariant that is fixed before any of them runs. `prepare` already
+    /// throws, so the invariant is established at the boundary and relied on inside.
+    public static func validateGrid(_ frames: [THW], spatialMergeSize merge: Int) throws {
+        guard merge > 0 else {
+            throw VLMError.processing(
+                "vision config declares spatial_merge_size = \(merge); it must be positive")
+        }
+        for (i, f) in frames.enumerated() where f.h % merge != 0 || f.w % merge != 0 {
+            throw VLMError.processing(
+                "frame \(i) is \(f.h)x\(f.w), which spatial_merge_size \(merge) does not "
+                    + "divide. The vision tower reshapes each frame by the merge size, so a "
+                    + "non-divisible grid cannot be formed. This is a property of the bundle's "
+                    + "preprocessor configuration, not of the request.")
+        }
+    }
+
 }

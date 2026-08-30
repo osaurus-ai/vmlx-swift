@@ -875,6 +875,7 @@ let package = Package(
                 "VLShapeGuardFocusedTests.swift",
                 "JANGTQStreamingExpertDescriptorTests.swift",
                 "JANGTQHadamardShuffleTests.swift",
+                "Glm4GridInvariantTests.swift",
                 "MiniMaxJANGTQResidentExpertTests.swift",
                 "JangPressMachCacheTests.swift",
                 "JangPressPrestackerCleanupTests.swift",
