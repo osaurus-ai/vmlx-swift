@@ -853,7 +853,12 @@ private func gatedDeltaUpdate(
             q: q, k: k, v: v, g: g, b: b, state: state, mask: mask,
             roundStateEachStep: roundStateEachStep)
     }
-    let beta = sigmoid(b)
+    // float32, matching `GatedDelta.swift`'s text path. Everything around this keeps the recurrent
+    // state in float32 precisely so a cached-prefix boundary cannot diverge; feeding it a `beta`
+    // still in the input dtype reintroduces exactly that divergence on the non-kernel route.
+    // `MTPRuntimeFocusedTests.qwen35GDNVerifierStateHasStrictAndFastModes` asserts this invariant
+    // over BOTH implementations and was failing on the VL one.
+    let beta = sigmoid(b).asType(.float32)
     return gatedDeltaOps(
         q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask,
         roundStateEachStep: roundStateEachStep)
