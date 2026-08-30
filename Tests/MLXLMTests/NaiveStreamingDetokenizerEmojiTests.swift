@@ -42,79 +42,67 @@ struct NaiveStreamingDetokenizerEmojiTests {
         ) throws -> [Int] { [] }
     }
 
-    /// Step the streamer through the timeline and collect each
-    /// non-empty yield. Empty-string emits (pre-existing contract
-    /// when newSegment.count == segment.count) are no-ops from the
-    /// consumer's perspective, so filter them.
+    /// Step the streamer through the timeline, then FLUSH.
+    ///
+    /// `next()` holds back the trailing `trailingHoldbackCharacters` (24) of the segment, so on a
+    /// short timeline it legitimately yields nothing at all and only `flush()` releases the text.
+    /// The previous version of this harness called `next()` alone and asserted a per-token emission
+    /// cadence; every case in this suite is under 24 characters, so it collected `[]` and all four
+    /// tests failed while appearing to be about emoji.
+    ///
+    /// The holdback is itself a broader guard against the symptom in the header comment — it cannot
+    /// render a partial cluster because it never renders the tail at all. So these now assert the
+    /// PROPERTY that survives any holdback size: the stream reconstructs the text exactly, and no
+    /// chunk ever ends inside a grapheme cluster.
     static func run(_ timeline: [String]) -> [String] {
         var det = NaiveStreamingDetokenizer(tokenizer: StubTokenizer(timeline: timeline))
         var emitted: [String] = []
-        for tok in 0..<timeline.count {
+        for tok in 0 ..< timeline.count {
             det.append(token: tok)
             if let s = det.next(), !s.isEmpty { emitted.append(s) }
         }
+        if let s = det.flush(), !s.isEmpty { emitted.append(s) }
         return emitted
+    }
+
+    /// No chunk may end part-way through a grapheme cluster: concatenating the chunks and counting
+    /// graphemes must agree with counting the graphemes of each chunk.
+    static func splitsNoCluster(_ chunks: [String]) -> Bool {
+        chunks.joined().count == chunks.reduce(0) { $0 + $1.count }
     }
 
     @Test("US flag emoji 🇺🇸 streams atomically (no mid-pair render)")
     func usFlagAtomic() {
-        // Decode timeline:
-        //   step 1: model emits regional-indicator U → "🇺" alone
-        //   step 2: model emits regional-indicator S → flag complete
-        let timeline = ["🇺", "🇺🇸"]
-        let emitted = Self.run(timeline)
-        // Streamer must defer step 1 (unpaired regional indicator)
-        // and emit the full flag only after step 2 completes.
-        #expect(emitted == ["🇺🇸"],
-            "got \(emitted) — flag must not stream as two halves")
-    }
-
-    @Test("Trailing ZWJ at end-of-chunk defers (no \\u200D leaks alone)")
-    func zwjMidStream() {
-        // 👨‍🦰 = man + ZWJ + red-hair (compound emoji).
-        // step 1: "👨"        — base, emits as-is
-        // step 2: "👨\u{200D}" — base + dangling ZWJ → DEFER
-        //         (in Swift this happens to be ONE grapheme cluster
-        //         with count==1, so the suffix is empty and nothing
-        //         gets to the lastChar check anyway — but the defer
-        //         contract still holds: we must NOT yield a bare
-        //         U+200D to the consumer.)
-        // step 3: "👨\u{200D}🦰" — full grapheme cluster (count==1
-        //         relative to segment of count==1, suffix is empty).
-        //         This is a deeper limitation: when a token EXTENDS a
-        //         previously-yielded grapheme into a compound, the
-        //         streamer cannot retroactively replace the prior
-        //         emit. The "👨" already left the streamer. Consumer
-        //         sees "👨", not "👨\u{200D}🦰".
-        //
-        // What this test guards: bare ZWJ never reaches the consumer.
-        // The compound-emoji-extends-prior-grapheme case is a known
-        // limitation tracked elsewhere — not what this test covers.
-        let timeline = ["👨", "👨\u{200D}", "👨\u{200D}🦰"]
-        let emitted = Self.run(timeline)
-        // Verify: no bare U+200D string in emitted.
-        for s in emitted {
-            #expect(
-                !s.unicodeScalars.contains { $0.value == 0x200D && s.count == 1 },
-                "emit \(s.debugDescription) leaks a bare ZWJ to consumer")
-        }
-        // First emit is the base.
-        #expect(emitted.first == "👨")
+        // step 1: model emits regional-indicator U → "🇺" alone
+        // step 2: regional-indicator S arrives → flag complete
+        let emitted = Self.run(["🇺", "🇺🇸"])
+        #expect(emitted.joined() == "🇺🇸", "the completed flag must arrive whole")
+        #expect(Self.splitsNoCluster(emitted), "no chunk may end inside the pair")
+        #expect(!emitted.contains("🇺"), "the lone regional indicator is the reported symptom")
     }
 
     @Test("Plain ASCII / non-emoji chars unaffected")
     func plainAsciiUnaffected() {
-        let timeline = ["H", "Hello", "Hello world"]
-        let emitted = Self.run(timeline)
-        #expect(emitted == ["H", "ello", " world"])
+        let emitted = Self.run(["H", "Hello", "Hello world"])
+        #expect(emitted.joined() == "Hello world")
+        #expect(Self.splitsNoCluster(emitted))
     }
 
     @Test("Trailing replacement char (legacy contract) still defers")
     func legacyFFFDDeferral() {
-        let timeline = ["abc", "abc\u{FFFD}", "abc🌍"]
-        let emitted = Self.run(timeline)
-        // Step 2 ends in FFFD → defer (existing contract).
-        // Step 3 completes the emoji — emit the full delta.
-        #expect(emitted == ["abc", "🌍"])
+        // Step 2 ends in FFFD → must not be shown; step 3 completes the emoji.
+        let emitted = Self.run(["abc", "abc\u{FFFD}", "abc🌍"])
+        #expect(emitted.joined() == "abc🌍")
+        #expect(!emitted.joined().contains("\u{FFFD}"), "a replacement char must never reach output")
+        #expect(Self.splitsNoCluster(emitted))
+    }
+
+    @Test("Trailing ZWJ at end-of-chunk defers (no \u{200D} leaks alone)")
+    func trailingZWJDefers() {
+        // A ZWJ sequence built up one scalar at a time: 👨 → 👨‍ → 👨‍👩
+        let emitted = Self.run(["👨", "👨\u{200D}", "👨\u{200D}👩"])
+        #expect(emitted.joined() == "👨\u{200D}👩")
+        #expect(!emitted.joined().hasSuffix("\u{200D}"), "output must not end on a dangling joiner")
+        #expect(Self.splitsNoCluster(emitted))
     }
 }
