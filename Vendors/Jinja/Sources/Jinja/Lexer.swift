@@ -430,7 +430,14 @@ public enum Lexer: Sendable {
             let char = source[pos]
             if char.isNumber {
                 pos = source.index(after: pos)
-            } else if char == "." && !hasDot {
+            } else if char == "." && !hasDot
+                && source.index(after: pos) < source.endIndex
+                && source[source.index(after: pos)].isNumber
+            {
+                // A dot only continues the number when a DIGIT follows it. In `content.0.type`
+                // the trailing dot is a member separator, and swallowing it produced the number
+                // "0." — which then failed to parse as an index and surfaced, three layers up, as
+                // a model that would not stop generating.
                 hasDot = true
                 pos = source.index(after: pos)
             } else {

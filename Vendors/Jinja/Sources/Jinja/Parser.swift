@@ -519,8 +519,20 @@ public struct Parser: Sendable {
 
         while true {
             if match(.dot) {
-                let name = try consumeIdentifier()
-                expr = .member(expr, .identifier(name), computed: false)
+                // `foo.0` is Jinja's sugar for `foo[0]` — a NUMBER after the dot is a subscript,
+                // not an attribute name. Rejecting it failed GLM-5.3's chat template ("Expected
+                // identifier but found number"), and because the caller catches a template failure
+                // and substitutes a family fallback, the model was then prompted in a DIFFERENT
+                // family's format: fluent, plausible, and never emitting its own turn-end token, so
+                // generation ran to the token limit every time.
+                let token = peek()
+                if token.kind == .number, let index = Int(token.value) {
+                    advance()
+                    expr = .member(expr, .integer(index), computed: true)
+                } else {
+                    let name = try consumeIdentifier()
+                    expr = .member(expr, .identifier(name), computed: false)
+                }
             } else if match(.openBracket) {
                 // Slice or subscript
                 let start = try? parseExpression()
