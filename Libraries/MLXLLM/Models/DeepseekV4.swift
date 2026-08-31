@@ -959,6 +959,12 @@ public class DeepseekV4HyperConnection: Module {
     let hcMult: Int
     let hcIters: Int
     let hcEps: Float
+    /// `rms_norm_eps` — the UNWEIGHTED input norm's epsilon, which the reference reads from a
+    /// different config field than `hc_eps`. DSV4 ships both at 1e-6 so the distinction is
+    /// invisible for this family; GLM-5.3 ships 1e-5 and 1e-6, and reusing `hc_eps` there shifts
+    /// every mHC output. Kept explicit rather than defaulted so a new family has to say which it
+    /// means.
+    let hcNormEps: Float
     let hiddenSize: Int
     let mixHc: Int  // (2 + hcMult) * hcMult — bundle stores params at this width
     /// `hc_{attn,ffn}_fn`: shape `((2+hc)*hc, hc*hidden)`. Bundle stores
@@ -971,16 +977,19 @@ public class DeepseekV4HyperConnection: Module {
     convenience init(config: DeepseekV4Configuration) {
         self.init(
             hcMult: config.hcMult, sinkhornIterations: config.hcSinkhornIters,
-            eps: config.hcEps, hiddenSize: config.hiddenSize)
+            eps: config.hcEps, normEps: config.rmsNormEps, hiddenSize: config.hiddenSize)
     }
 
     /// The designated initialiser, in explicit quantities rather than one family's configuration —
     /// GLM-5.3 (`glm5_next`) ships the same mechanism and the same three parameters, under an `hc_`
     /// prefix its loader strips.
-    public init(hcMult: Int, sinkhornIterations: Int, eps: Float, hiddenSize: Int) {
+    public init(
+        hcMult: Int, sinkhornIterations: Int, eps: Float, normEps: Float, hiddenSize: Int
+    ) {
         self.hcMult = hcMult
         self.hcIters = sinkhornIterations
         self.hcEps = eps
+        self.hcNormEps = normEps
         self.hiddenSize = hiddenSize
         self.mixHc = (2 + hcMult) * hcMult
         self._fn.wrappedValue = zeros([mixHc, hcMult * hiddenSize])
@@ -1008,11 +1017,13 @@ public class DeepseekV4HyperConnection: Module {
         {
             return DeepseekV4Math.hcPreCompiled(
                 h, fn: fn, scale: scale, base: base,
-                hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps)
+                hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps,
+                normEps: hcNormEps)
         }
         return DeepseekV4Math.hcPreGraph(
             h, fn: fn, scale: scale, base: base,
-            hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps)
+            hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps,
+            normEps: hcNormEps)
     }
 
     /// Expand: given attn/ffn output `blockOut` (B, L, hiddenSize),
@@ -1205,7 +1216,8 @@ class DeepseekV4DecoderLayer: Module {
                             hA, fn: self.ffnHC.fn, scale: self.ffnHC.scale,
                             base: self.ffnHC.base, hcMult: self.ffnHC.hcMult,
                             hiddenSize: self.ffnHC.hiddenSize,
-                            iters: self.ffnHC.hcIters, eps: self.ffnHC.hcEps)
+                            iters: self.ffnHC.hcIters, eps: self.ffnHC.hcEps,
+                            normEps: self.ffnHC.hcNormEps)
                         let normedF = self.postAttentionLayerNorm(xF)
                         let out = self.mlp.moeMath(
                             normedF, inputIds: args.count > 4 ? args[4] : nil)
