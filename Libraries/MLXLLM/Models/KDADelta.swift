@@ -185,7 +185,7 @@ private func kdaKernel(
 
 /// KDA recurrence over a full segment. `fRaw` is the raw f-projection output
 /// (decay computed here); `beta` must already be `sigmoid(b_proj(x))`.
-public func kdaUpdate(
+func kdaUpdate(
     q: MLXArray,  // [B, T, H, Dk] — L2-normalized, scaled
     k: MLXArray,  // [B, T, H, Dk] — L2-normalized
     v: MLXArray,  // [B, T, H, Dv]
@@ -227,11 +227,3 @@ public func kdaUpdate(
         q: q, k: k, v: v, g: g, beta: beta.asType(.float32),
         state: state, mask: mask)
 }
-
-/// The KDA attention module, named for the mechanism rather than the first family to ship it.
-///
-/// The recurrence above already had a file of its own; the module that feeds it did not, and lived
-/// inside `BailingMoeV3`. GLM-5.3 (`glm5_next`) runs the identical mechanism — same
-/// `linear_attn_config` quantities, same weight names — so it uses this rather than carrying a
-/// second copy that could drift from the kernel it calls.
-public typealias KDAAttention = BailingV3KDAAttention

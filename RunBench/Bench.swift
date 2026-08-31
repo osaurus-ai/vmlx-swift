@@ -89,12 +89,10 @@ struct Bench {
                     let out = compiled
                         ? DeepseekV4Math.hcPreCompiled(
                             h, fn: fnW, scale: scaleW, base: baseW,
-                            hcMult: hcMult, hiddenSize: hidden, iters: iters, eps: eps,
-                            normEps: eps)
+                            hcMult: hcMult, hiddenSize: hidden, iters: iters, eps: eps)
                         : DeepseekV4Math.hcPreGraph(
                             h, fn: fnW, scale: scaleW, base: baseW,
-                            hcMult: hcMult, hiddenSize: hidden, iters: iters, eps: eps,
-                            normEps: eps)
+                            hcMult: hcMult, hiddenSize: hidden, iters: iters, eps: eps)
                     // Keep all three outputs live and chain the next call on
                     // them so per-call work cannot collapse or run ahead.
                     h = (h0

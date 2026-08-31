@@ -955,16 +955,10 @@ class DeepseekV4MLP: Module, UnaryLayer {
 
 // MARK: - mHC Hyper-Connection (per-block collapse + expand)
 
-public class DeepseekV4HyperConnection: Module {
+class DeepseekV4HyperConnection: Module {
     let hcMult: Int
     let hcIters: Int
     let hcEps: Float
-    /// `rms_norm_eps` — the UNWEIGHTED input norm's epsilon, which the reference reads from a
-    /// different config field than `hc_eps`. DSV4 ships both at 1e-6 so the distinction is
-    /// invisible for this family; GLM-5.3 ships 1e-5 and 1e-6, and reusing `hc_eps` there shifts
-    /// every mHC output. Kept explicit rather than defaulted so a new family has to say which it
-    /// means.
-    let hcNormEps: Float
     let hiddenSize: Int
     let mixHc: Int  // (2 + hcMult) * hcMult — bundle stores params at this width
     /// `hc_{attn,ffn}_fn`: shape `((2+hc)*hc, hc*hidden)`. Bundle stores
@@ -974,24 +968,12 @@ public class DeepseekV4HyperConnection: Module {
     @ParameterInfo(key: "scale") var scale: MLXArray
     /// `hc_{attn,ffn}_base`: shape `((2+hc)*hc,)` per-field bias.
     @ParameterInfo(key: "base") var base: MLXArray
-    convenience init(config: DeepseekV4Configuration) {
-        self.init(
-            hcMult: config.hcMult, sinkhornIterations: config.hcSinkhornIters,
-            eps: config.hcEps, normEps: config.rmsNormEps, hiddenSize: config.hiddenSize)
-    }
-
-    /// The designated initialiser, in explicit quantities rather than one family's configuration —
-    /// GLM-5.3 (`glm5_next`) ships the same mechanism and the same three parameters, under an `hc_`
-    /// prefix its loader strips.
-    public init(
-        hcMult: Int, sinkhornIterations: Int, eps: Float, normEps: Float, hiddenSize: Int
-    ) {
-        self.hcMult = hcMult
-        self.hcIters = sinkhornIterations
-        self.hcEps = eps
-        self.hcNormEps = normEps
-        self.hiddenSize = hiddenSize
-        self.mixHc = (2 + hcMult) * hcMult
+    init(config: DeepseekV4Configuration) {
+        self.hcMult = config.hcMult
+        self.hcIters = config.hcSinkhornIters
+        self.hcEps = config.hcEps
+        self.hiddenSize = config.hiddenSize
+        self.mixHc = (2 + config.hcMult) * config.hcMult
         self._fn.wrappedValue = zeros([mixHc, hcMult * hiddenSize])
         self._scale.wrappedValue = zeros([3])
         self._base.wrappedValue = zeros([mixHc])
@@ -1007,7 +989,7 @@ public class DeepseekV4HyperConnection: Module {
     ///   mixes    = x_normed @ fn.T                 # (B, L, mix_hc)
     ///   pre, post, comb = hc_split_sinkhorn(mixes, scale, base, hc, iters, eps)
     ///   y = sum(pre[..., None] * x_flat.reshape(B,L,hc,D), axis=2)
-    public func collapse(_ h: MLXArray) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
+    func collapse(_ h: MLXArray) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
         // Decode (L==1) routes through a shared compiled region — the graph is
         // identical for every layer/step, so weights ride along as inputs and
         // the host-side graph build is amortized (Python `_get_hc_pre_compiled`).
@@ -1017,13 +999,11 @@ public class DeepseekV4HyperConnection: Module {
         {
             return DeepseekV4Math.hcPreCompiled(
                 h, fn: fn, scale: scale, base: base,
-                hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps,
-                normEps: hcNormEps)
+                hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps)
         }
         return DeepseekV4Math.hcPreGraph(
             h, fn: fn, scale: scale, base: base,
-            hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps,
-            normEps: hcNormEps)
+            hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps)
     }
 
     /// Expand: given attn/ffn output `blockOut` (B, L, hiddenSize),
@@ -1032,7 +1012,7 @@ public class DeepseekV4HyperConnection: Module {
     ///
     /// Mirrors Python `_hc_post`:
     ///   y = post[..., None] * x[..., None, :] + matmul(comb, residual)
-    public func expand(
+    func expand(
         blockOut: MLXArray, residual: MLXArray, post: MLXArray, comb: MLXArray
     ) -> MLXArray {
         DeepseekV4Math.hcPost(
@@ -1216,8 +1196,7 @@ class DeepseekV4DecoderLayer: Module {
                             hA, fn: self.ffnHC.fn, scale: self.ffnHC.scale,
                             base: self.ffnHC.base, hcMult: self.ffnHC.hcMult,
                             hiddenSize: self.ffnHC.hiddenSize,
-                            iters: self.ffnHC.hcIters, eps: self.ffnHC.hcEps,
-                            normEps: self.ffnHC.hcNormEps)
+                            iters: self.ffnHC.hcIters, eps: self.ffnHC.hcEps)
                         let normedF = self.postAttentionLayerNorm(xF)
                         let out = self.mlp.moeMath(
                             normedF, inputIds: args.count > 4 ? args[4] : nil)

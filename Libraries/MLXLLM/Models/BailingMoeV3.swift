@@ -181,17 +181,17 @@ public struct BailingMoeV3Configuration: Codable, Sendable {
 
 /// RMSNorm whose gate goes through SIGMOID — Ling 3.0's `o_norm` is fla's
 /// `FusedRMSNormGated(activation='sigmoid')`, unlike Qwen3Next's silu gate.
-public final class BailingV3RMSNormGated: Module {
+final class BailingV3RMSNormGated: Module {
     let weight: MLXArray
     let eps: Float
 
-    public init(dimensions: Int, eps: Float = 1e-6) {
+    init(dimensions: Int, eps: Float = 1e-6) {
         self.weight = MLXArray.ones([dimensions])
         self.eps = eps
         super.init()
     }
 
-    public func callAsFunction(_ x: MLXArray, gate: MLXArray) -> MLXArray {
+    func callAsFunction(_ x: MLXArray, gate: MLXArray) -> MLXArray {
         MLXFast.rmsNorm(x, weight: weight, eps: eps) * sigmoid(gate.asType(.float32))
             .asType(x.dtype)
     }
@@ -199,7 +199,7 @@ public final class BailingV3RMSNormGated: Module {
 
 // MARK: - KDA linear attention
 
-public final class BailingV3KDAAttention: Module {
+final class BailingV3KDAAttention: Module {
     let numHeads: Int
     let headDim: Int
     let projectionSize: Int
@@ -229,40 +229,17 @@ public final class BailingV3KDAAttention: Module {
     @ModuleInfo(key: "o_norm") var oNorm: BailingV3RMSNormGated
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
-    /// Convenience for Ling 3.0 / BailingMoeV3, which is where this module started.
-    convenience init(_ args: BailingMoeV3Configuration) {
-        self.init(
-            hiddenSize: args.hiddenSize, numHeads: args.numAttentionHeads,
-            headDim: args.headDim, convKernelSize: args.shortConvKernelSize,
-            safeGate: args.kdaSafeGate, lowerBound: args.kdaLowerBound,
-            useLoRAGates: !args.noKdaLora, rmsNormEps: args.rmsNormEps)
-    }
-
-    /// The designated initialiser, in explicit dimensions rather than one family's configuration
-    /// type — so a second family can build the same module without importing the first one's
-    /// config. GLM-5.3 (`glm5_next`) uses it: its `linear_attn_config` names exactly these
-    /// quantities (`num_heads`, `head_dim`, `short_conv_kernel_size`, `gate_lower_bound`) and its
-    /// weights carry the same parameter names, down to `f_a_proj` / `g_b_proj` / `o_norm`.
-    public init(
-        hiddenSize: Int,
-        numHeads: Int,
-        headDim: Int,
-        convKernelSize: Int,
-        safeGate: Bool,
-        lowerBound: Float,
-        useLoRAGates: Bool,
-        rmsNormEps: Float
-    ) {
-        self.numHeads = numHeads
-        self.headDim = headDim
+    init(_ args: BailingMoeV3Configuration) {
+        self.numHeads = args.numAttentionHeads
+        self.headDim = args.headDim
         self.projectionSize = numHeads * headDim
-        self.convKernelSize = convKernelSize
-        self.safeGate = safeGate
-        self.lowerBound = lowerBound
+        self.convKernelSize = args.shortConvKernelSize
+        self.safeGate = args.kdaSafeGate
+        self.lowerBound = args.kdaLowerBound
 
-        _qProj.wrappedValue = Linear(hiddenSize, projectionSize, bias: false)
-        _kProj.wrappedValue = Linear(hiddenSize, projectionSize, bias: false)
-        _vProj.wrappedValue = Linear(hiddenSize, projectionSize, bias: false)
+        _qProj.wrappedValue = Linear(args.hiddenSize, projectionSize, bias: false)
+        _kProj.wrappedValue = Linear(args.hiddenSize, projectionSize, bias: false)
+        _vProj.wrappedValue = Linear(args.hiddenSize, projectionSize, bias: false)
 
         let makeConv = { (channels: Int, kernel: Int) -> Conv1d in
             Conv1d(
@@ -279,23 +256,24 @@ public final class BailingV3KDAAttention: Module {
         _aLog.wrappedValue = MLXArray.zeros([numHeads])
         _dtBias.wrappedValue = MLXArray.zeros([projectionSize])
 
-        if useLoRAGates {
-            _fAProj.wrappedValue = Linear(hiddenSize, headDim, bias: false)
-            _fBProj.wrappedValue = Linear(headDim, projectionSize, bias: false)
-            _gAProj.wrappedValue = Linear(hiddenSize, headDim, bias: false)
-            _gBProj.wrappedValue = Linear(headDim, projectionSize, bias: false)
+        if args.noKdaLora {
+            _fProj.wrappedValue = Linear(args.hiddenSize, projectionSize, bias: false)
+            _gProj.wrappedValue = Linear(args.hiddenSize, projectionSize, bias: false)
         } else {
-            _fProj.wrappedValue = Linear(hiddenSize, projectionSize, bias: false)
-            _gProj.wrappedValue = Linear(hiddenSize, projectionSize, bias: false)
+            _fAProj.wrappedValue = Linear(args.hiddenSize, headDim, bias: false)
+            _fBProj.wrappedValue = Linear(headDim, projectionSize, bias: false)
+            _gAProj.wrappedValue = Linear(args.hiddenSize, headDim, bias: false)
+            _gBProj.wrappedValue = Linear(headDim, projectionSize, bias: false)
         }
-        _bProj.wrappedValue = Linear(hiddenSize, numHeads, bias: false)
+        _bProj.wrappedValue = Linear(args.hiddenSize, numHeads, bias: false)
 
-        _oNorm.wrappedValue = BailingV3RMSNormGated(dimensions: headDim, eps: rmsNormEps)
-        _oProj.wrappedValue = Linear(projectionSize, hiddenSize, bias: false)
+        _oNorm.wrappedValue = BailingV3RMSNormGated(
+            dimensions: headDim, eps: args.rmsNormEps)
+        _oProj.wrappedValue = Linear(projectionSize, args.hiddenSize, bias: false)
         super.init()
     }
 
-    public func callAsFunction(
+    func callAsFunction(
         _ x: MLXArray, mask: MLXArray? = nil, cache: MambaCache? = nil
     ) -> MLXArray {
         let B = x.dim(0)

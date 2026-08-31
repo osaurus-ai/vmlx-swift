@@ -88,21 +88,17 @@ private func chatTemplateText(modelDirectory: URL) -> String? {
     return template
 }
 
-/// `processorInit` may throw: a processor that has to resolve something from the tokenizer — a
-/// special-token id, say — can fail, and the closure this returns already throws, so widening the
-/// parameter costs nothing. Non-throwing initialisers still convert implicitly, so every existing
-/// registration is unaffected.
 private func create<C: Codable, P>(
     _ configurationType: C.Type,
     _ processorInit:
         @escaping (
             C,
             any Tokenizer
-        ) throws -> P
+        ) -> P
 ) -> (Data, any Tokenizer) throws -> P {
     { data, tokenizer in
         let configuration = try JSONDecoder.json5().decode(C.self, from: data)
-        return try processorInit(configuration, tokenizer)
+        return processorInit(configuration, tokenizer)
     }
 }
 
@@ -149,9 +145,6 @@ public enum VLMTypeRegistry {
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
         "glm4v": create(Glm4vConfiguration.self, Glm4v.init),
-        // Declares `ModelComponentMapping`, so it selects: text, vision and video, with the
-        // vision tower built only when the request needs it.
-        "glm5_next": createSelecting(Glm5NextConfiguration.self, Glm5Next.init(_:requesting:)),
         "glm4v_moe": create(Glm4vMoeConfiguration.self, Glm4vMoe.init),
         // DeepSeek-OCR / Unlimited-OCR (top model_type "deepseek_vl_v2").
         "deepseek_vl_v2": create(DeepseekOCRConfiguration.self, DeepseekOCR.init),
@@ -250,11 +243,6 @@ public enum VLMProcessorTypeRegistry {
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
         "Glm4vProcessor": create(   // GLM-4.5V (glm4v_moe) — same QwenVL-style preprocessing as glm_ocr
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
-        // GLM-5.3. Registering the MODEL without this entry got as far as loading 95 GB of weights
-        // and then threw "Unsupported processor type" — the model table and the processor table are
-        // two halves of one registration.
-        "Glm5NextProcessor": create(
-            Glm5NextProcessorConfiguration.self, Glm5NextProcessor.init),
         // DeepSeek-OCR ships `processor_class: "DeepseekVLV2Processor"`. The
         // processor reads only `imageTokenIndex` from the model config, and
         // every DeepseekOCRConfiguration field is decodeIfPresent-defaulted, so
