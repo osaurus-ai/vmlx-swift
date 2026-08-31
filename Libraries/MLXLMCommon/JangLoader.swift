@@ -2443,8 +2443,36 @@ public struct JangLoader: Sendable {
             // output that collapsed the forward. A self-consistent declaration whose
             // inputDim ∈ validInDims is the strongest available evidence for roles
             // without a more specific tensor manifest or semantic width constraint.
+            /// The DECLARED (bits, group_size), when the packed tensors can actually have been
+            /// produced by it.
+            ///
+            /// A packed width does not determine the pair. `(bits: 8, group_size: 64)` and
+            /// `(bits: 4, group_size: 128)` pack a row to exactly the same number of uint32 words
+            /// and imply input dims that differ by a factor of two, so shape inference alone cannot
+            /// choose between them — it can only guess, and on GLM-5.3 it guessed wrong for 35
+            /// modules. Its KDA `o_proj` is declared 8-bit/g64 (input 8192 = 64 heads x 128), the
+            /// walk re-stamped 4-bit/g128 (input 16384), and the model died in the first layer with
+            /// "Last dimension of first input with shape (..., 8192) does not match the expanded
+            /// quantized matrix (16384, 4096)".
+            ///
+            /// So: where the declaration is POSSIBLE, take it. It is a statement by whoever produced
+            /// the file, and preferring a coin-flip over it is not inference. Where it is impossible
+            /// — the packed width cannot come from it — it is ignored exactly as before, which is
+            /// what the rest of this chain exists for.
+            let declaredIfConsistent: (bits: Int, groupSize: Int)? = {
+                guard let declared = declaredForLayer, declared.bits > 0, declared.groupSize > 0
+                else { return nil }
+                let inDim = numGroups * declared.groupSize
+                guard inDim > 0, packedDim > 0,
+                    packedDim * 32 == inDim * declared.bits
+                else { return nil }
+                return (declared.bits, declared.groupSize)
+            }()
+
             if let manifest = manifestQuantization(for: basePath) {
                 (bits, inferredGroupSize) = (manifest.bits, manifest.groupSize)
+            } else if let declared = declaredIfConsistent {
+                (bits, inferredGroupSize) = declared
             } else if isLanguageHiddenAnchor,
                       let hiddenSize = hiddenSizeHint,
                       let exact = inferExactQuantization(expectedInDim: hiddenSize)
