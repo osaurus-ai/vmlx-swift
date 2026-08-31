@@ -465,6 +465,11 @@ public enum DeepseekV4Math {
     /// Raw mHC-pre math (Python `_hc_pre_impl`): fp32 flatten, scalar
     /// reciprocal RMS applied after the projection, split-Sinkhorn, four-way
     /// residual mix. Shared by the eager path and the compiled decode region.
+    /// - Parameters:
+    ///   - eps: `hc_eps`. The epsilon of the sigmoid / softmax / Sinkhorn arithmetic.
+    ///   - normEps: `rms_norm_eps`. The epsilon of the UNWEIGHTED input RMS norm, which the
+    ///     reference takes from a different config field. DSV4 ships both at 1e-6, so reusing one
+    ///     for the other is invisible there; GLM-5.3 ships 1e-5 and 1e-6, where it is not.
     public static func hcPreGraph(
         _ h: MLXArray,
         fn: MLXArray,
@@ -473,13 +478,14 @@ public enum DeepseekV4Math {
         hcMult: Int,
         hiddenSize: Int,
         iters: Int,
-        eps: Float
+        eps: Float,
+        normEps: Float
     ) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
         let B = h.dim(0)
         let L = h.dim(1)
         let xFlat = h.reshaped(B, L, hcMult * hiddenSize).asType(.float32)
         let reciprocalRMS = rsqrt(
-            (xFlat * xFlat).mean(axis: -1, keepDims: true) + eps)
+            (xFlat * xFlat).mean(axis: -1, keepDims: true) + normEps)
         let mixes = xFlat.matmul(fn.asType(.float32).transposed()) * reciprocalRMS
         let (pre, post, comb) = hcSplitSinkhorn(
             mixes: mixes, scale: scale, base: base,
@@ -506,7 +512,8 @@ public enum DeepseekV4Math {
         hcMult: Int,
         hiddenSize: Int,
         iters: Int,
-        eps: Float
+        eps: Float,
+        normEps: Float
     ) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
         let key = "\(hcMult)|\(hiddenSize)|\(iters)|\(eps)"
         hcPreCompiledLock.lock()
@@ -516,7 +523,7 @@ public enum DeepseekV4Math {
                 let out = hcPreGraph(
                     args[0], fn: args[1], scale: args[2], base: args[3],
                     hcMult: hcMult, hiddenSize: hiddenSize,
-                    iters: iters, eps: eps)
+                    iters: iters, eps: eps, normEps: normEps)
                 return [out.x, out.post, out.comb]
             }
             hcPreCompiledCache[key] = region

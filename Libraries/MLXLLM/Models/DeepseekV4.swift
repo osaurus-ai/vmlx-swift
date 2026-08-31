@@ -959,6 +959,12 @@ class DeepseekV4HyperConnection: Module {
     let hcMult: Int
     let hcIters: Int
     let hcEps: Float
+    /// `rms_norm_eps` — the UNWEIGHTED input norm's epsilon, which the reference reads from a
+    /// different config field than `hc_eps`. DSV4 ships both at 1e-6 so the distinction is
+    /// invisible for this family; GLM-5.3 ships 1e-5 and 1e-6, and reusing `hc_eps` there shifts
+    /// every mHC output. Kept explicit rather than defaulted so a new family has to say which it
+    /// means.
+    let hcNormEps: Float
     let hiddenSize: Int
     let mixHc: Int  // (2 + hcMult) * hcMult — bundle stores params at this width
     /// `hc_{attn,ffn}_fn`: shape `((2+hc)*hc, hc*hidden)`. Bundle stores
@@ -968,12 +974,25 @@ class DeepseekV4HyperConnection: Module {
     @ParameterInfo(key: "scale") var scale: MLXArray
     /// `hc_{attn,ffn}_base`: shape `((2+hc)*hc,)` per-field bias.
     @ParameterInfo(key: "base") var base: MLXArray
-    init(config: DeepseekV4Configuration) {
-        self.hcMult = config.hcMult
-        self.hcIters = config.hcSinkhornIters
-        self.hcEps = config.hcEps
-        self.hiddenSize = config.hiddenSize
-        self.mixHc = (2 + config.hcMult) * config.hcMult
+    convenience init(config: DeepseekV4Configuration) {
+        // The norm epsilon comes from `rms_norm_eps`, NOT `hc_eps`. DSV4 ships both at 1e-6, so for
+        // this family the two are interchangeable and nothing here can tell them apart; a family
+        // that ships them differently gets a different mHC output for every token.
+        self.init(
+            hcMult: config.hcMult, sinkhornIterations: config.hcSinkhornIters,
+            eps: config.hcEps, normEps: config.rmsNormEps, hiddenSize: config.hiddenSize)
+    }
+
+    /// The designated initialiser, in explicit quantities rather than one family's configuration.
+    /// Taking the two epsilons separately is what lets a test set them to DIFFERENT values — with a
+    /// DSV4 config alone they are always equal, so a conflation of the two is unobservable.
+    init(hcMult: Int, sinkhornIterations: Int, eps: Float, normEps: Float, hiddenSize: Int) {
+        self.hcMult = hcMult
+        self.hcIters = sinkhornIterations
+        self.hcEps = eps
+        self.hcNormEps = normEps
+        self.hiddenSize = hiddenSize
+        self.mixHc = (2 + hcMult) * hcMult
         self._fn.wrappedValue = zeros([mixHc, hcMult * hiddenSize])
         self._scale.wrappedValue = zeros([3])
         self._base.wrappedValue = zeros([mixHc])
@@ -999,11 +1018,13 @@ class DeepseekV4HyperConnection: Module {
         {
             return DeepseekV4Math.hcPreCompiled(
                 h, fn: fn, scale: scale, base: base,
-                hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps)
+                hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps,
+                normEps: hcNormEps)
         }
         return DeepseekV4Math.hcPreGraph(
             h, fn: fn, scale: scale, base: base,
-            hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps)
+            hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps,
+            normEps: hcNormEps)
     }
 
     /// Expand: given attn/ffn output `blockOut` (B, L, hiddenSize),
@@ -1196,7 +1217,8 @@ class DeepseekV4DecoderLayer: Module {
                             hA, fn: self.ffnHC.fn, scale: self.ffnHC.scale,
                             base: self.ffnHC.base, hcMult: self.ffnHC.hcMult,
                             hiddenSize: self.ffnHC.hiddenSize,
-                            iters: self.ffnHC.hcIters, eps: self.ffnHC.hcEps)
+                            iters: self.ffnHC.hcIters, eps: self.ffnHC.hcEps,
+                            normEps: self.ffnHC.hcNormEps)
                         let normedF = self.postAttentionLayerNorm(xF)
                         let out = self.mlp.moeMath(
                             normedF, inputIds: args.count > 4 ? args[4] : nil)
