@@ -13,9 +13,9 @@
 import Foundation
 
 #if canImport(Darwin)
-import Darwin
+    import Darwin
 #elseif canImport(Glibc)
-import Glibc
+    import Glibc
 #endif
 
 private func jangPressPrestackerCleanupAtExit() {
@@ -49,14 +49,23 @@ public enum JangPressPrestacker {
     ) throws -> URL {
         guard enabled else { return originalURL }
 
+        // Heal dtype-misaligned containers before any mmap-backed load. This
+        // is an in-place, atomic, byte-verified optimization for ordinary
+        // writable model directories. Hash-addressed/symlinked stores and all
+        // failures retain the original shard and use MLX's aligned-copy
+        // fallback, so storage optimization can never refuse a model load.
+        SafetensorsStorageHealer.healBundleIfEligible(at: originalURL)
+
         let env = ProcessInfo.processInfo.environment
         let prestackRaw = env["MLXPRESS_PRESTACK"] ?? env["JANGPRESS_PRESTACK"]
         let prestackExplicitlyEnabled = isEnabledFlag(prestackRaw)
         let prestackDisabled = !prestackExplicitlyEnabled
-        let alignSafetensors = env["MLXPRESS_ALIGN_SAFETENSORS"]
+        let alignSafetensors =
+            env["MLXPRESS_ALIGN_SAFETENSORS"]
             ?? env["JANGPRESS_ALIGN_SAFETENSORS"]
         let alignExplicitlyEnabled = isEnabledFlag(alignSafetensors)
-        let prestackStrict = env["MLXPRESS_PRESTACK_STRICT"]
+        let prestackStrict =
+            env["MLXPRESS_PRESTACK_STRICT"]
             ?? env["JANGPRESS_PRESTACK_STRICT"]
         if prestackDisabled && !alignExplicitlyEnabled {
             return originalURL
@@ -80,10 +89,11 @@ public enum JangPressPrestacker {
                 let cacheURL = try cacheDirectory(for: originalURL, files: scan.files)
                 try ensureOverlayLinks(from: originalURL, to: cacheURL)
                 let outputURL = cacheURL.appendingPathComponent(outputName)
-                let manifestURL = cacheURL.appendingPathComponent("jangpress-prestack-manifest.json")
+                let manifestURL = cacheURL.appendingPathComponent(
+                    "jangpress-prestack-manifest.json")
 
                 if FileManager.default.fileExists(atPath: outputURL.path),
-                   FileManager.default.fileExists(atPath: manifestURL.path)
+                    FileManager.default.fileExists(atPath: manifestURL.path)
                 {
                     log("using existing prestacked overlay \(cacheURL.path)")
                     preparedURL = cacheURL
@@ -95,10 +105,12 @@ public enum JangPressPrestacker {
                     try writeSafetensors(plan: plan, to: outputURL)
                     try writeManifest(plan: plan, source: originalURL, to: manifestURL)
                     let totalBytes = plan.reduce(UInt64(0)) { $0 + $1.totalBytes }
-                    log(String(format:
-                        "wrote %d prestacked routed tensors (%.1f GB) into %@",
-                        plan.count, Double(totalBytes) / 1_073_741_824.0,
-                        outputURL.path))
+                    log(
+                        String(
+                            format:
+                                "wrote %d prestacked routed tensors (%.1f GB) into %@",
+                            plan.count, Double(totalBytes) / 1_073_741_824.0,
+                            outputURL.path))
                     preparedURL = cacheURL
                 }
             } catch {
@@ -173,8 +185,10 @@ public enum JangPressPrestacker {
 
     private static func scanBundle(_ directory: URL) throws -> BundleScan {
         let fm = FileManager.default
-        guard let enumerator = fm.enumerator(
-            at: directory, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey])
+        guard
+            let enumerator = fm.enumerator(
+                at: directory,
+                includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey])
         else {
             return BundleScan(files: [], groups: [:])
         }
@@ -186,15 +200,18 @@ public enum JangPressPrestacker {
 
         for case let url as URL in enumerator {
             guard url.pathExtension == "safetensors",
-                  url.lastPathComponent != "jangtq_runtime.safetensors",
-                  url.lastPathComponent != outputName
+                url.lastPathComponent != "jangtq_runtime.safetensors",
+                url.lastPathComponent != outputName
             else { continue }
 
-            let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-            files.append(SourceFile(
-                url: url,
-                size: UInt64(values.fileSize ?? 0),
-                modified: values.contentModificationDate?.timeIntervalSince1970 ?? 0))
+            let values = try url.resourceValues(forKeys: [
+                .fileSizeKey, .contentModificationDateKey,
+            ])
+            files.append(
+                SourceFile(
+                    url: url,
+                    size: UInt64(values.fileSize ?? 0),
+                    modified: values.contentModificationDate?.timeIntervalSince1970 ?? 0))
 
             let header = try readSafetensorsHeader(url)
             for (key, value) in header.tensors {
@@ -202,11 +219,11 @@ public enum JangPressPrestacker {
                     existingStackedKeys.insert(key)
                 }
                 guard let match = matchPerExpertKey(key),
-                      let dtype = value["dtype"] as? String,
-                      let shape = value["shape"] as? [Int],
-                      let offsets = value["data_offsets"] as? [UInt64],
-                      offsets.count == 2,
-                      offsets[1] >= offsets[0]
+                    let dtype = value["dtype"] as? String,
+                    let shape = value["shape"] as? [Int],
+                    let offsets = value["data_offsets"] as? [UInt64],
+                    offsets.count == 2,
+                    offsets[1] >= offsets[0]
                 else { continue }
 
                 let source = TensorSource(
@@ -232,7 +249,7 @@ public enum JangPressPrestacker {
             guard let maxExpert = group.byExpert.keys.max(), group.byExpert[0] != nil else {
                 return false
             }
-            return (0...maxExpert).allSatisfy { group.byExpert[$0] != nil }
+            return (0 ... maxExpert).allSatisfy { group.byExpert[$0] != nil }
         }
 
         return BundleScan(files: files.sorted { $0.url.path < $1.url.path }, groups: groups)
@@ -249,7 +266,8 @@ public enum JangPressPrestacker {
         defer { try? handle.close() }
         let prefix = try handle.read(upToCount: 8) ?? Data()
         guard prefix.count == 8 else {
-            throw NSError(domain: "JangPressPrestacker", code: 1,
+            throw NSError(
+                domain: "JangPressPrestacker", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "short safetensors header: \(url.path)"])
         }
         let headerLength = prefix.withUnsafeBytes {
@@ -257,12 +275,14 @@ public enum JangPressPrestacker {
         }
         let headerData = try handle.read(upToCount: Int(headerLength)) ?? Data()
         guard headerData.count == Int(headerLength) else {
-            throw NSError(domain: "JangPressPrestacker", code: 2,
+            throw NSError(
+                domain: "JangPressPrestacker", code: 2,
                 userInfo: [NSLocalizedDescriptionKey: "truncated safetensors header: \(url.path)"])
         }
         let json = try JSONSerialization.jsonObject(with: headerData)
         guard let dict = json as? [String: Any] else {
-            throw NSError(domain: "JangPressPrestacker", code: 3,
+            throw NSError(
+                domain: "JangPressPrestacker", code: 3,
                 userInfo: [NSLocalizedDescriptionKey: "invalid safetensors JSON: \(url.path)"])
         }
         let metadata = dict["__metadata__"] as? [String: Any]
@@ -294,11 +314,12 @@ public enum JangPressPrestacker {
             let perTensorBytes = sources.reduce(UInt64(0)) { $0 + $1.byteLength }
             let expectedBytes = UInt64(sources.count) * first.byteLength
             guard perTensorBytes == expectedBytes else { continue }
-            result.append(WriteTensor(
-                key: group.outputKey,
-                dtype: first.dtype,
-                shape: [sources.count] + first.shape,
-                sources: sources))
+            result.append(
+                WriteTensor(
+                    key: group.outputKey,
+                    dtype: first.dtype,
+                    shape: [sources.count] + first.shape,
+                    sources: sources))
         }
         var offset: UInt64 = 0
         for i in result.indices {
@@ -341,9 +362,10 @@ public enum JangPressPrestacker {
         let dataBaseAlignment = 4096
         let misalignment = (8 + headerData.count) % dataBaseAlignment
         if misalignment != 0 {
-            headerData.append(Data(
-                repeating: 0x20,
-                count: dataBaseAlignment - misalignment))
+            headerData.append(
+                Data(
+                    repeating: 0x20,
+                    count: dataBaseAlignment - misalignment))
         }
         var headerLength = UInt64(headerData.count).littleEndian
         try withUnsafeBytes(of: &headerLength) { raw in
@@ -440,10 +462,13 @@ public enum JangPressPrestacker {
                 .appendingPathComponent("vmlx-swift-lm", isDirectory: true)
                 .appendingPathComponent("jangpress-prestack", isDirectory: true)
         }
-        let hash = stableHash(([version, originalURL.path] + files.map {
-            "\($0.url.lastPathComponent):\($0.size):\($0.modified)"
-        }).joined(separator: "|"))
-        return root
+        let hash = stableHash(
+            ([version, originalURL.path]
+                + files.map {
+                    "\($0.url.lastPathComponent):\($0.size):\($0.modified)"
+                }).joined(separator: "|"))
+        return
+            root
             .appendingPathComponent(originalURL.lastPathComponent + "-" + hash, isDirectory: true)
     }
 
@@ -507,7 +532,8 @@ public enum JangPressPrestacker {
             "bytes": total,
             "created": Date().timeIntervalSince1970,
         ]
-        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        let data = try JSONSerialization.data(
+            withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: url, options: [.atomic])
     }
 
@@ -558,7 +584,8 @@ public enum JangPressPrestacker {
         originalIsJANGTQ: Bool,
         env: [String: String]
     ) throws -> URL {
-        let alignSafetensors = env["MLXPRESS_ALIGN_SAFETENSORS"]
+        let alignSafetensors =
+            env["MLXPRESS_ALIGN_SAFETENSORS"]
             ?? env["JANGPRESS_ALIGN_SAFETENSORS"]
         guard isEnabledFlag(alignSafetensors) else {
             return directory
@@ -567,7 +594,8 @@ public enum JangPressPrestacker {
         // every source shard for those models can double very large cache
         // footprints, so keep it opt-in unless a focused investigation
         // requests it.
-        let alignJANGTQ = env["MLXPRESS_ALIGN_JANGTQ"]
+        let alignJANGTQ =
+            env["MLXPRESS_ALIGN_JANGTQ"]
             ?? env["JANGPRESS_ALIGN_JANGTQ"]
         if originalIsJANGTQ && alignJANGTQ != "1" {
             return directory
@@ -587,9 +615,10 @@ public enum JangPressPrestacker {
 
         try FileManager.default.createDirectory(
             at: cacheURL, withIntermediateDirectories: true)
-        let rewriteNames = Set(scan.plans.filter(\.needsAlignment).map {
-            $0.source.url.lastPathComponent
-        })
+        let rewriteNames = Set(
+            scan.plans.filter(\.needsAlignment).map {
+                $0.source.url.lastPathComponent
+            })
         try ensureAlignedOverlayLinks(from: directory, to: cacheURL, rewriting: rewriteNames)
 
         var rewritten = 0
@@ -603,11 +632,13 @@ public enum JangPressPrestacker {
             rewrittenCount: rewritten,
             source: directory,
             to: manifestURL)
-        log(String(format:
-            "wrote aligned safetensors overlay: files=%d payload=%.1f GB into %@",
-            rewritten,
-            Double(scan.rewriteBytes) / 1_073_741_824.0,
-            cacheURL.path))
+        log(
+            String(
+                format:
+                    "wrote aligned safetensors overlay: files=%d payload=%.1f GB into %@",
+                rewritten,
+                Double(scan.rewriteBytes) / 1_073_741_824.0,
+                cacheURL.path))
         return cacheURL
     }
 
@@ -636,10 +667,10 @@ public enum JangPressPrestacker {
             var containsRouted = false
             for (key, value) in header.tensors {
                 guard let dtype = value["dtype"] as? String,
-                      let shape = value["shape"] as? [Int],
-                      let offsets = value["data_offsets"] as? [UInt64],
-                      offsets.count == 2,
-                      offsets[1] >= offsets[0]
+                    let shape = value["shape"] as? [Int],
+                    let offsets = value["data_offsets"] as? [UInt64],
+                    offsets.count == 2,
+                    offsets[1] >= offsets[0]
                 else { continue }
 
                 let sourceOffset = header.dataBase + offsets[0]
@@ -651,25 +682,27 @@ public enum JangPressPrestacker {
                 if isRoutedTensorKey(key) {
                     containsRouted = true
                 }
-                tensors.append(AlignmentTensor(
-                    key: key,
-                    dtype: dtype,
-                    shape: shape,
-                    sourceOffset: sourceOffset,
-                    byteLength: byteLength))
+                tensors.append(
+                    AlignmentTensor(
+                        key: key,
+                        dtype: dtype,
+                        shape: shape,
+                        sourceOffset: sourceOffset,
+                        byteLength: byteLength))
             }
 
-            plans.append(AlignmentFilePlan(
-                source: source,
-                metadata: header.metadata,
-                tensors: tensors.sorted { lhs, rhs in
-                    if lhs.sourceOffset == rhs.sourceOffset {
-                        return lhs.key < rhs.key
-                    }
-                    return lhs.sourceOffset < rhs.sourceOffset
-                },
-                needsAlignment: needsAlignment,
-                containsRoutedTensor: containsRouted))
+            plans.append(
+                AlignmentFilePlan(
+                    source: source,
+                    metadata: header.metadata,
+                    tensors: tensors.sorted { lhs, rhs in
+                        if lhs.sourceOffset == rhs.sourceOffset {
+                            return lhs.key < rhs.key
+                        }
+                        return lhs.sourceOffset < rhs.sourceOffset
+                    },
+                    needsAlignment: needsAlignment,
+                    containsRoutedTensor: containsRouted))
         }
 
         return AlignmentScan(
@@ -742,7 +775,7 @@ public enum JangPressPrestacker {
         var arranged = plan.tensors
         var headerData = Data()
 
-        for _ in 0..<8 {
+        for _ in 0 ..< 8 {
             var dataOffset: UInt64 = 0
             for i in arranged.indices {
                 let alignment = UInt64(dtypeAlignment(arranged[i].dtype))
@@ -777,9 +810,10 @@ public enum JangPressPrestacker {
             let dataBaseAlignment = 4096
             let misalignment = (8 + headerData.count) % dataBaseAlignment
             if misalignment != 0 {
-                headerData.append(Data(
-                    repeating: 0x20,
-                    count: dataBaseAlignment - misalignment))
+                headerData.append(
+                    Data(
+                        repeating: 0x20,
+                        count: dataBaseAlignment - misalignment))
             }
             let newDataBase = UInt64(8 + headerData.count)
             if newDataBase == dataBase {
@@ -880,7 +914,7 @@ public enum JangPressPrestacker {
             ?? env["JANGPRESS_ALIGN_CACHE_DIR"]
             ?? env["MLXPRESS_PRESTACK_CACHE_DIR"]
             ?? env["JANGPRESS_PRESTACK_CACHE_DIR"],
-           !override.isEmpty
+            !override.isEmpty
         {
             root = URL(fileURLWithPath: override)
         } else {
@@ -888,10 +922,13 @@ public enum JangPressPrestacker {
                 .appendingPathComponent("vmlx-swift-lm", isDirectory: true)
                 .appendingPathComponent("jangpress-align", isDirectory: true)
         }
-        let hash = stableHash(([alignmentVersion, originalURL.path] + files.map {
-            "\($0.url.lastPathComponent):\($0.size):\($0.modified)"
-        }).joined(separator: "|"))
-        return root
+        let hash = stableHash(
+            ([alignmentVersion, originalURL.path]
+                + files.map {
+                    "\($0.url.lastPathComponent):\($0.size):\($0.modified)"
+                }).joined(separator: "|"))
+        return
+            root
             .appendingPathComponent(originalURL.lastPathComponent + "-" + hash, isDirectory: true)
     }
 
@@ -939,7 +976,8 @@ public enum JangPressPrestacker {
         ) {
             return KeyMatch(
                 expert: Int(m[2])!,
-                outputKey: "model.layers.\(m[1]).block_sparse_moe.switch_mlp.\(projName(m[3])).\(m[4])")
+                outputKey:
+                    "model.layers.\(m[1]).block_sparse_moe.switch_mlp.\(projName(m[3])).\(m[4])")
         }
         if let m = match(
             key,
@@ -980,8 +1018,7 @@ public enum JangPressPrestacker {
     }
 
     private static func isStackedRoutedKey(_ key: String) -> Bool {
-        key.contains(".switch_mlp.") &&
-            (key.hasSuffix(".tq_packed") || key.hasSuffix(".tq_norms"))
+        key.contains(".switch_mlp.") && (key.hasSuffix(".tq_packed") || key.hasSuffix(".tq_norms"))
     }
 
     private static func projName(_ raw: String) -> String {
@@ -999,7 +1036,7 @@ public enum JangPressPrestacker {
         let range = NSRange(location: 0, length: ns.length)
         guard let m = re.firstMatch(in: value, range: range) else { return nil }
         var captures: [String] = []
-        for i in 0..<m.numberOfRanges {
+        for i in 0 ..< m.numberOfRanges {
             let r = m.range(at: i)
             captures.append(r.location == NSNotFound ? "" : ns.substring(with: r))
         }
@@ -1007,10 +1044,10 @@ public enum JangPressPrestacker {
     }
 
     private static func stableHash(_ input: String) -> String {
-        var hash: UInt64 = 0xcbf29ce484222325
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
         for byte in input.utf8 {
             hash ^= UInt64(byte)
-            hash &*= 0x100000001b3
+            hash &*= 0x100_0000_01b3
         }
         return String(format: "%016llx", hash)
     }
@@ -1020,43 +1057,47 @@ public enum JangPressPrestacker {
     }
 
     private static func posixError(_ op: String, path: String) -> NSError {
-        NSError(domain: "JangPressPrestacker", code: Int(errno),
-            userInfo: [NSLocalizedDescriptionKey: "\(op)(\(path)) failed: \(String(cString: strerror(errno)))"])
+        NSError(
+            domain: "JangPressPrestacker", code: Int(errno),
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "\(op)(\(path)) failed: \(String(cString: strerror(errno)))"
+            ])
     }
 
     #if canImport(Darwin)
-    private static func systemOpen(_ path: String, _ flags: Int32) -> Int32 {
-        Darwin.open(path, flags, 0)
-    }
-    private static func systemClose(_ fd: Int32) -> Int32 { Darwin.close(fd) }
-    private static func systemEnableNoCache(_ fd: Int32) -> Int32 {
-        Darwin.fcntl(fd, F_NOCACHE, 1)
-    }
-    private static func systemPread(
-        _ fd: Int32, _ buffer: UnsafeMutableRawPointer, _ count: Int, _ offset: Int64
-    ) -> Int {
-        Darwin.pread(fd, buffer, count, off_t(offset))
-    }
-    private static func systemWrite(
-        _ fd: Int32, _ buffer: UnsafeRawPointer, _ count: Int
-    ) -> Int {
-        Darwin.write(fd, buffer, count)
-    }
+        private static func systemOpen(_ path: String, _ flags: Int32) -> Int32 {
+            Darwin.open(path, flags, 0)
+        }
+        private static func systemClose(_ fd: Int32) -> Int32 { Darwin.close(fd) }
+        private static func systemEnableNoCache(_ fd: Int32) -> Int32 {
+            Darwin.fcntl(fd, F_NOCACHE, 1)
+        }
+        private static func systemPread(
+            _ fd: Int32, _ buffer: UnsafeMutableRawPointer, _ count: Int, _ offset: Int64
+        ) -> Int {
+            Darwin.pread(fd, buffer, count, off_t(offset))
+        }
+        private static func systemWrite(
+            _ fd: Int32, _ buffer: UnsafeRawPointer, _ count: Int
+        ) -> Int {
+            Darwin.write(fd, buffer, count)
+        }
     #elseif canImport(Glibc)
-    private static func systemOpen(_ path: String, _ flags: Int32) -> Int32 {
-        Glibc.open(path, flags, 0)
-    }
-    private static func systemClose(_ fd: Int32) -> Int32 { Glibc.close(fd) }
-    private static func systemEnableNoCache(_ fd: Int32) -> Int32 { 0 }
-    private static func systemPread(
-        _ fd: Int32, _ buffer: UnsafeMutableRawPointer, _ count: Int, _ offset: Int64
-    ) -> Int {
-        Glibc.pread(fd, buffer, count, off_t(offset))
-    }
-    private static func systemWrite(
-        _ fd: Int32, _ buffer: UnsafeRawPointer, _ count: Int
-    ) -> Int {
-        Glibc.write(fd, buffer, count)
-    }
+        private static func systemOpen(_ path: String, _ flags: Int32) -> Int32 {
+            Glibc.open(path, flags, 0)
+        }
+        private static func systemClose(_ fd: Int32) -> Int32 { Glibc.close(fd) }
+        private static func systemEnableNoCache(_ fd: Int32) -> Int32 { 0 }
+        private static func systemPread(
+            _ fd: Int32, _ buffer: UnsafeMutableRawPointer, _ count: Int, _ offset: Int64
+        ) -> Int {
+            Glibc.pread(fd, buffer, count, off_t(offset))
+        }
+        private static func systemWrite(
+            _ fd: Int32, _ buffer: UnsafeRawPointer, _ count: Int
+        ) -> Int {
+            Glibc.write(fd, buffer, count)
+        }
     #endif
 }

@@ -2,14 +2,15 @@
 
 import Foundation
 import MLX
+
 #if canImport(Cmlx)
-import Cmlx
+    import Cmlx
 #endif
 
 #if canImport(Darwin)
-import Darwin
+    import Darwin
 #elseif canImport(Glibc)
-import Glibc
+    import Glibc
 #endif
 
 /// File patterns required to resolve a tokenizer without downloading model weights.
@@ -608,17 +609,20 @@ public func loadModel(
         applyPlainDeepseekV4ProcessMemoryLimitsIfNeeded(facts: facts)
     if loadConfiguration.useMmapSafetensors && !useMmapSafetensors {
         let reason = "DeepSeek V4 affine JANG selected resident safetensors for production decode"
-        FileHandle.standardError.write(Data(
-            "[Load] \(reason)\n".utf8))
+        FileHandle.standardError.write(
+            Data(
+                "[Load] \(reason)\n".utf8))
     }
     if loadConfiguration.memoryLimit != memoryLimit {
-        FileHandle.standardError.write(Data(
-            "[Load] DeepSeek V4 affine JANG uses RAM admission instead of the decode-throttling MLX memory limit\n"
-                .utf8))
+        FileHandle.standardError.write(
+            Data(
+                "[Load] DeepSeek V4 affine JANG uses RAM admission instead of the decode-throttling MLX memory limit\n"
+                    .utf8))
     }
 
     // 2. Resolve JangPress policy → concrete options.
-    let resolvedOptions: JangPressLoadOptions = facts.requiresResidentSafetensors
+    let resolvedOptions: JangPressLoadOptions =
+        facts.requiresResidentSafetensors
         ? .disabled
         : loadConfiguration.jangPress.resolve(facts: facts)
 
@@ -657,11 +661,13 @@ public func loadModel(
     //     size" rejection (the original 847a8c7 crash condition). See
     //     docs/WIRED-LIMIT-INVESTIGATION-2026-05-03.md.
     if dsv4NativeAllocatorCeiling == nil,
-        let rawCap = memoryLimit
-        .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory)
+        let rawCap =
+            memoryLimit
+            .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory)
     {
         let workingSetCap = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
-        let safeCap = max(1 * 1024 * 1024 * 1024,  // never below 1 GB
+        let safeCap = max(
+            1 * 1024 * 1024 * 1024,  // never below 1 GB
             min(rawCap, workingSetCap))
         MLX.Memory.memoryLimit = safeCap
     }
@@ -674,8 +680,10 @@ public func loadModel(
     //    whole-shard mmap loader, then use cold-page advice and OS
     //    compression/reclaim instead of a large stacked cache overlay.
     //    Active-expert pread streaming is an explicit fallback/diagnostic
-    //    path only. Alignment overlays remain separately gated by
-    //    MLXPRESS_ALIGN_* / JANGPRESS_ALIGN_*.
+    //    path only. Before mmap, ordinary writable model directories are
+    //    automatically healed when a safetensors shard has dtype-misaligned
+    //    offsets. The older side-copy alignment overlay remains separately
+    //    gated by MLXPRESS_ALIGN_* / JANGPRESS_ALIGN_*.
     let loadDirectory = try JangPressPrestacker.prepareBundleIfNeeded(
         originalURL: directory,
         enabled: useMmapSafetensors)
@@ -689,10 +697,12 @@ public func loadModel(
     // proved that wrapping every tensor span as its own Metal buffer increases
     // load time without lowering Activity Monitor footprint; the real blocker
     // is model sanitize replacing routed mmap tensors with full stacked banks.
-    let tensorBuffersRaw = ProcessInfo.processInfo.environment["MLXPRESS_MMAP_TENSOR_BUFFERS"]
+    let tensorBuffersRaw =
+        ProcessInfo.processInfo.environment["MLXPRESS_MMAP_TENSOR_BUFFERS"]
         ?? ProcessInfo.processInfo.environment["JANGPRESS_MMAP_TENSOR_BUFFERS"]
         ?? ""
-    let useTensorMmapBuffers = useMmapSafetensors
+    let useTensorMmapBuffers =
+        useMmapSafetensors
         && resolvedOptions.enabled
         && resolvedOptions.backend == .mmap
         && ["1", "true", "on", "yes"].contains(tensorBuffersRaw.lowercased())
@@ -824,65 +834,65 @@ private func withMmapSafetensorsEnv<R>(
     startColdPercent: Int?,
     _ body: () async throws -> R
 ) async throws -> R {
-#if canImport(Darwin) || canImport(Glibc)
-    let mmapKey = "MLX_SAFETENSORS_MMAP"
-    let vmlxMmapKey = "VMLX_MMAP_SAFETENSORS"
-    let tensorKey = "MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS"
-    let startColdKey = "MLX_SAFETENSORS_MMAP_START_COLD"
-    let coldPctKey = "MLX_SAFETENSORS_MMAP_COLD_PCT"
-    let priorMmap = getenv(mmapKey).map { String(cString: $0) }
-    let priorVmlxMmap = getenv(vmlxMmapKey).map { String(cString: $0) }
-    let priorTensor = getenv(tensorKey).map { String(cString: $0) }
-    let priorStartCold = getenv(startColdKey).map { String(cString: $0) }
-    let priorColdPct = getenv(coldPctKey).map { String(cString: $0) }
-    if enabled {
-        setenv(mmapKey, "1", 1)
-        setenv(vmlxMmapKey, "1", 1)
-        if tensorBuffers {
-            setenv(tensorKey, "1", 1)
-        }
-        if let startColdPercent, startColdPercent > 0 {
-            setenv(startColdKey, "1", 1)
-            setenv(
-                coldPctKey,
-                String(max(0, min(100, startColdPercent))),
-                1)
-        }
-    } else {
-        unsetenv(mmapKey)
-        unsetenv(vmlxMmapKey)
-        unsetenv(tensorKey)
-        unsetenv(startColdKey)
-        unsetenv(coldPctKey)
-    }
-    defer {
-        if let priorMmap {
-            setenv(mmapKey, priorMmap, 1)
+    #if canImport(Darwin) || canImport(Glibc)
+        let mmapKey = "MLX_SAFETENSORS_MMAP"
+        let vmlxMmapKey = "VMLX_MMAP_SAFETENSORS"
+        let tensorKey = "MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS"
+        let startColdKey = "MLX_SAFETENSORS_MMAP_START_COLD"
+        let coldPctKey = "MLX_SAFETENSORS_MMAP_COLD_PCT"
+        let priorMmap = getenv(mmapKey).map { String(cString: $0) }
+        let priorVmlxMmap = getenv(vmlxMmapKey).map { String(cString: $0) }
+        let priorTensor = getenv(tensorKey).map { String(cString: $0) }
+        let priorStartCold = getenv(startColdKey).map { String(cString: $0) }
+        let priorColdPct = getenv(coldPctKey).map { String(cString: $0) }
+        if enabled {
+            setenv(mmapKey, "1", 1)
+            setenv(vmlxMmapKey, "1", 1)
+            if tensorBuffers {
+                setenv(tensorKey, "1", 1)
+            }
+            if let startColdPercent, startColdPercent > 0 {
+                setenv(startColdKey, "1", 1)
+                setenv(
+                    coldPctKey,
+                    String(max(0, min(100, startColdPercent))),
+                    1)
+            }
         } else {
             unsetenv(mmapKey)
-        }
-        if let priorVmlxMmap {
-            setenv(vmlxMmapKey, priorVmlxMmap, 1)
-        } else {
             unsetenv(vmlxMmapKey)
-        }
-        if let priorTensor {
-            setenv(tensorKey, priorTensor, 1)
-        } else {
             unsetenv(tensorKey)
-        }
-        if let priorStartCold {
-            setenv(startColdKey, priorStartCold, 1)
-        } else {
             unsetenv(startColdKey)
-        }
-        if let priorColdPct {
-            setenv(coldPctKey, priorColdPct, 1)
-        } else {
             unsetenv(coldPctKey)
         }
-    }
-#endif
+        defer {
+            if let priorMmap {
+                setenv(mmapKey, priorMmap, 1)
+            } else {
+                unsetenv(mmapKey)
+            }
+            if let priorVmlxMmap {
+                setenv(vmlxMmapKey, priorVmlxMmap, 1)
+            } else {
+                unsetenv(vmlxMmapKey)
+            }
+            if let priorTensor {
+                setenv(tensorKey, priorTensor, 1)
+            } else {
+                unsetenv(tensorKey)
+            }
+            if let priorStartCold {
+                setenv(startColdKey, priorStartCold, 1)
+            } else {
+                unsetenv(startColdKey)
+            }
+            if let priorColdPct {
+                setenv(coldPctKey, priorColdPct, 1)
+            } else {
+                unsetenv(coldPctKey)
+            }
+        }
+    #endif
     return try await body()
 }
 
@@ -892,49 +902,52 @@ private func adviseCanonicalMmapRoutedExpertsIfAvailable(
     mmapEnabled: Bool
 ) -> Int64? {
     guard mmapEnabled,
-          options.enabled,
-          options.backend == .mmap,
-          options.compressPct > 0
+        options.enabled,
+        options.backend == .mmap,
+        options.compressPct > 0
     else { return nil }
 
-#if canImport(Cmlx)
-    guard let adviseRouted = lookupSafetensorsMmapAdviseRouted() else {
+    #if canImport(Cmlx)
+        guard let adviseRouted = lookupSafetensorsMmapAdviseRouted() else {
+            return nil
+        }
+
+        let advised = adviseRouted(
+            0,  // 0 = cold advice; C++ defaults to MADV_DONTNEED and can be env-selected.
+            Int32(max(0, min(100, options.compressPct))))
+
+        let env = ProcessInfo.processInfo.environment
+        if advised > 0,
+            env["MLXPRESS_DEBUG"] == "1"
+                || env["JANGPRESS_DEBUG"] == "1"
+                || env["MLX_SAFETENSORS_MMAP_DEBUG"] == "1"
+        {
+            FileHandle.standardError.write(
+                Data(
+                    "[MLXPress] advised \(advised) canonical mmap routed bytes cold (pct=\(options.compressPct))\n"
+                        .utf8))
+        }
+        return advised
+    #else
         return nil
-    }
-
-    let advised = adviseRouted(
-        0,  // 0 = cold advice; C++ defaults to MADV_DONTNEED and can be env-selected.
-        Int32(max(0, min(100, options.compressPct))))
-
-    let env = ProcessInfo.processInfo.environment
-    if advised > 0,
-       (env["MLXPRESS_DEBUG"] == "1"
-        || env["JANGPRESS_DEBUG"] == "1"
-        || env["MLX_SAFETENSORS_MMAP_DEBUG"] == "1")
-    {
-        FileHandle.standardError.write(Data(
-            "[MLXPress] advised \(advised) canonical mmap routed bytes cold (pct=\(options.compressPct))\n".utf8))
-    }
-    return advised
-#else
-    return nil
-#endif
+    #endif
 }
 
 #if canImport(Cmlx)
-private typealias SafetensorsMmapAdviseRoutedFn = @convention(c) (
-    Int32,
-    Int32
-) -> Int64
+    private typealias SafetensorsMmapAdviseRoutedFn =
+        @convention(c) (
+            Int32,
+            Int32
+        ) -> Int64
 
-private func lookupSafetensorsMmapAdviseRouted() -> SafetensorsMmapAdviseRoutedFn? {
-    guard let handle = dlopen(nil, RTLD_NOW),
-          let symbol = dlsym(handle, "mlx_safetensors_mmap_advise_routed")
-    else {
-        return nil
+    private func lookupSafetensorsMmapAdviseRouted() -> SafetensorsMmapAdviseRoutedFn? {
+        guard let handle = dlopen(nil, RTLD_NOW),
+            let symbol = dlsym(handle, "mlx_safetensors_mmap_advise_routed")
+        else {
+            return nil
+        }
+        return unsafeBitCast(symbol, to: SafetensorsMmapAdviseRoutedFn.self)
     }
-    return unsafeBitCast(symbol, to: SafetensorsMmapAdviseRoutedFn.self)
-}
 #endif
 
 /// Protocol for types that can provide ModelFactory instances.
