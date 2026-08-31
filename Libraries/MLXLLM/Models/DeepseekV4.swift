@@ -955,7 +955,7 @@ class DeepseekV4MLP: Module, UnaryLayer {
 
 // MARK: - mHC Hyper-Connection (per-block collapse + expand)
 
-class DeepseekV4HyperConnection: Module {
+public class DeepseekV4HyperConnection: Module {
     let hcMult: Int
     let hcIters: Int
     let hcEps: Float
@@ -968,12 +968,21 @@ class DeepseekV4HyperConnection: Module {
     @ParameterInfo(key: "scale") var scale: MLXArray
     /// `hc_{attn,ffn}_base`: shape `((2+hc)*hc,)` per-field bias.
     @ParameterInfo(key: "base") var base: MLXArray
-    init(config: DeepseekV4Configuration) {
-        self.hcMult = config.hcMult
-        self.hcIters = config.hcSinkhornIters
-        self.hcEps = config.hcEps
-        self.hiddenSize = config.hiddenSize
-        self.mixHc = (2 + config.hcMult) * config.hcMult
+    convenience init(config: DeepseekV4Configuration) {
+        self.init(
+            hcMult: config.hcMult, sinkhornIterations: config.hcSinkhornIters,
+            eps: config.hcEps, hiddenSize: config.hiddenSize)
+    }
+
+    /// The designated initialiser, in explicit quantities rather than one family's configuration —
+    /// GLM-5.3 (`glm5_next`) ships the same mechanism and the same three parameters, under an `hc_`
+    /// prefix its loader strips.
+    public init(hcMult: Int, sinkhornIterations: Int, eps: Float, hiddenSize: Int) {
+        self.hcMult = hcMult
+        self.hcIters = sinkhornIterations
+        self.hcEps = eps
+        self.hiddenSize = hiddenSize
+        self.mixHc = (2 + hcMult) * hcMult
         self._fn.wrappedValue = zeros([mixHc, hcMult * hiddenSize])
         self._scale.wrappedValue = zeros([3])
         self._base.wrappedValue = zeros([mixHc])
@@ -989,7 +998,7 @@ class DeepseekV4HyperConnection: Module {
     ///   mixes    = x_normed @ fn.T                 # (B, L, mix_hc)
     ///   pre, post, comb = hc_split_sinkhorn(mixes, scale, base, hc, iters, eps)
     ///   y = sum(pre[..., None] * x_flat.reshape(B,L,hc,D), axis=2)
-    func collapse(_ h: MLXArray) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
+    public func collapse(_ h: MLXArray) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
         // Decode (L==1) routes through a shared compiled region — the graph is
         // identical for every layer/step, so weights ride along as inputs and
         // the host-side graph build is amortized (Python `_get_hc_pre_compiled`).
@@ -1012,7 +1021,7 @@ class DeepseekV4HyperConnection: Module {
     ///
     /// Mirrors Python `_hc_post`:
     ///   y = post[..., None] * x[..., None, :] + matmul(comb, residual)
-    func expand(
+    public func expand(
         blockOut: MLXArray, residual: MLXArray, post: MLXArray, comb: MLXArray
     ) -> MLXArray {
         DeepseekV4Math.hcPost(
