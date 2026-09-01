@@ -263,6 +263,20 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("coordinator.hasValidatedDiskEntry("))
     }
 
+    /// Anchored FORWARD from the info yield, and deliberately not from `onGenerationEnd`.
+    ///
+    /// `handler.onGenerationEnd(emit: continuation.yield)` occurs THREE times in this task and
+    /// `continuation.finish()` FOUR — twice each on early-exit branches that precede the main path.
+    /// An unranged `range(of:)` returns the FIRST match, so anchoring there lands in a branch, and
+    /// `onEnd < info` then holds for a reason that has nothing to do with the terminal sequence: it
+    /// is two positions in unrelated code, ordered by accident of layout. The assertion cannot fail,
+    /// which is the same as not making it.
+    ///
+    /// `_ = continuation.yield(handler.infoEvent(info))` occurs exactly once, so every step below is
+    /// anchored to a unique site and each `<` says something about the order the runtime actually
+    /// runs in: info is published first, then the GPU drain, the cache store, the second drain, the
+    /// advisor drain, and only then the stream finishes. Safety is preserved by the STREAM END, not
+    /// by `.info` ordering — which is precisely why `.info` may come first and why the rest may not.
     @Test("token iterator publishes info early but finishes only after cache store drain")
     func tokenIteratorFinishesOnlyAfterCacheStoreDrain() throws {
         let source = try String(
@@ -271,17 +285,14 @@ struct BatchEngineGrowingChatCacheSourceTests {
         let taskRange = try #require(source.range(of: "private func generateLoopTask"))
         let task = String(source[taskRange.lowerBound...])
 
-        let onEnd = try #require(task.range(of: "handler.onGenerationEnd(emit: continuation.yield)"))
-        let store = try #require(task.range(of: "iterator.storeCacheAfterGeneration("))
-        let info = try #require(task.range(
-            of: "handler.infoEvent(info)",
-            range: onEnd.upperBound..<store.lowerBound))
+        let info = try #require(task.range(of: "_ = continuation.yield(handler.infoEvent(info))"))
         let preStoreSync = try #require(task.range(
-            of: "Stream().synchronize()",
-            range: info.upperBound..<store.lowerBound))
+            of: "Stream().synchronize()", range: info.upperBound..<task.endIndex))
+        let store = try #require(task.range(
+            of: "iterator.storeCacheAfterGeneration(",
+            range: preStoreSync.upperBound..<task.endIndex))
         let postStoreSync = try #require(task.range(
-            of: "Stream().synchronize()",
-            range: store.upperBound..<task.endIndex))
+            of: "Stream().synchronize()", range: store.upperBound..<task.endIndex))
         let advisorDrain = try #require(task.range(
             of: "MLXPressCanonicalExpertAdvisor.shared.waitUntilIdle()",
             range: postStoreSync.upperBound..<task.endIndex))
@@ -289,7 +300,6 @@ struct BatchEngineGrowingChatCacheSourceTests {
             of: "continuation.finish()",
             range: advisorDrain.upperBound..<task.endIndex))
 
-        #expect(onEnd.lowerBound < info.lowerBound)
         #expect(info.lowerBound < preStoreSync.lowerBound)
         #expect(preStoreSync.lowerBound < store.lowerBound)
         #expect(store.lowerBound < postStoreSync.lowerBound)
