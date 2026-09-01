@@ -105,8 +105,12 @@ enum SafetensorsStorageHealer {
 
         let entries: [URL]
         do {
+            // RESOLVED: `contentsOfDirectory(at:)` throws on a URL naming a symlink to a
+            // directory, so a bundle reached through one would enumerate to nothing and take the
+            // fallback below — the healer silently declining to do its job on exactly the bundles
+            // an operator has deduplicated by symlinking between namespaces.
             entries = try FileManager.default.contentsOfDirectory(
-                at: directory,
+                at: directory.resolvingSymlinksInPath(),
                 includingPropertiesForKeys: [.isSymbolicLinkKey, .fileSizeKey],
                 options: [.skipsHiddenFiles]
             )
