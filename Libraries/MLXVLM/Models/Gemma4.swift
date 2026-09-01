@@ -12,6 +12,9 @@
 import CoreImage
 import Foundation
 import MLX
+// For Gemma4TextModel's shared checkpoint-key helpers: this wrapper reads the same
+// checkpoints as the text model and must rename their keys identically.
+import MLXLLM
 import MLXLMCommon
 import MLXNN
 
@@ -1395,7 +1398,7 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
             if nk.hasPrefix("language_model.") && !nk.hasPrefix("language_model.model.") {
                 nk = "language_model.model." + String(nk.dropFirst("language_model.".count))
             }
-            if nk.contains(".switch_mlp.") { nk = nk.replacingOccurrences(of: ".switch_mlp.", with: ".experts.switch_glu.") }
+            nk = Gemma4TextModel.remappingSwitchMLP(nk)
             if nk.contains(".experts.down_proj.") {
                 nk = nk.replacingOccurrences(of: ".experts.down_proj.", with: ".experts.switch_glu.down_proj.")
             } else if nk.hasSuffix(".experts.down_proj") {
@@ -1429,10 +1432,10 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
             }
             p[nk] = v
         }
-        let ev = config.textConfig.vocabSize
-        for k in ["language_model.model.embed_tokens.weight", "language_model.model.embed_tokens.scales", "language_model.model.embed_tokens.biases", "language_model.lm_head.weight", "language_model.lm_head.scales", "language_model.lm_head.biases"] {
-            if let w = p[k], w.dim(0) != ev { p[k] = w[0 ..< ev] }
-        }
+        // Same tensors, same trim as the text model — only the prefix differs here, because the
+        // text tower is a submodule and keeps its `language_model.` name.
+        Gemma4TextModel.trimmingVocabDimension(
+            &p, prefix: "language_model.", vocabSize: config.textConfig.vocabSize)
         return p
     }
 }
