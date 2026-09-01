@@ -1417,6 +1417,20 @@ enum Qwen35Language {
             let mode: QuantizationMode
         }
 
+        /// One scheme-compatible run of the ordered projections
+        /// [qkv, z, b, a]: either a fused record covering ≥2 members or a
+        /// passthrough to the original module. Grouped fusion replaces the
+        /// original all-or-nothing scheme guard, which refused real JANG
+        /// stamps outright — the 27B stamps qkv+z at 5-bit and b+a at 4-bit
+        /// (group size 128 throughout), so the uniform check never fused a
+        /// single layer on it. Groups fuse what can fuse (4→2 there, 4→1 on
+        /// uniform stamps) and leave the rest untouched.
+        private enum FusedInputSegment {
+            case fused(members: [Int], projection: FusedDecodeInputProjection, splitIndices: [Int])
+            case single(member: Int)
+        }
+        private var fusedInputSegments: [FusedInputSegment]?
+
         let hiddenSize: Int
         let numVHeads: Int
         let numKHeads: Int
@@ -1541,22 +1555,148 @@ enum Qwen35Language {
         }
 
         private func fusedDecodeInputs(_ inputs: MLXArray) -> [MLXArray]? {
-            guard let fusedDecodeInputProjection = ensureFusedDecodeInputProjection(inputs)
+            // Uniform-scheme fast path: the existing whole-4 fusion and its
+            // native BF16-affine kernel, byte-for-byte the shipped behavior
+            // (Flash Next / qwen4_exp bundles land here).
+            if let fusedDecodeInputProjection = ensureFusedDecodeInputProjection(inputs) {
+                let splitIndices = [
+                    convDim, convDim + valueDim, convDim + valueDim + numVHeads,
+                ]
+                let combined = Qwen4ExpBF16Affine.dense(
+                    inputs, fusedDecodeInputProjection.weight,
+                    scales: fusedDecodeInputProjection.scales,
+                    biases: fusedDecodeInputProjection.biases,
+                    groupSize: fusedDecodeInputProjection.groupSize,
+                    bits: fusedDecodeInputProjection.bits,
+                    mode: fusedDecodeInputProjection.mode)
+                return MLX.split(
+                    combined,
+                    indices: splitIndices,
+                    axis: -1)
+            }
+
+            // Grouped fallback for mixed-scheme stamps the uniform guard
+            // refuses (the 27B: qkv+z 5-bit, b+a 4-bit → 4 launches become
+            // 2). Uses `quantizedMM` — exactly the op the unfused
+            // QuantizedLinear modules run — so this path is bit-identical to
+            // the separate calls (pinned by Qwen35FusedInputProjectionTests
+            // on the LLM twin of this class, whose first draft used the
+            // native kernel here and failed the identity gate).
+            guard let segments = ensureFusedInputSegments(inputs) else { return nil }
+            let modules = [inProjQKV, inProjZ, inProjB, inProjA]
+            var outputs = [MLXArray?](repeating: nil, count: 4)
+            for segment in segments {
+                switch segment {
+                case .single(let member):
+                    outputs[member] = modules[member](inputs)
+                case .fused(let members, let projection, let splitIndices):
+                    let combined = quantizedMM(
+                        inputs, projection.weight,
+                        scales: projection.scales, biases: projection.biases,
+                        transpose: true,
+                        groupSize: projection.groupSize, bits: projection.bits,
+                        mode: projection.mode)
+                    let parts = splitIndices.isEmpty
+                        ? [combined]
+                        : MLX.split(combined, indices: splitIndices, axis: -1)
+                    guard parts.count == members.count else { return nil }
+                    for (part, member) in zip(parts, members) {
+                        outputs[member] = part
+                    }
+                }
+            }
+            guard outputs.allSatisfy({ $0 != nil }) else { return nil }
+            return outputs.map { $0! }
+        }
+
+        private var attemptedGroupedInputFusion = false
+
+        private func ensureFusedInputSegments(
+            _ inputs: MLXArray
+        ) -> [FusedInputSegment]? {
+            guard
+                RuntimeEnvironment.value("VMLX_QWEN4_EXP_FUSE_DECODE_INPUTS") != "0",
+                RuntimeEnvironment.value("VMLX_GDN_FUSE_DECODE_INPUTS") != "0",
+                fuseDecodeInputProjections, inputs.dim(1) == 1,
+                !CompiledDecodeTrace.isActive
             else { return nil }
-            let splitIndices = [
-                convDim, convDim + valueDim, convDim + valueDim + numVHeads,
-            ]
-            let combined = Qwen4ExpBF16Affine.dense(
-                inputs, fusedDecodeInputProjection.weight,
-                scales: fusedDecodeInputProjection.scales,
-                biases: fusedDecodeInputProjection.biases,
-                groupSize: fusedDecodeInputProjection.groupSize,
-                bits: fusedDecodeInputProjection.bits,
-                mode: fusedDecodeInputProjection.mode)
-            return MLX.split(
-                combined,
-                indices: splitIndices,
-                axis: -1)
+
+            if attemptedGroupedInputFusion { return fusedInputSegments }
+            attemptedGroupedInputFusion = true
+
+            let modules = [inProjQKV, inProjZ, inProjB, inProjA]
+            let quantizedModules = modules.map { $0 as? QuantizedLinear }
+            guard
+                quantizedModules.allSatisfy({
+                    $0 != nil && $0?.bias == nil && $0?.biases != nil
+                })
+            else { return nil }
+            let q = quantizedModules.map { $0! }
+
+            func scheme(_ m: QuantizedLinear) -> String {
+                "\(m.groupSize)/\(m.bits)/\(m.mode)/\(m.scales.dtype)/\(m.biases!.dtype)"
+            }
+
+            var segments: [FusedInputSegment] = []
+            var run: [Int] = []
+            func flushRun() {
+                guard !run.isEmpty else { return }
+                if run.count == 1 {
+                    segments.append(.single(member: run[0]))
+                } else {
+                    let members = run
+                    let mods = members.map { q[$0] }
+                    let weight = concatenated(mods.map(\.weight), axis: 0)
+                    let scales = concatenated(mods.map(\.scales), axis: 0)
+                    let biases = concatenated(mods.map { $0.biases! }, axis: 0)
+                    MLX.eval(weight, scales, biases)
+                    var splits: [Int] = []
+                    var offset = 0
+                    for m in mods.dropLast() {
+                        offset += m.scales.dim(0)
+                        splits.append(offset)
+                    }
+                    segments.append(
+                        .fused(
+                            members: members,
+                            projection: FusedDecodeInputProjection(
+                                weight: weight, scales: scales, biases: biases,
+                                groupSize: mods[0].groupSize, bits: mods[0].bits,
+                                mode: mods[0].mode),
+                            splitIndices: splits))
+                }
+                run = []
+            }
+            for index in modules.indices {
+                if let last = run.last, scheme(q[last]) != scheme(q[index]) {
+                    flushRun()
+                }
+                run.append(index)
+            }
+            flushRun()
+
+            guard
+                segments.contains(where: {
+                    if case .fused = $0 { return true }
+                    return false
+                })
+            else { return nil }
+            fusedInputSegments = segments
+
+            Self.fusionDiagnosticLock.lock()
+            if !Self.didReportDecodeInputFusion {
+                Self.didReportDecodeInputFusion = true
+                let fusedCounts = segments.compactMap { segment -> Int? in
+                    if case .fused(let members, _, _) = segment { return members.count }
+                    return nil
+                }
+                FileHandle.standardError.write(
+                    Data(
+                        "[Qwen4Exp] fused_gdn_decode_input_projections=active groups=\(fusedCounts) dtype=\(inputs.dtype)\n"
+                            .utf8))
+            }
+            Self.fusionDiagnosticLock.unlock()
+            return segments
         }
 
         private func compiledDecodeFront(
@@ -2195,9 +2335,17 @@ enum Qwen35Language {
             let compiledDecodeRegions = shouldCompileDecodeRegions(args)
 
             if isLinear {
+                // Fusion no longer rides the compiled-decode-regions flag:
+                // the grouped fused path is bit-identical to the unfused
+                // projections (matched quantizedMM kernel; pinned by
+                // Qwen35FusedInputProjectionTests) and the compiled-trace
+                // guard inside `ensureFusedInputSegments` already keeps it
+                // out of trace capture. Tying it to compiledDecodeRegions
+                // left every mixed-scheme JANG stamp — including the 27B —
+                // running four decode launches per GDN layer for no reason.
                 _linearAttn.wrappedValue = GatedDeltaNet(
                     args,
-                    fuseDecodeInputProjections: compiledDecodeRegions)
+                    fuseDecodeInputProjections: true)
             } else {
                 _selfAttn.wrappedValue = Attention(args)
             }
