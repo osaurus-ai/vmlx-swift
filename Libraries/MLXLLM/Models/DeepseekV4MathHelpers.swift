@@ -515,7 +515,12 @@ public enum DeepseekV4Math {
         eps: Float,
         normEps: Float
     ) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
-        let key = "\(hcMult)|\(hiddenSize)|\(iters)|\(eps)"
+        // `normEps` belongs in the key. The cached region is a function of all FIVE quantities, but
+        // the key named only four — so two families agreeing on hcMult/hiddenSize/iters/eps and
+        // differing only in the norm epsilon would collide, and the second one silently gets the
+        // first one's region. DSV4 alone cannot expose this: it derives both epsilons from a
+        // configuration that always makes them equal, so its key is unambiguous by accident.
+        let key = "\(hcMult)|\(hiddenSize)|\(iters)|\(eps)|\(normEps)"
         hcPreCompiledLock.lock()
         var region = hcPreCompiledCache[key]
         if region == nil {
