@@ -97,7 +97,9 @@ public struct Gemma3VisionConfiguration: Codable, Sendable {
 
 public struct Gemma3Configuration: Codable, Sendable {
     public let textConfiguration: Gemma3TextConfiguration
-    public let visionConfiguration: Gemma3VisionConfiguration
+    /// Optional, like `Gemma4Configuration.visionConfig`. A text-only Gemma 3 bundle carries no
+    /// `vision_config`, and while this was non-optional such a bundle could not DECODE at all.
+    public let visionConfiguration: Gemma3VisionConfiguration?
     public let modelType: String
     public let mmTokensPerImage: Int
     public let quantization: BaseConfiguration.Quantization?
@@ -799,21 +801,21 @@ class Gemma3MultiModalProjector: Module, UnaryLayer {
     let tokensPerSide: Int
     let kernelSize: Int
 
-    init(config: Gemma3Configuration) {
+    init(config: Gemma3Configuration, vision: Gemma3VisionConfiguration) {
         self.config = config
 
         self._mmInputProjectionWeight.wrappedValue = ones([
-            config.visionConfiguration.hiddenSize,
+            vision.hiddenSize,
             config.textConfiguration.hiddenSize,
         ])
 
         self._mmSoftEmbNorm.wrappedValue = Gemma.RMSNorm(
-            dimensions: config.visionConfiguration.hiddenSize,
-            eps: config.visionConfiguration.layerNormEps
+            dimensions: vision.hiddenSize,
+            eps: vision.layerNormEps
         )
 
         self.patchesPerImage =
-            config.visionConfiguration.imageSize / config.visionConfiguration.patchSize
+            vision.imageSize / vision.patchSize
 
         self.tokensPerSide = Int(sqrt(Double(config.mmTokensPerImage)))
         self.kernelSize = patchesPerImage / tokensPerSide
@@ -896,10 +898,10 @@ private func maskedScatter(
 
 // MARK: - Gemma 3 Model
 
-public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
-    @ModuleInfo(key: "vision_tower") private var visionTower: VisionModel
+public class Gemma3: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing {
+    @ModuleInfo(key: "vision_tower") private var visionTower: VisionModel?
     @ModuleInfo(key: "language_model") private var languageModel: LanguageModel
-    @ModuleInfo(key: "multi_modal_projector") var multiModalProjector: Gemma3MultiModalProjector
+    @ModuleInfo(key: "multi_modal_projector") var multiModalProjector: Gemma3MultiModalProjector?
 
     public let config: Gemma3Configuration
 
@@ -911,12 +913,44 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
         return languageModel.newCache(parameters: parameters)
     }
 
-    public init(_ config: Gemma3Configuration) {
+    /// What this instance actually carries. Same contract as the other converted families.
+    public let modalities: Set<ModelRuntimeRequestModality>
+
+    /// Which towers this configuration can instantiate. SigLIP here is image-only, so no `.video`.
+    public static func constructibleModalities(
+        of config: Gemma3Configuration
+    ) -> Set<ModelRuntimeRequestModality> {
+        config.visionConfiguration != nil ? [.text, .vision] : [.text]
+    }
+
+    public convenience init(_ config: Gemma3Configuration) {
+        self.init(config, modalities: Self.constructibleModalities(of: config))
+    }
+
+    /// - Parameter requesting: the caller's subset, or nil for "everything this config offers".
+    public convenience init(
+        _ config: Gemma3Configuration,
+        requesting: Set<ModelRuntimeRequestModality>?
+    ) throws {
+        let resolved = try Set.resolveForConstruction(
+            requested: requesting, constructible: Self.constructibleModalities(of: config))
+        self.init(config, modalities: resolved)
+    }
+
+    /// The one real initialiser: builds exactly the towers named by `modalities`.
+    public init(
+        _ config: Gemma3Configuration,
+        modalities: Set<ModelRuntimeRequestModality>
+    ) {
+        self.modalities = modalities
         self.config = config
 
-        self._visionTower.wrappedValue = VisionModel(config: config.visionConfiguration)
+        if let vision = config.visionConfiguration, modalities.contains(.vision) {
+            self._visionTower.wrappedValue = VisionModel(config: vision)
+            self._multiModalProjector.wrappedValue = Gemma3MultiModalProjector(
+                config: config, vision: vision)
+        }
         self._languageModel.wrappedValue = LanguageModel(config.textConfiguration)
-        self._multiModalProjector.wrappedValue = Gemma3MultiModalProjector(config: config)
     }
 
     private func getInputEmbeddings(
@@ -932,6 +966,15 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
 
         // Process image through vision tower
         let processedPixels = pixelValues.transposed(0, 2, 3, 1).asType(inputsEmbeds.dtype)
+
+        // Images arrived at a model that carries no vision tower. Refuse rather than embed the
+        // prompt without them: a silently image-free answer looks like a bad model, not a bad call.
+        guard let visionTower, let multiModalProjector else {
+            throw VLMError.processing(
+                "image input requires the vision tower, and this instance carries none "
+                + "(modalities: \(modalities.modalityDescription)). "
+                + "Load with .vision requested, or send text only.")
+        }
 
         let (hiddenState, _, _) = visionTower(
             processedPixels,
@@ -1053,8 +1096,16 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
         var processedWeights = languageModel.sanitize(
             weights: weights, quantizationConfig: config.quantization)
 
-        // Handle vision model sanitization (conv2d weight reshaping, etc.)
-        processedWeights = visionTower.sanitize(weights: processedWeights)
+        // Handle vision model sanitization (conv2d weight reshaping, etc.). With no tower built
+        // the bundle's vision weights have no destination — drop them rather than reshape them
+        // onto a module that does not exist.
+        if let visionTower {
+            processedWeights = visionTower.sanitize(weights: processedWeights)
+        } else {
+            processedWeights = processedWeights.filter {
+                !$0.key.contains("vision_tower") && !$0.key.contains("multi_modal_projector")
+            }
+        }
 
         return processedWeights
     }

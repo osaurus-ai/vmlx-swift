@@ -155,9 +155,9 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) ->
     let config = try JSONDecoder().decode(Gemma4Configuration.self, from: data)
 
     #expect(config.imageTokenId == 258880)
-    #expect(config.visionConfig.defaultOutputLength == 280)
-    #expect(config.visionConfig.poolingKernelSize == 3)
-    #expect(config.visionConfig.patchSize == 16)
+    #expect(config.visionConfig?.defaultOutputLength == 280)
+    #expect(config.visionConfig?.poolingKernelSize == 3)
+    #expect(config.visionConfig?.patchSize == 16)
     #expect(config.textConfig.numHiddenLayers == 35)
     #expect(config.textConfig.numKvSharedLayers == 20)
     #expect(config.textConfig.slidingWindow == 512)
@@ -270,12 +270,12 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) ->
     #expect(config.textConfig.slidingWindow == 1024)
     #expect(config.textConfig.layerTypes.filter { $0 == "full_attention" }.count == 8)
     #expect(config.textConfig.layerTypes.filter { $0 == "sliding_attention" }.count == 40)
-    #expect(config.visionConfig.usesUnifiedVisionEmbedder)
-    #expect(config.visionConfig.hiddenSize == 3840)
-    #expect(config.visionConfig.outputProjectionDimensions == 3840)
-    #expect(config.visionConfig.modelPatchSize == 48)
-    #expect(config.visionConfig.positionEmbeddingSize == 1120)
-    #expect(config.visionConfig.defaultOutputLength == 280)
+    #expect(config.visionConfig?.usesUnifiedVisionEmbedder == true)
+    #expect(config.visionConfig?.hiddenSize == 3840)
+    #expect(config.visionConfig?.outputProjectionDimensions == 3840)
+    #expect(config.visionConfig?.modelPatchSize == 48)
+    #expect(config.visionConfig?.positionEmbeddingSize == 1120)
+    #expect(config.visionConfig?.defaultOutputLength == 280)
 }
 
 @Test func gemma4ProportionalRoPEHandlesAsymmetricGlobalKeyWidth() {
@@ -540,8 +540,8 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) ->
 
     // This is the root invariant: processor token count must match vision feature count
     #expect(
-        procConfig.imageSeqLength == modelConfig.visionConfig.defaultOutputLength,
-        "Processor imageSeqLength (\(procConfig.imageSeqLength)) must equal vision defaultOutputLength (\(modelConfig.visionConfig.defaultOutputLength))")
+        procConfig.imageSeqLength == modelConfig.visionConfig?.defaultOutputLength,
+        "Processor imageSeqLength (\(procConfig.imageSeqLength)) must equal vision defaultOutputLength (\(modelConfig.visionConfig?.defaultOutputLength))")
 }
 
 @Test func gemma4E4BConfigDecode() throws {
@@ -556,6 +556,6 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) ->
     let config = try JSONDecoder().decode(Gemma4Configuration.self, from: data)
 
     #expect(config.imageTokenId == 258880)
-    #expect(config.visionConfig.defaultOutputLength == 280)
-    #expect(config.visionConfig.poolingKernelSize == 3)
+    #expect(config.visionConfig?.defaultOutputLength == 280)
+    #expect(config.visionConfig?.poolingKernelSize == 3)
 }
