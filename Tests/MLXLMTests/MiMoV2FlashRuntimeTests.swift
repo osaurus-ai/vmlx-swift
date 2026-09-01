@@ -145,7 +145,20 @@ struct MiMoV2FlashRuntimeTests {
         #expect(source.contains("let firstSimple = cache.first { $0 is KVCacheSimple }"))
         #expect(source.contains("if let simpleCache = cache[i] as? KVCacheSimple"))
         #expect(source.contains("TurboQuantKVCache.fromSimpleCache"))
-        #expect(source.contains("RotatingKVCache, DeepseekV4Cache, MambaCache, CacheList: skip"))
+        // The skip list gained `ZayaMoEPlaceholderCache` and the comment wrapped, so the old
+        // one-line literal stopped matching text that is present and correct. Match against
+        // whitespace-collapsed source, and name the types individually so ADDING a skipped cache
+        // does not break the test while REMOVING one still does.
+        let flat = source.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        for skipped in [
+            "RotatingKVCache", "DeepseekV4Cache", "MambaCache", "CacheList",
+            "ZayaMoEPlaceholderCache",
+        ] {
+            #expect(
+                flat.contains("\(skipped),") || flat.contains("\(skipped):"),
+                "\(skipped) must stay in the TurboQuant skip list")
+        }
+        #expect(flat.contains("ZayaMoEPlaceholderCache: skip."))
 
         let topology = ModelCacheTopologySnapshot(cache: [
             TurboQuantKVCache(),

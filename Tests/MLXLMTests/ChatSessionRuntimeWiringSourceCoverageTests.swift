@@ -16,7 +16,16 @@ struct ChatSessionRuntimeWiringSourceCoverageTests {
     @Test("streamMap passes container cache coordinator into TokenIterator")
     func streamMapPassesCacheCoordinatorIntoTokenIterator() throws {
         let source = try Self.source("Libraries/MLXLMCommon/ChatSession.swift")
-        #expect(source.contains("let cacheCoordinator = model.cacheCoordinator"))
+        // The coordinator is taken from the CONTAINER and then suppressed when the KV cache is
+        // already populated — a refinement added after this test was written, which renamed the
+        // binding and left the old literal (`let cacheCoordinator = model.cacheCoordinator`)
+        // nowhere in the file. The subject is unchanged: the container's coordinator reaches
+        // `TokenIterator`. Pin that, including the suppression, rather than one stale spelling.
+        #expect(source.contains("let containerCacheCoordinator = model.cacheCoordinator"))
+        #expect(
+            source.contains(
+                "let cacheCoordinator = kvCacheIsPopulated ? nil : containerCacheCoordinator"),
+            "a populated KV cache must not also be handed the container coordinator")
         #expect(source.contains("cacheCoordinator: cacheCoordinator"))
         #expect(source.contains("let iterator = try TokenIterator("))
     }
