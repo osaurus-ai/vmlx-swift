@@ -130,7 +130,7 @@ class DeepseekV4RoPE: Module {
         if let e = tables[key], e.offset == offset, e.length == length {
             return (e.cos, e.sin)
         }
-        let positions = MLXArray(Int32(offset)..<Int32(offset + length)).asType(.float32)
+        let positions = MLXArray(Int32(offset) ..< Int32(offset + length)).asType(.float32)
         // positions: (L,), invFreq: (dim/2,) → angles: (L, dim/2)
         let angles = positions.expandedDimensions(axis: -1) * invFreq.expandedDimensions(axis: 0)
         let c = cos(angles)
@@ -154,7 +154,7 @@ class DeepseekV4RoPE: Module {
             return (e.cos, e.sin)
         }
         let positions =
-            MLXArray(Int32(0)..<Int32(count)).asType(.float32) * Float(stride)
+            MLXArray(Int32(0) ..< Int32(count)).asType(.float32) * Float(stride)
             + Float(base)
         let angles = positions.expandedDimensions(axis: -1) * invFreq.expandedDimensions(axis: 0)
         let c = cos(angles)
@@ -694,7 +694,7 @@ private enum DeepseekV4CompiledSelectorCache {
             let originalScores = sqrt(log1p(exp(logits)))
             let biasedScores = originalScores + bias
             let indices = argPartition(
-                -biasedScores, kth: topK - 1, axis: -1)[.ellipsis, 0..<topK]
+                -biasedScores, kth: topK - 1, axis: -1)[.ellipsis, 0 ..< topK]
                 .asType(.int32)
             var weights = takeAlong(originalScores, indices, axis: -1)
             if topK > 1 && normalize {
@@ -804,11 +804,33 @@ class DeepseekV4MoEGate: Module {
 
 // MARK: - MoE (SwitchGLU routed + shared expert)
 
+private protocol DeepseekV4RoutedSwitch: Module {
+    func dsv4Routed(
+        _ input: MLXArray, indices: MLXArray, preDownScores: MLXArray
+    ) -> MLXArray
+}
+
+extension SwitchGLU: DeepseekV4RoutedSwitch {
+    fileprivate func dsv4Routed(
+        _ input: MLXArray, indices: MLXArray, preDownScores: MLXArray
+    ) -> MLXArray {
+        callAsFunction(input, indices, preDownScores: preDownScores)
+    }
+}
+
+extension AffineStreamingSwitchGLU: DeepseekV4RoutedSwitch {
+    fileprivate func dsv4Routed(
+        _ input: MLXArray, indices: MLXArray, preDownScores: MLXArray
+    ) -> MLXArray {
+        routed(input, indices: indices, preDownScores: preDownScores)
+    }
+}
+
 class DeepseekV4MoE: Module, UnaryLayer {
     let config: DeepseekV4Configuration
     let layerIdx: Int
     let topK: Int
-    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    @ModuleInfo(key: "switch_mlp") var switchMLP: Module
     var gate: DeepseekV4MoEGate
     @ModuleInfo(key: "shared_experts") var sharedExperts: DeepseekV4MLP
     /// Python `_decode_moe_region` parity: one compiled region per layer
@@ -821,6 +843,9 @@ class DeepseekV4MoE: Module, UnaryLayer {
     private let regionLock = NSLock()
     private var moeDecodeRegion: DeepseekV4CompiledRegion? = nil
     fileprivate var moeRegionWarm = false
+    fileprivate var usesStreamingExperts: Bool {
+        switchMLP is AffineStreamingSwitchGLU
+    }
     init(config: DeepseekV4Configuration, layerIdx: Int) {
         self.config = config
         self.layerIdx = layerIdx
@@ -854,9 +879,11 @@ class DeepseekV4MoE: Module, UnaryLayer {
             swigluLimit: limit)
     }
 
-    fileprivate func moeMath(_ x: MLXArray, inputIds: MLXArray?) -> (y: MLXArray, indices: MLXArray) {
+    fileprivate func moeMath(_ x: MLXArray, inputIds: MLXArray?) -> (y: MLXArray, indices: MLXArray)
+    {
         let (indices, scores) = gate(x, inputIds: inputIds)
-        let routed = switchMLP(x, indices, preDownScores: scores)
+        let routed = (switchMLP as! any DeepseekV4RoutedSwitch).dsv4Routed(
+            x, indices: indices, preDownScores: scores)
         let y = DeepseekV4Math.addSharedExpertFP32(
             DeepseekV4Math.reduceRoutedExpertsFP32(routed),
             shared: sharedExperts(x), outputDType: x.dtype)
@@ -879,7 +906,7 @@ class DeepseekV4MoE: Module, UnaryLayer {
         // Hash layers without threaded ids fall back to eager (mirrors the
         // Python guard) so the trace never bakes the wrong gate variant.
         let ids = gate.isHashLayer ? inputIds : nil
-        if DeepseekV4Math.compileRegionsEnabled, !profileStages,
+        if DeepseekV4Math.compileRegionsEnabled, !usesStreamingExperts, !profileStages,
             x.dim(1) == 1, moeRegionWarm, !(gate.isHashLayer && ids == nil)
         {
             let region = deepseekV4CachedRegion(regionLock, &moeDecodeRegion) {
@@ -908,16 +935,21 @@ class DeepseekV4MoE: Module, UnaryLayer {
             guard profileStages else { return }
             MLX.eval(arrays)
             let now = CFAbsoluteTimeGetCurrent()
-            FileHandle.standardError.write(Data(String(format:
-                "[DSV4MoEProfile] layer=%d stage=%@ ms=%.3f\n",
-                layerIdx, name, (now - stageStart) * 1_000).utf8))
+            FileHandle.standardError.write(
+                Data(
+                    String(
+                        format:
+                            "[DSV4MoEProfile] layer=%d stage=%@ ms=%.3f\n",
+                        layerIdx, name, (now - stageStart) * 1_000
+                    ).utf8))
             stageStart = now
         }
 
         let (indices, scores) = gate(x, inputIds: ids)
         finishStage("gate", [indices, scores])
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
-        let routed = switchMLP(x, indices, preDownScores: scores)
+        let routed = (switchMLP as! any DeepseekV4RoutedSwitch).dsv4Routed(
+            x, indices: indices, preDownScores: scores)
         var y = DeepseekV4Math.reduceRoutedExpertsFP32(routed)
         finishStage("routed", [y])
         finishStage("route_reduce", [y])
@@ -1088,7 +1120,8 @@ class DeepseekV4HyperHead: Module {
             weight: hcHeadRMSOnes.asType(.float32),
             eps: hcEps)
         let mixes = xNormed.matmul(fn.asType(.float32).transposed())  // (B, L, hcMult)
-        let pre = sigmoid(mixes * scale.asType(.float32) + base.asType(.float32))
+        let pre =
+            sigmoid(mixes * scale.asType(.float32) + base.asType(.float32))
             + MLXArray(hcEps)
         let xReshape = xFlat.reshaped(B, L, hcMult, hiddenSize)
         return (pre.asType(dtype).expandedDimensions(axis: -1) * xReshape).sum(axis: -2)
@@ -1150,9 +1183,13 @@ class DeepseekV4DecoderLayer: Module {
             guard profileStages else { return }
             MLX.eval(arrays)
             let now = CFAbsoluteTimeGetCurrent()
-            FileHandle.standardError.write(Data(String(format:
-                "[DSV4StageProfile] layer=%d stage=%@ ms=%.3f\n",
-                layerIdx, name, (now - stageStart) * 1_000).utf8))
+            FileHandle.standardError.write(
+                Data(
+                    String(
+                        format:
+                            "[DSV4StageProfile] layer=%d stage=%@ ms=%.3f\n",
+                        layerIdx, name, (now - stageStart) * 1_000
+                    ).utf8))
             stageStart = now
         }
         // ---- Attention HC ----
@@ -1200,7 +1237,7 @@ class DeepseekV4DecoderLayer: Module {
         // having run eager once (`moeRegionWarm`) so SwitchGLU's fused
         // gate+up cache — which evals — materializes before any trace.
         let ids = mlp.gate.isHashLayer ? inputIds : nil
-        if DeepseekV4Math.compileRegionsEnabled, !profileStages,
+        if DeepseekV4Math.compileRegionsEnabled, !mlp.usesStreamingExperts, !profileStages,
             h.dim(1) == 1, mlp.moeRegionWarm,
             !(mlp.gate.isHashLayer && ids == nil)
         {
@@ -1272,7 +1309,7 @@ public class DeepseekV4ModelInner: Module {
         self.config = config
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
-        self.layers = (0..<config.numHiddenLayers).map {
+        self.layers = (0 ..< config.numHiddenLayers).map {
             DeepseekV4DecoderLayer(config: config, layerIdx: $0)
         }
         self._hcHead.wrappedValue = DeepseekV4HyperHead(config: config)
@@ -1353,7 +1390,9 @@ public class DeepseekV4ModelInner: Module {
 
 // MARK: - Outer model
 
-public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel {
+public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel,
+    SafetensorsLoadKeyExcluding, SafetensorsModelDirectoryConfigurable
+{
     /// The canonical SWA + CSA/HSA `DeepseekV4Cache` pool is path-dependent
     /// and has no B-wide wrapper. Preserve concurrent request queuing while
     /// decoding one DSV4 sequence at a time.
@@ -1363,15 +1402,68 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     var config: DeepseekV4Configuration
     public var model: DeepseekV4ModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
+    private let affineExpertCatalog: AffineStreamingExpertCatalog
 
     public init(_ config: DeepseekV4Configuration) {
         self.config = config
+        self.affineExpertCatalog = AffineStreamingExpertCatalog(
+            numExperts: config.nRoutedExperts,
+            inputDims: config.hiddenSize,
+            hiddenDims: config.moeIntermediateSize,
+            layout: .deepseekV4PerExpert)
         // Single latent KV head per layer — report kvHeads as [1]*L so
         // the cache allocator sizes per-layer caches correctly.
         self.kvHeads = Array(repeating: 1, count: config.numHiddenLayers)
         self.model = DeepseekV4ModelInner(config: config)
         self._lmHead.wrappedValue = Linear(
             config.hiddenSize, config.vocabSize, bias: false)
+    }
+
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        AffineStreamingExpertCatalog.isDeepseekV4RoutedTensorKey(key)
+    }
+
+    public func configureSafetensorsModelDirectory(_ modelDirectory: URL) throws {
+        try affineExpertCatalog.configure(
+            modelDirectory: modelDirectory, layerCount: config.numHiddenLayers)
+        var moduleUpdates: [(String, Module)] = []
+        moduleUpdates.reserveCapacity(model.layers.count)
+        for layerIndex in model.layers.indices {
+            let limit = config.swigluLimit
+            let streamingSwitch = AffineStreamingSwitchGLU(
+                inputDims: config.hiddenSize,
+                hiddenDims: config.moeIntermediateSize,
+                numExperts: config.nRoutedExperts,
+                layerIndex: layerIndex,
+                catalog: affineExpertCatalog,
+                cacheExpertLimit: max(config.numExpertsPerTok, 8),
+                prefillChunkSize: 4,
+                glue: { gate, up in
+                    DeepseekV4Math.dsv4SwiGLU(gate: gate, up: up, limit: limit)
+                },
+                scoredGlue: { gate, up, scores in
+                    DeepseekV4Math.dsv4ScoredSwiGLU(
+                        gate: gate, up: up, scores: scores, limit: limit)
+                })
+            moduleUpdates.append((
+                "model.layers.\(layerIndex).mlp.switch_mlp",
+                streamingSwitch
+            ))
+        }
+        // `switchMLP` is registered through `@ModuleInfo`; direct assignment
+        // after construction violates MLXNN's module-tree invariants and
+        // process-fatals in `ModuleInfo.set`. Replace the registered children
+        // through the supported tree update API before generic weight loading.
+        try update(
+            modules: ModuleChildren.unflattened(moduleUpdates),
+            verify: .none
+        )
+        FileHandle.standardError.write(
+            Data(
+                ("[DSV4AffineExperts] production path=exact-mmap-region "
+                    + "layers=\(config.numHiddenLayers) experts=\(config.nRoutedExperts) "
+                    + "top_k=\(config.numExpertsPerTok) cache_experts_per_layer="
+                    + "\(max(config.numExpertsPerTok, 8))\n").utf8))
     }
 
     /// Build per-layer caches.
@@ -1407,7 +1499,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         let envMode = env["DSV4_KV_MODE"]?.lowercased()
         let mode: String = envMode ?? "sliding"
 
-        return (0..<config.numHiddenLayers).map { layerIdx in
+        return (0 ..< config.numHiddenLayers).map { layerIdx in
             switch mode {
             case "full", "tq":
                 return KVCacheSimple()
@@ -1656,7 +1748,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         // and the in-tree `TurboQuantSwitchLinear` use `tq_packed` /
         // `tq_norms`. Rewrite the un-prefixed names so the
         // `@ParameterInfo` keys match. Layout-preserving rename only.
-        for layerIdx in 0..<config.numHiddenLayers {
+        for layerIdx in 0 ..< config.numHiddenLayers {
             for projName in ["gate_proj", "down_proj", "up_proj"] {
                 for (src, dst) in [("packed", "tq_packed"), ("norms", "tq_norms")] {
                     let from = "model.layers.\(layerIdx).mlp.switch_mlp.\(projName).\(src)"
@@ -1687,21 +1779,22 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         // `model.layers.L.mlp.switch_mlp.{gate,down,up}_proj.{suffix}`.
         let suffixes = ["weight", "scales", "biases", "tq_packed", "tq_norms"]
         let streamJANGTQExperts = JANGTQStreamingExperts.isEnabled
-        for layerIdx in 0..<config.numHiddenLayers {
+        let streamAffineExperts = model.layers.first?.mlp.usesStreamingExperts == true
+        for layerIdx in 0 ..< config.numHiddenLayers {
             let prefix = "model.layers.\(layerIdx).mlp.experts"
             for projName in ["gate_proj", "down_proj", "up_proj"] {
                 for suffix in suffixes {
                     let first = "\(prefix).0.\(projName).\(suffix)"
                     guard out[first] != nil else { continue }
                     if streamJANGTQExperts && (suffix == "tq_packed" || suffix == "tq_norms") {
-                        for e in 0..<config.nRoutedExperts {
+                        for e in 0 ..< config.nRoutedExperts {
                             out.removeValue(
                                 forKey: "\(prefix).\(e).\(projName).\(suffix)")
                         }
                         continue
                     }
                     var tensors: [MLXArray] = []
-                    for e in 0..<config.nRoutedExperts {
+                    for e in 0 ..< config.nRoutedExperts {
                         let key = "\(prefix).\(e).\(projName).\(suffix)"
                         guard let t = out[key] else {
                             tensors = []
@@ -1709,13 +1802,13 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                         }
                         tensors.append(t)
                     }
-                    if tensors.count == config.nRoutedExperts {
+                    if tensors.count == config.nRoutedExperts && !streamAffineExperts {
                         let stackedKey =
                             "model.layers.\(layerIdx).mlp.switch_mlp.\(projName).\(suffix)"
                         if out[stackedKey] == nil {
                             out[stackedKey] = stacked(tensors)
                         }
-                        for e in 0..<config.nRoutedExperts {
+                        for e in 0 ..< config.nRoutedExperts {
                             out.removeValue(
                                 forKey: "\(prefix).\(e).\(projName).\(suffix)")
                         }
@@ -1728,7 +1821,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                 // prestacked bundles (DSV4-Flash JANGTQ_K, etc.) ship a
                 // single `mlp.switch_mlp.{proj}.tq_bits` per layer.
                 // Drop both regardless of which layout.
-                for e in 0..<config.nRoutedExperts {
+                for e in 0 ..< config.nRoutedExperts {
                     out.removeValue(
                         forKey: "\(prefix).\(e).\(projName).tq_bits")
                 }

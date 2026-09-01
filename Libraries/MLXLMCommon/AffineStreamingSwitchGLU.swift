@@ -32,13 +32,17 @@ public enum AffineStreamingExpertError: Error, CustomStringConvertible {
     }
 }
 
-/// Header-only catalog for Qwen4's stacked native-affine expert tensors.
+/// Header-only catalog for stacked or per-expert native-affine routed tensors.
 ///
 /// The generic loader must exclude these tensors. At runtime this catalog maps
 /// one exact expert slice at a time with `mlx_array_new_mmap_file_region`, so a
-/// Metal command never receives the 512-expert backing buffer that caused the
-/// entire routed bank to become Wired Memory.
+/// Metal command never receives a full routed-expert backing buffer that would
+/// otherwise fault the entire bank into the process footprint.
 public final class AffineStreamingExpertCatalog: @unchecked Sendable {
+    public enum Layout: Sendable {
+        case qwen4Stacked
+        case deepseekV4PerExpert
+    }
     public enum Projection: String, CaseIterable, Sendable {
         case gate = "gate_proj"
         case up = "up_proj"
@@ -81,24 +85,34 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
         let bits: Int
     }
 
+    private enum ProjectionStorage: Sendable {
+        case stacked(ProjectionSpec)
+        case perExpert([ProjectionSpec])
+    }
+
     private struct LayerSpec: Sendable {
-        let gate: ProjectionSpec
-        let up: ProjectionSpec
-        let down: ProjectionSpec
+        let gate: ProjectionStorage
+        let up: ProjectionStorage
+        let down: ProjectionStorage
     }
 
     public let numExperts: Int
     public let inputDims: Int
     public let hiddenDims: Int
+    public let layout: Layout
 
     private let lock = NSLock()
     private var layers: [Int: LayerSpec] = [:]
     private var configuredDirectory: URL?
 
-    public init(numExperts: Int, inputDims: Int, hiddenDims: Int) {
+    public init(
+        numExperts: Int, inputDims: Int, hiddenDims: Int,
+        layout: Layout = .qwen4Stacked
+    ) {
         self.numExperts = numExperts
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
+        self.layout = layout
     }
 
     /// Exact key predicate used by Qwen4's generic-loader exclusion gate.
@@ -110,6 +124,21 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
             parts[0] == "language_model", parts[1] == "layers",
             Int(parts[2]) != nil, parts[3] == "mlp", parts[4] == "switch_mlp",
             ["gate_proj", "up_proj", "down_proj"].contains(String(parts[5])),
+            ["weight", "scales", "biases"].contains(String(parts[6]))
+        else { return false }
+        return true
+    }
+
+    /// Exact DSV4 affine routed-expert predicate. Shared experts, the router,
+    /// dense layers, attention, and JANGTQ tensors are deliberately excluded.
+    public static func isDeepseekV4RoutedTensorKey(_ originalKey: String) -> Bool {
+        var key = originalKey
+        if key.hasPrefix("model.") { key.removeFirst("model.".count) }
+        let parts = key.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 7,
+            parts[0] == "layers", Int(parts[1]) != nil,
+            parts[2] == "ffn", parts[3] == "experts", Int(parts[4]) != nil,
+            ["w1", "w2", "w3"].contains(String(parts[5])),
             ["weight", "scales", "biases"].contains(String(parts[6]))
         else { return false }
         return true
@@ -138,6 +167,18 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
 
         func canonicalName(layer: Int, projection: Projection, suffix: String) -> String {
             "language_model.layers.\(layer).mlp.switch_mlp.\(projection.rawValue).\(suffix)"
+        }
+
+        func deepseekName(
+            layer: Int, expert: Int, projection: Projection, suffix: String
+        ) -> String {
+            let source: String
+            switch projection {
+            case .gate: source = "w1"
+            case .down: source = "w2"
+            case .up: source = "w3"
+            }
+            return "layers.\(layer).ffn.experts.\(expert).\(source).\(suffix)"
         }
 
         func locate(_ canonical: String) throws -> Region {
@@ -181,49 +222,76 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
                 dataOffset: descriptor.dataOffset, dataLength: descriptor.dataLength)
         }
 
-        func projectionSpec(layer: Int, projection: Projection) throws -> ProjectionSpec {
-            let weight = try locate(canonicalName(layer: layer, projection: projection, suffix: "weight"))
-            let scales = try locate(canonicalName(layer: layer, projection: projection, suffix: "scales"))
-            let biases = try locate(canonicalName(layer: layer, projection: projection, suffix: "biases"))
+        func projectionSpec(
+            layer: Int, expert: Int? = nil, projection: Projection
+        ) throws -> ProjectionSpec {
+            func name(_ suffix: String) -> String {
+                if let expert {
+                    return deepseekName(
+                        layer: layer, expert: expert, projection: projection, suffix: suffix)
+                }
+                return canonicalName(layer: layer, projection: projection, suffix: suffix)
+            }
+            let weight = try locate(name("weight"))
+            let scales = try locate(name("scales"))
+            let biases = try locate(name("biases"))
             let inFeatures = projection == .down ? hiddenDims : inputDims
             let outFeatures = projection == .down ? inputDims : hiddenDims
             let label = weight.name
+            let expertPrefix = expert == nil ? [numExperts] : []
             guard weight.dtype == .uint32, scales.dtype == .float16,
                 biases.dtype == .float16,
-                weight.shape.count == 3, scales.shape.count == 3,
+                weight.shape.count == expertPrefix.count + 2,
+                scales.shape.count == expertPrefix.count + 2,
                 biases.shape == scales.shape,
-                weight.shape[0] == numExperts, scales.shape[0] == numExperts,
-                weight.shape[1] == outFeatures, scales.shape[1] == outFeatures,
-                weight.shape[2] > 0, scales.shape[2] > 0
+                Array(weight.shape.prefix(expertPrefix.count)) == expertPrefix,
+                Array(scales.shape.prefix(expertPrefix.count)) == expertPrefix,
+                weight.shape[expertPrefix.count] == outFeatures,
+                scales.shape[expertPrefix.count] == outFeatures,
+                weight.shape.last! > 0, scales.shape.last! > 0
             else {
                 throw AffineStreamingExpertError.invalidTensor(
-                    label, "expected stacked U32 weight and matching F16 affine companions")
+                    label, "expected U32 weight and matching F16 affine companions")
             }
-            let packedBits = weight.shape[2].multipliedReportingOverflow(by: 32)
+            let packedBits = weight.shape.last!.multipliedReportingOverflow(by: 32)
             guard !packedBits.overflow, packedBits.partialValue % inFeatures == 0 else {
-                throw AffineStreamingExpertError.invalidTensor(label, "non-integral packed bit width")
+                throw AffineStreamingExpertError.invalidTensor(
+                    label, "non-integral packed bit width")
             }
             let bits = packedBits.partialValue / inFeatures
-            // MLX's native affine quantized kernels accept 2/4/8-bit packed
-            // weights. PLE's independent SSD row decoder supports odd widths,
-            // but routed matmul must reject those rather than reaching Metal.
-            guard [2, 4, 8].contains(bits),
-                inFeatures % scales.shape[2] == 0
+            // MLX's native affine Metal kernels support the complete packed
+            // width set below. DSV4 uses it per projection (including 3-bit
+            // gate tensors), so the catalog validates each expert tensor's
+            // exact geometry rather than imposing one bundle-wide width.
+            guard [2, 3, 4, 5, 6, 8].contains(bits),
+                inFeatures % scales.shape.last! == 0
             else {
                 throw AffineStreamingExpertError.invalidTensor(
                     label, "unsupported bit width or affine group geometry")
             }
-            let groupSize = inFeatures / scales.shape[2]
+            let groupSize = inFeatures / scales.shape.last!
             return ProjectionSpec(
                 weight: weight, scales: scales, biases: biases,
                 groupSize: groupSize, bits: bits)
         }
 
         for layer in 0 ..< layerCount {
-            built[layer] = try LayerSpec(
-                gate: projectionSpec(layer: layer, projection: .gate),
-                up: projectionSpec(layer: layer, projection: .up),
-                down: projectionSpec(layer: layer, projection: .down))
+            switch layout {
+            case .qwen4Stacked:
+                built[layer] = try LayerSpec(
+                    gate: .stacked(projectionSpec(layer: layer, projection: .gate)),
+                    up: .stacked(projectionSpec(layer: layer, projection: .up)),
+                    down: .stacked(projectionSpec(layer: layer, projection: .down)))
+            case .deepseekV4PerExpert:
+                func all(_ projection: Projection) throws -> ProjectionStorage {
+                    .perExpert(
+                        try (0 ..< numExperts).map {
+                            try projectionSpec(layer: layer, expert: $0, projection: projection)
+                        })
+                }
+                built[layer] = try LayerSpec(
+                    gate: all(.gate), up: all(.up), down: all(.down))
+            }
         }
 
         lock.lock()
@@ -232,8 +300,10 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
         lock.unlock()
 
         let mappedBytes = shards.values.reduce(UInt64(0)) { $0 + $1.fileSize }
-        FileHandle.standardError.write(Data(
-            "[Qwen4AffineExperts] exact-region catalog ready layers=\(layerCount) experts=\(numExperts) files=\(shards.count) indexed_file_bytes=\(mappedBytes) cache=file-backed\n".utf8))
+        FileHandle.standardError.write(
+            Data(
+                "[AffineStreamingExperts] exact-region catalog ready layout=\(String(describing: layout)) layers=\(layerCount) experts=\(numExperts) files=\(shards.count) indexed_file_bytes=\(mappedBytes) cache=file-backed\n"
+                    .utf8))
     }
 
     public func loadExpert(layer: Int, expert: Int) throws -> ExpertArrays {
@@ -254,31 +324,58 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
             down: loadProjection(layerSpec.down, expert: expert))
     }
 
-    private func loadProjection(_ spec: ProjectionSpec, expert: Int) throws -> ProjectionArrays {
-        ProjectionArrays(
-            weight: try mapExpertRegion(spec.weight, expert: expert),
-            scales: try mapExpertRegion(spec.scales, expert: expert),
-            biases: try mapExpertRegion(spec.biases, expert: expert),
+    private func loadProjection(
+        _ storage: ProjectionStorage, expert: Int
+    ) throws -> ProjectionArrays {
+        let spec: ProjectionSpec
+        let slicesStacked: Bool
+        switch storage {
+        case .stacked(let value):
+            spec = value
+            slicesStacked = true
+        case .perExpert(let values):
+            guard expert < values.count else {
+                throw AffineStreamingExpertError.invalidExpert(layer: -1, expert: expert)
+            }
+            spec = values[expert]
+            slicesStacked = false
+        }
+        return ProjectionArrays(
+            weight: try mapRegion(spec.weight, expert: expert, slicesStacked: slicesStacked),
+            scales: try mapRegion(spec.scales, expert: expert, slicesStacked: slicesStacked),
+            biases: try mapRegion(spec.biases, expert: expert, slicesStacked: slicesStacked),
             groupSize: spec.groupSize,
             bits: spec.bits)
     }
 
-    private func mapExpertRegion(_ region: Region, expert: Int) throws -> MLXArray {
-        guard region.shape.first == numExperts,
-            region.dataLength % UInt64(numExperts) == 0
-        else {
-            throw AffineStreamingExpertError.invalidTensor(
-                region.name, "expert dimension does not divide payload")
+    private func mapRegion(
+        _ region: Region, expert: Int, slicesStacked: Bool
+    ) throws -> MLXArray {
+        let length: UInt64
+        let offset: UInt64
+        let shape: [Int]
+        if slicesStacked {
+            guard region.shape.first == numExperts,
+                region.dataLength % UInt64(numExperts) == 0
+            else {
+                throw AffineStreamingExpertError.invalidTensor(
+                    region.name, "expert dimension does not divide payload")
+            }
+            length = region.dataLength / UInt64(numExperts)
+            let offsetResult = UInt64(expert).multipliedReportingOverflow(by: length)
+            guard !offsetResult.overflow,
+                region.dataOffset <= UInt64.max - offsetResult.partialValue
+            else {
+                throw AffineStreamingExpertError.invalidTensor(
+                    region.name, "expert offset overflow")
+            }
+            offset = region.dataOffset + offsetResult.partialValue
+            shape = Array(region.shape.dropFirst())
+        } else {
+            length = region.dataLength
+            offset = region.dataOffset
+            shape = region.shape
         }
-        let length = region.dataLength / UInt64(numExperts)
-        let offsetResult = UInt64(expert).multipliedReportingOverflow(by: length)
-        guard !offsetResult.overflow,
-            region.dataOffset <= UInt64.max - offsetResult.partialValue
-        else {
-            throw AffineStreamingExpertError.invalidTensor(region.name, "expert offset overflow")
-        }
-        let offset = region.dataOffset + offsetResult.partialValue
-        let shape = Array(region.shape.dropFirst())
         var cShape = shape.map(Int32.init)
         var result = mlx_array_new()
         let rc = region.url.withUnsafeFileSystemRepresentation { path -> Int32 in
@@ -304,7 +401,8 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
         }
     }
 
-    private static func checkedByteCount(shape: [Int], dtype: DType, name: String) throws -> UInt64 {
+    private static func checkedByteCount(shape: [Int], dtype: DType, name: String) throws -> UInt64
+    {
         var count = UInt64(dtype.size)
         for dimension in shape {
             guard dimension >= 0 else {
@@ -338,6 +436,8 @@ public final class AffineStreamingSwitchGLU: Module {
     public let prefillChunkSize: Int
 
     private let catalog: AffineStreamingExpertCatalog
+    private let glue: ((MLXArray, MLXArray) -> MLXArray)?
+    private let scoredGlue: ((MLXArray, MLXArray, MLXArray) -> MLXArray)?
     private let lock = NSLock()
     private var cache: [Int: CachedExpert] = [:]
     private var accessClock: UInt64 = 0
@@ -349,7 +449,9 @@ public final class AffineStreamingSwitchGLU: Module {
         layerIndex: Int,
         catalog: AffineStreamingExpertCatalog,
         cacheExpertLimit: Int = 16,
-        prefillChunkSize: Int = 4
+        prefillChunkSize: Int = 4,
+        glue: ((MLXArray, MLXArray) -> MLXArray)? = nil,
+        scoredGlue: ((MLXArray, MLXArray, MLXArray) -> MLXArray)? = nil
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
@@ -358,6 +460,8 @@ public final class AffineStreamingSwitchGLU: Module {
         self.catalog = catalog
         self.cacheExpertLimit = max(1, cacheExpertLimit)
         self.prefillChunkSize = max(1, prefillChunkSize)
+        self.glue = glue
+        self.scoredGlue = scoredGlue
         super.init()
     }
 
@@ -368,11 +472,21 @@ public final class AffineStreamingSwitchGLU: Module {
     }
 
     public func reduced(_ x: MLXArray, indices: MLXArray, scores: MLXArray) -> MLXArray {
+        let routed = routed(x, indices: indices, preDownScores: nil)
+        return (routed * scores[.ellipsis, .newAxis]).sum(axis: -2)
+    }
+
+    /// Exact routed output shaped like `SwitchGLU`: (..., topK, inputDims).
+    /// DSV4 passes `preDownScores` so route weighting happens in fp32 before
+    /// the quantized down projection, matching its checkpoint graph.
+    public func routed(
+        _ x: MLXArray, indices: MLXArray, preDownScores: MLXArray?
+    ) -> MLXArray {
         let totalTokens = x.size / inputDims
         let kSlots = indices.dim(-1)
         let xFlat = x.reshaped([totalTokens, inputDims])
         let indicesFlat = indices.reshaped([totalTokens, kSlots])
-        let scoresFlat = scores.reshaped([totalTokens, kSlots])
+        let scoresFlat = preDownScores?.reshaped([totalTokens, kSlots])
         var chunks: [MLXArray] = []
         chunks.reserveCapacity((totalTokens + prefillChunkSize - 1) / prefillChunkSize)
 
@@ -382,7 +496,7 @@ public final class AffineStreamingSwitchGLU: Module {
             let chunkIndices = indicesFlat[start ..< end, 0...]
             let ids = chunkIndices.reshaped([-1]).asArray(Int32.self).map(Int.init)
             guard !ids.isEmpty, ids.allSatisfy({ $0 >= 0 && $0 < numExperts }) else {
-                fatalError("[Qwen4AffineExperts] invalid routed IDs at layer \(layerIndex)")
+                fatalError("[AffineStreamingExperts] invalid routed IDs at layer \(layerIndex)")
             }
             let unique = Array(Set(ids)).sorted()
             let selected = unique.map { expert($0) }
@@ -390,7 +504,8 @@ public final class AffineStreamingSwitchGLU: Module {
             remap.reserveCapacity(unique.count)
             for (local, global) in unique.enumerated() { remap[global] = Int32(local) }
             let localIndices = MLXArray(
-                ids.map { remap[$0]! }, chunkIndices.shape).asType(.uint32)
+                ids.map { remap[$0]! }, chunkIndices.shape
+            ).asType(.uint32)
 
             func bank(
                 _ projection: (AffineStreamingExpertCatalog.ExpertArrays)
@@ -419,7 +534,14 @@ public final class AffineStreamingSwitchGLU: Module {
                 biases: bank({ $0.gate }, { $0.biases }), rhsIndices: localIndices,
                 transpose: true, groupSize: gate0.groupSize, bits: gate0.bits,
                 mode: .affine)
-            let activated = silu(gate) * up
+            let activated: MLXArray
+            if let scores = scoresFlat?[start ..< end, 0...], let scoredGlue {
+                activated = scoredGlue(gate, up, scores)
+            } else if let glue {
+                activated = glue(gate, up)
+            } else {
+                activated = silu(gate) * up
+            }
             let down = MLX.gatherQuantizedMM(
                 activated, bank({ $0.down }, { $0.weight }),
                 scales: bank({ $0.down }, { $0.scales }),
@@ -427,15 +549,13 @@ public final class AffineStreamingSwitchGLU: Module {
                 transpose: true, groupSize: down0.groupSize, bits: down0.bits,
                 mode: .affine)
             let routed = squeezed(down, axis: -2)
-            let reduced = (routed * scoresFlat[start ..< end, 0...][.ellipsis, .newAxis])
-                .sum(axis: -2)
-            MLX.eval(reduced)
-            chunks.append(reduced)
+            MLX.eval(routed)
+            chunks.append(routed)
             start = end
         }
 
         let result = chunks.count == 1 ? chunks[0] : concatenated(chunks, axis: 0)
-        return result.reshaped(x.shape)
+        return result.reshaped(Array(x.shape.dropLast()) + [kSlots, inputDims])
     }
 
     private func expert(_ index: Int) -> AffineStreamingExpertCatalog.ExpertArrays {
@@ -453,7 +573,7 @@ public final class AffineStreamingSwitchGLU: Module {
         do {
             loaded = try catalog.loadExpert(layer: layerIndex, expert: index)
         } catch {
-            fatalError("[Qwen4AffineExperts] \(error)")
+            fatalError("[AffineStreamingExperts] \(error)")
         }
 
         lock.lock()
@@ -472,8 +592,10 @@ public final class AffineStreamingSwitchGLU: Module {
         lock.unlock()
 
         if accessClock == 2 || accessClock % 256 == 0 {
-            FileHandle.standardError.write(Data(
-                "[Qwen4AffineExperts] layer=\(layerIndex) mapped_expert=\(index) cache=\(count)/\(cacheExpertLimit) backend=exact-mmap-region mode=affine\n".utf8))
+            FileHandle.standardError.write(
+                Data(
+                    "[AffineStreamingExperts] layer=\(layerIndex) mapped_expert=\(index) cache=\(count)/\(cacheExpertLimit) backend=exact-mmap-region mode=affine\n"
+                        .utf8))
         }
         return loaded
     }
