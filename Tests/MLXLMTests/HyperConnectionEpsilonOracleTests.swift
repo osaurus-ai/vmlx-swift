@@ -159,4 +159,39 @@ struct HyperConnectionEpsilonOracleTests {
             #expect(d < Self.tolerance, "the bracketed block output differs from the reference by \(d)")
         }
     }
+
+    /// The final collapse across streams is a MEAN, not a sum.
+    ///
+    /// The fixture has carried `reducedMean` all along; this is the assertion that consumes it. It was
+    /// written alongside the two above and could not travel with them, because it needs
+    /// `Glm5NextLanguageModel` and GLM-5.3 was not upstream yet. It is now.
+    ///
+    /// Worth stating separately because a sum is the natural guess — the streams were summed on the
+    /// way in, so summing them on the way out looks symmetric — and it is wrong. The negative is
+    /// asserted directly rather than left implicit: a sum differs from the mean by exactly `hcMult`
+    /// here, so if the two were ever close enough to be confused, this test would be proving nothing
+    /// and says so.
+    @Test("the final stream collapse is an unweighted mean, not a sum")
+    func reduceIsAMean() throws {
+        let f = Self.fixture
+        try MLXMetalTestLock.withLock {
+            let after = MLXArray(
+                Self.flatten(f.out.afterBlock),
+                [f.shape.B, f.shape.L, f.shape.hc, f.shape.hidden])
+            let reduced = Glm5NextLanguageModel.reduceHyperConnectionStream(after)
+            eval(reduced)
+
+            #expect(reduced.shape == [f.shape.B, f.shape.L, f.shape.hidden])
+            let expected = Self.flatten(f.out.reducedMean)
+            let d = Self.maxAbsDiff(reduced, expected)
+            #expect(d < 1e-5, "the reduce differs from the reference mean by \(d)")
+
+            let sumInstead = after.sum(axis: -2)
+            let dSum = Self.maxAbsDiff(sumInstead, expected)
+            #expect(
+                dSum > 0.1,
+                "a sum is indistinguishable from the mean here (\(dSum)); the test proves nothing")
+        }
+    }
+
 }
