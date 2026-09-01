@@ -23,6 +23,14 @@ public actor ModelTypeRegistry {
         creators[type] = creator
     }
 
+    /// Every `model_type` this registry can instantiate.
+    ///
+    /// Exposed so the two registries can be checked against each other. A family with both a
+    /// text-only and a multimodal implementation is registered in two different factories, in files
+    /// that share no symbol — and comparing the key sets is the only way to notice one was missed.
+    /// See `DualPathFamilies`.
+    public var registeredModelTypes: Set<String> { Set(creators.keys) }
+
     /// Given a `modelType` and configuration data instantiate a new `LanguageModel`.
     public func createModel(configuration: Data, modelType: String) throws -> sending LanguageModel
     {
