@@ -7,7 +7,7 @@ permissions:
 
 jobs:
   lint:
-    if: github.repository == 'ml-explore/mlx-swift'
+    if: github.repository == 'osaurus-ai/vmlx-swift'
     runs-on: ubuntu-latest
     container:
       image: swift:6.2-rhel-ubi9
@@ -71,7 +71,7 @@ jobs:
 
   mac_build_and_test:
     needs: lint
-    if: github.repository == 'ml-explore/mlx-swift'
+    if: github.repository == 'osaurus-ai/vmlx-swift'
     runs-on: [self-hosted, macos]
     steps:
       - uses: actions/checkout@v6
