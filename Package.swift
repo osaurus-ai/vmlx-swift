@@ -852,6 +852,8 @@ let package = Package(
                 "MuseGlimmerNormFoldOwnershipTests.swift",
                 "DeepseekV4Step37RuntimeContractsTests.swift",
                 "DSMLInlineJSONToolFallbackFocusedTests.swift",
+                "MuseGlimmerCapabilityLoadTests.swift",
+                "ModelConstructionModalitiesTests.swift",
                 "DSMLToolCallParserFocusedTests.swift",
                 "DeepseekV4ToolHistoryPrefixBoundaryTests.swift",
                 "DeepseekV4DropThinkingCacheTests.swift",
