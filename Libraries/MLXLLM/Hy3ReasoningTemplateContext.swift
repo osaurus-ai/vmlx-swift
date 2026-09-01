@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+import MLXLMCommon
 
 /// Template-context adapter for official Hunyuan v3 (`model_type = hy_v3`).
 ///
@@ -19,10 +20,10 @@ import Foundation
 /// - with neither present, nothing is injected and the template's own
 ///   default (`no_think`) applies.
 public enum Hy3ReasoningTemplateContext {
+    /// Delegates to `Hy3EffortPolicy`, which declares this family's efforts and default alongside
+    /// the other families. One definition of "is this Hunyuan 3", not two that can drift apart.
     public static func applies(to modelType: String?) -> Bool {
-        guard let t = modelType?.lowercased() else { return false }
-        return t == "hy_v3" || t.hasPrefix("hy_v3_") || t.hasPrefix("hy3")
-            || t.hasPrefix("hunyuan")
+        Hy3EffortPolicy.applies(to: modelType)
     }
 
     public static func apply(

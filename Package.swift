@@ -886,6 +886,7 @@ let package = Package(
                 "JangAffine1RuntimeContractTests.swift",
                 "DeepseekV4IndexerCausalTopKTests.swift",
                 "DeepseekV4ReasoningPolicyTests.swift",
+                "ReasoningEffortPolicyTests.swift",
                 "MetalLiveBufferGuardFocusedTests.swift",
                 "DSV4SpeedFastpathSourceTests.swift",
                 "Gemma4ZyphraToolParserFocusedTests.swift",
