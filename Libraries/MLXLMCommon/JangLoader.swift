@@ -1414,8 +1414,17 @@ public struct JangLoader: Sendable {
                 options: [.prettyPrinted, .sortedKeys])
             try rewrittenSidecar.write(to: shimDir.appendingPathComponent("chat_template.json"))
 
-            let entries = (try? fileManager.contentsOfDirectory(
-                at: directory, includingPropertiesForKeys: nil)) ?? []
+            // RESOLVED, and the failure is not swallowed. `contentsOfDirectory(at:)` THROWS on a URL
+            // naming a symlink to a directory ("couldn't be opened"), so a `try? … ?? []` here yields
+            // an empty list and leaves a shim holding only the files rewritten above. The load then
+            // fails as a MISSING TOKENIZER — which says nothing about the symlinked bundle that
+            // caused it, and sends you looking for a file that is present.
+            //
+            // A shim that cannot be populated is worse than no shim, so fall back to the bundle
+            // itself, exactly as the `catch` below does.
+            guard let entries = try? fileManager.contentsOfDirectory(
+                at: directory.resolvingSymlinksInPath(), includingPropertiesForKeys: nil)
+            else { return directory }
             let rewrittenTemplateFiles: Set<String> = [
                 "tokenizer_config.json",
                 "chat_template.jinja",
@@ -1665,8 +1674,17 @@ public struct JangLoader: Sendable {
                 to: shimDir.appendingPathComponent("tokenizer_config.json"))
             // Symlink all OTHER files — tokenizer.json especially is often
             // large and we don't want to duplicate it.
-            let entries = (try? fileManager.contentsOfDirectory(
-                at: directory, includingPropertiesForKeys: nil)) ?? []
+            // RESOLVED, and the failure is not swallowed. `contentsOfDirectory(at:)` THROWS on a URL
+            // naming a symlink to a directory ("couldn't be opened"), so a `try? … ?? []` here yields
+            // an empty list and leaves a shim holding only the files rewritten above. The load then
+            // fails as a MISSING TOKENIZER — which says nothing about the symlinked bundle that
+            // caused it, and sends you looking for a file that is present.
+            //
+            // A shim that cannot be populated is worse than no shim, so fall back to the bundle
+            // itself, exactly as the `catch` below does.
+            guard let entries = try? fileManager.contentsOfDirectory(
+                at: directory.resolvingSymlinksInPath(), includingPropertiesForKeys: nil)
+            else { return directory }
             for entry in entries where entry.lastPathComponent != "tokenizer_config.json" {
                 let dest = shimDir.appendingPathComponent(entry.lastPathComponent)
                 // Some tokenizer caches already contain symlinks — follow them
