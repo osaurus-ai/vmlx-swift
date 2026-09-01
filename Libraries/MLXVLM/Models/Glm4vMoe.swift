@@ -977,91 +977,11 @@ public class Glm4vMoe: Module, VLMModel, KVCacheDimensionProvider {
     private func getRopeIndex(
         inputIds: MLXArray, imageGridThw: [THW]?
     ) -> (MLXArray, MLXArray) {
-        let batchSize = inputIds.dim(0)
-        let seqLength = inputIds.dim(1)
-        let spatialMergeSize = config.visionConfiguration.spatialMergeSize
-        let imageTokenId = config.baseConfiguration.imageTokenId
-
-        guard let imageGridThw, !imageGridThw.isEmpty else {
-            let positions = MLXArray(0 ..< Int32(seqLength)).expandedDimensions(axis: 0)
-            let positionIds = tiled(
-                broadcast(positions, to: [batchSize, seqLength]).expandedDimensions(axis: 0),
-                repetitions: [3, 1, 1])
-            let deltas = MLXArray(Int32(0))
-            return (positionIds, deltas)
-        }
-
-        precondition(batchSize == 1, "Glm4vMoe getRopeIndex only supports batchSize == 1")
-        let positionIds = zeros([3, batchSize, seqLength], type: Int32.self)
-        var imageIndex = 0
-        var mropePositionDelta: Int = 0
-
-        for batchIdx in 0 ..< batchSize {
-            let inputTokens: [Int32] = inputIds[batchIdx].asArray(Int32.self)
-
-            var dimT = [Int32]()
-            var dimH = [Int32]()
-            var dimW = [Int32]()
-            dimT.reserveCapacity(seqLength)
-            dimH.reserveCapacity(seqLength)
-            dimW.reserveCapacity(seqLength)
-            var st = 0
-            var lastMax: Int32 = -1
-
-            let appendTextPositions = { (count: Int) in
-                guard count > 0 else { return }
-                let base: Int32 = lastMax + 1
-                for j in 0 ..< count {
-                    let pos = base + Int32(j)
-                    dimT.append(pos)
-                    dimH.append(pos)
-                    dimW.append(pos)
-                }
-                lastMax = base + Int32(count) - 1
-            }
-
-            while imageIndex < imageGridThw.count {
-                guard let ed = inputTokens[st...].firstIndex(of: Int32(imageTokenId)) else {
-                    break
-                }
-
-                let frame = imageGridThw[imageIndex]
-                let llmGridT = frame.t
-                let llmGridH = frame.h / spatialMergeSize
-                let llmGridW = frame.w / spatialMergeSize
-                imageIndex += 1
-
-                appendTextPositions(ed - st)
-
-                let imgOffset: Int32 = lastMax + 1
-                for t in 0 ..< llmGridT {
-                    for h in 0 ..< llmGridH {
-                        for w in 0 ..< llmGridW {
-                            dimT.append(Int32(t) + imgOffset)
-                            dimH.append(Int32(h) + imgOffset)
-                            dimW.append(Int32(w) + imgOffset)
-                        }
-                    }
-                }
-                let tMax = Int32(llmGridT - 1) + imgOffset
-                let hMax = Int32(llmGridH - 1) + imgOffset
-                let wMax = Int32(llmGridW - 1) + imgOffset
-                lastMax = max(tMax, max(hMax, wMax))
-
-                st = ed + llmGridT * llmGridH * llmGridW
-            }
-
-            appendTextPositions(inputTokens.count - st)
-
-            positionIds[0, batchIdx] = MLXArray(dimT)
-            positionIds[1, batchIdx] = MLXArray(dimH)
-            positionIds[2, batchIdx] = MLXArray(dimW)
-
-            mropePositionDelta = Int(lastMax) + 1 - inputTokens.count
-        }
-
-        let deltas = MLXArray(Int32(mropePositionDelta))
-        return (positionIds, deltas)
+        Glm4SharedVision.ropeIndex(
+            inputIds: inputIds, imageGridThw: imageGridThw,
+            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+            imageTokenId: config.baseConfiguration.imageTokenId,
+            family: "Glm4vMoe")
     }
 
     private func inputEmbeddings(inputIds: MLXArray, pixelValues: MLXArray?, frames: [THW]?)
