@@ -911,6 +911,7 @@ let package = Package(
                 "MixedGroupSizeQuantizationFocusedTests.swift",
                 "JangSamplingDefaultsTests.swift",
                 "MLXPressCLISourceContractsTests.swift",
+                "ChatTemplateResolutionTests.swift",
                 "VMLXServerRuntimeSettingsTests.swift",
                 "VMLXMemorySafetySettingsTests.swift",
                 "DSV4AgenticToolSourceTests.swift",

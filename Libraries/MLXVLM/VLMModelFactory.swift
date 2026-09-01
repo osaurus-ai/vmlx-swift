@@ -73,19 +73,7 @@ private func create<C: Codable, M>(
 }
 
 private func chatTemplateText(modelDirectory: URL) -> String? {
-    let templateURL = modelDirectory.appending(component: "chat_template.jinja")
-    if let template = try? String(contentsOf: templateURL, encoding: .utf8) {
-        return template
-    }
-    let tokenizerConfigURL = modelDirectory.appending(component: "tokenizer_config.json")
-    guard
-        let data = try? Data(contentsOf: tokenizerConfigURL),
-        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-        let template = object["chat_template"] as? String
-    else {
-        return nil
-    }
-    return template
+    ChatTemplateResolver.text(modelDirectory: modelDirectory)
 }
 
 private func create<C: Codable, P>(
