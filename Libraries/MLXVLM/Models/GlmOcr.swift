@@ -8,6 +8,7 @@
 //
 
 import CoreImage
+import CoreMedia
 import Foundation
 import MLX
 import MLXLMCommon
@@ -828,6 +829,96 @@ public struct GlmOcrProcessor: UserInputProcessor {
         return result
     }
 
+    /// Sample a video and patchify it into ONE GRID PER TEMPORAL PATCH.
+    ///
+    /// Returns the concatenated patch rows, one `(1, h, w)` grid per temporal patch, and the
+    /// timestamp in seconds that labels each — the reference takes every `temporal_patch_size`-th
+    /// raw timestamp, because that is how many raw frames each patch consumes.
+    ///
+    /// Sampling is 2 fps, the `fps` default of GLM-4V's own video processor; `max_duration` there is
+    /// 300 s, which at 2 fps is the 600-frame ceiling applied below.
+    private func preprocessVideo(
+        _ video: UserInput.Video, processing: UserInput.Processing?
+    ) async throws -> (pixels: MLXArray, frames: [THW], timestamps: [Int]) {
+        var resizedSize: CGSize = .zero
+        let sequence = try await MediaProcessing.asProcessedSequence(
+            video, targetFPS: { _ in 2.0 }, maxFrames: 600
+        ) { frame in
+            let applied = MediaProcessing.apply(frame.frame, processing: processing)
+            if resizedSize == .zero {
+                let (extentH, extentW) = try QwenVL.intExtent(applied.extent.size)
+                let (h, w) = try QwenVL.targetSize(
+                    height: extentH, width: extentW,
+                    factor: config.patchSize * config.mergeSize,
+                    minPixels: config.minPixels, maxPixels: config.maxPixels)
+                resizedSize = CGSize(width: w, height: h)
+            }
+            return VideoFrame(
+                frame: preprocess(image: applied, resizedSize: resizedSize),
+                timeStamp: frame.timeStamp)
+        }
+
+        guard !sequence.frames.isEmpty else {
+            throw VLMError.processing("the video decoded to no frames at 2 fps")
+        }
+
+        // Patchify each temporal patch on its OWN, so every one yields a `t == 1` grid. Patchifying
+        // the whole clip at once would produce a single `t == frames` grid, which the rope walk
+        // would then position as one enormous image rather than a run of timestamped frames.
+        let step = config.temporalPatchSize
+        var pixelChunks = [MLXArray]()
+        var grids = [THW]()
+        var seconds = [Int]()
+        for start in stride(from: 0, to: sequence.frames.count, by: step) {
+            let chunk = Array(sequence.frames[start ..< min(start + step, sequence.frames.count)])
+            let (pixels, grid) = try QwenVL.patchify(
+                images: chunk, mergeSize: config.mergeSize, patchSize: config.patchSize,
+                temporalPatchSize: config.temporalPatchSize)
+            pixelChunks.append(pixels)
+            grids.append(grid)
+            let stamp = sequence.timestamps[min(start, sequence.timestamps.count - 1)]
+            seconds.append(Int(CMTimeGetSeconds(stamp).rounded(.down)))
+        }
+        return (concatenated(pixelChunks), grids, seconds)
+    }
+
+    /// The text that follows each video frame's image block.
+    ///
+    /// GLM-4V writes the bare integer second; GLM-5.3, whose `replace_video_token` is otherwise
+    /// byte-identical, writes `"%.1f seconds"`. The difference is one token run and no shape check
+    /// would ever catch it, so `Glm4vVideoTimestampTests` pins this one. The GLM-5.3 format is
+    /// pinned alongside its own implementation, together with the assertion that the two must
+    /// never converge.
+    public static func frameTimestampMarkup(_ seconds: Double) -> String {
+        "\(Int(seconds.rounded(.down)))"
+    }
+
+    /// Rewrite the single video placeholder into the run of timestamped image blocks GLM-4V expects.
+    private func replaceVideoPlaceholder(
+        in promptTokens: [Int], frames: [THW], timestamps: [Int]
+    ) throws -> [Int] {
+        let placeholder = tokenizer.encode(text: "<|begin_of_video|><|video|><|end_of_video|>")
+        guard let range = promptTokens.ranges(of: placeholder).first else {
+            throw VLMError.processing(
+                "no video placeholder in the rendered prompt; the chat template did not mark the "
+                + "video, so there is nowhere to put its frames")
+        }
+        let mergeLength = config.mergeSize * config.mergeSize
+        var replacement = [Int]()
+        for (grid, second) in zip(frames, timestamps) {
+            let count = grid.product / mergeLength
+            replacement.append(
+                contentsOf: tokenizer.encode(
+                    text: "<|begin_of_image|>"
+                        + Array(repeating: "<|image|>", count: count).joined()
+                        + "<|end_of_image|>" + Self.frameTimestampMarkup(Double(second))))
+        }
+        var result = Array(promptTokens[promptTokens.startIndex ..< range.lowerBound])
+        result.append(contentsOf: replacement)
+        result.append(contentsOf: promptTokens[range.upperBound...])
+        return result
+    }
+
     public func prepare(input: UserInput) async throws -> LMInput {
         let messages = GlmOcrMessageGenerator().generate(from: input)
 
@@ -843,8 +934,25 @@ public struct GlmOcrProcessor: UserInputProcessor {
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         }
 
-        // Process images
+        // GLM-4V does not have a separate video pathway, and that is not a simplification here —
+        // it is how the family works. Its processor rewrites a video placeholder into a RUN OF
+        // IMAGE BLOCKS, one per temporal patch, each followed by that frame's timestamp in whole
+        // seconds:
+        //
+        //     <|begin_of_image|>{image tokens}<|end_of_image|>{seconds}   × frames
+        //
+        // so by the time the language model sees the prompt there are no video tokens left, every
+        // frame is an image grid of shape (1, h, w), and the existing M-RoPE walk and feature merge
+        // — both of which key on the IMAGE token — are already correct for it. Feeding the frames
+        // through the image slot is therefore the faithful port, not a shortcut around one.
+        guard input.images.isEmpty || input.videos.isEmpty else {
+            throw VLMError.processing(
+                "GLM-4V: images and video in one request are not supported here; their placeholders "
+                + "are positional and interleaving them correctly needs the reference's ordering")
+        }
+
         var processedImage: LMInput.ProcessedImage?
+
         if !input.images.isEmpty {
             let imagePixelsAndFrames = try input.images.map {
                 try preprocess(images: [try $0.asCIImage()], processing: input.processing)
@@ -856,6 +964,18 @@ public struct GlmOcrProcessor: UserInputProcessor {
                 promptTokens = try replacePaddingTokens(
                     in: promptTokens, frames: imageFrames)
             }
+        }
+
+        if !input.videos.isEmpty {
+            guard input.videos.count == 1 else {
+                throw VLMError.processing(
+                    "GLM-4V: \(input.videos.count) videos supplied; only one per request is wired")
+            }
+            let (pixels, frames, seconds) = try await preprocessVideo(
+                input.videos[0], processing: input.processing)
+            processedImage = LMInput.ProcessedImage(pixels: pixels, frames: frames)
+            promptTokens = try replaceVideoPlaceholder(
+                in: promptTokens, frames: frames, timestamps: seconds)
         }
 
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
@@ -1260,6 +1380,11 @@ public struct GlmOcrMessageGenerator: MessageGenerator {
             ]
                 + message.images.map { _ in
                     ["type": "image"]
+                }
+                // Videos were absent here, so the chat template never rendered a video placeholder
+                // and the processor had nothing to replace — the frames were decoded and dropped.
+                + message.videos.map { _ in
+                    ["type": "video"]
                 },
         ]
     }
