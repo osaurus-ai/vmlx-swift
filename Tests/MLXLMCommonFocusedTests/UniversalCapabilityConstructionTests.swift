@@ -89,9 +89,12 @@ struct UniversalCapabilityConstructionTests {
     /// factory, so they are not this suite's subject at all.
     @Test("report which families this machine can actually exercise")
     func coverageIsLegible() {
+        // The nine dual-path families PLUS qwen4_exp, which is VLM-only and therefore not in
+        // DualPathFamilies — but the modality convention is about multimodal construction, not
+        // about dual registration, so it belongs in this suite's scope.
         let families = [
             "gemma3", "gemma4", "gemma4_unified", "qwen3_5", "qwen3_5_moe",
-            "mistral3", "ministral3", "muse_glimmer", "diffusion_gemma",
+            "mistral3", "ministral3", "muse_glimmer", "diffusion_gemma", "qwen4_exp",
         ]
         var withVision: [String] = []
         var textOnlyOnly: [String] = []
@@ -152,6 +155,33 @@ struct UniversalCapabilityConstructionTests {
         // Audio is claimed only for the conformer tower; whether THIS bundle has one is a
         // property of the bundle, so pin only that the claim is one of the two coherent answers.
         #expect(lanes.isSubset(of: [.text, .vision, .audio]))
+    }
+
+    /// qwen4_exp is the first family to ARRIVE after the convention existed, which makes it the
+    /// real test of whether the convention is one. Like qwen3_5 it genuinely consumes video —
+    /// `prepare` reads `input.video` and threads video frames into the tower — so it claims the
+    /// video lane rather than the image-only shape the Gemma and Pixtral families use.
+    @Test("qwen4_exp declares text, vision and video, and narrows like the rest")
+    func qwen4ExpFollowsTheConvention() throws {
+        guard let raw = Self.rawConfig(modelType: "qwen4_exp") else { return }
+        let cfg = try JSONDecoder.json5().decode(Qwen4ExpConfiguration.self, from: Self.asData(raw))
+        #expect(Qwen4Exp.constructibleModalities(of: cfg) == [.text, .vision, .video])
+
+        let narrowed = try Qwen4Exp(cfg, requesting: [.text])
+        #expect(narrowed.modalities == [.text])
+        #expect(Qwen4Exp(cfg).modalities == [.text, .vision, .video])
+
+        // Narrowing must SKIP the tower, not merely declare a smaller set.
+        let visionKeys = narrowed.parameters().flattened().map(\.0).filter { $0.contains("visual") }
+        #expect(visionKeys.isEmpty)
+
+        // And the weights it cannot receive are dropped rather than handed to nothing.
+        let out = narrowed.sanitize(weights: [
+            "visual.patch_embed.proj.weight": MLXArray([0.0] as [Float]),
+            "model.language_model.layers.0.self_attn.q_proj.weight": MLXArray([0.0] as [Float]),
+        ])
+        #expect(out.keys.first { $0.contains("visual") } == nil)
+        #expect(out.count == 1)
     }
 
     // MARK: a vision-less config decodes, and builds text only
