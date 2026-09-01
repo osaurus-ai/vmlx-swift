@@ -890,30 +890,49 @@ public class Gemma4TextModel: Module, LLMModel {
                 continue
             }
 
-            // Remap JANG expert naming to match module tree:
-            // JANG uses:          switch_mlp.{gate,up,down}_proj.*
-            // mlx-community uses: experts.switch_glu.{gate,up,down}_proj.*
-            // Module tree expects: experts.switch_glu.{gate,up,down}_proj.*
-            if newKey.contains(".switch_mlp.") {
-                newKey = newKey.replacingOccurrences(of: ".switch_mlp.", with: ".experts.switch_glu.")
-            }
+            newKey = Self.remappingSwitchMLP(newKey)
 
             processedWeights[newKey] = value
         }
 
-        // Trim vocab-dimension tensors to match config
-        let expectedVocab = config.vocabSize
-        for key in [
+        Self.trimmingVocabDimension(&processedWeights, prefix: "", vocabSize: config.vocabSize)
+
+        return processedWeights
+    }
+
+    /// Remap JANG expert naming to the module tree's.
+    ///
+    ///     JANG:           switch_mlp.{gate,up,down}_proj.*
+    ///     mlx-community:  experts.switch_glu.{gate,up,down}_proj.*
+    ///     module tree:    experts.switch_glu.{gate,up,down}_proj.*
+    ///
+    /// SINGLE OWNER: the `Gemma4` VLM wrapper reads the same checkpoints and needs the same
+    /// rename. While both files spelled it out, a change to one left the other's experts under
+    /// keys no module claims — on that path only.
+    public static func remappingSwitchMLP(_ key: String) -> String {
+        key.contains(".switch_mlp.")
+            ? key.replacingOccurrences(of: ".switch_mlp.", with: ".experts.switch_glu.")
+            : key
+    }
+
+    /// Trim vocab-dimension tensors to the configured vocabulary.
+    ///
+    /// SINGLE OWNER, same reason. Only the key PREFIX differs by path — bare here, and
+    /// `language_model.` under the VLM, where the text tower is a submodule — so that is the
+    /// parameter. Which tensors carry a vocab dimension, and the trim itself, do not differ.
+    public static func trimmingVocabDimension(
+        _ weights: inout [String: MLXArray], prefix: String, vocabSize: Int
+    ) {
+        for suffix in [
             "model.embed_tokens.weight", "model.embed_tokens.scales",
             "model.embed_tokens.biases",
             "lm_head.weight", "lm_head.scales", "lm_head.biases",
         ] {
-            if let w = processedWeights[key], w.dim(0) != expectedVocab {
-                processedWeights[key] = w[0 ..< expectedVocab]
+            let key = prefix + suffix
+            if let w = weights[key], w.dim(0) != vocabSize {
+                weights[key] = w[0 ..< vocabSize]
             }
         }
-
-        return processedWeights
     }
 
     // Per-layer-type cache: RotatingKVCache for sliding, KVCacheSimple for full attention.

@@ -864,6 +864,7 @@ let package = Package(
                 "Mistral3ScalarEosDecodeTests.swift",
                 "NativeMTPWarmupMemoScopeTests.swift",
                 "NormConventionResolverTests.swift",
+                "Gemma4SharedKeyPolicyTests.swift",
                 "TestSourcesAreRegisteredTests.swift",
                 "DFlash2UnusableBlockWidthTests.swift",
                 "NativeMTPTuningShapeTests.swift",
