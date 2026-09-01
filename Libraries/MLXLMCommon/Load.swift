@@ -1046,8 +1046,8 @@ public func loadWeights(
     // unless the bundle has live proof that affine quant metadata must be
     // materialized to bf16 while raw TurboQuant tensors stay untouched.
     let mmapSafetensorsActive = envFlag("MLX_SAFETENSORS_MMAP")
-        || envFlag("VMLINUX_MMAP_SAFETENSORS")
-    let allowJANGTQMmapBFloat16 = envFlag("VMLINUX_JANGTQ_BF16_MMAP")
+        || RuntimeEnvironment.flag("VMLX_MMAP_SAFETENSORS")
+    let allowJANGTQMmapBFloat16 = RuntimeEnvironment.flag("VMLX_JANGTQ_BF16_MMAP")
         || envFlag("MLX_JANGTQ_BF16_MMAP")
     let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)
     // Gemma 4 and Qwen4-exp JANG affine bundles carry F16 scales/biases whose

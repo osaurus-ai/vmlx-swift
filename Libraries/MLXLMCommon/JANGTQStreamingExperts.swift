@@ -3644,13 +3644,21 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
     ) rethrows -> T {
         #if canImport(Darwin) || canImport(Glibc)
         let mmapKey = "MLX_SAFETENSORS_MMAP"
-        let vmlxMmapKey = "VMLINUX_MMAP_SAFETENSORS"
+        // Both spellings, deliberately. The consumer of this variable is in the MLX C++
+        // submodule (`mmap_safetensors_enabled`), which today reads only the legacy name — so
+        // writing just the new one would stop forcing mmap here, silently. Writing just the
+        // legacy one leaves the new name inert. Drop the legacy write once the submodule reads
+        // both.
+        let vmlxMmapKey = "VMLX_MMAP_SAFETENSORS"
+        let legacyVmlxMmapKey = RuntimeEnvironment.legacyName(of: vmlxMmapKey)!
         let tensorKey = "MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS"
         let priorMmap = getenv(mmapKey).map { String(cString: $0) }
         let priorVmlxMmap = getenv(vmlxMmapKey).map { String(cString: $0) }
+        let priorLegacyVmlxMmap = getenv(legacyVmlxMmapKey).map { String(cString: $0) }
         let priorTensor = getenv(tensorKey).map { String(cString: $0) }
         setenv(mmapKey, "1", 1)
         setenv(vmlxMmapKey, "1", 1)
+        setenv(legacyVmlxMmapKey, "1", 1)
         setenv(tensorKey, "1", 1)
         defer {
             if let priorMmap {
@@ -3662,6 +3670,11 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
                 setenv(vmlxMmapKey, priorVmlxMmap, 1)
             } else {
                 unsetenv(vmlxMmapKey)
+            }
+            if let priorLegacyVmlxMmap {
+                setenv(legacyVmlxMmapKey, priorLegacyVmlxMmap, 1)
+            } else {
+                unsetenv(legacyVmlxMmapKey)
             }
             if let priorTensor {
                 setenv(tensorKey, priorTensor, 1)

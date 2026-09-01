@@ -12,11 +12,15 @@ import Foundation
 public enum DeepseekV4ReasoningPolicy {
     /// Deprecated compatibility key. `reasoning_effort=max` now passes through
     /// without an opt-in environment variable.
-    public static let rawMaxEnvironmentKey = "VMLINUX_DSV4_RAW_MAX"
+    public static let rawMaxEnvironmentKey = "VMLX_DSV4_RAW_MAX"
+    /// The pre-rename spelling, still honoured. See `RuntimeEnvironment`.
+    public static let legacyRawMaxEnvironmentKey = "VMLINUX_DSV4_RAW_MAX"
 
     /// Deprecated compatibility key. Public request/template controls must win;
     /// process environment must not silently force direct-answer rails.
-    public static let forceDirectRailEnvironmentKey = "VMLINUX_DSV4_FORCE_DIRECT_RAIL"
+    public static let forceDirectRailEnvironmentKey = "VMLX_DSV4_FORCE_DIRECT_RAIL"
+    /// The pre-rename spelling, still honoured. See `RuntimeEnvironment`.
+    public static let legacyForceDirectRailEnvironmentKey = "VMLINUX_DSV4_FORCE_DIRECT_RAIL"
 
     public static func isDeepseekV4(modelType: String?) -> Bool {
         guard let modelType else { return false }
@@ -34,7 +38,7 @@ public enum DeepseekV4ReasoningPolicy {
     public static func rawMaxEnabled(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
-        truthy(environment[rawMaxEnvironmentKey])
+        truthy(environment[rawMaxEnvironmentKey] ?? environment[legacyRawMaxEnvironmentKey])
     }
 
     @available(
@@ -43,7 +47,8 @@ public enum DeepseekV4ReasoningPolicy {
     public static func forceDirectRailEnabled(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
-        truthy(environment[forceDirectRailEnvironmentKey])
+        truthy(environment[forceDirectRailEnvironmentKey]
+            ?? environment[legacyForceDirectRailEnvironmentKey])
     }
 
     public static func normalizedReasoningEffort(

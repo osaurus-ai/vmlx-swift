@@ -33,7 +33,7 @@ Runtime names reserved for the future Osaurus/vMLX setting:
 Suggested environment variable for local benches:
 
 ```sh
-VMLINUX_ACCELERATOR=auto
+VMLX_ACCELERATOR=auto
 ```
 
 Implemented API shape:
@@ -136,8 +136,8 @@ For every island and model family:
 2. Use `ANEProbe` as the isolated Core ML capability check. It is deliberately
    outside the hot decode path and reports Core ML / Neural Engine visibility.
 3. Convert one media encoder first, preferably Nemotron-Omni RADIO or Parakeet,
-   and benchmark `BENCH_VL_CHAT_CACHE` with `VMLINUX_ACCELERATOR=metal` vs
-   `VMLINUX_ACCELERATOR=ane-coreml`.
+   and benchmark `BENCH_VL_CHAT_CACHE` with `VMLX_ACCELERATOR=metal` vs
+   `VMLX_ACCELERATOR=ane-coreml`.
 4. Only after a measured win, wire `AccelerationMode` into generation options
    and Osaurus settings.
 5. Leave dense/MoE decoder ANE islands as research until the media island is
@@ -145,7 +145,7 @@ For every island and model family:
 
 ## Current Flag Behavior
 
-`VMLINUX_ACCELERATOR` is parsed by `AccelerationRuntime.requestedMode()`:
+`VMLX_ACCELERATOR` is parsed by `AccelerationRuntime.requestedMode()`:
 
 | Value | Current behavior |
 | --- | --- |
@@ -162,10 +162,10 @@ before a real Core ML subgraph exists.
 2026-05-07 on the local M5 Max:
 
 ```text
-VMLINUX_ANE_PROBE_VERSION=1
-VMLINUX_ACCELERATOR_REQUESTED=metal
-VMLINUX_TEXT_DECODE_ACCELERATOR=metal
-VMLINUX_TEXT_DECODE_REASON=explicit-metal
+VMLX_ANE_PROBE_VERSION=1
+VMLX_ACCELERATOR_REQUESTED=metal
+VMLX_TEXT_DECODE_ACCELERATOR=metal
+VMLX_TEXT_DECODE_REASON=explicit-metal
 COREML_AVAILABLE=YES
 MLX_DIRECT_ANE_DEVICE=NO
 COREML_COMPUTE_UNITS=all

@@ -291,15 +291,15 @@ else
   fail_msg "Osaurus PR dirty-scope classifier exists"
 fi
 
-VMLINUX_BRANCH="$(git -C "$ROOT" branch --show-current 2>/dev/null || true)"
-VMLINUX_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+VMLX_BRANCH="$(git -C "$ROOT" branch --show-current 2>/dev/null || true)"
+VMLX_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
 OSAURUS_BRANCH="$(git -C "$OSAURUS_ROOT" branch --show-current 2>/dev/null || true)"
 OSAURUS_HEAD="$(git -C "$OSAURUS_ROOT" rev-parse HEAD 2>/dev/null || true)"
-VMLINUX_DIRTY_COUNT="$({ git -C "$ROOT" status --short 2>/dev/null || true; } | wc -l | tr -d ' ')"
+VMLX_DIRTY_COUNT="$({ git -C "$ROOT" status --short 2>/dev/null || true; } | wc -l | tr -d ' ')"
 OSAURUS_DIRTY_COUNT="$({ git -C "$OSAURUS_ROOT" status --short 2>/dev/null || true; } | wc -l | tr -d ' ')"
-VMLINUX_DIRTY_SAMPLE="$LOG_ROOT/vmlx-dirty-sample.txt"
+VMLX_DIRTY_SAMPLE="$LOG_ROOT/vmlx-dirty-sample.txt"
 OSAURUS_DIRTY_SAMPLE="$LOG_ROOT/osaurus-dirty-sample.txt"
-git -C "$ROOT" status --short 2>/dev/null | sed -n '1,80p' >"$VMLINUX_DIRTY_SAMPLE" || true
+git -C "$ROOT" status --short 2>/dev/null | sed -n '1,80p' >"$VMLX_DIRTY_SAMPLE" || true
 git -C "$OSAURUS_ROOT" status --short 2>/dev/null | sed -n '1,80p' >"$OSAURUS_DIRTY_SAMPLE" || true
 
 cat > "$LOG_ROOT/SUMMARY.md" <<SUMMARY
@@ -316,9 +316,9 @@ Inputs:
 
 Repos:
 
-- vMLX branch/head: ${VMLINUX_BRANCH:-unknown} ${VMLINUX_HEAD:-unknown}
+- vMLX branch/head: ${VMLX_BRANCH:-unknown} ${VMLX_HEAD:-unknown}
 - Osaurus branch/head: ${OSAURUS_BRANCH:-unknown} ${OSAURUS_HEAD:-unknown}
-- vMLX dirty entries: $VMLINUX_DIRTY_COUNT (sample: $VMLINUX_DIRTY_SAMPLE)
+- vMLX dirty entries: $VMLX_DIRTY_COUNT (sample: $VMLX_DIRTY_SAMPLE)
 - Osaurus dirty entries: $OSAURUS_DIRTY_COUNT (sample: $OSAURUS_DIRTY_SAMPLE)
 
 Logs: $LOG_ROOT

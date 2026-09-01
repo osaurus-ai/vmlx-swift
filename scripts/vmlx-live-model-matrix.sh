@@ -611,11 +611,11 @@ maybe_build() {
   fi
   if [[ "$BUILD_CONFIGURATION" == "release" ]]; then
     run_logged build_runbench env DEVELOPER_DIR="$SWIFT_DEVELOPER_DIR" \
-      swift build -c release --jobs "${VMLINUX_SWIFT_BUILD_JOBS:-2}" \
+      swift build -c release --jobs "${VMLX_SWIFT_BUILD_JOBS:-${VMLINUX_SWIFT_BUILD_JOBS:-2}}" \
         --product RunBench
   else
     run_logged build_runbench env DEVELOPER_DIR="$SWIFT_DEVELOPER_DIR" \
-      swift build --jobs "${VMLINUX_SWIFT_BUILD_JOBS:-2}" \
+      swift build --jobs "${VMLX_SWIFT_BUILD_JOBS:-${VMLINUX_SWIFT_BUILD_JOBS:-2}}" \
         --product RunBench
   fi
 }

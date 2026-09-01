@@ -8,22 +8,22 @@ import CoreML
 @main
 enum ANEProbe {
     static func main() {
-        print("VMLINUX_ANE_PROBE_VERSION=1")
+        print("VMLX_ANE_PROBE_VERSION=1")
         let mode = AccelerationRuntime.requestedMode()
-        print("VMLINUX_ACCELERATOR_REQUESTED=\(mode.flagValue)")
+        print("VMLX_ACCELERATOR_REQUESTED=\(mode.flagValue)")
         do {
             let decision = try AccelerationRuntime.resolveTextDecode(mode)
             switch decision {
             case .metal(let reason):
-                print("VMLINUX_TEXT_DECODE_ACCELERATOR=metal")
-                print("VMLINUX_TEXT_DECODE_REASON=\(reason)")
+                print("VMLX_TEXT_DECODE_ACCELERATOR=metal")
+                print("VMLX_TEXT_DECODE_REASON=\(reason)")
             case .coreMLANE(let manifestID):
-                print("VMLINUX_TEXT_DECODE_ACCELERATOR=ane-coreml")
-                print("VMLINUX_TEXT_DECODE_MANIFEST=\(manifestID)")
+                print("VMLX_TEXT_DECODE_ACCELERATOR=ane-coreml")
+                print("VMLX_TEXT_DECODE_MANIFEST=\(manifestID)")
             }
         } catch {
-            print("VMLINUX_TEXT_DECODE_ACCELERATOR=unavailable")
-            print("VMLINUX_TEXT_DECODE_ERROR=\(error.localizedDescription)")
+            print("VMLX_TEXT_DECODE_ACCELERATOR=unavailable")
+            print("VMLX_TEXT_DECODE_ERROR=\(error.localizedDescription)")
         }
 
         #if canImport(CoreML)

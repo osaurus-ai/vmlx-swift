@@ -95,13 +95,12 @@ enum Qwen4ExpCompiledGDNInputs {
 
     private static let enabled: Bool = {
         let value =
-            ProcessInfo.processInfo.environment["VMLINUX_QWEN4_EXP_COMPILE_GDN"]
+            RuntimeEnvironment.value("VMLX_QWEN4_EXP_COMPILE_GDN")
             ?? "1"
         return value != "0" && value.lowercased() != "false"
     }()
     private static let allowFP32Tail =
-        ProcessInfo.processInfo.environment[
-            "VMLINUX_QWEN4_EXP_COMPILE_GDN_FP32_TAIL"] == "1"
+        RuntimeEnvironment.flag("VMLX_QWEN4_EXP_COMPILE_GDN_FP32_TAIL")
     private static let lock = NSLock()
     nonisolated(unsafe) private static var regions: [String: Region] = [:]
     nonisolated(unsafe) private static var didReport = false
@@ -354,9 +353,7 @@ private enum Qwen4ExpCompiledMoE {
     typealias Region = @Sendable ([MLXArray]) -> [MLXArray]
 
     static let enabled: Bool = {
-        let value =
-            ProcessInfo.processInfo.environment["VMLINUX_QWEN4_EXP_COMPILE_MOE"]
-            ?? "1"
+        let value = RuntimeEnvironment.value("VMLX_QWEN4_EXP_COMPILE_MOE") ?? "1"
         return value != "0" && value.lowercased() != "false"
     }()
     private static let lock = NSLock()
@@ -1121,7 +1118,9 @@ enum Qwen35Language {
         _ args: Qwen35Configuration.TextConfiguration,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
-        if let override = environment["VMLINUX_QWEN35_COMPILE_DECODE_REGIONS"] {
+        if let override = RuntimeEnvironment.value(
+            "VMLX_QWEN35_COMPILE_DECODE_REGIONS", in: environment)
+        {
             return override != "0" && override.lowercased() != "false"
         }
         return args.modelType == "qwen3_5_moe_text"
@@ -1492,8 +1491,7 @@ enum Qwen35Language {
             _ inputs: MLXArray
         ) -> FusedDecodeInputProjection? {
             guard
-                ProcessInfo.processInfo.environment[
-                    "VMLINUX_QWEN4_EXP_FUSE_DECODE_INPUTS"] != "0",
+                RuntimeEnvironment.value("VMLX_QWEN4_EXP_FUSE_DECODE_INPUTS") != "0",
                 fuseDecodeInputProjections, inputs.dim(1) == 1,
                 !CompiledDecodeTrace.isActive
             else { return nil }
@@ -1569,9 +1567,8 @@ enum Qwen35Language {
             // linear-attention layer, which breaks speculative-decoding
             // output equivalence and draft acceptance. Retain it only as an
             // explicit diagnostic while the native path remains the default.
-            guard ProcessInfo.processInfo.environment[
-                "VMLINUX_QWEN4_EXP_COMPILE_GDN_FRONT"
-            ] == "1" else { return nil }
+            guard RuntimeEnvironment.value("VMLX_QWEN4_EXP_COMPILE_GDN_FRONT") == "1"
+            else { return nil }
             guard let fused = ensureFusedDecodeInputProjection(inputs) else { return nil }
             return Qwen4ExpCompiledGDNInputs.callFront(
                 input: inputs,

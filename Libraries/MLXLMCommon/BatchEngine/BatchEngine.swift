@@ -94,7 +94,7 @@ private func debugLogReasoningPromptTail(
     promptTail: String?,
     path: String
 ) {
-    guard ProcessInfo.processInfo.environment["VMLINUX_REASONING_PROMPT_TAIL_LOG"] == "1"
+    guard RuntimeEnvironment.flag("VMLX_REASONING_PROMPT_TAIL_LOG")
     else { return }
     let escaped = (promptTail ?? "<nil>")
         .replacingOccurrences(of: "\\", with: "\\\\")
@@ -113,7 +113,7 @@ private func debugDumpReasoningPrompt(
     path: String
 ) {
     let env = ProcessInfo.processInfo.environment
-    guard let dir = env["VMLINUX_REASONING_PROMPT_DUMP_DIR"],
+    guard let dir = RuntimeEnvironment.value("VMLX_REASONING_PROMPT_DUMP_DIR", in: env),
           !dir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     else { return }
 

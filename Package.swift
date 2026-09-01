@@ -917,6 +917,8 @@ let package = Package(
                 "ChatTemplateResolutionTests.swift",
                 "VMLXServerRuntimeSettingsTests.swift",
                 "VMLXMemorySafetySettingsTests.swift",
+                "RuntimeEnvironmentNamingTests.swift",
+                "RuntimeEnvironmentSourceCoverageTests.swift",
                 "DSV4AgenticToolSourceTests.swift",
                 "AgenticTaskBenchConfinementFocusedTests.swift",
                 "NoHiddenReasoningCloseBiasFocusedTests.swift",

@@ -32,9 +32,7 @@ enum Qwen4ExpFusedAffineMoE {
     private static let maximumRows = 4
 
     private static let enabled: Bool = {
-        let raw =
-            ProcessInfo.processInfo.environment[
-                "VMLINUX_QWEN4_EXP_FUSED_AFFINE_MOE"] ?? "1"
+        let raw = RuntimeEnvironment.value("VMLX_QWEN4_EXP_FUSED_AFFINE_MOE") ?? "1"
         return raw != "0" && raw.lowercased() != "false"
     }()
 

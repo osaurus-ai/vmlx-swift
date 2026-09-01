@@ -135,7 +135,9 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
         XCTAssertTrue(modelSource.contains("JANGTQ_ENABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH"))
         XCTAssertTrue(modelSource.contains("JANGTQ_DISABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH"))
         XCTAssertTrue(modelSource.contains("VMLX_NEMOTRON_LAYER_PROFILE"))
-        XCTAssertTrue(modelSource.contains("VMLINUX_NEMOTRON_LAYER_PROFILE"))
+        // Not the legacy literal: `RuntimeEnvironment.legacyName(of:)` derives `VMLINUX_…` from
+        // the current name, so the old variable still works without every call site spelling it
+        // out. Covered by `RuntimeEnvironmentSourceCoverageTests`.
         XCTAssertTrue(modelSource.contains("NEMOTRON_LAYER_PROFILE label=%@"))
         XCTAssertTrue(modelSource.contains("mamba.in_proj"))
         XCTAssertTrue(modelSource.contains("mamba.split"))

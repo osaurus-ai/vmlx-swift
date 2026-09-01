@@ -228,13 +228,12 @@ private enum Qwen4ExpCompiledMHC {
     typealias Region = @Sendable ([MLXArray]) -> [MLXArray]
 
     private static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["VMLINUX_QWEN4_EXP_COMPILE_MHC"]
+        let value = RuntimeEnvironment.value("VMLX_QWEN4_EXP_COMPILE_MHC")
             ?? "1"
         return value != "0" && value.lowercased() != "false"
     }()
     private static let allowTwoTokenVerify: Bool =
-        ProcessInfo.processInfo.environment[
-            "VMLINUX_QWEN4_EXP_COMPILE_MHC_S2"] == "1"
+        RuntimeEnvironment.flag("VMLX_QWEN4_EXP_COMPILE_MHC_S2")
     private static let lock = NSLock()
     nonisolated(unsafe) private static var regions: [String: Region] = [:]
     nonisolated(unsafe) private static var didReport = false
@@ -393,8 +392,7 @@ private enum Qwen4ExpCompiledMHC {
 
 private final class Qwen4ExpGatedResidual: Module {
     private static let fuseDecodeInputs =
-        ProcessInfo.processInfo.environment[
-            "VMLINUX_QWEN4_EXP_FUSE_DECODE_INPUTS"] != "0"
+        RuntimeEnvironment.value("VMLX_QWEN4_EXP_FUSE_DECODE_INPUTS") != "0"
     private static let fusionDiagnosticLock = NSLock()
     private nonisolated(unsafe) static var didReportInputFusion = false
 
@@ -570,12 +568,9 @@ private final class Qwen4ExpGatedResidual: Module {
 }
 
 private final class Qwen4ExpPLE: Module {
-    private static let profileHost = ProcessInfo.processInfo.environment[
-        "VMLINUX_QWEN4_EXP_PROFILE_PLE"] == "1"
-    private static let traceHistory = ProcessInfo.processInfo.environment[
-        "VMLINUX_QWEN4_EXP_TRACE_PLE_HISTORY"] == "1"
-    private static let traceState = ProcessInfo.processInfo.environment[
-        "VMLINUX_QWEN4_EXP_TRACE_PLE_STATE"] == "1"
+    private static let profileHost = RuntimeEnvironment.flag("VMLX_QWEN4_EXP_PROFILE_PLE")
+    private static let traceHistory = RuntimeEnvironment.flag("VMLX_QWEN4_EXP_TRACE_PLE_HISTORY")
+    private static let traceState = RuntimeEnvironment.flag("VMLX_QWEN4_EXP_TRACE_PLE_STATE")
     let config: Qwen4ExpConfiguration
     let pleLayerIndex: Int
     let multipliers: [Int64]
@@ -1020,12 +1015,9 @@ private final class Qwen4ExpAttention: Module {
 }
 
 private final class Qwen4ExpDecoderLayer: Module {
-    private static let profiledLayer = ProcessInfo.processInfo.environment[
-        "VMLINUX_QWEN4_EXP_PROFILE_LAYER"].flatMap(Int.init)
-    private static let profileLimit = Int(ProcessInfo.processInfo.environment[
-        "VMLINUX_QWEN4_EXP_PROFILE_LIMIT"] ?? "4") ?? 4
-    private static let profileSequenceLength = Int(ProcessInfo.processInfo.environment[
-        "VMLINUX_QWEN4_EXP_PROFILE_SEQUENCE"] ?? "1") ?? 1
+    private static let profiledLayer = RuntimeEnvironment.value("VMLX_QWEN4_EXP_PROFILE_LAYER").flatMap(Int.init)
+    private static let profileLimit = Int(RuntimeEnvironment.value("VMLX_QWEN4_EXP_PROFILE_LIMIT") ?? "4") ?? 4
+    private static let profileSequenceLength = Int(RuntimeEnvironment.value("VMLX_QWEN4_EXP_PROFILE_SEQUENCE") ?? "1") ?? 1
 
     let layerIndex: Int
     let isLinear: Bool

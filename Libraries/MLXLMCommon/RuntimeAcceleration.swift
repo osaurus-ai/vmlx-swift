@@ -3,7 +3,7 @@
 
 import Foundation
 
-/// Runtime accelerator requested by a caller or by `VMLINUX_ACCELERATOR`.
+/// Runtime accelerator requested by a caller or by `VMLX_ACCELERATOR`.
 ///
 /// This is a selection contract, not an implementation shortcut. The current
 /// MLX backend exposes CPU/GPU devices, while public Neural Engine execution is
@@ -26,7 +26,12 @@ public enum AccelerationMode: Sendable, Equatable, CustomStringConvertible {
     /// contract. Stored explicitly so generation can fail closed.
     case invalid(String)
 
-    public static let environmentVariable = "VMLINUX_ACCELERATOR"
+    public static let environmentVariable = "VMLX_ACCELERATOR"
+
+    /// The pre-rename spelling, still honoured. Kept as its own symbol rather than left as the
+    /// value of `environmentVariable`: a consumer reading that symbol to build a settings UI or
+    /// documentation would otherwise publish the legacy name outward.
+    public static let legacyEnvironmentVariable = "VMLINUX_ACCELERATOR"
 
     public init(flagValue rawValue: String) {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -94,7 +99,13 @@ public enum AccelerationRuntime {
     public static func requestedMode(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> AccelerationMode {
-        guard let raw = environment[AccelerationMode.environmentVariable] else {
+        // Both, in that order. This read went through the symbol alone, so flipping the
+        // constant without widening it here would have silently dropped every existing
+        // VMLINUX_ACCELERATOR user.
+        guard
+            let raw = environment[AccelerationMode.environmentVariable]
+                ?? environment[AccelerationMode.legacyEnvironmentVariable]
+        else {
             return .metal
         }
         return AccelerationMode(flagValue: raw)

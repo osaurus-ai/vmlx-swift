@@ -782,7 +782,7 @@ func applyPlainDeepseekV4ProcessMemoryLimitsIfNeeded(
 private func load<R>(loader: (ModelFactory) async throws -> sending R) async throws -> sending R {
     let factories = ModelFactoryRegistry.shared.modelFactories()
     let traceFactoryFallbacks: Bool = {
-        let raw = ProcessInfo.processInfo.environment["VMLINUX_MODEL_FACTORY_TRACE"]?
+        let raw = RuntimeEnvironment.value("VMLX_MODEL_FACTORY_TRACE")?
             .lowercased()
         return raw == "1" || raw == "true" || raw == "on" || raw == "yes"
     }()
@@ -837,17 +837,24 @@ private func withMmapSafetensorsEnv<R>(
     #if canImport(Darwin) || canImport(Glibc)
         let mmapKey = "MLX_SAFETENSORS_MMAP"
         let vmlxMmapKey = "VMLX_MMAP_SAFETENSORS"
+        // The consumer is `mmap_safetensors_enabled` in the MLX C++ submodule, which reads
+        // MLX_SAFETENSORS_MMAP or the LEGACY spelling — not this one. Writing only the new name
+        // made this a dead write; mmap kept working solely because MLX_SAFETENSORS_MMAP is set
+        // beside it. Write both until the submodule reads the new name too.
+        let legacyVmlxMmapKey = RuntimeEnvironment.legacyName(of: vmlxMmapKey)!
         let tensorKey = "MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS"
         let startColdKey = "MLX_SAFETENSORS_MMAP_START_COLD"
         let coldPctKey = "MLX_SAFETENSORS_MMAP_COLD_PCT"
         let priorMmap = getenv(mmapKey).map { String(cString: $0) }
         let priorVmlxMmap = getenv(vmlxMmapKey).map { String(cString: $0) }
+        let priorLegacyVmlxMmap = getenv(legacyVmlxMmapKey).map { String(cString: $0) }
         let priorTensor = getenv(tensorKey).map { String(cString: $0) }
         let priorStartCold = getenv(startColdKey).map { String(cString: $0) }
         let priorColdPct = getenv(coldPctKey).map { String(cString: $0) }
         if enabled {
             setenv(mmapKey, "1", 1)
             setenv(vmlxMmapKey, "1", 1)
+            setenv(legacyVmlxMmapKey, "1", 1)
             if tensorBuffers {
                 setenv(tensorKey, "1", 1)
             }
@@ -875,6 +882,11 @@ private func withMmapSafetensorsEnv<R>(
                 setenv(vmlxMmapKey, priorVmlxMmap, 1)
             } else {
                 unsetenv(vmlxMmapKey)
+            }
+            if let priorLegacyVmlxMmap {
+                setenv(legacyVmlxMmapKey, priorLegacyVmlxMmap, 1)
+            } else {
+                unsetenv(legacyVmlxMmapKey)
             }
             if let priorTensor {
                 setenv(tensorKey, priorTensor, 1)

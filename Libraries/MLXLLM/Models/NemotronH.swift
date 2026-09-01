@@ -98,7 +98,7 @@ private func nemotronHEnvFlag(_ name: String) -> Bool {
 }
 
 private let nemotronHActivationBF16RetentionFlag =
-    nemotronHEnvFlag("VMLINUX_ENABLE_NEMOTRON_ACTIVATION_BF16")
+    RuntimeEnvironment.flag("VMLX_ENABLE_NEMOTRON_ACTIVATION_BF16")
     && !nemotronHEnvFlag("JANGTQ_DISABLE_NEMOTRON_ACTIVATION_BF16")
 private let nemotronHWeightedMoEFastPathFlag =
     nemotronHEnvFlag("JANGTQ_ENABLE_NEMOTRON_WEIGHTED_MOE_FASTPATH")
@@ -143,10 +143,9 @@ internal func nemotronHNativeMTPEnabled() -> Bool {
 }
 
 private let nemotronHLayerProfileFlag =
-    nemotronHEnvFlag("VMLX_NEMOTRON_LAYER_PROFILE")
-    || nemotronHEnvFlag("VMLINUX_NEMOTRON_LAYER_PROFILE")
+    RuntimeEnvironment.flag("VMLX_NEMOTRON_LAYER_PROFILE")
 private let nemotronHMambaConvFastPathDisabledFlag =
-    nemotronHEnvFlag("VMLINUX_DISABLE_NEMOTRON_MAMBA_CONV_FASTPATH")
+    RuntimeEnvironment.flag("VMLX_DISABLE_NEMOTRON_MAMBA_CONV_FASTPATH")
 
 private func nemotronHActivationBF16RetentionEnabled() -> Bool {
     nemotronHActivationBF16RetentionFlag

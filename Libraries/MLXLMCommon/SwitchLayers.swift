@@ -65,8 +65,7 @@ private enum Qwen4ExpCompiledRoutedSwitchGLU {
     typealias Region = @Sendable ([MLXArray]) -> [MLXArray]
 
     private static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment[
-            "VMLINUX_QWEN4_EXP_COMPILE_ROUTED_MOE"] ?? "1"
+        let value = RuntimeEnvironment.value("VMLX_QWEN4_EXP_COMPILE_ROUTED_MOE") ?? "1"
         return value != "0" && value.lowercased() != "false"
     }()
     private static let lock = NSLock()

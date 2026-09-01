@@ -445,8 +445,7 @@ public func reDeriveAndStoreSSMStatesAtPromptBoundaries(
     prefillStepSize: Int = 512
 ) -> [Int: [MLXArray]] {
     func trace(_ message: String) {
-        guard ProcessInfo.processInfo.environment["VMLINUX_SSM_REDERIVE_TRACE"] == "1"
-            || ProcessInfo.processInfo.environment["VMLX_SSM_REDERIVE_TRACE"] == "1"
+        guard RuntimeEnvironment.flag("VMLX_SSM_REDERIVE_TRACE")
         else { return }
         FileHandle.standardError.write(
             Data("[vmlx][cache/ssm-rederive] prompt-boundaries/\(message) hybrid=\(coordinator.isHybrid) promptLen=\(promptTokenIds.count)\n".utf8))

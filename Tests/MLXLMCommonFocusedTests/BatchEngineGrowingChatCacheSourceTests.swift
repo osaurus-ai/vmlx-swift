@@ -622,7 +622,12 @@ struct BatchEngineGrowingChatCacheSourceTests {
             contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
             encoding: .utf8)
 
-        #expect(engine.contains("VMLINUX_REASONING_PROMPT_TAIL_LOG"))
+        // The legacy `VMLINUX_` spelling is no longer a literal at the call site: it is derived
+        // centrally by `RuntimeEnvironment.legacyName(of:)`, so the variable still resolves while
+        // each call site names only the current spelling. Asserting the old literal here pinned the
+        // duplication rather than the guarantee. `RuntimeEnvironmentSourceCoverageTests` enforces that no site
+        // reads a legacy name as its ONLY spelling.
+        #expect(engine.contains("VMLX_REASONING_PROMPT_TAIL_LOG"))
         #expect(engine.contains("debugLogReasoningPromptTail"))
         #expect(engine.contains("path: \"BatchEngine.generate\""))
         #expect(engine.contains("path: \"BatchEngine.submit\""))

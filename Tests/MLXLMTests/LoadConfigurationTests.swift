@@ -244,7 +244,11 @@ struct LoadConfigurationTests {
             encoding: .utf8)
 
         #expect(source.contains("let mmapSafetensorsActive = envFlag(\"MLX_SAFETENSORS_MMAP\")"))
-        #expect(source.contains("let allowJANGTQMmapBFloat16 = envFlag(\"VMLINUX_JANGTQ_BF16_MMAP\")"))
+        // `RuntimeEnvironment.flag` replaced the raw `envFlag` here and names only the current
+        // spelling; the legacy `VMLINUX_` name is still honoured, derived centrally by
+        // `RuntimeEnvironment.legacyName(of:)`. See `RuntimeEnvironmentSourceCoverageTests`.
+        #expect(source.contains(
+            "let allowJANGTQMmapBFloat16 = RuntimeEnvironment.flag(\"VMLX_JANGTQ_BF16_MMAP\")"))
         #expect(source.contains("let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)"))
         #expect(source.contains("!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16"))
         #expect(source.contains("|| autoJANGTQMmapBFloat16"))
