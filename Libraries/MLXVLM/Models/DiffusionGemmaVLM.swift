@@ -49,11 +49,45 @@ public struct DiffusionGemmaVLMConfiguration: Codable, Sendable {
 /// tower, install the vision modules + the prompt-embedding splice closure.
 /// Text-only bundles (no `vision_config` / `image_token_id`) come back as
 /// the plain text engine.
+/// Which lanes this configuration can actually build.
+///
+/// Note the second condition: a vision tower is only installable when the bundle ALSO declares an
+/// `image_token_id`, because without it there is nowhere to splice the features. A bundle with a
+/// `vision_config` and no image token is not a vision bundle, and saying so here keeps the
+/// declaration honest rather than optimistic.
+public func diffusionGemmaConstructibleModalities(
+    of config: DiffusionGemmaVLMConfiguration
+) -> Set<ModelRuntimeRequestModality> {
+    config.visionConfig != nil && config.core.imageTokenId != nil ? [.text, .vision] : [.text]
+}
+
+/// - Parameter requesting: the caller's subset, or nil for "everything this config offers".
+///   Asking for a lane the config cannot build throws rather than yielding a model that fails
+///   later at `prepare()`.
+public func makeDiffusionGemmaVLM(
+    _ config: DiffusionGemmaVLMConfiguration,
+    requesting: Set<ModelRuntimeRequestModality>?
+) throws -> DiffusionGemmaModel {
+    let resolved = try Set.resolveForConstruction(
+        requested: requesting,
+        constructible: diffusionGemmaConstructibleModalities(of: config))
+    return makeDiffusionGemmaVLM(config, modalities: resolved)
+}
+
 public func makeDiffusionGemmaVLM(
     _ config: DiffusionGemmaVLMConfiguration
 ) -> DiffusionGemmaModel {
+    makeDiffusionGemmaVLM(config, modalities: diffusionGemmaConstructibleModalities(of: config))
+}
+
+/// Builds exactly the lanes named by `modalities`.
+public func makeDiffusionGemmaVLM(
+    _ config: DiffusionGemmaVLMConfiguration,
+    modalities: Set<ModelRuntimeRequestModality>
+) -> DiffusionGemmaModel {
     let model = DiffusionGemmaModel(config.core)
-    guard let visionConfig = config.visionConfig,
+    guard modalities.contains(.vision),
+        let visionConfig = config.visionConfig,
         let imageTokenId = config.core.imageTokenId
     else {
         return model

@@ -579,7 +579,15 @@ class DiffusionGemmaInnerModel: Module {
 
 // MARK: - Top-level model
 
-public class DiffusionGemmaModel: Module, LLMModel {
+public class DiffusionGemmaModel: Module, LLMModel, ModalityBearing {
+    /// What this instance actually carries.
+    ///
+    /// Unlike the other converted families this is a `var`, and honestly so: this type is built
+    /// as the text engine and GAINS its vision lane later, when `installVision` attaches a tower.
+    /// Its VLM creator returns this same type — there is no separate multimodal class — so the
+    /// modality set has to follow the installation rather than the initialiser.
+    public private(set) var modalities: Set<ModelRuntimeRequestModality> = [.text]
+
 
     @ModuleInfo var model: DiffusionGemmaInnerModel
 
@@ -746,6 +754,7 @@ public class DiffusionGemmaModel: Module, LLMModel {
             @escaping (LMInput, DiffusionGemmaModel) throws
                 -> (embeddings: MLXArray, visionBlockIds: MLXArray)?
     ) {
+        modalities.insert(.vision)
         model.encoder.visionTower = tower
         model.encoder.embedVision = embedder
         visionPromptEmbedder = promptEmbedder

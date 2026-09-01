@@ -1074,7 +1074,9 @@ public struct Qwen35Configuration: Codable, Sendable {
     public typealias VisionConfiguration = Qwen3VLConfiguration.VisionConfiguration
 
     public let textConfiguration: TextConfiguration
-    public let visionConfiguration: VisionConfiguration
+    /// Optional, like `Gemma4Configuration.visionConfig`. A text-only Qwen 3.5 bundle carries no
+    /// `vision_config`, and while this was non-optional such a bundle could not DECODE at all.
+    public let visionConfiguration: VisionConfiguration?
     public let modelType: String
     private let _ignoreIndex: Int?
     public var ignoreIndex: Int { _ignoreIndex ?? -100 }
@@ -2654,7 +2656,7 @@ enum Qwen35Language {
                             inputIds: inputs,
                             imageGridTHW: imageGridTHW,
                             videoGridTHW: videoGridTHW,
-                            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+                            spatialMergeSize: config.visionConfiguration?.spatialMergeSize ?? 1,
                             imageTokenId: config.imageTokenId,
                             videoTokenId: config.videoTokenId,
                             visionStartTokenId: config.visionStartTokenId,
@@ -2895,14 +2897,50 @@ enum Qwen35Language {
 public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel,
     DFlash2StagedVerifyRollbackModel
 {
-    @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
+    @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel?
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
     public let config: Qwen35Configuration
 
-    public init(_ config: Qwen35Configuration) {
+    /// What this instance actually carries. Same contract as the other converted families.
+    public let modalities: Set<ModelRuntimeRequestModality>
+
+    /// Which towers this configuration can instantiate.
+    ///
+    /// `.video` IS claimed here, unlike the Gemma and Mistral families: `prepare` consumes
+    /// `input.video` and the vision tower takes a `videoGridTHW`, so the lane is real rather than
+    /// nominal. The image/video split earns its keep exactly here — one flag would have made this
+    /// family and Pixtral indistinguishable.
+    public static func constructibleModalities(
+        of config: Qwen35Configuration
+    ) -> Set<ModelRuntimeRequestModality> {
+        config.visionConfiguration != nil ? [.text, .vision, .video] : [.text]
+    }
+
+    public convenience init(_ config: Qwen35Configuration) {
+        self.init(config, modalities: Self.constructibleModalities(of: config))
+    }
+
+    /// - Parameter requesting: the caller's subset, or nil for "everything this config offers".
+    public convenience init(
+        _ config: Qwen35Configuration,
+        requesting: Set<ModelRuntimeRequestModality>?
+    ) throws {
+        let resolved = try Set.resolveForConstruction(
+            requested: requesting, constructible: Self.constructibleModalities(of: config))
+        self.init(config, modalities: resolved)
+    }
+
+    /// The one real initialiser: builds exactly the towers named by `modalities`.
+    public init(
+        _ config: Qwen35Configuration,
+        modalities: Set<ModelRuntimeRequestModality>
+    ) {
+        self.modalities = modalities
         self.config = config
-        _visionModel.wrappedValue = Qwen3VLVision.VisionModel(config.visionConfiguration)
+        if let vision = config.visionConfiguration, modalities.contains(.vision) {
+            _visionModel.wrappedValue = Qwen3VLVision.VisionModel(vision)
+        }
         _languageModel.wrappedValue = Qwen35Language.LanguageModel(config)
         super.init()
     }
@@ -3008,8 +3046,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     /// vision tower's output rows: each `THW` frame yields
     /// `t*h*w / spatialMergeSize^2` rows.
     private func mergedRowCount(for frames: [THW]?) -> Int {
-        guard let frames else { return 0 }
-        let merge = config.visionConfiguration.spatialMergeSize
+        guard let frames, let vision = config.visionConfiguration else { return 0 }
+        let merge = vision.spatialMergeSize
         let divisor = max(1, merge * merge)
         return frames.reduce(0) { $0 + $1.product / divisor }
     }
@@ -3042,7 +3080,16 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         var imageFrames: [THW]?
         var videoFrames: [THW]?
 
-        let visionDType = visionModel.patchEmbed.proj.weight.dtype
+        // Media arrived at a model that carries no vision tower. Refuse rather than embed the
+        // prompt without it: a silently media-free answer looks like a bad model, not a bad call.
+        if input.image != nil || input.video != nil, visionModel == nil {
+            throw VLMError.processing(
+                "image or video input requires the vision tower, and this instance carries none "
+                + "(modalities: \(modalities.modalityDescription)). "
+                + "Load with .vision requested, or send text only.")
+        }
+        let visionDType =
+            visionModel?.patchEmbed.proj.weight.dtype ?? languageModel.model.embedTokens.weight.dtype
         var pixelParts: [MLXArray] = []
 
         if let image = input.image {
@@ -3059,7 +3106,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
 
         var inputEmbeddings: MLXArray?
 
-        if let pixelValues,
+        if let pixelValues, let visionModel,
             let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
                 .nilIfEmpty
         {
@@ -3386,6 +3433,11 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
             sanitized[key] = value
         }
 
+        // With no tower built, the bundle's vision weights have no destination — drop them
+        // rather than hand them to a module that does not exist.
+        guard let visionModel else {
+            return sanitized.filter { !$0.key.contains("visual") && !$0.key.contains("vision_tower") }
+        }
         return visionModel.sanitize(weights: sanitized)
     }
 

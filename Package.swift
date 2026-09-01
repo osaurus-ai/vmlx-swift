@@ -863,6 +863,7 @@ let package = Package(
                 "ToolCallProgressRoutingTests.swift",
                 "FocusedMLXTestSupport.swift",
                 "CanonicalChatCacheBoundariesTests.swift",
+                "UniversalCapabilityConstructionTests.swift",
                 "RotatingKVCachePhysicalGrowthTests.swift",
                 "Mistral3ScalarEosDecodeTests.swift",
                 "NativeMTPWarmupMemoScopeTests.swift",

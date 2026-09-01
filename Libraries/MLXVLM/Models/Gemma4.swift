@@ -299,7 +299,9 @@ struct G4TextConfig: Codable, Sendable {
 
 public struct Gemma4Configuration: Codable, Sendable {
     let textConfig: G4TextConfig
-    let visionConfig: Gemma4VisionConfig
+    /// Optional, like `audioConfig` below. A text-only Gemma 4 bundle carries no `vision_config`,
+    /// and while this was non-optional such a bundle could not DECODE this configuration at all.
+    let visionConfig: Gemma4VisionConfig?
     /// Full `audio_config` when present. `model_type == "gemma4_audio"`
     /// (E2B/E4B) means the bundle ships a conformer `audio_tower`;
     /// `gemma4_unified_audio` (12B) is the encoder-free raw-chunking path.
@@ -344,7 +346,7 @@ public struct Gemma4Configuration: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: DecodingKeys.self)
         textConfig = try c.decode(G4TextConfig.self, forKey: .textConfig)
-        visionConfig = try c.decode(Gemma4VisionConfig.self, forKey: .visionConfig)
+        visionConfig = try c.decodeIfPresent(Gemma4VisionConfig.self, forKey: .visionConfig)
         modelType = try c.decodeIfPresent(String.self, forKey: .modelType) ?? "gemma4"
         imageTokenId = try c.decodeIfPresent(Int.self, forKey: .imageTokenId) ?? 258880
         audioTokenId = try c.decodeIfPresent(Int.self, forKey: .audioTokenId) ?? 258881
@@ -360,7 +362,9 @@ public struct Gemma4Configuration: Codable, Sendable {
         }
         visionSoftTokensPerImage =
             try c.decodeIfPresent(Int.self, forKey: .visionSoftTokensPerImage)
-            ?? visionConfig.defaultOutputLength
+            // Zero when the bundle has no vision section: there are no image soft tokens to
+            // budget for, and any value would be a fiction.
+            ?? visionConfig?.defaultOutputLength ?? 0
         quantization = try c.decodeIfPresent(BaseConfiguration.Quantization.self, forKey: .quantization)
     }
 }
@@ -1151,7 +1155,7 @@ func gemma4MaskedScatter(
 
 // MARK: - Gemma4 VLM
 
-public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
+public class Gemma4: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing {
     @ModuleInfo(key: "vision_tower") private var visionTower: VisionTower?
     @ModuleInfo(key: "vision_embedder") private var unifiedVisionEmbedder: UnifiedVisionEmbedder?
     @ModuleInfo(key: "audio_tower") private var audioTower: Gemma4AudioTower?
@@ -1171,23 +1175,72 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] { languageModel.newCache(parameters: parameters) }
 
-    public init(_ config: Gemma4Configuration) {
+    /// What this instance actually carries. Same contract as the other converted families.
+    public let modalities: Set<ModelRuntimeRequestModality>
+
+    /// Which towers this configuration can instantiate.
+    ///
+    /// No `.video` lane, deliberately: `prepare` refuses video outright ("no proven vMLX video
+    /// path yet"), so declaring it would let a video request pass construction and fail later —
+    /// exactly the failure the modality set exists to move earlier.
+    ///
+    /// `.audio` is claimed only for the CONFORMER tower. `gemma4_unified_audio` bundles take the
+    /// encoder-free raw-chunking path and build no tower, so there is nothing to skip.
+    public static func constructibleModalities(
+        of config: Gemma4Configuration
+    ) -> Set<ModelRuntimeRequestModality> {
+        var m: Set<ModelRuntimeRequestModality> = [.text]
+        if config.visionConfig != nil { m.insert(.vision) }
+        if config.hasConformerAudioTower { m.insert(.audio) }
+        return m
+    }
+
+    public convenience init(_ config: Gemma4Configuration) {
+        self.init(config, modalities: Self.constructibleModalities(of: config))
+    }
+
+    /// - Parameter requesting: the caller's subset, or nil for "everything this config offers".
+    public convenience init(
+        _ config: Gemma4Configuration,
+        requesting: Set<ModelRuntimeRequestModality>?
+    ) throws {
+        let resolved = try Set.resolveForConstruction(
+            requested: requesting, constructible: Self.constructibleModalities(of: config))
+        self.init(config, modalities: resolved)
+    }
+
+    /// The one real initialiser: builds exactly the towers named by `modalities`.
+    public init(
+        _ config: Gemma4Configuration,
+        modalities: Set<ModelRuntimeRequestModality>
+    ) {
+        self.modalities = modalities
         self.config = config
-        if config.visionConfig.usesUnifiedVisionEmbedder {
-            _unifiedVisionEmbedder.wrappedValue = UnifiedVisionEmbedder(config.visionConfig)
-        } else {
-            _visionTower.wrappedValue = VisionTower(config.visionConfig)
+        if let visionConfig = config.visionConfig, modalities.contains(.vision) {
+            if visionConfig.usesUnifiedVisionEmbedder {
+                _unifiedVisionEmbedder.wrappedValue = UnifiedVisionEmbedder(visionConfig)
+            } else {
+                _visionTower.wrappedValue = VisionTower(visionConfig)
+            }
         }
         // The conformer audio tower exists only on E-series bundles
         // (audio_config.model_type == "gemma4_audio"). Unified 12B bundles
         // (gemma4_unified_audio) and audio-less 26B/31B bundles stay
         // tower-free; their `audio_tower.*` weights (if any) are discarded
         // in sanitize().
-        if let audioConfig = config.audioConfig, audioConfig.isConformerTower {
+        if let audioConfig = config.audioConfig, audioConfig.isConformerTower,
+            modalities.contains(.audio)
+        {
             _audioTower.wrappedValue = Gemma4AudioTower(audioConfig)
         }
         _languageModel.wrappedValue = G4LanguageModel(config.textConfig)
-        _embedVision.wrappedValue = MultimodalEmbedder(embDim: config.visionConfig.outputProjectionDimensions, textDim: config.textConfig.hiddenSize)
+        // Built unconditionally: it is a projection the checkpoint may still carry, and its
+        // dimension comes from the vision config when there is one. With no vision section
+        // there are no `embed_vision.*` weights to receive either.
+        _embedVision.wrappedValue = MultimodalEmbedder(
+            embDim: config.visionConfig?.outputProjectionDimensions
+                ?? config.textConfig.hiddenSize,
+            textDim: config.textConfig.hiddenSize)
         _embedAudio.wrappedValue = MultimodalEmbedder(embDim: config.audioEmbedDim, textDim: config.textConfig.hiddenSize)
     }
 
@@ -1387,8 +1440,8 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                 p[nk] = v
                 continue
             }
-            if nk.hasPrefix("vision_tower.") && config.visionConfig.usesUnifiedVisionEmbedder { continue }
-            if nk.hasPrefix("vision_embedder.") && !config.visionConfig.usesUnifiedVisionEmbedder { continue }
+            if nk.hasPrefix("vision_tower.") && (config.visionConfig?.usesUnifiedVisionEmbedder ?? true) { continue }
+            if nk.hasPrefix("vision_embedder.") && !(config.visionConfig?.usesUnifiedVisionEmbedder ?? false) { continue }
             // Skip clipped linear params on non-audio modules — the vision
             // tower uses plain Linear. (Audio tower keys are handled above
             // and KEEP their input/output clipping scalars.)
