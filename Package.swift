@@ -854,6 +854,7 @@ let package = Package(
                 "ModelConstructionModalitiesTests.swift",
                 "DSMLToolCallParserFocusedTests.swift",
                 "DeepseekV4ToolHistoryPrefixBoundaryTests.swift",
+                "Mistral3CapabilityConstructionTests.swift",
                 "DeepseekV4DropThinkingCacheTests.swift",
                 "DeepseekV4AgentLoopBoundaryTests.swift",
                 "EarlyCompletionBeforeCachePersistTests.swift",
