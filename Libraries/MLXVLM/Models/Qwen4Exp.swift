@@ -1377,7 +1377,7 @@ protocol Qwen4ExpModelDirectoryConfigurable: AnyObject {
 
 public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurable,
     SafetensorsLoadKeyExcluding, NativeMTPModel, DFlash2StagedVerifyRollbackModel,
-    CompiledDecodeExternalInputModel
+    CompiledDecodeExternalInputModel, ModalityBearing
 {
     /// QSA index selection and its path-dependent cache currently require a
     /// single sequence. Keep concurrent requests queued until a B-wide QSA
@@ -1388,7 +1388,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     @ModuleInfo(key: "language_model") private var textModel: Qwen4ExpTextModel
     @ModuleInfo(key: "lm_head") private var head: Linear
     @ModuleInfo(key: "mtp") private var mtp: Qwen4ExpMTPModule?
-    @ModuleInfo(key: "visual") private var visionModel: Qwen3VLVision.VisionModel
+    @ModuleInfo(key: "visual") private var visionModel: Qwen3VLVision.VisionModel?
 
     /// M-RoPE delta established by the most recent media prefill, keyed by the
     /// conversation's cache identity so concurrent sessions do not cross.
@@ -1398,7 +1398,40 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     private let ropeDeltaLock = NSLock()
     nonisolated(unsafe) private var ropeDeltas: [ObjectIdentifier: Int] = [:]
 
-    public init(_ config: Qwen4ExpConfiguration) {
+    /// What this instance actually carries. Same contract as every other multimodal family here.
+    public let modalities: Set<ModelRuntimeRequestModality>
+
+    /// Which towers this configuration can instantiate.
+    ///
+    /// `.video` IS claimed: `prepare` consumes `input.video` and threads real video frames into
+    /// the tower, so the lane is genuine rather than nominal — the same shape as `qwen3_5`, and
+    /// unlike the Gemma and Pixtral families which are image-only.
+    public static func constructibleModalities(
+        of config: Qwen4ExpConfiguration
+    ) -> Set<ModelRuntimeRequestModality> {
+        config.base.visionConfiguration != nil ? [.text, .vision, .video] : [.text]
+    }
+
+    public convenience init(_ config: Qwen4ExpConfiguration) {
+        self.init(config, modalities: Self.constructibleModalities(of: config))
+    }
+
+    /// - Parameter requesting: the caller's subset, or nil for "everything this config offers".
+    public convenience init(
+        _ config: Qwen4ExpConfiguration,
+        requesting: Set<ModelRuntimeRequestModality>?
+    ) throws {
+        let resolved = try Set.resolveForConstruction(
+            requested: requesting, constructible: Self.constructibleModalities(of: config))
+        self.init(config, modalities: resolved)
+    }
+
+    /// The one real initialiser: builds exactly the towers named by `modalities`.
+    public init(
+        _ config: Qwen4ExpConfiguration,
+        modalities: Set<ModelRuntimeRequestModality>
+    ) {
+        self.modalities = modalities
         self.config = config
         _textModel.wrappedValue = Qwen4ExpTextModel(config)
         _head.wrappedValue = Linear(
@@ -1407,7 +1440,9 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         if config.extras.mtpNumHiddenLayers > 0 {
             _mtp.wrappedValue = Qwen4ExpMTPModule(config)
         }
-        _visionModel.wrappedValue = Qwen3VLVision.VisionModel(config.base.visionConfiguration)
+        if let vision = config.base.visionConfiguration, modalities.contains(.vision) {
+            _visionModel.wrappedValue = Qwen3VLVision.VisionModel(vision)
+        }
         super.init()
     }
 
@@ -1457,6 +1492,15 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
             return .logits(LMOutput(logits: callAsFunction(inputIds, cache: cache)))
         }
 
+        // Media arrived at a model that carries no vision tower. Refuse rather than embed the
+        // prompt without it: a silently media-free answer looks like a bad model, not a bad call.
+        guard let visionModel else {
+            throw VLMError.processing(
+                "image or video input requires the vision tower, and this instance carries none "
+                + "(modalities: \(modalities.modalityDescription)). "
+                + "Load with .vision requested, or send text only.")
+        }
+
         // Media prefill: encode pixels through the bundled quantized vision
         // tower, scatter image rows onto image placeholders and video rows
         // onto video placeholders (never interleaved), and derive 3-channel
@@ -1485,7 +1529,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         let (visionHidden, _) = visionModel(concatenated(pixelParts), gridTHW: frames)
         let features = visionHidden.asType(textEmbeds.dtype)
 
-        let mergeSize = config.base.visionConfiguration.spatialMergeSize
+        let mergeSize = config.base.visionConfiguration?.spatialMergeSize ?? 1
         let divisor = max(1, mergeSize * mergeSize)
         let imageRowCount = (imageFrames ?? []).reduce(0) { $0 + $1.product / divisor }
         let mergedEmbeddings = try Self.scatterMediaFeatures(
@@ -1711,6 +1755,11 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
                 || originalKey.contains("ngram_embedding.shards")
                 || originalKey.contains("ngram_heads_") || originalKey.contains("layer_multipliers")
             { continue }
+            // No tower to receive them. A multimodal bundle loaded text-only still SHIPS its
+            // vision weights; handing them to a module that was never built leaves keys with no
+            // destination. Dropping them is what every other converted family does here, and it
+            // mirrors the `mtp.` guard directly above — same idea, different lane.
+            if !modalities.contains(.vision), originalKey.hasPrefix("visual.") { continue }
             var key = originalKey
             var value = originalValue
             if key.hasPrefix("model.language_model.") {
@@ -1745,7 +1794,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
             // already-MLX-format tensor passes through untouched.
             if key == "visual.patch_embed.proj.weight",
                 value.ndim == 5,
-                value.dim(-1) != config.base.visionConfiguration.inChannels
+                value.dim(-1) != (config.base.visionConfiguration?.inChannels ?? -1)
             {
                 value = value.transposed(0, 2, 3, 4, 1)
             }
