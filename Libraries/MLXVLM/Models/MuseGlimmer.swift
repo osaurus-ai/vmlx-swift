@@ -16,7 +16,27 @@ import MLXNN
 
 public struct MuseGlimmerConfiguration: Codable, Sendable {
     public let textConfiguration: MuseGlimmerTextConfiguration
-    public let visionConfiguration: MuseGlimmerVisionConfiguration
+    /// Optional, following `Gemma4Configuration.audioConfig`. A text-only Muse Glimmer bundle has
+    /// no `vision_config`, and until this was optional such a bundle could not DECODE this
+    /// configuration at all — the first of the reasons a second `muse_glimmer` registration
+    /// (`MuseGlimmerTextConfiguration` / `MuseGlimmerTextModel`) exists in LLMModelFactory.
+    ///
+    /// It is NOT the only reason, and this change does not retire that entry — because the entry
+    /// is not in fact a duplicate. `muse_glimmer` names two different BUNDLE SHAPES: one with a
+    /// vision section, one without. The two registrations serve one each, and `ModelFactory`'s
+    /// `load(loader:)` already routes between them by content: `ModelFactoryRegistry` seeds
+    /// itself with an `MLXVLM` trampoline ahead of an `MLXLLM` one, and the loop falls through on
+    /// ANY error, not only `unsupportedModelType`. So a text-only bundle is tried against the VLM
+    /// factory, fails there when `loadProcessorConfig` finds no `preprocessor_config.json`
+    /// (surfacing as `ModelFactoryError.configurationFileError`), and is then served by the LLM
+    /// factory. That is content-based dispatch, not redundancy.
+    ///
+    /// What THIS change buys is orthogonal to that routing, and is the actual point: a bundle
+    /// that does carry a vision section can now be constructed text-only, leaving the tower
+    /// unallocated. On a 30B Muse Glimmer that spares 3.84 GB. Nothing about the two-entry
+    /// routing needs to change for it, and retiring either entry would remove a bundle shape's
+    /// only route.
+    public let visionConfiguration: MuseGlimmerVisionConfiguration?
     public let imageTokenId: Int
     public let videoTokenId: Int
     /// Width of a merged vision token before the adapter — `hidden * merge²`.
@@ -39,16 +59,18 @@ public struct MuseGlimmerConfiguration: Codable, Sendable {
         // The text config decoder accepts either the nested or flat shape, so
         // hand it the whole document.
         textConfiguration = try MuseGlimmerTextConfiguration(from: decoder)
-        visionConfiguration = try c.decode(
+        visionConfiguration = try c.decodeIfPresent(
             MuseGlimmerVisionConfiguration.self, forKey: .visionConfig)
         imageTokenId = try c.decodeIfPresent(Int.self, forKey: .imageTokenId) ?? 200_092
         videoTokenId = try c.decodeIfPresent(Int.self, forKey: .videoTokenId) ?? 200_091
         projectorHiddenSize =
             try c.decodeIfPresent(Int.self, forKey: .projectorHiddenSize) ?? 4096
-        let merged =
-            visionConfiguration.hiddenSize * visionConfiguration.mergeSize
-            * visionConfiguration.mergeSize
-        outHiddenSize = try c.decodeIfPresent(Int.self, forKey: .outHiddenSize) ?? merged
+        // Derived from the tower when there is one; a declared value still wins. With no tower the
+        // adapter is never built, so the value is unused rather than wrong — 0 is honest here.
+        let merged = visionConfiguration.map {
+            $0.hiddenSize * $0.mergeSize * $0.mergeSize
+        }
+        outHiddenSize = try c.decodeIfPresent(Int.self, forKey: .outHiddenSize) ?? merged ?? 0
     }
 
     /// Written by hand because the `CodingKeys` case names deliberately differ
@@ -57,7 +79,7 @@ public struct MuseGlimmerConfiguration: Codable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(textConfiguration, forKey: .textConfig)
-        try c.encode(visionConfiguration, forKey: .visionConfig)
+        try c.encodeIfPresent(visionConfiguration, forKey: .visionConfig)
         try c.encode(imageTokenId, forKey: .imageTokenId)
         try c.encode(videoTokenId, forKey: .videoTokenId)
         try c.encode(outHiddenSize, forKey: .outHiddenSize)
@@ -67,11 +89,11 @@ public struct MuseGlimmerConfiguration: Codable, Sendable {
 
 // MARK: - Model
 
-public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
+public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing {
 
-    @ModuleInfo(key: "vision_tower") private var visionTower: MuseGlimmerVisionModel
-    @ModuleInfo(key: "vision_adapter") private var visionAdapter: MuseGlimmerVisionProjector
-    @ModuleInfo(key: "vision_projection") private var visionProjection: Linear
+    @ModuleInfo(key: "vision_tower") private var visionTower: MuseGlimmerVisionModel?
+    @ModuleInfo(key: "vision_adapter") private var visionAdapter: MuseGlimmerVisionProjector?
+    @ModuleInfo(key: "vision_projection") private var visionProjection: Linear?
     @ModuleInfo(key: "language_model") private var languageModel: MuseGlimmerTextModel
 
     /// `RotatingKVCache`'s stock allocation step. Prefill chunks must not
@@ -84,27 +106,80 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
     public var kvHeads: [Int] { languageModel.kvHeads }
     public var loraLayers: [Module] { languageModel.loraLayers }
 
-    public init(_ config: MuseGlimmerConfiguration) {
+    /// What this instance actually carries — not what the bundle advertises. The bundle-level
+    /// claim lives in `ModelRuntimeCapabilitySnapshot.supportsVision` and answers a different
+    /// question; see `ModelConstructionModalities.swift` for why the two are kept apart.
+    public let modalities: Set<ModelRuntimeRequestModality>
+
+    public convenience init(_ config: MuseGlimmerConfiguration) {
+        // Unchanged behaviour for every existing caller: build everything the config permits.
+        //
+        // Non-throwing by CONSTRUCTION, not by argument. `resolveForConstruction` can only throw
+        // when a request exceeds what is constructible, and this path makes no request — but
+        // "provably unreachable" is a property of the function above it, and that function can be
+        // edited. Passing the constructible set directly removes the possibility instead of
+        // reasoning about it.
+        self.init(config, modalities: Self.constructibleModalities(of: config))
+    }
+
+    /// Which towers this configuration can actually instantiate.
+    ///
+    /// Structural, and deliberately not read from the bundle's `supports_vision` stamp: a config
+    /// with no vision section cannot build a vision tower no matter what the stamp claims, and a
+    /// mismatch between the two is a broken conversion worth surfacing rather than smoothing over.
+    public static func constructibleModalities(
+        of config: MuseGlimmerConfiguration
+    ) -> Set<ModelRuntimeRequestModality> {
+        config.visionConfiguration != nil ? [.text, .vision, .video] : [.text]
+    }
+
+    /// - Parameter requesting: the caller's subset, or nil for "everything this config offers".
+    ///   Asking for a modality the config cannot build throws rather than yielding a model that
+    ///   fails later at `prepare()`.
+    public convenience init(
+        _ config: MuseGlimmerConfiguration,
+        requesting: Set<ModelRuntimeRequestModality>?
+    ) throws {
+        let resolved = try Set.resolveForConstruction(
+            requested: requesting, constructible: Self.constructibleModalities(of: config))
+        self.init(config, modalities: resolved)
+    }
+
+    /// The one real initialiser: builds exactly the towers named by `modalities`.
+    public init(
+        _ config: MuseGlimmerConfiguration,
+        modalities: Set<ModelRuntimeRequestModality>
+    ) {
+        self.modalities = modalities
         self.config = config
-        self._visionTower.wrappedValue = MuseGlimmerVisionModel(config.visionConfiguration)
-        self._visionAdapter.wrappedValue = MuseGlimmerVisionProjector(
-            inputDimensions: config.outHiddenSize,
-            hiddenDimensions: config.projectorHiddenSize)
-        self._visionProjection.wrappedValue = Linear(
-            config.projectorHiddenSize, config.textConfiguration.hiddenSize, bias: false)
+        // Built only when the bundle has a tower AND the caller asked for it. Skipping it is not a
+        // degraded mode: it is the text-only load that previously required a separate registration,
+        // and on a 30B bundle it leaves 3.84 GB of vision weights unallocated.
+        if config.visionConfiguration != nil, modalities.contains(.vision) {
+            self._visionTower.wrappedValue = MuseGlimmerVisionModel(config.visionConfiguration!)
+            self._visionAdapter.wrappedValue = MuseGlimmerVisionProjector(
+                inputDimensions: config.outHiddenSize,
+                hiddenDimensions: config.projectorHiddenSize)
+            self._visionProjection.wrappedValue = Linear(
+                config.projectorHiddenSize, config.textConfiguration.hiddenSize, bias: false)
+        }
         self._languageModel.wrappedValue = MuseGlimmerTextModel(config.textConfiguration)
         super.init()
     }
 
     /// Vision tower → 2×2-merged tokens → adapter → projection into the text
     /// width, then scattered over the `<|patch|>` / `<|video|>` placeholders.
-    private func visionFeatures(_ pixels: MLXArray, frames: [THW]) -> MLXArray {
-        visionProjection(visionAdapter(visionTower(pixels, frames: frames)))
+    /// Nil when this instance carries no vision tower — either the bundle has none, or the caller
+    /// asked for text only. Callers must already handle "no image embeddings"; that path exists for
+    /// text-only prompts to a multimodal model.
+    private func visionFeatures(_ pixels: MLXArray, frames: [THW]) -> MLXArray? {
+        guard let visionTower, let visionAdapter, let visionProjection else { return nil }
+        return visionProjection(visionAdapter(visionTower(pixels, frames: frames)))
     }
 
     private func inputEmbeddings(
         inputIds: MLXArray, pixelValues: MLXArray?, frames: [THW]?
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         guard let pixelValues, let frames, !frames.isEmpty else {
             // `input.text.tokens` already arrives as `(1, T)` on this path.
             // Adding `.newAxis` unconditionally (as the Qwen VLMs do, where the
@@ -118,7 +193,15 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         }
 
         let inputEmbeds = languageModel.model.embed(inputIds)
-        var features = visionFeatures(pixelValues, frames: frames)
+        // Images arrived at a model that carries no vision tower. Refuse rather than embed the
+        // prompt without them: a silently image-free answer looks like a bad model, not a bad call.
+        // Same stance as Gemma4's video guard — "do not silently generate over missing embeddings".
+        guard var features = visionFeatures(pixelValues, frames: frames) else {
+            throw VLMError.processing(
+                "image input requires the vision tower, and this instance carries none "
+                + "(modalities: \(modalities.modalityDescription)). "
+                + "Load with .vision requested, or send text only.")
+        }
         if features.ndim == 2 {
             features = features[.newAxis, 0..., 0...]
         }
@@ -135,7 +218,8 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         // The vision tower is unquantized F16 even in the JANG bundles, so the
         // dtype comes from the tower rather than being assumed to match the
         // quantized text tower.
-        let dtype = visionTower.lnPre.weight?.dtype ?? .float16
+        // With no tower there is nothing to convert — the fallback was already the default here.
+        let dtype = visionTower?.lnPre.weight?.dtype ?? .float16
 
         var allPixels: MLXArray?
         var allFrames: [THW] = []
@@ -150,7 +234,7 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
             allFrames.append(contentsOf: frames)
         }
 
-        let embeddings = inputEmbeddings(
+        let embeddings = try inputEmbeddings(
             inputIds: input.text.tokens, pixelValues: allPixels,
             frames: allFrames.isEmpty ? nil : allFrames)
 
@@ -227,6 +311,11 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         for (key, value) in weights {
             var rehomed = key
             if rehomed.hasPrefix("model.vision_") {
+                // No tower to receive them. A multimodal bundle loaded text-only still SHIPS its
+                // vision weights; rehoming them onto a module that was never built leaves keys with
+                // no destination. Dropping them is what MuseGlimmerTextModel.sanitize already does,
+                // and what Gemma4 does with `audio_tower.*` on audio-less bundles.
+                guard modalities.contains(.vision) else { continue }
                 rehomed = String(rehomed.dropFirst("model.".count))
             }
             out[rehomed] = value
