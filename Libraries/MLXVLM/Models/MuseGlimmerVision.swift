@@ -627,3 +627,8 @@ public class MuseGlimmerVisionProjector: Module {
         geluApproximate(fc2(geluApproximate(fc1(x))))
     }
 }
+
+extension MuseGlimmerVisionModel: ModelCapabilityProviding {
+    /// See `Qwen3VLVision.VisionModel`: the encoder claims `.vision` only.
+    public var providedModalities: Set<ModelRuntimeRequestModality> { [.vision] }
+}

@@ -121,8 +121,14 @@ struct Gemma4AudioGuardTests {
         let audioSource = try Self.gemma4AudioSource()
 
         // Tower instantiation is gated on audio_config presence + type.
-        #expect(source.contains("audioConfig.isConformerTower"),
-            "Gemma4.init must gate the audio tower on audio_config.model_type == gemma4_audio.")
+        // The gate moved behind a named property when construction became request-driven: the
+        // config now exposes `hasConformerAudioTower`, and the initialiser asks THAT. Pin both
+        // halves — the property's definition and the fact the tower is built only when it and the
+        // plan agree — rather than the raw `audioConfig.isConformerTower` spelling it replaced.
+        #expect(source.contains("audioConfig?.isConformerTower ?? false"),
+            "hasConformerAudioTower must still derive from audio_config.model_type.")
+        #expect(source.contains("config.hasConformerAudioTower"),
+            "Gemma4 must gate the audio tower on audio_config.model_type == gemma4_audio.")
         #expect(audioSource.contains("modelType == \"gemma4_audio\""),
             "isConformerTower must require model_type gemma4_audio so unified 12B bundles stay tower-free.")
         #expect(source.contains("@ModuleInfo(key: \"audio_tower\") private var audioTower"),

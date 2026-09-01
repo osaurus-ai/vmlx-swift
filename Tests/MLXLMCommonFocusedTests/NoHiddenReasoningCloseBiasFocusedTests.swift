@@ -2047,7 +2047,12 @@ struct Gemma4VLMFocusedSourceContractsTests {
         let llmFactory = try focusedRepositoryFile("Libraries/MLXLLM/LLMModelFactory.swift")
         let source = try gemma4VLMSource()
 
-        #expect(vlmFactory.contains(#""gemma4_unified": create(Gemma4Configuration.self, Gemma4.init)"#))
+        // `createSelecting` + the explicit `init(_:requesting:)` is the spelling that says this family
+        // CONSULTS the construction request; a plain `create` here would mean the request is dropped.
+        #expect(
+            vlmFactory.contains(
+                #""gemma4_unified": createSelecting(Gemma4Configuration.self, Gemma4.init(_:requesting:))"#
+            ))
         #expect(vlmFactory.contains(#""Gemma4UnifiedProcessor": create("#))
         #expect(llmFactory.contains(#""gemma4_unified": create(Gemma4TextConfiguration.self, Gemma4TextModel.init)"#))
         #expect(llmFactory.contains(#""gemma4_unified_text": create(Gemma4TextConfiguration.self, Gemma4TextModel.init)"#))

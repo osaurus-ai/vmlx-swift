@@ -63,10 +63,26 @@ public struct BaseProcessorConfiguration: Codable, Sendable {
 }
 
 /// Creates a function that loads a configuration file and instantiates a model with the proper configuration
-private func create<C: Codable, M>(
+/// Registration adapter for a family that SELECTS what it builds.
+///
+/// Written out at the registration site (`Model.init(_:requesting:)`) rather than resolved by
+/// overloading, so that a family which consults the request is visible in the registry table —
+/// the thing that was impossible to see when the request never left the factory.
+private func createSelecting<C: Codable, M: LanguageModel>(
+    _ configurationType: C.Type,
+    _ modelInit: @escaping (C, Set<ModelRuntimeRequestModality>?) throws -> M
+) -> ModelCreator {
+    { data, requesting in
+        let configuration = try JSONDecoder.json5().decode(C.self, from: data)
+        return try modelInit(configuration, requesting)
+    }
+}
+
+private func create<C: Codable, M: LanguageModel>(
     _ configurationType: C.Type, _ modelInit: @escaping (C) -> M
-) -> (Data) throws -> M {
-    { data in
+) -> ModelCreator {
+    // Ignores the request: this family builds the same thing whatever is asked of it.
+    { data, _ in
         let configuration = try JSONDecoder.json5().decode(C.self, from: data)
         return modelInit(configuration)
     }
@@ -102,21 +118,21 @@ public enum VLMTypeRegistry {
     /// Shared instance with default model types.
     public static let shared: ModelTypeRegistry = .init(creators: _creators)
 
-    nonisolated(unsafe) private static let _creators: [String: (Data) throws -> any LanguageModel] = [
+    nonisolated(unsafe) private static let _creators: [String: ModelCreator] = [
         "paligemma": create(PaliGemmaConfiguration.self, PaliGemma.init),
         // Block-diffusion Gemma: the MLXLLM engine with the Gemma4 vision
         // tower installed. Generation runs via BlockDiffusionTokenIterator;
         // the throwing prepare() guard keeps AR routes loud.
-        "diffusion_gemma": create(
-            DiffusionGemmaVLMConfiguration.self, makeDiffusionGemmaVLM),
+        "diffusion_gemma": createSelecting(
+            DiffusionGemmaVLMConfiguration.self, makeDiffusionGemmaVLM(_:requesting:)),
         "qwen2_vl": create(Qwen2VLConfiguration.self, Qwen2VL.init),
         "qwen2_5_vl": create(Qwen25VLConfiguration.self, Qwen25VL.init),
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
-        "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
-        "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
-        "qwen4_exp": create(Qwen4ExpConfiguration.self, Qwen4Exp.init),
+        "qwen3_5": createSelecting(Qwen35Configuration.self, Qwen35.init(_:requesting:)),
+        "qwen3_5_moe": createSelecting(Qwen35Configuration.self, Qwen35MoE.init(_:requesting:)),
+        "qwen4_exp": createSelecting(Qwen4ExpConfiguration.self, Qwen4Exp.init(_:requesting:)),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
-        "muse_glimmer": create(MuseGlimmerConfiguration.self, MuseGlimmer.init),
+        "muse_glimmer": createSelecting(MuseGlimmerConfiguration.self, MuseGlimmer.init(_:requesting:)),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
         "smolvlm": create(SmolVLM2Configuration.self, SmolVLM2.init),
         // TODO: see if we can make it work with fastvlm rather than llava_qwen2
@@ -137,8 +153,8 @@ public enum VLMTypeRegistry {
         // DeepSeek-OCR / Unlimited-OCR (top model_type "deepseek_vl_v2").
         "deepseek_vl_v2": create(DeepseekOCRConfiguration.self, DeepseekOCR.init),
         "deepseekocr": create(DeepseekOCRConfiguration.self, DeepseekOCR.init),
-        "gemma4": create(Gemma4Configuration.self, Gemma4.init),
-        "gemma4_unified": create(Gemma4Configuration.self, Gemma4.init),
+        "gemma4": createSelecting(Gemma4Configuration.self, Gemma4.init(_:requesting:)),
+        "gemma4_unified": createSelecting(Gemma4Configuration.self, Gemma4.init(_:requesting:)),
         "nemotron_dense_audex": create(AudexConfiguration.self, Audex.init),
         "nemotron_h_audex": create(AudexHConfiguration.self, AudexH.init),
         "nemotron_h_omni": create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
@@ -147,7 +163,9 @@ public enum VLMTypeRegistry {
         "zaya1_vl": dispatchZaya1VL,
     ]
 
-    private static func dispatchZaya1VL(data: Data) throws -> any LanguageModel {
+    private static func dispatchZaya1VL(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
         let configuration = try JSONDecoder.json5().decode(Zaya1VLConfiguration.self, from: data)
         return try Zaya1VL(configuration)
     }
@@ -162,7 +180,9 @@ public enum VLMTypeRegistry {
     ///   2. `text_config.model_type == "mistral4"` → `Mistral4VLM` (Mistral 3
     ///      VLM wrapping a Mistral 4 text decoder).
     ///   3. Otherwise → vanilla `Mistral3VLM`.
-    static func dispatchMistral3VLM(data: Data) throws -> any LanguageModel {
+    static func dispatchMistral3VLM(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
         struct WFCheck: Codable {
             let weightFormat: String?
             enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
@@ -585,7 +605,8 @@ public final class VLMModelFactory: ModelFactory {
         let model: LanguageModel
         do {
             model = try await typeRegistry.createModel(
-                configuration: mergedConfigData, modelType: dispatchModelType)
+                configuration: mergedConfigData, modelType: dispatchModelType,
+                requesting: configuration.requestedModalities)
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)

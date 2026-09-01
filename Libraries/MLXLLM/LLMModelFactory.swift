@@ -5,10 +5,11 @@ import MLX
 import MLXLMCommon
 
 /// Creates a function that decodes configuration data and instantiates a model with the proper configuration
-private func create<C: Codable, M>(
+private func create<C: Codable, M: LanguageModel>(
     _ configurationType: C.Type, _ modelInit: @escaping (C) -> M
-) -> (Data) throws -> M {
-    { data in
+) -> ModelCreator {
+    // Ignores the request: this family builds the same thing whatever is asked of it.
+    { data, _ in
         let configuration = try JSONDecoder.json5().decode(C.self, from: data)
         return modelInit(configuration)
     }
@@ -20,7 +21,7 @@ private func create<C: Codable, M>(
 public enum LLMTypeRegistry {
 
     // Split into functions to help the compiler type-check the large model registry
-    private static func coreModels() -> [String: (Data) throws -> any LanguageModel] {
+    private static func coreModels() -> [String: ModelCreator] {
         [
             "mistral": create(LlamaConfiguration.self, LlamaModel.init),
             "llama": create(LlamaConfiguration.self, LlamaModel.init),
@@ -49,7 +50,7 @@ public enum LLMTypeRegistry {
             "qwen3_moe": create(Qwen3MoEConfiguration.self, Qwen3MoEModel.init),
             "qwen3_next": create(Qwen3NextConfiguration.self, Qwen3NextModel.init),
             "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
-            "qwen3_5_moe": { data in
+            "qwen3_5_moe": { data, _ in
                 // Peek at weight_format — "mxtq" routes to the JANGTQ variant,
                 // which swaps the routed-expert SwitchGLU for TurboQuantSwitchGLU
                 // so the codebook Metal kernels run instead of gather_qmm.
@@ -72,7 +73,7 @@ public enum LLMTypeRegistry {
         ]
     }
 
-    private static func extendedModels() -> [String: (Data) throws -> any LanguageModel] {
+    private static func extendedModels() -> [String: ModelCreator] {
         [
             "mistral4": create(Mistral4Configuration.self, Mistral4Model.init),
             "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
@@ -110,7 +111,7 @@ public enum LLMTypeRegistry {
             "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
             "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
             "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),
-            "minimax_m2": { data in
+            "minimax_m2": { data, _ in
                 // Peek at weight_format — "mxtq" routes to the JANGTQ variant,
                 // which swaps the MoE SwitchGLU for TurboQuantSwitchGLU so the
                 // codebook Metal kernels run instead of gather_qmm. Attention
@@ -142,7 +143,7 @@ public enum LLMTypeRegistry {
             // full/SWA attention, 48/72 query heads, dual RoPE, 256 routed
             // experts with top-10 selection, and one shared expert. Older
             // Laguna variants continue to decode their bundle-specific arrays.
-            "laguna": { data in
+            "laguna": { data, _ in
                 // Legacy Laguna mxtq bundles are mixed-format.
                 //
                 //   - Dense paths (attention Q/K/V/O, layer-0 dense MLP
@@ -208,7 +209,7 @@ public enum LLMTypeRegistry {
         ]
     }
 
-    private static func additionalModels() -> [String: (Data) throws -> any LanguageModel] {
+    private static func additionalModels() -> [String: ModelCreator] {
         [
             "baichuan_m1": create(BaichuanM1Configuration.self, BaichuanM1Model.init),
             "exaone4": create(Exaone4Configuration.self, Exaone4Model.init),
@@ -268,7 +269,9 @@ public enum LLMTypeRegistry {
     /// CCA state (`conv_state`, `prev_hs`) round-trips via `ZayaCCACache`
     /// (LayerKind.zayaCCA) and `BatchZayaCCACache`; the BatchEngine
     /// auto-detects ZAYA caches and flips paged-incompatible+hybrid.
-    private static func dispatchZaya(data: Data) throws -> any LanguageModel {
+    private static func dispatchZaya(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
         struct Probe: Codable {
             let weightFormat: String?
             let mxtqBits: ProbeBits?
@@ -391,7 +394,9 @@ public enum LLMTypeRegistry {
     /// (`BailingMoeV3Model`, `architectures = ["BailingMoeV3ForCausalLM"]`).
     /// The `architectures` list is the discriminator; a KDA marker key is the
     /// fallback for configs that omit it.
-    private static func dispatchBailingHybrid(data: Data) throws -> any LanguageModel {
+    private static func dispatchBailingHybrid(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
         struct Probe: Decodable {
             var architectures: [String]?
             var linearAttention: String?
@@ -418,7 +423,9 @@ public enum LLMTypeRegistry {
         return BailingHybridModel(configuration)
     }
 
-    private static func dispatchNemotronH(data: Data) throws -> any LanguageModel {
+    private static func dispatchNemotronH(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
         enum ProbeBits: Decodable {
             case int(Int)
             case routed(up: Int?, down: Int?)
@@ -540,7 +547,9 @@ public enum LLMTypeRegistry {
     ///     paths without triggering DSV4 errors.
     ///
     /// Follow `Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md` to finish.
-    private static func dispatchDeepseekV4(data: Data) throws -> any LanguageModel {
+    private static func dispatchDeepseekV4(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
         // DeepseekV4 (JANGTQ + JANG family). The right variant depends
         // on whether routed experts are stored as MXTQ codebook
         // (TurboQuantSwitchGLU) or plain affine (SwitchGLU).
@@ -689,7 +698,9 @@ public enum LLMTypeRegistry {
     ///      (Mistral 3 wrapper around a Mistral 4 text decoder).
     ///   3. If `weight_format == "mxtq"` → Mistral3TextJANGTQModel.
     ///   4. Otherwise → vanilla Mistral3TextModel.
-    static func dispatchMistral3LLM(data: Data) throws -> any LanguageModel {
+    static func dispatchMistral3LLM(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
         // 1. Vision gate — VLM bundles must not be loaded under this LLM route.
         struct VisionGate: Codable {
             let visionConfig: AnyDecodable?
@@ -750,7 +761,9 @@ public enum LLMTypeRegistry {
         return Mistral3TextModel(config)
     }
 
-    private static func dispatchDeepseekV3Family(data: Data) throws -> any LanguageModel {
+    private static func dispatchDeepseekV3Family(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
         struct FormatCheck: Codable {
             let weightFormat: String?
             enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
@@ -801,7 +814,9 @@ public enum LLMTypeRegistry {
         return DeepseekV3Model(config)
     }
 
-    private static func dispatchStep3p5(data: Data) throws -> any LanguageModel {
+    private static func dispatchStep3p5(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
         struct Probe: Codable {
             let weightFormat: String?
             let mxtqBits: Int?
@@ -1795,7 +1810,8 @@ public final class LLMModelFactory: ModelFactory {
         let model: LanguageModel
         do {
             model = try await typeRegistry.createModel(
-                configuration: configData, modelType: baseConfig.modelType)
+                configuration: configData, modelType: baseConfig.modelType,
+                requesting: configuration.requestedModalities)
         } catch {
             // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,
             // or the config couldn't be decoded for that type).
@@ -1806,7 +1822,8 @@ public final class LLMModelFactory: ModelFactory {
             {
                 do {
                     model = try await typeRegistry.createModel(
-                        configuration: configData, modelType: textModelType)
+                        configuration: configData, modelType: textModelType,
+                        requesting: configuration.requestedModalities)
                 } catch let innerError as DecodingError {
                     throw ModelFactoryError.configurationDecodingError(
                         configurationURL.lastPathComponent, configuration.name, innerError)

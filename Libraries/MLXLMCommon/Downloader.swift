@@ -85,6 +85,13 @@ public struct ResolvedModelConfiguration: Sendable {
     /// No-load MTP/VL status inferred from bundle metadata and tensor names.
     public var mtpStatus: MTPBundleStatus?
 
+    /// Which lanes the caller intends to use, or `nil` for "everything this bundle supports".
+    ///
+    /// Rides in the configuration rather than as a parallel parameter on `_load`, because it is a
+    /// property of the load being requested — and because a second parameter threaded beside the
+    /// configuration is exactly the kind of path that gets forgotten at one call site out of three.
+    public var requestedModalities: Set<ModelRuntimeRequestModality>?
+
     public init(
         modelDirectory: URL,
         tokenizerDirectory: URL,
@@ -95,7 +102,8 @@ public struct ResolvedModelConfiguration: Sendable {
         toolCallFormat: ToolCallFormat?,
         reasoningParserName: String? = nil,
         generationDefaults: GenerationConfigFile? = nil,
-        mtpStatus: MTPBundleStatus? = nil
+        mtpStatus: MTPBundleStatus? = nil,
+        requestedModalities: Set<ModelRuntimeRequestModality>? = nil
     ) {
         self.modelDirectory = modelDirectory
         self.tokenizerDirectory = tokenizerDirectory
@@ -107,6 +115,7 @@ public struct ResolvedModelConfiguration: Sendable {
         self.reasoningParserName = reasoningParserName
         self.generationDefaults = generationDefaults
         self.mtpStatus = mtpStatus
+        self.requestedModalities = requestedModalities
     }
 }
 

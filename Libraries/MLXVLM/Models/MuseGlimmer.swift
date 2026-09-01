@@ -89,7 +89,9 @@ public struct MuseGlimmerConfiguration: Codable, Sendable {
 
 // MARK: - Model
 
-public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing {
+public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing,
+    ModelComponentMapping
+{
 
     @ModuleInfo(key: "vision_tower") private var visionTower: MuseGlimmerVisionModel?
     @ModuleInfo(key: "vision_adapter") private var visionAdapter: MuseGlimmerVisionProjector?
@@ -119,7 +121,8 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider, ModalityBe
         // "provably unreachable" is a property of the function above it, and that function can be
         // edited. Passing the constructible set directly removes the possibility instead of
         // reasoning about it.
-        self.init(config, modalities: Self.constructibleModalities(of: config))
+        // nil = everything the configuration offers, which cannot fail validation.
+        self.init(config, plan: try! Self.resolveConstruction(config, requesting: nil))
     }
 
     /// Which towers this configuration can actually instantiate.
@@ -140,22 +143,47 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider, ModalityBe
         _ config: MuseGlimmerConfiguration,
         requesting: Set<ModelRuntimeRequestModality>?
     ) throws {
-        let resolved = try Set.resolveForConstruction(
-            requested: requesting, constructible: Self.constructibleModalities(of: config))
-        self.init(config, modalities: resolved)
+        self.init(config, plan: try Self.resolveConstruction(config, requesting: requesting))
     }
 
-    /// The one real initialiser: builds exactly the towers named by `modalities`.
-    public init(
+
+    /// What the built modules serve. `.text` is this family's core being a text LM, not a default.
+    public static func servedModalities(
+        by components: Set<ModelComponent>, of config: MuseGlimmerConfiguration
+    ) -> Set<ModelRuntimeRequestModality> {
+        var m: Set<ModelRuntimeRequestModality> = []
+        if components.contains(.languageCore) { m.insert(.text) }
+        if components.contains(.visionTower) { m.formUnion([.vision, .video]) }
+        return m
+    }
+
+    /// Which MODULES a request needs. `.vision` and `.video` are different lanes served by the SAME
+    /// tower, so gating on `.vision` alone accepted `requesting: [.text, .video]` and then built no
+    /// tower at all — the late `prepare()` failure this whole mechanism exists to prevent.
+    public static func components(
+        for requested: Set<ModelRuntimeRequestModality>, of config: MuseGlimmerConfiguration
+    ) -> Set<ModelComponent> {
+        var out: Set<ModelComponent> = []
+        if requested.contains(.vision) || requested.contains(.video) { out.insert(.visionTower) }
+        return out
+    }
+
+    /// What was actually built.
+    public let plan: ResolvedConstructionPlan
+
+    /// The one real initialiser. Private: a plan can only come from `resolveConstruction`, so no
+    /// caller can construct an empty or unsupported instance.
+    private init(
         _ config: MuseGlimmerConfiguration,
-        modalities: Set<ModelRuntimeRequestModality>
+        plan: ResolvedConstructionPlan
     ) {
-        self.modalities = modalities
+        self.modalities = plan.served
+        self.plan = plan
         self.config = config
         // Built only when the bundle has a tower AND the caller asked for it. Skipping it is not a
         // degraded mode: it is the text-only load that previously required a separate registration,
         // and on a 30B bundle it leaves 3.84 GB of vision weights unallocated.
-        if config.visionConfiguration != nil, modalities.contains(.vision) {
+        if config.visionConfiguration != nil, plan.builds(.visionTower) {
             self._visionTower.wrappedValue = MuseGlimmerVisionModel(config.visionConfiguration!)
             self._visionAdapter.wrappedValue = MuseGlimmerVisionProjector(
                 inputDimensions: config.outHiddenSize,
@@ -315,7 +343,10 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider, ModalityBe
                 // vision weights; rehoming them onto a module that was never built leaves keys with
                 // no destination. Dropping them is what MuseGlimmerTextModel.sanitize already does,
                 // and what Gemma4 does with `audio_tower.*` on audio-less bundles.
-                guard modalities.contains(.vision) else { continue }
+                // The MODULE, not the lane: a video-only instance HAS the tower, so its
+                // weights must survive. Asking about `.vision` here would drop the weights
+                // of a tower that was just built.
+                guard plan.builds(.visionTower) else { continue }
                 rehomed = String(rehomed.dropFirst("model.".count))
             }
             out[rehomed] = value

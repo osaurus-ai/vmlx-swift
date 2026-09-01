@@ -1377,7 +1377,7 @@ protocol Qwen4ExpModelDirectoryConfigurable: AnyObject {
 
 public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurable,
     SafetensorsLoadKeyExcluding, NativeMTPModel, DFlash2StagedVerifyRollbackModel,
-    CompiledDecodeExternalInputModel, ModalityBearing
+    CompiledDecodeExternalInputModel, ModalityBearing, ModelComponentMapping
 {
     /// QSA index selection and its path-dependent cache currently require a
     /// single sequence. Keep concurrent requests queued until a B-wide QSA
@@ -1412,8 +1412,29 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         config.base.visionConfiguration != nil ? [.text, .vision, .video] : [.text]
     }
 
+
+    /// What the built modules serve. `.text` is this family's core being a text LM, not a default.
+    public static func servedModalities(
+        by components: Set<ModelComponent>, of config: Qwen4ExpConfiguration
+    ) -> Set<ModelRuntimeRequestModality> {
+        var m: Set<ModelRuntimeRequestModality> = []
+        if components.contains(.languageCore) { m.insert(.text) }
+        if components.contains(.visionTower) { m.formUnion([.vision, .video]) }
+        return m
+    }
+
+    /// Which MODULES a request needs. `.vision` and `.video` share one tower, so gating on
+    /// `.vision` alone accepted a video-only request and built nothing.
+    public static func components(
+        for requested: Set<ModelRuntimeRequestModality>, of config: Qwen4ExpConfiguration
+    ) -> Set<ModelComponent> {
+        var out: Set<ModelComponent> = []
+        if requested.contains(.vision) || requested.contains(.video) { out.insert(.visionTower) }
+        return out
+    }
+
     public convenience init(_ config: Qwen4ExpConfiguration) {
-        self.init(config, modalities: Self.constructibleModalities(of: config))
+        self.init(config, plan: try! Self.resolveConstruction(config, requesting: nil))
     }
 
     /// - Parameter requesting: the caller's subset, or nil for "everything this config offers".
@@ -1421,17 +1442,19 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         _ config: Qwen4ExpConfiguration,
         requesting: Set<ModelRuntimeRequestModality>?
     ) throws {
-        let resolved = try Set.resolveForConstruction(
-            requested: requesting, constructible: Self.constructibleModalities(of: config))
-        self.init(config, modalities: resolved)
+        self.init(config, plan: try Self.resolveConstruction(config, requesting: requesting))
     }
 
-    /// The one real initialiser: builds exactly the towers named by `modalities`.
-    public init(
+    /// What was actually built.
+    public let plan: ResolvedConstructionPlan
+
+    /// The one real initialiser. Private: a plan comes only from `resolveConstruction`.
+    private init(
         _ config: Qwen4ExpConfiguration,
-        modalities: Set<ModelRuntimeRequestModality>
+        plan: ResolvedConstructionPlan
     ) {
-        self.modalities = modalities
+        self.modalities = plan.served
+        self.plan = plan
         self.config = config
         _textModel.wrappedValue = Qwen4ExpTextModel(config)
         _head.wrappedValue = Linear(
@@ -1440,7 +1463,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         if config.extras.mtpNumHiddenLayers > 0 {
             _mtp.wrappedValue = Qwen4ExpMTPModule(config)
         }
-        if let vision = config.base.visionConfiguration, modalities.contains(.vision) {
+        if let vision = config.base.visionConfiguration, plan.builds(.visionTower) {
             _visionModel.wrappedValue = Qwen3VLVision.VisionModel(vision)
         }
         super.init()
@@ -1759,7 +1782,8 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
             // vision weights; handing them to a module that was never built leaves keys with no
             // destination. Dropping them is what every other converted family does here, and it
             // mirrors the `mtp.` guard directly above — same idea, different lane.
-            if !modalities.contains(.vision), originalKey.hasPrefix("visual.") { continue }
+            // The MODULE: a video-only instance HAS the tower and must keep its weights.
+            if !plan.builds(.visionTower), originalKey.hasPrefix("visual.") { continue }
             var key = originalKey
             var value = originalValue
             if key.hasPrefix("model.language_model.") {

@@ -1155,7 +1155,9 @@ func gemma4MaskedScatter(
 
 // MARK: - Gemma4 VLM
 
-public class Gemma4: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing {
+public class Gemma4: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing,
+    ModelComponentMapping
+{
     @ModuleInfo(key: "vision_tower") private var visionTower: VisionTower?
     @ModuleInfo(key: "vision_embedder") private var unifiedVisionEmbedder: UnifiedVisionEmbedder?
     @ModuleInfo(key: "audio_tower") private var audioTower: Gemma4AudioTower?
@@ -1191,12 +1193,48 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing
     ) -> Set<ModelRuntimeRequestModality> {
         var m: Set<ModelRuntimeRequestModality> = [.text]
         if config.visionConfig != nil { m.insert(.vision) }
-        if config.hasConformerAudioTower { m.insert(.audio) }
+        // BOTH audio paths, not just the conformer one. Gating on `hasConformerAudioTower`
+        // rejected `requesting: [.audio]` on unified 12B bundles (`gemma4_unified_audio`), which
+        // are encoder-free and feed raw 40 ms frames straight through
+        // `embed_audio.embedding_projection` — a proven audio path with no tower. A request
+        // modality asks what the model can SERVE; which modules that needs is a separate question,
+        // answered by `components(for:of:)`.
+        if config.audioConfig != nil { m.insert(.audio) }
         return m
     }
 
+
+    /// What the built modules serve. Image-only on the vision side — this family has no video lane
+    /// — and audio from either path's projection.
+    public static func servedModalities(
+        by components: Set<ModelComponent>, of config: Gemma4Configuration
+    ) -> Set<ModelRuntimeRequestModality> {
+        var m: Set<ModelRuntimeRequestModality> = []
+        if components.contains(.languageCore) { m.insert(.text) }
+        if components.contains(.visionTower) { m.insert(.vision) }
+        if components.contains(.audioProjection) { m.insert(.audio) }
+        return m
+    }
+
+    /// Which MODULES a request needs.
+    ///
+    /// The audio lane is the case that shows request modalities cannot equal optional towers: the
+    /// same `.audio` request needs a conformer tower plus a projection on E-series bundles, and the
+    /// projection alone on unified ones.
+    public static func components(
+        for requested: Set<ModelRuntimeRequestModality>, of config: Gemma4Configuration
+    ) -> Set<ModelComponent> {
+        var out: Set<ModelComponent> = []
+        if requested.contains(.vision) { out.insert(.visionTower) }
+        if requested.contains(.audio) {
+            out.insert(.audioProjection)                             // both paths
+            if config.hasConformerAudioTower { out.insert(.audioTower) }   // encoder path only
+        }
+        return out
+    }
+
     public convenience init(_ config: Gemma4Configuration) {
-        self.init(config, modalities: Self.constructibleModalities(of: config))
+        self.init(config, plan: try! Self.resolveConstruction(config, requesting: nil))
     }
 
     /// - Parameter requesting: the caller's subset, or nil for "everything this config offers".
@@ -1204,19 +1242,21 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing
         _ config: Gemma4Configuration,
         requesting: Set<ModelRuntimeRequestModality>?
     ) throws {
-        let resolved = try Set.resolveForConstruction(
-            requested: requesting, constructible: Self.constructibleModalities(of: config))
-        self.init(config, modalities: resolved)
+        self.init(config, plan: try Self.resolveConstruction(config, requesting: requesting))
     }
 
-    /// The one real initialiser: builds exactly the towers named by `modalities`.
-    public init(
+    /// What was actually built.
+    public let plan: ResolvedConstructionPlan
+
+    /// The one real initialiser. Private: a plan comes only from `resolveConstruction`.
+    private init(
         _ config: Gemma4Configuration,
-        modalities: Set<ModelRuntimeRequestModality>
+        plan: ResolvedConstructionPlan
     ) {
-        self.modalities = modalities
+        self.modalities = plan.served
+        self.plan = plan
         self.config = config
-        if let visionConfig = config.visionConfig, modalities.contains(.vision) {
+        if let visionConfig = config.visionConfig, plan.builds(.visionTower) {
             if visionConfig.usesUnifiedVisionEmbedder {
                 _unifiedVisionEmbedder.wrappedValue = UnifiedVisionEmbedder(visionConfig)
             } else {
@@ -1228,9 +1268,7 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing
         // (gemma4_unified_audio) and audio-less 26B/31B bundles stay
         // tower-free; their `audio_tower.*` weights (if any) are discarded
         // in sanitize().
-        if let audioConfig = config.audioConfig, audioConfig.isConformerTower,
-            modalities.contains(.audio)
-        {
+        if let audioConfig = config.audioConfig, plan.builds(.audioTower) {
             _audioTower.wrappedValue = Gemma4AudioTower(audioConfig)
         }
         _languageModel.wrappedValue = G4LanguageModel(config.textConfig)
@@ -2037,4 +2075,8 @@ private struct Gemma4MessageGenerator: MessageGenerator {
         dict["content"] = content.isEmpty ? message.content : content
         return dict
     }
+}
+extension VisionTower: ModelCapabilityProviding {
+    /// Gemma4's encoder is image-only; this family has no video lane at all.
+    var providedModalities: Set<ModelRuntimeRequestModality> { [.vision] }
 }

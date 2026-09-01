@@ -1937,3 +1937,9 @@ public struct Qwen3VLMessageGenerator: MessageGenerator {
         ]
     }
 }
+
+extension Qwen3VLVision.VisionModel: ModelCapabilityProviding {
+    /// An image encoder. `.video` is NOT claimed here: frames additionally need the model's video
+    /// token ids, so that lane is the model's to add on top of this one.
+    public var providedModalities: Set<ModelRuntimeRequestModality> { [.vision] }
+}

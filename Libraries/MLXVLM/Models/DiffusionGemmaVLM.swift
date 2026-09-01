@@ -81,7 +81,11 @@ public func makeDiffusionGemmaVLM(
 }
 
 /// Builds exactly the lanes named by `modalities`.
-public func makeDiffusionGemmaVLM(
+///
+/// INTERNAL on purpose. As a public entry point this accepted an empty or unsupported set and
+/// recorded it unchecked on the model, so a caller could describe an instance the configuration
+/// cannot produce. The validated `requesting:` overload above is the only public route.
+func makeDiffusionGemmaVLM(
     _ config: DiffusionGemmaVLMConfiguration,
     modalities: Set<ModelRuntimeRequestModality>
 ) -> DiffusionGemmaModel {

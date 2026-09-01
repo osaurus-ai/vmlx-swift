@@ -2895,7 +2895,7 @@ enum Qwen35Language {
 // MARK: - Model
 
 public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel,
-    DFlash2StagedVerifyRollbackModel
+    DFlash2StagedVerifyRollbackModel, ModalityBearing, ModelComponentMapping
 {
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel?
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
@@ -2917,8 +2917,37 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         config.visionConfiguration != nil ? [.text, .vision, .video] : [.text]
     }
 
+
+    /// What the built modules serve. `.text` comes from THIS family's core being a text LM — it is
+    /// not a universal truth, which is why there is no default doing it for everyone.
+    public static func servedModalities(
+        by components: Set<ModelComponent>, of config: Qwen35Configuration
+    ) -> Set<ModelRuntimeRequestModality> {
+        var m: Set<ModelRuntimeRequestModality> = []
+        if components.contains(.languageCore) { m.insert(.text) }
+        if components.contains(.visionTower) { m.formUnion([.vision, .video]) }
+        return m
+    }
+
+    /// Which MODULES a request needs, as opposed to which lanes it names.
+    ///
+    /// The distinction is the whole point: `.vision` and `.video` are different lanes served by the
+    /// SAME tower. Gating construction on `.vision` alone — which is what this did — accepted
+    /// `requesting: [.video]` and then built nothing, because validation asked "is video
+    /// constructible?" and construction asked "does the set contain vision?". Both were right about
+    /// different questions.
+    public static func components(
+        for requested: Set<ModelRuntimeRequestModality>, of config: Qwen35Configuration
+    ) -> Set<ModelComponent> {
+        var out: Set<ModelComponent> = []
+        if requested.contains(.vision) || requested.contains(.video) { out.insert(.visionTower) }
+        return out
+    }
+
     public convenience init(_ config: Qwen35Configuration) {
-        self.init(config, modalities: Self.constructibleModalities(of: config))
+        // `nil` means "everything this configuration offers", which cannot fail.
+        let plan = try! Self.resolveConstruction(config, requesting: nil)
+        self.init(config, plan: plan)
     }
 
     /// - Parameter requesting: the caller's subset, or nil for "everything this config offers".
@@ -2926,24 +2955,37 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         _ config: Qwen35Configuration,
         requesting: Set<ModelRuntimeRequestModality>?
     ) throws {
-        let resolved = try Set.resolveForConstruction(
-            requested: requesting, constructible: Self.constructibleModalities(of: config))
-        self.init(config, modalities: resolved)
+        self.init(config, plan: try Self.resolveConstruction(config, requesting: requesting))
     }
 
-    /// The one real initialiser: builds exactly the towers named by `modalities`.
-    public init(
-        _ config: Qwen35Configuration,
-        modalities: Set<ModelRuntimeRequestModality>
-    ) {
-        self.modalities = modalities
+    /// The one real initialiser. Private on purpose: a plan can only come from
+    /// `resolveConstruction`, so no caller can hand this an empty or unsupported selection.
+    private init(_ config: Qwen35Configuration, plan: ResolvedConstructionPlan) {
+        self.plan = plan
         self.config = config
-        if let vision = config.visionConfiguration, modalities.contains(.vision) {
-            _visionModel.wrappedValue = Qwen3VLVision.VisionModel(vision)
+        // Built first, so the capability report can be COLLECTED from what actually exists rather
+        // than copied from the plan. A tower that did not get built — because the caller narrowed
+        // the request, or because the configuration had no vision stanza — cannot contribute, so
+        // the report cannot claim a lane the instance lacks.
+        var tower: Qwen3VLVision.VisionModel?
+        if let vision = config.visionConfiguration, plan.builds(.visionTower) {
+            tower = Qwen3VLVision.VisionModel(vision)
+            _visionModel.wrappedValue = tower
         }
         _languageModel.wrappedValue = Qwen35Language.LanguageModel(config)
+
+        // The components declare their own contribution; `.video` is added here because it needs
+        // this model's video token id, which the encoder knows nothing about.
+        var provided = Set<ModelRuntimeRequestModality>.provided(by: [tower])
+        provided.insert(.text)  // this family's core is a text LM
+        if provided.contains(.vision), config.videoTokenId != nil { provided.insert(.video) }
+        self.modalities = provided
         super.init()
     }
+
+    /// What was actually built. Kept so `prepare` and `sanitize` can ask about MODULES rather than
+    /// re-deriving them from lanes.
+    public let plan: ResolvedConstructionPlan
 
     public var vocabularySize: Int { config.vocabSize }
 
