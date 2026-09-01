@@ -186,6 +186,51 @@ class ReasoningBudgetTests: XCTestCase {
                 tokenizer: ThinkVocabTokenizer(), promptTail: "<think>", tokenCount: -5))
     }
 
+    /// APERTUS 1.5. Its monologue markers are neither `<think>` nor any of the other
+    /// spellings the candidate lists carried, so `arm` could not resolve a close token
+    /// for an Apertus bundle and the ceiling stayed inert no matter what budget the
+    /// caller asked for — the budget silently did nothing rather than failing loudly.
+    ///
+    /// The template primes NEITHER tag (the generation prompt tail is a bare
+    /// `<|assistant|>`), so this is the self-opening case: the count must start when the
+    /// model emits `<|inner_prefix|>` itself, which is what `startTokenIDs` expresses.
+    private struct ApertusVocabTokenizer: MLXLMCommon.Tokenizer {
+        let vocab: [String: Int] = [
+            "<|inner_prefix|>": 32, "<|inner_suffix|>": 33, "hello": 12,
+        ]
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { [12] }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "hello" }
+        func convertTokenToId(_ token: String) -> Int? { vocab[token] }
+        func convertIdToToken(_ id: Int) -> String? { vocab.first { $0.value == id }?.key }
+        var bosToken: String? { nil }
+        var eosToken: String? { "<|endoftext|>" }
+        var unknownToken: String? { nil }
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] { [12] }
+    }
+
+    func testApertusMonologueMarkersArmTheCeiling() {
+        let armed = ReasoningBudget.arm(
+            tokenizer: ApertusVocabTokenizer(),
+            promptTail: "<|assistant|>",
+            tokenCount: 96
+        )
+        XCTAssertNotNil(
+            armed,
+            "Apertus markers must resolve, or a requested budget is silently inert for every Apertus bundle."
+        )
+        XCTAssertEqual(armed?.tokenCount, 96)
+        XCTAssertEqual(armed?.closeTokenID, 33, "<|inner_suffix|> closes the monologue")
+        XCTAssertEqual(
+            armed?.startTokenIDs, [32],
+            "The template primes no opener, so the count starts when the model emits <|inner_prefix|>."
+        )
+        XCTAssertEqual(armed?.openTokenIDs, [32])
+    }
+
     func testEnvArmedPathStillDelegatesToTheSameResolution() {
         // Without VMLX_REASONING_BUDGET in the environment the legacy entry
         // point must stay nil even though the vocab could arm.

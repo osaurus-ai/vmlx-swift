@@ -71,6 +71,7 @@ public enum ReasoningBudget {
         "</thinking>",
         "<|/think|>",
         "<|end_thought|>",
+        "<|inner_suffix|>",  // Apertus 1.5 (apertus1p5)
         "<end_of_turn>",
     ]
 
@@ -81,6 +82,8 @@ public enum ReasoningBudget {
     /// that only armed on a primed tail would silently skip that second group.
     public static let openTokenCandidates: [String] = [
         "<think>", "<thinking>", "<|think|>", "<|start_thought|>",
+        "<|inner_prefix|>",  // Apertus 1.5: its template primes neither tag, so the model
+                             // emits the open marker itself as its first generated token.
     ]
 
     /// Resolve the open-token ids that exist in this bundle's vocab, so a
