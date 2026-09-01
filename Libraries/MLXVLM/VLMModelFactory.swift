@@ -150,6 +150,7 @@ public enum VLMTypeRegistry {
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
         "glm4v": create(Glm4vConfiguration.self, Glm4v.init),
         "glm4v_moe": create(Glm4vMoeConfiguration.self, Glm4vMoe.init),
+        "glm5_next": createSelecting(Glm5NextConfiguration.self, Glm5Next.init(_:requesting:)),
         // DeepSeek-OCR / Unlimited-OCR (top model_type "deepseek_vl_v2").
         "deepseek_vl_v2": create(DeepseekOCRConfiguration.self, DeepseekOCR.init),
         "deepseekocr": create(DeepseekOCRConfiguration.self, DeepseekOCR.init),
