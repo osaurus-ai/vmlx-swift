@@ -872,6 +872,37 @@ extension ReasoningParser {
             return ReasoningParser(startInReasoning: true)
         }
 
+        // Apertus 1.5 wraps its inner monologue in two dedicated vocabulary tokens
+        // rather than XML. Its chat template sets them explicitly (lines 152-153):
+        //
+        //     {%- set inner_token = '<|inner_prefix|>' -%}
+        //     {%- set outer_token = '<|inner_suffix|>' -%}
+        //
+        // and the generation prompt tail is a bare `<|assistant|>` — no prefilled
+        // opener — so the model emits `<|inner_prefix|>` itself and
+        // `startInReasoning` stays false, as for Gemma-4.
+        //
+        // Observed on cubiculum/Apertus-v1.5-8B-Jang_6M (gsm8k, 3/3 turns):
+        //
+        //   <|inner_prefix|>We need to parse the question. …3.7 kB of monologue…
+        //   <|inner_suffix|>The friend gave \(24\) outfits. … \boxed{87}
+        //
+        // Opens and closes were balanced 3/3, so the unclosed-block hazard the
+        // Hunyuan entry documents does not apply. Both markers are single special
+        // tokens that cannot occur in prose, so strays are stripped.
+        //
+        // SCOPED TO 1.5 DELIBERATELY. Plain `apertus` is Apertus 1.0, which has no
+        // monologue and is enumerated as a non-thinking family in
+        // `ReasoningStampFromModelTypeTests.testPlainFamiliesGetNone`; matching the
+        // bare `apertus` prefix here would contradict that contract.
+        if normalized.hasPrefix("apertus1p5") {
+            return ReasoningParser(
+                startTag: "<|inner_prefix|>",
+                endTag: "<|inner_suffix|>",
+                startInReasoning: false,
+                stripStrayTags: true)
+        }
+
         if normalized.hasPrefix("mistral4")
             || normalized.hasPrefix("mistral_4")
             || normalized.hasPrefix("mistral_small_4")
@@ -1258,6 +1289,20 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
     // Harmony marker leak.
     if compact.hasPrefix("gptoss") {
         return "harmony"
+    }
+
+    // Apertus 1.5 — dedicated `<|inner_prefix|>` / `<|inner_suffix|>` monologue
+    // markers, resolved by `fromCapabilityName`. Without this stamp `apertus1p5`
+    // falls through to the terminal "none", no parser is selected, and the entire
+    // monologue — raw markers included — streams into the user-visible chunk.
+    // Measured on Apertus-v1.5-8B before this entry: text=3998ch reasoning=0ch,
+    // with the answer buried 3.7 kB deep. Same failure shape as the `gptoss`
+    // Harmony leak and the `muse_glimmer` fall-through.
+    //
+    // Matches 1.5 ONLY: plain `apertus` (1.0) has no monologue and must keep its
+    // "none" stamp — see `testPlainFamiliesGetNone`.
+    if compact.hasPrefix("apertus1p5") {
+        return "apertus1p5"
     }
 
     // ZAYA1-VL is a sibling multimodal architecture, not the text
