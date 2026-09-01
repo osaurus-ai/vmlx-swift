@@ -415,11 +415,11 @@ internal final class Mistral3JANGTQLanguageModel: Module, KVCacheDimensionProvid
 /// JANGTQ-quantized Mistral3 VLM. Sibling of `Mistral3VLM`; differs
 /// only in the language-model inner. Pixtral vision tower stays
 /// vanilla.
-public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
-    @ModuleInfo(key: "vision_tower") private var visionTower: PixtralVision.VisionModel
+public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing {
+    @ModuleInfo(key: "vision_tower") private var visionTower: PixtralVision.VisionModel?
     @ModuleInfo(key: "language_model") private var languageModel: Mistral3JANGTQLanguageModel
     @ModuleInfo(key: "multi_modal_projector") private var multiModalProjector:
-        Mistral3MultiModalProjector
+        Mistral3MultiModalProjector?
 
     public let config: Mistral3VLMConfiguration
     let visionFeatureLayer: Int
@@ -427,14 +427,51 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
     public var vocabularySize: Int { config.vocabSize }
     public var kvHeads: [Int] { languageModel.kvHeads }
 
-    public init(_ config: Mistral3VLMConfiguration, bits: Int = 2, seed: Int = 42) {
+    /// What this instance actually carries. See `Mistral3VLM` — same contract, same vocabulary.
+    public let modalities: Set<ModelRuntimeRequestModality>
+
+    /// Which towers this configuration can instantiate. Pixtral is image-only: no `.video` lane.
+    public static func constructibleModalities(
+        of config: Mistral3VLMConfiguration
+    ) -> Set<ModelRuntimeRequestModality> {
+        config.visionConfig != nil ? [.text, .vision] : [.text]
+    }
+
+    public convenience init(_ config: Mistral3VLMConfiguration, bits: Int = 2, seed: Int = 42) {
+        self.init(
+            config, modalities: Self.constructibleModalities(of: config), bits: bits, seed: seed)
+    }
+
+    /// - Parameter requesting: the caller's subset, or nil for "everything this config offers".
+    public convenience init(
+        _ config: Mistral3VLMConfiguration,
+        requesting: Set<ModelRuntimeRequestModality>?,
+        bits: Int = 2,
+        seed: Int = 42
+    ) throws {
+        let resolved = try Set.resolveForConstruction(
+            requested: requesting, constructible: Self.constructibleModalities(of: config))
+        self.init(config, modalities: resolved, bits: bits, seed: seed)
+    }
+
+    /// The one real initialiser: builds exactly the towers named by `modalities`.
+    public init(
+        _ config: Mistral3VLMConfiguration,
+        modalities: Set<ModelRuntimeRequestModality>,
+        bits: Int = 2,
+        seed: Int = 42
+    ) {
+        self.modalities = modalities
         self.config = config
         self.visionFeatureLayer = config.visionFeatureLayer
 
-        self._visionTower.wrappedValue = PixtralVision.VisionModel(config.visionConfig)
+        if let vision = config.visionConfig, modalities.contains(.vision) {
+            self._visionTower.wrappedValue = PixtralVision.VisionModel(vision)
+            self._multiModalProjector.wrappedValue = Mistral3MultiModalProjector(
+                config, vision: vision)
+        }
         self._languageModel.wrappedValue = Mistral3JANGTQLanguageModel(
             config.textConfig, bits: bits, seed: seed)
-        self._multiModalProjector.wrappedValue = Mistral3MultiModalProjector(config)
     }
 
     private func getInputEmbeddings(
@@ -457,6 +494,13 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
 
         if pixelValues.ndim == 3 {
             pixelValues = pixelValues.expandedDimensions(axis: 0)
+        }
+
+        guard let visionTower, let multiModalProjector else {
+            throw VLMError.processing(
+                "image input requires the vision tower, and this instance carries none "
+                + "(modalities: \(modalities.modalityDescription)). "
+                + "Load with .vision requested, or send text only.")
         }
 
         let (_, _, hiddenStates) = visionTower(
@@ -530,8 +574,8 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
         let imageSizes: [(Int, Int)]?
         if let frames = input.image?.frames {
             imageSizes = frames.map { ($0.h, $0.w) }
-        } else if pixelValues != nil {
-            imageSizes = [(config.visionConfig.imageSize, config.visionConfig.imageSize)]
+        } else if pixelValues != nil, let vision = config.visionConfig {
+            imageSizes = [(vision.imageSize, vision.imageSize)]
         } else {
             imageSizes = nil
         }

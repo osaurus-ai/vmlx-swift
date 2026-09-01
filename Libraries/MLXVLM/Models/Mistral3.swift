@@ -73,7 +73,10 @@ public struct Mistral3VLMTextConfiguration: Codable, Sendable {
 
 public struct Mistral3VLMConfiguration: Codable, Sendable {
     public let textConfig: Mistral3VLMTextConfiguration
-    public let visionConfig: Mistral3VisionConfiguration
+    /// Optional, following `Gemma4Configuration.audioConfig` and `MuseGlimmerConfiguration`. A
+    /// text-only conversion of a Mistral 3 bundle carries no `vision_config`, and while this was
+    /// non-optional such a bundle could not DECODE this configuration at all.
+    public let visionConfig: Mistral3VisionConfiguration?
     public let modelType: String
 
     public var ignoreIndex: Int { _ignoreIndex ?? -100 }
@@ -196,11 +199,11 @@ class Mistral3PatchMerger: Module {
 
     @ModuleInfo(key: "merging_layer") var mergingLayer: Linear
 
-    init(_ config: Mistral3VLMConfiguration) {
+    init(_ config: Mistral3VLMConfiguration, vision: Mistral3VisionConfiguration) {
         self.spatialMergeSize = config.spatialMergeSize
-        self.patchSize = config.visionConfig.patchSize
+        self.patchSize = vision.patchSize
 
-        let hiddenSize = config.visionConfig.hiddenSize
+        let hiddenSize = vision.hiddenSize
         self._mergingLayer.wrappedValue = Linear(
             hiddenSize * spatialMergeSize * spatialMergeSize,
             hiddenSize,
@@ -268,11 +271,11 @@ class Mistral3MultiModalProjector: Module {
     @ModuleInfo var gelu: GELU
     @ModuleInfo(key: "linear_2") var linear2: Linear
 
-    init(_ config: Mistral3VLMConfiguration) {
-        self._norm.wrappedValue = RMSNorm(dimensions: config.visionConfig.hiddenSize)
-        self._patchMerger.wrappedValue = Mistral3PatchMerger(config)
+    init(_ config: Mistral3VLMConfiguration, vision: Mistral3VisionConfiguration) {
+        self._norm.wrappedValue = RMSNorm(dimensions: vision.hiddenSize)
+        self._patchMerger.wrappedValue = Mistral3PatchMerger(config, vision: vision)
         self._linear1.wrappedValue = Linear(
-            config.visionConfig.hiddenSize,
+            vision.hiddenSize,
             config.textConfig.hiddenSize,
             bias: config.multimodalProjectorBias
         )
@@ -685,12 +688,12 @@ private enum Language {
 
 // MARK: - Mistral3 VLM Model
 
-public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
+public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing {
     // Use PixtralVision.VisionModel from Pixtral.swift
-    @ModuleInfo(key: "vision_tower") private var visionTower: PixtralVision.VisionModel
+    @ModuleInfo(key: "vision_tower") private var visionTower: PixtralVision.VisionModel?
     @ModuleInfo(key: "language_model") private var languageModel: Language.LanguageModel
     @ModuleInfo(key: "multi_modal_projector") private var multiModalProjector:
-        Mistral3MultiModalProjector
+        Mistral3MultiModalProjector?
 
     public let config: Mistral3VLMConfiguration
     let visionFeatureLayer: Int
@@ -698,13 +701,56 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
     public var vocabularySize: Int { config.vocabSize }
     public var kvHeads: [Int] { languageModel.kvHeads }
 
-    public init(_ config: Mistral3VLMConfiguration) {
+    /// What this instance actually carries — not what the bundle advertises. The bundle-level
+    /// claim lives in `ModelRuntimeCapabilitySnapshot.supportsVision` and answers a different
+    /// question; see `ModelConstructionModalities.swift` for why the two are kept apart.
+    public let modalities: Set<ModelRuntimeRequestModality>
+
+    /// Which towers this configuration can actually instantiate. Pixtral is image-only, so there
+    /// is no `.video` lane here even though the vision tower exists.
+    public static func constructibleModalities(
+        of config: Mistral3VLMConfiguration
+    ) -> Set<ModelRuntimeRequestModality> {
+        config.visionConfig != nil ? [.text, .vision] : [.text]
+    }
+
+    public convenience init(_ config: Mistral3VLMConfiguration) {
+        // Unchanged behaviour for every existing caller: build everything the config permits.
+        // Non-throwing by CONSTRUCTION rather than by argument — passing the constructible set
+        // directly removes the throw instead of reasoning about why it cannot happen.
+        self.init(config, modalities: Self.constructibleModalities(of: config))
+    }
+
+    /// - Parameter requesting: the caller's subset, or nil for "everything this config offers".
+    ///   Asking for a modality the config cannot build throws rather than yielding a model that
+    ///   fails later at `prepare()`.
+    public convenience init(
+        _ config: Mistral3VLMConfiguration,
+        requesting: Set<ModelRuntimeRequestModality>?
+    ) throws {
+        let resolved = try Set.resolveForConstruction(
+            requested: requesting, constructible: Self.constructibleModalities(of: config))
+        self.init(config, modalities: resolved)
+    }
+
+    /// The one real initialiser: builds exactly the towers named by `modalities`.
+    public init(
+        _ config: Mistral3VLMConfiguration,
+        modalities: Set<ModelRuntimeRequestModality>
+    ) {
+        self.modalities = modalities
         self.config = config
         self.visionFeatureLayer = config.visionFeatureLayer
 
-        self._visionTower.wrappedValue = PixtralVision.VisionModel(config.visionConfig)
+        // Built only when the bundle has a tower AND the caller asked for it. Skipping it is not a
+        // degraded mode: it is the text-only load that previously required the separate
+        // `mistral3` registration in LLMModelFactory, and it leaves ~0.8 GB unallocated.
+        if let vision = config.visionConfig, modalities.contains(.vision) {
+            self._visionTower.wrappedValue = PixtralVision.VisionModel(vision)
+            self._multiModalProjector.wrappedValue = Mistral3MultiModalProjector(
+                config, vision: vision)
+        }
         self._languageModel.wrappedValue = Language.LanguageModel(config.textConfig)
-        self._multiModalProjector.wrappedValue = Mistral3MultiModalProjector(config)
     }
 
     private func getInputEmbeddings(
@@ -728,6 +774,15 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         // Handle 3D pixel values (missing batch dimension)
         if pixelValues.ndim == 3 {
             pixelValues = pixelValues.expandedDimensions(axis: 0)
+        }
+
+        // Images arrived at a model that carries no vision tower. Refuse rather than embed the
+        // prompt without them: a silently image-free answer looks like a bad model, not a bad call.
+        guard let visionTower, let multiModalProjector else {
+            throw VLMError.processing(
+                "image input requires the vision tower, and this instance carries none "
+                + "(modalities: \(modalities.modalityDescription)). "
+                + "Load with .vision requested, or send text only.")
         }
 
         // Process through vision tower (reuses Pixtral vision model)
@@ -828,8 +883,8 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         let imageSizes: [(Int, Int)]?
         if let frames = input.image?.frames {
             imageSizes = frames.map { ($0.h, $0.w) }
-        } else if pixelValues != nil {
-            imageSizes = [(config.visionConfig.imageSize, config.visionConfig.imageSize)]
+        } else if pixelValues != nil, let vision = config.visionConfig {
+            imageSizes = [(vision.imageSize, vision.imageSize)]
         } else {
             imageSizes = nil
         }
@@ -865,6 +920,17 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
 
         for (key, value) in weights {
             var newKey = key
+
+            // No tower to receive them. A multimodal bundle loaded text-only still SHIPS its
+            // vision weights; rehoming them onto modules that were never built leaves keys with no
+            // destination. Dropping them is what MuseGlimmer does, and what Gemma4 does with
+            // `audio_tower.*` on audio-less bundles.
+            if !modalities.contains(.vision),
+                key.contains("vision_tower") || key.contains("vision_encoder")
+                    || key.contains("vision_projection") || key.contains("multi_modal_projector")
+            {
+                continue
+            }
 
             // Transform keys to match model structure
             // Vision tower keys: vision_tower.X -> vision_tower.vision_model.X (for pixtral structure)

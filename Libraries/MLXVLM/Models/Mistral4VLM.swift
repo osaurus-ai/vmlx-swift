@@ -16,7 +16,8 @@ import MLXNN
 /// Mistral4 VLM top-level configuration (wraps text + vision)
 public struct Mistral4VLMConfiguration: Codable, Sendable {
     public let textConfig: Mistral3VLMTextConfiguration  // Reuses Mistral3's text config structure
-    public let visionConfig: Mistral3VisionConfiguration  // Same Pixtral vision
+    /// Optional, matching `Mistral3VLMConfiguration`: a text-only conversion carries none.
+    public let visionConfig: Mistral3VisionConfiguration?  // Same Pixtral vision
     public let modelType: String
 
     public var imageTokenIndex: Int { _imageTokenIndex ?? _imageTokenId ?? 10 }
@@ -75,7 +76,8 @@ public struct Mistral4VLMConfiguration: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         textConfig = try c.decode(Mistral3VLMTextConfiguration.self, forKey: .textConfig)
-        visionConfig = try c.decode(Mistral3VisionConfiguration.self, forKey: .visionConfig)
+        visionConfig = try c.decodeIfPresent(
+            Mistral3VisionConfiguration.self, forKey: .visionConfig)
         modelType = try c.decodeIfPresent(String.self, forKey: .modelType) ?? "mistral3"
         _imageTokenIndex = try c.decodeIfPresent(Int.self, forKey: ._imageTokenIndex)
         _imageTokenId = try c.decodeIfPresent(Int.self, forKey: ._imageTokenId)
@@ -327,22 +329,54 @@ private class M4LanguageModel: Module, KVCacheDimensionProvider {
 
 // MARK: - Mistral4 VLM Model
 
-public class Mistral4VLM: Module, VLMModel, KVCacheDimensionProvider {
-    @ModuleInfo(key: "vision_tower") private var visionTower: PixtralVision.VisionModel
+public class Mistral4VLM: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing {
+    @ModuleInfo(key: "vision_tower") private var visionTower: PixtralVision.VisionModel?
     @ModuleInfo(key: "language_model") private var languageModel: M4LanguageModel
-    @ModuleInfo(key: "multi_modal_projector") private var multiModalProjector: Mistral3MultiModalProjector
+    @ModuleInfo(key: "multi_modal_projector") private var multiModalProjector:
+        Mistral3MultiModalProjector?
 
     public let config: Mistral4VLMConfiguration
 
     public var vocabularySize: Int { config.vocabSize }
     public var kvHeads: [Int] { languageModel.kvHeads }
 
-    public init(_ config: Mistral4VLMConfiguration) {
+    /// What this instance actually carries. Same contract as `Mistral3VLM`.
+    public let modalities: Set<ModelRuntimeRequestModality>
+
+    /// Which towers this configuration can instantiate. Pixtral is image-only: no `.video` lane.
+    public static func constructibleModalities(
+        of config: Mistral4VLMConfiguration
+    ) -> Set<ModelRuntimeRequestModality> {
+        config.visionConfig != nil ? [.text, .vision] : [.text]
+    }
+
+    public convenience init(_ config: Mistral4VLMConfiguration) {
+        self.init(config, modalities: Self.constructibleModalities(of: config))
+    }
+
+    /// - Parameter requesting: the caller's subset, or nil for "everything this config offers".
+    public convenience init(
+        _ config: Mistral4VLMConfiguration,
+        requesting: Set<ModelRuntimeRequestModality>?
+    ) throws {
+        let resolved = try Set.resolveForConstruction(
+            requested: requesting, constructible: Self.constructibleModalities(of: config))
+        self.init(config, modalities: resolved)
+    }
+
+    /// The one real initialiser: builds exactly the towers named by `modalities`.
+    public init(
+        _ config: Mistral4VLMConfiguration,
+        modalities: Set<ModelRuntimeRequestModality>
+    ) {
+        self.modalities = modalities
         self.config = config
-        _visionTower.wrappedValue = PixtralVision.VisionModel(config.visionConfig)
+        if let vision = config.visionConfig, modalities.contains(.vision) {
+            _visionTower.wrappedValue = PixtralVision.VisionModel(vision)
+            _multiModalProjector.wrappedValue = Mistral3MultiModalProjector(
+                Mistral3VLMConfiguration(from: config, vision: vision), vision: vision)
+        }
         _languageModel.wrappedValue = M4LanguageModel(config)
-        _multiModalProjector.wrappedValue = Mistral3MultiModalProjector(
-            Mistral3VLMConfiguration(from: config))
     }
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
@@ -356,8 +390,8 @@ public class Mistral4VLM: Module, VLMModel, KVCacheDimensionProvider {
         let imageSizes: [(Int, Int)]?
         if let frames = input.image?.frames {
             imageSizes = frames.map { ($0.h, $0.w) }
-        } else if pixelValues != nil {
-            imageSizes = [(config.visionConfig.imageSize, config.visionConfig.imageSize)]
+        } else if pixelValues != nil, let vision = config.visionConfig {
+            imageSizes = [(vision.imageSize, vision.imageSize)]
         } else {
             imageSizes = nil
         }
@@ -374,6 +408,13 @@ public class Mistral4VLM: Module, VLMModel, KVCacheDimensionProvider {
 
         let inputsEmbeds = languageModel.embedTokens(inputIds)
         if pixelValues.ndim == 3 { pixelValues = pixelValues.expandedDimensions(axis: 0) }
+
+        guard let visionTower, let multiModalProjector else {
+            throw VLMError.processing(
+                "image input requires the vision tower, and this instance carries none "
+                + "(modalities: \(modalities.modalityDescription)). "
+                + "Load with .vision requested, or send text only.")
+        }
 
         let (_, _, hiddenStates) = visionTower(pixelValues.transposed(0, 2, 3, 1), outputHiddenStates: true)
         guard let hiddenStates else {
@@ -450,11 +491,13 @@ extension Mistral4VLM: LoRAModel {
 
 // Helper to create Mistral3VLMConfiguration from Mistral4VLMConfiguration (for projector reuse)
 private extension Mistral3VLMConfiguration {
-    init(from m4: Mistral4VLMConfiguration) {
+    /// The vision config is passed in rather than read from `m4`, because it is optional there
+    /// and this bridge is only reached once the caller has unwrapped it to build the tower.
+    init(from m4: Mistral4VLMConfiguration, vision: Mistral3VisionConfiguration) {
         // Create a minimal Mistral3VLMConfiguration for the projector
         self.init(
             textConfig: m4.textConfig,
-            visionConfig: m4.visionConfig,
+            visionConfig: vision,
             modelType: m4.modelType
         )
     }
