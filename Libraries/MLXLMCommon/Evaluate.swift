@@ -134,7 +134,7 @@ public struct GenerateParameters: Sendable {
 
     /// Runtime accelerator selection for generation.
     ///
-    /// Defaults to `VMLINUX_ACCELERATOR` when present, otherwise `.metal`.
+    /// Defaults to `VMLX_ACCELERATOR` when present, otherwise `.metal`.
     /// `ane-coreml` is a fail-closed request: it is accepted only when the
     /// selected runtime surface has a validated Core ML island. Text decode
     /// currently has no such island, so it stays on MLX/Metal.
@@ -2263,13 +2263,17 @@ public struct TokenIterator: TokenIteratorProtocol {
             .filter { $0 > 0 && $0 < promptTokenIds.count }
             .max()
         if ProcessInfo.processInfo.environment["VMLX_STRIP_BOUNDARY_TRACE"] == "1" {
-            FileHandle.standardError.write(Data(
-                ("[vmlx][strip-boundary] prompt=\(promptTokenIds.count) "
-                    + "canonical=\(canonicalBoundary.map(String.init) ?? "nil") "
-                    + "prefixCounts=\(input.cachePrefixTokenCounts) "
-                    + "stableCounts=\(input.cacheStablePrefixTokenCounts) "
-                    + "genSuffixTokens=\(coordinator?.genPromptSuffixTokens ?? []) "
-                    + "heuristic=\(heuristicBoundary.map(String.init) ?? "nil")\n").utf8))
+            // Appended in steps rather than as one `+` chain. Six interpolations joined by `+`
+            // inside a `Data(...)` call gives the type checker an overload search it cannot finish:
+            // `error: unable to type-check this expression in reasonable time`. Each `+=` here is
+            // independently trivial to check.
+            var trace = "[vmlx][strip-boundary] prompt=\(promptTokenIds.count) "
+            trace += "canonical=\(canonicalBoundary.map(String.init) ?? "nil") "
+            trace += "prefixCounts=\(input.cachePrefixTokenCounts) "
+            trace += "stableCounts=\(input.cacheStablePrefixTokenCounts) "
+            trace += "genSuffixTokens=\(coordinator?.genPromptSuffixTokens ?? []) "
+            trace += "heuristic=\(heuristicBoundary.map(String.init) ?? "nil")\n"
+            FileHandle.standardError.write(Data(trace.utf8))
         }
         guard ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
             let coordinator,
