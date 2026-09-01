@@ -445,10 +445,7 @@ public class MuseGlimmerTextModel: Module, LLMModel, KVCacheDimensionProvider {
         // Fold the centered-norm `+1` in once. Every norm this model uses is
         // zero-centered, and the vision tower's LayerNorms are excluded above,
         // so the transform applies to exactly the text tower's RMSNorm gains.
-        for (key, value) in out where Self.isCenteredNormWeight(key) {
-            out[key] = value + 1
-        }
-        return out
+        return Self.foldCenteredNorms(out)
     }
 
     /// Zero-centered RMSNorm gains in the text tower. Matched by suffix because
@@ -459,6 +456,22 @@ public class MuseGlimmerTextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// them leaves those layers without their `+1` entirely, which shifts unit
     /// gain to zero gain — the model still runs and still emits fluent text, so
     /// `MuseGlimmerCenteredNormCoverage` pins the list against the checkpoint.
+    /// Apply the centered-norm `+1` fold to every gain this architecture centers.
+    ///
+    /// SINGLE OWNER, deliberately. This model and the `MuseGlimmer` VLM wrapper must apply the
+    /// fold identically, and while the loop lived in both files the drift failure was SILENT:
+    /// unfolded gains load into a forward that no longer adds the `+1`, leaving every norm at
+    /// zero gain. The model still loads and still emits text; only a behavioural probe catches
+    /// it. `isCenteredNormWeight` already matches both key shapes — bare `norm.weight` here and
+    /// `language_model.model.norm.weight` under the VLM — so one function serves both callers.
+    public static func foldCenteredNorms(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        var out = weights
+        for (key, value) in out where isCenteredNormWeight(key) {
+            out[key] = value + 1
+        }
+        return out
+    }
+
     public static func isCenteredNormWeight(_ key: String) -> Bool {
         guard key.hasSuffix(".weight") else { return false }
         return key.hasSuffix("input_layernorm.weight")

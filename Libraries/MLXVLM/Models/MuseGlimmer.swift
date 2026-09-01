@@ -231,14 +231,13 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
             }
             out[rehomed] = value
         }
-        // The VLM does not route through `MuseGlimmerTextModel.sanitize`, so the
-        // centered-norm fold has to happen here too. Without it the text tower
-        // loads unfolded gains into a forward that no longer adds the `+1`,
-        // which leaves every one of its norms at zero gain — the model still
-        // loads and still emits text, and only a behavioural probe catches it.
-        for (key, value) in out where MuseGlimmerTextModel.isCenteredNormWeight(key) {
-            out[key] = value + 1
-        }
-        return out
+        // The VLM does not route through `MuseGlimmerTextModel.sanitize` — the key mapping
+        // genuinely differs, since here the text tower is a SUBMODULE and keeps its
+        // `language_model.` prefix. But the fold itself must be identical on both paths, so it
+        // is called, not copied: `foldCenteredNorms` is its single owner. Copying it is what
+        // this file used to do, and the drift failure is silent — unfolded gains against a
+        // forward that no longer adds the `+1` leave every norm at zero gain, and the model
+        // still loads and still emits text.
+        return MuseGlimmerTextModel.foldCenteredNorms(out)
     }
 }
