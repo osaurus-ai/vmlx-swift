@@ -562,14 +562,22 @@ struct MLXPressLowRamPolicySourceTests {
     @Test("README keeps Nemotron Ultra resident speed separate from mmap speed")
     func readmeKeepsNemotronUltraReleaseBoundaryHonest() throws {
         let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
+        // The prose in this README is hard-wrapped, so a phrase that straddles a line break fails a
+        // raw `contains` even though the text is present and correct — two of the assertions below
+        // did exactly that. Match whitespace-collapsed text so a re-wrap cannot fail a test whose
+        // subject is CONTENT.
+        let flat = readme.split(whereSeparator: \.isWhitespace).joined(separator: " ")
 
-        #expect(readme.contains("resident Swift decode | 8.1 tok/s"))
-        #expect(readme.contains("low-footprint mmap decode | 7.0 tok/s full-run, 9.8-9.9 tok/s tail"))
-        #expect(readme.contains("The current Swift runtime proof is intentionally split by runtime path"))
-        #expect(readme.contains("It uses about 100 GB physical footprint"))
-        #expect(readme.contains("first-decode cost remains the open low-footprint speed gap"))
-        #expect(readme.contains("hybrid SSM disk-backed prefix-cache"))
-        #expect(readme.contains("SSM companion hits and cache-salt isolation"))
+        // The subject of this test is that the two runtime paths are quoted SEPARATELY and that the
+        // resident figure is not passed off as the low-footprint one — not these exact numbers.
+        // Update them together with the table whenever a re-measurement lands.
+        #expect(flat.contains("resident Swift decode | 9.8 tok/s"))
+        #expect(flat.contains("low-footprint mmap decode | 6.7 tok/s full-run, 7.7 tok/s tail"))
+        #expect(flat.contains("The current Swift runtime proof is intentionally split by runtime path"))
+        #expect(flat.contains("It uses about 100 GB physical footprint"))
+        #expect(flat.contains("first-decode cost remains speed-open"))
+        #expect(flat.contains("hybrid SSM disk-backed prefix-cache"))
+        #expect(flat.contains("SSM companion hits and cache-salt isolation"))
     }
 
     @Test("Nemotron-H JANGTQ docs do not regress to obsolete wrapper-blocked status")
