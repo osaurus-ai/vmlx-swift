@@ -8,6 +8,9 @@
 // Python reference: mlx_vlm/models/gemma4/language.py
 
 import Foundation
+import OSLog
+
+private let gemma4WeightsLogger = Logger(subsystem: "vmlx", category: "Gemma4Weights")
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -929,8 +932,28 @@ public class Gemma4TextModel: Module, LLMModel {
             "lm_head.weight", "lm_head.scales", "lm_head.biases",
         ] {
             let key = prefix + suffix
-            if let w = weights[key], w.dim(0) != vocabSize {
+            guard let w = weights[key] else { continue }
+            let height = w.dim(0)
+            if height > vocabSize {
                 weights[key] = w[0 ..< vocabSize]
+            } else if height < vocabSize {
+                // The guard used to be `!=`, which sent this case through the same slice. MLX
+                // CLAMPS an out-of-range slice rather than trapping, so the tensor came back
+                // unchanged and the policy's intent — "make this exactly vocabSize" — silently did
+                // not happen. The load then continues with an embedding shorter than the
+                // vocabulary the config declares, which is not recoverable by trimming: there are
+                // no rows to trim.
+                //
+                // Reported rather than thrown because `sanitize` is not throwing (that is Apple's
+                // `LanguageModel` protocol, so making it throwing is an upstream change, not a
+                // local one). A warning is at least a tell; silence was not.
+                gemma4WeightsLogger.warning(
+                    """
+                    \(key, privacy: .public) has \(height, privacy: .public) rows but the config \
+                    declares vocab_size \(vocabSize, privacy: .public). A vocabulary-sized tensor \
+                    cannot be produced by trimming a shorter one; the bundle is malformed and the \
+                    weights should be re-converted. Leaving the tensor as-is.
+                    """)
             }
         }
     }

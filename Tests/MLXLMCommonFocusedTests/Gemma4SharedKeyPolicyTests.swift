@@ -123,26 +123,30 @@ struct Gemma4SharedKeyPolicyTests {
         #expect(out.asArray(Float.self) == (0 ..< 12).map { Float($0) }, "keeps the FIRST rows")
     }
 
-    /// The relation the inherited policy never distinguished. `dim(0) != vocabSize` is true when
-    /// the tensor is SMALLER as well, and the guard then slices `0 ..< vocabSize` past the end.
+    /// The relation the guard used to conflate. `dim(0) != vocabSize` is true when the tensor is
+    /// SMALLER as well, and that sent it through the same slice — which MLX CLAMPS rather than
+    /// trapping, so the tensor came back unchanged and the policy's intent silently did not happen.
     ///
-    /// Measured, not assumed: MLX **clamps** rather than trapping, so the tensor is returned
-    /// unchanged at its original height. That is a silent no-op — the policy's intent ("make this
-    /// exactly `vocabSize`") is not achieved, nothing reports it, and an embedding shorter than the
-    /// configured vocabulary flows onward to fail somewhere else, or not at all.
-    ///
-    /// This test pins the CURRENT contract rather than changing it: #313 is a behaviour-preserving
-    /// refactor, and making an undersized tensor an error is a behaviour change that deserves its
-    /// own decision. Recorded here so the behaviour is unambiguous either way.
-    @Test("an undersized tensor is silently left alone — the trim clamps, it does not throw")
-    func undersizedIsASilentNoOp() {
+    /// The tensor is still left alone, because there is nothing correct to do: a vocabulary-sized
+    /// embedding cannot be produced by trimming a shorter one. What changed is that it is now
+    /// REPORTED. Asserted here as behaviour (unchanged, not truncated, not grown) — the warning
+    /// itself is checked by reading the source, since `Logger` output is not capturable in-process.
+    @Test("an undersized tensor is left unchanged, and is no longer silent about it")
+    func undersizedIsReportedNotSilent() throws {
         var w: [String: MLXArray] = ["model.embed_tokens.weight": Self.embedding(rows: 4)]
         Gemma4TextModel.trimmingVocabDimension(&w, prefix: "", vocabSize: 9)
         let out = w["model.embed_tokens.weight"]!
-        #expect(out.dim(0) == 4, "clamped to the source height, NOT grown to vocabSize")
+        #expect(out.dim(0) == 4, "left at its own height — trimming cannot invent rows")
+        #expect(out.asArray(Float.self) == (0 ..< 8).map { Float($0) }, "values untouched")
+
+        // The three relations are now distinct branches, not one `!=`.
+        let source = try #require(
+            try? String(
+                contentsOfFile: "Libraries/MLXLLM/Models/Gemma4Text.swift", encoding: .utf8))
         #expect(
-            out.asArray(Float.self) == (0 ..< 8).map { Float($0) },
-            "and the values are untouched")
+            source.contains("height > vocabSize") && source.contains("height < vocabSize"),
+            "the undersized case must be its own branch, not folded into `!=`")
+        #expect(source.contains("gemma4WeightsLogger.warning"), "and it must report")
     }
 
     // MARK: - Both real callers (requested on #313)
