@@ -1265,6 +1265,15 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
 // strictly increases context coverage. After pooling, applies the
 // absolute position embedding (APE) and partial RoPE at the chunk
 // positions. Updates the per-layer V4Cache pool if provided.
+/// Gate for the DSA dense-indexer score matmul input dtype. Default runs in
+/// the pool's native dtype (no per-step full-pool fp32 copy); the env var
+/// restores the historical fp32-input matmul for A/B and fallback.
+enum DeepseekV4IndexerRuntime {
+    nonisolated(unsafe) static var scoreFP32Inputs: Bool = {
+        ProcessInfo.processInfo.environment["VMLX_DSA_INDEX_FP32"] == "1"
+    }()
+}
+
 enum DeepseekV4CompressorQATKind {
     case attentionKV
     case indexer
@@ -1827,9 +1836,24 @@ public final class DeepseekV4Indexer: Module {
         // scores: (B, nHeads, L, pooledLen). Match Python shape.
         // q is (B, nHeads, L, headDim); pooled is (B, pooledLen, headDim).
         // Expand pooled to (B, 1, pooledLen, headDim) for broadcast.
+        //
+        // The matmul runs in the pool's native dtype: casting `pooled` to
+        // fp32 materialized a full-pool fp32 copy on EVERY decode step
+        // (linear-in-context traffic per token — the same tax class as the
+        // MLA decode cast fixed in AttentionUtils). Metal GEMM accumulates
+        // in fp32 internally, and these are SELECTION logits: bf16 storage
+        // rounding (~2^-8 relative) can only flip near-tie block choices,
+        // and the fp32 head-weighted sum below happens after the cast.
+        // `VMLX_DSA_INDEX_FP32=1` restores the fp32-input matmul for A/B.
         let pooledBroad = pooled.expandedDimensions(axis: 1)
-        var scores = q.asType(.float32).matmul(
-            pooledBroad.asType(.float32).swappedAxes(-1, -2))
+        var scores: MLXArray
+        if DeepseekV4IndexerRuntime.scoreFP32Inputs {
+            scores = q.asType(.float32).matmul(
+                pooledBroad.asType(.float32).swappedAxes(-1, -2))
+        } else {
+            scores = q.asType(pooled.dtype).matmul(
+                pooledBroad.swappedAxes(-1, -2)).asType(.float32)
+        }
         scores = maximum(scores, MLXArray(0.0)) * MLXArray(scale)
 
         // Reshape scores sum axis: (B, 1, L, nHeads) multiply → sum.

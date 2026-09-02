@@ -61,6 +61,14 @@ class PhiAttention: Module {
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         // Finally perform the attention computation
+        //
+        // The fp32 query cast is LOAD-BEARING, not a leftover: Phi ships
+        // fp16, and fp16 attention scores overflow (+-65504) — the fp32
+        // promotion (mirroring Python mlx-lm's phi implementation) keeps
+        // score range and softmax reduction in fp32. Same class as Gemma-4's
+        // global-layer upcast: removing it trades correctness for bandwidth.
+        // The KV cache itself still stores the model's native dtype — only
+        // the SDPA consumption is promoted.
         let scale = sqrt(1 / Float(queries.dim(-1)))
         let output = attentionWithCacheUpdate(
             queries: queries.asType(.float32),

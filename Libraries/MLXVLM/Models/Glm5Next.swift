@@ -41,6 +41,15 @@ import MLXNN
 /// Which attention a decoder layer runs. GLM-5.3 interleaves them explicitly rather than by
 /// interval — 34 linear to 11 sparse in the shipped 45-layer bundle — so the schedule is read as a
 /// list and not derived from a stride the way `Qwen35`'s `full_attention_interval` is.
+/// Gate for the GLM5-next sparse-index pooling/scoring dtype. Default runs
+/// in the packed cache's native dtype (no per-step full-context fp32
+/// copies); the env var restores the historical fp32 pipeline for A/B.
+enum Glm5NextIndexerRuntime {
+    nonisolated(unsafe) static var poolFP32: Bool = {
+        ProcessInfo.processInfo.environment["VMLX_GLM5_INDEX_FP32"] == "1"
+    }()
+}
+
 public enum Glm5NextLayerKind: String, Codable, Sendable {
     case linearAttention = "linear_attention"
     case deepseekSparseAttention = "deepseek_sparse_attention"
@@ -909,17 +918,28 @@ extension Glm5NextIndexer {
         }
         // A LEARNED weighted average within each pool: softmax over the POOL-MEMBER axis, per
         // feature channel — not one scalar weight per member.
-        var logits = groupedGate.asType(.float32) + ape.asType(.float32)[.newAxis, .newAxis]
+        //
+        // The gathers above span the ENTIRE packed index history and this
+        // runs every decode step, so fp32 casts here materialized two
+        // full-context fp32 tensors per token (the MLA-cast tax class).
+        // The softmax reduces over the tiny pool-member axis only, and the
+        // pooled keys feed SELECTION scores, so native-dtype math changes
+        // at most near-tie pool choices. `VMLX_GLM5_INDEX_FP32=1` restores
+        // the fp32 pipeline for A/B.
+        let poolMathDtype: DType =
+            Glm5NextIndexerRuntime.poolFP32 ? .float32 : packed.dtype
+        var logits = groupedGate.asType(poolMathDtype)
+            + ape.asType(poolMathDtype)[.newAxis, .newAxis]
         logits = MLX.where(
             groupedValid.expandedDimensions(axis: -1), logits,
-            MLXArray(-Float.greatestFiniteMagnitude))
+            MLXArray(-Float.greatestFiniteMagnitude).asType(poolMathDtype))
         var probabilities = softmax(logits, axis: 2)
         // A fully invalid pool softmaxes -inf against -inf and yields NaN; it is masked out of the
         // selection anyway, but a NaN here would poison the pooled key and, through it, the scores
         // of every VALID pool in the same matmul.
         probabilities = MLX.where(
-            isNaN(probabilities), MLXArray(Float(0)), probabilities)
-        let pooled = (probabilities * groupedKeys.asType(.float32)).sum(axis: 2)
+            isNaN(probabilities), MLXArray(Float(0)).asType(poolMathDtype), probabilities)
+        let pooled = (probabilities * groupedKeys.asType(poolMathDtype)).sum(axis: 2)
 
         return (pooled.asType(packed.dtype), poolIndices, poolValid)
     }
@@ -939,9 +959,21 @@ extension Glm5NextIndexer {
         let poolCount = poolIndices.dim(0)
 
         // (B, S, H, D) @ (B, 1, D, P) -> (B, S, H, P)
-        var scores = matmul(
-            queries.asType(.float32),
-            poolKeys.asType(.float32).swappedAxes(-1, -2).expandedDimensions(axis: 1))
+        // Native-dtype matmul (fp32 accumulation happens inside the GEMM);
+        // only the small score tensor is carried in fp32 for the weighting
+        // math below. Casting poolKeys to fp32 copied the whole pool per
+        // decode step. Gated with the pooling math above.
+        var scores: MLXArray
+        if Glm5NextIndexerRuntime.poolFP32 {
+            scores = matmul(
+                queries.asType(.float32),
+                poolKeys.asType(.float32).swappedAxes(-1, -2).expandedDimensions(axis: 1))
+        } else {
+            scores = matmul(
+                queries.asType(poolKeys.dtype),
+                poolKeys.swappedAxes(-1, -2).expandedDimensions(axis: 1)
+            ).asType(.float32)
+        }
         scores = maximum(scores * (1.0 / sqrt(Float(headDim))), MLXArray(Float(0)))
 
         // One learned scalar per index head, then a weighted sum ACROSS heads.
