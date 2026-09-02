@@ -31,6 +31,31 @@ private enum WiredMemoryBackend {
     }
 }
 
+/// Directly set the process-wide wired memory limit so a just-loaded model's
+/// weights stay GPU-resident.
+///
+/// MLX's default wired limit is ~75% of the device's recommended max working
+/// set. A model LARGER than that default has its pages swapped during every
+/// `eval`, which stalls Metal command buffers — observed live as a 95 GB
+/// bundle pinning memory and thrashing ~15-20 GB of swap while warmup never
+/// finishes. This mirrors the Python engine's load-time
+/// `_set_wired_limit_for_model`: a loaded model is a LONG-LIVED residency
+/// requirement, not the transient active work that ``WiredMemoryManager``
+/// tickets model, so the limit is applied directly and persists until the next
+/// load sets it again.
+///
+/// The caller must clamp `bytes` to the OS working set
+/// (``GPU/maxRecommendedWorkingSetBytes()``) — Apple rejects a wired limit
+/// above the max working set. This only ever talks to the backend; it never
+/// blocks, throttles, or refuses a load.
+///
+/// - Returns: `true` when the limit was applied (GPU device), `false` on an
+///   unsupported device where wiring is a no-op.
+@discardableResult
+public func setModelResidencyWiredLimit(_ bytes: Int) -> Bool {
+    WiredMemoryBackend.applyLimit(max(0, bytes))
+}
+
 /// Debug event emitted by ``WiredMemoryManager`` when coordinating wired memory changes.
 ///
 /// Events are only emitted in DEBUG builds. In release builds the event stream

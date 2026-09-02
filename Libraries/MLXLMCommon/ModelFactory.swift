@@ -672,6 +672,30 @@ public func loadModel(
         MLX.Memory.memoryLimit = safeCap
     }
 
+    // 3c. Raise the MLX WIRED limit to keep the model's weights GPU-resident.
+    //     MLX's default wired limit is ~75% of the recommended working set, so
+    //     a model larger than that has its pages SWAPPED on every eval — Metal
+    //     command-buffer stalls (observed live: a 95 GB bundle pinned memory
+    //     and thrashed ~15-20 GB of swap, warmup never finished, while the same
+    //     bundle multiturns fine on the Python engine, which does exactly this
+    //     at load). Mirror `_set_wired_limit_for_model`: wire the model plus
+    //     headroom (max(16 GB, 30% of weights) — routed-expert dequant + KV +
+    //     Metal scratch spike past a flat 8 GB on big MoE bundles), CLAMPED to
+    //     the OS working set so we never trip Apple's "limit larger than max
+    //     working set" rejection. Only ever ADVISES the allocator by RAISING a
+    //     limit — it never blocks or refuses a load, and a small model simply
+    //     gets a smaller (cheaper) residency set. The user can lift the OS cap
+    //     with `sudo sysctl iogpu.wired_limit_mb=<MB>`.
+    if facts.totalSafetensorsBytes > 0 {
+        let modelBytes = Int(clamping: facts.totalSafetensorsBytes)
+        let headroom = max(
+            16 * 1024 * 1024 * 1024,
+            Int((Double(modelBytes) * 0.30).rounded()))
+        let workingSet = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
+        let target = min(modelBytes + headroom, workingSet)
+        setModelResidencyWiredLimit(target)
+    }
+
     // 4. Optional disk-layout preparation. The permanent prestacked
     //    safetensors overlay is now explicit opt-in via
     //    MLXPRESS_PRESTACK=1 / JANGPRESS_PRESTACK=1. MLXPress's normal
