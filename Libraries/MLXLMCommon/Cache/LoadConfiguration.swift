@@ -661,8 +661,22 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// and collapses throughput. Hosts must perform their normal pre-load RAM
     /// admission check instead of silently throttling a successfully admitted
     /// model.
+    /// Families whose resident bank is larger than the default cap, so a cap would force MLX to
+    /// destroy and rebuild decode intermediates every token.
+    ///
+    /// Measured on GLM-5.3: the bundle is 95 GB and the default cap is 0.70 x 128 GB = 89.6 GB, so
+    /// the model does not fit under its own allowance. A decode profile is then dominated by
+    /// `MetalAllocator::malloc` and `IOGPUResourceCreate` — buffer churn through IOKit — rather
+    /// than by any matmul, and generation runs at 0.38 tok/s.
+    ///
+    /// One property for both caps deliberately: they are the same decision about the same bundle,
+    /// and a family added to one list and not the other is exactly how this reached production.
+    public var requiresUncappedResidentPools: Bool {
+        isPlainDeepseekV4AffineJANG || isGlm5NextAffineJANG
+    }
+
     public func resolveMLXMemoryLimit(requested: ResidentCap) -> ResidentCap {
-        isPlainDeepseekV4AffineJANG ? .unlimited : requested
+        requiresUncappedResidentPools ? .unlimited : requested
     }
 
     /// Plain affine DSV4 must also keep MLX's freed-buffer reuse pool
@@ -672,7 +686,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// the same throughput-collapse mechanism as the total MLX memory limit
     /// above, so RAM admission remains the owning safety gate for both caps.
     public func resolveMLXAllocatorCacheLimit(requested: ResidentCap) -> ResidentCap {
-        isPlainDeepseekV4AffineJANG ? .unlimited : requested
+        requiresUncappedResidentPools ? .unlimited : requested
     }
 }
 
