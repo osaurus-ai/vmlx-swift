@@ -40,6 +40,24 @@ import MLX
 /// called `cache.update(...)` and is passing the full post-update keys/values.
 /// Calling the generic helper after a manual MLA update appends the same keys
 /// twice and corrupts cache length/positioning.
+/// Decode-step fp32 cast gate. The historical decode path cast Q/K/V to
+/// float32 for every S==1 step, which materializes a full-context fp32 copy
+/// of the KV cache per token per MLA layer — ~5x the KV traffic of a bf16
+/// SDPA and the dominant cost of long-context decode for every MLA family
+/// (measured: Raptor 8B-A1B fell 173 -> 35 tok/s from 0.4k -> 26k context,
+/// ~0.95us per context token per step, all of it attention-side copies).
+/// `VMLX_MLA_SDPA_FP32=1` restores the old cast for A/B and fallback.
+enum MLAAttentionRuntime {
+    /// Read at every decode step; written only by the env initializer and by
+    /// the focused dtype tests (which run serialized under the shared MLX
+    /// test lock). Plain Bool loads/stores are atomic on arm64; a torn or
+    /// stale read here could at worst run one step down the other (equally
+    /// correct) SDPA path.
+    nonisolated(unsafe) static var decodeFP32Cast: Bool = {
+        ProcessInfo.processInfo.environment["VMLX_MLA_SDPA_FP32"] == "1"
+    }()
+}
+
 public func mlaScaledDotProductAttention(
     queries: MLXArray,
     keys: MLXArray,
@@ -49,7 +67,7 @@ public func mlaScaledDotProductAttention(
 ) -> MLXArray {
     let originalDtype = queries.dtype
     let queryLength = queries.dim(2)
-    if queryLength == 1 && originalDtype != .float32 {
+    if MLAAttentionRuntime.decodeFP32Cast, queryLength == 1, originalDtype != .float32 {
         let maskFp32: MLXFast.ScaledDotProductAttentionMaskMode = {
             switch mask {
             case .array(let m): return .array(m.asType(.float32))
