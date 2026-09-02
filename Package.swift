@@ -850,6 +850,7 @@ let package = Package(
                 "DualPathFamiliesTests.swift",
                 "Qwen35FusedInputProjectionTests.swift",
                 "MLADecodeSDPADtypeTests.swift",
+                "MTPHeadDtypeTests.swift",
                 "NoContextScalingFP32CastSourceTests.swift",
                 "DeepseekV4ChatTemplateFallbackFocusedTests.swift",
                 "MuseGlimmerNormFoldOwnershipTests.swift",
