@@ -390,6 +390,13 @@ public enum Glm5NextCheckpointKeys {
 
     /// Weights for a tower that was not built. Dropping them is what makes a narrowed construction
     /// loadable at all: MLX refuses keys with no matching module.
+    /// The decoder-layer index a key belongs to, or nil if it names no layer.
+    static func decoderLayerIndex(_ key: String) -> Int? {
+        guard let range = key.range(of: "layers.") else { return nil }
+        let digits = key[range.upperBound...].prefix { $0.isNumber }
+        return digits.isEmpty ? nil : Int(digits)
+    }
+
     public static func isVisionKey(_ key: String) -> Bool {
         key.hasPrefix("model.visual.") || key.hasPrefix("visual.")
             || key.hasPrefix("model.vision_tower.") || key.hasPrefix("vision_tower.")
@@ -439,12 +446,18 @@ public enum Glm5NextCheckpointKeys {
     }
 
     /// Apply the policy. `keepVision` is the plan's answer, not a guess from the key set.
+    /// - Parameter dropLayersFrom: when non-nil, discard weights for decoder layers at or above
+    ///   this index. That is how an MTP-carrying bundle loads with the head switched off: the keys
+    ///   are dropped here rather than left unclaimed, which `verify: [.noUnusedKeys]` would reject.
     public static func sanitize(
-        _ weights: [String: MLXArray], keepVision: Bool
+        _ weights: [String: MLXArray], keepVision: Bool, dropLayersFrom: Int? = nil
     ) -> [String: MLXArray] {
         var out = [String: MLXArray](minimumCapacity: weights.count)
         for (key, value) in weights {
             if !keepVision, isVisionKey(key) { continue }
+            if let floor = dropLayersFrom, let index = decoderLayerIndex(key), index >= floor {
+                continue
+            }
             // Torch conv layout [O, I, …] -> MLX [O, …, I]. `patch_embed.proj` is 5-D and
             // `downsample` is 4-D; a bundle already converted is left alone, which is what the
             // trailing-dimension check decides.
@@ -469,6 +482,26 @@ public enum Glm5NextCheckpointKeys {
         }
         return out
     }
+}
+
+/// Whether this load builds GLM-5.3's multi-token-prediction head.
+///
+/// `num_nextn_predict_layers` is `1` in BOTH shipped bundles, but only the `-MTP` bundle carries
+/// layer 45's weights. Building the head from the config alone therefore allocated a 288-expert MoE
+/// that no checkpoint key binds to: three DENSE, UNQUANTIZED `switch_mlp` projections at 4.83 GB
+/// each. Nothing read them — the backbone forward runs `layers.prefix(numDecoderLayers)` and
+/// `multiTokenPredictionLayer` has no callers — but 14.5 GB of resident parameters pushed the
+/// process past MLX's allocator GC threshold (`0.95 * recommendedMaxWorkingSetSize`, which no cap
+/// can raise). Above it `MetalAllocator::malloc` releases the buffer cache on EVERY allocation, so
+/// buffer reuse stops entirely.
+///
+/// `verify: [.noUnusedKeys]` cannot catch this: it asserts that no checkpoint KEY went unclaimed,
+/// and a module that receives no weights consumes no keys.
+///
+/// Fail-closed, matching `nemotronHNativeMTPEnabled()`: with no host request the head is never
+/// built and costs nothing. `LoadConfiguration.nativeMTP` is how a host asks for it.
+internal func glm5NextNativeMTPEnabled() -> Bool {
+    NativeMTPActivation.isExplicitlyRequested
 }
 
 // MARK: - Linear attention
@@ -2304,7 +2337,10 @@ public final class Glm5NextLanguageModel: Module {
     public init(_ config: Glm5NextTextConfiguration) throws {
         let schedule = try config.validatedSchedule()
         self.numDecoderLayers = config.numHiddenLayers
-        self.numMTPLayers = max(0, config.numNextnPredictLayers)
+        // Gated, not config-driven: see `glm5NextNativeMTPEnabled()`. A bundle that declares an
+        // MTP layer but ships no weights for it must not allocate one.
+        self.numMTPLayers =
+            glm5NextNativeMTPEnabled() ? max(0, config.numNextnPredictLayers) : 0
         self.usesHyperConnections = config.mhc
         self.hcMult = config.hcMult
 
@@ -2675,7 +2711,10 @@ public class Glm5Next: Module, ModalityBearing, ModelComponentMapping {
     /// Applies the bundle's key policy, asking the PLAN whether the tower exists rather than
     /// inferring it from which keys happen to be present.
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        Glm5NextCheckpointKeys.sanitize(weights, keepVision: plan.builds(.visionTower))
+        Glm5NextCheckpointKeys.sanitize(
+            weights, keepVision: plan.builds(.visionTower),
+            dropLayersFrom: glm5NextNativeMTPEnabled()
+                ? nil : config.textConfig.numHiddenLayers)
     }
 
     /// The linear-attention layers, in decoder order. Built lazily by `buildLinearAttentionLayers`
