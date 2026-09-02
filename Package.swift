@@ -908,6 +908,7 @@ let package = Package(
                 "VLGrowingConversationReuseTests.swift",
                 "VLMediaTokenDeclarationReachabilityTests.swift",
                 "Apertus1p5PrefixNormalisationTests.swift",
+                "Qwen3VLFeatureOrderTests.swift",
                 "NemotronHOmniPreEncodedAudioTests.swift",
                 "NemotronHJANGTQDispatchFocusedTests.swift",
                 "MTPRuntimeFocusedTests.swift",

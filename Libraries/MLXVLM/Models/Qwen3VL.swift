@@ -1754,6 +1754,82 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         return indices
     }
 
+    /// Permutation that reorders vision feature rows from batch order
+    /// (image rows first, then video rows — the order `prepare`
+    /// concatenates pixels in) to PLACEHOLDER order (conversation order).
+    ///
+    /// The pooled scatter over `imageMask .|| videoMask` assumes those two
+    /// orders agree, and they do not: a chat whose earlier turn carried a
+    /// video and whose current turn carries an image has video placeholders
+    /// FIRST, so the pooled scatter lays the image's rows onto the video's
+    /// pads and vice versa — the blocks swap, silently, because the total
+    /// element count still matches (same defect fixed in Qwen35.swift; this
+    /// model additionally re-applies the rows per deepstack layer, so the
+    /// permutation is computed once and applied to every row batch).
+    ///
+    /// Returns `nil` when only one media kind is present — one kind cannot
+    /// mis-order, and the fast path stays untouched.
+    private func placeholderOrderPermutation(
+        inputIds: MLXArray,
+        imageTokenIndex: Int,
+        videoTokenIndex: Int,
+        imageRowCount: Int,
+        totalRows: Int
+    ) throws -> MLXArray? {
+        guard imageRowCount > 0, totalRows > imageRowCount else { return nil }
+        let flatIds = inputIds.flattened()
+        let imagePositions = nonZero((flatIds .== MLXArray(imageTokenIndex)).asType(.bool))
+        let videoPositions = nonZero((flatIds .== MLXArray(videoTokenIndex)).asType(.bool))
+        guard imagePositions.count == imageRowCount,
+            videoPositions.count == totalRows - imageRowCount
+        else {
+            throw Qwen3VLError.featureTokenMismatch(
+                expected: imagePositions.count + videoPositions.count, actual: totalRows)
+        }
+        return MLXArray(
+            Self.placeholderOrderPermutation(
+                imagePositions: imagePositions,
+                videoPositions: videoPositions,
+                imageRowCount: imageRowCount))
+    }
+
+    /// Pure core of the reordering: walk the combined placeholder positions
+    /// in ascending (conversation) order; each position consumes the next
+    /// row of its kind's queue. Rows [0, imageRowCount) are the image batch,
+    /// the rest the video batch.
+    static func placeholderOrderPermutation(
+        imagePositions: [Int],
+        videoPositions: [Int],
+        imageRowCount: Int
+    ) -> [UInt32] {
+        let totalRows = imagePositions.count + videoPositions.count
+        var permutation = [UInt32](repeating: 0, count: totalRows)
+        var imageNext = 0
+        var videoNext = imageRowCount
+        var imageIdx = 0
+        var videoIdx = 0
+        for slot in 0 ..< totalRows {
+            let takeImage: Bool
+            if imageIdx == imagePositions.count {
+                takeImage = false
+            } else if videoIdx == videoPositions.count {
+                takeImage = true
+            } else {
+                takeImage = imagePositions[imageIdx] < videoPositions[videoIdx]
+            }
+            if takeImage {
+                permutation[slot] = UInt32(imageNext)
+                imageNext += 1
+                imageIdx += 1
+            } else {
+                permutation[slot] = UInt32(videoNext)
+                videoNext += 1
+                videoIdx += 1
+            }
+        }
+        return permutation
+    }
+
     private func combinedFrames(
         imageFrames: [THW]?,
         videoFrames: [THW]?
@@ -1815,7 +1891,24 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             let splits = framesList.map { $0.product / (mergeSize * mergeSize) }
             let splitIndices = cumulativeSplitIndices(from: splits)
             let featureSlices = visionHidden.split(indices: splitIndices)
-            let flattenedFeatures = concatenated(featureSlices).asType(textEmbeds.dtype)
+            var flattenedFeatures = concatenated(featureSlices).asType(textEmbeds.dtype)
+
+            // Rows arrive image-batch-first; placeholders sit in conversation
+            // order. Reorder rows to placeholder order ONCE so the pooled
+            // scatter below — and every per-layer deepstack application of
+            // the same rows — lands each block on its own medium's pads.
+            let imageRowCount = (imageFrames ?? []).reduce(0) {
+                $0 + $1.product / (mergeSize * mergeSize)
+            }
+            let rowPermutation = try placeholderOrderPermutation(
+                inputIds: inputIds,
+                imageTokenIndex: config.imageTokenIndex,
+                videoTokenIndex: config.videoTokenIndex,
+                imageRowCount: imageRowCount,
+                totalRows: flattenedFeatures.dim(0))
+            if let rowPermutation {
+                flattenedFeatures = flattenedFeatures[rowPermutation]
+            }
 
             let (mergedEmbeds, mask) = try mergeInputIdsWithImageFeatures(
                 imageFeatures: flattenedFeatures,
@@ -1831,7 +1924,13 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
                 deepstackEmbeds = deepstackOutputs.map { layerFeatures in
                     let splitIndices = cumulativeSplitIndices(from: splits)
                     let slices = layerFeatures.split(indices: splitIndices)
-                    let concatenatedSlices = concatenated(slices).asType(textEmbeds.dtype)
+                    var concatenatedSlices = concatenated(slices).asType(textEmbeds.dtype)
+                    // Same batch-order rows, same placeholder-order pads:
+                    // applyDeepstack adds these rows at visualMask positions
+                    // per layer, so they need the same reordering.
+                    if let rowPermutation {
+                        concatenatedSlices = concatenatedSlices[rowPermutation]
+                    }
                     return concatenatedSlices
                 }
             }
