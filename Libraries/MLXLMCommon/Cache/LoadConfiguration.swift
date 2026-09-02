@@ -621,12 +621,34 @@ public struct LoadBundleFacts: Sendable, Equatable {
             && isRouted
     }
 
+    /// GLM-5.3 (`glm5_next`) needs the same resident treatment DSV4 does, and for the same reason:
+    /// a routed affine bank far larger than the page cache will hold.
+    ///
+    /// Measured on a 95 GB bundle / 128 GB machine. Mapped, it sits at 60-74 GB file-backed with
+    /// free memory pinned near zero and the kernel evicting and re-reading continuously — `sys`
+    /// runs ~37x `user`, i.e. the model spends its life faulting rather than computing.
+    ///
+    /// This is NOT "mmap is bad": mmap is what lets a model LARGER than RAM run at all. It is that
+    /// a bundle which fits resident should be resident, because file-backed pages are evictable and
+    /// macOS drops them eagerly, while anonymous pages are not. 95 GB of 128 GB fits.
+    public var isGlm5NextAffineJANG: Bool {
+        let type = modelType?.lowercased() ?? ""
+        let format = weightFormat?.lowercased() ?? ""
+        let declaresAffine = format.isEmpty || format == "affine" || format == "jang"
+        return (type == "glm5_next" || type == "glm5_next_text")
+            && !hasJangTQRuntime
+            && declaresAffine
+            && isRouted
+            && (numRoutedExperts ?? 0) >= 128
+    }
+
     /// Plain split-expert DSV4 currently requires a resident compute bank.
     /// Qwen4Exp must retain the caller's mmap choice: its 61+ GiB packed bank
     /// is valid mixed-dtype MLX input, while its PLE/ngram tensors already stay
     /// in the model-owned exact-row SSD reader.
     public var requiresResidentSafetensors: Bool {
-        isPlainDeepseekV4AffineJANG && !hasPrestackedAffineRoutedExperts
+        (isPlainDeepseekV4AffineJANG && !hasPrestackedAffineRoutedExperts)
+            || isGlm5NextAffineJANG
     }
 
     public func resolveMmapSafetensors(requested: Bool) -> Bool {
