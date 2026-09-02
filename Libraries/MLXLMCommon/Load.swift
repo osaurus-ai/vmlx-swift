@@ -1075,6 +1075,34 @@ public func loadWeights(
             shouldSkip: isJANGTQNative ? isJANGTQParameterKey : { _ in false })
     }
 
+    // The Gemma-4 / DSV4-prestacked preserve branches keep f16 affine
+    // metadata file-backed (correct: materializing the scale banks costs
+    // gigabytes and can alter logits), but `dequantized` types embedding
+    // output from the SCALES dtype — so the quantized EMBEDDING seeded f16
+    // into a bf16 stream and the first mixed op promoted the whole
+    // activation path to fp32 (doubled KV caches, refused fused-decode
+    // gates). Pin only the embedding OUTPUT to bf16: the dequant math still
+    // reads the exact file-backed f16 metadata; qwen4_exp bundles are
+    // excluded because their native-module swap already handles this.
+    if preserveJANGAffineMmapDtypes,
+        !shouldUseQwen4ExpNativeBF16Affine(modelDirectory: modelDirectory)
+    {
+        var pinned = 0
+        for (_, module) in model.leafModules().flattened() {
+            if let embedding = module as? QuantizedEmbedding,
+                embedding.scales.dtype == .float16
+            {
+                embedding.outputDType = .bfloat16
+                pinned += 1
+            }
+        }
+        if pinned > 0 {
+            FileHandle.standardError.write(Data(
+                "[Load] jang_affine_preserve embedding_output_dtype=bfloat16 modules=\(pinned)\n"
+                    .utf8))
+        }
+    }
+
     if shouldPreserveQwen4ExpJANGAffineMmapDtypes(modelDirectory: modelDirectory) {
         let flat = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
         var count = 0

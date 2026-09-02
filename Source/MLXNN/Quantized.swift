@@ -239,19 +239,35 @@ open class QuantizedEmbedding: Embedding, Quantized {
         self.freeze()
     }
 
+    /// When set, embedding lookups (and the tied lm-head projection) are cast
+    /// to this dtype on the way out. `dequantized` types its output from the
+    /// SCALES dtype, so a bundle that keeps f16 affine metadata file-backed
+    /// (Gemma-4 / DSV4 prestacked mmap preserves) seeds f16 into a bf16
+    /// model's stream — the first mixed op then promotes to fp32 and the
+    /// whole activation path degrades. The loader sets this for those
+    /// bundles; the dequant math itself still uses the exact f16 metadata.
+    public var outputDType: DType? = nil
+
     open override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let s = x.shape
         let x = x.flattened()
-        let out = dequantized(
+        var out = dequantized(
             weight[x], scales: scales[x], biases: biases == nil ? nil : biases![x],
             groupSize: groupSize, bits: bits, mode: mode)
+        if let outputDType, out.dtype != outputDType {
+            out = out.asType(outputDType)
+        }
         return out.reshaped(s + [-1])
     }
 
     open override func asLinear(_ x: MLXArray) -> MLXArray {
-        quantizedMM(
+        var out = quantizedMM(
             x, weight, scales: scales, biases: biases, transpose: true, groupSize: groupSize,
             bits: bits, mode: mode)
+        if let outputDType, out.dtype != outputDType {
+            out = out.asType(outputDType)
+        }
+        return out
     }
 }
 
