@@ -66,8 +66,18 @@ enum SafetensorsStorageHealer {
         let rawEnabled =
             env["MLXPRESS_HEAL_SAFETENSORS"]
             ?? env["JANGPRESS_HEAL_SAFETENSORS"]
-        if isDisabledFlag(rawEnabled) {
-            configuration.logger("event=disabled path=\(quoted(originalURL.path))")
+        // Default OFF (opt-in). The realignment rewrites the user's ORIGINAL
+        // model shards in place — payload-preserving and atomic, but it still
+        // changes the file bytes, which breaks HF-hash verification and
+        // cross-engine comparison of the local directory (osaurus#2604). It
+        // is only a mmap optimization: MLX's aligned-copy fallback loads the
+        // misaligned tensors correctly without it, so declining to heal never
+        // blocks a load. We do not modify a user's files for a perf
+        // optimization unless they explicitly opt in via
+        // MLXPRESS_HEAL_SAFETENSORS=1 (or JANGPRESS_HEAL_SAFETENSORS=1).
+        guard isEnabledFlag(rawEnabled) else {
+            configuration.logger(
+                "event=disabled reason=opt_in_required path=\(quoted(originalURL.path))")
             return Result()
         }
 
@@ -558,6 +568,13 @@ enum SafetensorsStorageHealer {
     private static func isDisabledFlag(_ raw: String?) -> Bool {
         guard let raw = raw?.lowercased() else { return false }
         return raw == "0" || raw == "false" || raw == "no" || raw == "off"
+    }
+
+    /// Explicit opt-in for the in-place realignment. Unset / empty / any
+    /// non-truthy value keeps the healer OFF (originals untouched).
+    private static func isEnabledFlag(_ raw: String?) -> Bool {
+        guard let raw = raw?.lowercased() else { return false }
+        return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
     }
 
     private static func quoted(_ value: String) -> String {
