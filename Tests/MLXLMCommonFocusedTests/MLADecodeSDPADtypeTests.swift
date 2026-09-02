@@ -77,6 +77,21 @@ struct MLADecodeSDPADtypeTests {
         assertClose(bf16, fp32, label: "192/128 @ 4096")
     }
 
+    @Test("32k context: bf16 softmax reduction does not collapse at MLA dims")
+    func longContextReduction() throws {
+        // Gemma-4's global layers (head_dim 512 + softcap) collapse to <pad>
+        // past ~26k when the unfused SDPA fallback reduces softmax in bf16 —
+        // that is why ITS fp32 upcast is a correctness workaround, not a bug.
+        // This pins that MLA dims (192/128) do NOT live in that regime: at
+        // 32k keys the bf16 decode output must stay within bf16 rounding of
+        // the fp32 arm. Live corroboration: Raptor at 25.9k context decodes
+        // a coherent greedy summary (110 tok/s, clean stop, no loops).
+        let (bf16, fp32) = try runBothArms(
+            heads: 16, context: 32_768, kDim: 192, vDim: 128,
+            scale: pow(192, -0.5))
+        assertClose(bf16, fp32, label: "192/128 @ 32768")
+    }
+
     @Test("large-magnitude queries stay bounded (softmax saturation case)")
     func largeLogitSaturation() throws {
         // 8x query spread pushes pre-softmax logits far from zero — the
