@@ -172,6 +172,40 @@ struct JangPressSafetensorsAlignmentTests {
         #expect(try Self.readFixture(shard).unalignedCount == 0)
     }
 
+    @Test("healing a shard never rewrites config.json or normalizes its numbers (#2604)")
+    func healingLeavesConfigJsonByteIdentical() throws {
+        let bundle = try Self.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: bundle) }
+        let shard = bundle.appendingPathComponent("model.safetensors")
+        try Self.writeUnalignedFixture(shard)
+
+        // #2604 reports config.json numbers being normalized — `1e10` losing
+        // its `.0`, `9.99…e-07` collapsing to `1e-06`. That is the signature of
+        // a JSON parse-and-reserialize. Ship a config.json with exactly those
+        // shapes and prove the healer leaves it byte-for-byte untouched: the
+        // healer only ever renames `.safetensors` shards.
+        let configURL = bundle.appendingPathComponent("config.json")
+        let configText = """
+            {
+              "gradient_clipping": 10000000000.0,
+              "rms_norm_eps": 9.9999999999999995e-07,
+              "model_type": "qwen3_5"
+            }
+            """
+        try Data(configText.utf8).write(to: configURL)
+        let before = try Data(contentsOf: configURL)
+
+        let result = SafetensorsStorageHealer.healBundle(
+            at: bundle, configuration: Self.configuration())
+
+        #expect(result.healedShards == 1)
+        // Byte-for-byte identical — no rewrite, no number normalization.
+        #expect(try Data(contentsOf: configURL) == before)
+        let after = try String(contentsOf: configURL, encoding: .utf8)
+        #expect(after.contains("10000000000.0"))
+        #expect(after.contains("9.9999999999999995e-07"))
+    }
+
     @Test("resident/non-mmap loads do not mutate model storage")
     func disabledMmapDoesNotHeal() throws {
         let bundle = try Self.makeDirectory()
