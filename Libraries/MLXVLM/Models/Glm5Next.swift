@@ -809,7 +809,13 @@ public final class Glm5NextIndexedKVCache: KVCache {
             // The packed buffer is the ONLY optional trailing entry, so its presence is decided by
             // the count rather than by position — restoring it into the KV slots would corrupt both.
             let kvCount = kv.state.count
-            kv.state = Array(newValue.prefix(kvCount))
+            let kvPortion = Array(newValue.prefix(kvCount))
+            // Same empty guard as `copy()`: the inner setter traps on a count
+            // that is not exactly 2, and an empty restore (fresh snapshot)
+            // yields no KV arrays.
+            if !kvPortion.isEmpty {
+                kv.state = kvPortion
+            }
             indexerPacked = newValue.count > kvCount ? newValue[kvCount] : nil
         }
     }
@@ -839,7 +845,17 @@ public final class Glm5NextIndexedKVCache: KVCache {
 
     public func copy() -> any KVCache {
         let copy = Glm5NextIndexedKVCache()
-        copy.kv.state = kv.state.map(Self.owned)
+        // The inner KVCacheSimple's state setter requires EXACTLY [keys,
+        // values] and traps on any other count. A fresh cache (no tokens yet)
+        // yields an EMPTY state, so restore it only when present — the same
+        // guard `KVCacheSimple.copy()` and `DeepseekV4Compressor` already use.
+        // Without it, snapshotting a fresh cache at the prompt boundary (the
+        // very first generation) round-tripped `[]` through the setter and
+        // trapped, crashing the app before any token was produced.
+        let innerState = kv.state
+        if !innerState.isEmpty {
+            copy.kv.state = innerState.map(Self.owned)
+        }
         copy.kv.metaState = kv.metaState
         copy.kv.offset = kv.offset
         copy.indexerPacked = indexerPacked.map(Self.owned)
