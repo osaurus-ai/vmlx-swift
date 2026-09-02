@@ -680,7 +680,12 @@ class BailingLinearAttention: Module {
             cache?.offset += L
         }
 
-        let flat = output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        // The GLA recurrence intentionally runs and stores its STATE in fp32
+        // (fp16-overflow fix above); the layer OUTPUT has no such need, and
+        // returning it fp32 promoted the residual stream — and through it
+        // every downstream attention layer's KV cache — to fp32 on bf16
+        // bundles. Cast the output lane back; the state lane stays fp32.
+        let flat = output.transposed(0, 2, 1, 3).reshaped(B, L, -1).asType(x.dtype)
         let gated = gNorm(flat) * sigmoid(gProj(x))
         return dense(gated)
     }

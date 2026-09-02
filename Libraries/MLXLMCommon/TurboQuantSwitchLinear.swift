@@ -97,7 +97,11 @@ public class TurboQuantSwitchLinear: Module {
             batchTokens: batch, K: K,
             inFeatures: inFeatures, outFeatures: outFeatures, bits: bits
         )
-        return y.reshaped(indices.shape + [outFeatures])
+        // The TQ kernel declares fp32 outputs (accumulator dtype). The GLU
+        // sibling casts back to the activation dtype; this single-projection
+        // class was the outlier and leaked fp32 into the residual stream of
+        // any JANGTQ model using a standalone projection.
+        return y.reshaped(indices.shape + [outFeatures]).asType(x.dtype)
     }
 }
 

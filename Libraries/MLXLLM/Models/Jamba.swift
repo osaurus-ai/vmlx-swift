@@ -366,7 +366,7 @@ class JambaSparseMoeBlock: Module {
         scores = MLX.softmax(scores, axis: -1, precise: true)
 
         let y = switchMLP(x, inds)
-        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        return (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
     }
 }
 

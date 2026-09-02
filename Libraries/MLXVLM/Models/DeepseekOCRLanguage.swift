@@ -222,7 +222,7 @@ private class DeepseekOCRMoE: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
         var y = switchMLP(x, inds)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        y = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
         if let shared = sharedExperts {
             y = y + shared(x)
         }

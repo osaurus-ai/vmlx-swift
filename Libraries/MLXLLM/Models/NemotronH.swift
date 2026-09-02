@@ -915,7 +915,7 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
             y = weighted
         } else {
             y = layer(expertInput, inds)
-            y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+            y = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
         if profile {
             MLX.eval(y)

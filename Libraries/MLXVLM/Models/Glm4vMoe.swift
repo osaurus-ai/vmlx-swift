@@ -339,7 +339,7 @@ private enum Glm4vMoeLanguage {
             let (inds, scores) = gate(x)
             JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
             var y = switchMLP(x, inds)
-            y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+            y = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
             if let sharedExperts {
                 y = y + sharedExperts(x)
             }

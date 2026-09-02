@@ -3,6 +3,19 @@
 import Foundation
 import MLX
 
+/// Runtime gate for quantized-module output dtype. MLX types quantized
+/// matmul/dequant outputs as `promote_types(activation, scales)`; JANG
+/// bundles stamp f16 scales, so bf16 models silently promote to fp32 and
+/// the fp32 propagates model-wide (fp32 residual stream, doubled KV caches,
+/// refused fused-decode gates). The default pins module outputs back to the
+/// activation dtype; `VMLX_QUANTIZED_OUTPUT_PROMOTE=1` restores the
+/// historical propagation for A/B and fallback.
+enum QuantizedRuntime {
+    nonisolated(unsafe) static var propagatePromotedOutput: Bool = {
+        ProcessInfo.processInfo.environment["VMLX_QUANTIZED_OUTPUT_PROMOTE"] == "1"
+    }()
+}
+
 /// Protocol for layers that can be quantized
 public protocol Quantizable {
 
@@ -359,6 +372,7 @@ open class QuantizedLinear: Linear, Quantized {
     }
 
     open override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let inputDType = x.dtype
         var x = quantizedMM(
             x,
             weight,
@@ -371,6 +385,19 @@ open class QuantizedLinear: Linear, Quantized {
         )
         if let bias {
             x = x + bias
+        }
+        // MLX types quantizedMM output as promote_types(x, scales): bf16
+        // activations against the f16 scales JANG bundles stamp promote to
+        // FLOAT32, and without this pin the fp32 silently propagates through
+        // the whole layer stack — fp32 residual stream, fp32 K/V projections
+        // (doubling every KV cache and disk-cache entry), and fused/compiled
+        // decode regions refusing their dtype gates. fp32 stays where it
+        // belongs: inside the matmul as the accumulator. The env var
+        // restores the historical promote-and-propagate behavior for A/B.
+        if !QuantizedRuntime.propagatePromotedOutput, x.dtype != inputDType,
+            inputDType == .bfloat16 || inputDType == .float16
+        {
+            x = x.asType(inputDType)
         }
         return x
     }

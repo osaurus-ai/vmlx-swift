@@ -87,7 +87,7 @@ final class DeepseekV4MoEJANGTQ: Module, UnaryLayer {
             y = streaming.reduced(x, indices: indices, scores: scores)
         } else {
             y = switchMLP(x, indices)
-            y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+            y = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
         }
         y = y + sharedExperts(x)
         return y

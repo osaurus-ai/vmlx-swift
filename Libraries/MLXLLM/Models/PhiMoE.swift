@@ -145,7 +145,7 @@ class PhiMoESparseMoeBlock: Module {
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
 
         let y = switchMLP(x, inds)
-        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        return (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
     }
 }
 

@@ -435,7 +435,10 @@ public final class AffineStreamingSwitchGLU: Module {
         }
 
         let result = chunks.count == 1 ? chunks[0] : concatenated(chunks, axis: 0)
-        return result.reshaped(x.shape)
+        // This path REQUIRES f16 scales, so gatherQuantizedMM promotes bf16
+        // activations to fp32 (promote_types) and the whole MoE block leaked
+        // fp32 into the residual stream. Pin to the activation dtype.
+        return result.reshaped(x.shape).asType(x.dtype)
     }
 
     private func expert(_ index: Int) -> AffineStreamingExpertCatalog.ExpertArrays {

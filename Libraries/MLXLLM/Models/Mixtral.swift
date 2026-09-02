@@ -126,7 +126,7 @@ private class MixtralSparseMoeBlock: Module {
         let scores = MLX.softmax(MLX.takeAlong(gates, inds, axis: -1), axis: -1, precise: true)
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         let y = switchMLP(x, inds)
-        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        return (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
     }
 }
 

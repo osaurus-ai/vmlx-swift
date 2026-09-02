@@ -534,7 +534,7 @@ final class Qwen35JANGTQSparseMoeBlock: Module, UnaryLayer {
             combined = streaming.reduced(x, indices: inds, scores: scores)
         } else {
             let y = switchMLP(x, inds)
-            combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+            combined = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
         }
 
         let sharedY = sharedExpert(x)

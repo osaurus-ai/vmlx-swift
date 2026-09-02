@@ -394,7 +394,7 @@ final class Qwen3NextSparseMoeBlock: Module {
         }
 
         let y = switchMLP(x, inds)
-        let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        let combined = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
 
         var sharedY = sharedExpert(x)
         sharedY = sigmoid(sharedExpertGate(x)) * sharedY

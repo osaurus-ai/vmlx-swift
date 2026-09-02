@@ -1600,8 +1600,15 @@ enum Qwen35Language {
                         ? [combined]
                         : MLX.split(combined, indices: splitIndices, axis: -1)
                     guard parts.count == members.count else { return nil }
+                    // Pin to the activation dtype: f16 JANG scales promote
+                    // quantizedMM to fp32 (the unfused QuantizedLinear
+                    // reference now pins the same way, so bit-identity with
+                    // the fallback path is preserved). Without this the fp32
+                    // qkv/z/b/a flowed into the GDN recurrence and tripped
+                    // the compiled_gdn_tail dtype gate.
                     for (part, member) in zip(parts, members) {
-                        outputs[member] = part
+                        outputs[member] = part.dtype == inputs.dtype
+                            ? part : part.asType(inputs.dtype)
                     }
                 }
             }
@@ -1815,7 +1822,14 @@ enum Qwen35Language {
                 kNormed = front[4]
                 v = front[5]
                 convInput = front[6]
-                if let cache, convKernelSize > 1 { cache[0] = front[6] }
+                if let cache, convKernelSize > 1 {
+                    // The compiled front can emit a promoted fp32 conv tail
+                    // (f16-scale bundles); the conv-state CACHE lane must
+                    // stay in the activation dtype or every later step pays
+                    // 2x state traffic and re-promotes the conv input.
+                    let tail = front[6]
+                    cache[0] = tail.dtype == inputs.dtype ? tail : tail.asType(inputs.dtype)
+                }
             } else {
                 let fusedInputs = fusedDecodeInputs(inputs)
                 var mixedQKV = fusedInputs?[0] ?? inProjQKV(inputs)
@@ -2285,7 +2299,7 @@ enum Qwen35Language {
             } else if let turbo = switchMLP as? TurboQuantSwitchGLU {
                 let y = turbo(x, inds)
                 routed = nil
-                eagerCombined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+                eagerCombined = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
             } else if let affine = switchMLP as? SwitchGLU {
                 if let combined = affine.qwen4ExpReduced(
                     x, indices: inds, scores: scores)

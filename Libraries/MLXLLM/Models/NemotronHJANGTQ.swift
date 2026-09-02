@@ -73,7 +73,7 @@ internal final class NemotronHJANGTQSwitchMLP: Module, NemotronHSwitchMLPLayer {
     ///   - `indices` : `(B, T, K)` — expert ids per token
     ///   - return    : `(B, T, K, hidden)` — per-(token, expert) outputs.
     ///                 The caller (`NemotronHMoE.callAsFunction`) does
-    ///                 `(y * scores[.ellipsis, .newAxis]).sum(axis: -2)`
+    ///                 `(y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)`
     ///                 to reduce over the K dim.
     ///
     /// We bypass `TurboQuantSwitchLinear.callAsFunction(_:_:)` and call

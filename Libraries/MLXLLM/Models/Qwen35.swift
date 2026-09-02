@@ -358,8 +358,12 @@ final class Qwen35GatedDeltaNet: Module {
                     ? [combined]
                     : MLX.split(combined, indices: splitIndices, axis: -1)
                 guard parts.count == members.count else { return nil }
+                // Pin to the activation dtype: f16 JANG scales promote
+                // quantizedMM to fp32; the unfused QuantizedLinear reference
+                // pins the same way, so bit-identity is preserved.
                 for (part, member) in zip(parts, members) {
-                    outputs[member] = part
+                    outputs[member] = part.dtype == inputs.dtype
+                        ? part : part.asType(inputs.dtype)
                 }
             }
         }
@@ -890,7 +894,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         }
 
         let y = switchMLP(x, inds)
-        let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        let combined = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
 
         let sharedY = sharedExpert(x)
         let gatedSharedY = compiledSigmoidGate(sharedExpertGate(x), sharedY)

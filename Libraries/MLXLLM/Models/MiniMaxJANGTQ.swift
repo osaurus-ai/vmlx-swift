@@ -209,7 +209,7 @@ private class MiniMaxJANGTQSparseMoeBlock: Module {
             return streaming.reduced(x, indices: inds, scores: scores)
         }
         let y = switchMLP(x, inds)
-        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        return (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
     }
 }
 

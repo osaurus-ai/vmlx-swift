@@ -471,7 +471,7 @@ class Hy3MoE: Module, UnaryLayer {
             routed = streaming.reduced(x, indices: indices, scores: scores)
         } else {
             let y = switchMLP(x, indices)
-            routed = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+            routed = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
         }
         return routed + sharedExperts(x)
     }
@@ -508,7 +508,7 @@ class Hy3AffineMoE: Module, UnaryLayer {
         let (indices, scores) = gate(x)
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         let y = switchMLP(x, indices)
-        let routed = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        let routed = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
         return routed + sharedExperts(x)
     }
 }

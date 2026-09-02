@@ -381,7 +381,7 @@ final class DeepseekV3JANGTQMoE: Module, UnaryLayer {
             }
         } else {
             y = switchMLP(routeInput, indices)
-            y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+            y = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
         }
 
         if let shared = sharedExperts {

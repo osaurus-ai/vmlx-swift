@@ -644,6 +644,27 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
             result = result + MLX.expandedDimensions(bias[indices], axis: -2)
         }
 
+        // Same contract as QuantizedLinear: gatherQuantizedMM types its
+        // output as promote_types(x, scales) — f16 JANG scales against bf16
+        // activations promote every expert output to fp32, which then flows
+        // through the MoE reduce into the residual stream and every KV cache
+        // behind it. Pin back to the activation dtype (fp32 accumulation
+        // still happens inside the kernel). VMLX_QUANTIZED_OUTPUT_PROMOTE=1
+        // restores the historical propagation.
+        if !SwitchLayerRuntime.propagatePromotedOutput, result.dtype != x.dtype,
+            x.dtype == .bfloat16 || x.dtype == .float16
+        {
+            result = result.asType(x.dtype)
+        }
+
         return result
     }
+}
+
+/// Mirrors `QuantizedRuntime` in MLXNN (module boundaries in different
+/// packages, same env contract).
+enum SwitchLayerRuntime {
+    nonisolated(unsafe) static var propagatePromotedOutput: Bool = {
+        ProcessInfo.processInfo.environment["VMLX_QUANTIZED_OUTPUT_PROMOTE"] == "1"
+    }()
 }
