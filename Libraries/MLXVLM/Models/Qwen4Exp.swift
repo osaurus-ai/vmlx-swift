@@ -860,6 +860,15 @@ private final class Qwen4ExpPLE: Module {
     }
 }
 
+/// Runtime gate for the QSA pooled-index cache. Default on; the env var
+/// exists for A/B and emergency fallback only — the cached and recomputed
+/// paths are bit-identical by construction (see `processBlocks`).
+enum Qwen4ExpQSARuntime {
+    nonisolated(unsafe) static var poolCache: Bool = {
+        ProcessInfo.processInfo.environment["VMLX_QSA_POOL_CACHE"] != "0"
+    }()
+}
+
 private final class Qwen4ExpQSAIndexer: Module {
     let extras: Qwen4ExpConfiguration.TextExtras
     let hiddenSize: Int
@@ -910,21 +919,55 @@ private final class Qwen4ExpQSAIndexer: Module {
             .transposed(0, 2, 1, 3)
         let blocks = total / extras.indexerCompressRatio
         guard blocks > 0 else { return nil }
-        var pooled = allKeys[0..., ..<(blocks * extras.indexerCompressRatio), 0...]
-            .reshaped(B, blocks, extras.indexerCompressRatio, extras.indexerHeadDim)
-            .asType(.float32).mean(axis: 2).asType(allKeys.dtype)
-        pooled = kNorm(pooled)
+
+        /// Pool, norm, and rotate index-key blocks `range` (block indices)
+        /// out of `allKeys`. Every operation is per-block-row independent
+        /// (mean within the block, rowwise RMSNorm, per-position rope), so
+        /// processing blocks in chunks is bit-identical to processing them
+        /// all at once.
+        func processBlocks(_ range: Range<Int>) -> MLXArray {
+            let ratio = extras.indexerCompressRatio
+            var chunk = allKeys[0..., (range.lowerBound * ratio) ..< (range.upperBound * ratio), 0...]
+                .reshaped(B, range.count, ratio, extras.indexerHeadDim)
+                .asType(.float32).mean(axis: 2).asType(allKeys.dtype)
+            chunk = kNorm(chunk)
+            let positions = MLXArray(stride(
+                from: range.lowerBound * ratio, to: range.upperBound * ratio,
+                by: ratio)).asType(.int32).reshaped(1, range.count)
+            let chunk4 = expandedDimensions(chunk, axis: 1)
+            let (kCos, kSin) = rotary(x: chunk4, positionIds: positions)
+            return Qwen35Language.applyMultimodalRotaryPosEmb(
+                q: chunk4, k: chunk4, cos: kCos, sin: kSin).0[0..., 0, 0..., 0...]
+        }
+
+        // Completed blocks never change content or rope position, so the
+        // processed form is append-only. Re-pooling + re-norming + re-rotating
+        // the ENTIRE history every decode token made the indexer's overhead
+        // linear in context per step; keep the processed blocks on the cache
+        // and extend by only the newly completed ones. Any trim/rollback or
+        // state restore drops the derived lane and the next forward rebuilds
+        // it here in one pass. `VMLX_QSA_POOL_CACHE=0` restores full
+        // recompute for A/B.
+        var pooled: MLXArray
+        if Qwen4ExpQSARuntime.poolCache, let cache {
+            if cache.derivedPooledBlockCount > blocks { cache.dropDerivedPooledBlocks() }
+            let have = cache.derivedPooledBlockCount
+            if blocks > have {
+                let fresh = processBlocks(have ..< blocks)
+                cache.derivedPooledBlocks = cache.derivedPooledBlocks.map {
+                    concatenated([$0, fresh], axis: 1)
+                } ?? fresh
+                cache.derivedPooledBlockCount = blocks
+            }
+            pooled = cache.derivedPooledBlocks![0..., ..<blocks, 0...]
+        } else {
+            pooled = processBlocks(0 ..< blocks)
+        }
+
         let qPositions = MLXArray(past ..< (past + S)).asType(.int32).reshaped(1, S)
-        let blockPositions = MLXArray(stride(
-            from: 0, to: blocks * extras.indexerCompressRatio,
-            by: extras.indexerCompressRatio)).asType(.int32).reshaped(1, blocks)
         let (qCos, qSin) = rotary(x: query, positionIds: qPositions)
         query = Qwen35Language.applyMultimodalRotaryPosEmb(
             q: query, k: query, cos: qCos, sin: qSin).0
-        let pooled4 = expandedDimensions(pooled, axis: 1)
-        let (kCos, kSin) = rotary(x: pooled4, positionIds: blockPositions)
-        pooled = Qwen35Language.applyMultimodalRotaryPosEmb(
-            q: pooled4, k: pooled4, cos: kCos, sin: kSin).0[0..., 0, 0..., 0...]
         return Qwen4ExpQSA.selectedTokenMask(
             query: query, pooledKeys: expandedDimensions(pooled, axis: 1),
             pastLen: past, compressRatio: extras.indexerCompressRatio,

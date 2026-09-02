@@ -608,6 +608,26 @@ public class QSAKVCache: KVCacheSimple {
     /// matching the reference forward order.
     public private(set) var indexerKeys: MLXArray?
 
+    /// DERIVED pooled-index lane: kNorm+rope-processed block keys
+    /// `[B, blockCount, indexerHeadDim]`, processed left-to-right by the
+    /// indexer. Block contents and block rope positions never change once a
+    /// block is complete, so the indexer appends only the NEW blocks each
+    /// step instead of re-pooling, re-norming, and re-rotating the entire
+    /// history per decode token (which made the indexer cost linear in
+    /// context every step).
+    ///
+    /// This lane is pure derivation from `indexerKeys`: it is never
+    /// serialized (`state` drops it), never copied, and any trim/rollback
+    /// clears it — the next forward rebuilds it from the raw lane in one
+    /// pass, bit-identical, and resumes incrementally after that.
+    public var derivedPooledBlocks: MLXArray?
+    public var derivedPooledBlockCount: Int = 0
+
+    public func dropDerivedPooledBlocks() {
+        derivedPooledBlocks = nil
+        derivedPooledBlockCount = 0
+    }
+
     public func updateIndexerKeys(_ rawKeys: MLXArray) -> MLXArray {
         if let existing = indexerKeys, existing.dim(1) > 0 {
             // Stale rows beyond `offset` (a trim/rollback that happened
@@ -622,7 +642,7 @@ public class QSAKVCache: KVCacheSimple {
     }
 
     public override func innerState() -> [MLXArray] {
-        super.innerState() + [indexerKeys].compactMap { $0 }
+        super.innerState() + [indexerKeys, derivedPooledBlocks].compactMap { $0 }
     }
 
     public override var state: [MLXArray] {
@@ -643,14 +663,21 @@ public class QSAKVCache: KVCacheSimple {
                 super.state = newValue
                 indexerKeys = nil
             }
+            // A restored cache may hold any raw-lane content; the derived
+            // pooled lane is rebuilt from it on the next forward.
+            dropDerivedPooledBlocks()
         }
     }
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
         let trimmed = super.trim(n)
-        if trimmed > 0, let existing = indexerKeys, existing.dim(1) > offset {
-            indexerKeys = existing[0..., ..<offset, 0...]
+        if trimmed > 0 {
+            if let existing = indexerKeys, existing.dim(1) > offset {
+                indexerKeys = existing[0..., ..<offset, 0...]
+            }
+            // Rollback invalidates trailing blocks; rebuild from raw keys.
+            dropDerivedPooledBlocks()
         }
         return trimmed
     }
