@@ -570,7 +570,20 @@ public final class MLXArray {
     /// Note: this is an implementation detail and only visible because of the need to call it from
     /// other `mlx-swift` modules.
     public func _updateInternal(_ array: MLXArray) {
-        mlx_array_set(&self.ctx, array.ctx)
+        // Replacing `ctx` releases the previous backing `array::Data`, whose
+        // buffer another thread may be copying out of under `evalLock` (every
+        // host read — `asArray`, `item`, `asData` — holds `evalLock` across the
+        // realized copy). In-place cache updates (`ArraysCache` subscript
+        // setter → here) run on the decode thread with no lock, so without
+        // serializing this swap a concurrent host read frees the buffer
+        // mid-copy and dereferences a dangling `MTL::Buffer` in
+        // `Buffer::raw_ptr()` — the production EXC_BAD_ACCESS behind Sentry
+        // APPLE-MACOS-1ZE (qwen4_exp PLE reads its recurrent slot every decode
+        // step). `evalLock` is recursive, so nested updates issued while eval
+        // or compile already holds it stay safe.
+        evalLock.withLock {
+            mlx_array_set(&self.ctx, array.ctx)
+        }
     }
 
     /// Internal function for copying the backing `mlx::core::array` context.
