@@ -100,7 +100,10 @@ iOSInjectionProject/
 .vscode/
 
 # Internal engineering notes — root-cause writeups, live-proof logs, campaign
-# state. Local only; never published.
+# state. Local only; never published. Git is case-sensitive: the real path is
+# lowercase `docs/internal/`, so both casings are listed to defeat the earlier
+# `Docs/Internal/`-only pattern that never matched and let the tree get tracked.
+docs/internal/
 Docs/Internal/
 
 # session-local scratch build paths
