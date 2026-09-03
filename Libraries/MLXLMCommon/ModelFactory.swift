@@ -686,14 +686,22 @@ public func loadModel(
     //     limit — it never blocks or refuses a load, and a small model simply
     //     gets a smaller (cheaper) residency set. The user can lift the OS cap
     //     with `sudo sysctl iogpu.wired_limit_mb=<MB>`.
+    //     SAFETY: wired pages can't be reclaimed, so this only RAISES the limit
+    //     when the whole model fits inside a safe physical-RAM reserve. On a
+    //     constrained Mac where the model is a large fraction of RAM it leaves
+    //     the swappable default instead of wiring the machine into a
+    //     memory-pressure panic (osaurus#2612). See `modelResidencyWiredTarget`.
     if facts.totalSafetensorsBytes > 0 {
         let modelBytes = Int(clamping: facts.totalSafetensorsBytes)
-        let headroom = max(
-            16 * 1024 * 1024 * 1024,
-            Int((Double(modelBytes) * 0.30).rounded()))
         let workingSet = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
-        let target = min(modelBytes + headroom, workingSet)
-        setModelResidencyWiredLimit(target)
+        let physical = Int(clamping: facts.physicalMemory)
+        if let target = modelResidencyWiredTarget(
+            modelBytes: modelBytes,
+            workingSet: workingSet,
+            physicalMemory: physical)
+        {
+            setModelResidencyWiredLimit(target)
+        }
     }
 
     // 4. Optional disk-layout preparation. The permanent prestacked

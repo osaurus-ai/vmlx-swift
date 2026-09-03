@@ -56,6 +56,56 @@ public func setModelResidencyWiredLimit(_ bytes: Int) -> Bool {
     WiredMemoryBackend.applyLimit(max(0, bytes))
 }
 
+/// Compute the model-residency wired-limit target for a just-loaded model, or
+/// `nil` to leave the OS/MLX default untouched.
+///
+/// Wired pages cannot be reclaimed — not swapped, not compressed — so wiring a
+/// model that leaves a constrained Mac too little headroom removes the OS's
+/// only relief valve under memory pressure. Raising the residency limit to the
+/// full working set did exactly that: on 16 GB Macs, models that ran fine
+/// before began flickering, freezing, and triggering kernel restarts
+/// (osaurus#2612), with much higher resident RAM.
+///
+/// This policy reserves a generous slice of PHYSICAL RAM for the OS plus the
+/// decode transients (KV cache, Metal scratch) that must stay reclaimable, and
+/// only raises the wired limit when the whole model fits inside that safe
+/// ceiling — precisely the case the residency raise was meant to help (a large
+/// bundle on a Mac with room to spare, which would otherwise swap its pages on
+/// every `eval`). When the model is a large fraction of RAM it returns `nil`:
+/// the pages stay swappable, which is slower under pressure but never panics —
+/// the pre-residency default that constrained Macs relied on.
+///
+/// The reserve scales with the machine (a fraction, floored at a flat minimum)
+/// so large Macs still get the residency win while small Macs stay safe.
+///
+/// - Parameters:
+///   - modelBytes: on-disk weight size of the model.
+///   - workingSet: Metal's recommended max working set; Apple rejects a wired
+///     limit above this. Pass `Int.max` when unknown (non-Metal backends).
+///   - physicalMemory: total installed RAM in bytes.
+/// - Returns: a byte target for ``setModelResidencyWiredLimit(_:)``, or `nil`
+///   to leave the default (the safe choice on a constrained Mac).
+public func modelResidencyWiredTarget(
+    modelBytes: Int,
+    workingSet: Int,
+    physicalMemory: Int
+) -> Int? {
+    guard modelBytes > 0, physicalMemory > 0 else { return nil }
+    let gib = 1024 * 1024 * 1024
+    let headroom = max(16 * gib, Int((Double(modelBytes) * 0.30).rounded()))
+    // Keep at least this much PHYSICAL RAM reclaimable for the OS + decode
+    // transients. 35% of RAM, floored at 8 GB — enough for the OS, the app,
+    // and a model's KV/scratch spike on the small end; scales up on big Macs.
+    let osReserve = max(8 * gib, physicalMemory / 100 * 35)
+    let safeCeiling = max(0, physicalMemory - osReserve)
+    let target = min(modelBytes + headroom, workingSet, safeCeiling)
+    // Only raise when the whole model fits wired inside the safe ceiling.
+    // Otherwise leave the default: the model stays swappable (safe), instead of
+    // wiring a machine into a memory-pressure panic.
+    guard target >= modelBytes else { return nil }
+    return target
+}
+
 /// Debug event emitted by ``WiredMemoryManager`` when coordinating wired memory changes.
 ///
 /// Events are only emitted in DEBUG builds. In release builds the event stream
