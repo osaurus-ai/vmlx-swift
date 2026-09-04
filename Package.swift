@@ -849,6 +849,7 @@ let package = Package(
             sources: [
                 "ProposalHeadStampTests.swift",
                 "NativeMTPARSafetyTests.swift",
+                "HybridRestoreBoundaryInvariantTests.swift",
                 "DualPathFamiliesTests.swift",
                 "Qwen35FusedInputProjectionTests.swift",
                 "MLADecodeSDPADtypeTests.swift",
