@@ -100,15 +100,50 @@ struct BailingMoeV3Tests {
         #expect(name.contains("BailingMoeV3"))
     }
 
-    @Test("a V2 config keeps resolving to the legacy GLA runtime")
-    func legacyDispatch() async throws {
+    @Test("bailing_hybrid never resolves to the Ling 2.6 GLA runtime, even for a 2.6-shaped config")
+    func legacyShapeUnderHybridNeverGLA() async throws {
+        // Raptor reports: a bundle that reached the GLA runtime under
+        // `bailing_hybrid` streamed `!` at 100+ tok/s. The type is V3-only now;
+        // a config that cannot decode as V3 must throw, never fall back.
+        let name: String? = try await MLXMetalTestLock.withLock {
+            do {
+                let model = try await LLMTypeRegistry.shared.createModel(
+                    configuration: Self.legacyConfigJSON, modelType: "bailing_hybrid")
+                return String(describing: type(of: model))
+            } catch {
+                return nil
+            }
+        }
+        if let name {
+            #expect(name.contains("BailingMoeV3"))
+        }
+        #expect(name?.contains("BailingHybridModel") != true)
+    }
+
+    @Test("bailing_moe_v2_5 is the only route to the legacy GLA runtime")
+    func v25Dispatch() async throws {
         let name = try await MLXMetalTestLock.withLock {
             let model = try await LLMTypeRegistry.shared.createModel(
-                configuration: Self.legacyConfigJSON, modelType: "bailing_hybrid")
+                configuration: Self.legacyConfigJSON, modelType: "bailing_moe_v2_5")
             return String(describing: type(of: model))
         }
         #expect(name.contains("BailingHybridModel"))
         #expect(!name.contains("V3"))
+    }
+
+    @Test("bailing_hybrid dispatches to V3 with every Ling 3 marker stripped from the config")
+    func v3DispatchWithoutMarkers() async throws {
+        var dict = try JSONSerialization.jsonObject(with: Self.v3ConfigJSON) as! [String: Any]
+        dict.removeValue(forKey: "architectures")
+        dict.removeValue(forKey: "linear_attention")
+        dict.removeValue(forKey: "kda_lower_bound")
+        let data = try JSONSerialization.data(withJSONObject: dict)
+        let name = try await MLXMetalTestLock.withLock {
+            let model = try await LLMTypeRegistry.shared.createModel(
+                configuration: data, modelType: "bailing_hybrid")
+            return String(describing: type(of: model))
+        }
+        #expect(name.contains("BailingMoeV3"))
     }
 
     @Test("layer typing matches the reference rule for 24 layers / group 4")
