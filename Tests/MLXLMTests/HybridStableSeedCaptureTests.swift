@@ -66,7 +66,11 @@ struct HybridStableSeedCaptureTests {
     /// State tolerance, relative to the reference magnitude; same as
     /// `HybridRestoreBoundaryRoundTripTests` / `BailingMoeV3Tests`.
     static let stateTolerance: Float = 2e-2
-    static let logitTolerance: Float = 2e-2
+    /// Last-position logits: bf16/chunking noise on this fixture sits at
+    /// 0.01-0.03, so 5e-2 is the hard bound; anything above `realDivergence`
+    /// is far outside noise and is reported as such.
+    static let logitTolerance: Float = 5e-2
+    static let realDivergence: Float = 1e-1
     /// Greedy-token equality is only meaningful when the reference's top-2
     /// logit margin exceeds the numerical noise of a chunk-split forward.
     static let tokenMarginFloor: Float = 5e-2
@@ -425,10 +429,11 @@ struct HybridStableSeedCaptureTests {
             states: mambaStates(iterator.cache, fx))
     }
 
-    /// One-shot forward of the whole prompt on a fresh cache.
+    /// One-shot forward of the whole prompt on a fresh cache. `allLogits` is
+    /// `[1, N, V]` so callers can compare positions other than the last one.
     private static func oneShot(
         _ fx: Fixture, prompt: [Int]
-    ) throws -> (token: Int, margin: Float, logits: MLXArray, states: [Int: [MLXArray]]) {
+    ) throws -> (token: Int, margin: Float, logits: MLXArray, allLogits: MLXArray, states: [Int: [MLXArray]]) {
         let cache = fx.model.newCache(parameters: nil)
         let array = MLXArray(prompt.map { Int32($0) }).expandedDimensions(axis: 0)
         let logits = fx.model(array, cache: cache)
@@ -436,7 +441,20 @@ struct HybridStableSeedCaptureTests {
         MLX.eval(cache.flatMap(\.state))
         let last = logits[0, prompt.count - 1].asType(.float32)
         let g = greedy(last)
-        return (g.token, g.margin, last, mambaStates(cache, fx))
+        return (g.token, g.margin, last, logits, mambaStates(cache, fx))
+    }
+
+    /// A restore seats the record's own `MLXArray` objects into the cache
+    /// (`restoreMambaLayer` -> `ArraysCache.state`), and the next KDA forward
+    /// then updates those objects IN PLACE (`ArraysCache.subscript set` ->
+    /// `_updateInternal`). Production never sees this because every fetch
+    /// loads fresh arrays from disk; a test that restores the same dictionary
+    /// twice must hand each restore its own buffers, or the second restore
+    /// seats the state the first forward already advanced.
+    private static func freshCopy(_ record: [String: MLXArray]) -> [String: MLXArray] {
+        let copy = record.mapValues { $0 * 1 }
+        MLX.eval(Array(copy.values))
+        return copy
     }
 
     @Test("after a warm restore of the seed, every re-fed length T and split shape gives the cache-off first token and recurrent states")
@@ -552,24 +570,36 @@ struct HybridStableSeedCaptureTests {
                     let label = "direct T=\(t) refeed=\(remaining.count) split=\(shape.rawValue)(head \(head))"
 
                     var cache = fx.model.newCache(parameters: nil)
-                    let restoredTokens = restoreFromDiskArrays(record, into: &cache)
+                    let restoredTokens = restoreFromDiskArrays(Self.freshCopy(record), into: &cache)
                     MLX.eval(cache.flatMap(\.state))
                     try #require(restoredTokens == Self.seedBoundary)
                     try #require(validateRestoredCacheBoundary(
                         cache, matchedTokens: Self.seedBoundary, restoredTokens: restoredTokens, detail: "direct"))
 
-                    try Self.feed(Array(remaining.prefix(head)), model: fx.model, cache: cache)
+                    // The head's last position is the earliest point at which a
+                    // wrong seed shows: nothing has decayed yet. Compare it to
+                    // the same position of the one-shot forward.
+                    let headLogits = try Self.feed(Array(remaining.prefix(head)), model: fx.model, cache: cache)
+                    let headPosition = Self.seedBoundary + head - 1
+                    let headDiff = Self.maxAbsDiff(
+                        headLogits[0, headLogits.dim(1) - 1].asType(.float32),
+                        shot.allLogits[0, headPosition].asType(.float32))
                     let logits = try Self.feed(Array(remaining.dropFirst(head)), model: fx.model, cache: cache)
                     let last = logits[0, logits.dim(1) - 1].asType(.float32)
 
                     let logitDiff = Self.maxAbsDiff(last, shot.logits)
                     let stateDivergence = Self.statesDivergence(Self.mambaStates(cache, fx), shot.states)
-                    Self.trace("\(label) logitDiff=\(logitDiff) states=\(stateDivergence ?? "match")")
+                    Self.trace("\(label) headDiff@\(headPosition)=\(headDiff) logitDiff=\(logitDiff) states=\(stateDivergence ?? "match")")
+                    let severity = { (d: Float) in d >= Self.realDivergence ? "REAL divergence" : "above tolerance" }
+                    if headDiff >= Self.logitTolerance {
+                        divergent.append("\(label): first re-fed position \(headPosition) logits \(severity(headDiff)) \(headDiff)")
+                    }
                     if logitDiff >= Self.logitTolerance {
-                        divergent.append("\(label): last-position logits diverged by \(logitDiff)")
+                        divergent.append("\(label): last-position logits \(severity(logitDiff)) \(logitDiff)")
                     }
                     if let d = stateDivergence { divergent.append("\(label): \(d)") }
-                    #expect(logitDiff < Self.logitTolerance, "\(label): logits diverged \(logitDiff)")
+                    #expect(headDiff < Self.logitTolerance, "\(label): position \(headPosition) logits \(severity(headDiff)) \(headDiff)")
+                    #expect(logitDiff < Self.logitTolerance, "\(label): last-position logits \(severity(logitDiff)) \(logitDiff)")
                     #expect(stateDivergence == nil, "\(label): \(stateDivergence ?? "")")
                     #expect(cache.allSatisfy { $0.offset == prompt.count }, "\(label): offsets \(Set(cache.map(\.offset)).sorted())")
                 }
