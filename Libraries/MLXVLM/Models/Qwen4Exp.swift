@@ -1952,6 +1952,15 @@ extension Qwen4Exp: NativeMTPProposalHeadInstalling {
     /// requantized copy inherits the calibration. Draft-only by
     /// construction: only `nativeMTPForward` reads `proposalHead`.
     public func installNativeMTPProposalHead(bits: Int) {
+        // No MTP module loaded (loadPreservedMTP off / MTP-less bundle) means
+        // nativeMTPForward can never run — building a permanently resident
+        // low-bit head copy (plus a ~1 GB transient dequantized peak) would
+        // be pure waste. Stamping is unaffected; only the install is skipped.
+        guard mtp != nil else {
+            FileHandle.standardError.write(Data(
+                "[ProposalHead] eligible bundle but no MTP module loaded — skipping proposal-head build\n".utf8))
+            return
+        }
         guard let quantized = head as? QuantizedLinear else { return }
         let full = dequantized(
             quantized.weight,
