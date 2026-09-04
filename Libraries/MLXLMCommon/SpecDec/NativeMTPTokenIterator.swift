@@ -2177,10 +2177,22 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveWindow.removeFirst(adaptiveWindow.count - Self.adaptiveWindowSize)
         }
 
+        // The safety warmup exists for the lazy-repair verifier (an
+        // unaccepted row could reach committed state). Under the STAGED
+        // verifier that corruption class is structurally gone — the
+        // verify-cycle gate already skips warmup there — yet this
+        // acceptance verdict still ran after `hybridWarmupCycleCount` staged
+        // cycles, and one low-acceptance prose generation wrote a PERMANENT
+        // negative memo that turned every later generation in the process
+        // into pure AR (live 2026-09-04: `hybrid_warmup_memo`, verifyCalls=0,
+        // 324/325 tokens AR). Speculation economics under staged verify are
+        // the AR-safety governor's job (windowed, reversible) — never a
+        // one-shot permanent verdict.
         if usesHybridMambaCache,
            speculativeSampler.isGreedy,
            processor == nil,
            !hybridSafetyWarmupComplete,
+           stagedVerifierCommitCount == 0,
            verifyCalls >= Self.hybridWarmupCycleCount
         {
             let acceptedTokens = acceptedByDepth.reduce(0) { partial, item in
