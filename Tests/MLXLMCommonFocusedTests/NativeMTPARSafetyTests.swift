@@ -77,4 +77,38 @@ final class NativeMTPARSafetyTests: XCTestCase {
             deltaEmitted: 16, deltaWallMs: 320, deltaVerifyMs: 6 * 16, margin: 1.25)
         XCTAssertEqual(v?.arBaselineMs ?? 0, 10, accuracy: 1e-6)
     }
+
+    // MARK: median guard (one stalled cycle must not trip the window)
+
+    private func ring(_ cycleMs: [Double], emittedPerCycle: Int = 4) -> [V.ARSafetySample] {
+        var out = [V.ARSafetySample(emitted: 0, wall: 0, verifyTotal: 0)]
+        var wall = 0.0, emitted = 0
+        for ms in cycleMs {
+            wall += ms / 1000; emitted += emittedPerCycle
+            out.append(V.ARSafetySample(emitted: emitted, wall: wall, verifyTotal: 0))
+        }
+        return out
+    }
+
+    func testMedianIgnoresSingleStallCycle() {
+        // 7 healthy cycles at 10 ms/tok, one 400 ms/tok stall: the MEAN is
+        // ~59 ms/tok (would trip against a 25 ms AR step × 1.25), the median
+        // stays at 10 ms/tok → no trip.
+        let r = ring([40, 40, 40, 40, 1600, 40, 40, 40])
+        XCTAssertEqual(V.medianCycleMsPerToken(r) ?? -1, 10, accuracy: 1e-9)
+    }
+
+    func testMedianTripsOnSustainedLoss() {
+        // Every cycle costs 45 ms/tok against a 25 ms AR step → median agrees.
+        let r = ring(Array(repeating: 180, count: 8))
+        XCTAssertEqual(V.medianCycleMsPerToken(r) ?? -1, 45, accuracy: 1e-9)
+        XCTAssertGreaterThan(V.medianCycleMsPerToken(r)!, 25 * 1.25)
+    }
+
+    func testMedianGuardsEmptyAndZeroEmission() {
+        XCTAssertNil(V.medianCycleMsPerToken([]))
+        XCTAssertNil(V.medianCycleMsPerToken([V.ARSafetySample(emitted: 0, wall: 0, verifyTotal: 0)]))
+        let flat = [V.ARSafetySample(emitted: 3, wall: 0, verifyTotal: 0), V.ARSafetySample(emitted: 3, wall: 1, verifyTotal: 0)]
+        XCTAssertNil(V.medianCycleMsPerToken(flat))
+    }
 }

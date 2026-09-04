@@ -438,7 +438,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     // Design + audit trail: docs/internal/MTP-AR-SAFETY-GOVERNOR-SWIFT-2026-09-04.md
     // (Swift port of vmlx-private-evidence MTP-ONFLY-AR-FALLBACK-PLAN, plus
     // the reversible Phase 2 the Python plan deferred).
-    private struct ARSafetySample {
+    struct ARSafetySample {
         let emitted: Int
         let wall: TimeInterval
         let verifyTotal: TimeInterval
@@ -460,13 +460,25 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var arSafetyTokensSincePause = 0
     private var arSafetyResumeInterval = NativeMTPTokenIterator.arSafetyResumeIntervalStart
     private var arSafetyProbeCyclesRemaining = 0
+    /// True while a kept re-entry is speculating: a trip in that state backs
+    /// the resume interval off further instead of resetting it.
+    private var arSafetyReentered = false
     private(set) var arSafetyTrips = 0
     private(set) var arSafetyResumes = 0
-    private static let arSafetyWindow = 16
+    /// Judged every verify cycle over the last `arSafetyWindow` cycles once
+    /// `arSafetyWarmupCycles` have run: earliest trip = cycle 16 (~0.65 s at
+    /// d3), a later drop is caught within ~8 cycles (~0.3 s).
+    private static let arSafetyWindow = 8
+    private static let arSafetyWarmupCycles = 8
     private static let arSafetyMargin = 1.25
     private static let arSafetyProbeWindow = 6
-    private static let arSafetyResumeIntervalStart = 64
-    private static let arSafetyResumeIntervalMax = 512
+    /// Re-probe after 16, 32, 64… AR tokens (×2 per lost probe, ×4 on a
+    /// clear loss); a kept re-entry that trips again backs off further.
+    private static let arSafetyResumeIntervalStart = 16
+    private static let arSafetyResumeIntervalMax = 4096
+    /// A probe is kept only when MTP beats the live AR cost by this factor
+    /// (10% hysteresis) so a re-entry cannot ride the noise floor.
+    private static let arSafetyReentryHysteresis = 1.10
     /// A probe that lost by this factor or more is a clear regime signal:
     /// back off ×4 instead of ×2.
     private static let arSafetyClearLossFactor = 1.3
@@ -2039,9 +2051,26 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     private var arSafetyWindowForRequest: Int {
-        // Restored prefixes start with a cold aligned-head cache: dilute the
-        // judgement window the same 4× the adaptive gates use.
-        restoredPrefixStart ? 4 * Self.arSafetyWindow : Self.arSafetyWindow
+        // A restored prefix starts with a cold aligned-head cache, but the
+        // 8-cycle warmup already excludes those cycles from the judgement
+        // window; no extra dilution (a 4× window hid real losses for ~2.6 s).
+        Self.arSafetyWindow
+    }
+
+    /// Median per-cycle ms/token over the ring. A single stalled cycle
+    /// (allocator hiccup, page-in) can push the window MEAN over the margin;
+    /// the median must agree before a trip counts as a sustained loss.
+    static func medianCycleMsPerToken(_ ring: [ARSafetySample]) -> Double? {
+        var perCycle: [Double] = []
+        perCycle.reserveCapacity(Swift.max(ring.count - 1, 0))
+        for (a, b) in zip(ring, ring.dropFirst()) {
+            let emitted = b.emitted - a.emitted
+            guard emitted > 0 else { continue }
+            perCycle.append((b.wall - a.wall) * 1000 / Double(emitted))
+        }
+        guard !perCycle.isEmpty else { return nil }
+        let sorted = perCycle.sorted()
+        return sorted[sorted.count / 2]
     }
 
     /// After every verify cycle (any depth policy): sample, then either
@@ -2077,7 +2106,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // WIN outright to stay; otherwise pause again with backoff.
             let liveArMs = (arSafetyLiveStepSec ?? arSafetySeedStepSec ?? 0) * 1000
             let mtpMsPerToken = deltaEmitted > 0 ? deltaWallMs / Double(deltaEmitted) : .infinity
-            if liveArMs > 0, mtpMsPerToken >= liveArMs {
+            if liveArMs > 0, mtpMsPerToken * Self.arSafetyReentryHysteresis >= liveArMs {
                 arSafetyPause(
                     reason: String(
                         format: "ar_safety_probe_lost(mtp=%.1fms/tok live_ar=%.1fms)",
@@ -2087,7 +2116,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     arSafetyResumeInterval * (clearLoss ? 4 : 2), Self.arSafetyResumeIntervalMax)
             } else {
                 arSafetyResumes += 1
-                arSafetyResumeInterval = Self.arSafetyResumeIntervalStart
+                arSafetyReentered = true
+                // The interval is NOT reset here: a re-entry that trips again
+                // backs off from where it was (no ping-pong); it resets only
+                // when the generation ends.
+                adaptiveFallbackReason = nil
                 FileHandle.standardError.write(Data(String(
                     format: "[NativeMTP] ar_safety resumed: mtp=%.1fms/tok live_ar=%.1fms depth=%d\n",
                     mtpMsPerToken, liveArMs, currentDepth).utf8))
@@ -2095,8 +2128,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        // Warmup: judge only once the window is full of post-warmup cycles.
-        guard verifyCalls >= window, let seed = arSafetySeedStepSec else { return }
+        // Warmup: judge only once `arSafetyWarmupCycles` have run AND the
+        // window is full of post-warmup cycles (earliest trip = cycle 16).
+        guard verifyCalls >= Self.arSafetyWarmupCycles + window,
+            let seed = arSafetySeedStepSec
+        else { return }
         if let verdict = Self.windowedARVerdict(
             arStepMs: seed * 1000,
             firstVerifyMs: (arSafetyFirstVerifySec ?? 0) * 1000,
@@ -2104,7 +2140,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             deltaEmitted: deltaEmitted,
             deltaWallMs: deltaWallMs,
             deltaVerifyMs: deltaVerifyMs,
-            margin: Self.arSafetyMargin)
+            margin: Self.arSafetyMargin),
+            let median = Self.medianCycleMsPerToken(arSafetyRing),
+            median > verdict.arBaselineMs * Self.arSafetyMargin
         {
             arSafetyPause(
                 reason: String(
@@ -2116,6 +2154,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private mutating func arSafetyPause(reason: String) {
         arSafetyPaused = true
         arSafetyTrips += 1
+        if arSafetyReentered {
+            // A kept re-entry lost again: back off further (spec: no ping-pong).
+            arSafetyReentered = false
+            arSafetyResumeInterval = Swift.min(
+                arSafetyResumeInterval * 2, Self.arSafetyResumeIntervalMax)
+        }
         arSafetyTokensSincePause = 0
         arSafetyProbeCyclesRemaining = 0
         arSafetyRing.removeAll(keepingCapacity: true)
