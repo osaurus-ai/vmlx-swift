@@ -3708,3 +3708,40 @@ extension Qwen35 {
         return castCache(cache)
     }
 }
+
+// MARK: - Proposal-head stamping (draft-only low-bit lm_head)
+
+extension Qwen35: NativeMTPProposalHeadInstalling {
+
+    public var nativeMTPProposalHeadFamily: String { "qwen3_5" }
+
+    /// The ACTUAL loaded head layout. A nil `lm_head` means the family ties
+    /// the head to the embedding (`embedTokens.asLinear`) — reported as
+    /// `tied` so the stamp records the truthful ineligibility reason. An
+    /// unquantized standalone head has no quantized layout to measure and
+    /// skips stamping entirely.
+    public var nativeMTPProposalHeadSourceLayout: ProposalHeadSourceLayout? {
+        guard let lmHead = languageModel.lmHead else {
+            return ProposalHeadSourceLayout(bits: 0, groupSize: 0, mode: "none", tied: true)
+        }
+        guard let quantized = lmHead as? QuantizedLinear else { return nil }
+        return ProposalHeadSourceLayout(
+            bits: quantized.bits,
+            groupSize: quantized.groupSize,
+            mode: quantized.mode.rawValue,
+            tied: false
+        )
+    }
+
+    /// Every shipped qwen3_5 bundle is ineligible (heads are ≤6-bit or
+    /// mxfp8), so this can only be reached by a FUTURE q8/g64 27B — whose
+    /// draft routing does not exist yet. Stamping stays truthful (bundle
+    /// eligibility is a property of the head); the runtime just logs that it
+    /// is not taking the acceleration rather than pretending it did.
+    public func installNativeMTPProposalHead(bits: Int) {
+        FileHandle.standardError.write(Data(
+            ("[ProposalHead] qwen3_5 head is stamp-eligible (q\(bits)) but draft "
+                + "routing is not implemented for this family yet; drafting stays "
+                + "on the full head\n").utf8))
+    }
+}

@@ -1150,6 +1150,13 @@ public func loadWeights(
 
     eval(model)
     MLX.Memory.clearCache()
+
+    // One-shot proposal-head stamp check + install (draft-only low-bit
+    // lm_head; `ProposalHeadStamp` contract). Runs after the weights are
+    // final so the ACTUAL head layout is what gets checked. Adoption of the
+    // installing protocol is the family gate; the call cannot throw and
+    // fail-opens on every path, so it can never break or block a load.
+    ProposalHeadBootstrap.ensure(model: model, modelDirectory: modelDirectory)
 }
 
 /// Safetensors files emitted or copied by converters for calibration and

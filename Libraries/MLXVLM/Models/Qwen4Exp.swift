@@ -1433,6 +1433,14 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     @ModuleInfo(key: "mtp") private var mtp: Qwen4ExpMTPModule?
     @ModuleInfo(key: "visual") private var visionModel: Qwen3VLVision.VisionModel?
 
+    /// Low-bit DRAFT-ONLY copy of `head` (`ProposalHeadStamp` contract).
+    /// Used exclusively by `nativeMTPForward` to sample draft proposals;
+    /// every trunk/verify projection keeps the checkpoint head, so emitted
+    /// tokens remain exactly verified. Not a @ModuleInfo — it is derived at
+    /// load from the already-loaded head, never read from or written to the
+    /// checkpoint.
+    private var proposalHead: QuantizedLinear?
+
     /// M-RoPE delta established by the most recent media prefill, keyed by the
     /// conversation's cache identity so concurrent sessions do not cross.
     /// Decode positions after a media prefill continue at
@@ -1770,8 +1778,21 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         let preMixer = mtp.preMixerHidden(
             hiddenStates: hiddenStates, nextTokenIds: nextTokenIds,
             embedding: textModel.embedding, cache: cache)
+        // DRAFT projection: the proposal head (when installed) replaces the
+        // full head HERE and nowhere else. Draft logits only choose which
+        // tokens get proposed; the verify forwards above project with the
+        // checkpoint head, so acceptance can shift but outputs cannot.
+        let mixed = mtp.mixed(preMixer)
+        let logits: MLXArray
+        if let proposalHead {
+            let raw = proposalHead(mixed)
+            logits =
+                config.declaredComputeDType.map { raw.dtype == $0 ? raw : raw.asType($0) } ?? raw
+        } else {
+            logits = projectToLogits(mixed)
+        }
         return NativeMTPForwardResult(
-            logits: projectToLogits(mtp.mixed(preMixer)),
+            logits: logits,
             hiddenStates: preMixer)
     }
 
@@ -1902,5 +1923,54 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
             "[Qwen4Exp] declared_compute_dtype=\(computeDType) affine_metadata_checkpoint_dtype=\(storageDTypes) affine_metadata_count=\(affineMetadataCount)\n".utf8))
 
         return output
+    }
+}
+
+// MARK: - Proposal-head stamping (draft-only low-bit lm_head)
+
+extension Qwen4Exp: NativeMTPProposalHeadInstalling {
+
+    public var nativeMTPProposalHeadFamily: String { "qwen4_exp" }
+
+    /// The ACTUAL loaded head layout. qwen4_exp always ships a standalone
+    /// `lm_head` (never tied to the embedding), so `tied` is false whenever
+    /// the head loaded quantized; a non-quantized head reports nil and the
+    /// bootstrap skips the bundle.
+    public var nativeMTPProposalHeadSourceLayout: ProposalHeadSourceLayout? {
+        guard let quantized = head as? QuantizedLinear else { return nil }
+        return ProposalHeadSourceLayout(
+            bits: quantized.bits,
+            groupSize: quantized.groupSize,
+            mode: quantized.mode.rawValue,
+            tied: false
+        )
+    }
+
+    /// Dequantize the calibrated checkpoint head and requantize at the
+    /// stamp's proposal bits (same group size / affine mode). The AWQ
+    /// equalization is folded into the stored weights at conversion, so the
+    /// requantized copy inherits the calibration. Draft-only by
+    /// construction: only `nativeMTPForward` reads `proposalHead`.
+    public func installNativeMTPProposalHead(bits: Int) {
+        guard let quantized = head as? QuantizedLinear else { return }
+        let full = dequantized(
+            quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits,
+            mode: quantized.mode
+        )
+        let copy = QuantizedLinear(
+            weight: full,
+            bias: quantized.bias,
+            groupSize: quantized.groupSize,
+            bits: bits,
+            mode: quantized.mode
+        )
+        // Materialize now so the one-time build cost lands at load, not on
+        // the first draft token.
+        eval(copy.weight, copy.scales)
+        proposalHead = copy
     }
 }
