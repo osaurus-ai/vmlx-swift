@@ -369,6 +369,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var mtpForwardCount = 0
     private(set) var autoregressiveFallbackTokenCount = 0
     private(set) var adaptiveDepthDownshiftCount = 0
+    /// Hard ceiling for adaptive promotion — the resolved depth cap, which
+    /// may exceed the REQUESTED depth (the request is a starting point, not
+    /// a lid, since 2026-09-04). See the depth-policy comment in `init`.
+    private let adaptiveDepthCeiling: Int
     private(set) var seedMainForwardTime: TimeInterval = 0
     private(set) var verifyMainForwardTime: TimeInterval = 0
     private(set) var replayMainForwardTime: TimeInterval = 0
@@ -407,6 +411,25 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var hybridSafetyWarmupComplete = false
     private var adaptiveWindow: [AdaptiveCycle] = []
     private var adaptiveFallbackReason: String?
+    /// Timestamp of the previous adaptive cycle's bookkeeping; diffs give
+    /// per-cycle wall time for wall-clock depth pricing.
+    private var lastAdaptiveCycleTimestamp: TimeInterval?
+    /// Measured committed-tokens-per-second per depth (EMA, α = 0.5),
+    /// recorded each time a full window evaluates at that depth. Wall-clock
+    /// truth for the controller: acceptance floors alone kept a d3 window at
+    /// 0.65 acceptance pinned at d3 even when its throughput measurably lost
+    /// to d2 (Eric, 2026-09-04: "d3 is slower than d2 sometimes").
+    private var measuredThroughputByDepth: [Int: Double] = [:]
+    /// Windows evaluated at the current depth since the level above was last
+    /// throughput-probed; after `upperProbeCooldownWindows`, the stale upper
+    /// measurement is dropped so the climb can be re-attempted (prompt
+    /// character changes mid-generation — a table after prose).
+    private var windowsSinceUpperProbe = 0
+    private static let upperProbeCooldownWindows = 8
+    /// A lower depth must beat the current one by this factor before the
+    /// wall-clock rule demotes — hysteresis so measurement noise doesn't
+    /// oscillate the depth.
+    private static let wallClockDemoteFactor = 1.05
     private(set) var nativeMTPStats: NativeMTPGenerationStats?
     private var generationStatsFinalized = false
     private let iteratorStartTime = Date.timeIntervalSinceReferenceDate
@@ -418,6 +441,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private struct AdaptiveCycle {
         let depth: Int
         let accepted: Int
+        /// Tokens this cycle actually delivered (accepted drafts + the
+        /// verifier's own token) — the numerator of wall-clock pricing.
+        let committed: Int
+        /// Wall seconds since the previous cycle's bookkeeping — drafting,
+        /// verify, sampling, cache commit, everything the user waits on.
+        /// 0 for the first cycle of a generation (no predecessor to diff
+        /// against); throughput sums skip those.
+        let wallSeconds: Double
     }
 
     init(
@@ -473,21 +504,21 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.sampler = effectiveParameters.sampler()
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
         self.maxTokens = effectiveParameters.maxTokens
-        // Depth policy: D3 is the ceiling. The old D2 cap was calibrated on
-        // the lazy-repair/sequential verifier, where every rejection cost a
-        // checkpoint restore + full replay forward (Nemotron D3 0.48x, the
-        // Python depth-3 prose figure 14% slower than AR). Under the staged
-        // verifier those numbers no longer describe this code: 2026-08-19 on
-        // Qwen3.8-27B-JANG_4D, D3 measured 28.4 tok/s vs D2 27.5 vs plain
-        // 16.5, byte-identical output, 3.13 committed tokens per verify.
-        // A default cap below what a measured tuning artifact requests is a
-        // silent clamp on the host's explicit choice — the same bug this
-        // comment already records for the cap=1 era. The adaptive controller
-        // still downshifts unprofitable depth at runtime; benchmarks can
-        // override via VMLX_MTP_DEPTH_CAP.
+        // Depth policy (2026-09-04): the REQUESTED depth is the STARTING
+        // depth; the hard cap is 5 and the adaptive controller may promote
+        // past the request up to that cap when a full acceptance window
+        // clears the top floor with margin — near-perfect-acceptance shapes
+        // (counting, enumeration, tables) earn d4/d5 at runtime instead of
+        // being pinned to their start. History: the D2 cap era was
+        // calibrated on the lazy-repair verifier (Nemotron D3 0.48x); the
+        // staged verifier re-measured D3 as a win (27B_4D: 28.4 vs 16.5
+        // plain, byte-identical), and the same acceptance-priced controller
+        // that downshifts unprofitable depth governs every step above the
+        // start. Benchmarks can still override via VMLX_MTP_DEPTH_CAP.
         let depthCap =
             ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
-            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 3
+            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 5
+        self.adaptiveDepthCeiling = depthCap
         self.depth = Swift.min(requestedDepth, depthCap)
         self.currentDepth = Swift.min(requestedDepth, depthCap)
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode
@@ -771,7 +802,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             ProcessInfo.processInfo.environment["VMLX_MTP_COMPILED_VERIFY"] == "1"
         {
             let promptOffset = self.cache.map(\.offset).max() ?? promptTokenIds.count
-            let bufferLength = promptOffset + (self.maxTokens ?? 4096) + self.depth + 8
+            // Sized by the promotion CEILING, not the starting depth — the
+            // adaptive controller may climb past the request mid-generation.
+            let bufferLength =
+                promptOffset + (self.maxTokens ?? 4096) + self.adaptiveDepthCeiling + 8
             self.cache = self.cache.map { layer in
                 // Never promote QSAKVCache: the qwen4_exp indexer needs the
                 // concrete type for its raw-key lane (osaurus#2525).
@@ -1877,7 +1911,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
             return
         }
-        adaptiveWindow.append(AdaptiveCycle(depth: currentDepth, accepted: accepted))
+        let now = Date.timeIntervalSinceReferenceDate
+        let cycleWall = lastAdaptiveCycleTimestamp.map { now - $0 } ?? 0
+        lastAdaptiveCycleTimestamp = now
+        adaptiveWindow.append(
+            AdaptiveCycle(
+                depth: currentDepth,
+                accepted: accepted,
+                committed: accepted + 1,
+                wallSeconds: Swift.max(0, cycleWall)))
         if adaptiveWindow.count > Self.adaptiveWindowSize {
             adaptiveWindow.removeFirst(adaptiveWindow.count - Self.adaptiveWindowSize)
         }
@@ -1972,10 +2014,65 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // the sample budget before any demote judgment.
         let inRestoredGraceWindow =
             restoredPrefixStart && verifyCalls < 4 * Self.adaptiveWindowSize
-        if currentDepth >= 3, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
+
+        // WALL-CLOCK pricing (2026-09-04). Acceptance floors are a proxy;
+        // what the user feels is committed tokens per second. Record this
+        // window's measured throughput for the current depth, then demote
+        // when a LOWER depth's remembered throughput beats it with margin —
+        // even at healthy acceptance. This is the fix for "d3 is slower
+        // than d2 sometimes": drafting more per token does not pay when the
+        // acceptance decay + per-row verify cost eat the extra drafts.
+        let timedSamples = activeSamples.filter { $0.wallSeconds > 0 }
+        let windowWall = timedSamples.reduce(0.0) { $0 + $1.wallSeconds }
+        if windowWall > 0, timedSamples.count >= Self.adaptiveMinimumSamplesPerDepth {
+            let committed = timedSamples.reduce(0) { $0 + $1.committed }
+            let throughput = Double(committed) / windowWall
+            measuredThroughputByDepth[currentDepth] =
+                measuredThroughputByDepth[currentDepth].map { 0.5 * $0 + 0.5 * throughput }
+                ?? throughput
+            windowsSinceUpperProbe += 1
+            if windowsSinceUpperProbe >= Self.upperProbeCooldownWindows {
+                // The level above was measured in a different stretch of the
+                // generation; forget it so the climb can be re-attempted.
+                measuredThroughputByDepth[currentDepth + 1] = nil
+                windowsSinceUpperProbe = 0
+            }
+            if currentDepth > 1, !inRestoredGraceWindow,
+                let lower = measuredThroughputByDepth[currentDepth - 1],
+                lower > throughput * Self.wallClockDemoteFactor
+            {
+                currentDepth -= 1
+                adaptiveDepthDownshiftCount += 1
+                adaptiveWindow.removeAll(keepingCapacity: true)
+                lastAdaptiveCycleTimestamp = nil
+                windowsSinceUpperProbe = 0
+                mtpCache = model.makeNativeMTPCache()
+                mtpCacheRefreshCount += 1
+                return
+            }
+        }
+
+        // Above the measured d3 regime, price each level one step at a time:
+        // a d5 window that stops paying drops to d4, not to d2 — the deep
+        // levels exist only because acceptance earned them, and one soft
+        // window shouldn't forfeit the whole climb.
+        if currentDepth >= 4, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
+            currentDepth -= 1
+            adaptiveDepthDownshiftCount += 1
+            adaptiveWindow.removeAll(keepingCapacity: true)
+            lastAdaptiveCycleTimestamp = nil
+            windowsSinceUpperProbe = 0
+            mtpCache = model.makeNativeMTPCache()
+            mtpCacheRefreshCount += 1
+            return
+        }
+
+        if currentDepth == 3, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
             currentDepth = 2
             adaptiveDepthDownshiftCount += 1
             adaptiveWindow.removeAll(keepingCapacity: true)
+            lastAdaptiveCycleTimestamp = nil
+            windowsSinceUpperProbe = 0
             mtpCache = model.makeNativeMTPCache()
             mtpCacheRefreshCount += 1
             return
@@ -1988,6 +2085,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             currentDepth = 1
             adaptiveDepthDownshiftCount += 1
             adaptiveWindow.removeAll(keepingCapacity: true)
+            lastAdaptiveCycleTimestamp = nil
+            windowsSinceUpperProbe = 0
             mtpCache = model.makeNativeMTPCache()
             mtpCacheRefreshCount += 1
             return
@@ -2002,22 +2101,35 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        // Re-arm. The controller could historically only demote, so a single
-        // cold window — a restored prefix arriving with a cold aligned-head
-        // cache — pinned the whole session below its configured depth. When a
-        // full window at the CURRENT depth clears the floor of the depth
-        // above with margin, promote one level; the window reset re-prices
-        // the new depth on fresh samples.
-        if currentDepth < depth {
+        // Promote. Historically bounded by the REQUESTED depth (recovery
+        // only); since 2026-09-04 the request is a STARTING depth and a full
+        // window that clears the floor of the level above with margin climbs
+        // toward `adaptiveDepthCeiling` — near-perfect-acceptance shapes
+        // (counting, enumeration) ride to d4/d5 while ordinary prose, whose
+        // acceptance sits under the floors, never leaves its start. Only the
+        // staged verifier earns the extended ceiling: the lazy-repair
+        // verifier keeps the old recover-to-request bound (its rejection
+        // cost model was never re-measured above d3).
+        let promotionCeiling = staged ? adaptiveDepthCeiling : depth
+        if currentDepth < promotionCeiling {
             let nextFloor: Double
             switch currentDepth {
             case 1: nextFloor = depthTwoFloor
             default: nextFloor = depthThreeFloor
             }
-            if acceptanceRatio >= nextFloor + Self.adaptivePromotionMargin {
+            // Don't re-climb to a level whose measured wall-clock already
+            // lost to this one (the cooldown above forgets it eventually so
+            // a changed prompt regime can re-probe).
+            let upperKnownWorse =
+                measuredThroughputByDepth[currentDepth + 1].map { upper in
+                    measuredThroughputByDepth[currentDepth].map { upper < $0 } ?? false
+                } ?? false
+            if acceptanceRatio >= nextFloor + Self.adaptivePromotionMargin, !upperKnownWorse {
                 currentDepth += 1
                 adaptiveDepthPromotionCount += 1
                 adaptiveWindow.removeAll(keepingCapacity: true)
+                lastAdaptiveCycleTimestamp = nil
+                windowsSinceUpperProbe = 0
             }
         }
     }
