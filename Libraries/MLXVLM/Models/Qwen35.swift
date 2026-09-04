@@ -1441,6 +1441,10 @@ enum Qwen35Language {
         let convKernelSize: Int
         let convDim: Int
         let fuseDecodeInputProjections: Bool
+        /// Verify-tile (workplan W2a) opt-in. GatedDeltaNet is shared across
+        /// the qwen3_5 VLM family; only qwen4_exp passes `true`, keeping the
+        /// experiment family-scoped. See `Qwen4ExpVerifyTile`.
+        let verifyTilePadding: Bool
         private var attemptedDecodeInputFusion = false
         private var fusedDecodeInputProjection: FusedDecodeInputProjection?
 
@@ -1459,7 +1463,8 @@ enum Qwen35Language {
         init(
             _ args: Qwen35Configuration.TextConfiguration,
             outputGateSigmoid: Bool = false,
-            fuseDecodeInputProjections: Bool = false
+            fuseDecodeInputProjections: Bool = false,
+            verifyTilePadding: Bool = false
         ) {
             self.hiddenSize = args.hiddenSize
             self.numVHeads = args.linearNumValueHeads
@@ -1471,6 +1476,7 @@ enum Qwen35Language {
             self.convKernelSize = args.linearConvKernelDim
             self.convDim = keyDim * 2 + valueDim
             self.fuseDecodeInputProjections = fuseDecodeInputProjections
+            self.verifyTilePadding = verifyTilePadding
 
             precondition(
                 numVHeads % numKHeads == 0,
@@ -1832,11 +1838,11 @@ enum Qwen35Language {
                 }
             } else {
                 let fusedInputs = fusedDecodeInputs(inputs)
-                var mixedQKV = fusedInputs?[0] ?? inProjQKV(inputs)
-                z = (fusedInputs?[1] ?? inProjZ(inputs)).reshaped(
+                var mixedQKV = fusedInputs?[0] ?? verifyTiled(inputs) { inProjQKV($0) }
+                z = (fusedInputs?[1] ?? verifyTiled(inputs) { inProjZ($0) }).reshaped(
                     B, S, numVHeads, headVDim)
-                b = fusedInputs?[2] ?? inProjB(inputs)
-                a = fusedInputs?[3] ?? inProjA(inputs)
+                b = fusedInputs?[2] ?? verifyTiled(inputs) { inProjB($0) }
+                a = fusedInputs?[3] ?? verifyTiled(inputs) { inProjA($0) }
 
                 if let mask {
                     mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
@@ -1955,9 +1961,35 @@ enum Qwen35Language {
                 }
             }
 
-            if let tail = compiledDecodeTail(out, gate: z) { return tail }
-            out = norm(out, gate: z)
-            return outProj(out.reshaped(B, S, -1))
+            // Verify-tile (workplan W2a): norm-with-gate is rowwise and
+            // outProj is a row-independent matmul, so the whole output stage
+            // may run at padded M and be sliced back afterwards. All cache
+            // and staging writes above already saw only the real rows.
+            return verifyTiledOutput(out, gate: z) { paddedOut, paddedGate in
+                if let tail = compiledDecodeTail(paddedOut, gate: paddedGate) {
+                    return tail
+                }
+                let normed = norm(paddedOut, gate: paddedGate)
+                return outProj(
+                    normed.reshaped(normed.dim(0), normed.dim(1), -1))
+            }
+        }
+
+        /// Verify-tile M-pad for this layer's row-independent projections; a
+        /// no-op unless this instance opted in (qwen4_exp only).
+        private func verifyTiled(
+            _ x: MLXArray, _ body: (MLXArray) -> MLXArray
+        ) -> MLXArray {
+            guard verifyTilePadding else { return body(x) }
+            return Qwen4ExpVerifyTile.padded(x) { body($0) }
+        }
+
+        private func verifyTiledOutput(
+            _ x: MLXArray, gate: MLXArray,
+            _ body: (MLXArray, MLXArray) -> MLXArray
+        ) -> MLXArray {
+            guard verifyTilePadding else { return body(x, gate) }
+            return Qwen4ExpVerifyTile.padded(x, gate) { body($0, $1) }
         }
 
         /// Commit for the STAGED (compile-compatible) verify: the forward

@@ -903,7 +903,7 @@ private final class Qwen4ExpQSAIndexer: Module {
         let B = x.dim(0), S = x.dim(1)
         precondition(B == 1, "qwen4_exp QSA currently supports batch size 1")
         let past = cache?.offset ?? 0
-        let qk = projection(x)
+        let qk = Qwen4ExpVerifyTile.padded(x) { projection($0) }
         let split = MLX.split(
             qk, indices: [extras.indexerNHeads * extras.indexerHeadDim], axis: -1)
         let rawKeys = split[1]
@@ -1015,13 +1015,21 @@ private final class Qwen4ExpAttention: Module {
         let past = cache?.offset ?? 0
         let sparseMask = indexer(x, cache: cache)
         let headDim = text.headDim ?? (text.hiddenSize / text.attentionHeads)
-        let qg = qProj(x).reshaped(B, S, text.attentionHeads, headDim * 2)
+        // Verify-tile (workplan W2a): the projections are row-independent
+        // weight matmuls, so their M dimension may be padded to the NAX tile
+        // and sliced back before any reshape, rope, cache, or SDPA touches
+        // the rows. Off by default; see `Qwen4ExpVerifyTile`.
+        let qg = Qwen4ExpVerifyTile.padded(x) { qProj($0) }
+            .reshaped(B, S, text.attentionHeads, headDim * 2)
             .split(parts: 2, axis: -1)
         var query = qNorm(qg[0]).transposed(0, 2, 1, 3)
         let gate = qg[1].reshaped(B, S, -1)
-        var key = kNorm(kProj(x).reshaped(B, S, text.kvHeads, headDim))
-            .transposed(0, 2, 1, 3)
-        let value = vProj(x).reshaped(B, S, text.kvHeads, headDim).transposed(0, 2, 1, 3)
+        var key = kNorm(
+            Qwen4ExpVerifyTile.padded(x) { kProj($0) }
+                .reshaped(B, S, text.kvHeads, headDim)
+        ).transposed(0, 2, 1, 3)
+        let value = Qwen4ExpVerifyTile.padded(x) { vProj($0) }
+            .reshaped(B, S, text.kvHeads, headDim).transposed(0, 2, 1, 3)
         // Media prefill passes explicit 3-channel M-RoPE positions from
         // getRopeIndex; decode after media continues from past + ropeDelta.
         // Text-only keeps the sequential cache-offset positions (offset 0).
@@ -1054,7 +1062,7 @@ private final class Qwen4ExpAttention: Module {
             queries: query, keys: key, values: value, cache: cache,
             scale: scale, mask: mask)
             .transposed(0, 2, 1, 3).reshaped(B, S, -1)
-        return oProj(output * sigmoid(gate))
+        return Qwen4ExpVerifyTile.padded(output * sigmoid(gate)) { oProj($0) }
     }
 }
 
@@ -1084,7 +1092,8 @@ private final class Qwen4ExpDecoderLayer: Module {
         if isLinear {
             _linearAttention.wrappedValue = Qwen35Language.GatedDeltaNet(
                 text, outputGateSigmoid: config.extras.outputGateType == "sigmoid",
-                fuseDecodeInputProjections: true)
+                fuseDecodeInputProjections: true,
+                verifyTilePadding: true)
         } else {
             _attention.wrappedValue = Qwen4ExpAttention(config)
         }
@@ -1723,7 +1732,10 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     }
 
     private func projectToLogits(_ headInput: MLXArray) -> MLXArray {
-        let logits = head(headInput)
+        // Verify-tile (workplan W2a): at verify width every lm_head row costs
+        // a full qmv stream of the 5120x248320 head; padding M to the NAX
+        // tile streams it once for all rows. Off by default.
+        let logits = Qwen4ExpVerifyTile.padded(headInput) { head($0) }
         let result: MLXArray
         guard let computeDType = config.declaredComputeDType,
             logits.dtype != computeDType
