@@ -236,7 +236,15 @@ public enum ProposalHeadBootstrap {
     /// eligible. Every failure path is log-and-continue; this function can
     /// not throw and must never meaningfully delay the load beyond the
     /// measured ~166 ms eligible-path rebuild.
-    public static func ensure(model: Any, modelDirectory: URL) {
+    ///
+    /// `isCalibratedBundle` gates DERIVATION, not honoring: the eligibility
+    /// rule's whole premise is "valid because JANG bundles are AWQ+imatrix
+    /// calibrated at conversion". A plain mlx_lm benchmark quant can carry a
+    /// q8/g64 head without having earned an eligible verdict — the runtime
+    /// must not mint one (the speed-audit packs are left unstamped on
+    /// purpose). An EXISTING source-matching stamp is still honored either
+    /// way: placing one in a non-JANG bundle is an explicit human action.
+    public static func ensure(model: Any, modelDirectory: URL, isCalibratedBundle: Bool) {
         guard let installing = model as? NativeMTPProposalHeadInstalling else { return }
         guard let actual = installing.nativeMTPProposalHeadSourceLayout else {
             stampLog.info(
@@ -253,7 +261,7 @@ public enum ProposalHeadBootstrap {
             // is never rewritten (a jang-tools calibrated verdict must not be
             // clobbered by a runtime re-derivation).
             verdict = stamp.verdict
-        } else {
+        } else if isCalibratedBundle {
             verdict = ProposalHeadVerdict.derive(from: actual)
             let fresh = ProposalHeadStamp(
                 family: installing.nativeMTPProposalHeadFamily,
@@ -263,6 +271,11 @@ public enum ProposalHeadBootstrap {
                     "derived at load by vmlx-swift from the actual lm_head layout (contract 2026-09-04)"
             )
             fresh.write(toBundleAt: modelDirectory)
+        } else {
+            stampLog.info(
+                "proposal head: \(modelDirectory.lastPathComponent, privacy: .public) is not a calibrated JANG bundle — not stamping, drafting stays on the full head"
+            )
+            return
         }
 
         switch verdict {

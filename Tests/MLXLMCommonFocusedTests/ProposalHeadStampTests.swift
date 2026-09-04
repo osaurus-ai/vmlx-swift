@@ -206,7 +206,7 @@ extension ProposalHeadStampTests {
 
         let model = HeadDouble(
             layout: ProposalHeadSourceLayout(bits: 8, groupSize: 64, mode: "affine", tied: false))
-        ProposalHeadBootstrap.ensure(model: model, modelDirectory: dir)
+        ProposalHeadBootstrap.ensure(model: model, modelDirectory: dir, isCalibratedBundle: true)
 
         XCTAssertEqual(model.installedBits, [4], "re-derived verdict must be used in-process")
         let healed = ProposalHeadStamp.load(fromBundleAt: dir)
@@ -239,7 +239,7 @@ extension ProposalHeadStampTests {
         let before = try Data(contentsOf: url)
 
         let model = HeadDouble(layout: source)
-        ProposalHeadBootstrap.ensure(model: model, modelDirectory: dir)
+        ProposalHeadBootstrap.ensure(model: model, modelDirectory: dir, isCalibratedBundle: true)
 
         XCTAssertTrue(model.installedBits.isEmpty, "authoritative ineligible stamp must win")
         let after = try Data(contentsOf: url)
@@ -256,12 +256,45 @@ extension ProposalHeadStampTests {
             for _ in 0..<8 {
                 group.addTask {
                     ProposalHeadBootstrap.ensure(
-                        model: HeadDouble(layout: layout), modelDirectory: dir)
+                        model: HeadDouble(layout: layout), modelDirectory: dir,
+                        isCalibratedBundle: true)
                 }
             }
         }
         let loaded = ProposalHeadStamp.load(fromBundleAt: dir)
         XCTAssertEqual(loaded?.verdict, .eligible(proposalBits: 4))
         XCTAssertEqual(loaded?.source, layout)
+    }
+}
+
+extension ProposalHeadStampTests {
+
+    /// Uncalibrated (non-JANG) bundles must never be stamped by the runtime:
+    /// a plain mlx_lm benchmark quant can carry a q8/g64 head without having
+    /// earned an eligible verdict (the eligibility rule's premise is JANG's
+    /// AWQ+imatrix calibration). The speed-audit packs are left unstamped on
+    /// purpose. An existing source-matching stamp is still honored — placing
+    /// one is an explicit human action.
+    func testUncalibratedBundleIsNeverStampedButExistingStampIsHonored() throws {
+        let dir = try makeBundleDir()
+        let layout = ProposalHeadSourceLayout(
+            bits: 8, groupSize: 64, mode: "affine", tied: false)
+
+        // No stamp + uncalibrated: no derivation, no write, no install.
+        let model = HeadDouble(layout: layout)
+        ProposalHeadBootstrap.ensure(
+            model: model, modelDirectory: dir, isCalibratedBundle: false)
+        XCTAssertNil(ProposalHeadStamp.load(fromBundleAt: dir))
+        XCTAssertTrue(model.installedBits.isEmpty)
+
+        // Human-placed matching stamp on the same uncalibrated bundle: honored.
+        ProposalHeadStamp(
+            family: "qwen4_exp", source: layout,
+            verdict: .eligible(proposalBits: 4), basis: "human decision"
+        ).write(toBundleAt: dir)
+        let second = HeadDouble(layout: layout)
+        ProposalHeadBootstrap.ensure(
+            model: second, modelDirectory: dir, isCalibratedBundle: false)
+        XCTAssertEqual(second.installedBits, [4])
     }
 }
