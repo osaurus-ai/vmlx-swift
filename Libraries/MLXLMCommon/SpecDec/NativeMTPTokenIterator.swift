@@ -464,9 +464,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var arSafetyResumes = 0
     private static let arSafetyWindow = 16
     private static let arSafetyMargin = 1.25
-    private static let arSafetyProbeWindow = 8
-    private static let arSafetyResumeIntervalStart = 24
-    private static let arSafetyResumeIntervalMax = 192
+    private static let arSafetyProbeWindow = 6
+    private static let arSafetyResumeIntervalStart = 64
+    private static let arSafetyResumeIntervalMax = 512
+    /// A probe that lost by this factor or more is a clear regime signal:
+    /// back off ×4 instead of ×2.
+    private static let arSafetyClearLossFactor = 1.3
     /// `VMLX_NATIVE_MTP_AR_SAFETY=0` disables the governor (measurement
     /// hatch, like the adaptive one). Default ON.
     private static let arSafetyDisabled =
@@ -1068,7 +1071,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     {
                         continue
                     }
-                    if let boundarySnapshot = cacheSnapshotForBoundary(
+                    let tBoundary = Date()
+                    let boundarySnapshotOpt = cacheSnapshotForBoundary(
                         tokens: boundaryTokens,
                         promptSnapshot: promptCacheSnapshot,
                         allowDiskBackedRederive: shouldForceStableBoundaryRederive(
@@ -1076,7 +1080,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                             isReusablePrefixWarmup: isReusablePrefixWarmup,
                             requiresRecurrentSSMCompanion:
                                 coordinator.requiresRecurrentSSMCompanion))
-                    {
+                    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                        print("[vmlx][gen/tail/derive] label=history-boundary tokens=\(boundaryTokens.count) snapshot=\(Date().timeIntervalSince(tBoundary))s stable=\(isStableBoundary)")
+                    }
+                    if let boundarySnapshot = boundarySnapshotOpt {
                         store(
                             tokens: boundaryTokens,
                             snapshot: boundarySnapshot,
@@ -1103,11 +1110,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     // loop can't store this boundary (no allowDiskBackedRederive),
                     // and `stripAt` routinely coincides with a prefix-count entry.
                     let strippedTokens = Array(promptTokenIds.prefix(stripAt))
-                    if let strippedSnapshot = cacheSnapshotForBoundary(
+                    let tStrip = Date()
+                    let strippedSnapshotOpt = cacheSnapshotForBoundary(
                         tokens: strippedTokens,
                         promptSnapshot: promptCacheSnapshot,
                         allowDiskBackedRederive: true)
-                    {
+                    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                        print("[vmlx][gen/tail/derive] label=gen-suffix-stripped tokens=\(strippedTokens.count) snapshot=\(Date().timeIntervalSince(tStrip))s")
+                    }
+                    if let strippedSnapshot = strippedSnapshotOpt {
                         store(
                             tokens: strippedTokens,
                             snapshot: strippedSnapshot,
@@ -2071,8 +2082,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     reason: String(
                         format: "ar_safety_probe_lost(mtp=%.1fms/tok live_ar=%.1fms)",
                         mtpMsPerToken, liveArMs))
+                let clearLoss = liveArMs > 0 && mtpMsPerToken >= liveArMs * Self.arSafetyClearLossFactor
                 arSafetyResumeInterval = Swift.min(
-                    arSafetyResumeInterval * 2, Self.arSafetyResumeIntervalMax)
+                    arSafetyResumeInterval * (clearLoss ? 4 : 2), Self.arSafetyResumeIntervalMax)
             } else {
                 arSafetyResumes += 1
                 arSafetyResumeInterval = Self.arSafetyResumeIntervalStart
