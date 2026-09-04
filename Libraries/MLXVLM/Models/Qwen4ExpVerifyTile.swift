@@ -26,10 +26,18 @@ import MLXLMCommon
 /// Gate: `VMLX_MTP_VERIFY_TILE=<rows>` (16 recommended; 8 stays BELOW the
 /// qmv→qmm floor for the large trunk matmuls on M5-class devices and only
 /// helps if the floor is lower on the running device), `off`/`0`/unset
-/// disables. Family-scoped: only qwen4_exp call sites consult this, and the
-/// shared GatedDeltaNet participates only when constructed with
-/// `verifyTilePadding: true` (which only Qwen4Exp passes).
+/// disables. Family-scoped by call site: qwen4_exp (QSA q/k/v/o + indexer,
+/// GDN, lm_head) and qwen3_5 (attention q/k/v/o, GDN, lm_head) each pass
+/// their own `family` tag so the one-shot activation log names the trunk
+/// that engaged; the shared GatedDeltaNet participates only when constructed
+/// with `verifyTilePadding: true`. Routed MoE never consults this.
 enum Qwen4ExpVerifyTile {
+    /// Activation-log tags. One line per family per process.
+    enum Family {
+        static let qwen4Exp = "Qwen4Exp"
+        static let qwen35 = "Qwen35"
+    }
+
     /// Rows to pad verify-width matmuls to; `nil` = disabled (the default).
     /// Read once from the environment; mutable ONLY so focused tests can
     /// exercise the padded path without process-level env plumbing.
@@ -52,16 +60,15 @@ enum Qwen4ExpVerifyTile {
     }
 
     private static let activationLogLock = NSLock()
-    private nonisolated(unsafe) static var didReportActivation = false
+    private nonisolated(unsafe) static var reportedFamilies: Set<String> = []
 
-    private static func reportActivation(tile: Int) {
+    private static func reportActivation(tile: Int, family: String) {
         activationLogLock.lock()
         defer { activationLogLock.unlock() }
-        guard !didReportActivation else { return }
-        didReportActivation = true
+        guard reportedFamilies.insert(family).inserted else { return }
         FileHandle.standardError.write(
             Data(
-                "[Qwen4Exp] verify_tile=\(tile) path=m-pad\n".utf8))
+                "[\(family)] verify_tile=\(tile) path=m-pad\n".utf8))
     }
 
     /// Runs `body` — a row-independent weight matmul over the axis-1 rows of
@@ -70,7 +77,8 @@ enum Qwen4ExpVerifyTile {
     /// when the gate is off, `S == 1` (AR decode: qmv IS the right kernel),
     /// `S >= tile` (prefill / already at the tile), or batch > 1.
     static func padded(
-        _ x: MLXArray, tile: Int? = rows, _ body: (MLXArray) -> MLXArray
+        _ x: MLXArray, tile: Int? = rows, family: String = Family.qwen4Exp,
+        _ body: (MLXArray) -> MLXArray
     ) -> MLXArray {
         guard let tile, x.ndim >= 2, x.dim(0) == 1 else { return body(x) }
         let s = x.dim(1)
@@ -80,7 +88,7 @@ enum Qwen4ExpVerifyTile {
         let out = body(
             concatenated(
                 [x, MLXArray.zeros(padShape, dtype: x.dtype)], axis: 1))
-        reportActivation(tile: tile)
+        reportActivation(tile: tile, family: family)
         return out[0..., ..<s]
     }
 
@@ -89,6 +97,7 @@ enum Qwen4ExpVerifyTile {
     /// the result is sliced back to the real rows.
     static func padded(
         _ x: MLXArray, _ gate: MLXArray, tile: Int? = rows,
+        family: String = Family.qwen4Exp,
         _ body: (MLXArray, MLXArray) -> MLXArray
     ) -> MLXArray {
         guard let tile, x.ndim >= 2, x.dim(0) == 1, gate.ndim >= 2,
@@ -103,7 +112,7 @@ enum Qwen4ExpVerifyTile {
         let out = body(
             concatenated([x, MLXArray.zeros(xPad, dtype: x.dtype)], axis: 1),
             concatenated([gate, MLXArray.zeros(gatePad, dtype: gate.dtype)], axis: 1))
-        reportActivation(tile: tile)
+        reportActivation(tile: tile, family: family)
         return out[0..., ..<s]
     }
 }

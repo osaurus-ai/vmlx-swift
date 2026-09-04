@@ -1305,13 +1305,25 @@ enum Qwen35Language {
             let B = x.dim(0)
             let L = x.dim(1)
 
-            let qProjOutput = qProj(x)
+            // Verify-tile (workplan W2a): at verify width (1 < L < tile,
+            // B == 1) each projection re-streams its full weight per row
+            // through the qmv kernel; zero-padding M to the tile streams it
+            // once. The pad is sliced off before q/k norms, RoPE, and the
+            // KV cache write, so the cache only ever sees the real rows.
+            // Off unless VMLX_MTP_VERIFY_TILE is set.
+            let qProjOutput = Qwen4ExpVerifyTile.padded(
+                x, family: Qwen4ExpVerifyTile.Family.qwen35
+            ) { qProj($0) }
             let qSplit = qProjOutput.reshaped(B, L, numAttentionHeads, -1).split(parts: 2, axis: -1)
             var queries = qSplit[0]
             let gate = qSplit[1].reshaped(B, L, -1)
 
-            var keys = kProj(x)
-            var values = vProj(x)
+            var keys = Qwen4ExpVerifyTile.padded(
+                x, family: Qwen4ExpVerifyTile.Family.qwen35
+            ) { kProj($0) }
+            var values = Qwen4ExpVerifyTile.padded(
+                x, family: Qwen4ExpVerifyTile.Family.qwen35
+            ) { vProj($0) }
 
             queries = qNorm(queries).transposed(0, 2, 1, 3)
             keys = kNorm(keys.reshaped(B, L, numKeyValueHeads, -1)).transposed(0, 2, 1, 3)
@@ -1382,7 +1394,10 @@ enum Qwen35Language {
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
 
-            return oProj(compiledSigmoidMultiply(output, gate))
+            return Qwen4ExpVerifyTile.padded(
+                compiledSigmoidMultiply(output, gate),
+                family: Qwen4ExpVerifyTile.Family.qwen35
+            ) { oProj($0) }
         }
     }
 
@@ -1442,9 +1457,11 @@ enum Qwen35Language {
         let convDim: Int
         let fuseDecodeInputProjections: Bool
         /// Verify-tile (workplan W2a) opt-in. GatedDeltaNet is shared across
-        /// the qwen3_5 VLM family; only qwen4_exp passes `true`, keeping the
-        /// experiment family-scoped. See `Qwen4ExpVerifyTile`.
+        /// the qwen3_5 VLM family; each trunk that opts in passes `true`
+        /// plus its own `verifyTileFamily` tag so the one-shot activation
+        /// log names the family that engaged. See `Qwen4ExpVerifyTile`.
         let verifyTilePadding: Bool
+        let verifyTileFamily: String
         private var attemptedDecodeInputFusion = false
         private var fusedDecodeInputProjection: FusedDecodeInputProjection?
 
@@ -1464,7 +1481,8 @@ enum Qwen35Language {
             _ args: Qwen35Configuration.TextConfiguration,
             outputGateSigmoid: Bool = false,
             fuseDecodeInputProjections: Bool = false,
-            verifyTilePadding: Bool = false
+            verifyTilePadding: Bool = false,
+            verifyTileFamily: String = Qwen4ExpVerifyTile.Family.qwen4Exp
         ) {
             self.hiddenSize = args.hiddenSize
             self.numVHeads = args.linearNumValueHeads
@@ -1477,6 +1495,7 @@ enum Qwen35Language {
             self.convDim = keyDim * 2 + valueDim
             self.fuseDecodeInputProjections = fuseDecodeInputProjections
             self.verifyTilePadding = verifyTilePadding
+            self.verifyTileFamily = verifyTileFamily
 
             precondition(
                 numVHeads % numKHeads == 0,
@@ -1976,12 +1995,12 @@ enum Qwen35Language {
         }
 
         /// Verify-tile M-pad for this layer's row-independent projections; a
-        /// no-op unless this instance opted in (qwen4_exp only).
+        /// no-op unless this instance opted in (qwen4_exp and qwen3_5 do).
         private func verifyTiled(
             _ x: MLXArray, _ body: (MLXArray) -> MLXArray
         ) -> MLXArray {
             guard verifyTilePadding else { return body(x) }
-            return Qwen4ExpVerifyTile.padded(x) { body($0) }
+            return Qwen4ExpVerifyTile.padded(x, family: verifyTileFamily) { body($0) }
         }
 
         private func verifyTiledOutput(
@@ -1989,7 +2008,9 @@ enum Qwen35Language {
             _ body: (MLXArray, MLXArray) -> MLXArray
         ) -> MLXArray {
             guard verifyTilePadding else { return body(x, gate) }
-            return Qwen4ExpVerifyTile.padded(x, gate) { body($0, $1) }
+            return Qwen4ExpVerifyTile.padded(x, gate, family: verifyTileFamily) {
+                body($0, $1)
+            }
         }
 
         /// Commit for the STAGED (compile-compatible) verify: the forward
@@ -2389,9 +2410,14 @@ enum Qwen35Language {
                 // out of trace capture. Tying it to compiledDecodeRegions
                 // left every mixed-scheme JANG stamp — including the 27B —
                 // running four decode launches per GDN layer for no reason.
+                // Verify-tile (workplan W2a): pad the GDN's verify-width
+                // projections to the NAX qmm tile. Off unless
+                // VMLX_MTP_VERIFY_TILE is set; see `Qwen4ExpVerifyTile`.
                 _linearAttn.wrappedValue = GatedDeltaNet(
                     args,
-                    fuseDecodeInputProjections: true)
+                    fuseDecodeInputProjections: true,
+                    verifyTilePadding: true,
+                    verifyTileFamily: Qwen4ExpVerifyTile.Family.qwen35)
             } else {
                 _selfAttn.wrappedValue = Attention(args)
             }
@@ -2738,6 +2764,23 @@ enum Qwen35Language {
         fileprivate var precomputedPositionIds: MLXArray? = nil
         fileprivate var ropeDeltas: MLXArray? = nil
 
+        /// The LM-head projection (untied `lm_head` or the tied embedding),
+        /// with verify-tile M-padding (workplan W2a): at verify width every
+        /// head row costs a full qmv stream of the hidden x vocab weight;
+        /// padding M to the NAX tile streams it once for all rows and the
+        /// padded rows are sliced away before the logits leave. Off unless
+        /// VMLX_MTP_VERIFY_TILE is set.
+        fileprivate func headLogits(_ hidden: MLXArray) -> MLXArray {
+            Qwen4ExpVerifyTile.padded(
+                hidden, family: Qwen4ExpVerifyTile.Family.qwen35
+            ) { input in
+                if let lmHead {
+                    return lmHead(input)
+                }
+                return model.embedTokens.asLinear(input)
+            }
+        }
+
         init(_ config: Qwen35Configuration) {
             self.config = config
             self.textConfig = config.textConfiguration
@@ -2914,11 +2957,7 @@ enum Qwen35Language {
                 positionIds: positionIds
             )
 
-            if let lmHead {
-                out = lmHead(out)
-            } else {
-                out = model.embedTokens.asLinear(out)
-            }
+            out = headLogits(out)
 
             return LMOutput(logits: out)
         }
@@ -2973,12 +3012,7 @@ enum Qwen35Language {
                 positionIds: positionIds,
                 captureLayerIDs: captureLayerIDs,
                 recordPrefixCommitStates: recordPrefixCommitStates)
-            let logits: MLXArray
-            if let lmHead {
-                logits = lmHead(hidden)
-            } else {
-                logits = model.embedTokens.asLinear(hidden)
-            }
+            let logits = headLogits(hidden)
             return (logits, captured)
         }
 
@@ -3008,19 +3042,13 @@ enum Qwen35Language {
             let logits: MLXArray
             if NativeMTPPhaseDiagnostics.enabled {
                 let start = Date.timeIntervalSinceReferenceDate
-                if let lmHead {
-                    logits = lmHead(model.norm(hidden))
-                } else {
-                    logits = model.embedTokens.asLinear(model.norm(hidden))
-                }
+                logits = headLogits(model.norm(hidden))
                 MLX.eval(logits)
                 NativeMTPPhaseDiagnostics.record(
                     "vlm_lm_head",
                     seconds: Date.timeIntervalSinceReferenceDate - start)
-            } else if let lmHead {
-                logits = lmHead(model.norm(hidden))
             } else {
-                logits = model.embedTokens.asLinear(model.norm(hidden))
+                logits = headLogits(model.norm(hidden))
             }
             return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
         }
@@ -3046,12 +3074,7 @@ enum Qwen35Language {
                     seconds: Date.timeIntervalSinceReferenceDate - blockStart)
 
                 let headStart = Date.timeIntervalSinceReferenceDate
-                let logits: MLXArray
-                if let lmHead {
-                    logits = lmHead(mtp.norm(hidden))
-                } else {
-                    logits = model.embedTokens.asLinear(mtp.norm(hidden))
-                }
+                let logits = headLogits(mtp.norm(hidden))
                 MLX.eval(logits)
                 NativeMTPPhaseDiagnostics.record(
                     "vlm_mtp_lm_head",
@@ -3063,12 +3086,7 @@ enum Qwen35Language {
                 nextTokenIds: nextTokenIds,
                 embedTokens: model.embedTokens,
                 cache: cache)
-            let logits: MLXArray
-            if let lmHead {
-                logits = lmHead(mtp.norm(hidden))
-            } else {
-                logits = model.embedTokens.asLinear(mtp.norm(hidden))
-            }
+            let logits = headLogits(mtp.norm(hidden))
             return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
         }
 
