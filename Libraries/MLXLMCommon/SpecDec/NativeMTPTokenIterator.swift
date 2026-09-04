@@ -959,8 +959,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 cachePrefixTokenCounts + [sharedPromptStripBoundary].compactMap { $0 }
             ))
 
-            func store(tokens: [Int], snapshot: [KVCache], label _: String) {
+            func store(tokens: [Int], snapshot: [KVCache], label: String) {
                 guard !tokens.isEmpty else { return }
+                // Post-generation tail breakdown (VMLX_CACHE_FETCH_TRACE=1): live
+                // 2026-09-04 the whole 9.5–15 s "hang at the last letters" was
+                // this store; name the step that costs it.
+                let trace = ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
+                let t0 = Date()
                 // Same guard as the other store paths: saving a cache materialises
                 // it several times over at the memory high-water mark, and a
                 // prefix-cache entry is only ever a speed-up for a later request —
@@ -970,6 +975,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 guard CacheStoreBudget.canStore(snapshot) else { return }
                 let cacheSnapshot = snapshot.map { $0.copy() }
                 MLX.eval(cacheSnapshot)
+                let tCopy = Date()
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(cacheSnapshot)
                 let perLayerData = requiresDiskBackedRestore
@@ -1015,9 +1021,21 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         persistCapturedStatesToDisk: false,
                         prefillStepSize: cacheInitParameters.prefillStepSize)
                 }()
+                let tSSM = Date()
                 let diskStoreCache = makeDiskStoreCache(
                     fromPromptBoundary: cacheSnapshot,
                     parameters: cacheInitParameters)
+                let tDisk = Date()
+                defer {
+                    if trace {
+                        print(
+                            "[vmlx][gen/tail/store] label=\(label) tokens=\(tokens.count)"
+                                + " copyEval=\(tCopy.timeIntervalSince(t0))s"
+                                + " layerData+ssm=\(tSSM.timeIntervalSince(tCopy))s"
+                                + " diskCachePrep=\(tDisk.timeIntervalSince(tSSM))s"
+                                + " coordinatorStore=\(Date().timeIntervalSince(tDisk))s")
+                    }
+                }
                 coordinator.storeAfterGeneration(
                     promptTokens: tokens,
                     perLayerData: perLayerData,
