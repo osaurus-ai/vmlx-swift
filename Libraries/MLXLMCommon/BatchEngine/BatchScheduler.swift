@@ -155,21 +155,35 @@ struct BatchSlot {
     /// `BucketHandle` holding shared `[B, H, maxLen, D]` buffers.
     var compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])?
 
+    /// `VMLX_LOGITS_NAN_TRACE=1` diagnostic (see ``NaNLogitsTrace``).
+    /// `nil` when the flag is off. Set by the engine at slot admission,
+    /// finished in `finishSlot`.
+    var nanTrace: NaNLogitsTrace?
+
     // MARK: - Sampling
 
     /// Sample a token from logits, applying processor and sampler.
     ///
     /// Returns the sampled token as an `MLXArray` scalar.
     mutating func sampleToken(from logits: MLXArray) -> MLXArray {
+        // Diagnostic only: the raw `[1, V]` row before any processor rewrite.
+        let rawRow = nanTrace != nil ? logits : nil
         var logits = logits
+        let token: MLXArray
         if var proc = processor {
             logits = proc.process(logits: logits)
-            let token = sampler.sample(logits: logits)
+            token = sampler.sample(logits: logits)
             proc.didSample(token: token)
             self.processor = proc
-            return token
+        } else {
+            token = sampler.sample(logits: logits)
         }
-        return sampler.sample(logits: logits)
+        if let rawRow, let nanTrace {
+            nanTrace.observe(
+                rawRow, site: "batch", step: generatedTokenCount,
+                sampled: { token.item(Int.self) })
+        }
+        return token
     }
 }
 

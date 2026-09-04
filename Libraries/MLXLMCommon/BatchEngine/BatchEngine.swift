@@ -1911,7 +1911,12 @@ public actor BatchEngine {
                 }
             }
 
-            let slot = BatchSlot(from: request, cache: cache, stopTokenIDs: stopTokenIDs)
+            var slot = BatchSlot(from: request, cache: cache, stopTokenIDs: stopTokenIDs)
+            if NaNLogitsTrace.isEnabled {
+                slot.nanTrace = NaNLogitsTrace(
+                    slot: request.id.description,
+                    model: context.configuration.name)
+            }
             slot.continuation.yield(.prefillProgress(PrefillProgress(
                 stage: .queued,
                 completedUnitCount: 0,
@@ -3262,6 +3267,7 @@ public actor BatchEngine {
     /// future cache reuse.
     private func finishSlot(_ liveSlot: inout BatchSlot, reason: GenerateStopReason) {
         let slot = liveSlot
+        slot.nanTrace?.finish(totalSteps: slot.generatedTokenCount)
         defer {
             // Cache stores are synchronous. Drop the sole retained prompt/seed
             // snapshot as soon as they finish instead of holding it until the

@@ -242,6 +242,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     var tokenCount = 0
     var promptPrefillTime: TimeInterval = 0
 
+    /// `VMLX_LOGITS_NAN_TRACE=1` diagnostic (see ``NaNLogitsTrace``);
+    /// `nil` when the flag is off. Probes the backbone (target) logits at
+    /// every site that samples a committed token: chunk verify, rollback
+    /// repair, sequential verify, and the AR fallback. Draft-head logits
+    /// are not probed — a non-finite draft is rejected by verify anyway and
+    /// probing them would drain the draft pipeline once per level.
+    private var nanTrace: NaNLogitsTrace?
+
     private var pendingTokens: [Int] = []
     private var pendingIndex = 0
     private var nextMain: MLXArray?
@@ -575,6 +583,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         effectiveParameters = nativeMTPParameters
 
         self.model = model
+        self.nanTrace = NaNLogitsTrace(model: String(describing: type(of: model)))
         self.cache = cache ?? model.newCache(parameters: effectiveParameters)
         self.mtpCache = model.makeNativeMTPCache()
         self.cacheCoordinator = cacheCoordinator
@@ -1208,6 +1217,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         abandonPendingVerify()
         guard !generationStatsFinalized else { return }
         generationStatsFinalized = true
+        nanTrace?.finish(totalSteps: tokenCount)
         let accepted = acceptedByDepth
             .sorted { $0.key < $1.key }
             .map { "\($0.key):\($0.value)" }
@@ -1632,6 +1642,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         materializeSyncTime += verifyDecision.materializeSyncTime
         samplingTime += Date.timeIntervalSinceReferenceDate - sampleStart
+        if let nanTrace {
+            // Whole verify slab `[1, K+1, V]`: every row is a decode position.
+            let next = verifyDecision.nextToken
+            nanTrace.observe(
+                verifier.logits, site: "mtp", step: tokenCount, role: "verify",
+                sampled: { next.item(Int.self) })
+        }
 
         var accepted = verifyDecision.accepted
         var nextVerifiedToken = verifyDecision.nextToken
@@ -1762,6 +1779,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 .token
             recordMaterializeSync {
                 MLX.eval(nextVerifiedToken)
+            }
+            if let nanTrace {
+                let sampled = nextVerifiedToken
+                nanTrace.observe(
+                    repaired.logits[0..., -1, 0...], site: "mtp", step: tokenCount,
+                    role: "repair", sampled: { sampled.item(Int.self) })
             }
             repairedHiddenForNextMTP =
                 repaired.hiddenStates[0..., accepted ..< (accepted + 1), 0...]
@@ -2562,6 +2585,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         samplingTime += Date.timeIntervalSinceReferenceDate - sampleStart
 
         let tokenID = recordMaterializeSync { sample.token.item(Int.self) }
+        nanTrace?.observe(
+            output.logits[0..., -1, 0...], site: "mtp", step: tokenCount, role: "ar",
+            sampled: { tokenID })
         pendingTokens.append(tokenID)
         autoregressiveFallbackTokenCount += 1
         nextMain = sample.token
@@ -2598,6 +2624,22 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             targetForwardCount += 1
             verifyMainForwardCount += 1
             verifyInputTokenCount += 1
+
+            // Diagnostic only: logits are already materialized here, so the
+            // count is cheap; the sampled id is whichever token this
+            // iteration appends (every branch below appends exactly one
+            // before `continue`/`break`), read in the deferred report.
+            let nonFinite = nanTrace == nil
+                ? nil : NaNLogitsTrace.nonFiniteCounts(verifier.logits[0..., -1, 0...])
+            let stepForReport = tokenCount
+            defer {
+                if let nonFinite, let nanTrace {
+                    nanTrace.record(
+                        site: "mtp", step: stepForReport, nan: nonFinite.nan,
+                        inf: nonFinite.inf, role: "verify-seq",
+                        sampled: pendingTokens.last ?? -1)
+                }
+            }
 
             hiddenForNextMTP = Self.lastHidden(verifier.hiddenStates)
 
