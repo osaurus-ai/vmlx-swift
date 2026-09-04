@@ -450,6 +450,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// prompt-sized here, not an AR step; the lazy-eval trap is avoided by
     /// timing after `MLX.eval`).
     private var arSafetySeedStepSec: TimeInterval?
+    private var arSafetySeedFirstSampleSec: TimeInterval?
     /// First MTP cycle's verify-forward wall; verify growth over it tracks
     /// AR's own context growth (context-fair baseline).
     private var arSafetyFirstVerifySec: TimeInterval?
@@ -2105,8 +2106,16 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     ) {
         guard !Self.arSafetyDisabled, !forceAutoregressiveFallback else { return }
         if arSafetySeedStepSec == nil {
-            arSafetySeedStepSec = stepSec
-            arSafetyStartSpeculating(hidden: hidden, nextToken: nextToken, probe: false)
+            // The very first decode step carries graph/kernel warm-up and
+            // reads high (a lenient, never over-eager baseline — but lenient
+            // enough that a prose regime at ~AR speed never tripped). Take
+            // the MIN of two consecutive true AR steps as the seed.
+            if let first = arSafetySeedFirstSampleSec {
+                arSafetySeedStepSec = Swift.min(first, stepSec)
+                arSafetyStartSpeculating(hidden: hidden, nextToken: nextToken, probe: false)
+            } else {
+                arSafetySeedFirstSampleSec = stepSec
+            }
             return
         }
         guard arSafetyPaused else { return }
@@ -2366,6 +2375,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         if currentDepth == 1, acceptanceRatio < depthOneFloor, !inRestoredGraceWindow {
+            // Under the staged verifier with the governor on, "d1 doesn't
+            // pay" is a REVERSIBLE verdict: pause to AR and let the governor's
+            // probes bring MTP back when the regime changes. Live (4M prose,
+            // build #4): this irreversible fallback fired on 6/8 prose gens
+            // BEFORE the governor could act, locking 55–366 AR tokens per
+            // turn — the "never recovers" behaviour the governor exists to
+            // end. The lazy-repair verifier keeps the irreversible fallback.
+            if staged, !Self.arSafetyDisabled {
+                arSafetyPause(
+                    reason: String(
+                        format: "adaptive_accept_ratio=%.2f_depth=1_paused",
+                        acceptanceRatio))
+                return
+            }
             enableAutoregressiveFallback(
                 reason: String(
                     format: "adaptive_accept_ratio=%.2f_depth=%d",
