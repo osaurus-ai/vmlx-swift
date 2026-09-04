@@ -136,6 +136,46 @@ func makeDiskStoreCache(
         kvMode: parameters.kvMode)
 }
 
+/// Fail-closed validation of a coordinator cache restore.
+///
+/// A hit restores two independently derived lengths: attention layers take
+/// their offset from the restored KV tensors (`restoreLayerData` /
+/// `restoreFromDiskArrays`), recurrent layers (MambaCache — KDA on Ling 3 /
+/// Raptor, Gated DeltaNet on Qwen 3.5 / Ornith) take theirs from the matched
+/// boundary (`restoreSSMStates(boundary:)` or the record's
+/// `__mamba_i_offset__`). Nothing used to check that they agree: attention
+/// then runs over M tokens while the recurrent state summarises N ≠ M, the
+/// hybrid's two halves desynchronise, and the logits degenerate (token id 0
+/// `!` on Raptor, verbatim loops on Ornith) — the dots3 `cached_tokens % 256`
+/// class of bug, hidden behind a `restoredTokens > 0` liveness check.
+///
+/// The real invariant is `offset == matchedTokens` for EVERY layer, and
+/// `restoredTokens == matchedTokens`. A restore that violates it is refused
+/// and the caller rebuilds the cache and full-prefills; a refused entry costs
+/// one prefill, an accepted one costs correctness for the whole continuation.
+public func validateRestoredCacheBoundary(
+    _ cache: [any KVCache],
+    matchedTokens: Int,
+    restoredTokens: Int,
+    detail: String = ""
+) -> Bool {
+    let offsets = cache.map(\.offset)
+    let consistent =
+        matchedTokens > 0
+        && restoredTokens == matchedTokens
+        && offsets.allSatisfy { $0 == matchedTokens }
+    if !consistent {
+        let unique = Array(Set(offsets)).sorted()
+        let message =
+            "[vmlx][cache/restore] REFUSED offset/key mismatch detail=\(detail) "
+            + "matched=\(matchedTokens) restored=\(restoredTokens) offsets=\(unique)"
+        // Always visible: a refused restore is the difference between one
+        // extra prefill and a whole corrupted continuation.
+        FileHandle.standardError.write(Data((message + "\n").utf8))
+    }
+    return consistent
+}
+
 /// True when any cache layer carries path-dependent non-KV recurrent state.
 ///
 /// Paged KV blocks store attention KV tensors only. Mamba, linear-attention

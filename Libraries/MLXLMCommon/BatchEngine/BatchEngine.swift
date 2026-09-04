@@ -2034,10 +2034,12 @@ public actor BatchEngine {
                 {
                     var restored = false
                     var retainedDiskRestore = false
+                    var restoredTokenCount = 0
                     if !blocks.isEmpty {
                         let restoredTokens = restoreLayerData(from: blocks, into: slot.cache)
                         coordinator.release(blocks: blocks)
                         if restoredTokens > 0 {
+                            restoredTokenCount = restoredTokens
                             if let ssm = ssmStates {
                                 restoreSSMStates(
                                     ssm, into: slot.cache, boundary: matchedTokens)
@@ -2102,6 +2104,7 @@ public actor BatchEngine {
                             return count
                         }
                         if diskRestored > 0 {
+                            restoredTokenCount = diskRestored
                             // 2026-04-27 fix: materialize restored cache state
                             // in its own command buffer BEFORE prefill builds
                             // its forward graph. Disk restore produces lazy
@@ -2135,6 +2138,19 @@ public actor BatchEngine {
                         }
                     }
 
+                    // Fail closed: attention offsets come from the restored KV
+                    // tensors, recurrent offsets from the matched boundary. A
+                    // hybrid whose two halves disagree must rebuild and full-prefill.
+                    if restored,
+                        !validateRestoredCacheBoundary(
+                            slot.cache, matchedTokens: matchedTokens,
+                            restoredTokens: restoredTokenCount, detail: detail.rawValue)
+                    {
+                        restored = false
+                        retainedDiskRestore = false
+                        slot.cache = context.model.newCache(parameters: slot.parameters)
+                        inputForPrepare = slot.originalInput
+                    }
                     if restored {
                         if usesPostPrepareAlias {
                             slot.cachePromptTokenIds = tokenIds

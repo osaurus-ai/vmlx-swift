@@ -684,10 +684,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 let ssmStates, let diskArrays):
                 var restored = false
                 var retainedDiskRestore = false
+                var restoredTokenCount = 0
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
                     coordinator.release(blocks: blocks)
                     if restoredTokens > 0 {
+                        restoredTokenCount = restoredTokens
                         if let ssm = ssmStates {
                             restoreSSMStates(
                                 ssm, into: self.cache, boundary: matchedTokens)
@@ -699,6 +701,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 if let diskArrays, !restored {
                     let diskRestored = restoreFromDiskArrays(diskArrays, into: &self.cache)
                     if diskRestored > 0 {
+                        restoredTokenCount = diskRestored
                         let cacheHasArraysState = self.cache.contains {
                             String(describing: type(of: $0)).contains("Arrays")
                         }
@@ -714,6 +717,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     }
                 }
 
+                // Fail closed: attention offsets come from the restored KV
+                // tensors, recurrent offsets from the matched boundary. A
+                // hybrid whose two halves disagree must rebuild and full-prefill.
+                if restored,
+                    !validateRestoredCacheBoundary(
+                        self.cache, matchedTokens: matchedTokens,
+                        restoredTokens: restoredTokenCount, detail: "native-mtp")
+                {
+                    restored = false
+                    retainedDiskRestore = false
+                    self.cache = model.newCache(parameters: effectiveParameters)
+                    inputForPrepare = input
+                }
                 if restored {
                     if cacheLookupUsesPostPrepareAlias {
                         self.promptTokenIds = cacheLookupTokenIds
