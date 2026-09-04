@@ -388,12 +388,15 @@ public enum LLMTypeRegistry {
         return ZayaModel(config, moe: context)
     }
 
-    /// Ling 2.6 and Ling 3.0 both declare `model_type = "bailing_hybrid"`,
-    /// but they are different architectures: 2.6 is Lightning/GLA linear
-    /// attention (`BailingHybridModel`), 3.0 is KDA + MLA + V3 MoE
-    /// (`BailingMoeV3Model`, `architectures = ["BailingMoeV3ForCausalLM"]`).
-    /// The `architectures` list is the discriminator; a KDA marker key is the
-    /// fallback for configs that omit it.
+    /// `model_type = "bailing_hybrid"` is Ling 3.0 (KDA + MLA + V3 MoE,
+    /// `BailingMoeV3Model`). It used to fall back to the Ling 2.6 GLA runtime
+    /// (`BailingHybridModel`) when the V3 markers were absent — and a Ling 3
+    /// bundle routed there decodes to garbage (token 0 "!" streams, loops).
+    /// Nothing we ship needs the 2.6 path under this model type, so the
+    /// fallback is gone: `bailing_hybrid` is V3-only, and a config that does
+    /// not decode as V3 fails LOUDLY naming the runtime instead of silently
+    /// loading the wrong architecture. The 2.6 runtime remains reachable only
+    /// under its own `bailing_moe_v2_5` model type.
     private static func dispatchBailingHybrid(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
         throws -> any LanguageModel
     {
@@ -401,7 +404,6 @@ public enum LLMTypeRegistry {
             var architectures: [String]?
             var linearAttention: String?
             var kdaLowerBound: Float?
-
             enum CodingKeys: String, CodingKey {
                 case architectures
                 case linearAttention = "linear_attention"
@@ -409,18 +411,21 @@ public enum LLMTypeRegistry {
             }
         }
         let probe = try? JSONDecoder().decode(Probe.self, from: data)
-        let isV3 =
-            probe?.architectures?.contains(where: { $0.contains("MoeV3") }) == true
-            || probe?.linearAttention == "kda"
-            || probe?.kdaLowerBound != nil
-        if isV3 {
+        let markers =
+            "architectures=\(probe?.architectures ?? []) linear_attention=\(probe?.linearAttention ?? "nil") kda_lower_bound=\(probe?.kdaLowerBound.map { String($0) } ?? "nil")"
+        do {
             let configuration = try JSONDecoder().decode(
                 BailingMoeV3Configuration.self, from: data)
+            FileHandle.standardError.write(Data(
+                "[LLMModelFactory] bailing_hybrid → Ling 3.0 runtime (BailingMoeV3Model, KDA) \(markers)\n".utf8))
             return BailingMoeV3Model(configuration)
+        } catch {
+            FileHandle.standardError.write(Data(
+                ("[LLMModelFactory] bailing_hybrid config does not decode as Ling 3.0 (BailingMoeV3Configuration): "
+                    + "\(error). The Ling 2.6 GLA runtime is no longer a fallback for this model_type "
+                    + "(it produces garbage for Ling 3 bundles); use model_type bailing_moe_v2_5 for a genuine 2.6 bundle. \(markers)\n").utf8))
+            throw error
         }
-        let configuration = try JSONDecoder().decode(
-            BailingHybridConfiguration.self, from: data)
-        return BailingHybridModel(configuration)
     }
 
     private static func dispatchNemotronH(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
