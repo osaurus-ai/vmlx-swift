@@ -381,6 +381,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// stats line): which rule moved the depth, how often.
     private var adaptiveWallClockDemotes = 0
     private var adaptiveAcceptanceDemotes = 0
+    /// Oscillation brake: how many times each depth has been demoted FROM
+    /// in this generation. Live on 4M prose (2026-09-04): d3 start →
+    /// 12 downshifts over 414 cycles — acceptance demoted, the margin gate
+    /// promoted straight back, each hop cold-starting the head cache. A
+    /// level demoted twice is closed for the rest of the generation.
+    private var adaptiveDemotedFromCount: [Int: Int] = [:]
+    private static let adaptiveMaxDemotesPerLevel = 2
     /// Hard ceiling for adaptive promotion — the resolved depth cap, which
     /// may exceed the REQUESTED depth (the request is a starting point, not
     /// a lid, since 2026-09-04). See the depth-policy comment in `init`.
@@ -2287,6 +2294,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 let lower = measuredThroughputByDepth[currentDepth - 1],
                 lower > throughput * Self.wallClockDemoteFactor
             {
+                adaptiveDemotedFromCount[currentDepth, default: 0] += 1
                 currentDepth -= 1
                 adaptiveDepthDownshiftCount += 1
                 adaptiveWallClockDemotes += 1
@@ -2304,6 +2312,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // levels exist only because acceptance earned them, and one soft
         // window shouldn't forfeit the whole climb.
         if currentDepth >= 4, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
+            adaptiveDemotedFromCount[currentDepth, default: 0] += 1
             currentDepth -= 1
             adaptiveDepthDownshiftCount += 1
             adaptiveAcceptanceDemotes += 1
@@ -2316,6 +2325,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         if currentDepth == 3, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
+            adaptiveDemotedFromCount[3, default: 0] += 1
             currentDepth = 2
             adaptiveDepthDownshiftCount += 1
             adaptiveAcceptanceDemotes += 1
@@ -2331,6 +2341,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // A failing D2 downshifts to D1 first — D1's breakeven is far
             // lower, so "D2 doesn't pay" is not evidence that speculation
             // itself doesn't.
+            adaptiveDemotedFromCount[2, default: 0] += 1
             currentDepth = 1
             adaptiveDepthDownshiftCount += 1
             adaptiveAcceptanceDemotes += 1
@@ -2374,7 +2385,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 measuredThroughputByDepth[currentDepth + 1].map { upper in
                     measuredThroughputByDepth[currentDepth].map { upper < $0 } ?? false
                 } ?? false
-            if acceptanceRatio >= nextFloor + Self.adaptivePromotionMargin, !upperKnownWorse {
+            let upperClosed =
+                adaptiveDemotedFromCount[currentDepth + 1, default: 0]
+                >= Self.adaptiveMaxDemotesPerLevel
+            if acceptanceRatio >= nextFloor + Self.adaptivePromotionMargin,
+                !upperKnownWorse, !upperClosed
+            {
                 currentDepth += 1
                 adaptiveDepthPromotionCount += 1
                 adaptiveWindow.removeAll(keepingCapacity: true)
