@@ -181,10 +181,14 @@ final class ProposalHeadStampTests: XCTestCase {
 private final class HeadDouble: NativeMTPProposalHeadInstalling {
     let layout: ProposalHeadSourceLayout?
     private(set) var installedBits: [Int] = []
+    private(set) var installedDrafts: [ProposalHeadCalibratedDraft?] = []
     init(layout: ProposalHeadSourceLayout?) { self.layout = layout }
     var nativeMTPProposalHeadFamily: String { "qwen4_exp" }
     var nativeMTPProposalHeadSourceLayout: ProposalHeadSourceLayout? { layout }
-    func installNativeMTPProposalHead(bits: Int) { installedBits.append(bits) }
+    func installNativeMTPProposalHead(bits: Int, calibratedDraft: ProposalHeadCalibratedDraft?) {
+        installedBits.append(bits)
+        installedDrafts.append(calibratedDraft)
+    }
 }
 
 extension ProposalHeadStampTests {
@@ -297,5 +301,174 @@ extension ProposalHeadStampTests {
         ProposalHeadBootstrap.ensure(
             model: second, modelDirectory: dir, isCalibratedBundle: false)
         XCTAssertEqual(second.installedBits, [4])
+    }
+}
+
+// MARK: - Calibrated draft sidecar (draft_artifact, 2026-09-04 final layout)
+
+extension ProposalHeadStampTests {
+
+    private var ericFullStampJSON: String {
+        """
+        {
+         "version": 1,
+         "family": "qwen4_exp",
+         "source": { "bits": 8, "group_size": 64, "mode": "affine", "tied": false },
+         "eligible": true,
+         "proposal_bits": 4,
+         "basis": "settled 2026-09-03 A/B on Qwen3.8-Flash-Next-JANG_4S fixed-D3",
+         "draft_artifact": {
+          "file": "mtp_draft/vmlx_mtp_proposal_head.safetensors",
+          "sha256": "b05e7c98c4985c85a91518892ed78a62f017d73c1b8007382fa1bf343de4dc3f",
+          "bits": 4,
+          "group_size": 64,
+          "mode": "affine",
+          "method": "imatrix-weighted affine ALS refit",
+          "imatrix": "q38fn-calib/capture/diag.safetensors lm_head.diag",
+          "weighted_nmse": { "rtn_q4": 0.0043, "calibrated_q4": 0.0023 },
+          "acceptance_validated": false,
+          "notes": "fall back to RTN on mismatch"
+         }
+        }
+        """
+    }
+
+    /// The exact shipped stamp (extra artifact fields and all) decodes, the
+    /// verdict is unchanged, and the artifact's contract fields surface.
+    func testShippedDraftArtifactStampDecodes() throws {
+        let dir = try makeBundleDir()
+        try ericFullStampJSON.write(
+            to: dir.appendingPathComponent(ProposalHeadStamp.fileName),
+            atomically: true, encoding: .utf8)
+        let stamp = ProposalHeadStamp.load(fromBundleAt: dir)
+        XCTAssertEqual(stamp?.verdict, .eligible(proposalBits: 4))
+        let artifact = try XCTUnwrap(stamp?.draftArtifact)
+        XCTAssertEqual(artifact.file, "mtp_draft/vmlx_mtp_proposal_head.safetensors")
+        XCTAssertEqual(
+            artifact.sha256,
+            "b05e7c98c4985c85a91518892ed78a62f017d73c1b8007382fa1bf343de4dc3f")
+        XCTAssertEqual(artifact.bits, 4)
+        XCTAssertEqual(artifact.groupSize, 64)
+        XCTAssertEqual(artifact.acceptanceValidated, false)
+    }
+
+    /// A stamp WITHOUT the artifact block still decodes (artifact nil) and a
+    /// runtime-derived stamp never invents one.
+    func testArtifactlessStampDecodesAndRuntimeStampCarriesNone() throws {
+        let dir = try makeBundleDir()
+        let source = ProposalHeadSourceLayout(
+            bits: 8, groupSize: 64, mode: "affine", tied: false)
+        ProposalHeadStamp(
+            family: "qwen4_exp", source: source,
+            verdict: .derive(from: source), basis: "unit-test"
+        ).write(toBundleAt: dir)
+        let loaded = ProposalHeadStamp.load(fromBundleAt: dir)
+        XCTAssertNil(loaded?.draftArtifact)
+        let raw = try String(
+            contentsOf: dir.appendingPathComponent(ProposalHeadStamp.fileName),
+            encoding: .utf8)
+        XCTAssertFalse(raw.contains("draft_artifact"))
+    }
+
+    /// Escape-shaped artifact paths must be rejected before any I/O.
+    func testDraftArtifactRejectsUnsafePaths() {
+        for path in ["/etc/passwd", "../outside.safetensors", "a/../../b.safetensors"] {
+            let artifact = ProposalHeadDraftArtifact(file: path, sha256: "00")
+            XCTAssertNil(
+                ProposalHeadCalibratedDraft.loadVerified(
+                    artifact: artifact,
+                    bundleDirectory: FileManager.default.temporaryDirectory,
+                    expectedBits: 4, expectedGroupSize: 64),
+                "\(path) must be rejected")
+        }
+    }
+
+    /// Missing file and sha mismatch both silently void the artifact.
+    func testDraftArtifactMissingFileAndShaMismatchFallBack() throws {
+        let dir = try makeBundleDir()
+        // Missing file.
+        XCTAssertNil(
+            ProposalHeadCalibratedDraft.loadVerified(
+                artifact: ProposalHeadDraftArtifact(
+                    file: "mtp_draft/vmlx_mtp_proposal_head.safetensors", sha256: "ab"),
+                bundleDirectory: dir, expectedBits: 4, expectedGroupSize: 64))
+        // Present but wrong hash.
+        let sub = dir.appendingPathComponent("mtp_draft", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        let file = sub.appendingPathComponent("vmlx_mtp_proposal_head.safetensors")
+        try Data("not the artifact".utf8).write(to: file)
+        XCTAssertNil(
+            ProposalHeadCalibratedDraft.loadVerified(
+                artifact: ProposalHeadDraftArtifact(
+                    file: "mtp_draft/vmlx_mtp_proposal_head.safetensors",
+                    sha256: String(repeating: "0", count: 64)),
+                bundleDirectory: dir, expectedBits: 4, expectedGroupSize: 64))
+    }
+
+    /// Declared layout fields that contradict the verdict void the artifact
+    /// without touching the file system.
+    func testDraftArtifactLayoutContradictionsFallBack() {
+        let dir = FileManager.default.temporaryDirectory
+        XCTAssertNil(
+            ProposalHeadCalibratedDraft.loadVerified(
+                artifact: ProposalHeadDraftArtifact(
+                    file: "mtp_draft/x.safetensors", sha256: "ab", bits: 8),
+                bundleDirectory: dir, expectedBits: 4, expectedGroupSize: 64))
+        XCTAssertNil(
+            ProposalHeadCalibratedDraft.loadVerified(
+                artifact: ProposalHeadDraftArtifact(
+                    file: "mtp_draft/x.safetensors", sha256: "ab", groupSize: 128),
+                bundleDirectory: dir, expectedBits: 4, expectedGroupSize: 64))
+        XCTAssertNil(
+            ProposalHeadCalibratedDraft.loadVerified(
+                artifact: ProposalHeadDraftArtifact(
+                    file: "mtp_draft/x.safetensors", sha256: "ab", mode: "mxfp4"),
+                bundleDirectory: dir, expectedBits: 4, expectedGroupSize: 64))
+    }
+
+    /// The streaming hasher agrees with a known digest.
+    func testSha256HexMatchesKnownVector() throws {
+        let dir = try makeBundleDir()
+        let file = dir.appendingPathComponent("v.bin")
+        try Data("abc".utf8).write(to: file)
+        XCTAssertEqual(
+            ProposalHeadCalibratedDraft.sha256Hex(of: file),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    }
+}
+
+// MARK: - Index-manifest shard selection (final layout, 2026-09-04)
+
+extension ProposalHeadStampTests {
+
+    /// weight_map file values are the load manifest: unique, sorted, and
+    /// escape-shaped entries dropped.
+    func testIndexedShardFileNamesSelectsExactlyTheMappedFiles() throws {
+        let dir = try makeBundleDir()
+        let index: [String: Any] = [
+            "weight_map": [
+                "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                "mtp.layers.0.weight": "model-00002-of-00002.safetensors",
+                "lm_head.weight": "model-00002-of-00002.safetensors",
+                "evil": "../outside.safetensors",
+                "evil2": "/abs.safetensors",
+            ]
+        ]
+        let data = try JSONSerialization.data(withJSONObject: index)
+        try data.write(to: dir.appendingPathComponent("model.safetensors.index.json"))
+        XCTAssertEqual(
+            indexedShardFileNames(at: dir),
+            ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"])
+    }
+
+    /// No index (or an unreadable one) means no manifest — the caller keeps
+    /// the legacy directory-scan path.
+    func testIndexedShardFileNamesNilWithoutAnIndex() throws {
+        let dir = try makeBundleDir()
+        XCTAssertNil(indexedShardFileNames(at: dir))
+        try "corrupt {".write(
+            to: dir.appendingPathComponent("model.safetensors.index.json"),
+            atomically: true, encoding: .utf8)
+        XCTAssertNil(indexedShardFileNames(at: dir))
     }
 }

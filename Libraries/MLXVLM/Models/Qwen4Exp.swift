@@ -1,5 +1,6 @@
 // Copyright © 2026 Apple Inc.
 
+import CryptoKit
 import Foundation
 import MLX
 import MLXLMCommon
@@ -1946,12 +1947,17 @@ extension Qwen4Exp: NativeMTPProposalHeadInstalling {
         )
     }
 
-    /// Dequantize the calibrated checkpoint head and requantize at the
-    /// stamp's proposal bits (same group size / affine mode). The AWQ
-    /// equalization is folded into the stored weights at conversion, so the
-    /// requantized copy inherits the calibration. Draft-only by
-    /// construction: only `nativeMTPForward` reads `proposalHead`.
-    public func installNativeMTPProposalHead(bits: Int) {
+    /// Install the draft-only proposal head. Preferred source is the
+    /// converter's sha-verified calibrated sidecar (imatrix-weighted refit —
+    /// measurably lower weighted NMSE than RTN); fallback is the RTN
+    /// rebuild: dequantize the calibrated checkpoint head and requantize at
+    /// the stamp's proposal bits (same group size / affine mode — the AWQ
+    /// equalization is folded into the stored weights, so even the RTN copy
+    /// inherits calibration). Draft-only by construction: only
+    /// `nativeMTPForward` reads `proposalHead`.
+    public func installNativeMTPProposalHead(
+        bits: Int, calibratedDraft: ProposalHeadCalibratedDraft?
+    ) {
         // No MTP module loaded (loadPreservedMTP off / MTP-less bundle) means
         // nativeMTPForward can never run — building a permanently resident
         // low-bit head copy (plus a ~1 GB transient dequantized peak) would
@@ -1962,6 +1968,16 @@ extension Qwen4Exp: NativeMTPProposalHeadInstalling {
             return
         }
         guard let quantized = head as? QuantizedLinear else { return }
+
+        if let draft = calibratedDraft,
+            let copy = calibratedProposalHead(from: draft, matching: quantized)
+        {
+            eval(copy.weight, copy.scales)
+            proposalHead = copy
+            logProposalHeadDigestIfRequested(copy, origin: "sidecar")
+            return
+        }
+
         let full = dequantized(
             quantized.weight,
             scales: quantized.scales,
@@ -1981,5 +1997,69 @@ extension Qwen4Exp: NativeMTPProposalHeadInstalling {
         // the first draft token.
         eval(copy.weight, copy.scales)
         proposalHead = copy
+        logProposalHeadDigestIfRequested(copy, origin: "rtn")
+    }
+
+    /// `VMLX_PROPOSAL_HEAD_DIGEST=1`: log sha256 of the INSTALLED packed
+    /// tensors so a harness can byte-compare them against the sidecar file's
+    /// tensor payloads offline. RTN produces different q4 codes than the
+    /// imatrix-weighted refit, so digest equality with the sidecar is hard
+    /// proof the calibrated head is live (and inequality proves RTN). Debug
+    /// aid only — costs one hash pass, gated off by default.
+    private func logProposalHeadDigestIfRequested(_ copy: QuantizedLinear, origin: String) {
+        guard ProcessInfo.processInfo.environment["VMLX_PROPOSAL_HEAD_DIGEST"] == "1"
+        else { return }
+        func digest(_ array: MLXArray) -> String {
+            let data = array.asData(access: .copy).data
+            var hasher = SHA256()
+            hasher.update(data: data)
+            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        }
+        FileHandle.standardError.write(Data(
+            ("[ProposalHead] digest origin=\(origin) "
+                + "weight=\(digest(copy.weight)) "
+                + "scales=\(digest(copy.scales)) "
+                + "biases=\(copy.biases.map(digest) ?? "none")\n").utf8))
+    }
+
+    /// Adopt the sidecar tensors verbatim as the proposal head, but only
+    /// when their shapes actually describe THIS head (out rows equal, packed
+    /// q-bits column arithmetic consistent with the head's input width).
+    /// A shape surprise silently yields nil → the RTN rebuild proceeds.
+    private func calibratedProposalHead(
+        from draft: ProposalHeadCalibratedDraft, matching head: QuantizedLinear
+    ) -> QuantizedLinear? {
+        let inFeatures = head.scales.dim(1) * head.groupSize
+        let outFeatures = head.scales.dim(0)
+        func rejected(_ why: String) -> QuantizedLinear? {
+            FileHandle.standardError.write(Data(
+                "[ProposalHead] calibrated sidecar shape rejected (\(why)) — RTN rebuild\n".utf8))
+            return nil
+        }
+        guard draft.weight.ndim == 2, draft.scales.ndim == 2 else {
+            return rejected("tensor rank")
+        }
+        guard draft.weight.dim(0) == outFeatures, draft.scales.dim(0) == outFeatures else {
+            return rejected(
+                "out rows \(draft.weight.dim(0)) vs head \(outFeatures)")
+        }
+        guard draft.scales.dim(1) * draft.groupSize == inFeatures else {
+            return rejected(
+                "group cols \(draft.scales.dim(1))×g\(draft.groupSize) vs in \(inFeatures)")
+        }
+        guard draft.weight.dim(1) * 32 == inFeatures * draft.bits else {
+            return rejected(
+                "packed cols \(draft.weight.dim(1)) vs q\(draft.bits) over in \(inFeatures)")
+        }
+        let copy = QuantizedLinear(
+            weight: draft.weight,
+            bias: head.bias,
+            scales: draft.scales,
+            biases: draft.biases,
+            groupSize: draft.groupSize,
+            bits: draft.bits,
+            mode: head.mode
+        )
+        return copy
     }
 }

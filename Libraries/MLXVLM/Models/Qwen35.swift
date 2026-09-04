@@ -3738,7 +3738,9 @@ extension Qwen35: NativeMTPProposalHeadInstalling {
     /// draft routing does not exist yet. Stamping stays truthful (bundle
     /// eligibility is a property of the head); the runtime just logs that it
     /// is not taking the acceleration rather than pretending it did.
-    public func installNativeMTPProposalHead(bits: Int) {
+    public func installNativeMTPProposalHead(
+        bits: Int, calibratedDraft: ProposalHeadCalibratedDraft?
+    ) {
         FileHandle.standardError.write(Data(
             ("[ProposalHead] qwen3_5 head is stamp-eligible (q\(bits)) but draft "
                 + "routing is not implemented for this family yet; drafting stays "

@@ -48,6 +48,7 @@
 //  the private wiki.)
 //
 
+import CryptoKit
 import Foundation
 import MLX
 import MLXNN
@@ -109,6 +110,45 @@ public enum ProposalHeadVerdict: Equatable, Sendable {
     }
 }
 
+/// A calibrated draft-head sidecar the stamp may declare: pre-quantized
+/// q4/g64 lm_head tensors produced by the converter's imatrix-weighted
+/// refit (measurably better proposal quality than the runtime's RTN
+/// requantize). The artifact is OPTIONAL sugar on top of the verdict:
+/// runtimes unaware of it — and any load where the file is missing, the
+/// sha256 mismatches, or the tensors don't fit the head — keep the RTN
+/// rebuild. Fail-open, silently.
+public struct ProposalHeadDraftArtifact: Codable, Equatable, Sendable {
+    /// Bundle-relative path of the safetensors sidecar. The final layout
+    /// puts it in a SUBFOLDER (`mtp_draft/…`) so the bundle root stays free
+    /// of tensor files that are not model shards.
+    public let file: String
+    /// Hex sha256 of the sidecar file; a mismatch voids the artifact.
+    public let sha256: String
+    public let bits: Int?
+    public let groupSize: Int?
+    public let mode: String?
+    public let acceptanceValidated: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case file, sha256, bits
+        case groupSize = "group_size"
+        case mode
+        case acceptanceValidated = "acceptance_validated"
+    }
+
+    public init(
+        file: String, sha256: String, bits: Int? = nil, groupSize: Int? = nil,
+        mode: String? = nil, acceptanceValidated: Bool? = nil
+    ) {
+        self.file = file
+        self.sha256 = sha256
+        self.bits = bits
+        self.groupSize = groupSize
+        self.mode = mode
+        self.acceptanceValidated = acceptanceValidated
+    }
+}
+
 /// The on-disk stamp. Tolerant decode: any structural surprise reads as
 /// "no stamp" so the load re-derives instead of failing.
 public struct ProposalHeadStamp: Codable, Equatable, Sendable {
@@ -122,11 +162,16 @@ public struct ProposalHeadStamp: Codable, Equatable, Sendable {
     public let proposalBits: Int?
     public let reason: String?
     public let basis: String?
+    /// Converter-shipped calibrated draft sidecar (see
+    /// ``ProposalHeadDraftArtifact``). Runtime-derived stamps never carry
+    /// one — only the converter can attest a calibrated artifact.
+    public let draftArtifact: ProposalHeadDraftArtifact?
 
     enum CodingKeys: String, CodingKey {
         case version, family, source, eligible
         case proposalBits = "proposal_bits"
         case reason, basis
+        case draftArtifact = "draft_artifact"
     }
 
     public init(
@@ -134,7 +179,8 @@ public struct ProposalHeadStamp: Codable, Equatable, Sendable {
         family: String,
         source: ProposalHeadSourceLayout,
         verdict: ProposalHeadVerdict,
-        basis: String?
+        basis: String?,
+        draftArtifact: ProposalHeadDraftArtifact? = nil
     ) {
         self.version = version
         self.family = family
@@ -150,6 +196,7 @@ public struct ProposalHeadStamp: Codable, Equatable, Sendable {
             self.reason = why
         }
         self.basis = basis
+        self.draftArtifact = draftArtifact
     }
 
     public var verdict: ProposalHeadVerdict {
@@ -225,9 +272,12 @@ public protocol NativeMTPProposalHeadInstalling: AnyObject {
     /// The ACTUAL loaded lm_head layout, or nil when the model has no
     /// standalone quantized head (tied/fp heads report `tied`/nil per family).
     var nativeMTPProposalHeadSourceLayout: ProposalHeadSourceLayout? { get }
-    /// Build the low-bit proposal copy from the loaded head and route the
-    /// DRAFT branch through it. Verify paths must be untouched.
-    func installNativeMTPProposalHead(bits: Int)
+    /// Build the low-bit proposal copy and route the DRAFT branch through
+    /// it. When `calibratedDraft` is non-nil it carries the sha-verified
+    /// converter sidecar tensors — install those verbatim; otherwise rebuild
+    /// by RTN (dequantize the loaded head → requantize). Verify paths must
+    /// be untouched either way.
+    func installNativeMTPProposalHead(bits: Int, calibratedDraft: ProposalHeadCalibratedDraft?)
 }
 
 public enum ProposalHeadBootstrap {
@@ -254,6 +304,7 @@ public enum ProposalHeadBootstrap {
         }
 
         let verdict: ProposalHeadVerdict
+        var honoredStamp: ProposalHeadStamp?
         if let stamp = ProposalHeadStamp.load(fromBundleAt: modelDirectory),
             stamp.source == actual
         {
@@ -261,6 +312,7 @@ public enum ProposalHeadBootstrap {
             // is never rewritten (a jang-tools calibrated verdict must not be
             // clobbered by a runtime re-derivation).
             verdict = stamp.verdict
+            honoredStamp = stamp
         } else if isCalibratedBundle {
             verdict = ProposalHeadVerdict.derive(from: actual)
             let fresh = ProposalHeadStamp(
@@ -281,15 +333,116 @@ public enum ProposalHeadBootstrap {
         switch verdict {
         case .eligible(let proposalBits):
             let started = Date()
-            installing.installNativeMTPProposalHead(bits: proposalBits)
+            // The calibrated sidecar is only ever declared by an HONORED
+            // stamp — a runtime re-derivation cannot attest calibration.
+            var calibratedDraft: ProposalHeadCalibratedDraft?
+            if let artifact = honoredStamp?.draftArtifact {
+                calibratedDraft = ProposalHeadCalibratedDraft.loadVerified(
+                    artifact: artifact,
+                    bundleDirectory: modelDirectory,
+                    expectedBits: proposalBits,
+                    expectedGroupSize: actual.groupSize)
+            }
+            installing.installNativeMTPProposalHead(
+                bits: proposalBits, calibratedDraft: calibratedDraft)
             let ms = Int(Date().timeIntervalSince(started) * 1000)
+            let origin = calibratedDraft != nil ? "sidecar, sha-verified" : "RTN rebuild"
             stampLog.info(
-                "proposal head installed for \(modelDirectory.lastPathComponent, privacy: .public): q\(proposalBits)/g\(actual.groupSize) draft-only copy built in \(ms) ms"
+                "proposal head installed for \(modelDirectory.lastPathComponent, privacy: .public): q\(proposalBits)/g\(actual.groupSize) draft-only copy ready in \(ms) ms (origin: \(origin, privacy: .public))"
             )
         case .ineligible(let reason):
             stampLog.info(
                 "proposal head not used for \(modelDirectory.lastPathComponent, privacy: .public): \(reason, privacy: .public)"
             )
         }
+    }
+}
+
+// MARK: - Calibrated draft sidecar
+
+/// Pre-quantized draft-head tensors loaded from a stamp's `draft_artifact`
+/// sidecar, sha256-verified. Consumed by the family install hook in place
+/// of the RTN dequant→requant rebuild.
+public struct ProposalHeadCalibratedDraft {
+    public let weight: MLXArray
+    public let scales: MLXArray
+    public let biases: MLXArray?
+    public let bits: Int
+    public let groupSize: Int
+
+    /// Load + verify a declared sidecar. ANY failure — traversal-unsafe or
+    /// missing file, sha256 mismatch, unreadable tensors, layout fields that
+    /// contradict the verdict — returns nil so the caller silently keeps the
+    /// RTN rebuild. This function must never throw and never block a load on
+    /// anything but the one-pass hash of the artifact itself.
+    public static func loadVerified(
+        artifact: ProposalHeadDraftArtifact,
+        bundleDirectory: URL,
+        expectedBits: Int,
+        expectedGroupSize: Int
+    ) -> ProposalHeadCalibratedDraft? {
+        func reject(_ why: String) -> ProposalHeadCalibratedDraft? {
+            stampLog.info(
+                "draft artifact rejected (\(why, privacy: .public)) — keeping RTN rebuild")
+            return nil
+        }
+        // Declared layout, when present, must agree with the verdict.
+        if let bits = artifact.bits, bits != expectedBits {
+            return reject("declared bits \(bits) != verdict q\(expectedBits)")
+        }
+        if let group = artifact.groupSize, group != expectedGroupSize {
+            return reject("declared group \(group) != head group \(expectedGroupSize)")
+        }
+        if let mode = artifact.mode, mode != QuantizationMode.affine.rawValue {
+            return reject("declared mode \(mode) unsupported")
+        }
+        // Bundle-relative path only; the stamp must not become a probe.
+        guard !artifact.file.hasPrefix("/"), !artifact.file.contains("..") else {
+            return reject("unsafe artifact path")
+        }
+        let url = bundleDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent(artifact.file)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return reject("missing \(artifact.file)")
+        }
+        guard let digest = sha256Hex(of: url) else {
+            return reject("unreadable \(artifact.file)")
+        }
+        guard digest == artifact.sha256.lowercased() else {
+            return reject("sha256 mismatch for \(artifact.file)")
+        }
+        guard let arrays = try? MLX.loadArrays(url: url) else {
+            return reject("unparseable safetensors \(artifact.file)")
+        }
+        guard let weight = arrays["lm_head.weight"],
+            let scales = arrays["lm_head.scales"]
+        else {
+            return reject("missing lm_head.weight/scales tensors")
+        }
+        return ProposalHeadCalibratedDraft(
+            weight: weight,
+            scales: scales,
+            biases: arrays["lm_head.biases"],
+            bits: expectedBits,
+            groupSize: expectedGroupSize)
+    }
+
+    /// Streaming sha256 of a file (8 MiB chunks), lowercase hex. nil when
+    /// the file cannot be read.
+    static func sha256Hex(of url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            let chunk: Data?
+            do {
+                chunk = try handle.read(upToCount: 8 * 1024 * 1024)
+            } catch {
+                return nil
+            }
+            guard let chunk, !chunk.isEmpty else { break }
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }

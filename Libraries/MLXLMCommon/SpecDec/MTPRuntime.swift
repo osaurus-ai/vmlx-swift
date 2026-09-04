@@ -1866,19 +1866,39 @@ public enum MTPBundleInspector {
         // one small read per shard and this runs only at load-time
         // inspection.
         var names: Set<String> = []
+        var indexedFiles: Set<String> = []
         let indexURL = directory.appendingPathComponent("model.safetensors.index.json")
         if let index = try loadJSONObjectIfExists(indexURL),
             let weightMap = index["weight_map"] as? [String: Any]
         {
             names.formUnion(weightMap.keys)
+            indexedFiles.formUnion(weightMap.values.compactMap { $0 as? String })
         }
 
-        let contents =
-            (try? FileManager.default.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: [.isRegularFileKey],
-                options: [.skipsHiddenFiles])) ?? []
-        let safetensors = contents.filter { $0.pathExtension == "safetensors" }
+        // Header scan scope follows the FINAL layout contract (2026-09-04):
+        // with an index present, only the files the index maps into are
+        // inspection-worthy — a stray tensor file the index doesn't mention
+        // (withdrawn `mtp-00001-*` shard, an interim root-level draft-head
+        // sidecar, the deliberate `mtp_draft/` artifact) must never make a
+        // bundle LOOK like it has loadable MTP weights the loader will not
+        // load. The header union itself stays: the index can omit tensors
+        // that are physically in its own shards (observed live on
+        // Qwen3.8-27B-JANG_4D, 31 `mtp.*` tensors missing from a 2,348-entry
+        // weight_map), and detection must not refuse a complete head over
+        // that. Index-less bundles keep the full directory scan.
+        let safetensors: [URL]
+        if !indexedFiles.isEmpty {
+            safetensors = indexedFiles.sorted().map {
+                directory.appendingPathComponent($0)
+            }.filter { FileManager.default.fileExists(atPath: $0.path) }
+        } else {
+            let contents =
+                (try? FileManager.default.contentsOfDirectory(
+                    at: directory,
+                    includingPropertiesForKeys: [.isRegularFileKey],
+                    options: [.skipsHiddenFiles])) ?? []
+            safetensors = contents.filter { $0.pathExtension == "safetensors" }
+        }
 
         for file in safetensors {
             names.formUnion(try safetensorsHeaderNames(file))

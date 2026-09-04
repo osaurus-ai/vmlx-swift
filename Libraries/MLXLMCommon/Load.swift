@@ -122,6 +122,28 @@ private func modelIndexContainsPreservedMTPWeight(at modelDirectory: URL) -> Boo
     return weightMap.keys.contains(where: isPreservedMTPWeightKey)
 }
 
+/// The unique shard file names `model.safetensors.index.json` maps weights
+/// into, or nil when the bundle has no readable index (single-file and
+/// legacy bundles keep the directory-scan path). Entries that try to escape
+/// the bundle (absolute paths, `..`) are dropped — weight_map values are
+/// plain file names by contract, and a hostile index must not become a
+/// file-system probe.
+func indexedShardFileNames(at modelDirectory: URL) -> [String]? {
+    let indexURL = modelDirectory.appendingPathComponent("model.safetensors.index.json")
+    guard let data = try? Data(contentsOf: indexURL),
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let weightMap = json["weight_map"] as? [String: Any]
+    else { return nil }
+    var names: Set<String> = []
+    for value in weightMap.values {
+        guard let name = value as? String, !name.isEmpty,
+            !name.hasPrefix("/"), !name.contains("..")
+        else { continue }
+        names.insert(name)
+    }
+    return names.isEmpty ? nil : names.sorted()
+}
+
 private func loadJangConfigSanitizeMetadata(at modelDirectory: URL) -> [String: String] {
     guard let url = JangLoader.findConfigPath(at: modelDirectory),
         let data = try? Data(contentsOf: url),
@@ -241,6 +263,62 @@ public func loadWeights(
                 continue
             }
             allShardURLs.append(url)
+        }
+        // FINAL bundle-layout contract (2026-09-04, JANG bundles): when the
+        // bundle ships `model.safetensors.index.json`, the index IS the load
+        // manifest — load exactly the files its weight_map names, nothing
+        // else. Discovery-by-glob is what let withdrawn artifacts (a
+        // dedicated `mtp-00001-*` shard, an interim root-level draft-head
+        // sidecar) leak into `model.update()` as duplicate/unknown keys and
+        // fail loads the index itself defines as complete. An extra file the
+        // index does not mention must never fail — or even affect — a load;
+        // the calibrated draft sidecar lives in `mtp_draft/` for exactly
+        // that reason. Named runtime overlays (`jangtq_stacked`,
+        // `jangpress-prestacked`) are deliberate artifacts, not indexed
+        // weights, so they keep their exact-path opt-in. Gated to JANG
+        // bundles: stock community bundles keep the historical glob and are
+        // untouched by this contract.
+        if jangConfig != nil,
+            let indexedNames = indexedShardFileNames(at: modelDirectory)
+        {
+            var selected: [URL] = []
+            var missing: [String] = []
+            for name in indexedNames {
+                let url = modelDirectory.appendingPathComponent(name)
+                if FileManager.default.fileExists(atPath: url.path) {
+                    selected.append(url)
+                } else {
+                    missing.append(name)
+                }
+            }
+            if !missing.isEmpty {
+                let message =
+                    "model.safetensors.index.json references \(missing.count) "
+                    + "file(s) that are not in \(modelDirectory.path): "
+                    + missing.sorted().joined(separator: ", ")
+                    + ". The bundle layout is incomplete or superseded — "
+                    + "re-download the bundle."
+                FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                throw TruncatedSafetensorsError(description: message)
+            }
+            for overlay in ["jangtq_stacked.safetensors", "jangpress-prestacked.safetensors"] {
+                if overlay == "jangtq_stacked.safetensors" && skipDSV4Sidecar { continue }
+                let url = modelDirectory.appendingPathComponent(overlay)
+                if FileManager.default.fileExists(atPath: url.path),
+                    !selected.contains(where: { $0.lastPathComponent == overlay })
+                {
+                    selected.append(url)
+                }
+            }
+            let droppedCount = allShardURLs.filter { url in
+                !selected.contains(where: { $0.path == url.path })
+            }.count
+            if droppedCount > 0 {
+                FileHandle.standardError.write(Data(
+                    ("[loadWeights] index-manifest load: ignoring \(droppedCount) "
+                        + "non-indexed safetensors file(s) in the bundle\n").utf8))
+            }
+            allShardURLs = selected
         }
         // Detect mixed `model-NNNNN-of-MMMMM.safetensors` sets: parse
         // the trailing `MMMMM` total and group by it. >1 distinct total
