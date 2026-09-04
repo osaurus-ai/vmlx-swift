@@ -210,7 +210,8 @@ extension ProposalHeadStampTests {
 
         XCTAssertEqual(model.installedBits, [4], "re-derived verdict must be used in-process")
         let healed = ProposalHeadStamp.load(fromBundleAt: dir)
-        XCTAssertEqual(healed?.source, model.layout, "stamp must be overwritten with the MEASURED source")
+        XCTAssertEqual(
+            healed?.source, model.layout, "stamp must be overwritten with the MEASURED source")
         XCTAssertEqual(healed?.verdict, .eligible(proposalBits: 4))
     }
 
@@ -253,7 +254,7 @@ extension ProposalHeadStampTests {
         let layout = ProposalHeadSourceLayout(
             bits: 8, groupSize: 64, mode: "affine", tied: false)
         await withTaskGroup(of: Void.self) { group in
-            for _ in 0..<8 {
+            for _ in 0 ..< 8 {
                 group.addTask {
                     ProposalHeadBootstrap.ensure(
                         model: HeadDouble(layout: layout), modelDirectory: dir,
