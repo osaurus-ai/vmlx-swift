@@ -635,7 +635,8 @@ public final class VLMModelFactory: ModelFactory {
         var eosTokenIds = ModelTokenConfigurationResolver.resolvedEOSTokenIds(
             baseConfig: baseConfig,
             configurationData: mergedConfigData,
-            generationConfig: generationConfig)
+            generationConfig: generationConfig,
+            jangStopTokenIds: earlyJangConfig?.chat?.stopTokenIds)
         if baseConfig.modelType == "deepseek_v4" {
             eosTokenIds.formUnion([1, 128803, 128804])
         }

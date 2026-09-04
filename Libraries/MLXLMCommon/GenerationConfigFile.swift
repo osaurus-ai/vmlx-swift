@@ -154,6 +154,26 @@ public enum ModelTokenConfigurationResolver {
         return eosTokenIds
     }
 
+    /// Same as ``resolvedEOSTokenIds(baseConfig:configurationData:generationConfig:)``
+    /// plus the JANG bundle's `chat.stop_token_ids`, which are ADDED to (never
+    /// replace) the config / generation_config declaration. Raptor stamps
+    /// `<|role_end|>` (156895) there and nowhere else.
+    public static func resolvedEOSTokenIds(
+        baseConfig: BaseConfiguration,
+        configurationData: Data,
+        generationConfig: GenerationConfigFile?,
+        jangStopTokenIds: [Int]?
+    ) -> Set<Int> {
+        var eosTokenIds = resolvedEOSTokenIds(
+            baseConfig: baseConfig,
+            configurationData: configurationData,
+            generationConfig: generationConfig)
+        if let jangStopTokenIds {
+            eosTokenIds.formUnion(jangStopTokenIds)
+        }
+        return eosTokenIds
+    }
+
     private struct TextConfigTokens: Codable {
         let eosTokenIds: IntOrIntArray?
 

@@ -1864,7 +1864,8 @@ public final class LLMModelFactory: ModelFactory {
         var eosTokenIds = ModelTokenConfigurationResolver.resolvedEOSTokenIds(
             baseConfig: baseConfig,
             configurationData: configData,
-            generationConfig: generationConfig)
+            generationConfig: generationConfig,
+            jangStopTokenIds: earlyJangConfig?.chat?.stopTokenIds)
         if baseConfig.modelType == "deepseek_v4" {
             // DSV4's Python runtime treats EOS plus both role-boundary
             // sentinels as hard stops: {1, 128803, 128804}. The public
