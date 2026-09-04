@@ -377,6 +377,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var mtpForwardCount = 0
     private(set) var autoregressiveFallbackTokenCount = 0
     private(set) var adaptiveDepthDownshiftCount = 0
+    /// Per-rule audit counters for the depth controller (printed on the
+    /// stats line): which rule moved the depth, how often.
+    private var adaptiveWallClockDemotes = 0
+    private var adaptiveAcceptanceDemotes = 0
     /// Hard ceiling for adaptive promotion — the resolved depth cap, which
     /// may exceed the REQUESTED depth (the request is a starting point, not
     /// a lid, since 2026-09-04). See the depth-policy comment in `init`.
@@ -1202,7 +1206,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             arSafetyResumes: arSafetyResumes)
         let line = String(
             format:
-                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d]\n",
+                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d] depthMoves[promotions=%d,wallclockDemotes=%d,acceptanceDemotes=%d]\n",
             depth,
             currentDepth,
             verifyCalls,
@@ -1248,7 +1252,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             verifierMode,
             arSafetyTrips,
             arSafetyResumes,
-            arSafetyPaused ? 1 : 0)
+            arSafetyPaused ? 1 : 0,
+            adaptiveDepthPromotionCount,
+            adaptiveWallClockDemotes,
+            adaptiveAcceptanceDemotes)
         FileHandle.standardError.write(Data(line.utf8))
     }
 
@@ -2282,6 +2289,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             {
                 currentDepth -= 1
                 adaptiveDepthDownshiftCount += 1
+                adaptiveWallClockDemotes += 1
                 adaptiveWindow.removeAll(keepingCapacity: true)
                 lastAdaptiveCycleTimestamp = nil
                 windowsSinceUpperProbe = 0
@@ -2298,6 +2306,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         if currentDepth >= 4, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
             currentDepth -= 1
             adaptiveDepthDownshiftCount += 1
+            adaptiveAcceptanceDemotes += 1
             adaptiveWindow.removeAll(keepingCapacity: true)
             lastAdaptiveCycleTimestamp = nil
             windowsSinceUpperProbe = 0
@@ -2309,6 +2318,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         if currentDepth == 3, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
             currentDepth = 2
             adaptiveDepthDownshiftCount += 1
+            adaptiveAcceptanceDemotes += 1
             adaptiveWindow.removeAll(keepingCapacity: true)
             lastAdaptiveCycleTimestamp = nil
             windowsSinceUpperProbe = 0
@@ -2323,6 +2333,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // itself doesn't.
             currentDepth = 1
             adaptiveDepthDownshiftCount += 1
+            adaptiveAcceptanceDemotes += 1
             adaptiveWindow.removeAll(keepingCapacity: true)
             lastAdaptiveCycleTimestamp = nil
             windowsSinceUpperProbe = 0
