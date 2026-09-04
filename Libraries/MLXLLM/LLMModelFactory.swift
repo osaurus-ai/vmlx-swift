@@ -220,7 +220,6 @@ public enum LLMTypeRegistry {
             "olmo3": create(Olmo3Configuration.self, Olmo3Model.init),
             "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
             "bailing_hybrid": dispatchBailingHybrid,
-            "bailing_moe_v2_5": create(BailingHybridConfiguration.self, BailingHybridModel.init),
             "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
             "step": dispatchStep3p5,
             "step3p5": dispatchStep3p5,
@@ -413,6 +412,18 @@ public enum LLMTypeRegistry {
         let probe = try? JSONDecoder().decode(Probe.self, from: data)
         let markers =
             "architectures=\(probe?.architectures ?? []) linear_attention=\(probe?.linearAttention ?? "nil") kda_lower_bound=\(probe?.kdaLowerBound.map { String($0) } ?? "nil")"
+        // A config that NAMES the Ling 2.6 architecture is a genuine 2.6
+        // bundle. The GLA runtime is gone, and decoding it as V3 would only
+        // produce garbage — fail with a named error instead.
+        if let architectures = probe?.architectures,
+            architectures.contains(where: { $0.hasPrefix("BailingMoeV2") })
+        {
+            FileHandle.standardError.write(Data(
+                ("[LLMModelFactory] bailing_hybrid refused: \(markers) names the Ling 2.6 (GLA) architecture. "
+                    + "The Ling 2.6 runtime is not shipped; only Ling 3.0 (BailingMoeV3, KDA) bundles are supported.\n").utf8))
+            throw ModelFactoryError.unsupportedModelType(
+                "bailing_hybrid (Ling 2.6 / \(architectures.joined(separator: ","))) — only Ling 3.0 (BailingMoeV3) bundles are supported")
+        }
         do {
             let configuration = try JSONDecoder().decode(
                 BailingMoeV3Configuration.self, from: data)
@@ -423,7 +434,7 @@ public enum LLMTypeRegistry {
             FileHandle.standardError.write(Data(
                 ("[LLMModelFactory] bailing_hybrid config does not decode as Ling 3.0 (BailingMoeV3Configuration): "
                     + "\(error). The Ling 2.6 GLA runtime is no longer a fallback for this model_type "
-                    + "(it produces garbage for Ling 3 bundles); use model_type bailing_moe_v2_5 for a genuine 2.6 bundle. \(markers)\n").utf8))
+                    + "(it produces garbage for Ling 3 bundles) and is not shipped. \(markers)\n").utf8))
             throw error
         }
     }
