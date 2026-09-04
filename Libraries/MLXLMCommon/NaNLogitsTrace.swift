@@ -30,7 +30,7 @@ public final class NaNLogitsTrace: @unchecked Sendable {
         ProcessInfo.processInfo.environment["VMLX_LOGITS_NAN_TRACE"] == "1"
 
     private static let globalLock = NSLock()
-    private static var generationsWithNonFinite = 0
+    nonisolated(unsafe) private static var generationsWithNonFinite = 0  // guarded by globalLock
 
     /// Process-wide count of generations that saw at least one non-finite
     /// row. Exposed for tests.
