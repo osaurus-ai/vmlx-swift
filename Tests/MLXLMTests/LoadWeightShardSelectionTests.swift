@@ -6,6 +6,7 @@ final class LoadWeightShardSelectionTests: XCTestCase {
     func testCalibrationArtifactsAreExcluded() {
         XCTAssertTrue(isAuxiliaryCalibrationSafetensor("awq-calibration.safetensors"))
         XCTAssertTrue(isAuxiliaryCalibrationSafetensor("jang_imatrix.safetensors"))
+        XCTAssertTrue(isAuxiliaryCalibrationSafetensor("awq_activations.safetensors"))
     }
 
     func testInferenceArtifactsRemainEligible() {

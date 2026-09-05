@@ -1247,7 +1247,10 @@ public func loadWeights(
 /// must never participate in inference weight loading.
 func isAuxiliaryCalibrationSafetensor(_ filename: String) -> Bool {
     switch filename {
-    case "awq-calibration.safetensors", "jang_imatrix.safetensors":
+    // `awq_activations.safetensors`: the Ling 3 / Raptor converter's activation
+    // capture, shipped next to the bf16 source shards. Its flat `lm_head` key
+    // fails `update(parameters:)` when globbed in with the indexed shards.
+    case "awq-calibration.safetensors", "jang_imatrix.safetensors", "awq_activations.safetensors":
         true
     default:
         false
