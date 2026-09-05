@@ -78,6 +78,11 @@ public enum MLXCacheIOLock {
 /// that mattered, because it implies the caller's arrays are retained past the
 /// call, and callers reasoning about copy lifetimes were misled by it. Reads are
 /// likewise synchronous since they typically feed directly into model inference.
+enum DiskCacheIntegrityError: Error {
+    case incompleteFile(String)
+    case incompleteWrite(String)
+}
+
 public final class DiskCache: @unchecked Sendable {
 
     private struct ValidatedFileFingerprint: Equatable {
@@ -175,6 +180,17 @@ public final class DiskCache: @unchecked Sendable {
 
         // Create cache directory if needed
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        // Storage integrity at open: an interrupted store (crash, force-quit,
+        // disk full) used to leave a partial `<hash>.safetensors` under its
+        // FINAL name. `fetch` only checked existence, `loadArraysAndMetadata`
+        // maps lazily, and the MLX reader's short-read exception is dropped
+        // on the stream (`Load::eval_cpu` waits on the future without
+        // `get()`), so the row restored as zero-filled KV / recurrent state
+        // at a valid offset — silently. Stores now publish atomically
+        // (temp → rename), so at open anything still named `*.tmp` is a dead
+        // write, and any final-named file whose size is short of the
+        // payload its own header declares is removed together with its row.
+        Self.sweepUnpublishedAndIncompleteFiles(in: cacheDir)
 
         // Open SQLite database
         let dbPath = cacheDir.appendingPathComponent("cache_index.db").path
@@ -325,8 +341,22 @@ public final class DiskCache: @unchecked Sendable {
         Stream.gpu.synchronize()
         let tEval = Date()
         do {
+            // Atomic publication: the row becomes visible under its content
+            // hash only after every byte is on disk. A reader that races the
+            // write, or a process that dies mid-write, never sees a partial
+            // file under the final name (it sees a miss, or a `.tmp` swept
+            // at the next open).
+            let finalURL = url
+            let url = Self.temporaryURL(for: finalURL)
+            try? FileManager.default.removeItem(at: url)
             try save(arrays: arrays, metadata: ["format": "mlx"], url: url)
             Stream.gpu.synchronize()
+            guard Self.isCompleteSafetensors(url: url) else {
+                try? FileManager.default.removeItem(at: url)
+                throw DiskCacheIntegrityError.incompleteWrite(finalURL.lastPathComponent)
+            }
+            try? FileManager.default.removeItem(at: finalURL)
+            try FileManager.default.moveItem(at: url, to: finalURL)
             if phaseTrace {
                 // A 27B ternary model spent ~25 s storing a single ~357 MB
                 // boundary — about 14 MB/s, which is far too slow to be the
@@ -341,7 +371,7 @@ public final class DiskCache: @unchecked Sendable {
             }
 
             let fileSize: Int
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: finalURL.path),
                 let size = attrs[.size] as? Int
             {
                 fileSize = size
@@ -350,7 +380,7 @@ public final class DiskCache: @unchecked Sendable {
             }
 
             _insertEntryLocked(hash: hash, tokenCount: tokenCount, fileSize: fileSize)
-            if let fingerprint = _fileFingerprint(url: url), fingerprint.size > 0 {
+            if let fingerprint = _fileFingerprint(url: finalURL), fingerprint.size > 0 {
                 validatedFiles[hash] = fingerprint
             } else {
                 validatedFiles.removeValue(forKey: hash)
@@ -429,6 +459,12 @@ public final class DiskCache: @unchecked Sendable {
         }
 
         do {
+            // Fail closed on a short file BEFORE the lazy map: the reader's
+            // short-read error never reaches the caller, so a truncated row
+            // would otherwise restore as zeros at a valid offset.
+            guard Self.isCompleteSafetensors(url: url) else {
+                throw DiskCacheIntegrityError.incompleteFile(url.lastPathComponent)
+            }
             let (arrays, _) = try loadArraysAndMetadata(url: url)
             if let fingerprint = _fileFingerprint(url: url), fingerprint.size > 0 {
                 validatedFiles[hash] = fingerprint
@@ -716,6 +752,74 @@ public final class DiskCache: @unchecked Sendable {
     /// Build the file URL for a given hash.
     private func safetensorsURL(for hash: String) -> URL {
         cacheDir.appendingPathComponent("\(hash).safetensors")
+    }
+
+    /// Sibling temp name used while a row is being written. MLX's `save`
+    /// chooses the container format from the extension, so the temp name
+    /// must still end in `.safetensors`; the `.partial-` infix marks it as
+    /// unpublished (never a content-hash filename, never fetched).
+    static func temporaryURL(for finalURL: URL) -> URL {
+        let stem = finalURL.deletingPathExtension().lastPathComponent
+        return finalURL.deletingLastPathComponent()
+            .appendingPathComponent("\(stem).partial-\(UUID().uuidString.prefix(8)).safetensors")
+    }
+
+    static func isUnpublishedName(_ name: String) -> Bool {
+        name.contains(".partial-") && name.hasSuffix(".safetensors")
+    }
+
+    /// The byte offset one past the last tensor payload the file's own
+    /// safetensors header declares (8-byte little-endian header length, JSON
+    /// header, `data_offsets: [begin, end]` per tensor relative to the end
+    /// of the header), or nil when the header itself cannot be read.
+    static func declaredPayloadEnd(url: URL) -> Int? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8 else { return nil }
+        let headerLength = lengthData.withUnsafeBytes { Int($0.load(as: UInt64.self).littleEndian) }
+        guard headerLength > 0, headerLength < 256 * 1024 * 1024 else { return nil }
+        guard let headerData = try? handle.read(upToCount: headerLength), headerData.count == headerLength,
+            let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any]
+        else { return nil }
+        var end = 0
+        for (key, value) in header where key != "__metadata__" {
+            guard let tensor = value as? [String: Any],
+                let offsets = tensor["data_offsets"] as? [Any], offsets.count == 2,
+                let last = (offsets[1] as? NSNumber)?.intValue
+            else { return nil }
+            end = max(end, last)
+        }
+        return 8 + headerLength + end
+    }
+
+    /// True when the file on disk holds every byte its header declares.
+    static func isCompleteSafetensors(url: URL) -> Bool {
+        guard let declared = declaredPayloadEnd(url: url),
+            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+            let size = (attributes[.size] as? NSNumber)?.intValue
+        else { return false }
+        return size >= declared
+    }
+
+    /// Remove dead temp files and incomplete final-named rows (with their
+    /// index rows) from `cacheDir`. Header-only reads: cheap even for a
+    /// multi-hundred-GB cache.
+    static func sweepUnpublishedAndIncompleteFiles(in cacheDir: URL) {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path) else { return }
+        var removed = 0
+        for name in names {
+            let url = cacheDir.appendingPathComponent(name)
+            if isUnpublishedName(name) {
+                try? FileManager.default.removeItem(at: url); removed += 1
+            } else if name.hasSuffix(".safetensors"), !isCompleteSafetensors(url: url) {
+                try? FileManager.default.removeItem(at: url); removed += 1
+                FileHandle.standardError.write(Data(
+                    "[vmlx][cache/disk] removed incomplete row \(name) at open (short of its declared payload)\n".utf8))
+            }
+        }
+        if removed > 0 {
+            FileHandle.standardError.write(Data("[vmlx][cache/disk] integrity sweep removed \(removed) file(s)\n".utf8))
+        }
     }
 
     private func _fileFingerprint(url: URL) -> ValidatedFileFingerprint? {

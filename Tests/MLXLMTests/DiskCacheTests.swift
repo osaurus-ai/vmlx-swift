@@ -1075,3 +1075,72 @@ import Testing
         #expect(companion.fetch(tokens: tokens, boundary: tokens.count) == nil)
     }
 }
+
+// MARK: - Storage integrity (2026-09-05 audit: a partial row restored as zeros)
+
+/// A row whose file is shorter than the payload its own header declares must
+/// be a MISS (and be removed with its index row), never a lazily-mapped hit
+/// whose short read is swallowed on the MLX stream.
+@Test func diskCacheTruncatedRowIsAMissAndIsRemoved() async throws {
+    try await MLXMetalTestLock.withLock {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx_test_\(UUID())")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let cache = DiskCache(cacheDir: tempDir, maxSizeGB: 0.1)
+        let tokens = [7, 8, 9, 10, 11, 12]
+        cache.store(tokens: tokens, arrays: ["keys": MLXArray.ones([2, 4, 64]), "values": MLXArray.ones([2, 4, 64])])
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        let files = try FileManager.default.contentsOfDirectory(atPath: tempDir.path)
+        let row = try #require(files.first { $0.hasSuffix(".safetensors") && !$0.contains(".partial-") })
+        #expect(!files.contains { $0.contains(".partial-") }, "store must publish atomically, leaving no partial file")
+        let url = tempDir.appendingPathComponent(row)
+        #expect(DiskCache.isCompleteSafetensors(url: url))
+        let declared = try #require(DiskCache.declaredPayloadEnd(url: url))
+        let full = try Data(contentsOf: url)
+        #expect(full.count >= declared)
+
+        // Truncate: keep the header and half the payload — the shape an
+        // interrupted write leaves behind.
+        let cut = 8 + (declared - 8) / 2
+        try full.prefix(cut).write(to: url)
+        #expect(!DiskCache.isCompleteSafetensors(url: url))
+
+        let result = cache.fetch(tokens: tokens)
+        #expect(result == nil, "a short row must fail closed to a miss")
+        #expect(!FileManager.default.fileExists(atPath: url.path), "the short row is removed")
+        // The next store of the same prefix heals the entry.
+        cache.store(tokens: tokens, arrays: ["keys": MLXArray.ones([2, 4, 64]), "values": MLXArray.ones([2, 4, 64])])
+        try await Task.sleep(nanoseconds: 200_000_000)
+        #expect(cache.fetch(tokens: tokens) != nil)
+    }
+}
+
+/// Dead temp files and incomplete final-named rows left by a crash are
+/// removed when the cache opens, so quota accounting and fetches never see
+/// them.
+@Test func diskCacheOpenSweepsUnpublishedAndIncompleteFiles() async throws {
+    try await MLXMetalTestLock.withLock {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx_test_\(UUID())")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        // A dead temp file and a header-only "row" (declares 4 floats, has no payload).
+        let deadTemp = tempDir.appendingPathComponent("deadbeef.partial-1a2b3c4d.safetensors")
+        try Data("junk".utf8).write(to: deadTemp)
+        let header = #"{"kv_0_keys":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#
+        var incomplete = Data()
+        var length = UInt64(header.utf8.count).littleEndian
+        incomplete.append(Data(bytes: &length, count: 8))
+        incomplete.append(Data(header.utf8))
+        let shortRow = tempDir.appendingPathComponent("0123456789abcdef.safetensors")
+        try incomplete.write(to: shortRow)
+        #expect(DiskCache.declaredPayloadEnd(url: shortRow) == 8 + header.utf8.count + 16)
+        #expect(!DiskCache.isCompleteSafetensors(url: shortRow))
+
+        _ = DiskCache(cacheDir: tempDir, maxSizeGB: 0.1)
+        #expect(!FileManager.default.fileExists(atPath: deadTemp.path))
+        #expect(!FileManager.default.fileExists(atPath: shortRow.path))
+    }
+}
