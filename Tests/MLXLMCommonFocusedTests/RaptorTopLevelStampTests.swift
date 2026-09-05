@@ -221,10 +221,13 @@ final class RaptorTopLevelStampTests: XCTestCase {
 
     // MARK: - Reasoning default
 
-    func testReasoningDefaultOnBecomesEnableThinkingDefault() throws {
+    func testReasoningDefaultOnLeavesTemplateDefaultUntouched() throws {
         let config = try parseRaptor()
-        XCTAssertEqual(config.chat?.templateKwargsDefaults?.enableThinking, true)
-        XCTAssertEqual(config.chat?.reasoning?.defaultMode, "thinking")
+        // `on` is the template's own default: no kwarg is synthesised, so the
+        // Bailing directive stays where the template puts it (prompt bytes
+        // identical to pre-stamp builds).
+        XCTAssertNil(config.chat?.templateKwargsDefaults?.enableThinking)
+        XCTAssertNil(config.chat?.reasoning?.defaultMode)
         XCTAssertEqual(config.chat?.reasoning?.supported, true)
 
         let context = llmDefaultAdditionalContext(
@@ -232,7 +235,7 @@ final class RaptorTopLevelStampTests: XCTestCase {
             capabilities: config.capabilities,
             generationConfig: nil,
             chatConfig: config.chat)
-        XCTAssertEqual(context?["enable_thinking"] as? Bool, true)
+        XCTAssertNil(context?["enable_thinking"])
     }
 
     func testReasoningDefaultOffMapsToChatMode() throws {
@@ -265,7 +268,8 @@ final class RaptorTopLevelStampTests: XCTestCase {
         // The chat sub-blocks still derive from the top-level blocks where
         // `chat` itself says nothing.
         XCTAssertEqual(config.chat?.stopTokenIds, [156895])
-        XCTAssertEqual(config.chat?.templateKwargsDefaults?.enableThinking, true)
+        // "on" is the template default: nothing is synthesised for it.
+        XCTAssertNil(config.chat?.templateKwargsDefaults?.enableThinking)
     }
 
     func testExplicitChatSubBlocksWinOverTopLevelBlocks() throws {

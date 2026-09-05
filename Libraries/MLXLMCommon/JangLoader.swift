@@ -1949,13 +1949,17 @@ public struct JangLoader: Sendable {
                 templateKwargsDefaults = ChatTemplateKwargsDefaults(
                     enableThinking: defaults["enable_thinking"] as? Bool)
             } else if let rDict = topLevelReasoning,
-                let enableThinking = topLevelReasoningDefaultEnableThinking(rDict)
+                let enableThinking = topLevelReasoningDefaultEnableThinking(rDict),
+                enableThinking == false
             {
-                // `reasoning.default: "on"` is the bundle-authored template
-                // default (`enable_thinking`), the same knob
-                // `chat.template_kwargs_defaults.enable_thinking` carries.
+                // Only an explicit `reasoning.default: "off"` needs the kwarg:
+                // the template's own default is what "on" already produces,
+                // and passing `enable_thinking=true` explicitly moved the
+                // Bailing "detailed thinking on" directive from the end of the
+                // system turn (template default) to its start (injected
+                // context), changing Raptor's prompt bytes between releases.
                 templateKwargsDefaults = ChatTemplateKwargsDefaults(
-                    enableThinking: enableThinking)
+                    enableThinking: false)
             } else {
                 templateKwargsDefaults = nil
             }
@@ -2028,10 +2032,14 @@ public struct JangLoader: Sendable {
     /// `reasoning.default` (`"on"` / `"off"`) → the `chat.reasoning.default_mode`
     /// vocabulary (`"thinking"` / `"chat"`) `llmDefaultAdditionalContext` reads.
     static func topLevelReasoningDefaultMode(_ reasoning: [String: Any]) -> String? {
+        // Only an explicit "off" needs a synthesised mode: "on" is what the
+        // Bailing template already does by default, and stamping it made the
+        // factories inject `enable_thinking=true` (moving the "detailed
+        // thinking on" directive to the start of the system turn and changing
+        // Raptor's prompt bytes between releases).
         switch topLevelReasoningDefaultEnableThinking(reasoning) {
-        case true?: return "thinking"
         case false?: return "chat"
-        case nil: return nil
+        case true?, nil: return nil
         }
     }
 
