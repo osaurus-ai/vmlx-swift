@@ -160,7 +160,14 @@ private func kdaKernel(
         mask != nil ? KDAKernelManager.shared.kernelMasked : KDAKernelManager.shared.kernel
     guard let kernel = selected else { fatalError("KDA kernel not available") }
 
-    var inputs: [MLXArray] = [q, k, v, g.asType(q.dtype), beta, state, MLXArray(T)]
+    // The decay `g` (exp of the fp32 gate, values in (0, 1]) and `beta` stay
+    // float32 into the kernel: narrowed to bf16, any per-channel decay above
+    // ~0.998 rounds to exactly 1.0 (no decay) and 0.997 to 0.996, an error
+    // the recurrence compounds every token. Upstream FLA computes the gate
+    // in fp32 inside its kernel; the Metal source reads both through
+    // `static_cast<float>`, so the array dtype is the only thing that
+    // decides the precision.
+    var inputs: [MLXArray] = [q, k, v, g.asType(.float32), beta.asType(.float32), state, MLXArray(T)]
     if let mask { inputs.append(mask) }
 
     let outputs = kernel(
@@ -220,7 +227,7 @@ public func kdaUpdate(
     let available = (mask != nil ? manager.kernelMasked : manager.kernel) != nil
     if available && Dk >= 32 && Dk % 32 == 0 {
         return kdaKernel(
-            q: q, k: k, v: v, g: g, beta: beta.asType(q.dtype),
+            q: q, k: k, v: v, g: g, beta: beta,
             state: state, mask: mask)
     }
     return gatedDeltaOps(

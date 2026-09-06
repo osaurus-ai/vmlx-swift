@@ -202,6 +202,47 @@ struct BailingMoeV3Tests {
         }
     }
 
+    /// The kernel used to receive the decay narrowed to the activation dtype:
+    /// in bf16 every per-channel decay above ~0.998 is exactly 1.0 (that
+    /// channel never forgets) and 0.997 becomes 0.996. Nine steps of random
+    /// gates never show it; a long horizon of slow-decay channels does. The
+    /// ops fallback keeps everything fp32 and is the reference here.
+    @Test("KDA Metal kernel keeps slow decays over a long horizon (fp32 gate into the kernel)")
+    func kdaKernelSlowDecayLongHorizon() throws {
+        try MLXMetalTestLock.withLock {
+            MLXRandom.seed(11)
+            let (B, T, H, Dk, Dv) = (1, 4096, 1, 32, 32)
+            let q = (MLXRandom.normal([B, T, H, Dk]) * 0.3).asType(.bfloat16)
+            let k = (MLXRandom.normal([B, T, H, Dk]) * 0.3).asType(.bfloat16)
+            let v = (MLXRandom.normal([B, T, H, Dv]) * 0.3).asType(.bfloat16)
+            // Very negative pre-activations → sigmoid ≈ 1.7e-5 → g ≈ -8e-5 →
+            // decay ≈ 0.99992: representable in fp32, exactly 1.0 in bf16
+            // (the largest bf16 below 1 is 0.99609). Over 4096 steps the
+            // fp32 reference forgets ~28% of early content; the narrowed
+            // kernel forgets nothing.
+            let fRaw = (MLXRandom.normal([B, T, H, Dk]) * 0.2 - 11.0).asType(.bfloat16)
+            let beta = sigmoid(MLXRandom.normal([B, T, H])).asType(.bfloat16)
+            let aLog = MLXArray(converting: [0.0])
+            let dtBias = MLXArray.zeros([H * Dk])
+
+            let (yKernel, sKernel) = kdaUpdate(
+                q: q, k: k, v: v, fRaw: fRaw, beta: beta,
+                aLog: aLog, dtBias: dtBias, safeGate: true, lowerBound: -5)
+            let g = computeKDADecay(fRaw: fRaw, aLog: aLog, dtBias: dtBias, safeGate: true, lowerBound: -5)
+            #expect(g.min().item(Float.self) > 0.9997, "fixture must exercise decays bf16 cannot represent")
+            #expect(g.max().item(Float.self) < 1.0, "fixture must actually decay")
+            let state = MLXArray.zeros([B, H, Dv, Dk], dtype: .float32)
+            let (yOps, sOps) = gatedDeltaOps(
+                q: q, k: k, v: v, g: g, beta: beta.asType(.float32), state: state)
+
+            let sScale = abs(sOps).max().item(Float.self)
+            let sDiff = abs(sKernel.asType(.float32) - sOps.asType(.float32)).max().item(Float.self)
+            let yDiff = abs(yKernel.asType(.float32)[0, -1] - yOps.asType(.float32)[0, -1]).max().item(Float.self)
+            #expect(sDiff / max(sScale, 1e-6) < 1e-3, "final state diverges from the fp32 reference: \(sDiff) (scale \(sScale)); the narrowed kernel measured 1.1e-2 here, the fp32 one 4e-7")
+            #expect(yDiff < 1e-3, "last-step output diverges from the fp32 reference: \(yDiff); the narrowed kernel measured 1.6e-2 here")
+        }
+    }
+
     @Test("safe-gate decay is bounded to (exp(lower_bound), 1)")
     func safeGateBounds() throws {
         try MLXMetalTestLock.withLock {
