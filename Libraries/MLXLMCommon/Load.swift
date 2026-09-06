@@ -128,6 +128,81 @@ private func modelIndexContainsPreservedMTPWeight(at modelDirectory: URL) -> Boo
 /// the bundle (absolute paths, `..`) are dropped — weight_map values are
 /// plain file names by contract, and a hostile index must not become a
 /// file-system probe.
+/// What `model.safetensors.index.json` means for the load, given which of the
+/// files it names exist next to it:
+/// - every named file exists → the index is the load manifest (`manifest`);
+/// - some exist and some do not → a truncated or partially replaced download
+///   (`truncated`): loading the rest would silently leave tensors
+///   uninitialised (`model.update` verifies unused keys, not missing ones),
+///   so the load fails loud;
+/// - NONE exist and the directory holds exactly one COMPLETE numbered
+///   `model-NNNNN-of-MMMMM` family (every 1…M present) → the index is from
+///   another layout of the same bundle (`staleIndex`); that family — and
+///   only that family — is the bundle the index failed to describe;
+/// - NONE exist and there is no complete family (an empty or partial
+///   download, unrelated sidecars only, two families) → `incomplete`: fail
+///   loud, nothing can be positively identified as the model.
+enum IndexManifestDecision: Equatable {
+    case manifest([String])
+    case truncated(missing: [String])
+    case staleIndex(missing: [String], replacement: [String])
+    case incomplete(missing: [String])
+}
+
+/// The one complete `model-NNNNN-of-MMMMM.safetensors` family among `names`
+/// (1…M all present, exactly one M), in shard order; nil otherwise.
+func completeNumberedShardFamily(in names: [String]) -> [String]? {
+    let regex = try! NSRegularExpression(pattern: #"^model-(\d+)-of-(\d+)\.safetensors$"#)
+    var byTotal: [Int: [Int: String]] = [:]
+    for name in names {
+        let whole = NSRange(name.startIndex..., in: name)
+        guard let match = regex.firstMatch(in: name, range: whole),
+            let indexRange = Range(match.range(at: 1), in: name),
+            let totalRange = Range(match.range(at: 2), in: name),
+            let index = Int(name[indexRange]), let total = Int(name[totalRange])
+        else { continue }
+        byTotal[total, default: [:]][index] = name
+    }
+    guard byTotal.count == 1, let (total, files) = byTotal.first, total > 0,
+        Set(files.keys) == Set(1...total)
+    else { return nil }
+    return (1...total).map { files[$0]! }
+}
+
+func indexManifestDecision(indexedNames: [String], presentNames: [String]) -> IndexManifestDecision {
+    let present = Set(presentNames)
+    var found: [String] = []
+    var missing: [String] = []
+    for name in indexedNames {
+        if present.contains(name) { found.append(name) } else { missing.append(name) }
+    }
+    if missing.isEmpty { return .manifest(found) }
+    if !found.isEmpty { return .truncated(missing: missing) }
+    if let family = completeNumberedShardFamily(in: presentNames) {
+        return .staleIndex(missing: missing, replacement: family)
+    }
+    return .incomplete(missing: missing)
+}
+
+/// The tensor names a safetensors file declares (header only, no payload
+/// read); nil when the header cannot be read.
+func safetensorsTensorKeys(_ url: URL) -> [String]? {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+    defer { try? handle.close() }
+    guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8
+    else { return nil }
+    var headerLength: UInt64 = 0
+    for (index, byte) in lengthData.enumerated() {
+        headerLength |= UInt64(byte) << UInt64(index * 8)
+    }
+    guard headerLength > 0, headerLength <= 64 * 1024 * 1024,
+        let headerData = try? handle.read(upToCount: Int(headerLength)),
+        headerData.count == Int(headerLength),
+        let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any]
+    else { return nil }
+    return header.keys.filter { $0 != "__metadata__" }
+}
+
 func indexedShardFileNames(at modelDirectory: URL) -> [String]? {
     let indexURL = modelDirectory.appendingPathComponent("model.safetensors.index.json")
     guard let data = try? Data(contentsOf: indexURL),
@@ -281,17 +356,14 @@ public func loadWeights(
         if jangConfig != nil,
             let indexedNames = indexedShardFileNames(at: modelDirectory)
         {
+            let decision = indexManifestDecision(
+                indexedNames: indexedNames,
+                presentNames: allShardURLs.map(\.lastPathComponent))
             var selected: [URL] = []
-            var missing: [String] = []
-            for name in indexedNames {
-                let url = modelDirectory.appendingPathComponent(name)
-                if FileManager.default.fileExists(atPath: url.path) {
-                    selected.append(url)
-                } else {
-                    missing.append(name)
-                }
-            }
-            if !missing.isEmpty {
+            switch decision {
+            case .manifest(let names):
+                selected = names.map { modelDirectory.appendingPathComponent($0) }
+            case .truncated(let missing), .incomplete(let missing):
                 let message =
                     "model.safetensors.index.json references \(missing.count) "
                     + "file(s) that are not in \(modelDirectory.path): "
@@ -300,6 +372,45 @@ public func loadWeights(
                     + "re-download the bundle."
                 FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
                 throw TruncatedSafetensorsError(description: message)
+            case .staleIndex(let missing, let replacement):
+                // The index describes a layout that is not in this directory
+                // at all (a bundle re-uploaded with new shards but an old
+                // index — JANGQ-AI/Ling-2.6-flash-JANGTQ names 31 files, ships
+                // a complete 29-shard family, osaurus#2652). The one complete
+                // numbered family IS the bundle; load exactly it (plus the
+                // named overlays below), never every safetensors file, and
+                // refuse if two shards declare the same tensor — the
+                // `model.update` verification behind this only checks unused
+                // keys, so a duplicate would silently win by order.
+                var seen: [String: String] = [:]
+                var duplicates: [String] = []
+                for name in replacement {
+                    let url = modelDirectory.appendingPathComponent(name)
+                    guard let keys = safetensorsTensorKeys(url) else {
+                        let message =
+                            "model.safetensors.index.json is stale (names \(missing.count) absent file(s)) "
+                            + "and the replacement shard \(name) has an unreadable header — re-download the bundle."
+                        FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                        throw TruncatedSafetensorsError(description: message)
+                    }
+                    for key in keys {
+                        if let first = seen[key] { duplicates.append("\(key) (\(first), \(name))") } else { seen[key] = name }
+                    }
+                }
+                if !duplicates.isEmpty {
+                    let message =
+                        "model.safetensors.index.json is stale and the \(replacement.count)-shard replacement "
+                        + "declares \(duplicates.count) duplicate tensor(s): "
+                        + duplicates.sorted().prefix(5).joined(separator: ", ") + " — re-download the bundle."
+                    FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                    throw TruncatedSafetensorsError(description: message)
+                }
+                FileHandle.standardError.write(Data(
+                    ("[loadWeights] model.safetensors.index.json is stale: none of the "
+                        + "\(missing.count) file(s) it names exist in \(modelDirectory.path) "
+                        + "(e.g. \(missing.sorted().first ?? "")); loading the complete "
+                        + "\(replacement.count)-shard family present instead (\(seen.count) tensors, no duplicates)\n").utf8))
+                selected = replacement.map { modelDirectory.appendingPathComponent($0) }
             }
             for overlay in ["jangtq_stacked.safetensors", "jangpress-prestacked.safetensors"] {
                 if overlay == "jangtq_stacked.safetensors" && skipDSV4Sidecar { continue }
