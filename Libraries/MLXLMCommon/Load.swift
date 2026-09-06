@@ -1447,7 +1447,16 @@ private func isJANGTQParameterKey(_ key: String) -> Bool {
     key.hasSuffix(".tq_packed") || key.hasSuffix(".tq_norms")
 }
 
-private func requiresJANGTQMmapBFloat16(_ modelDirectory: URL) -> Bool {
+/// JANGTQ-native bundles whose NON-TurboQuant affine weights must be
+/// materialised to bf16 even under mmap. Under mmap the loader otherwise keeps
+/// every file-backed tensor as stored, and JANG stamps f16 affine scales: the
+/// 8-bit embedding then seeds an f16 residual stream and every f16-range
+/// overflow in the runtime becomes NaN. Ling 2.6 flash JANGTQ (`bailing_hybrid`,
+/// GLA linear attention, osaurus#2652) is the measured case: with the mmap
+/// path every logit was NaN (157184/157184, token 0 "!" streams) and with the
+/// bf16 materialisation alone the same load answered coherently. The
+/// TurboQuant tensors themselves (`tq_packed`/`tq_norms`) stay raw either way.
+func requiresJANGTQMmapBFloat16(_ modelDirectory: URL) -> Bool {
     let configURL = modelDirectory.appendingPathComponent("config.json")
     guard
         let data = try? Data(contentsOf: configURL),
@@ -1455,10 +1464,14 @@ private func requiresJANGTQMmapBFloat16(_ modelDirectory: URL) -> Bool {
     else {
         return false
     }
+    return requiresJANGTQMmapBFloat16(config: object)
+}
+
+func requiresJANGTQMmapBFloat16(config object: [String: Any]) -> Bool {
     let config = (object["text_config"] as? [String: Any]) ?? object
     let modelType = ((config["model_type"] as? String) ?? (object["model_type"] as? String) ?? "")
         .lowercased()
-    if modelType == "nemotron_h" {
+    if modelType == "nemotron_h" || modelType == "bailing_hybrid" {
         return true
     }
     guard modelType == "qwen3_5_moe" || modelType == "qwen3_5_moe_text" else {

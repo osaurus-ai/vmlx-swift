@@ -55,4 +55,18 @@ final class LoadWeightShardSelectionTests: XCTestCase {
         XCTAssertEqual(completeNumberedShardFamily(in: ["model-00002-of-00002.safetensors", "model-00001-of-00002.safetensors"]),
             ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"])
     }
+
+    /// osaurus#2652: under mmap a JANGTQ-native bundle keeps its f16 affine
+    /// scales unless its family is listed here; Ling 2.6 flash (bailing_hybrid)
+    /// produced all-NaN logits without the bf16 materialisation and answered
+    /// coherently with it (single-variable control, 2026-09-06).
+    func testJANGTQMmapBFloat16FamiliesIncludeBailingHybrid() {
+        XCTAssertTrue(requiresJANGTQMmapBFloat16(config: ["model_type": "bailing_hybrid"]))
+        XCTAssertTrue(requiresJANGTQMmapBFloat16(config: ["model_type": "Bailing_Hybrid"]))
+        XCTAssertTrue(requiresJANGTQMmapBFloat16(config: ["model_type": "nemotron_h"]))
+        XCTAssertTrue(requiresJANGTQMmapBFloat16(config: ["model_type": "qwen3_5_moe", "layer_types": ["linear_attention", "full_attention"]]))
+        XCTAssertFalse(requiresJANGTQMmapBFloat16(config: ["model_type": "qwen3_5_moe", "layer_types": ["full_attention"]]))
+        XCTAssertFalse(requiresJANGTQMmapBFloat16(config: ["model_type": "llama"]))
+        XCTAssertFalse(requiresJANGTQMmapBFloat16(config: [:]))
+    }
 }
