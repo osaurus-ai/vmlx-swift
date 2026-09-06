@@ -302,6 +302,56 @@ public enum Hy3EffortPolicy: ReasoningEffortPolicy {
     }
 }
 
+/// GLM-5.x (`glm5`, `glm5_next`). The control is a SYSTEM LINE, not a boolean, and the template
+/// states the whole contract on its first two lines:
+///
+///     {%- set effective_reasoning_effort = reasoning_effort
+///           if reasoning_effort is defined and reasoning_effort in ['low', 'high']
+///           else 'max' -%}
+///     {%- if effective_reasoning_effort is not none -%}
+///     <|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
+///
+/// So: `low` and `high` are honoured verbatim, ANYTHING else — including an absent key — resolves
+/// to `max`, and there is no off state. The generation prompt then ends `<|assistant|><think>`
+/// unconditionally, which is why the model reasons whatever you ask of it.
+///
+/// WITHOUT THIS POLICY the family fell through to the "no effort scale" branch, because a bundle's
+/// effort vocabulary is only ever read from `jang_config.json` and neither `zai-org/GLM-5.3-Flash`
+/// nor its JANG conversion ships one — the declaration lives in the template, where nothing looked.
+/// `ReasoningCapability.forModel(at:)` therefore reported `levels=[1] efforts=[] templateKey=nil`,
+/// `applying(level:)` returned an EMPTY context for the only level it admitted, no `reasoning_effort`
+/// was ever populated, and every request — including one for the LEAST reasoning — took the
+/// template's `else 'max'` branch. A control the model genuinely has was invisible, and the failure
+/// was silent in both directions: nothing errored, and the rows recorded a level nobody ran at.
+public enum Glm5EffortPolicy: ReasoningEffortPolicy {
+    /// `glm5`, `glm5_next`, `glm_5_*` — but NOT `glm4*`, whose templates carry `enable_thinking`
+    /// instead and are governed by the toggle path.
+    public static func applies(to modelType: String?) -> Bool {
+        guard let t = modelType?.lowercased() else { return false }
+        let compact = t.replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: ".", with: "")
+        return compact.hasPrefix("glm5")
+    }
+    public static let templateKey = "reasoning_effort"
+    /// Weakest to strongest. `max` is in the list because the template reaches it by FALLING
+    /// THROUGH: passing the literal string `max` is not in `['low', 'high']`, so the else-branch
+    /// fires and the system line reads `Reasoning Effort: Max`. Sending it explicitly is therefore
+    /// both correct and, unlike sending nothing, self-documenting in the recorded context.
+    public static let efforts = ["low", "high", "max"]
+    /// The template's OWN fallback when the key is absent — which is what every run got before this
+    /// policy existed.
+    public static let defaultEffort = "max"
+    /// No off state: the template emits a Reasoning Effort line unconditionally and prefills
+    /// `<think>` at the generation prompt. A caller asking for level 0 gets the nearest thing the
+    /// model can do, and the harness records that it was substituted.
+    public static let supportsDisabling = false
+    public static let offEffort: String? = nil
+    // No `normalize` override: the default is derived from `efforts` and cannot drift from it, and
+    // this family has no aliases worth inventing. `medium` in particular is NOT mapped — low/high/max
+    // has no middle rung, and guessing one would put a run at an effort nobody chose.
+}
+
 // MARK: - Resolution
 
 public enum ReasoningCapabilityRegistry {
@@ -312,6 +362,7 @@ public enum ReasoningCapabilityRegistry {
         BailingReasoningPolicy.self,
         DeepseekV4EffortPolicy.self,
         Hy3EffortPolicy.self,
+        Glm5EffortPolicy.self,
     ]
 
     public static func policy(for modelType: String?) -> (any ReasoningEffortPolicy.Type)? {
