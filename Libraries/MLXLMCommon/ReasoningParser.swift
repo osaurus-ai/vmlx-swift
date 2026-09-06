@@ -837,6 +837,25 @@ extension ReasoningParser {
     ///
     /// - **`none`** (Mistral, LFM2, plain models) — returns `nil` so the
     ///   pipeline skips reasoning parsing entirely.
+    /// Whether a stamp NAMES something this type understands — including the spellings that mean
+    /// "no reasoning".
+    ///
+    /// `fromCapabilityName` returns nil for two unrelated reasons, and a caller that cannot tell them
+    /// apart will get one of them wrong:
+    ///
+    ///   * `none`, `off`, `disabled`, `mistral`, `gemma` are RECOGNISED, and they declare that the
+    ///     model emits no reasoning. That is an answer.
+    ///   * anything else falls to `default`, meaning the name is unknown to us. That is a gap.
+    ///
+    /// Honouring the first and degrading gracefully on the second needs this distinction, because
+    /// both arrive as a nil parser.
+    public static func namesAKnownFamily(_ name: String?) -> Bool {
+        guard let name, !name.isEmpty else { return false }
+        if fromCapabilityName(name) != nil { return true }
+        let n = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["none", "off", "disabled", "mistral", "gemma"].contains(n)
+    }
+
     public static func fromCapabilityName(_ name: String?) -> ReasoningParser? {
         guard let name, !name.isEmpty else { return nil }
         let n = name.lowercased()
@@ -860,7 +879,17 @@ extension ReasoningParser {
                 stripStrayTags: false)
         }
 
-        if normalized.hasPrefix("glm4_moe")
+        // `glm_think_block` is the stamp GLM-5.3 bundles actually ship
+        // (`jang_config.capabilities.reasoning_parser`, inside config.json).
+        // It named nothing here, so resolution fell through to the terminal
+        // `default: return nil` and NO parser was built — every decoded byte
+        // routed to `.chunk` and the generation came back as
+        // `"…reasoning…</think>…answer…"` in the answer channel, with the close
+        // marker intact. The bundle also sets `reasoning_prefill_open_tag:
+        // true`, matching the template's unconditional `<|assistant|><think>`
+        // tail, so this starts INSIDE reasoning like the rest of the family.
+        if normalized == "glm_think_block"
+            || normalized.hasPrefix("glm4_moe")
             || normalized.hasPrefix("glm5")
             || normalized.hasPrefix("glm_5")
             || compact.hasPrefix("glm5")
