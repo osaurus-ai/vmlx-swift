@@ -243,6 +243,48 @@ struct BailingMoeV3Tests {
         }
     }
 
+    /// fla's l2norm puts eps on the SUM of squares; rmsNorm puts it on the
+    /// MEAN. The equivalent rmsNorm eps is therefore eps / D. With a bare
+    /// 1e-6 the stabiliser is D× too large — invisible on ordinary
+    /// activations, measurable on small ones.
+    @Test("KDA q/k normalisation reproduces fla's l2norm (eps on the sum of squares)")
+    func kdaQKNormMatchesL2Norm() throws {
+        try MLXMetalTestLock.withLock {
+            let D = 128
+            MLXRandom.seed(3)
+            let x = (MLXRandom.normal([1, 4, 2, D]) * 0.002).asType(.float32)  // small activations
+            let invScale = pow(Float(D), -0.5)
+            let l2 = x * rsqrt((x * x).sum(axis: -1, keepDims: true) + 1e-6)  // fla l2norm
+            let viaRms = MLXArray(invScale) * MLXFast.rmsNorm(x, weight: MLXArray.mlxNone, eps: 1e-6 / Float(D))
+            let viaRmsBareEps = MLXArray(invScale) * MLXFast.rmsNorm(x, weight: MLXArray.mlxNone, eps: 1e-6)
+            let good = abs(viaRms - l2).max().item(Float.self)
+            let bad = abs(viaRmsBareEps - l2).max().item(Float.self)
+            #expect(good < 1e-5, "eps/D form must equal l2norm: \(good)")
+            #expect(bad > 1e-3, "the bare-eps form is measurably different on small activations: \(bad)")
+        }
+    }
+
+    /// The reference combines routed expert outputs with float32 routing
+    /// weights and sums in float32; rounding the weights to bf16 and summing
+    /// the top-k products in bf16 is a different result.
+    @Test("routed-expert combination is float32 (weights and sum), cast back once")
+    func moeCombineIsFloat32() throws {
+        try MLXMetalTestLock.withLock {
+            MLXRandom.seed(5)
+            let y = MLXRandom.normal([2, 3, 8, 64]).asType(.bfloat16)          // [B, T, topk, D]
+            let scores = softmax(MLXRandom.normal([2, 3, 8]), axis: -1)          // float32
+            let combined = BailingV3SparseMoE.combineExpertOutputs(y, scores: scores)
+            #expect(combined.dtype == .bfloat16)
+            let reference = (y.asType(.float32) * scores[.ellipsis, .newAxis]).sum(axis: -2)
+            let bf16Path = (y * scores[.ellipsis, .newAxis].asType(.bfloat16)).sum(axis: -2).asType(.float32)
+            let ours = abs(combined.asType(.float32) - reference).max().item(Float.self)
+            let old = abs(bf16Path - reference).max().item(Float.self)
+            // Ours differs from the float32 reference only by the final bf16 rounding of the result.
+            #expect(ours <= abs(reference).max().item(Float.self) * 0.008, "combine deviates from the float32 reference: \(ours)")
+            #expect(old > ours, "the bf16 path must be measurably worse (old \(old) vs ours \(ours))")
+        }
+    }
+
     @Test("safe-gate decay is bounded to (exp(lower_bound), 1)")
     func safeGateBounds() throws {
         try MLXMetalTestLock.withLock {

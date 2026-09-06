@@ -329,15 +329,17 @@ public final class BailingV3KDAAttention: Module {
         q = q.reshaped(B, T, numHeads, headDim)
         k = k.reshaped(B, T, numHeads, headDim)
 
-        // fla applies true per-head L2 norm and scales q by Dk^-0.5. An
-        // unweighted rmsNorm is l2norm * sqrt(D), so multiplying by
-        // invScale^2 / invScale reproduces l2(q)*Dk^-0.5 and l2(k) exactly —
-        // the same identity Qwen3Next uses.
+        // fla applies true per-head L2 norm (eps 1e-6 on the SUM of squares)
+        // and scales q by Dk^-0.5. An unweighted rmsNorm is l2norm * sqrt(D)
+        // — but its eps sits on the MEAN of squares, so the equivalent
+        // stabiliser is 1e-6 / D (upstream mlx-lm `_normalize_kda_qk` uses
+        // exactly that). A bare 1e-6 here was D× too large.
         let invScale = pow(Float(headDim), -0.5)
+        let l2Eps = Float(1e-6) / Float(headDim)
         q = MLXArray(invScale * invScale, dtype: q.dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: l2Eps)
         k = MLXArray(invScale, dtype: k.dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: l2Eps)
 
         let fRaw: MLXArray
         if let fProj {
@@ -623,12 +625,22 @@ final class BailingV3SparseMoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
-        var y = switchMLP(x, inds)
-        y = (y * scores[.ellipsis, .newAxis].asType(y.dtype)).sum(axis: -2)
+        var y = Self.combineExpertOutputs(switchMLP(x, inds), scores: scores)
         if let sharedExperts {
             y = y + sharedExperts(x)
         }
         return y
+    }
+
+    /// Routed-expert combination in float32, cast back once — the reference
+    /// (`modeling_bailing_moe_v3.py`, `.type(topk_weight.dtype).mul_(…).sum(…).type(new_x.dtype)`)
+    /// and upstream mlx-lm both weight and sum in the scores' float32. The
+    /// previous form rounded the scores to the expert dtype and summed the
+    /// top-k products in bf16.
+    static func combineExpertOutputs(_ y: MLXArray, scores: MLXArray) -> MLXArray {
+        (y.asType(.float32) * scores[.ellipsis, .newAxis].asType(.float32))
+            .sum(axis: -2)
+            .asType(y.dtype)
     }
 }
 
