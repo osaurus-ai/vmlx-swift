@@ -41,6 +41,15 @@ struct Ling26GLAProbe {
         let tokenizer = context.tokenizer
         let model = context.model
         print("PROBE model=\(type(of: model)) dir=\(modelDir)")
+        // Effective parameter dtypes after load: the embedding scales and one
+        // attention projection tell whether the loader materialised bf16.
+        let flat = model.parameters().flattened()
+        let samples = ["model.word_embeddings.scales", "model.word_embeddings.weight", "model.layers.0.attention.query_key_value.scales", "model.layers.7.attention.q_a_proj.scales", "model.layers.0.attention.dense.scales", "model.layers.0.input_layernorm.weight", "model.norm.weight", "lm_head.scales"]
+        for name in samples {
+            if let arr = flat.first(where: { $0.0 == name })?.1 { print("PROBE dtype \(name) = \(arr.dtype)") }
+        }
+        let dtypeCounts = Dictionary(grouping: flat.map { String(describing: $0.1.dtype) }, by: { $0 }).mapValues(\.count)
+        print("PROBE dtype histogram: \(dtypeCounts)")
 
         // A system prompt in the app's shape (long, prose) so the GLA prefill
         // runs well past the ~80-token horizon where the fp16 overflow lived.
@@ -51,12 +60,23 @@ struct Ling26GLAProbe {
             ["role": "system", "content": system],
             ["role": "user", "content": userText],
         ]
-        let prompt = try tokenizer.applyChatTemplate(messages: messages)
-        print("PROBE prompt tokens=\(prompt.count)")
+        let prefillStep = Int(env["VMLX_LING26_PREFILL_STEP"] ?? "") ?? 512
+        let prompt: [Int]
+        if let rawPath = env["VMLX_LING26_RAW_PROMPT_FILE"] {
+            // The app's own rendered prompt (a VMLX_REASONING_PROMPT_DUMP_DIR
+            // file: header lines, then the prompt text after the first blank line).
+            let raw = try String(contentsOfFile: rawPath, encoding: .utf8)
+            let body = raw.range(of: "\n\n").map { String(raw[$0.upperBound...]) } ?? raw
+            prompt = tokenizer.encode(text: body, addSpecialTokens: false)
+            print("PROBE raw prompt from \(rawPath): \(prompt.count) tokens")
+        } else {
+            prompt = try tokenizer.applyChatTemplate(messages: messages)
+        }
+        print("PROBE prompt tokens=\(prompt.count) prefillStep=\(prefillStep)")
 
         let cache = model.newCache(parameters: nil)
         let array = MLXArray(prompt.map { Int32($0) }).expandedDimensions(axis: 0)
-        let prepared = try model.prepare(LMInput(text: .init(tokens: array)), cache: cache, windowSize: 512)
+        let prepared = try model.prepare(LMInput(text: .init(tokens: array)), cache: cache, windowSize: prefillStep)
         var logits: MLXArray
         switch prepared {
         case .tokens(let tail):
@@ -93,7 +113,7 @@ struct Ling26GLAProbe {
         var params = GenerateParameters(
             maxTokens: maxTok, temperature: 0.7, topP: 0.95, topK: 20, minP: 0,
             randomSeed: 11, repetitionPenalty: 1.05, repetitionContextSize: 64,
-            prefillStepSize: 512)
+            prefillStepSize: prefillStep)
         if env["VMLX_LING26_COMPILED"] == "1" { params.enableCompiledDecode = true }
         var it = try TokenIterator(
             input: LMInput(tokens: MLXArray(prompt.map { Int32($0) }).expandedDimensions(axis: 0), tokenIds: prompt),
@@ -107,6 +127,32 @@ struct Ling26GLAProbe {
         let sampledBangs = sampled.filter { $0 == 0 }.count
         print("PROBE sampled tokens=\(sampled.count) token0Count=\(sampledBangs) compiled=\(params.enableCompiledDecode) text=\(sampledText.replacingOccurrences(of: "\n", with: "\\n"))")
         print("PROBE VERDICT sampled token0Fraction=\(Double(sampledBangs) / Double(max(sampled.count, 1)))")
+
+        // ---------- BATCH ENGINE (the app's generation path: BatchEngine solo/batch slots) ----------
+        if let bs = Int(env["VMLX_LING26_BATCH"] ?? "") {
+            let engine = BatchEngine(context: context, maxBatchSize: bs)
+            var bparams = GenerateParameters(maxTokens: maxTok, temperature: 0)
+            bparams.prefillStepSize = prefillStep
+            if env["VMLX_LING26_COMPILED"] == "1" { bparams.enableCompiledDecode = true }
+            if let kv = Int(env["VMLX_LING26_KVBITS"] ?? "") { bparams.kvBits = kv }
+            print("PROBE batch params compiled=\(bparams.enableCompiledDecode) kvBits=\(String(describing: bparams.kvBits)) kvGroupSize=\(bparams.kvGroupSize) quantizedKVStart=\(bparams.quantizedKVStart)")
+            let stream = await engine.generate(
+                input: LMInput(tokens: MLXArray(prompt.map { Int32($0) }).expandedDimensions(axis: 0), tokenIds: prompt),
+                parameters: bparams)
+            var btext = ""
+            var stop = "?"
+            for await ev in stream {
+                switch ev {
+                case .chunk(let s): btext += s
+                case .info(let info): stop = String(describing: info.stopReason)
+                default: break
+                }
+            }
+            await engine.shutdown()
+            let bangs = btext.filter { $0 == "!" }.count
+            print("PROBE batch(maxBatchSize=\(bs)) stop=\(stop) chars=\(btext.count) bangChars=\(bangs) text=\(btext.prefix(160).replacingOccurrences(of: "\n", with: "\\n"))")
+            print("PROBE VERDICT batch bangFraction=\(Double(bangs) / Double(max(btext.count, 1)))")
+        }
 
         // ---------- RESTORE (the app's shape) ----------
         // osaurus warms the system prompt up, stores that prefix through the
@@ -141,7 +187,7 @@ struct Ling26GLAProbe {
                     cacheStablePrefixTokenCounts: prefix)
             }
             var seedParams = GenerateParameters(maxTokens: 1, temperature: 0)
-            seedParams.prefillStepSize = 512
+            seedParams.prefillStepSize = prefillStep
             let seedPrompt = Array(prompt.prefix(boundary + 8))
             var seedIt = try TokenIterator(
                 input: makeInput(seedPrompt, prefix: [boundary]), model: model,
@@ -163,7 +209,7 @@ struct Ling26GLAProbe {
             let perLayer = restoredCache.enumerated().map { "\($0.offset):\(String(describing: type(of: $0.element)).prefix(12)):\($0.element.offset)" }
             print("PROBE restored tokens=\(restoredTokens) layer offsets distinct=\(Set(offsets).sorted()) perLayer=\(perLayer.prefix(10).joined(separator: " ")) …")
             let remArray = MLXArray(remaining.map { Int32($0) }).expandedDimensions(axis: 0)
-            let preparedR = try model.prepare(LMInput(text: .init(tokens: remArray)), cache: restoredCache, windowSize: 512)
+            let preparedR = try model.prepare(LMInput(text: .init(tokens: remArray)), cache: restoredCache, windowSize: prefillStep)
             var rl: MLXArray
             switch preparedR {
             case .tokens(let tail):
@@ -197,7 +243,7 @@ struct Ling26GLAProbe {
             // iterator), greedy. Any '[vmlx][cache/restore] REFUSED' line in
             // the log means the engine fell back to a full prefill.
             var reqParams = GenerateParameters(maxTokens: maxTok, temperature: 0)
-            reqParams.prefillStepSize = 512
+            reqParams.prefillStepSize = prefillStep
             var reqIt = try TokenIterator(
                 input: makeInput(prompt, prefix: [boundary]), model: model,
                 parameters: reqParams, cacheCoordinator: coordinator)

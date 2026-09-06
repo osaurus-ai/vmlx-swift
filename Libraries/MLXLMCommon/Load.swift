@@ -1255,13 +1255,32 @@ public func loadWeights(
                 modelDirectory: modelDirectory)
             || shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(
                 modelDirectory: modelDirectory))
-    if !preserveJANGAffineMmapDtypes
+    let materialiseBFloat16 =
+        !preserveJANGAffineMmapDtypes
         && (!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16
             || autoJANGTQMmapBFloat16)
-    {
+    if materialiseBFloat16 {
         convertToBFloat16(
             model: model,
             shouldSkip: isJANGTQNative ? isJANGTQParameterKey : { _ in false })
+    }
+    // Always-on, one line per load: which dtype policy this load took and what
+    // the parameters actually are afterwards. An f16-seeded activation stream
+    // (JANG f16 affine scales kept file-backed under mmap) is invisible in
+    // every other log line and surfaces only as NaN logits (osaurus#2652);
+    // this line makes the loaded dtype a fact instead of an inference.
+    do {
+        var histogram: [String: Int] = [:]
+        for (_, array) in model.parameters().flattened() {
+            histogram[String(describing: array.dtype), default: 0] += 1
+        }
+        let summary = histogram.sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+        FileHandle.standardError.write(Data(
+            ("[Load] dtype-materialisation bf16=\(materialiseBFloat16) mmap=\(mmapSafetensorsActive) "
+                + "jangtqNative=\(isJANGTQNative) preserveJANGAffine=\(preserveJANGAffineMmapDtypes) "
+                + "autoJANGTQBF16=\(autoJANGTQMmapBFloat16) allowJANGTQBF16=\(allowJANGTQMmapBFloat16) "
+                + "params[\(summary)]\n").utf8))
     }
 
     // The Gemma-4 / DSV4-prestacked preserve branches keep f16 affine
