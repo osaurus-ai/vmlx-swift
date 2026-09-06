@@ -657,15 +657,41 @@ public final class Glm5NextSparseAttention: Module {
         // applied causality (a pool is a candidate only if its last token is visible to the query),
         // so anding them again would be redundant, and passing the causal mask instead of the
         // sparse one would silently un-sparsify the layer.
-        var effectiveMask = mask
+        var maskMode: MLXFast.ScaledDotProductAttentionMaskMode =
+            mask.map { .array($0) } ?? .none
         if let selected {
             let visible = indexer.maskFromIndices(selected, kvLength: keys.dim(2))
-            effectiveMask = MLX.where(
-                visible, MLXArray(Float(0)).asType(q.dtype),
-                MLXArray(-Float.greatestFiniteMagnitude).asType(q.dtype))
+            maskMode = .array(
+                MLX.where(
+                    visible, MLXArray(Float(0)).asType(q.dtype),
+                    MLXArray(-Float.greatestFiniteMagnitude).asType(q.dtype)))
+        } else if mask == nil, T > 1 {
+            // CAUSALITY, for the path where the selection is SKIPPED.
+            //
+            // The sparse mask above carries causality with it — a pool is a candidate only if its
+            // last token is visible to the query — so a SELECTING forward needs nothing more. But
+            // below `index_topk` the indexer deliberately returns nothing, and on that path nothing
+            // supplied causality at all: every caller passes `mask: nil`, the language model
+            // forwards that nil to each layer unchanged, and `scaledDotProductAttention` treats nil
+            // as NO MASK rather than as a causal sentinel.
+            //
+            // Prefill below `index_topk` was therefore BIDIRECTIONAL — every token attended to every
+            // later token. Measured on this layer, appending 4 tokens to a 16-token prefill moved
+            // each earlier token's output by ~50% of its own magnitude, and single-shot, chunked and
+            // stepwise prefill produced three different answers. It also silently poisoned the
+            // SELECTING path, because a first chunk below `index_topk` wrote non-causal keys into
+            // the cache that later selecting chunks then read.
+            //
+            // `.causal` and NOT a materialised `[T, S]` array: the mode lets MLX take its fused
+            // kernel, whereas an explicit mask array can force the scores to be materialised — at
+            // 64 heads an 8k prefill is then 8192 x 8192 x 64 x 2 B = 8.6 GB per layer. The mode
+            // also carries the cache offset by convention (the last `T` queries align to the last
+            // `T` keys), which is what `createAttentionMask` relies on when it returns `.causal`
+            // for a non-zero offset. `T == 1` needs no mask: a lone query has no future.
+            maskMode = .causal
         }
         let out = MLXFast.scaledDotProductAttention(
-            queries: q, keys: keys, values: values, scale: scale, mask: effectiveMask)
+            queries: q, keys: keys, values: values, scale: scale, mask: maskMode)
         return oProj(out.transposed(0, 2, 1, 3).reshaped(B, T, numHeads * vHeadDim))
     }
 }
