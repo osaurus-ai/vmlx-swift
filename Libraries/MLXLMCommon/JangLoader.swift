@@ -365,13 +365,30 @@ public enum ParserResolution {
             )
         }
 
-        if let cap = capabilities, cap.reasoningParser != nil {
+        if let cap = capabilities, let stamp = cap.reasoningParser {
             // Stamped — honour exactly. `nil` is a valid stamp meaning
             // "this model emits no reasoning".
-            return (
-                ReasoningParser.fromCapabilityName(cap.reasoningParser),
-                .jangStamped
-            )
+            //
+            // An UNRECOGNISED stamp is a different thing entirely, and
+            // conflating the two is how a declared reasoning model ended up
+            // with no parser at all. GLM-5.3 ships
+            // `reasoning_parser: "glm_think_block"`; that named nothing in
+            // `fromCapabilityName`, which returned nil, and nil was taken as
+            // the model's own claim not to reason. The bundle that DECLARED
+            // its parser therefore fared WORSE than one declaring nothing,
+            // which falls through to the model_type heuristic below and gets a
+            // working `think_xml`.
+            //
+            // So: a stamp we understand wins; a stamp we do not understand is
+            // missing information, not a negative claim, and degrades to the
+            // heuristic. The next vendor spelling we have not seen then loses
+            // precision instead of losing the reasoning channel.
+            // A stamp we KNOW wins outright — including the spellings that mean "no reasoning",
+            // whose nil is an answer rather than a gap. Only a name we do not recognise falls
+            // through to the heuristic below.
+            if ReasoningParser.namesAKnownFamily(stamp) {
+                return (ReasoningParser.fromCapabilityName(stamp), .jangStamped)
+            }
         }
         if declaresLFM25ThinkingTemplate(modelType: modelType, chatTemplate: chatTemplate) {
             return (
