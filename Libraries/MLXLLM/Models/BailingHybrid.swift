@@ -1131,6 +1131,8 @@ class BailingDecoderLayer: Module {
 // MARK: - Top-level model
 
 public class BailingHybridLanguageModel: Module {
+    nonisolated(unsafe) static let nonFiniteTraceEnabled: Bool =
+        ProcessInfo.processInfo.environment["VMLX_LOGITS_NAN_TRACE"] == "1"
     let args: BailingHybridConfiguration
 
     @ModuleInfo(key: "word_embeddings") var wordEmbeddings: Embedding
@@ -1177,10 +1179,35 @@ public class BailingHybridLanguageModel: Module {
         // even on small (20-token) prompts. Per-layer eval bounds peak
         // resident memory to a single layer's worth of intermediates
         // (~5 GB) at the cost of a Metal dispatch sync per layer.
+        // VMLX_LOGITS_NAN_TRACE=1 (observation only, never a guard): the first
+        // layer whose output carries a non-finite value, with the activation
+        // dtype and magnitude at the embedding, so an all-NaN logit row can be
+        // placed inside this runtime (osaurus#2652).
+        let trace = Self.nonFiniteTraceEnabled
+        if trace {
+            let emb = h.asType(.float32)
+            let nonFinite = (1 - MLX.isFinite(emb).asType(.int32)).sum().item(Int32.self)
+            FileHandle.standardError.write(Data(
+                "[vmlx][bailing-hybrid-trace] embedding dtype=\(h.dtype) shape=\(h.shape) maxAbs=\(MLX.abs(emb).max().item(Float.self)) nonFinite=\(nonFinite) offset=\(offset)\n".utf8))
+        }
+        var firstBadLayer: Int? = nil
         for (i, layer) in layers.enumerated() {
             let layerCache = (cache != nil && i < cache!.count) ? cache![i] : nil
             h = layer(h, attnMask: attnMask, cache: layerCache, offset: offset)
             MLX.eval(h)
+            if trace, firstBadLayer == nil {
+                let hf = h.asType(.float32)
+                let nonFinite = (1 - MLX.isFinite(hf).asType(.int32)).sum().item(Int32.self)
+                if nonFinite > 0 {
+                    firstBadLayer = i
+                    FileHandle.standardError.write(Data(
+                        ("[vmlx][bailing-hybrid-trace] FIRST non-finite at layer \(i) (\(layers[i].isGlobal ? "MLA" : "GLA")) "
+                            + "dtype=\(h.dtype) nonFinite=\(nonFinite)/\(h.size) L=\(h.dim(1)) offset=\(offset)\n").utf8))
+                } else if i == 0 || i == firstGlobalIdx {
+                    FileHandle.standardError.write(Data(
+                        "[vmlx][bailing-hybrid-trace] layer \(i) (\(layers[i].isGlobal ? "MLA" : "GLA")) dtype=\(h.dtype) maxAbs=\(MLX.abs(hf).max().item(Float.self)) finite\n".utf8))
+                }
+            }
         }
         return norm(h)
     }

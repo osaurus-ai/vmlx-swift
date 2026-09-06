@@ -130,14 +130,33 @@ struct Ling26GLAProbe {
 
         // ---------- BATCH ENGINE (the app's generation path: BatchEngine solo/batch slots) ----------
         if let bs = Int(env["VMLX_LING26_BATCH"] ?? "") {
-            let engine = BatchEngine(context: context, maxBatchSize: bs)
-            var bparams = GenerateParameters(maxTokens: maxTok, temperature: 0)
+            // App-shaped options: compiled BATCH decode (the native-MTP fallback the app
+            // enables), a disk-backed CacheCoordinator, and the request's prefix boundaries.
+            let cbd = env["VMLX_LING26_CBD"] == "1"
+            var coordinator: CacheCoordinator? = nil
+            if env["VMLX_LING26_COORD"] == "1" {
+                let diskDir = FileManager.default.temporaryDirectory.appendingPathComponent("ling26-batch-\(UUID().uuidString)")
+                let c = CacheCoordinator(config: CacheCoordinatorConfig(
+                    usePagedCache: false, enableDiskCache: true, diskCacheDir: diskDir, modelKey: "ling26-batch"))
+                let topology = ModelCacheTopologySnapshot(cache: model.newCache(parameters: nil))
+                c.setHybrid(topology.requiresSSMCompanionState,
+                    requiresRecurrentSSMCompanion: topology.requiresRecurrentSSMCompanionState,
+                    requiresSeparateRecurrentPayload: topology.requiresSeparateRecurrentPayloadState)
+                coordinator = c
+            }
+            let boundaries = (env["VMLX_LING26_BOUNDARIES"] ?? "").split(separator: ",").compactMap { Int($0) }
+            let stable = (env["VMLX_LING26_STABLE"] ?? "").split(separator: ",").compactMap { Int($0) }
+            let engine = coordinator.map { BatchEngine(context: context, maxBatchSize: bs, cacheCoordinator: $0) }
+                ?? BatchEngine(context: context, maxBatchSize: bs)
+            var bparams = GenerateParameters(maxTokens: maxTok, enableCompiledBatchDecode: cbd, temperature: 0)
             bparams.prefillStepSize = prefillStep
+            print("PROBE batch shape cbd=\(cbd) coordinator=\(coordinator != nil) boundaries=\(boundaries) stable=\(stable)")
             if env["VMLX_LING26_COMPILED"] == "1" { bparams.enableCompiledDecode = true }
             if let kv = Int(env["VMLX_LING26_KVBITS"] ?? "") { bparams.kvBits = kv }
             print("PROBE batch params compiled=\(bparams.enableCompiledDecode) kvBits=\(String(describing: bparams.kvBits)) kvGroupSize=\(bparams.kvGroupSize) quantizedKVStart=\(bparams.quantizedKVStart)")
             let stream = await engine.generate(
-                input: LMInput(tokens: MLXArray(prompt.map { Int32($0) }).expandedDimensions(axis: 0), tokenIds: prompt),
+                input: LMInput(tokens: MLXArray(prompt.map { Int32($0) }).expandedDimensions(axis: 0), tokenIds: prompt,
+                    cachePrefixTokenCounts: boundaries, cacheStablePrefixTokenCounts: stable),
                 parameters: bparams)
             var btext = ""
             var stop = "?"
