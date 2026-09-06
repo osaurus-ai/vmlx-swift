@@ -1311,18 +1311,26 @@ private struct LLMUserInputProcessor: UserInputProcessor {
     let modelType: String?
     let messageGenerator: MessageGenerator
     let defaultAdditionalContext: [String: any Sendable]?
+    /// True when the bundle's chat template reads the standard
+    /// `enable_thinking` kwarg itself (Ling 3.0: `{%- if enable_thinking is
+    /// defined %}` and it renders "detailed thinking on/off" at the END of the
+    /// SYSTEM turn). Then the kwarg is passed through untouched; the legacy
+    /// Bailing directive prepend is only for templates that do not read it.
+    let templateReadsEnableThinking: Bool
 
     internal init(
         tokenizer: any Tokenizer, configuration: ModelConfiguration,
         modelType: String?,
         messageGenerator: MessageGenerator,
-        defaultAdditionalContext: [String: any Sendable]? = nil
+        defaultAdditionalContext: [String: any Sendable]? = nil,
+        templateReadsEnableThinking: Bool = false
     ) {
         self.tokenizer = tokenizer
         self.configuration = configuration
         self.modelType = modelType
         self.messageGenerator = messageGenerator
         self.defaultAdditionalContext = defaultAdditionalContext
+        self.templateReadsEnableThinking = templateReadsEnableThinking
     }
 
     func prepare(input: UserInput) throws -> LMInput {
@@ -1340,7 +1348,8 @@ private struct LLMUserInputProcessor: UserInputProcessor {
         let bailingMessages = BailingThinkingTemplateContext.apply(
             to: messageGenerator.generate(from: input),
             modelType: modelType,
-            additionalContext: additionalContext
+            additionalContext: additionalContext,
+            templateReadsEnableThinking: templateReadsEnableThinking
         )
         var messages = NemotronToolChoiceTemplateContext.apply(
             to: bailingMessages,
@@ -2049,7 +2058,8 @@ public final class LLMModelFactory: ModelFactory {
                 modelType: baseConfig.modelType,
                 capabilities: jangConfig?.capabilities,
                 generationConfig: generationConfig,
-                chatConfig: jangConfig?.chat))
+                chatConfig: jangConfig?.chat),
+            templateReadsEnableThinking: BailingThinkingTemplateContext.templateReadsEnableThinking(chatTemplate))
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

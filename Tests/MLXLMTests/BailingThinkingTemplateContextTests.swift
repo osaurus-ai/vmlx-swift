@@ -147,4 +147,21 @@ final class BailingThinkingTemplateContextTests: XCTestCase {
             """
         )
     }
+    /// Ling 3.0 templates read `enable_thinking` themselves and place the
+    /// directive at the end of the SYSTEM turn; the prepend must not run there.
+    func testTemplateThatReadsEnableThinkingIsLeftToTheTemplate() {
+        let ling3 = "{%- if enable_thinking is defined %}\n{%- if enable_thinking %}{%- set thinking_option = 'on' %}{%- endif %}{%- endif %}"
+        XCTAssertTrue(BailingThinkingTemplateContext.templateReadsEnableThinking(ling3))
+        XCTAssertFalse(BailingThinkingTemplateContext.templateReadsEnableThinking("{{ messages[0].content }} detailed thinking on"))
+        XCTAssertFalse(BailingThinkingTemplateContext.templateReadsEnableThinking(nil))
+        let messages: [Message] = [["role": "system", "content": "You are Osaurus."], ["role": "user", "content": "hi"]]
+        let untouched = BailingThinkingTemplateContext.apply(
+            to: messages, modelType: "bailing_hybrid",
+            additionalContext: ["enable_thinking": true], templateReadsEnableThinking: true)
+        XCTAssertEqual(untouched[0]["content"] as? String, "You are Osaurus.")
+        let legacy = BailingThinkingTemplateContext.apply(
+            to: messages, modelType: "bailing_hybrid",
+            additionalContext: ["enable_thinking": true], templateReadsEnableThinking: false)
+        XCTAssertEqual(legacy[0]["content"] as? String, "detailed thinking on\n\nYou are Osaurus.")
+    }
 }

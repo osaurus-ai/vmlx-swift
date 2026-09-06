@@ -19,12 +19,26 @@ enum BailingThinkingTemplateContext {
         modelType?.lowercased().hasPrefix("bailing") == true
     }
 
+    /// Ling 3.0's template reads the standard kwarg (`{%- if enable_thinking is
+    /// defined %}`) and renders "detailed thinking on/off" itself at the END
+    /// of the SYSTEM turn, after the tools block — the trained position. The
+    /// prepend below puts it at the START of the system content (and the
+    /// template then skips its own), which is not what the model saw in
+    /// training. When the template reads the kwarg, leave the messages alone
+    /// and let the kwarg travel.
+    static func templateReadsEnableThinking(_ chatTemplate: String?) -> Bool {
+        guard let chatTemplate else { return false }
+        return chatTemplate.contains("enable_thinking is defined")
+            || chatTemplate.contains("enable_thinking is not defined")
+    }
+
     static func apply(
         to messages: [Message],
         modelType: String?,
-        additionalContext: [String: any Sendable]?
+        additionalContext: [String: any Sendable]?,
+        templateReadsEnableThinking: Bool = false
     ) -> [Message] {
-        guard applies(to: modelType) else {
+        guard applies(to: modelType), !templateReadsEnableThinking else {
             return messages
         }
 
