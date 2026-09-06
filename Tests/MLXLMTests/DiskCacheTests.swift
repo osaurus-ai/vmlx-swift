@@ -1144,3 +1144,45 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: shortRow.path))
     }
 }
+
+/// osaurus#2652: a record carrying NaN/Inf must be neither persisted nor
+/// restored. Store-side: refused, no file. Fetch-side: an existing poisoned
+/// file (written by an older build) is removed on first touch and reported
+/// as a miss, so the next prefill re-stores a finite record.
+@Test func diskCacheRefusesNonFiniteRecordsOnStoreAndOnFetch() async throws {
+    try await MLXMetalTestLock.withLock {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx_test_\(UUID())")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let cache = DiskCache(cacheDir: tempDir, maxSizeGB: 0.1)
+
+        // Store-side refusal: one NaN in one tensor.
+        let poisoned: [String: MLXArray] = [
+            "kv_7_keys": MLXArray.ones([1, 2, 8, 4]),
+            "ssm_1": MLXArray([Float.nan, 1, 2, 3]).reshaped(1, 1, 2, 2),
+        ]
+        cache.store(tokens: [1, 2, 3], arrays: poisoned)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        #expect(cache.refusedNonFiniteStores == 1)
+        #expect(cache.stores == 0)
+        #expect(cache.fetch(tokens: [1, 2, 3]) == nil)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: tempDir.path).filter { $0.hasSuffix(".safetensors") }.isEmpty)
+
+        // Fetch-side removal: a finite record whose file is later overwritten
+        // with an Inf payload (the shape an older build left behind).
+        let finite: [String: MLXArray] = ["kv_7_keys": MLXArray.ones([1, 2, 8, 4]), "ssm_1": MLXArray.zeros([1, 1, 2, 2])]
+        cache.store(tokens: [4, 5, 6], arrays: finite)
+        try await Task.sleep(nanoseconds: 500_000_000)
+        #expect(cache.fetch(tokens: [4, 5, 6]) != nil)
+        let files = try FileManager.default.contentsOfDirectory(atPath: tempDir.path).filter { $0.hasSuffix(".safetensors") }
+        #expect(files.count == 1)
+        let url = tempDir.appendingPathComponent(files[0])
+        let inf: [String: MLXArray] = ["kv_7_keys": MLXArray.ones([1, 2, 8, 4]), "ssm_1": MLXArray([Float.infinity, 0, 0, 0]).reshaped(1, 1, 2, 2)]
+        try MLX.save(arrays: inf, url: url)
+        #expect(cache.fetch(tokens: [4, 5, 6]) == nil)
+        #expect(cache.refusedNonFiniteFetches == 1)
+        #expect(!FileManager.default.fileExists(atPath: url.path))
+        // Integer payloads are never inspected for finiteness.
+        #expect(DiskCache.nonFiniteTensorNames(in: ["ids": MLXArray([Int32(1), 2])]).isEmpty)
+    }
+}

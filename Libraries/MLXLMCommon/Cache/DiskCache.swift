@@ -81,6 +81,12 @@ public enum MLXCacheIOLock {
 enum DiskCacheIntegrityError: Error {
     case incompleteFile(String)
     case incompleteWrite(String)
+    /// A record whose payload carries NaN/Inf. A cache row is only worth
+    /// restoring when it reproduces a finite forward; a poisoned row restores
+    /// a non-finite recurrent state or KV and every generation built on it is
+    /// token 0 forever (osaurus#2652: 14 such rows, written once by a broken
+    /// build, kept serving "!" on every later build until removed).
+    case nonFinitePayload(String)
 }
 
 public final class DiskCache: @unchecked Sendable {
@@ -118,6 +124,27 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Number of store operations that reused an already validated file.
     public private(set) var storeSkips: Int = 0
+    /// Stores refused because the payload carried NaN/Inf (never persisted).
+    public private(set) var refusedNonFiniteStores: Int = 0
+    /// Fetches that found a NaN/Inf record on disk (removed, reported as a miss).
+    public private(set) var refusedNonFiniteFetches: Int = 0
+
+    /// The names of the float tensors in `arrays` that carry a non-finite
+    /// value (at most `limit`), in key order. Integer and boolean tensors are
+    /// skipped. Used on both sides of the disk boundary: a record is neither
+    /// written nor restored when it is not entirely finite.
+    static func nonFiniteTensorNames(in arrays: [String: MLXArray], limit: Int = 4) -> [String] {
+        var names: [String] = []
+        for key in arrays.keys.sorted() {
+            guard let array = arrays[key], array.dtype.isFloatingPoint, array.size > 0 else { continue }
+            let nonFinite = (1 - MLX.isFinite(array).asType(.int32)).sum().item(Int32.self)
+            if nonFinite > 0 {
+                names.append("\(key)(\(nonFinite))")
+                if names.count >= limit { break }
+            }
+        }
+        return names
+    }
 
     /// Number of logical cache boundaries removed by quota enforcement.
     public private(set) var evictions: Int = 0
@@ -289,6 +316,19 @@ public final class DiskCache: @unchecked Sendable {
         // `@Sendable` closures under Swift 6 strict concurrency. The
         // unfair-lock primitive doesn't require Sendable — we just need
         // `defer { unlock() }` to cover every exit path.
+        // A payload with NaN/Inf is not a cache entry, it is the failure the
+        // cache would replay: refuse before touching the disk or the index.
+        let nonFinite = Self.nonFiniteTensorNames(in: arrays)
+        if !nonFinite.isEmpty {
+            lock.lock()
+            refusedNonFiniteStores += 1
+            lock.unlock()
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk-store] REFUSED non-finite payload count=\(tokenCount) "
+                    + "hash=\(hash.prefix(12)) modelKey=\(modelKey ?? "nil") tensors=\(nonFinite)\n").utf8))
+            return
+        }
+
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
@@ -466,6 +506,15 @@ public final class DiskCache: @unchecked Sendable {
                 throw DiskCacheIntegrityError.incompleteFile(url.lastPathComponent)
             }
             let (arrays, _) = try loadArraysAndMetadata(url: url)
+            // A record written before the store-side check (or by a build that
+            // computed NaN) must never be restored: it is removed on first touch
+            // so an installed user recovers on the next prefill without clearing
+            // anything by hand.
+            let nonFinite = Self.nonFiniteTensorNames(in: arrays)
+            if !nonFinite.isEmpty {
+                refusedNonFiniteFetches += 1
+                throw DiskCacheIntegrityError.nonFinitePayload(nonFinite.joined(separator: ","))
+            }
             if let fingerprint = _fileFingerprint(url: url), fingerprint.size > 0 {
                 validatedFiles[hash] = fingerprint
             }
@@ -488,7 +537,7 @@ public final class DiskCache: @unchecked Sendable {
             // corrupt file so the next turn doesn't retry and log the
             // same error on every fetch.
             FileHandle.standardError.write(Data(
-                "[vmlx][cache/disk] fetch corrupt entry at \(url.lastPathComponent): \(error) — removing\n"
+                "[vmlx][cache/disk] fetch REFUSED entry at \(url.lastPathComponent) count=\(tokens.count): \(error) — removing\n"
                 .utf8))
             try? FileManager.default.removeItem(at: url)
             // Drop the SQLite row too. Removing only the file orphans the
