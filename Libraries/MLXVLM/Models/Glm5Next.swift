@@ -1635,8 +1635,23 @@ public enum Glm5NextActivation {
     /// the reference would have bounded.
     public static func clampedSwiGLU(gate g: MLXArray, up u: MLXArray, limit: Float?) -> MLXArray {
         guard let limit else { return silu(g) * u }
-        let gateClamped = minimum(g, MLXArray(limit))
-        let upClamped = clip(u, min: -limit, max: limit)
+        // THE SCALARS MUST CARRY THE OPERAND'S DTYPE. `MLXArray(someFloat)` is a FLOAT32 scalar, and
+        // `minimum(bf16, f32)` promotes — so the bound, not the data, decided the width of every
+        // activation in the model.
+        //
+        // The blast radius was the whole network, not this function: the promoted MLP output becomes
+        // `blockOut`, the hyper-connection expand returns `blockOut.dtype`, and the residual stream
+        // is float32 from the first layer onward for all 45. Measured, that is most of GLM-5.3's
+        // ~7.8 MB/token prefill growth, and it is why the fused affine MoE decode kernel — whose
+        // contract is BF16 in and out — was rejected on every invocation, so a fast path that was
+        // correctly built and correctly wired never once ran.
+        //
+        // Nothing here changes the ARITHMETIC: the clamp is `minimum(gate, limit)` and
+        // `clip(up, -limit, limit)`, exactly as the reference's `_clamped_swiglu` does it.
+        let hi = MLXArray(limit).asType(g.dtype)
+        let gateClamped = minimum(g, hi)
+        let bound = MLXArray(limit).asType(u.dtype)
+        let upClamped = clip(u, min: -bound, max: bound)
         return silu(gateClamped) * upClamped
     }
 }
