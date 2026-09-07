@@ -2215,20 +2215,25 @@ extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel {
     public func callAsFunction(
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
-        // The protocol's forward cannot throw, and this model's genuinely can — a sequence past
-        // `index_topk`, or a malformed shape. Reporting through `LMOutput` is not possible either,
-        // so the failure is surfaced as a zero-logit output ONLY after being written to stderr,
-        // rather than being silently swallowed.
+        LMOutput(logits: callAsFunction(input.tokens, cache: cache))
+    }
+
+    /// Token-only forward: the shared engine drives this overload outside generation — the
+    /// SSD-cache store re-derives the recurrent (KDA) states at prompt boundaries by replaying the
+    /// prompt through it (`reDeriveSSMStatesAtBoundaries`). The `LanguageModel` default traps
+    /// (`fatalError("not implemented")`), which took the whole app down at the end of every
+    /// GLM-5.3 generation: the turn was persisted, then the cache store crashed the process
+    /// (osaurus, 2026-09-07, `LanguageModel.swift:511`). Same contract as the `LMInput.Text`
+    /// overload: the forward genuinely can throw (a sequence past `index_topk`, a malformed
+    /// shape) and the protocol cannot, so a failure is written to stderr and surfaced as a
+    /// zero-logit output rather than swallowed — or trapped.
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         do {
-            let logits = try callAsFunction(
-                input.tokens, mask: nil, caches: cache, inputEmbedding: nil)
-            return LMOutput(logits: logits)
+            return try callAsFunction(inputs, mask: nil, caches: cache, inputEmbedding: nil)
         } catch {
             FileHandle.standardError.write(
                 Data("[glm5_next] forward failed: \(error)\n".utf8))
-            return LMOutput(
-                logits: MLXArray.zeros(
-                    [input.tokens.dim(0), input.tokens.dim(1), vocabularySize]))
+            return MLXArray.zeros([inputs.dim(0), inputs.dim(1), vocabularySize])
         }
     }
 }

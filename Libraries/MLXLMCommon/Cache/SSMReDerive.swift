@@ -307,7 +307,8 @@ public func reDeriveSSMStates(
             } else {
                 tailInput = tail.tokens.reshaped([1, tail.tokens.size])
             }
-            _ = model.callAsFunction(tailInput, cache: freshCache)
+            _ = model.callAsFunction(
+                LMInput.Text(tokens: tailInput), cache: freshCache, state: nil)
         }
     case .logits:
         break
@@ -376,11 +377,19 @@ public func reDeriveSSMStatesAtBoundaries(
                     let tailInput = tail.tokens.ndim >= 2
                         ? tail.tokens
                         : tail.tokens.reshaped([1, tail.tokens.size])
-                    _ = model.callAsFunction(tailInput, cache: freshCache)
+                    _ = model.callAsFunction(
+                        LMInput.Text(tokens: tailInput), cache: freshCache, state: nil)
                 }
                 needsFreshReplayPreparation = false
             } else {
-                _ = model.callAsFunction(tokenArray, cache: freshCache)
+                // Generation's own contract (`LMInput.Text`), not the raw token
+                // overload: vision-language models implement the former and
+                // inherit a trapping default for the latter, so replaying a
+                // hybrid VLM's prompt here used to crash the process at the
+                // end of every generation (GLM-5.3, 2026-09-07). Plain LLMs
+                // reach their token overload through the protocol default.
+                _ = model.callAsFunction(
+                    LMInput.Text(tokens: tokenArray), cache: freshCache, state: nil)
             }
             MLX.eval(freshCache)
             cursor = end

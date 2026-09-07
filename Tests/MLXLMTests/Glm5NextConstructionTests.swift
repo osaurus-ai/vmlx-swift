@@ -1145,3 +1145,33 @@ struct Glm5NextConstructionTests {
     }
 
 }
+
+/// The SSD-cache store re-derives the recurrent (KDA) states at prompt boundaries by replaying the
+/// prompt through the model's token-only forward. `Glm5Next` inherited `LanguageModel`'s trapping
+/// default for that overload, so every GLM-5.3 generation ended with the persisted turn followed by
+/// a process crash in `storeCacheAfterGeneration` (osaurus 2026-09-07, `LanguageModel.swift:511`).
+/// This replays a short prompt through both entry points on a tiny text-only model: no trap, states
+/// captured at every requested boundary.
+@Suite("Glm5Next token-only forward and SSM re-derivation")
+struct Glm5NextTokenForwardTests {
+    @Test("the token-only overload forwards instead of trapping")
+    func tokenOverloadForwards() throws {
+        let model = try Glm5Next(Glm5NextConstructionTests.config(), requesting: [.text])
+        let cache = model.newCache(parameters: nil)
+        let tokens = MLXArray([Int32(5), 7, 11, 13]).reshaped([1, 4])
+        let logits = model.callAsFunction(tokens, cache: cache)
+        MLX.eval(logits)
+        #expect(logits.shape == [1, 4, model.vocabularySize])
+    }
+
+    @Test("the SSD-store re-derivation replays a hybrid VLM prompt without trapping")
+    func reDeriveReplaysWithoutTrap() throws {
+        let model = try Glm5Next(Glm5NextConstructionTests.config(), requesting: [.text])
+        let states = try reDeriveSSMStatesAtBoundaries(
+            model: model, tokens: [5, 7, 11, 13, 17, 19], boundaries: [3, 6], prefillStepSize: 2)
+        #expect(Set(states.keys) == [3, 6], "one recurrent snapshot per requested boundary")
+        for (_, arrays) in states {
+            #expect(!arrays.isEmpty, "the KDA layers carry recurrent state")
+        }
+    }
+}
