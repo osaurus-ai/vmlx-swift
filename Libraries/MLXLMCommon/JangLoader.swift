@@ -1916,9 +1916,28 @@ public struct JangLoader: Sendable {
                 // Raptor-era top-level `reasoning` block: `default` is
                 // `"on"` / `"off"`, which is the `default_mode`
                 // `"thinking"` / `"chat"` pair the factories already read.
+                //
+                // It also carries the EFFORT VOCABULARY, under different names
+                // from the nested block — `supported_reasoning_efforts` and
+                // `default_reasoning_effort` rather than
+                // `reasoning_effort_levels` and `default_effort`. Dropping them
+                // here left every bundle using this schema looking like it had
+                // no effort scale: GLM-5.3 declares [low, high, max] and three
+                // Qwen3.8 bundles declare [low, medium, xhigh], and all four
+                // resolved to none, so every request took the chat template's
+                // own default.
+                //
+                // `reasoning_effort_supported: false` is the same block's way
+                // of saying there is no scale, and is honoured as such rather
+                // than treated as a missing key.
+                let effortsDeclared = (rDict["reasoning_effort_supported"] as? Bool) != false
                 reasoning = JangChatReasoning(
                     supported: rDict["supported"] as? Bool,
-                    defaultMode: topLevelReasoningDefaultMode(rDict)
+                    defaultMode: topLevelReasoningDefaultMode(rDict),
+                    defaultEffort: effortsDeclared
+                        ? rDict["default_reasoning_effort"] as? String : nil,
+                    reasoningEffortLevels: effortsDeclared
+                        ? parseEffortLevels(rDict["supported_reasoning_efforts"]) : nil
                 )
             } else { reasoning = nil }
 

@@ -390,7 +390,8 @@ public enum ReasoningCapabilityRegistry {
         declaredDefault: String? = nil,
         supportsThinking: Bool? = nil,
         templateMentionsToggle: Bool = false,
-        reasoningSignal: Bool = false
+        reasoningSignal: Bool = false,
+        declaredTemplateKey: String? = nil
     ) -> ReasoningCapability {
         // 1. A family policy: the only source that also knows which template key to populate.
         if let p = policy(for: modelType) { return p.capability }
@@ -400,6 +401,7 @@ public enum ReasoningCapabilityRegistry {
         if declaredEfforts.count > 1 {
             return ReasoningCapability(efforts: declaredEfforts, defaultEffort: declaredDefault,
                                        supportsDisabling: supportsThinking != false,
+                                       templateKey: declaredTemplateKey,
                                        source: .declared)
         }
 
@@ -443,16 +445,37 @@ extension ReasoningCapability {
         let modelType = (cfg?["model_type"] as? String)
             ?? ((cfg?["text_config"] as? [String: Any])?["model_type"] as? String)
 
+        // THE CONFIG LIVES IN TWO PLACES, and reading only one is how this went wrong. A bundle may
+        // ship `jang_config.json` beside its weights, or embed the same block inside `config.json`.
+        // `JangLoader.loadConfig` already resolved both — file first, then embedded — before this
+        // type existed; reading just the file here made a SECOND, weaker reader of one declaration,
+        // and every bundle using the embedded form looked like it declared nothing.
         let jang = json(at: directory.appendingPathComponent("jang_config.json"))
+            ?? (json(at: directory.appendingPathComponent("config.json"))?["jang_config"]
+                as? [String: Any])
         let chat = jang?["chat"] as? [String: Any]
-        let reasoning = chat?["reasoning"] as? [String: Any]
+        // …and the block itself lives in two places too. The nested `chat.reasoning` is the older
+        // shape; newer bundles put it at the top level with different key names. Prefer whichever is
+        // present, nested first so no existing bundle changes meaning.
+        let reasoning = (chat?["reasoning"] as? [String: Any])
+            ?? (jang?["reasoning"] as? [String: Any])
 
         // Efforts, in the order the field names actually appear in the wild. `reasoning_effort_levels`
         // is the canonical spelling; `reasoning_values` is a SIBLING of `chat.reasoning` that Muse
         // Glimmer uses; and some bundles put the effort vocabulary in `modes`, which is only
         // distinguishable from real on/off modes by the absence of an off-mode name. Reading just the
         // first spelling is how a model declaring four levels was read as declaring none.
+        // NAMING, as it actually is. The nested block spells the vocabulary `reasoning_effort_levels`
+        // and its default `default_effort`; the top-level block spells them
+        // `supported_reasoning_efforts` and `default_reasoning_effort`, and adds a separate BOOLEAN
+        // `reasoning_effort_supported` whose name is one word-order away from the list's. Reading a
+        // bundle means accepting every spelling it might have been written with; picking one and
+        // ignoring the rest is what produced this bug.
         var efforts = reasoning?["reasoning_effort_levels"] as? [String] ?? []
+        if efforts.count < 2, (reasoning?["reasoning_effort_supported"] as? Bool) != false,
+           let supported = reasoning?["supported_reasoning_efforts"] as? [String] {
+            efforts = supported
+        }
         if efforts.count < 2, let values = chat?["reasoning_values"] as? [String] { efforts = values }
         if efforts.count < 2, let modes = reasoning?["modes"] as? [String],
            !modes.contains(where: { offModeNames.contains($0.lowercased()) }) {
@@ -460,6 +483,7 @@ extension ReasoningCapability {
         }
 
         let declaredDefault = (reasoning?["default_effort"] as? String)
+            ?? (reasoning?["default_reasoning_effort"] as? String)
             ?? (reasoning?["default_mode"] as? String)
             ?? (chat?["reasoning_default"] as? String)
 
@@ -498,10 +522,41 @@ extension ReasoningCapability {
         let signal = reasoningMarkers.contains { artefacts.contains($0) }
             || (cfg?["capabilities"] as? [String: Any])?["reasoning_parser"] != nil
 
+        // WHICH KWARG carries the effort. A bundle declaring
+        // `reasoning_effort_transport: "chat_template_kwarg"` names the transport and not the key,
+        // and a capability with efforts but NO key is visible and inert: `applying(level:)` writes
+        // the effort only when a key exists, so the request goes out without it and the template
+        // picks its own default — the same end state as declaring nothing.
+        //
+        // Take the name from the template, which states it outright, rather than assuming the
+        // common spelling. `reasoning_effort` is what most families read, but not all: Muse Glimmer
+        // reads `reasoning_strength`, so a guess would be indistinguishable from a correct read
+        // right up until it silently wasn't. A family policy still outranks this; it is consulted
+        // first, inside `capability(...)`.
+        let inferredKey = templateEffortKey(in: template)
+
         return ReasoningCapabilityRegistry.capability(
             modelType: modelType, declaredEfforts: efforts, declaredDefault: declaredDefault,
             supportsThinking: supportsThinking, templateMentionsToggle: mentionsToggle,
-            reasoningSignal: signal)
+            reasoningSignal: signal, declaredTemplateKey: inferredKey)
+    }
+
+    /// Which chat-template variable carries the reasoning effort, read from the template itself.
+    ///
+    /// A bundle declaring `reasoning_effort_transport: "chat_template_kwarg"` names the transport and
+    /// not the key, and a capability with efforts but no key is visible and INERT — `applying(level:)`
+    /// writes the effort only when a key exists.
+    ///
+    /// Assuming `reasoning_effort` would be right for most families and silently wrong for the one
+    /// that already differs, so the name is taken as evidence rather than as a default. Ordered most
+    /// specific first: a template mentioning both should be read as using the distinctive one.
+    ///
+    /// EXTRACTED FOR TESTABILITY. Inline, this could not be falsified against the local zoo: the only
+    /// `reasoning_strength` bundle also has a family policy, which is consulted first, so a test that
+    /// went through `forModel(at:)` passed whether this read the template or hardcoded the common
+    /// spelling — a saturated comparison that asserted nothing.
+    public static func templateEffortKey(in template: String) -> String? {
+        ["reasoning_strength", "reasoning_effort"].first { template.contains($0) }
     }
 
     /// Names that mean "do not reason" across the families we have seen.
