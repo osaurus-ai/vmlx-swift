@@ -96,6 +96,17 @@ public enum Glm5NextIndexerRuntime {
     ///
     /// Opt out for diagnostics and numerical comparison, mirroring the reference's own
     /// `VMLX_GLM5_MLA_ABSORB` switch — which defaults ON there for the same reason it does here.
+    /// Gather the selected latent rows instead of masking over the whole history.
+    ///
+    /// Default ON, matching the reference, whose absorbed path gathers for EVERY query length —
+    /// prefill chunks included — rather than only for decode. Opt out for differential comparison:
+    /// the two paths compute the same attention and `Glm5NextGatherTests` asserts it.
+    nonisolated(unsafe) public static var gatherSelected: Bool = {
+        let v = ProcessInfo.processInfo.environment["VMLX_GLM5_GATHER_SELECTED"]?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        return v == nil || ["1", "true", "yes", "on"].contains(v!)
+    }()
+
     nonisolated(unsafe) public static var absorbMLA: Bool = {
         let v = ProcessInfo.processInfo.environment["VMLX_GLM5_MLA_ABSORB"]?
             .trimmingCharacters(in: .whitespaces).lowercased()
@@ -689,6 +700,80 @@ public final class Glm5NextSparseAttention: Module {
         return (k, v)
     }
 
+
+    /// Attend to each query's SELECTED latent rows, without a dense mask over the whole history.
+    ///
+    /// This is the difference between a working set that grows with context and one that does not.
+    /// The masking path runs full attention over every cached key and then hides most of it: its
+    /// scores are `[heads, S, total]`, so the transient grows linearly with history forever.
+    /// Measured on this model at 8k, that was 81% of all peak growth — 2.98 MiB per chunk-token,
+    /// which is exactly 3.0 tensors of `[64 heads x history]` in bf16 (one score matrix plus the two
+    /// dense masks). Gathering instead makes the cost `O(tile x K x rank)` where K is `index_topk`,
+    /// which is CAPPED — so past the selection threshold the transient stops growing at all.
+    ///
+    /// The shape trick is the reference's: each query ROW becomes a batch element with its own K
+    /// gathered rows, so the 64 attention heads move into the query axis and the kv head count is 1.
+    /// All heads of one query share the same selected keys, which is what makes that legal.
+    ///
+    /// `gatherElementBudget` bounds the tile so the gathered block is a predictable size regardless
+    /// of how many queries arrive at once; the reference uses the same constant.
+    static let gatherElementBudget = 268_435_456
+
+    private func gatherAbsorbedAttention(
+        queries: MLXArray,  // [B, H, S, rank]
+        latent: MLXArray,  // [B, 1, total, rank]
+        indices: MLXArray,  // [B, S, K]
+        valid: MLXArray,  // [B, S, K], true where the index is usable
+        past: Int
+    ) -> MLXArray {
+        let B = queries.dim(0), H = queries.dim(1), S = queries.dim(2), rank = queries.dim(3)
+        let K = indices.dim(-1)
+        let flat = latent[0..., 0]  // [B, total, rank]
+        let total = flat.dim(1)
+        let tile = max(1, min(S, Self.gatherElementBudget / max(K * rank, 1)))
+
+        var outputs: [MLXArray] = []
+        var start = 0
+        while start < S {
+            let stop = min(start + tile, S)
+            let rows = stop - start
+            let idx = indices[0..., start ..< stop]
+            let validRows = valid[0..., start ..< stop]
+            let safe = MLX.where(validRows, idx, MLXArray.zeros(like: idx))
+
+            let gathered: MLXArray
+            if B == 1 {
+                gathered = take(flat[0], safe.reshaped(rows * K), axis: 0)
+            } else {
+                // Fold the batch into the row index so one gather serves every sequence.
+                let offsets = (MLXArray(Int32(0) ..< Int32(B)) * MLXArray(Int32(total)))
+                    .asType(safe.dtype).expandedDimensions(axis: -1)
+                let shifted = (safe.reshaped(B, rows * K) + offsets).reshaped(B * rows * K)
+                gathered = take(flat.reshaped(B * total, rank), shifted, axis: 0)
+            }
+            let keys = gathered.reshaped(B * rows, 1, K, rank)
+            let q = queries[0..., 0..., start ..< stop]
+                .transposed(0, 2, 1, 3).reshaped(B * rows, 1, H, rank)
+
+            // Causality still has to be enforced here: the indexer may offer a pool whose rows run
+            // past this query's own position, and there is no causal mask left to catch it.
+            let qPos = (MLXArray(Int32(start) ..< Int32(stop)) + MLXArray(Int32(past)))
+                .expandedDimensions(axis: 0).expandedDimensions(axis: -1)
+            let allowed = validRows .&& (idx .<= qPos.asType(idx.dtype))
+            let bias = MLX.where(
+                allowed, MLXArray(Float(0)),
+                MLXArray(-Float.greatestFiniteMagnitude)
+            ).reshaped(B * rows, 1, 1, K)
+
+            let attended = MLXFast.scaledDotProductAttention(
+                queries: q, keys: keys, values: keys, scale: scale,
+                mask: .array(bias.asType(q.dtype)))
+            outputs.append(attended.reshaped(B, rows, H, rank).transposed(0, 2, 1, 3))
+            start = stop
+        }
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+    }
+
     /// MLA over the keys the indexer selects.
     ///
     /// Below `index_topk` the selection is skipped, and that is an EQUIVALENCE rather than an
@@ -801,9 +886,22 @@ public final class Glm5NextSparseAttention: Module {
                 // unchanged because it is the same dot product, merely regrouped.
                 let (wk, wv) = kbFactors()
                 let qEff = matmul(q, wk.expandedDimensions(axis: 0).asType(q.dtype))
-                let attended = MLXFast.scaledDotProductAttention(
-                    queries: qEff, keys: latent, values: latent,
-                    scale: scale, mask: attentionMask(kvLength: total, dtype: qEff.dtype))
+                let attended: MLXArray
+                if let selected, Glm5NextIndexerRuntime.gatherSelected {
+                    // GATHER the selected rows rather than attending over all of them and hiding
+                    // most with a mask. Same attention, but the working set is O(tile x K x rank)
+                    // with K capped at `index_topk`, so it stops growing with context.
+                    let valid =
+                        (selected .>= MLXArray(Int32(0)))
+                        .&& (selected .< MLXArray(Int32(total)))
+                    attended = gatherAbsorbedAttention(
+                        queries: qEff, latent: latent, indices: selected, valid: valid,
+                        past: cached)
+                } else {
+                    attended = MLXFast.scaledDotProductAttention(
+                        queries: qEff, keys: latent, values: latent,
+                        scale: scale, mask: attentionMask(kvLength: total, dtype: qEff.dtype))
+                }
                 out = matmul(
                     attended,
                     wv.expandedDimensions(axis: 0).swappedAxes(-1, -2).asType(attended.dtype))
