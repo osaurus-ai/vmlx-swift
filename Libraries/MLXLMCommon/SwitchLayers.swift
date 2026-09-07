@@ -228,12 +228,22 @@ public class SwitchGLU: Module, SwitchGLULayer {
     /// Built after checkpoint loading on the first Qwen4Exp decode call, then
     /// reused without repeating projection casts, shape walks, or dtype checks
     /// in every routed layer for every token.
+    /// The SwiGLU clamp this bank's activation applies, when it applies one.
+    ///
+    /// Kept ALONGSIDE `activation` rather than inferred from it: the closure is opaque, and the
+    /// fused kernel needs the number, not a function. Both should come from the same config field —
+    /// GLM-5.3 passes `swiglu_limit` to each. A model that clamps its eager activation but leaves
+    /// this nil would get an unclamped fast path and a clamped slow one, which is why
+    /// `Glm5NextMoE` sets them from one value.
+    public let swigluLimit: Float?
+
     private lazy var qwen4ExpReducer: Qwen4ExpFusedAffineMoE.Reducer? = {
         guard let gate = gateProj as? QuantizedSwitchLinear,
             let up = upProj as? QuantizedSwitchLinear,
             let down = downProj as? QuantizedSwitchLinear
         else { return nil }
-        return Qwen4ExpFusedAffineMoE.makeReducer(gate: gate, up: up, down: down)
+        return Qwen4ExpFusedAffineMoE.makeReducer(
+            gate: gate, up: up, down: down, swigluLimit: swigluLimit)
     }()
 
     public init(
@@ -245,8 +255,10 @@ public class SwitchGLU: Module, SwitchGLULayer {
         glue: ((MLXArray, MLXArray) -> MLXArray)? = nil,
         scoredGlue: ((MLXArray, MLXArray, MLXArray) -> MLXArray)? = nil,
         allowFusedGateUpCache: Bool = true,
-        compileSeparatedDecode: Bool = false
+        compileSeparatedDecode: Bool = false,
+        swigluLimit: Float? = nil
     ) {
+        self.swigluLimit = swigluLimit
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts

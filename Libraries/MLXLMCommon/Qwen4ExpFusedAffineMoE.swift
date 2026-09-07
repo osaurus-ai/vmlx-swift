@@ -9,8 +9,8 @@ import MLXFast
 /// hidden vector, avoiding a materialized `[routes, hidden]` routed
 /// output. Inputs and outputs are BF16; quantized dot products and reduction
 /// accumulate in FP32 registers.
-enum Qwen4ExpFusedAffineMoE {
-    typealias Reducer = (MLXArray, MLXArray, MLXArray) -> MLXArray?
+public enum Qwen4ExpFusedAffineMoE {
+    public typealias Reducer = (MLXArray, MLXArray, MLXArray) -> MLXArray?
 
     private struct Shape: Equatable {
         let inputDimensions: Int
@@ -24,8 +24,56 @@ enum Qwen4ExpFusedAffineMoE {
         inputDimensions: 2560, expertDimensions: 640, routes: 10)
     private static let ornith35Shape = Shape(
         inputDimensions: 2048, expertDimensions: 512, routes: 8)
+    /// GLM-5.3 (`glm5_next`): hidden 4096, `moe_intermediate_size` 2048, 8 of 288 experts routed.
+    ///
+    /// Added with the parity coverage this comment asks for — `Qwen4ExpFusedAffineMoEShapeTests`
+    /// runs the fused reducer against the generic routed path at exactly this geometry, including
+    /// GLM-5.3's mixed expert quantization (gate/up at 2 bits group 128, down at either 2/128 or
+    /// 3/64 depending on the layer). Before this, `makeReducer` returned nil for GLM-5.3 and its
+    /// `SwitchGLU` fell back to three separate `gatherQuantizedMM` dispatches per layer — on a model
+    /// that routes 8 of 288 experts through 42 sparse layers, so the MoE is its dominant decode
+    /// compute.
+    private static let glm5NextShape = Shape(
+        inputDimensions: 4096, expertDimensions: 2048, routes: 8)
+    private static let supportedShapes = [qwen4ExpShape, ornith35Shape, glm5NextShape]
     private static let supportedBits = Set([2, 3, 4, 5, 6])
-    private static let supportedGroupSizes = Set([32, 64])
+    /// 128 joins 32 and 64 for GLM-5.3, whose 2-bit expert projections are grouped at 128.
+    ///
+    /// Nothing in either kernel is sized by the group: it appears only as `GROUP_SIZE / VALUES_PER_PACK`
+    /// and `<reduced dim> / GROUP_SIZE`, both plain integer divisions on template constants. What the
+    /// group size must satisfy is DIVISIBILITY, and that is now checked directly by
+    /// `geometryIsRepresentable` rather than implied by a list — so this set records what has been
+    /// QUALIFIED while the guard enforces what is POSSIBLE, and adding a future entry fails safe
+    /// instead of computing garbage.
+    private static let supportedGroupSizes = Set([32, 64, 128])
+
+    /// How many quantized values share one 32-bit-ish pack, for a given bit width — the packing the
+    /// kernels' `VALUES_PER_PACK` computes, restated here so the Swift guard and the Metal source
+    /// cannot drift apart.
+    private static func valuesPerPack(_ bits: Int) -> Int {
+        (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : 32 / bits)
+    }
+
+    /// The structural preconditions BOTH kernels assume, checked rather than assumed.
+    ///
+    /// Gate and up walk the INPUT dimension; down walks the EXPERT dimension. Each needs its packs
+    /// to tile its reduced axis, its group to be a whole number of packs, and its reduced axis to be
+    /// a whole number of groups. A shape that fails any of these does not run slowly — it reads off
+    /// the end of a row, so the allow-list above must never be the only thing standing between a new
+    /// geometry and the kernel.
+    private static func geometryIsRepresentable(
+        _ shape: Shape, gate: QuantizedSwitchLinear, up: QuantizedSwitchLinear,
+        down: QuantizedSwitchLinear
+    ) -> Bool {
+        func tiles(_ reduced: Int, _ bits: Int, _ groupSize: Int) -> Bool {
+            let perPack = valuesPerPack(bits)
+            return perPack > 0 && reduced % perPack == 0 && groupSize % perPack == 0
+                && reduced % groupSize == 0
+        }
+        return tiles(shape.inputDimensions, gate.bits, gate.groupSize)
+            && tiles(shape.inputDimensions, up.bits, up.groupSize)
+            && tiles(shape.expertDimensions, down.bits, down.groupSize)
+    }
     /// Decode and native-MTP verification only. A single decode token is one
     /// row; native MTP verifies the current token plus at most three drafts.
     /// Larger prompt/prefill batches deliberately stay on the generic path.
@@ -38,7 +86,7 @@ enum Qwen4ExpFusedAffineMoE {
 
     private static let pairKernel = MLXFast.metalKernel(
         name: "vmlx_qwen4_q4g64_pair_swiglu",
-        inputNames: ["x", "gw", "gs", "gb", "uw", "us", "ub", "inds"],
+        inputNames: ["x", "gw", "gs", "gb", "uw", "us", "ub", "inds", "lim"],
         outputNames: ["act"],
         source: """
             uint tid = thread_position_in_grid.x;
@@ -121,7 +169,20 @@ enum Qwen4ExpFusedAffineMoE {
             if (lane == 0u) {
               float g = float(T(gacc));
               float u = float(T(uacc));
-              float activated = g / (1.0f + metal::fast::exp(-g)) * u;
+              // GLM-5.3 ships `swiglu_limit` 10.0, and its clamp is NOT "clamp the activation":
+              // it bounds the gate from ABOVE only, before the SiLU, and bounds the up projection
+              // on BOTH sides — `silu(min(g, L)) * clip(u, -L, L)`. That is what the reference's
+              // `_clamped_swiglu` does and what this model's own eager path does. An earlier
+              // version of this kernel clamped `silu(g)` symmetrically and left `u` alone, which is
+              // a different function; it went unnoticed because the parity oracle restated the
+              // kernel's formula instead of the model's. CLAMP is a template constant, so the
+              // branch disappears for models that set no limit.
+              if (CLAMP) {
+                float L = float(lim[0]);
+                g = metal::min(g, L);
+                u = metal::clamp(u, -L, L);
+              }
+              float activated = (g / (1.0f + metal::fast::exp(-g))) * u;
               act[(row * ROUTES + k) * EXPERT_DIM + m] = T(activated);
             }
             """,
@@ -262,19 +323,30 @@ enum Qwen4ExpFusedAffineMoE {
             && projection.biases?.dtype == metadataDType
     }
 
-    static func makeReducer(
+    /// - Parameter swigluLimit: clamp applied to `silu(gate)` before the up-projection multiply,
+    ///   for models that set one (GLM-5.3's `swiglu_limit` is 10.0). `nil` means unclamped, which is
+    ///   what Qwen4-Exp and Ornith use and leaves their generated kernel unchanged.
+    public static func makeReducer(
         gate: QuantizedSwitchLinear,
         up: QuantizedSwitchLinear,
-        down: QuantizedSwitchLinear
+        down: QuantizedSwitchLinear,
+        swigluLimit: Float? = nil
     ) -> Reducer? {
-        let shape = Shape(
-            inputDimensions: gate.inputDims,
-            expertDimensions: gate.outputDims,
-            routes: gate.inputDims == ornith35Shape.inputDimensions
-                && gate.outputDims == ornith35Shape.expertDimensions
-                ? ornith35Shape.routes : qwen4ExpShape.routes)
+        // The projections give the two dimensions but not the route count, so it is looked up from
+        // the qualified shape whose dimensions match. This was a two-way ternary defaulting to
+        // Qwen4-Exp's 10 routes, which silently mislabels any third shape and then fails its own
+        // allow-list check — the failure mode being a fast path that is never taken for a reason
+        // that never appears anywhere.
+        guard let matched = supportedShapes.first(where: {
+            $0.inputDimensions == gate.inputDims && $0.expertDimensions == gate.outputDims
+        }) else {
+            reportConstructionRejection(gate: gate, up: up, down: down)
+            return nil
+        }
+        let shape = matched
         guard enabled,
-            shape == qwen4ExpShape || shape == ornith35Shape,
+            supportedShapes.contains(shape),
+            geometryIsRepresentable(shape, gate: gate, up: up, down: down),
             up.inputDims == shape.inputDimensions,
             up.outputDims == shape.expertDimensions,
             down.inputDims == shape.expertDimensions,
@@ -299,6 +371,11 @@ enum Qwen4ExpFusedAffineMoE {
         let gateGroupSize = gate.groupSize
         let upGroupSize = up.groupSize
         let downGroupSize = down.groupSize
+
+        // Built once, not per token: a one-element scalar carrying the SwiGLU clamp. It is passed
+        // even when unclamped (the kernel's CLAMP template constant decides whether it is read), so
+        // the input list has one shape for every specialization.
+        let limitArray = MLXArray([swigluLimit ?? 0]).asType(.float32)
 
         return { input, indices, scores in
             // The 4M bundle quantizes its router and produces BF16 scores.
@@ -330,10 +407,11 @@ enum Qwen4ExpFusedAffineMoE {
                     input,
                     gateWeight, gateScales, gateBiases,
                     upWeight, upScales, upBiases,
-                    indices,
+                    indices, limitArray,
                 ],
                 template: [
                     ("T", input.dtype),
+                    ("CLAMP", swigluLimit != nil ? 1 : 0),
                     ("G_BITS", gateUpBits),
                     ("U_BITS", upBits),
                     ("G_GROUP_SIZE", gateGroupSize),
