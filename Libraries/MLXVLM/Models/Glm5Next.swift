@@ -1713,16 +1713,34 @@ public final class Glm5NextMoE: Module {
             numExperts: config.nRoutedExperts,
             // `swiglu_limit` is 10.0 in this bundle, so the activation is CLAMPED. Plain silu would
             // be wrong on the tail, silently — nothing about the shapes would object.
-            activation: { clip(silu($0), min: -config.swigluLimit!, max: config.swigluLimit!) })
+            activation: { clip(silu($0), min: -config.swigluLimit!, max: config.swigluLimit!) },
+            // The SAME value that builds the eager activation above, so the fused decode kernel and
+            // the generic path cannot disagree about the clamp.
+            swigluLimit: config.swigluLimit)
         _sharedExperts.wrappedValue = Glm5NextSharedExpert(config)
         super.init()
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, weights) = gate(x, correctionBias: eScoreCorrectionBias)
-        let routed = switchMLP(x, indices)
-        // `switchMLP` returns [..., topK, hidden]; weight each expert's contribution and sum.
-        let combined = (routed * expandedDimensions(weights, axis: -1)).sum(axis: -2)
+
+        // DECODE FAST PATH. `qwen4ExpReduced` walks gate and up in one pass and applies the router
+        // scores while reducing the down projections straight into the hidden vector, so it never
+        // materialises the [routes, hidden] routed tensor the generic path builds. It returns nil
+        // for anything it does not handle exactly — prefill batches, unqualified geometry, a
+        // quantization it has not been given — and the generic path below then runs unchanged.
+        //
+        // Asking for it is the half that was missing: the kernel and its shape gate can both be
+        // correct while nothing ever calls them, which is what made this a fast path GLM-5.3 could
+        // not reach no matter what the gate said.
+        let combined: MLXArray
+        if let fused = switchMLP.qwen4ExpReduced(x, indices: indices, scores: weights) {
+            combined = fused
+        } else {
+            let routed = switchMLP(x, indices)
+            // `switchMLP` returns [..., topK, hidden]; weight each expert's contribution and sum.
+            combined = (routed * expandedDimensions(weights, axis: -1)).sum(axis: -2)
+        }
         // The shared expert is ALWAYS on — it is not one of the routed `topK`.
         return combined + sharedExperts(x)
     }
