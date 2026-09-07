@@ -192,7 +192,22 @@ public final class BailingV3RMSNormGated: Module {
     }
 
     public func callAsFunction(_ x: MLXArray, gate: MLXArray) -> MLXArray {
-        MLXFast.rmsNorm(x, weight: weight, eps: eps) * sigmoid(gate.asType(.float32))
+        // ROUND ONCE, AT THE END. Swift binds the trailing `.asType` to the expression it
+        // follows, so the original
+        //
+        //     MLXFast.rmsNorm(x, weight: weight, eps: eps) * sigmoid(gate.asType(.float32))
+        //         .asType(x.dtype)
+        //
+        // cast the SIGMOID back to `x.dtype` and then multiplied — rounding the gate to half
+        // precision before it was applied. The output dtype was already `x.dtype`; what differs is
+        // WHERE the rounding happens.
+        //
+        // The reference weights in float32 and casts the product once:
+        // `(o32 * sigmoid(gate.astype(float32))).astype(seg.dtype)`. Parenthesising the product and
+        // casting that reproduces it, and matches the discipline the surrounding code already keeps
+        // — the float32 sigmoid is deliberate because the gate saturates, and rounding it early
+        // throws away the precision it was computed at.
+        (MLXFast.rmsNorm(x, weight: weight, eps: eps) * sigmoid(gate.asType(.float32)))
             .asType(x.dtype)
     }
 }
