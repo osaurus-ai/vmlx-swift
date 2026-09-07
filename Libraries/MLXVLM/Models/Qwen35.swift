@@ -1120,22 +1120,22 @@ enum Qwen35Language {
         _ args: Qwen35Configuration.TextConfiguration,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
-        if let override = RuntimeEnvironment.value(
-            "VMLX_QWEN35_COMPILE_DECODE_REGIONS", in: environment)
-        {
-            return override != "0" && override.lowercased() != "false"
-        }
-        return args.modelType == "qwen3_5_moe_text"
-            && args.hiddenSize == 2048
-            && args.hiddenLayers == 40
-            && args.fullAttentionInterval == 4
-            && args.numExperts == 256
-            && args.numExpertsPerTok == 8
-            && args.moeIntermediateSize == 512
-            && args.linearNumKeyHeads == 16
-            && args.linearNumValueHeads == 32
-            && args.linearKeyHeadDim == 128
-            && args.linearValueHeadDim == 128
+        // Shared with the text-only path (Qwen35CompiledDecodePolicy lives in
+        // MLXLMCommon next to the compiled region it gates), so the two Qwen 3.5
+        // constructions cannot drift apart.
+        Qwen35CompiledDecodePolicy.shouldCompileDecodeRegions(
+            modelType: args.modelType,
+            hiddenSize: args.hiddenSize,
+            hiddenLayers: args.hiddenLayers,
+            fullAttentionInterval: args.fullAttentionInterval,
+            numExperts: args.numExperts,
+            numExpertsPerTok: args.numExpertsPerTok,
+            moeIntermediateSize: args.moeIntermediateSize,
+            linearNumKeyHeads: args.linearNumKeyHeads,
+            linearNumValueHeads: args.linearNumValueHeads,
+            linearKeyHeadDim: args.linearKeyHeadDim,
+            linearValueHeadDim: args.linearValueHeadDim,
+            environment: environment)
     }
 
     final class RotaryEmbedding {
