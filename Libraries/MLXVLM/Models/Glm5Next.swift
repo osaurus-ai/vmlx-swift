@@ -44,6 +44,35 @@ import MLXNN
 /// Gate for the GLM5-next sparse-index pooling/scoring dtype. Default runs
 /// in the packed cache's native dtype (no per-step full-context fp32
 /// copies); the env var restores the historical fp32 pipeline for A/B.
+/// Where does prefill memory actually go? Set `VMLX_GLM5_PREFILL_MEMORY=1`.
+///
+/// Reports, per chunk: MLX's live-tensor total, its allocator free-buffer cache, the high-water
+/// mark, and the bytes held by the KV/indexer caches themselves. The split is the point — a per-token
+/// cost that shows up in ACTIVE memory is something genuinely retained, while one that shows up in
+/// CACHE memory is the allocator holding freed buffers and is not a leak. Attributing GLM-5.3's
+/// residual ~0.25 MB/token needs that distinction; a process-level "peak RAM" number cannot make it.
+enum Glm5NextPrefillMemoryProbe {
+    nonisolated(unsafe) static let enabled: Bool =
+        ProcessInfo.processInfo.environment["VMLX_GLM5_PREFILL_MEMORY"] == "1"
+
+    static func report(tokens: Int, caches: [KVCache]) {
+        guard enabled else { return }
+        var cacheBytes = 0
+        var slots = 0
+        for c in caches {
+            for a in c.state {
+                cacheBytes += a.size * a.dtype.size
+                slots += 1
+            }
+        }
+        let g = 1024.0 * 1024.0 * 1024.0
+        FileHandle.standardError.write(Data(String(
+            format: "[glm5-mem] tokens=%d active=%.2fG cache=%.2fG peak=%.2fG kvcache=%.3fG slots=%d\n",
+            tokens, Double(GPU.activeMemory) / g, Double(GPU.cacheMemory) / g,
+            Double(GPU.peakMemory) / g, Double(cacheBytes) / g, slots).utf8))
+    }
+}
+
 public enum Glm5NextIndexerRuntime {
     nonisolated(unsafe) static var poolFP32: Bool = {
         ProcessInfo.processInfo.environment["VMLX_GLM5_INDEX_FP32"] == "1"
@@ -1956,7 +1985,53 @@ extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel {
         let imagePixels = input.image?.pixels
         let videoPixels = input.video?.pixels
         guard imagePixels != nil || videoPixels != nil else {
-            return .tokens(input.text)
+            // TEXT-ONLY PREFILL, IN CHUNKS.
+            //
+            // Returning `.tokens` hands the prompt to the generic path, which runs it as ONE forward
+            // (`_ = model(remaining[text: .newAxis], ...)`). Every layer's activations for the whole
+            // prompt are then live at once, so peak memory grows with prompt LENGTH: measured at
+            // 4.2 MB/token after the dtype fix, against a KV cache of 11 KiB/token. That is what put
+            // the context ceiling between 4k and 5k on a machine with ~8 GiB of working headroom
+            // above a 95 GiB model.
+            //
+            // Chunking bounds the working set to one chunk instead of the whole prompt. The
+            // `MLX.eval(cache)` is what makes it work at all: MLX is lazy, so without forcing the
+            // graph each chunk's intermediates stay alive and chunking buys nothing. The reference
+            // does exactly this in its runner (512-token chunks, `mx.eval(cache)`, commented "Force
+            // evaluation to free intermediate memory"), and four models here already do it through
+            // `chunkedPrefillEmbedding` — GLM-5.3 simply never did.
+            //
+            // This was BLOCKED until the causal-mask fix. Chunking is only sound if the forward is
+            // segmentation-invariant, and GLM-5.3's was not: with no causal mask below `index_topk`,
+            // each chunking produced a different answer. `Glm5NextSparseAttentionTests` now pins
+            // that invariance, which is what makes this safe to do.
+            // `VMLX_GLM5_PREFILL_STEP` overrides the caller's step. It is a real memory/latency
+            // knob, measured at 8k: 128 versus 512 gives peak 97.0 vs 99.2 GB and TTFT 124-135s vs
+            // 99-108s, both reproducible in every paired run. Smaller chunks bound the attention
+            // working set and cost launch overhead.
+            let step =
+                Int(ProcessInfo.processInfo.environment["VMLX_GLM5_PREFILL_STEP"] ?? "")
+                ?? (windowSize ?? 512)
+            let ids = input.text.tokens.ndim == 1
+                ? input.text.tokens.expandedDimensions(axis: 0) : input.text.tokens
+            let promptTokenCount = ids.dim(1)
+            guard step > 0, promptTokenCount > step else { return .tokens(input.text) }
+
+            var offset = 0
+            while offset + step < promptTokenCount {
+                try Task.checkCancellation()
+                let end = offset + step
+                _ = try languageModel(ids[0..., offset ..< end], mask: nil, caches: cache)
+                MLX.eval(cache)
+                PrefillProgressReporter.reportCompletedUnits(end)
+                offset = end
+                Glm5NextPrefillMemoryProbe.report(tokens: end, caches: cache)
+                MLX.Memory.clearCache()
+            }
+            // The final chunk returns the hidden states the caller needs logits from.
+            let hidden = try languageModel(ids[0..., offset...], mask: nil, caches: cache)
+            let logits = lmHead.map { $0(hidden) } ?? languageModel.embedTokens.asLinear(hidden)
+            return .logits(LMOutput(logits: logits))
         }
 
         guard let tower = visionTower else {
