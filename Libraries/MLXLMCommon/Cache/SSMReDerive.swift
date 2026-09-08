@@ -168,9 +168,9 @@ public func maybeReDeriveSSMState(
 ///     contain the SSM state at the boundary because Mamba caches are
 ///     state-replacing (O(1) per token), not appending — the live
 ///     cache IS the snapshot.
-///   • We deep-copy via `extractSSMStates(from:)` (which calls
-///     `state.value.copy()` per CacheHelpers.swift) so subsequent
-///     mutation by generation-prompt tokens doesn't alias.
+///   • `extractSSMStates(from:)` returns the LIVE cache arrays (it does not
+///     copy); the copy that protects this snapshot from later in-place
+///     writes is the `* 1` materialisation in `SSMStateCache.store`.
 ///   • Storage matches `maybeReDeriveSSMState`: keyed on the stripped
 ///     prefix hash + modelKey so multi-turn fetch hits exactly.
 ///
@@ -307,8 +307,7 @@ public func reDeriveSSMStates(
             } else {
                 tailInput = tail.tokens.reshaped([1, tail.tokens.size])
             }
-            _ = model.callAsFunction(
-                LMInput.Text(tokens: tailInput), cache: freshCache, state: nil)
+            _ = try model.replayForward(tailInput, cache: freshCache)
         }
     case .logits:
         break
@@ -377,28 +376,38 @@ public func reDeriveSSMStatesAtBoundaries(
                     let tailInput = tail.tokens.ndim >= 2
                         ? tail.tokens
                         : tail.tokens.reshaped([1, tail.tokens.size])
-                    _ = model.callAsFunction(
-                        LMInput.Text(tokens: tailInput), cache: freshCache, state: nil)
+                    _ = try model.replayForward(tailInput, cache: freshCache)
                 }
                 needsFreshReplayPreparation = false
             } else {
-                // Generation's own contract (`LMInput.Text`), not the raw token
-                // overload: vision-language models implement the former and
-                // inherit a trapping default for the latter, so replaying a
-                // hybrid VLM's prompt here used to crash the process at the
-                // end of every generation (GLM-5.3, 2026-09-07). Plain LLMs
-                // reach their token overload through the protocol default.
-                _ = model.callAsFunction(
-                    LMInput.Text(tokens: tokenArray), cache: freshCache, state: nil)
+                // The throwing replay contract, not the raw token overload:
+                // vision-language models implement the `LMInput.Text` forward
+                // and inherit a trapping default for the raw one, so replaying
+                // a hybrid VLM's prompt here used to crash the process at the
+                // end of every generation (GLM-5.3, 2026-09-07). A model whose
+                // forward fails throws here, and the store publishes nothing.
+                _ = try model.replayForward(tokenArray, cache: freshCache)
             }
             MLX.eval(freshCache)
             cursor = end
             Memory.clearCache()
         }
 
-        let states = extractSSMStates(from: freshCache)
-        if !states.isEmpty {
-            out[boundary] = states
+        // OWN the snapshot before the replay continues. `extractSSMStates`
+        // returns the cache's live arrays, and KDA / Mamba layers write their
+        // next state through the `ArraysCache` subscript, which updates those
+        // arrays IN PLACE (`_updateInternal`). Without this copy the list kept
+        // for an earlier boundary is advanced by every later chunk, and the
+        // store publishes boundary-8 state under the boundary-3 key
+        // (GLM-5.3 tiny-fixture parity, 2026-09-07; `SSMStateCache.store`
+        // copies too late — after the whole replay). `* 1` materialises a
+        // fresh buffer, the same idiom the store uses; the eval detaches it
+        // from the lazy graph so the copy cannot observe a later write.
+        let live = extractSSMStates(from: freshCache)
+        if !live.isEmpty {
+            let owned = live.map { $0 * 1 }
+            MLX.eval(owned)
+            out[boundary] = owned
         }
     }
 
