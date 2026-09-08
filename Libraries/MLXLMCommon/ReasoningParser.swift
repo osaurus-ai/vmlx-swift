@@ -117,6 +117,10 @@ public struct ReasoningParser: Sendable {
     /// reasoning/content mode.
     public let consumesRecipientHeaders: Bool
 
+    /// MiniCPM5's native XML envelope owns its payload, including literal
+    /// reasoning tags inside CDATA. Opt-in; other dialects are unchanged.
+    public let preservesXMLFunctionPayloads: Bool
+
     // MARK: State
 
     /// Text not yet emitted because it might be a partial tag prefix.
@@ -171,13 +175,15 @@ public struct ReasoningParser: Sendable {
         stripStrayTags: Bool = true,
         startTagAliases: [String] = [],
         endTagAliases: [String] = [],
-        consumesRecipientHeaders: Bool = false
+        consumesRecipientHeaders: Bool = false,
+        preservesXMLFunctionPayloads: Bool = false
     ) {
         self.startTag = startTag
         self.endTag = endTag
         self.insideReasoning = startInReasoning
         self.stripStrayTags = stripStrayTags
         self.consumesRecipientHeaders = consumesRecipientHeaders
+        self.preservesXMLFunctionPayloads = preservesXMLFunctionPayloads
         self.startTagAliases = startTagAliases.filter { !$0.isEmpty && $0 != startTag }
         self.endTagAliases = endTagAliases.filter { !$0.isEmpty && $0 != endTag }
     }
@@ -712,6 +718,29 @@ public struct ReasoningParser: Sendable {
                         $0, among: firstTagIsOpener ? openerSpellings : closerSpellings)
                 } == true
 
+            // Once content commits to a native XML function, reasoning tags
+            // inside its values are data. A reasoning example is deliberately
+            // NOT protected while insideReasoning. Hold incomplete envelopes
+            // until their CDATA-aware closer; never invent or close a tag.
+            if preservesXMLFunctionPayloads, !insideReasoning,
+                let function = buffer.range(of: "<function name=\""),
+                firstTagRange.map({ function.lowerBound < $0.lowerBound }) ?? true
+            {
+                let before = String(buffer[..<function.lowerBound])
+                if !before.isEmpty { out.append(.content(before)) }
+                buffer = String(buffer[function.lowerBound...])
+                if let end = MiniCPM5ToolCallParser().completeToolCallEnd(in: buffer) {
+                    out.append(.content(String(buffer[..<end])))
+                    buffer.removeSubrange(buffer.startIndex..<end)
+                    continue
+                }
+                if !allowPartialTagAtEnd {
+                    out.append(.content(buffer))
+                    buffer.removeAll(keepingCapacity: false)
+                }
+                break
+            }
+
             // A tool-recipient channel header is protocol that no tag spelling
             // covers, so it is resolved against the tag search by position:
             // whichever starts first wins. Running it unconditionally first
@@ -780,7 +809,9 @@ public struct ReasoningParser: Sendable {
                 // guards the edge case of an empty tag (a mis-configured
                 // model-specific override), where a negative `safeTail` would
                 // make `offsetBy: -safeTail` walk past `endIndex` and trap.
-                let longestTag = (openerSpellings + closerSpellings)
+                let literalOpeners = preservesXMLFunctionPayloads && !insideReasoning
+                    ? ["<function name=\""] : []
+                let longestTag = (openerSpellings + closerSpellings + literalOpeners)
                     .map(\.count).max() ?? 0
                 let safeTail = max(0, longestTag - 1)
                 if buffer.count > safeTail {
@@ -861,6 +892,10 @@ extension ReasoningParser {
         let n = name.lowercased()
         let normalized = normalizedReasoningAlias(n)
         let compact = compactReasoningAlias(n)
+
+        if normalized == "minicpm5" || normalized == "minicpm5_xml_function" {
+            return ReasoningParser(preservesXMLFunctionPayloads: true)
+        }
 
         if compact.hasPrefix("gemma4") {
             return ReasoningParser(
@@ -1191,7 +1226,8 @@ extension ReasoningParser {
             // exactly this way: the flag was set by `fromCapabilityName`,
             // dropped here, and the generation loop only ever uses this path,
             // so three correct parser fixes changed nothing on the app.
-            consumesRecipientHeaders: base.consumesRecipientHeaders)
+            consumesRecipientHeaders: base.consumesRecipientHeaders,
+            preservesXMLFunctionPayloads: base.preservesXMLFunctionPayloads)
         if startInReasoning && parser.isHarmonyChannelParser {
             parser.insideHarmonyChannel = true
             parser.harmonyChannelIsReasoning = true

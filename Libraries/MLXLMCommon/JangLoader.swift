@@ -390,6 +390,11 @@ public enum ParserResolution {
                 return (ReasoningParser.fromCapabilityName(stamp), .jangStamped)
             }
         }
+        if MiniCPM5ToolCallParser.matchesTemplate(chatTemplate),
+            templateDeclaresThinkEnvelope(chatTemplate)
+        {
+            return (ReasoningParser.fromCapabilityName("minicpm5"), .chatTemplate)
+        }
         if declaresLFM25ThinkingTemplate(modelType: modelType, chatTemplate: chatTemplate) {
             return (
                 ReasoningParser.fromCapabilityName("qwen3"),
@@ -519,6 +524,14 @@ public enum ParserResolution {
         modelType: String?,
         chatTemplate: String? = nil
     ) -> (format: ToolCallFormat?, source: JangCapabilities.ResolutionSource) {
+        // This complete native grammar distinguishes MiniCPM5 from Llama
+        // JSON tools despite their shared architecture. Generic converter
+        // metadata (or a vocab-size heuristic) cannot describe its wire form.
+        if MiniCPM5ToolCallParser.matchesTemplate(chatTemplate),
+            capabilities?.toolParser == nil || capabilities?.toolParser == "llama"
+        {
+            return (.minicpm5, .chatTemplate)
+        }
         if let cap = capabilities,
             let stamped = ToolCallFormat.fromCapabilityName(cap.toolParser)
         {
@@ -552,6 +565,7 @@ public enum ParserResolution {
 
     private static func templateDeclaredToolCallFormat(_ chatTemplate: String?) -> ToolCallFormat? {
         guard let chatTemplate else { return nil }
+        if MiniCPM5ToolCallParser.matchesTemplate(chatTemplate) { return .minicpm5 }
         let lower = chatTemplate.lowercased()
         // XML-function envelope: `<tool_call><function=name><parameter=key>…`
         // (Qwen3-Coder, Qwen3.5/3.6, Nemotron-style). Checked BEFORE the bare-JSON

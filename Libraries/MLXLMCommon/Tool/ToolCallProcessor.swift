@@ -1917,14 +1917,16 @@ public class ToolCallProcessor {
                 return visible.isEmpty ? nil : visible
             }
 
-            if let matchedEndTag = firstTag(
-                in: toolCallBuffer,
-                tags: endTags,
-                prefixes: endTagPrefixes
-            ) {
-                // Separate the trailing token
-                let trailingToken = separateToken(
-                    from: &toolCallBuffer, separator: matchedEndTag, returnLeading: false)
+            let completeEnd: String.Index?
+            if parser.usesCustomEndBoundary {
+                completeEnd = parser.completeToolCallEnd(in: toolCallBuffer)
+            } else {
+                completeEnd = firstTag(in: toolCallBuffer, tags: endTags, prefixes: endTagPrefixes)
+                    .flatMap { toolCallBuffer.range(of: $0)?.upperBound }
+            }
+            if let completeEnd {
+                let trailingToken: String? = String(toolCallBuffer[completeEnd...])
+                toolCallBuffer = String(toolCallBuffer[..<completeEnd])
 
                 // Parse the completed wrapper. Some formats, including Hy3 /
                 // Hunyuan, can carry multiple calls inside one outer block.
@@ -1995,7 +1997,7 @@ public class ToolCallProcessor {
     }
 
     private func visibleLeadingTextBeforeToolCall(parsedToolCalls: [ToolCall]) -> String {
-        if !parsedToolCalls.isEmpty,
+        if !parser.preservesWhitespaceBeforeToolCalls, !parsedToolCalls.isEmpty,
             leadingTextBeforeToolCall
                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {

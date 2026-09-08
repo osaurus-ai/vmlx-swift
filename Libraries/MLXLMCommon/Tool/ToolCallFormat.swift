@@ -36,6 +36,15 @@ public protocol ToolCallParser: Sendable {
     /// Prefixes for dynamic end tags matching ``startTagPrefixes``.
     var endTagPrefixes: [String] { get }
 
+    /// Opt-in boundary scanning for formats whose values can contain literal
+    /// closing tags (for example XML CDATA). Other formats keep tag matching.
+    var usesCustomEndBoundary: Bool { get }
+    func completeToolCallEnd(in content: String) -> String.Index?
+
+    /// Inline text/tool dialects retain even a whitespace-only chunk before
+    /// a call; otherwise detokenizer chunk boundaries change the answer text.
+    var preservesWhitespaceBeforeToolCalls: Bool { get }
+
     /// Exact protocol CLOSER tags that must be stripped from the visible
     /// stream even when they appear WITHOUT a matching opener ("orphan
     /// closers"). Live rows of some families (ZAYA / Gemma-4 AppleScript
@@ -101,6 +110,10 @@ extension ToolCallParser {
     public var startTagPrefixes: [String] { [] }
 
     public var endTagPrefixes: [String] { [] }
+
+    public var usesCustomEndBoundary: Bool { false }
+    public func completeToolCallEnd(in content: String) -> String.Index? { nil }
+    public var preservesWhitespaceBeforeToolCalls: Bool { false }
 
     public var orphanStripTags: [String] { [] }
 
@@ -182,6 +195,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<invoke name="f"><parameter name="k">v</parameter></invoke>`
     case minimaxM2 = "minimax_m2"
 
+    /// MiniCPM5: `<function name="f"><param name="x">v</param></function>`.
+    case minicpm5 = "minicpm5_xml_function"
+
     /// Mistral V11+ format with [TOOL_CALLS] and [ARGS] delimiters.
     /// Example: `[TOOL_CALLS]get_weather [ARGS]{"location": "Tokyo"}`
     case mistral
@@ -247,6 +263,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return KimiK2ToolCallParser()
         case .minimaxM2:
             return MiniMaxM2ToolCallParser()
+        case .minicpm5:
+            return MiniCPM5ToolCallParser()
         case .mistral:
             return MistralToolCallParser()
         case .llama3:
@@ -272,8 +290,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// formats because the parser only accepts explicit protocol envelopes.
     public var parsesToolCallsFromReasoningChannel: Bool {
         switch self {
-        case .dsml:
-            // The official DSV4 contract places complete reasoning inside
+        case .dsml, .minicpm5:
+            // These contracts place complete reasoning inside
             // <think>...</think> before any tool call. Tool-shaped examples or
             // malformed protocol text inside reasoning_content are therefore
             // reasoning, never executable transport.
@@ -639,6 +657,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // `minimax_m2_5` per the converter.
         case "minimax", "minimax_m2_5":
             return .minimaxM2
+        case "minicpm5":
+            return .minicpm5
         // GLM 4.x / 5 / DeepSeek tool format (arg_key / arg_value tags).
         // `glm4` is also the canonical rawValue and already matches via
         // the direct lookup above, but is listed here for parity with
