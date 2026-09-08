@@ -43,6 +43,7 @@ struct ZeroArgumentToolCallTests {
         (.glm4, "<tool_call>list_mailboxes</tool_call>"),
         (.hunyuan, "<tool_calls><tool_call>list_mailboxes<tool_sep></tool_call></tool_calls>"),
         (.minimaxM2, #"<invoke name="list_mailboxes"></invoke>"#),
+        (.minicpm5, #"<function name="list_mailboxes"></function>"#),
         (.atem, """
             <atem:function_calls>
             <atem:invoke name="list_mailboxes">

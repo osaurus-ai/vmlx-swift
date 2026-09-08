@@ -602,7 +602,9 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
             value, paramName: paramName, funcName: funcName, tools: tools)
     }
 
-    private func parsePythonContainerLiteral(_ value: String) -> (any Sendable)? {
+    // Shared with XML transports whose native templates print Python-style
+    // collection literals. This parses data only, never evaluates source.
+    func parsePythonContainerLiteral(_ value: String) -> (any Sendable)? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard
             (trimmed.first == "[" && trimmed.last == "]")
