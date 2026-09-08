@@ -74,7 +74,16 @@ public struct ToolCall: Hashable, Codable, Sendable {
                 if inString {
                     if ch == "\"" {
                         inString = false
-                        if capturing { keys.append(current); current = ""; capturing = false }
+                        if capturing {
+                            // Decode JSON escapes in the key too: persisted
+                            // JSON may spell the same XML name with \u escapes.
+                            guard let key = try? JSONDecoder().decode(
+                                String.self, from: Data(("\"" + current + "\"").utf8))
+                            else { return nil }
+                            keys.append(key)
+                            current = ""
+                            capturing = false
+                        }
                     } else if capturing {
                         current.append(ch)
                     }

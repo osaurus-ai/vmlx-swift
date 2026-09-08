@@ -6,6 +6,15 @@ import VMLXJinja
 
 @Suite("Tool argument order reaches native template rendering")
 struct ToolArgumentOrderRenderingTests {
+    @Test func jsonEscapedNamesRetainTheirNativeOrder() throws {
+        let call = ToolCall(function: .init(
+            name: "write", arguments: ["zé": .string("007"), "a\"b": .int(2)],
+            rawArgumentsJSON: #"{"z\u00e9":"007","a\"b":2}"#))
+        #expect(call.function.argumentOrder == ["zé", "a\"b"])
+        let input = defaultMessageDict(for: .assistant("", toolCalls: [call]))
+        #expect(try keys(input, nested: true) == "zé=007;a\"b=2;")
+    }
+
     private func message(order: [String]?) throws -> [String: any Sendable] {
         let call = ToolCall(function: .init(
             name: "write", arguments: ["path": .string("note.md"), "content": .string("007")],
