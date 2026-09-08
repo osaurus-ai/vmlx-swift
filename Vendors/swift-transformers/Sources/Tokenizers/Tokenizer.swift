@@ -366,6 +366,10 @@ public protocol Tokenizer: Sendable {
     /// Whether this tokenizer has a chat template configured.
     var hasChatTemplate: Bool { get }
 
+    /// Configured source selected by the ordinary default/tool-use contract.
+    /// Allows adapters to recognize native grammars without guessing from BOS tokens.
+    func configuredChatTemplate(forTools: Bool) -> String?
+
     /// Applies the configured chat template to format messages for model input.
     ///
     /// - Parameter messages: Array of message dictionaries representing the conversation
@@ -455,6 +459,7 @@ public protocol Tokenizer: Sendable {
 
 extension Tokenizer {
     public var hasChatTemplate: Bool { false }
+    public func configuredChatTemplate(forTools: Bool) -> String? { nil }
 
     /// Default: defer to `encode`.
     ///
@@ -835,6 +840,16 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     /// Whether this tokenizer has a chat template configured.
     public var hasChatTemplate: Bool {
         !tokenizerConfig.chatTemplate.isNull()
+    }
+
+    public func configuredChatTemplate(forTools: Bool) -> String? {
+        let value: Config = tokenizerConfig.chatTemplate
+        if let source = value.string() { return source }
+        guard let entries = value.array() else { return nil }
+        if forTools, let entry = entries.first(where: { $0["name"].string() == "tool_use" }) {
+            return entry["template"].string()
+        }
+        return entries.first(where: { $0["name"].string() == "default" })?["template"].string()
     }
 
     public func applyChatTemplate(messages: [Message]) throws -> [Int] {

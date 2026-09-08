@@ -138,6 +138,16 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 throw MLXLMCommon.TokenizerError.missingChatTemplate
                             }
                         }
+                        // MiniCPM shares <s>/ChatML tokens with Nemotron, but NOT
+                        // its tool grammar or thinking tail. Keep the configured
+                        // native template, including errors; never substitute a
+                        // foreign dialect merely because tools are present.
+                        if MLXLMCommon.MiniCPM5ToolCallParser.matchesTemplate(
+                            upstream.configuredChatTemplate(forTools: !(tools?.isEmpty ?? true))) {
+                            return try upstream.applyChatTemplate(
+                                messages: messages, tools: chatTemplateTools,
+                                additionalContext: additionalContext)
+                        }
                         let lagunaEos =
                             String(UnicodeScalar(0x3008)!)
                             + "|EOS|"
@@ -570,6 +580,14 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             } catch VMLXTokenizers.TokenizerError.missingChatTemplate {
                                 throw MLXLMCommon.TokenizerError.missingChatTemplate
                             }
+                        }
+                        if MLXLMCommon.MiniCPM5ToolCallParser.matchesTemplate(
+                            upstream.configuredChatTemplate(forTools: !(tools?.isEmpty ?? true))) {
+                            return try upstream.applyChatTemplate(
+                                messages: messages, chatTemplate: nil,
+                                addGenerationPrompt: addGenerationPrompt,
+                                truncation: false, maxLength: nil,
+                                tools: chatTemplateTools, additionalContext: additionalContext)
                         }
                         let lagunaEos =
                             String(UnicodeScalar(0x3008)!)
