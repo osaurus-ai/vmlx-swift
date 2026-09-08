@@ -2215,21 +2215,40 @@ extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel {
     public func callAsFunction(
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
-        // The protocol's forward cannot throw, and this model's genuinely can — a sequence past
-        // `index_topk`, or a malformed shape. Reporting through `LMOutput` is not possible either,
-        // so the failure is surfaced as a zero-logit output ONLY after being written to stderr,
-        // rather than being silently swallowed.
+        LMOutput(logits: callAsFunction(input.tokens, cache: cache))
+    }
+
+    /// Token-only GENERATION forward. The `LanguageModel` default for this overload traps
+    /// (`fatalError("not implemented")`), which took the whole app down at the end of every
+    /// GLM-5.3 generation when the SSD-cache store replayed the prompt through it (osaurus,
+    /// 2026-09-07, `LanguageModel.swift:511`). Mirrors the `LMInput.Text` overload: a failed
+    /// forward (a batch whose sequences start at different offsets, an indexer without its
+    /// compression gate, a malformed shape) is written to stderr and returned as zero logits.
+    ///
+    /// UNRESOLVED: that zero-logit substitution is the pre-existing generation behaviour, kept
+    /// here only so that this overload does not trap. It is not a correct output — decoding
+    /// continues from a substituted distribution — and the live cache the generation leaves
+    /// behind is captured by `captureCleanSSMStateInline` without any signal that a forward was
+    /// substituted, so an inline snapshot after such a turn is of unvalidated state. A failure
+    /// signal on the generation path (or a throwing generation contract) is the real fix and is
+    /// not part of this change. The cache-store REPLAY no longer comes through here; it uses
+    /// `replayForward`, which throws, so a failed replay is never published.
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         do {
-            let logits = try callAsFunction(
-                input.tokens, mask: nil, caches: cache, inputEmbedding: nil)
-            return LMOutput(logits: logits)
+            return try callAsFunction(inputs, mask: nil, caches: cache, inputEmbedding: nil)
         } catch {
             FileHandle.standardError.write(
                 Data("[glm5_next] forward failed: \(error)\n".utf8))
-            return LMOutput(
-                logits: MLXArray.zeros(
-                    [input.tokens.dim(0), input.tokens.dim(1), vocabularySize]))
+            return MLXArray.zeros([inputs.dim(0), inputs.dim(1), vocabularySize])
         }
+    }
+
+    /// Replay forward for the SSD-cache store: the same computation, but a failure is thrown so
+    /// `reDeriveSSMStatesAtBoundaries` aborts and the store publishes nothing (no zero-logit
+    /// substitute can leak into a persisted recurrent-state snapshot). This closes the replay
+    /// path only; see the UNRESOLVED note on the generation overload above.
+    public func replayForward(_ tokens: MLXArray, cache: [KVCache]?) throws -> MLXArray {
+        try callAsFunction(tokens, mask: nil, caches: cache, inputEmbedding: nil)
     }
 }
 
