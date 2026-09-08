@@ -510,6 +510,86 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(nativeMTP.contains("boundary: matchedTokens"))
     }
 
+    @Test("standalone rotating/SWA caches share the generation-suffix-stripped boundary policy")
+    func standaloneRotatingSharesStrippedBoundaryPolicy() throws {
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+        let batch = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let mtp = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift",
+            encoding: .utf8)
+        let dflash2 = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift",
+            encoding: .utf8)
+
+        // The shared helper admits the proven standalone rotating/SWA
+        // predicate in addition to the coordinator hybrid flag, so rotating
+        // chat prompts get the same generation-suffix-stripped cross-turn
+        // boundary instead of only the never-matching full-prompt key.
+        #expect(evaluate.contains(
+            "coordinator.isHybrid || cacheHasStandaloneRotatingWindowState(cache))"))
+        // Every call site hands the helper the live cache topology so the
+        // standalone-rotating admission cannot silently miss an engine.
+        #expect(evaluate.contains(
+            "input: input,\n            cache: self.cache)"))
+        #expect(batch.contains(
+            "input: slot.originalInput,\n                cache: slot.cache)"))
+        #expect(mtp.contains(
+            "input: originalInput,\n                cache: cache)"))
+        #expect(dflash2.contains(
+            "input: input,\n            cache: self.cache)"))
+        // The gen-suffix-stripped store itself admits the same topology
+        // predicate on the batched and MTP paths; the solo store is driven by
+        // `hybridStripBoundary` alone and follows via the helper.
+        #expect(batch.contains(
+            "cacheHasStandaloneRotatingWindowState(slot.cache)),\n"
+                + "                   let stripAt = sharedPromptStripBoundary"))
+        #expect(mtp.contains(
+            "cacheHasStandaloneRotatingWindowState(cache)),\n"
+                + "                   !originalInput.hasMediaContent"))
+        // DFlash2's store is boundary-driven with no local gate of its own; the
+        // widened helper is what admits standalone rotating there.
+        #expect(dflash2.contains("TokenIterator.hybridStripBoundaryIndex("))
+        #expect(!dflash2.contains(
+            "coordinator.isHybrid,\n                   let stripAt"))
+        // The exact/N-1 disk-seed and post-answer policy for standalone
+        // rotating/SWA caches is deliberately preserved: the canonical-boundary
+        // flag stays hybrid-only on every path (`diskSeedBoundaryIndex` owns
+        // the rotating N-1 seed contract).
+        #expect(evaluate.contains(
+            "let usesCanonicalHybridBoundary =\n"
+                + "            coordinator.isHybrid && hybridStripBoundary != nil"))
+        #expect(batch.contains(
+            "let usesCanonicalHybridBoundary =\n"
+                + "                coordinator.isHybrid && sharedPromptStripBoundary != nil"))
+        #expect(mtp.contains(
+            "let usesCanonicalHybridBoundary =\n"
+                + "                coordinator.isHybrid && sharedPromptStripBoundary != nil"))
+        #expect(!batch.contains(
+            "usesCanonicalHybridBoundary =\n"
+                + "                (coordinator.isHybrid"))
+        #expect(!mtp.contains(
+            "usesCanonicalHybridBoundary =\n"
+                + "                (coordinator.isHybrid"))
+        #expect(!evaluate.contains(
+            "usesCanonicalHybridBoundary =\n"
+                + "            (coordinator.isHybrid"))
+        // Dense/paged, media-unsafe, path-dependent-hybrid, and unsupported
+        // topologies keep their existing gates: rotating admission must not
+        // widen the recurrent/SSM companion paths or the media-unsafe store.
+        #expect(evaluate.contains(
+            "guard coordinator.isHybrid else { return nil }"))
+        #expect(batch.contains(
+            "guard cacheCoordinator?.isHybrid == true,"))
+        #expect(batch.contains(
+            "guard coordinator.isHybrid else { return nil }"))
+        #expect(evaluate.contains("input.canCaptureHybridStripBoundary("))
+        #expect(mtp.contains("!originalInput.hasMediaContent"))
+    }
+
     @Test("token iterator does not blanket-eval disk-backed cache snapshots before store")
     func tokenIteratorDoesNotBlanketEvalDiskBackedSnapshotsBeforeStore() throws {
         let source = try String(

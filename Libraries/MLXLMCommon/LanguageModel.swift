@@ -473,6 +473,20 @@ public protocol LanguageModel: Module {
     /// Models may implement this simplified interface if they do not produce any ``LMOutput/State``
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
 
+    /// Token-only forward used OUTSIDE generation to rebuild recurrent (SSM / linear-attention)
+    /// state by replaying prompt tokens into a fresh cache — the SSD-cache store's boundary
+    /// re-derivation (`reDeriveSSMStatesAtBoundaries`).
+    ///
+    /// Unlike the generation forwards this one may throw. A replay that fails must abort the
+    /// store so nothing built from a partial or substituted forward is published as a
+    /// legitimate snapshot. The default forwards to the generation path, which is exact for
+    /// every model whose forward cannot fail; a model whose forward CAN fail and currently
+    /// substitutes an output on the generation path (GLM-5.3: stderr + zero logits) must
+    /// override this and throw instead. That substitution itself, and the validity of an inline
+    /// live-cache capture taken after a substituted generation, remain UNRESOLVED — this
+    /// contract only keeps such a forward out of the replay store.
+    func replayForward(_ tokens: MLXArray, cache: [KVCache]?) throws -> MLXArray
+
     /// create a new array of ``KVCache`` -- automatic implementation if self
     /// implements ``KVCacheDimensionProvider``
     func newCache(parameters: GenerateParameters?) -> [KVCache]
@@ -509,6 +523,14 @@ extension LanguageModel {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         fatalError("callAsFunction(inputs:cache:) not implemented for \(Self.self)")
+    }
+
+    /// Default replay = the generation contract. Vision-language models implement the
+    /// `LMInput.Text` overload and plain LLMs the token overload; either way this reaches the
+    /// model's own forward and never the trapping default above unless the model implements
+    /// neither — which is a programming error the type system cannot express here.
+    public func replayForward(_ tokens: MLXArray, cache: [KVCache]?) throws -> MLXArray {
+        callAsFunction(LMInput.Text(tokens: tokens), cache: cache, state: nil).logits
     }
 }
 

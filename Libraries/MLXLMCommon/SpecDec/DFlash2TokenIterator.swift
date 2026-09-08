@@ -116,15 +116,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Index of the generation-suffix-stripped boundary in
     /// ``promptTokenIds`` — the last turn-start token, i.e. the end of the
     /// prompt with its trailing generation prompt removed. `nil` when it
-    /// does not apply (dense target, no turn-start token, tiers disabled).
+    /// does not apply (dense target, no turn-start token, tiers disabled, or
+    /// a topology that is neither hybrid nor a standalone rotating/SWA
+    /// cache).
     ///
-    /// For a hybrid target this is the ONLY reusable cross-turn
-    /// checkpoint: the next turn's prompt replaces the generation suffix,
-    /// so it never contains this turn's full prompt, and hybrid state is
-    /// path-dependent, so the full-prompt cache cannot be trimmed back.
-    /// Storing only the full prompt therefore stores a boundary no later
-    /// turn can match — measured as turn 2 re-prefilling all 14 of 14
-    /// tokens in `DFlash2PrefixCacheReuseTests` before this existed.
+    /// For hybrid and standalone rotating/SWA targets this is the reusable
+    /// cross-turn checkpoint: the next turn replaces the generation suffix,
+    /// so it never contains this turn's full prompt. The full-prompt cache
+    /// therefore cannot provide this growing-turn boundary.
     private var hybridStripBoundary: Int?
 
     /// Cache state at ``hybridStripBoundary``, captured DURING prefill as
@@ -499,11 +498,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             ? (config.slidingWindow.map { $0 - 1 })
             : nil
         // Same boundary rule as TokenIterator, so both iterators agree on
-        // what the canonical cross-turn checkpoint is.
+        // what the canonical cross-turn checkpoint is (hybrid SSM and
+        // standalone rotating/SWA topologies).
         self.hybridStripBoundary = TokenIterator.hybridStripBoundaryIndex(
             coordinator: cacheCoordinator,
             promptTokenIds: self.promptTokenIds,
-            input: input)
+            input: input,
+            cache: self.cache)
         // The boundary index is absolute; prefill only sees the suffix a
         // cache hit left over. A boundary inside the restored prefix needs
         // no capture — a stored boundary at least that long already exists

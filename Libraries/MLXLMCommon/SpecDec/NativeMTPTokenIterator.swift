@@ -974,7 +974,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let sharedPromptStripBoundary = TokenIterator.hybridStripBoundaryIndex(
                 coordinator: coordinator,
                 promptTokenIds: promptTokenIds,
-                input: originalInput)
+                input: originalInput,
+                cache: cache)
             let isReusablePrefixWarmup =
                 originalInput.cachePromptIntent == .reusablePrefixWarmup
             // Same canonical-boundary policy as the solo TokenIterator,
@@ -988,6 +989,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // path; the first three were gated and this one was missed —
             // measured live as an extra ~100ms + ~350-500MB record on
             // EVERY tool-call cycle (exact 3446 beside canonical 3445).
+            // Standalone rotating/SWA caches keep the post-answer policy
+            // untouched and only gain the stripped-boundary store below.
             let usesCanonicalHybridBoundary =
                 coordinator.isHybrid && sharedPromptStripBoundary != nil
             let shouldPersistExactWarmupPrompt = shouldPersistExactPromptBoundary(
@@ -1128,16 +1131,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     }
                 }
 
-                // Gen-suffix-stripped cross-turn boundary (hybrid SSM) — same as
-                // the solo TokenIterator path. The prompt boundary ends in the
-                // chat template's generation-prompt suffix, which the NEXT chat
-                // turn replaces with the assistant reply + following user turn, so
-                // the full-prompt key never matches as a prefix. The stripped
-                // boundary (everything before the final turn-start token) DOES,
-                // so store it to enable growing-turn reuse under MTP. Clean SSM
-                // comes from `store`'s re-derive (enableSSMReDerive).
+                // Gen-suffix-stripped cross-turn boundary — same as the solo
+                // TokenIterator path for hybrid SSM and standalone rotating/SWA.
+                // The prompt boundary ends in the generation-prompt suffix,
+                // which the next chat turn replaces with the assistant reply and
+                // following user turn. The stripped boundary remains an exact
+                // prefix of that next prompt, so store it for growing-turn reuse.
                 if ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
-                   coordinator.isHybrid,
+                   (coordinator.isHybrid
+                       || cacheHasStandaloneRotatingWindowState(cache)),
                    !originalInput.hasMediaContent,
                    let stripAt = sharedPromptStripBoundary
                 {

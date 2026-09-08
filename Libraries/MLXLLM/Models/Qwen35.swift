@@ -853,6 +853,12 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     let normTopkProb: Bool
     let numExperts: Int
     let topK: Int
+    /// Whether exact-shape single-token decode may reach the trusted compiled
+    /// routed-MoE region in `SwitchGLU` (see `Qwen35CompiledDecodePolicy`).
+    /// Mirrors the VLM construction: the main decoder stack consults the
+    /// shared architecture/environment policy; MTP layers keep the eager
+    /// default, matching the VLM's MTP path.
+    let compileDecodeRegions: Bool
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -860,17 +866,23 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
-    init(_ args: Qwen35TextConfiguration, layerIdx: Int) {
+    init(
+        _ args: Qwen35TextConfiguration,
+        layerIdx: Int,
+        compileDecodeRegions: Bool = false
+    ) {
         self.layerIdx = layerIdx
         self.normTopkProb = args.normTopkProb
         self.numExperts = args.numExperts
         self.topK = args.numExpertsPerTok
+        self.compileDecodeRegions = compileDecodeRegions
 
         _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
-            numExperts: args.numExperts
+            numExperts: args.numExperts,
+            compileSeparatedDecode: compileDecodeRegions
         )
 
         _sharedExpert.wrappedValue = Qwen3NextMLP(
@@ -918,6 +930,21 @@ final class Qwen35DecoderLayer: Module {
 
     init(_ args: Qwen35TextConfiguration, layerIdx: Int) {
         self.isLinear = (layerIdx + 1) % args.fullAttentionInterval != 0
+        // Same architecture/environment policy as the VLM path: only the
+        // validated Qwen 3.5 MoE text topology may reach the trusted
+        // compiled routed-MoE decode region; every other shape stays eager.
+        let compiledDecodeRegions = Qwen35CompiledDecodePolicy.shouldCompileDecodeRegions(
+            modelType: args.modelType,
+            hiddenSize: args.hiddenSize,
+            hiddenLayers: args.hiddenLayers,
+            fullAttentionInterval: args.fullAttentionInterval,
+            numExperts: args.numExperts,
+            numExpertsPerTok: args.numExpertsPerTok,
+            moeIntermediateSize: args.moeIntermediateSize,
+            linearNumKeyHeads: args.linearNumKeyHeads,
+            linearNumValueHeads: args.linearNumValueHeads,
+            linearKeyHeadDim: args.linearKeyHeadDim,
+            linearValueHeadDim: args.linearValueHeadDim)
 
         if isLinear {
             _linearAttn.wrappedValue = Qwen35GatedDeltaNet(args)
@@ -926,7 +953,10 @@ final class Qwen35DecoderLayer: Module {
         }
 
         if args.numExperts > 0 {
-            _mlp.wrappedValue = Qwen35SparseMoeBlock(args, layerIdx: layerIdx)
+            _mlp.wrappedValue = Qwen35SparseMoeBlock(
+                args,
+                layerIdx: layerIdx,
+                compileDecodeRegions: compiledDecodeRegions)
         } else {
             _mlp.wrappedValue = Qwen3NextMLP(
                 dimensions: args.hiddenSize,
