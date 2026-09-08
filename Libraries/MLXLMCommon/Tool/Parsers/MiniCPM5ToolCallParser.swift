@@ -92,14 +92,17 @@ public struct MiniCPM5ToolCallParser: ToolCallParser, Sendable {
         case "number":
             if let value = Double(trimmed), value.isFinite { return value }
         case "boolean":
-            if trimmed == "true" { return true }
-            if trimmed == "false" { return false }
+            if trimmed.lowercased() == "true" { return true }
+            if trimmed.lowercased() == "false" { return false }
         case "null":
             if trimmed == "null" { return NSNull() }
         case "array", "object":
             if let value = try? JSONSerialization.jsonObject(with: Data(trimmed.utf8)),
                 (type == "array" && value is [Any]) || (type == "object" && value is [String: Any])
             { return asSendable(value) }
+            if let value = PythonicToolCallParser().parsePythonContainerLiteral(trimmed),
+                (type == "array" && value is [Any]) || (type == "object" && value is [String: Any])
+            { return value }
         default: break
         }
         // Malformed schema-typed values stay visible to downstream validation.

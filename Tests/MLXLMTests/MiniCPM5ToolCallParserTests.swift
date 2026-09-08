@@ -42,6 +42,15 @@ struct MiniCPM5ToolCallParserTests {
         #expect(parser.parse(content: xml, tools: nil)?.function.arguments["n"] == .string("3"))
         #expect(parser.parse(content: call("<param name=\"b\">banana</param>"), tools: Self.tools)?
             .function.arguments["b"] == .string("banana"))
+        #expect(parser.parse(content: call("<param name=\"b\">True</param>"), tools: Self.tools)?
+            .function.arguments["b"] == .bool(true))
+        #expect(parser.parse(content: call("<param name=\"a\">['x', True, None]</param>"), tools: Self.tools)?
+            .function.arguments["a"] == .array([.string("x"), .bool(true), .null]))
+        let expression = "[__import__('os').system('not executed')]"
+        #expect(parser.parse(content: call("<param name=\"a\">\(expression)</param>"), tools: Self.tools)?
+            .function.arguments["a"] == .string(expression))
+        #expect(parser.parse(content: call("<param name=\"a\">['x']</param>"), tools: nil)?
+            .function.arguments["a"] == .string("['x']"))
     }
 
     @Test func cdataIsLiteralAndDoesNotEndTheEnvelope() {
