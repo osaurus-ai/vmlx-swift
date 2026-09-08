@@ -287,6 +287,7 @@ public struct NoSystemMessageGenerator: MessageGenerator {
 /// beside (not inside) `tool_calls`, so templates serializing a tool call do
 /// not expose an implementation field to the model.
 let rawToolArgumentsJSONMessageKey = "_vmlx_raw_tool_arguments_json"
+let toolArgumentOrdersMessageKey = "_vmlx_tool_argument_orders"
 
 /// Produce the canonical Jinja-renderer dict for a ``Chat.Message``.
 ///
@@ -316,6 +317,10 @@ public func defaultMessageDict(for message: Chat.Message) -> Message {
         let rawArguments = toolCalls.map { $0.function.rawArgumentsJSON ?? "" }
         if rawArguments.contains(where: { !$0.isEmpty }) {
             dict[rawToolArgumentsJSONMessageKey] = rawArguments
+        }
+        let argumentOrders = toolCalls.map { $0.function.argumentOrder ?? [] }
+        if argumentOrders.contains(where: { !$0.isEmpty }) {
+            dict[toolArgumentOrdersMessageKey] = argumentOrders
         }
     }
 

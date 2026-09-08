@@ -15,6 +15,46 @@ public typealias Message = [String: any Sendable]
 /// A type alias for tool specifications used in chat templating.
 public typealias ToolSpec = [String: any Sendable]
 
+/// Preserve an explicitly recorded tool argument order at the Jinja boundary.
+/// The sidecar is internal history metadata, never a field in a rendered call.
+/// Missing, duplicate or stale key lists leave the existing canonical order alone.
+func chatTemplateMessageValue(_ message: Message) throws -> Value {
+    let key = "_vmlx_tool_argument_orders"
+    let orders = message[key] as? [[String]]
+    var visibleMessage = message
+    visibleMessage.removeValue(forKey: key)
+    let value = try Value(any: visibleMessage)
+    guard let orders, case .object(var object) = value,
+        case .array(var calls) = object["tool_calls"], orders.count == calls.count
+    else { return value }
+
+    func reordered(_ value: Value?, using order: [String]) -> Value? {
+        guard case .object(let arguments) = value,
+            order.count == arguments.count, Set(order).count == order.count,
+            Set(order) == Set(arguments.keys)
+        else { return value }
+        var result = OrderedDictionary<String, Value>()
+        for key in order { result[key] = arguments[key] }
+        return .object(result)
+    }
+
+    for index in calls.indices {
+        guard case .object(var call) = calls[index] else { continue }
+        if let arguments = call["arguments"] {
+            call["arguments"] = reordered(arguments, using: orders[index])
+        }
+        if case .object(var function) = call["function"] {
+            if let arguments = function["arguments"] {
+                function["arguments"] = reordered(arguments, using: orders[index])
+            }
+            call["function"] = .object(function)
+        }
+        calls[index] = .object(call)
+    }
+    object["tool_calls"] = .array(calls)
+    return .object(object)
+}
+
 /// Errors that can occur during tokenizer operations.
 public enum TokenizerError: LocalizedError {
     case missingConfig
@@ -898,7 +938,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         // survive the loader re-fetching it from the Hub.
         let template = try compiledTemplate(for: ChatTemplateRepair.repaired(selectedChatTemplate))
         var context: [String: VMLXJinja.Value] = try [
-            "messages": .array(messages.map { try Value(any: $0) }),
+            "messages": .array(messages.map { try chatTemplateMessageValue($0) }),
             "add_generation_prompt": .boolean(addGenerationPrompt),
         ]
         if let tools {
