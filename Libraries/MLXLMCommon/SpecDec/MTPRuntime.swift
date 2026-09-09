@@ -974,8 +974,9 @@ public enum NativeMTPAutoDecodePolicy {
     /// measured tuning artifact. A tuning file, when present, contributes its
     /// explicit verifier mode. An explicitly blocked artifact vetoes manual
     /// activation too: `blocked` is the bundle owner's safety decision, not a
-    /// missing-measurement condition. Callers must pair every accepted manual
-    /// activation with greedy sampling for the model+session.
+    /// missing-measurement condition. Sampling remains the caller's resolved
+    /// generation contract; native MTP supports greedy and exact-p/q sampling
+    /// on eligible requests. Manual activation is not a performance proof.
     public static func manualRecommendation(
         depth: Int,
         configData: Data?,
@@ -999,7 +1000,7 @@ public enum NativeMTPAutoDecodePolicy {
             depth: depth,
             verifierMode: status.nativeMTPTuning?.explicitVerifierMode,
             reason:
-                "User-enforced manual depth \(depth): tensor-evidence activation without measured tuning; greedy sampling enforced for this model+session.",
+                "User-enforced manual depth \(depth): tensor-evidence activation without measured tuning; configured sampling is preserved.",
             evidence: evidence)
     }
 

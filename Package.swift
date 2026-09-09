@@ -852,6 +852,7 @@ let package = Package(
                 "NativeMTPClockTests.swift",
                 "NativeMTPDepthPolicyTests.swift",
                 "NativeMTPDepthExecutionTests.swift",
+                "NativeMTPManualSafetyParityTests.swift",
                 "RaptorTopLevelStampTests.swift",
                 "HybridRestoreBoundaryInvariantTests.swift",
                 "DualPathFamiliesTests.swift",

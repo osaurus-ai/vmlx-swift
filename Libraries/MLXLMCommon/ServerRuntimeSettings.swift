@@ -366,7 +366,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                     // measured tuning artifact. An explicit bundle safety
                     // block still wins; a user request is not permission to
                     // bypass a known-bad production result.
-                    if status.nativeMTPTuning?.manualBlocked == true {
+                    if status.isExplicitlyBlocked {
                         issues.append(.error(
                             field: "mtp.mode",
                             message: "MTP is explicitly blocked by this bundle's tuning metadata: \(status.nativeMTPTuning?.reason ?? "no reason recorded")"))
@@ -439,7 +439,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 // Manual depth can bypass missing measurement, never an
                 // explicit bundle safety block.
                 return (status?.hasCompleteMTPArtifact == true
-                    && status?.nativeMTPTuning?.manualBlocked != true) ? .speculative : .blocked
+                    && status?.isExplicitlyBlocked != true) ? .speculative : .blocked
             }
             return (status?.canAutoLaunchMTP == true) ? .speculative : .blocked
         }
@@ -469,7 +469,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         // Manual depth: an explicit user activation. Family/profile/tensor
         // evidence is still required (requireVerifiedRuntime: false skips only
         // the measured-tuning gate), the requested depth replaces the tuned
-        // recommendation, and greedy sampling is enforced for the session.
+        // recommendation. Sampling remains the resolved generation contract.
         if mtp.mode == .forceOn, let depth = mtp.explicitDepth {
             guard (1...3).contains(depth) else {
                 return .init(
@@ -477,7 +477,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                     recommendation: nil,
                     reason: "MTP explicit depth must be 1, 2, or 3 (got \(depth)).")
             }
-            if status?.nativeMTPTuning?.manualBlocked == true {
+            if status?.isExplicitlyBlocked == true {
                 return .init(
                     launchMode: .blocked,
                     recommendation: nil,
@@ -1585,13 +1585,11 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
 
     /// Explicit user-enforced draft depth (1–3) for `mode == .forceOn`.
     ///
-    /// Manual depth is a different contract from Auto: Auto launches only
-    /// from a measured, usable `vmlx_mtp_tuning.json`, while an explicit
-    /// depth is a deliberate user activation that requires tensor-complete
-    /// MTP evidence for a supported runtime but NOT a tuning artifact —
-    /// the user is the measurement. Any active MTP launch (auto or manual)
-    /// forces greedy sampling for that model+session; see
-    /// ``mtpEnforcedGreedySampling``.
+    /// Auto requires usable tuning or a supported measured-family default.
+    /// Explicit depth can activate a supported MTP artifact without tuning,
+    /// but cannot bypass an explicit safety block. Choosing a depth is not
+    /// evidence of quality or speed. Sampling remains the request/runtime/
+    /// bundle contract, independent of the depth control.
     public var explicitDepth: Int?
 
     /// Folder holding a downloaded DFlash 2 drafter, or `nil` for none.
@@ -1625,11 +1623,10 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
         self.explicitDepth = explicitDepth
     }
 
-    /// The sampler override every active MTP launch enforces, scoped to the
-    /// requests of the model+session that runs speculative decode: greedy
-    /// (temperature 0, top-p 1, top-k 0, min-p 0). Measured on JANG_2L:
-    /// greedy MTP 41.4 tok/s with byte-exact AR parity; sampled MTP loses
-    /// ~10% and forfeits the parity guarantee.
+    /// Compatibility-only constants for an explicitly requested greedy run.
+    /// Despite the historical name, native MTP does not apply this override.
+    /// Hosts must preserve resolved generation parameters rather than using
+    /// these values merely because speculation is enabled.
     public static var mtpEnforcedGreedySampling:
         (temperature: Float, topP: Float, topK: Int, minP: Float)
     { (0, 1, 0, 0) }
