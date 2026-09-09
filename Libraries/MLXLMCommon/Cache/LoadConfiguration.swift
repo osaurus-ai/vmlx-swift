@@ -106,6 +106,8 @@ public enum ResidentCap: Sendable, Equatable {
 /// `loadModel(from:using:loadConfiguration:)` overload (added in
 /// step 2) consumes this struct.
 public struct LoadConfiguration: Sendable, Equatable {
+    /// Default-denied original-file repair. Does not replace the existing opt-in.
+    public var alignmentRepairAuthorization: AlignmentRepairAuthorization = .disabled
     /// Cold-weight (MLXPress) policy.
     public var jangPress: JangPressPolicy
 

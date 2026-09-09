@@ -45,7 +45,8 @@ public enum JangPressPrestacker {
 
     public static func prepareBundleIfNeeded(
         originalURL: URL,
-        enabled: Bool
+        enabled: Bool,
+        alignmentRepairAuthorization: AlignmentRepairAuthorization = .disabled
     ) throws -> URL {
         guard enabled else { return originalURL }
 
@@ -54,7 +55,8 @@ public enum JangPressPrestacker {
         // writable model directories. Hash-addressed/symlinked stores and all
         // failures retain the original shard and use MLX's aligned-copy
         // fallback, so storage optimization can never refuse a model load.
-        SafetensorsStorageHealer.healBundleIfEligible(at: originalURL)
+        SafetensorsStorageHealer.healBundleIfEligible(
+            at: originalURL, authorization: alignmentRepairAuthorization)
 
         let env = ProcessInfo.processInfo.environment
         let prestackRaw = env["MLXPRESS_PRESTACK"] ?? env["JANGPRESS_PRESTACK"]

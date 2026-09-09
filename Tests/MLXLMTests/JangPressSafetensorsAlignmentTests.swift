@@ -166,7 +166,8 @@ struct JangPressSafetensorsAlignmentTests {
         setenv("MLXPRESS_HEAL_SAFETENSORS", "1", 1)
 
         let prepared = try JangPressPrestacker.prepareBundleIfNeeded(
-            originalURL: bundle, enabled: true)
+            originalURL: bundle, enabled: true,
+            alignmentRepairAuthorization: .directUserSend)
 
         #expect(prepared.standardizedFileURL == bundle.standardizedFileURL)
         #expect(try Self.readFixture(shard).unalignedCount == 0)
