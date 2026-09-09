@@ -7,17 +7,53 @@ import Foundation
 public struct GLM4ToolCallParser: ToolCallParser, Sendable {
     public let startTag: String? = "<tool_call>"
     public let endTag: String? = "</tool_call>"
+    public var usesCustomEndBoundary: Bool { true }
 
     public init() {}
 
-    public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
-        // Strip tags if present
-        var text = content
-        if let start = startTag {
-            text = text.replacingOccurrences(of: start, with: "")
+    /// Argument values are raw text, not nested tool envelopes. Only a closer
+    /// outside an arg_value can finish the call (including across stream chunks).
+    public func completeToolCallEnd(in content: String) -> String.Index? {
+        var cursor = content.startIndex
+        while cursor < content.endIndex {
+            let close = content.range(of: "</tool_call>", range: cursor..<content.endIndex)
+            let value = content.range(of: "<arg_value>", range: cursor..<content.endIndex)
+            if let value, close == nil || value.lowerBound < close!.lowerBound {
+                guard let end = content.range(of: "</arg_value>", range: value.upperBound..<content.endIndex)
+                else { return nil }
+                cursor = end.upperBound
+            } else {
+                return close?.upperBound
+            }
         }
-        if let end = endTag {
-            text = text.replacingOccurrences(of: end, with: "")
+        return nil
+    }
+
+    public func parseEOS(_ content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+        var remaining = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !remaining.hasPrefix("<tool_call>") {
+            return parse(content: remaining, tools: tools).map { [$0] } ?? []
+        }
+        var calls: [ToolCall] = []
+        while !remaining.isEmpty {
+            guard remaining.hasPrefix("<tool_call>"),
+                let end = completeToolCallEnd(in: remaining),
+                let call = parse(content: String(remaining[..<end]), tools: tools)
+            else { return [] }
+            calls.append(call)
+            remaining = String(remaining[end...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return calls
+    }
+
+    public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
+        // Remove only the outer envelope. Global replacement corrupts strings
+        // that document the protocol or contain another call as literal data.
+        var text = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.hasPrefix("<tool_call>") {
+            guard let end = completeToolCallEnd(in: text), end == text.endIndex else { return nil }
+            text.removeFirst("<tool_call>".count)
+            text.removeLast("</tool_call>".count)
         }
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -44,15 +80,17 @@ public struct GLM4ToolCallParser: ToolCallParser, Sendable {
         if nameEnd == nil {
             guard Self.isFunctionNameShaped(funcName) else { return nil }
         } else {
-            guard !funcName.isEmpty else { return nil }
+            guard !funcName.isEmpty, !funcName.contains("<"), !funcName.contains(">") else { return nil }
         }
 
         var arguments: [String: any Sendable] = [:]
 
         // An unfinished pair invalidates the entire call. Returning the pairs
         // parsed so far can execute a different operation from the emitted one.
-        var searchRange = text.startIndex ..< text.endIndex
+        var searchRange = (nameEnd ?? text.endIndex) ..< text.endIndex
         while let keyStart = text.range(of: "<arg_key>", range: searchRange) {
+            guard text[searchRange.lowerBound..<keyStart.lowerBound]
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             // Find </arg_key>
             guard
                 let keyEnd = text.range(
@@ -61,12 +99,16 @@ public struct GLM4ToolCallParser: ToolCallParser, Sendable {
 
             let key = String(text[keyStart.upperBound ..< keyEnd.lowerBound])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty, !key.contains("<"), !key.contains(">"), arguments[key] == nil else { return nil }
 
             // Find <arg_value> after </arg_key>
             guard
                 let valueStart = text.range(
                     of: "<arg_value>", range: keyEnd.upperBound ..< text.endIndex)
             else { return nil }
+
+            guard text[keyEnd.upperBound..<valueStart.lowerBound]
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
 
             // Find </arg_value>
             guard
@@ -86,6 +128,8 @@ public struct GLM4ToolCallParser: ToolCallParser, Sendable {
 
             searchRange = valueEnd.upperBound ..< text.endIndex
         }
+
+        guard text[searchRange].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
 
         return ToolCall(function: .init(name: funcName, arguments: arguments))
     }

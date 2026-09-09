@@ -6,6 +6,79 @@ import MLXHuggingFace
 
 @Suite("Spark2.5 declared tool dialect", .serialized)
 struct Spark25DialectTests {
+    @Test func eosCannotPublishAnUnfinishedValueOrEnvelope() {
+        for raw in [
+            "<tool_call>write_note<arg_key>text</arg_key><arg_value>literal </tool_call>",
+            "<tool_call>write_note<arg_key>text</arg_key><arg_value>note</arg_value>",
+        ] {
+            let processor = ToolCallProcessor(format: .glm4)
+            for char in raw { _ = processor.processChunk(String(char)) }
+            #expect(processor.toolCalls.isEmpty)
+            _ = processor.processEOS()
+            #expect(processor.toolCalls.isEmpty)
+            #expect(processor.toolCallProtocolFailure == .malformedEnvelope)
+        }
+    }
+
+    @Test func literalClosersAndAdjacentCallsKeepTheirBoundaries() throws {
+        let value = "Literal <tool_call>example</tool_call> and <arg_key>key</arg_key>."
+        let first = "<tool_call>write_note<arg_key>text</arg_key><arg_value>\(value)</arg_value></tool_call>"
+        let raw = first + "<tool_call>lookup_marker</tool_call>"
+        let parser = GLM4ToolCallParser()
+        #expect(parser.parseEOS(raw, tools: nil).count == 2)
+        for split in 0...raw.count {
+            let index = raw.index(raw.startIndex, offsetBy: split)
+            let processor = ToolCallProcessor(format: .glm4)
+            _ = processor.processChunk(String(raw[..<index]))
+            _ = processor.processChunk(String(raw[index...]))
+            #expect(processor.toolCalls.map(\.function.name) == ["write_note", "lookup_marker"], "split \(split)")
+            #expect(processor.toolCalls.first?.function.arguments["text"] == .string(value))
+            #expect(processor.toolCallProtocolFailure == nil)
+        }
+    }
+
+    @Test func malformedStructureOutsideValuesIsNotReinterpreted() {
+        let pair = "<arg_key>text</arg_key><arg_value>note</arg_value>"
+        for body in [
+            "write_note<tool_call>other\(pair)",
+            "write_note\(pair)<tool_call>other",
+            "write_note<arg_key>text</arg_key><tool_call>other<arg_value>note</arg_value>",
+            "write_note\(pair)unparsed suffix",
+            "write_note\(pair)\(pair)",
+        ] {
+            let raw = "<tool_call>\(body)</tool_call>"
+            #expect(GLM4ToolCallParser().parse(content: raw, tools: nil) == nil)
+            #expect(GLM4ToolCallParser().parseEOS(raw, tools: nil).isEmpty)
+            let processor = ToolCallProcessor(format: .glm4)
+            for char in raw { _ = processor.processChunk(String(char)) }
+            #expect(processor.toolCalls.isEmpty)
+            #expect(processor.toolCallProtocolFailure == .malformedEnvelope)
+        }
+    }
+
+    @Test func literalToolStartMarkerInsideStringArgumentIsNotDeleted() throws {
+        let value = "Document <tool_call> as the opening marker."
+        let body = "write_note<arg_key>text</arg_key><arg_value>\(value)</arg_value>"
+        let function: [String: any Sendable] = [
+            "name": "write_note", "parameters": ["type": "object",
+                "properties": ["text": ["type": "string"]], "required": ["text"]] as [String: any Sendable]]
+        let tools: [[String: any Sendable]] = [["type": "function", "function": function]]
+        for input in [body, "<tool_call>\(body)</tool_call>"] {
+            let call = try #require(GLM4ToolCallParser().parse(content: input, tools: tools))
+            #expect(call.function.arguments["text"] == .string(value))
+        }
+        let raw = "<tool_call>\(body)</tool_call>"
+        for split in 0...raw.count {
+            let index = raw.index(raw.startIndex, offsetBy: split)
+            let processor = ToolCallProcessor(format: .glm4, tools: tools)
+            _ = processor.processChunk(String(raw[..<index]))
+            _ = processor.processChunk(String(raw[index...]))
+            #expect(processor.toolCalls.count == 1)
+            #expect(processor.toolCalls.first?.function.arguments["text"] == .string(value), "split \(split)")
+            #expect(processor.toolCallProtocolFailure == nil)
+        }
+    }
+
     @Test func incompleteArgumentCannotPublishAPartialCall() {
         let processor = ToolCallProcessor(format: .glm4)
         _ = processor.processChunk("<tool_call>read_file<arg_key>path</arg_key><arg_value>note.md</arg_value><arg_key>limit</arg_key></tool_call>")
