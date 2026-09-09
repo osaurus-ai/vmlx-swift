@@ -48,12 +48,29 @@ public enum Lexer: Sendable {
                 }
             }
 
-            let (token, newPosition) = try extractToken(
+            let (token, extractedPosition) = try extractToken(
                 from: preprocessed,
                 at: position,
                 inTag: inTag,
                 curlyBracketDepth: curlyBracketDepth
             )
+            var newPosition = extractedPosition
+
+            // Comments have the same explicit whitespace controls as statements.
+            // Handle them only after lexing a real comment, never with a global
+            // replacement that could alter a quoted template string.
+            if token.kind == .comment {
+                if token.value.hasPrefix("-"), let previous = tokens.last,
+                    previous.kind == .text {
+                    var value = previous.value
+                    while value.last?.isWhitespace == true { value.removeLast() }
+                    tokens[tokens.count - 1] = Token(
+                        kind: .text, value: value, position: previous.position)
+                }
+                if token.value.hasSuffix("-") {
+                    newPosition = skipWhitespace(in: preprocessed, at: newPosition)
+                }
+            }
 
             switch token.kind {
             case .openExpression, .openStatement:

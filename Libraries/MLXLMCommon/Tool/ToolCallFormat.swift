@@ -372,6 +372,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         }
 
         // GLM/GLM-style families (glm4, glm4_moe, glm5, glm47, GPT-OSS).
+        if compact == "spark25" {
+            return .glm4
+        }
         if compact.hasPrefix("glm4")
             || compact.hasPrefix("glm5")
             || compact.hasPrefix("glm47")
@@ -549,6 +552,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         let n = name.lowercased()
         let normalized = normalizedAlias(n)
         let compact = compactAlias(n)
+
+        // Spark2.5 declares the GLM arg_key/arg_value wire grammar by this name.
+        if compact == "spark25" { return .glm4 }
 
         // Direct rawValue match first (e.g. "xml_function", "minimax_m2").
         if let direct = ToolCallFormat(rawValue: n)

@@ -49,14 +49,15 @@ public struct GLM4ToolCallParser: ToolCallParser, Sendable {
 
         var arguments: [String: any Sendable] = [:]
 
-        // Find all arg_key/arg_value pairs
+        // An unfinished pair invalidates the entire call. Returning the pairs
+        // parsed so far can execute a different operation from the emitted one.
         var searchRange = text.startIndex ..< text.endIndex
         while let keyStart = text.range(of: "<arg_key>", range: searchRange) {
             // Find </arg_key>
             guard
                 let keyEnd = text.range(
                     of: "</arg_key>", range: keyStart.upperBound ..< text.endIndex)
-            else { break }
+            else { return nil }
 
             let key = String(text[keyStart.upperBound ..< keyEnd.lowerBound])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -65,13 +66,13 @@ public struct GLM4ToolCallParser: ToolCallParser, Sendable {
             guard
                 let valueStart = text.range(
                     of: "<arg_value>", range: keyEnd.upperBound ..< text.endIndex)
-            else { break }
+            else { return nil }
 
             // Find </arg_value>
             guard
                 let valueEnd = text.range(
                     of: "</arg_value>", range: valueStart.upperBound ..< text.endIndex)
-            else { break }
+            else { return nil }
 
             let value = String(text[valueStart.upperBound ..< valueEnd.lowerBound])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
