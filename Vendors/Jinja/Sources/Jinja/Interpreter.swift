@@ -310,6 +310,24 @@ public enum Interpreter {
 
             switch iterableValue {
             case let .array(items):
+                // Loop metadata and neighbors describe the items that actually
+                // participate, not entries excluded by a Jinja for-if filter.
+                let items: [Value] = try {
+                    guard let test else { return items }
+                    let filterEnv = Environment(parent: env)
+                    return try items.filter { item in
+                        switch loopVar {
+                        case let .single(name): filterEnv[name] = item
+                        case let .tuple(names):
+                            if case let .array(values) = item {
+                                for (i, name) in names.enumerated() {
+                                    filterEnv[name] = i < values.count ? values[i] : .undefined
+                                }
+                            }
+                        }
+                        return try evaluateExpression(test, env: filterEnv).isTruthy
+                    }
+                }()
                 if items.isEmpty {
                     // Execute else block
                     for node in elseBody {
@@ -331,12 +349,10 @@ public enum Interpreter {
                             }
                         }
 
-                        childEnv["loop"] = makeLoopObject(index: index, totalCount: items.count)
-                        if let test = test {
-                            let testValue = try evaluateExpression(test, env: childEnv)
-                            if !testValue.isTruthy { continue }
-                        }
-
+                        childEnv["loop"] = makeLoopObject(
+                            index: index, totalCount: items.count,
+                            previous: index > 0 ? items[index - 1] : .undefined,
+                            next: index + 1 < items.count ? items[index + 1] : .undefined)
                         var shouldBreak = false
                         for node in body {
                             do {
@@ -785,7 +801,9 @@ public enum Interpreter {
         throw JinjaError.runtime("Unknown filter: \(filterName)")
     }
 
-    private static func makeLoopObject(index: Int, totalCount: Int) -> Value {
+    private static func makeLoopObject(
+        index: Int, totalCount: Int, previous: Value = .undefined, next: Value = .undefined
+    ) -> Value {
         var loopContext: OrderedDictionary<String, Value> = [
             "index": .int(index + 1),
             "index0": .int(index),
@@ -794,6 +812,8 @@ public enum Interpreter {
             "length": .int(totalCount),
             "revindex": .int(totalCount - index),
             "revindex0": .int(totalCount - index - 1),
+            "previtem": previous,
+            "nextitem": next,
         ]
 
         loopContext["cycle"] = .function { args, _, _ in

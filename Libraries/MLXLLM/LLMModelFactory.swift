@@ -47,6 +47,7 @@ public enum LLMTypeRegistry {
             "diffusion_gemma": create(DiffusionGemmaConfiguration.self, DiffusionGemmaModel.init),
             "qwen2": create(Qwen2Configuration.self, Qwen2Model.init),
             "qwen3": create(Qwen3Configuration.self, Qwen3Model.init),
+            "spark2_5": create(Spark25Configuration.self, Spark25Model.init),
             "qwen3_moe": create(Qwen3MoEConfiguration.self, Qwen3MoEModel.init),
             "qwen3_next": create(Qwen3NextConfiguration.self, Qwen3NextModel.init),
             "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
