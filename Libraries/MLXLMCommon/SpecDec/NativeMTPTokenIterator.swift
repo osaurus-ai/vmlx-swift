@@ -396,9 +396,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// level demoted twice is closed for the rest of the generation.
     private var adaptiveDemotedFromCount: [Int: Int] = [:]
     private static let adaptiveMaxDemotesPerLevel = 2
-    /// Hard ceiling for adaptive promotion — the resolved depth cap, which
-    /// may exceed the REQUESTED depth (the request is a starting point, not
-    /// a lid, since 2026-09-04). See the depth-policy comment in `init`.
+    /// Resolved promotion ceiling: fixed requests never exceed their chosen
+    /// depth; explicitly adaptive requests may explore to their bounded cap.
     private let adaptiveDepthCeiling: Int
     private(set) var seedMainForwardTime: TimeInterval = 0
     private(set) var verifyMainForwardTime: TimeInterval = 0
@@ -591,23 +590,16 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.sampler = effectiveParameters.sampler()
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
         self.maxTokens = effectiveParameters.maxTokens
-        // Depth policy (2026-09-04): the REQUESTED depth is the STARTING
-        // depth; the hard cap is 5 and the adaptive controller may promote
-        // past the request up to that cap when a full acceptance window
-        // clears the top floor with margin — near-perfect-acceptance shapes
-        // (counting, enumeration, tables) earn d4/d5 at runtime instead of
-        // being pinned to their start. History: the D2 cap era was
-        // calibrated on the lazy-repair verifier (Nemotron D3 0.48x); the
-        // staged verifier re-measured D3 as a win (27B_4D: 28.4 vs 16.5
-        // plain, byte-identical), and the same acceptance-priced controller
-        // that downshifts unprofitable depth governs every step above the
-        // start. Benchmarks can still override via VMLX_MTP_DEPTH_CAP.
+        // One resolved policy governs initialization, recovery and promotion.
+        // The environment bounds exploration but cannot raise a fixed request.
         let depthCap =
             ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
             .flatMap(Int.init).map { Swift.max($0, 1) } ?? 5
-        self.adaptiveDepthCeiling = depthCap
-        self.depth = Swift.min(requestedDepth, depthCap)
-        self.currentDepth = Swift.min(requestedDepth, depthCap)
+        let resolvedDepth = try effectiveParameters.nativeMTPDepthPolicy.resolve(
+            requestedDepth: requestedDepth, runtimeCap: depthCap)
+        self.adaptiveDepthCeiling = resolvedDepth.maximumDepth
+        self.depth = resolvedDepth.initialDepth
+        self.currentDepth = resolvedDepth.initialDepth
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode
         let promptTokenStart = NativeMTPClock.now()
         let promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
@@ -2512,15 +2504,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        // Promote. Historically bounded by the REQUESTED depth (recovery
-        // only); since 2026-09-04 the request is a STARTING depth and a full
-        // window that clears the floor of the level above with margin climbs
-        // toward `adaptiveDepthCeiling` — near-perfect-acceptance shapes
-        // (counting, enumeration) ride to d4/d5 while ordinary prose, whose
-        // acceptance sits under the floors, never leaves its start. Only the
-        // staged verifier earns the extended ceiling: the lazy-repair
-        // verifier keeps the old recover-to-request bound (its rejection
-        // cost model was never re-measured above d3).
+        // Recovery/promotion respects the request's resolved policy. Only an
+        // explicitly adaptive staged verifier may explore above its initial
+        // depth; the lazy-repair verifier remains bounded by its initial depth.
         let promotionCeiling = staged ? adaptiveDepthCeiling : depth
         if currentDepth < promotionCeiling {
             let nextFloor: Double
