@@ -20,6 +20,8 @@ enum SafetensorsStorageHealer {
         var environment: [String: String] = ProcessInfo.processInfo.environment
         var availableBytes: ((URL) throws -> UInt64)?
         var failAfterCopiedBytes: UInt64?
+        var checkCancellation: () throws -> Void = { try Task.checkCancellation() }
+        var progress: (AlignmentRepairProgress) -> Void = { AlignmentRepairProgress.observer?($0) }
         var logger: (String) -> Void = { message in
             fputs("[SafetensorsStorageHealer] \(message)\n", stderr)
         }
@@ -53,7 +55,11 @@ enum SafetensorsStorageHealer {
     private static let freeSpaceReserve = UInt64(512 * 1024 * 1024)
     private static let maximumHeaderBytes = UInt64(100_000_000)
 
-    static func healBundleIfEligible(at originalURL: URL) {
+    static func healBundleIfEligible(
+        at originalURL: URL,
+        authorization: AlignmentRepairAuthorization = .disabled
+    ) {
+        guard authorization == .directUserSend else { return }
         _ = healBundle(at: originalURL, configuration: Configuration())
     }
 
@@ -135,6 +141,7 @@ enum SafetensorsStorageHealer {
         }
 
         for shard in entries {
+            if (try? configuration.checkCancellation()) == nil { break }
             result.scannedShards += 1
             do {
                 let values = try shard.resourceValues(forKeys: [.isSymbolicLinkKey])
@@ -178,12 +185,15 @@ enum SafetensorsStorageHealer {
                     sourceHeader: header,
                     sourceAttributes: attributes,
                     directoryFD: directoryFD,
-                    failAfterCopiedBytes: configuration.failAfterCopiedBytes)
+                    configuration: configuration)
                 result.healedShards += 1
                 configuration.logger(
                     "event=healed shard=\(quoted(shard.path)) tensors=\(header.tensors.count) bytes=\(sourceSize)"
                 )
             } catch {
+                configuration.progress(.init(
+                    bundle: directory, shard: shard, stage: .fallback,
+                    copiedBytes: 0, totalBytes: 0))
                 result.fallbackShards += 1
                 configuration.logger(
                     "event=fallback reason=heal_failed shard=\(quoted(shard.path)) detail=\(quoted(String(describing: error)))"
@@ -199,7 +209,7 @@ enum SafetensorsStorageHealer {
         sourceHeader: Header,
         sourceAttributes: [FileAttributeKey: Any],
         directoryFD: Int32,
-        failAfterCopiedBytes: UInt64?
+        configuration: Configuration
     ) throws {
         let temporary = shard.deletingLastPathComponent().appendingPathComponent(
             ".\(shard.lastPathComponent).vmlx-heal-\(UUID().uuidString).tmp")
@@ -223,6 +233,14 @@ enum SafetensorsStorageHealer {
             cursor = addition.partialValue
         }
         let headerData = try makeHeader(metadata: sourceHeader.metadata, tensors: rewritten)
+        let totalBytes = cursor
+        func report(_ stage: AlignmentRepairProgress.Stage, _ copied: UInt64) {
+            configuration.progress(.init(
+                bundle: shard.deletingLastPathComponent(), shard: shard,
+                stage: stage, copiedBytes: copied, totalBytes: totalBytes))
+        }
+        try configuration.checkCancellation()
+        report(.copying, 0)
 
         let outputFD = systemOpen(
             temporary.path,
@@ -257,7 +275,9 @@ enum SafetensorsStorageHealer {
                 byteLength: tensor.byteLength,
                 outputFD: outputFD,
                 copied: &copied,
-                failAfterCopiedBytes: failAfterCopiedBytes)
+                failAfterCopiedBytes: configuration.failAfterCopiedBytes,
+                checkCancellation: configuration.checkCancellation,
+                progress: { report(.copying, $0) })
         }
         guard systemFsync(outputFD) == 0 else {
             throw posixError("fsync", temporary.path)
@@ -275,6 +295,8 @@ enum SafetensorsStorageHealer {
         }
 
         let outputHeader = try readHeader(temporary)
+        try configuration.checkCancellation()
+        report(.verifying, copied)
         try verifyDescriptorsAndPayloads(
             sourceURL: shard,
             sourceHeader: sourceHeader,
@@ -282,6 +304,7 @@ enum SafetensorsStorageHealer {
             outputHeader: outputHeader)
 
         let currentAttributes = try FileManager.default.attributesOfItem(atPath: shard.path)
+        try configuration.checkCancellation()
         guard sameSourceIdentity(sourceAttributes, currentAttributes) else {
             throw healerError("source changed during heal")
         }
@@ -293,6 +316,7 @@ enum SafetensorsStorageHealer {
         // The shard itself is already durable. Directory fsync is best effort
         // because some filesystems reject fsync on directory descriptors.
         _ = systemFsync(directoryFD)
+        report(.installed, copied)
     }
 
     private static func readHeader(_ url: URL) throws -> Header {
@@ -430,13 +454,16 @@ enum SafetensorsStorageHealer {
         byteLength: UInt64,
         outputFD: Int32,
         copied: inout UInt64,
-        failAfterCopiedBytes: UInt64?
+        failAfterCopiedBytes: UInt64?,
+        checkCancellation: () throws -> Void,
+        progress: (UInt64) -> Void
     ) throws {
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferBytes, alignment: 4096)
         defer { buffer.deallocate() }
         var remaining = byteLength
         var offset = sourceOffset
         while remaining > 0 {
+            try checkCancellation()
             if let limit = failAfterCopiedBytes, copied >= limit {
                 throw healerError("injected interrupted write")
             }
@@ -451,6 +478,7 @@ enum SafetensorsStorageHealer {
             remaining -= UInt64(read)
             offset += UInt64(read)
             copied += UInt64(read)
+            progress(copied)
         }
     }
 

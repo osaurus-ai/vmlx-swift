@@ -713,12 +713,13 @@ public func loadModel(
     //    compression/reclaim instead of a large stacked cache overlay.
     //    Active-expert pread streaming is an explicit fallback/diagnostic
     //    path only. Before mmap, ordinary writable model directories are
-    //    automatically healed when a safetensors shard has dtype-misaligned
-    //    offsets. The older side-copy alignment overlay remains separately
+    //    healed only with direct-Send authorization AND explicit repair opt-in.
+    //    The older side-copy alignment overlay remains separately
     //    gated by MLXPRESS_ALIGN_* / JANGPRESS_ALIGN_*.
     let loadDirectory = try JangPressPrestacker.prepareBundleIfNeeded(
         originalURL: directory,
-        enabled: useMmapSafetensors)
+        enabled: useMmapSafetensors,
+        alignmentRepairAuthorization: loadConfiguration.alignmentRepairAuthorization)
 
     // 5. Load the model normally. Patched osaurus mlx-swift pins honor
     //    MLX_SAFETENSORS_MMAP=1 inside loadArraysAndMetadata(url:),
