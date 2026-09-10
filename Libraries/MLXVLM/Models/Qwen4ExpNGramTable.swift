@@ -372,8 +372,52 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
     }
 
     /// Returns row-major Float32 values. Only bytes belonging to selected rows
-    /// are touched; duplicate row ids are intentionally preserved.
+    /// are touched. Duplicate output rows are preserved, but each distinct row
+    /// is read and dequantized once per gather. No data is retained across calls.
     func gather(_ rows: [Int64], parallelRows: Bool? = nil) throws -> [Float] {
+        // Avoid dictionary/scatter allocation for single rows or an already
+        // strictly increasing set. A decode token has multiple n-gram heads;
+        // disjoint ordered head ranges need no duplicate detection dictionary.
+        if rows.count <= 1 || zip(rows, rows.dropFirst()).allSatisfy({ $0.0 < $0.1 }) {
+            let (values, bytesRead) = try gatherDistinct(rows, parallelRows: parallelRows)
+            recordGather(rows: rows.count, bytesRead: bytesRead)
+            return values
+        }
+        var uniqueRows: [Int64] = []
+        var positions: [Int64: Int] = [:]
+        var outputPositions: [Int] = []
+        uniqueRows.reserveCapacity(rows.count)
+        outputPositions.reserveCapacity(rows.count)
+        for row in rows {
+            guard row >= 0, row < rowCount else {
+                throw Qwen4ExpNGramTableError.rowOutOfRange(row)
+            }
+            if let position = positions[row] {
+                outputPositions.append(position)
+            } else {
+                positions[row] = uniqueRows.count
+                outputPositions.append(uniqueRows.count)
+                uniqueRows.append(row)
+            }
+        }
+        let (values, bytesRead) = try gatherDistinct(
+            uniqueRows, parallelRows: parallelRows)
+        // rowsRead remains the logical requested-row count; payloadBytesRead
+        // measures actual selected-row I/O, excluding duplicate reads avoided.
+        recordGather(rows: rows.count, bytesRead: bytesRead)
+        guard uniqueRows.count != rows.count else { return values }
+        var output = [Float](repeating: 0, count: rows.count * dimensions)
+        for (outputRow, position) in outputPositions.enumerated() {
+            output.replaceSubrange(
+                outputRow * dimensions ..< (outputRow + 1) * dimensions,
+                with: values[position * dimensions ..< (position + 1) * dimensions])
+        }
+        return output
+    }
+
+    private func gatherDistinct(
+        _ rows: [Int64], parallelRows: Bool?
+    ) throws -> ([Float], UInt64) {
         if parallelRows ?? Self.parallelRows, rows.count > 1 {
             return try gatherParallel(rows)
         }
@@ -392,11 +436,10 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
                 outputRow * dimensions ..< (outputRow + 1) * dimensions,
                 with: values)
         }
-        recordGather(rows: rows.count, bytesRead: bytesRead)
-        return output
+        return (output, bytesRead)
     }
 
-    private func gatherParallel(_ rows: [Int64]) throws -> [Float] {
+    private func gatherParallel(_ rows: [Int64]) throws -> ([Float], UInt64) {
         let buffers = ParallelGatherBuffers(
             valueCount: rows.count * dimensions, rowCount: rows.count)
         DispatchQueue.concurrentPerform(iterations: rows.count) { outputRow in
@@ -424,8 +467,7 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         let bytesRead = (0 ..< rows.count).reduce(UInt64(0)) {
             $0 + buffers.bytes[$1]
         }
-        recordGather(rows: rows.count, bytesRead: bytesRead)
-        return output
+        return (output, bytesRead)
     }
 
     func ioStats() -> IOStats {
