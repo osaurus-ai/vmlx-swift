@@ -713,7 +713,11 @@ public final class CacheCoordinator: @unchecked Sendable {
         else {
             return false
         }
-        if isHybrid, requiresRecurrentSSMCompanion {
+        // Match storeAfterGeneration's payload contract, not the broader
+        // path-dependence flag. Mamba state is persisted inside the v2 row;
+        // requiring an intentionally unwritten sidecar rebuilds every boundary.
+        // ArraysCache/GDN still requires its separate recurrent payload.
+        if isHybrid, requiresSeparateRecurrentPayload {
             return ssmStateCache.hasValidatedCompleteDiskEntry(
                 tokens: tokens,
                 boundary: tokens.count,
@@ -732,7 +736,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     ) -> Bool {
         guard diskCache?.hasDurableEntry(tokens: tokens, mediaSalt: mediaSalt) == true
         else { return false }
-        if isHybrid, requiresRecurrentSSMCompanion {
+        if isHybrid, requiresSeparateRecurrentPayload {
             return ssmStateCache.hasValidatedCompleteDiskEntry(
                 tokens: tokens,
                 boundary: tokens.count,
