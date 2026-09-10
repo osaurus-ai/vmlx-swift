@@ -1562,7 +1562,9 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         textModel.layers.map { layer in
             if layer.isLinear {
-                return MambaCache(slots: layer.ple == nil ? 2 : 6) as KVCache
+                let cache = MambaCache(slots: layer.ple == nil ? 2 : 6)
+                cache.persistentStateSlotCount = layer.ple == nil ? 2 : 4
+                return cache as KVCache
             }
             return QSAKVCache() as KVCache
         }

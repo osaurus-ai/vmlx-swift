@@ -833,6 +833,18 @@ private func restoreFromV2Arrays(
             continue
         }
         switch entry.data {
+        case .mamba(let comp):
+            guard canRestoreMambaLayer(comp, into: cache[entry.index]) else {
+                FileHandle.standardError.write(Data(
+                    "[disk cache] restore REFUSED: incomplete or incompatible Mamba persistent slots at layer \(entry.index), stored capacity \(comp.persistentSlotCount)\n".utf8))
+                return 0
+            }
+        case .cacheList(let subs):
+            for sub in subs {
+                if case .requiredMiss = sub { return 0 }
+                if case .mamba(let comp) = sub,
+                   !canRestoreMambaLayer(comp, into: cache[entry.index]) { return 0 }
+            }
         case .qkv(let comp):
             // Quantized-KV layers share the atomic contract: a record whose
             // group size / bit width no longer matches the runtime cache (or
@@ -1610,13 +1622,30 @@ private func restoreZayaCCATQLayer(
 /// `CacheList` containing one). Silently no-ops for other cache classes,
 /// which can happen if the serialized model layout has drifted from the
 /// current runtime.
+private func canRestoreMambaLayer(
+    _ comp: TQDiskSerializer.MambaLayerComponents, into layer: any KVCache
+) -> Bool {
+    if let mamba = layer as? MambaCache {
+        return comp.offset >= 0
+            && comp.persistentSlotCount == mamba.persistentStateSlotCount
+            && comp.persistentSlotCount <= mamba.slotCount
+            && (comp.persistentSlotCount <= 2
+                || (comp.state1 != nil
+                    && comp.additionalStates.count == comp.persistentSlotCount - 2))
+    }
+    if let list = layer as? CacheList {
+        return (0..<list.count).contains { canRestoreMambaLayer(comp, into: list[$0]) }
+    }
+    return false
+}
+
 private func restoreMambaLayer(
     _ comp: TQDiskSerializer.MambaLayerComponents,
     into layer: any KVCache
 ) {
     func apply(_ mamba: MambaCache) {
         if let state1 = comp.state1 {
-            mamba.state = [comp.state0, state1]
+            mamba.state = [comp.state0, state1] + comp.additionalStates
         } else {
             // Single-slot layout (LFM2/LFM2.5 short-conv): restore into
             // slot 0 via the subscript so the 2-slot container geometry is

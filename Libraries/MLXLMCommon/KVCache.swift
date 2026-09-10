@@ -1513,6 +1513,9 @@ public class ArraysCache: BaseKVCache {
 
 /// Simple cache for Mamba-style state space models
 public class MambaCache: ArraysCache {
+    /// Leading slots owned by the model across requests. Slots beyond this
+    /// boundary are temporary verification scratch, not reusable prefix state.
+    public var persistentStateSlotCount: Int
     private struct PrefixCommitState {
         var arrays: [MLXArray]
         var offset: Int
@@ -1521,6 +1524,7 @@ public class MambaCache: ArraysCache {
     private var prefixCommitStates: [Int: PrefixCommitState] = [:]
 
     public init(leftPadding: [Int]? = nil) {
+        persistentStateSlotCount = 2
         super.init(size: 2, leftPadding: leftPadding)
     }
 
@@ -1529,6 +1533,7 @@ public class MambaCache: ArraysCache {
     /// layer's cache and stores previous-context token ids in slot 2 and the
     /// dilated-conv state in slot 3.
     public init(slots: Int, leftPadding: [Int]? = nil) {
+        persistentStateSlotCount = slots
         super.init(size: slots, leftPadding: leftPadding)
     }
 
@@ -1646,6 +1651,7 @@ public class MambaCache: ArraysCache {
 
     public override func copy() -> any KVCache {
         let new = MambaCache(slots: slotCount)
+        new.persistentStateSlotCount = persistentStateSlotCount
         copySlots(into: new)
         new.offset = self.offset
         new.leftPadding = self.leftPadding

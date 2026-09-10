@@ -217,6 +217,18 @@ struct Qwen4ExpPrefillTests {
                 _ = try model.prepare(head, cache: captured, windowSize: 8)
                 let owned = captured.map { $0.copy() }
                 MLX.eval(owned)
+                let file = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("flash-ple-boundary-\(UUID().uuidString).safetensors")
+                defer { try? FileManager.default.removeItem(at: file) }
+                let serialized = TQDiskSerializer.serialize(cache: owned)
+                try MLX.save(arrays: serialized, url: file)
+                let persisted = try MLX.loadArrays(url: file)
+                var diskRestored = model.newCache(parameters: nil)
+                #expect(restoreFromDiskArrays(persisted, into: &diskRestored) == 37)
+                let ple = try #require(diskRestored.first as? MambaCache)
+                #expect(ple.persistentStateSlotCount == 4 && ple.state.count == 4)
+                _ = try model.prepare(
+                    LMInput(text: .init(tokens: ids[0..., 37...])), cache: diskRestored, windowSize: 8)
                 _ = try model.prepare(
                     LMInput(text: .init(tokens: ids[0..., 37...])), cache: captured, windowSize: 8)
                 _ = try model.prepare(head, cache: headReference, windowSize: 8)
@@ -228,8 +240,11 @@ struct Qwen4ExpPrefillTests {
                     }
                 }
                 let next = MLXArray([Int32(47)]).reshaped(1, 1)
-                expectEqual(model(next, cache: captured), model(next, cache: baseline),
+                let expectedNext = model(next, cache: baseline)
+                expectEqual(model(next, cache: captured), expectedNext,
                             "structural split next-token logits")
+                expectEqual(model(next, cache: diskRestored), expectedNext,
+                            "disk-restored PLE QSA next-token logits")
             }
         }
     }
