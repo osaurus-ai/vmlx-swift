@@ -880,22 +880,27 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         nextMain = secondToken
         pendingTokens.append(recordMaterializeSync { secondToken.item(Int.self) })
-        let draftStart = NativeMTPClock.now()
         try Task.checkCancellation()
-        let draftBatch = Self.makeDrafts(
-            model: model,
-            hidden: Self.lastHidden(bridge.hiddenStates),
-            nextToken: secondToken,
-            mtpCache: mtpCache,
-            depth: self.currentDepth,
-            sampler: sampler,
-            speculativeSampler: speculativeSampler,
-            processor: processor)
-        drafts = draftBatch.tokens
-        draftProbabilities = draftBatch.probabilities
-        mtpForwardCount += draftBatch.forwardCount
-        materializeSyncTime += draftBatch.materializeSyncTime
-        self.mtpDraftTime += NativeMTPClock.now() - draftStart
+        // With the governor enabled, next() first measures two AR steps.
+        // Those steps discard initial drafts and re-prime from fresh hidden
+        // states, so generating proposals here would be entirely wasted work.
+        if Self.arSafetyDisabled && !forceAutoregressiveFallback {
+            let draftStart = NativeMTPClock.now()
+            let draftBatch = Self.makeDrafts(
+                model: model,
+                hidden: Self.lastHidden(bridge.hiddenStates),
+                nextToken: secondToken,
+                mtpCache: mtpCache,
+                depth: self.currentDepth,
+                sampler: sampler,
+                speculativeSampler: speculativeSampler,
+                processor: processor)
+            drafts = draftBatch.tokens
+            draftProbabilities = draftBatch.probabilities
+            mtpForwardCount += draftBatch.forwardCount
+            materializeSyncTime += draftBatch.materializeSyncTime
+            self.mtpDraftTime += NativeMTPClock.now() - draftStart
+        }
 
         // MARK: compiled verify promotion — after prefill and the boundary
         // snapshot, so stored prefix-cache entries stay plain.

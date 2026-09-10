@@ -7,6 +7,33 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testGovernorCalibrationDoesNotBuildDiscardedInitialDrafts() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
+            throw XCTSkip("Requires governor calibration")
+        }
+        try FocusedMLXTestSupport.withLock {
+            for depth in 1...3 {
+                for temperature: Float in [0, 1] {
+                    let model = DepthDispatchTarget()
+                    var parameters = GenerateParameters(maxTokens: 16, temperature: temperature)
+                    parameters.randomSeed = 829
+                    parameters.draftStrategy = .nativeMTP(depth: depth)
+                    parameters.nativeMTPDepthPolicy = .fixed
+                    let started = ProcessInfo.processInfo.systemUptime
+                    var iterator = try NativeMTPTokenIterator(
+                        input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                        parameters: parameters, depth: depth)
+                    XCTAssertEqual(model.draftCalls, 0, "D\(depth) initial proposals would be discarded")
+                    for _ in 0..<3 { XCTAssertEqual(iterator.next(), 1) }
+                    XCTAssertEqual(model.draftCalls, 0, "First calibration step must not draft")
+                    XCTAssertEqual(iterator.next(), 1)
+                    XCTAssertEqual(iterator.autoregressiveFallbackTokenCount, 2)
+                    XCTAssertEqual(model.draftCalls, depth, "Prime only after the second calibration step")
+                    print("CALIBRATION depth=\(depth) temperature=\(temperature) drafts=\(model.draftCalls) fixtureTokS=\(4 / (ProcessInfo.processInfo.systemUptime - started))")
+                }
+            }
+        }
+    }
     func testEarlyStopAbandonsPrefetchedKVRows() throws {
         guard ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] != "0" else {
             throw XCTSkip("Requires prefetch enabled")
