@@ -132,10 +132,94 @@ struct Qwen4ExpNGramTableTests {
         #expect(table.ioStats() == .init(
             gatherCalls: 3,
             rowsRead: 7,
-            payloadBytesRead: 84,
+            payloadBytesRead: 60,
             backingFileCount: 1,
             backingFileBytes: UInt64(bytes.count),
             noCacheFileCount: 1))
+
+        for parallel in [false, true] {
+            let before = table.ioStats()
+            #expect(try table.gather([], parallelRows: parallel).isEmpty)
+            let repeated = try table.gather([1, 1, 1, 1], parallelRows: parallel)
+            #expect(repeated == Array(repeating: values, count: 4).flatMap { $0 })
+            #expect(table.ioStats().payloadBytesRead - before.payloadBytesRead == 12)
+            let uniqueBefore = table.ioStats()
+            let unique = try table.gather([0, 1], parallelRows: parallel)
+            #expect(Array(unique[8..<16]) == values)
+            #expect(table.ioStats().payloadBytesRead - uniqueBefore.payloadBytesRead == 24)
+            let invalidBefore = table.ioStats()
+            #expect(throws: Qwen4ExpNGramTableError.self) {
+                _ = try table.gather([1, -1, 1], parallelRows: parallel)
+            }
+            #expect(table.ioStats() == invalidBefore)
+        }
+
+        // Opt-in host-I/O diagnostic, not a model throughput benchmark. Keep
+        // identical fixture, row order and schedules across before/after runs.
+        if ProcessInfo.processInfo.environment["VMLX_PLE_IO_BENCH"] == "1" {
+            for parallel in [false, true] {
+                for (label, rows) in [
+                    ("single", [Int64(1)]),
+                    ("unique", [Int64(0), 1]),
+                    ("duplicate512", (0..<512).map { Int64($0 % 2) }),
+                ] {
+                    let before = table.ioStats()
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    var checksum: Float = 0
+                    for _ in 0..<32 {
+                        let result = try table.gather(rows, parallelRows: parallel)
+                        checksum += result.last ?? 0
+                    }
+                    let elapsed = DispatchTime.now().uptimeNanoseconds - start
+                    let readBytes = table.ioStats().payloadBytesRead - before.payloadBytesRead
+                    print("PLE_IO_BENCH schedule=\(parallel ? "parallel" : "sequential") "
+                        + "case=\(label) iterations=32 ns=\(elapsed) bytes=\(readBytes) checksum=\(checksum)")
+                }
+            }
+        }
+    }
+
+    @Test("opt-in real PLE table row parity and bounded host I/O timing")
+    func realTableRowTiming() throws {
+        guard let path = ProcessInfo.processInfo.environment["VMLX_PLE_TABLE_BENCH_MODEL"] else {
+            return
+        }
+        let directory = URL(fileURLWithPath: path, isDirectory: true)
+        let config = try JSONDecoder().decode(
+            Qwen4ExpConfiguration.self,
+            from: Data(contentsOf: directory.appendingPathComponent("config.json")))
+        let layer = try #require(config.extras.pleLayerIds.first)
+        let table = try Qwen4ExpNGramTable(
+            modelDirectory: directory, layerIndex: layer - 1,
+            shardCount: config.extras.splitNgramParts)
+        #expect(table.rowCount >= 512)
+        guard table.rowCount >= 512 else { return }
+        let uniqueRows = (0..<512).map { Int64($0) * (table.rowCount / 512) }
+        // An independently gathered row at a time checks the scatter ordering,
+        // including shard boundaries, without loading any model weights.
+        let reference = try uniqueRows.flatMap { try table.gather([$0], parallelRows: false) }
+        let duplicateRows = (0..<512).map { uniqueRows[$0 % 8] }
+        let duplicateReference = (0..<512).flatMap { row in
+            Array(reference[(row % 8) * table.dimensions..<(row % 8 + 1) * table.dimensions])
+        }
+        for parallel in [false, true] {
+            #expect(try table.gather(uniqueRows, parallelRows: parallel) == reference)
+            #expect(try table.gather(duplicateRows, parallelRows: parallel) == duplicateReference)
+            for round in 0..<3 {
+                for (label, rows) in [("unique512", uniqueRows), ("duplicate512", duplicateRows)] {
+                    let before = table.ioStats()
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    var checksum: Float = 0
+                    for _ in 0..<8 {
+                        checksum += try table.gather(rows, parallelRows: parallel).last ?? 0
+                    }
+                    let ns = DispatchTime.now().uptimeNanoseconds - start
+                    print("PLE_REAL_BENCH round=\(round) parallel=\(parallel) case=\(label) "
+                        + "iterations=8 ns=\(ns) bytes=\(table.ioStats().payloadBytesRead - before.payloadBytesRead) "
+                        + "checksum=\(checksum) dimensions=\(table.dimensions)")
+                }
+            }
+        }
     }
 
     @Test("local Qwen4Exp variants validate every PLE shard and use exact SSD reads")
