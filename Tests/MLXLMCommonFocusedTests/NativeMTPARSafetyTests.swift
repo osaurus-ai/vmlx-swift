@@ -16,6 +16,24 @@ final class NativeMTPARSafetyTests: XCTestCase {
 
     private typealias V = NativeMTPTokenIterator
 
+    func testProductionMarginDoesNotDeliberatelyPermitSustainedSlowdown() {
+        // Same context, sustained 5% loss: both the window and median must
+        // reject it. This pins the production threshold, not a test override.
+        let samples = ring(Array(repeating: 42, count: 8))
+        let verdict = V.windowedARVerdict(
+            arStepMs: 10, firstVerifyMs: 12, windowCycles: 8,
+            deltaEmitted: 32, deltaWallMs: 336, deltaVerifyMs: 96,
+            margin: V.arSafetyMargin)
+        XCTAssertNotNil(verdict)
+        XCTAssertGreaterThan(V.medianCycleMsPerToken(samples)!, 10 * V.arSafetyMargin)
+        for cost in [9.0, 10.0] {
+            XCTAssertNil(V.windowedARVerdict(
+                arStepMs: 10, firstVerifyMs: 12, windowCycles: 8,
+                deltaEmitted: 32, deltaWallMs: cost * 32, deltaVerifyMs: 96,
+                margin: V.arSafetyMargin))
+        }
+    }
+
     func testResumeProbeCompletesAtSixCyclesNotTwelve() {
         var remaining = 6
         var samples = [V.ARSafetySample(emitted: 40, wall: 1, verifyTotal: 0)]

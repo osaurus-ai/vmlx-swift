@@ -481,7 +481,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// d3), a later drop is caught within ~8 cycles (~0.3 s).
     private static let arSafetyWindow = 8
     private static let arSafetyWarmupCycles = 8
-    private static let arSafetyMargin = 1.25
+    // Do not deliberately retain sustained MTP losses. The median guard
+    // rejects isolated stalls; re-entry has its own stricter hysteresis.
+    // This windowed estimate is not an instantaneous AR speed guarantee.
+    static let arSafetyMargin = 1.0
     private static let arSafetyProbeWindow = 6
 
     /// Advance once per completed verify cycle, including while the timing
