@@ -60,13 +60,13 @@ enum ResidentSafetensorsReader {
         guard fstat(file.fileDescriptor, &status) == 0, status.st_size >= 8 else {
             throw InvalidFile(detail: "missing or short file")
         }
-        let prefix = try readExactly(file, count: 8)
+        let prefix = try readExactly(file, count: 8, fileSize: Int(status.st_size))
         let length = prefix.enumerated().reduce(UInt64(0)) { $0 | UInt64($1.element) << (8 * $1.offset) }
         guard length > 0, length <= 64 * 1024 * 1024,
             length <= UInt64(status.st_size - 8) else {
             throw InvalidFile(detail: "header length out of bounds")
         }
-        let header = try JSONDecoder().decode(Header.self, from: readExactly(file, count: Int(length)))
+        let header = try JSONDecoder().decode(Header.self, from: readExactly(file, count: Int(length), fileSize: Int(status.st_size)))
         let dataStart = 8 + Int(length)
         let dataLength = Int(status.st_size) - dataStart
         // Validate every entry before allocating any tensors, including excluded
@@ -109,7 +109,7 @@ enum ResidentSafetensorsReader {
         for (name, entry) in ordered where !excludingKeys.contains(name) {
             try autoreleasepool {
                 try file.seek(toOffset: UInt64(dataStart + entry.data_offsets[0]))
-                let data = try readExactly(file, count: entry.data_offsets[1] - entry.data_offsets[0])
+                let data = try readExactly(file, count: entry.data_offsets[1] - entry.data_offsets[0], fileSize: Int(status.st_size))
                 let array = MLXArray(data, entry.shape, dtype: dtypes[entry.dtype]!)
                 MLX.eval(array)
                 arrays[name] = array
@@ -121,14 +121,41 @@ enum ResidentSafetensorsReader {
         #endif
     }
 
-    private static func readExactly(_ file: FileHandle, count: Int) throws -> Data {
+    private static func readExactly(_ file: FileHandle, count: Int, fileSize: Int) throws -> Data {
+        #if canImport(Darwin)
+        let offset = try file.offset()
+        guard offset <= UInt64(fileSize), count >= 0, count <= fileSize - Int(offset) else {
+            throw InvalidFile(detail: "read range out of bounds")
+        }
+        if count == 0 { return Data() }
+        let start = Int(offset)
+        let end = start + count
+        let page = Int(getpagesize())
+        // Unaligned large reads can populate the filesystem cache even with
+        // F_NOCACHE. Read page-aligned ranges and retain only the requested bytes.
+        // This is I/O alignment, not a rewrite of the safetensors bundle.
+        var position = start - start % page
+        let padding = end % page == 0 ? 0 : min(page - end % page, fileSize - end)
+        let physicalEnd = end + padding
+        try file.seek(toOffset: UInt64(position))
         var result = Data()
         result.reserveCapacity(count)
-        while result.count < count {
-            guard let chunk = try file.read(upToCount: min(count - result.count, 4 * 1024 * 1024)),
-                !chunk.isEmpty else { throw InvalidFile(detail: "unexpected end of file") }
-            result.append(chunk)
+        while position < physicalEnd {
+            let remaining = physicalEnd - position
+            // Keep a partial EOF page separate from the aligned bulk read.
+            let amount = remaining < page ? remaining : min(remaining / page * page, 4 * 1024 * 1024)
+            guard let chunk = try file.read(upToCount: amount), chunk.count == amount else {
+                throw InvalidFile(detail: "short aligned read")
+            }
+            let lower = max(start - position, 0)
+            let upper = min(end - position, amount)
+            if lower < upper { result.append(chunk[lower..<upper]) }
+            position += amount
         }
+        try file.seek(toOffset: UInt64(end))
         return result
+        #else
+        throw InvalidFile(detail: "uncached owned reader requires Darwin")
+        #endif
     }
 }

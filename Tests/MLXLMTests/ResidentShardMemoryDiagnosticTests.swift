@@ -47,11 +47,27 @@ struct ResidentShardMemoryDiagnosticTests {
             print("RESIDENT_REAL dtypes=\(selectedTypes.sorted())")
             print("RESIDENT_REAL file=\(path) bytes=\(bytes) keys=\(selected.sorted()) cache_temperature=unknown")
             if let arm = ProcessInfo.processInfo.environment["VMLX_RESIDENT_READ_ARM"] {
-                try #require(arm == "mapped" || arm == "direct")
+                try #require(arm == "mapped" || arm == "direct" || arm == "resident")
+                func fileResidency(_ stage: String) throws {
+                    var status = stat()
+                    try #require(fstat(input.fileDescriptor, &status) == 0)
+                    let size = Int(status.st_size)
+                    let mapping = mmap(nil, size, PROT_NONE, MAP_SHARED, input.fileDescriptor, 0)
+                    try #require(mapping != MAP_FAILED)
+                    defer { munmap(mapping, size) }
+                    let pageSize = Int(getpagesize())
+                    var states = [CChar](repeating: 0, count: (size + pageSize - 1) / pageSize)
+                    try #require(mincore(mapping, size, &states) == 0)
+                    print("FILE_RESIDENCY stage=\(stage) pages=\(states.filter { ($0 & 1) != 0 }.count) pageSize=\(pageSize) mlxActive=\(MLX.Memory.activeMemory) mlxCache=\(MLX.Memory.cacheMemory)")
+                }
                 MLX.Memory.clearCache()
                 try sample("\(arm)-start")
+                try fileResidency("before")
                 var values: [String: MLXArray] = [:]
-                if arm == "mapped" {
+                if arm == "resident" {
+                    let excluded = Set(header.keys).subtracting(selected).subtracting(["__metadata__"])
+                    (values, _) = try ResidentSafetensorsReader.load(url: url, excludingKeys: excluded)
+                } else if arm == "mapped" {
                     try autoreleasepool {
                         let excluded = Set(header.keys).subtracting(selected).subtracting(["__metadata__"])
                         let (mapped, _) = try loadArraysAndMetadata(url: url, excludingKeys: excluded, exactTensorBuffers: true)
@@ -81,11 +97,13 @@ struct ResidentShardMemoryDiagnosticTests {
                 #expect(Set(values.keys) == selected)
                 #expect(values.values.reduce(0) { $0 + $1.nbytes } == bytes)
                 try sample("\(arm)-owned-live")
+                try fileResidency("owned-live")
                 MLX.Memory.clearCache()
                 try sample("\(arm)-owned-live-cache-cleared")
                 values.removeAll()
                 MLX.Memory.clearCache()
                 try sample("\(arm)-released")
+                try fileResidency("released")
                 return
             }
             let excluded = Set(header.keys).subtracting(selected).subtracting(["__metadata__"])

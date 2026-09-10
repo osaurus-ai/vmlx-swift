@@ -5,6 +5,20 @@ import Testing
 
 @Suite(.serialized)
 struct ResidentSafetensorsReaderTests {
+    @Test func unalignedPayloadCrossesReadChunkAndPartialEOF() throws {
+        try MLXMetalTestLock.withLock {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("resident-chunks-\(UUID()).safetensors")
+            defer { try? FileManager.default.removeItem(at: url) }
+            // A little over the 4-MiB physical read chunk, with a partial EOF page.
+            let expected = MLXArray((0..<(1024 * 1024 + 3)).map { UInt32($0) })
+            try MLX.save(arrays: ["w": expected], url: url)
+            let (loaded, _) = try ResidentSafetensorsReader.load(url: url, excludingKeys: [])
+            let actual = try #require(loaded["w"])
+            #expect(actual.shape == expected.shape && actual.dtype == expected.dtype)
+            #expect(MLX.all(actual .== expected).item(Bool.self))
+        }
+    }
+
     @Test func nullMetadataMatchesAbsentMetadata() throws {
         // Real Flash Next shards 6, 7 and 13 carry __metadata__: null.
         // Exclude the payload: this regression exercises header parsing only.
