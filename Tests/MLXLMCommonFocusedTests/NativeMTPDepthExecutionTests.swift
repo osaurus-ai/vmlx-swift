@@ -7,6 +7,51 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testSampledAcceptancePauseCanProbeAgain() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
+            throw XCTSkip("Requires the production AR-safety governor")
+        }
+        try FocusedMLXTestSupport.withLock {
+            let model = DepthDispatchTarget(
+                draftLogits: [100, -100, -100, -100], backboneDelay: 0.005,
+                trackKV: true)
+            var parameters = GenerateParameters(maxTokens: 160, temperature: 1)
+            parameters.randomSeed = 829
+            parameters.draftStrategy = .nativeMTP(depth: 1)
+            parameters.nativeMTPDepthPolicy = .fixed
+            var iterator = try NativeMTPTokenIterator(
+                input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                parameters: parameters, depth: 1)
+            let start = ProcessInfo.processInfo.systemUptime
+            var count = 0
+            var verifiesAtChange = 0
+            var previousAR = 0
+            while count < 160, let token = iterator.next() {
+                count += 1
+                XCTAssertEqual(token, 1, "Rejected proposals must never enter target output")
+                if iterator.autoregressiveFallbackTokenCount > previousAR {
+                    previousAR = iterator.autoregressiveFallbackTokenCount
+                    let kv = try XCTUnwrap(iterator.cache.last as? KVCacheSimple)
+                    XCTAssertEqual(kv.offset, 3 + count - 1)
+                    let state = try XCTUnwrap(kv.readKV())
+                    XCTAssertEqual(state.keys.asArray(Int32.self), (0..<kv.offset).map(Int32.init))
+                    XCTAssertEqual(state.values.asArray(Int32.self), Array(repeating: 1, count: kv.offset))
+                }
+                if count == 64 {
+                    verifiesAtChange = iterator.verifyCalls
+                    model.useTargetAsDraft = true
+                }
+            }
+            XCTAssertEqual(count, 160)
+            XCTAssertGreaterThan(iterator.sequentialVerifierCount, 0)
+            XCTAssertEqual(iterator.stagedVerifierCommitCount, 0)
+            XCTAssertGreaterThan(iterator.rejectedCount, 0)
+            XCTAssertGreaterThan(iterator.autoregressiveFallbackTokenCount, 2)
+            XCTAssertGreaterThan(iterator.verifyCalls, verifiesAtChange,
+                "An acceptance-based AR pause must probe again after proposal quality changes")
+            print("SAMPLED-RECOVERY verifiesAtChange=\(verifiesAtChange) finalVerifies=\(iterator.verifyCalls) trips=\(iterator.arSafetyTrips) fixtureTokS=\(Double(count) / (ProcessInfo.processInfo.systemUptime - start)) fullCacheProof=false realModelSpeedProof=false")
+        }
+    }
     func testSuccessfulResumeUsesRecentlyMeasuredARCostForLaterLoss() throws {
         guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
             throw XCTSkip("Requires the production AR-safety governor")
@@ -280,6 +325,7 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
     private let verifyDelay: TimeInterval
     private let trackKV: Bool
     var draftCalls = 0
+    var useTargetAsDraft = false
     init(
         targetLogits: [Float] = [-100, 100, -100, -100],
         draftLogits: [Float] = [-100, 100, -100, -100],
@@ -327,7 +373,7 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
         draftCalls += 1
         let delay = timingLock.withLock { draftDelay }
         if delay > 0 { Thread.sleep(forTimeInterval: delay) }
-        return result(nextTokenIds, logits: draftLogits)
+        return result(nextTokenIds, logits: useTargetAsDraft ? targetLogits : draftLogits)
     }
     func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool { true }
     private func appendKV(_ inputs: MLXArray, cache: [KVCache]?) {

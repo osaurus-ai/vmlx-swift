@@ -2374,7 +2374,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpDraftTime += NativeMTPClock.now() - draftStart
     }
 
-    private mutating func recordAdaptiveCycle(accepted: Int) {
+    private mutating func recordAdaptiveCycle(accepted: Int, committedSequentially: Bool = false) {
         // While the AR-safety governor holds the request in AR (or is
         // probing a resume) the depth controller must not also act: one
         // decision per window, one owner.
@@ -2592,14 +2592,18 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         if currentDepth == 1, acceptanceRatio < depthOneFloor, !inRestoredGraceWindow {
-            // Under the staged verifier with the governor on, "d1 doesn't
+            // Under a committed verifier with the governor on, "d1 doesn't
             // pay" is a REVERSIBLE verdict: pause to AR and let the governor's
             // probes bring MTP back when the regime changes. Live (4M prose,
             // build #4): this irreversible fallback fired on 6/8 prose gens
             // BEFORE the governor could act, locking 55–366 AR tokens per
             // turn — the "never recovers" behaviour the governor exists to
-            // end. The lazy-repair verifier keeps the irreversible fallback.
-            if staged, !Self.arSafetyDisabled {
+            // end. Sampled sequential verification also commits only accepted
+            // inputs before reaching this callback, and its ordinary governor
+            // pauses already support re-entry. Do not confuse it with a chunk
+            // lazy-repair path, which retains the irreversible safety fallback.
+            let resumableSampled = committedSequentially && !speculativeSampler.isGreedy
+            if (staged || resumableSampled), !Self.arSafetyDisabled {
                 arSafetyPause(
                     reason: String(
                         format: "adaptive_accept_ratio=%.2f_depth=1_paused",
@@ -2851,7 +2855,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         nextMain = nextToken
         arSafetyAfterVerifyCycle(accepted: accepted)
-        recordAdaptiveCycle(accepted: accepted)
+        recordAdaptiveCycle(accepted: accepted, committedSequentially: true)
         if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
             draftProbabilities.removeAll(keepingCapacity: true)
