@@ -1,3 +1,5 @@
+// Frozen pre-optimization mask reference from runtime 1f41c51e.
+// Test-only: retain token-level membership as an independent regression oracle.
 // Copyright © 2026 Apple Inc.
 
 // Qwen 3.8 Next Flash (qwen4_exp) — QSA (Qwen Sparse Attention) block
@@ -13,7 +15,7 @@
 import Foundation
 import MLX
 
-enum Qwen4ExpQSA {
+enum Qwen4ExpQSAOriginalReference {
     /// Boolean attention mask [B, 1, T, keyLen] from indexer scores.
     ///
     /// - Parameters:
@@ -59,8 +61,12 @@ enum Qwen4ExpQSA {
         // selectedBlocks: [B, T, blockTopK]
 
         let tokenIdx = MLXArray((0 ..< keyLen).map(Int32.init))  // [keyLen]
-        let selectedTokens = tokenMembership(
-            selectedBlocks: selectedBlocks, keyLen: keyLen, compressRatio: compressRatio)
+        let tokenBlocks = floorDivide(tokenIdx, MLXArray(Int32(compressRatio)))
+        let selectedTokens = MLX.any(
+            MLX.equal(
+                tokenBlocks.reshaped(1, 1, 1, keyLen),
+                expandedDimensions(selectedBlocks, axis: -1)),
+            axis: 2)
         // selectedTokens: [B, T, keyLen]
 
         // The incomplete tail block up to each query position always attends.
@@ -80,23 +86,5 @@ enum Qwen4ExpQSA {
             causal)
         return expandedDimensions(mask, axis: 1)  // [B, 1, T, keyLen]
     }
-
-    /// Membership is constant within a compressed block. Compare each selected
-    /// block once, then expand the boolean result, instead of constructing a
-    /// [B,T,K,keyLen] equality temporary. The partial final block is included
-    /// in this grid; the caller retains ownership of causal and tail masking.
-    static func tokenMembership(
-        selectedBlocks: MLXArray, keyLen: Int, compressRatio: Int
-    ) -> MLXArray {
-        let blocks = (keyLen + compressRatio - 1) / compressRatio
-        let ids = MLXArray((0..<blocks).map(Int32.init))
-        let membership = MLX.any(
-            MLX.equal(ids.reshaped(1, 1, 1, blocks),
-                expandedDimensions(selectedBlocks, axis: -1)), axis: 2)
-        let batch = selectedBlocks.dim(0), queries = selectedBlocks.dim(1)
-        return broadcast(
-            expandedDimensions(membership, axis: -1),
-            to: [batch, queries, blocks, compressRatio])
-            .reshaped(batch, queries, blocks * compressRatio)[.ellipsis, ..<keyLen]
-    }
 }
+
