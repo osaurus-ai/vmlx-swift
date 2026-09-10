@@ -458,7 +458,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// Wall of one TRUE single-token AR step measured after eval — the first
     /// decode cycle runs AR precisely to capture this (the seed forward is
     /// prompt-sized here, not an AR step; the lazy-eval trap is avoided by
-    /// timing after `MLX.eval`).
+    /// timing after `MLX.eval`). After a successful resume this anchor is
+    /// refreshed from the AR steps measured during the preceding pause.
     private var arSafetySeedStepSec: TimeInterval?
     private var arSafetySeedFirstSampleSec: TimeInterval?
     /// First MTP cycle's verify-forward wall; verify growth over it tracks
@@ -2239,13 +2240,26 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             } else {
                 arSafetyResumes += 1
                 arSafetyReentered = true
+                // The probe won against current-context AR, not startup AR.
+                // Keep that same measurement for ordinary windows after the
+                // resume. Re-anchor verify timing at the probe as well: mixing
+                // a new AR measurement with the startup verify duration would
+                // apply the old context-growth estimate a second time.
+                if let liveStep = arSafetyLiveStepSec, liveStep.isFinite, liveStep > 0 {
+                    arSafetySeedStepSec = liveStep
+                    let probeVerifySec = deltaVerifyMs / Double(window) / 1000
+                    arSafetyFirstVerifySec = probeVerifySec.isFinite && probeVerifySec > 0
+                        ? probeVerifySec : nil
+                }
                 // The interval is NOT reset here: a re-entry that trips again
                 // backs off from where it was (no ping-pong); it resets only
                 // when the generation ends.
                 adaptiveFallbackReason = nil
                 FileHandle.standardError.write(Data(String(
-                    format: "[NativeMTP] ar_safety resumed: mtp=%.1fms/tok live_ar=%.1fms depth=%d\n",
-                    mtpMsPerToken, liveArMs, currentDepth).utf8))
+                    format: "[NativeMTP] ar_safety resumed: mtp=%.1fms/tok live_ar=%.1fms depth=%d ordinary_ar=%.1fms verify_anchor=%.1fms\n",
+                    mtpMsPerToken, liveArMs, currentDepth,
+                    (arSafetySeedStepSec ?? 0) * 1000,
+                    (arSafetyFirstVerifySec ?? 0) * 1000).utf8))
             }
             return
         }

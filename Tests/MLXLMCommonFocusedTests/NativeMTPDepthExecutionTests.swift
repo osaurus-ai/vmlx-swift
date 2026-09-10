@@ -7,6 +7,53 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testSuccessfulResumeUsesRecentlyMeasuredARCostForLaterLoss() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
+            throw XCTSkip("Requires the production AR-safety governor")
+        }
+        try FocusedMLXTestSupport.withLock {
+            // Controlled host delays, not model performance: expensive startup
+            // AR, then cheaper live AR, a winning resume and a subsequent loss.
+            let model = DepthDispatchTarget(
+                draftDelay: 0.100, backboneDelay: 0.020, verifyDelay: 0.004)
+            var parameters = GenerateParameters(maxTokens: 320, temperature: 0)
+            parameters.draftStrategy = .nativeMTP(depth: 3)
+            parameters.nativeMTPDepthPolicy = .fixed
+            var iterator = try NativeMTPTokenIterator(
+                input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                parameters: parameters, depth: 3)
+            var enteredPause = false
+            var resumedAt: Int?
+            var count = 0
+            let start = ProcessInfo.processInfo.systemUptime
+            while count < 320, let token = iterator.next() {
+                count += 1
+                XCTAssertEqual(token, 1)
+                if !enteredPause, iterator.arSafetyTrips > 0 {
+                    enteredPause = true
+                    model.setDelays(draft: 0, backbone: 0.004)
+                }
+                if resumedAt == nil, iterator.arSafetyResumes > 0 {
+                    resumedAt = iterator.verifyCalls
+                    // ~16ms/token now loses to live AR ~4ms, but looks cheap
+                    // against the stale startup AR ~20ms. Verify width is fixed.
+                    model.setDelays(draft: 0.020, backbone: 0.004)
+                }
+                if let resumedAt,
+                    iterator.arSafetyTrips >= 2 || iterator.verifyCalls >= resumedAt + 12
+                { break }
+            }
+            XCTAssertTrue(enteredPause, "Control must enter the initial AR pause")
+            XCTAssertNotNil(resumedAt, "Control must complete a winning resume probe")
+            XCTAssertGreaterThanOrEqual(iterator.arSafetyTrips, 2,
+                "A later loss must use the recent AR measurement, not the startup seed")
+            if let resumedAt {
+                XCTAssertLessThanOrEqual(iterator.verifyCalls - resumedAt, 12)
+            }
+            print("GOVERNOR-REENTRY tokens=\(count) fixtureTokS=\(Double(count) / (ProcessInfo.processInfo.systemUptime - start)) trips=\(iterator.arSafetyTrips) resumes=\(iterator.arSafetyResumes) resumedAt=\(String(describing: resumedAt)) finalVerify=\(iterator.verifyCalls) realModelSpeedProof=false")
+        }
+    }
+
     func testGovernorCalibrationDoesNotBuildDiscardedInitialDrafts() throws {
         guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
             throw XCTSkip("Requires governor calibration")
@@ -227,19 +274,23 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
     var verifyWidths: [Int] = []
     private let targetLogits: MLXArray
     private let draftLogits: MLXArray
-    private let draftDelay: TimeInterval
-    private let backboneDelay: TimeInterval
+    private let timingLock = NSLock()
+    private var draftDelay: TimeInterval
+    private var backboneDelay: TimeInterval
+    private let verifyDelay: TimeInterval
     private let trackKV: Bool
     var draftCalls = 0
     init(
         targetLogits: [Float] = [-100, 100, -100, -100],
         draftLogits: [Float] = [-100, 100, -100, -100],
-        draftDelay: TimeInterval = 0, backboneDelay: TimeInterval = 0, trackKV: Bool = false
+        draftDelay: TimeInterval = 0, backboneDelay: TimeInterval = 0,
+        verifyDelay: TimeInterval = 0, trackKV: Bool = false
     ) {
         self.targetLogits = MLXArray(targetLogits)
         self.draftLogits = MLXArray(draftLogits)
         self.draftDelay = draftDelay
         self.backboneDelay = backboneDelay
+        self.verifyDelay = verifyDelay
         self.trackKV = trackKV
         super.init()
     }
@@ -247,6 +298,12 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
         trackKV ? [MambaCache(), KVCacheSimple()] : [MambaCache()]
     }
     func makeNativeMTPCache() -> [KVCache] { [] }
+    func setDelays(draft: TimeInterval, backbone: TimeInterval) {
+        timingLock.withLock {
+            draftDelay = draft
+            backboneDelay = backbone
+        }
+    }
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
         .tokens(input.text)
     }
@@ -255,18 +312,21 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
         return result(inputs).logits
     }
     func nativeBackboneForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
-        if backboneDelay > 0 { Thread.sleep(forTimeInterval: backboneDelay) }
+        let delay = timingLock.withLock { backboneDelay }
+        if delay > 0 { Thread.sleep(forTimeInterval: delay) }
         appendKV(inputs, cache: cache)
         return result(inputs)
     }
     func nativeBackboneMTPVerifyForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
+        if verifyDelay > 0 { Thread.sleep(forTimeInterval: verifyDelay) }
         verifyWidths.append(inputs.ndim >= 2 ? inputs.dim(1) : inputs.size)
         appendKV(inputs, cache: cache)
         return result(inputs)
     }
     func nativeMTPForward(hiddenStates: MLXArray, nextTokenIds: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
         draftCalls += 1
-        if draftDelay > 0 { Thread.sleep(forTimeInterval: draftDelay) }
+        let delay = timingLock.withLock { draftDelay }
+        if delay > 0 { Thread.sleep(forTimeInterval: delay) }
         return result(nextTokenIds, logits: draftLogits)
     }
     func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool { true }
