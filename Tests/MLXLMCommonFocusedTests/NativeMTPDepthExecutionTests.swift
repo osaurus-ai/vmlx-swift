@@ -7,6 +7,87 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testEarlyStopAbandonsPrefetchedKVRows() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] != "0" else {
+            throw XCTSkip("Requires prefetch enabled")
+        }
+        try FocusedMLXTestSupport.withLock {
+            let model = DepthDispatchTarget(trackKV: true)
+            var parameters = GenerateParameters(maxTokens: 80, temperature: 0)
+            parameters.draftStrategy = .nativeMTP(depth: 3)
+            parameters.nativeMTPDepthPolicy = .fixed
+            var iterator = try NativeMTPTokenIterator(
+                input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                parameters: parameters, depth: 3)
+            let started = ProcessInfo.processInfo.systemUptime
+            var tokens: [Int] = []
+            while iterator.verifyPrefetchSubmitCount == 0, tokens.count < 40,
+                  let token = iterator.next() { tokens.append(token) }
+            XCTAssertGreaterThan(iterator.verifyPrefetchSubmitCount, 0)
+            let committed = iterator.acceptedByDepth.reduce(0) { $0 + ($1.key + 1) * $1.value }
+            let expectedOffset = 3 + 1 + iterator.autoregressiveFallbackTokenCount + committed
+            XCTAssertGreaterThan(iterator.cache.last!.offset, expectedOffset,
+                                 "The control must have speculative KV rows outstanding")
+            iterator.storeCacheAfterGeneration(generatedTokenIds: tokens, includeGeneratedBoundary: false)
+            XCTAssertEqual(iterator.verifyPrefetchAbandonedCount, 1)
+            let kv = try XCTUnwrap(iterator.cache.last as? KVCacheSimple)
+            XCTAssertEqual(kv.offset, expectedOffset)
+            let state = try XCTUnwrap(kv.readKV())
+            XCTAssertEqual(state.keys.asArray(Int32.self), (0..<expectedOffset).map(Int32.init))
+            XCTAssertEqual(state.values.asArray(Int32.self), Array(repeating: 1, count: expectedOffset))
+            print("PREFETCH-STOP fixtureTokS=\(Double(tokens.count) / (ProcessInfo.processInfo.systemUptime - started)) restoredOffset=\(kv.offset) diskProof=false")
+        }
+    }
+    func testGovernorPausePreservesCommittedTokensAndBoundsResumeProbe() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
+            throw XCTSkip("Governor-on fixture requires AR safety enabled")
+        }
+        try FocusedMLXTestSupport.withLock {
+            let model = DepthDispatchTarget(draftDelay: 0.010, backboneDelay: 0.001, trackKV: true)
+            var parameters = GenerateParameters(maxTokens: 240, temperature: 0)
+            parameters.draftStrategy = .nativeMTP(depth: 3)
+            parameters.nativeMTPDepthPolicy = .fixed
+            var iterator = try NativeMTPTokenIterator(
+                input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                parameters: parameters, depth: 3)
+            var count = 0
+            var previousAR = 0
+            var pauses: [Int] = []
+            let started = ProcessInfo.processInfo.systemUptime
+            while count < 240 {
+                let oldTrips = iterator.arSafetyTrips
+                let oldDrafts = model.draftCalls
+                guard let token = iterator.next() else { break }
+                count += 1
+                XCTAssertEqual(token, 1)
+                if iterator.arSafetyTrips > oldTrips {
+                    pauses.append(iterator.verifyCalls)
+                    XCTAssertEqual(model.draftCalls, oldDrafts,
+                                   "A paused cycle must not build another draft batch")
+                }
+                if iterator.autoregressiveFallbackTokenCount > previousAR {
+                    previousAR = iterator.autoregressiveFallbackTokenCount
+                    let committed = iterator.acceptedByDepth.reduce(0) { $0 + ($1.key + 1) * $1.value }
+                    XCTAssertEqual(count, 2 + previousAR + committed,
+                                   "AR resumed before all verified tokens reached the consumer")
+                    let kv = try XCTUnwrap(iterator.cache.last as? KVCacheSimple)
+                    XCTAssertEqual(kv.offset, 3 + count - 1)
+                    let state = try XCTUnwrap(kv.readKV())
+                    XCTAssertEqual(state.keys.asArray(Int32.self), (0..<kv.offset).map(Int32.init))
+                    XCTAssertEqual(state.values.asArray(Int32.self), Array(repeating: 1, count: kv.offset))
+                    if pauses.count >= 2 { break }
+                }
+            }
+            XCTAssertGreaterThanOrEqual(pauses.count, 2)
+            if pauses.count >= 2 { XCTAssertEqual(pauses[1] - pauses[0], 6) }
+            XCTAssertGreaterThan(iterator.stagedVerifierCommitCount, 0)
+            if ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] != "0" {
+                XCTAssertGreaterThan(iterator.verifyPrefetchConsumedCount, 0)
+            }
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            print("GOVERNOR-FIXTURE pauses=\(pauses) tokens=\(count) fixtureTokS=\(Double(count) / elapsed) prefetchConsumed=\(iterator.verifyPrefetchConsumedCount) kvPositionProof=true recurrentStateProof=false")
+        }
+    }
     func testFixedDepthsBoundExecutedVerifyWidths() throws {
         try requireIsolatedDepthRun()
         try FocusedMLXTestSupport.withLock {
@@ -114,36 +195,62 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
 private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
     KVCacheDimensionProvider, DFlash2StagedVerifyRollbackModel, @unchecked Sendable
 {
-    var kvHeads: [Int] { [1] }
+    var kvHeads: [Int] { trackKV ? [1, 1] : [1] }
     var nativeMTPAvailable: Bool { true }
     var verifyWidths: [Int] = []
     private let targetLogits: MLXArray
     private let draftLogits: MLXArray
+    private let draftDelay: TimeInterval
+    private let backboneDelay: TimeInterval
+    private let trackKV: Bool
+    var draftCalls = 0
     init(
         targetLogits: [Float] = [-100, 100, -100, -100],
-        draftLogits: [Float] = [-100, 100, -100, -100]
+        draftLogits: [Float] = [-100, 100, -100, -100],
+        draftDelay: TimeInterval = 0, backboneDelay: TimeInterval = 0, trackKV: Bool = false
     ) {
         self.targetLogits = MLXArray(targetLogits)
         self.draftLogits = MLXArray(draftLogits)
+        self.draftDelay = draftDelay
+        self.backboneDelay = backboneDelay
+        self.trackKV = trackKV
         super.init()
     }
-    func newCache(parameters: GenerateParameters?) -> [KVCache] { [MambaCache()] }
+    func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        trackKV ? [MambaCache(), KVCacheSimple()] : [MambaCache()]
+    }
     func makeNativeMTPCache() -> [KVCache] { [] }
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
         .tokens(input.text)
     }
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray { result(inputs).logits }
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        appendKV(inputs, cache: cache)
+        return result(inputs).logits
+    }
     func nativeBackboneForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
-        result(inputs)
+        if backboneDelay > 0 { Thread.sleep(forTimeInterval: backboneDelay) }
+        appendKV(inputs, cache: cache)
+        return result(inputs)
     }
     func nativeBackboneMTPVerifyForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
         verifyWidths.append(inputs.ndim >= 2 ? inputs.dim(1) : inputs.size)
+        appendKV(inputs, cache: cache)
         return result(inputs)
     }
     func nativeMTPForward(hiddenStates: MLXArray, nextTokenIds: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
-        result(nextTokenIds, logits: draftLogits)
+        draftCalls += 1
+        if draftDelay > 0 { Thread.sleep(forTimeInterval: draftDelay) }
+        return result(nextTokenIds, logits: draftLogits)
     }
     func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool { true }
+    private func appendKV(_ inputs: MLXArray, cache: [KVCache]?) {
+        guard trackKV, let kv = cache?.last as? KVCacheSimple else { return }
+        let count = inputs.size
+        let positions = MLXArray((kv.offset..<(kv.offset + count)).map(Int32.init))
+        let arrays = kv.update(keys: positions.reshaped(1, 1, count, 1),
+                               values: inputs.reshaped(1, 1, count, 1))
+        MLX.eval(arrays.0, arrays.1)
+    }
     func commitStagedVerifiedBlock(cache: [KVCache], acceptedInputs: Int, blockLength: Int) -> Bool { true }
     private func result(_ inputs: MLXArray, logits: MLXArray? = nil) -> NativeMTPForwardResult {
         let length = inputs.ndim >= 2 ? inputs.dim(1) : inputs.size

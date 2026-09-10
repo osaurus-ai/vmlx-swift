@@ -439,7 +439,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     //
     // Runs every cycle regardless of depth policy (fixed or adaptive): if a
     // WINDOWED MTP ms/token exceeds a context-scaled AR baseline, the request
-    // pauses speculation and decodes AR "instantaneously"; while paused it
+    // pauses speculation and returns to AR; while paused it
     // measures the live AR step cost and periodically PROBES a resume at the
     // starting depth, keeping MTP only if the probe window beats live AR.
     // Design + audit trail: docs/internal/MTP-AR-SAFETY-GOVERNOR-SWIFT-2026-09-04.md
@@ -479,6 +479,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static let arSafetyWarmupCycles = 8
     private static let arSafetyMargin = 1.25
     private static let arSafetyProbeWindow = 6
+
+    /// Advance once per completed verify cycle, including while the timing
+    /// ring is filling. Waiting for a full ring before counting doubles the
+    /// probe's exposure to a losing depth.
+    static func advanceARSafetyProbe(remaining: inout Int) -> Bool {
+        guard remaining > 0 else { return false }
+        remaining -= 1
+        return remaining == 0
+    }
     /// Re-probe after 16, 32, 64… AR tokens (×2 per lost probe, ×4 on a
     /// clear loss); a kept re-entry that trips again backs off further.
     private static let arSafetyResumeIntervalStart = 16
@@ -1730,8 +1739,6 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         verifyCalls += 1
         acceptedByDepth[accepted, default: 0] += 1
-        arSafetyAfterVerifyCycle(accepted: accepted)
-        recordAdaptiveCycle(accepted: accepted)
         if Self.traceEnabled {
             let requestedIDs = recordMaterializeSync { requested.map { $0.item(Int.self) } }
             let currentDrafts = drafts
@@ -1923,7 +1930,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         nextMain = nextToken
-        if forceAutoregressiveFallback {
+        // Controllers may clear drafts. Only invoke them after the accepted
+        // proposals have been queued and their cache state committed.
+        arSafetyAfterVerifyCycle(accepted: accepted)
+        recordAdaptiveCycle(accepted: accepted)
+        if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
             draftProbabilities.removeAll(keepingCapacity: true)
             return
@@ -2115,7 +2126,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         arSafetyRing.append(
             ARSafetySample(
                 emitted: arSafetyEmittedTotal, wall: now, verifyTotal: targetVerifyTime))
-        let window = arSafetyProbeCyclesRemaining > 0
+        let wasProbe = arSafetyProbeCyclesRemaining > 0
+        let probeComplete = Self.advanceARSafetyProbe(remaining: &arSafetyProbeCyclesRemaining)
+        let window = wasProbe
             ? Self.arSafetyProbeWindow : arSafetyWindowForRequest
         if arSafetyRing.count > window + 1 {
             arSafetyRing.removeFirst(arSafetyRing.count - (window + 1))
@@ -2131,9 +2144,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let deltaWallMs = (newest.wall - oldest.wall) * 1000
         let deltaVerifyMs = (newest.verifyTotal - oldest.verifyTotal) * 1000
 
-        if arSafetyProbeCyclesRemaining > 0 {
-            arSafetyProbeCyclesRemaining -= 1
-            guard arSafetyProbeCyclesRemaining == 0 else { return }
+        if wasProbe {
+            guard probeComplete else { return }
             // Probe verdict against the LIVE AR cost measured while paused
             // (already at the current context — no scaling needed). MTP must
             // WIN outright to stay; otherwise pause again with backoff.
@@ -2245,6 +2257,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         currentDepth = depth
         arSafetyRing.removeAll(keepingCapacity: true)
         arSafetyProbeCyclesRemaining = probe ? Self.arSafetyProbeWindow : 0
+        if probe {
+            // Anchor before drafting so the first cycle and re-prime cost
+            // are priced, not dropped from the resume decision.
+            arSafetyRing.append(ARSafetySample(
+                emitted: arSafetyEmittedTotal, wall: NativeMTPClock.now(),
+                verifyTotal: targetVerifyTime))
+        }
         let draftStart = NativeMTPClock.now()
         let draftBatch = Self.makeDrafts(
             model: model,
@@ -2723,8 +2742,6 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         acceptedByDepth[accepted, default: 0] += 1
-        arSafetyAfterVerifyCycle(accepted: accepted)
-        recordAdaptiveCycle(accepted: accepted)
         prefixCommitCount += 1
 
         guard let nextToken, let hiddenForNextMTP else {
@@ -2742,7 +2759,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         nextMain = nextToken
-        if forceAutoregressiveFallback {
+        arSafetyAfterVerifyCycle(accepted: accepted)
+        recordAdaptiveCycle(accepted: accepted)
+        if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
             draftProbabilities.removeAll(keepingCapacity: true)
             return
