@@ -81,19 +81,27 @@ enum Qwen4ExpQSA {
         return expandedDimensions(mask, axis: 1)  // [B, 1, T, keyLen]
     }
 
-    /// Membership is constant within a compressed block. Compare each selected
-    /// block once, then expand the boolean result, instead of constructing a
-    /// [B,T,K,keyLen] equality temporary. The partial final block is included
-    /// in this grid; the caller retains ownership of causal and tail masking.
+    /// Scatter selected block membership, then expand to tokens. Integer max
+    /// makes duplicate IDs order-independent without a [B,T,K,blocks] equality
+    /// grid. Invalid IDs contribute zero to a safe index, preserving the old
+    /// equality implementation's behavior. Causal/tail policy remains above.
     static func tokenMembership(
         selectedBlocks: MLXArray, keyLen: Int, compressRatio: Int
     ) -> MLXArray {
         let blocks = (keyLen + compressRatio - 1) / compressRatio
-        let ids = MLXArray((0..<blocks).map(Int32.init))
-        let membership = MLX.any(
-            MLX.equal(ids.reshaped(1, 1, 1, blocks),
-                expandedDimensions(selectedBlocks, axis: -1)), axis: 2)
         let batch = selectedBlocks.dim(0), queries = selectedBlocks.dim(1)
+        guard blocks > 0, selectedBlocks.dim(2) > 0 else {
+            return MLXArray.zeros([batch, queries, keyLen], dtype: .bool)
+        }
+        let valid = logicalAnd(
+            greaterEqual(selectedBlocks, MLXArray(Int32(0))),
+            less(selectedBlocks, MLXArray(Int32(blocks))))
+        let safeIDs = MLX.where(valid, selectedBlocks, MLXArray(Int32(0)))
+        let batchIDs = MLXArray((0..<batch).map(Int32.init)).reshaped(batch, 1, 1)
+        let queryIDs = MLXArray((0..<queries).map(Int32.init)).reshaped(1, queries, 1)
+        let membership = MLXArray.zeros([batch, queries, blocks], dtype: .int32)
+            .at[batchIDs, queryIDs, safeIDs].maximum(valid.asType(.int32))
+            .asType(.bool)
         return broadcast(
             expandedDimensions(membership, axis: -1),
             to: [batch, queries, blocks, compressRatio])
