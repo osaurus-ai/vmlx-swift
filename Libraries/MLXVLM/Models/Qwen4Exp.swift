@@ -1573,6 +1573,29 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
 
         guard input.image != nil || input.video != nil else {
             setRopeDelta(0, for: cache)
+            // The caller's window also bounds cache-boundary reconstruction.
+            // A whole-prompt forward here retained prefill intermediates at the
+            // post-generation high-water mark. Keep QSA/PLE/recurrent state in
+            // the supplied cache and materialize it between text chunks.
+            // Media retains its full-grid M-RoPE/scatter path below.
+            let step = windowSize ?? GenerateParameters().prefillStepSize
+            if inputIds.ndim == 2, !cache.isEmpty, step > 0, inputIds.dim(1) > step {
+                let count = inputIds.dim(1)
+                var offset = 0
+                while count - offset > step {
+                    try Task.checkCancellation()
+                    let end = offset + step
+                    _ = textModel(inputIds[0..., offset ..< end], cache: cache)
+                    MLX.eval(cache)
+                    PrefillProgressReporter.reportCompletedUnits(end)
+                    offset = end
+                    MLX.Memory.clearCache()
+                }
+                try Task.checkCancellation()
+                return .logits(LMOutput(
+                    logits: callAsFunction(inputIds[0..., offset...], cache: cache)))
+            }
+            try Task.checkCancellation()
             return .logits(LMOutput(logits: callAsFunction(inputIds, cache: cache)))
         }
 
