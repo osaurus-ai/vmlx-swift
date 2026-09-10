@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -208,6 +209,51 @@ struct Qwen4ExpPrefillTests {
                     expectEqual(
                         model(next, cache: actualCache),
                         model(next, cache: referenceCache), "next decode")
+                }
+            }
+        }
+    }
+
+    @Test("opt-in preprocessing decode matches native multi-token continuation", .enabled(
+        if: ProcessInfo.processInfo.environment["VMLX_QWEN4_EXP_COMPILE_GDN_PREPROCESS"] == "1"
+            || ProcessInfo.processInfo.environment["VMLX_RUN_GDN_PREPROCESS_CONTROL"] == "1"))
+    func compiledPreprocessingContinuationParity() throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture(routedBits: [2, 3, 4]) { model in
+                let prefix = model.newCache(parameters: nil)
+                let ids = MLXArray((0 ..< 35).map { Int32(2 + $0 % 100) }).reshaped(1, 35)
+                MLX.eval(model(ids, cache: prefix)); MLX.eval(prefix)
+                let decoded = prefix.map { $0.copy() }
+                let native = prefix.map { $0.copy() }
+                let tokens = MLXArray([Int32(41), 42, 43, 44]).reshaped(1, 4)
+                let expected = model(tokens, cache: native)
+                MLX.eval(expected); MLX.eval(native)
+                var pieces: [MLXArray] = []
+                for index in 0 ..< 4 {
+                    let output = model(tokens[0..., index ..< index + 1], cache: decoded)
+                    MLX.eval(output); MLX.eval(decoded)
+                    pieces.append(output)
+                }
+                let actual = concatenated(pieces, axis: 1)
+                func digest(_ arrays: [MLXArray]) -> String {
+                    var hash = SHA256()
+                    for array in arrays {
+                        let values = array.asType(.float32).asArray(Float.self)
+                        values.withUnsafeBytes { hash.update(bufferPointer: $0) }
+                    }
+                    return hash.finalize().map { String(format: "%02x", $0) }.joined()
+                }
+                print("[GDNPreprocessIntegration] enabled=\(Qwen4ExpCompiledGDNInputs.preprocessEnabled)"
+                    + " decode_sha=\(digest([actual])) native_sha=\(digest([expected]))"
+                    + " decode_cache_sha=\(digest(decoded.flatMap { $0.state }))"
+                    + " native_cache_sha=\(digest(native.flatMap { $0.state }))")
+                expectEqual(actual, expected, "compiled decode logits")
+                for (layer, pair) in zip(decoded, native).enumerated() {
+                    #expect(pair.0.offset == 39 && pair.1.offset == 39)
+                    #expect(pair.0.state.count == pair.1.state.count)
+                    for (slot, values) in zip(pair.0.state, pair.1.state).enumerated() {
+                        expectEqual(values.0, values.1, "compiled layer\(layer) slot\(slot)")
+                    }
                 }
             }
         }
