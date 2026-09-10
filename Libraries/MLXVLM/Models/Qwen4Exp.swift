@@ -945,13 +945,14 @@ private final class Qwen4ExpQSAIndexer: Module {
         // processed form is append-only. Re-pooling + re-norming + re-rotating
         // the ENTIRE history every decode token made the indexer's overhead
         // linear in context per step; keep the processed blocks on the cache
-        // and extend by only the newly completed ones. Any trim/rollback or
-        // state restore drops the derived lane and the next forward rebuilds
-        // it here in one pass. `VMLX_QSA_POOL_CACHE=0` restores full
+        // and extend by only the newly completed ones. Trim/rollback retains
+        // only complete accepted blocks; state restore drops the derived lane.
+        // `VMLX_QSA_POOL_CACHE=0` restores full
         // recompute for A/B.
         var pooled: MLXArray
         if Qwen4ExpQSARuntime.poolCache, let cache {
             if cache.derivedPooledBlockCount > blocks { cache.dropDerivedPooledBlocks() }
+            cache.prepareDerivedPooledBlocks(compressionRatio: extras.indexerCompressRatio)
             let have = cache.derivedPooledBlockCount
             if blocks > have {
                 let fresh = processBlocks(have ..< blocks)

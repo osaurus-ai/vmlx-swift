@@ -16,7 +16,7 @@ struct Qwen4ExpPrefillTests {
         func read() -> [Int] { lock.withLock { values } }
     }
 
-    private func withFixture(_ body: (Qwen4Exp) throws -> Void) throws {
+    private func withFixture(routedBits: [Int] = [], _ body: (Qwen4Exp) throws -> Void) throws {
         // Entire geometry is bounded before construction; no installed model is read.
         let data = Data(
             """
@@ -42,7 +42,29 @@ struct Qwen4ExpPrefillTests {
               }
             }
             """.utf8)
-        let config = try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: data)
+        var fixtureData = data
+        var routedSpecs: [String: Int] = [:]
+        if !routedBits.isEmpty {
+            try #require(routedBits.count == 3 && (routedBits == [0, 0, 0] || routedBits.allSatisfy { [2, 3, 4, 6].contains($0) }))
+            var root = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            var text = try #require(root["text_config"] as? [String: Any])
+            text["dtype"] = "bfloat16"
+            text["moe_intermediate_size"] = 64
+            text["shared_expert_intermediate_size"] = 64
+            root["text_config"] = text
+            var quantization: [String: Any] = ["bits": 8, "group_size": 64]
+            for layer in 0..<2 {
+                for (projection, bits) in zip(["gate_proj", "up_proj", "down_proj"], routedBits) {
+                    if bits == 0 { continue } // BF16 dense control, same geometry.
+                    let path = "language_model.layers.\(layer).mlp.switch_mlp.\(projection)"
+                    routedSpecs[path] = bits
+                    quantization[path] = ["bits": bits, "group_size": 64]
+                }
+            }
+            if !routedSpecs.isEmpty { root["quantization"] = quantization }
+            fixtureData = try JSONSerialization.data(withJSONObject: root)
+        }
+        let config = try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: fixtureData)
         let text = config.base.textConfiguration
         try #require(text.hiddenSize == 64 && text.hiddenLayers == 2)
         try #require(text.vocabularySize == 128 && text.numExperts == 8)
@@ -50,6 +72,31 @@ struct Qwen4ExpPrefillTests {
         let model = Qwen4Exp(config)
         let count = model.parameters().flattened().reduce(0) { $0 + $1.1.size }
         try #require(count < 2_000_000, "refuse fixture drift before MLX evaluation")
+        if !routedBits.isEmpty {
+            // Match the retained live parameter-domain contract: ordinary
+            // parameters BF16, router weights FP32. This is still a tiny
+            // generated fixture, not a shipped-weight numerical reference.
+            model.update(parameters: ModuleParameters.unflattened(
+                model.parameters().flattened().map { path, value in
+                    (path, path.hasSuffix(".mlp.gate.weight") ? value : value.asType(.bfloat16))
+                }))
+        }
+        if !routedSpecs.isEmpty {
+            quantize(model: model, filter: { path, _ in
+                guard let bits = routedSpecs[path] else { return nil }
+                return (groupSize: 64, bits: bits, mode: QuantizationMode.affine)
+            })
+            let leaves = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
+            for (path, bits) in routedSpecs {
+                let projection = try #require(leaves[path] as? any Quantized)
+                try #require(projection.bits == bits && projection.groupSize == 64)
+            }
+            model.update(parameters: ModuleParameters.unflattened(
+                model.parameters().flattened().compactMap { path, value in
+                    guard path.hasSuffix(".scales") || path.hasSuffix(".biases") else { return nil }
+                    return (path, value.asType(.float16))
+                }))
+        }
 
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("flash-prefill-\(UUID().uuidString)", isDirectory: true)
@@ -245,6 +292,142 @@ struct Qwen4ExpPrefillTests {
                             "structural split next-token logits")
                 expectEqual(model(next, cache: diskRestored), expectedNext,
                             "disk-restored PLE QSA next-token logits")
+            }
+        }
+    }
+
+    @Test(
+        "staged Flash acceptance preserves PLE GDN QSA state and next logits",
+        .enabled(
+            if: ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0",
+            "Strict comparison requires TF32 off; no tolerance relaxation for mixed quantization"
+        ),
+        arguments: [[], [0, 0, 0], [2, 2, 2], [2, 3, 3], [4, 4, 4], [4, 4, 6]])
+    func stagedAcceptedPrefixMatchesSequential(routedBits: [Int]) throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture(routedBits: routedBits) { model in
+                let start = Date()
+                var checkedRows = 0
+                for prefixLength in [0, 35, 71, 127] {
+                    let prefix = model.newCache(parameters: nil)
+                    if prefixLength > 0 {
+                        let ids = MLXArray((0..<prefixLength).map { Int32(2 + $0 % 100) })
+                            .reshaped(1, prefixLength)
+                        _ = try model.prepare(
+                            LMInput(text: .init(tokens: ids)), cache: prefix, windowSize: 8)
+                        MLX.eval(prefix)
+                    }
+                    for width in [2, 3, 4] {
+                        let ids = MLXArray((0..<width).map { Int32(47 + $0) }).reshaped(1, width)
+                        for accepted in 1...width {
+                            let staged = prefix.map { $0.copy() }
+                            let reference = prefix.map { $0.copy() }
+                            let before = staged.map { $0.copy() }
+                            MLX.eval(before)
+                            let verified = NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+                                model.nativeBackboneMTPVerifyForward(ids, cache: staged)
+                            }
+                            MLX.eval(verified.logits, verified.hiddenStates)
+                            MLX.eval(staged)
+                            let qsa = try #require(staged.last as? QSAKVCache)
+                            let pooledBeforeTrim = qsa.derivedPooledBlockCount
+                            let mamba = try #require(staged.first as? MambaCache)
+                            #expect(mamba.offset == prefixLength)
+                            #expect(mamba.verifyStagingReady)
+                            #expect(mamba[4] != nil && mamba[5] != nil)
+                            let prior = try #require(before.first as? MambaCache)
+                            for slot in 0..<4 {
+                                if let expected = prior[slot] {
+                                    let actual = try #require(mamba[slot])
+                                    expectEqual(actual, expected, "uncommitted slot\(slot)")
+                                } else {
+                                    #expect(mamba[slot] == nil)
+                                }
+                            }
+                            if accepted < width {
+                                for layer in staged where layer.isTrimmable {
+                                    #expect(layer.trim(width - accepted) == width - accepted)
+                                }
+                            }
+                            try #require(model.commitStagedVerifiedBlock(
+                                cache: staged, acceptedInputs: accepted, blockLength: width))
+                            // Fixture compression ratio is 4. Completed blocks
+                            // preceding the accepted boundary must not be rebuilt
+                            // merely because the speculative suffix was rejected.
+                            #expect(qsa.derivedPooledBlockCount == min(
+                                pooledBeforeTrim, (prefixLength + accepted) / 4))
+                            #expect(mamba[4] == nil && mamba[5] == nil)
+                            for row in 0..<accepted {
+                                MLX.eval(model(ids[0..., row..<(row + 1)], cache: reference))
+                                MLX.eval(reference)
+                            }
+                            for (layer, pair) in zip(staged, reference).enumerated() {
+                                #expect(pair.0.offset == prefixLength + accepted)
+                                #expect(pair.0.offset == pair.1.offset)
+                                #expect(pair.0.state.count == pair.1.state.count)
+                                for (slot, arrays) in zip(pair.0.state, pair.1.state).enumerated() {
+                                    if prefixLength == 35 && width == 2 && accepted == 1 {
+                                        let delta = MLX.max(abs(arrays.0.asType(.float32) - arrays.1.asType(.float32))).item(Float.self)
+                                        print("STAGED-STATE-DELTA bits=\(routedBits) layer=\(layer) slot=\(slot) maxAbs=\(delta)")
+                                    }
+                                    expectEqual(arrays.0, arrays.1,
+                                        "prefix\(prefixLength) width\(width) accepted\(accepted) layer\(layer) slot\(slot)")
+                                }
+                            }
+                            let next = MLXArray([Int32(73)]).reshaped(1, 1)
+                            if prefixLength == 35 && width == 2 && accepted == 1 {
+                                let patched = staged.map { $0.copy() }
+                                let control = reference.map { $0.copy() }
+                                let patchedMamba = try #require(patched.first as? MambaCache)
+                                let controlMamba = try #require(control.first as? MambaCache)
+                                let recurrent = try #require(controlMamba[1]) * 1
+                                MLX.eval(recurrent)
+                                patchedMamba[1] = recurrent
+                                let a = model(next, cache: patched).asType(.float32)
+                                let b = model(next, cache: control).asType(.float32)
+                                let delta = MLX.max(abs(a - b)).item(Float.self)
+                                print("STAGED-RECURRENT-TRANSPLANT bits=\(routedBits) nextMaxAbs=\(delta); diagnostic only")
+                            }
+                            // Both copies drop derived QSA pools. Keep the original
+                            // comparison below: this is localization, not a bypass.
+                            let stagedFreshPools = staged.map { $0.copy() }
+                            let referenceFreshPools = reference.map { $0.copy() }
+                            MLX.eval(stagedFreshPools)
+                            MLX.eval(referenceFreshPools)
+                            expectEqual(model(next, cache: staged), model(next, cache: reference),
+                                "prefix\(prefixLength) width\(width) accepted\(accepted) next logits")
+                            expectEqual(
+                                model(next, cache: stagedFreshPools),
+                                model(next, cache: referenceFreshPools),
+                                "freshPools prefix\(prefixLength) width\(width) accepted\(accepted) next logits")
+                            if prefixLength >= 35 {
+                                let rebuilt = try #require(stagedFreshPools.last as? QSAKVCache)
+                                let retainedPool = try #require(qsa.derivedPooledBlocks)
+                                let rebuiltPool = try #require(rebuilt.derivedPooledBlocks)
+                                expectEqual(retainedPool, rebuiltPool, "retained vs rebuilt pooled keys")
+                                // Exercise sparse selection on those real indexer
+                                // pools with fixed, varied query directions. This
+                                // supplements the actual model next-logit checks.
+                                for direction in [-1, 1] {
+                                    let query = MLXArray((0..<16).map {
+                                        Float(direction * ($0 - 7)) / 8
+                                    }).reshaped(1, 2, 1, 8).asType(retainedPool.dtype)
+                                    let mask = try #require(Qwen4ExpQSA.selectedTokenMask(
+                                        query: query, pooledKeys: expandedDimensions(retainedPool, axis: 1),
+                                        pastLen: qsa.offset - 1, compressRatio: 4,
+                                        blockTopK: 8, keyLen: qsa.offset))
+                                    let full = try #require(Qwen4ExpQSA.selectedTokenMask(
+                                        query: query, pooledKeys: expandedDimensions(rebuiltPool, axis: 1),
+                                        pastLen: rebuilt.offset - 1, compressRatio: 4,
+                                        blockTopK: 8, keyLen: rebuilt.offset))
+                                    #expect(arrayEqual(mask, full).item(Bool.self))
+                                }
+                            }
+                            checkedRows += accepted
+                        }
+                    }
+                }
+                print("FLASH-STAGED-FIXTURE routedBits=\(routedBits) checkedAcceptedRows=\(checkedRows) fixtureRowsPerSecond=\(Double(checkedRows) / max(Date().timeIntervalSince(start), 1e-9)); not model decode throughput")
             }
         }
     }
