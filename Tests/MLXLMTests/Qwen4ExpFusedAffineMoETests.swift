@@ -40,6 +40,7 @@ struct Qwen4ExpFusedAffineMoETests {
         Combo(label: "6S_up_down_q6", gate: (4, 64), up: (6, 64), down: (6, 64)),
         Combo(label: "Ornith_late_gate_up_q5", gate: (5, 64), up: (5, 64), down: (4, 64)),
         Combo(label: "q5_all_projections", gate: (5, 64), up: (5, 64), down: (5, 64)),
+        Combo(label: "mixed_gate_g128_up_down_g64", gate: (4, 128), up: (4, 64), down: (4, 64)),
     ]
 
     private static func makeProjection(
@@ -349,7 +350,7 @@ struct Qwen4ExpFusedAffineMoETests {
         #expect(error < 0.01, "Ornith fused/eager relative error \(error)")
     }
 
-    @Test("construction rejects unsupported metadata and group sizes")
+    @Test("construction accepts qualified groups and rejects unsupported metadata and bits")
     func constructionRejection() throws {
         // f32 affine metadata must be rejected: the kernels only accept
         // bf16/f16 scales with matching bias dtype.
@@ -374,7 +375,8 @@ struct Qwen4ExpFusedAffineMoETests {
             Qwen4ExpFusedAffineMoE.makeReducer(
                 gate: f32Projection, up: good, down: goodDown) == nil)
 
-        // Group size 128 is outside the supported set.
+        // Group 128 was added to the supported set; mixed-group arithmetic is
+        // covered above and in the multirow verifier parity test.
         let g128Source = MLXRandom.uniform(
             low: -0.5, high: 0.5, [Self.experts, Self.expertDims, Self.inputDims],
             key: MLXRandom.key(8)
@@ -387,6 +389,12 @@ struct Qwen4ExpFusedAffineMoETests {
 
         #expect(
             Qwen4ExpFusedAffineMoE.makeReducer(
-                gate: g128Projection, up: good, down: goodDown) == nil)
+                gate: g128Projection, up: good, down: goodDown) != nil)
+
+        // Valid generic affine storage, but outside this fused kernel's bits.
+        let (q8, _) = Self.makeProjection(
+            inputDims: Self.inputDims, outputDims: Self.expertDims,
+            bits: 8, groupSize: 64, seed: 13)
+        #expect(Qwen4ExpFusedAffineMoE.makeReducer(gate: q8, up: good, down: goodDown) == nil)
     }
 }

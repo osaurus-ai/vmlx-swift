@@ -32,7 +32,9 @@ enum ResidentSafetensorsReader {
             let values = try decoder.container(keyedBy: Key.self)
             for key in values.allKeys {
                 if key.stringValue == "__metadata__" {
-                    metadata = try values.decode([String: String].self, forKey: key)
+                    // Existing safetensors readers treat null metadata as absent.
+                    // Some Flash Next shards use null while others omit the key.
+                    metadata = try values.decodeIfPresent([String: String].self, forKey: key) ?? [:]
                 } else {
                     entries[key.stringValue] = try values.decode(Entry.self, forKey: key)
                 }

@@ -5,6 +5,26 @@ import Testing
 
 @Suite(.serialized)
 struct ResidentSafetensorsReaderTests {
+    @Test func nullMetadataMatchesAbsentMetadata() throws {
+        // Real Flash Next shards 6, 7 and 13 carry __metadata__: null.
+        // Exclude the payload: this regression exercises header parsing only.
+        for metadata in [NSNull(), [:] as NSDictionary] as [Any] {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("resident-metadata-\(UUID()).safetensors")
+            defer { try? FileManager.default.removeItem(at: url) }
+            let header = try JSONSerialization.data(withJSONObject: [
+                "__metadata__": metadata,
+                "w": ["dtype": "U32", "shape": [1], "data_offsets": [0, 4]],
+            ])
+            var length = UInt64(header.count).littleEndian
+            var data = withUnsafeBytes(of: &length) { Data($0) }
+            data.append(header)
+            data.append(Data(repeating: 0, count: 4))
+            try data.write(to: url)
+            let (arrays, result) = try ResidentSafetensorsReader.load(url: url, excludingKeys: ["w"])
+            #expect(arrays.isEmpty && result.isEmpty)
+        }
+    }
+
     @Test func mixedTypesAndExclusions() throws {
         try MLXMetalTestLock.withLock {
             let url = FileManager.default.temporaryDirectory.appendingPathComponent("resident-reader-\(UUID()).safetensors")
