@@ -11,6 +11,85 @@ import Testing
 @Suite("qwen4_exp QSA block selection", .serialized)
 struct Qwen4ExpQSATests {
 
+    private func blockGridMembership(_ selected: MLXArray, keyLen: Int, ratio: Int) -> MLXArray {
+        let blocks = (keyLen + ratio - 1) / ratio
+        let ids = MLXArray((0..<blocks).map(Int32.init))
+        let member = MLX.any(MLX.equal(ids.reshaped(1, 1, 1, blocks),
+            expandedDimensions(selected, axis: -1)), axis: 2)
+        return broadcast(expandedDimensions(member, axis: -1),
+            to: [selected.dim(0), selected.dim(1), blocks, ratio])
+            .reshaped(selected.dim(0), selected.dim(1), blocks * ratio)[.ellipsis, ..<keyLen]
+    }
+
+    @Test("membership scatter preserves duplicates, invalid IDs and independent prefill rows")
+    func scatterMembershipRows() throws {
+        try MLXMetalTestLock.withLock {
+            for queries in [1, 4, 32, 128] {
+                for keyLen in [1, 33, 8193, 32769] {
+                    let batch = 2, count = 512, ratio = 4
+                    let blocks = (keyLen + ratio - 1) / ratio
+                    let values: [Int32] = (0..<(batch * queries * count)).map {
+                        if $0 % 7 == 0 { return -1 }
+                        if $0 % 11 == 0 { return Int32(blocks + 1) }
+                        return Int32(($0 * 13) % blocks)
+                    }
+                    let selected = MLXArray(values).reshaped(batch, queries, count)
+                    var expected = [Bool](repeating: false, count: batch * queries * keyLen)
+                    for row in 0..<(batch * queries) {
+                        for slot in 0..<count {
+                            let block = Int(values[row * count + slot])
+                            guard block >= 0 && block < blocks else { continue }
+                            for token in (block * ratio)..<min((block + 1) * ratio, keyLen) {
+                                expected[row * keyLen + token] = true
+                            }
+                        }
+                    }
+                    let result = Qwen4ExpQSA.tokenMembership(
+                        selectedBlocks: selected, keyLen: keyLen, compressRatio: ratio)
+                    #expect(result.shape == [batch, queries, keyLen])
+                    let actual = result.asArray(Bool.self)
+                    #expect(zip(actual, expected).allSatisfy { $0 == $1 },
+                        "queries=\(queries) keys=\(keyLen)")
+                }
+            }
+            let empty = Qwen4ExpQSA.tokenMembership(
+                selectedBlocks: MLXArray.zeros([2, 4, 0], dtype: .int32),
+                keyLen: 33, compressRatio: 4)
+            #expect(empty.asArray(Bool.self).allSatisfy { !$0 })
+        }
+    }
+
+    @Test("membership scatter versus block-grid synchronized diagnostic")
+    func scatterMembershipTiming() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_QSA_SCATTER_BENCH"] == "1" else { return }
+        try MLXMetalTestLock.withLock {
+            for queries in [1, 4, 32, 128] {
+                let keyLen = 32769, ratio = 4
+                let selected = MLXArray((0..<(queries * 512)).map {
+                    Int32(($0 * 7) % (keyLen / ratio))
+                }).reshaped(1, queries, 512)
+                let expected = blockGridMembership(selected, keyLen: keyLen, ratio: ratio).asArray(Bool.self)
+                for round in 0..<3 {
+                    for candidate in (round % 2 == 0 ? [false, true] : [true, false]) {
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        for _ in 0..<4 {
+                            let result = candidate
+                                ? Qwen4ExpQSA.tokenMembership(selectedBlocks: selected,
+                                    keyLen: keyLen, compressRatio: ratio)
+                                : blockGridMembership(selected, keyLen: keyLen, ratio: ratio)
+                            MLX.eval(result)
+                        }
+                        let elapsed = DispatchTime.now().uptimeNanoseconds - start
+                        let actual = Qwen4ExpQSA.tokenMembership(selectedBlocks: selected,
+                            keyLen: keyLen, compressRatio: ratio).asArray(Bool.self)
+                        #expect(zip(actual, expected).allSatisfy { $0 == $1 })
+                        print("QSA_SCATTER_BENCH round=\(round) candidate=\(candidate) keys=\(keyLen) queries=\(queries) iterations=4 ns=\(elapsed)")
+                    }
+                }
+            }
+        }
+    }
+
     @Test("complete QSA masks match the frozen original across prefill, budget crossings and ties")
     func completeMaskParity() throws {
         try MLXMetalTestLock.withLock {
