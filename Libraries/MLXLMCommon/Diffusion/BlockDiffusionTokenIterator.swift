@@ -173,6 +173,12 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
                 }
                 if !restored, let diskArrays {
                     restored = restoreFromDiskArrays(diskArrays, into: &self.cache) > 0
+                    if !restored {
+                        coordinator.rejectDiskCandidate(
+                            tokens: Array(promptTokenIds.prefix(matchedTokens)),
+                            arrays: diskArrays,
+                            mediaSalt: mediaSalt)
+                    }
                     if restored {
                         MLX.eval(self.cache)
                     }

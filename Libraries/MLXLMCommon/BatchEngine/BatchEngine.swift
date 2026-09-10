@@ -2108,6 +2108,12 @@ public actor BatchEngine {
                             }
                             return count
                         }
+                        if diskRestored == 0 {
+                            coordinator.rejectDiskCandidate(
+                                tokens: Array(tokenIds.prefix(matchedTokens)),
+                                arrays: diskArrays,
+                                mediaSalt: slot.mediaSalt)
+                        }
                         if diskRestored > 0 {
                             restoredTokenCount = diskRestored
                             // 2026-04-27 fix: materialize restored cache state

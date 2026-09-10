@@ -702,6 +702,16 @@ public final class CacheCoordinator: @unchecked Sendable {
         return .miss
     }
 
+    /// A structurally readable disk payload can still be incompatible with
+    /// the model's cache layout. Do not retain its validated/durable status
+    /// after that rejection, or stable-prefix stores will elide the repair.
+    /// Invoke after leaving any serialized MLX restore closure.
+    public func rejectDiskCandidate(
+        tokens: [Int], arrays: [String: MLXArray], mediaSalt: String? = nil
+    ) {
+        diskCache?.rejectCandidate(tokens: tokens, arrays: arrays, mediaSalt: mediaSalt)
+    }
+
     /// True only after the current process has deserialized or written the
     /// exact L2 entry and its on-disk fingerprint still matches the index.
     public func hasValidatedDiskEntry(

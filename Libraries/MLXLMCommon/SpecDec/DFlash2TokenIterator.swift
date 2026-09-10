@@ -444,7 +444,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     }
                 }
                 if let diskArrays, !restored {
-                    if restoreFromDiskArrays(diskArrays, into: &self.cache) > 0 {
+                    let diskRestored = restoreFromDiskArrays(diskArrays, into: &self.cache)
+                    if diskRestored == 0 {
+                        coordinator.rejectDiskCandidate(
+                            tokens: Array(tokensToPrefill.prefix(matchedTokens)),
+                            arrays: diskArrays,
+                            mediaSalt: mediaSalt)
+                    }
+                    if diskRestored > 0 {
                         if let ssm = ssmStates {
                             restoreSSMStates(ssm, into: self.cache, boundary: matchedTokens)
                         }

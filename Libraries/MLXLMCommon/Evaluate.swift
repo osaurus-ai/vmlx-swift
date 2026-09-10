@@ -1980,6 +1980,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                         }
                         return count
                     }
+                    if diskRestored == 0 {
+                        coordinator.rejectDiskCandidate(
+                            tokens: Array(cacheLookupTokenIds.prefix(matchedTokens)),
+                            arrays: diskArrays,
+                            mediaSalt: mediaSalt)
+                    }
                     if diskRestored > 0 {
                         restoredTokenCount = diskRestored
                         restored = true

@@ -71,6 +71,100 @@ struct LFM2ShortConvCacheRestoreFocusedTests {
         }
     }
 
+    @Test("same-key disk publication replaces a fetched legacy PLE layout")
+    func diskPublicationReplacesLegacyPLELayout() throws {
+        try FocusedMLXTestSupport.withLock {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ple-disk-upgrade-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let tokens = Array(1...9)
+            let modelKey = "tiny-ple-layout-upgrade"
+            let disk = DiskCache(cacheDir: directory, maxSizeGB: 0.01, modelKey: modelKey)
+            let legacy = MambaCache()
+            legacy[0] = MLXArray.ones([1, 2, 8])
+            legacy[1] = MLXArray.ones([1, 4, 4])
+            legacy.offset = tokens.count
+            let oldArrays = TQDiskSerializer.serialize(
+                cache: [prefilledKV(tokens: tokens.count), legacy])
+            disk.store(tokens: tokens, arrays: oldArrays)
+            disk.store(tokens: tokens, arrays: oldArrays, mediaSalt: "unrelated-media")
+            let fetched = try #require(disk.fetch(tokens: tokens))
+            var target: [any KVCache] = [KVCacheSimple(), MambaCache(slots: 6)]
+            (target[1] as! MambaCache).persistentStateSlotCount = 4
+            #expect(restoreFromDiskArrays(fetched, into: &target) == 0)
+
+            let repaired = MambaCache(slots: 6)
+            repaired.persistentStateSlotCount = 4
+            repaired[0] = MLXArray.ones([1, 2, 8])
+            repaired[1] = MLXArray.ones([1, 4, 4])
+            repaired[2] = MLXArray([Int32(17), 23, 31]).reshaped(1, 3)
+            repaired[3] = MLXArray.full([1, 2, 8], values: MLXArray(Float(3.5)))
+            repaired.offset = tokens.count
+            disk.store(tokens: tokens, arrays: TQDiskSerializer.serialize(
+                cache: [prefilledKV(tokens: tokens.count), repaired]))
+
+            // Open a new disk-cache instance so the assertion cannot be
+            // satisfied by only updating a process-local validation record.
+            let reopened = DiskCache(
+                cacheDir: directory, maxSizeGB: 0.01, modelKey: modelKey)
+            let persisted = try #require(reopened.fetch(tokens: tokens))
+            #expect(persisted["mamba_1_state2"] != nil)
+            #expect(persisted["mamba_1_state3"] != nil)
+            #expect(restoreFromDiskArrays(persisted, into: &target) == tokens.count)
+            let unrelated = try #require(reopened.fetch(
+                tokens: tokens, mediaSalt: "unrelated-media"))
+            #expect(unrelated["mamba_1_state2"] == nil)
+            #expect(unrelated["mamba_1_state3"] == nil)
+        }
+    }
+
+    @Test("rejected disk candidates lose validation without removing newer readers or other keys")
+    func rejectedDiskCandidateIdentityAndIsolation() throws {
+        try FocusedMLXTestSupport.withLock {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ple-reject-identity-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let config = CacheCoordinatorConfig(
+                usePagedCache: false, enableDiskCache: true,
+                diskCacheMaxGB: 0.01, diskCacheDir: directory, modelKey: "reject-ple")
+            let coordinator = CacheCoordinator(config: config)
+            let disk = try #require(coordinator.diskCache)
+            let tokens = Array(1...9)
+            let arrays = TQDiskSerializer.serialize(cache: [
+                prefilledKV(tokens: 9), shortConvCache(fill: 1, offset: 9),
+            ])
+            disk.store(tokens: tokens, arrays: arrays)
+            let storesBefore = disk.snapshotStats().storeSkips
+            disk.store(tokens: tokens, arrays: arrays)
+            #expect(disk.snapshotStats().storeSkips == storesBefore + 1)
+            disk.store(tokens: tokens, arrays: arrays, mediaSalt: "other")
+            let otherModel = DiskCache(
+                cacheDir: directory, maxSizeGB: 0.01, modelKey: "other-model")
+            otherModel.store(tokens: tokens, arrays: arrays)
+            let earlier = try #require(disk.fetch(tokens: tokens))
+            let current = try #require(disk.fetch(tokens: tokens))
+            coordinator.rejectDiskCandidate(tokens: tokens, arrays: earlier)
+            #expect(coordinator.hasValidatedDiskEntry(tokens: tokens))
+            coordinator.rejectDiskCandidate(tokens: tokens, arrays: current)
+            #expect(!coordinator.hasValidatedDiskEntry(tokens: tokens))
+            #expect(!coordinator.hasDurableDiskEntry(tokens: tokens))
+            #expect(disk.fetch(tokens: tokens) == nil)
+            #expect(disk.fetch(tokens: tokens, mediaSalt: "other") != nil)
+            #expect(otherModel.fetch(tokens: tokens) != nil)
+
+            disk.store(tokens: tokens, arrays: arrays)
+            let stale = try #require(disk.fetch(tokens: tokens))
+            let externalWriter = DiskCache(
+                cacheDir: directory, maxSizeGB: 0.01, modelKey: "reject-ple")
+            var replacement = arrays
+            replacement["new-layout-state"] = MLXArray.ones([32])
+            externalWriter.store(tokens: tokens, arrays: replacement)
+            coordinator.rejectDiskCandidate(tokens: tokens, arrays: stale)
+            let retained = try #require(disk.fetch(tokens: tokens))
+            #expect(retained["new-layout-state"] != nil)
+        }
+    }
+
     @Test("extended Mamba disk payload preserves PLE history and convolution state")
     func diskRoundTripExtendedPLEState() throws {
         try FocusedMLXTestSupport.withLock {
