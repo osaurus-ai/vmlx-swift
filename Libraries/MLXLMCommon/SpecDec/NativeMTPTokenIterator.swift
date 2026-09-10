@@ -237,6 +237,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     let originalInput: LMInput
     let cacheInitParameters: GenerateParameters
     var promptCacheSnapshot: [KVCache]?
+    /// Owned state at the reusable text boundary, captured before consuming
+    /// the generation suffix. Recurrent state cannot be trimmed back later.
+    var strippedPromptSnapshot: (boundary: Int, cache: [KVCache])?
     let mediaSalt: String?
 
     var tokenCount = 0
@@ -801,12 +804,35 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         let start = NativeMTPClock.now()
         try Task.checkCancellation()
+        if originalInput.cachePromptIntent != .auxiliary,
+           let boundary = TokenIterator.hybridStripBoundaryIndex(
+            coordinator: cacheCoordinator, promptTokenIds: promptTokenIds,
+            input: originalInput, cache: self.cache),
+           let split = Self.splitTextPrefill(
+            inputForPrepare, promptCount: promptTokenIds.count,
+            boundary: boundary, cache: self.cache)
+        {
+            if let head = split.head {
+                switch try model.prepare(
+                    head, cache: self.cache, windowSize: effectiveParameters.prefillStepSize)
+                {
+                case .tokens(let remainder):
+                    _ = model.nativeBackboneForward(
+                        Self.sequenceInput(remainder.tokens), cache: self.cache)
+                case .logits:
+                    break
+                }
+            }
+            try Task.checkCancellation()
+            self.strippedPromptSnapshot = (
+                boundary, makePromptBoundaryCacheSnapshot(from: self.cache))
+            inputForPrepare = split.tail
+        }
         let prepared = try model.prepare(
             inputForPrepare,
             cache: self.cache,
             windowSize: effectiveParameters.prefillStepSize)
         self.promptPrefillTime = NativeMTPClock.now() - start
-        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
 
         let firstToken: MLXArray
         switch prepared {
@@ -857,6 +883,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             self.materializeSyncTime += NativeMTPClock.now() - syncStart
         }
 
+        // A .tokens prepare result has not consumed its final remainder yet.
+        // Seal only after that forward, before the bridge adds generated tokens.
+        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
         let firstID = recordMaterializeSync {
             firstToken.item(Int.self)
         }
@@ -962,6 +991,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
+        defer { strippedPromptSnapshot = nil }
         // A prefetched verify that was never consumed left speculative rows
         // in the attention lanes; roll it back before any boundary snapshot
         // can capture them.
@@ -1156,7 +1186,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     // and `stripAt` routinely coincides with a prefix-count entry.
                     let strippedTokens = Array(promptTokenIds.prefix(stripAt))
                     let tStrip = Date()
-                    let strippedSnapshotOpt = cacheSnapshotForBoundary(
+                    let captured = strippedPromptSnapshot.flatMap {
+                        $0.boundary == stripAt ? $0.cache : nil
+                    }
+                    let strippedSnapshotOpt = captured ?? cacheSnapshotForBoundary(
                         tokens: strippedTokens,
                         promptSnapshot: promptCacheSnapshot,
                         allowDiskBackedRederive: true)
@@ -1393,6 +1426,39 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let result = body()
         cacheSnapshotRestoreTime += NativeMTPClock.now() - start
         return result
+    }
+
+    /// Same text-only structural split as solo prefill. A restored prefix is
+    /// subtracted from the absolute boundary; masks must be token-aligned.
+    /// Unknown media/typed-pool contracts retain the existing replay path.
+    private static func splitTextPrefill(
+        _ input: LMInput, promptCount: Int, boundary: Int, cache: [KVCache]
+    ) -> (head: LMInput?, tail: LMInput)? {
+        guard !input.hasMediaContent, !input.requiresPostPrepareCacheKey,
+              !cache.contains(where: { $0 is HybridPoolCache }) else { return nil }
+        let size = input.text.tokens.size
+        let split = boundary - (promptCount - size)
+        guard split >= 0, split < size else { return nil }
+        if let mask = input.text.mask, mask.size != size { return nil }
+        if let ids = input.text.tokenIds, ids.count != size { return nil }
+        let flat = input.text.tokens.reshaped([-1])
+        func part(_ range: Range<Int>) -> LMInput {
+            let mask = input.text.mask.map { original -> MLXArray in
+                let sliced = original.reshaped([-1])[range]
+                return original.ndim >= 2 ? sliced[.newAxis, 0...] : sliced
+            }
+            return LMInput(
+                text: LMInput.Text(
+                    tokens: flat[range][.newAxis, 0...], mask: mask,
+                    tokenIds: input.text.tokenIds.map { Array($0[range]) }),
+                cacheScopeSalt: input.cacheScopeSalt,
+                cachePrefixTokenCounts: input.cachePrefixTokenCounts,
+                cacheStablePrefixTokenCounts: input.cacheStablePrefixTokenCounts,
+                cachePromptIntent: input.cachePromptIntent,
+                cacheRestorePolicy: input.cacheRestorePolicy,
+                toolSchemas: input.toolSchemas)
+        }
+        return (split > 0 ? part(0..<split) : nil, part(split..<size))
     }
 
     private func cacheSnapshotForBoundary(

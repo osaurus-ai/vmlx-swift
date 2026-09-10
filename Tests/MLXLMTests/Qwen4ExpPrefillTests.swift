@@ -199,6 +199,41 @@ struct Qwen4ExpPrefillTests {
         }
     }
 
+    @Test(
+        "live structural boundary capture preserves Flash PLE QSA continuation",
+        .enabled(
+            if: ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0",
+            "Strict FP32 segmentation oracle requires TF32 off; production policy is unchanged"
+        ))
+    func structuralBoundaryCaptureParity() throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture { model in
+                let ids = MLXArray((0..<44).map { Int32(2 + $0 % 100) }).reshaped(1, 44)
+                let baseline = model.newCache(parameters: nil)
+                let captured = model.newCache(parameters: nil)
+                let headReference = model.newCache(parameters: nil)
+                _ = try model.prepare(LMInput(text: .init(tokens: ids)), cache: baseline, windowSize: 8)
+                let head = LMInput(text: .init(tokens: ids[0..., 0..<37]))
+                _ = try model.prepare(head, cache: captured, windowSize: 8)
+                let owned = captured.map { $0.copy() }
+                MLX.eval(owned)
+                _ = try model.prepare(
+                    LMInput(text: .init(tokens: ids[0..., 37...])), cache: captured, windowSize: 8)
+                _ = try model.prepare(head, cache: headReference, windowSize: 8)
+                for (index, pair) in zip(owned, headReference).enumerated() {
+                    #expect(pair.0.offset == 37 && pair.1.offset == 37)
+                    #expect(pair.0.state.count == pair.1.state.count)
+                    for (slot, state) in zip(pair.0.state, pair.1.state).enumerated() {
+                        expectEqual(state.0, state.1, "owned layer\(index) slot\(slot)")
+                    }
+                }
+                let next = MLXArray([Int32(47)]).reshaped(1, 1)
+                expectEqual(model(next, cache: captured), model(next, cache: baseline),
+                            "structural split next-token logits")
+            }
+        }
+    }
+
     @Test("cancelled text prefill does no cache work")
     func cancelledPrefillDoesNotAdvanceCache() async throws {
         try await MLXMetalTestLock.withLock {
