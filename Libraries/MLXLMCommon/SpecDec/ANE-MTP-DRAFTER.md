@@ -73,10 +73,13 @@ Two consequences:
   Flash-Next step 1.7 ms. A draft that falls outside the pruned vocab is just
   a draft the verifier rejects; it never affects correctness.
 - `reduce_argmax` / `cast` are CPU-only under Core ML, so the argmax is done
-  arithmetically on the ANE per lm_head chunk (max, then
-  `clip(1 + 1024·(x − max))·ramp` → index; indices ≤ 16384 exact in fp16) and
-  the host picks the winning chunk. Ties within 1e-3 resolve to the larger
-  index — below fp16 logit resolution, so effectively a real tie.
+  arithmetically on the ANE per lm_head chunk: a mask
+  `clip(1 + 4096·(x − max))` that is 1 only at the maximum, then the index
+  in two exact fp16 parts — the 64-wide group (`hi` < 256) and the offset in
+  the winning group (`lo` < 64) — because **fp16 holds integers exactly only
+  up to 2048** (a flat ramp over a 16k chunk rounded 5214 → 5216 and drafted
+  garbage on the live 27B; found via `VMLX_ANE_MTP_PARITY=1`). The host
+  composes `chunk·16384 + hi·64 + lo` and picks the winning chunk.
 
 ## Architecture
 

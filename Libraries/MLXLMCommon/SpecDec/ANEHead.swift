@@ -292,29 +292,46 @@ public enum ANEHeadEmitter {
         let hOut = b.add(h1, down, "o0_hidden")
 
         // lm_head over the draft vocab, argmax per chunk on the ANE.
+        //
+        // fp16 holds integers exactly only up to 2048, so a flat index ramp
+        // over a 16384-wide chunk rounds (5214 -> 5216). The index is
+        // therefore recovered in two exact parts: the 64-wide group `hi`
+        // (< 256) and the offset `lo` (< 64) inside the winning group, both
+        // selected by masks that are 1 only at (near-)maximal logits. The
+        // host composes chunk*16384 + hi*64 + lo.
         let nf = rmsnorm(hOut, axis: 1, weight: normConst(.final, dim: H, shape: [1, H, 1, 1]), "lnf")
-        var maxes: [ANEMILBuilder.Value] = [], idxs: [ANEMILBuilder.Value] = []
+        var maxes: [ANEMILBuilder.Value] = [], his: [ANEMILBuilder.Value] = [], los: [ANEMILBuilder.Value] = []
         var rows = 0
         var chunk = 0
+        let rampLo = b.constFP16((0 ..< 64).map { Float16(Float($0)) }, shape: [1, 1, 64, 1], "ramp_lo")
         while rows < g.draftVocab {
             let n = min(ANEHeadGeometry.lmHeadChunk, g.draftVocab - rows)
+            precondition(n % 64 == 0, "draft vocab chunk \(n) must be a multiple of 64")
+            let groups = n / 64
             let logits = linear(nf, source.lmHeadRows(rows ..< (rows + n)), "lm\(chunk)")
-            let m = b.reduceMax(logits, axis: 1, "am_max\(chunk)")
-            var d = b.sub(logits, m, "am_d\(chunk)")
-            d = b.mul(d, scalar: 1024, "am_ds\(chunk)")
+            let x4 = b.reshape(logits, [1, groups, 64, R], "am_x4_\(chunk)")
+            let m = b.reduceMax(b.reduceMax(x4, axis: 2, "am_gm_\(chunk)"), axis: 1, "am_max\(chunk)")   // [1,1,1,R]
+            var d = b.sub(x4, m, "am_d\(chunk)")
+            d = b.mul(d, scalar: 4096, "am_ds\(chunk)")
             d = b.add(d, scalar: 1, "am_d1\(chunk)")
-            let mask = b.clip(d, low: 0, high: 1, "am_mask\(chunk)")
-            let ramp = b.constFP16((0 ..< n).map { Float16(Float($0)) }, shape: [1, n, 1, 1], "ramp\(chunk)")
-            let idx = b.reduceMax(b.mul(mask, ramp, "am_mr\(chunk)"), axis: 1, "am_idx\(chunk)")
-            maxes.append(m); idxs.append(idx)
+            let mask = b.clip(d, low: 0, high: 1, "am_mask\(chunk)")                    // [1,groups,64,R]
+            let gAny = b.reduceMax(mask, axis: 2, "am_gany\(chunk)")                       // [1,groups,1,R]
+            let rampHi = b.constFP16((0 ..< groups).map { Float16(Float($0)) }, shape: [1, groups, 1, 1], "ramp_hi\(chunk)")
+            let hi = b.reduceMax(b.mul(gAny, rampHi, "am_ghi\(chunk)"), axis: 1, "am_hi\(chunk)")   // [1,1,1,R]
+            let sel = b.clip(b.sub(b.constScalarOne(), b.abs(b.sub(rampHi, hi, "am_gd\(chunk)"), "am_ga\(chunk)"), "am_gs\(chunk)"),
+                             low: 0, high: 1, "am_sel\(chunk)")                            // [1,groups,1,R]
+            let loMasked = b.mul(b.mul(mask, sel, "am_ms\(chunk)"), rampLo, "am_ml\(chunk)")
+            let lo = b.reduceMax(b.reduceMax(loMasked, axis: 2, "am_lo2_\(chunk)"), axis: 1, "am_lo\(chunk)")
+            maxes.append(m); his.append(hi); los.append(lo)
             rows += n; chunk += 1
         }
         let maxOut = b.concat(maxes, axis: 1, "o3_max")
-        let idxOut = b.concat(idxs, axis: 1, "o4_idx")
+        let hiOut = b.concat(his, axis: 1, "o4_hi")
+        let loOut = b.concat(los, axis: 1, "o5_lo")
 
-        let mil = b.program(returning: [hOut, kNew, vNew, maxOut, idxOut])
+        let mil = b.program(returning: [hOut, kNew, vNew, maxOut, hiOut, loOut])
         let inputs = [H * R, H * R, KVH * HD * W, KVH * W * HD, R * (W + R), ROT / 2 * R, ROT / 2 * R].map { $0 * 2 }
-        let outputs = [H * R, KVH * HD * R, KVH * HD * R, chunk * R, chunk * R].map { $0 * 2 }
+        let outputs = [H * R, KVH * HD * R, KVH * HD * R, chunk * R, chunk * R, chunk * R].map { $0 * 2 }
         return Emission(mil: mil, weights: b.weights, inputByteCounts: inputs, outputByteCounts: outputs, geometry: g)
     }
 }

@@ -17,7 +17,7 @@ import Testing
 @Suite("ANE head parity", .serialized)
 struct ANEHeadParityTests {
 
-    private static func makeModel() throws -> Qwen35TextModel {
+    private static func makeModel(vocab: Int = 512) throws -> Qwen35TextModel {
         let json = """
             {
               "hidden_size": 128,
@@ -25,7 +25,7 @@ struct ANEHeadParityTests {
               "num_key_value_heads": 2,
               "head_dim": 32,
               "intermediate_size": 256,
-              "vocab_size": 512,
+              "vocab_size": \(vocab),
               "num_hidden_layers": 2,
               "mtp_num_hidden_layers": 1,
               "num_experts": 0,
@@ -126,6 +126,36 @@ struct ANEHeadParityTests {
             print("after commit: cos \(cos) ane \(out.token) ref \(refToken)")
             #expect(cos > 0.995)
             #expect(out.token == refToken)
+        }
+    }
+
+    /// fp16 holds integers exactly only up to 2048; a 20480 vocab spans a
+    /// chunk boundary (16384 + 4096) and forces ids far above that limit.
+    @Test("argmax ids are exact above 2048 and across lm_head chunks")
+    func argmaxExactLargeVocab() throws {
+        guard ANEProgram.isAvailable else { print("ANE unavailable; skipping"); return }
+        try FocusedMLXTestSupport.withLock {
+            MLXRandom.seed(47)
+            let model = try Self.makeModel(vocab: 20480)
+            let source = try #require(model.aneHeadWeightSource(draftVocab: 20480, window: 64))
+            let runner = try ANEHeadRunner(source: source, cacheDirectory: nil)
+            let cache = model.makeNativeMTPCache()
+            var matches = 0, above2048 = 0
+            let steps = 12
+            for _ in 0 ..< steps {
+                let hidden = MLXRandom.normal([1, 1, 128])
+                let token = Int.random(in: 0 ..< 20480)
+                MLX.eval(hidden)
+                let ref = model.nativeMTPForward(
+                    hiddenStates: hidden, nextTokenIds: MLXArray([Int32(token)]).reshaped(1, 1), cache: cache)
+                let refToken = ref.logits.reshaped(-1).argMax().item(Int.self)
+                let out = try runner.draftStep(hidden: hidden.reshaped(-1).asArray(Float.self).map { Float16($0) }, token: token)
+                if out.token == refToken { matches += 1 }
+                if refToken > 2048 { above2048 += 1 }
+                print("large-vocab step \(runner.length): ane \(out.token) ref \(refToken)")
+            }
+            #expect(above2048 > 0)
+            #expect(matches >= steps - 1)
         }
     }
 }

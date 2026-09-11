@@ -19,7 +19,7 @@ public final class ANEHeadRunner {
 
     private let aHidden: ANEPlane, bEmbed: ANEPlane, cK: ANEPlane, dV: ANEPlane
     private let eMask: ANEPlane, fCos: ANEPlane, gSin: ANEPlane
-    private let oHidden: ANEPlane, oKNew: ANEPlane, oVNew: ANEPlane, oMax: ANEPlane, oIdx: ANEPlane
+    private let oHidden: ANEPlane, oKNew: ANEPlane, oVNew: ANEPlane, oMax: ANEPlane, oHi: ANEPlane, oLo: ANEPlane
 
     /// Live head positions.
     public private(set) var length = 0
@@ -46,7 +46,7 @@ public final class ANEHeadRunner {
         let ins = emission.inputByteCounts.map { ANEPlane(byteCount: $0)! }
         let outs = emission.outputByteCounts.map { ANEPlane(byteCount: $0)! }
         aHidden = ins[0]; bEmbed = ins[1]; cK = ins[2]; dV = ins[3]; eMask = ins[4]; fCos = ins[5]; gSin = ins[6]
-        oHidden = outs[0]; oKNew = outs[1]; oVNew = outs[2]; oMax = outs[3]; oIdx = outs[4]
+        oHidden = outs[0]; oKNew = outs[1]; oVNew = outs[2]; oMax = outs[3]; oHi = outs[4]; oLo = outs[5]
         slotPosition = [Int](repeating: -1, count: geometry.window)
         embedScratch = [Float16](repeating: 0, count: geometry.hidden)
         embeddingTable = ProcessInfo.processInfo.environment["VMLX_ANE_MTP_EMBED_TABLE"] == "0"
@@ -150,7 +150,8 @@ public final class ANEHeadRunner {
             let m = Float(oMax.fp16[c * R + r])
             if m > best {
                 best = m
-                bestIdx = c * ANEHeadGeometry.lmHeadChunk + Int(Float(oIdx.fp16[c * R + r]))
+                let hi = Int(Float(oHi.fp16[c * R + r])), lo = Int(Float(oLo.fp16[c * R + r]))
+                bestIdx = c * ANEHeadGeometry.lmHeadChunk + hi * 64 + lo
             }
         }
         return bestIdx

@@ -125,6 +125,11 @@ public struct ANEMILBuilder {
         return Value(name: n, shape: shape, dtype: .fp16)
     }
 
+    /// The fp16 tensor `[[[[1]]]]`, for broadcast arithmetic against a Value.
+    public mutating func constScalarOne() -> Value {
+        constFP16([Float16(1)], shape: [1, 1, 1, 1], "one")
+    }
+
     /// int8 per-row affine weight [n, k, 1, 1] with fp16 row scales, ready for `conv`.
     public mutating func int8Weight(_ q: [Int8], scales: [Float16], n: Int, k: Int, _ base: String = "w") -> Value {
         precondition(q.count == n * k && scales.count == n)
@@ -184,6 +189,10 @@ public struct ANEMILBuilder {
 
     public mutating func silu(_ x: Value, _ base: String = "silu") -> Value {
         emit(base, shape: x.shape) { _ in "silu(x = \(x.ref))" }
+    }
+
+    public mutating func abs(_ x: Value, _ base: String = "abs") -> Value {
+        emit(base, shape: x.shape) { _ in "abs(x = \(x.ref))" }
     }
 
     public mutating func sigmoid(_ x: Value, _ base: String = "sig") -> Value {
