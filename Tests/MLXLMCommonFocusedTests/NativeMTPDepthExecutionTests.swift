@@ -7,6 +7,45 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testSampledChunkDecisionCarriesEmittedTokenIDs() throws {
+        try FocusedMLXTestSupport.withLock {
+            for rejectionCase in 0...2 {
+                let model = DepthDispatchTarget(sequence: true)
+                model.setWrongDraft(rejectionCase == 1)
+                if rejectionCase == 2 {
+                    // Governor seeding advances the first speculative block.
+                    // Put the wrong proposal at its second draft in either mode.
+                    let governorOff = ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] == "0"
+                    model.setWrongDraftInput(governorOff ? 4 : 6)
+                }
+                var parameters = GenerateParameters(maxTokens: 24, temperature: 1)
+                parameters.randomSeed = 829
+                // This fixture has no recurrent prefix snapshots. Exercise
+                // chunk acceptance with checkpoint/replay, rather than claiming
+                // it implements a real hybrid model's prefix-commit protocol.
+                parameters.draftStrategy = .nativeMTP(depth: 3, verifierMode: "chunk_replay")
+                var iterator = try NativeMTPTokenIterator(
+                    input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                    parameters: parameters, depth: 3)
+                var tokens: [Int] = []
+                let started = ProcessInfo.processInfo.systemUptime
+                while let token = iterator.next() { tokens.append(token) }
+                XCTAssertEqual(tokens, (0..<24).map { (2 + $0) % 32 })
+                XCTAssertGreaterThan(iterator.chunkVerifierCount, 0)
+                if rejectionCase != 0 {
+                    XCTAssertGreaterThan(iterator.residualCorrectionCount, 0)
+                } else {
+                    XCTAssertGreaterThan(iterator.bonusCount, 0)
+                }
+                if rejectionCase == 2 {
+                    XCTAssertGreaterThan(iterator.acceptedByDepth[1, default: 0], 0,
+                        "Must reject after accepting one draft, not just at index zero")
+                }
+                print("SAMPLED-CHUNK rejectionCase=\(rejectionCase) accepted=\(iterator.acceptedByDepth) fixtureTokS=\(Double(tokens.count) / max(ProcessInfo.processInfo.systemUptime - started, 1e-9)) realModelSpeedProof=false")
+            }
+        }
+    }
+
     func testProductiveCalibrationResumesPriorDepth() throws {
         guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0",
               ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0" else {
@@ -210,6 +249,7 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
     var verifyWidths: [Int] { timingLock.withLock { widths } }
     private var delaysByWidth: [Int: TimeInterval] = [:]
     private var wrongDraft = false
+    private var wrongDraftInput: Int?
     let sequence: Bool
     let verifyDelay: TimeInterval
     let backboneDelay: TimeInterval
@@ -222,6 +262,7 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
         timingLock.withLock { delaysByWidth = values }
     }
     func setWrongDraft(_ value: Bool) { timingLock.withLock { wrongDraft = value } }
+    func setWrongDraftInput(_ value: Int) { timingLock.withLock { wrongDraftInput = value } }
     func newCache(parameters: GenerateParameters?) -> [KVCache] {
         sequence ? [MambaCache(), KVCacheSimple()] : [MambaCache()]
     }
@@ -249,7 +290,10 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
         return result(inputs)
     }
     func nativeMTPForward(hiddenStates: MLXArray, nextTokenIds: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
-        if timingLock.withLock({ wrongDraft }) {
+        let shouldReject = timingLock.withLock {
+            wrongDraft || wrongDraftInput.map { nextTokenIds.reshaped(-1)[0].item(Int.self) == $0 } == true
+        }
+        if shouldReject {
             let length = nextTokenIds.size
             return .init(logits: broadcast(MLXArray([Float(100)] + Array(repeating: Float(-100), count: 31)), to: [1, length, 32]),
                          hiddenStates: MLXArray.zeros([1, length, 4]))

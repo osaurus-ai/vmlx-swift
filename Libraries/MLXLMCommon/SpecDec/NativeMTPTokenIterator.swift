@@ -2962,11 +2962,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
             let syncStart = NativeMTPClock.now()
             MLX.eval(correction)
+            let correctionID = correction.item(Int.self)
             materializeSyncTime += NativeMTPClock.now() - syncStart
             return VerifyDecision(
                 accepted: accepted,
                 nextToken: correction,
-                targetTokenIds: [],
+                // The consumer indexes the emitted token at `accepted`,
+                // including when building the aligned head-cache chain.
+                // Sampled verification has no batched greedy IDs to reuse.
+                targetTokenIds: Array(draftTokenIds.prefix(accepted)) + [correctionID],
                 acceptanceProbabilitySum: probabilitySum,
                 acceptanceProbabilityCount: probabilityCount,
                 materializeSyncTime: materializeSyncTime)
@@ -2975,11 +2979,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let bonus = speculativeSampler.sampleFromTarget(probabilities: targetProbabilities[drafts.count])
         let syncStart = NativeMTPClock.now()
         MLX.eval(bonus)
+        let bonusID = bonus.item(Int.self)
         materializeSyncTime += NativeMTPClock.now() - syncStart
         return VerifyDecision(
             accepted: accepted,
             nextToken: bonus,
-            targetTokenIds: [],
+            targetTokenIds: draftTokenIds + [bonusID],
             acceptanceProbabilitySum: probabilitySum,
             acceptanceProbabilityCount: probabilityCount,
             materializeSyncTime: materializeSyncTime)
