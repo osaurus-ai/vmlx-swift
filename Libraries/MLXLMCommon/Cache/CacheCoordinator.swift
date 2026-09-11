@@ -702,6 +702,16 @@ public final class CacheCoordinator: @unchecked Sendable {
         return .miss
     }
 
+    /// A structurally readable disk payload can still be incompatible with
+    /// the model's cache layout. Do not retain its validated/durable status
+    /// after that rejection, or stable-prefix stores will elide the repair.
+    /// Invoke after leaving any serialized MLX restore closure.
+    public func rejectDiskCandidate(
+        tokens: [Int], arrays: [String: MLXArray], mediaSalt: String? = nil
+    ) {
+        diskCache?.rejectCandidate(tokens: tokens, arrays: arrays, mediaSalt: mediaSalt)
+    }
+
     /// True only after the current process has deserialized or written the
     /// exact L2 entry and its on-disk fingerprint still matches the index.
     public func hasValidatedDiskEntry(
@@ -713,7 +723,11 @@ public final class CacheCoordinator: @unchecked Sendable {
         else {
             return false
         }
-        if isHybrid, requiresRecurrentSSMCompanion {
+        // Match storeAfterGeneration's payload contract, not the broader
+        // path-dependence flag. Mamba state is persisted inside the v2 row;
+        // requiring an intentionally unwritten sidecar rebuilds every boundary.
+        // ArraysCache/GDN still requires its separate recurrent payload.
+        if isHybrid, requiresSeparateRecurrentPayload {
             return ssmStateCache.hasValidatedCompleteDiskEntry(
                 tokens: tokens,
                 boundary: tokens.count,
@@ -732,7 +746,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     ) -> Bool {
         guard diskCache?.hasDurableEntry(tokens: tokens, mediaSalt: mediaSalt) == true
         else { return false }
-        if isHybrid, requiresRecurrentSSMCompanion {
+        if isHybrid, requiresSeparateRecurrentPayload {
             return ssmStateCache.hasValidatedCompleteDiskEntry(
                 tokens: tokens,
                 boundary: tokens.count,

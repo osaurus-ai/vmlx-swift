@@ -6,6 +6,59 @@ import Testing
 
 // MARK: - CacheCoordinator Tests
 
+@Test func coordinatorDurableMambaBoundaryDoesNotRequireUnwrittenSidecar() throws {
+    try MLXMetalTestLock.withLock {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("durable-mamba-boundary-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let config = CacheCoordinatorConfig(
+            usePagedCache: false, enableDiskCache: true,
+            diskCacheMaxGB: 0.1, diskCacheDir: tmp,
+            modelKey: "durable-mamba-boundary")
+        let tokens = [31, 32, 33]
+        let cache = MambaCache()
+        cache.offset = tokens.count
+        cache[0] = MLXArray.ones([1, 2, 4])
+        cache[1] = MLXArray.ones([1, 2, 4, 4]) * 2
+        let topology = ModelCacheTopologySnapshot(cache: [cache])
+        #expect(topology.requiresRecurrentSSMCompanionState)
+        #expect(!topology.requiresSeparateRecurrentPayloadState)
+        let writer = CacheCoordinator(config: config)
+        writer.setHybrid(true,
+            requiresRecurrentSSMCompanion: topology.requiresRecurrentSSMCompanionState,
+            requiresSeparateRecurrentPayload: topology.requiresSeparateRecurrentPayloadState)
+        writer.storeAfterGeneration(promptTokens: tokens, perLayerData: [],
+            ssmStates: nil, cache: [cache])
+        #expect(writer.diskCache?.hasDurableEntry(tokens: tokens) == true)
+        #expect(writer.hasDurableDiskEntry(tokens: tokens),
+            "the in-file Mamba payload must not be rebuilt for an intentionally absent sidecar")
+        #expect(writer.hasValidatedDiskEntry(tokens: tokens))
+        let restarted = CacheCoordinator(config: config)
+        restarted.setHybrid(true, requiresRecurrentSSMCompanion: true,
+            requiresSeparateRecurrentPayload: false)
+        #expect(restarted.hasDurableDiskEntry(tokens: tokens))
+        #expect(!restarted.hasValidatedDiskEntry(tokens: tokens))
+        #expect(!restarted.hasDurableDiskEntry(tokens: [31, 32, 99]))
+        #expect(!restarted.hasDurableDiskEntry(tokens: tokens, mediaSalt: "different-media"))
+        guard case .hit(let matched, _, _, _, _, let arrays) =
+            restarted.fetch(tokens: tokens + [34])
+        else {
+            Issue.record("the persisted Mamba prefix must remain consumable after restart")
+            return
+        }
+        #expect(matched == tokens.count)
+        let payload = try #require(arrays)
+        var restored: [any KVCache] = [MambaCache()]
+        _ = restoreFromDiskArrays(payload, into: &restored)
+        #expect(restored[0].offset == tokens.count)
+        #expect(restored[0].state.count == cache.state.count)
+        for (actual, expected) in zip(restored[0].state, cache.state) {
+            #expect(actual.asArray(Float.self) == expected.asArray(Float.self))
+        }
+        #expect(restarted.hasValidatedDiskEntry(tokens: tokens))
+    }
+}
+
 @Test func coordinatorValidatedDiskEntryRequiresCurrentProcessProof() throws {
     try MLXMetalTestLock.withLock {
         let tmp = FileManager.default.temporaryDirectory
@@ -73,6 +126,7 @@ import Testing
             cache: nil)
         #expect(!coordinator.hasValidatedDiskEntry(tokens: tokens),
             "validated KV alone must not hide a missing recurrent companion")
+        #expect(!coordinator.hasDurableDiskEntry(tokens: tokens))
 
         coordinator.storeAfterGeneration(
             promptTokens: tokens,
@@ -80,6 +134,7 @@ import Testing
             ssmStates: [MLXArray.ones([1, 4])],
             cache: nil)
         #expect(coordinator.hasValidatedDiskEntry(tokens: tokens))
+        #expect(coordinator.hasDurableDiskEntry(tokens: tokens))
     }
 }
 

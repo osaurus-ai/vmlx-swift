@@ -92,7 +92,9 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
     /// position: v2 has no `LayerKind` for it, so `restoreFromDiskArrays`
     /// leaves those layers at their initial value and the companion is the
     /// sole carrier. MambaCache state round-trips in-file as
-    /// `mamba_{i}_state0/1` and is restored by `deserializeV2` directly —
+    /// `mamba_{i}_stateN` with the model-declared persistent-slot capacity
+    /// (including extended PLE history/convolution, excluding verify scratch)
+    /// and is restored by `deserializeV2` directly —
     /// measured live on Qwen3.8-27B (48 mamba layers), the companion copies
     /// added ~300MB per stored boundary that the restore path never applied.
     ///

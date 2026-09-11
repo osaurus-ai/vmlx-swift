@@ -617,15 +617,26 @@ public class QSAKVCache: KVCacheSimple {
     /// context every step).
     ///
     /// This lane is pure derivation from `indexerKeys`: it is never
-    /// serialized (`state` drops it), never copied, and any trim/rollback
-    /// clears it — the next forward rebuilds it from the raw lane in one
-    /// pass, bit-identical, and resumes incrementally after that.
+    /// serialized (`state` drops it) or copied. Rollback retains only complete
+    /// blocks covered by the accepted raw prefix. Unknown geometry fails
+    /// closed to a full rebuild rather than guessing a compression ratio.
     public var derivedPooledBlocks: MLXArray?
     public var derivedPooledBlockCount: Int = 0
+    private var derivedPoolCompressionRatio: Int?
+
+    /// The indexer supplies the active model's geometry, independently of
+    /// quantization. Changing it invalidates the previous derived lane.
+    public func prepareDerivedPooledBlocks(compressionRatio: Int) {
+        if compressionRatio <= 0 || derivedPoolCompressionRatio != compressionRatio {
+            dropDerivedPooledBlocks()
+        }
+        derivedPoolCompressionRatio = compressionRatio > 0 ? compressionRatio : nil
+    }
 
     public func dropDerivedPooledBlocks() {
         derivedPooledBlocks = nil
         derivedPooledBlockCount = 0
+        derivedPoolCompressionRatio = nil
     }
 
     public func updateIndexerKeys(_ rawKeys: MLXArray) -> MLXArray {
@@ -676,8 +687,24 @@ public class QSAKVCache: KVCacheSimple {
             if let existing = indexerKeys, existing.dim(1) > offset {
                 indexerKeys = existing[0..., ..<offset, 0...]
             }
-            // Rollback invalidates trailing blocks; rebuild from raw keys.
-            dropDerivedPooledBlocks()
+            // Complete blocks within the accepted prefix contain no rejected
+            // rows. Retain that prefix, but never retain a partial block.
+            if let ratio = derivedPoolCompressionRatio,
+                let pooled = derivedPooledBlocks, pooled.ndim == 3,
+                derivedPooledBlockCount >= 0,
+                derivedPooledBlockCount <= pooled.dim(1),
+                let raw = indexerKeys, raw.dim(1) >= offset
+            {
+                let keep = min(derivedPooledBlockCount, offset / ratio)
+                if keep > 0 {
+                    derivedPooledBlocks = pooled[0..., ..<keep, 0...]
+                    derivedPooledBlockCount = keep
+                } else {
+                    dropDerivedPooledBlocks()
+                }
+            } else {
+                dropDerivedPooledBlocks()
+            }
         }
         return trimmed
     }
@@ -1513,6 +1540,9 @@ public class ArraysCache: BaseKVCache {
 
 /// Simple cache for Mamba-style state space models
 public class MambaCache: ArraysCache {
+    /// Leading slots owned by the model across requests. Slots beyond this
+    /// boundary are temporary verification scratch, not reusable prefix state.
+    public var persistentStateSlotCount: Int
     private struct PrefixCommitState {
         var arrays: [MLXArray]
         var offset: Int
@@ -1521,6 +1551,7 @@ public class MambaCache: ArraysCache {
     private var prefixCommitStates: [Int: PrefixCommitState] = [:]
 
     public init(leftPadding: [Int]? = nil) {
+        persistentStateSlotCount = 2
         super.init(size: 2, leftPadding: leftPadding)
     }
 
@@ -1529,6 +1560,7 @@ public class MambaCache: ArraysCache {
     /// layer's cache and stores previous-context token ids in slot 2 and the
     /// dilated-conv state in slot 3.
     public init(slots: Int, leftPadding: [Int]? = nil) {
+        persistentStateSlotCount = slots
         super.init(size: slots, leftPadding: leftPadding)
     }
 
@@ -1646,6 +1678,7 @@ public class MambaCache: ArraysCache {
 
     public override func copy() -> any KVCache {
         let new = MambaCache(slots: slotCount)
+        new.persistentStateSlotCount = persistentStateSlotCount
         copySlots(into: new)
         new.offset = self.offset
         new.leftPadding = self.leftPadding

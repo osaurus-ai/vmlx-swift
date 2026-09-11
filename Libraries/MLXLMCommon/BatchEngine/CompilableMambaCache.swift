@@ -121,6 +121,7 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
     ///   prefill of Mamba / GDN layers.
     public convenience init(from mamba: MambaCache) {
         self.init(slots: mamba.slotCount, leftPadding: nil)
+        self.persistentStateSlotCount = mamba.persistentStateSlotCount
 
         // Copy offset + leftPadding from source.
         self.offset = mamba.offset
@@ -257,6 +258,7 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
 
     public override func copy() -> any KVCache {
         let new = CompilableMambaCache(slots: stableSlotCount)
+        new.persistentStateSlotCount = persistentStateSlotCount
         new.offset = self.offset
         new.leftPadding = self.leftPadding
         for index in 0 ..< stableSlotCount {

@@ -93,6 +93,9 @@ private let _vlmCompiledPreciseSwiGLU: @Sendable (MLXArray, MLXArray, MLXArray) 
 enum Qwen4ExpCompiledGDNInputs {
     typealias Region = @Sendable ([MLXArray]) -> [MLXArray]
 
+    static let preprocessEnabled =
+        RuntimeEnvironment.value("VMLX_QWEN4_EXP_COMPILE_GDN_PREPROCESS") == "1"
+
     private static let enabled: Bool = {
         let value =
             RuntimeEnvironment.value("VMLX_QWEN4_EXP_COMPILE_GDN")
@@ -266,6 +269,54 @@ enum Qwen4ExpCompiledGDNInputs {
             input, convState, weight, scales, biases, convWeight,
         ])
         return outputs.count == 7 ? outputs : nil
+    }
+
+    /// Decode-only experiment after projection dispatch. All layer weights are
+    /// explicit inputs; neither quantized projection selection nor cache writes
+    /// are part of this graph. Geometry comes from the active layer.
+    static func callPreprocess(
+        convInput: MLXArray, convWeight: MLXArray,
+        numKHeads: Int, headKDim: Int, numVHeads: Int, headVDim: Int
+    ) -> [MLXArray]? {
+        guard enabled, !CompiledDecodeTrace.isActive,
+            convInput.ndim == 3, convWeight.ndim == 3,
+            numKHeads > 0, headKDim > 0, numVHeads > 0, headVDim > 0,
+            convInput.dtype == .bfloat16, convWeight.dtype == convInput.dtype
+        else { return nil }
+        let keyDim = numKHeads * headKDim
+        let convDim = 2 * keyDim + numVHeads * headVDim
+        guard convInput.dim(2) == convDim,
+            convWeight.dim(0) == convDim, convWeight.dim(2) == 1,
+            convInput.dim(1) == convWeight.dim(1), convWeight.dim(1) > 0
+        else { return nil }
+        let key = ["preprocess", String(numKHeads), String(headKDim),
+            String(numVHeads), String(headVDim), String(convWeight.dim(1))]
+            .joined(separator: "|")
+        lock.lock()
+        var region = regions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                let B = args[0].dim(0)
+                let output = silu(conv1d(args[0], args[1], stride: 1,
+                    padding: 0, dilation: 1, groups: convDim))
+                let split = MLX.split(output, indices: [keyDim, 2 * keyDim], axis: -1)
+                let q = split[0].reshaped(B, 1, numKHeads, headKDim)
+                let k = split[1].reshaped(B, 1, numKHeads, headKDim)
+                let v = split[2].reshaped(B, 1, numVHeads, headVDim)
+                let invScale = pow(Float(headKDim), -0.5)
+                return [
+                    MLXArray(pow(invScale, 2), dtype: q.dtype)
+                        * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6),
+                    MLXArray(invScale, dtype: k.dtype)
+                        * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6), v,
+                ]
+            }
+            regions[key] = region
+            FileHandle.standardError.write(Data(
+                "[Qwen4Exp] compiled_gdn_preprocess=selected geometry=\(key) weights=explicit_inputs dtype=bfloat16\n".utf8))
+        }
+        lock.unlock()
+        return region!([convInput, convWeight])
     }
 
     static func callTail(
@@ -1879,18 +1930,31 @@ enum Qwen35Language {
                     }
                 }
 
-                let convOut = silu(conv1d(convInput))
-                let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-                let q = split[0].reshaped(B, S, numKHeads, headKDim)
-                let k = split[1].reshaped(B, S, numKHeads, headKDim)
-                v = split[2].reshaped(B, S, numVHeads, headVDim)
-                let invScale = pow(Float(headKDim), -0.5)
-                qNormed =
-                    MLXArray(pow(invScale, 2), dtype: q.dtype)
-                    * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-                kNormed =
-                    MLXArray(invScale, dtype: k.dtype)
-                    * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+                let preprocessing = S == 1 && mask == nil
+                    && Qwen4ExpCompiledGDNInputs.preprocessEnabled
+                    ? Qwen4ExpCompiledGDNInputs.callPreprocess(
+                        convInput: convInput, convWeight: conv1d.weight,
+                        numKHeads: numKHeads, headKDim: headKDim,
+                        numVHeads: numVHeads, headVDim: headVDim)
+                    : nil
+                if let preprocessing {
+                    qNormed = preprocessing[0]
+                    kNormed = preprocessing[1]
+                    v = preprocessing[2]
+                } else {
+                    let convOut = silu(conv1d(convInput))
+                    let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+                    let q = split[0].reshaped(B, S, numKHeads, headKDim)
+                    let k = split[1].reshaped(B, S, numKHeads, headKDim)
+                    v = split[2].reshaped(B, S, numVHeads, headVDim)
+                    let invScale = pow(Float(headKDim), -0.5)
+                    qNormed =
+                        MLXArray(pow(invScale, 2), dtype: q.dtype)
+                        * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                    kNormed =
+                        MLXArray(invScale, dtype: k.dtype)
+                        * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+                }
             }
 
             // Same defense as the conv slot: a mis-restored recurrent state

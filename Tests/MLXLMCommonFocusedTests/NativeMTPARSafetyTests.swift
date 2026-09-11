@@ -16,6 +16,44 @@ final class NativeMTPARSafetyTests: XCTestCase {
 
     private typealias V = NativeMTPTokenIterator
 
+    func testProductionMarginDoesNotDeliberatelyPermitSustainedSlowdown() {
+        // Same context, sustained 5% loss: both the window and median must
+        // reject it. This pins the production threshold, not a test override.
+        let samples = ring(Array(repeating: 42, count: 8))
+        let verdict = V.windowedARVerdict(
+            arStepMs: 10, firstVerifyMs: 12, windowCycles: 8,
+            deltaEmitted: 32, deltaWallMs: 336, deltaVerifyMs: 96,
+            margin: V.arSafetyMargin)
+        XCTAssertNotNil(verdict)
+        XCTAssertGreaterThan(V.medianCycleMsPerToken(samples)!, 10 * V.arSafetyMargin)
+        for cost in [9.0, 10.0] {
+            XCTAssertNil(V.windowedARVerdict(
+                arStepMs: 10, firstVerifyMs: 12, windowCycles: 8,
+                deltaEmitted: 32, deltaWallMs: cost * 32, deltaVerifyMs: 96,
+                margin: V.arSafetyMargin))
+        }
+    }
+
+    func testResumeProbeCompletesAtSixCyclesNotTwelve() {
+        var remaining = 6
+        var samples = [V.ARSafetySample(emitted: 40, wall: 1, verifyTotal: 0)]
+        for cycle in 1...6 {
+            samples.append(V.ARSafetySample(
+                emitted: 40 + cycle * 2, wall: 1.030 + Double(cycle) * 0.020,
+                verifyTotal: Double(cycle) * 0.010))
+            let complete = V.advanceARSafetyProbe(remaining: &remaining)
+            XCTAssertEqual(complete, cycle == 6)
+            XCTAssertEqual(remaining, 6 - cycle)
+        }
+        XCTAssertEqual(samples.count, 7)
+        let wall = samples.last!.wall - samples.first!.wall
+        let emitted = samples.last!.emitted - samples.first!.emitted
+        // 30ms initial drafting plus six 20ms cycles; initial cost counts.
+        XCTAssertEqual(wall * 1000 / Double(emitted), 12.5, accuracy: 1e-9)
+        XCTAssertFalse(V.advanceARSafetyProbe(remaining: &remaining))
+        XCTAssertEqual(remaining, 0)
+    }
+
     func testFastMTPHolds() {
         // MTP at 5ms/tok, AR seed 10ms, no context growth -> MTP is 2x faster.
         XCTAssertNil(

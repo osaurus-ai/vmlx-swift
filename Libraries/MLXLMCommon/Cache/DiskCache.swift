@@ -96,6 +96,21 @@ public final class DiskCache: @unchecked Sendable {
         let modificationDate: Date
     }
 
+    private struct TensorLayout: Equatable {
+        let shape: [Int]
+        let dtype: DType
+    }
+
+    private struct ValidatedEntry {
+        let fingerprint: ValidatedFileFingerprint
+        let layout: [String: TensorLayout]
+        let candidateIdentity: [String: ObjectIdentifier]?
+    }
+
+    private static func layout(of arrays: [String: MLXArray]) -> [String: TensorLayout] {
+        arrays.mapValues { TensorLayout(shape: $0.shape, dtype: $0.dtype) }
+    }
+
     // MARK: - Properties
 
     /// Root directory for cache files and the SQLite index.
@@ -153,7 +168,7 @@ public final class DiskCache: @unchecked Sendable {
     /// fingerprint lets `store` avoid realizing and rewriting the same large
     /// prompt boundary after a cache hit, while a fresh process still validates
     /// an inherited file before it can take the fast path.
-    private var validatedFiles: [String: ValidatedFileFingerprint] = [:]
+    private var validatedFiles: [String: ValidatedEntry] = [:]
 
     /// Trace-only identity of the most recent boundary written by this cache
     /// instance. Growing agent loops can store N tokens and immediately probe N
@@ -350,7 +365,8 @@ public final class DiskCache: @unchecked Sendable {
         // entry instead of preserving an assumption.
         if let validated = validatedFiles[hash],
            let current = _fileFingerprint(url: url),
-           current == validated,
+           current == validated.fingerprint,
+           validated.layout == Self.layout(of: arrays),
            let indexed = _entryMetadataLocked(hash: hash),
            indexed.tokenCount == tokenCount,
            indexed.fileSize == current.size,
@@ -421,7 +437,9 @@ public final class DiskCache: @unchecked Sendable {
 
             _insertEntryLocked(hash: hash, tokenCount: tokenCount, fileSize: fileSize)
             if let fingerprint = _fileFingerprint(url: finalURL), fingerprint.size > 0 {
-                validatedFiles[hash] = fingerprint
+                validatedFiles[hash] = ValidatedEntry(
+                    fingerprint: fingerprint, layout: Self.layout(of: arrays),
+                    candidateIdentity: nil)
             } else {
                 validatedFiles.removeValue(forKey: hash)
             }
@@ -516,7 +534,9 @@ public final class DiskCache: @unchecked Sendable {
                 throw DiskCacheIntegrityError.nonFinitePayload(nonFinite.joined(separator: ","))
             }
             if let fingerprint = _fileFingerprint(url: url), fingerprint.size > 0 {
-                validatedFiles[hash] = fingerprint
+                validatedFiles[hash] = ValidatedEntry(
+                    fingerprint: fingerprint, layout: Self.layout(of: arrays),
+                    candidateIdentity: arrays.mapValues { ObjectIdentifier($0) })
             }
             if touchRecency {
                 _touchEntryLocked(hash: hash)
@@ -574,7 +594,7 @@ public final class DiskCache: @unchecked Sendable {
 
         guard let validated = validatedFiles[hash],
               let current = _fileFingerprint(url: url),
-              current == validated,
+              current == validated.fingerprint,
               current.size > 0,
               let indexed = _entryMetadataLocked(hash: hash),
               indexed.tokenCount == tokens.count,
@@ -611,6 +631,37 @@ public final class DiskCache: @unchecked Sendable {
             return false
         }
         return true
+    }
+
+    /// Invalidate the candidate identified by this instance's last fetch.
+    /// Preserve a file whose observed fingerprint changed in the meantime.
+    /// Call outside withSerializedMLXCacheIO (the IO lock is non-recursive).
+    @discardableResult
+    func rejectCandidate(
+        tokens: [Int], arrays: [String: MLXArray], mediaSalt: String? = nil
+    ) -> Bool {
+        let hash = Self.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
+        let url = safetensorsURL(for: hash)
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let validated = validatedFiles[hash],
+              validated.candidateIdentity == arrays.mapValues({ ObjectIdentifier($0) }),
+              _fileFingerprint(url: url) == validated.fingerprint
+        else { return false }
+        validatedFiles.removeValue(forKey: hash)
+        do {
+            try FileManager.default.removeItem(at: url)
+            _deleteEntryLocked(hash: hash)
+            FileHandle.standardError.write(Data(
+                "[vmlx][cache/disk] removed model-rejected candidate hash=\(hash) tokens=\(tokens.count)\n".utf8))
+            return true
+        } catch {
+            FileHandle.standardError.write(Data(
+                "[vmlx][cache/disk] failed to remove model-rejected candidate hash=\(hash): \(error)\n".utf8))
+            return false
+        }
     }
 
     /// Candidate prompt-boundary lengths currently present in the disk index.

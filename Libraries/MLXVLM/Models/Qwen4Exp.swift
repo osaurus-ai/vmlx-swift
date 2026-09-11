@@ -945,13 +945,14 @@ private final class Qwen4ExpQSAIndexer: Module {
         // processed form is append-only. Re-pooling + re-norming + re-rotating
         // the ENTIRE history every decode token made the indexer's overhead
         // linear in context per step; keep the processed blocks on the cache
-        // and extend by only the newly completed ones. Any trim/rollback or
-        // state restore drops the derived lane and the next forward rebuilds
-        // it here in one pass. `VMLX_QSA_POOL_CACHE=0` restores full
+        // and extend by only the newly completed ones. Trim/rollback retains
+        // only complete accepted blocks; state restore drops the derived lane.
+        // `VMLX_QSA_POOL_CACHE=0` restores full
         // recompute for A/B.
         var pooled: MLXArray
         if Qwen4ExpQSARuntime.poolCache, let cache {
             if cache.derivedPooledBlockCount > blocks { cache.dropDerivedPooledBlocks() }
+            cache.prepareDerivedPooledBlocks(compressionRatio: extras.indexerCompressRatio)
             let have = cache.derivedPooledBlockCount
             if blocks > have {
                 let fresh = processBlocks(have ..< blocks)
@@ -1430,6 +1431,7 @@ protocol Qwen4ExpModelDirectoryConfigurable: AnyObject {
 
 public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurable,
     SafetensorsLoadKeyExcluding, NativeMTPModel, DFlash2StagedVerifyRollbackModel,
+    NativeMTPSampledStagedDiagnosticModel,
     CompiledDecodeExternalInputModel, ModalityBearing, ModelComponentMapping
 {
     /// QSA index selection and its path-dependent cache currently require a
@@ -1562,7 +1564,9 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         textModel.layers.map { layer in
             if layer.isLinear {
-                return MambaCache(slots: layer.ple == nil ? 2 : 6) as KVCache
+                let cache = MambaCache(slots: layer.ple == nil ? 2 : 6)
+                cache.persistentStateSlotCount = layer.ple == nil ? 2 : 4
+                return cache as KVCache
             }
             return QSAKVCache() as KVCache
         }
@@ -1573,6 +1577,29 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
 
         guard input.image != nil || input.video != nil else {
             setRopeDelta(0, for: cache)
+            // The caller's window also bounds cache-boundary reconstruction.
+            // A whole-prompt forward here retained prefill intermediates at the
+            // post-generation high-water mark. Keep QSA/PLE/recurrent state in
+            // the supplied cache and materialize it between text chunks.
+            // Media retains its full-grid M-RoPE/scatter path below.
+            let step = windowSize ?? GenerateParameters().prefillStepSize
+            if inputIds.ndim == 2, !cache.isEmpty, step > 0, inputIds.dim(1) > step {
+                let count = inputIds.dim(1)
+                var offset = 0
+                while count - offset > step {
+                    try Task.checkCancellation()
+                    let end = offset + step
+                    _ = textModel(inputIds[0..., offset ..< end], cache: cache)
+                    MLX.eval(cache)
+                    PrefillProgressReporter.reportCompletedUnits(end)
+                    offset = end
+                    MLX.Memory.clearCache()
+                }
+                try Task.checkCancellation()
+                return .logits(LMOutput(
+                    logits: callAsFunction(inputIds[0..., offset...], cache: cache)))
+            }
+            try Task.checkCancellation()
             return .logits(LMOutput(logits: callAsFunction(inputIds, cache: cache)))
         }
 

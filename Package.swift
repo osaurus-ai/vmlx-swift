@@ -849,6 +849,11 @@ let package = Package(
             sources: [
                 "ProposalHeadStampTests.swift",
                 "NativeMTPARSafetyTests.swift",
+                "NativeMTPClockTests.swift",
+                "NativeMTPDepthPolicyTests.swift",
+                "NativeMTPDepthExecutionTests.swift",
+                "NativeMTPBoundaryCaptureTests.swift",
+                "NativeMTPManualSafetyParityTests.swift",
                 "RaptorTopLevelStampTests.swift",
                 "HybridRestoreBoundaryInvariantTests.swift",
                 "DualPathFamiliesTests.swift",

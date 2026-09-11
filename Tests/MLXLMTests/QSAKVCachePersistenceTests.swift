@@ -27,6 +27,57 @@ private func makeQSACache(
     return cache
 }
 
+@Test(arguments: [2, 4, 8])
+func qsaRollbackRetainsOnlyCompleteAcceptedBlocks(ratio: Int) throws {
+    try MLXMetalTestLock.withLock {
+        for removed in [1, ratio, ratio + 1, 32] {
+            let cache = makeQSACache(tokens: 32)
+            cache.prepareDerivedPooledBlocks(compressionRatio: ratio)
+            let blocks = MLXArray((0..<(32 / ratio * 4)).map(Float.init))
+                .reshaped(1, 32 / ratio, 4)
+            cache.derivedPooledBlocks = blocks
+            cache.derivedPooledBlockCount = 32 / ratio
+            #expect(cache.trim(removed) == removed)
+            let kept = (32 - removed) / ratio
+            #expect(cache.derivedPooledBlockCount == kept)
+            #expect(cache.indexerKeys?.dim(1) == 32 - removed)
+            if kept == 0 {
+                #expect(cache.derivedPooledBlocks == nil)
+            } else {
+                let actual = try #require(cache.derivedPooledBlocks)
+                #expect(arrayEqual(actual, blocks[0..., ..<kept, 0...]).item(Bool.self))
+            }
+            // Neither disk state nor copies carry derived blocks or geometry.
+            let copied = try #require(cache.copy() as? QSAKVCache)
+            #expect(copied.derivedPooledBlockCount == 0)
+            #expect(copied.derivedPooledBlocks == nil)
+            let rawState = cache.state
+            cache.state = rawState
+            #expect(cache.derivedPooledBlockCount == 0)
+        }
+    }
+}
+
+@Test func qsaPoolGeometryChangeAndUnknownGeometryInvalidate() {
+    MLXMetalTestLock.withLock {
+        for ratio in [0, 2, 8] {
+            let cache = makeQSACache(tokens: 32)
+            cache.prepareDerivedPooledBlocks(compressionRatio: 4)
+            cache.derivedPooledBlocks = MLXArray.ones([1, 8, 4])
+            cache.derivedPooledBlockCount = 8
+            cache.prepareDerivedPooledBlocks(compressionRatio: ratio)
+            #expect(cache.derivedPooledBlocks == nil)
+            #expect(cache.derivedPooledBlockCount == 0)
+        }
+        let unknown = makeQSACache(tokens: 32)
+        unknown.derivedPooledBlocks = MLXArray.ones([1, 8, 4])
+        unknown.derivedPooledBlockCount = 8
+        _ = unknown.trim(1)
+        #expect(unknown.derivedPooledBlocks == nil)
+        #expect(unknown.derivedPooledBlockCount == 0)
+    }
+}
+
 /// The full round-trip: serialize → deserialize (kind `.qsaKV`) → restore
 /// into a fresh QSAKVCache → the lane covers exactly `offset`, and a
 /// follow-up segment keeps `total == offset + S` — the invariant whose

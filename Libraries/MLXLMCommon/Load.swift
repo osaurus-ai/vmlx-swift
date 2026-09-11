@@ -537,6 +537,12 @@ public func loadWeights(
             JANGTQStreamingExperts.configureModelDirectory(modelDirectory)
         }
         let modelKeyExcluder = model as? any SafetensorsLoadKeyExcluding
+        let uncachedResidentRead = modelKeyExcluder?.requiresResidentSafetensorsWeights == true
+            && ProcessInfo.processInfo.environment["VMLX_FLASH_RESIDENT_READER"] == "uncached"
+        if uncachedResidentRead {
+            FileHandle.standardError.write(Data(
+                "[loadWeights] resident_reader=uncached_owned opt_in=true source_files_unchanged=true\n".utf8))
+        }
         for url in allShardURLs {
             let isPrestackedShard = url.lastPathComponent == "jangpress-prestacked.safetensors"
             let headerNames = (try? loadSafetensorsHeaderNamesForBaseLoad(url)) ?? []
@@ -577,10 +583,12 @@ public func loadWeights(
                     continue
                 }
             }
-            let (w, m) = try loadArraysAndMetadata(
-                url: url,
-                excludingKeys: excludedKeys,
-                exactTensorBuffers: modelKeyExcluder?.requiresExactTensorMmapBuffers == true)
+            let (w, m) = try uncachedResidentRead
+                ? ResidentSafetensorsReader.load(url: url, excludingKeys: excludedKeys)
+                : loadArraysAndMetadata(
+                    url: url,
+                    excludingKeys: excludedKeys,
+                    exactTensorBuffers: modelKeyExcluder?.requiresExactTensorMmapBuffers == true)
             var shardWeights: [String: MLXArray] = [:]
             for (key, value) in w {
                 if shouldFilterPreservedMTP, isPreservedMTPWeightKey(key) {
@@ -612,7 +620,7 @@ public func loadWeights(
                 // excluded above, so this materializes compute tensors only.
                 // `* 1` creates owned MLX storage even for already-contiguous
                 // mmap inputs (unlike `contiguous()`, which may return them as-is).
-                let resident = shardWeights.mapValues { $0 * 1 }
+                let resident = uncachedResidentRead ? shardWeights : shardWeights.mapValues { $0 * 1 }
                 MLX.eval(Array(resident.values))
                 residentSafetensorsBytes += resident.values.reduce(0) { $0 + $1.nbytes }
                 for (key, value) in resident { weights[key] = value }

@@ -583,6 +583,12 @@ struct MTPRuntimeFocusedTests {
         #expect(status.snapshot.tuning?.legacyBlockSuperseded == true)
         #expect(status.statusLine.contains("legacy_block=superseded_by_row_parity_fix"))
         #expect(recommendation?.depth == 3)
+        var manualSettings = VMLXServerRuntimeSettings()
+        manualSettings.mtp.mode = .forceOn
+        manualSettings.mtp.explicitDepth = 3
+        #expect(manualSettings.effectiveMTPLaunchMode(for: status) == .speculative)
+        #expect(manualSettings.resolvedMTPLaunch(
+            configData: config, jangConfig: nil, status: status).launchMode == .speculative)
         #expect(recommendation?.evidence.contains(
             "legacy_block=superseded_by_qwen4_exp_q4_row_parity_fix") == true)
 
@@ -610,6 +616,9 @@ struct MTPRuntimeFocusedTests {
         #expect(!changedStatus.isLegacyBlockSuperseded)
         #expect(changedStatus.isExplicitlyBlocked)
         #expect(!changedStatus.canAutoLaunchMTP)
+        #expect(manualSettings.effectiveMTPLaunchMode(for: changedStatus) == .blocked)
+        #expect(manualSettings.resolvedMTPLaunch(
+            configData: config, jangConfig: nil, status: changedStatus).launchMode == .blocked)
     }
 
     @Test("measured Flash-Next cold start is not inherited by other Qwen families")

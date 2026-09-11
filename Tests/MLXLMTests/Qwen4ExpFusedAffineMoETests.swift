@@ -40,10 +40,12 @@ struct Qwen4ExpFusedAffineMoETests {
         Combo(label: "6S_up_down_q6", gate: (4, 64), up: (6, 64), down: (6, 64)),
         Combo(label: "Ornith_late_gate_up_q5", gate: (5, 64), up: (5, 64), down: (4, 64)),
         Combo(label: "q5_all_projections", gate: (5, 64), up: (5, 64), down: (5, 64)),
+        Combo(label: "mixed_gate_g128_up_down_g64", gate: (4, 128), up: (4, 64), down: (4, 64)),
     ]
 
     private static func makeProjection(
-        inputDims: Int, outputDims: Int, bits: Int, groupSize: Int, seed: UInt64
+        inputDims: Int, outputDims: Int, bits: Int, groupSize: Int, seed: UInt64,
+        metadataDType: DType = .float16
     ) -> (module: QuantizedSwitchLinear, dequantized: MLXArray) {
         let source = MLXRandom.uniform(
             low: -0.5, high: 0.5, [experts, outputDims, inputDims],
@@ -56,13 +58,13 @@ struct Qwen4ExpFusedAffineMoETests {
             outputDims: outputDims,
             numExperts: experts,
             weight: weight,
-            scales: scales,
-            biases: biases,
+            scales: scales.asType(metadataDType),
+            biases: biases?.asType(metadataDType),
             groupSize: groupSize,
             bits: bits,
             mode: .affine)
         let exact = dequantized(
-            weight, scales: scales, biases: biases,
+            weight, scales: scales.asType(metadataDType), biases: biases?.asType(metadataDType),
             groupSize: groupSize, bits: bits, mode: .affine, dtype: .float32)
         return (module, exact)
     }
@@ -73,6 +75,85 @@ struct Qwen4ExpFusedAffineMoETests {
         let num = MLX.sqrt(((c - r) * (c - r)).sum())
         let den = MLX.sqrt((r * r).sum())
         return (num / den).item(Float.self)
+    }
+
+    // Explicit diagnostic only: generated, cache-warm weights and synchronized
+    // calls do not establish whole-model bandwidth or app token throughput.
+    @Test("opt-in mixed-layout fused versus generic reducer timing", .enabled(
+        if: ProcessInfo.processInfo.environment["VMLX_RUN_FLASH_MOE_BENCH"] == "1"))
+    func fusedReducerTiming() throws {
+        try MLXMetalTestLock.withLock {
+            let combos = Self.shippedCombos + [
+                Combo(label: "2L_uniform_q2g64", gate: (2, 64), up: (2, 64), down: (2, 64)),
+            ]
+            for (combo, metadata) in combos.flatMap({ combo in
+                [DType.float16, .bfloat16].map { (combo, $0) }
+            }) {
+                let (gate, _) = Self.makeProjection(
+                    inputDims: Self.inputDims, outputDims: Self.expertDims,
+                    bits: combo.gate.bits, groupSize: combo.gate.group, seed: 901,
+                    metadataDType: metadata)
+                let (up, _) = Self.makeProjection(
+                    inputDims: Self.inputDims, outputDims: Self.expertDims,
+                    bits: combo.up.bits, groupSize: combo.up.group, seed: 902,
+                    metadataDType: metadata)
+                let (down, _) = Self.makeProjection(
+                    inputDims: Self.expertDims, outputDims: Self.inputDims,
+                    bits: combo.down.bits, groupSize: combo.down.group, seed: 903,
+                    metadataDType: metadata)
+                let reducer = try #require(Qwen4ExpFusedAffineMoE.makeReducer(
+                    gate: gate, up: up, down: down))
+                MLX.eval(gate, up, down)
+                for rows in 1 ... 4 {
+                    let x = MLXRandom.uniform(
+                        low: -1, high: 1, [1, rows, Self.inputDims],
+                        key: MLXRandom.key(904)).asType(.bfloat16)
+                    let indices = MLXArray((0 ..< rows * Self.topK).map {
+                        UInt32(($0 * 3) % Self.experts)
+                    }).reshaped(1, rows, Self.topK)
+                    let scores = MLX.softmax(MLXRandom.uniform(
+                        low: 0, high: 1, [1, rows, Self.topK],
+                        key: MLXRandom.key(905)), axis: -1)
+                    MLX.eval(x, indices, scores)
+                    let fused: () -> MLXArray = { reducer(x, indices, scores)! }
+                    let generic: () -> MLXArray = {
+                        let expanded = MLX.expandedDimensions(x, axes: [-2, -3])
+                        let g = gate(expanded, indices)
+                        let u = up(expanded, indices)
+                        let activation = (g * MLX.sigmoid(g)) * u
+                        let routed = MLX.squeezed(down(activation, indices), axis: -2)
+                        return (routed.asType(.float32) * scores[.ellipsis, .newAxis])
+                            .sum(axis: -2).asType(.bfloat16)
+                    }
+                    let error = Self.relativeError(fused(), generic())
+                    #expect(error.isFinite && error < 0.02, "reducer relative error \(error)")
+                    for _ in 0 ..< 5 { MLX.eval(fused()); MLX.eval(generic()) }
+                    func measure(_ operation: () -> MLXArray) -> Double {
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        for _ in 0 ..< 20 { MLX.eval(operation()) }
+                        return Double(DispatchTime.now().uptimeNanoseconds - start) / 20_000_000
+                    }
+                    var fusedSamples: [Double] = []
+                    var genericSamples: [Double] = []
+                    for round in 0 ..< 7 {
+                        if round.isMultiple(of: 2) {
+                            fusedSamples.append(measure(fused))
+                            genericSamples.append(measure(generic))
+                        } else {
+                            genericSamples.append(measure(generic))
+                            fusedSamples.append(measure(fused))
+                        }
+                    }
+                    print("[FlashMoEBench] combo=\(combo.label) metadata=\(metadata) rows=\(rows)"
+                        + " gate=\(gate.bits)/\(gate.groupSize) up=\(up.bits)/\(up.groupSize)"
+                        + " down=\(down.bits)/\(down.groupSize)"
+                        + " relative_error=\(error) fused_ms=\(fusedSamples)"
+                        + " generic_ms=\(genericSamples)"
+                        + " median_ratio=\(genericSamples.sorted()[3] / fusedSamples.sorted()[3])"
+                        + " generated_weights=1 cache_warm=1 synchronized_calls=1")
+                }
+            }
+        }
     }
 
     @Test("fused kernel matches exact math for every shipped bit/group layout")
@@ -349,7 +430,7 @@ struct Qwen4ExpFusedAffineMoETests {
         #expect(error < 0.01, "Ornith fused/eager relative error \(error)")
     }
 
-    @Test("construction rejects unsupported metadata and group sizes")
+    @Test("construction accepts qualified groups and rejects unsupported metadata and bits")
     func constructionRejection() throws {
         // f32 affine metadata must be rejected: the kernels only accept
         // bf16/f16 scales with matching bias dtype.
@@ -374,7 +455,8 @@ struct Qwen4ExpFusedAffineMoETests {
             Qwen4ExpFusedAffineMoE.makeReducer(
                 gate: f32Projection, up: good, down: goodDown) == nil)
 
-        // Group size 128 is outside the supported set.
+        // Group 128 was added to the supported set; mixed-group arithmetic is
+        // covered above and in the multirow verifier parity test.
         let g128Source = MLXRandom.uniform(
             low: -0.5, high: 0.5, [Self.experts, Self.expertDims, Self.inputDims],
             key: MLXRandom.key(8)
@@ -387,6 +469,12 @@ struct Qwen4ExpFusedAffineMoETests {
 
         #expect(
             Qwen4ExpFusedAffineMoE.makeReducer(
-                gate: g128Projection, up: good, down: goodDown) == nil)
+                gate: g128Projection, up: good, down: goodDown) != nil)
+
+        // Valid generic affine storage, but outside this fused kernel's bits.
+        let (q8, _) = Self.makeProjection(
+            inputDims: Self.inputDims, outputDims: Self.expertDims,
+            bits: 8, groupSize: 64, seed: 13)
+        #expect(Qwen4ExpFusedAffineMoE.makeReducer(gate: q8, up: good, down: goodDown) == nil)
     }
 }

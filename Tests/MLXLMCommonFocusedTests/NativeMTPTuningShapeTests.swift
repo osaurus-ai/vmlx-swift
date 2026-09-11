@@ -54,6 +54,31 @@ struct NativeMTPTuningShapeTests {
         #expect(tuning.usableBestDepth == 2)
     }
 
+    @Test func missingEquivalenceIsDecodedButDoesNotBecomeAutoEvidence() throws {
+        let row = "\"best_depth\": 2, \"validated\": true, \"blocked\": false, \"speedup_vs_baseline\": 1.1"
+        for json in ["{\(row)}", "{\"native_mtp\": {\(row)}}"] {
+            let dir = try write(json)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let tuning = try #require(MTPBundleInspector.tuningForTesting(at: dir))
+            #expect(tuning.bestDepth == 2)
+            #expect(!tuning.outputEquivalent)
+            #expect(tuning.usableBestDepth == nil)
+        }
+    }
+
+    @Test func decodingBothShapesDoesNotEraseExplicitBlocks() throws {
+        for block in ["blocked", "manual_blocked"] {
+            let row = "\(Self.row), \"\(block)\": true"
+            for json in ["{\(row)}", "{\"native_mtp\": {\(row)}}"] {
+                let dir = try write(json)
+                defer { try? FileManager.default.removeItem(at: dir) }
+                let tuning = try #require(MTPBundleInspector.tuningForTesting(at: dir))
+                #expect(tuning.usableBestDepth == nil)
+                #expect(block == "blocked" ? tuning.blocked : tuning.manualBlocked)
+            }
+        }
+    }
+
     /// No file at all is still no tuning — leniency must not invent one.
     @Test func absentFileYieldsNothing() throws {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())

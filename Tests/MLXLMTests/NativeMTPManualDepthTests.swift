@@ -5,8 +5,8 @@ import Testing
 
 /// Manual-depth activation contract (the Speculative Depth 1/2/3 buttons):
 /// an explicit user depth activates a tensor-complete MTP head WITHOUT a
-/// measured `vmlx_mtp_tuning.json`, Auto stays tuning-gated, and any active
-/// launch pairs with enforced greedy sampling for that model+session.
+/// measured `vmlx_mtp_tuning.json`. Auto uses usable tuning or its supported
+/// measured-family default; neither mode prescribes a sampler override.
 @Suite("Native MTP manual depth contract")
 struct NativeMTPManualDepthTests {
 
@@ -50,10 +50,11 @@ struct NativeMTPManualDepthTests {
                 reason: "live workload regressed versus autoregressive decode"))
     }
 
-    /// Auto has no winning depth, but manual diagnostics remain permitted.
-    /// This is the existing Flash-Next 4M shape and must not be changed by the
-    /// Ornith-specific `manual_blocked` contract.
-    private static var autoOnlyBlockedStatus: MTPBundleStatus {
+    /// `blocked` alone is still an explicit veto. A missing winning measurement
+    /// is represented by unusable/absent tuning, not by ignoring a safety block.
+    /// The separately fingerprinted superseded Flash-Next exception is not this
+    /// generic fixture.
+    private static var blockedWithoutManualFlagStatus: MTPBundleStatus {
         MTPBundleStatus(
             bundleHasMTP: true,
             configuredLayers: 1,
@@ -91,13 +92,13 @@ struct NativeMTPManualDepthTests {
         }
     }
 
-    @Test("auto stays tuning-gated for the same complete untuned head")
+    @Test("dense Qwen Auto stays tuning-gated for a complete untuned head")
     func autoStaysTuningGated() throws {
         let settings = Self.settings(mode: .auto)
         #expect(
             settings.effectiveMTPLaunchMode(for: Self.completeUntunedStatus) == .off)
         let launch = settings.resolvedMTPLaunch(
-            configData: Self.config(),
+            configData: Self.config(modelType: "qwen3_5"),
             jangConfig: nil,
             status: Self.completeUntunedStatus)
         #expect(launch.launchMode == .off)
@@ -140,11 +141,13 @@ struct NativeMTPManualDepthTests {
 
     @Test("the load gate accepts a manual-depth run without usable tuning")
     func loadGateAcceptsManualDepth() throws {
+        // Dense Qwen has no measured-family cold start. Flash-Next does, so
+        // using it as the negative control would now permit Auto legitimately.
         try NativeMTPActivation.$explicitRequestOverride.withValue(true) {
             try NativeMTPActivation.$manualDepthOverride.withValue(2) {
                 let allowed = try NativeMTPActivation.shouldLoadNativeMTPWeights(
-                    configData: Self.config(),
-                    baseModelType: "qwen4_exp",
+                    configData: Self.config(modelType: "qwen3_5"),
+                    baseModelType: "qwen3_5",
                     status: Self.completeUntunedStatus)
                 #expect(allowed)
             }
@@ -153,8 +156,8 @@ struct NativeMTPManualDepthTests {
         try NativeMTPActivation.$explicitRequestOverride.withValue(true) {
             #expect(throws: (any Error).self) {
                 _ = try NativeMTPActivation.shouldLoadNativeMTPWeights(
-                    configData: Self.config(),
-                    baseModelType: "qwen4_exp",
+                    configData: Self.config(modelType: "qwen3_5"),
+                    baseModelType: "qwen3_5",
                     status: Self.completeUntunedStatus)
             }
         }
@@ -197,31 +200,33 @@ struct NativeMTPManualDepthTests {
         }
     }
 
-    @Test("an Auto-only block does not disable explicit diagnostics")
-    func autoOnlyBlockStillAllowsManualDepth() throws {
+    @Test("a non-superseded block vetoes manual activation without a second flag")
+    func blockedWithoutManualFlagStillVetoesDepth() throws {
         let settings = Self.settings(mode: .forceOn, explicitDepth: 2)
         #expect(
-            settings.effectiveMTPLaunchMode(for: Self.autoOnlyBlockedStatus)
-                == .speculative)
+            settings.effectiveMTPLaunchMode(for: Self.blockedWithoutManualFlagStatus)
+                == .blocked)
         let launch = settings.resolvedMTPLaunch(
             configData: Self.config(),
             jangConfig: nil,
-            status: Self.autoOnlyBlockedStatus)
-        #expect(launch.launchMode == .speculative)
-        #expect(launch.recommendation?.depth == 2)
+            status: Self.blockedWithoutManualFlagStatus)
+        #expect(launch.launchMode == .blocked)
+        #expect(launch.recommendation == nil)
+        #expect(launch.reason.contains("explicitly blocked"))
 
         try NativeMTPActivation.$explicitRequestOverride.withValue(true) {
             try NativeMTPActivation.$manualDepthOverride.withValue(2) {
-                let allowed = try NativeMTPActivation.shouldLoadNativeMTPWeights(
-                    configData: Self.config(),
-                    baseModelType: "qwen4_exp",
-                    status: Self.autoOnlyBlockedStatus)
-                #expect(allowed)
+                #expect(throws: NativeMTPActivationError.self) {
+                    _ = try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                        configData: Self.config(),
+                        baseModelType: "qwen4_exp",
+                        status: Self.blockedWithoutManualFlagStatus)
+                }
             }
         }
     }
 
-    @Test("enforced greedy sampling constants are exact")
+    @Test("legacy explicit-greedy compatibility constants retain their values")
     func enforcedGreedySamplingConstants() {
         let greedy = VMLXServerMTPSettings.mtpEnforcedGreedySampling
         #expect(greedy.temperature == 0)
