@@ -5,8 +5,7 @@ import Testing
 
 /// Manual-depth activation contract (the Speculative Depth 1/2/3 buttons):
 /// an explicit user depth activates a tensor-complete MTP head WITHOUT a
-/// measured `vmlx_mtp_tuning.json`, Auto stays tuning-gated, and any active
-/// launch pairs with enforced greedy sampling for that model+session.
+/// measured `vmlx_mtp_tuning.json`. Sampling is independent of depth selection.
 @Suite("Native MTP manual depth contract")
 struct NativeMTPManualDepthTests {
 
