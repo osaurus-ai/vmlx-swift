@@ -290,6 +290,10 @@ struct FlashPersistentDiskContinuationTests {
                             tokens: ids,
                             mediaSalt: computeCacheSalt(for: LMInput(tokens: prompt), parameters: parameters))
                         else { continue }
+                        #expect(coordinator.hasDurableDiskEntry(
+                            tokens: ids,
+                            mediaSalt: computeCacheSalt(for: LMInput(tokens: prompt), parameters: parameters)),
+                            "A complete self-contained Flash disk snapshot must be reusable without a redundant companion file")
                         var restored = model.newCache(parameters: parameters)
                         #expect(restoreFromDiskArrays(arrays, into: &restored) == ids.count)
                         let reference = model.newCache(parameters: parameters)
