@@ -1756,9 +1756,23 @@ public func savePromptCache(
     cache: [KVCache],
     metadata: [String: String] = [:]
 ) throws {
+    func needsMambaGeometry(_ mamba: MambaCache) -> Bool {
+        let occupied = (0..<mamba.persistentSlotCount).filter { mamba[$0] != nil }
+        return mamba.slotCount != 2 || mamba.persistentSlotCount != 2 || mamba.offset != 0
+            || occupied != Array(0..<occupied.count)
+    }
     let cacheData = cache.map { $0.state }
-    let cacheInfo = cache.map { $0.metaState }
-    // Use Python-compatible class names for cross-platform compatibility
+    let cacheInfo = cache.map { layer -> [String] in
+        if let mamba = layer as? MambaCache, needsMambaGeometry(mamba) {
+            let occupied = (0..<mamba.persistentSlotCount).filter { mamba[$0] != nil }
+            return ["1", String(mamba.slotCount), String(mamba.persistentSlotCount),
+                    String(mamba.offset), occupied.map(String.init).joined(separator: ",")]
+        }
+        return layer.metaState
+    }
+    // Ordinary layouts retain Python-compatible names. Extended recurrent
+    // records use a distinct class tag so older readers reject rather than
+    // silently seating a partial state into their default two-slot cache.
     let cacheClasses = cache.map { cache -> String in
         switch cache {
         case is ChunkedKVCache:
@@ -1769,8 +1783,8 @@ public func savePromptCache(
             return "RotatingKVCache"
         case is QuantizedKVCache:
             return "QuantizedKVCache"
-        case is MambaCache:
-            return "MambaCache"  // Must precede ArraysCache because of inheritance
+        case let mamba as MambaCache:
+            return needsMambaGeometry(mamba) ? "VmlxMambaCacheV1" : "MambaCache"
         case is ArraysCache:
             return "ArraysCache"
         case is CacheList:
@@ -1872,7 +1886,31 @@ public func loadPromptCache(
         case "ChunkedKVCache":
             cache = ChunkedKVCache()
         case "MambaCache":
+            guard cacheData[i].count <= 2 else {
+                throw KVCacheError(message: "Extended legacy Mamba cache lacks persistent-slot geometry")
+            }
             cache = MambaCache()
+        case "VmlxMambaCacheV1":
+            let info = cacheInfo[i]
+            guard info.count == 5, info[0] == "1",
+                  let slots = Int(info[1]), slots > 0, slots <= 4096,
+                  let persistent = Int(info[2]), persistent > 0, persistent <= slots,
+                  let offset = Int(info[3]), offset >= 0
+            else { throw KVCacheError(message: "Invalid persistent Mamba cache geometry") }
+            // Bound metadata-driven allocation before constructing the cache.
+            // This is a file-format resource limit, not model dispatch.
+            let rawIndices = info[4].split(separator: ",", omittingEmptySubsequences: false)
+            let occupied = info[4].isEmpty ? [] : rawIndices.compactMap { Int($0) }
+            guard (info[4].isEmpty || occupied.count == rawIndices.count),
+                  occupied.count == cacheData[i].count,
+                  Set(occupied).count == occupied.count, occupied == occupied.sorted(),
+                  occupied.allSatisfy({ $0 >= 0 && $0 < persistent })
+            else { throw KVCacheError(message: "Invalid persistent Mamba cache occupancy") }
+            let mamba = MambaCache(slots: slots, persistentSlotCount: persistent)
+            for (slot, state) in zip(occupied, cacheData[i]) { mamba[slot] = state }
+            mamba.offset = offset
+            caches.append(mamba)
+            continue
         case "ArraysCache":
             // Size doesn't matter here as it's only needed to initialize the `cache` container inside
             // The container will be set as a `state` with correct size before returning a cache

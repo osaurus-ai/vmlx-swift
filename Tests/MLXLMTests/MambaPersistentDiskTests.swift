@@ -1,9 +1,62 @@
+import Foundation
 import MLX
 @testable import MLXLMCommon
 import Testing
 
 @Suite(.serialized)
 struct MambaPersistentDiskTests {
+    @Test
+    func malformedPromptGeometryThrowsWithoutAllocatingDeclaredCapacity() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let source = MambaCache(slots: 6, persistentSlotCount: 4)
+        for slot in 0..<4 { source[slot] = MLXArray([Int32(slot)]) }
+        source.offset = 8
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mamba-malformed-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: path) }
+        try savePromptCache(url: path, cache: [source])
+        let (arrays, originalMetadata) = try loadArraysAndMetadata(url: path)
+        for damage in 0..<5 {
+            var metadata = originalMetadata
+            switch damage {
+            case 0: metadata["0.0.1"] = "2147483647"
+            case 1: metadata["0.0.4"] = "0,1,2,2"
+            case 2: metadata["0.0.3"] = "-1"
+            case 3: metadata["0.0.4"] = "0,1,2,9"
+            default: metadata["2.0"] = "MambaCache"
+            }
+            try MLX.save(arrays: arrays, metadata: metadata, url: path)
+            #expect(throws: KVCacheError.self) { try loadPromptCache(url: path) }
+        }
+    }
+
+    @Test
+    func promptCacheFilePreservesDeclaredGeometryAndHoles() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let source = MambaCache(slots: 6, persistentSlotCount: 4)
+        source[0] = MLXArray([Int32(10)])
+        source[2] = MLXArray([Int32(12)])
+        source[3] = MLXArray([Int32(13)])
+        source[4] = MLXArray([Int32(999)])
+        source.offset = 8
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mamba-prompt-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: path) }
+        try savePromptCache(url: path, cache: [source], metadata: ["test": "preserve"])
+        let (restored, metadata) = try loadPromptCache(url: path)
+        let result = try #require(restored.first as? MambaCache)
+        #expect(metadata == ["test": "preserve"])
+        #expect(result.slotCount == 6 && result.persistentSlotCount == 4)
+        #expect(result.offset == 8)
+        if result.slotCount >= 6 {
+            #expect(result[1] == nil && result[4] == nil && result[5] == nil)
+            #expect(result[2]?.item(Int32.self) == 12)
+            #expect(result[3]?.item(Int32.self) == 13)
+        }
+    }
+
     private func attention() -> KVCacheSimple {
         let cache = KVCacheSimple()
         _ = cache.update(keys: MLXArray.ones([1, 1, 8, 4]), values: MLXArray.ones([1, 1, 8, 4]))
