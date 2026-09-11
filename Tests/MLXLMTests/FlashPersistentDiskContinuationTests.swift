@@ -9,6 +9,23 @@ import Testing
 // Bounded generated fixture: no installed model or experimental sampled verifier.
 @Suite(.serialized)
 struct FlashPersistentDiskContinuationTests {
+    private final class ProgressRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [Int] = []
+
+        func append(_ value: Int) {
+            lock.lock()
+            values.append(value)
+            lock.unlock()
+        }
+
+        func snapshot() -> [Int] {
+            lock.lock()
+            defer { lock.unlock() }
+            return values
+        }
+    }
+
     private func withFixture(routedBits: [Int] = [], mtpEnabled: Bool = false,
                              inputProjectionBits: Int? = nil, _ body: (Qwen4Exp) throws -> Void) throws {
         // Entire geometry is bounded before construction; no installed model is read.
@@ -222,6 +239,101 @@ struct FlashPersistentDiskContinuationTests {
                 }
             }
         }
+    }
+
+    @Test("Flash text prepare honors its chunk budget without changing continuation state",
+          .enabled(if: ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0",
+                   "Requires strict fixture oracle"), arguments: [0, 2, 6])
+    func textPrefillChunkBudget(inputBits: Int) throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture(routedBits: inputBits == 0 ? [] : [2, 3, 4],
+                            inputProjectionBits: inputBits == 0 ? nil : inputBits) { model in
+                let tokens = MLXArray((2..<15).map(Int32.init)).reshaped(1, 13)
+                let referenceCache = model.newCache(parameters: nil)
+                let referenceLogits = model(tokens, cache: referenceCache)
+                MLX.eval(referenceLogits, referenceCache)
+                for step in [1, 2, 4, 8, 13] {
+                    let cache = model.newCache(parameters: nil)
+                    guard case .logits(let output) = try model.prepare(
+                        LMInput(tokens: tokens), cache: cache, windowSize: step)
+                    else { Issue.record("text prepare must return final-chunk logits"); continue }
+                    MLX.eval(output.logits, cache)
+                    #expect(output.logits.dim(1) <= step,
+                            "prepare must not retain full-prompt logits beyond the supplied chunk budget")
+                    expectEqual(output.logits[0..., (-1)..., 0...],
+                                referenceLogits[0..., (-1)..., 0...], "chunk\(step) final logits")
+                    for (layer, pair) in zip(cache, referenceCache).enumerated() {
+                        #expect(pair.0.offset == pair.1.offset)
+                        #expect(pair.0.state.count == pair.1.state.count)
+                        for (slot, states) in zip(pair.0.state, pair.1.state).enumerated() {
+                            expectEqual(states.0, states.1, "chunk\(step) layer\(layer) state\(slot)")
+                        }
+                    }
+                    let next = MLXArray([Int32(73)]).reshaped(1, 1)
+                    let referenceCopy = referenceCache.map { $0.copy() }
+                    MLX.eval(referenceCopy)
+                    expectEqual(model(next, cache: cache), model(next, cache: referenceCopy),
+                                "chunk\(step) continuation")
+                }
+            }
+        }
+    }
+
+    @Test("Flash default prefill budget reports real progress past the QSA budget",
+          .enabled(if: ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0",
+                   "Requires strict fixture oracle"))
+    func defaultPrefillBudgetAndProgress() throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture { model in
+                let tokens = MLXArray((0..<513).map { Int32(2 + $0 % 100) }).reshaped(1, 513)
+                let referenceCache = model.newCache(parameters: nil)
+                let reference = model(tokens, cache: referenceCache)
+                MLX.eval(reference, referenceCache)
+                for step: Int? in [nil, 64, 0, -1] {
+                    let cache = model.newCache(parameters: nil)
+                    let recorder = ProgressRecorder()
+                    let prepared = try PrefillProgressReporter.withHandler({ recorder.append($0) }) {
+                        try model.prepare(LMInput(tokens: tokens), cache: cache, windowSize: step)
+                    }
+                    guard case .logits(let output) = prepared else {
+                        Issue.record("expected final logits"); continue
+                    }
+                    MLX.eval(output.logits, cache)
+                    let effectiveStep = step ?? 512
+                    #expect(output.logits.dim(1) == (effectiveStep > 0 ? 1 : 513))
+                    #expect(recorder.snapshot() == (effectiveStep > 0
+                        ? Array(stride(from: effectiveStep, to: 513, by: effectiveStep)) : []))
+                    expectEqual(output.logits[0..., (-1)..., 0...],
+                                reference[0..., (-1)..., 0...], "default/long QSA final logits")
+                    let referenceCopy = referenceCache.map { $0.copy() }
+                    MLX.eval(referenceCopy)
+                    let next = MLXArray([Int32(73)]).reshaped(1, 1)
+                    expectEqual(model(next, cache: cache), model(next, cache: referenceCopy),
+                                "default/long QSA continuation")
+                }
+            }
+        }
+    }
+
+    @Test("Flash text prefill cancellation does not advance the cache")
+    func cancelledPrefillDoesNotAdvanceCache() async throws {
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try MLXMetalTestLock.withLock {
+                try withFixture { model in
+                    let cache = model.newCache(parameters: nil)
+                    do {
+                        _ = try model.prepare(
+                            LMInput(tokens: MLXArray([Int32(2), 3, 4]).reshaped(1, 3)),
+                            cache: cache, windowSize: 1)
+                        Issue.record("cancelled prepare unexpectedly completed")
+                    } catch is CancellationError {
+                        #expect(cache.allSatisfy { $0.offset == 0 })
+                    }
+                }
+            }
+        }
+        try await task.value
     }
 
     private func expectEqual(_ actual: MLXArray, _ expected: MLXArray, _ label: String) {
