@@ -120,8 +120,20 @@ let transformersSwiftSettings: [SwiftSetting] = [
     .enableExperimentalFeature("StrictConcurrency")
 ]
 
+#if os(Linux)
+    let aneBridgeExcludes: [String] = ["vmlx_ane_bridge.m"]
+    let aneBridgeLinkerSettings: [LinkerSetting] = []
+#else
+    let aneBridgeExcludes: [String] = ["vmlx_ane_bridge_stub.c"]
+    let aneBridgeLinkerSettings: [LinkerSetting] = [
+        .linkedFramework("Foundation"),
+        .linkedFramework("IOSurface"),
+    ]
+#endif
+
 let mlxLMCommonExcludedFiles: [String] = [
     "README.md",
+    "SpecDec/ANE-MTP-DRAFTER.md",
     "BatchEngine/BATCH_ENGINE.md",
     "BatchEngine/DSV4-OSAURUS-HOOKUP.md",
     "BatchEngine/FORK-SYNC-PROCESS.md",
@@ -485,8 +497,16 @@ let package = Package(
         ),
 
         .target(
+            name: "VMLXANEBridge",
+            dependencies: [],
+            path: "Libraries/VMLXANEBridge",
+            exclude: aneBridgeExcludes,
+            publicHeadersPath: "include",
+            linkerSettings: aneBridgeLinkerSettings
+        ),
+        .target(
             name: "MLXLMCommon",
-            dependencies: ["MLX", "MLXFast", "MLXNN", "MLXOptimizers", "MLXRandom"],
+            dependencies: ["MLX", "MLXFast", "MLXNN", "MLXOptimizers", "MLXRandom", "VMLXANEBridge"],
             path: "Libraries/MLXLMCommon",
             exclude: mlxLMCommonExcludedFiles,
             // Compile this target in the Swift 5 language mode. The package is
@@ -942,6 +962,7 @@ let package = Package(
                 "LFM2ShortConvCacheRestoreFocusedTests.swift",
                 "LFM25ChatTemplateRenderFocusedTests.swift",
                 "LogitProcessorIndependentCopyTests.swift",
+                "ANEBridgeLinearParityTests.swift",
             ]
         ),
         .testTarget(
