@@ -7,6 +7,102 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testGroupedProbabilityEvaluationTiming() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_BENCH_GROUPED_PROBABILITIES"] == "1" else {
+            throw XCTSkip("Opt-in generated-logit component timing")
+        }
+        try FocusedMLXTestSupport.withLock {
+            // Matches the inspected Flash bundle vocabulary, not an allocation
+            // of model weights. Production still derives shapes from logits.
+            let vocab = 248_320
+            var parameters = GenerateParameters(temperature: 1, topP: 0.95, topK: 20)
+            parameters.randomSeed = 829
+            let sampler = SpeculativeSamplingController(parameters: parameters)
+            for count in [2, 3, 4, 6] {
+                let values = (0..<(count * vocab)).map { Float(sin(Double($0) * 0.037)) }
+                let logits = MLXArray(values).reshaped(count, vocab).asType(.bfloat16)
+                MLX.eval(logits)
+                func measure(grouped: Bool) -> Double {
+                    let start = ProcessInfo.processInfo.systemUptime
+                    var rows: [MLXArray] = []
+                    for row in 0..<count {
+                        let p = sampler.probabilities(logits: logits[row])
+                        if !grouped { MLX.eval(p) }
+                        rows.append(p)
+                    }
+                    if grouped { MLX.eval(rows) }
+                    return (ProcessInfo.processInfo.systemUptime - start) * 1000
+                }
+                for _ in 0..<3 { _ = measure(grouped: false); _ = measure(grouped: true) }
+                var sequential: [Double] = []
+                var grouped: [Double] = []
+                for trial in 0..<9 {
+                    if trial.isMultiple(of: 2) {
+                        sequential.append(measure(grouped: false)); grouped.append(measure(grouped: true))
+                    } else {
+                        grouped.append(measure(grouped: true)); sequential.append(measure(grouped: false))
+                    }
+                }
+                print("GROUPED-PROBABILITY-BENCH rows=\(count) vocab=\(vocab) sequential_ms=\(sequential) grouped_ms=\(grouped) median_ratio=\(sequential.sorted()[4] / grouped.sorted()[4]) generated_logits=1 synchronized=1 realModelSpeedProof=false")
+            }
+        }
+    }
+
+    func testGroupedProbabilityEvaluationPreservesDistributionsAndRandomDraws() throws {
+        try FocusedMLXTestSupport.withLock {
+            var parameters = GenerateParameters(temperature: 1, topP: 0.95, topK: 20)
+            parameters.randomSeed = 829
+            var compared = 0
+            var accepted = 0
+            var corrected = 0
+            for dtype: DType in [.float16, .bfloat16, .float32] {
+                for depth in [1, 2, 3, 5] {
+                    let count = depth + 1
+                    let vocab = 257
+                    let values = (0..<(count * vocab)).map {
+                        Float(sin(Double($0) * 0.37) * 3 + cos(Double($0) * 0.11))
+                    }
+                    let logits = MLXArray(values).reshaped(count, vocab).asType(dtype)
+                    MLX.eval(logits)
+                    let sequential = SpeculativeSamplingController(parameters: parameters)
+                    let grouped = SpeculativeSamplingController(parameters: parameters)
+                    var reference: [MLXArray] = []
+                    var candidate: [MLXArray] = []
+                    for row in 0..<count {
+                        let p = sequential.probabilities(logits: logits[row])
+                        MLX.eval(p)
+                        reference.append(p)
+                        candidate.append(grouped.probabilities(logits: logits[row]))
+                    }
+                    MLX.eval(candidate)
+                    for row in 0..<count {
+                        XCTAssertEqual(reference[row].asArray(Float.self),
+                                       candidate[row].asArray(Float.self))
+                        let token = MLXArray(0)
+                        // Alternating exact proposals and disjoint-support proposals
+                        // cover acceptance and residual correction without new draws.
+                        let q = row.isMultiple(of: 2) ? reference[row]
+                            : MLXArray([Float(1)] + Array(repeating: Float(0), count: vocab - 1))
+                        let a = sequential.acceptOrCorrect(draftToken: token,
+                            targetProbabilities: reference[row], draftProbabilities: q)
+                        let b = grouped.acceptOrCorrect(draftToken: token,
+                            targetProbabilities: candidate[row], draftProbabilities: q)
+                        XCTAssertEqual(a.accepted, b.accepted)
+                        if a.accepted { accepted += 1 } else { corrected += 1 }
+                        XCTAssertEqual(a.acceptanceProbability, b.acceptanceProbability)
+                        XCTAssertEqual(a.correction?.item(Int.self), b.correction?.item(Int.self))
+                        XCTAssertEqual(sequential.sampleFromTarget(probabilities: reference[row]).item(Int.self),
+                                       grouped.sampleFromTarget(probabilities: candidate[row]).item(Int.self))
+                        compared += 1
+                    }
+                }
+            }
+            XCTAssertGreaterThan(accepted, 0)
+            XCTAssertGreaterThan(corrected, 0)
+            print("GROUPED-PROBABILITY rows=\(compared) exact_distribution_and_rng_control=true realModelSpeedProof=false")
+        }
+    }
+
     func testSampledStagingOptInDoesNotEnableUnqualifiedModel() throws {
         try FocusedMLXTestSupport.withLock {
             let model = DepthDispatchTarget()

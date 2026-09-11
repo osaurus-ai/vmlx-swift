@@ -1722,7 +1722,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             draftProbabilities: draftProbabilities,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
-            processor: processor)
+            processor: processor,
+            batchTargetProbabilityEvaluation: experimentalSampledStaging && stagedVerify)
         else {
             if let checkpoint {
                 let restoreStart = NativeMTPClock.now()
@@ -2915,7 +2916,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         draftProbabilities: [MLXArray],
         sampler: LogitSampler,
         speculativeSampler: SpeculativeSamplingController,
-        processor: LogitProcessor?
+        processor: LogitProcessor?,
+        batchTargetProbabilityEvaluation: Bool
     ) -> VerifyDecision? {
         if speculativeSampler.isGreedy {
             var materializeSyncTime: TimeInterval = 0
@@ -2984,18 +2986,30 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         var targetProbabilities: [MLXArray] = []
         targetProbabilities.reserveCapacity(drafts.count + 1)
         var verifyProcessor = processor
+        let batchEvaluation = batchTargetProbabilityEvaluation && processor == nil
         for index in 0 ... drafts.count {
             let probabilities = processedProbabilities(
                 logits: logits[0..., index, 0...],
                 speculativeSampler: speculativeSampler,
                 processor: &verifyProcessor)
-            let syncStart = NativeMTPClock.now()
-            MLX.eval(probabilities)
-            materializeSyncTime += NativeMTPClock.now() - syncStart
+            if !batchEvaluation {
+                let syncStart = NativeMTPClock.now()
+                MLX.eval(probabilities)
+                materializeSyncTime += NativeMTPClock.now() - syncStart
+            }
             targetProbabilities.append(probabilities)
             if index < drafts.count {
                 verifyProcessor?.didSample(token: drafts[index])
             }
+        }
+        if batchEvaluation {
+            // No processor history or RNG is advanced by probabilities(). Preserve
+            // each row's graph and filter order, but submit their materialization
+            // together instead of draining the GPU once per target row. This stays
+            // inside the opt-in Flash staged diagnostic until live qualification.
+            let syncStart = NativeMTPClock.now()
+            MLX.eval(targetProbabilities)
+            materializeSyncTime += NativeMTPClock.now() - syncStart
         }
 
         var accepted = 0
