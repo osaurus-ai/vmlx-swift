@@ -648,7 +648,7 @@ public func restoreSSMStates(
     // matching neither layout is refused outright rather than cross-wiring
     // layer N with layer N+1's state.
     func restoreArity(_ mamba: MambaCache, ordinaryArity: Int) -> Int {
-        mamba.slotCount > 2 ? mamba.slotCount - 2 : ordinaryArity
+        mamba.persistentSlotCount > 2 ? mamba.persistentSlotCount : ordinaryArity
     }
     var totalWithTwoSlotMamba = 0
     var totalWithOneSlotMamba = 0
@@ -833,6 +833,8 @@ private func restoreFromV2Arrays(
             continue
         }
         switch entry.data {
+        case .mamba, .cacheList:
+            guard canRestoreMambaRecords(entry.data, into: cache[entry.index]) else { return 0 }
         case .qkv(let comp):
             // Quantized-KV layers share the atomic contract: a record whose
             // group size / bit width no longer matches the runtime cache (or
@@ -958,7 +960,7 @@ private func restoreFromV2Arrays(
             // Mamba state arrays are cumulative — no sequence dim to
             // measure, so they don't contribute to `totalTokens`. The
             // attention side already provides that number.
-            restoreMambaLayer(comp, into: cache[i])
+            guard restoreMambaLayer(comp, into: cache[i]) else { return 0 }
 
         case .tq(let comp):
             // Restore the compressed prefix into the existing
@@ -1064,7 +1066,7 @@ private func restoreFromV2Arrays(
             // runtime CacheList's internal order — type matching does
             // the dispatch. This is the same convention SSM state
             // restoration in extractSSMStates uses.
-            for subData in subLayers {
+            for (subIndex, subData) in subLayers.enumerated() {
                 switch subData {
                 case .standard(let kv):
                     var keys = kv.keys
@@ -1082,7 +1084,9 @@ private func restoreFromV2Arrays(
                     restoreKVLayer(keys: keys, values: values, into: cache[i])
 
                 case .mamba(let comp):
-                    restoreMambaLayer(comp, into: cache[i])
+                    guard let list = cache[i] as? CacheList, subIndex < list.count,
+                          restoreMambaLayer(comp, into: list[subIndex])
+                    else { return 0 }
 
                 case .rotating(let comp):
                     restoreRotatingLayer(comp, into: cache[i])
@@ -1606,35 +1610,49 @@ private func restoreZayaCCATQLayer(
     return zaya.offset == comp.tq.offset && zaya.usesTurboQuantKV
 }
 
-/// Helper: restore Mamba SSM state into a `MambaCache` layer (or a
-/// `CacheList` containing one). Silently no-ops for other cache classes,
-/// which can happen if the serialized model layout has drifted from the
-/// current runtime.
+/// Validate Mamba state before restoration. CacheList children are validated
+/// at their serialized index. Any recurrent
+/// layout mismatch is rejected before the caller mutates an attention sibling.
+private func canRestoreMambaRecords(
+    _ data: TQDiskSerializer.LayerData, into layer: any KVCache
+) -> Bool {
+    switch data {
+    case .requiredMiss:
+        return false
+    case .mamba(let component):
+        guard let target = layer as? MambaCache else { return false }
+        if let count = component.persistentSlotCount {
+            guard count == target.persistentSlotCount else { return false }
+        } else {
+            guard target.persistentSlotCount <= 2 else { return false }
+        }
+        return component.occupiedStates.keys.allSatisfy {
+            $0 >= 0 && $0 < target.persistentSlotCount
+        }
+    case .cacheList(let components):
+        guard let list = layer as? CacheList, components.count == list.count else { return false }
+        return components.enumerated().allSatisfy {
+            canRestoreMambaRecords($0.element, into: list[$0.offset])
+        }
+    default:
+        return true
+    }
+}
+
+@discardableResult
 private func restoreMambaLayer(
     _ comp: TQDiskSerializer.MambaLayerComponents,
     into layer: any KVCache
-) {
-    func apply(_ mamba: MambaCache) {
-        if let state1 = comp.state1 {
-            mamba.state = [comp.state0, state1]
-        } else {
-            // Single-slot layout (LFM2/LFM2.5 short-conv): restore into
-            // slot 0 via the subscript so the 2-slot container geometry is
-            // preserved and slot 1 stays genuinely empty.
-            mamba[0] = comp.state0
-        }
-        mamba.offset = comp.offset
+) -> Bool {
+    guard canRestoreMambaRecords(.mamba(comp), into: layer),
+          let mamba = layer as? MambaCache
+    else { return false }
+    // Restore by index: compactMap would shift an occupied slot across a nil
+    // hole. Also clear scratch left over from a previous verify request.
+    for slot in 0..<mamba.slotCount {
+        mamba[slot] = comp.occupiedStates[slot]
     }
-    if let mamba = layer as? MambaCache {
-        apply(mamba)
-        return
-    }
-    if let cacheList = layer as? CacheList {
-        for i in 0..<cacheList.count {
-            if let mamba = cacheList[i] as? MambaCache {
-                apply(mamba)
-                return
-            }
-        }
-    }
+    mamba.clearVerifyStaging()
+    mamba.offset = comp.offset
+    return true
 }

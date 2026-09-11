@@ -120,7 +120,7 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
     /// - Parameter mamba: Source cache, typically produced by a model's
     ///   prefill of Mamba / GDN layers.
     public convenience init(from mamba: MambaCache) {
-        self.init(slots: mamba.slotCount, leftPadding: nil)
+        self.init(slots: mamba.slotCount, persistentSlotCount: mamba.persistentSlotCount, leftPadding: nil)
 
         // Copy offset + leftPadding from source.
         self.offset = mamba.offset
@@ -136,6 +136,18 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
     }
 
     // MARK: - Subscript override
+
+    public override init(slots: Int, persistentSlotCount: Int, leftPadding: [Int]? = nil) {
+        precondition((2 ... 6).contains(slots))
+        self.convStateArray = nil
+        self.hiddenStateArray = nil
+        self.companionStateArray2 = nil
+        self.companionStateArray3 = nil
+        self.companionStateArray4 = nil
+        self.companionStateArray5 = nil
+        self.stableSlotCount = slots
+        super.init(slots: slots, persistentSlotCount: persistentSlotCount, leftPadding: leftPadding)
+    }
 
     /// Route slot reads/writes to the direct `convStateArray` /
     /// `hiddenStateArray` properties. Existing model code that does
@@ -227,14 +239,10 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
 
     /// Match the parent's state contract but route through our direct
     /// properties. Called by the cache coordinator on restore. The
-    /// setter validates exactly-2 entries because `MambaCache` always
-    /// has 2 state slots.
+    /// getter excludes the model-declared transient staging suffix.
     public override var state: [MLXArray] {
         get {
-            var out: [MLXArray] = []
-            if let conv = convStateArray { out.append(conv) }
-            if let hidden = hiddenStateArray { out.append(hidden) }
-            return out
+            (0..<persistentSlotCount).compactMap { self[$0] }
         }
         set {
             precondition(newValue.count <= stableSlotCount)
@@ -256,7 +264,7 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
     // MARK: - Copy
 
     public override func copy() -> any KVCache {
-        let new = CompilableMambaCache(slots: stableSlotCount)
+        let new = CompilableMambaCache(slots: stableSlotCount, persistentSlotCount: persistentSlotCount)
         new.offset = self.offset
         new.leftPadding = self.leftPadding
         for index in 0 ..< stableSlotCount {
