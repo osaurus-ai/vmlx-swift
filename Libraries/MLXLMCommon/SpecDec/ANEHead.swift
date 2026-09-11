@@ -152,6 +152,14 @@ public enum ANEHeadEmitter {
         return (q, scales)
     }
 
+    /// Smallest divisor of `k` that keeps each conv's K under the measured
+    /// ~4608 cliff (mlx-serve: a single K=17408 conv was 2.6x slower). A `k`
+    /// with no such divisor up to 16 runs as one conv and eats the cliff.
+    static func kChunks(for k: Int) -> Int {
+        for n in 1 ... 16 where k % n == 0 && k / n <= 4608 { return n }
+        return 1
+    }
+
     /// Emitted program plus the plane byte sizes the caller must allocate,
     /// in the alphabetical input order the ANE binds them.
     public struct Emission {
@@ -191,9 +199,8 @@ public enum ANEHeadEmitter {
         }
         func linear(_ x: ANEMILBuilder.Value, _ m: MLXArray, _ tag: String) -> ANEMILBuilder.Value {
             let n = m.dim(0), k = m.dim(1)
-            let kChunks = max(1, (k + 4607) / 4608)
+            let kChunks = Self.kChunks(for: k)
             let kc = k / kChunks
-            precondition(kc * kChunks == k, "K \(k) must split evenly into \(kChunks) chunks")
             var acc: ANEMILBuilder.Value?
             for c in 0 ..< kChunks {
                 let slab = kChunks == 1 ? m : m[0..., (c * kc) ..< ((c + 1) * kc)]
