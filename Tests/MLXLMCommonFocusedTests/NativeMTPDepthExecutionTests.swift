@@ -7,6 +7,44 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testProductiveCalibrationResumesPriorDepth() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0",
+              ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0" else {
+            throw XCTSkip("Requires governor on and prefetch off for controlled cost observation")
+        }
+        try FocusedMLXTestSupport.withLock {
+            for depth in 1...3 {
+                let model = DepthDispatchTarget(sequence: true, backboneDelay: 0.010)
+                var parameters = GenerateParameters(maxTokens: 340, temperature: 0)
+                parameters.draftStrategy = .nativeMTP(depth: depth)
+                var iterator = try NativeMTPTokenIterator(
+                    input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                    parameters: parameters, depth: depth)
+                var tokens: [Int] = []
+                var widthsBeforeCalibration: Int?
+                var resumedWidth: Int?
+                let started = ProcessInfo.processInfo.systemUptime
+                while tokens.count < 340, let token = iterator.next() {
+                    tokens.append(token)
+                    if iterator.autoregressiveFallbackTokenCount > 2,
+                       widthsBeforeCalibration == nil {
+                        widthsBeforeCalibration = model.verifyWidths.count
+                    }
+                    if let before = widthsBeforeCalibration,
+                       model.verifyWidths.count > before, resumedWidth == nil {
+                        resumedWidth = model.verifyWidths[before]
+                    }
+                }
+                XCTAssertEqual(tokens, (0..<340).map { (2 + $0) % 32 })
+                XCTAssertNotNil(widthsBeforeCalibration, "Must exercise real productive AR calibration")
+                XCTAssertEqual(iterator.autoregressiveFallbackTokenCount, 4,
+                    "Expected two seed and two calibration steps, not an unrelated loss recovery")
+                XCTAssertEqual(resumedWidth, depth + 1, "Calibration must retain the productive depth")
+                print("CALIBRATION-RESUME depth=\(depth) width=\(String(describing: resumedWidth)) fixtureTokS=\(Double(tokens.count) / max(ProcessInfo.processInfo.systemUptime - started, 1e-9)) realModelSpeedProof=false")
+            }
+        }
+    }
+
     func testSampledRejectionPauseCanProbeAfterProposalQualityChanges() throws {
         guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
             throw XCTSkip("Requires the real governor")
@@ -46,8 +84,11 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
             throw XCTSkip("Controlled host-cost row: governor on, verify prefetch off; prefetch parity is separate")
         }
         try FocusedMLXTestSupport.withLock {
-            let model = DepthDispatchTarget(sequence: true, backboneDelay: 0.004)
-            model.setVerifyDelays([2: 0.001, 3: 0.040, 4: 0.080])
+            // Deliberately separate cost regimes from sub-millisecond dispatch
+            // and timer jitter. D3/D2 initially lose to AR, D1 wins; afterward
+            // equal verify costs make each wider accepted block cheaper/token.
+            let model = DepthDispatchTarget(sequence: true, backboneDelay: 0.020)
+            model.setVerifyDelays([2: 0.012, 3: 0.160, 4: 0.320])
             var parameters = GenerateParameters(maxTokens: 480, temperature: 0)
             parameters.draftStrategy = .nativeMTP(depth: 3)
             var iterator = try NativeMTPTokenIterator(
@@ -64,7 +105,7 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
                     XCTAssertTrue(widths.contains(3), "D3 must descend through D2")
                     XCTAssertTrue(widths.contains(2), "D1 should be discovered")
                     widthsAtChange = widths.count
-                    model.setVerifyDelays([2: 0.001, 3: 0.001, 4: 0.001])
+                    model.setVerifyDelays([2: 0.012, 3: 0.012, 4: 0.012])
                 }
             }
             let recovered = Array(model.verifyWidths.dropFirst(widthsAtChange))
