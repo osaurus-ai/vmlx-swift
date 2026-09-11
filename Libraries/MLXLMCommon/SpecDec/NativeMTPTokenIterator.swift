@@ -468,6 +468,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var arSafetyProbeStartedEmitted = 0
     private var arSafetyLastMeasuredToken = 0
     private var arSafetyCalibrationRemaining = 0
+    // Calibration refreshes the AR baseline; it is not evidence that the
+    // productive depth lost. Real loss recovery still begins at D1.
+    private var arSafetyCalibrationResumeDepth: Int?
     /// True while a kept re-entry is speculating: a trip in that state backs
     /// the resume interval off further instead of resetting it.
     private var arSafetyReentered = false
@@ -511,6 +514,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// measurement is dropped so the climb can be re-attempted (prompt
     /// character changes mid-generation — a table after prose).
     private var windowsSinceUpperProbe = 0
+
     private static let upperProbeCooldownWindows = 8
     /// A lower depth must beat the current one by this factor before the
     /// wall-clock rule demotes — hysteresis so measurement noise doesn't
@@ -2237,6 +2241,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         arSafetyTokensSincePause = 0
         arSafetyCalibrationRemaining = loss ? 0 : 2
+        arSafetyCalibrationResumeDepth = loss ? nil : currentDepth
         arSafetyProbeCyclesRemaining = 0
         arSafetyProbeStartedAt = nil
         arSafetyRing.removeAll(keepingCapacity: true)
@@ -2281,11 +2286,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             guard arSafetyTokensSincePause >= arSafetyResumeInterval else { return }
         }
         arSafetyPaused = false
-        arSafetyStartSpeculating(hidden: hidden, nextToken: nextToken, probe: true)
+        let resumeDepth = arSafetyCalibrationResumeDepth ?? 1
+        arSafetyCalibrationResumeDepth = nil
+        arSafetyStartSpeculating(
+            hidden: hidden, nextToken: nextToken, probe: true, resumeDepth: resumeDepth)
     }
 
     private mutating func arSafetyStartSpeculating(
-        hidden: MLXArray, nextToken: MLXArray, probe: Bool
+        hidden: MLXArray, nextToken: MLXArray, probe: Bool, resumeDepth: Int = 1
     ) {
         // Same re-prime the depth controller uses on every depth change: a
         // fresh head cache, drafts from the current hidden. Drafts are only
@@ -2293,7 +2301,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // cache can only cost acceptance, never correctness.
         mtpCache = model.makeNativeMTPCache()
         mtpCacheRefreshCount += 1
-        currentDepth = probe ? 1 : depth
+        currentDepth = probe
+            ? Swift.max(1, Swift.min(resumeDepth, adaptiveDepthCeiling)) : depth
         arSafetyRing.removeAll(keepingCapacity: true)
         arSafetyProbeCyclesRemaining = probe ? Self.arSafetyProbeWindow : 0
         arSafetyProbeStartedAt = probe ? NativeMTPClock.now() : nil
