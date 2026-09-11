@@ -373,6 +373,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// `VMLX_ANE_MTP_PARITY=1`: also run the GPU head on every draft input and log agreement.
     private static let aneParityProbe = ProcessInfo.processInfo.environment["VMLX_ANE_MTP_PARITY"] == "1"
 
+    private func aneStepMs(_ key: KeyPath<ANEHeadRunner.ANEStepTimer, Double>) -> Double {
+        guard let t = aneDrafter?.runner.stepTimer, t.steps > 0 else { return 0 }
+        return t[keyPath: key] / Double(t.steps) * 1000
+    }
+
     private mutating func trimHead(rows: Int) {
         if let aneDrafter { aneDrafter.trim(rows: rows) } else { Self.trimHeadChain(mtpCache, rows: rows) }
     }
@@ -1366,7 +1371,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             arSafetyResumes: arSafetyResumes)
         let line = String(
             format:
-                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ drafter=%@ aneForwards=%d cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d] depthMoves[promotions=%d,wallclockDemotes=%d,acceptanceDemotes=%d]\n",
+                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ drafter=%@ aneForwards=%d aneStepMs[pack=%.2f,eval=%.2f,store=%.2f] cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d] depthMoves[promotions=%d,wallclockDemotes=%d,acceptanceDemotes=%d]\n",
             depth,
             currentDepth,
             verifyCalls,
@@ -1412,6 +1417,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             verifierMode,
             aneDrafter != nil ? "ane" : "gpu",
             aneDraftForwardCount,
+            aneStepMs(\.packSeconds), aneStepMs(\.evalSeconds), aneStepMs(\.storeSeconds),
             arSafetyTrips,
             arSafetyResumes,
             arSafetyPaused ? 1 : 0,

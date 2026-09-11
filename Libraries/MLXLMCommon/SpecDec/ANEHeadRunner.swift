@@ -53,7 +53,21 @@ public final class ANEHeadRunner {
             ? nil : ANEEmbeddingTable(source: source)
         program = try ANEProgram(name: name, mil: emission.mil, weights: emission.weights,
                                  inputs: ins, outputs: outs, cacheDirectory: cacheDirectory)
+        // Planes start zeroed; every tile row's mask starts as self-only so an
+        // unused row's softmax is defined. Rows are only rewritten when used:
+        // a stale row's output is never read, and its mask keeps it finite.
+        for r in 0 ..< geometry.rows { packIdleMask(r) }
+        stepTimer = ANEStepTimer()
     }
+
+    /// Host vs ANE time per step, for the stats line.
+    public struct ANEStepTimer {
+        public var packSeconds = 0.0
+        public var evalSeconds = 0.0
+        public var storeSeconds = 0.0
+        public var steps = 0
+    }
+    public private(set) var stepTimer = ANEStepTimer()
 
     public func reset() {
         length = 0
@@ -111,13 +125,9 @@ public final class ANEHeadRunner {
         }
     }
 
-    /// Fills unused tile rows with something finite whose mask keeps softmax defined.
-    private func packIdleRow(_ r: Int) {
-        let g = geometry, R = g.rows, W = g.window
-        for c in 0 ..< g.hidden {
-            aHidden.fp16[c * R + r] = 0
-            bEmbed.fp16[c * R + r] = 0
-        }
+    /// Self-only mask for a tile row that is not part of this eval.
+    private func packIdleMask(_ r: Int) {
+        let R = geometry.rows, W = geometry.window
         let base = r * (W + R)
         for s in 0 ..< W + R { eMask.fp16[base + s] = s == W + r ? 0 : Self.maskedOut }
     }
@@ -162,14 +172,32 @@ public final class ANEHeadRunner {
     /// One draft step at head position `length`: predicts the token after
     /// `token`, appends this position's K/V, returns the head hidden for the
     /// next chained step.
+    /// Rows the last eval used beyond row 0; their masks are reset to
+    /// self-only before the next eval that does not use them.
+    private var activeRows = 1
+
+    private func resetRows(keeping used: Int) {
+        if activeRows > used {
+            for r in used ..< activeRows { packIdleMask(r) }
+        }
+        activeRows = used
+    }
+
     public func draftStep(hidden: [Float16], token: Int) throws -> StepResult {
         let position = length
+        let t0 = Date.timeIntervalSinceReferenceDate
+        resetRows(keeping: 1)
         packRow(0, hidden: hidden, embed: embedding(token), position: position, tileRows: 1)
-        for r in 1 ..< geometry.rows { packIdleRow(r) }
+        let t1 = Date.timeIntervalSinceReferenceDate
         try program.eval()
+        let t2 = Date.timeIntervalSinceReferenceDate
         storeRow(0, position: position)
         length = position + 1
-        return StepResult(token: readArgmax(0), hidden: readHidden(0))
+        let result = StepResult(token: readArgmax(0), hidden: readHidden(0))
+        let t3 = Date.timeIntervalSinceReferenceDate
+        stepTimer.packSeconds += t1 - t0; stepTimer.evalSeconds += t2 - t1; stepTimer.storeSeconds += t3 - t2
+        stepTimer.steps += 1
+        return result
     }
 
     /// The aligned commit folded into the first draft: pairs `0 ..< n-1` are
@@ -178,15 +206,22 @@ public final class ANEHeadRunner {
     public func draftChainStart(pairs: [(hidden: [Float16], token: Int)]) throws -> StepResult {
         precondition(!pairs.isEmpty && pairs.count <= geometry.rows)
         let start = length
+        let t0 = Date.timeIntervalSinceReferenceDate
+        resetRows(keeping: pairs.count)
         for (r, pair) in pairs.enumerated() {
             packRow(r, hidden: pair.hidden, embed: embedding(pair.token), position: start + r, tileRows: pairs.count)
         }
-        for r in pairs.count ..< geometry.rows { packIdleRow(r) }
+        let t1 = Date.timeIntervalSinceReferenceDate
         try program.eval()
+        let t2 = Date.timeIntervalSinceReferenceDate
         for r in 0 ..< pairs.count { storeRow(r, position: start + r) }
         length = start + pairs.count
         let last = pairs.count - 1
-        return StepResult(token: readArgmax(last), hidden: readHidden(last))
+        let result = StepResult(token: readArgmax(last), hidden: readHidden(last))
+        let t3 = Date.timeIntervalSinceReferenceDate
+        stepTimer.packSeconds += t1 - t0; stepTimer.evalSeconds += t2 - t1; stepTimer.storeSeconds += t3 - t2
+        stepTimer.steps += 1
+        return result
     }
 
     /// Commits up to `rows` (hidden, token) pairs at positions `length...`
@@ -195,10 +230,10 @@ public final class ANEHeadRunner {
         precondition(pairs.count <= geometry.rows)
         guard !pairs.isEmpty else { return }
         let start = length
+        resetRows(keeping: pairs.count)
         for (r, pair) in pairs.enumerated() {
             packRow(r, hidden: pair.hidden, embed: embedding(pair.token), position: start + r, tileRows: pairs.count)
         }
-        for r in pairs.count ..< geometry.rows { packIdleRow(r) }
         try program.eval()
         for r in 0 ..< pairs.count { storeRow(r, position: start + r) }
         length = start + pairs.count
