@@ -63,6 +63,46 @@ public protocol ANEHeadWeightSource {
     func ropeTables(positions: [Int]) -> (cos: MLXArray, sin: MLXArray)
     /// Input embedding of one token as `[H]` (whatever the trunk feeds the head).
     func embedding(token: Int) -> MLXArray
+    /// Embedding rows `range` as `[rows, H]`, for building a CPU-side table.
+    func embeddingRows(_ range: Range<Int>) -> MLXArray
+    var vocabularySize: Int { get }
+}
+
+/// CPU-resident int8 (per-row scale) copy of the input embedding so a draft
+/// chain never touches the GPU between ANE evals. One byte per parameter.
+public final class ANEEmbeddingTable {
+    public let hidden: Int
+    public let vocab: Int
+    private var q: [Int8]
+    private var scales: [Float]
+
+    public init(source: ANEHeadWeightSource, chunk: Int = 8192) {
+        hidden = source.geometry.hidden
+        vocab = source.vocabularySize
+        q = []
+        q.reserveCapacity(vocab * hidden)
+        scales = []
+        scales.reserveCapacity(vocab)
+        var row = 0
+        while row < vocab {
+            let n = min(chunk, vocab - row)
+            let (cq, cs) = ANEHeadEmitter.int8Rows(source.embeddingRows(row ..< (row + n)))
+            q.append(contentsOf: cq)
+            scales.append(contentsOf: cs.map { Float($0) })
+            row += n
+        }
+    }
+
+    public var byteCount: Int { q.count + scales.count * 4 }
+
+    public func row(_ token: Int, into out: inout [Float16]) {
+        precondition(token >= 0 && token < vocab && out.count == hidden)
+        let s = scales[token]
+        q.withUnsafeBufferPointer { qp in
+            let base = token * hidden
+            for i in 0 ..< hidden { out[i] = Float16(Float(qp[base + i]) * s) }
+        }
+    }
 }
 
 /// Builds the MIL program + weight blob for one head step from a weight source.
@@ -84,9 +124,8 @@ public enum ANEHeadEmitter {
                     let scale = absmax > 0 ? absmax / 127 : 1
                     var inv = 1 / scale
                     vDSP_vsmul(row, 1, &inv, &scaled, 1, vDSP_Length(k))
-                    for j in 0 ..< k {
-                        qp[i * k + j] = Int8(clamping: Int(scaled[j].rounded()))
-                    }
+                    // |scaled| <= 127 by construction, so the rounded fix cannot overflow.
+                    vDSP_vfixr8(scaled, 1, qp.baseAddress! + i * k, 1, vDSP_Length(k))
                     scales[i] = Float16(scale)
                 }
             }

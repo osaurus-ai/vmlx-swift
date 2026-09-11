@@ -15,6 +15,7 @@ public final class ANEHeadRunner {
     public let geometry: ANEHeadGeometry
     public let program: ANEProgram
     private let source: ANEHeadWeightSource
+    public var embeddingTableBytes: Int { embeddingTable?.byteCount ?? 0 }
 
     private let aHidden: ANEPlane, bEmbed: ANEPlane, cK: ANEPlane, dV: ANEPlane
     private let eMask: ANEPlane, fCos: ANEPlane, gSin: ANEPlane
@@ -25,6 +26,9 @@ public final class ANEHeadRunner {
     /// Absolute position stored in each slot (−1 = empty).
     private var slotPosition: [Int]
     private var ropeCache: [Int: (cos: [Float16], sin: [Float16])] = [:]
+    /// CPU embedding table (`VMLX_ANE_MTP_EMBED_TABLE=0` falls back to MLX lookups).
+    private let embeddingTable: ANEEmbeddingTable?
+    private var embedScratch: [Float16]
 
     /// A large negative that survives fp16 and still zeroes a softmax term.
     private static let maskedOut = Float16(-30000)
@@ -44,6 +48,9 @@ public final class ANEHeadRunner {
         aHidden = ins[0]; bEmbed = ins[1]; cK = ins[2]; dV = ins[3]; eMask = ins[4]; fCos = ins[5]; gSin = ins[6]
         oHidden = outs[0]; oKNew = outs[1]; oVNew = outs[2]; oMax = outs[3]; oIdx = outs[4]
         slotPosition = [Int](repeating: -1, count: geometry.window)
+        embedScratch = [Float16](repeating: 0, count: geometry.hidden)
+        embeddingTable = ProcessInfo.processInfo.environment["VMLX_ANE_MTP_EMBED_TABLE"] == "0"
+            ? nil : ANEEmbeddingTable(source: source)
         program = try ANEProgram(name: name, mil: emission.mil, weights: emission.weights,
                                  inputs: ins, outputs: outs, cacheDirectory: cacheDirectory)
     }
@@ -60,6 +67,14 @@ public final class ANEHeadRunner {
     }
 
     // MARK: - packing
+
+    private func embedding(_ token: Int) -> [Float16] {
+        if let embeddingTable {
+            embeddingTable.row(token, into: &embedScratch)
+            return embedScratch
+        }
+        return source.embedding(token: token).asType(.float32).asArray(Float.self).map { Float16($0) }
+    }
 
     private func rope(_ position: Int) -> (cos: [Float16], sin: [Float16]) {
         if let hit = ropeCache[position] { return hit }
@@ -148,8 +163,7 @@ public final class ANEHeadRunner {
     /// next chained step.
     public func draftStep(hidden: [Float16], token: Int) throws -> StepResult {
         let position = length
-        let embed = source.embedding(token: token).asType(.float32).asArray(Float.self).map { Float16($0) }
-        packRow(0, hidden: hidden, embed: embed, position: position, tileRows: 1)
+        packRow(0, hidden: hidden, embed: embedding(token), position: position, tileRows: 1)
         for r in 1 ..< geometry.rows { packIdleRow(r) }
         try program.eval()
         storeRow(0, position: position)
@@ -164,8 +178,7 @@ public final class ANEHeadRunner {
         precondition(!pairs.isEmpty && pairs.count <= geometry.rows)
         let start = length
         for (r, pair) in pairs.enumerated() {
-            let embed = source.embedding(token: pair.token).asType(.float32).asArray(Float.self).map { Float16($0) }
-            packRow(r, hidden: pair.hidden, embed: embed, position: start + r, tileRows: pairs.count)
+            packRow(r, hidden: pair.hidden, embed: embedding(pair.token), position: start + r, tileRows: pairs.count)
         }
         for r in pairs.count ..< geometry.rows { packIdleRow(r) }
         try program.eval()
@@ -182,8 +195,7 @@ public final class ANEHeadRunner {
         guard !pairs.isEmpty else { return }
         let start = length
         for (r, pair) in pairs.enumerated() {
-            let embed = source.embedding(token: pair.token).asType(.float32).asArray(Float.self).map { Float16($0) }
-            packRow(r, hidden: pair.hidden, embed: embed, position: start + r, tileRows: pairs.count)
+            packRow(r, hidden: pair.hidden, embed: embedding(pair.token), position: start + r, tileRows: pairs.count)
         }
         for r in pairs.count ..< geometry.rows { packIdleRow(r) }
         try program.eval()

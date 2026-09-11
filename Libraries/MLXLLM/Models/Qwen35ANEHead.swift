@@ -107,6 +107,12 @@ struct Qwen35ANEHeadWeightSource: ANEHeadWeightSource {
     func embedding(token: Int) -> MLXArray {
         embedTokens(MLXArray([Int32(token)])).reshaped(geometry.hidden)
     }
+
+    func embeddingRows(_ range: Range<Int>) -> MLXArray {
+        aneDenseEmbedding(embedTokens)[range, 0...]
+    }
+
+    var vocabularySize: Int { embedTokens.weight.dim(0) }
 }
 
 extension Qwen35TextModel {
