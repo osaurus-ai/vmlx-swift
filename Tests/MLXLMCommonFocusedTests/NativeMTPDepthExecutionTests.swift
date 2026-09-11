@@ -7,6 +7,32 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testInitialDepthIsMeasuredAsAProbe() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0",
+              ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0" else {
+            throw XCTSkip("Requires controlled governor costs without verify prefetch")
+        }
+        try FocusedMLXTestSupport.withLock {
+            let model = DepthDispatchTarget(sequence: true, backboneDelay: 0.010)
+            model.setVerifyDelays([2: 0.080, 3: 0.120, 4: 0.160])
+            var parameters = GenerateParameters(maxTokens: 100, temperature: 0)
+            parameters.draftStrategy = .nativeMTP(depth: 3)
+            var iterator = try NativeMTPTokenIterator(
+                input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                parameters: parameters, depth: 3)
+            let started = ProcessInfo.processInfo.systemUptime
+            var tokens: [Int] = []
+            while iterator.verifyCalls < 6, let token = iterator.next() {
+                tokens.append(token)
+            }
+            XCTAssertEqual(tokens, (0..<tokens.count).map { (2 + $0) % 32 })
+            XCTAssertEqual(iterator.verifyCalls, 6)
+            XCTAssertGreaterThan(iterator.adaptiveDepthDownshiftCount + iterator.arSafetyTrips, 0,
+                "The initial losing trial must be judged as a probe, not wait for warmup plus a window")
+            print("INITIAL-PROBE verifies=\(iterator.verifyCalls) fixtureTokS=\(Double(tokens.count) / max(ProcessInfo.processInfo.systemUptime - started, 1e-9)) realModelSpeedProof=false")
+        }
+    }
+
     func testProductiveCalibrationResumesPriorDepth() throws {
         guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0",
               ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0" else {
@@ -40,6 +66,8 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
                 XCTAssertEqual(iterator.autoregressiveFallbackTokenCount, 4,
                     "Expected two seed and two calibration steps, not an unrelated loss recovery")
                 XCTAssertEqual(resumedWidth, depth + 1, "Calibration must retain the productive depth")
+                XCTAssertEqual(iterator.arSafetyResumes, 1,
+                    "Initial admission must not be counted as resuming a parked decoder")
                 print("CALIBRATION-RESUME depth=\(depth) width=\(String(describing: resumedWidth)) fixtureTokS=\(Double(tokens.count) / max(ProcessInfo.processInfo.systemUptime - started, 1e-9)) realModelSpeedProof=false")
             }
         }
