@@ -3797,3 +3797,90 @@ extension Qwen35: NativeMTPProposalHeadInstalling {
                 + "on the full head\n").utf8))
     }
 }
+
+// MARK: - ANE drafter weight source
+
+/// The VLM Qwen3.5 MTP head for the Neural Engine emitter. Same head shape
+/// as the text-only model; text decode drives the multimodal rope with all
+/// three position components equal, which is plain RoPE, so the tables are
+/// the rotary embedding's own cos/sin at a single 1-D position.
+struct Qwen35VLMANEHeadWeightSource: ANEHeadWeightSource {
+    let geometry: ANEHeadGeometry
+    private let mtp: Qwen35Language.MTPModule
+    private let layer: Qwen35Language.MTPDecoderLayer
+    private let mlp: Qwen35Language.MLP
+    private let embedTokens: Embedding
+    private let lmHead: Linear?
+
+    init?(model: Qwen35, draftVocab: Int, window: Int) {
+        let language = model.languageModel
+        guard let mtp = language.mtp, mtp.layers.count == 1, let layer = mtp.layers.first,
+              let mlp = layer.mlp as? Qwen35Language.MLP else { return nil }
+        let args = language.textConfig
+        let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
+        self.mtp = mtp
+        self.layer = layer
+        self.mlp = mlp
+        self.embedTokens = language.model.embedTokens
+        self.lmHead = language.lmHead
+        self.geometry = ANEHeadGeometry(
+            hidden: args.hiddenSize, heads: args.attentionHeads, kvHeads: args.kvHeads,
+            headDim: headDim, rotaryDims: max(2, Int(Float(headDim) * args.partialRotaryFactor)),
+            intermediate: args.intermediateSize,
+            draftVocab: min(draftVocab, args.vocabularySize), window: window, eps: args.rmsNormEps)
+    }
+
+    func matrix(_ which: ANEHeadMatrix) -> MLXArray {
+        switch which {
+        case .fc: return aneDenseWeight(mtp.fc)
+        case .qProj: return aneDenseWeight(layer.selfAttn.qProj)
+        case .kProj: return aneDenseWeight(layer.selfAttn.kProj)
+        case .vProj: return aneDenseWeight(layer.selfAttn.vProj)
+        case .oProj: return aneDenseWeight(layer.selfAttn.oProj)
+        case .gateProj: return aneDenseWeight(mlp.gateProj)
+        case .upProj: return aneDenseWeight(mlp.upProj)
+        case .downProj: return aneDenseWeight(mlp.downProj)
+        }
+    }
+
+    func normWeight(_ which: ANEHeadNorm) -> MLXArray {
+        switch which {
+        case .preFCHidden: return mtp.preFCNormHidden.weight
+        case .preFCEmbedding: return mtp.preFCNormEmbedding.weight
+        case .inputLayerNorm: return layer.inputLayerNorm.weight
+        case .postAttentionLayerNorm: return layer.postAttentionLayerNorm.weight
+        case .qNorm: return layer.selfAttn.qNorm.weight
+        case .kNorm: return layer.selfAttn.kNorm.weight
+        case .final: return mtp.norm.weight
+        }
+    }
+
+    func lmHeadRows(_ range: Range<Int>) -> MLXArray {
+        if let lmHead { return aneDenseWeight(lmHead)[range, 0...] }
+        return aneDenseEmbedding(embedTokens)[range, 0...]
+    }
+
+    func ropeTables(positions: [Int]) -> (cos: MLXArray, sin: MLXArray) {
+        let half = geometry.rotaryDims / 2
+        let ids = MLXArray(positions.map { Int32($0) }).reshaped(1, positions.count)
+        let probe = MLXArray.zeros([1, 1, positions.count, geometry.headDim], dtype: .float32)
+        let (c, s) = layer.selfAttn.rotaryEmbedding(x: probe, positionIds: ids)   // [1, P, rot]
+        return (c.reshaped(positions.count, -1)[0..., 0 ..< half], s.reshaped(positions.count, -1)[0..., 0 ..< half])
+    }
+
+    func embedding(token: Int) -> MLXArray {
+        embedTokens(MLXArray([Int32(token)])).reshaped(geometry.hidden)
+    }
+
+    func embeddingRows(_ range: Range<Int>) -> MLXArray {
+        aneDenseEmbedding(embedTokens)[range, 0...]
+    }
+
+    var vocabularySize: Int { embedTokens.weight.dim(0) }
+}
+
+extension Qwen35: ANEDraftableModel {
+    public func aneHeadWeightSource(draftVocab: Int, window: Int) -> ANEHeadWeightSource? {
+        Qwen35VLMANEHeadWeightSource(model: self, draftVocab: draftVocab, window: window)
+    }
+}

@@ -4,6 +4,25 @@
 import Accelerate
 import Foundation
 import MLX
+import MLXNN
+
+/// Dequantized `[out, in]` weight of a Linear, whatever its storage.
+public func aneDenseWeight(_ linear: Linear) -> MLXArray {
+    if let q = linear as? QuantizedLinear {
+        return dequantized(q.weight, scales: q.scales, biases: q.biases,
+                           groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+    }
+    return linear.weight
+}
+
+/// Dequantized `[vocab, H]` table of an Embedding, whatever its storage.
+public func aneDenseEmbedding(_ embedding: Embedding) -> MLXArray {
+    if let q = embedding as? QuantizedEmbedding {
+        return dequantized(q.weight, scales: q.scales, biases: q.biases,
+                           groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+    }
+    return embedding.weight
+}
 
 /// Static geometry of one Qwen3.5-family native-MTP head as the ANE runs it.
 public struct ANEHeadGeometry: Sendable, Equatable {

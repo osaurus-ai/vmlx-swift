@@ -11,23 +11,6 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-/// Dequantized `[out, in]` weight of a Linear, whatever its storage.
-func aneDenseWeight(_ linear: Linear) -> MLXArray {
-    if let q = linear as? QuantizedLinear {
-        return dequantized(q.weight, scales: q.scales, biases: q.biases,
-                           groupSize: q.groupSize, bits: q.bits, mode: q.mode)
-    }
-    return linear.weight
-}
-
-func aneDenseEmbedding(_ embedding: Embedding) -> MLXArray {
-    if let q = embedding as? QuantizedEmbedding {
-        return dequantized(q.weight, scales: q.scales, biases: q.biases,
-                           groupSize: q.groupSize, bits: q.bits, mode: q.mode)
-    }
-    return embedding.weight
-}
-
 struct Qwen35ANEHeadWeightSource: ANEHeadWeightSource {
     let geometry: ANEHeadGeometry
     private let mtp: Qwen35MTPModule
