@@ -964,6 +964,7 @@ let package = Package(
                 "LogitProcessorIndependentCopyTests.swift",
                 "ANEBridgeLinearParityTests.swift",
                 "ANEGPUContentionProbeTests.swift",
+                "ANEHeadParityTests.swift",
             ]
         ),
         .testTarget(

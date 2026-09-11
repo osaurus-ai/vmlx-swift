@@ -186,6 +186,10 @@ public struct ANEMILBuilder {
         emit(base, shape: x.shape) { _ in "silu(x = \(x.ref))" }
     }
 
+    public mutating func sigmoid(_ x: Value, _ base: String = "sig") -> Value {
+        emit(base, shape: x.shape) { _ in "sigmoid(x = \(x.ref))" }
+    }
+
     public mutating func reduceMean(_ x: Value, axis: Int, _ base: String = "mean") -> Value {
         let axes = constInt32([axis], "axes"), kd = constBool(true, "kd")
         var shape = x.shape
