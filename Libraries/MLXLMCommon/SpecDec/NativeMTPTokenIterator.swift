@@ -370,6 +370,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// lifecycle through `trimHead`/`refreshHeadCache`.
     private var aneDrafter: ANEMTPDrafter?
     private(set) var aneDraftForwardCount = 0
+    /// `VMLX_ANE_MTP_PARITY=1`: also run the GPU head on every draft input and log agreement.
+    private static let aneParityProbe = ProcessInfo.processInfo.environment["VMLX_ANE_MTP_PARITY"] == "1"
 
     private mutating func trimHead(rows: Int) {
         if let aneDrafter { aneDrafter.trim(rows: rows) } else { Self.trimHeadChain(mtpCache, rows: rows) }
@@ -388,6 +390,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             do {
                 let ids = try aneDrafter.drafts(hidden: hidden, nextTokens: nextToken, depth: depth)
                 aneDraftForwardCount += ids.count
+                if Self.aneParityProbe {
+                    // Same inputs through the GPU head on a throwaway cache:
+                    // comparable exactly when the ANE window is also empty
+                    // (first cycle) and approximately after (no history).
+                    let scratch = model.makeNativeMTPCache()
+                    let gpu = Self.makeDrafts(
+                        model: model, hidden: hidden, nextToken: nextToken, mtpCache: scratch,
+                        depth: depth, sampler: sampler, speculativeSampler: speculativeSampler,
+                        processor: processor)
+                    let gpuIds = gpu.tokens.map { $0.item(Int32.self) }
+                    let absMax = hidden.abs().max().item(Float.self)
+                    FileHandle.standardError.write(Data(
+                        "[ANE parity] aneLen=\(aneDrafter.length) rows=\(nextToken.dim(-1)) |hidden|max=\(absMax) ane=\(ids) gpu=\(gpuIds) firstMatch=\(ids.first == gpuIds.first)\n".utf8))
+                }
                 return DraftBatch(
                     tokens: ids.map { MLXArray([$0]) },
                     probabilities: [],
