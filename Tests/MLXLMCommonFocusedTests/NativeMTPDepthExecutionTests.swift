@@ -7,6 +7,41 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testMeasuredInitialLossParksDirectlyAtAR() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0",
+              ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0" else {
+            throw XCTSkip("Requires controlled governor costs without verify prefetch")
+        }
+        try FocusedMLXTestSupport.withLock {
+            for depth in 1...3 {
+                let model = DepthDispatchTarget(sequence: true, backboneDelay: 0.010)
+                model.setVerifyDelays([2: 0.080, 3: 0.120, 4: 0.160])
+                var parameters = GenerateParameters(maxTokens: 100, temperature: 0)
+                parameters.draftStrategy = .nativeMTP(depth: depth)
+                var iterator = try NativeMTPTokenIterator(
+                    input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                    parameters: parameters, depth: depth)
+                let started = ProcessInfo.processInfo.systemUptime
+                var tokens: [Int] = []
+                while iterator.verifyCalls < 6, let token = iterator.next() {
+                    tokens.append(token)
+                }
+                XCTAssertEqual(iterator.arSafetyTrips, 1,
+                    "A measured loss must park at AR, not try another unqualified depth")
+                // Drain already verified tokens; the next computation must be AR.
+                for _ in 0...depth {
+                    if iterator.autoregressiveFallbackTokenCount > 2 { break }
+                    if let token = iterator.next() { tokens.append(token) }
+                }
+                XCTAssertEqual(iterator.verifyCalls, 6)
+                XCTAssertEqual(iterator.autoregressiveFallbackTokenCount, 3)
+                XCTAssertEqual(tokens, (0..<tokens.count).map { (2 + $0) % 32 })
+                XCTAssertTrue(model.verifyWidths.allSatisfy { $0 <= depth + 1 })
+                print("DIRECT-AR depth=\(depth) fixtureTokS=\(Double(tokens.count) / max(ProcessInfo.processInfo.systemUptime - started, 1e-9)) realModelSpeedProof=false")
+            }
+        }
+    }
+
     func testInitialDepthIsMeasuredAsAProbe() throws {
         guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0",
               ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0" else {
@@ -130,7 +165,8 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
                 if tokens.count == 240 {
                     let widths = model.verifyWidths
                     XCTAssertTrue(widths.contains(4))
-                    XCTAssertTrue(widths.contains(3), "D3 must descend through D2")
+                    XCTAssertGreaterThan(iterator.arSafetyTrips, 0,
+                        "Losing D3 must park before probing a lower depth")
                     XCTAssertTrue(widths.contains(2), "D1 should be discovered")
                     widthsAtChange = widths.count
                     model.setVerifyDelays([2: 0.012, 3: 0.012, 4: 0.012])
