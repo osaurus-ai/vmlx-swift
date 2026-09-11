@@ -221,7 +221,7 @@ import Testing
 }
 
 @Test func restoreSSMStatesSupportsExtendedPLEMambaAlongsideOrdinaryMamba() {
-    let sourcePLE = MambaCache(slots: 6)
+    let sourcePLE = MambaCache(slots: 6, persistentSlotCount: 4)
     for index in 0 ..< 4 {
         sourcePLE[index] = MLXArray([Int32(index + 10)])
     }
@@ -232,7 +232,7 @@ import Testing
     let states = extractSSMStates(from: [sourcePLE, sourceOrdinary])
     #expect(states.count == 6)
 
-    let restoredPLE = MambaCache(slots: 6)
+    let restoredPLE = MambaCache(slots: 6, persistentSlotCount: 4)
     let restoredOrdinary = MambaCache()
     restoreSSMStates(states, into: [restoredPLE, restoredOrdinary], boundary: 17)
 

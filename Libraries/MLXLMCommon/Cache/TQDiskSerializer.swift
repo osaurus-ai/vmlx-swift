@@ -465,18 +465,26 @@ public enum TQDiskSerializer {
         index i: Int,
         into result: inout [String: MLXArray]
     ) {
-        let state = mamba.state
-        guard state.count >= 1 else {
-            // Pre-prefill layer with no state at all — nothing to persist.
-            // Deserialization treats a tagged mamba layer without state as
-            // an atomic required miss.
-            return
+        serializeMambaState(mamba, prefix: "mamba_\(i)", into: &result)
+    }
+
+    /// An explicit occupancy map preserves nil holes and distinguishes a
+    /// missing tensor from an intentionally empty slot. Slot geometry comes
+    /// from the cache owner, never the model name or quantization preset.
+    private static func serializeMambaState(
+        _ mamba: MambaCache, prefix: String, into result: inout [String: MLXArray]
+    ) {
+        guard mamba[0] != nil else { return }
+        var occupied: [Int32] = []
+        for slot in 0..<mamba.persistentSlotCount {
+            if let state = mamba[slot] {
+                result["\(prefix)_state\(slot)"] = state
+                occupied.append(Int32(slot))
+            }
         }
-        result["mamba_\(i)_state0"] = state[0]
-        if state.count >= 2 {
-            result["mamba_\(i)_state1"] = state[1]
-        }
-        result["__mamba_\(i)_offset__"] = metaInt32(Int32(mamba.offset))
+        result["__\(prefix)_slots__"] = metaInt32(Int32(mamba.persistentSlotCount))
+        result["__\(prefix)_occupied__"] = MLXArray(occupied)
+        result["__\(prefix)_offset__"] = metaInt32(Int32(mamba.offset))
     }
 
     /// Serialize a single RotatingKVCache layer (sliding-window attention).
@@ -559,19 +567,9 @@ public enum TQDiskSerializer {
             let sub = list[j]
 
             if let mamba = sub as? MambaCache {
-                let state = mamba.state
-                if state.count >= 1 {
-                    result["mamba_\(i)_sub_\(j)_state0"] = state[0]
-                    if state.count >= 2 {
-                        result["mamba_\(i)_sub_\(j)_state1"] = state[1]
-                    }
-                    result["__mamba_\(i)_sub_\(j)_offset__"] =
-                        metaInt32(Int32(mamba.offset))
-                    result[subKindKey(layer: i, sub: j)] = kindArray(.mamba)
-                    anyPersisted = true
-                } else {
-                    result[subKindKey(layer: i, sub: j)] = kindArray(.skip)
-                }
+                serializeMambaState(mamba, prefix: "mamba_\(i)_sub_\(j)", into: &result)
+                result[subKindKey(layer: i, sub: j)] = kindArray(.mamba)
+                anyPersisted = true
                 continue
             }
 
@@ -893,6 +891,9 @@ public enum TQDiskSerializer {
         public let state0: MLXArray
         public let state1: MLXArray?
         public let offset: Int
+        /// Nil only for legacy one/two-slot entries.
+        public let persistentSlotCount: Int?
+        public let occupiedStates: [Int: MLXArray]
     }
 
     /// RotatingKVCache state for a single sliding-window attention layer.
@@ -1145,53 +1146,8 @@ public enum TQDiskSerializer {
                     out.append(IndexedLayerData(index: i, data: .requiredMiss))
                 }
             case .mamba:
-                if let s0 = arrays["mamba_\(i)_state0"] {
-                    // `state1` is optional: short-conv (LFM2/LFM2.5) layers
-                    // persist a single slot, full Mamba layers persist two.
-                    let offset: Int
-                    if let offArr = arrays["__mamba_\(i)_offset__"] {
-                        guard let off = readMetaInt32(offArr) else {
-                            // A recurrent state with an unreadable offset
-                            // cannot be trusted at any position — atomic miss,
-                            // same rule as an incomplete TQ payload.
-                            out.append(IndexedLayerData(index: i, data: .requiredMiss))
-                            continue
-                        }
-                        offset = Int(off)
-                    } else {
-                        // MISSING is damage, not "position zero".
-                        //
-                        // `serializeMambaLayer` writes `__mamba_i_offset__`
-                        // unconditionally whenever it writes `state0`, so a
-                        // payload carrying recurrent state without its offset
-                        // was truncated. Defaulting to 0 seated real state at
-                        // the wrong position and let the record report a hit —
-                        // the sibling branch two lines up already refuses an
-                        // UNREADABLE offset for exactly this reason, and a
-                        // missing one is no more trustworthy.
-                        out.append(IndexedLayerData(index: i, data: .requiredMiss))
-                        continue
-                    }
-                    out.append(
-                        IndexedLayerData(
-                            index: i,
-                            data: .mamba(
-                                MambaLayerComponents(
-                                    state0: s0,
-                                    state1: arrays["mamba_\(i)_state1"],
-                                    offset: offset
-                                )
-                            )
-                        )
-                    )
-                } else {
-                    // A tagged mamba layer without persisted state cannot
-                    // degrade to a KV-only hit: recurrent prefix state is
-                    // required, so the whole entry is an atomic miss (this
-                    // also retires pre-fix entries that skipped short-conv
-                    // state while stamping the mamba kind tag).
-                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
-                }
+                let component = deserializeMambaState(prefix: "mamba_\(i)", from: arrays)
+                out.append(IndexedLayerData(index: i, data: component.map(LayerData.mamba) ?? .requiredMiss))
             case .qkv:
                 if let comp = deserializeQKVLayer(index: i, from: arrays) {
                     out.append(IndexedLayerData(index: i, data: .qkv(comp)))
@@ -1471,6 +1427,46 @@ public enum TQDiskSerializer {
         )
     }
 
+    private static func deserializeMambaState(
+        prefix: String, from arrays: [String: MLXArray]
+    ) -> MambaLayerComponents? {
+        guard let state0 = arrays["\(prefix)_state0"],
+              let offsetArray = arrays["__\(prefix)_offset__"],
+              let offset = readMetaInt32(offsetArray), offset >= 0
+        else { return nil }
+        let slotArray = arrays["__\(prefix)_slots__"]
+        let occupancyArray = arrays["__\(prefix)_occupied__"]
+        var states: [Int: MLXArray] = [0: state0]
+        let count: Int?
+        if slotArray != nil || occupancyArray != nil {
+            guard let slotArray, let occupancyArray,
+                  let slotCount = readMetaInt32(slotArray), slotCount > 0,
+                  occupancyArray.dtype == .int32, occupancyArray.ndim == 1,
+                  occupancyArray.size > 0, occupancyArray.size <= Int(slotCount)
+            else { return nil }
+            let occupied = occupancyArray.asArray(Int32.self).map(Int.init)
+            guard Set(occupied).count == occupied.count, occupied.contains(0),
+                  occupied.allSatisfy({ $0 >= 0 && $0 < Int(slotCount) })
+            else { return nil }
+            states = [:]
+            for slot in occupied {
+                guard let state = arrays["\(prefix)_state\(slot)"] else { return nil }
+                states[slot] = state
+            }
+            let payloadKeys = Set(arrays.keys.filter { $0.hasPrefix("\(prefix)_state") })
+            guard payloadKeys == Set(occupied.map { "\(prefix)_state\($0)" }) else { return nil }
+            count = Int(slotCount)
+        } else {
+            // Legacy records do not describe extended layouts. Restoration
+            // permits these only into ordinary one/two-slot cache geometry.
+            if let state1 = arrays["\(prefix)_state1"] { states[1] = state1 }
+            count = nil
+        }
+        return MambaLayerComponents(
+            state0: state0, state1: states[1], offset: Int(offset),
+            persistentSlotCount: count, occupiedStates: states)
+    }
+
     /// Deserialize a `CacheList` composite. Reads
     /// `__cache_list_{i}_count__` then iterates each sub-cache by its
     /// own `__cache_list_{i}_sub_{j}_kind__` tag, dispatching to the
@@ -1512,26 +1508,8 @@ public enum TQDiskSerializer {
                     subs.append(.skip)
                 }
             case .mamba:
-                if let s0 = arrays["mamba_\(i)_sub_\(j)_state0"] {
-                    let off: Int
-                    if let oa = arrays["__mamba_\(i)_sub_\(j)_offset__"] {
-                        guard let offValue = readMetaInt32(oa) else {
-                            subs.append(.skip)
-                            continue
-                        }
-                        off = Int(offValue)
-                    } else {
-                        off = 0
-                    }
-                    subs.append(
-                        .mamba(
-                            MambaLayerComponents(
-                                state0: s0,
-                                state1: arrays["mamba_\(i)_sub_\(j)_state1"],
-                                offset: off)))
-                } else {
-                    subs.append(.skip)
-                }
+                let component = deserializeMambaState(prefix: "mamba_\(i)_sub_\(j)", from: arrays)
+                subs.append(component.map(LayerData.mamba) ?? .requiredMiss)
             case .rotating:
                 if let k = arrays["rot_\(i)_sub_\(j)_keys"],
                    let v = arrays["rot_\(i)_sub_\(j)_values"],
