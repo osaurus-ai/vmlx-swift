@@ -963,6 +963,7 @@ let package = Package(
                 "LFM25ChatTemplateRenderFocusedTests.swift",
                 "LogitProcessorIndependentCopyTests.swift",
                 "ANEBridgeLinearParityTests.swift",
+                "ANEGPUContentionProbeTests.swift",
             ]
         ),
         .testTarget(

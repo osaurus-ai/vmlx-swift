@@ -37,6 +37,7 @@ Probe: `tools/ane-draft-probe/aneprobe.m` (int8 per-row weights via
 | blockwise 4-bit (`constexpr_blockwise_shift_scale`) | only per-row scales compile; gs64/gs256 refused by ANECCompile |
 | ANE eval with GPU at 52 TFLOPS (GEMM) | 0.673 ms vs 0.678 alone; GPU unchanged |
 | ANE eval with GPU blit at 525 GB/s | 0.692 ms (+2%); GPU falls to 439 GB/s (−16%); fabric total 568 GB/s |
+| ANE eval loop vs MLX 4-bit decode loop (M=4, 16×8192² gs64, 283 GB/s) | GPU pass 2.137 → 2.217 ms (**+3.8%**); ANE 0.681 → 0.677 ms (unchanged) — `ANEGPUContentionProbeTests` |
 
 So: the ANE streams ~130 G params/s regardless of weight width, is ~9× slower
 per parameter than the GPU on 4-bit weights, and is genuinely concurrent. It
@@ -131,6 +132,46 @@ candidate, so a bonus token inside the head's top-32 still has a ready chain.
 Measure before building: the gain is bounded by the draft fraction of the
 round (~15–20% on Flash-Next at D3) minus the GPU bandwidth tax while both
 engines stream (≤16% of GPU BW during the ANE's active window).
+
+## Prior art reviewed (2026-09-10)
+
+**ANEMLL** (`Anemll/Anemll`, 1.6k★; issues #33/#35/#58, PR #50): whole small
+models (1–8B) on the ANE via Core ML — LUT4 FFN + LUT6 lm_head, static
+context 512–1024, chunked lm_head, `MLState` KV, one function per shape.
+Their own numbers say it: ANE sits at 10–20% utilization at decode because
+it is memory-bound (#35), and an M1 4B does 11 t/s on ANE vs 23 t/s MLX
+(#33). No speculative decoding anywhere in the repo. The org has since
+moved big-MoE work to Metal (`ds4-qwen`, `ds4-ssd`, `anemll-flash-llama.cpp`).
+Useful pieces: `fp16_preflight` (residual-stream overflow check — Gemma3
+needs α-scaling, Qwen3 peaks ~15k of 65k), `ane_profiler.py` (compute-plan
++ per-op placement, same approach as `computeplan.swift`), and the Qwen3.5
+DeltaNet port's ANE constraints (per-layer `MLState`, no batch prefill for
+the recurrence, transposed state layout, fp32 recurrence step — meaning a
+Flash-Next/GDN *trunk* on the ANE is a non-starter; the MTP head we target
+is attention + MLP only).
+
+**Core AI** (`apple/coreai-models`, `coreai-torch`, `coreai-optimization`;
+macOS 27 / Xcode 27): the public successor to the private path —
+`SpecializationOptions(preferredComputeUnitKind: .neuralEngine)`, I/O bound
+to `MTLBuffer`/`IOSurface` via `NDArray.MutableRawView`, "chunked static →
+Neural Engine" LLM engines, and a GPU-pipelined engine
+(`CoreAIPipelinedEngine`: non-blocking encode, GPU-side sampling, depth-3
+buffer rotation). Apple's Neural Engine authoring rules match this note's
+measurements exactly (64-byte last-axis alignment, BC1S layout, conv-as-
+linear, fp16 only, static shapes, "keep the whole graph resident").
+Not available on Eric's Macs (26.3.2 / 26.4) today; the bridge is written so
+the emitter and drafter can retarget Core AI when the OS moves.
+
+**Hybrid ANE+GPU trunk decode ("fused decode")**: the fabric numbers rule it
+out for bandwidth-bound decode of 4-bit weights. The GPU reads 0.5 B/param;
+the ANE must read ≥1 B/param (4-bit expands at compile). On a shared fabric
+that delivered 568 GB/s combined in the blit test, moving any slice of the
+trunk to the ANE lowers total params/s (GPU alone ≈ 1.05 T params/s; GPU +
+ANE ≈ 0.88 T + 0.13 T = 1.01 T at best, before the ANE's 32-row tile
+computes 32× the needed rows). mlx-serve reached the same place empirically:
+ANE offload helps *prefill* (compute-bound) on M1–M4 and is off on M5. What
+does compose with the GPU is overhead-bound work — the draft head, samplers,
+small controllers — which is this design.
 
 ## What this is not
 
