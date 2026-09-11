@@ -7,6 +7,27 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testSampledStagedDispatchRequiresModelOptIn() throws {
+        try FocusedMLXTestSupport.withLock {
+            for enabled in [false, true] {
+                let model = DepthDispatchTarget(sequence: true)
+                model.nativeMTPSampledStagedVerificationEnabled = enabled
+                var parameters = GenerateParameters(maxTokens: 24, temperature: 1)
+                parameters.randomSeed = 829
+                parameters.draftStrategy = .nativeMTP(depth: 3)
+                var iterator = try NativeMTPTokenIterator(
+                    input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                    parameters: parameters, depth: 3)
+                var tokens: [Int] = []
+                let started = ProcessInfo.processInfo.systemUptime
+                while let token = iterator.next() { tokens.append(token) }
+                XCTAssertEqual(tokens, (0..<24).map { (2 + $0) % 32 })
+                XCTAssertEqual(iterator.stagedVerifierCommitCount > 0, enabled)
+                print("SAMPLED-STAGED optIn=\(enabled) fixtureTokS=\(Double(tokens.count) / max(ProcessInfo.processInfo.systemUptime - started, 1e-9)) dispatchOnly=true realModelSpeedProof=false")
+            }
+        }
+    }
+
     func testSampledChunkDecisionCarriesEmittedTokenIDs() throws {
         try FocusedMLXTestSupport.withLock {
             for rejectionCase in 0...2 {
@@ -244,6 +265,7 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
 {
     var kvHeads: [Int] { sequence ? [1, 1] : [1] }
     var nativeMTPAvailable: Bool { true }
+    var nativeMTPSampledStagedVerificationEnabled = false
     private let timingLock = NSLock()
     private var widths: [Int] = []
     var verifyWidths: [Int] { timingLock.withLock { widths } }

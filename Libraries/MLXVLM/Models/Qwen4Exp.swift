@@ -1780,6 +1780,12 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
 
     public var nativeMTPAvailable: Bool { mtp != nil }
 
+    /// Experimental until shipped-bundle sampled continuation is qualified.
+    /// This does not change the distinct Qwen 27B model implementation.
+    public var nativeMTPSampledStagedVerificationEnabled: Bool {
+        RuntimeEnvironment.value("VMLX_QWEN4_EXP_SAMPLED_STAGED") == "1"
+    }
+
     public func makeNativeMTPCache() -> [KVCache] {
         mtp?.makeCache() ?? []
     }

@@ -1467,7 +1467,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // ONLY; it must never leak into prefill/seed/sequential forwards.
         let explicitHybridMode = Self.nativeMTPHybridVerifySetting(verifierModeSetting)
         let stagedCapable = usesHybridMambaCache
-            && speculativeSampler.isGreedy
+            && (speculativeSampler.isGreedy || model.nativeMTPSampledStagedVerificationEnabled)
             && processor == nil
             && model is DFlash2StagedVerifyRollbackModel
         let stagedVerify = stagedCapable
@@ -1549,7 +1549,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 cache,
                 verifierMode: verifierModeSetting)
         let canCommitVerifierCache = Self.canCommitVerifierCache(cache)
-        let requiresSequentialRepair = Self.requiresSequentialVerifierRepair(
+        let requiresSequentialRepair = !stagedVerify && Self.requiresSequentialVerifierRepair(
             cache,
             speculativeSampler: speculativeSampler,
             verifierMode: verifierModeSetting)
@@ -1965,6 +1965,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private mutating func maybePrefetchNextVerify(stagedVerify: Bool) {
         guard Self.verifyPrefetchEnabled,
             stagedVerify,
+            speculativeSampler.isGreedy,
             !compiledVerifyEnabled,
             !Self.traceEnabled,
             !forceAutoregressiveFallback,

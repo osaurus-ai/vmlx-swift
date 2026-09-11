@@ -6,7 +6,8 @@ import MLXRandom
 @testable import MLXVLM
 import Testing
 
-// Bounded generated fixture: no installed model or experimental sampled verifier.
+// Bounded generated fixture: no installed model. Sampled staging is exercised
+// only when the explicit Flash experiment environment variable is enabled.
 @Suite(.serialized)
 struct FlashPersistentDiskContinuationTests {
     private final class ProgressRecorder: @unchecked Sendable {
@@ -253,6 +254,13 @@ struct FlashPersistentDiskContinuationTests {
                     while let token = iterator.next() { emitted.append(token) }
                     #expect(emitted.count == cap)
                     #expect(iterator.mtpForwardCount > 0, "native MTP must actually execute")
+                    if model.nativeMTPSampledStagedVerificationEnabled && cap == 32 {
+                        #expect(iterator.stagedVerifierCommitCount > 0,
+                                "Opt-in must reach the real Flash staged commit")
+                        #expect(iterator.residualCorrectionCount > 0,
+                                "The real sampled fixture must exercise rejection")
+                    }
+                    print("FLASH-SAMPLED-PATH cap=\(cap) staged=\(iterator.stagedVerifierCommitCount) correction=\(iterator.residualCorrectionCount) bonus=\(iterator.bonusCount) accepted=\(iterator.acceptedByDepth)")
                     iterator.storeCacheAfterGeneration(generatedTokenIds: emitted, includeGeneratedBoundary: true)
                     let disk = try #require(coordinator.diskCache)
                     // Exercise the production restore caller too; raw serializer
