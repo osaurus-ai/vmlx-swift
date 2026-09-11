@@ -4594,6 +4594,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     let task = Task {
         let performIteration = {
             var handler = handler.consume()
+            let streamTiming = StreamTimingRecorder()
 
             // Construct the iterator *inside* the streaming task so any
             // prefill work (cache fetch + prompt prepare) runs here rather
@@ -4686,6 +4687,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 if token == tokenizer.unknownTokenId || stopTokenIds.contains(token) {
                     if includeStopToken {
                         tokenCount += 1
+                        streamTiming?.record()
                         if !handler.onStopToken(token, emit: continuation.yield) {
                             stopReason = .cancelled
                             break
@@ -4696,6 +4698,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 }
 
                 tokenCount += 1
+                streamTiming?.record()
                 if !handler.onToken(token, emit: continuation.yield) {
                     // Distinguish "downstream consumer terminated the
                     // stream" from "library-internal stop-sequence
@@ -4731,6 +4734,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
             let now = Date.timeIntervalSinceReferenceDate
             let generateTime = now - start
+            streamTiming?.finish(tokenCount: tokenCount, stopReason: String(describing: stopReason))
             MLXPressGenerationProfile.dumpAndReset(
                 reason: "generation-end tokens=\(tokenCount)")
 
