@@ -273,6 +273,10 @@ public struct GenerateParameters: Sendable {
     /// `DDTREE-DESIGN.md` for the full spec.
     public var draftStrategy: DraftStrategy? = nil
 
+    /// Fixed native-MTP depth is a ceiling; adaptive exploration must be
+    /// requested explicitly. Either policy may descend to shallower work or AR.
+    public var nativeMTPDepthPolicy: NativeMTPDepthPolicy = .fixed
+
     /// Additional text-level stop sequences. When any of these strings
     /// appears in the user-visible assistant output, the library halts
     /// generation, truncates the match and everything after it, and

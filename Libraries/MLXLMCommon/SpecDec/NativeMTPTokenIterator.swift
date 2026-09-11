@@ -389,16 +389,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// stats line): which rule moved the depth, how often.
     private var adaptiveWallClockDemotes = 0
     private var adaptiveAcceptanceDemotes = 0
-    /// Oscillation brake: how many times each depth has been demoted FROM
-    /// in this generation. Live on 4M prose (2026-09-04): d3 start →
-    /// 12 downshifts over 414 cycles — acceptance demoted, the margin gate
-    /// promoted straight back, each hop cold-starting the head cache. A
-    /// level demoted twice is closed for the rest of the generation.
+    /// Losses space future exploration geometrically, never close a depth
+    /// permanently. A changed regime can recover within the selected ceiling.
     private var adaptiveDemotedFromCount: [Int: Int] = [:]
-    private static let adaptiveMaxDemotesPerLevel = 2
-    /// Hard ceiling for adaptive promotion — the resolved depth cap, which
-    /// may exceed the REQUESTED depth (the request is a starting point, not
-    /// a lid, since 2026-09-04). See the depth-policy comment in `init`.
+    private var upperProbeNotBeforeCycle: [Int: Int] = [:]
+    /// Resolved promotion ceiling: fixed requests never exceed their chosen
+    /// depth; explicitly adaptive requests may explore to their bounded cap.
     private let adaptiveDepthCeiling: Int
     private(set) var seedMainForwardTime: TimeInterval = 0
     private(set) var verifyMainForwardTime: TimeInterval = 0
@@ -440,9 +436,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     //
     // Runs every cycle regardless of depth policy (fixed or adaptive): if a
     // WINDOWED MTP ms/token exceeds a context-scaled AR baseline, the request
-    // pauses speculation and decodes AR "instantaneously"; while paused it
-    // measures the live AR step cost and periodically PROBES a resume at the
-    // starting depth, keeping MTP only if the probe window beats live AR.
+    // descends one rung, reaching AR only after D1 loses. While paused it
+    // measures live AR cost and periodically probes D1. Observing a loss and
+    // draining committed output have measurable cost, not an instantaneous floor.
     // Design + audit trail: docs/internal/MTP-AR-SAFETY-GOVERNOR-SWIFT-2026-09-04.md
     // (Swift port of vmlx-private-evidence MTP-ONFLY-AR-FALLBACK-PLAN, plus
     // the reversible Phase 2 the Python plan deferred).
@@ -468,6 +464,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var arSafetyTokensSincePause = 0
     private var arSafetyResumeInterval = NativeMTPTokenIterator.arSafetyResumeIntervalStart
     private var arSafetyProbeCyclesRemaining = 0
+    private var arSafetyProbeStartedAt: TimeInterval?
+    private var arSafetyProbeStartedEmitted = 0
+    private var arSafetyLastMeasuredToken = 0
+    private var arSafetyCalibrationRemaining = 0
     /// True while a kept re-entry is speculating: a trip in that state backs
     /// the resume interval off further instead of resetting it.
     private var arSafetyReentered = false
@@ -518,7 +518,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static let wallClockDemoteFactor = 1.05
     private(set) var nativeMTPStats: NativeMTPGenerationStats?
     private var generationStatsFinalized = false
-    private let iteratorStartTime = Date.timeIntervalSinceReferenceDate
+    private let iteratorStartTime = NativeMTPClock.now()
 
     private var usesHybridMambaCache: Bool {
         cache.contains { $0 is MambaCache }
@@ -591,27 +591,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.sampler = effectiveParameters.sampler()
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
         self.maxTokens = effectiveParameters.maxTokens
-        // Depth policy (2026-09-04): the REQUESTED depth is the STARTING
-        // depth; the hard cap is 5 and the adaptive controller may promote
-        // past the request up to that cap when a full acceptance window
-        // clears the top floor with margin — near-perfect-acceptance shapes
-        // (counting, enumeration, tables) earn d4/d5 at runtime instead of
-        // being pinned to their start. History: the D2 cap era was
-        // calibrated on the lazy-repair verifier (Nemotron D3 0.48x); the
-        // staged verifier re-measured D3 as a win (27B_4D: 28.4 vs 16.5
-        // plain, byte-identical), and the same acceptance-priced controller
-        // that downshifts unprofitable depth governs every step above the
-        // start. Benchmarks can still override via VMLX_MTP_DEPTH_CAP.
+        // One resolved policy governs initialization, recovery and promotion.
+        // The environment bounds exploration but cannot raise a fixed request.
         let depthCap =
             ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
             .flatMap(Int.init).map { Swift.max($0, 1) } ?? 5
-        self.adaptiveDepthCeiling = depthCap
-        self.depth = Swift.min(requestedDepth, depthCap)
-        self.currentDepth = Swift.min(requestedDepth, depthCap)
+        let resolvedDepth = try effectiveParameters.nativeMTPDepthPolicy.resolve(
+            requestedDepth: requestedDepth, runtimeCap: depthCap)
+        self.adaptiveDepthCeiling = resolvedDepth.maximumDepth
+        self.depth = resolvedDepth.initialDepth
+        self.currentDepth = resolvedDepth.initialDepth
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode
-        let promptTokenStart = Date.timeIntervalSinceReferenceDate
+        let promptTokenStart = NativeMTPClock.now()
         let promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
-        let promptTokenElapsed = Date.timeIntervalSinceReferenceDate - promptTokenStart
+        let promptTokenElapsed = NativeMTPClock.now() - promptTokenStart
         self.promptTokenIds = promptTokenIds
         self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
         self.restoredPrefixStart = input.cachePrefixTokenCounts.contains { $0 > 0 }
@@ -798,20 +791,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
         }
 
-        let start = Date.timeIntervalSinceReferenceDate
+        let start = NativeMTPClock.now()
         try Task.checkCancellation()
         let prepared = try model.prepare(
             inputForPrepare,
             cache: self.cache,
             windowSize: effectiveParameters.prefillStepSize)
-        self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - start
+        self.promptPrefillTime = NativeMTPClock.now() - start
         self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
 
         let firstToken: MLXArray
         switch prepared {
         case .tokens(let tokens):
             processor?.prompt(input.text.tokens)
-            let seedStart = Date.timeIntervalSinceReferenceDate
+            let seedStart = NativeMTPClock.now()
             let backbone = model.nativeBackboneForward(
                 Self.sequenceInput(tokens.tokens),
                 cache: self.cache)
@@ -821,11 +814,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 speculativeSampler: speculativeSampler,
                 processor: &processor)
                 .token
-            let syncStart = Date.timeIntervalSinceReferenceDate
+            let syncStart = NativeMTPClock.now()
             try Task.checkCancellation()
             MLX.eval(firstToken)
-            self.materializeSyncTime += Date.timeIntervalSinceReferenceDate - syncStart
-            self.seedMainForwardTime += Date.timeIntervalSinceReferenceDate - seedStart
+            self.materializeSyncTime += NativeMTPClock.now() - syncStart
+            self.seedMainForwardTime += NativeMTPClock.now() - seedStart
             self.seedMainForwardCount += 1
         case .logits(let output):
             if let effectivePromptTokens = output.effectivePromptTokens,
@@ -850,10 +843,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 speculativeSampler: speculativeSampler,
                 processor: &processor)
                 .token
-            let syncStart = Date.timeIntervalSinceReferenceDate
+            let syncStart = NativeMTPClock.now()
             try Task.checkCancellation()
             MLX.eval(firstToken)
-            self.materializeSyncTime += Date.timeIntervalSinceReferenceDate - syncStart
+            self.materializeSyncTime += NativeMTPClock.now() - syncStart
         }
 
         let firstID = recordMaterializeSync {
@@ -861,7 +854,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         pendingTokens.append(firstID)
 
-        let bridgeStart = Date.timeIntervalSinceReferenceDate
+        let bridgeStart = NativeMTPClock.now()
         try Task.checkCancellation()
         let bridge = model.nativeBackboneForward(Self.tokenInput(firstToken), cache: self.cache)
         let secondToken = Self.sampleLast(
@@ -870,16 +863,16 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             speculativeSampler: speculativeSampler,
             processor: &processor)
             .token
-        let secondSyncStart = Date.timeIntervalSinceReferenceDate
+        let secondSyncStart = NativeMTPClock.now()
         try Task.checkCancellation()
         MLX.eval(secondToken)
-        self.materializeSyncTime += Date.timeIntervalSinceReferenceDate - secondSyncStart
-        self.seedMainForwardTime += Date.timeIntervalSinceReferenceDate - bridgeStart
+        self.materializeSyncTime += NativeMTPClock.now() - secondSyncStart
+        self.seedMainForwardTime += NativeMTPClock.now() - bridgeStart
         self.seedMainForwardCount += 1
 
         nextMain = secondToken
         pendingTokens.append(recordMaterializeSync { secondToken.item(Int.self) })
-        let draftStart = Date.timeIntervalSinceReferenceDate
+        let draftStart = NativeMTPClock.now()
         try Task.checkCancellation()
         let draftBatch = Self.makeDrafts(
             model: model,
@@ -894,7 +887,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         draftProbabilities = draftBatch.probabilities
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
-        self.mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
+        self.mtpDraftTime += NativeMTPClock.now() - draftStart
 
         // MARK: compiled verify promotion — after prefill and the boundary
         // snapshot, so stored prefix-cache entries stay plain.
@@ -1235,7 +1228,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             : 0
         let gdnReplay = NativeMTPGDNReplayDiagnostics.snapshot()
         let phaseSummary = NativeMTPPhaseDiagnostics.summary()
-        let iteratorWallTime = Date.timeIntervalSinceReferenceDate - iteratorStartTime
+        let iteratorWallTime = NativeMTPClock.now() - iteratorStartTime
         let adaptiveFallback = adaptiveFallbackReason ?? "none"
         let verifierMode: String
         if chunkVerifierCount > 0 && sequentialVerifierCount > 0 {
@@ -1375,17 +1368,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
     @inline(__always)
     private mutating func recordMaterializeSync<T>(_ body: () -> T) -> T {
-        let start = Date.timeIntervalSinceReferenceDate
+        let start = NativeMTPClock.now()
         let result = body()
-        materializeSyncTime += Date.timeIntervalSinceReferenceDate - start
+        materializeSyncTime += NativeMTPClock.now() - start
         return result
     }
 
     @inline(__always)
     private mutating func recordCacheSnapshotRestore<T>(_ body: () -> T) -> T {
-        let start = Date.timeIntervalSinceReferenceDate
+        let start = NativeMTPClock.now()
         let result = body()
-        cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - start
+        cacheSnapshotRestoreTime += NativeMTPClock.now() - start
         return result
     }
 
@@ -1564,13 +1557,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // captured immediately before the prefetched forward.
             checkpoint = consumedPrefetch.checkpoint
         } else {
-            let checkpointStart = Date.timeIntervalSinceReferenceDate
+            let checkpointStart = NativeMTPClock.now()
             checkpoint =
                 (canCommitVerifierCache && !requiresSequentialRepair && !replayChunkCommit
                     && !lazyChunkRepair && !needsBatchedVerifierRecovery)
                 ? nil
                 : NativeMTPCacheCheckpoint(cache)
-            cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - checkpointStart
+            cacheSnapshotRestoreTime += NativeMTPClock.now() - checkpointStart
         }
         let forwardVerifierMode = stagedVerify
             ? NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue
@@ -1579,7 +1572,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         if let consumedPrefetch {
             verifier = consumedPrefetch.verifier
         } else {
-        let verifyStart = Date.timeIntervalSinceReferenceDate
+        let verifyStart = NativeMTPClock.now()
         if stagedVerify, compiledVerifyEnabled,
             compiledVerifyWarmedSizes.contains(requested.count)
         {
@@ -1607,21 +1600,21 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 compiledVerifyWarmedSizes.insert(requested.count)
             }
         }
-        let verifyElapsed = Date.timeIntervalSinceReferenceDate - verifyStart
+        let verifyElapsed = NativeMTPClock.now() - verifyStart
         targetVerifyTime += verifyElapsed
         verifyMainForwardTime += verifyElapsed
         }
         if Self.phaseTimersEnabled {
-            let gpuStart = Date.timeIntervalSinceReferenceDate
+            let gpuStart = NativeMTPClock.now()
             MLX.eval(verifier.logits)
-            verifyGpuWaitTime += Date.timeIntervalSinceReferenceDate - gpuStart
+            verifyGpuWaitTime += NativeMTPClock.now() - gpuStart
         }
         targetForwardCount += 1
         verifyMainForwardCount += 1
         verifyInputTokenCount += requested.count
         chunkVerifierCount += 1
 
-        let sampleStart = Date.timeIntervalSinceReferenceDate
+        let sampleStart = NativeMTPClock.now()
         guard let verifyDecision = Self.verifyDrafts(
             logits: verifier.logits,
             drafts: drafts,
@@ -1632,9 +1625,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             processor: processor)
         else {
             if let checkpoint {
-                let restoreStart = Date.timeIntervalSinceReferenceDate
+                let restoreStart = NativeMTPClock.now()
                 checkpoint.restore(into: &cache)
-                cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - restoreStart
+                cacheSnapshotRestoreTime += NativeMTPClock.now() - restoreStart
             }
             if stagedVerify {
                 for layer in cache { (layer as? MambaCache)?.clearVerifyStaging() }
@@ -1643,7 +1636,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
         materializeSyncTime += verifyDecision.materializeSyncTime
-        samplingTime += Date.timeIntervalSinceReferenceDate - sampleStart
+        samplingTime += NativeMTPClock.now() - sampleStart
         if let nanTrace {
             // Whole verify slab `[1, K+1, V]`: every row is a decode position.
             let next = verifyDecision.nextToken
@@ -1663,19 +1656,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
 
             func restoreCheckpoint() {
-                let restoreStart = Date.timeIntervalSinceReferenceDate
+                let restoreStart = NativeMTPClock.now()
                 checkpoint.restore(into: &cache)
-                cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - restoreStart
+                cacheSnapshotRestoreTime += NativeMTPClock.now() - restoreStart
             }
 
             func replayPrefix(count: Int) -> NativeMTPForwardResult {
                 // Host ids already materialized once at cycle start.
                 let acceptedInputIds = Array(requestedInputIds.prefix(count))
                 let acceptedInput = MLXArray(acceptedInputIds).reshaped(1, count)
-                let replayStart = Date.timeIntervalSinceReferenceDate
+                let replayStart = NativeMTPClock.now()
                 let repaired = model.nativeBackboneForward(acceptedInput, cache: cache)
                 MLX.eval(repaired.logits, repaired.hiddenStates)
-                replayMainForwardTime += Date.timeIntervalSinceReferenceDate - replayStart
+                replayMainForwardTime += NativeMTPClock.now() - replayStart
                 repairForwardCount += 1
                 replayMainForwardCount += 1
                 return repaired
@@ -1738,8 +1731,6 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         verifyCalls += 1
         acceptedByDepth[accepted, default: 0] += 1
-        arSafetyAfterVerifyCycle(accepted: accepted)
-        recordAdaptiveCycle(accepted: accepted)
         if Self.traceEnabled {
             let requestedIDs = recordMaterializeSync { requested.map { $0.item(Int.self) } }
             let currentDrafts = drafts
@@ -1759,16 +1750,16 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             guard let checkpoint else {
                 throw NativeMTPRuntimeError.verifierCacheCommitFailed
             }
-            let restoreStart = Date.timeIntervalSinceReferenceDate
+            let restoreStart = NativeMTPClock.now()
             checkpoint.restore(into: &cache)
-            cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - restoreStart
+            cacheSnapshotRestoreTime += NativeMTPClock.now() - restoreStart
 
             let acceptedInputIds = Array(requestedInputIds.prefix(accepted + 1))
             let acceptedInput = MLXArray(acceptedInputIds).reshaped(1, accepted + 1)
-            let replayStart = Date.timeIntervalSinceReferenceDate
+            let replayStart = NativeMTPClock.now()
             let repaired = model.nativeBackboneForward(acceptedInput, cache: cache)
             MLX.eval(repaired.logits, repaired.hiddenStates)
-            replayMainForwardTime += Date.timeIntervalSinceReferenceDate - replayStart
+            replayMainForwardTime += NativeMTPClock.now() - replayStart
             repairForwardCount += 1
             replayMainForwardCount += 1
 
@@ -1794,7 +1785,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         let committedInputCount = accepted + 1
-        let commitStart = Date.timeIntervalSinceReferenceDate
+        let commitStart = NativeMTPClock.now()
         let committedCache: Bool
         if stagedVerify {
             // Staged verify left recurrent state and offsets untouched;
@@ -1827,7 +1818,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     totalInputCount: requested.count)
                 : false
         }
-        cacheCommitTime += Date.timeIntervalSinceReferenceDate - commitStart
+        cacheCommitTime += NativeMTPClock.now() - commitStart
         if committedCache {
             prefixCommitCount += 1
         }
@@ -1888,18 +1879,18 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 guard let checkpoint else {
                     throw NativeMTPRuntimeError.verifierCacheCommitFailed
                 }
-                let restoreStart = Date.timeIntervalSinceReferenceDate
+                let restoreStart = NativeMTPClock.now()
                 checkpoint.restore(into: &cache)
-                cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - restoreStart
+                cacheSnapshotRestoreTime += NativeMTPClock.now() - restoreStart
 
                 let acceptedInputIds = recordMaterializeSync {
                     requested.prefix(accepted + 1).map { Int32($0.item(Int.self)) }
                 }
                 let acceptedInput = MLXArray(acceptedInputIds).reshaped(1, accepted + 1)
-                let replayStart = Date.timeIntervalSinceReferenceDate
+                let replayStart = NativeMTPClock.now()
                 let repaired = model.nativeBackboneForward(acceptedInput, cache: cache)
                 MLX.eval(repaired.logits, repaired.hiddenStates)
-                replayMainForwardTime += Date.timeIntervalSinceReferenceDate - replayStart
+                replayMainForwardTime += NativeMTPClock.now() - replayStart
                 repairForwardCount += 1
                 replayMainForwardCount += 1
                 hiddenForNextMTP =
@@ -1931,12 +1922,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         nextMain = nextToken
-        if forceAutoregressiveFallback {
+        // Policy may clear proposals or replace their cache. Consume this
+        // cycle's accepted drafts and commit target state BEFORE that mutation.
+        updateDepthAfterCommittedCycle(accepted: accepted)
+        if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
             draftProbabilities.removeAll(keepingCapacity: true)
             return
         }
-        let draftStart = Date.timeIntervalSinceReferenceDate
+        let draftStart = NativeMTPClock.now()
         let draftBatch = Self.makeDrafts(
             model: model,
             hidden: alignedCommitHidden ?? hiddenForNextMTP,
@@ -1955,7 +1949,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             ? Swift.max(0, draftBatch.tokens.count - 1) : 0
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
-        mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
+        mtpDraftTime += NativeMTPClock.now() - draftStart
 
         maybePrefetchNextVerify(stagedVerify: stagedVerify)
     }
@@ -1994,10 +1988,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             stacked(requested.map { $0.reshaped(-1) }).asArray(Int32.self)
         }
         let input = MLXArray(requestedInputIds).reshaped(1, requested.count)
-        let checkpointStart = Date.timeIntervalSinceReferenceDate
+        let checkpointStart = NativeMTPClock.now()
         let checkpoint = NativeMTPCacheCheckpoint(cache)
-        cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - checkpointStart
-        let verifyStart = Date.timeIntervalSinceReferenceDate
+        cacheSnapshotRestoreTime += NativeMTPClock.now() - checkpointStart
+        let verifyStart = NativeMTPClock.now()
         let verifier = NativeMTPVerifierStatePolicy.withVerifierMode(
             NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue
         ) {
@@ -2016,7 +2010,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             asyncEval(logits, hidden)
             scheduled.signal()
         }
-        let verifyElapsed = Date.timeIntervalSinceReferenceDate - verifyStart
+        let verifyElapsed = NativeMTPClock.now() - verifyStart
         targetVerifyTime += verifyElapsed
         verifyMainForwardTime += verifyElapsed
         verifyPrefetchSubmitCount += 1
@@ -2037,13 +2031,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         guard let prefetch = pendingVerify else { return }
         pendingVerify = nil
         verifyPrefetchAbandonedCount += 1
-        let restoreStart = Date.timeIntervalSinceReferenceDate
+        let restoreStart = NativeMTPClock.now()
         // The background thread may still be scheduling the graph; it must
         // finish before the checkpoint restore rewrites the cache arrays.
         prefetch.scheduled.wait()
         prefetch.checkpoint.restore(into: &cache)
         for layer in cache { (layer as? MambaCache)?.clearVerifyStaging() }
-        cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - restoreStart
+        cacheSnapshotRestoreTime += NativeMTPClock.now() - restoreStart
     }
 
     /// Measurement-only escape hatch: `VMLX_NATIVE_MTP_DISABLE_ADAPTIVE=1`
@@ -2119,90 +2113,132 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private mutating func arSafetyAfterVerifyCycle(accepted: Int) {
         guard !Self.arSafetyDisabled, !forceAutoregressiveFallback else { return }
         arSafetyEmittedTotal += accepted + 1
-        let now = Date.timeIntervalSinceReferenceDate
-        arSafetyRing.append(
-            ARSafetySample(
-                emitted: arSafetyEmittedTotal, wall: now, verifyTotal: targetVerifyTime))
-        let window = arSafetyProbeCyclesRemaining > 0
-            ? Self.arSafetyProbeWindow : arSafetyWindowForRequest
+        let now = NativeMTPClock.now()
+        arSafetyRing.append(ARSafetySample(
+            emitted: arSafetyEmittedTotal, wall: now, verifyTotal: targetVerifyTime))
+        let window = arSafetyWindowForRequest
         if arSafetyRing.count > window + 1 {
             arSafetyRing.removeFirst(arSafetyRing.count - (window + 1))
         }
         if arSafetyFirstVerifySec == nil, arSafetyRing.count >= 2 {
-            let d = arSafetyRing[1].verifyTotal - arSafetyRing[0].verifyTotal
-            if d > 0 { arSafetyFirstVerifySec = d }
+            let delta = arSafetyRing[1].verifyTotal - arSafetyRing[0].verifyTotal
+            if delta > 0 { arSafetyFirstVerifySec = delta }
         }
-        guard arSafetyRing.count == window + 1,
-            let oldest = arSafetyRing.first, let newest = arSafetyRing.last
-        else { return }
-        let deltaEmitted = newest.emitted - oldest.emitted
-        let deltaWallMs = (newest.wall - oldest.wall) * 1000
-        let deltaVerifyMs = (newest.verifyTotal - oldest.verifyTotal) * 1000
 
         if arSafetyProbeCyclesRemaining > 0 {
             arSafetyProbeCyclesRemaining -= 1
             guard arSafetyProbeCyclesRemaining == 0 else { return }
-            // Probe verdict against the LIVE AR cost measured while paused
-            // (already at the current context — no scaling needed). MTP must
-            // WIN outright to stay; otherwise pause again with backoff.
-            let liveArMs = (arSafetyLiveStepSec ?? arSafetySeedStepSec ?? 0) * 1000
-            let mtpMsPerToken = deltaEmitted > 0 ? deltaWallMs / Double(deltaEmitted) : .infinity
-            if liveArMs > 0, mtpMsPerToken * Self.arSafetyReentryHysteresis >= liveArMs {
-                arSafetyPause(
-                    reason: String(
-                        format: "ar_safety_probe_lost(mtp=%.1fms/tok live_ar=%.1fms)",
-                        mtpMsPerToken, liveArMs))
-                let clearLoss = liveArMs > 0 && mtpMsPerToken >= liveArMs * Self.arSafetyClearLossFactor
-                arSafetyResumeInterval = Swift.min(
-                    arSafetyResumeInterval * (clearLoss ? 4 : 2), Self.arSafetyResumeIntervalMax)
+            // Include the initial draft/cache re-prime and EVERY probe cycle,
+            // rather than warming six cycles and judging only the following six.
+            let emitted = arSafetyEmittedTotal - arSafetyProbeStartedEmitted
+            let elapsed = now - (arSafetyProbeStartedAt ?? now)
+            let mtpMs = emitted > 0 && elapsed > 0
+                ? elapsed * 1000 / Double(emitted) : .infinity
+            let arMs = (arSafetyLiveStepSec ?? arSafetySeedStepSec ?? 0) * 1000
+            arSafetyProbeStartedAt = nil
+            if arMs <= 0 || mtpMs * Self.arSafetyReentryHysteresis >= arMs {
+                arSafetyDemoteOrPause(reason: String(
+                    format: "ar_safety_probe_lost(mtp=%.1fms/tok live_ar=%.1fms)",
+                    mtpMs, arMs))
+                if arSafetyPaused {
+                    let clearLoss = arMs > 0 && mtpMs >= arMs * Self.arSafetyClearLossFactor
+                    arSafetyResumeInterval = Swift.min(
+                        arSafetyResumeInterval * (clearLoss ? 4 : 2),
+                        Self.arSafetyResumeIntervalMax)
+                }
             } else {
                 arSafetyResumes += 1
                 arSafetyReentered = true
-                // The interval is NOT reset here: a re-entry that trips again
-                // backs off from where it was (no ping-pong); it resets only
-                // when the generation ends.
+                arSafetySeedStepSec = arSafetyLiveStepSec ?? arSafetySeedStepSec
+                arSafetyFirstVerifySec = nil
                 adaptiveFallbackReason = nil
                 FileHandle.standardError.write(Data(String(
                     format: "[NativeMTP] ar_safety resumed: mtp=%.1fms/tok live_ar=%.1fms depth=%d\n",
-                    mtpMsPerToken, liveArMs, currentDepth).utf8))
+                    mtpMs, arMs, currentDepth).utf8))
             }
             return
         }
 
-        // Warmup: judge only once `arSafetyWarmupCycles` have run AND the
-        // window is full of post-warmup cycles (earliest trip = cycle 16).
+        // Refresh real AR periodically; calibration does not reset failed-probe
+        // spacing. This is bounded measurement overhead, not a free speed floor.
+        if arSafetySeedStepSec != nil, tokenCount - arSafetyLastMeasuredToken >= 256 {
+            arSafetyPause(reason: "ar_safety_calibration", loss: false)
+            return
+        }
         guard verifyCalls >= Self.arSafetyWarmupCycles + window,
-            let seed = arSafetySeedStepSec
+            arSafetyRing.count == window + 1,
+            let oldest = arSafetyRing.first, let newest = arSafetyRing.last,
+            let seed = arSafetySeedStepSec,
+            let median = Self.medianCycleMsPerToken(arSafetyRing)
         else { return }
-        if let verdict = Self.windowedARVerdict(
+        let emitted = newest.emitted - oldest.emitted
+        guard emitted > 0 else { return }
+        let wallMs = (newest.wall - oldest.wall) * 1000
+        let mtpMs = wallMs / Double(emitted)
+        if let live = arSafetyLiveStepSec,
+            tokenCount - arSafetyLastMeasuredToken < 512 {
+            let arMs = live * 1000
+            if mtpMs > arMs, median > arMs {
+                arSafetyDemoteOrPause(reason: String(
+                    format: "ar_safety_fresh_loss(mtp=%.1fms/tok median=%.1fms live_ar=%.1fms depth=%d)",
+                    mtpMs, median, arMs, currentDepth))
+            }
+        } else if let verdict = Self.windowedARVerdict(
             arStepMs: seed * 1000,
             firstVerifyMs: (arSafetyFirstVerifySec ?? 0) * 1000,
-            windowCycles: window,
-            deltaEmitted: deltaEmitted,
-            deltaWallMs: deltaWallMs,
-            deltaVerifyMs: deltaVerifyMs,
+            windowCycles: window, deltaEmitted: emitted, deltaWallMs: wallMs,
+            deltaVerifyMs: (newest.verifyTotal - oldest.verifyTotal) * 1000,
             margin: Self.arSafetyMargin),
-            let median = Self.medianCycleMsPerToken(arSafetyRing),
-            median > verdict.arBaselineMs * Self.arSafetyMargin
-        {
-            arSafetyPause(
-                reason: String(
-                    format: "ar_safety_windowed(mtp=%.1fms/tok ar=%.1fms depth=%d)",
-                    verdict.mtpMsPerToken, verdict.arBaselineMs, currentDepth))
+            median > verdict.arBaselineMs * Self.arSafetyMargin {
+            arSafetyDemoteOrPause(reason: String(
+                format: "ar_safety_windowed(mtp=%.1fms/tok ar=%.1fms depth=%d)",
+                verdict.mtpMsPerToken, verdict.arBaselineMs, currentDepth))
         }
     }
 
-    private mutating func arSafetyPause(reason: String) {
+    private mutating func recordDepthLoss() {
+        adaptiveDemotedFromCount[currentDepth, default: 0] += 1
+        let losses = adaptiveDemotedFromCount[currentDepth, default: 0]
+        let delay = 16 << Swift.min(5, Swift.max(0, losses - 1))
+        upperProbeNotBeforeCycle[currentDepth] = verifyCalls + delay
+    }
+
+    private mutating func arSafetyDemoteOrPause(reason: String) {
+        guard currentDepth > 1 else {
+            arSafetyPause(reason: reason)
+            return
+        }
+        let previous = currentDepth
+        recordDepthLoss()
+        currentDepth -= 1
+        adaptiveDepthDownshiftCount += 1
+        adaptiveWallClockDemotes += 1
+        arSafetyRing.removeAll(keepingCapacity: true)
+        adaptiveWindow.removeAll(keepingCapacity: true)
+        lastAdaptiveCycleTimestamp = nil
+        arSafetyFirstVerifySec = nil
+        arSafetyProbeCyclesRemaining = 0
+        arSafetyProbeStartedAt = nil
+        windowsSinceUpperProbe = 0
+        mtpCache = model.makeNativeMTPCache()
+        mtpCacheRefreshCount += 1
+        headChainPairs = 0
+        FileHandle.standardError.write(Data(
+            "[NativeMTP] ar_safety depth=\(previous)->\(currentDepth) reason=\(reason)\n".utf8))
+    }
+    private mutating func arSafetyPause(reason: String, loss: Bool = true) {
         arSafetyPaused = true
         arSafetyTrips += 1
-        if arSafetyReentered {
+        if loss && arSafetyReentered {
             // A kept re-entry lost again: back off further (spec: no ping-pong).
             arSafetyReentered = false
             arSafetyResumeInterval = Swift.min(
                 arSafetyResumeInterval * 2, Self.arSafetyResumeIntervalMax)
         }
         arSafetyTokensSincePause = 0
+        arSafetyCalibrationRemaining = loss ? 0 : 2
         arSafetyProbeCyclesRemaining = 0
+        arSafetyProbeStartedAt = nil
         arSafetyRing.removeAll(keepingCapacity: true)
         adaptiveWindow.removeAll(keepingCapacity: true)
         lastAdaptiveCycleTimestamp = nil
@@ -2227,6 +2263,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // the MIN of two consecutive true AR steps as the seed.
             if let first = arSafetySeedFirstSampleSec {
                 arSafetySeedStepSec = Swift.min(first, stepSec)
+                arSafetyLastMeasuredToken = tokenCount
                 arSafetyStartSpeculating(hidden: hidden, nextToken: nextToken, probe: false)
             } else {
                 arSafetySeedFirstSampleSec = stepSec
@@ -2235,8 +2272,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         guard arSafetyPaused else { return }
         arSafetyLiveStepSec = arSafetyLiveStepSec.map { 0.7 * $0 + 0.3 * stepSec } ?? stepSec
+        arSafetyLastMeasuredToken = tokenCount
         arSafetyTokensSincePause += 1
-        guard arSafetyTokensSincePause >= arSafetyResumeInterval else { return }
+        if arSafetyCalibrationRemaining > 0 {
+            arSafetyCalibrationRemaining -= 1
+            guard arSafetyCalibrationRemaining == 0 else { return }
+        } else {
+            guard arSafetyTokensSincePause >= arSafetyResumeInterval else { return }
+        }
         arSafetyPaused = false
         arSafetyStartSpeculating(hidden: hidden, nextToken: nextToken, probe: true)
     }
@@ -2250,10 +2293,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // cache can only cost acceptance, never correctness.
         mtpCache = model.makeNativeMTPCache()
         mtpCacheRefreshCount += 1
-        currentDepth = depth
+        currentDepth = probe ? 1 : depth
         arSafetyRing.removeAll(keepingCapacity: true)
         arSafetyProbeCyclesRemaining = probe ? Self.arSafetyProbeWindow : 0
-        let draftStart = Date.timeIntervalSinceReferenceDate
+        arSafetyProbeStartedAt = probe ? NativeMTPClock.now() : nil
+        arSafetyProbeStartedEmitted = arSafetyEmittedTotal
+        arSafetyFirstVerifySec = nil
+        headChainPairs = 0
+        let draftStart = NativeMTPClock.now()
         let draftBatch = Self.makeDrafts(
             model: model,
             hidden: hidden,
@@ -2269,7 +2316,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             ? Swift.max(0, draftBatch.tokens.count - 1) : 0
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
-        mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
+        mtpDraftTime += NativeMTPClock.now() - draftStart
+    }
+
+    private mutating func updateDepthAfterCommittedCycle(accepted: Int) {
+        let previousDepth = currentDepth
+        let previousTrips = arSafetyTrips
+        arSafetyAfterVerifyCycle(accepted: accepted)
+        // A loss/recovery decision owns the cycle. Do not immediately undo it
+        // through the acceptance controller on the same committed tokens.
+        guard currentDepth == previousDepth, arSafetyTrips == previousTrips else { return }
+        recordAdaptiveCycle(accepted: accepted)
     }
 
     private mutating func recordAdaptiveCycle(accepted: Int) {
@@ -2288,7 +2345,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
             return
         }
-        let now = Date.timeIntervalSinceReferenceDate
+        let now = NativeMTPClock.now()
         let cycleWall = lastAdaptiveCycleTimestamp.map { now - $0 } ?? 0
         lastAdaptiveCycleTimestamp = now
         adaptiveWindow.append(
@@ -2430,7 +2487,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 let lower = measuredThroughputByDepth[currentDepth - 1],
                 lower > throughput * Self.wallClockDemoteFactor
             {
-                adaptiveDemotedFromCount[currentDepth, default: 0] += 1
+                recordDepthLoss()
                 currentDepth -= 1
                 adaptiveDepthDownshiftCount += 1
                 adaptiveWallClockDemotes += 1
@@ -2448,7 +2505,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // levels exist only because acceptance earned them, and one soft
         // window shouldn't forfeit the whole climb.
         if currentDepth >= 4, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
-            adaptiveDemotedFromCount[currentDepth, default: 0] += 1
+            recordDepthLoss()
             currentDepth -= 1
             adaptiveDepthDownshiftCount += 1
             adaptiveAcceptanceDemotes += 1
@@ -2461,7 +2518,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         if currentDepth == 3, acceptanceRatio < depthThreeFloor, !inRestoredGraceWindow {
-            adaptiveDemotedFromCount[3, default: 0] += 1
+            recordDepthLoss()
             currentDepth = 2
             adaptiveDepthDownshiftCount += 1
             adaptiveAcceptanceDemotes += 1
@@ -2477,7 +2534,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // A failing D2 downshifts to D1 first — D1's breakeven is far
             // lower, so "D2 doesn't pay" is not evidence that speculation
             // itself doesn't.
-            adaptiveDemotedFromCount[2, default: 0] += 1
+            recordDepthLoss()
             currentDepth = 1
             adaptiveDepthDownshiftCount += 1
             adaptiveAcceptanceDemotes += 1
@@ -2490,14 +2547,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         if currentDepth == 1, acceptanceRatio < depthOneFloor, !inRestoredGraceWindow {
-            // Under the staged verifier with the governor on, "d1 doesn't
-            // pay" is a REVERSIBLE verdict: pause to AR and let the governor's
-            // probes bring MTP back when the regime changes. Live (4M prose,
-            // build #4): this irreversible fallback fired on 6/8 prose gens
-            // BEFORE the governor could act, locking 55–366 AR tokens per
-            // turn — the "never recovers" behaviour the governor exists to
-            // end. The lazy-repair verifier keeps the irreversible fallback.
-            if staged, !Self.arSafetyDisabled {
+            // Economics is reversible for both sampled/sequential and staged
+            // verification. A poor proposal span is not permanent incapability.
+            if !Self.arSafetyDisabled {
                 arSafetyPause(
                     reason: String(
                         format: "adaptive_accept_ratio=%.2f_depth=1_paused",
@@ -2512,15 +2564,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        // Promote. Historically bounded by the REQUESTED depth (recovery
-        // only); since 2026-09-04 the request is a STARTING depth and a full
-        // window that clears the floor of the level above with margin climbs
-        // toward `adaptiveDepthCeiling` — near-perfect-acceptance shapes
-        // (counting, enumeration) ride to d4/d5 while ordinary prose, whose
-        // acceptance sits under the floors, never leaves its start. Only the
-        // staged verifier earns the extended ceiling: the lazy-repair
-        // verifier keeps the old recover-to-request bound (its rejection
-        // cost model was never re-measured above d3).
+        // Recovery/promotion respects the request's resolved policy. Only an
+        // explicitly adaptive staged verifier may explore above its initial
+        // depth; the lazy-repair verifier remains bounded by its initial depth.
         let promotionCeiling = staged ? adaptiveDepthCeiling : depth
         if currentDepth < promotionCeiling {
             let nextFloor: Double
@@ -2535,11 +2581,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 measuredThroughputByDepth[currentDepth + 1].map { upper in
                     measuredThroughputByDepth[currentDepth].map { upper < $0 } ?? false
                 } ?? false
-            let upperClosed =
-                adaptiveDemotedFromCount[currentDepth + 1, default: 0]
-                >= Self.adaptiveMaxDemotesPerLevel
+            let upperDue = verifyCalls >= upperProbeNotBeforeCycle[currentDepth + 1, default: 0]
+            let liveAR = arSafetyLiveStepSec ?? arSafetySeedStepSec
+            let measuredCurrent = measuredThroughputByDepth[currentDepth]
+            let beatsAR = Self.arSafetyDisabled || (liveAR.map { ar in
+                measuredCurrent.map { rate in rate > 0 && ar > 0 && 1 / rate < ar } ?? false
+            } ?? false)
             if acceptanceRatio >= nextFloor + Self.adaptivePromotionMargin,
-                !upperKnownWorse, !upperClosed
+                !upperKnownWorse, upperDue, beatsAR
             {
                 currentDepth += 1
                 adaptiveDepthPromotionCount += 1
@@ -2565,17 +2614,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             throw NativeMTPRuntimeError.verifierProducedNoTokens
         }
 
-        let verifyStart = Date.timeIntervalSinceReferenceDate
+        let verifyStart = NativeMTPClock.now()
         let output = model.nativeBackboneForward(Self.tokenInput(primary), cache: cache)
         MLX.eval(output.logits, output.hiddenStates)
-        let elapsed = Date.timeIntervalSinceReferenceDate - verifyStart
+        let elapsed = NativeMTPClock.now() - verifyStart
         targetVerifyTime += elapsed
         verifyMainForwardTime += elapsed
         targetForwardCount += 1
         verifyMainForwardCount += 1
         verifyInputTokenCount += 1
 
-        let sampleStart = Date.timeIntervalSinceReferenceDate
+        let sampleStart = NativeMTPClock.now()
         let sample = Self.sampleLast(
             logits: output.logits,
             sampler: sampler,
@@ -2584,7 +2633,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         recordMaterializeSync {
             MLX.eval(sample.token)
         }
-        samplingTime += Date.timeIntervalSinceReferenceDate - sampleStart
+        samplingTime += NativeMTPClock.now() - sampleStart
 
         let tokenID = recordMaterializeSync { sample.token.item(Int.self) }
         nanTrace?.observe(
@@ -2598,7 +2647,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         drafts.removeAll(keepingCapacity: true)
         draftProbabilities.removeAll(keepingCapacity: true)
         arSafetyAfterARStep(
-            stepSec: elapsed,
+            stepSec: NativeMTPClock.now() - verifyStart,
             hidden: Self.lastHidden(output.hiddenStates),
             nextToken: sample.token)
     }
@@ -2617,10 +2666,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         sequentialVerifierCount += 1
 
         for index in 0 ... drafts.count {
-            let verifyStart = Date.timeIntervalSinceReferenceDate
+            let verifyStart = NativeMTPClock.now()
             let verifier = model.nativeBackboneForward(Self.tokenInput(currentInput), cache: cache)
             MLX.eval(verifier.logits, verifier.hiddenStates)
-            let verifyElapsed = Date.timeIntervalSinceReferenceDate - verifyStart
+            let verifyElapsed = NativeMTPClock.now() - verifyStart
             targetVerifyTime += verifyElapsed
             verifyMainForwardTime += verifyElapsed
             targetForwardCount += 1
@@ -2646,7 +2695,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             hiddenForNextMTP = Self.lastHidden(verifier.hiddenStates)
 
             if speculativeSampler.isGreedy {
-                let sampleStart = Date.timeIntervalSinceReferenceDate
+                let sampleStart = NativeMTPClock.now()
                 let sample = Self.sampleLast(
                     logits: verifier.logits,
                     sampler: sampler,
@@ -2655,7 +2704,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 recordMaterializeSync {
                     MLX.eval(sample.token)
                 }
-                samplingTime += Date.timeIntervalSinceReferenceDate - sampleStart
+                samplingTime += NativeMTPClock.now() - sampleStart
 
                 let targetID = recordMaterializeSync { sample.token.item(Int.self) }
                 targetTokenIds.append(targetID)
@@ -2682,7 +2731,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 break
             }
 
-            let sampleStart = Date.timeIntervalSinceReferenceDate
+            let sampleStart = NativeMTPClock.now()
             let probabilities = Self.processedProbabilities(
                 logits: verifier.logits[0..., -1, 0...],
                 speculativeSampler: speculativeSampler,
@@ -2690,7 +2739,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             recordMaterializeSync {
                 MLX.eval(probabilities)
             }
-            samplingTime += Date.timeIntervalSinceReferenceDate - sampleStart
+            samplingTime += NativeMTPClock.now() - sampleStart
 
             if index < drafts.count {
                 let decision = speculativeSampler.acceptOrCorrect(
@@ -2737,8 +2786,6 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         acceptedByDepth[accepted, default: 0] += 1
-        arSafetyAfterVerifyCycle(accepted: accepted)
-        recordAdaptiveCycle(accepted: accepted)
         prefixCommitCount += 1
 
         guard let nextToken, let hiddenForNextMTP else {
@@ -2756,12 +2803,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         nextMain = nextToken
-        if forceAutoregressiveFallback {
+        updateDepthAfterCommittedCycle(accepted: accepted)
+        if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
             draftProbabilities.removeAll(keepingCapacity: true)
             return
         }
-        let draftStart = Date.timeIntervalSinceReferenceDate
+        let draftStart = NativeMTPClock.now()
         let draftBatch = Self.makeDrafts(
             model: model,
             hidden: hiddenForNextMTP,
@@ -2775,7 +2823,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         draftProbabilities = draftBatch.probabilities
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
-        mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
+        mtpDraftTime += NativeMTPClock.now() - draftStart
     }
 
     private struct VerifyDecision {
@@ -2829,11 +2877,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         sampler: sampler,
                         speculativeSampler: speculativeSampler,
                         processor: &verifyProcessor)
-                    let syncStart = Date.timeIntervalSinceReferenceDate
+                    let syncStart = NativeMTPClock.now()
                     MLX.eval(sample.token)
                     tokenRows.append(sample.token)
                     tokenIDs.append(sample.token.item(Int.self))
-                    materializeSyncTime += Date.timeIntervalSinceReferenceDate - syncStart
+                    materializeSyncTime += NativeMTPClock.now() - syncStart
                 }
                 sampled = tokenRows
                 sampledIDs = tokenIDs
@@ -2875,9 +2923,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 logits: logits[0..., index, 0...],
                 speculativeSampler: speculativeSampler,
                 processor: &verifyProcessor)
-            let syncStart = Date.timeIntervalSinceReferenceDate
+            let syncStart = NativeMTPClock.now()
             MLX.eval(probabilities)
-            materializeSyncTime += Date.timeIntervalSinceReferenceDate - syncStart
+            materializeSyncTime += NativeMTPClock.now() - syncStart
             targetProbabilities.append(probabilities)
             if index < drafts.count {
                 verifyProcessor?.didSample(token: drafts[index])
@@ -2903,9 +2951,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             guard let correction = decision.correction else {
                 preconditionFailure("rejected speculative token must return a residual correction")
             }
-            let syncStart = Date.timeIntervalSinceReferenceDate
+            let syncStart = NativeMTPClock.now()
             MLX.eval(correction)
-            materializeSyncTime += Date.timeIntervalSinceReferenceDate - syncStart
+            materializeSyncTime += NativeMTPClock.now() - syncStart
             return VerifyDecision(
                 accepted: accepted,
                 nextToken: correction,
@@ -2916,9 +2964,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         let bonus = speculativeSampler.sampleFromTarget(probabilities: targetProbabilities[drafts.count])
-        let syncStart = Date.timeIntervalSinceReferenceDate
+        let syncStart = NativeMTPClock.now()
         MLX.eval(bonus)
-        materializeSyncTime += Date.timeIntervalSinceReferenceDate - syncStart
+        materializeSyncTime += NativeMTPClock.now() - syncStart
         return VerifyDecision(
             accepted: accepted,
             nextToken: bonus,
@@ -3026,9 +3074,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // on-graph and the NEXT cycle reads every draft id in one
             // batched readback. A per-level MLX.eval here stalled the whole
             // pipeline once per draft for a value nobody reads yet.
-            let syncStart = Date.timeIntervalSinceReferenceDate
+            let syncStart = NativeMTPClock.now()
             asyncEval(draft.token, out.hiddenStates)
-            materializeSyncTime += Date.timeIntervalSinceReferenceDate - syncStart
+            materializeSyncTime += NativeMTPClock.now() - syncStart
             tokens.append(draft.token)
             if !speculativeSampler.isGreedy {
                 probabilities.append(draft.probabilities)
@@ -3205,7 +3253,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         let candidateLogits = logits[0..., 0 ..< count, 0...]
         let tokenBatch = argMax(candidateLogits, axis: -1).asType(.int32)
-        let syncStart = Date.timeIntervalSinceReferenceDate
+        let syncStart = NativeMTPClock.now()
         MLX.eval(tokenBatch)
         guard tokenBatch.size == count else {
             return nil
@@ -3214,7 +3262,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         guard tokenIds.count == count else {
             return nil
         }
-        let materializeSyncTime = Date.timeIntervalSinceReferenceDate - syncStart
+        let materializeSyncTime = NativeMTPClock.now() - syncStart
         let tokens = tokenIds.map { MLXArray([Int32($0)]) }
         return (
             tokens: tokens,
