@@ -744,6 +744,12 @@ public extension NativeMTPModel {
     }
 }
 
+/// Explicit eligibility for the default-off sampled-staging experiment.
+/// Conformance is not production qualification. Other native-MTP formats must
+/// retain their existing verifier until separately checked with real cache state.
+public protocol NativeMTPSampledStagedDiagnosticModel:
+    NativeMTPModel, DFlash2StagedVerifyRollbackModel {}
+
 public enum NativeMTPActivationError: Error, LocalizedError, CustomStringConvertible {
     case requestedButMissingArtifact(MTPBundleStatus?)
     case requestedWithoutUsableTuning(MTPBundleStatus?)

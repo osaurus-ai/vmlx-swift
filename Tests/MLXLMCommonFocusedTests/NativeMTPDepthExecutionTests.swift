@@ -7,6 +7,25 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testSampledStagingOptInDoesNotEnableUnqualifiedModel() throws {
+        try FocusedMLXTestSupport.withLock {
+            let model = DepthDispatchTarget()
+            var parameters = GenerateParameters(maxTokens: 32, temperature: 1)
+            parameters.randomSeed = 829
+            parameters.draftStrategy = .nativeMTP(depth: 3)
+            var iterator = try NativeMTPTokenIterator(
+                input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                parameters: parameters, depth: 3, experimentalSampledStaging: true)
+            var count = 0
+            let start = ProcessInfo.processInfo.systemUptime
+            while iterator.next() != nil { count += 1 }
+            XCTAssertEqual(count, 32)
+            XCTAssertNil(iterator.terminalErrorDescription)
+            XCTAssertEqual(iterator.stagedVerifierCommitCount, 0)
+            XCTAssertGreaterThan(iterator.sequentialVerifierCount, 0)
+            print("SAMPLED-STAGING-EXCLUDED fixtureTokS=\(Double(count) / max(ProcessInfo.processInfo.systemUptime - start, 1e-9)) realModelSpeedProof=false")
+        }
+    }
     func testSampledAcceptancePauseCanProbeAgain() throws {
         guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
             throw XCTSkip("Requires the production AR-safety governor")

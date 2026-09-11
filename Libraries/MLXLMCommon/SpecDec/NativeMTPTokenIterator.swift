@@ -232,6 +232,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var restoredPrefixStart: Bool = false
     private var adaptiveDepthPromotionCount = 0
     let verifierModeSetting: String?
+    // Default-off diagnostic, additionally restricted by model capability.
+    private let experimentalSampledStaging: Bool
     var promptTokenIds: [Int]
     let cachePrefixTokenCounts: [Int]
     let originalInput: LMInput
@@ -533,6 +535,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static let wallClockDemoteFactor = 1.05
     private(set) var nativeMTPStats: NativeMTPGenerationStats?
     private var generationStatsFinalized = false
+    private(set) var terminalErrorDescription: String?
     private let iteratorStartTime = NativeMTPClock.now()
 
     private var usesHybridMambaCache: Bool {
@@ -558,7 +561,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         cache: [KVCache]? = nil,
         parameters: GenerateParameters,
         depth requestedDepth: Int,
-        cacheCoordinator: CacheCoordinator? = nil
+        cacheCoordinator: CacheCoordinator? = nil,
+        experimentalSampledStaging: Bool = false
     ) throws {
         guard model.nativeMTPAvailable else {
             throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
@@ -617,6 +621,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.depth = resolvedDepth.initialDepth
         self.currentDepth = resolvedDepth.initialDepth
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode
+        let sampledStagingRequested = experimentalSampledStaging
+            || RuntimeEnvironment.value("VMLX_FLASH_EXPERIMENTAL_SAMPLED_STAGED") == "1"
+        self.experimentalSampledStaging = sampledStagingRequested
+            && model is NativeMTPSampledStagedDiagnosticModel
         let promptTokenStart = NativeMTPClock.now()
         let promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
         let promptTokenElapsed = NativeMTPClock.now() - promptTokenStart
@@ -986,6 +994,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     try verifyCycle()
                 }
             } catch {
+                terminalErrorDescription = String(describing: error)
                 return nil
             }
         }
@@ -1552,7 +1561,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // ONLY; it must never leak into prefill/seed/sequential forwards.
         let explicitHybridMode = Self.nativeMTPHybridVerifySetting(verifierModeSetting)
         let stagedCapable = usesHybridMambaCache
-            && speculativeSampler.isGreedy
+            && (speculativeSampler.isGreedy || experimentalSampledStaging)
             && processor == nil
             && model is DFlash2StagedVerifyRollbackModel
         let stagedVerify = stagedCapable
@@ -1634,7 +1643,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 cache,
                 verifierMode: verifierModeSetting)
         let canCommitVerifierCache = Self.canCommitVerifierCache(cache)
-        let requiresSequentialRepair = Self.requiresSequentialVerifierRepair(
+        // Staged commit owns rollback. A sequential replay here would erase
+        // its staging slots before commit whenever at least one draft wins.
+        let requiresSequentialRepair = !stagedVerify && Self.requiresSequentialVerifierRepair(
             cache,
             speculativeSampler: speculativeSampler,
             verifierMode: verifierModeSetting)
@@ -3008,11 +3019,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
             let syncStart = NativeMTPClock.now()
             MLX.eval(correction)
+            let correctionID = correction.item(Int.self)
             materializeSyncTime += NativeMTPClock.now() - syncStart
             return VerifyDecision(
                 accepted: accepted,
                 nextToken: correction,
-                targetTokenIds: [],
+                targetTokenIds: Array(draftTokenIds.prefix(accepted)) + [correctionID],
                 acceptanceProbabilitySum: probabilitySum,
                 acceptanceProbabilityCount: probabilityCount,
                 materializeSyncTime: materializeSyncTime)
@@ -3021,11 +3033,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let bonus = speculativeSampler.sampleFromTarget(probabilities: targetProbabilities[drafts.count])
         let syncStart = NativeMTPClock.now()
         MLX.eval(bonus)
+        let bonusID = bonus.item(Int.self)
         materializeSyncTime += NativeMTPClock.now() - syncStart
         return VerifyDecision(
             accepted: accepted,
             nextToken: bonus,
-            targetTokenIds: [],
+            targetTokenIds: draftTokenIds + [bonusID],
             acceptanceProbabilitySum: probabilitySum,
             acceptanceProbabilityCount: probabilityCount,
             materializeSyncTime: materializeSyncTime)

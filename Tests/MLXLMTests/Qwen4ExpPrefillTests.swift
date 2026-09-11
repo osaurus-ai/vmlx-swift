@@ -1,7 +1,7 @@
 import Foundation
 import CryptoKit
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXNN
 import MLXRandom
 import Testing
@@ -17,7 +17,7 @@ struct Qwen4ExpPrefillTests {
         func read() -> [Int] { lock.withLock { values } }
     }
 
-    private func withFixture(routedBits: [Int] = [], _ body: (Qwen4Exp) throws -> Void) throws {
+    private func withFixture(routedBits: [Int] = [], mtpEnabled: Bool = false, _ body: (Qwen4Exp) throws -> Void) throws {
         // Entire geometry is bounded before construction; no installed model is read.
         let data = Data(
             """
@@ -44,10 +44,17 @@ struct Qwen4ExpPrefillTests {
             }
             """.utf8)
         var fixtureData = data
+        if mtpEnabled {
+            var root = try #require(JSONSerialization.jsonObject(with: fixtureData) as? [String: Any])
+            var text = try #require(root["text_config"] as? [String: Any])
+            text["mtp_num_hidden_layers"] = 1
+            root["text_config"] = text
+            fixtureData = try JSONSerialization.data(withJSONObject: root)
+        }
         var routedSpecs: [String: Int] = [:]
         if !routedBits.isEmpty {
             try #require(routedBits.count == 3 && (routedBits == [0, 0, 0] || routedBits.allSatisfy { [2, 3, 4, 6].contains($0) }))
-            var root = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            var root = try #require(JSONSerialization.jsonObject(with: fixtureData) as? [String: Any])
             var text = try #require(root["text_config"] as? [String: Any])
             text["dtype"] = "bfloat16"
             text["moe_intermediate_size"] = 64
@@ -127,6 +134,218 @@ struct Qwen4ExpPrefillTests {
             .write(to: directory.appendingPathComponent("config.json"))
         try model.configure(modelDirectory: directory)
         try body(model)
+    }
+
+    @Test("sampled Flash iterator target cache matches emitted-prefix replay",
+          .enabled(if: ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0"
+                   && ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0",
+                   "Requires TF32 off and prefetch off before inspecting live cache; abandonment is tested separately"),
+          arguments: [false, true])
+    func sampledIteratorCommittedPrefixParity(staged: Bool) throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture(routedBits: [2, 3, 4], mtpEnabled: true) { model in
+                try #require(model.nativeMTPAvailable)
+                for depth in 1...3 {
+                    let prompt = MLXArray([Int32(2), 3, 4]).reshaped(1, 3)
+                    var parameters = GenerateParameters(maxTokens: 32, temperature: 1, topP: 0.95, topK: 20)
+                    parameters.randomSeed = 829
+                    parameters.draftStrategy = .nativeMTP(depth: depth)
+                    parameters.nativeMTPDepthPolicy = .fixed
+                    var iterator = try NativeMTPTokenIterator(
+                        input: LMInput(tokens: prompt), model: model, parameters: parameters, depth: depth,
+                        experimentalSampledStaging: staged)
+                    var emitted: [Int32] = []
+                    var checked = 0
+                    let start = Date()
+                    while let token = iterator.next() {
+                        emitted.append(Int32(token))
+                        let offset = try #require(iterator.cache.first).offset
+                        // Pending accepted tokens can be ahead of the consumer.
+                        // Compare only boundaries fully represented in emitted ids.
+                        let generatedInputs = offset - 3
+                        guard generatedInputs >= 0, generatedInputs <= emitted.count else { continue }
+                        let reference = model.newCache(parameters: parameters)
+                        MLX.eval(model.nativeBackboneForward(prompt, cache: reference).logits)
+                        for id in emitted.prefix(generatedInputs) {
+                            MLX.eval(model.nativeBackboneForward(MLXArray([id]).reshaped(1, 1), cache: reference).logits)
+                        }
+                        for (layer, pair) in zip(iterator.cache, reference).enumerated() {
+                            #expect(pair.0.offset == pair.1.offset)
+                            #expect(pair.0.state.count == pair.1.state.count)
+                            for (slot, arrays) in zip(pair.0.state, pair.1.state).enumerated() {
+                                expectEqual(arrays.0, arrays.1, "sampled D\(depth) emitted\(emitted.count) layer\(layer) slot\(slot)")
+                            }
+                        }
+                        checked += 1
+                    }
+                    #expect(emitted.count == 32)
+                    #expect(iterator.terminalErrorDescription == nil)
+                    #expect(checked > 0)
+                    #expect(iterator.acceptanceProbabilityCount > 0)
+                    if staged {
+                        #expect(iterator.stagedVerifierCommitCount > 0)
+                    } else {
+                        #expect(iterator.stagedVerifierCommitCount == 0)
+                    }
+                    print("FLASH-SAMPLED-CACHE depth=\(depth) checked=\(checked) rejections=\(iterator.rejectedCount) staged=\(iterator.stagedVerifierCommitCount) fixtureTokS=\(Double(emitted.count) / max(Date().timeIntervalSince(start), 1e-9)) realModelSpeedProof=false draftCacheProof=false")
+                }
+            }
+        }
+    }
+
+    @Test("sampled Flash early stop abandons real prefetched state",
+          .enabled(if: ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0"
+                   && ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] != "0",
+                   "Requires strict fixture oracle and prefetch enabled"))
+    func sampledPrefetchAbandonmentParity() throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture(routedBits: [2, 3, 4], mtpEnabled: true) { model in
+                for prefixLength in [3, 35] {
+                    for depth in 1...3 {
+                        let prompt = MLXArray((0..<prefixLength).map { Int32(2 + $0) })
+                            .reshaped(1, prefixLength)
+                        var parameters = GenerateParameters(maxTokens: 64, temperature: 1, topP: 0.95, topK: 20)
+                        parameters.randomSeed = 829
+                        parameters.draftStrategy = .nativeMTP(depth: depth)
+                        parameters.nativeMTPDepthPolicy = .fixed
+                        var iterator = try NativeMTPTokenIterator(
+                            input: LMInput(tokens: prompt), model: model, parameters: parameters, depth: depth,
+                            experimentalSampledStaging: true)
+                        var emitted: [Int] = []
+                        let start = Date()
+                        while let token = iterator.next() {
+                            emitted.append(token)
+                            let committedOffset = try #require(iterator.cache.first).offset
+                            if iterator.verifyPrefetchSubmitCount > iterator.verifyPrefetchConsumedCount
+                                + iterator.verifyPrefetchAbandonedCount,
+                               committedOffset - prefixLength <= emitted.count { break }
+                        }
+                        try #require(iterator.verifyPrefetchSubmitCount > iterator.verifyPrefetchConsumedCount
+                                     + iterator.verifyPrefetchAbandonedCount)
+                        let abandonedBefore = iterator.verifyPrefetchAbandonedCount
+                        // Joins outstanding work and restores its checkpoint before
+                        // any comparison touches mutable attention/staging arrays.
+                        iterator.storeCacheAfterGeneration(generatedTokenIds: emitted, includeGeneratedBoundary: false)
+                        #expect(iterator.verifyPrefetchAbandonedCount == abandonedBefore + 1)
+                        #expect(iterator.terminalErrorDescription == nil)
+                        let offset = try #require(iterator.cache.first).offset
+                        let generatedInputs = offset - prefixLength
+                        try #require(generatedInputs >= 0 && generatedInputs <= emitted.count)
+                        let reference = model.newCache(parameters: parameters)
+                        MLX.eval(model.nativeBackboneForward(prompt, cache: reference).logits)
+                        for id in emitted.prefix(generatedInputs) {
+                            MLX.eval(model.nativeBackboneForward(MLXArray([Int32(id)]).reshaped(1, 1), cache: reference).logits)
+                        }
+                        for (layer, pair) in zip(iterator.cache, reference).enumerated() {
+                            #expect(pair.0.offset == pair.1.offset)
+                            #expect(pair.0.state.count == pair.1.state.count)
+                            for (slot, arrays) in zip(pair.0.state, pair.1.state).enumerated() {
+                                expectEqual(arrays.0, arrays.1, "abandon prefix\(prefixLength) D\(depth) layer\(layer) slot\(slot)")
+                            }
+                        }
+                        let next = MLXArray([Int32(73)]).reshaped(1, 1)
+                        expectEqual(model(next, cache: iterator.cache), model(next, cache: reference),
+                                    "abandon prefix\(prefixLength) D\(depth) next logits")
+                        print("FLASH-SAMPLED-PREFETCH-STOP prefix=\(prefixLength) depth=\(depth) offset=\(offset) abandoned=\(iterator.verifyPrefetchAbandonedCount) fixtureTokS=\(Double(emitted.count) / max(Date().timeIntervalSince(start), 1e-9)) realModelSpeedProof=false")
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("sampled staged Flash draft cache matches fresh replay after trimming",
+          .enabled(if: ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0"
+                   && ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0",
+                   "Requires isolated strict fixture with prefetch off"))
+    func sampledDraftCacheContinuationParity() throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture(routedBits: [2, 3, 4], mtpEnabled: true) { base in
+                for depth in 1...3 {
+                    let model = DraftReplayAuditor(base: base, compare: expectEqual)
+                    var parameters = GenerateParameters(maxTokens: 40, temperature: 1, topP: 0.95, topK: 20)
+                    parameters.randomSeed = 829
+                    parameters.draftStrategy = .nativeMTP(depth: depth)
+                    parameters.nativeMTPDepthPolicy = .fixed
+                    var iterator = try NativeMTPTokenIterator(
+                        input: LMInput(tokens: MLXArray([Int32(2), 3, 4]).reshaped(1, 3)), model: model,
+                        parameters: parameters, depth: depth, experimentalSampledStaging: true)
+                    let start = Date()
+                    var emitted = 0
+                    while iterator.next() != nil { emitted += 1 }
+                    #expect(emitted == 40)
+                    #expect(iterator.terminalErrorDescription == nil)
+                    #expect(iterator.stagedVerifierCommitCount > 0)
+                    #expect(iterator.rejectedCount > 0)
+                    #expect(model.checked > 0)
+                    if depth > 1 { #expect(model.trims > 0) }
+                    print("FLASH-DRAFT-REPLAY depth=\(depth) checked=\(model.checked) trims=\(model.trims) staged=\(iterator.stagedVerifierCommitCount) fixtureTokS=\(Double(emitted) / max(Date().timeIntervalSince(start), 1e-9)) realModelSpeedProof=false")
+                }
+            }
+        }
+    }
+
+    private final class DraftReplayAuditor: Module, NativeMTPModel,
+        NativeMTPSampledStagedDiagnosticModel, @unchecked Sendable {
+        let base: Qwen4Exp
+        let compare: (MLXArray, MLXArray, String) -> Void
+        var pairs: [(MLXArray, MLXArray)] = []
+        var checked = 0
+        var trims = 0
+        init(base: Qwen4Exp, compare: @escaping (MLXArray, MLXArray, String) -> Void) {
+            self.base = base
+            self.compare = compare
+            super.init()
+        }
+        var nativeMTPAvailable: Bool { base.nativeMTPAvailable }
+        func newCache(parameters: GenerateParameters?) -> [KVCache] { base.newCache(parameters: parameters) }
+        func makeNativeMTPCache() -> [KVCache] { base.makeNativeMTPCache() }
+        func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+            try base.prepare(input, cache: cache, windowSize: windowSize)
+        }
+        func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray { base(inputs, cache: cache) }
+        func nativeBackboneForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
+            base.nativeBackboneForward(inputs, cache: cache)
+        }
+        func nativeBackboneMTPVerifyForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
+            base.nativeBackboneMTPVerifyForward(inputs, cache: cache)
+        }
+        func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool {
+            base.commitVerifiedBlock(cache: cache, acceptedInputs: acceptedInputs)
+        }
+        func commitStagedVerifiedBlock(cache: [KVCache], acceptedInputs: Int, blockLength: Int) -> Bool {
+            base.commitStagedVerifiedBlock(cache: cache, acceptedInputs: acceptedInputs, blockLength: blockLength)
+        }
+        func nativeMTPForward(hiddenStates: MLXArray, nextTokenIds: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
+            let offset = cache?.first?.offset ?? 0
+            #expect(offset <= pairs.count)
+            if offset < pairs.count { trims += 1; pairs = Array(pairs.prefix(offset)) }
+            let ownedHidden = hiddenStates * 1
+            let ownedIds = nextTokenIds * 1
+            MLX.eval(ownedHidden, ownedIds)
+            let actual = base.nativeMTPForward(hiddenStates: hiddenStates, nextTokenIds: nextTokenIds, cache: cache)
+            MLX.eval(actual.logits, actual.hiddenStates)
+            for row in 0..<nextTokenIds.size {
+                pairs.append((ownedHidden[0..., row..<(row + 1), 0...], ownedIds.reshaped(1, -1)[0..., row..<(row + 1)]))
+            }
+            let reference = base.makeNativeMTPCache()
+            var last: NativeMTPForwardResult?
+            for pair in pairs {
+                last = base.nativeMTPForward(hiddenStates: pair.0, nextTokenIds: pair.1, cache: reference)
+                MLX.eval(last!.logits, last!.hiddenStates)
+            }
+            if let last {
+                compare(actual.logits[0..., -1, 0...], last.logits[0..., -1, 0...], "draft continuation logits")
+                for (layer, pair) in zip(cache ?? [], reference).enumerated() {
+                    #expect(pair.0.offset == pair.1.offset)
+                    #expect(pair.0.state.count == pair.1.state.count)
+                    for (slot, arrays) in zip(pair.0.state, pair.1.state).enumerated() {
+                        compare(arrays.0, arrays.1, "draft layer\(layer) slot\(slot)")
+                    }
+                }
+            }
+            checked += 1
+            return actual
+        }
     }
 
     @Test("caller window bounds Flash prefill and reports completed chunks")
@@ -440,8 +659,22 @@ struct Qwen4ExpPrefillTests {
                             let referenceFreshPools = reference.map { $0.copy() }
                             MLX.eval(stagedFreshPools)
                             MLX.eval(referenceFreshPools)
-                            expectEqual(model(next, cache: staged), model(next, cache: reference),
+                            let stagedNext = model(next, cache: staged)
+                            let referenceNext = model(next, cache: reference)
+                            expectEqual(stagedNext, referenceNext,
                                 "prefix\(prefixLength) width\(width) accepted\(accepted) next logits")
+                            // Sampled verification needs the target distribution,
+                            // not just an unchanged argmax. Exercise the actual
+                            // probability transform after every committed prefix.
+                            // This is a fixture setting, not a production override;
+                            // it does not qualify draft-cache or iterator rollback.
+                            var sampling = GenerateParameters(temperature: 1, topP: 0.95, topK: 20)
+                            sampling.randomSeed = 829
+                            let sampler = SpeculativeSamplingController(parameters: sampling)
+                            expectEqual(
+                                sampler.probabilities(logits: stagedNext[0..., -1, 0...]),
+                                sampler.probabilities(logits: referenceNext[0..., -1, 0...]),
+                                "sampled distribution prefix\(prefixLength) width\(width) accepted\(accepted)")
                             expectEqual(
                                 model(next, cache: stagedFreshPools),
                                 model(next, cache: referenceFreshPools),
