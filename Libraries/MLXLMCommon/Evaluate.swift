@@ -4674,6 +4674,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 // prose to EOS (measured up to maxTokens of zombie decode).
                 if Task.isCancelled {
                     stopReason = handler.emittedToolCall ? .stop : .cancelled
+                    streamTiming?.recordTermination(handler.emittedToolCall ? "tool_consumer_cancelled" : "task_cancelled")
                     break
                 }
 
@@ -4685,10 +4686,13 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
                 // Check for end-of-sequence tokens
                 if token == tokenizer.unknownTokenId || stopTokenIds.contains(token) {
+                    streamTiming?.recordTermination(
+                        token == tokenizer.unknownTokenId ? "unknown_token:\(token)" : "stop_token:\(token)")
                     if includeStopToken {
                         tokenCount += 1
                         streamTiming?.record()
                         if !handler.onStopToken(token, emit: continuation.yield) {
+                            streamTiming?.recordTermination("stop_token_consumer_terminated:\(token)")
                             stopReason = .cancelled
                             break
                         }
@@ -4700,6 +4704,10 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 tokenCount += 1
                 streamTiming?.record()
                 if !handler.onToken(token, emit: continuation.yield) {
+                    streamTiming?.recordTermination(
+                        handler.stopSequenceHit ? "stop_sequence"
+                        : handler.haltedOnRepetition ? "repetition_detector"
+                        : handler.emittedToolCall ? "tool_call" : "consumer_terminated")
                     // Distinguish "downstream consumer terminated the
                     // stream" from "library-internal stop-sequence
                     // match" — the latter should report `stopReason =
@@ -4718,8 +4726,10 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             if stopReason == nil {
                 if Task.isCancelled {
                     stopReason = handler.emittedToolCall ? .stop : .cancelled
+                    streamTiming?.recordTermination(handler.emittedToolCall ? "tool_consumer_cancelled" : "task_cancelled")
                 } else if let maxTokens = iterator.maxTokens, tokenCount >= maxTokens {
                     stopReason = .length
+                    streamTiming?.recordTermination("token_limit")
                 } else {
                     stopReason = .cancelled
                 }

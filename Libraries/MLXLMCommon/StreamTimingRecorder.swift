@@ -1,12 +1,18 @@
 import Foundation
 
 /// Opt-in proof instrumentation. Measures iterator delivery, not GPU completion
-/// or UI rendering. No token text/IDs, synchronization, or per-token I/O.
+/// or UI rendering. No token text, synchronization, or per-token I/O.
+/// A terminating special-token ID may be recorded to distinguish stop causes.
 final class StreamTimingRecorder {
     private let directory: URL
     private let start = DispatchTime.now().uptimeNanoseconds
     private var arrivals: [UInt64] = []
     private var truncated = false
+    private var terminationCause = "iterator_exhausted"
+
+    func recordTermination(_ cause: String) {
+        terminationCause = cause
+    }
 
     init?(environment: [String: String] = ProcessInfo.processInfo.environment) {
         guard let path = environment["VMLX_STREAM_TIMING_DIR"], path.hasPrefix("/") else {
@@ -29,6 +35,7 @@ final class StreamTimingRecorder {
             "start_uptime_ns": start, "end_elapsed_ns": end,
             "token_arrival_elapsed_ns": arrivals,
             "generation_token_count": tokenCount, "stop_reason": stopReason,
+            "termination_cause": terminationCause,
             "truncated": truncated,
         ]
         do {
