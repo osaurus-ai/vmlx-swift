@@ -2,6 +2,20 @@ import XCTest
 @testable import MLXLMCommon
 
 final class NativeMTPDepthPolicyTests: XCTestCase {
+    func testManualRecommendationDoesNotClaimSamplerCoercion() throws {
+        let status = MTPBundleStatus(
+            bundleHasMTP: true, configuredLayers: 1, tensorCount: 57,
+            mode: .preservedEnabled, nativeMTPTuning: nil)
+        for depth in 1...3 {
+            let recommendation = try XCTUnwrap(NativeMTPAutoDecodePolicy.manualRecommendation(
+                depth: depth, configData: Data("{\"model_type\":\"qwen4_exp\"}".utf8),
+                jangConfig: nil, status: status))
+            XCTAssertEqual(recommendation.depth, depth)
+            XCTAssertTrue(recommendation.reason.contains("request sampling remains in effect"))
+            XCTAssertFalse(recommendation.reason.contains("greedy"))
+        }
+    }
+
     func testFixedRequestsCannotPromoteAboveSelectedDepth() throws {
         for depth in 1...3 {
             let result = try NativeMTPDepthPolicy.fixed.resolve(requestedDepth: depth, runtimeCap: 5)
