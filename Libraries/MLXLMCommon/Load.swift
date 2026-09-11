@@ -537,6 +537,16 @@ public func loadWeights(
             JANGTQStreamingExperts.configureModelDirectory(modelDirectory)
         }
         let modelKeyExcluder = model as? any SafetensorsLoadKeyExcluding
+        // A model requesting owned compute weights must not also retain a
+        // complete filesystem-backed copy while loading them. Model-owned
+        // auxiliary tensors remain excluded by the existing key contract.
+        let uncachedResidentRead = ResidentSafetensorsReader.shouldUse(
+            requiresOwnedCompute: modelKeyExcluder?.requiresResidentSafetensorsWeights == true,
+            readerOverride: RuntimeEnvironment.value("VMLX_FLASH_RESIDENT_READER"))
+        if uncachedResidentRead {
+            FileHandle.standardError.write(Data(
+                "[loadWeights] resident_reader=uncached_owned source_files_unchanged=true\n".utf8))
+        }
         for url in allShardURLs {
             let isPrestackedShard = url.lastPathComponent == "jangpress-prestacked.safetensors"
             let headerNames = (try? loadSafetensorsHeaderNamesForBaseLoad(url)) ?? []
@@ -577,10 +587,12 @@ public func loadWeights(
                     continue
                 }
             }
-            let (w, m) = try loadArraysAndMetadata(
-                url: url,
-                excludingKeys: excludedKeys,
-                exactTensorBuffers: modelKeyExcluder?.requiresExactTensorMmapBuffers == true)
+            let (w, m) = try uncachedResidentRead
+                ? ResidentSafetensorsReader.load(url: url, excludingKeys: excludedKeys)
+                : loadArraysAndMetadata(
+                    url: url,
+                    excludingKeys: excludedKeys,
+                    exactTensorBuffers: modelKeyExcluder?.requiresExactTensorMmapBuffers == true)
             var shardWeights: [String: MLXArray] = [:]
             for (key, value) in w {
                 if shouldFilterPreservedMTP, isPreservedMTPWeightKey(key) {
@@ -612,7 +624,7 @@ public func loadWeights(
                 // excluded above, so this materializes compute tensors only.
                 // `* 1` creates owned MLX storage even for already-contiguous
                 // mmap inputs (unlike `contiguous()`, which may return them as-is).
-                let resident = shardWeights.mapValues { $0 * 1 }
+                let resident = uncachedResidentRead ? shardWeights : shardWeights.mapValues { $0 * 1 }
                 MLX.eval(Array(resident.values))
                 residentSafetensorsBytes += resident.values.reduce(0) { $0 + $1.nbytes }
                 for (key, value) in resident { weights[key] = value }
