@@ -467,6 +467,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var arSafetyProbeCyclesRemaining = 0
     private var arSafetyProbeStartedAt: TimeInterval?
     private var arSafetyProbeStartedEmitted = 0
+    private var arSafetyInitialProbe = false
     private var arSafetyLastMeasuredToken = 0
     private var arSafetyCalibrationRemaining = 0
     // Calibration refreshes the AR baseline; it is not evidence that the
@@ -2188,22 +2189,28 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 arSafetyDemoteOrPause(reason: String(
                     format: "ar_safety_probe_lost(mtp=%.1fms/tok live_ar=%.1fms)",
                     mtpMs, arMs))
-                if arSafetyPaused {
+                // Initial admission has not attempted recovery yet. Preserve
+                // the first retry interval; backoff belongs to failed re-entry.
+                if arSafetyPaused && !arSafetyInitialProbe {
                     let clearLoss = arMs > 0 && mtpMs >= arMs * Self.arSafetyClearLossFactor
                     arSafetyResumeInterval = Swift.min(
                         arSafetyResumeInterval * (clearLoss ? 4 : 2),
                         Self.arSafetyResumeIntervalMax)
                 }
             } else {
-                arSafetyResumes += 1
-                arSafetyReentered = true
+                if !arSafetyInitialProbe {
+                    arSafetyResumes += 1
+                    arSafetyReentered = true
+                }
                 arSafetySeedStepSec = arSafetyLiveStepSec ?? arSafetySeedStepSec
                 arSafetyFirstVerifySec = nil
                 adaptiveFallbackReason = nil
+                let event = arSafetyInitialProbe ? "admitted" : "resumed"
                 FileHandle.standardError.write(Data(String(
-                    format: "[NativeMTP] ar_safety resumed: mtp=%.1fms/tok live_ar=%.1fms depth=%d\n",
+                    format: "[NativeMTP] ar_safety \(event): mtp=%.1fms/tok live_ar=%.1fms depth=%d\n",
                     mtpMs, arMs, currentDepth).utf8))
             }
+            arSafetyInitialProbe = false
             return
         }
 
@@ -2313,7 +2320,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             if let first = arSafetySeedFirstSampleSec {
                 arSafetySeedStepSec = Swift.min(first, stepSec)
                 arSafetyLastMeasuredToken = tokenCount
-                arSafetyStartSpeculating(hidden: hidden, nextToken: nextToken, probe: false)
+                // Admission must measure the first trial, including draft re-prime,
+                // just like re-entry. Otherwise the initial depth bypasses the
+                // probe and waits for the longer warmup plus judgement window.
+                arSafetyStartSpeculating(
+                    hidden: hidden, nextToken: nextToken, probe: true, resumeDepth: depth,
+                    initialProbe: true)
             } else {
                 arSafetySeedFirstSampleSec = stepSec
             }
@@ -2337,7 +2349,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     private mutating func arSafetyStartSpeculating(
-        hidden: MLXArray, nextToken: MLXArray, probe: Bool, resumeDepth: Int = 1
+        hidden: MLXArray, nextToken: MLXArray, probe: Bool, resumeDepth: Int = 1,
+        initialProbe: Bool = false
     ) {
         // Same re-prime the depth controller uses on every depth change: a
         // fresh head cache, drafts from the current hidden. Drafts are only
@@ -2349,6 +2362,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             ? Swift.max(1, Swift.min(resumeDepth, adaptiveDepthCeiling)) : depth
         arSafetyRing.removeAll(keepingCapacity: true)
         arSafetyProbeCyclesRemaining = probe ? Self.arSafetyProbeWindow : 0
+        arSafetyInitialProbe = initialProbe
         arSafetyProbeStartedAt = probe ? NativeMTPClock.now() : nil
         arSafetyProbeStartedEmitted = arSafetyEmittedTotal
         arSafetyFirstVerifySec = nil
