@@ -666,8 +666,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     self.aneDrafter = drafter
                     let g = drafter.runner.geometry
                     FileHandle.standardError.write(
-                        Data(String(format: "[NativeMTP] ANE drafter ready: vocab=%d window=%d build=%.2fs compile=%.2fs cacheHit=%d\n",
-                                    g.draftVocab, g.window, drafter.buildSeconds,
+                        Data(String(format: "[NativeMTP] ANE drafter ready: vocab=%d window=%d weights=%@ build=%.2fs compile=%.2fs cacheHit=%d\n",
+                                    g.draftVocab, g.window, ANEHeadEmitter.fp16Weights ? "fp16" : "int8", drafter.buildSeconds,
                                     drafter.runner.program.compileSeconds,
                                     drafter.runner.program.cacheHit ? 1 : 0).utf8))
                 } catch {

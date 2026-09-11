@@ -170,8 +170,15 @@ public enum ANEHeadEmitter {
         public let geometry: ANEHeadGeometry
     }
 
+    /// `VMLX_ANE_MTP_WEIGHTS=fp16` carries exact fp16 weights (2 B/param,
+    /// ~1.7x the int8 stream time) instead of int8 per-row requantization.
+    public static var fp16Weights: Bool {
+        ProcessInfo.processInfo.environment["VMLX_ANE_MTP_WEIGHTS"]?.lowercased() == "fp16"
+    }
+
     public static func emit(from source: ANEHeadWeightSource) -> Emission {
         let g = source.geometry
+        let fp16 = fp16Weights
         let H = g.hidden, NH = g.heads, KVH = g.kvHeads, HD = g.headDim, R = g.rows, W = g.window
         let ROT = g.rotaryDims, G = NH / KVH
         var b = ANEMILBuilder()
@@ -204,8 +211,14 @@ public enum ANEHeadEmitter {
             var acc: ANEMILBuilder.Value?
             for c in 0 ..< kChunks {
                 let slab = kChunks == 1 ? m : m[0..., (c * kc) ..< ((c + 1) * kc)]
-                let (q, s) = int8Rows(slab)
-                let w = b.int8Weight(q, scales: s, n: n, k: kc, "\(tag)_w\(c)")
+                let w: ANEMILBuilder.Value
+                if fp16 {
+                    let values = slab.asType(.float16).asArray(Float16.self)
+                    w = b.constFP16(values, shape: [n, kc, 1, 1], "\(tag)_w\(c)")
+                } else {
+                    let (q, s) = int8Rows(slab)
+                    w = b.int8Weight(q, scales: s, n: n, k: kc, "\(tag)_w\(c)")
+                }
                 let xin = kChunks == 1 ? x : b.slice(x, begin: [0, c * kc, 0, 0], size: [1, kc, 1, R], "\(tag)_x\(c)")
                 let p = b.conv(xin, weight: w, "\(tag)_p\(c)")
                 acc = acc.map { b.add($0, p, "\(tag)_s\(c)") } ?? p
