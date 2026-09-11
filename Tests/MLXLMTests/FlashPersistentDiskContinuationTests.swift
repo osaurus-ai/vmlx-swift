@@ -154,6 +154,75 @@ struct FlashPersistentDiskContinuationTests {
         try body(model)
     }
 
+    @Test("Flash staged prefixes preserve PLE GDN QSA and disk continuation",
+          .enabled(if: ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0",
+                   "Strict arithmetic control, not production performance qualification"),
+          arguments: [[Int](), [2, 3, 4], [4, 4, 4], [6, 6, 6]])
+    func stagedPrefixWithPLE(routedBits: [Int]) throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture(routedBits: routedBits, mtpEnabled: true) { model in
+                for accepted in 1...4 {
+                    let staged = model.newCache(parameters: nil)
+                    let reference = model.newCache(parameters: nil)
+                    let prefix = MLXArray([Int32(1), 2, 3]).reshaped(1, 3)
+                    for cache in [staged, reference] {
+                        MLX.eval(model.nativeBackboneForward(prefix, cache: cache).logits)
+                        MLX.eval(cache)
+                    }
+                    let recurrent = try #require(staged.first as? MambaCache)
+                    try #require(recurrent.state.count == 4, "PLE history and convolution must be present")
+                    let before = recurrent.state.map { $0 * 1 }
+                    MLX.eval(before)
+                    let beforeOffset = recurrent.offset
+                    let block = MLXArray([Int32(4), 5, 6, 7]).reshaped(1, 4)
+                    let output = NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+                        model.nativeBackboneMTPVerifyForward(block, cache: staged)
+                    }
+                    MLX.eval(output.logits)
+                    MLX.eval(staged)
+                    #expect(recurrent.offset == beforeOffset)
+                    for (slot, pair) in zip(recurrent.state, before).enumerated() {
+                        expectEqual(pair.0, pair.1, "staged unchanged bits=\(routedBits) prefix=\(accepted) slot=\(slot)")
+                    }
+                    for cache in staged where cache.isTrimmable { _ = cache.trim(4 - accepted) }
+                    try #require(model.commitStagedVerifiedBlock(
+                        cache: staged, acceptedInputs: accepted, blockLength: 4))
+                    for token in 4..<(4 + accepted) {
+                        let row = token - 4
+                        let expected = model.nativeBackboneForward(
+                            MLXArray([Int32(token)]).reshaped(1, 1), cache: reference)
+                        expectEqual(output.logits[0..., row..<(row + 1), 0...], expected.logits,
+                            "verify bits=\(routedBits) prefix=\(accepted) row=\(row)")
+                    }
+                    for (layer, pair) in zip(staged, reference).enumerated() {
+                        #expect(pair.0.offset == pair.1.offset)
+                        #expect(pair.0.state.count == pair.1.state.count)
+                        for (slot, values) in zip(pair.0.state, pair.1.state).enumerated() {
+                            expectEqual(values.0, values.1,
+                                "commit bits=\(routedBits) prefix=\(accepted) layer=\(layer) slot=\(slot)")
+                        }
+                    }
+                    // Exercise the real disk-array contract, not a cache.copy shortcut.
+                    let arrays = TQDiskSerializer.serialize(cache: staged)
+                    let cacheFile = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("flash-staged-\(UUID().uuidString).safetensors")
+                    defer { try? FileManager.default.removeItem(at: cacheFile) }
+                    try MLX.save(arrays: arrays, url: cacheFile)
+                    let diskArrays = try MLX.loadArrays(url: cacheFile)
+                    var restored = model.newCache(parameters: nil)
+                    #expect(restoreFromDiskArrays(diskArrays, into: &restored) == 3 + accepted)
+                    let next = MLXArray([Int32(11)]).reshaped(1, 1)
+                    let expected = model.nativeBackboneForward(next, cache: reference).logits
+                    let actual = model.nativeBackboneForward(next, cache: restored).logits
+                    expectEqual(actual, expected, "restored continuation bits=\(routedBits) prefix=\(accepted)")
+                    let spread = (expected.max() - expected.min()).item(Float.self)
+                    #expect(spread.isFinite && spread > 1e-6)
+                    print("FLASH-STAGED-PLE bits=\(routedBits) accepted=\(accepted) realModelSpeedProof=false")
+                }
+            }
+        }
+    }
+
     @Test("native Flash token cap never publishes pending tokens under an emitted-prefix key",
           .enabled(if: ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0",
                    "Requires strict quantized-fixture oracle"), arguments: [2, 6])

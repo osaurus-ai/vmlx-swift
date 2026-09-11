@@ -3,6 +3,8 @@
 import Foundation
 import MLX
 import MLXNN
+import MLXLMCommon
+import MLXRandom
 import Testing
 
 @testable import MLXVLM
@@ -57,6 +59,80 @@ struct Qwen4ExpConfigurationTests {
               }
             }
             """.utf8)
+    }
+
+    @Test("tiny GDN QSA staged prefixes preserve continuation without PLE")
+    func stagedPrefixContinuationWithoutPLE() throws {
+        try MLXMetalTestLock.withLock {
+            var root = try #require(JSONSerialization.jsonObject(
+                with: configData(dtype: "float32")) as? [String: Any])
+            var text = try #require(root["text_config"] as? [String: Any])
+            // This row qualifies GDN/QSA only. PLE requires a real table fixture
+            // and remains a separate gate before production enablement.
+            text["ple_layer_ids"] = [Int]()
+            root["text_config"] = text
+            let config = try JSONDecoder().decode(Qwen4ExpConfiguration.self,
+                from: JSONSerialization.data(withJSONObject: root))
+            #expect(config.base.textConfiguration.hiddenSize == 64)
+            #expect(config.base.textConfiguration.hiddenLayers == 2)
+            MLXRandom.seed(829)
+            let model = try Qwen4Exp(config, requesting: [.text])
+            let count = model.parameters().flattened().reduce(0) { $0 + $1.1.size }
+            try #require(count < 2_000_000, "Never evaluate a production-size fixture")
+            func compare(_ actual: MLXArray, _ expected: MLXArray, _ label: String) {
+                #expect(actual.shape == expected.shape, "\(label)")
+                guard actual.shape == expected.shape else { return }
+                let error = abs(actual.asType(.float32) - expected.asType(.float32)).max().item(Float.self)
+                print("QWEN-STAGED \(label) maxAbs=\(error) parameters=\(count)")
+                #expect(error.isFinite && error <= 1e-5, "\(label) maxAbs=\(error)")
+            }
+            for accepted in 1...4 {
+                let staged = model.newCache(parameters: nil)
+                let reference = model.newCache(parameters: nil)
+                let prefix = MLXArray([Int32(1), 2, 3]).reshaped(1, 3)
+                for cache in [staged, reference] {
+                    let out = model.nativeBackboneForward(prefix, cache: cache)
+                    MLX.eval(out.logits, cache)
+                }
+                let recurrent = try #require(staged.first as? MambaCache)
+                let before = recurrent.state.map { $0 * 1 }
+                MLX.eval(before)
+                let beforeOffset = recurrent.offset
+                let block = MLXArray([Int32(4), 5, 6, 7]).reshaped(1, 4)
+                let verified = NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+                    model.nativeBackboneMTPVerifyForward(block, cache: staged)
+                }
+                MLX.eval(verified.logits, staged)
+                #expect(recurrent.offset == beforeOffset)
+                #expect(recurrent.state.count == before.count)
+                for (index, pair) in zip(recurrent.state, before).enumerated() {
+                    compare(pair.0, pair.1, "uncommitted prefix=\(accepted) slot=\(index)")
+                }
+                for layer in staged where layer.isTrimmable { _ = layer.trim(4 - accepted) }
+                try #require(model.commitStagedVerifiedBlock(
+                    cache: staged, acceptedInputs: accepted, blockLength: 4))
+                for token in 4..<(4 + accepted) {
+                    let out = model.nativeBackboneForward(MLXArray([Int32(token)]).reshaped(1, 1), cache: reference)
+                    MLX.eval(out.logits, reference)
+                    let row = token - 4
+                    compare(verified.logits[0..., row..<(row + 1), 0...], out.logits,
+                        "verifier logits prefix=\(accepted) row=\(row)")
+                }
+                let referenceRecurrent = try #require(reference.first as? MambaCache)
+                #expect(recurrent.offset == referenceRecurrent.offset)
+                #expect(recurrent.state.count == referenceRecurrent.state.count)
+                #expect(staged.map(\.offset) == reference.map(\.offset))
+                for (index, pair) in zip(recurrent.state, referenceRecurrent.state).enumerated() {
+                    compare(pair.0, pair.1, "committed prefix=\(accepted) slot=\(index)")
+                }
+                let next = MLXArray([Int32(11)]).reshaped(1, 1)
+                let actual = model.nativeBackboneForward(next, cache: staged)
+                let expected = model.nativeBackboneForward(next, cache: reference)
+                compare(actual.logits, expected.logits, "continuation prefix=\(accepted)")
+                let spread = (expected.logits.max() - expected.logits.min()).item(Float.self)
+                #expect(spread.isFinite && spread > 1e-6, "Reject a constant-logit oracle")
+            }
+        }
     }
 
     @Test("decodes native text_config fields and null seed fallback")
