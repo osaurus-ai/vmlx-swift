@@ -116,3 +116,11 @@ extension Qwen35TextModel {
         Qwen35ANEHeadWeightSource(model: self, args: configuration, draftVocab: draftVocab, window: window)
     }
 }
+
+extension Qwen35TextModel: ANEDraftableModel {}
+
+extension Qwen35Model: ANEDraftableModel {
+    public func aneHeadWeightSource(draftVocab: Int, window: Int) -> ANEHeadWeightSource? {
+        languageModel.aneHeadWeightSource(draftVocab: draftVocab, window: window)
+    }
+}

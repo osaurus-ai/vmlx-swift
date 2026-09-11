@@ -364,6 +364,55 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// before the next commit so an unverified draft can never persist.
     private var headChainPairs = 0
 
+    /// Neural Engine drafter (`VMLX_ANE_MTP=1`, greedy only). When set, the
+    /// draft chain runs on the ANE and `mtpCache` stays empty: the head's
+    /// K/V lives in the drafter's window and follows the same trim/refresh
+    /// lifecycle through `trimHead`/`refreshHeadCache`.
+    private var aneDrafter: ANEMTPDrafter?
+    private(set) var aneDraftForwardCount = 0
+
+    private mutating func trimHead(rows: Int) {
+        if let aneDrafter { aneDrafter.trim(rows: rows) } else { Self.trimHeadChain(mtpCache, rows: rows) }
+    }
+
+    private mutating func refreshHeadCache() {
+        mtpCache = model.makeNativeMTPCache()
+        mtpCacheRefreshCount += 1
+        aneDrafter?.reset()
+    }
+
+    /// The `makeDrafts` seam: ANE when configured, GPU head otherwise.
+    private mutating func produceDrafts(hidden: MLXArray, nextToken: MLXArray, depth: Int) -> DraftBatch {
+        if let aneDrafter {
+            let syncStart = Date.timeIntervalSinceReferenceDate
+            do {
+                let ids = try aneDrafter.drafts(hidden: hidden, nextTokens: nextToken, depth: depth)
+                aneDraftForwardCount += ids.count
+                return DraftBatch(
+                    tokens: ids.map { MLXArray([$0]) },
+                    probabilities: [],
+                    forwardCount: ids.count,
+                    materializeSyncTime: Date.timeIntervalSinceReferenceDate - syncStart)
+            } catch {
+                // A failed ANE eval is not a reason to stop generating: fall
+                // back to the GPU head for the rest of this generation.
+                FileHandle.standardError.write(
+                    Data("[NativeMTP] ANE drafter failed (\(error)); GPU head takes over\n".utf8))
+                self.aneDrafter = nil
+                refreshHeadCache()
+            }
+        }
+        return Self.makeDrafts(
+            model: model,
+            hidden: hidden,
+            nextToken: nextToken,
+            mtpCache: mtpCache,
+            depth: depth,
+            sampler: sampler,
+            speculativeSampler: speculativeSampler,
+            processor: processor)
+    }
+
     /// Static so callers can trim without holding a mutating borrow on
     /// `self` across the surrounding expression (the caches are reference
     /// types, so the rows really are dropped).
@@ -591,6 +640,29 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.sampler = effectiveParameters.sampler()
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
         self.maxTokens = effectiveParameters.maxTokens
+        if ANEMTPSettings.enabled {
+            if !self.speculativeSampler.isGreedy {
+                FileHandle.standardError.write(
+                    Data("[NativeMTP] VMLX_ANE_MTP=1 ignored: the ANE drafter is greedy-only and this request samples\n".utf8))
+            } else if let draftable = model as? any ANEDraftableModel {
+                do {
+                    let drafter = try ANEMTPDrafter(model: draftable)
+                    self.aneDrafter = drafter
+                    let g = drafter.runner.geometry
+                    FileHandle.standardError.write(
+                        Data(String(format: "[NativeMTP] ANE drafter ready: vocab=%d window=%d build=%.2fs compile=%.2fs cacheHit=%d\n",
+                                    g.draftVocab, g.window, drafter.buildSeconds,
+                                    drafter.runner.program.compileSeconds,
+                                    drafter.runner.program.cacheHit ? 1 : 0).utf8))
+                } catch {
+                    FileHandle.standardError.write(
+                        Data("[NativeMTP] VMLX_ANE_MTP=1 ignored: \(error)\n".utf8))
+                }
+            } else {
+                FileHandle.standardError.write(
+                    Data("[NativeMTP] VMLX_ANE_MTP=1 ignored: \(String(describing: type(of: model))) has no ANE head emitter\n".utf8))
+            }
+        }
         // Depth policy (2026-09-04): the REQUESTED depth is the STARTING
         // depth; the hard cap is 5 and the adaptive controller may promote
         // past the request up to that cap when a full acceptance window
@@ -881,15 +953,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         pendingTokens.append(recordMaterializeSync { secondToken.item(Int.self) })
         let draftStart = Date.timeIntervalSinceReferenceDate
         try Task.checkCancellation()
-        let draftBatch = Self.makeDrafts(
-            model: model,
+        let draftBatch = produceDrafts(
             hidden: Self.lastHidden(bridge.hiddenStates),
             nextToken: secondToken,
-            mtpCache: mtpCache,
-            depth: self.currentDepth,
-            sampler: sampler,
-            speculativeSampler: speculativeSampler,
-            processor: processor)
+            depth: self.currentDepth)
         drafts = draftBatch.tokens
         draftProbabilities = draftBatch.probabilities
         mtpForwardCount += draftBatch.forwardCount
@@ -1283,7 +1350,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             arSafetyResumes: arSafetyResumes)
         let line = String(
             format:
-                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d] depthMoves[promotions=%d,wallclockDemotes=%d,acceptanceDemotes=%d]\n",
+                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ drafter=%@ aneForwards=%d cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d] depthMoves[promotions=%d,wallclockDemotes=%d,acceptanceDemotes=%d]\n",
             depth,
             currentDepth,
             verifyCalls,
@@ -1327,6 +1394,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             phaseSummary,
             speculativeSampler.isGreedy ? "greedy" : "exact-pq",
             verifierMode,
+            aneDrafter != nil ? "ane" : "gpu",
+            aneDraftForwardCount,
             arSafetyTrips,
             arSafetyResumes,
             arSafetyPaused ? 1 : 0,
@@ -1854,7 +1923,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // Full accept: commit (h0,d1) … (h_{k-1},dk), (hk,bonus). The
             // bonus pair is the one the old retained cache always dropped.
             if Self.alignedHeadCacheEnabled, repairedHiddenForNextMTP == nil {
-                Self.trimHeadChain(mtpCache, rows: headChainPairs)
+                trimHead(rows: headChainPairs)
                 headChainPairs = 0
                 // Copy out of `self` first: recordMaterializeSync is
                 // mutating, so a closure reading self.drafts overlaps it.
@@ -1913,7 +1982,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // here is what the old path did, and it is exactly the context
             // loss that held acceptance down.
             if Self.alignedHeadCacheEnabled, repairedHiddenForNextMTP == nil, committedCache {
-                Self.trimHeadChain(mtpCache, rows: headChainPairs)
+                trimHead(rows: headChainPairs)
                 headChainPairs = 0
                 let ids = Array(requestedInputIds.dropFirst().prefix(accepted))
                     + [Int32(verifyDecision.targetTokenIds[accepted])]
@@ -1921,8 +1990,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 alignedCommitHidden =
                     verifier.hiddenStates[0..., 0 ..< ids.count, 0...]
             } else {
-                mtpCache = model.makeNativeMTPCache()
-                mtpCacheRefreshCount += 1
+                refreshHeadCache()
             }
         }
 
@@ -1937,15 +2005,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
         let draftStart = Date.timeIntervalSinceReferenceDate
-        let draftBatch = Self.makeDrafts(
-            model: model,
+        let draftBatch = produceDrafts(
             hidden: alignedCommitHidden ?? hiddenForNextMTP,
             nextToken: alignedCommitTokens ?? nextToken,
-            mtpCache: mtpCache,
-            depth: currentDepth,
-            sampler: sampler,
-            speculativeSampler: speculativeSampler,
-            processor: processor)
+            depth: currentDepth)
         drafts = draftBatch.tokens
         draftProbabilities = draftBatch.probabilities
         // Levels beyond the first append speculative rows to the head
@@ -2248,21 +2311,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // fresh head cache, drafts from the current hidden. Drafts are only
         // proposals — verification owns every emitted token — so a cold head
         // cache can only cost acceptance, never correctness.
-        mtpCache = model.makeNativeMTPCache()
-        mtpCacheRefreshCount += 1
+        refreshHeadCache()
         currentDepth = depth
         arSafetyRing.removeAll(keepingCapacity: true)
         arSafetyProbeCyclesRemaining = probe ? Self.arSafetyProbeWindow : 0
         let draftStart = Date.timeIntervalSinceReferenceDate
-        let draftBatch = Self.makeDrafts(
-            model: model,
+        let draftBatch = produceDrafts(
             hidden: hidden,
             nextToken: nextToken,
-            mtpCache: mtpCache,
-            depth: currentDepth,
-            sampler: sampler,
-            speculativeSampler: speculativeSampler,
-            processor: processor)
+            depth: currentDepth)
         drafts = draftBatch.tokens
         draftProbabilities = draftBatch.probabilities
         headChainPairs = Self.alignedHeadCacheEnabled
@@ -2437,8 +2494,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 adaptiveWindow.removeAll(keepingCapacity: true)
                 lastAdaptiveCycleTimestamp = nil
                 windowsSinceUpperProbe = 0
-                mtpCache = model.makeNativeMTPCache()
-                mtpCacheRefreshCount += 1
+                refreshHeadCache()
                 return
             }
         }
@@ -2455,8 +2511,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveWindow.removeAll(keepingCapacity: true)
             lastAdaptiveCycleTimestamp = nil
             windowsSinceUpperProbe = 0
-            mtpCache = model.makeNativeMTPCache()
-            mtpCacheRefreshCount += 1
+            refreshHeadCache()
             return
         }
 
@@ -2468,8 +2523,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveWindow.removeAll(keepingCapacity: true)
             lastAdaptiveCycleTimestamp = nil
             windowsSinceUpperProbe = 0
-            mtpCache = model.makeNativeMTPCache()
-            mtpCacheRefreshCount += 1
+            refreshHeadCache()
             return
         }
 
@@ -2484,8 +2538,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveWindow.removeAll(keepingCapacity: true)
             lastAdaptiveCycleTimestamp = nil
             windowsSinceUpperProbe = 0
-            mtpCache = model.makeNativeMTPCache()
-            mtpCacheRefreshCount += 1
+            refreshHeadCache()
             return
         }
 
@@ -2555,8 +2608,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         adaptiveFallbackReason = reason
         drafts.removeAll(keepingCapacity: true)
         draftProbabilities.removeAll(keepingCapacity: true)
-        mtpCache = model.makeNativeMTPCache()
-        mtpCacheRefreshCount += 1
+        refreshHeadCache()
     }
 
     private mutating func generateAutoregressiveToken() throws {
@@ -2676,8 +2728,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     bonusCount += 1
                 } else {
                     rejectedCount += 1
-                    mtpCache = model.makeNativeMTPCache()
-                    mtpCacheRefreshCount += 1
+                    refreshHeadCache()
                 }
                 break
             }
@@ -2720,8 +2771,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 pendingTokens.append(recordMaterializeSync { correction.item(Int.self) })
                 rejectedCount += 1
                 residualCorrectionCount += 1
-                mtpCache = model.makeNativeMTPCache()
-                mtpCacheRefreshCount += 1
+                refreshHeadCache()
                 break
             }
 
@@ -2762,15 +2812,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
         let draftStart = Date.timeIntervalSinceReferenceDate
-        let draftBatch = Self.makeDrafts(
-            model: model,
+        let draftBatch = produceDrafts(
             hidden: hiddenForNextMTP,
             nextToken: nextToken,
-            mtpCache: mtpCache,
-            depth: currentDepth,
-            sampler: sampler,
-            speculativeSampler: speculativeSampler,
-            processor: processor)
+            depth: currentDepth)
         drafts = draftBatch.tokens
         draftProbabilities = draftBatch.probabilities
         mtpForwardCount += draftBatch.forwardCount

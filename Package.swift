@@ -965,6 +965,7 @@ let package = Package(
                 "ANEBridgeLinearParityTests.swift",
                 "ANEGPUContentionProbeTests.swift",
                 "ANEHeadParityTests.swift",
+                "ANEDrafterIteratorTests.swift",
             ]
         ),
         .testTarget(

@@ -157,6 +157,24 @@ public final class ANEHeadRunner {
         return StepResult(token: readArgmax(0), hidden: readHidden(0))
     }
 
+    /// The aligned commit folded into the first draft: pairs `0 ..< n-1` are
+    /// confirmed (trunk hidden, token) rows, pair `n-1` seeds the chain. One
+    /// tile eval stores every row's K/V and returns the last row's draft.
+    public func draftChainStart(pairs: [(hidden: [Float16], token: Int)]) throws -> StepResult {
+        precondition(!pairs.isEmpty && pairs.count <= geometry.rows)
+        let start = length
+        for (r, pair) in pairs.enumerated() {
+            let embed = source.embedding(token: pair.token).asType(.float32).asArray(Float.self).map { Float16($0) }
+            packRow(r, hidden: pair.hidden, embed: embed, position: start + r, tileRows: pairs.count)
+        }
+        for r in pairs.count ..< geometry.rows { packIdleRow(r) }
+        try program.eval()
+        for r in 0 ..< pairs.count { storeRow(r, position: start + r) }
+        length = start + pairs.count
+        let last = pairs.count - 1
+        return StepResult(token: readArgmax(last), hidden: readHidden(last))
+    }
+
     /// Commits up to `rows` (hidden, token) pairs at positions `length...`
     /// in ONE tile eval (the aligned head-cache commit).
     public func commit(pairs: [(hidden: [Float16], token: Int)]) throws {
