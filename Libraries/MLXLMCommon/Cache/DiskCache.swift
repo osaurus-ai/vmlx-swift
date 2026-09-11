@@ -96,6 +96,33 @@ public final class DiskCache: @unchecked Sendable {
         let modificationDate: Date
     }
 
+    private struct ValidatedRecord {
+        let file: ValidatedFileFingerprint
+        let layout: [String]
+        let hasRecurrentGeometry: Bool
+    }
+
+    private static func hasRecurrentGeometry(_ names: Set<String>) -> Bool {
+        names.filter { $0.hasPrefix("mamba_") && $0.hasSuffix("_state0") }
+            .allSatisfy { name in
+                let prefix = String(name.dropLast("_state0".count))
+                return names.contains("__\(prefix)_slots__")
+                    && names.contains("__\(prefix)_occupied__")
+            }
+    }
+
+    /// Token identity alone cannot justify retaining an older representation.
+    /// Include tensor geometry and typed serializer metadata, without reading
+    /// the large state tensors back to the CPU or retaining mapped arrays.
+    private static func payloadLayout(_ arrays: [String: MLXArray]) -> [String] {
+        arrays.keys.sorted().map { key in
+            let array = arrays[key]!
+            let metadata = key.hasPrefix("__") && array.dtype == .int32
+                ? String(describing: array.asArray(Int32.self)) : ""
+            return "\(key)|\(array.dtype)|\(array.shape)|\(metadata)"
+        }
+    }
+
     // MARK: - Properties
 
     /// Root directory for cache files and the SQLite index.
@@ -153,7 +180,7 @@ public final class DiskCache: @unchecked Sendable {
     /// fingerprint lets `store` avoid realizing and rewriting the same large
     /// prompt boundary after a cache hit, while a fresh process still validates
     /// an inherited file before it can take the fast path.
-    private var validatedFiles: [String: ValidatedFileFingerprint] = [:]
+    private var validatedFiles: [String: ValidatedRecord] = [:]
 
     /// Trace-only identity of the most recent boundary written by this cache
     /// instance. Growing agent loops can store N tokens and immediately probe N
@@ -350,7 +377,9 @@ public final class DiskCache: @unchecked Sendable {
         // entry instead of preserving an assumption.
         if let validated = validatedFiles[hash],
            let current = _fileFingerprint(url: url),
-           current == validated,
+           current == validated.file,
+           validated.hasRecurrentGeometry,
+           Self.payloadLayout(arrays) == validated.layout,
            let indexed = _entryMetadataLocked(hash: hash),
            indexed.tokenCount == tokenCount,
            indexed.fileSize == current.size,
@@ -421,7 +450,9 @@ public final class DiskCache: @unchecked Sendable {
 
             _insertEntryLocked(hash: hash, tokenCount: tokenCount, fileSize: fileSize)
             if let fingerprint = _fileFingerprint(url: finalURL), fingerprint.size > 0 {
-                validatedFiles[hash] = fingerprint
+                validatedFiles[hash] = ValidatedRecord(
+                    file: fingerprint, layout: Self.payloadLayout(arrays),
+                    hasRecurrentGeometry: Self.hasRecurrentGeometry(Set(arrays.keys)))
             } else {
                 validatedFiles.removeValue(forKey: hash)
             }
@@ -516,7 +547,9 @@ public final class DiskCache: @unchecked Sendable {
                 throw DiskCacheIntegrityError.nonFinitePayload(nonFinite.joined(separator: ","))
             }
             if let fingerprint = _fileFingerprint(url: url), fingerprint.size > 0 {
-                validatedFiles[hash] = fingerprint
+                validatedFiles[hash] = ValidatedRecord(
+                    file: fingerprint, layout: Self.payloadLayout(arrays),
+                    hasRecurrentGeometry: Self.hasRecurrentGeometry(Set(arrays.keys)))
             }
             if touchRecency {
                 _touchEntryLocked(hash: hash)
@@ -574,7 +607,8 @@ public final class DiskCache: @unchecked Sendable {
 
         guard let validated = validatedFiles[hash],
               let current = _fileFingerprint(url: url),
-              current == validated,
+              current == validated.file,
+              validated.hasRecurrentGeometry,
               current.size > 0,
               let indexed = _entryMetadataLocked(hash: hash),
               indexed.tokenCount == tokens.count,
@@ -610,7 +644,15 @@ public final class DiskCache: @unchecked Sendable {
         else {
             return false
         }
-        return true
+        // A legacy recurrent payload is readable for ordinary two-slot caches,
+        // but cannot suppress producing the current declared representation.
+        // This also covers a cold process before its first fetch. Read only the
+        // safetensors header; do not map or realize model state to decide.
+        if let validated = validatedFiles[hash], validated.file == current {
+            return validated.hasRecurrentGeometry
+        }
+        guard let header = Self.tensorHeader(url: url) else { return false }
+        return Self.hasRecurrentGeometry(Set(header.tensors.keys))
     }
 
     /// Candidate prompt-boundary lengths currently present in the disk index.
@@ -822,6 +864,19 @@ public final class DiskCache: @unchecked Sendable {
     /// header, `data_offsets: [begin, end]` per tensor relative to the end
     /// of the header), or nil when the header itself cannot be read.
     static func declaredPayloadEnd(url: URL) -> Int? {
+        guard let header = tensorHeader(url: url) else { return nil }
+        var end = 0
+        for (key, value) in header.tensors where key != "__metadata__" {
+            guard let tensor = value as? [String: Any],
+                let offsets = tensor["data_offsets"] as? [Any], offsets.count == 2,
+                let last = (offsets[1] as? NSNumber)?.intValue
+            else { return nil }
+            end = max(end, last)
+        }
+        return 8 + header.length + end
+    }
+
+    private static func tensorHeader(url: URL) -> (length: Int, tensors: [String: Any])? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8 else { return nil }
@@ -830,15 +885,7 @@ public final class DiskCache: @unchecked Sendable {
         guard let headerData = try? handle.read(upToCount: headerLength), headerData.count == headerLength,
             let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any]
         else { return nil }
-        var end = 0
-        for (key, value) in header where key != "__metadata__" {
-            guard let tensor = value as? [String: Any],
-                let offsets = tensor["data_offsets"] as? [Any], offsets.count == 2,
-                let last = (offsets[1] as? NSNumber)?.intValue
-            else { return nil }
-            end = max(end, last)
-        }
-        return 8 + headerLength + end
+        return (headerLength, header)
     }
 
     /// True when the file on disk holds every byte its header declares.

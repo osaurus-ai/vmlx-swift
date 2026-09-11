@@ -6,6 +6,72 @@ import Testing
 @Suite(.serialized)
 struct MambaPersistentDiskTests {
     @Test
+    func sameKeyPayloadLayoutChangesAreNotDeduplicated() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("disk-layout-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let disk = DiskCache(cacheDir: root, maxSizeGB: 0.1)
+        let tokens = [2, 3, 5]
+        for change in 0..<4 {
+            let arrays: [String: MLXArray] = [
+                "data": change < 2 ? MLXArray.ones([2, 2])
+                    : MLXArray.ones([2, 4]).asType(change == 2 ? .float32 : .float16),
+                "__test_geometry__": MLXArray([Int32(change == 0 ? 2 : 4)]),
+            ]
+            let skips = disk.snapshotStats().storeSkips
+            disk.store(tokens: tokens, arrays: arrays)
+            #expect(disk.snapshotStats().storeSkips == skips)
+            let restored = try #require(disk.fetch(tokens: tokens))
+            #expect(restored["data"]?.shape == arrays["data"]?.shape)
+            #expect(restored["data"]?.dtype == arrays["data"]?.dtype)
+            #expect(restored["__test_geometry__"]?.item(Int32.self) == (change == 0 ? 2 : 4))
+            disk.store(tokens: tokens, arrays: arrays)
+            #expect(disk.snapshotStats().storeSkips == skips + 1)
+        }
+    }
+
+    @Test
+    func legacyDiskRecordCanBeReplacedByCompletePersistentState() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mamba-migration-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let disk = DiskCache(cacheDir: root, maxSizeGB: 0.1)
+        let source = MambaCache(slots: 6, persistentSlotCount: 4)
+        for slot in 0..<4 { source[slot] = MLXArray([Int32(slot + 10)]) }
+        source.offset = 8
+        let complete = TQDiskSerializer.serialize(cache: [attention(), source])
+        var legacy = complete
+        for key in ["__mamba_1_slots__", "__mamba_1_occupied__",
+                    "mamba_1_state2", "mamba_1_state3"] {
+            legacy.removeValue(forKey: key)
+        }
+        let tokens = Array(0..<8)
+        disk.store(tokens: tokens, arrays: legacy)
+        #expect(!disk.hasValidatedEntry(tokens: tokens))
+        #expect(!disk.hasDurableEntry(tokens: tokens))
+        let reopened = DiskCache(cacheDir: root, maxSizeGB: 0.1)
+        #expect(!reopened.hasDurableEntry(tokens: tokens))
+        let candidate = try #require(disk.fetch(tokens: tokens))
+        var rejected: [any KVCache] = [KVCacheSimple(), MambaCache(slots: 6, persistentSlotCount: 4)]
+        #expect(restoreFromDiskArrays(candidate, into: &rejected) == 0)
+        // A real full prefill republishes the same token key with complete state.
+        // A file-level validation must not suppress this format migration.
+        disk.store(tokens: tokens, arrays: complete)
+        #expect(disk.hasValidatedEntry(tokens: tokens))
+        #expect(reopened.hasDurableEntry(tokens: tokens))
+        let migrated = try #require(disk.fetch(tokens: tokens))
+        var restored: [any KVCache] = [KVCacheSimple(), MambaCache(slots: 6, persistentSlotCount: 4)]
+        #expect(restoreFromDiskArrays(migrated, into: &restored) == 8)
+        let skips = disk.snapshotStats().storeSkips
+        disk.store(tokens: tokens, arrays: complete)
+        #expect(disk.snapshotStats().storeSkips == skips + 1)
+    }
+
+    @Test
     func malformedPromptGeometryThrowsWithoutAllocatingDeclaredCapacity() throws {
         let lock = lockSerializedMLXTest()
         defer { lock.unlock() }
