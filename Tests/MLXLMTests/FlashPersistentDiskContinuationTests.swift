@@ -155,6 +155,58 @@ struct FlashPersistentDiskContinuationTests {
         try body(model)
     }
 
+    @Test("Native Flash captures the stripped boundary during prefill", arguments: [0, 2, 3, 4])
+    func nativeStrippedPrefillCapture(restoredCount: Int) throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture(mtpEnabled: true) { model in
+                let root = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("flash-strip-capture-\(UUID().uuidString)")
+                defer { try? FileManager.default.removeItem(at: root) }
+                let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+                    usePagedCache: false, enableDiskCache: true, diskCacheMaxGB: 1,
+                    diskCacheDir: root, modelKey: "flash-strip-capture"))
+                var parameters = GenerateParameters(maxTokens: 8, temperature: 1)
+                parameters.randomSeed = 829
+                parameters.draftStrategy = .nativeMTP(depth: 3)
+                let promptIDs = [2, 3, 4, 5, 6]
+                let input = LMInput(tokens: MLXArray(promptIDs.map(Int32.init)),
+                                    cachePrefixTokenCounts: [3])
+                if restoredCount > 0 {
+                    let seedCache = model.newCache(parameters: parameters)
+                    let seedIDs = Array(promptIDs.prefix(restoredCount))
+                    MLX.eval(model.nativeBackboneForward(
+                        MLXArray(seedIDs.map(Int32.init)).reshaped(1, -1), cache: seedCache).logits)
+                    try #require(coordinator.diskCache).store(tokens: seedIDs,
+                        arrays: TQDiskSerializer.serialize(cache: seedCache),
+                        mediaSalt: computeCacheSalt(for: input, parameters: parameters))
+                }
+                var iterator = try NativeMTPTokenIterator(
+                    input: input, model: model, parameters: parameters, depth: 3,
+                    cacheCoordinator: coordinator)
+                let captured = iterator.strippedPrefillSnapshot
+                #expect((captured != nil) == (restoredCount <= 3))
+                if let captured { #expect(captured.boundary == 3) }
+                let reference = model.newCache(parameters: parameters)
+                MLX.eval(model.nativeBackboneForward(
+                    MLXArray([Int32(2), 3, 4]).reshaped(1, 3), cache: reference).logits)
+                var ids: [Int] = []
+                let started = Date()
+                while let token = iterator.next() { ids.append(token) }
+                for (layer, pair) in zip(captured?.cache ?? [], reference).enumerated() {
+                    #expect(pair.0.offset == pair.1.offset)
+                    #expect(pair.0.state.count == pair.1.state.count)
+                    for (slot, values) in zip(pair.0.state, pair.1.state).enumerated() {
+                        expectEqual(values.0, values.1, "captured layer\(layer) slot\(slot)")
+                    }
+                }
+                iterator.storeCacheAfterGeneration(generatedTokenIds: ids, includeGeneratedBoundary: true)
+                #expect(coordinator.hasDurableDiskEntry(tokens: [2, 3, 4],
+                    mediaSalt: computeCacheSalt(for: input, parameters: parameters)))
+                print("FLASH-STRIP restored=\(restoredCount) captured=\(captured != nil) fixtureTokS=\(Double(ids.count) / max(Date().timeIntervalSince(started), 1e-9)) realModelSpeedProof=false")
+            }
+        }
+    }
+
     @Test("Flash staged prefixes preserve PLE GDN QSA and disk continuation",
           .enabled(if: ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0",
                    "Strict arithmetic control, not production performance qualification"),
