@@ -349,7 +349,7 @@ enum Qwen4ExpCompiledGDNInputs {
     }
 }
 
-enum Qwen4ExpCompiledMoE {
+private enum Qwen4ExpCompiledMoE {
     typealias Region = @Sendable ([MLXArray]) -> [MLXArray]
 
     static let enabled: Bool = {
@@ -452,21 +452,16 @@ enum Qwen4ExpCompiledMoE {
         sharedGateWeight: MLXArray,
         groupSize: Int, bits: Int, mode: QuantizationMode
     ) -> MLXArray? {
-        let metadataDType = gateScales.dtype
-        guard enabled, !CompiledDecodeTrace.isActive, x.ndim == 3, x.dim(1) == 1,
+        guard enabled, !CompiledDecodeTrace.isActive, x.dim(1) == 1,
             x.dtype == .bfloat16,
-            metadataDType == .bfloat16 || metadataDType == .float16,
             [
                 gateScales, gateBiases, upScales, upBiases, downScales,
                 downBiases,
             ]
-            .allSatisfy({ $0.dtype == metadataDType })
+            .allSatisfy({ $0.dtype == .bfloat16 })
                 && sharedGateWeight.dtype == .bfloat16
         else { return nil }
-        // Preserve the checkpoint's affine metadata and the existing QMM
-        // rounding boundaries. In particular, F16 metadata does not require
-        // converting the router or any model parameter to BF16.
-        let key = "shared|\(x.dim(-1))|\(gateWeight.dim(0))|\(groupSize)|\(bits)|\(mode)|\(metadataDType)"
+        let key = "shared|\(x.dim(-1))|\(gateWeight.dim(0))|\(groupSize)|\(bits)|\(mode)"
         lock.lock()
         var region = sharedRegions[key]
         if region == nil {
@@ -490,7 +485,7 @@ enum Qwen4ExpCompiledMoE {
             didReportShared = true
             FileHandle.standardError.write(
                 Data(
-                    "[Qwen4Exp] compiled_moe_shared_expert=active shared_weight_inputs=true input_dtype=bfloat16 metadata=\(metadataDType)\n"
+                    "[Qwen4Exp] compiled_moe_shared_expert=active shared_weight_inputs=true dtype=bfloat16\n"
                         .utf8))
         }
         lock.unlock()
