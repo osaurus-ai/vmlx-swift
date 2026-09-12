@@ -466,8 +466,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var arSafetyProbeCyclesRemaining = 0
     private var arSafetyProbeStartedAt: TimeInterval?
     private var arSafetyProbeStartedEmitted = 0
+    private var arSafetyInitialProbe = false
     private var arSafetyLastMeasuredToken = 0
     private var arSafetyCalibrationRemaining = 0
+    // Calibration refreshes the AR baseline; it is not evidence that the
+    // productive depth lost. Real loss recovery still begins at D1.
+    private var arSafetyCalibrationResumeDepth: Int?
     /// True while a kept re-entry is speculating: a trip in that state backs
     /// the resume interval off further instead of resetting it.
     private var arSafetyReentered = false
@@ -511,6 +515,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// measurement is dropped so the climb can be re-attempted (prompt
     /// character changes mid-generation — a table after prose).
     private var windowsSinceUpperProbe = 0
+
     private static let upperProbeCooldownWindows = 8
     /// A lower depth must beat the current one by this factor before the
     /// wall-clock rule demotes — hysteresis so measurement noise doesn't
@@ -2137,25 +2142,31 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let arMs = (arSafetyLiveStepSec ?? arSafetySeedStepSec ?? 0) * 1000
             arSafetyProbeStartedAt = nil
             if arMs <= 0 || mtpMs * Self.arSafetyReentryHysteresis >= arMs {
-                arSafetyDemoteOrPause(reason: String(
+                arSafetyParkOnMeasuredLoss(reason: String(
                     format: "ar_safety_probe_lost(mtp=%.1fms/tok live_ar=%.1fms)",
                     mtpMs, arMs))
-                if arSafetyPaused {
+                // Initial admission has not attempted recovery yet. Preserve
+                // the first retry interval; backoff belongs to failed re-entry.
+                if arSafetyPaused && !arSafetyInitialProbe {
                     let clearLoss = arMs > 0 && mtpMs >= arMs * Self.arSafetyClearLossFactor
                     arSafetyResumeInterval = Swift.min(
                         arSafetyResumeInterval * (clearLoss ? 4 : 2),
                         Self.arSafetyResumeIntervalMax)
                 }
             } else {
-                arSafetyResumes += 1
-                arSafetyReentered = true
+                if !arSafetyInitialProbe {
+                    arSafetyResumes += 1
+                    arSafetyReentered = true
+                }
                 arSafetySeedStepSec = arSafetyLiveStepSec ?? arSafetySeedStepSec
                 arSafetyFirstVerifySec = nil
                 adaptiveFallbackReason = nil
+                let event = arSafetyInitialProbe ? "admitted" : "resumed"
                 FileHandle.standardError.write(Data(String(
-                    format: "[NativeMTP] ar_safety resumed: mtp=%.1fms/tok live_ar=%.1fms depth=%d\n",
+                    format: "[NativeMTP] ar_safety \(event): mtp=%.1fms/tok live_ar=%.1fms depth=%d\n",
                     mtpMs, arMs, currentDepth).utf8))
             }
+            arSafetyInitialProbe = false
             return
         }
 
@@ -2179,7 +2190,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             tokenCount - arSafetyLastMeasuredToken < 512 {
             let arMs = live * 1000
             if mtpMs > arMs, median > arMs {
-                arSafetyDemoteOrPause(reason: String(
+                arSafetyParkOnMeasuredLoss(reason: String(
                     format: "ar_safety_fresh_loss(mtp=%.1fms/tok median=%.1fms live_ar=%.1fms depth=%d)",
                     mtpMs, median, arMs, currentDepth))
             }
@@ -2190,7 +2201,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             deltaVerifyMs: (newest.verifyTotal - oldest.verifyTotal) * 1000,
             margin: Self.arSafetyMargin),
             median > verdict.arBaselineMs * Self.arSafetyMargin {
-            arSafetyDemoteOrPause(reason: String(
+            arSafetyParkOnMeasuredLoss(reason: String(
                 format: "ar_safety_windowed(mtp=%.1fms/tok ar=%.1fms depth=%d)",
                 verdict.mtpMsPerToken, verdict.arBaselineMs, currentDepth))
         }
@@ -2203,28 +2214,16 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         upperProbeNotBeforeCycle[currentDepth] = verifyCalls + delay
     }
 
-    private mutating func arSafetyDemoteOrPause(reason: String) {
-        guard currentDepth > 1 else {
-            arSafetyPause(reason: reason)
-            return
-        }
-        let previous = currentDepth
+    private mutating func arSafetyParkOnMeasuredLoss(reason: String) {
+        // Losing against measured AR is not evidence that the next lower
+        // speculative depth wins. Return to the measured baseline now; the
+        // existing timed re-entry starts at D1 and may climb within the ceiling.
+        // Keep acceptance-only/relative-depth decisions separate from this
+        // absolute AR-cost verdict.
         recordDepthLoss()
-        currentDepth -= 1
-        adaptiveDepthDownshiftCount += 1
         adaptiveWallClockDemotes += 1
-        arSafetyRing.removeAll(keepingCapacity: true)
-        adaptiveWindow.removeAll(keepingCapacity: true)
-        lastAdaptiveCycleTimestamp = nil
-        arSafetyFirstVerifySec = nil
-        arSafetyProbeCyclesRemaining = 0
-        arSafetyProbeStartedAt = nil
         windowsSinceUpperProbe = 0
-        mtpCache = model.makeNativeMTPCache()
-        mtpCacheRefreshCount += 1
-        headChainPairs = 0
-        FileHandle.standardError.write(Data(
-            "[NativeMTP] ar_safety depth=\(previous)->\(currentDepth) reason=\(reason)\n".utf8))
+        arSafetyPause(reason: reason)
     }
     private mutating func arSafetyPause(reason: String, loss: Bool = true) {
         arSafetyPaused = true
@@ -2237,6 +2236,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         arSafetyTokensSincePause = 0
         arSafetyCalibrationRemaining = loss ? 0 : 2
+        arSafetyCalibrationResumeDepth = loss ? nil : currentDepth
         arSafetyProbeCyclesRemaining = 0
         arSafetyProbeStartedAt = nil
         arSafetyRing.removeAll(keepingCapacity: true)
@@ -2264,7 +2264,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             if let first = arSafetySeedFirstSampleSec {
                 arSafetySeedStepSec = Swift.min(first, stepSec)
                 arSafetyLastMeasuredToken = tokenCount
-                arSafetyStartSpeculating(hidden: hidden, nextToken: nextToken, probe: false)
+                // Admission must measure the first trial, including draft re-prime,
+                // just like re-entry. Otherwise the initial depth bypasses the
+                // probe and waits for the longer warmup plus judgement window.
+                arSafetyStartSpeculating(
+                    hidden: hidden, nextToken: nextToken, probe: true, resumeDepth: depth,
+                    initialProbe: true)
             } else {
                 arSafetySeedFirstSampleSec = stepSec
             }
@@ -2281,11 +2286,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             guard arSafetyTokensSincePause >= arSafetyResumeInterval else { return }
         }
         arSafetyPaused = false
-        arSafetyStartSpeculating(hidden: hidden, nextToken: nextToken, probe: true)
+        let resumeDepth = arSafetyCalibrationResumeDepth ?? 1
+        arSafetyCalibrationResumeDepth = nil
+        arSafetyStartSpeculating(
+            hidden: hidden, nextToken: nextToken, probe: true, resumeDepth: resumeDepth)
     }
 
     private mutating func arSafetyStartSpeculating(
-        hidden: MLXArray, nextToken: MLXArray, probe: Bool
+        hidden: MLXArray, nextToken: MLXArray, probe: Bool, resumeDepth: Int = 1,
+        initialProbe: Bool = false
     ) {
         // Same re-prime the depth controller uses on every depth change: a
         // fresh head cache, drafts from the current hidden. Drafts are only
@@ -2293,9 +2302,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // cache can only cost acceptance, never correctness.
         mtpCache = model.makeNativeMTPCache()
         mtpCacheRefreshCount += 1
-        currentDepth = probe ? 1 : depth
+        currentDepth = probe
+            ? Swift.max(1, Swift.min(resumeDepth, adaptiveDepthCeiling)) : depth
         arSafetyRing.removeAll(keepingCapacity: true)
         arSafetyProbeCyclesRemaining = probe ? Self.arSafetyProbeWindow : 0
+        arSafetyInitialProbe = initialProbe
         arSafetyProbeStartedAt = probe ? NativeMTPClock.now() : nil
         arSafetyProbeStartedEmitted = arSafetyEmittedTotal
         arSafetyFirstVerifySec = nil
