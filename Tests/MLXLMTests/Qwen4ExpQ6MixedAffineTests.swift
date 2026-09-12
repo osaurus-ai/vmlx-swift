@@ -220,6 +220,20 @@ struct Qwen4ExpQ6MixedAffineTests {
         }
     }
 
+    @Test("diagnostic disable restores the original F32 projection", .enabled(if:
+        ProcessInfo.processInfo.environment["VMLX_DISABLE_MIXED_Q6"] == "1"))
+    func mixedQ6DisabledUsesPromotion() {
+        MLXMetalTestLock.withLock {
+            let (x, q, s, b) = fixture(k: 2560, n: 48, seed: 829)
+            let actual = product(x, q, s, b)
+            let expected = product(x, q, s, b, reference: true)
+            MLX.eval(actual, expected)
+            #expect(actual.dtype == .float32)
+            #expect((actual .== expected).all().item(Bool.self))
+            print("[q6-disabled] actual_output=\(actual.dtype) reference_exact=1")
+        }
+    }
+
     @Test("opt-in synchronized q6 GDN projection timing")
     func mixedDenseQ6Timing() {
         guard ProcessInfo.processInfo.environment["VMLX_Q6_MIXED_BENCH"] == "1" else {
