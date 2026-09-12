@@ -188,6 +188,127 @@ private func kdaKernel(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - Fused decode-step short convolution
+
+/// One kernel for the whole of a KDA decode step's input stage: three depthwise short convolutions,
+/// three SiLUs, and the three state shifts.
+///
+/// The unfused path, per layer per token, is a `concatenated` to prepend the conv state, three
+/// `Conv1d`s, three `silu`s and a slice-store to put the state back — roughly eight dispatches and
+/// as many intermediate allocations. GLM-5.3 runs KDA in 34 of its 45 layers, so that is ~270
+/// dispatches per decoded token where this is 34. The allocations matter as much as the dispatches
+/// on a model this size: past MLX's `gc_limit_` every allocation triggers `release_cached_buffers`,
+/// so removing seven per layer per step removes them from the steady state too.
+///
+/// DECODE ONLY, and deliberately so — `B == 1, T == 1`. A prefill has real arithmetic per token and
+/// the stock `Conv1d` is the better kernel for it; this exists because a decode step's arithmetic is
+/// trivial and its cost is almost all launch and allocation overhead. Every other shape, dtype or
+/// geometry returns `nil` and the caller keeps its existing path, so this can only ever be a FAST
+/// path, never a semantic one.
+///
+/// Our conv state is PACKED as `[B, K-1, 3 * proj]` (q, then k, then v), because that is what
+/// `BailingV3KDAAttention` already keeps in `cache[0]`; the reference keeps three separate states.
+/// Packing costs one integer division per thread to recover which projection a channel belongs to,
+/// and saves changing a cache layout that is serialized, snapshotted and restored.
+private final class KDAConvKernelManager: Sendable {
+    static let shared = KDAConvKernelManager()
+    let kernel: MLXFast.MLXFastKernel?
+
+    private init() {
+        // `P`, `C3` and `K` arrive as template parameters, so MLX specializes and caches one variant
+        // per geometry rather than this file rebuilding a source string per shape.
+        let source = """
+                uint c = thread_position_in_grid.x;
+                if (c >= (uint)C3) return;
+
+                uint lane = c / (uint)P;
+                uint ch = c - lane * (uint)P;
+                device const T* w = lane == 0u ? q_weight : (lane == 1u ? k_weight : v_weight);
+
+                // Taps 0..K-2 read the carried state; the last tap is this step's own token. That is
+                // exactly what a stock conv1d with zero padding computes over `concat(state, token)`,
+                // which is what makes this a fast path and not a variant.
+                float acc = 0.0f;
+                for (uint tap = 0; tap < (uint)K - 1u; ++tap) {
+                    acc += (float)state[(size_t)tap * (size_t)C3 + c]
+                         * (float)w[(size_t)ch * (size_t)K + tap];
+                }
+                float cur = (float)token[c];
+                acc += cur * (float)w[(size_t)ch * (size_t)K + ((uint)K - 1u)];
+
+                // Shift the window: drop the oldest tap, append this token. Writing `next` from
+                // `state` rather than in place keeps the two disjoint, so the caller may pass the
+                // live cache buffer.
+                for (uint tap = 0; tap + 2u < (uint)K; ++tap) {
+                    next[(size_t)tap * (size_t)C3 + c] =
+                        state[(size_t)(tap + 1u) * (size_t)C3 + c];
+                }
+                next[(size_t)((uint)K - 2u) * (size_t)C3 + c] = (T)cur;
+
+                // SiLU, folded in: x * sigmoid(x), written as the division the reference uses.
+                out[c] = (T)(acc / (1.0f + metal::exp(-acc)));
+            """
+        kernel = MLXFast.metalKernel(
+            name: "vmlx_glm5_kda_qkv_conv_packed",
+            inputNames: ["token", "state", "q_weight", "k_weight", "v_weight"],
+            outputNames: ["out", "next"],
+            source: source)
+    }
+}
+
+public enum KDAConvRuntime {
+    /// Default ON, matching the reference, with the same shape of explicit rollback.
+    nonisolated(unsafe) public static var enabled: Bool = {
+        let v = ProcessInfo.processInfo.environment["VMLX_GLM5_FUSED_KDA_CONV"]?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        return !(["0", "false", "off", "no", ""].contains(v ?? "1"))
+    }()
+}
+
+/// Convolve + activate + shift one decode step, or return `nil` meaning "use the stock path".
+///
+/// Returns `nil` for every shape, dtype or geometry it does not handle EXACTLY, rather than trying
+/// to cope: a fast path that silently accepts a case it gets subtly wrong is worse than none, and
+/// the caller already holds a correct implementation.
+public func glm5KDAConvDecode(
+    token: MLXArray,  // [1, 1, 3 * proj] — this step's q|k|v projections, packed
+    state: MLXArray,  // [1, kernelSize - 1, 3 * proj]
+    qWeight: MLXArray,  // [proj, kernelSize, 1] — Conv1d's depthwise layout
+    kWeight: MLXArray,
+    vWeight: MLXArray,
+    proj: Int,
+    kernelSize: Int,
+    /// `nil` reads the process-wide default. Callers that hold their own copy pass it explicitly —
+    /// which is what the layer does, so the choice is fixed when a module is built rather than
+    /// re-read per call. A flag that can change between two calls on the same cache is a race in
+    /// waiting, and one already cost a session's debugging on the MLA representation switch.
+    enabled: Bool? = nil
+) -> (out: MLXArray, next: MLXArray)? {
+    guard enabled ?? KDAConvRuntime.enabled, kernelSize >= 2 else { return nil }
+    guard let kernel = KDAConvKernelManager.shared.kernel else { return nil }
+
+    let channels = 3 * proj
+    guard token.ndim == 3, token.shape == [1, 1, channels],
+        state.ndim == 3, state.shape == [1, kernelSize - 1, channels]
+    else { return nil }
+    // float32 is excluded for the reason the reference excludes it: the production decode path is
+    // half precision, and a variant nobody runs is a variant nobody tests.
+    guard token.dtype == .float16 || token.dtype == .bfloat16, state.dtype == token.dtype
+    else { return nil }
+    for w in [qWeight, kWeight, vWeight] {
+        guard w.dtype == token.dtype, w.size == proj * kernelSize else { return nil }
+    }
+
+    let outputs = kernel(
+        [token, state, qWeight, kWeight, vWeight],
+        template: [("T", token.dtype), ("P", proj), ("C3", channels), ("K", kernelSize)],
+        grid: (channels, 1, 1),
+        threadGroup: (min(256, channels), 1, 1),
+        outputShapes: [token.shape, state.shape],
+        outputDTypes: [token.dtype, token.dtype])
+    return (outputs[0], outputs[1])
+}
+
 // MARK: - Public entry
 
 /// KDA recurrence over a full segment. `fRaw` is the raw f-projection output
