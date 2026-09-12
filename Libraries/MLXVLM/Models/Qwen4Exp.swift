@@ -1582,7 +1582,26 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
 
         guard input.image != nil || input.video != nil else {
             setRopeDelta(0, for: cache)
-            return .logits(LMOutput(logits: callAsFunction(inputIds, cache: cache)))
+            // Native MTP calls prepare directly, unlike the batch AR lane's
+            // outer segmentation. Honor the same prefill budget here so a
+            // cold or required-tool request cannot materialize a whole long
+            // prompt's expert activations and vocabulary logits at once.
+            let tokens = inputIds.ndim == 1 ? inputIds.expandedDimensions(axis: 0) : inputIds
+            let step = windowSize ?? 512
+            let count = tokens.dim(1)
+            var offset = 0
+            if step > 0 {
+                while count - offset > step {
+                    try Task.checkCancellation()
+                    _ = callAsFunction(tokens[0..., offset..<(offset + step)], cache: cache)
+                    MLX.eval(cache)
+                    offset += step
+                    PrefillProgressReporter.reportCompletedUnits(offset)
+                    MLX.Memory.clearCache()
+                }
+            }
+            try Task.checkCancellation()
+            return .logits(LMOutput(logits: callAsFunction(tokens[0..., offset...], cache: cache)))
         }
 
         // Media arrived at a model that carries no vision tower. Refuse rather than embed the
