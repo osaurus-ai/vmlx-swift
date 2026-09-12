@@ -5,7 +5,8 @@ import MLX
 import MLXLMCommon
 import Testing
 
-/// Generated fixtures only: no model is loaded and no bundle is modified.
+/// Generated fixtures by default; the opt-in payload test reads individual tensors.
+/// No model is loaded and no bundle is modified.
 /// The large shapes match the Flash-Next JANG_2L GDN header inventory.
 @Suite("Qwen4Exp q6 mixed affine decode", .serialized)
 struct Qwen4ExpQ6MixedAffineTests {
@@ -43,16 +44,15 @@ struct Qwen4ExpQ6MixedAffineTests {
             ] {
                 let (x, q, s, b) = fixture(k: k, n: n, seed: seed)
                 let actual = product(x, q, s, b)
-                let expected = product(x, q, s, b, reference: true).asType(.bfloat16)
+                let expected = product(x, q, s, b, reference: true)
                 MLX.eval(actual, expected)
-                let rounded = actual.asType(.bfloat16)
-                let error = abs(rounded.asType(.float32) - expected.asType(.float32))
+                let error = abs(actual - expected)
                     .max().item(Float.self)
-                let unequal = (rounded .!= expected).asType(.int32).sum().item(Int.self)
+                let unequal = (actual .!= expected).asType(.int32).sum().item(Int.self)
                 print("[q6-mixed] K=\(k) N=\(n) seed=\(seed) input=\(x.dtype)"
                     + " metadata=\(s.dtype) output=\(actual.dtype) max_abs=\(error)"
-                    + " unequal_bf16=\(unequal) generated_weights=1")
-                #expect(actual.dtype == .bfloat16)
+                    + " unequal_f32=\(unequal) generated_weights=1")
+                #expect(actual.dtype == .float32)
                 #expect(actual.shape == [1, 1, n])
                 #expect(isFinite(actual).all().item(Bool.self))
                 // This is a storage/dispatch optimization, not permission to
@@ -96,6 +96,43 @@ struct Qwen4ExpQ6MixedAffineTests {
         }
     }
 
+    @Test("q6 retains raw F32 output through hyper-connection residual arithmetic")
+    func q6PreservesRawConsumerPrecision() {
+        MLXMetalTestLock.withLock {
+            let (x, q, s, b) = fixture(k: 6144, n: 2560, seed: 832)
+            let actual = product(x, q, s, b)
+            let expected = product(x, q, s, b, reference: true)
+            let hyper = MLXRandom.normal([1, 1, 4, 2560], key: MLXRandom.key(834))
+                .asType(.bfloat16)
+            let injection = MLXRandom.uniform(low: 0, high: 1, [1, 1, 4, 1], key: MLXRandom.key(835))
+                .asType(.bfloat16)
+            // This is the consuming arithmetic in Qwen4ExpGatedResidual.combine,
+            // not a projection-only comparison after discarding F32 precision.
+            let actualResidual = (hyper + actual.expandedDimensions(axis: -2) * injection)
+                .asType(.bfloat16)
+            let expectedResidual = (hyper + expected.expandedDimensions(axis: -2) * injection)
+                .asType(.bfloat16)
+            let compiled = MLX.compile { (args: [MLXArray]) -> [MLXArray] in
+                let projected = quantizedMM(
+                    args[0], q, scales: s, biases: b, transpose: true,
+                    groupSize: 64, bits: 6, mode: .affine)
+                return [(args[1] + projected.expandedDimensions(axis: -2) * args[2])
+                    .asType(.bfloat16)]
+            }
+            let compiledResidual = compiled([x, hyper, injection])[0]
+            MLX.eval(actual, expected, actualResidual, expectedResidual, compiledResidual)
+            let rawUnequal = (actual .!= expected).asType(.int32).sum().item(Int.self)
+            let residualUnequal = (actualResidual .!= expectedResidual)
+                .asType(.int32).sum().item(Int.self)
+            print("[q6-consumer] raw_dtype=\(actual.dtype) raw_unequal=\(rawUnequal)"
+                + " residual_unequal=\(residualUnequal) generated_weights=1")
+            #expect(actual.dtype == .float32)
+            #expect(rawUnequal == 0)
+            #expect(residualUnequal == 0)
+            #expect((compiledResidual .== expectedResidual).all().item(Bool.self))
+        }
+    }
+
     @Test("q6 strided input, compiled projection and verifier rows preserve results")
     func mixedDenseQ6LayoutsAndCompilation() {
         MLXMetalTestLock.withLock {
@@ -104,7 +141,7 @@ struct Qwen4ExpQ6MixedAffineTests {
                 .asType(.bfloat16)
             let rows = backing[0..., .stride(by: 2)]
             MLX.eval(rows)
-            let batched = product(rows, q, s, b).asType(.bfloat16)
+            let batched = product(rows, q, s, b)
             let rowwise = concatenated((0..<4).map {
                 product(rows[$0..<($0 + 1)], q, s, b)
             })
@@ -114,15 +151,28 @@ struct Qwen4ExpQ6MixedAffineTests {
             }
             let oneRow = rows[0..<1]
             let compiledRow = compiled(oneRow)
-            let reference = product(oneRow, q, s, b, reference: true).asType(.bfloat16)
+            let reference = product(oneRow, q, s, b, reference: true)
             let modelRoute = Qwen4ExpBF16Affine.dense(
                 oneRow, q, scales: s, biases: b,
                 groupSize: 64, bits: 6, mode: .affine)
             MLX.eval(batched, rowwise, compiledRow, reference, modelRoute)
             #expect((batched .== rowwise).all().item(Bool.self))
-            #expect(compiledRow.dtype == .bfloat16)
+            #expect(compiledRow.dtype == .float32)
             #expect((compiledRow .== reference).all().item(Bool.self))
-            #expect((modelRoute .== reference).all().item(Bool.self))
+            // The fused input wrapper owns an explicit BF16 output boundary.
+            #expect((modelRoute .== reference.asType(.bfloat16)).all().item(Bool.self))
+
+            let bankQ = stacked([q, q, q])
+            let bankS = stacked([s, s * 0.5, s * 2])
+            let bankB = b.map { stacked([$0, $0 * 0.5, $0 * 2]) }
+            let broadcastInput = oneRow.expandedDimensions(axis: 0)
+            let broadcastOutput = product(broadcastInput, bankQ, bankS, bankB)
+            let broadcastReference = product(
+                broadcastInput, bankQ, bankS, bankB, reference: true)
+            MLX.eval(broadcastOutput, broadcastReference)
+            #expect(broadcastOutput.shape == [3, 1, 48])
+            #expect(broadcastOutput.dtype == .float32)
+            #expect((broadcastOutput .== broadcastReference).all().item(Bool.self))
         }
     }
 
@@ -205,9 +255,9 @@ struct Qwen4ExpQ6MixedAffineTests {
                 for seed: UInt64 in [0, 829, 65537] {
                     let x = MLXRandom.normal([1, 1, k], key: MLXRandom.key(seed)).asType(.bfloat16)
                     let actual = product(x, q, s, b)
-                    let expected = product(x, q, s, b, reference: true).asType(.bfloat16)
+                    let expected = product(x, q, s, b, reference: true)
                     MLX.eval(actual, expected)
-                    #expect(actual.dtype == .bfloat16)
+                    #expect(actual.dtype == .float32)
                     #expect(isFinite(actual).all().item(Bool.self))
                     #expect((actual .== expected).all().item(Bool.self), "\(name) seed=\(seed)")
                 }
