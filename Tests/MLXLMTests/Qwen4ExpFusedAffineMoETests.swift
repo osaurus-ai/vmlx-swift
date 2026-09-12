@@ -7,8 +7,10 @@ import Testing
 
 /// Numerical parity coverage for `Qwen4ExpFusedAffineMoE`.
 ///
-/// Every combination below ships in a real JANG bundle (source:
-/// /Users/eric/models/Logs/q38fn-maps). The fused kernel and the eager
+/// Generated fixtures cover the 14 distinct routed format triples found in a
+/// header audit of Flash-Next JANG_1L/2L/4M/4S/6S, plus supplemental layouts.
+/// These are numerical fixtures, not actual model throughput or quality proof.
+/// The fused kernel and the eager
 /// gather-QMM fallback are both compared against the exact f32 result computed
 /// from dequantized weights. A packing/unpack defect produces O(1) relative
 /// error; legitimate accumulation-order drift stays at bf16 rounding scale in
@@ -28,18 +30,28 @@ struct Qwen4ExpFusedAffineMoETests {
         let down: (bits: Int, group: Int)
     }
 
-    /// Shipped layouts: 4M uniform, the three 4S mixes incl. the layer-44
-    /// g32 outlier, the 2L down g32 outlier, and the two 6S q6 mixes.
+    /// Keep each projection's format independent. In particular, the installed
+    /// 4S gate-g32 layer has up=q3, and the final 6S mix can be q6/q6/q6.
+    /// Existing supplemental fixtures remain for regression coverage.
     private static let shippedCombos: [Combo] = [
         Combo(label: "4M_uniform_q4g64", gate: (4, 64), up: (4, 64), down: (4, 64)),
         Combo(label: "4S_common_q2q3q3", gate: (2, 64), up: (3, 64), down: (3, 64)),
         Combo(label: "4S_upper_q3q3q4", gate: (3, 64), up: (3, 64), down: (4, 64)),
-        Combo(label: "4S_L44_gate_g32", gate: (2, 32), up: (2, 64), down: (4, 64)),
+        Combo(label: "supplemental_q2g32_q2_q4", gate: (2, 32), up: (2, 64), down: (4, 64)),
         Combo(label: "2L_down_g32", gate: (2, 64), up: (2, 64), down: (2, 32)),
         Combo(label: "6S_down_q6", gate: (4, 64), up: (4, 64), down: (6, 64)),
         Combo(label: "6S_up_down_q6", gate: (4, 64), up: (6, 64), down: (6, 64)),
         Combo(label: "Ornith_late_gate_up_q5", gate: (5, 64), up: (5, 64), down: (4, 64)),
         Combo(label: "q5_all_projections", gate: (5, 64), up: (5, 64), down: (5, 64)),
+        Combo(label: "q2_q2_q2", gate: (2, 64), up: (2, 64), down: (2, 64)),
+        Combo(label: "q2_q2_q3", gate: (2, 64), up: (2, 64), down: (3, 64)),
+        Combo(label: "q3_q3_q3", gate: (3, 64), up: (3, 64), down: (3, 64)),
+        Combo(label: "q2g32_q3_q4", gate: (2, 32), up: (3, 64), down: (4, 64)),
+        Combo(label: "q2_q2_q4", gate: (2, 64), up: (2, 64), down: (4, 64)),
+        Combo(label: "q2_q3_q4", gate: (2, 64), up: (3, 64), down: (4, 64)),
+        Combo(label: "q3_q2_q4", gate: (3, 64), up: (2, 64), down: (4, 64)),
+        Combo(label: "q6_q6_q6", gate: (6, 64), up: (6, 64), down: (6, 64)),
+        Combo(label: "supplemental_q4g128_q4_q4", gate: (4, 128), up: (4, 64), down: (4, 64)),
     ]
 
     private static func makeProjection(
@@ -349,7 +361,7 @@ struct Qwen4ExpFusedAffineMoETests {
         #expect(error < 0.01, "Ornith fused/eager relative error \(error)")
     }
 
-    @Test("construction rejects unsupported metadata and group sizes")
+    @Test("construction rejects unsupported metadata and bit widths")
     func constructionRejection() throws {
         // f32 affine metadata must be rejected: the kernels only accept
         // bf16/f16 scales with matching bias dtype.
@@ -374,19 +386,20 @@ struct Qwen4ExpFusedAffineMoETests {
             Qwen4ExpFusedAffineMoE.makeReducer(
                 gate: f32Projection, up: good, down: goodDown) == nil)
 
-        // Group size 128 is outside the supported set.
-        let g128Source = MLXRandom.uniform(
+        // q8 is outside the fused reducer's supported bit set. Group 128 is
+        // supported when it divides the geometry and is covered above.
+        let q8Source = MLXRandom.uniform(
             low: -0.5, high: 0.5, [Self.experts, Self.expertDims, Self.inputDims],
             key: MLXRandom.key(8)
         ).asType(.float16)
-        let (w128, s128, b128) = MLX.quantized(g128Source, groupSize: 128, bits: 4, mode: .affine)
-        let g128Projection = QuantizedSwitchLinear(
+        let (w8, s8, b8) = MLX.quantized(q8Source, groupSize: 64, bits: 8, mode: .affine)
+        let q8Projection = QuantizedSwitchLinear(
             inputDims: Self.inputDims, outputDims: Self.expertDims,
             numExperts: Self.experts,
-            weight: w128, scales: s128, biases: b128, groupSize: 128, bits: 4, mode: .affine)
+            weight: w8, scales: s8, biases: b8, groupSize: 64, bits: 8, mode: .affine)
 
         #expect(
             Qwen4ExpFusedAffineMoE.makeReducer(
-                gate: g128Projection, up: good, down: goodDown) == nil)
+                gate: q8Projection, up: good, down: goodDown) == nil)
     }
 }
