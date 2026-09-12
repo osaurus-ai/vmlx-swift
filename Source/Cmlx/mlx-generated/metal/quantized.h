@@ -837,7 +837,25 @@ METAL_FUNC void qmv_fast_impl(
   y += tid.x * out_vec_size + out_row;
 
   for (int k = 0; k < in_vec_size; k += block_size) {
-    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+    U sum;
+    if constexpr (
+        bits == 6 && metal::is_same_v<T, bfloat16_t> &&
+        metal::is_same_v<S, float16_t>) {
+      // Match the promoted-F32 q6 path without materializing F32 arrays.
+      // Adding BF16 operands before widening rounds the affine bias sum,
+      // even though qdot and the final reduction already accumulate in F32.
+      sum = 0;
+      for (int i = 0; i < values_per_thread; i += 4) {
+        U x0 = x[i], x1 = x[i + 1], x2 = x[i + 2], x3 = x[i + 3];
+        sum += x0 + x1 + x2 + x3;
+        x_thread[i] = x0;
+        x_thread[i + 1] = x1 / 64.0f;
+        x_thread[i + 2] = x2 / 16.0f;
+        x_thread[i + 3] = x3 / 4.0f;
+      }
+    } else {
+      sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+    }
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
