@@ -708,6 +708,10 @@ public protocol NativeMTPModel: LanguageModel {
     /// whose weights were allowed through the loader.
     var nativeMTPAvailable: Bool { get }
 
+    /// Explicit model opt-in for exact sampled verification with staged
+    /// recurrent-state commits. Other families retain sequential repair.
+    var nativeMTPSampledStagedVerificationEnabled: Bool { get }
+
     /// Private per-request cache for the MTP head. It is never prefix/paged/L2
     /// cache state.
     func makeNativeMTPCache() -> [KVCache]
@@ -736,6 +740,8 @@ public protocol NativeMTPModel: LanguageModel {
 }
 
 public extension NativeMTPModel {
+    var nativeMTPSampledStagedVerificationEnabled: Bool { false }
+
     func nativeBackboneMTPVerifyForward(
         _ inputs: MLXArray,
         cache: [KVCache]?

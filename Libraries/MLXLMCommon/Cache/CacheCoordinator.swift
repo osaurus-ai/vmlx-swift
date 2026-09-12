@@ -704,6 +704,8 @@ public final class CacheCoordinator: @unchecked Sendable {
 
     /// True only after the current process has deserialized or written the
     /// exact L2 entry and its on-disk fingerprint still matches the index.
+    /// Self-contained Mamba snapshots carry recurrent state in the L2 file;
+    /// only topologies with a separate payload require the companion pair.
     public func hasValidatedDiskEntry(
         tokens: [Int],
         mediaSalt: String? = nil
@@ -713,7 +715,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         else {
             return false
         }
-        if isHybrid, requiresRecurrentSSMCompanion {
+        if isHybrid, requiresSeparateRecurrentPayload {
             return ssmStateCache.hasValidatedCompleteDiskEntry(
                 tokens: tokens,
                 boundary: tokens.count,
@@ -732,7 +734,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     ) -> Bool {
         guard diskCache?.hasDurableEntry(tokens: tokens, mediaSalt: mediaSalt) == true
         else { return false }
-        if isHybrid, requiresRecurrentSSMCompanion {
+        if isHybrid, requiresSeparateRecurrentPayload {
             return ssmStateCache.hasValidatedCompleteDiskEntry(
                 tokens: tokens,
                 boundary: tokens.count,

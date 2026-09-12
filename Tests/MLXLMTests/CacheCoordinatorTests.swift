@@ -73,6 +73,8 @@ import Testing
             cache: nil)
         #expect(!coordinator.hasValidatedDiskEntry(tokens: tokens),
             "validated KV alone must not hide a missing recurrent companion")
+        #expect(!coordinator.hasDurableDiskEntry(tokens: tokens),
+            "durable KV alone must not hide a required separate companion")
 
         coordinator.storeAfterGeneration(
             promptTokens: tokens,
@@ -80,6 +82,7 @@ import Testing
             ssmStates: [MLXArray.ones([1, 4])],
             cache: nil)
         #expect(coordinator.hasValidatedDiskEntry(tokens: tokens))
+        #expect(coordinator.hasDurableDiskEntry(tokens: tokens))
     }
 }
 

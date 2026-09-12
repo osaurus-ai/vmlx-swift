@@ -7,6 +7,167 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testMeasuredInitialLossParksDirectlyAtAR() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0",
+              ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0" else {
+            throw XCTSkip("Requires controlled governor costs without verify prefetch")
+        }
+        try FocusedMLXTestSupport.withLock {
+            for depth in 1...3 {
+                let model = DepthDispatchTarget(sequence: true, backboneDelay: 0.010)
+                model.setVerifyDelays([2: 0.080, 3: 0.120, 4: 0.160])
+                var parameters = GenerateParameters(maxTokens: 100, temperature: 0)
+                parameters.draftStrategy = .nativeMTP(depth: depth)
+                var iterator = try NativeMTPTokenIterator(
+                    input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                    parameters: parameters, depth: depth)
+                let started = ProcessInfo.processInfo.systemUptime
+                var tokens: [Int] = []
+                while iterator.verifyCalls < 6, let token = iterator.next() {
+                    tokens.append(token)
+                }
+                XCTAssertEqual(iterator.arSafetyTrips, 1,
+                    "A measured loss must park at AR, not try another unqualified depth")
+                // Drain already verified tokens; the next computation must be AR.
+                for _ in 0...depth {
+                    if iterator.autoregressiveFallbackTokenCount > 2 { break }
+                    if let token = iterator.next() { tokens.append(token) }
+                }
+                XCTAssertEqual(iterator.verifyCalls, 6)
+                XCTAssertEqual(iterator.autoregressiveFallbackTokenCount, 3)
+                XCTAssertEqual(tokens, (0..<tokens.count).map { (2 + $0) % 32 })
+                XCTAssertTrue(model.verifyWidths.allSatisfy { $0 <= depth + 1 })
+                print("DIRECT-AR depth=\(depth) fixtureTokS=\(Double(tokens.count) / max(ProcessInfo.processInfo.systemUptime - started, 1e-9)) realModelSpeedProof=false")
+            }
+        }
+    }
+
+    func testInitialDepthIsMeasuredAsAProbe() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0",
+              ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0" else {
+            throw XCTSkip("Requires controlled governor costs without verify prefetch")
+        }
+        try FocusedMLXTestSupport.withLock {
+            let model = DepthDispatchTarget(sequence: true, backboneDelay: 0.010)
+            model.setVerifyDelays([2: 0.080, 3: 0.120, 4: 0.160])
+            var parameters = GenerateParameters(maxTokens: 100, temperature: 0)
+            parameters.draftStrategy = .nativeMTP(depth: 3)
+            var iterator = try NativeMTPTokenIterator(
+                input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                parameters: parameters, depth: 3)
+            let started = ProcessInfo.processInfo.systemUptime
+            var tokens: [Int] = []
+            while iterator.verifyCalls < 6, let token = iterator.next() {
+                tokens.append(token)
+            }
+            XCTAssertEqual(tokens, (0..<tokens.count).map { (2 + $0) % 32 })
+            XCTAssertEqual(iterator.verifyCalls, 6)
+            XCTAssertGreaterThan(iterator.adaptiveDepthDownshiftCount + iterator.arSafetyTrips, 0,
+                "The initial losing trial must be judged as a probe, not wait for warmup plus a window")
+            print("INITIAL-PROBE verifies=\(iterator.verifyCalls) fixtureTokS=\(Double(tokens.count) / max(ProcessInfo.processInfo.systemUptime - started, 1e-9)) realModelSpeedProof=false")
+        }
+    }
+
+    func testSampledStagedDispatchRequiresModelOptIn() throws {
+        try FocusedMLXTestSupport.withLock {
+            for enabled in [false, true] {
+                let model = DepthDispatchTarget(sequence: true)
+                model.nativeMTPSampledStagedVerificationEnabled = enabled
+                var parameters = GenerateParameters(maxTokens: 24, temperature: 1)
+                parameters.randomSeed = 829
+                parameters.draftStrategy = .nativeMTP(depth: 3)
+                var iterator = try NativeMTPTokenIterator(
+                    input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                    parameters: parameters, depth: 3)
+                var tokens: [Int] = []
+                let started = ProcessInfo.processInfo.systemUptime
+                while let token = iterator.next() { tokens.append(token) }
+                XCTAssertEqual(tokens, (0..<24).map { (2 + $0) % 32 })
+                XCTAssertEqual(iterator.stagedVerifierCommitCount > 0, enabled)
+                print("SAMPLED-STAGED optIn=\(enabled) fixtureTokS=\(Double(tokens.count) / max(ProcessInfo.processInfo.systemUptime - started, 1e-9)) dispatchOnly=true realModelSpeedProof=false")
+            }
+        }
+    }
+
+    func testSampledChunkDecisionCarriesEmittedTokenIDs() throws {
+        try FocusedMLXTestSupport.withLock {
+            for rejectionCase in 0...2 {
+                let model = DepthDispatchTarget(sequence: true)
+                model.setWrongDraft(rejectionCase == 1)
+                if rejectionCase == 2 {
+                    // Governor seeding advances the first speculative block.
+                    // Put the wrong proposal at its second draft in either mode.
+                    let governorOff = ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] == "0"
+                    model.setWrongDraftInput(governorOff ? 4 : 6)
+                }
+                var parameters = GenerateParameters(maxTokens: 24, temperature: 1)
+                parameters.randomSeed = 829
+                // This fixture has no recurrent prefix snapshots. Exercise
+                // chunk acceptance with checkpoint/replay, rather than claiming
+                // it implements a real hybrid model's prefix-commit protocol.
+                parameters.draftStrategy = .nativeMTP(depth: 3, verifierMode: "chunk_replay")
+                var iterator = try NativeMTPTokenIterator(
+                    input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                    parameters: parameters, depth: 3)
+                var tokens: [Int] = []
+                let started = ProcessInfo.processInfo.systemUptime
+                while let token = iterator.next() { tokens.append(token) }
+                XCTAssertEqual(tokens, (0..<24).map { (2 + $0) % 32 })
+                XCTAssertGreaterThan(iterator.chunkVerifierCount, 0)
+                if rejectionCase != 0 {
+                    XCTAssertGreaterThan(iterator.residualCorrectionCount, 0)
+                } else {
+                    XCTAssertGreaterThan(iterator.bonusCount, 0)
+                }
+                if rejectionCase == 2 {
+                    XCTAssertGreaterThan(iterator.acceptedByDepth[1, default: 0], 0,
+                        "Must reject after accepting one draft, not just at index zero")
+                }
+                print("SAMPLED-CHUNK rejectionCase=\(rejectionCase) accepted=\(iterator.acceptedByDepth) fixtureTokS=\(Double(tokens.count) / max(ProcessInfo.processInfo.systemUptime - started, 1e-9)) realModelSpeedProof=false")
+            }
+        }
+    }
+
+    func testProductiveCalibrationResumesPriorDepth() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0",
+              ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0" else {
+            throw XCTSkip("Requires governor on and prefetch off for controlled cost observation")
+        }
+        try FocusedMLXTestSupport.withLock {
+            for depth in 1...3 {
+                let model = DepthDispatchTarget(sequence: true, backboneDelay: 0.010)
+                var parameters = GenerateParameters(maxTokens: 340, temperature: 0)
+                parameters.draftStrategy = .nativeMTP(depth: depth)
+                var iterator = try NativeMTPTokenIterator(
+                    input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                    parameters: parameters, depth: depth)
+                var tokens: [Int] = []
+                var widthsBeforeCalibration: Int?
+                var resumedWidth: Int?
+                let started = ProcessInfo.processInfo.systemUptime
+                while tokens.count < 340, let token = iterator.next() {
+                    tokens.append(token)
+                    if iterator.autoregressiveFallbackTokenCount > 2,
+                       widthsBeforeCalibration == nil {
+                        widthsBeforeCalibration = model.verifyWidths.count
+                    }
+                    if let before = widthsBeforeCalibration,
+                       model.verifyWidths.count > before, resumedWidth == nil {
+                        resumedWidth = model.verifyWidths[before]
+                    }
+                }
+                XCTAssertEqual(tokens, (0..<340).map { (2 + $0) % 32 })
+                XCTAssertNotNil(widthsBeforeCalibration, "Must exercise real productive AR calibration")
+                XCTAssertEqual(iterator.autoregressiveFallbackTokenCount, 4,
+                    "Expected two seed and two calibration steps, not an unrelated loss recovery")
+                XCTAssertEqual(resumedWidth, depth + 1, "Calibration must retain the productive depth")
+                XCTAssertEqual(iterator.arSafetyResumes, 1,
+                    "Initial admission must not be counted as resuming a parked decoder")
+                print("CALIBRATION-RESUME depth=\(depth) width=\(String(describing: resumedWidth)) fixtureTokS=\(Double(tokens.count) / max(ProcessInfo.processInfo.systemUptime - started, 1e-9)) realModelSpeedProof=false")
+            }
+        }
+    }
+
     func testSampledRejectionPauseCanProbeAfterProposalQualityChanges() throws {
         guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
             throw XCTSkip("Requires the real governor")
@@ -46,8 +207,11 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
             throw XCTSkip("Controlled host-cost row: governor on, verify prefetch off; prefetch parity is separate")
         }
         try FocusedMLXTestSupport.withLock {
-            let model = DepthDispatchTarget(sequence: true, backboneDelay: 0.004)
-            model.setVerifyDelays([2: 0.001, 3: 0.040, 4: 0.080])
+            // Deliberately separate cost regimes from sub-millisecond dispatch
+            // and timer jitter. D3/D2 initially lose to AR, D1 wins; afterward
+            // equal verify costs make each wider accepted block cheaper/token.
+            let model = DepthDispatchTarget(sequence: true, backboneDelay: 0.020)
+            model.setVerifyDelays([2: 0.012, 3: 0.160, 4: 0.320])
             var parameters = GenerateParameters(maxTokens: 480, temperature: 0)
             parameters.draftStrategy = .nativeMTP(depth: 3)
             var iterator = try NativeMTPTokenIterator(
@@ -61,10 +225,11 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
                 if tokens.count == 240 {
                     let widths = model.verifyWidths
                     XCTAssertTrue(widths.contains(4))
-                    XCTAssertTrue(widths.contains(3), "D3 must descend through D2")
+                    XCTAssertGreaterThan(iterator.arSafetyTrips, 0,
+                        "Losing D3 must park before probing a lower depth")
                     XCTAssertTrue(widths.contains(2), "D1 should be discovered")
                     widthsAtChange = widths.count
-                    model.setVerifyDelays([2: 0.001, 3: 0.001, 4: 0.001])
+                    model.setVerifyDelays([2: 0.012, 3: 0.012, 4: 0.012])
                 }
             }
             let recovered = Array(model.verifyWidths.dropFirst(widthsAtChange))
@@ -164,11 +329,13 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
 {
     var kvHeads: [Int] { sequence ? [1, 1] : [1] }
     var nativeMTPAvailable: Bool { true }
+    var nativeMTPSampledStagedVerificationEnabled = false
     private let timingLock = NSLock()
     private var widths: [Int] = []
     var verifyWidths: [Int] { timingLock.withLock { widths } }
     private var delaysByWidth: [Int: TimeInterval] = [:]
     private var wrongDraft = false
+    private var wrongDraftInput: Int?
     let sequence: Bool
     let verifyDelay: TimeInterval
     let backboneDelay: TimeInterval
@@ -181,6 +348,7 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
         timingLock.withLock { delaysByWidth = values }
     }
     func setWrongDraft(_ value: Bool) { timingLock.withLock { wrongDraft = value } }
+    func setWrongDraftInput(_ value: Int) { timingLock.withLock { wrongDraftInput = value } }
     func newCache(parameters: GenerateParameters?) -> [KVCache] {
         sequence ? [MambaCache(), KVCacheSimple()] : [MambaCache()]
     }
@@ -208,7 +376,10 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
         return result(inputs)
     }
     func nativeMTPForward(hiddenStates: MLXArray, nextTokenIds: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
-        if timingLock.withLock({ wrongDraft }) {
+        let shouldReject = timingLock.withLock {
+            wrongDraft || wrongDraftInput.map { nextTokenIds.reshaped(-1)[0].item(Int.self) == $0 } == true
+        }
+        if shouldReject {
             let length = nextTokenIds.size
             return .init(logits: broadcast(MLXArray([Float(100)] + Array(repeating: Float(-100), count: 31)), to: [1, length, 32]),
                          hiddenStates: MLXArray.zeros([1, length, 4]))
