@@ -868,6 +868,11 @@ enum Qwen4ExpQSARuntime {
     nonisolated(unsafe) static var poolCache: Bool = {
         ProcessInfo.processInfo.environment["VMLX_QSA_POOL_CACHE"] != "0"
     }()
+
+    // Flash-Next-only qualification boundary. Other Qwen models keep their
+    // existing RotaryEmbedding default; explicit media positions are unchanged.
+    static let textPositionFastPath =
+        RuntimeEnvironment.value("VMLX_QWEN4_EXP_TEXT_ROPE_FAST_PATH") != "0"
 }
 
 private final class Qwen4ExpQSAIndexer: Module {
@@ -895,7 +900,8 @@ private final class Qwen4ExpQSAIndexer: Module {
         // runtime's mrope_section=[11, 11, 10] contract.
         rotary = Qwen35Language.RotaryEmbedding(
             dim: Int(Float(text.headDim ?? 256) * text.partialRotaryFactor),
-            base: text.ropeTheta, mropeSection: config.extras.mropeSection)
+            base: text.ropeTheta, mropeSection: config.extras.mropeSection,
+            textPositionFastPath: Qwen4ExpQSARuntime.textPositionFastPath)
         super.init()
     }
 
@@ -1002,7 +1008,8 @@ private final class Qwen4ExpAttention: Module {
         _indexer.wrappedValue = Qwen4ExpQSAIndexer(config)
         rotary = Qwen35Language.RotaryEmbedding(
             dim: Int(Float(headDim) * text.partialRotaryFactor),
-            base: text.ropeTheta, mropeSection: config.extras.mropeSection)
+            base: text.ropeTheta, mropeSection: config.extras.mropeSection,
+            textPositionFastPath: Qwen4ExpQSARuntime.textPositionFastPath)
         super.init()
     }
 

@@ -1141,14 +1141,19 @@ enum Qwen35Language {
     final class RotaryEmbedding {
         private let invFreq: MLXArray
         private let mropeSection: [Int]
+        private let textPositionFastPath: Bool
 
-        init(dim: Int, base: Float, mropeSection: [Int]) {
+        init(
+            dim: Int, base: Float, mropeSection: [Int],
+            textPositionFastPath: Bool = false
+        ) {
             let safeDim = max(1, dim)
             var freq = MLXArray(stride(from: 0, to: safeDim, by: 2)).asType(.float32)
             freq = freq / Float(safeDim)
             self.invFreq = 1.0 / pow(MLXArray(base), freq)
             self.mropeSection =
                 mropeSection.count >= 3 ? mropeSection : [11, 11, 10]
+            self.textPositionFastPath = textPositionFastPath
         }
 
         private func applyInterleavedMRope(_ freqs: MLXArray) -> MLXArray {
@@ -1173,6 +1178,18 @@ enum Qwen35Language {
         }
 
         func callAsFunction(x: MLXArray, positionIds: MLXArray) -> (MLXArray, MLXArray) {
+            if textPositionFastPath, positionIds.ndim == 2 {
+                // A [B,S] text position is broadcast identically to all three
+                // M-RoPE channels. Selecting a channel for each frequency is
+                // therefore redundant. Preserve the original FP32 elementwise
+                // product, trig operations and final dtype; no K=1 matmul or
+                // collapsed media positions. Explicit [3,B,S] positions below
+                // retain the full interleaved path, including after media.
+                let freqs = positionIds.asType(.float32)[0..., 0..., .newAxis]
+                    * invFreq.asType(.float32)[.newAxis, .newAxis, 0...]
+                let emb = concatenated([freqs, freqs], axis: -1)
+                return (cos(emb).asType(x.dtype), sin(emb).asType(x.dtype))
+            }
             var positionIds = positionIds
             if positionIds.ndim == 2 {
                 positionIds = broadcast(
