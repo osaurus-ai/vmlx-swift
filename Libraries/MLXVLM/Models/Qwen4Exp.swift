@@ -868,6 +868,11 @@ enum Qwen4ExpQSARuntime {
     nonisolated(unsafe) static var poolCache: Bool = {
         ProcessInfo.processInfo.environment["VMLX_QSA_POOL_CACHE"] != "0"
     }()
+
+    // Flash-Next-only qualification boundary. Other Qwen models keep their
+    // existing RotaryEmbedding default; explicit media positions are unchanged.
+    static let textPositionFastPath =
+        RuntimeEnvironment.value("VMLX_QWEN4_EXP_TEXT_ROPE_FAST_PATH") != "0"
 }
 
 private final class Qwen4ExpQSAIndexer: Module {
@@ -895,7 +900,8 @@ private final class Qwen4ExpQSAIndexer: Module {
         // runtime's mrope_section=[11, 11, 10] contract.
         rotary = Qwen35Language.RotaryEmbedding(
             dim: Int(Float(text.headDim ?? 256) * text.partialRotaryFactor),
-            base: text.ropeTheta, mropeSection: config.extras.mropeSection)
+            base: text.ropeTheta, mropeSection: config.extras.mropeSection,
+            textPositionFastPath: Qwen4ExpQSARuntime.textPositionFastPath)
         super.init()
     }
 
@@ -1002,7 +1008,8 @@ private final class Qwen4ExpAttention: Module {
         _indexer.wrappedValue = Qwen4ExpQSAIndexer(config)
         rotary = Qwen35Language.RotaryEmbedding(
             dim: Int(Float(headDim) * text.partialRotaryFactor),
-            base: text.ropeTheta, mropeSection: config.extras.mropeSection)
+            base: text.ropeTheta, mropeSection: config.extras.mropeSection,
+            textPositionFastPath: Qwen4ExpQSARuntime.textPositionFastPath)
         super.init()
     }
 
@@ -1575,7 +1582,26 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
 
         guard input.image != nil || input.video != nil else {
             setRopeDelta(0, for: cache)
-            return .logits(LMOutput(logits: callAsFunction(inputIds, cache: cache)))
+            // Native MTP calls prepare directly, unlike the batch AR lane's
+            // outer segmentation. Honor the same prefill budget here so a
+            // cold or required-tool request cannot materialize a whole long
+            // prompt's expert activations and vocabulary logits at once.
+            let tokens = inputIds.ndim == 1 ? inputIds.expandedDimensions(axis: 0) : inputIds
+            let step = windowSize ?? 512
+            let count = tokens.dim(1)
+            var offset = 0
+            if step > 0 {
+                while count - offset > step {
+                    try Task.checkCancellation()
+                    _ = callAsFunction(tokens[0..., offset..<(offset + step)], cache: cache)
+                    MLX.eval(cache)
+                    offset += step
+                    PrefillProgressReporter.reportCompletedUnits(offset)
+                    MLX.Memory.clearCache()
+                }
+            }
+            try Task.checkCancellation()
+            return .logits(LMOutput(logits: callAsFunction(tokens[0..., offset...], cache: cache)))
         }
 
         // Media arrived at a model that carries no vision tower. Refuse rather than embed the
