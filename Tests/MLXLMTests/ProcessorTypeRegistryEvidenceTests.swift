@@ -33,7 +33,8 @@ struct ProcessorTypeRegistryEvidenceTests {
         }
     }
 
-    @Test("architecture overrides and configured processor selection share one rule",
+    @Test(
+        "architecture overrides and configured processor selection share one rule",
         arguments: [
             ["mistral3", "PixtralProcessor", "Mistral3Processor"],
             ["ministral3", "PixtralProcessor", "Mistral3Processor"],
@@ -46,7 +47,8 @@ struct ProcessorTypeRegistryEvidenceTests {
         let resolved = VLMProcessorTypeRegistry.processorType(
             modelType: row[0], declaredProcessorType: row[1])
         #expect(resolved == row[2])
-        #expect(VLMProcessorTypeRegistry.shared.containsProcessorType(resolved)
-            == (resolved != "NotAnInstalledProcessor"))
+        #expect(
+            VLMProcessorTypeRegistry.shared.containsProcessorType(resolved)
+                == (resolved != "NotAnInstalledProcessor"))
     }
 }
