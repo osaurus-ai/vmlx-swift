@@ -203,3 +203,23 @@ all dtype/residency assertions remain (`glm-resident-policy-green.log`).
 The complete LoadConfiguration rerun passed 42 tests in two suites
 (`glm-resident-policy-green-2.log`). Public-pin and UI evidence for this
 additional process-policy correction remains pending.
+
+## September 15 processor admission follow-up — source prepared
+
+The paired Osaurus header-only probe found three false positives: unknown processor
+class, invalid safetensors dtype, and shape/payload byte mismatch. The probe scored
+5/8; these findings are independent of the GLM reasoning-only streamed response.
+`ProcessorTypeRegistry` now exposes synchronous membership/version from the same
+locked creator table used by construction. Registration updates invalidate cached
+admission evidence. `VLMProcessorTypeRegistry.processorType` centralizes the existing
+four architecture overrides; the factory and paired app use that same resolver.
+No catalog-name fallback or new processor allowlist is introduced.
+
+New `ProcessorTypeRegistryEvidenceTests` cover missing registration, live creator
+selection after registration, version changes, and override resolution. These tests
+have NOT executed yet: the inherited bounded local supervisor refused at normal
+pressure,48.1GiBkernel-free and7.48GiBswap versus2GiBcutoff, exit3 with zero owned
+processes left. Receipt `SWIFTTEST_VisionProcessorRegistryTests0915__022706.log` in
+`/Users/eric/vmlx-private-evidence/ornith-vision-2026-09-14/`. The previous42+65+9
+focused results and28/33image sweep precede this follow-up. Compilation, tests,
+installed-model reproof and combined nativeUI remain required. Do not promote yet.
