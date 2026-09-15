@@ -27,6 +27,8 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
     public var arraysLayerCount: Int
     public var zayaCCALayerCount: Int
     public var cacheListLayerCount: Int
+    /// Optional for decoding telemetry written before custom disk contracts.
+    public private(set) var diskCacheStateIdentifiers: [String]?
 
     public init(
         layerCount: Int = 0,
@@ -106,6 +108,7 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
 
     public var requiresDiskBackedCoordinatorRestore: Bool {
         requiresSSMCompanionState
+            || !(diskCacheStateIdentifiers ?? []).isEmpty
             || rotatingKVLayerCount > 0
             || compilableRotatingKVLayerCount > 0
             || rotatingWrapperLayerCount > 0
@@ -117,6 +120,9 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
 
     public var topologyTags: [String] {
         var tags: [String] = ["layers=\(layerCount)"]
+        for identifier in diskCacheStateIdentifiers ?? [] {
+            tags.append("diskState=\(identifier)")
+        }
         if kvLayerCount > 0 { tags.append("kvLayers=\(kvLayerCount)") }
         if chunkedKVLayerCount > 0 { tags.append("chunkedKVLayers=\(chunkedKVLayerCount)") }
         if quantizedKVLayerCount > 0 { tags.append("quantizedKVLayers=\(quantizedKVLayerCount)") }
@@ -143,6 +149,13 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
     }
 
     private mutating func record(_ cache: any KVCache) {
+        if let custom = cache as? any DiskCacheStateProviding {
+            // Hosts include these tags in cache keys, separating a new
+            // complete layout (or runtime mode) from older lossy records.
+            var identifiers = Set(diskCacheStateIdentifiers ?? [])
+            identifiers.insert(custom.diskCacheStateIdentifier)
+            diskCacheStateIdentifiers = identifiers.sorted()
+        }
         switch cache {
         case let list as CacheList:
             cacheListLayerCount += 1

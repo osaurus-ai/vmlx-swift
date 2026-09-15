@@ -83,6 +83,9 @@ struct MambaPersistentDiskTests {
         defer { try? FileManager.default.removeItem(at: path) }
         try savePromptCache(url: path, cache: [source])
         let (arrays, originalMetadata) = try loadArraysAndMetadata(url: path)
+        // These arrays read lazily from path. Finish that read before the
+        // corruption loop overwrites the same file with altered metadata.
+        MLX.eval(arrays)
         for damage in 0..<5 {
             var metadata = originalMetadata
             switch damage {

@@ -1937,7 +1937,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // entry).
                     let diskRestored = MLXCacheIOLock.withSerializedMLXCacheIO {
                         () -> Int in
-                        let count = restoreFromDiskArrays(diskArrays, into: &self.cache)
+                        let count = restoreFromDiskArrays(
+                                diskArrays, into: &self.cache, requirePromptBoundary: true)
                         if count > 0 {
                             // The v2 disk format has NO LayerKind for the
                             // GatedDeltaNet linear-attention (ArraysCache) state

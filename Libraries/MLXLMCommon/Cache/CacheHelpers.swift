@@ -172,6 +172,9 @@ public func validateRestoredCacheBoundary(
         // Always visible: a refused restore is the difference between one
         // extra prefill and a whole corrupted continuation.
         FileHandle.standardError.write(Data((message + "\n").utf8))
+    } else if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] != nil {
+        FileHandle.standardError.write(Data(
+            "[vmlx][cache/restore] ACCEPTED detail=\(detail) boundary=\(matchedTokens) layers=\(cache.count)\n".utf8))
     }
     return consistent
 }
@@ -209,7 +212,8 @@ public func cacheRequiresDiskBackedCoordinatorRestore(_ cache: [any KVCache]) ->
         return true
     }
     return cache.contains { layer in
-        layer is HybridPoolCache ||
+        layer is DiskCacheStateProviding ||
+            layer is HybridPoolCache ||
             layer is RotatingKVCache ||
             layer is RotatingKVCacheWrapper ||
             layer is TurboQuantKVCache ||
@@ -576,7 +580,8 @@ public func restoreLayerData(from blocks: [CacheBlock], into cache: [any KVCache
     let totalTokens = blocks.reduce(0) { $0 + $1.tokenCount }
     if let companion = blocks.last?.boundaryCompanionData {
         var mutableCache = cache
-        let companionTokens = restoreFromDiskArrays(companion, into: &mutableCache)
+        let companionTokens = restoreFromDiskArrays(
+            companion, into: &mutableCache, requirePromptBoundary: true)
         guard companionTokens == totalTokens else { return 0 }
     }
     return totalTokens
@@ -778,8 +783,26 @@ public func restoreSSMStates(
 /// - Returns: The total number of tokens restored, measured from the first
 ///   attention layer's key tensor sequence dim, or `0` if nothing matched.
 @discardableResult
-public func restoreFromDiskArrays(_ arrays: [String: MLXArray], into cache: inout [any KVCache]) -> Int {
+public func restoreFromDiskArrays(
+    _ arrays: [String: MLXArray], into cache: inout [any KVCache],
+    requirePromptBoundary: Bool = false
+) -> Int {
+    // A later layer may reject an entry after earlier recurrent layers have
+    // been seated. A miss must leave the live cache untouched: callers then
+    // prefill the full prompt, which would otherwise advance restored SSM
+    // state twice. Stage every format, including unsupported custom layers.
     let version = TQDiskSerializer.formatVersion(of: arrays)
+    if requirePromptBoundary {
+        var staged = cache.map { $0.copy() }
+        let restored = version >= 2
+            ? restoreFromV2Arrays(arrays, into: &staged)
+            : restoreFromLegacyArrays(arrays, into: staged)
+        guard restored > 0 else { return 0 }
+    }
+    // Keep object identity for callers that retain references to individual
+    // layers (including CacheList children). The staged pass has validated
+    // the entire payload for generation. Low-level snapshot users can still
+    // round-trip valid zero-offset state without claiming a prompt-cache hit.
     if version >= 2 {
         return restoreFromV2Arrays(arrays, into: &cache)
     }
@@ -956,6 +979,13 @@ private func restoreFromV2Arrays(
                 totalTokens = keys.dim(2)
             }
 
+        case .modelState(let header, let arrays):
+            guard let custom = cache[i] as? any DiskCacheStateProviding,
+                custom.diskCacheStateIdentifier == header.identifier,
+                custom.restoreDiskCacheState(arrays, metadata: header.metadata, offset: header.offset)
+            else { return 0 }
+            if totalTokens == 0 { totalTokens = header.offset }
+
         case .mamba(let comp):
             // Mamba state arrays are cumulative — no sequence dim to
             // measure, so they don't contribute to `totalTokens`. The
@@ -1095,7 +1125,7 @@ private func restoreFromV2Arrays(
                     }
 
                 case .tq, .qkv, .deepseekV4, .zayaCCA, .zayaCCATQ, .cacheList,
-                     .qsaKV, .requiredMiss, .skip:
+                     .qsaKV, .modelState, .requiredMiss, .skip:
                     // .skip is a per-sub no-op (sub-cache had no
                     // persistable state). The other cases (incl. .qsaKV —
                     // no model nests a QSAKVCache inside a CacheList) are

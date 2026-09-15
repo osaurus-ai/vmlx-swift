@@ -220,6 +220,30 @@ public enum VLMTypeRegistry {
 
 public enum VLMProcessorTypeRegistry {
 
+    /// Resolve the configured architecture's processor exactly as the factory does.
+    /// This is also used by header-only admission; catalog/model display names are not inputs.
+    public static func processorType(modelType: String, declaredProcessorType: String) -> String {
+        // Override processor type based on model type for models that need special handling
+        // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
+        // to handle spatial merging correctly. Nemotron-Omni bundles use a custom
+        // image_processor_type that doesn't map to processor_class — force the
+        // NemotronHOmniProcessor when we've detected the omni bundle.
+        let processorTypeOverrides: [String: String] = [
+            "mistral3": "Mistral3Processor",
+            // Mistral 3.5 VLM bundles can carry the outer model_type
+            // `ministral3` (the inner text decoder spelling promoted to
+            // the outer level). Their preprocessor_config.json still
+            // ships `processor_class: "PixtralProcessor"`, which loses
+            // Mistral3's spatial-merge handling. Force the spatial-merge
+            // processor here for both spellings — same dispatch as
+            // VLMTypeRegistry.dispatchMistral3VLM.
+            "ministral3": "Mistral3Processor",
+            "NemotronH_Nano_Omni_Reasoning_V3": "NemotronHOmniProcessor",
+            "nemotron_h_omni": "NemotronHOmniProcessor",
+        ]
+        return processorTypeOverrides[modelType] ?? declaredProcessorType
+    }
+
     /// Shared instance with default processor types.
     public static let shared: ProcessorTypeRegistry = .init(creators: [
         "MuseGlimmerProcessor": create(
@@ -755,26 +779,9 @@ public final class VLMModelFactory: ModelFactory {
                 error.filename, configuration.name, error.underlying)
         }
 
-        // Override processor type based on model type for models that need special handling
-        // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
-        // to handle spatial merging correctly. Nemotron-Omni bundles use a custom
-        // image_processor_type that doesn't map to processor_class — force the
-        // NemotronHOmniProcessor when we've detected the omni bundle.
-        let processorTypeOverrides: [String: String] = [
-            "mistral3": "Mistral3Processor",
-            // Mistral 3.5 VLM bundles can carry the outer model_type
-            // `ministral3` (the inner text decoder spelling promoted to
-            // the outer level). Their preprocessor_config.json still
-            // ships `processor_class: "PixtralProcessor"`, which loses
-            // Mistral3's spatial-merge handling. Force the spatial-merge
-            // processor here for both spellings — same dispatch as
-            // VLMTypeRegistry.dispatchMistral3VLM.
-            "ministral3": "Mistral3Processor",
-            "NemotronH_Nano_Omni_Reasoning_V3": "NemotronHOmniProcessor",
-            "nemotron_h_omni": "NemotronHOmniProcessor",
-        ]
-        let processorType =
-            processorTypeOverrides[dispatchModelType] ?? baseProcessorConfig.processorClass
+        let processorType = VLMProcessorTypeRegistry.processorType(
+            modelType: dispatchModelType,
+            declaredProcessorType: baseProcessorConfig.processorClass)
 
         let baseProcessor = try await processorRegistry.createModel(
             configuration: processorConfigData,

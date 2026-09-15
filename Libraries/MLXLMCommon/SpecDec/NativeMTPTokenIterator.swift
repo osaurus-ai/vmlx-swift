@@ -701,7 +701,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 }
 
                 if let diskArrays, !restored {
-                    let diskRestored = restoreFromDiskArrays(diskArrays, into: &self.cache)
+                    let diskRestored = restoreFromDiskArrays(
+                                diskArrays, into: &self.cache, requirePromptBoundary: true)
                     if diskRestored > 0 {
                         restoredTokenCount = diskRestored
                         let cacheHasArraysState = self.cache.contains {
