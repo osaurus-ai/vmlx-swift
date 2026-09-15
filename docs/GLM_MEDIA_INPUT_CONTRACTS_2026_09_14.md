@@ -135,5 +135,71 @@ five architecture damage-matrix and five QSA persistence tests. An empty
 Mamba child in CacheList is now tagged as skip when it has neither tokens
 nor tensors; the existing empty-composite regression exposed this earlier
 serializer defect. No normal-generation or empty-snapshot checks were
-removed. The ten-architecture real-model follow-up and Release UI proof
-remain pending for this exact candidate.
+removed. The subsequent evidence below supersedes this pending status for engine
+`ffee904d4f4f0680aa6a2c39c3dedff9cedae010`.
+
+
+## September 15 follow-up and process-limit regression
+
+At engine `ffee904d4f4f0680aa6a2c39c3dedff9cedae010`, the additional
+TokenIterator progress and hybrid boundary suites passed four tests, bringing
+the focused cache/input total to 65 (`glm-final-pipeline-regressions.json`).
+The 11-case representative run covered all ten installed architectures:
+ten passed and ZAYA's changed-image history failed. Both complete GLM cases
+passed all seven image/stream/agent/history checks and logged three accepted
+restores each (`glm-v7-architecture-receipt.json`).
+
+A fresh public-dependency build at Osaurus `a4d3405223bfae79b82ee496e414b44585b75c5c`
+then repeated the full installed sweep: 79 inventoried, 33 selected, 28 passed,
+four failed, and one GLM MTP case was deliberately interrupted. Five declared
+vision bundles remained rejected by installed evidence; none were excluded by
+header audit. The failures were Ornith 9B 2D, both ZAYA quantizations, and
+CRACK Qwen3.8 27B 2D. These were already failing models; this does not erase
+previous failures or qualify every installed bundle.
+`glm-public-full-matrix-receipt.json` retains each report and the interruption.
+
+The public non-MTP GLM case returned all seven expected answers, but early
+requests ran at about 0.67 tok/s and later history at 15.6–15.9 tok/s.
+The Release UI also returned Red and Blue for actual changed attachments;
+a retained-image response was cancelled after 171 reasoning tokens with no
+visible answer. The cancellation and next-image recovery were exercised
+through the real controls. Peak UI physical footprint was 99,902 MiB; this
+is not low-RAM qualification. Evidence: `glm-ui-v7-receipt.json`,
+`glm-ui-history-v7.json`, and `glm-release-ui-v7.log`.
+
+The UI model switch from LFM to GLM exposed a separate policy application
+mismatch: `LoadBundleFacts.requiresUncappedResidentPools` selected GLM, but
+`ModelFactory` applied the corresponding process-global reset only to DSV4.
+Resolving `.unlimited` produces no integer assignment, leaving LFM's 70% cap
+active. The added parameterized test reproduces six failing assertions for
+GLM's two aliases, while DSV4 takes the reset path
+(`glm-resident-policy-red.log`). The loader now uses the existing shared
+property for both policy resolution and application, and records previous
+and applied limits when cache tracing is enabled. The native ceiling formula
+and wired-memory reserve are unchanged; ordinary capped models retain their
+existing behavior.
+
+This mismatch does not explain the whole CLI slowdown: both compared CLI
+builds already had the native 95% ceiling. The 70% observation belongs to the
+UI model-switch run. `glm-stale-limit-investigation.json` records that
+correction. No new throughput or low-RAM claim follows from this change.
+The final process-policy candidate still requires its focused tests, public
+pin rebuild, complete installed matrix and Release UI model-switch proof.
+
+The ZAYA native-processor diagnostic is not included. It failed all seven
+answer checks for both installed quantizations, with locked dependencies and
+no test sampler overrides (`zaya-native-locked/results.json`). Publisher
+processor/template/generation metadata matches the installed metadata, but
+that comparison does not prove weight or runtime correctness.
+
+The policy candidate re-ran all 65 cache/input regressions and nine wired-memory
+and safety-level tests successfully (`glm-policy-regressions.json`). Its first
+full LoadConfiguration run passed the new live MLX process-limit assertions
+but exposed one pre-existing source-string assertion still expecting a private
+helper. That helper became internal in `163798115` on September 5. The
+assertion now checks the same signature without the obsolete visibility;
+all dtype/residency assertions remain (`glm-resident-policy-green.log`).
+
+The complete LoadConfiguration rerun passed 42 tests in two suites
+(`glm-resident-policy-green-2.log`). Public-pin and UI evidence for this
+additional process-policy correction remains pending.

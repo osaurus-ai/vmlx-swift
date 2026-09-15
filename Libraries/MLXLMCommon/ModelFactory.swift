@@ -605,10 +605,10 @@ public func loadModel(
         requested: loadConfiguration.useMmapSafetensors)
     let memoryLimit = facts.resolveMLXMemoryLimit(
         requested: loadConfiguration.memoryLimit)
-    let dsv4NativeAllocatorCeiling =
-        applyPlainDeepseekV4ProcessMemoryLimitsIfNeeded(facts: facts)
+    let nativeResidentPoolCeiling =
+        applyResidentPoolProcessMemoryLimitsIfNeeded(facts: facts)
     if loadConfiguration.useMmapSafetensors && !useMmapSafetensors {
-        let reason = "DeepSeek V4 affine JANG selected resident safetensors for production decode"
+        let reason = "Resident affine bundle selected materialized safetensors for production decode"
         FileHandle.standardError.write(
             Data(
                 "[Load] \(reason)\n".utf8))
@@ -616,7 +616,7 @@ public func loadModel(
     if loadConfiguration.memoryLimit != memoryLimit {
         FileHandle.standardError.write(
             Data(
-                "[Load] DeepSeek V4 affine JANG uses RAM admission instead of the decode-throttling MLX memory limit\n"
+                "[Load] Resident affine bundle uses RAM admission instead of the decode-throttling MLX memory limit\n"
                     .utf8))
     }
 
@@ -630,8 +630,8 @@ public func loadModel(
     //    Skipped when `.unlimited` so existing iter-25 in-loader cap
     //    (1 GB during sanitize) is not overridden.
     let priorCap: Int?
-    if dsv4NativeAllocatorCeiling != nil {
-        // DSV4 needs the native freed-buffer reuse pool for decode. Keep the
+    if nativeResidentPoolCeiling != nil {
+        // This policy needs the native freed-buffer reuse pool for decode. Keep the
         // restored ceiling after load instead of putting a stale model-specific
         // cap back in the defer below.
         priorCap = nil
@@ -660,7 +660,7 @@ public func loadModel(
     //     so we never trip Apple's "limit larger than max working set
     //     size" rejection (the original 847a8c7 crash condition). See
     //     docs/WIRED-LIMIT-INVESTIGATION-2026-05-03.md.
-    if dsv4NativeAllocatorCeiling == nil,
+    if nativeResidentPoolCeiling == nil,
         let rawCap =
             memoryLimit
             .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory)
@@ -782,21 +782,21 @@ public func loadModel(
     return (context, runtime)
 }
 
-/// Restore MLX's native process ceilings for plain affine DSV4.
+/// Apply the existing resident-pool policy to MLX's process-wide ceilings.
 ///
-/// `MLX.Memory.memoryLimit` is process-global and intentionally persists after
-/// a model load. A preceding Safe Auto model therefore leaves a 70%-of-RAM
-/// limit behind. DSV4 resolves its requested limit to `.unlimited`, but that
-/// produces no integer assignment and used to leave the stale cap active,
-/// collapsing decode throughput. The allocator cache has the same process-wide
-/// hazard. Reset both to MLX's native ceiling before loading DSV4; Osaurus keeps
-/// ownership of RAM admission before this point.
+/// An `.unlimited` resolved cap produces no integer assignment. Without an
+/// explicit reset, a preceding capped model leaves its limit active for the
+/// next model. Both the loader and policy resolver must use the same bundle
+/// property: selecting this application step by a separate architecture check
+/// left GLM's advertised unlimited policy running under the previous 70% cap.
+/// Pre-load RAM admission remains the host's gate; this restores the native
+/// MLX ceilings only for bundles already selected by that policy.
 @discardableResult
-func applyPlainDeepseekV4ProcessMemoryLimitsIfNeeded(
+func applyResidentPoolProcessMemoryLimitsIfNeeded(
     facts: LoadBundleFacts,
     recommendedWorkingSetBytes: Int? = MLX.GPU.maxRecommendedWorkingSetBytes()
 ) -> Int? {
-    guard facts.isPlainDeepseekV4AffineJANG else { return nil }
+    guard facts.requiresUncappedResidentPools else { return nil }
 
     let physical = Int(clamping: facts.physicalMemory)
     let physical95 = (physical / 20) * 19 + ((physical % 20) * 19) / 20
@@ -807,8 +807,16 @@ func applyPlainDeepseekV4ProcessMemoryLimitsIfNeeded(
         return recommendedWorkingSetBytes + half
     }()
     let nativeCeiling = max(1 << 30, min(physical95, recommended150))
+    let previousMemoryLimit = MLX.Memory.memoryLimit
+    let previousCacheLimit = MLX.Memory.cacheLimit
     MLX.Memory.memoryLimit = nativeCeiling
     MLX.Memory.cacheLimit = nativeCeiling
+    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] != nil {
+        FileHandle.standardError.write(Data(
+            ("[Load] resident-pool limits model_type=\(facts.modelType ?? "unknown") "
+                + "previous_memory=\(previousMemoryLimit) previous_cache=\(previousCacheLimit) "
+                + "native_ceiling=\(nativeCeiling)\n").utf8))
+    }
     return nativeCeiling
 }
 

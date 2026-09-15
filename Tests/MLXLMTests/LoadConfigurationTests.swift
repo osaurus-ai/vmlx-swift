@@ -252,7 +252,7 @@ struct LoadConfigurationTests {
         #expect(source.contains("let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)"))
         #expect(source.contains("!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16"))
         #expect(source.contains("|| autoJANGTQMmapBFloat16"))
-        #expect(source.contains("private func requiresJANGTQMmapBFloat16(_ modelDirectory: URL) -> Bool"))
+        #expect(source.contains("func requiresJANGTQMmapBFloat16(_ modelDirectory: URL) -> Bool"))
         #expect(source.contains("modelType == \"nemotron_h\""))
         #expect(source.contains("modelType == \"qwen3_5_moe\""))
         #expect(source.contains("modelType == \"qwen3_5_moe_text\""))
@@ -290,8 +290,9 @@ struct LoadConfigurationTests {
         #expect(s.memoryLimit == target)
     }
 
-    @Test("DSV4 clears stale process-wide MLX limits")
-    func dsv4ClearsStaleProcessLimits() {
+    @Test("Resident-pool policy clears stale process-wide MLX limits",
+          arguments: ["deepseek_v4", "glm5_next", "glm5_next_text"])
+    func residentPoolPolicyClearsStaleProcessLimits(modelType: String) {
         let priorMemoryLimit = MLX.Memory.memoryLimit
         let priorCacheLimit = MLX.Memory.cacheLimit
         defer {
@@ -304,15 +305,17 @@ struct LoadConfigurationTests {
             totalSafetensorsBytes: 95 * gib,
             isRouted: true,
             physicalMemory: 128 * gib,
-            modelType: "deepseek_v4",
+            modelType: modelType,
             weightFormat: "affine",
             hasJangConfig: true,
             numRoutedExperts: 256,
             topK: 8)
+        #expect(facts.requiresUncappedResidentPools)
+        #expect(facts.resolveMLXMemoryLimit(requested: .fraction(0.7)) == .unlimited)
         MLX.Memory.memoryLimit = Int(128 * gib * 7 / 10)
         MLX.Memory.cacheLimit = 128 << 20
 
-        let restored = applyPlainDeepseekV4ProcessMemoryLimitsIfNeeded(
+        let restored = applyResidentPoolProcessMemoryLimitsIfNeeded(
             facts: facts,
             recommendedWorkingSetBytes: Int(80 * gib))
 
@@ -321,8 +324,8 @@ struct LoadConfigurationTests {
         #expect(MLX.Memory.cacheLimit == restored)
     }
 
-    @Test("non-DSV4 load does not rewrite process-wide MLX limits")
-    func nonDSV4DoesNotRewriteProcessLimits() {
+    @Test("A capped model does not reset process-wide MLX limits")
+    func cappedModelDoesNotResetProcessLimits() {
         let priorMemoryLimit = MLX.Memory.memoryLimit
         let priorCacheLimit = MLX.Memory.cacheLimit
         defer {
@@ -339,7 +342,7 @@ struct LoadConfigurationTests {
         MLX.Memory.memoryLimit = Int(64 * gib)
         MLX.Memory.cacheLimit = Int(2 * gib)
 
-        let restored = applyPlainDeepseekV4ProcessMemoryLimitsIfNeeded(
+        let restored = applyResidentPoolProcessMemoryLimitsIfNeeded(
             facts: facts,
             recommendedWorkingSetBytes: Int(80 * gib))
 
