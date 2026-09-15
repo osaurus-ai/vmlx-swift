@@ -76,6 +76,15 @@ public protocol KVCache: Evaluatable, Updatable {
     func copy() -> any KVCache
 }
 
+/// Opt-in disk persistence for cache implementations with model-owned
+/// companion tensors. The identifier versions the complete state layout,
+/// including runtime modes that change its meaning. Restoration must validate
+/// every tensor and metadata field before accepting the prompt boundary.
+public protocol DiskCacheStateProviding: KVCache {
+    var diskCacheStateIdentifier: String { get }
+    func restoreDiskCacheState(_ state: [MLXArray], metadata: [String], offset: Int) -> Bool
+}
+
 /// Materialize an OWNED copy of a cache state array for `copy()`.
 ///
 /// The previous idiom, `x[.ellipsis]`, is a slice — and `Slice::eval` shares

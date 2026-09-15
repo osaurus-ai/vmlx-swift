@@ -139,6 +139,8 @@ public enum TQDiskSerializer {
         /// pre-fix entry) must be refused on restore, never seated.
         /// Added 2026-08-28.
         case qsaKV = 11
+        /// Complete model-owned state, validated by a runtime protocol contract.
+        case modelState = 12
         /// Cache type we don't know how to persist. On restore, treated as
         /// a forced miss for the affected layer only.
         case skip = 4
@@ -264,6 +266,22 @@ public enum TQDiskSerializer {
             {
                 serializeTQLayer(tq, index: i, into: &result)
                 result[kindKey(for: i)] = kindArray(.tq)
+            } else if let custom = layer as? any DiskCacheStateProviding {
+                let state = custom.state
+                let header = ModelStateHeader(
+                    identifier: custom.diskCacheStateIdentifier, count: state.count,
+                    metadata: custom.metaState, offset: custom.offset)
+                if !state.isEmpty, custom.offset > 0,
+                    let encoded = try? JSONEncoder().encode(header)
+                {
+                    result["model_\(i)_header"] = MLXArray(Array(encoded))
+                    for (j, array) in state.enumerated() {
+                        result["model_\(i)_state_\(j)"] = array
+                    }
+                    result[kindKey(for: i)] = kindArray(.modelState)
+                } else {
+                    result[kindKey(for: i)] = kindArray(.skip)
+                }
             } else if let mamba = layer as? MambaCache {
                 serializeMambaLayer(mamba, index: i, into: &result)
                 result[kindKey(for: i)] = kindArray(.mamba)
@@ -567,6 +585,10 @@ public enum TQDiskSerializer {
             let sub = list[j]
 
             if let mamba = sub as? MambaCache {
+                guard mamba.offset > 0 || !mamba.state.isEmpty else {
+                    result[subKindKey(layer: i, sub: j)] = kindArray(.skip)
+                    continue
+                }
                 serializeMambaState(mamba, prefix: "mamba_\(i)_sub_\(j)", into: &result)
                 result[subKindKey(layer: i, sub: j)] = kindArray(.mamba)
                 anyPersisted = true
@@ -975,11 +997,19 @@ public enum TQDiskSerializer {
         public let batchSize: Int
     }
 
+    public struct ModelStateHeader: Codable {
+        public let identifier: String
+        public let count: Int
+        public let metadata: [String]
+        public let offset: Int
+    }
+
     /// Result of deserializing one cache layer from a dict.
     public indirect enum LayerData {
         case tq(TQLayerComponents)
         case standard(KVLayerComponents)
         case qsaKV(QSAKVLayerComponents)
+        case modelState(ModelStateHeader, [MLXArray])
         case mamba(MambaLayerComponents)
         case qkv(QKVLayerComponents)
         case rotating(RotatingLayerComponents)
@@ -1105,6 +1135,20 @@ public enum TQDiskSerializer {
                     // turn it into a false mixed-topology hit.
                     out.append(IndexedLayerData(index: i, data: .requiredMiss))
                 }
+            case .modelState:
+                guard let bytes = arrays["model_\(i)_header"], bytes.dtype == .uint8,
+                    bytes.ndim == 1, bytes.size <= 65536,
+                    let header = try? JSONDecoder().decode(
+                        ModelStateHeader.self, from: Data(bytes.asArray(UInt8.self))),
+                    header.count > 0, header.count <= 1024, header.offset > 0
+                else {
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
+                    continue
+                }
+                let state = (0..<header.count).compactMap { arrays["model_\(i)_state_\($0)"] }
+                out.append(IndexedLayerData(
+                    index: i,
+                    data: state.count == header.count ? .modelState(header, state) : .requiredMiss))
             case .qsaKV:
                 if let keys = arrays["kv_\(i)_keys"],
                    let values = arrays["kv_\(i)_values"],
@@ -1536,7 +1580,7 @@ public enum TQDiskSerializer {
                 }
             case .skip, .unknown:
                 subs.append(.skip)
-            case .tq, .qkv, .deepseekV4, .cacheList, .zayaCCA, .zayaCCATQ, .qsaKV:
+            case .tq, .qkv, .deepseekV4, .cacheList, .zayaCCA, .zayaCCATQ, .qsaKV, .modelState:
                 // Not currently emitted as sub-cache types — see
                 // serializeCacheListLayer (no model nests a QSAKVCache
                 // inside a CacheList). If a future bundle ships these

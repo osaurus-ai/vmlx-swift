@@ -76,3 +76,64 @@ logits for unexpected decoder errors. This change prevents the reproduced
 valid-input shape error from reaching that fallback; it does not claim a
 general throwing-generation error contract. Other installed-model failures
 from the broad audit remain visible in the Osaurus qualification document.
+
+## Cache continuation findings after v3
+
+Both v3 serial qualification cases failed: the MTP agent reached its output
+limit and non-MTP returned no visible changed-image answer. A fetched disk
+file was being counted as a hit even though its complete state was not
+restored. `glm-cache-restore-before.log` reproduces two underlying defects:
+
+1. Assigning populated indexed state into a fresh GLM cache used the
+   destination's zero array count, seating keys as the indexer and losing KV.
+2. The disk serializer skipped that custom cache but seated recurrent layers.
+   Restore returned zero while leaving a Mamba layer at offset four. The
+   caller then prefills the entire prompt into partly restored state.
+
+The follow-up corrects indexed-state layout and introduces an opt-in
+`DiskCacheStateProviding` contract. Model-owned tensors, metadata, offset,
+and a versioned runtime-mode identifier round-trip as one record. Missing
+arrays, incompatible modes and mismatched companion lengths are refused.
+The identifier enters runtime topology tags and thus Osaurus cache keys,
+separating complete records from the previous lossy format. No model-name
+list is involved in selecting this persistence path.
+
+Generation calls now set `requirePromptBoundary: true` at every production
+disk-restore call site: TokenIterator, BatchEngine, NativeMTP, DFlash2, block
+diffusion and paged companion restore. A staged pass rejects incomplete or
+zero-boundary records before live layers mutate, then applies a validated
+record in place to preserve retained layer references. Low-level snapshot
+callers retain their existing valid zero-offset round-trip behavior.
+
+An initial transaction that replaced live cache objects broke retained layer
+references; the TQ and ZAYA tests caught this and the failing logs remain.
+The first attempt to require a positive boundary for low-level snapshots
+also failed existing empty-state tests; separating snapshot and generation
+contracts preserves those checks. Neither failure was promoted as a pass.
+
+The Mamba malformed-file test also rewrote its input file before lazy tensor
+reads finished. Materializing those arrays before rewriting metadata allows
+the whole ten-test suite to complete; no corruption assertions were removed.
+
+`glm-custom-codec-roundtrip.log` contains thirteen passing focused tests,
+including actual safetensors media-cache continuation with numerical logits
+comparison, damaged payloads, and runtime-mode refusal.
+`glm-input-mtp-live-v4.json` and `glm-input-nonmtp-live-v4.json` each passed
+all seven real-image requests in the intermediate build. Peak physical
+footprint remains full-model size; these do not qualify low-RAM operation.
+The source and executable are identified in `glm-input-live-receipt-v4.json`.
+Final source adds in-place restoration, topology isolation and explicit
+accepted-restore tracing; its qualification remains pending.
+
+PR #475 is a draft. Its initial lint job failed with repository-wide
+formatter changes beyond this patch (`glm-pr475-lint-failure.log`). This is
+not a green CI or merge-ready claim.
+
+The final shared-cache run (`glm-final-shared-v7-receipt.json`) contains
+61 passing tests: 13 GLM input/copy, 20 TQ serializer, eight ZAYA, ten Mamba,
+five architecture damage-matrix and five QSA persistence tests. An empty
+Mamba child in CacheList is now tagged as skip when it has neither tokens
+nor tensors; the existing empty-composite regression exposed this earlier
+serializer defect. No normal-generation or empty-snapshot checks were
+removed. The ten-architecture real-model follow-up and Release UI proof
+remain pending for this exact candidate.

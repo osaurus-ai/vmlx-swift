@@ -8,6 +8,85 @@ import Testing
 
 @Suite("GLM image input contracts", .serialized)
 struct Glm5NextInputContractTests {
+    @Test("fresh indexed state restores KV and its companion together")
+    func indexedStateRestore() async throws {
+        try await MLXMetalTestLock.withLock {
+            let source = Glm5NextIndexedKVCache()
+            _ = source.update(
+                keys: MLXArray.ones([1, 1, 4, 8]),
+                values: MLXArray.ones([1, 1, 4, 8]) * 2)
+            _ = source.updateIndexer(MLXArray.ones([1, 4, 17]) * 3)
+            let restored = Glm5NextIndexedKVCache()
+            restored.state = source.state
+            restored.metaState = source.metaState
+            #expect(restored.offset == source.offset)
+            #expect(restored.state.map(\.shape) == source.state.map(\.shape))
+            #expect(restored.indexerPacked?.shape == [1, 4, 17])
+        }
+    }
+
+    @Test("unsupported indexed disk restore leaves recurrent state untouched")
+    func refusedDiskRestoreIsAtomic() async throws {
+        try await MLXMetalTestLock.withLock {
+            let indexed = Glm5NextIndexedKVCache()
+            _ = indexed.update(
+                keys: MLXArray.ones([1, 1, 4, 8]), values: MLXArray.ones([1, 1, 4, 8]))
+            _ = indexed.updateIndexer(MLXArray.ones([1, 4, 17]))
+            let recurrent = MambaCache()
+            recurrent[0] = MLXArray.ones([1, 4, 8])
+            recurrent[1] = MLXArray.ones([1, 4, 8]) * 2
+            recurrent.offset = 4
+            var arrays = TQDiskSerializer.serialize(cache: [indexed, recurrent])
+            // The previous serializer wrote this custom layer as .skip.
+            arrays["__layer_kind_0__"] = MLXArray([TQDiskSerializer.LayerKind.skip.rawValue])
+            var target: [any KVCache] = [Glm5NextIndexedKVCache(), MambaCache()]
+            let before = target.map { $0.state.map(\.shape) }
+            let count = restoreFromDiskArrays(arrays, into: &target, requirePromptBoundary: true)
+            #expect(count == 0)
+            #expect(target.map { $0.state.map(\.shape) } == before)
+            #expect(target.map(\.offset) == [0, 0])
+        }
+    }
+
+    @Test("indexed disk payload requires every companion and the same runtime mode")
+    func indexedDiskRoundTrip() async throws {
+        try await MLXMetalTestLock.withLock {
+            let source = Glm5NextIndexedKVCache(absorbed: true)
+            let topology = ModelCacheTopologySnapshot(cache: [source])
+            #expect(topology.requiresDiskBackedCoordinatorRestore)
+            #expect(cacheRequiresDiskBackedCoordinatorRestore([source]))
+            #expect(topology.topologyTags.contains("diskState=" + source.diskCacheStateIdentifier))
+            #expect(
+                topology.topologyTags
+                    != ModelCacheTopologySnapshot(
+                        cache: [Glm5NextIndexedKVCache(absorbed: false)]).topologyTags)
+            _ = source.update(
+                keys: MLXArray.ones([1, 1, 4, 8]), values: MLXArray.ones([1, 1, 4, 8]))
+            _ = source.updateIndexer(MLXArray.ones([1, 4, 17]))
+            let arrays = TQDiskSerializer.serialize(cache: [source])
+            var target: [any KVCache] = [Glm5NextIndexedKVCache(absorbed: true)]
+            #expect(restoreFromDiskArrays(arrays, into: &target) == 4)
+            #expect(target[0].state.map(\.shape) == source.state.map(\.shape))
+            for missing in [
+                "model_0_header", "model_0_state_0", "model_0_state_1", "model_0_state_2",
+            ] {
+                var damaged = arrays
+                damaged.removeValue(forKey: missing)
+                var fresh: [any KVCache] = [Glm5NextIndexedKVCache(absorbed: true)]
+                #expect(restoreFromDiskArrays(damaged, into: &fresh) == 0)
+                #expect(fresh[0].state.isEmpty)
+            }
+            var otherMode: [any KVCache] = [Glm5NextIndexedKVCache(absorbed: false)]
+            #expect(restoreFromDiskArrays(arrays, into: &otherMode) == 0)
+            #expect(otherMode[0].state.isEmpty)
+            var truncated = arrays
+            truncated["model_0_state_2"] = MLXArray.ones([1, 3, 17])
+            var fresh: [any KVCache] = [Glm5NextIndexedKVCache(absorbed: true)]
+            #expect(restoreFromDiskArrays(truncated, into: &fresh) == 0)
+            #expect(fresh[0].state.isEmpty)
+        }
+    }
+
     struct MarkerTokenizer: MLXLMCommon.Tokenizer {
         let omitLastImage: Bool
         var bosToken: String? { nil }
@@ -57,6 +136,64 @@ struct Glm5NextInputContractTests {
             let input = try await Self.processor().prepare(input: UserInput(prompt: "hello"))
             #expect(input.text.tokens.shape == [2])
             #expect(input.text.tokens[.newAxis, 0...].shape == [1, 2])
+        }
+    }
+
+    @Test("image prefill split after media matches uninterrupted decoder logits")
+    func splitImagePrefillParity() async throws {
+        try await MLXMetalTestLock.withLock {
+            let config = try JSONDecoder().decode(
+                Glm5NextConfiguration.self,
+                from: Data(
+                    Glm5NextConstructionTests.tinyJSON.replacingOccurrences(
+                        of: "\"image_token_id\":9", with: "\"image_token_id\":99"
+                    ).utf8))
+            let model = try Glm5Next(config, requesting: [.vision])
+            let red = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 28, height: 28))
+            let input = try await Self.processor().prepare(
+                input: UserInput(prompt: "color", images: [.ciImage(red)]))
+            let tokens = input.text.tokens.asArray(Int.self)
+            let boundary = tokens.count - 2
+            #expect(input.canCaptureHybridStripBoundary(promptTokenIds: tokens, boundary: boundary))
+            guard
+                case .logits(let full) = try model.prepare(
+                    input, cache: model.newCache(parameters: nil), windowSize: 512)
+            else {
+                Issue.record("Expected media logits")
+                return
+            }
+            let cache = model.newCache(parameters: nil)
+            let head = LMInput(
+                text: .init(tokens: input.text.tokens[..<boundary]), image: input.image,
+                mediaTokenIds: input.mediaTokenIds)
+            _ = try model.prepare(head, cache: cache, windowSize: 512)
+            MLX.eval(cache)
+            let path = FileManager.default.temporaryDirectory
+                .appendingPathComponent("glm-media-cache-\(UUID().uuidString).safetensors")
+            defer { try? FileManager.default.removeItem(at: path) }
+            try MLX.save(arrays: TQDiskSerializer.serialize(cache: cache), url: path)
+            let disk = try MLX.loadArrays(url: path)
+            var restored = model.newCache(parameters: nil)
+            #expect(restoreFromDiskArrays(disk, into: &restored) == boundary)
+            #expect(
+                validateRestoredCacheBoundary(
+                    restored, matchedTokens: boundary, restoredTokens: boundary))
+            MLX.eval(restored)
+            let tail = LMInput(tokens: input.text.tokens[boundary...].expandedDimensions(axis: 0))
+            guard
+                case .tokens(let remaining) = try model.prepare(tail, cache: cache, windowSize: 512)
+            else {
+                Issue.record("Expected generic text suffix")
+                return
+            }
+            let split = model(remaining[text: .newAxis], cache: cache, state: nil)
+            let error = abs(full.logits[0..., boundary..., 0...] - split.logits).max().item(
+                Float.self)
+            #expect(error < 1e-4)
+            let fromDisk = model(remaining[text: .newAxis], cache: restored, state: nil)
+            let diskError = abs(full.logits[0..., boundary..., 0...] - fromDisk.logits).max().item(
+                Float.self)
+            #expect(diskError < 1e-4)
         }
     }
 

@@ -1056,9 +1056,9 @@ public final class Glm5NextIndexer: Module {
 /// Composed around `KVCacheSimple` rather than derived from it, because that class is `public` and
 /// not `open` — it cannot be subclassed from this module. Composition also keeps the forwarding
 /// explicit, which is what makes `trim` and `copy` obviously cover BOTH buffers.
-public final class Glm5NextIndexedKVCache: KVCache {
+public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
 
-    private let kv = KVCacheSimple()
+    private var kv = KVCacheSimple()
 
     /// `(B, N, 2 * indexHeadDim + 1)` — the index key, the gate score, and a validity flag.
     ///
@@ -1080,6 +1080,27 @@ public final class Glm5NextIndexedKVCache: KVCache {
 
     public init(absorbed: Bool? = nil) {
         self.absorbed = absorbed ?? Glm5NextIndexerRuntime.absorbMLA
+    }
+
+    public var diskCacheStateIdentifier: String {
+        "glm5-indexed-kv-v1-" + (absorbed ? "absorbed" : "expanded")
+    }
+
+    public func restoreDiskCacheState(
+        _ state: [MLXArray], metadata: [String], offset: Int
+    ) -> Bool {
+        guard state.count == 3, metadata == kv.metaState, offset > 0 else { return false }
+        let keys = state[0], values = state[1], packed = state[2]
+        guard keys.ndim == 4, values.ndim == 4, packed.ndim == 3,
+            keys.dim(0) == 1, values.dim(0) == 1, packed.dim(0) == 1,
+            keys.dim(1) > 0, values.dim(1) == keys.dim(1),
+            keys.dim(2) == offset, values.dim(2) == offset, packed.dim(1) == offset,
+            keys.dim(3) > 0, values.dim(3) > 0,
+            packed.dim(2) >= 3, packed.dim(2) % 2 == 1,
+            keys.dtype.isFloatingPoint, keys.dtype == values.dtype, keys.dtype == packed.dtype
+        else { return false }
+        self.state = state
+        return true
     }
 
     /// Append this step's rows and return the whole history.
@@ -1106,17 +1127,18 @@ public final class Glm5NextIndexedKVCache: KVCache {
     public var state: [MLXArray] {
         get { kv.state + [indexerPacked].compactMap { $0 } }
         set {
-            // The packed buffer is the ONLY optional trailing entry, so its presence is decided by
-            // the count rather than by position — restoring it into the KV slots would corrupt both.
-            let kvCount = kv.state.count
-            let kvPortion = Array(newValue.prefix(kvCount))
-            // Same empty guard as `copy()`: the inner setter traps on a count
-            // that is not exactly 2, and an empty restore (fresh snapshot)
-            // yields no KV arrays.
-            if !kvPortion.isEmpty {
-                kv.state = kvPortion
+            // The serialized layout is [keys, values, optional indexer],
+            // independent of whether the destination has received tokens.
+            // Inferring the layout from a fresh destination's empty state
+            // seats keys as the indexer and loses both KV buffers.
+            if newValue.isEmpty {
+                kv = KVCacheSimple()
+                indexerPacked = nil
+                return
             }
-            indexerPacked = newValue.count > kvCount ? newValue[kvCount] : nil
+            precondition(newValue.count == 2 || newValue.count == 3)
+            kv.state = Array(newValue.prefix(2))
+            indexerPacked = newValue.count == 3 ? newValue[2] : nil
         }
     }
 
