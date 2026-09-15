@@ -2113,6 +2113,12 @@ extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel {
     public func prepare(
         _ input: LMInput, cache: [KVCache], windowSize: Int?
     ) throws -> PrepareResult {
+        let tokenShape = input.text.tokens.shape
+        guard tokenShape.count == 1 || (tokenShape.count == 2 && tokenShape[0] == 1) else {
+            throw Glm5NextInputShapeError(
+                got: tokenShape,
+                expected: "[sequence] or [1, sequence] tokens for single-sequence prefill")
+        }
         let imagePixels = input.image?.pixels
         let videoPixels = input.video?.pixels
         guard imagePixels != nil || videoPixels != nil else {
@@ -2146,7 +2152,15 @@ extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel {
             let ids = input.text.tokens.ndim == 1
                 ? input.text.tokens.expandedDimensions(axis: 0) : input.text.tokens
             let promptTokenCount = ids.dim(1)
-            guard step > 0, promptTokenCount > step else { return .tokens(input.text) }
+            guard step > 0, promptTokenCount > step else {
+                // Cache boundary splitting also calls prepare with [1, T]. The
+                // generator adds its own batch axis to every returned token tail.
+                return .tokens(
+                    .init(
+                        tokens: input.text.tokens.reshaped(-1),
+                        mask: input.text.mask.map { $0.reshaped(-1) },
+                        tokenIds: input.text.tokenIds))
+            }
 
             var offset = 0
             while offset + step < promptTokenCount {
@@ -2201,13 +2215,18 @@ extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel {
         let imageFeatures = try encode(imagePixels, input.image?.frames)
         let videoFeatures = try encode(videoPixels, input.video?.frames)
 
-        let embeddings = languageModel.embedTokens(input.text.tokens)
+        // Processors return an unbatched sequence. Media prefill owns the decoder
+        // call here, whereas text prefill gets its batch axis from the generator.
+        let ids =
+            input.text.tokens.ndim == 1
+            ? input.text.tokens.expandedDimensions(axis: 0) : input.text.tokens
+        let embeddings = languageModel.embedTokens(ids)
         let spliced = try spliceMediaFeatures(
-            inputIds: input.text.tokens.reshaped(-1), embeddings: embeddings,
+            inputIds: ids.reshaped(-1), embeddings: embeddings,
             imageFeatures: imageFeatures, videoFeatures: videoFeatures)
 
         let hidden = try languageModel(
-            input.text.tokens, mask: nil, caches: cache, inputEmbedding: spliced)
+            ids, mask: nil, caches: cache, inputEmbedding: spliced)
         let logits = lmHead.map { $0(hidden) } ?? languageModel.embedTokens.asLinear(hidden)
         return .logits(LMOutput(logits: logits))
     }
@@ -2482,11 +2501,31 @@ public final class Glm5NextProcessor: UserInputProcessor {
         // The canvas depends on how many frames there will BE, so it cannot be decided from the
         // first frame the way an image's can. Duration and natural size come from the asset, which
         // is metadata rather than decode, so this costs nothing and keeps sampling to one pass.
-        let asset = video.asAVAssetForSizing()
-        let duration = try await CMTimeGetSeconds(asset.load(.duration))
-        let track = try await asset.loadTracks(withMediaType: .video).first
-        let natural = try await track?.load(.naturalSize) ?? .zero
-        let sampled = min(2048, max(1, Int((duration * videoFPS).rounded(.down))))
+        let duration: Double
+        let natural: CGSize
+        let frameLimit: Int
+        func assetDimensions(_ asset: AVAsset) async throws -> (Double, CGSize) {
+            let duration = try await CMTimeGetSeconds(asset.load(.duration))
+            let track = try await asset.loadTracks(withMediaType: .video).first
+            return (duration, try await track?.load(.naturalSize) ?? .zero)
+        }
+        switch video {
+        case .frames(let frames):
+            guard let first = frames.first, let last = frames.last else {
+                throw Glm5NextInputShapeError(
+                    got: [0], expected: "at least one decoded video frame")
+            }
+            duration = CMTimeGetSeconds(last.timeStamp - first.timeStamp)
+            natural = first.frame.extent.size
+            frameLimit = min(2048, frames.count)
+        case .avAsset(let asset):
+            (duration, natural) = try await assetDimensions(asset)
+            frameLimit = 2048
+        case .url(let url):
+            (duration, natural) = try await assetDimensions(AVURLAsset(url: url))
+            frameLimit = 2048
+        }
+        let sampled = min(frameLimit, max(1, Int((duration * videoFPS).rounded(.down))))
         let canvas = Self.videoCanvas(
             frameCount: sampled,
             height: Int(natural.height), width: Int(natural.width),
@@ -2550,14 +2589,31 @@ public final class Glm5NextProcessor: UserInputProcessor {
     private func expandPlaceholder(
         in tokens: [Int], token: Int, name: String, replacement: [Int]
     ) throws -> [Int] {
-        guard let position = tokens.firstIndex(of: token) else {
-            throw Glm5NextDecoderUnavailable(
-                detail: "the chat template rendered no \(name) token (id \(token)), so the "
-                    + "attachment has nowhere to go")
+        try expandPlaceholders(in: tokens, token: token, name: name, replacements: [replacement])
+    }
+
+    /// Expand original placeholders in conversation order. Repeatedly replacing
+    /// the first marker would replace an already-expanded image run instead of
+    /// the next attachment, because both use the same token ID.
+    private func expandPlaceholders(
+        in tokens: [Int], token: Int, name: String, replacements: [[Int]]
+    ) throws -> [Int] {
+        let markerCount = tokens.filter { $0 == token }.count
+        guard markerCount == replacements.count else {
+            throw Glm5NextInputShapeError(
+                got: [markerCount, replacements.count],
+                expected: "one \(name) placeholder (id \(token)) per attachment")
         }
-        var out = Array(tokens[tokens.startIndex ..< position])
-        out.append(contentsOf: replacement)
-        out.append(contentsOf: tokens[(position + 1)...])
+        var out = [Int]()
+        var attachment = 0
+        for id in tokens {
+            if id == token {
+                out.append(contentsOf: replacements[attachment])
+                attachment += 1
+            } else {
+                out.append(id)
+            }
+        }
         return out
     }
 
@@ -2606,32 +2662,37 @@ public final class Glm5NextProcessor: UserInputProcessor {
             promptTokens = try expandPlaceholder(
                 in: promptTokens, token: videoToken, name: "<|video|>", replacement: replacement)
             return LMInput(
-                text: .init(tokens: MLXArray(promptTokens.map { Int32($0) })[.newAxis, 0...]),
+                text: .init(tokens: MLXArray(promptTokens.map { Int32($0) })),
                 image: .init(pixels: pixels, frames: grids),
+                mediaTokenIds: [imageToken],
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         }
 
         guard !input.images.isEmpty else {
             return LMInput(
-                text: .init(tokens: MLXArray(promptTokens.map { Int32($0) })[.newAxis, 0...]),
+                text: .init(tokens: MLXArray(promptTokens.map { Int32($0) })),
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         }
 
-        // One image at a time: the splice takes a single feature block per media kind, and
-        // concatenating several would need their placeholder runs kept in order.
-        guard input.images.count == 1 else {
-            throw Glm5NextDecoderUnavailable(
-                detail: "\(input.images.count) images supplied; only one per request is wired")
+        var patches = [MLXArray]()
+        var grids = [THW]()
+        var replacements = [[Int]]()
+        for image in input.images {
+            let prepared = try preprocess(image: try image.asCIImage())
+            patches.append(prepared.patches)
+            grids.append(prepared.grid)
+            replacements.append(Array(repeating: imageToken, count: prepared.tokenCount))
         }
-
-        let (patches, grid, tokenCount) = try preprocess(image: try input.images[0].asCIImage())
-        promptTokens = try expandPlaceholder(
+        promptTokens = try expandPlaceholders(
             in: promptTokens, token: imageToken, name: "<|image|>",
-            replacement: Array(repeating: imageToken, count: tokenCount))
+            replacements: replacements)
 
         return LMInput(
-            text: .init(tokens: MLXArray(promptTokens.map { Int32($0) })[.newAxis, 0...]),
-            image: .init(pixels: patches, frames: [grid]),
+            text: .init(tokens: MLXArray(promptTokens.map { Int32($0) })),
+            image: .init(
+                pixels: patches.count == 1 ? patches[0] : concatenated(patches, axis: 0),
+                frames: grids),
+            mediaTokenIds: [imageToken],
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }
@@ -2820,18 +2881,6 @@ extension Array {
     /// shorter list than there are layers, and neither should trap.
     fileprivate subscript(safe index: Int) -> Element? {
         indices.contains(index) ? self[index] : nil
-    }
-}
-
-extension UserInput.Video {
-    /// The asset, for METADATA only — duration and natural size, which the video canvas needs
-    /// before any frame is decoded. Decoding still goes through `MediaProcessing`.
-    fileprivate func asAVAssetForSizing() -> AVAsset {
-        switch self {
-        case .avAsset(let asset): return asset
-        case .url(let url): return AVURLAsset(url: url)
-        default: return AVURLAsset(url: URL(fileURLWithPath: "/dev/null"))
-        }
     }
 }
 

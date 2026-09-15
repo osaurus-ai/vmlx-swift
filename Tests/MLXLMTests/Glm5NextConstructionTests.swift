@@ -784,7 +784,8 @@ struct Glm5NextConstructionTests {
             let model = try Glm5Next(config, requesting: [.text])
 
             // Both attention kinds and both MLP kinds are exercised by this schedule.
-            #expect(model.languageModel.layers.count == 5, "4 decoder + 1 MTP")
+            #expect(
+                model.languageModel.layers.count == 4, "text-only construction omits the MTP head")
             #expect(model.languageModel.layers[0].linearAttention != nil)
             #expect(model.languageModel.layers[1].sparseAttention != nil)
             #expect(model.languageModel.layers[0].denseMLP != nil)
