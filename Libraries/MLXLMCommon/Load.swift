@@ -703,7 +703,8 @@ public func loadWeights(
     // Restored to the prior limit after sanitize so steady-state
     // inference performance is unaffected.
     let priorCacheLimit = MLX.Memory.cacheLimit
-    MLX.Memory.cacheLimit = 1 * 1024 * 1024 * 1024  // 1 GB during load
+    // Sanitization may reduce a large pool, never raise a caller's ceiling.
+    MLX.Memory.cacheLimit = min(priorCacheLimit, 1 * 1024 * 1024 * 1024)
     defer {
         MLX.Memory.cacheLimit = priorCacheLimit
     }

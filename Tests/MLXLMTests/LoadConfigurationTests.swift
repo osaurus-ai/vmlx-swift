@@ -351,6 +351,28 @@ struct LoadConfigurationTests {
         #expect(MLX.Memory.cacheLimit == Int(2 * gib))
     }
 
+    @Test("Resident policy respects a supplied allocator maximum without throttling total memory")
+    func residentPolicyKeepsExplicitAllocatorMaximum() {
+        let priorMemoryLimit = MLX.Memory.memoryLimit
+        let priorCacheLimit = MLX.Memory.cacheLimit
+        defer {
+            MLX.Memory.memoryLimit = priorMemoryLimit
+            MLX.Memory.cacheLimit = priorCacheLimit
+        }
+        let gib = UInt64(1 << 30)
+        let facts = LoadBundleFacts(
+            totalSafetensorsBytes: 95 * gib, isRouted: true,
+            physicalMemory: 128 * gib, modelType: "glm5_next",
+            weightFormat: "affine", hasJangConfig: true,
+            numRoutedExperts: 256, topK: 8)
+        let restored = applyResidentPoolProcessMemoryLimitsIfNeeded(
+            facts: facts, allocatorCacheLimit: 128 << 20,
+            recommendedWorkingSetBytes: Int(80 * gib))
+        #expect(restored == Int(120 * gib))
+        #expect(MLX.Memory.memoryLimit == restored)
+        #expect(MLX.Memory.cacheLimit == 128 << 20)
+    }
+
     // MARK: - LoadBundleFacts.inspect
 
     @Test("inspect counts safetensors byte total")

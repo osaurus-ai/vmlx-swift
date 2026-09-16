@@ -653,9 +653,14 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         let requestedAllocatorCap =
             memorySafety.customAllocatorCacheBytes.map(ResidentCap.absolute)
             ?? profile.allocatorCap
-        let allocatorCap = bundleFacts?.resolveMLXAllocatorCacheLimit(
-            requested: requestedAllocatorCap
-        ) ?? requestedAllocatorCap
+        // Family performance policy may replace a profile default, but an
+        // explicit user maximum must survive into the actual loader.
+        let allocatorCap =
+            memorySafety.customAllocatorCacheBytes != nil
+            ? requestedAllocatorCap
+            : (bundleFacts?.resolveMLXAllocatorCacheLimit(
+                requested: requestedAllocatorCap
+            ) ?? requestedAllocatorCap)
 
         var loadConfiguration = baseLoadConfiguration
         // Performance choices captured by the loaded model graph must survive

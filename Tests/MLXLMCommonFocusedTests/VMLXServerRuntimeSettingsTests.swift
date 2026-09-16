@@ -8,6 +8,28 @@ import Testing
 
 @Suite("VMLX server runtime settings")
 struct VMLXServerRuntimeSettingsTests {
+    @Test("explicit allocator maxima survive resident-family performance policy")
+    func explicitAllocatorMaximumSurvivesResidentPolicy() {
+        let gib = UInt64(1 << 30)
+        for modelType in ["deepseek_v4", "glm5_next", "glm5_next_text"] {
+            let facts = LoadBundleFacts(
+                totalSafetensorsBytes: 95 * gib, isRouted: true,
+                physicalMemory: 128 * gib, modelType: modelType,
+                weightFormat: "affine", hasJangConfig: true,
+                numRoutedExperts: 256, topK: 8)
+            #expect(facts.requiresUncappedResidentPools)
+            var settings = VMLXServerRuntimeSettings()
+            let automatic = settings.resolvedMemorySafetyPlan(bundleFacts: facts)
+            #expect(automatic.loadConfiguration.maxResidentBytes == .unlimited)
+            settings.memorySafety.customAllocatorCacheBytes = 128 << 20
+            let explicit = settings.resolvedMemorySafetyPlan(bundleFacts: facts)
+            #expect(explicit.loadConfiguration.maxResidentBytes == .absolute(128 << 20))
+            // The freed-buffer maximum does not throttle total MLX allocation.
+            #expect(
+                explicit.loadConfiguration.memoryLimit == automatic.loadConfiguration.memoryLimit)
+        }
+    }
+
     @Test("native MTP is opt-in on initialization and missing-mode decode")
     func sharedMTPDefaultsOffAndPreservesExplicitChoices() throws {
         #expect(VMLXServerMTPSettings().mode == .off)

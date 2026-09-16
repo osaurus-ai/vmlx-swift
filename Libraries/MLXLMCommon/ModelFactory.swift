@@ -606,7 +606,10 @@ public func loadModel(
     let memoryLimit = facts.resolveMLXMemoryLimit(
         requested: loadConfiguration.memoryLimit)
     let nativeResidentPoolCeiling =
-        applyResidentPoolProcessMemoryLimitsIfNeeded(facts: facts)
+        applyResidentPoolProcessMemoryLimitsIfNeeded(
+            facts: facts,
+            allocatorCacheLimit: loadConfiguration.maxResidentBytes
+                .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory))
     if loadConfiguration.useMmapSafetensors && !useMmapSafetensors {
         let reason = "Resident affine bundle selected materialized safetensors for production decode"
         FileHandle.standardError.write(
@@ -794,6 +797,7 @@ public func loadModel(
 @discardableResult
 func applyResidentPoolProcessMemoryLimitsIfNeeded(
     facts: LoadBundleFacts,
+    allocatorCacheLimit: Int? = nil,
     recommendedWorkingSetBytes: Int? = MLX.GPU.maxRecommendedWorkingSetBytes()
 ) -> Int? {
     guard facts.requiresUncappedResidentPools else { return nil }
@@ -810,12 +814,13 @@ func applyResidentPoolProcessMemoryLimitsIfNeeded(
     let previousMemoryLimit = MLX.Memory.memoryLimit
     let previousCacheLimit = MLX.Memory.cacheLimit
     MLX.Memory.memoryLimit = nativeCeiling
-    MLX.Memory.cacheLimit = nativeCeiling
+    MLX.Memory.cacheLimit = min(nativeCeiling, max(0, allocatorCacheLimit ?? nativeCeiling))
     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] != nil {
         FileHandle.standardError.write(Data(
             ("[Load] resident-pool limits model_type=\(facts.modelType ?? "unknown") "
                 + "previous_memory=\(previousMemoryLimit) previous_cache=\(previousCacheLimit) "
-                + "native_ceiling=\(nativeCeiling)\n").utf8))
+                    + "native_ceiling=\(nativeCeiling) allocator_ceiling=\(MLX.Memory.cacheLimit)\n")
+                    .utf8))
     }
     return nativeCeiling
 }
