@@ -149,7 +149,13 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("promptTokens + slot.generatedTokenIds"))
         #expect(scheduler.contains("let disablesGeneratedCacheBoundary: Bool"))
         #expect(scheduler.contains("request.input.toolSchemas?.isEmpty == false"))
-        #expect(source.contains("!slot.disablesGeneratedCacheBoundary"))
+        // Tool-enabled requests keep the post-answer boundary unless the
+        // generation actually emitted a tool call, decided by replaying the
+        // bridge's parser pipeline over the generated text (solo-path parity).
+        #expect(source.contains("Self.generatedTextEmitsToolCall("))
+        #expect(source.contains("tools: slot.originalInput.toolSchemas"))
+        #expect(source.contains("!emittedToolCall,"))
+        #expect(!source.contains("!slot.disablesGeneratedCacheBoundary,"))
         #expect(source.contains("slot.originalInput.cacheHitSuffixContainsMediaPlaceholder(remaining)"))
         #expect(source.contains("let requiresDiskBackedRestore ="))
         #expect(source.contains("cacheRequiresDiskBackedCoordinatorRestore(slot.cache)"))
