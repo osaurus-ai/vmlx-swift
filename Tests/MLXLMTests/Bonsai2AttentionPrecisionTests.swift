@@ -45,9 +45,9 @@ struct Bonsai2AttentionPrecisionTests {
                 #expect(reference.dtype == .float32 && actual.dtype == .float32)
                 #expect(old.state.allSatisfy { $0.dtype == .float32 })
                 #expect(new.state.allSatisfy { $0.dtype == .float16 })
-                #expect(
-                    old.state.map(\.nbytes).reduce(0, +) == 2 * new.state.map(\.nbytes).reduce(0, +)
-                )
+                let oldBytes: Int = old.state.reduce(0) { $0 + $1.nbytes }
+                let newBytes: Int = new.state.reduce(0) { $0 + $1.nbytes }
+                #expect(oldBytes == 2 * newBytes)
                 #expect(old.offset == new.offset)
                 close(actual, reference)
             }
@@ -209,7 +209,7 @@ struct Bonsai2AttentionPrecisionTests {
             "bonsai-namespace-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        let container = try MLXMetalTestLock.withLock {
+        let container = try await MLXMetalTestLock.withLock {
             let model = try Qwen35HadamardCacheTests.writeFixture(at: root, packed: false)
             let processor = TestInputProcessor()
             return ModelContainer(

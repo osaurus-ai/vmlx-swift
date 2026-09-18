@@ -4,12 +4,12 @@
 import Foundation
 import MLX
 import MLXNN
+import MLXVLM
 import Testing
 import os
 
 @testable import MLXLLM
 @testable import MLXLMCommon
-import MLXVLM
 
 /// A real four-layer Qwen graph, not hand-authored cache arrays. The fixture
 /// has three GDN layers and one attention layer. It exercises storage/checkpoint
@@ -84,22 +84,24 @@ struct Qwen35HadamardCacheTests {
         var config = try #require(
             JSONSerialization.jsonObject(with: Data(modelJSON.utf8)) as? [String: Any])
         if vision {
-            config["vision_config"] = [
-                "model_type": "qwen3_vl", "depth": 1, "hidden_size": 16,
-                "intermediate_size": 32, "out_hidden_size": 512, "num_heads": 4,
-                "patch_size": 2, "spatial_merge_size": 2, "temporal_patch_size": 1,
-                "num_position_embeddings": 16,
-            ] as [String: Any]
+            config["vision_config"] =
+                [
+                    "model_type": "qwen3_vl", "depth": 1, "hidden_size": 16,
+                    "intermediate_size": 32, "out_hidden_size": 512, "num_heads": 4,
+                    "patch_size": 2, "spatial_merge_size": 2, "temporal_patch_size": 1,
+                    "num_position_embeddings": 16,
+                ] as [String: Any]
             config["vocab_size"] = 128
             config["image_token_id"] = 98
             config["video_token_id"] = 97
             config["vision_start_token_id"] = 96
             config["vision_end_token_id"] = 95
             var text = config["text_config"] as! [String: Any]
-            text["rope_parameters"] = [
-                "rope_type": "default", "rope_theta": 10000.0,
-                "partial_rotary_factor": 0.25, "mrope_section": [2, 3, 3],
-            ] as [String: Any]
+            text["rope_parameters"] =
+                [
+                    "rope_type": "default", "rope_theta": 10000.0,
+                    "partial_rotary_factor": 0.25, "mrope_section": [2, 3, 3],
+                ] as [String: Any]
             config["text_config"] = text
         }
         let data = try JSONSerialization.data(withJSONObject: config)
