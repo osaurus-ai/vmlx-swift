@@ -853,7 +853,7 @@ enum Qwen3VLVision {
             return concatenated([hEmbeds, wEmbeds], axis: -1)
         }
 
-        private func positionalEmbeddings(_ grids: [THW]) -> MLXArray {
+        func positionalEmbeddings(_ grids: [THW]) -> MLXArray {
             let hiddenSize = config.hiddenSize
             let maxIndex = numGridPerSide - 1
 
@@ -909,23 +909,28 @@ enum Qwen3VLVision {
             }
 
             guard !cornerIndices[0].isEmpty else {
-                return MLXArray.zeros([0, hiddenSize], dtype: posEmbed.weight.dtype)
+                // Nothing to interpolate. The caller casts to its activation dtype.
+                return MLXArray.zeros([0, hiddenSize])
             }
 
-            // Step 2: Batch embedding lookup
+            // Step 2: Batch embedding lookup. The corner weights take the dtype of the rows the
+            // table returns, never `posEmbed.weight.dtype`: a quantized `pos_embed` loads as a
+            // `QuantizedEmbedding`, whose `weight` is the packed uint32 array, and casting the
+            // fractional weights to that truncates every one of them to 0.
             let indicesTensors = cornerIndices.map { concatenated($0, axis: 0).asType(.int32) }
+            let cornerEmbeds = indicesTensors.map { posEmbed($0) }
+            let dtype = cornerEmbeds[0].dtype
             let weightsTensors = cornerWeights.map {
-                concatenated($0, axis: 0).asType(posEmbed.weight.dtype)
+                concatenated($0, axis: 0).asType(dtype)
             }
 
             let totalPatches = indicesTensors[0].dim(0)
-            var patchPosEmbeds = MLXArray.zeros(
-                [totalPatches, hiddenSize], dtype: posEmbed.weight.dtype)
+            var patchPosEmbeds = MLXArray.zeros([totalPatches, hiddenSize], dtype: dtype)
 
             for cornerIdx in 0 ..< 4 {
-                let cornerEmbeds = posEmbed(indicesTensors[cornerIdx])
                 let weighted =
-                    cornerEmbeds * expandedDimensions(weightsTensors[cornerIdx], axis: -1)
+                    cornerEmbeds[cornerIdx]
+                    * expandedDimensions(weightsTensors[cornerIdx], axis: -1)
                 patchPosEmbeds = patchPosEmbeds + weighted
             }
 
@@ -998,7 +1003,9 @@ enum Qwen3VLVision {
         func callAsFunction(_ pixelValues: MLXArray, gridTHW: [THW]) -> (MLXArray, [MLXArray]) {
             var hiddenStates = patchEmbed(pixelValues)
 
-            let posEmbeds = positionalEmbeddings(gridTHW)
+            // In the activation dtype: a quantized table returns rows in its scales' dtype, and
+            // float16 + bfloat16 would promote every block after this one to float32.
+            let posEmbeds = positionalEmbeddings(gridTHW).asType(hiddenStates.dtype)
             hiddenStates = hiddenStates + posEmbeds
 
             let rotaryEmbeds = rotaryPositionEmbedding(gridTHW)
