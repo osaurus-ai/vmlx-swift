@@ -42,8 +42,10 @@ private final class CapturingGemma4Tokenizer: MLXLMCommon.Tokenizer, @unchecked 
         tools _: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
-        capturedMessages = messages
-        capturedAdditionalContext = additionalContext
+        if capturedMessages.isEmpty {
+            capturedMessages = messages
+            capturedAdditionalContext = additionalContext
+        }
         return [1, 2, 3]
     }
 }
@@ -333,8 +335,12 @@ struct ChatMessageToolCallTests {
         )
     }
 
-    @Test("Gemma4 required tool choice compacts closed prior tool protocol before latest user")
-    func gemma4RequiredToolChoiceCompactsClosedToolHistory() async throws {
+    @Test("Gemma4 required tool choice preserves closed prior tool protocol before latest user")
+    func gemma4RequiredToolChoicePreservesClosedToolHistory() async throws {
+        let mlxTestLock = lockSerializedMLXTest()
+        _ = mlxTestLock
+        let tokenizer = CapturingGemma4Tokenizer()
+        let processor = Gemma4Processor(Self.gemma4ProcessorConfiguration(), tokenizer: tokenizer)
         let call = ToolCall(
             id: "call_lines",
             function: .init(
@@ -343,7 +349,7 @@ struct ChatMessageToolCallTests {
             )
         )
 
-        let messages = Qwen2VLMessageGenerator().generate(from: UserInput(
+        _ = try await processor.prepare(input: UserInput(
             chat: [
                 .user("Use line_count on this exact text: red\ngreen\nblue"),
                 .assistant("", toolCalls: [call]),
@@ -354,25 +360,30 @@ struct ChatMessageToolCallTests {
             tools: [Self.lineCountToolSpec()],
             additionalContext: ["tool_choice": "required"]
         ))
-        let compacted = Gemma4Processor.compactCompletedToolHistoryForRequiredChoice(messages)
-
-        let priorMessages = Array(compacted.dropLast())
-        #expect(priorMessages.allSatisfy { $0["tool_calls"] == nil })
-        #expect(!priorMessages.contains { $0["role"] as? String == "tool" })
-        #expect(!compacted.contains {
+        let messages = tokenizer.capturedMessages
+        #expect(messages.count == 5)
+        #expect(messages[1]["tool_calls"] != nil)
+        #expect(messages[2]["role"] as? String == "tool")
+        #expect(messages[2]["tool_call_id"] as? String == "call_lines")
+        #expect(Self.contentText(messages[2]["content"]) == #"{"lines":3}"#)
+        #expect(messages.contains {
             Self.contentText($0["content"]) == "Use line_count on this exact text: red\ngreen\nblue"
         })
-        #expect(compacted.contains {
+        #expect(messages.contains {
             Self.contentText($0["content"]) == "Three lines were counted."
         })
-        #expect(!compacted.contains {
+        #expect(!messages.contains {
             Self.contentText($0["content"]) == "How many lines were counted?"
         })
-        #expect(Self.contentText(compacted.last?["content"]) == "Now use line_count on this exact text: one\ntwo")
+        #expect(Self.contentText(messages.last?["content"]) == "Now use line_count on this exact text: one\ntwo")
     }
 
-    @Test("Gemma4 required tool choice summarizes closed tool result when no later answer exists")
-    func gemma4RequiredToolChoiceSummarizesUnansweredToolHistory() async throws {
+    @Test("Gemma4 required tool choice preserves exact tool result when no later answer exists")
+    func gemma4RequiredToolChoicePreservesUnansweredToolHistory() async throws {
+        let mlxTestLock = lockSerializedMLXTest()
+        _ = mlxTestLock
+        let tokenizer = CapturingGemma4Tokenizer()
+        let processor = Gemma4Processor(Self.gemma4ProcessorConfiguration(), tokenizer: tokenizer)
         let call = ToolCall(
             id: "call_lines",
             function: .init(
@@ -381,7 +392,7 @@ struct ChatMessageToolCallTests {
             )
         )
 
-        let messages = Qwen2VLMessageGenerator().generate(from: UserInput(
+        _ = try await processor.prepare(input: UserInput(
             chat: [
                 .user("Use line_count on this exact text: red\ngreen\nblue"),
                 .assistant("", toolCalls: [call]),
@@ -391,15 +402,16 @@ struct ChatMessageToolCallTests {
             tools: [Self.lineCountToolSpec()],
             additionalContext: ["tool_choice": "required"]
         ))
-        let compacted = Gemma4Processor.compactCompletedToolHistoryForRequiredChoice(messages)
-
-        let priorMessages = Array(compacted.dropLast())
-        #expect(priorMessages.allSatisfy { $0["tool_calls"] == nil })
-        #expect(!priorMessages.contains { $0["role"] as? String == "tool" })
-        #expect(!compacted.contains {
+        let messages = tokenizer.capturedMessages
+        #expect(messages.count == 4)
+        #expect(messages[1]["tool_calls"] != nil)
+        #expect(messages[2]["role"] as? String == "tool")
+        #expect(messages[2]["tool_call_id"] as? String == "call_lines")
+        #expect(Self.contentText(messages[2]["content"]) == #"{"lines":3}"#)
+        #expect(messages.contains {
             Self.contentText($0["content"]) == "Use line_count on this exact text: red\ngreen\nblue"
         })
-        #expect(compacted.contains {
+        #expect(!messages.contains {
             Self.contentText($0["content"]) == #"Tool line_count returned {"lines":3}."#
         })
     }

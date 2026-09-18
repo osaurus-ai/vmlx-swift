@@ -1320,7 +1320,7 @@ internal func llmMergedAdditionalContext(
     )
 }
 
-private struct LLMUserInputProcessor: UserInputProcessor {
+struct LLMUserInputProcessor: UserInputProcessor {
 
     let tokenizer: Tokenizer
     let configuration: ModelConfiguration
@@ -1367,14 +1367,11 @@ private struct LLMUserInputProcessor: UserInputProcessor {
             additionalContext: additionalContext,
             templateReadsEnableThinking: templateReadsEnableThinking
         )
-        var messages = NemotronToolChoiceTemplateContext.apply(
+        let messages = NemotronToolChoiceTemplateContext.apply(
             to: bailingMessages,
             modelType: modelType,
             additionalContext: additionalContext
         )
-        if shouldCompactGemma4RequiredToolHistory(additionalContext) {
-            messages = compactGemma4RequiredToolHistory(messages)
-        }
         do {
             let promptTokens = try tokenizer.applyChatTemplate(
                 messages: messages, tools: input.tools, additionalContext: additionalContext)
@@ -1418,53 +1415,6 @@ private struct LLMUserInputProcessor: UserInputProcessor {
             requestAdditionalContext: requestContext,
             modelType: modelType
         )
-    }
-
-    private func shouldCompactGemma4RequiredToolHistory(
-        _ additionalContext: [String: any Sendable]?
-    ) -> Bool {
-        guard let modelType else { return false }
-        let normalized = modelType
-            .lowercased()
-            .replacingOccurrences(of: "-", with: "_")
-        let compact = normalized.replacingOccurrences(of: "_", with: "")
-        guard compact.hasPrefix("gemma4") else {
-            return false
-        }
-        if (additionalContext?["tool_choice"] as? String) == "required" {
-            return true
-        }
-        if let name = additionalContext?["tool_choice_name"] as? String,
-           !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            return true
-        }
-        return false
-    }
-
-    private func compactGemma4RequiredToolHistory(
-        _ messages: [[String: any Sendable]]
-    ) -> [[String: any Sendable]] {
-        guard let latestUserIndex = messages.lastIndex(where: {
-            let role = $0["role"] as? String
-            return role == "user" || role == "developer"
-        }) else {
-            return messages
-        }
-
-        var compacted: [[String: any Sendable]] = []
-        compacted.reserveCapacity(messages.count)
-        for message in messages[..<latestUserIndex] {
-            guard let role = message["role"] as? String else { continue }
-            if role == "system" || role == "developer" {
-                compacted.append(message)
-            }
-        }
-        compacted.append(messages[latestUserIndex])
-        if latestUserIndex + 1 < messages.endIndex {
-            compacted.append(contentsOf: messages[(latestUserIndex + 1)...])
-        }
-        return compacted
     }
 
     static func defaultContext(
