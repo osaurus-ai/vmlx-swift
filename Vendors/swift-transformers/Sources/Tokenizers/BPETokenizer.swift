@@ -10,26 +10,45 @@ import Foundation
 import VMLXHub
 
 /// A pair of byte/token strings used in Byte-Pair Encoding (BPE) merge operations.
+///
+/// Compared and hashed literally, by UTF-8 bytes, as Hugging Face tokenizers does. Swift's
+/// `String ==` is canonical instead, so canonically equivalent merges (577 groups in Gemma's table)
+/// collapsed onto one key carrying the rank of the group's last member.
 struct BytePair: Hashable, Sendable {
     let a: String
     let b: String
+
+    /// Stores both halves as native UTF-8, which the byte comparisons read fastest. Merge-table
+    /// strings arrive bridged from `NSString`, mostly as UTF-16; a native string costs a flag test.
     init(_ a: String, _ b: String) {
+        var a = a
+        var b = b
+        a.makeContiguousUTF8()
+        b.makeContiguousUTF8()
         self.a = a
         self.b = b
     }
 
     init(tuple: [String]) {
-        a = tuple[0]
-        b = tuple[1]
+        self.init(tuple[0], tuple[1])
     }
 
     static func == (lhs: BytePair, rhs: BytePair) -> Bool {
-        lhs.a == rhs.a && lhs.b == rhs.b
+        lhs.a.utf8.elementsEqual(rhs.a.utf8) && lhs.b.utf8.elementsEqual(rhs.b.utf8)
     }
 
     func hash(into hasher: inout Hasher) {
-        hasher.combine(a)
-        hasher.combine(b)
+        Self.hashBytes(of: a, into: &hasher)
+        Self.hashBytes(of: b, into: &hasher)
+    }
+
+    /// The string's UTF-8 bytes, after their count so that ("ab", "c") and ("a", "bc") differ.
+    private static func hashBytes(of string: String, into hasher: inout Hasher) {
+        var string = string
+        string.withUTF8 { bytes in
+            hasher.combine(bytes.count)
+            hasher.combine(bytes: UnsafeRawBufferPointer(bytes))
+        }
     }
 }
 
@@ -185,22 +204,31 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// (e.g. compact tool JSON), which a naive per-round rescan tokenizes in
     /// seconds.
     ///
-    /// Merges happen in canonical rank-rounds: within a round every
-    /// non-overlapping occurrence of the current min-rank pair is merged (left
-    /// to right) before any pair created by those merges is admitted. This
-    /// matters because SentencePiece tokenizers (Gemma/Llama) give whitespace
-    /// runs non-monotonic ranks — a merged pair can outrank its own components
-    /// (e.g. rank(\t\t,\t) < rank(\t,\t)) — so popping the global min after
-    /// every single merge would let a freshly-formed pair preempt the round's
-    /// remaining merges and diverge from canonical output on any tab/space/
-    /// newline run. Because the heap is keyed `(rank, leftIndex)`, same-rank
-    /// occurrences pop in left-to-right order for free. Stale heap entries (a
-    /// node consumed by an earlier merge, or whose pair rank no longer matches
-    /// the candidate) are skipped on pop.
-    func bpe(token: String) -> String {
-        let parts0 = Array(token).map { String($0) }
+    /// Merges happen in rank-rounds: within a round every non-overlapping
+    /// occurrence of the current min-rank pair is merged (left to right)
+    /// before any pair created by those merges is admitted, as in the original
+    /// per-round rescan, which the differential test pins. Hugging Face
+    /// tokenizers admits a new pair at once instead, so the two differ where a
+    /// merged pair outranks its own components, as in SentencePiece whitespace
+    /// runs (rank(\t\t,\t) < rank(\t,\t)): on Gemma's table, 32 tabs give
+    /// 16 + 16 here and 31 + 1 there. Because the heap is keyed
+    /// `(rank, leftIndex)`, same-rank occurrences pop in left-to-right order
+    /// for free. Stale heap entries (a node consumed by an earlier merge, or
+    /// whose pair rank no longer matches the candidate) are skipped on pop.
+    ///
+    /// Returns the pieces in order, and `[]` for an empty token. They stay an
+    /// array, as in upstream swift-transformers #355, because joining them on
+    /// " " and splitting again loses boundaries: a piece that starts with a
+    /// combining mark or an emoji modifier forms one grapheme cluster with the
+    /// space before it, and a piece containing U+0020 is split at it, or lost
+    /// if it holds nothing else.
+    func bpe(token: String) -> [String] {
+        // Seed from Unicode scalars, as Hugging Face tokenizers does. `Array(token)` yields grapheme
+        // clusters, and no merge can then produce a token that starts or ends inside one. Upstream
+        // swift-transformers #355 made the same fix; AddedTokenTrie.split(_:) notes the same trap.
+        let parts0 = token.unicodeScalars.map { String($0) }
         let n = parts0.count
-        if n <= 1 { return token }
+        if n <= 1 { return parts0 }
 
         var parts = parts0
         var prev = [Int](repeating: 0, count: n)
@@ -304,7 +332,7 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
             result.append(parts[i])
             i = next[i]
         }
-        return result.joined(separator: " ")
+        return result
     }
 
     /// Tokenizes input text using the BPE algorithm.
@@ -313,8 +341,7 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// - Returns: An array of BPE token strings
     func tokenize(text: String) -> [String] {
         var tokens: [String] = []
-        let bpeTokens = bpe(token: text).split(separator: " ").map { String($0) }
-        for token in bpeTokens {
+        for token in bpe(token: text) {
             if convertTokenToId(token) != unknownTokenId {
                 tokens.append(token)
             } else {
