@@ -119,7 +119,7 @@ struct JangHadamardRuntimeTests {
         "malformed packed bytes, tensor layouts and bias companions are refused",
         arguments: [
             "head", "tail", "weight-dtype", "weight-rank", "empty", "columns",
-            "scale-dtype", "scale-shape", "stored-bias", "missing-module",
+            "scale-dtype", "scale-shape", "stored-bias", "missing-module", "chunk-size",
         ])
     func invalidPacked(reason: String) throws {
         try MLXMetalTestLock.withLock {
@@ -148,9 +148,80 @@ struct JangHadamardRuntimeTests {
                 #expect(throws: JangLoaderError.self) { try contract.expand(weights: &weights) }
             } else {
                 #expect(throws: JangLoaderError.self) {
-                    try expandJangTernaryPacked(packed, scales: scales)
+                    try expandJangTernaryPacked(
+                        packed, scales: scales,
+                        maximumChunkCodes: reason == "chunk-size" ? 0 : 1_048_576)
                 }
             }
+        }
+    }
+
+    @Test("all canonical byte values at every position match scalar decoding on GPU and CPU")
+    func exhaustivePackedBytes() throws {
+        try MLXMetalTestLock.withLock {
+            var encoded: [UInt8] = []
+            var expected: [UInt32] = []
+            for position in 0 ..< 26 {
+                for byte in 0 ... (position == 25 ? 26 : 242) {
+                    var group = Array(repeating: UInt8(0), count: 26)
+                    group[position] = UInt8(byte)
+                    encoded.append(contentsOf: group)
+                    var trits: [UInt8] = []
+                    for (index, value) in group.enumerated() {
+                        var remainder = Int(value)
+                        for _ in 0 ..< (index == 25 ? 3 : 5) {
+                            trits.append(UInt8(remainder % 3))
+                            remainder /= 3
+                        }
+                    }
+                    expected.append(contentsOf: Self.nativeWords(trits))
+                }
+            }
+            let rows = encoded.count / 26
+            for device in [Device.gpu, Device.cpu] {
+                try Device.withDefaultDevice(device) {
+                    let result = try expandJangTernaryPacked(
+                        MLXArray(encoded, [rows, 26]),
+                        scales: MLXArray.ones([rows, 1], dtype: .float16),
+                        maximumChunkCodes: 128 * 111)
+                    #expect(result.weight.asArray(UInt32.self) == expected)
+                }
+            }
+        }
+    }
+
+    @Test("every noncanonical byte is rejected, including later row chunks")
+    func allInvalidPackedBytes() throws {
+        try MLXMetalTestLock.withLock {
+            for position in 0 ..< 26 {
+                for value in (position == 25 ? 27 : 243) ... 255 {
+                    var bytes = Array(repeating: UInt8(0), count: 52)
+                    bytes[26 + position] = UInt8(value)
+                    #expect(throws: JangLoaderError.self) {
+                        try expandJangTernaryPacked(
+                            MLXArray(bytes, [2, 26]),
+                            scales: MLXArray.ones([2, 1], dtype: .float16),
+                            maximumChunkCodes: 128)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("strided packed input ignores invalid padding and preserves scale identity")
+    func stridedPackedBytes() throws {
+        try MLXMetalTestLock.withLock {
+            let rows = 3
+            let width = 512
+            let values = Self.trits(rows: rows, width: width)
+            let bytes = Self.pack(values).flatMap { [$0, UInt8(255)] }
+            let backing = MLXArray(bytes, [rows, width / 128 * 52])
+            let packed = backing[0..., .stride(by: 2)]
+            let scales = MLXArray.ones([rows, width / 128], dtype: .float16)
+            let result = try expandJangTernaryPacked(
+                packed, scales: scales, maximumChunkCodes: width)
+            #expect(result.weight.asArray(UInt32.self) == Self.nativeWords(values))
+            #expect(result.scales === scales)
         }
     }
 
