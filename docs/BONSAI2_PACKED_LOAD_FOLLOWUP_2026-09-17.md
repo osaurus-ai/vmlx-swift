@@ -72,3 +72,33 @@ app evidence exist. Record cold and warm weight-loading time separately from
 media preparation, cache restoration, remaining prefill and decode. Retain
 the old long-media memory failure as a separate row; this change only affects
 the packed storage expansion during load, not the native affine2 bundle.
+
+### Current-main component rerun
+
+SOURCE EVIDENCE:34026e3f84952ad7a144843fc602649c5cfbd02e, including
+engine main87a686e9. Production expansion blob remains5ca3b628; the last
+change only formatted the new profile fixture. All three changed Swift files
+pass local strict swift-format. Repository-wide advisory CI lint still fails
+on unrelated files; no CI rule was weakened.
+
+LIVE EVIDENCE: bounded Max2 component run03:29:50–03:31:28PDT on2026-09-18,
+`/Users/eric/vmlx-private-evidence/runtime-followup-2026-09-18/`:
+
+- `SWIFTTEST_BonsaiPacked34026Components1__032950.log`:35test functions in
+  8suites,0failures/0skips; selected tests include both actual bundle
+  tokenizers/media processors (no full model weights), fragmented
+  tool/reasoning streams, Gemma required-history, codec rejection, Hadamard
+  routing and hybrid disk checkpoint reopen/continuation.
+- `packed-34026e3f84952ad7a144843fc602649c5cfbd02e-one-swift-testing.xml`
+  retains individual test records. `run-engine-components.sh packed
+  34026e3f84952ad7a144843fc602649c5cfbd02e one` records the exact filter,
+  vendor pins, lockfile and Metal artifact hashes; run through the bounded
+  supervisor, not directly.
+- Profile warm iterations1–4:4096x5120,7.000–8.722ms;
+  2048x17408,12.531–14.791ms. These are current component times, not a new
+  paired baseline or app load/decode speed claim.
+- Guard exit0, peak tracked physical footprint1.42GiB, swap1.67GiB unchanged;
+  final cleanup verified0group/0tracked/0watchdog survivors.
+
+PARTIAL: current native model-loading/continuation proof still requires the
+named follow-up authorization. No full model was loaded in this component run.
