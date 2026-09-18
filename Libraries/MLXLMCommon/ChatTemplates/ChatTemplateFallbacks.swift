@@ -1147,6 +1147,23 @@ value_1
     {%- endif -%}
 {%- endmacro -%}
 
+{# Match Zyphra's native ZAYA tool declaration contract: schema fields that
+   are not rendered explicitly become their own XML tags. In particular,
+   array-valued parameters use <items>{...}</items>; wrapping the whole
+   parameter in a synthetic <schema> tag teaches the model to copy schema
+   text into the call argument instead of producing a value. #}
+{%- macro render_extra_keys(json_dict, handled_keys) -%}
+    {%- if json_dict is mapping -%}
+        {%- for json_key in json_dict if json_key not in handled_keys -%}
+            {%- if json_dict[json_key] is mapping or (json_dict[json_key] is sequence and json_dict[json_key] is not string) -%}
+                {{- '\n<' ~ json_key ~ '>' ~ (json_dict[json_key] | tojson | safe) ~ '</' ~ json_key ~ '>' -}}
+            {%- else -%}
+                {{- '\n<' ~ json_key ~ '>' ~ (json_dict[json_key] | string) ~ '</' ~ json_key ~ '>' -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+
 {%- macro render_tool_call(tool_call) -%}
     {%- if tool_call['function'] is defined -%}
         {%- set tool_call = tool_call['function'] -%}
@@ -1243,8 +1260,15 @@ value_1
                     {%- if param['description'] is defined -%}
                         {{- '\n<description>' ~ (param['description'] | trim) ~ '</description>' -}}
                     {%- endif -%}
+                    {%- if param['enum'] is defined -%}
+                        {{- '\n<enum>' ~ (param['enum'] | tojson | safe) ~ '</enum>' -}}
+                    {%- endif -%}
+                    {%- set handled_param_keys = ['name', 'type', 'description', 'enum'] -%}
+                    {{- render_extra_keys(param, handled_param_keys) -}}
                     {{- '\n</parameter>' -}}
                 {%- endfor -%}
+                {%- set handled_parameter_keys = ['type', 'properties', 'required'] -%}
+                {{- render_extra_keys(tool['parameters'], handled_parameter_keys) -}}
                 {%- if tool['parameters']['required'] is defined -%}
                     {{- '\n<required>' ~ (tool['parameters']['required'] | tojson | safe) ~ '</required>' -}}
                 {%- endif -%}
@@ -1257,7 +1281,7 @@ value_1
         {%- if required_tool_choice -%}
             {{- '\n</tools>\n\nWhen the current assistant response is a function call, reply with one `<zyphra_tool_call>` block matching one listed function and no prose.' -}}
         {%- else -%}
-            {{- '\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<zyphra_tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</zyphra_tool_call>' -}}
+            {{- '\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<zyphra_tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</zyphra_tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <zyphra_tool_call></zyphra_tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' -}}
         {%- endif -%}
         {%- if required_tool_choice -%}
             {{- '\n\n' -}}
