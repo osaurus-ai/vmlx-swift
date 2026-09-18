@@ -62,11 +62,11 @@ struct Qwen35MediaPrefillTests {
         return model
     }
 
-    private func input(videoFirst: Bool, mask: Bool = false) -> LMInput {
+    private func input(videoFirst: Bool, mask: Bool = false, tailCount: Int = 6) -> LMInput {
         let imageTokens = [Int32(96), 98, 98, 98, 98, 95]
         let tokens: [Int32] = [1, 2]
             + (videoFirst ? [96, 97, 97, 95, 3] : [])
-            + imageTokens + [4, 5, 6, 7, 8, 9]
+            + imageTokens + (0 ..< tailCount).map { Int32(4 + $0 % 20) }
         let pixels = MLXArray((0 ..< 16 * 12).map { Float($0 % 19) / 19 }, [16, 12])
         let videoPixels = MLXArray((0 ..< 8 * 12).map { Float($0 % 13) / 13 }, [8, 12])
         return LMInput(
@@ -98,6 +98,15 @@ struct Qwen35MediaPrefillTests {
     @Test("actual vision/hybrid forward preserves positions, KV, GDN and next decode",
           arguments: [false, true], [3, 4, 8])
     func chunkParity(videoFirst: Bool, window: Int) throws {
+        try assertChunkParity(videoFirst: videoFirst, window: window, tailCount: 6)
+    }
+
+    @Test("long media history preserves state across larger prefill blocks")
+    func longMediaHistory() throws {
+        try assertChunkParity(videoFirst: true, window: 128, tailCount: 257)
+    }
+
+    private func assertChunkParity(videoFirst: Bool, window: Int, tailCount: Int) throws {
         try MLXMetalTestLock.withLock {
             for initialOffset in [0, 3] {
                 let reference = try model()
@@ -109,7 +118,7 @@ struct Qwen35MediaPrefillTests {
                     MLX.eval(reference(prefix, cache: expectedCache))
                     MLX.eval(chunked(prefix, cache: actualCache))
                 }
-                let input = input(videoFirst: videoFirst, mask: initialOffset > 0)
+                let input = input(videoFirst: videoFirst, mask: initialOffset > 0, tailCount: tailCount)
                 let expected = try logits(reference.prepare(input, cache: expectedCache, windowSize: 0))
                 MLX.eval(expected, expectedCache)
                 let progress = OSAllocatedUnfairLock(initialState: [Int]())
