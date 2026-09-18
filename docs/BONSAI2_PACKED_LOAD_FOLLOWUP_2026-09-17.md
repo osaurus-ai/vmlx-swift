@@ -57,3 +57,18 @@ the separately documented failed memory row.
 Eric's23:31PDT instruction prioritizes finishing the merged integration and
 forbids stretching into additional test scope. This bounded run is closed;
 no further app rebuild or model campaign was started for this candidate.
+
+## Resumed 2026-09-18 after 0.25.7
+
+The user explicitly resumed loading/prefill, Gemma and handoff improvements.
+Current engine main87a686e9 was merged into this branch as357d22a3, preserving
+Gemma required-tool history and the merged Bonsai runtime. The production
+expansion blob remains5ca3b62846a2456cbdd030aacd2f2a026315a2be; there is no
+additional kernel or codec change in this merge. Whitespace checks pass.
+This is not a substitute for rerunning the combined regression graph.
+
+The PR remains a draft until current-head combined tests and repinned native
+app evidence exist. Record cold and warm weight-loading time separately from
+media preparation, cache restoration, remaining prefill and decode. Retain
+the old long-media memory failure as a separate row; this change only affects
+the packed storage expansion during load, not the native affine2 bundle.
