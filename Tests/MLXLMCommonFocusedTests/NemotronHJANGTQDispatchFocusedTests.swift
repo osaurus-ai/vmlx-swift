@@ -158,7 +158,7 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
         XCTAssertTrue(modelSource.contains("cache.offset += y.dim(1)"))
         XCTAssertTrue(modelSource.contains("D.asType(hidden.dtype)"))
         XCTAssertTrue(modelSource.contains("residual.asType(x.dtype)"))
-        XCTAssertTrue(modelSource.contains("out.asType(lmHead.weight.dtype)"))
+        XCTAssertTrue(modelSource.contains("out.asType(lmHead.computeDType)"))
         XCTAssertTrue(jangtqSource.contains("func weightedDecode(_ x: MLXArray, _ indices: MLXArray, scores: MLXArray) -> MLXArray?"))
         XCTAssertTrue(jangtqSource.contains("JANGTQKernels.gatherTQTopKScored("))
         XCTAssertTrue(jangtqSource.contains("return reduced.reshaped(outShape).asType(x.dtype)"))

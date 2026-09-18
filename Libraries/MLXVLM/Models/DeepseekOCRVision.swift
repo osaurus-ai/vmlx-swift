@@ -247,7 +247,7 @@ private class DeepseekOCRVisionEmbeddings: Module {
     /// position 0.
     func callAsFunction(_ x: MLXArray, patchEmbeds: MLXArray? = nil) -> MLXArray {
         let batchSize = x.dim(0)
-        let targetDtype = positionEmbedding.weight.dtype
+        let targetDtype = positionEmbedding.computeDType
 
         let patchEmbeddings: MLXArray
         if let patchEmbeds {
