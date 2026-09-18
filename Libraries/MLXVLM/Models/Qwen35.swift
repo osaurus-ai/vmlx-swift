@@ -2884,7 +2884,7 @@ enum Qwen35Language {
             ropeDeltas = nil
         }
 
-        private func resolvedPositionIds(
+        fileprivate func resolvedPositionIds(
             inputs: MLXArray,
             cache: [KVCache?]?,
             mask: MLXArray?,
@@ -3404,6 +3404,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         cache: [any KVCache],
         windowSize: Int?
     ) throws -> PrepareResult {
+        try Task.checkCancellation()
         let inputIds = input.text.tokens
 
         var pixelValues: MLXArray?
@@ -3459,13 +3460,59 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
 
         let typedCache = castCache(cache)
 
+        let prefillStepSize = windowSize ?? 512
+        let promptTokenCount = inputIds.dim(1)
+        if let inputEmbeddings, pixelValues != nil, !cache.isEmpty,
+            prefillStepSize > 0, promptTokenCount > prefillStepSize,
+            input.text.mask == nil || input.text.mask?.ndim == 2,
+            let positions = languageModel.resolvedPositionIds(
+                inputs: inputIds,
+                cache: typedCache,
+                mask: input.text.mask,
+                providedPositionIds: nil,
+                imageGridTHW: imageFrames,
+                videoGridTHW: videoFrames,
+                resetForMedia: true)
+        {
+            // M-RoPE depends on the complete media grid. Resolve it once,
+            // retaining the full-prompt decode delta, then slice positions
+            // together with embeddings. Recomputing per chunk would restart
+            // image coordinates and corrupt subsequent text/decode positions.
+            // Evaluate vision/scatter once so prefix chunks do not retain the
+            // encoder's lazy intermediates alongside the language trunk.
+            try Task.checkCancellation()
+            MLX.eval(inputEmbeddings, positions)
+            var offset = 0
+            while offset + prefillStepSize < promptTokenCount {
+                try Task.checkCancellation()
+                let end = offset + prefillStepSize
+                _ = languageModel(
+                    inputIds[0..., offset ..< end],
+                    inputsEmbeds: inputEmbeddings[0..., offset ..< end, 0...],
+                    cache: typedCache,
+                    positionIds: positions[0..., 0..., offset ..< end])
+                // Both attention KV and GDN convolution/recurrent state must
+                // complete before transient buffers can be released.
+                MLX.eval(cache)
+                PrefillProgressReporter.reportCompletedUnits(end)
+                offset = end
+                MLX.Memory.clearCache()
+            }
+            try Task.checkCancellation()
+            return .logits(languageModel(
+                inputIds[0..., offset...],
+                inputsEmbeds: inputEmbeddings[0..., offset..., 0...],
+                cache: typedCache,
+                positionIds: positions[0..., 0..., offset...]))
+        }
+
         // Chunked text-only prefill so the UI prefill counter advances instead
         // of freezing at "0/N". The single-shot forward below emits no
         // `PrefillProgress` frames, so a long hybrid (Ornith / qwen3_5) prompt
         // showed a frozen counter until first token. Only the pure-text,
-        // causal-mask path is chunked: image/video prefill and custom masks keep
-        // the single-shot path because mrope position ids are derived from the
-        // full image grid. Chunking is numerically identical to single-shot —
+        // causal-mask path is handled here. Media with resolved full-prompt
+        // positions uses the separate chunk path above; unsupported custom
+        // masks keep the single-shot fallback. Chunking carries state —
         // the hybrid cache (GatedDeltaNet conv+recurrent state + KV) carries
         // state across forwards, and the language model derives position ids and
         // the causal mask from `cache.offset` (the same invariant that makes
@@ -3475,8 +3522,6 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         // how token-by-token decode runs), so a causal/padding prefill mask is
         // reconstructed correctly per chunk — same as Gemma4's chunked VLM
         // prefill, which also drops the incoming mask.
-        let prefillStepSize = windowSize ?? 512
-        let promptTokenCount = inputIds.dim(1)
         if inputEmbeddings == nil, pixelValues == nil,
             prefillStepSize > 0, promptTokenCount > prefillStepSize
         {
