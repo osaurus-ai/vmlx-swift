@@ -102,9 +102,25 @@ public final class Device: @unchecked Sendable, Equatable {
 
     private static func _resolveGlobalDefaultDevice() -> Device {
         _lock.withLock {
-            _defaultDevice ?? .gpu
+            #if os(Linux)
+                // No Metal here, so `.gpu` exists only when a GPU backend (CUDA)
+                // was compiled in; a CPU-only build has to start on the CPU.
+                _defaultDevice ?? _coreDefaultDevice()
+            #else
+                _defaultDevice ?? .gpu
+            #endif
         }
     }
+
+    #if os(Linux)
+        /// The C++ core's default device: the GPU when a GPU backend is available,
+        /// the CPU otherwise.
+        private static func _coreDefaultDevice() -> Device {
+            var ctx = mlx_device_new()
+            mlx_get_default_device(&ctx)
+            return Device(ctx)
+        }
+    #endif
 
     /// Return the current default device.
     ///
@@ -141,7 +157,8 @@ public final class Device: @unchecked Sendable, Equatable {
     /// Device.setDefault(device: Device(.cpu, index: 1))
     /// ```
     ///
-    /// By default this is ``gpu``.
+    /// By default this is ``gpu`` on Apple platforms. On Linux it is the MLX core's
+    /// default: the GPU when a GPU backend (CUDA) is compiled in, the CPU otherwise.
     ///
     /// ### See Also
     /// - ``withDefaultDevice(_:_:)-17vjl``
