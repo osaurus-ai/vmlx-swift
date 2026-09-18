@@ -1,0 +1,127 @@
+{
+ "conditions": {
+  "torch": "2.14.0",
+  "transformers": "4.57.3",
+  "tokenizers": "0.22.2",
+  "python": "3.12.11",
+  "platform": "macOS-27.2-arm64-arm-64bit",
+  "device": "cpu",
+  "attn_implementation": "eager",
+  "generator_sha256": "974ce0841e32e8ff058d81b3e2fb645df7432dbf45cd63a69a46ee6a162bddae",
+  "generator_git_blob": "38874c25ed61b44a1c6ff87c7c1c381bee483c85",
+  "seed": 20260918
+ },
+ "config": {
+  "vocab_size": 64,
+  "hidden_size": 128,
+  "intermediate_size": 192,
+  "num_hidden_layers": 4,
+  "num_attention_heads": 2,
+  "max_position_embeddings": 64,
+  "local_attention": 8,
+  "global_attn_every_n_layers": 3,
+  "global_rope_theta": 150000.0,
+  "local_rope_theta": 160000.0,
+  "norm_eps": 1e-12,
+  "hidden_activation": "gelu",
+  "pad_token_id": 0,
+  "bos_token_id": 2,
+  "eos_token_id": 1,
+  "cls_token_id": 2,
+  "sep_token_id": 1,
+  "reference_compile": false,
+  "model_type": "modernbert"
+ },
+ "clamp_config": {
+  "vocab_size": 64,
+  "hidden_size": 128,
+  "intermediate_size": 192,
+  "num_hidden_layers": 4,
+  "num_attention_heads": 2,
+  "max_position_embeddings": 12,
+  "local_attention": 8,
+  "global_attn_every_n_layers": 3,
+  "global_rope_theta": 150000.0,
+  "local_rope_theta": 160000.0,
+  "norm_eps": 1e-12,
+  "hidden_activation": "gelu",
+  "pad_token_id": 0,
+  "bos_token_id": 2,
+  "eos_token_id": 1,
+  "cls_token_id": 2,
+  "sep_token_id": 1,
+  "reference_compile": false,
+  "model_type": "modernbert"
+ },
+ "cases": {
+  "standard": {
+   "lengths": [
+    16,
+    11
+   ]
+  },
+  "aligned": {
+   "lengths": [
+    32,
+    11
+   ]
+  },
+  "clamp": {
+   "input_length": 20,
+   "limit": 12
+  },
+  "short": {
+   "lengths": [
+    6,
+    3
+   ]
+  }
+ },
+ "mlp_case": {
+  "layer": 1,
+  "tokens": 64,
+  "range": [
+   -3.0,
+   3.0
+  ]
+ },
+ "bounds": {
+  "model": 0.0002,
+  "mlp": 0.0001
+ },
+ "mutations": {
+  "1_swap_theta": {
+   "effect": 0.0123671293258667,
+   "bound": 0.0002,
+   "ratio": 61.835646629333496
+  },
+  "2_every_layer_global": {
+   "effect": 2.138418674468994,
+   "bound": 0.0002,
+   "ratio": 10692.09337234497
+  },
+  "3_layer0_attn_norm": {
+   "effect": 0.38212287425994873,
+   "bound": 0.0002,
+   "ratio": 1910.6143712997437
+  },
+  "4_clamp_literal": {
+   "effect": 1.30972421169281,
+   "bound": 0.0002,
+   "ratio": 6548.62105846405
+  },
+  "5_gelu_tanh_mlp_case": {
+   "effect": 0.0015101432800292969,
+   "bound": 0.0001,
+   "ratio": 15.101432800292969
+  },
+  "6_swap_wi_halves": {
+   "effect": 4.083624839782715,
+   "bound": 0.0002,
+   "ratio": 20418.124198913574
+  }
+ },
+ "outright_failures": {
+  "3_layer0_attn_norm": "load_state_dict refuses: no layers.0.attn_norm.weight"
+ }
+}

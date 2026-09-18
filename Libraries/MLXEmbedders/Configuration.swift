@@ -32,6 +32,11 @@ private class ModelTypeRegistry: @unchecked Sendable {
                 NomicBertConfiguration.self, from: data)
             return NomicBertModel(configuration, pooler: false)
         },
+        "modernbert": { data in
+            let configuration = try JSONDecoder.json5().decode(
+                ModernBertConfiguration.self, from: data)
+            return ModernBertModel(configuration)
+        },
         "qwen3": { data in
             let configuration = try JSONDecoder.json5().decode(Qwen3Configuration.self, from: data)
             return Qwen3Model(configuration)
