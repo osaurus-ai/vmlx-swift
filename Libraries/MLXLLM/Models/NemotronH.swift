@@ -1367,9 +1367,9 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         var out = backbone(inputs, cache: cache)
         if let lmHead {
             if nemotronHActivationBF16RetentionEnabled(),
-                out.dtype != lmHead.weight.dtype
+                out.dtype != lmHead.computeDType
             {
-                out = out.asType(lmHead.weight.dtype)
+                out = out.asType(lmHead.computeDType)
             }
             out = lmHead(out)
         } else {
@@ -1393,9 +1393,9 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         var out = backbone.forwardFromEmbeddings(inputsEmbeds, cache: cache)
         if let lmHead {
             if nemotronHActivationBF16RetentionEnabled(),
-                out.dtype != lmHead.weight.dtype
+                out.dtype != lmHead.computeDType
             {
-                out = out.asType(lmHead.weight.dtype)
+                out = out.asType(lmHead.computeDType)
             }
             out = lmHead(out)
         } else {

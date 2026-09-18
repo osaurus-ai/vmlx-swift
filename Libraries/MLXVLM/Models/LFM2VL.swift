@@ -223,7 +223,7 @@ private enum Vision {
         }
 
         func callAsFunction(_ pixelValues: MLXArray, spatialShapes: MLXArray) -> MLXArray {
-            let targetDtype = patchEmbedding.weight.dtype
+            let targetDtype = patchEmbedding.computeDType
             let patchEmbeds = patchEmbedding(pixelValues.asType(targetDtype))
 
             let positionalEmbeddings = positionEmbedding.weight.reshaped(
@@ -263,7 +263,7 @@ private enum Vision {
             spatialShapes: MLXArray
         ) -> (encoderOutputs: [MLXArray]?, embeddings: MLXArray, lastHiddenState: MLXArray) {
             var embeds = embeddings(x, spatialShapes: spatialShapes)
-            embeds = embeds.asType(embeddings.patchEmbedding.weight.dtype)
+            embeds = embeds.asType(embeddings.patchEmbedding.computeDType)
 
             let encoderOutputs = encoder(embeds, outputHiddenStates: outputHiddenStates, mask: nil)
             let lastHiddenState = postLayernorm(encoderOutputs?.last ?? embeds)
@@ -1043,7 +1043,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let dtype = visionModel.embeddings.patchEmbedding.weight.dtype
+        let dtype = visionModel.embeddings.patchEmbedding.computeDType
 
         // Get image data if available
         let pixelValues = input.image?.pixels.asType(dtype)

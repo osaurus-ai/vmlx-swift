@@ -602,7 +602,7 @@ private class Gemma4AudioAttention: Module {
         let kb = extractBlockContext(k, numBlocks: nb)
         let vb = extractBlockContext(v, numBlocks: nb)
 
-        var relK = relativeKProj(positionEmbeddings.asType(relativeKProj.weight.dtype))
+        var relK = relativeKProj(positionEmbeddings.asType(relativeKProj.computeDType))
         relK = relK.asType(.float32).reshaped(-1, numHeads, headDim)  // [P, H, D]
 
         let queries = qb.transposed(0, 3, 1, 2, 4)  // [B, H, nb, chunk, D]
@@ -621,7 +621,7 @@ private class Gemma4AudioAttention: Module {
         var out = matmul(attn, vb.transposed(0, 3, 1, 2, 4))  // [B, H, nb, chunk, D]
         out = out.transposed(0, 2, 3, 1, 4).reshaped(B, nb * chunkSize, numHeads * headDim)
         out = out[0..., ..<T]
-        return post(out.asType(post.linear.weight.dtype))
+        return post(out.asType(post.linear.computeDType))
     }
 }
 

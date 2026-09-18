@@ -519,7 +519,7 @@ private class VisionPatchEmbedder: Module {
         let patches = pixels.reshaped(B, C, H / p, p, W / p, p)
             .transposed(0, 2, 4, 3, 5, 1).reshaped(B, (H / p) * (W / p), C * p * p)
         let normalized = 2 * (patches - 0.5)
-        let embedded = inputProj(normalized.asType(inputProj.weight.dtype))
+        let embedded = inputProj(normalized.asType(inputProj.computeDType))
 
         let oh = oneHot(patchPos, numClasses: posEmbSize)
             .transposed(0, 2, 1, 3).asType(posTable.dtype)
@@ -653,7 +653,7 @@ private class UnifiedVisionEmbedder: Module {
             .transposed(0, 2, 4, 3, 5, 1)
             .reshaped(B, pH * pW, C * p * p)
         patches = patches[0..., ..<nReal, 0...]
-        var hidden = patchDense(patchNorm1(patches).asType(patchDense.weight.dtype))
+        var hidden = patchDense(patchNorm1(patches).asType(patchDense.computeDType))
         hidden = patchNorm2(hidden)
 
         var positions: [Int32] = []
@@ -1003,7 +1003,10 @@ private class TextModel: Module {
         if let ie = inputEmbedding {
             h = ie.ndim == 2 ? ie.expandedDimensions(axis: 0) : ie
         } else {
-            h = emb(inputs!) * MLXArray(sqrt(Float(cfg.hiddenSize)), dtype: emb.weight.dtype)
+            // In the rows' dtype, as `prepare` scales the prompt. `emb.weight.dtype` is the packed
+            // uint32 array once `embed_tokens` is quantized, which truncated the scale.
+            let rows = emb(inputs!)
+            h = rows * MLXArray(sqrt(Float(cfg.hiddenSize)), dtype: rows.dtype)
         }
 
         var pliList: [MLXArray?]
