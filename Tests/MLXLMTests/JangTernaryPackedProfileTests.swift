@@ -35,9 +35,11 @@ struct JangTernaryPackedProfileTests {
                     let record: [String: Any] = [
                         "kind": "bonsai2_packed_expansion", "rows": rows, "width": width,
                         "codes": rows * width, "iteration": iteration,
-                        "milliseconds": milliseconds, "device": String(describing: Device.defaultDevice()),
+                        "milliseconds": milliseconds,
+                        "device": String(describing: Device.defaultDevice()),
                     ]
-                    let data = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
+                    let data = try JSONSerialization.data(
+                        withJSONObject: record, options: [.sortedKeys])
                     print(String(decoding: data, as: UTF8.self))
                 }
             }
