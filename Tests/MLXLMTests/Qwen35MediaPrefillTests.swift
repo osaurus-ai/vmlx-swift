@@ -12,7 +12,8 @@ struct Qwen35MediaPrefillTests {
     private func model() throws -> Qwen35 {
         let config = try JSONDecoder().decode(
             Qwen35Configuration.self,
-            from: Data("""
+            from: Data(
+                """
                 {
                   "model_type": "qwen3_5", "text_config": {
                     "model_type": "qwen3_5_text", "hidden_size": 32,
@@ -49,8 +50,9 @@ struct Qwen35MediaPrefillTests {
             if name.hasSuffix(".A_log") || name.hasSuffix(".dt_bias") {
                 data = Array(repeating: 0, count: parameter.size)
             } else if name.contains("norm"), name.hasSuffix(".weight") {
-                let gamma: Float = name.hasPrefix("vision_tower.")
-                    || name.hasSuffix(".linear_attn.norm.weight") ? 1 : 0
+                let gamma: Float =
+                    name.hasPrefix("vision_tower.")
+                        || name.hasSuffix(".linear_attn.norm.weight") ? 1 : 0
                 data = Array(repeating: gamma, count: parameter.size)
             } else {
                 data = (0 ..< parameter.size).map { Float(($0 * 17 + seed) % 41 - 20) * 0.015 }
@@ -64,7 +66,8 @@ struct Qwen35MediaPrefillTests {
 
     private func input(videoFirst: Bool, mask: Bool = false, tailCount: Int = 6) -> LMInput {
         let imageTokens = [Int32(96), 98, 98, 98, 98, 95]
-        let tokens: [Int32] = [1, 2]
+        let tokens: [Int32] =
+            [1, 2]
             + (videoFirst ? [96, 97, 97, 95, 3] : [])
             + imageTokens + (0 ..< tailCount).map { Int32(4 + $0 % 20) }
         let pixels = MLXArray((0 ..< 16 * 12).map { Float($0 % 19) / 19 }, [16, 12])
@@ -89,14 +92,16 @@ struct Qwen35MediaPrefillTests {
         #expect(actual.shape == expected.shape)
         guard actual.shape == expected.shape else { return }
         let finite = MLX.all(isFinite(actual)).item(Bool.self)
-        let error = MLX.max(abs(actual.asType(.float32) - expected.asType(.float32))).item(Float.self)
+        let error = MLX.max(abs(actual.asType(.float32) - expected.asType(.float32))).item(
+            Float.self)
         let scale = MLX.max(abs(expected.asType(.float32))).item(Float.self)
         #expect(finite)
         #expect(error <= 0.0001 + 0.0001 * scale)
     }
 
-    @Test("actual vision/hybrid forward preserves positions, KV, GDN and next decode",
-          arguments: [false, true], [3, 4, 8])
+    @Test(
+        "actual vision/hybrid forward preserves positions, KV, GDN and next decode",
+        arguments: [false, true], [3, 4, 8])
     func chunkParity(videoFirst: Bool, window: Int) throws {
         try assertChunkParity(videoFirst: videoFirst, window: window, tailCount: 6)
     }
@@ -118,8 +123,10 @@ struct Qwen35MediaPrefillTests {
                     MLX.eval(reference(prefix, cache: expectedCache))
                     MLX.eval(chunked(prefix, cache: actualCache))
                 }
-                let input = input(videoFirst: videoFirst, mask: initialOffset > 0, tailCount: tailCount)
-                let expected = try logits(reference.prepare(input, cache: expectedCache, windowSize: 0))
+                let input = input(
+                    videoFirst: videoFirst, mask: initialOffset > 0, tailCount: tailCount)
+                let expected = try logits(
+                    reference.prepare(input, cache: expectedCache, windowSize: 0))
                 MLX.eval(expected, expectedCache)
                 let progress = OSAllocatedUnfairLock(initialState: [Int]())
                 let actual = try PrefillProgressReporter.withHandler({ completed in
@@ -130,7 +137,8 @@ struct Qwen35MediaPrefillTests {
                 MLX.eval(actual, actualCache)
                 equal(actual[0..., -1, 0...], expected[0..., -1, 0...])
                 #expect(actual.dim(1) <= window)
-                let expectedProgress = Array(stride(from: window, to: input.text.tokens.dim(1), by: window))
+                let expectedProgress = Array(
+                    stride(from: window, to: input.text.tokens.dim(1), by: window))
                 #expect(progress.withLock { $0 } == expectedProgress)
                 #expect(actualCache.count == expectedCache.count)
                 for (lhs, rhs) in zip(actualCache, expectedCache) {
@@ -149,7 +157,9 @@ struct Qwen35MediaPrefillTests {
         }
     }
 
-    @Test("fitting and disabled windows keep full-prompt logits without progress", arguments: [0, -1, 19, 64])
+    @Test(
+        "fitting and disabled windows keep full-prompt logits without progress",
+        arguments: [0, -1, 19, 64])
     func unchunkedWindows(window: Int) throws {
         try MLXMetalTestLock.withLock {
             let model = try model()
@@ -158,7 +168,9 @@ struct Qwen35MediaPrefillTests {
             let result = try PrefillProgressReporter.withHandler({ completed in
                 progress.withLock { $0.append(completed) }
             }) {
-                try logits(model.prepare(input, cache: model.newCache(parameters: nil), windowSize: window))
+                try logits(
+                    model.prepare(input, cache: model.newCache(parameters: nil), windowSize: window)
+                )
             }
             MLX.eval(result)
             #expect(result.dim(1) == input.text.tokens.dim(1))
@@ -185,7 +197,9 @@ struct Qwen35MediaPrefillTests {
         }
     }
 
-    @Test("Stop before work or after a completed chunk never processes the tail", arguments: [false, true])
+    @Test(
+        "Stop before work or after a completed chunk never processes the tail",
+        arguments: [false, true])
     func cancellation(afterChunk: Bool) async throws {
         try await Task {
             try MLXMetalTestLock.withLock {
