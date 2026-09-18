@@ -64,8 +64,6 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/cpu/gemms/bnns.cpp",  // macOS Accelerate version
         "mlx-conditional",
         "mlx-c/mlx/c/metal.cpp",
-
-        "mlx-c/mlx/c/fast.cpp",  // Exclude on Linux - calls metal_kernel unconditionally
     ]
 
     let cxxSettings: [CXXSetting] = []
@@ -80,8 +78,6 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
     let mlxSwiftExcludes: [String] = [
         "GPU+Metal.swift",
         "MLXArray+Metal.swift",
-        "MLXFast.swift",
-        "MLXFastKernel.swift",
     ]
 #else
     let platformExcludes: [String] = [
