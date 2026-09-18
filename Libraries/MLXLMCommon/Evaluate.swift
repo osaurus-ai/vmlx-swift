@@ -1908,7 +1908,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                 var retainedDiskRestore = false
                 var restoredTokenCount = 0
                 if !blocks.isEmpty {
-                    let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
+                    let restoredTokens = restoreLayerData(
+                        from: blocks, into: self.cache,
+                        preserveStandardKVStorageDType: coordinator.config.preserveStandardKVStorageDType)
                     coordinator.release(blocks: blocks)
                     if restoredTokens > 0 {
                         restoredTokenCount = restoredTokens

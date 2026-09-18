@@ -201,7 +201,8 @@ struct Qwen35HadamardCacheTests {
         let coordinator = CacheCoordinator(
             config: .init(
                 usePagedCache: false, enableDiskCache: true, diskCacheMaxGB: 0.1,
-                diskCacheDir: directory, modelKey: "bonsai2-four-layer|packed=\(packed)"))
+                diskCacheDir: directory, modelKey: "bonsai2-four-layer|packed=\(packed)",
+                preserveStandardKVStorageDType: true))
         coordinator.setHybrid(
             true, requiresRecurrentSSMCompanion: true, requiresSeparateRecurrentPayload: false)
         return coordinator

@@ -289,6 +289,9 @@ public final class ModelContainer: Sendable {
     /// Auto-detects hybrid models and sets modelKey from configuration if not provided.
     public func enableCaching(config: CacheCoordinatorConfig = CacheCoordinatorConfig()) {
         var config = config
+        if attentionCacheKeyComponent != nil {
+            config.preserveStandardKVStorageDType = true
+        }
         // Auto-set modelKey from model configuration if not provided
         if config.modelKey == nil {
             // Will be set asynchronously after first access — for now use a placeholder
@@ -307,6 +310,9 @@ public final class ModelContainer: Sendable {
     /// Call after model loading. Inspects the model's cache types to detect SSM layers.
     public func enableCachingAsync(config baseConfig: CacheCoordinatorConfig = CacheCoordinatorConfig()) async {
         var config = baseConfig
+        if attentionCacheKeyComponent != nil {
+            config.preserveStandardKVStorageDType = true
+        }
         let modelConfig = await context.read { $0.configuration }
         if config.modelKey == nil {
             config.modelKey = modelConfig.name

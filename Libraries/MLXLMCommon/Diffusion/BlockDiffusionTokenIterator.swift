@@ -167,7 +167,9 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             case .hit(let matchedTokens, let remainingTokens, _, let blocks, _, let diskArrays):
                 var restored = false
                 if !blocks.isEmpty {
-                    let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
+                    let restoredTokens = restoreLayerData(
+                        from: blocks, into: self.cache,
+                        preserveStandardKVStorageDType: coordinator.config.preserveStandardKVStorageDType)
                     coordinator.release(blocks: blocks)
                     restored = restoredTokens > 0
                 }

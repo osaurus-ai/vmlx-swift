@@ -472,7 +472,10 @@ public func extractLayerData(from cache: [any KVCache]) -> [(keys: MLXArray, val
 ///   - cache: The model's per-layer cache array to restore into.
 /// - Returns: The total number of tokens restored across all blocks.
 @discardableResult
-public func restoreLayerData(from blocks: [CacheBlock], into cache: [any KVCache]) -> Int {
+public func restoreLayerData(
+    from blocks: [CacheBlock], into cache: [any KVCache],
+    preserveStandardKVStorageDType: Bool = false
+) -> Int {
     guard let firstBlock = blocks.first, let firstData = firstBlock.cacheData else { return 0 }
     let numBlockLayers = firstData.count
 
@@ -520,7 +523,7 @@ public func restoreLayerData(from blocks: [CacheBlock], into cache: [any KVCache
 
         // Ensure restored KV matches bfloat16 (prevents dtype mismatch from stale
         // disk cache entries created before the universal bfloat16 conversion)
-        if restoredKeys.dtype == .float16 {
+        if !preserveStandardKVStorageDType, restoredKeys.dtype == .float16 {
             restoredKeys = restoredKeys.asType(.bfloat16)
             restoredValues = restoredValues.asType(.bfloat16)
         }
@@ -819,6 +822,14 @@ private func restoreFromV2Arrays(
     _ arrays: [String: MLXArray],
     into cache: inout [any KVCache]
 ) -> Int {
+    let preserveStandardKVStorageDType: Bool
+    if let marker = arrays[TQDiskSerializer.preserveStandardKVStorageDTypeKey] {
+        guard marker.shape == [1], marker.dtype == .int32,
+              marker.item(Int32.self) == 1 else { return 0 }
+        preserveStandardKVStorageDType = true
+    } else {
+        preserveStandardKVStorageDType = false
+    }
     let indexed = TQDiskSerializer.deserializeIndexed(arrays)
     guard !indexed.isEmpty else { return 0 }
 
@@ -913,7 +924,7 @@ private func restoreFromV2Arrays(
         case .standard(let kv):
             var keys = kv.keys
             var values = kv.values
-            if keys.dtype == .float16 {
+            if !preserveStandardKVStorageDType, keys.dtype == .float16 {
                 keys = keys.asType(.bfloat16)
                 values = values.asType(.bfloat16)
             }
@@ -1101,7 +1112,7 @@ private func restoreFromV2Arrays(
                 case .standard(let kv):
                     var keys = kv.keys
                     var values = kv.values
-                    if keys.dtype == .float16 {
+                    if !preserveStandardKVStorageDType, keys.dtype == .float16 {
                         keys = keys.asType(.bfloat16)
                         values = values.asType(.bfloat16)
                     }

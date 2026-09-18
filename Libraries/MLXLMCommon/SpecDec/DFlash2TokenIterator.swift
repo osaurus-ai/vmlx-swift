@@ -434,7 +434,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             {
                 var restored = false
                 if !blocks.isEmpty {
-                    let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
+                    let restoredTokens = restoreLayerData(
+                        from: blocks, into: self.cache,
+                        preserveStandardKVStorageDType: coordinator.config.preserveStandardKVStorageDType)
                     coordinator.release(blocks: blocks)
                     if restoredTokens > 0 {
                         if let ssm = ssmStates {

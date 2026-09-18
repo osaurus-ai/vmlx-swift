@@ -7,6 +7,13 @@ import Testing
 
 @Suite("Bonsai2 FP16 attention and unchanged recurrent state", .serialized)
 struct Bonsai2AttentionPrecisionTests {
+    private func actualOffset(_ cache: any KVCache) -> Int {
+        if let ring = cache as? CompilableRotatingKVCache {
+            return ring.offsetArray[0].item(Int.self)
+        }
+        return cache.offset
+    }
+
     private func tensor(_ shape: [Int], seed: Int = 0) -> MLXArray {
         let count = shape.reduce(1, *)
         return MLXArray((0 ..< count).map { Float(($0 * 17 + seed) % 101 - 50) / 37 }, shape)
@@ -90,7 +97,7 @@ struct Bonsai2AttentionPrecisionTests {
                     queries: q, keys: k, values: v, cache: cache, scale: 0.125,
                     mask: cache.makeMask(n: 1, windowSize: nil, returnArray: true), enabled: true)
                 close(actual, expected)
-                #expect(cache.offset == offset + 1)
+                #expect(actualOffset(cache) == offset + 1)
             }
         }
     }
@@ -193,7 +200,8 @@ struct Bonsai2AttentionPrecisionTests {
                         scale: 0.125, mask: .none, enabled: true)
                     let actual = forward([q, k, v])[0]
                     close(actual, expected)
-                    #expect(cache.offset == 8 + step && eager.offset == cache.offset)
+                    #expect(actualOffset(cache) == 8 + step)
+                    #expect(actualOffset(eager) == actualOffset(cache))
                     #expect(
                         cache.innerState().filter { $0.ndim == 4 }.allSatisfy {
                             $0.dtype == .float16
@@ -220,10 +228,96 @@ struct Bonsai2AttentionPrecisionTests {
         }
         let config = CacheCoordinatorConfig(
             usePagedCache: false, enableDiskCache: false, modelKey: "same-bundle-and-media")
+        #expect(!config.preserveStandardKVStorageDType)
         container.enableCaching(config: config)
         let syncKey = try #require(container.cacheCoordinator?.config.modelKey)
         #expect(syncKey == "same-bundle-and-media|bonsai-attention-fp16-v1")
+        #expect(container.cacheCoordinator?.config.preserveStandardKVStorageDType == true)
         await container.enableCachingAsync(config: config)
         #expect(container.cacheCoordinator?.config.modelKey == syncKey)
+        #expect(container.cacheCoordinator?.config.preserveStandardKVStorageDType == true)
+    }
+
+    @Test("native dtype disk metadata is opt-in, survives reopen, and leaves F32 SSM intact")
+    func diskStoragePolicy() throws {
+        try MLXMetalTestLock.withLock {
+            let file = FileManager.default.temporaryDirectory.appendingPathComponent(
+                "bonsai-dtype-\(UUID().uuidString).safetensors")
+            defer { try? FileManager.default.removeItem(at: file) }
+            for dtype: DType in [.float16, .bfloat16, .float32] {
+                for preserve in [false, true] {
+                    for nested in [false, true] {
+                        let kv = KVCacheSimple()
+                        let keys = tensor([1, 2, 7, 64]).asType(dtype)
+                        let values = tensor([1, 2, 7, 64], seed: 3).asType(dtype)
+                        _ = kv.update(keys: keys, values: values)
+                        let ssm = MambaCache()
+                        ssm[0] = tensor([1, 3, 64])
+                        ssm[1] = tensor([1, 2, 64, 64])
+                        ssm.offset = 7
+                        let source: [any KVCache] = nested ? [CacheList(ssm, kv)] : [ssm, kv]
+                        let payload = TQDiskSerializer.serialize(
+                            cache: source, preserveStandardKVStorageDType: preserve)
+                        let marker = payload[TQDiskSerializer.preserveStandardKVStorageDTypeKey]
+                        #expect((marker != nil) == preserve)
+                        try MLX.save(arrays: payload, url: file)
+                        let reopened = try MLX.loadArrays(url: file)
+                        let freshKV = KVCacheSimple()
+                        let freshSSM = MambaCache()
+                        var target: [any KVCache] =
+                            nested
+                            ? [CacheList(freshSSM, freshKV)] : [freshSSM, freshKV]
+                        let count = restoreFromDiskArrays(
+                            reopened, into: &target, requirePromptBoundary: true)
+                        #expect(count == 7 && freshKV.offset == 7 && freshSSM.offset == 7)
+                        let expectedDType: DType =
+                            !preserve && dtype == .float16 ? .bfloat16 : dtype
+                        #expect(freshKV.state.allSatisfy { $0.dtype == expectedDType })
+                        #expect(
+                            MLX.all(freshKV.state[0] .== keys.asType(expectedDType)).item(Bool.self)
+                        )
+                        #expect(
+                            MLX.all(freshKV.state[1] .== values.asType(expectedDType)).item(
+                                Bool.self))
+                        #expect(freshSSM.state.allSatisfy { $0.dtype == .float32 })
+                        for (actual, expected) in zip(freshSSM.state, ssm.state) {
+                            #expect(MLX.all(actual .== expected).item(Bool.self))
+                        }
+                    }
+                }
+            }
+
+            let populated = KVCacheSimple()
+            _ = populated.update(keys: tensor([1, 2, 7, 64]), values: tensor([1, 2, 7, 64]))
+            var payload = TQDiskSerializer.serialize(cache: [populated])
+            for invalid in [MLXArray([Int32(0)]), MLXArray([Int32(1), 1]), MLXArray([Float(1)])] {
+                payload[TQDiskSerializer.preserveStandardKVStorageDTypeKey] = invalid
+                var empty: [any KVCache] = [KVCacheSimple()]
+                #expect(
+                    restoreFromDiskArrays(payload, into: &empty, requirePromptBoundary: true) == 0)
+                #expect(empty[0].offset == 0 && empty[0].state.isEmpty)
+            }
+        }
+    }
+
+    @Test("paged restore uses the same opt-in dtype policy")
+    func pagedStoragePolicy() throws {
+        try MLXMetalTestLock.withLock {
+            let keys = tensor([1, 2, 7, 64]).asType(.float16)
+            let values = tensor([1, 2, 7, 64], seed: 3).asType(.float16)
+            let block = CacheBlock(blockId: 0, blockSize: 8)
+            block.tokenIds = Array(0 ..< 7)
+            block.cacheData = [(keys: keys, values: values)]
+            for preserve in [false, true] {
+                let target = KVCacheSimple()
+                let restored = restoreLayerData(
+                    from: [block], into: [target], preserveStandardKVStorageDType: preserve)
+                let dtype: DType = preserve ? .float16 : .bfloat16
+                #expect(restored == 7 && target.offset == 7)
+                #expect(target.state.allSatisfy { $0.dtype == dtype })
+                #expect(MLX.all(target.state[0] .== keys.asType(dtype)).item(Bool.self))
+                #expect(MLX.all(target.state[1] .== values.asType(dtype)).item(Bool.self))
+            }
+        }
     }
 }

@@ -1054,7 +1054,8 @@ public final class CacheCoordinator: @unchecked Sendable {
             if let cache {
                 let arrays = TQDiskSerializer.serialize(
                     cache: cache,
-                    ssmStates: persistSeparateRecurrentPayload ? ssmStates : nil)
+                    ssmStates: persistSeparateRecurrentPayload ? ssmStates : nil,
+                    preserveStandardKVStorageDType: config.preserveStandardKVStorageDType)
                 if !arrays.isEmpty {
                     diskArrays = arrays
                 }

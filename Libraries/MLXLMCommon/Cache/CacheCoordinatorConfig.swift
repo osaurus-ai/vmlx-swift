@@ -64,6 +64,11 @@ public struct CacheCoordinatorConfig: Sendable {
     /// return each other's cached KV state.
     public var modelKey: String?
 
+    /// Preserve native floating attention storage on paged/disk restore.
+    /// ModelContainer enables this for the Hadamard attention policy. The
+    /// default retains the legacy FP16-to-BF16 compatibility conversion.
+    public var preserveStandardKVStorageDType: Bool
+
     /// Default ``KVQuantizationMode`` applied to admitted slots whose
     /// request ``GenerateParameters.kvMode`` is `.none`.
     ///
@@ -112,7 +117,8 @@ public struct CacheCoordinatorConfig: Sendable {
         modelKey: String? = nil,
         defaultKVMode: KVQuantizationMode = .none,
         defaultMaxKVSize: Int? = nil,
-        longPromptMultiplier: Double = 2.0
+        longPromptMultiplier: Double = 2.0,
+        preserveStandardKVStorageDType: Bool = false
     ) {
         self.usePagedCache = usePagedCache
         self.enableDiskCache = enableDiskCache
@@ -126,6 +132,7 @@ public struct CacheCoordinatorConfig: Sendable {
         self.defaultKVMode = defaultKVMode
         self.defaultMaxKVSize = defaultMaxKVSize
         self.longPromptMultiplier = longPromptMultiplier
+        self.preserveStandardKVStorageDType = preserveStandardKVStorageDType
     }
 }
 

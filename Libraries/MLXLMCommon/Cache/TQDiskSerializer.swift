@@ -73,6 +73,10 @@ public enum TQDiskSerializer {
     /// Key that holds the format version scalar.
     public static let formatVersionKey = "__jang_cache_format_version__"
 
+    /// Explicit native attention dtype contract; absent on legacy/model-default
+    /// records. Recurrent state and typed/quantized layer formats are unchanged.
+    static let preserveStandardKVStorageDTypeKey = "__preserve_standard_kv_dtype__"
+
     /// Legacy marker. Pre-v2 code checked this to decide whether to parse at
     /// all. Still written for back-compat with any external consumer.
     public static let legacyMarkerKey = "__tq_native_marker__"
@@ -251,12 +255,16 @@ public enum TQDiskSerializer {
     /// - Returns: Flat dictionary ready for `DiskCache.store()`.
     public static func serialize(
         cache: [any KVCache],
-        ssmStates: [MLXArray]? = nil
+        ssmStates: [MLXArray]? = nil,
+        preserveStandardKVStorageDType: Bool = false
     ) -> [String: MLXArray] {
         var result: [String: MLXArray] = [:]
 
         result[formatVersionKey] = metaInt32(currentFormatVersion)
         result[legacyMarkerKey] = MLXArray([Int32(1)])
+        if preserveStandardKVStorageDType {
+            result[preserveStandardKVStorageDTypeKey] = metaInt32(1)
+        }
 
         for (i, layer) in cache.enumerated() {
             if let tq = layer as? TurboQuantKVCache,
