@@ -3462,7 +3462,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
 
         let prefillStepSize = windowSize ?? 512
         let promptTokenCount = inputIds.dim(1)
-        if let inputEmbeddings, pixelValues != nil,
+        if let inputEmbeddings, pixelValues != nil, !cache.isEmpty,
             prefillStepSize > 0, promptTokenCount > prefillStepSize,
             input.text.mask == nil || input.text.mask?.ndim == 2,
             let positions = languageModel.resolvedPositionIds(

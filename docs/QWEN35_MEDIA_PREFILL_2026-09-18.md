@@ -27,7 +27,7 @@ conversation order; preserve that correction.
    progress/releasing transient allocations. Keep final-tail logits lazy as
    on the existing text path. Honor cancellation before media work, between
    chunks, and before the final tail.
-4. Keep unchunked behavior for nonpositive/large windows and masks for which
+4. Keep unchunked behavior for empty caches, nonpositive/large windows and masks for which
    the existing position resolver cannot produce full positions. Do not alter
    model-native samplers, templates, schemas, media order or disk-cache keys.
 
@@ -52,3 +52,8 @@ Candidate and actual tiny-vision regression source parse successfully with
 `Qwen35MediaPrefillTests` covers image/video-first inputs, windows3/4/8,
 zero/nonzero initial offsets, a2D mask, KV/GDN/next-decode comparisons and
 Stop before work/at the final-tail boundary. Execution remains pending.
+
+Source review also added a cache-free fallback regression: `castCache([])`
+means no attention or recurrent state survives between forwards, so slicing
+that public prepare call would discard the prefix. The candidate only chunks
+when a cache is supplied. Exact-window and no-cache cases retain full logits.

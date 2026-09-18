@@ -123,6 +123,7 @@ struct Qwen35MediaPrefillTests {
                 #expect(actual.dim(1) <= window)
                 let expectedProgress = Array(stride(from: window, to: input.text.tokens.dim(1), by: window))
                 #expect(progress.withLock { $0 } == expectedProgress)
+                #expect(actualCache.count == expectedCache.count)
                 for (lhs, rhs) in zip(actualCache, expectedCache) {
                     #expect(lhs.offset == input.text.tokens.dim(1) + initialOffset)
                     #expect(lhs.offset == rhs.offset)
@@ -139,7 +140,7 @@ struct Qwen35MediaPrefillTests {
         }
     }
 
-    @Test("fitting and disabled windows keep full-prompt logits without progress", arguments: [0, -1, 64])
+    @Test("fitting and disabled windows keep full-prompt logits without progress", arguments: [0, -1, 19, 64])
     func unchunkedWindows(window: Int) throws {
         try MLXMetalTestLock.withLock {
             let model = try model()
@@ -152,6 +153,25 @@ struct Qwen35MediaPrefillTests {
             }
             MLX.eval(result)
             #expect(result.dim(1) == input.text.tokens.dim(1))
+            #expect(progress.withLock { $0.isEmpty })
+        }
+    }
+
+    @Test("cache-free media forward stays one-shot even with a small window")
+    func cacheFreeForward() throws {
+        try MLXMetalTestLock.withLock {
+            let reference = try model()
+            let candidate = try model()
+            let input = input(videoFirst: true)
+            let expected = try logits(reference.prepare(input, cache: [], windowSize: 0))
+            let progress = OSAllocatedUnfairLock(initialState: [Int]())
+            let actual = try PrefillProgressReporter.withHandler({ completed in
+                progress.withLock { $0.append(completed) }
+            }) {
+                try logits(candidate.prepare(input, cache: [], windowSize: 3))
+            }
+            equal(actual, expected)
+            #expect(actual.dim(1) == input.text.tokens.dim(1))
             #expect(progress.withLock { $0.isEmpty })
         }
     }
