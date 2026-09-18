@@ -271,6 +271,7 @@ public struct TurboQuantCacheTransitionSnapshot: Codable, Sendable, Equatable {
 /// ```
 public final class ModelContainer: Sendable {
     private let context: SerialAccessContainer<ModelContext>
+    private let attentionCacheKeyComponent: String?
 
     // MARK: - Multi-tier KV Cache
 
@@ -295,7 +296,8 @@ public final class ModelContainer: Sendable {
             config.modelKey = "\(ObjectIdentifier(self))"
         }
         if let modelKey = config.modelKey {
-            config.modelKey = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
+            let scoped = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
+            config.modelKey = attentionCacheKeyComponent.map { "\(scoped)|\($0)" } ?? scoped
         }
         let coordinator = CacheCoordinator(config: config)
         _cacheCoordinator.withLock { $0 = coordinator }
@@ -310,7 +312,8 @@ public final class ModelContainer: Sendable {
             config.modelKey = modelConfig.name
         }
         if let modelKey = config.modelKey {
-            config.modelKey = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
+            let scoped = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
+            config.modelKey = attentionCacheKeyComponent.map { "\(scoped)|\($0)" } ?? scoped
         }
 
         let topology = await cacheTopologySnapshot()
@@ -500,6 +503,7 @@ public final class ModelContainer: Sendable {
     }
 
     public init(context: consuming ModelContext) {
+        self.attentionCacheKeyComponent = JangHadamardAttention.cacheKeyComponent(model: context.model)
         self.context = .init(context)
     }
 

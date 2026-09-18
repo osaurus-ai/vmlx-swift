@@ -9,6 +9,7 @@ import os
 
 @testable import MLXLLM
 @testable import MLXLMCommon
+import MLXVLM
 
 /// A real four-layer Qwen graph, not hand-authored cache arrays. The fixture
 /// has three GDN layers and one attention layer. It exercises storage/checkpoint
@@ -77,12 +78,42 @@ struct Qwen35HadamardCacheTests {
         return MLXArray(bytes, [rows, width / 128 * 26])
     }
 
-    private static func writeFixture(at directory: URL, packed: Bool) throws -> Qwen35Model {
-        let data = Data(modelJSON.utf8)
-        let model = Qwen35Model(try JSONDecoder().decode(Qwen35Configuration.self, from: data))
+    static func writeFixture(
+        at directory: URL, packed: Bool, vision: Bool = false
+    ) throws -> any LanguageModel {
+        var config = try #require(
+            JSONSerialization.jsonObject(with: Data(modelJSON.utf8)) as? [String: Any])
+        if vision {
+            config["vision_config"] = [
+                "model_type": "qwen3_vl", "depth": 1, "hidden_size": 16,
+                "intermediate_size": 32, "out_hidden_size": 512, "num_heads": 4,
+                "patch_size": 2, "spatial_merge_size": 2, "temporal_patch_size": 1,
+                "num_position_embeddings": 16,
+            ] as [String: Any]
+            config["vocab_size"] = 128
+            config["image_token_id"] = 98
+            config["video_token_id"] = 97
+            config["vision_start_token_id"] = 96
+            config["vision_end_token_id"] = 95
+            var text = config["text_config"] as! [String: Any]
+            text["rope_parameters"] = [
+                "rope_type": "default", "rope_theta": 10000.0,
+                "partial_rotary_factor": 0.25, "mrope_section": [2, 3, 3],
+            ] as [String: Any]
+            config["text_config"] = text
+        }
+        let data = try JSONSerialization.data(withJSONObject: config)
+        let model: any LanguageModel
+        if vision {
+            model = MLXVLM.Qwen35(
+                try JSONDecoder().decode(MLXVLM.Qwen35Configuration.self, from: data))
+        } else {
+            model = Qwen35Model(
+                try JSONDecoder().decode(MLXLLM.Qwen35Configuration.self, from: data))
+        }
         let modules = model.namedModules()
         let forward = modules.compactMap { path, module -> String? in
-            guard module is Linear,
+            guard path.hasPrefix("language_model."), module is Linear,
                 !path.hasSuffix(".in_proj_a"), !path.hasSuffix(".in_proj_b")
             else { return nil }
             return path
@@ -122,7 +153,9 @@ struct Qwen35HadamardCacheTests {
         var tensors: [String: MLXArray] = [:]
         for (path, value) in model.parameters().flattened() {
             let values: [Float]
-            if path.hasSuffix(".linear_attn.norm.weight") {
+            if path.hasSuffix(".linear_attn.norm.weight")
+                || (path.hasPrefix("vision_tower.") && path.contains("norm.weight"))
+            {
                 values = Array(repeating: 1, count: value.size)
             } else if path.contains("norm.weight") || path.hasSuffix(".A_log")
                 || path.hasSuffix(".dt_bias")
@@ -222,9 +255,11 @@ struct Qwen35HadamardCacheTests {
                     break
                 }
                 MLX.eval(coldCache)
+                #expect(coldCache.last?.state.allSatisfy { $0.dtype == .float16 } == true)
                 #expect(coldCache.allSatisfy { $0.offset == Self.canonical.count })
                 for cache in coldCache.prefix(3) {
                     try #require(cache.state.count == 2)
+                    #expect(cache.state[1].dtype == .float32)
                     for state in cache.state {
                         #expect(
                             MLX.any(state .!= 0).item(Bool.self),

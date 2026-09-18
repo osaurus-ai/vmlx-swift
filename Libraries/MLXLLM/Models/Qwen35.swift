@@ -834,13 +834,14 @@ final class Qwen35Attention: Module {
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
-        let output = attentionWithCacheUpdate(
+        let output = JangHadamardAttention.attention(
             queries: queries,
             keys: keys,
             values: values,
             cache: cache,
             scale: scale,
-            mask: mask
+            mask: mask,
+            enabled: JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)

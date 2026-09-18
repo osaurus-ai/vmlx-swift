@@ -68,6 +68,15 @@ public final class BatchKVCache: BaseKVCache {
 
     // MARK: - KVCache Protocol
 
+    func prepareHadamardAttentionStorage() -> Bool {
+        // Check every slot before converting any: mixed custom/plain views
+        // must keep their existing policy as a unit.
+        guard slotCaches.allSatisfy({
+            $0 is KVCacheSimple || $0 is RotatingKVCache || $0 is CompilableKVCache
+        }) else { return false }
+        return slotCaches.allSatisfy { JangHadamardAttention.prepareStorage($0) }
+    }
+
     /// Update the cache with new keys and values from a batched forward pass.
     ///
     /// Input shapes: `[B, H, L, D]` where B = `batchSize`, L = query length

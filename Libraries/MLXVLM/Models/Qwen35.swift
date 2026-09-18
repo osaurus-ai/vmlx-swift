@@ -1433,13 +1433,14 @@ enum Qwen35Language {
                 attentionMask = .none
             }
 
-            let output = attentionWithCacheUpdate(
+            let output = JangHadamardAttention.attention(
                 queries: queries,
                 keys: keys,
                 values: values,
                 cache: cache,
                 scale: scale,
-                mask: attentionMask
+                mask: attentionMask,
+                enabled: JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
             )
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
