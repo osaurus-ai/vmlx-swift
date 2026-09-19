@@ -151,7 +151,7 @@ private func makeCacheDir() -> URL {
         // exactly what a crash between the file write and the insert leaves.
         // Quota accounting reads only cache_entries, so this is invisible to
         // eviction and would otherwise occupy disk forever.
-        let orphan = dir.appendingPathComponent("orphaned-by-crash.safetensors")
+        let orphan = dir.appendingPathComponent("0a1b2c3d4e5f60718293a4b5c6d7e8f9.safetensors")
         try Data(repeating: 0xAB, count: 50_000).write(to: orphan)
         #expect(FileManager.default.fileExists(atPath: orphan.path))
 

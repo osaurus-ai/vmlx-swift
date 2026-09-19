@@ -354,6 +354,10 @@ public final class DiskCache: @unchecked Sendable {
     public private(set) var refusedNonFiniteStores: Int = 0
     /// Fetches that found a NaN/Inf record on disk (removed, reported as a miss).
     public private(set) var refusedNonFiniteFetches: Int = 0
+    /// Stores refused because the payload's final name is held by something
+    /// that is not a regular file (a directory, a link). It is not an older
+    /// copy of the payload, so it is not replaced; nothing is published.
+    public private(set) var refusedOccupiedStores: Int = 0
 
     /// The names of the float tensors in `arrays` that carry a non-finite
     /// value (at most `limit`), in key order. Integer and boolean tensors are
@@ -618,6 +622,10 @@ public final class DiskCache: @unchecked Sendable {
             }
             return
         }
+        // Refuse before the expensive part: see `_refuseOccupiedStoreLocked`.
+        if _refuseOccupiedStoreLocked(finalURL: url, hash: hash, tokenCount: tokenCount) {
+            return
+        }
         // Pre-realize arrays under the lock so Metal work completes
         // before the writer hits the C++ save path AND no other thread
         // can interleave MLX ops on the same device during this window.
@@ -642,15 +650,29 @@ public final class DiskCache: @unchecked Sendable {
             // at the next open).
             let finalURL = url
             let url = Self.temporaryURL(for: finalURL)
-            try? FileManager.default.removeItem(at: url)
+            _ = Self.removeRegularFile(at: url)
             try save(arrays: arrays, metadata: ["format": "mlx"], url: url)
             Stream.gpu.synchronize()
             guard Self.isCompleteSafetensors(url: url) else {
-                try? FileManager.default.removeItem(at: url)
+                _ = Self.removeRegularFile(at: url)
                 throw DiskCacheIntegrityError.incompleteWrite(finalURL.lastPathComponent)
             }
-            try? FileManager.default.removeItem(at: finalURL)
-            try FileManager.default.moveItem(at: url, to: finalURL)
+            // Make room for the rename — only ever by unlinking an older
+            // regular file of the same hash. Anything else under that name
+            // is not an older copy of this payload, and `removeItem` would
+            // have descended into a directory.
+            if case .notRegularFile = Self.removeRegularFile(at: finalURL) {
+                _ = Self.removeRegularFile(at: url)
+                _ = _refuseOccupiedStoreLocked(
+                    finalURL: finalURL, hash: hash, tokenCount: tokenCount)
+                return
+            }
+            do {
+                try FileManager.default.moveItem(at: url, to: finalURL)
+            } catch {
+                _ = Self.removeRegularFile(at: url)
+                throw error
+            }
             if phaseTrace {
                 // A 27B ternary model spent ~25 s storing a single ~357 MB
                 // boundary — about 14 MB/s, which is far too slow to be the
@@ -678,7 +700,7 @@ public final class DiskCache: @unchecked Sendable {
             guard insertResult == SQLITE_DONE else {
                 // The payload is published but has no row, so no quota pass
                 // could ever see or evict it. Take it back rather than leak it.
-                try? FileManager.default.removeItem(at: finalURL)
+                _ = Self.removeRegularFile(at: finalURL)
                 validatedFiles.removeValue(forKey: hash)
                 failedIndexWrites += 1
                 FileHandle.standardError.write(Data(
@@ -705,6 +727,23 @@ public final class DiskCache: @unchecked Sendable {
                 "[vmlx][cache/disk] store failed for hash \(hash): \(error)\n"
                 .utf8))
         }
+    }
+
+    /// A store is refused — counted, logged, nothing published and no row
+    /// written — when its final name is held by something that is not a
+    /// regular file. The root is a user setting: a directory or a link that
+    /// happens to carry this hash is not an older copy of the payload and is
+    /// never replaced. The boundary is simply not cached; an ordinary miss.
+    /// Returns whether the store was refused. Caller holds `lock`.
+    private func _refuseOccupiedStoreLocked(finalURL: URL, hash: String, tokenCount: Int) -> Bool {
+        guard case .notRegularFile = Self.pathState(at: finalURL) else { return false }
+        refusedOccupiedStores += 1
+        validatedFiles.removeValue(forKey: hash)
+        FileHandle.standardError.write(Data(
+            ("[vmlx][cache/disk-store] REFUSED occupied path count=\(tokenCount) "
+                + "hash=\(hash.prefix(12)) — \(finalURL.lastPathComponent) is not a regular file "
+                + "and is left alone; nothing published\n").utf8))
+        return true
     }
 
     /// Fetch cached arrays for the given token sequence.
@@ -1696,38 +1735,114 @@ public final class DiskCache: @unchecked Sendable {
     /// path that cannot be examined counts as still there, because its row
     /// is what keeps it counted, and the caller keeps it.
     ///
+    /// Only a regular file is removed (``removeRegularFile(at:)``). The
+    /// paths given here are built from a hash or a key, so the name is ours;
+    /// a directory or a link that has taken that name is not the cache's
+    /// file. It is left alone and reported as still there, like a file that
+    /// could not be deleted — the same answer the import gives for such a
+    /// row.
+    ///
     /// A file that is still there is reported under its own tag — every
     /// `[vmlx][cache/disk-quota]` line is a pass summary beginning
     /// `before= after= max=`, and a log parser relies on that — and once per
     /// path per process: a file that can never be deleted is tried again by
     /// every over-cap store.
     static func removeCacheFile(at url: URL) -> Bool {
-        do {
-            try FileManager.default.removeItem(at: url)
+        let reason: String
+        switch removeRegularFile(at: url) {
+        case .removed, .missing:
             return true
-        } catch {
-            if pathState(at: url) == .missing { return true }
-            let firstReport = reportedDeleteFailures.withLock { $0.insert(url.path).inserted }
-            if firstReport {
-                FileHandle.standardError.write(Data(
-                    ("[vmlx][cache/disk-delete] failed path=\(url.path) "
-                        + "error=\(error.localizedDescription) — row kept\n").utf8))
-            }
-            return false
+        case .notRegularFile:
+            reason = "not a regular file, left alone"
+        case .failed(let code):
+            reason = String(cString: strerror(code))
         }
+        let firstReport = reportedDeleteFailures.withLock { $0.insert(url.path).inserted }
+        if firstReport {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk-delete] failed path=\(url.path) "
+                    + "error=\(reason) — row kept\n").utf8))
+        }
+        return false
     }
 
     /// Paths ``removeCacheFile(at:)`` has already reported in this process.
     private static let reportedDeleteFailures = OSAllocatedUnfairLock(initialState: Set<String>())
 
-    /// Remove all cached entries and safetensors files.
+    /// Forget every entry and remove this cache's payload files.
+    ///
+    /// The root is a user setting and may hold files that are not this
+    /// cache's — a model's shards, if it was pointed at a model folder — so
+    /// this removes by allow-list, and whatever is in doubt stays:
+    ///
+    /// - a name must be exactly a published payload's
+    ///   (``isPublishedPayloadName(_:)``: also what a crash between publish
+    ///   and insert leaves) or exactly a dead write's
+    ///   (``isUnpublishedPayloadName(_:)``);
+    /// - the entry must be a regular file by `lstat` — never a directory,
+    ///   never a symlink — and goes by `unlink`.
+    ///
+    /// In a root that looks like a model bundle (``modelBundleMarkers``)
+    /// nothing is removed from a LISTING of it, as in every other sweep: a
+    /// payload without a row and a dead partial stay, and one
+    /// `[vmlx][cache/disk-index] clear skipped:` line says so. The payloads
+    /// the index names still go, by the path built from each row's hash:
+    /// this cache wrote each of them under that name (a store replaces
+    /// whatever regular file held it), and the quota pass removes the same
+    /// files in the same root. Keeping them would leak them for good —
+    /// their rows are dropped here, and the unindexed-payload sweep skips a
+    /// bundle root too. The same applies when the root cannot be listed.
+    ///
+    /// The index is emptied and the counters reset in every case, so the
+    /// cache references nothing afterwards. A payload of ours that could not
+    /// be unlinked is left without a row; the import's unindexed-payload
+    /// sweep takes it once it is old enough (not in a bundle root).
     public func clear() {
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
 
-        // Delete all SQLite entries
         lock.lock()
         defer { lock.unlock() }
+
+        // Files first, rows after: dying in between leaves rows that name
+        // missing files, which the next fetch or import clears — never
+        // files the index has stopped counting.
+        var doomed = Set<String>()
+        _ = _queryLocked("SELECT hash FROM cache_entries") { stmt in
+            guard let text = sqlite3_column_text(stmt, 0) else { return }
+            // A row's hash is data; only one that spells a payload name
+            // becomes a path.
+            let name = String(cString: text) + Self.payloadSuffix
+            if Self.isPublishedPayloadName(name) { doomed.insert(name) }
+        }
+        var skipped: String?
+        do {
+            let names = try FileManager.default.contentsOfDirectory(atPath: cacheDir.path)
+            if let marker = Self.modelBundleMarker(in: names) {
+                skipped = "cache root holds \(marker), so it looks like a model bundle"
+            } else {
+                doomed.formUnion(names.filter {
+                    Self.isPublishedPayloadName($0) || Self.isUnpublishedPayloadName($0)
+                })
+            }
+        } catch {
+            skipped = "cache root could not be listed: \(error.localizedDescription)"
+        }
+        if let skipped {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk-index] clear skipped: \(skipped) — nothing is removed from "
+                    + "a listing of it, only the \(doomed.count) payload(s) the index names\n").utf8))
+        }
+        var leftBehind = 0
+        for name in doomed {
+            if case .failed = Self.removeRegularFile(at: cacheDir.appendingPathComponent(name)) {
+                leftBehind += 1
+            }
+        }
+        if leftBehind > 0 {
+            FileHandle.standardError.write(Data(
+                "[vmlx][cache/disk-index] clear could not remove \(leftBehind) payload(s)\n".utf8))
+        }
 
         // This cache does not own the companion files. Rows that carried one
         // hand it to the unlinked list so its bytes stay counted until the
@@ -1736,19 +1851,6 @@ public final class DiskCache: @unchecked Sendable {
             _runLocked(Self.moveLinkedCompanionsToLegacySQL + " WHERE companion_key IS NOT NULL")
         }
         executeSQL("DELETE FROM cache_entries")
-
-        // Remove all .safetensors files in the cache directory
-        if let enumerator = FileManager.default.enumerator(
-            at: cacheDir,
-            includingPropertiesForKeys: nil,
-            options: [.skipsSubdirectoryDescendants]
-        ) {
-            for case let fileURL as URL in enumerator {
-                if fileURL.pathExtension == "safetensors" {
-                    try? FileManager.default.removeItem(at: fileURL)
-                }
-            }
-        }
 
         // Reset stats
         hits = 0
@@ -1819,11 +1921,60 @@ public final class DiskCache: @unchecked Sendable {
             .appendingPathComponent("\(stem).partial-\(UUID().uuidString.prefix(8)).safetensors")
     }
 
+    /// Whether `name` carries the `.partial-` infix at all. Loose on purpose:
+    /// it answers "this is not a published entry" for a walk that counts,
+    /// and is never a reason to delete. Deleters use
+    /// ``isUnpublishedPayloadName(_:)`` (or the companion store's
+    /// equivalent), which also require that the name be one of ours.
     static func isUnpublishedName(_ name: String) -> Bool {
         name.contains(".partial-") && name.hasSuffix(".safetensors")
     }
 
     static let payloadSuffix = ".safetensors"
+    static let partialInfix = ".partial-"
+    /// `UUID().uuidString.prefix(8)` in ``temporaryURL(for:)``.
+    static let partialTagLength = 8
+
+    private static func isLowerHexDigit(_ byte: UInt8) -> Bool {
+        (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte)
+            || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains(byte)
+    }
+
+    /// `count` lowercase hex digits and nothing else: a content hash as
+    /// ``hashTokens(_:modelKey:mediaSalt:)`` (32) and the companion store's
+    /// key (64) spell it.
+    static func isLowercaseHex<S: StringProtocol>(_ text: S, count: Int) -> Bool {
+        text.utf8.count == count && text.utf8.allSatisfy(isLowerHexDigit)
+    }
+
+    /// Splits `<stem>.partial-<tag>.safetensors` — the shape
+    /// ``temporaryURL(for:)`` gives a file that is still being written — and
+    /// returns the stem, or nil when `name` is not exactly that: one
+    /// `.partial-` infix, then a tag of ``partialTagLength`` hex digits (a
+    /// UUID's first eight; uppercase as Foundation prints them, either case
+    /// accepted), then the suffix. The caller decides whether the stem is
+    /// one of its own.
+    static func unpublishedStem(ofName name: String) -> Substring? {
+        guard name.hasSuffix(payloadSuffix) else { return nil }
+        let body = name.dropLast(payloadSuffix.count)
+        guard let infix = body.range(of: partialInfix) else { return nil }
+        let tag = body[infix.upperBound...]
+        guard tag.utf8.count == partialTagLength,
+              tag.utf8.allSatisfy({
+                  isLowerHexDigit($0) || (UInt8(ascii: "A")...UInt8(ascii: "F")).contains($0)
+              })
+        else { return nil }
+        return body[..<infix.lowerBound]
+    }
+
+    /// Whether `name` is exactly what ``temporaryURL(for:)`` produces for one
+    /// of this cache's payloads: `<32 lowercase hex>.partial-<8 hex>.safetensors`.
+    /// `random.partial-abcdefgh.safetensors` in the same root is somebody
+    /// else's download, not a dead write of ours.
+    static func isUnpublishedPayloadName(_ name: String) -> Bool {
+        guard let stem = unpublishedStem(ofName: name) else { return false }
+        return isLowercaseHex(stem, count: 32)
+    }
 
     /// Whether `name` is exactly what ``safetensorsURL(for:)`` produces for a
     /// hash from ``hashTokens(_:modelKey:mediaSalt:)``: 32 lowercase hex
@@ -1833,10 +1984,7 @@ public final class DiskCache: @unchecked Sendable {
     /// `model-00001-of-00008.safetensors` — none of them is ours.
     static func isPublishedPayloadName(_ name: String) -> Bool {
         guard name.hasSuffix(payloadSuffix) else { return false }
-        let stem = name.utf8.dropLast(payloadSuffix.utf8.count)
-        return stem.count == 32
-            && stem.allSatisfy { (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0)
-                || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains($0) }
+        return isLowercaseHex(name.dropLast(payloadSuffix.count), count: 32)
     }
 
     /// Files that mark a directory as a model bundle. The host's own purge
@@ -1899,6 +2047,38 @@ public final class DiskCache: @unchecked Sendable {
         return rc == 0 ? 0 : errno
     }
 
+    /// What became of one path that carries one of this cache's names.
+    enum OwnFileRemoval: Equatable {
+        case removed
+        /// A definite "no such file".
+        case missing
+        /// A directory, a symlink or anything else that is not a regular
+        /// file holds the name. It is not ours, and it was left alone.
+        case notRegularFile
+        /// It could not be examined, or `unlink` failed.
+        case failed(errno: Int32)
+    }
+
+    /// Remove `url` if, and only if, a regular file holds that name: `lstat`
+    /// (a link is never followed), then `unlink`, which cannot descend into
+    /// a directory that took the name in between. Every removal in this
+    /// cache and in the companion store goes through here; which NAMES may
+    /// be removed is the caller's business.
+    static func removeRegularFile(at url: URL) -> OwnFileRemoval {
+        switch pathState(at: url) {
+        case .missing:
+            return .missing
+        case .notRegularFile:
+            return .notRegularFile
+        case .unreadable(let code):
+            return .failed(errno: code)
+        case .regularFile:
+            let code = unlinkFile(at: url)
+            if code == 0 { return .removed }
+            return code == ENOENT ? .missing : .failed(errno: code)
+        }
+    }
+
     /// The byte offset one past the last tensor payload the file's own
     /// safetensors header declares (8-byte little-endian header length, JSON
     /// header, `data_offsets: [begin, end]` per tensor relative to the end
@@ -1941,12 +2121,16 @@ public final class DiskCache: @unchecked Sendable {
     /// index rows) from `cacheDir`. Header-only reads: cheap even for a
     /// multi-hundred-GB cache.
     ///
-    /// The root may hold files that are not this cache's. Only regular files
-    /// are considered (by `lstat`: never a directory, which cannot be read
-    /// as a safetensors file and used to go recursively, and never a
+    /// The root may hold files that are not this cache's. A dead write must
+    /// carry exactly the name this cache gives one
+    /// (``isUnpublishedPayloadName(_:)``) and an incomplete file exactly a
+    /// published payload's (``isPublishedPayloadName(_:)``): somebody else's
+    /// `x.partial-y.safetensors`, or a shard that is still downloading, is
+    /// an "unpublished or incomplete safetensors file" too. Only regular
+    /// files are considered (by `lstat`: never a directory, which cannot be
+    /// read as a safetensors file and used to go recursively, and never a
     /// symlink), removal is by `unlink`, and a root that looks like a model
-    /// bundle is left alone entirely — a shard that is still downloading is
-    /// an "incomplete safetensors file" too.
+    /// bundle is left alone entirely.
     static func sweepUnpublishedAndIncompleteFiles(in cacheDir: URL) {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path) else { return }
         if let marker = modelBundleMarker(in: names) {
@@ -1956,10 +2140,12 @@ public final class DiskCache: @unchecked Sendable {
             return
         }
         var removed = 0
-        for name in names where name.hasSuffix(payloadSuffix) {
+        for name in names {
+            let isDeadWrite = isUnpublishedPayloadName(name)
+            guard isDeadWrite || isPublishedPayloadName(name) else { continue }
             let url = cacheDir.appendingPathComponent(name)
             guard case .regularFile = pathState(at: url) else { continue }
-            if isUnpublishedName(name) {
+            if isDeadWrite {
                 if unlinkFile(at: url) == 0 { removed += 1 }
             } else if !isCompleteSafetensors(url: url) {
                 guard unlinkFile(at: url) == 0 else { continue }

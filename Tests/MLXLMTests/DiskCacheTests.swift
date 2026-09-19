@@ -1127,14 +1127,14 @@ import Testing
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
 
         // A dead temp file and a header-only "row" (declares 4 floats, has no payload).
-        let deadTemp = tempDir.appendingPathComponent("deadbeef.partial-1a2b3c4d.safetensors")
+        let deadTemp = tempDir.appendingPathComponent("deadbeefdeadbeefdeadbeefdeadbeef.partial-1a2b3c4d.safetensors")
         try Data("junk".utf8).write(to: deadTemp)
         let header = #"{"kv_0_keys":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#
         var incomplete = Data()
         var length = UInt64(header.utf8.count).littleEndian
         incomplete.append(Data(bytes: &length, count: 8))
         incomplete.append(Data(header.utf8))
-        let shortRow = tempDir.appendingPathComponent("0123456789abcdef.safetensors")
+        let shortRow = tempDir.appendingPathComponent("0123456789abcdef0123456789abcdef.safetensors")
         try incomplete.write(to: shortRow)
         #expect(DiskCache.declaredPayloadEnd(url: shortRow) == 8 + header.utf8.count + 16)
         #expect(!DiskCache.isCompleteSafetensors(url: shortRow))

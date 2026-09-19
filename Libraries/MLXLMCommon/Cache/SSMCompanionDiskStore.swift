@@ -141,13 +141,45 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     }
 
     /// Tensor files are written under a `.partial-` name and renamed into
-    /// place, so anything still carrying that name at open is a dead write.
+    /// place, so one that still carries that name at open is a dead write —
+    /// if the name is exactly this store's (``isUnpublishedTensorName(_:)``)
+    /// and a regular file holds it. Anything else that starts with `ssm-` is
+    /// not this store's to remove.
     static func sweepUnpublishedFiles(in cacheDir: URL) {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path)
         else { return }
-        for name in names where name.hasPrefix("ssm-") && DiskCache.isUnpublishedName(name) {
-            try? FileManager.default.removeItem(at: cacheDir.appendingPathComponent(name))
+        for name in names where isUnpublishedTensorName(name) {
+            _ = DiskCache.removeRegularFile(at: cacheDir.appendingPathComponent(name))
         }
+    }
+
+    static let namePrefix = "ssm-"
+    /// ``keyFor(tokens:boundary:mediaSalt:modelKey:)`` is a whole SHA-256
+    /// digest in lowercase hex, and has been in every revision of this
+    /// store in this repository; a shorter `ssm-<32 hex>` name is not one
+    /// this code has written.
+    static let keyLength = 64
+
+    /// The key in `ssm-<key>.safetensors` / `ssm-<key>.json`, or nil when
+    /// `name` is not exactly one of those two with a real key. This is the
+    /// only test of "is this entry ours" that anything listing the directory
+    /// may use: `ssm-notes.txt` is not, nor is an `.partial-` name.
+    static func publishedEntryKey(fromName name: String) -> String? {
+        guard name.hasPrefix(namePrefix) else { return nil }
+        for suffix in [DiskCache.payloadSuffix, ".json"] where name.hasSuffix(suffix) {
+            let key = name.dropFirst(namePrefix.count).dropLast(suffix.count)
+            return DiskCache.isLowercaseHex(key, count: keyLength) ? String(key) : nil
+        }
+        return nil
+    }
+
+    /// Whether `name` is exactly what `DiskCache.temporaryURL(for:)` makes of
+    /// one of this store's tensor files:
+    /// `ssm-<key>.partial-<8 hex>.safetensors`.
+    static func isUnpublishedTensorName(_ name: String) -> Bool {
+        guard let stem = DiskCache.unpublishedStem(ofName: name), stem.hasPrefix(namePrefix)
+        else { return false }
+        return DiskCache.isLowercaseHex(stem.dropFirst(namePrefix.count), count: keyLength)
     }
 
     /// Where this store's files live.
@@ -393,8 +425,8 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         }
         MLXDiskCacheIOLock.shared.lock()
         lock.lock()
-        try? FileManager.default.removeItem(at: safetensorsURL(for: key))
-        try? FileManager.default.removeItem(at: sidecarURL(for: key))
+        _ = DiskCache.removeRegularFile(at: safetensorsURL(for: key))
+        _ = DiskCache.removeRegularFile(at: sidecarURL(for: key))
         validatedEntries.removeValue(forKey: key)
         lock.unlock()
         MLXDiskCacheIOLock.shared.unlock()
@@ -430,6 +462,20 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             }
         }
         return evicted.subtracting(stillOnDisk)
+    }
+
+    /// A write was refused because one of the entry's final names is held
+    /// by something that is not a regular file. It is not an older copy of
+    /// the entry and is never replaced.
+    struct OccupiedNameError: Error, CustomStringConvertible {
+        let name: String
+        var description: String { "\(name) is not a regular file and is left alone" }
+    }
+
+    private static func requireReplaceable(_ url: URL) throws {
+        if case .notRegularFile = DiskCache.pathState(at: url) {
+            throw OccupiedNameError(name: url.lastPathComponent)
+        }
     }
 
     private struct WriteOutcome {
@@ -498,6 +544,9 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             validatedEntries.removeValue(forKey: key)
         }
 
+        // Refuse before the expensive part; checked again at the rename.
+        try Self.requireReplaceable(safetensorsURL)
+
         // Pre-realize on calling thread — same rationale as
         // DiskCache.swift:148-157. GPU work must complete before the
         // safetensors writer can read the storage. MLX's tensor
@@ -522,15 +571,19 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         // mid-write must not leave a short tensor file under the final name,
         // where the next fetch would map it.
         let partialURL = DiskCache.temporaryURL(for: safetensorsURL)
-        try? FileManager.default.removeItem(at: partialURL)
+        _ = DiskCache.removeRegularFile(at: partialURL)
         do {
             try save(arrays: arrays, metadata: ["format": "mlx"], url: partialURL)
             Stream.gpu.synchronize()
-            try? FileManager.default.removeItem(at: safetensorsURL)
+            // Make room for the rename only by unlinking an older regular
+            // file of the same key; `removeItem` would have descended into a
+            // directory that carries the name.
+            try Self.requireReplaceable(safetensorsURL)
+            _ = DiskCache.removeRegularFile(at: safetensorsURL)
             try writeFaultForTesting?(.moveTensorIntoPlace)
             try FileManager.default.moveItem(at: partialURL, to: safetensorsURL)
         } catch {
-            try? FileManager.default.removeItem(at: partialURL)
+            _ = DiskCache.removeRegularFile(at: partialURL)
             throw error
         }
 
@@ -545,6 +598,9 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         let sidecarData = try JSONSerialization.data(
             withJSONObject: sidecar, options: [.sortedKeys])
         try writeFaultForTesting?(.writeSidecar)
+        // The atomic write renames over the final name; it must not land on
+        // (or through) a directory or a link that carries it.
+        try Self.requireReplaceable(sidecarURL)
         try sidecarData.write(to: sidecarURL, options: [.atomic])
 
         if let writtenSafetensors = fileFingerprint(at: safetensorsURL),
@@ -779,13 +835,14 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: cacheDir, includingPropertiesForKeys: nil) else { return nil }
-        for url in entries {
-            let name = url.lastPathComponent
-            if name.hasPrefix("ssm-") {
-                try? FileManager.default.removeItem(at: url)
-            }
+        // Only regular files that carry exactly one of this store's names:
+        // a published pair's, or a dead write's. `ssm-notes.txt`, a
+        // directory, a link — whatever else is here is not this store's.
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path)
+        else { return nil }
+        for name in names
+        where Self.publishedEntryKey(fromName: name) != nil || Self.isUnpublishedTensorName(name) {
+            _ = DiskCache.removeRegularFile(at: cacheDir.appendingPathComponent(name))
         }
         validatedEntries.removeAll(keepingCapacity: true)
         return ledger
@@ -932,8 +989,9 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             case .missing:
                 continue
             case .notRegularFile:
-                bytes = 0
-                modified = .distantPast
+                // A directory or a link under one of our names is not an
+                // entry: it is not counted, and never offered for deletion.
+                continue
             case .unreadable:
                 return nil
             }
@@ -980,18 +1038,12 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         return evicted
     }
 
+    /// An unpublished tensor file is not an entry (it is not counted, and
+    /// its name must not be mistaken for a key), and neither is anything
+    /// whose name is not exactly a published one: what this walk lists is
+    /// what the quota may delete.
     private func entryHash(for url: URL) -> String? {
-        let name = url.lastPathComponent
-        // An unpublished tensor file is not an entry: it is not counted, and
-        // its name must not be mistaken for a key.
-        guard name.hasPrefix("ssm-"),
-              !DiskCache.isUnpublishedName(name),
-              (name.hasSuffix(".safetensors") || name.hasSuffix(".json")),
-              let dot = name.lastIndex(of: ".")
-        else { return nil }
-        let start = name.index(name.startIndex, offsetBy: 4)
-        guard start < dot else { return nil }
-        return String(name[start..<dot])
+        Self.publishedEntryKey(fromName: url.lastPathComponent)
     }
 
     /// SHA-256 hash. P0-2 (2026-04-30): converged with `SSMStateCache.makeKey`

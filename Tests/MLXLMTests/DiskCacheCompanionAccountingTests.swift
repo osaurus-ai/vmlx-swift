@@ -2848,4 +2848,493 @@ struct DiskCacheCompanionAccountingTests {
             #expect(mine.first?.hasSuffix("— row kept") == true)
         }
     }
+
+    // MARK: Only our own names, only regular files
+
+    /// A safetensors file whose header declares 16 payload bytes it does not
+    /// have: what a crashed write, or a download in progress, looks like.
+    private static func truncatedSafetensors() -> Data {
+        let header = #"{"kv_0_keys":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#
+        var data = Data()
+        var length = UInt64(header.utf8.count).littleEndian
+        data.append(Data(bytes: &length, count: 8))
+        data.append(Data(header.utf8))
+        return data
+    }
+
+    /// Entries that are not this cache's, each for one reason, written into
+    /// `dir`. `validName` is a name this cache WOULD use, given to a
+    /// directory and to a symlink that points outside.
+    private struct ForeignEntries {
+        var files: [String: Data] = [:]
+        var inner: [URL: Data] = [:]
+        var links: [URL: URL] = [:]
+        var targets: [URL: Data] = [:]
+
+        var names: Set<String> {
+            Set(files.keys)
+                .union(inner.keys.map { $0.deletingLastPathComponent().lastPathComponent })
+                .union(links.keys.map(\.lastPathComponent))
+        }
+
+        mutating func addFile(_ name: String, _ data: Data, in dir: URL) throws {
+            try data.write(to: dir.appendingPathComponent(name))
+            files[name] = data
+        }
+
+        mutating func addDirectory(_ name: String, in dir: URL) throws {
+            let directory = dir.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let file = directory.appendingPathComponent("inner.bin")
+            let data = Data(repeating: 0x66, count: 2_053)
+            try data.write(to: file)
+            inner[file] = data
+        }
+
+        mutating func addLink(_ name: String, in dir: URL, toNewFileIn outside: URL) throws {
+            try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+            let target = outside.appendingPathComponent("target-of-\(name)")
+            let data = Data(repeating: 0x77, count: 3_001)
+            try data.write(to: target)
+            let link = dir.appendingPathComponent(name)
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+            links[link] = target
+            targets[target] = data
+        }
+
+        func expectIntact(
+            in dir: URL, after what: String, sourceLocation: SourceLocation = #_sourceLocation
+        ) {
+            for (name, data) in files.sorted(by: { $0.key < $1.key }) {
+                let now = try? Data(contentsOf: dir.appendingPathComponent(name))
+                #expect(
+                    now == data, "foreign file \(name) did not survive \(what) byte for byte",
+                    sourceLocation: sourceLocation)
+            }
+            for (file, data) in inner {
+                #expect(
+                    (try? Data(contentsOf: file)) == data,
+                    "the DIRECTORY \(file.deletingLastPathComponent().lastPathComponent) was removed by \(what)",
+                    sourceLocation: sourceLocation)
+            }
+            for (link, target) in links {
+                #expect(
+                    (try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)) == target.path,
+                    "the symlink \(link.lastPathComponent) was removed by \(what)",
+                    sourceLocation: sourceLocation)
+                #expect(
+                    (try? Data(contentsOf: target)) == targets[target],
+                    "the target of \(link.lastPathComponent) was touched by \(what)",
+                    sourceLocation: sourceLocation)
+            }
+        }
+    }
+
+    private static func listing(_ dir: URL) throws -> Set<String> {
+        Set(try FileManager.default.contentsOfDirectory(atPath: dir.path))
+    }
+
+    /// The name predicates are checked against what the production name
+    /// builders really produce, not against a literal that merely looks right.
+    @Test func namePredicatesAcceptExactlyWhatTheCacheProduces() throws {
+        let hash = DiskCache.hashTokens(Self.tokens(307, seed: 300), modelKey: "names")
+        let final = URL(fileURLWithPath: "/nonexistent/\(hash).safetensors")
+        #expect(DiskCache.isPublishedPayloadName(final.lastPathComponent))
+        for _ in 0..<8 {
+            let partial = DiskCache.temporaryURL(for: final).lastPathComponent
+            #expect(DiskCache.isUnpublishedPayloadName(partial), "\(partial)")
+            #expect(!DiskCache.isPublishedPayloadName(partial))
+        }
+        #expect(!DiskCache.isUnpublishedPayloadName(final.lastPathComponent))
+        for foreign in [
+            "random.partial-abcdefgh.safetensors",
+            "something.partial-xyz.safetensors",
+            "\(hash).partial-xyz.safetensors",
+            "\(hash).partial-1A2B3C4.safetensors",
+            "\(hash).partial-1A2B3C4D5.safetensors",
+            "\(hash).partial-1A2B3C4G.safetensors",
+            "\(hash.dropLast()).partial-1A2B3C4D.safetensors",
+            "\(hash)0.partial-1A2B3C4D.safetensors",
+            "\(hash.uppercased()).partial-1A2B3C4D.safetensors",
+            "\(hash).partial-1A2B3C4D.safetensors.bak",
+            "\(hash).partial-1A2B3C4D.partial-1A2B3C4D.safetensors",
+            "\(hash).tmp-1A2B3C4D.safetensors",
+        ] {
+            #expect(!DiskCache.isUnpublishedPayloadName(foreign), "\(foreign)")
+        }
+
+        let key = SSMCompanionDiskStore.keyFor(
+            tokens: Self.tokens(307, seed: 300), boundary: 307, modelKey: "names")
+        try #require(key.utf8.count == 64, "INVALID: the companion key is not 64 characters")
+        let tensor = URL(fileURLWithPath: "/nonexistent/ssm-\(key).safetensors")
+        #expect(SSMCompanionDiskStore.publishedEntryKey(fromName: tensor.lastPathComponent) == key)
+        #expect(SSMCompanionDiskStore.publishedEntryKey(fromName: "ssm-\(key).json") == key)
+        let partial = DiskCache.temporaryURL(for: tensor).lastPathComponent
+        #expect(SSMCompanionDiskStore.isUnpublishedTensorName(partial), "\(partial)")
+        #expect(SSMCompanionDiskStore.publishedEntryKey(fromName: partial) == nil)
+        for foreign in [
+            "ssm-notes.txt", "ssm-notes.safetensors", "ssm-notes.json", "ssm-\(key).txt",
+            "ssm-\(key.uppercased()).json", "ssm-\(key.dropLast()).json", "ssm-\(key)0.json",
+            "\(key).json", "ssm-\(key).json.bak",
+        ] {
+            #expect(SSMCompanionDiskStore.publishedEntryKey(fromName: foreign) == nil, "\(foreign)")
+            #expect(!SSMCompanionDiskStore.isUnpublishedTensorName(foreign), "\(foreign)")
+        }
+        for foreign in [
+            "ssm-notes.partial-1A2B3C4D.safetensors", "ssm-\(key).partial-xyz.safetensors",
+            "ssm-\(key).partial-1A2B3C4D.json", "\(key).partial-1A2B3C4D.safetensors",
+        ] {
+            #expect(!SSMCompanionDiskStore.isUnpublishedTensorName(foreign), "\(foreign)")
+        }
+    }
+
+    /// `clear()` is public, and the root is a user setting. It removes what
+    /// this cache wrote — indexed payloads, a payload a crash left without a
+    /// row, a dead partial — and nothing else, however it is named.
+    @Test func clearNeverTouchesForeignFiles() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("clear-foreign")
+            let outside = Self.makeRoot("clear-foreign-outside")
+            defer {
+                try? FileManager.default.removeItem(at: root)
+                try? FileManager.default.removeItem(at: outside)
+            }
+            let modelKey = "accounting-clear-foreign"
+            let coordinator = Self.coordinator(root: root, modelKey: modelKey, hybrid: false)
+            let disk = try #require(coordinator.diskCache)
+
+            let indexed = [Self.tokens(517, seed: 301), Self.tokens(1_003, seed: 302)]
+            let rowless = Self.tokens(307, seed: 303)
+            for tokens in indexed + [rowless] {
+                coordinator.storePersistentBoundary(
+                    tokens: tokens, diskArrays: Self.kv(), ssmStates: nil)
+            }
+            try RawDB(root: root).require(
+                "DELETE FROM cache_entries WHERE hash = '\(Self.kvHash(rowless, modelKey))'")
+            let rowlessURL = Self.payloadURL(root, Self.kvHash(rowless, modelKey))
+            let partialURL = DiskCache.temporaryURL(for: rowlessURL)
+            try Data(repeating: 0xEE, count: 40_003).write(to: partialURL)
+            let genuine = Set(
+                (indexed + [rowless]).map { "\(Self.kvHash($0, modelKey)).safetensors" }
+                    + [partialURL.lastPathComponent])
+            try #require(try Self.indexedRows(root).count == 2)
+
+            var foreign = ForeignEntries()
+            try foreign.addFile("foo.safetensors", Data(repeating: 0x11, count: 4_099), in: root)
+            try foreign.addFile(
+                "model-00001-of-00002.safetensors", Data(repeating: 0x22, count: 70_001), in: root)
+            try foreign.addFile(
+                "ABCDEF0123456789ABCDEF0123456789.safetensors", Data(repeating: 0x33, count: 1_031),
+                in: root)
+            try foreign.addFile(
+                "0123456789abcdef0123456789abcde.safetensors", Data(repeating: 0x44, count: 1_033),
+                in: root)
+            try foreign.addFile(
+                "0123456789abcdef0123456789abcdef0.safetensors", Data(repeating: 0x55, count: 1_039),
+                in: root)
+            try foreign.addFile(
+                "random.partial-abcdefgh.safetensors", Data(repeating: 0x56, count: 1_049), in: root)
+            try foreign.addFile(
+                "0123456789abcdef0123456789abcdef.partial-xyz.safetensors",
+                Data(repeating: 0x57, count: 1_051), in: root)
+            try foreign.addDirectory("0123456789abcdef0123456789abcdef.safetensors", in: root)
+            try foreign.addDirectory(
+                "00112233445566778899aabbccddeeff.partial-1A2B3C4D.safetensors", in: root)
+            try foreign.addLink(
+                "fedcba9876543210fedcba9876543210.safetensors", in: root, toNewFileIn: outside)
+            try foreign.addLink(
+                "fedcba9876543210fedcba9876543210.partial-1A2B3C4D.safetensors", in: root,
+                toNewFileIn: outside)
+
+            let before = try Self.listing(root)
+            try #require(before.isSuperset(of: genuine), "INVALID: a genuine file is not on disk")
+            try #require(before.isSuperset(of: foreign.names), "INVALID: a foreign entry is not on disk")
+
+            coordinator.clear()
+
+            let removed = before.subtracting(try Self.listing(root))
+            #expect(
+                removed == genuine,
+                "clear removed \(removed.sorted()); its own were \(genuine.sorted())")
+            foreign.expectIntact(in: root, after: "clear()")
+            #expect(try Self.indexedRows(root).isEmpty)
+            let stats = disk.snapshotStats()
+            #expect(stats.currentPayloadBytes == 0)
+            #expect(stats.currentEntryCount == 0)
+            for tokens in indexed { #expect(disk.fetch(tokens: tokens) == nil) }
+        }
+    }
+
+    /// A root that holds `config.json` or `jang_config.json` looks like a
+    /// model bundle, and nothing is removed from a LISTING of it: a payload
+    /// without a row and a dead partial stay, like every shard. The payloads
+    /// the index names are this cache's by construction — it wrote each one
+    /// under the hash in its row, and the quota pass removes the same files
+    /// in the same root — so they go, by the path built from the row. The
+    /// index is emptied either way.
+    @Test func clearIsSkippedForAModelBundleRoot() throws {
+        try MLXMetalTestLock.withLock {
+            for marker in ["config.json", "jang_config.json"] {
+                let root = Self.makeRoot("clear-bundle-root")
+                defer { try? FileManager.default.removeItem(at: root) }
+                let modelKey = "accounting-clear-bundle-\(marker)"
+                let coordinator = Self.coordinator(root: root, modelKey: modelKey, hybrid: false)
+                let disk = try #require(coordinator.diskCache)
+                let indexed = [Self.tokens(301, seed: 311), Self.tokens(517, seed: 312)]
+                let rowless = Self.tokens(1_003, seed: 313)
+                for tokens in indexed + [rowless] {
+                    coordinator.storePersistentBoundary(
+                        tokens: tokens, diskArrays: Self.kv(), ssmStates: nil)
+                }
+                try RawDB(root: root).require(
+                    "DELETE FROM cache_entries WHERE hash = '\(Self.kvHash(rowless, modelKey))'")
+                let rowlessURL = Self.payloadURL(root, Self.kvHash(rowless, modelKey))
+                let rowlessData = try Data(contentsOf: rowlessURL)
+                let partialURL = DiskCache.temporaryURL(for: rowlessURL)
+                let partialData = Data(repeating: 0xEE, count: 40_003)
+                try partialData.write(to: partialURL)
+
+                var foreign = ForeignEntries()
+                try foreign.addFile(marker, Data("{}".utf8), in: root)
+                try foreign.addFile(
+                    "model-00001-of-00002.safetensors", Data(repeating: 0x22, count: 70_001), in: root)
+                try foreign.addFile(
+                    "model-00002-of-00002.safetensors", Self.truncatedSafetensors(), in: root)
+                // A shard that happens to carry a name this cache would use.
+                try foreign.addFile(
+                    "0123456789abcdef0123456789abcdef.safetensors",
+                    Data(repeating: 0x23, count: 8_209), in: root)
+
+                let before = try Self.listing(root)
+                let (_, log) = try Self.capturingStandardError { coordinator.clear() }
+
+                let skipped = log.split(separator: "\n").filter {
+                    $0.hasPrefix("[vmlx][cache/disk-index] clear skipped: ")
+                }
+                #expect(skipped.count == 1, "\(marker): \(skipped)")
+                #expect(skipped.first?.contains(marker) == true)
+                foreign.expectIntact(in: root, after: "clear() in a \(marker) root")
+                #expect((try? Data(contentsOf: rowlessURL)) == rowlessData)
+                #expect((try? Data(contentsOf: partialURL)) == partialData)
+                let removed = before.subtracting(try Self.listing(root))
+                #expect(
+                    removed == Set(indexed.map { "\(Self.kvHash($0, modelKey)).safetensors" }),
+                    "\(marker): clear removed \(removed.sorted())")
+                #expect(try Self.indexedRows(root).isEmpty)
+                #expect(disk.snapshotStats().currentPayloadBytes == 0)
+                #expect(disk.snapshotStats().currentEntryCount == 0)
+            }
+        }
+    }
+
+    /// The sweep at open removes this cache's dead partials and its own
+    /// payloads that are short of their declared bytes. A partial or a
+    /// truncated shard under any other name is somebody else's download.
+    @Test func openSweepNeverTouchesForeignPartialsOrIncompleteForeignShards() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("open-sweep-names")
+            let outside = Self.makeRoot("open-sweep-names-outside")
+            defer {
+                try? FileManager.default.removeItem(at: root)
+                try? FileManager.default.removeItem(at: outside)
+            }
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let truncated = Self.truncatedSafetensors()
+
+            var foreign = ForeignEntries()
+            try foreign.addFile(
+                "something.partial-xyz.safetensors", Data(repeating: 0x31, count: 4_099), in: root)
+            try foreign.addFile("random.partial-abcdefgh.safetensors", truncated, in: root)
+            try foreign.addFile(
+                "0123456789abcdef0123456789abcdef.partial-xyz.safetensors", truncated, in: root)
+            try foreign.addFile("model-00001-of-00002.safetensors", truncated, in: root)
+            try foreign.addFile("0123456789abcdef.safetensors", truncated, in: root)
+            try foreign.addFile("ABCDEF0123456789ABCDEF0123456789.safetensors", truncated, in: root)
+            try foreign.addDirectory(
+                "00112233445566778899aabbccddeeff.partial-1A2B3C4D.safetensors", in: root)
+            try foreign.addLink(
+                "fedcba9876543210fedcba9876543210.partial-1A2B3C4D.safetensors", in: root,
+                toNewFileIn: outside)
+            try #require(
+                !DiskCache.isCompleteSafetensors(
+                    url: root.appendingPathComponent("model-00001-of-00002.safetensors")),
+                "INVALID: the foreign shard is not incomplete")
+
+            // The controls: the same bytes under names that ARE this cache's.
+            let oursTruncated = root.appendingPathComponent("00112233445566778899aabbccddeeff.safetensors")
+            try truncated.write(to: oursTruncated)
+            let oursPartial = DiskCache.temporaryURL(
+                for: root.appendingPathComponent("8899aabbccddeeff0011223344556677.safetensors"))
+            try Data(repeating: 0xEE, count: 40_003).write(to: oursPartial)
+
+            _ = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: "open-sweep-names")
+
+            #expect(
+                !FileManager.default.fileExists(atPath: oursTruncated.path),
+                "INVALID: the open sweep did not remove this cache's incomplete payload")
+            #expect(
+                !FileManager.default.fileExists(atPath: oursPartial.path),
+                "INVALID: the open sweep did not remove this cache's dead partial")
+            foreign.expectIntact(in: root, after: "the open sweep")
+        }
+    }
+
+    /// The companion directory: `clear()`, the sweep at open and the quota
+    /// listing act on regular files named `ssm-<key>.…` with a real key, and
+    /// on nothing else that happens to start with `ssm-`.
+    @Test func companionClearAndSweepNeverTouchForeignEntries() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("companion-foreign")
+            let outside = Self.makeRoot("companion-foreign-outside")
+            defer {
+                try? FileManager.default.removeItem(at: root)
+                try? FileManager.default.removeItem(at: outside)
+            }
+            let modelKey = "accounting-companion-foreign"
+            let tokens = Self.tokens(517, seed: 321)
+            let key = Self.ssmKey(tokens, modelKey)
+            let dir = Self.companionDir(root)
+            let otherKeys = (322...325).map { Self.ssmKey(Self.tokens(307, seed: $0), modelKey) }
+
+            var foreign = ForeignEntries()
+            let oursPartial: URL
+            do {
+                let coordinator = Self.coordinator(root: root, modelKey: modelKey)
+                coordinator.storePersistentBoundary(
+                    tokens: tokens, diskArrays: Self.kv(), ssmStates: Self.recurrent())
+                try #require(
+                    try Self.listing(dir) == ["ssm-\(key).json", "ssm-\(key).safetensors"],
+                    "INVALID: the genuine companion pair is not on disk")
+
+                try foreign.addFile("ssm-notes.txt", Data("mine".utf8), in: dir)
+                try foreign.addFile("ssm-notes.safetensors", Data(repeating: 0x41, count: 4_099), in: dir)
+                try foreign.addFile("ssm-notes.json", Data("{}".utf8), in: dir)
+                try foreign.addFile(
+                    "ssm-notes.partial-1A2B3C4D.safetensors", Data(repeating: 0x42, count: 1_031), in: dir)
+                try foreign.addFile(
+                    "ssm-\(otherKeys[0]).partial-xyz.safetensors", Data(repeating: 0x43, count: 1_033),
+                    in: dir)
+                try foreign.addDirectory("ssm-\(otherKeys[0]).safetensors", in: dir)
+                try foreign.addDirectory("ssm-\(otherKeys[1]).json", in: dir)
+                try foreign.addDirectory("ssm-\(otherKeys[1]).partial-1A2B3C4D.safetensors", in: dir)
+                try foreign.addLink("ssm-\(otherKeys[2]).safetensors", in: dir, toNewFileIn: outside)
+                try foreign.addLink("ssm-\(otherKeys[2]).json", in: dir, toNewFileIn: outside)
+                try foreign.addLink(
+                    "ssm-\(otherKeys[3]).partial-1A2B3C4D.safetensors", in: dir, toNewFileIn: outside)
+
+                oursPartial = DiskCache.temporaryURL(for: Self.companionURLs(root, key)[0])
+                try Data(repeating: 0xEE, count: 40_003).write(to: oursPartial)
+            }
+
+            // The sweep at open.
+            CacheCoordinator.resetImportedRootsForTesting()
+            let reopened = Self.coordinator(root: root, modelKey: modelKey)
+            let companion = try #require(reopened.ssmStateCache.diskStore)
+            #expect(
+                !FileManager.default.fileExists(atPath: oursPartial.path),
+                "INVALID: the open sweep did not remove this store's dead partial")
+            foreign.expectIntact(in: dir, after: "the companion sweep at open")
+
+            // What the quota would be offered for deletion.
+            #expect(companion.quotaEntries().map(\.hash) == [key])
+
+            let before = try Self.listing(dir)
+            reopened.clear()
+            let removed = before.subtracting(try Self.listing(dir))
+            #expect(
+                removed == ["ssm-\(key).json", "ssm-\(key).safetensors"],
+                "clear removed \(removed.sorted())")
+            foreign.expectIntact(in: dir, after: "the companion clear()")
+        }
+    }
+
+    /// A store publishes by renaming over its final name. Whatever sits there
+    /// that is not a regular file is not an older copy of the payload, and
+    /// making room for the rename must not descend into it.
+    @Test func storeRefusesToReplaceADirectoryNamedLikeItsPayload() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("store-over-directory")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-store-over-directory"
+            let disk = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
+            let tokens = Self.tokens(517, seed: 331)
+            let control = Self.tokens(1_003, seed: 332)
+            let hash = Self.kvHash(tokens, modelKey)
+
+            var foreign = ForeignEntries()
+            try foreign.addDirectory("\(hash).safetensors", in: root)
+
+            let (_, log) = try Self.capturingStandardError {
+                disk.store(tokens: tokens, arrays: Self.kv(), enforceQuota: false)
+            }
+            foreign.expectIntact(in: root, after: "a store of the same hash")
+            #expect(try Self.indexedRows(root).isEmpty, "a refused store left a row")
+            #expect(disk.refusedOccupiedStores == 1)
+            #expect(disk.fetch(tokens: tokens) == nil)
+            #expect(
+                log.split(separator: "\n").filter {
+                    $0.hasPrefix("[vmlx][cache/disk-store] REFUSED ") && $0.contains(hash.prefix(12))
+                }.count == 1, "\(log)")
+            #expect(
+                try Self.listing(root).allSatisfy { !$0.contains(".partial-") },
+                "a refused store left its partial behind")
+
+            // The control: the cache still stores, and an ordinary re-store
+            // over its own regular file still replaces it.
+            disk.store(tokens: control, arrays: Self.kv(), enforceQuota: false)
+            disk.forgetValidatedFiles()
+            disk.store(tokens: control, arrays: Self.kv(2_048), enforceQuota: false)
+            let row = try #require(try Self.indexedRows(root).first)
+            #expect(row.hash == Self.kvHash(control, modelKey))
+            #expect(row.fileSize == Self.fileBytes(Self.payloadURL(root, row.hash)))
+            #expect(disk.fetch(tokens: control) != nil)
+            #expect(disk.refusedOccupiedStores == 1)
+        }
+    }
+
+    /// The same, for the companion tensor.
+    @Test func companionStoreRefusesToReplaceADirectoryNamedLikeItsTensor() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("companion-store-over-directory")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-companion-store-over-directory"
+            let coordinator = Self.coordinator(root: root, modelKey: modelKey)
+            let companion = try #require(coordinator.ssmStateCache.diskStore)
+            let tokens = Self.tokens(517, seed: 341)
+            let key = Self.ssmKey(tokens, modelKey)
+            let dir = Self.companionDir(root)
+
+            var foreign = ForeignEntries()
+            try foreign.addDirectory("ssm-\(key).safetensors", in: dir)
+
+            #expect(throws: (any Error).self) {
+                _ = try companion.store(
+                    ssmStates: Self.recurrent(), tokens: tokens, boundary: tokens.count,
+                    enforceQuota: false)
+            }
+            foreign.expectIntact(in: dir, after: "a companion store of the same key")
+            #expect(
+                try Self.listing(dir) == ["ssm-\(key).safetensors"],
+                "a refused companion store left files behind")
+        }
+    }
+
+    /// Eviction and the corrupt-entry path remove by a path built from a
+    /// hash. If a directory has taken that name, it is not the cache's file.
+    @Test func removeCacheFileLeavesADirectoryAlone() throws {
+        let root = Self.makeRoot("remove-directory")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        var foreign = ForeignEntries()
+        try foreign.addDirectory("0123456789abcdef0123456789abcdef.safetensors", in: root)
+        let ours = root.appendingPathComponent("00112233445566778899aabbccddeeff.safetensors")
+        try Data([1, 2, 3]).write(to: ours)
+
+        #expect(!DiskCache.removeCacheFile(
+            at: root.appendingPathComponent("0123456789abcdef0123456789abcdef.safetensors")))
+        foreign.expectIntact(in: root, after: "removeCacheFile")
+        #expect(DiskCache.removeCacheFile(at: ours))
+        #expect(!FileManager.default.fileExists(atPath: ours.path))
+        #expect(DiskCache.removeCacheFile(at: ours), "a file that is not there is gone")
+    }
 }
