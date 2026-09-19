@@ -34,6 +34,16 @@ struct DiskQuotaScanCostProbe {
         String(format: "%.3f", value)
     }
 
+    /// The numbers differ several-fold between configurations, so every
+    /// result line says which one produced it.
+    private static var buildConfiguration: String {
+        #if DEBUG
+            return "debug"
+        #else
+            return "release"
+        #endif
+    }
+
     @Test(
         .enabled(if: ProcessInfo.processInfo.environment["VMLX_QUOTA_PROBE"] == "1"),
         arguments: [100, 1_000, 5_003])  // 5003 deliberately not round
@@ -85,11 +95,13 @@ struct DiskQuotaScanCostProbe {
             #expect(kvBefore.count == entries)
             #expect(companionBefore.count == entries)
             #expect(kvHashes.count == entries)
-            #expect(companionBefore.allSatisfy { entry in
+            // Hard requirements: an unlinked or empty fixture measures a
+            // different scan, so it must never reach a QUOTA_PROBE line.
+            try #require(companionBefore.allSatisfy { entry in
                 entry.kvHash.map(kvHashes.contains) ?? false
             })
-            #expect(kvBefore.allSatisfy { $0.bytes > 0 })
-            #expect(companionBefore.allSatisfy { $0.bytes > 0 })
+            try #require(kvBefore.allSatisfy { $0.bytes > 0 })
+            try #require(companionBefore.allSatisfy { $0.bytes > 0 })
             let fixtureBytes = kvBefore.reduce(Int64(0)) { $0 + $1.bytes }
                 + companionBefore.reduce(Int64(0)) { $0 + $1.bytes }
             #expect(fixtureBytes < Int64(disk.maxSizeBytes) / 100)
@@ -107,7 +119,7 @@ struct DiskQuotaScanCostProbe {
             #expect(companionAfter == entries)
 
             print(
-                "QUOTA_PROBE entries=\(entries) median_ms=\(Self.ms(full[2])) "
+                "QUOTA_PROBE entries=\(entries) build=\(Self.buildConfiguration) median_ms=\(Self.ms(full[2])) "
                     + "min_ms=\(Self.ms(full[0])) max_ms=\(Self.ms(full[4])) "
                     + "kv_rows=\(kvAfter) companion_entries=\(companionAfter)")
 
@@ -124,9 +136,13 @@ struct DiskQuotaScanCostProbe {
             #expect(companionSeen == entries)
 
             print(
-                "QUOTA_PROBE_PARTS entries=\(entries) "
+                "QUOTA_PROBE_PARTS entries=\(entries) build=\(Self.buildConfiguration) "
                     + "kv_quotaEntries_median_ms=\(Self.ms(kvPart[2])) "
-                    + "companion_quotaEntries_median_ms=\(Self.ms(companionPart[2]))")
+                    + "kv_quotaEntries_min_ms=\(Self.ms(kvPart[0])) "
+                    + "kv_quotaEntries_max_ms=\(Self.ms(kvPart[4])) "
+                    + "companion_quotaEntries_median_ms=\(Self.ms(companionPart[2])) "
+                    + "companion_quotaEntries_min_ms=\(Self.ms(companionPart[0])) "
+                    + "companion_quotaEntries_max_ms=\(Self.ms(companionPart[4]))")
 
             // Timed explicitly so the wall line accounts for fixture teardown;
             // the `defer` above remains the cleanup on every failing path.
