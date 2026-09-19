@@ -1659,9 +1659,14 @@ struct DiskCacheCompanionAccountingTests {
 
     /// S1. A permanently locked index must cost one walk and one busy wait
     /// per interval, not per store. The companion directory cannot be listed
-    /// here, so a retry inside the interval would see no companions, commit
-    /// an empty import and mark the root done — and the retry that IS due,
-    /// once the directory is readable again, would then never run.
+    /// during the store at 59 s, so an attempt made then cannot commit — an
+    /// unlistable directory is not an empty one — and a failed attempt
+    /// restarts the pacing timer. That is how a premature retry shows: the
+    /// retry that IS due, at 61 s, would find only 2 s on the timer and not
+    /// run, and the links would still be missing at the end. That catches a
+    /// retry that comes too early; it cannot catch pacing that is missing
+    /// altogether, so the store at 59 s is also checked for the line every
+    /// uncommitted attempt prints.
     @Test func failedImportIsNotRetriedBeforeTheIntervalHasPassed() throws {
         try MLXMetalTestLock.withLock {
             let root = Self.makeRoot("import-retry-paced")
@@ -1682,10 +1687,19 @@ struct DiskCacheCompanionAccountingTests {
                 [.posixPermissions: 0o000], ofItemAtPath: dir.path)
             try Self.requireUnlistable(dir)
             clock.advance(59)
-            coordinator.storePersistentBoundary(
-                tokens: Self.tokens(1_291, seed: 127), diskArrays: Self.kv(), ssmStates: nil)
+            let (_, early) = try Self.capturingStandardError {
+                coordinator.storePersistentBoundary(
+                    tokens: Self.tokens(1_291, seed: 127), diskArrays: Self.kv(), ssmStates: nil)
+            }
             try FileManager.default.setAttributes(
                 [.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            // An attempt that does not commit is always reported, and this
+            // one could not have committed. With no pacing at all the timer
+            // argument above sees nothing — the attempt at 61 s still runs —
+            // so the attempt itself is what is looked for.
+            #expect(
+                !early.contains("companion import reason=retry"),
+                "the import was retried 59 s after it failed")
             #expect(
                 try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) }
                     .allSatisfy { $0.companionKey == nil })
@@ -2249,6 +2263,589 @@ struct DiskCacheCompanionAccountingTests {
             #expect(disk.usageBytes() == Self.fileBytes(Self.payloadURL(root, Self.kvHash(tokens, modelKey))) + recorded)
             #expect(coordinator.reconcileDiskAccounting())
             try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    // MARK: The payload sweep only ever removes our own regular files
+
+    /// Everything written to standard error while `body` runs. The suite is
+    /// serialized and these tests hold `MLXMetalTestLock`, so nothing else in
+    /// the process is expected to write meanwhile.
+    private static func capturingStandardError<T>(_ body: () throws -> T) throws -> (T, String) {
+        let sink = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-stderr-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: sink) }
+        fflush(stderr)
+        let saved = dup(2)
+        try #require(saved >= 0, "INVALID: could not save standard error")
+        let fd = open(sink.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+        try #require(fd >= 0, "INVALID: could not open the capture file")
+        dup2(fd, 2)
+        close(fd)
+        defer {
+            fflush(stderr)
+            dup2(saved, 2)
+            close(saved)
+        }
+        let value = try body()
+        fflush(stderr)
+        let text = (try? String(contentsOf: sink, encoding: .utf8)) ?? ""
+        // Still visible in the test log.
+        FileHandle(fileDescriptor: saved).write(Data(text.utf8))
+        return (value, text)
+    }
+
+    private static let elevenMinutes: TimeInterval = 11 * 60
+
+    /// Set a path's own modification date — a symlink's, not its target's.
+    private static func age(_ url: URL, by seconds: TimeInterval) throws {
+        let when = Date().addingTimeInterval(-seconds).timeIntervalSince1970
+        var times = [
+            timeval(tv_sec: Int(when), tv_usec: 0), timeval(tv_sec: Int(when), tv_usec: 0),
+        ]
+        try #require(lutimes(url.path, &times) == 0, "INVALID: lutimes failed for \(url.lastPathComponent)")
+    }
+
+    /// An ACL entry that makes every stat of `url` fail with EACCES while the
+    /// directory that holds it stays listable; `false` removes the ACL.
+    private static func setStatDenied(_ url: URL, _ denied: Bool) throws {
+        let chmod = Process()
+        chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        chmod.arguments = denied ? ["+a", "everyone deny readattr", url.path] : ["-N", url.path]
+        try chmod.run()
+        chmod.waitUntilExit()
+        try #require(chmod.terminationStatus == 0, "INVALID: chmod \(chmod.arguments ?? []) failed")
+    }
+
+    /// Deny, and prove that this is a stat failure and nothing else.
+    private static func denyStat(
+        of url: URL, sourceLocation: SourceLocation = #_sourceLocation
+    ) throws {
+        try setStatDenied(url, true)
+        try #require(
+            lstatErrno(url) == EACCES,
+            "INVALID: lstat did not fail with EACCES (root / filesystem)",
+            sourceLocation: sourceLocation)
+        try #require(
+            (try? FileManager.default.contentsOfDirectory(
+                atPath: url.deletingLastPathComponent().path))?
+                .contains(url.lastPathComponent) == true,
+            "INVALID: the directory cannot be listed, so this is not a stat failure",
+            sourceLocation: sourceLocation)
+    }
+
+    private static func lstatErrno(_ url: URL) -> Int32 {
+        var info = stat()
+        return lstat(url.path, &info) == 0 ? 0 : errno
+    }
+
+    /// R1. The cache root is a user setting. Whatever else lives in it — a
+    /// model's shards, a directory, a link — has no row and is old, which is
+    /// exactly what the sweep looks for. Only a regular file named the way
+    /// this cache names payloads may go.
+    @Test func sweepNeverTouchesForeignSafetensors() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("foreign-sweep")
+            let outside = Self.makeRoot("foreign-sweep-outside")
+            defer {
+                try? FileManager.default.removeItem(at: root)
+                try? FileManager.default.removeItem(at: outside)
+            }
+            let modelKey = "accounting-foreign-sweep"
+            let coordinator = Self.coordinator(root: root, modelKey: modelKey)
+            let disk = try #require(coordinator.diskCache)
+            let indexed = Self.tokens(301, seed: 181)
+            let control = Self.tokens(517, seed: 182)
+            coordinator.storePersistentBoundary(
+                tokens: indexed, diskArrays: Self.kv(), ssmStates: Self.recurrent())
+            coordinator.storePersistentBoundary(
+                tokens: control, diskArrays: Self.kv(), ssmStates: nil)
+            let indexedName = "\(Self.kvHash(indexed, modelKey)).safetensors"
+            let controlName = "\(Self.kvHash(control, modelKey)).safetensors"
+            try RawDB(root: root).require(
+                "DELETE FROM cache_entries WHERE hash = '\(Self.kvHash(control, modelKey))'")
+
+            // Not ours, each for one reason.
+            let foreignFiles: [String: Data] = [
+                "foo.safetensors": Data(repeating: 0x11, count: 4_099),
+                "model-00001-of-00002.safetensors": Data(repeating: 0x22, count: 70_001),
+                "ABCDEF0123456789ABCDEF0123456789.safetensors": Data(repeating: 0x33, count: 1_031),
+                "0123456789abcdef0123456789abcde.safetensors": Data(repeating: 0x44, count: 1_033),
+                "0123456789abcdef0123456789abcdef0.safetensors": Data(repeating: 0x55, count: 1_039),
+            ]
+            for (name, data) in foreignFiles {
+                try #require(name.hasSuffix(".safetensors"))
+                try data.write(to: root.appendingPathComponent(name))
+            }
+            let directory = root.appendingPathComponent("0123456789abcdef0123456789abcdef.safetensors")
+            let inner = directory.appendingPathComponent("inner.bin")
+            let innerData = Data(repeating: 0x66, count: 2_053)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try innerData.write(to: inner)
+
+            try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+            let target = outside.appendingPathComponent("weights.safetensors")
+            let targetData = Data(repeating: 0x77, count: 3_001)
+            try targetData.write(to: target)
+            let link = root.appendingPathComponent("fedcba9876543210fedcba9876543210.safetensors")
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+            // All of it as old as the control, whichever date the sweep reads.
+            for name in Array(foreignFiles.keys) + [indexedName, controlName] {
+                try Self.age(root.appendingPathComponent(name), by: Self.elevenMinutes)
+            }
+            try Self.age(target, by: Self.elevenMinutes)
+            try Self.age(link, by: Self.elevenMinutes)
+            try Self.age(directory, by: Self.elevenMinutes)
+
+            func listing() throws -> Set<String> {
+                Set(try FileManager.default.contentsOfDirectory(atPath: root.path))
+            }
+            let before = try listing()
+            try #require(before.contains(controlName), "INVALID: the control payload is not on disk")
+
+            // The production path and the production guard age.
+            #expect(coordinator.reconcileDiskAccounting())
+
+            let removed = before.subtracting(try listing())
+            #expect(
+                removed == [controlName],
+                "the sweep removed \(removed.sorted()); only \(controlName) was its to remove")
+            for (name, data) in foreignFiles.sorted(by: { $0.key < $1.key }) {
+                let now = try? Data(contentsOf: root.appendingPathComponent(name))
+                #expect(now == data, "foreign file \(name) did not survive the sweep byte for byte")
+            }
+            #expect(
+                (try? Data(contentsOf: inner)) == innerData,
+                "a DIRECTORY named like a payload was removed with its contents")
+            #expect(
+                (try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)) == target.path,
+                "a symlink named like a payload was removed")
+            #expect((try? Data(contentsOf: target)) == targetData, "the symlink's target was touched")
+            #expect(disk.fetch(tokens: indexed) != nil)
+            try Self.expectUsageMatchesDisk(disk, root: root, checkCompleteness: false)
+        }
+    }
+
+    /// R1. A root that holds `config.json` or `jang_config.json` looks like a
+    /// model bundle. Nothing is swept there, not even a payload that is ours.
+    @Test func sweepIsSkippedForAModelBundleRoot() throws {
+        try MLXMetalTestLock.withLock {
+            for marker in ["config.json", "jang_config.json"] {
+                let root = Self.makeRoot("bundle-root")
+                defer { try? FileManager.default.removeItem(at: root) }
+                let modelKey = "accounting-bundle-root-\(marker)"
+                let coordinator = Self.coordinator(root: root, modelKey: modelKey)
+                let disk = try #require(coordinator.diskCache)
+                let kept = Self.tokens(301, seed: 183)
+                let rowless = Self.tokens(1_003, seed: 184)
+                for tokens in [kept, rowless] {
+                    coordinator.storePersistentBoundary(
+                        tokens: tokens, diskArrays: Self.kv(), ssmStates: nil)
+                }
+                let payload = Self.payloadURL(root, Self.kvHash(rowless, modelKey))
+                try RawDB(root: root).require(
+                    "DELETE FROM cache_entries WHERE hash = '\(Self.kvHash(rowless, modelKey))'")
+                try Self.age(payload, by: Self.elevenMinutes)
+                let bytes = try Data(contentsOf: payload)
+                let markerURL = root.appendingPathComponent(marker)
+                try Data("{}".utf8).write(to: markerURL)
+
+                let (committed, log) = try Self.capturingStandardError {
+                    coordinator.reconcileDiskAccounting()
+                }
+                #expect(committed, "a skipped sweep is not a failed import")
+                #expect((try? Data(contentsOf: payload)) == bytes, "\(marker): the sweep ran in a model bundle root")
+                let skipLines = log.split(separator: "\n").filter {
+                    $0.hasPrefix("[vmlx][cache/disk-index] payload sweep skipped: ")
+                }
+                #expect(skipLines.count == 1, "\(marker): expected one skip line, got \(skipLines)")
+                #expect(skipLines.first?.contains(marker) == true)
+
+                // The control: without the marker the very same file goes.
+                try FileManager.default.removeItem(at: markerURL)
+                #expect(coordinator.reconcileDiskAccounting())
+                #expect(!FileManager.default.fileExists(atPath: payload.path))
+                try Self.expectUsageMatchesDisk(disk, root: root)
+            }
+        }
+    }
+
+    /// R1. An index a newer build has claimed may name its payloads another
+    /// way. This build does not know which files are that build's, so it
+    /// removes none.
+    @Test func sweepIsSkippedOnANewerSchema() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("newer-schema")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-newer-schema"
+            let tokens = Self.tokens(1_003, seed: 185)
+            let payload = Self.payloadURL(root, Self.kvHash(tokens, modelKey))
+            do {
+                let writer = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
+                writer.store(tokens: tokens, arrays: Self.kv(), enforceQuota: false)
+            }
+            try RawDB(root: root).require("DELETE FROM cache_entries")
+            try Self.age(payload, by: Self.elevenMinutes)
+            let bytes = try Data(contentsOf: payload)
+
+            try RawDB(root: root).require("PRAGMA user_version = 7")
+            let newer = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
+            try #require(newer.indexSchemaVersion == 7, "INVALID: the newer version was not read")
+            try #require(newer.indexHasV2Columns, "INVALID: the import would not run at all")
+            let (summary, log) = try Self.capturingStandardError {
+                newer.reconcileCompanionAccounting(companions: [])
+            }
+            #expect(summary != nil, "the rest of the import still commits")
+            #expect(summary?.unindexedPayloadsRemoved == 0)
+            #expect((try? Data(contentsOf: payload)) == bytes, "swept under a schema this build does not know")
+            #expect(log.contains("[vmlx][cache/disk-index] payload sweep skipped: "))
+
+            // The control: the same file under the current schema goes.
+            try RawDB(root: root).require(
+                "PRAGMA user_version = \(DiskCacheIndexSchema.currentVersion)")
+            let current = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
+            try #require(current.indexSchemaVersion == DiskCacheIndexSchema.currentVersion)
+            let swept = try #require(current.reconcileCompanionAccounting(companions: []))
+            #expect(swept.unindexedPayloadsRemoved == 1)
+            #expect(!FileManager.default.fileExists(atPath: payload.path))
+        }
+    }
+
+    /// R1. A modification date in the future says nothing about how long a
+    /// file has been there, so it is kept. (Pinned, not a regression: a
+    /// negative age was already below the guard age.)
+    @Test func futureMtimeIsKept() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("future-mtime")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-future-mtime"
+            let disk = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
+            try #require(disk.indexHasV2Columns)
+            let tokens = Self.tokens(517, seed: 186)
+            let payload = Self.payloadURL(root, Self.kvHash(tokens, modelKey))
+            disk.store(tokens: tokens, arrays: Self.kv(), enforceQuota: false)
+            try RawDB(root: root).require("DELETE FROM cache_entries")
+
+            try Self.age(payload, by: -86_400)
+            let kept = try #require(disk.reconcileCompanionAccounting(companions: []))
+            #expect(kept.unindexedPayloadsRemoved == 0)
+            #expect(FileManager.default.fileExists(atPath: payload.path))
+            // Even against a guard age of zero.
+            let zero = try #require(
+                disk.reconcileCompanionAccounting(companions: [], unindexedPayloadGuardAge: 0))
+            #expect(zero.unindexedPayloadsRemoved == 0)
+            #expect(FileManager.default.fileExists(atPath: payload.path))
+
+            // The control: the same file, old, goes.
+            try Self.age(payload, by: Self.elevenMinutes)
+            let swept = try #require(disk.reconcileCompanionAccounting(companions: []))
+            #expect(swept.unindexedPayloadsRemoved == 1)
+            #expect(!FileManager.default.fileExists(atPath: payload.path))
+        }
+    }
+
+    /// R1, the sweep at open. It removes what cannot be read as a complete
+    /// safetensors file — which a directory never can, and which a model
+    /// shard that is still downloading cannot either.
+    @Test func openSweepLeavesDirectoriesLinksAndModelBundleRootsAlone() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("open-sweep-foreign")
+            let bundle = Self.makeRoot("open-sweep-bundle")
+            let outside = Self.makeRoot("open-sweep-outside")
+            defer {
+                for url in [root, bundle, outside] { try? FileManager.default.removeItem(at: url) }
+            }
+            for url in [root, bundle, outside] {
+                try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            }
+            let junk = Data(repeating: 0x5A, count: 4_099)  // no safetensors header
+
+            var innerFiles: [URL] = []
+            for name in ["0123456789abcdef0123456789abcdef.safetensors", "weights.safetensors"] {
+                let directory = root.appendingPathComponent(name)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                innerFiles.append(directory.appendingPathComponent("inner.bin"))
+                try junk.write(to: innerFiles.last!)
+            }
+            let target = outside.appendingPathComponent("unfinished.safetensors")
+            try junk.write(to: target)
+            let link = root.appendingPathComponent("fedcba9876543210fedcba9876543210.safetensors")
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+            // The control: a regular file of ours that is incomplete still goes.
+            let ours = root.appendingPathComponent("00112233445566778899aabbccddeeff.safetensors")
+            try junk.write(to: ours)
+
+            _ = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: "open-sweep")
+            for file in innerFiles {
+                #expect(
+                    (try? Data(contentsOf: file)) == junk,
+                    "the open sweep removed the directory \(file.deletingLastPathComponent().lastPathComponent)")
+            }
+            #expect((try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)) == target.path)
+            #expect((try? Data(contentsOf: target)) == junk)
+            #expect(!FileManager.default.fileExists(atPath: ours.path), "INVALID: the open sweep did not run")
+
+            let shard = bundle.appendingPathComponent("model-00001-of-00002.safetensors")
+            let oursInBundle = bundle.appendingPathComponent("00112233445566778899aabbccddeeff.safetensors")
+            try junk.write(to: shard)
+            try junk.write(to: oursInBundle)
+            try Data("{}".utf8).write(to: bundle.appendingPathComponent("config.json"))
+            _ = DiskCache(cacheDir: bundle, maxSizeBytes: 1 << 30, modelKey: "open-sweep")
+            #expect((try? Data(contentsOf: shard)) == junk, "the open sweep ran in a model bundle root")
+            #expect((try? Data(contentsOf: oursInBundle)) == junk)
+        }
+    }
+
+    /// `hash` is a TEXT primary key, which SQLite lets be NULL. Such a row
+    /// names no file: it neither hides a payload from the sweep nor exposes
+    /// one to it, and it must not stop the import for good.
+    @Test func nullHashRowNeitherBlocksTheImportNorExposesAPayload() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("null-hash")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-null-hash"
+            let disk = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
+            try #require(disk.indexHasV2Columns)
+            let tokens = Self.tokens(1_291, seed: 187)
+            let payload = Self.payloadURL(root, Self.kvHash(tokens, modelKey))
+            disk.store(tokens: tokens, arrays: Self.kv(), enforceQuota: false)
+            try Self.age(payload, by: Self.elevenMinutes)
+            try RawDB(root: root).require(
+                "INSERT INTO cache_entries (hash, token_count, file_size) VALUES (NULL, 1, 0)")
+
+            let summary = try #require(disk.reconcileCompanionAccounting(companions: []))
+            #expect(summary.unindexedPayloadsRemoved == 0)
+            #expect(disk.fetch(tokens: tokens) != nil)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    // MARK: "Could not look" is not "not there"
+
+    /// R2. A stat that fails for any reason other than "no such file" says
+    /// nothing about whether the file is there. Reading it as "gone" clears
+    /// a link (under-count) or deletes a row — and a payload without a row
+    /// is what the sweep removes at the next import.
+    ///
+    /// The error is produced without a product hook: an ACL entry denying
+    /// `readattr` on a file leaves its directory listable and makes `lstat`
+    /// of the file fail with EACCES — and `FileManager.fileExists` say false.
+    @Test func statErrorOtherThanMissingAbandonsTheImport() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("stat-error")
+            var denied: [URL] = []
+            func restorePermissions() {
+                for url in denied { try? Self.setStatDenied(url, false) }
+                denied = []
+            }
+            defer {
+                restorePermissions()
+                try? FileManager.default.removeItem(at: root)
+            }
+            let modelKey = "accounting-stat-error"
+            let clock = TestClock()
+            CacheCoordinator.resetImportedRootsForTesting()
+            let coordinator = Self.coordinator(root: root, modelKey: modelKey, clock: clock)
+            let disk = try #require(coordinator.diskCache)
+            for tokens in [Self.tokens(301, seed: 191), Self.tokens(1_003, seed: 192)] {
+                coordinator.storePersistentBoundary(
+                    tokens: tokens, diskArrays: Self.kv(), ssmStates: Self.recurrent())
+            }
+            let populated = try Self.indexedRows(root)
+            try #require(populated.count == 2)
+            try #require(populated.allSatisfy { $0.companionKey != nil && $0.companionBytes > 0 })
+            let populatedHashes = Set(populated.map(\.hash))
+            let companionFiles = populated.flatMap { Self.companionURLs(root, $0.companionKey!) }
+
+            // The walk is stale (empty), so every companion the index names
+            // is looked at again inside the transaction — and cannot be.
+            for url in companionFiles {
+                denied.append(url)
+                try Self.denyStat(of: url)
+            }
+            let (direct, directLog) = try Self.capturingStandardError {
+                disk.reconcileCompanionAccounting(companions: [])
+            }
+            let viaCoordinator = coordinator.reconcileDiskAccounting()
+            restorePermissions()
+            #expect(direct == nil, "an import that could not look at a companion committed")
+            #expect(directLog.contains("companion import abandoned"))
+            #expect(!viaCoordinator)
+            #expect(try Self.indexedRows(root) == populated, "a link was cleared for a companion that is on disk")
+            #expect(try Self.legacyRows(root).isEmpty)
+            for url in companionFiles {
+                #expect(Self.fileBytes(url) > 0, "\(url.lastPathComponent) is gone")
+            }
+
+            // Not marked imported: the quota pass retries, and only an
+            // import puts these links back.
+            try RawDB(root: root).require(
+                "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0")
+            clock.advance(61)
+            coordinator.storePersistentBoundary(
+                tokens: Self.tokens(307, seed: 193), diskArrays: Self.kv(), ssmStates: nil)
+            #expect(try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    /// R2. The other half: a row whose payload cannot be examined. Since the
+    /// sweep exists, deleting that row is worse than an over-count — the
+    /// payload is then row-less, and the NEXT import removes it.
+    @Test func unexaminablePayloadKeepsItsRowAndAbandonsTheImport() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("payload-stat-error")
+            var denied: [URL] = []
+            func restorePermissions() {
+                for url in denied { try? Self.setStatDenied(url, false) }
+                denied = []
+            }
+            defer {
+                restorePermissions()
+                try? FileManager.default.removeItem(at: root)
+            }
+            let modelKey = "accounting-payload-stat-error"
+            let clock = TestClock()
+            CacheCoordinator.resetImportedRootsForTesting()
+            let coordinator = Self.coordinator(root: root, modelKey: modelKey, clock: clock)
+            let disk = try #require(coordinator.diskCache)
+            for tokens in [Self.tokens(517, seed: 198), Self.tokens(1_291, seed: 199)] {
+                coordinator.storePersistentBoundary(
+                    tokens: tokens, diskArrays: Self.kv(), ssmStates: Self.recurrent())
+            }
+            let populated = try Self.indexedRows(root)
+            try #require(populated.count == 2)
+            let populatedHashes = Set(populated.map(\.hash))
+            let payloads = populated.map { Self.payloadURL(root, $0.hash) }
+            for url in payloads {
+                try Self.age(url, by: Self.elevenMinutes)
+                denied.append(url)
+                try Self.denyStat(of: url)
+            }
+
+            // `fileExists` says false for these payloads. A fetch is a miss,
+            // and must not take that for a lost payload either.
+            let misses = disk.snapshotStats().misses
+            #expect(disk.fetch(tokens: Self.tokens(517, seed: 198)) == nil)
+            try #require(disk.snapshotStats().misses == misses + 1)
+            #expect(try Self.indexedRows(root) == populated, "fetch deleted the row of a payload that is on disk")
+
+            let (committed, log) = try Self.capturingStandardError {
+                coordinator.reconcileDiskAccounting()
+            }
+            restorePermissions()
+            #expect(!committed, "an import that could not look at a payload committed")
+            #expect(log.contains("companion import abandoned"))
+            #expect(try Self.indexedRows(root) == populated, "a row was deleted for a payload that is on disk")
+
+            // The retry that is due commits, and sweeps nothing: the rows
+            // were kept, so the old payloads are still indexed.
+            try RawDB(root: root).require(
+                "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0")
+            clock.advance(61)
+            coordinator.storePersistentBoundary(
+                tokens: Self.tokens(307, seed: 200), diskArrays: Self.kv(), ssmStates: nil)
+            #expect(try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated)
+            for url in payloads {
+                #expect(Self.fileBytes(url) > 0, "\(url.lastPathComponent) was swept after losing its row")
+            }
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    /// R2. The sweep already deletes nothing when the root cannot be listed;
+    /// the import must not count as done either, or the sweep it skipped is
+    /// never run again in this process.
+    @Test func unreadablePayloadListingMakesTheImportNotCommit() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("listing-error")
+            func restorePermissions() {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o755], ofItemAtPath: root.path)
+            }
+            defer {
+                restorePermissions()
+                try? FileManager.default.removeItem(at: root)
+            }
+            let modelKey = "accounting-listing-error"
+            let clock = TestClock()
+            CacheCoordinator.resetImportedRootsForTesting()
+            let coordinator = Self.coordinator(root: root, modelKey: modelKey, clock: clock)
+            let disk = try #require(coordinator.diskCache)
+            let linked = [Self.tokens(301, seed: 194), Self.tokens(1_003, seed: 195)]
+            let rowless = Self.tokens(517, seed: 196)
+            for tokens in linked {
+                coordinator.storePersistentBoundary(
+                    tokens: tokens, diskArrays: Self.kv(), ssmStates: Self.recurrent())
+            }
+            coordinator.storePersistentBoundary(
+                tokens: rowless, diskArrays: Self.kv(), ssmStates: nil)
+            let rowlessPayload = Self.payloadURL(root, Self.kvHash(rowless, modelKey))
+            try RawDB(root: root).require(
+                "DELETE FROM cache_entries WHERE hash = '\(Self.kvHash(rowless, modelKey))'")
+            try Self.age(rowlessPayload, by: Self.elevenMinutes)
+            let populated = try Self.indexedRows(root)
+            try #require(populated.count == 2)
+
+            // Search but no read permission: every file can be examined,
+            // the directory cannot be listed.
+            try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: root.path)
+            try Self.requireUnlistable(root)
+            try #require(Self.lstatErrno(rowlessPayload) == 0, "INVALID: this is a stat failure too")
+            let committed = coordinator.reconcileDiskAccounting()
+            restorePermissions()
+            #expect(!committed, "an import whose payload sweep could not list the root counted as done")
+            #expect(try Self.indexedRows(root) == populated)
+            #expect(Self.fileBytes(rowlessPayload) > 0)
+
+            // Not marked imported: the quota pass retries, and this time the
+            // sweep runs.
+            clock.advance(61)
+            coordinator.storePersistentBoundary(
+                tokens: Self.tokens(307, seed: 197), diskArrays: Self.kv(), ssmStates: nil)
+            #expect(
+                !FileManager.default.fileExists(atPath: rowlessPayload.path),
+                "the import was never retried")
+            let populatedHashes = Set(populated.map(\.hash))
+            #expect(try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    // MARK: Log tags
+
+    /// R3. Every `[vmlx][cache/disk-quota]` line is a pass summary that
+    /// starts `before= after= max=`; a parser relies on it. A failed delete
+    /// has its own tag, once per path: a file that can never be deleted is
+    /// tried again by every over-cap store.
+    @Test func failedDeleteIsReportedOncePerPathUnderItsOwnTag() throws {
+        let root = Self.makeRoot("delete-tag")
+        defer {
+            Self.clearImmutableFlags(under: root)
+            try? FileManager.default.removeItem(at: root)
+        }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Self.requireImmutableBlocksDeletion(in: root)
+        let stuck = ["stuck-one.safetensors", "stuck-two.safetensors"].map {
+            root.appendingPathComponent($0)
+        }
+        for url in stuck {
+            try Data([1, 2, 3]).write(to: url)
+            try Self.setImmutable(url, true)
+        }
+
+        let (results, log) = try Self.capturingStandardError {
+            [stuck[0], stuck[0], stuck[1], stuck[0]].map { DiskCache.removeCacheFile(at: $0) }
+        }
+        #expect(results == [false, false, false, false])
+        let lines = log.split(separator: "\n").map(String.init)
+        #expect(!lines.contains { $0.hasPrefix("[vmlx][cache/disk-quota]") && !$0.contains(" before=") })
+        for url in stuck {
+            let mine = lines.filter { $0.contains("path=\(url.path) ") }
+            #expect(mine.count == 1, "\(url.lastPathComponent): \(mine)")
+            #expect(mine.first?.hasPrefix("[vmlx][cache/disk-delete] failed path=") == true)
+            #expect(mine.first?.hasSuffix("— row kept") == true)
         }
     }
 }

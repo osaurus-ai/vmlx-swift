@@ -334,10 +334,14 @@ public final class CacheCoordinator: @unchecked Sendable {
         guard let companions = companionStore.listedQuotaEntries() else {
             FileHandle.standardError.write(Data(
                 ("[vmlx][cache/disk-index] companion import reason=\(reason) committed=false "
-                    + "companion directory could not be listed\n").utf8))
+                    + "companion directory could not be listed or examined\n").utf8))
             return false
         }
-        let summary = diskCache.reconcileCompanionAccounting(companions: companions)
+        // The directory goes in with the entries that were listed from it:
+        // `ssmStateCache.diskStore` is a public var, and the re-check inside
+        // the transaction must look where this walk looked.
+        let summary = diskCache.reconcileCompanionAccounting(
+            companions: companions, companionDirectory: companionStore.directory)
         // A skipped import is always reported; a committed one only under
         // the trace flag, and only when it changed something.
         let traced = ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
@@ -365,10 +369,21 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///
     /// Walks the companion directory once (the same import that runs at
     /// open), drops rows whose payload is gone, removes payloads that have
-    /// had no row for ten minutes, and forgets which files this process had
-    /// validated.
+    /// no row and were last modified at least ten minutes ago, and forgets
+    /// which files this process had validated. The ten minutes are the
+    /// file's age, not how long it has been without a row: a week-old
+    /// payload whose row was deleted a second ago goes at once. Only regular
+    /// files named like this cache's payloads are ever removed, and none at
+    /// all in a root that holds `config.json` / `jang_config.json` or under
+    /// an index a newer build has claimed.
     ///
-    /// Returns false when the index write lock could not be taken. The index
+    /// Deleting `cache_index.db` by hand therefore does not keep the
+    /// payloads: every one of them is then without a row — not served, and
+    /// removed by the next import once it is old enough.
+    ///
+    /// Returns false when the index write lock could not be taken, or when
+    /// a directory or a file the import has to look at could not be examined
+    /// (which is never read as "not there"). The index
     /// is then unchanged — the validated sets HAVE been cleared, which only
     /// costs a re-validation — and the call can be repeated. It does not
     /// have to be: the root stops counting as imported, so this

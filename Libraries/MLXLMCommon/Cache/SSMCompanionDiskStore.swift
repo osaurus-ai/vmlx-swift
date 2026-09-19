@@ -300,12 +300,20 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         lock.lock()
         validatedEntries.removeValue(forKey: key)
         let ledger = self.ledger
-        let current = Self.publishedEntry(key: key, in: cacheDir)
+        let state = Self.publishedEntryState(key: key, in: cacheDir)
         lock.unlock()
 
         guard let ledger else { return }
-        guard let current else {
+        let current: (bytes: Int64, modifiedAt: Date)
+        switch state {
+        case .present(let bytes, let modifiedAt):
+            current = (bytes, modifiedAt)
+        case .absent:
             ledger.forgetCompanions(keys: [key])
+            return
+        case .unreadable:
+            // Could not look: whatever the ledger records for this key
+            // stays. An over-count at worst, which the next import settles.
             return
         }
         if let rc = ledger.recordCompanionFailureCode(
@@ -315,26 +323,49 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         }
     }
 
-    /// What is under one key's two final names right now: the bytes of
-    /// whichever of the tensor file and the sidecar exist, and the older of
-    /// their modification dates; nil when neither holds anything. Stats
-    /// only, no lock: also used by the index while it holds its own.
-    static func publishedEntry(
-        key: String, in cacheDir: URL
-    ) -> (bytes: Int64, modifiedAt: Date)? {
+    /// What is under one key's two final names right now.
+    enum PublishedEntryState {
+        /// The bytes of whichever of the tensor file and the sidecar are
+        /// regular files, and the older of their modification dates.
+        case present(bytes: Int64, modifiedAt: Date)
+        /// Neither name holds anything: each is a definite "no such file",
+        /// not a regular file, or empty.
+        case absent
+        /// One of the two could not be examined (any `lstat` failure other
+        /// than ENOENT). That says nothing about whether it is there, and
+        /// must not be read as `absent`: clearing a link or forgetting a
+        /// record on it under-counts files that are still on disk.
+        case unreadable(errno: Int32)
+    }
+
+    /// Stats only, no lock: also used by the index while it holds its own.
+    static func publishedEntryState(key: String, in cacheDir: URL) -> PublishedEntryState {
         var bytes: Int64 = 0
         var modified: Date?
         for name in ["ssm-\(key).safetensors", "ssm-\(key).json"] {
-            guard let values = try? cacheDir.appendingPathComponent(name).resourceValues(forKeys: [
-                .isRegularFileKey, .fileSizeKey, .contentModificationDateKey,
-            ]), values.isRegularFile == true
-            else { continue }
-            bytes += Int64(values.fileSize ?? 0)
-            if let date = values.contentModificationDate {
+            switch DiskCache.pathState(at: cacheDir.appendingPathComponent(name)) {
+            case .regularFile(let size, let date):
+                bytes += size
                 modified = modified.map { min($0, date) } ?? date
+            case .missing, .notRegularFile:
+                continue
+            case .unreadable(let code):
+                return .unreadable(errno: code)
             }
         }
-        return bytes > 0 ? (bytes, modified ?? Date()) : nil
+        return bytes > 0 ? .present(bytes: bytes, modifiedAt: modified ?? Date()) : .absent
+    }
+
+    /// ``publishedEntryState(key:in:)`` for callers that only correct bytes
+    /// upwards from what they find: nil when nothing is there OR it could
+    /// not be examined. Not for deciding that files are gone.
+    static func publishedEntry(
+        key: String, in cacheDir: URL
+    ) -> (bytes: Int64, modifiedAt: Date)? {
+        if case .present(let bytes, let modifiedAt) = publishedEntryState(key: key, in: cacheDir) {
+            return (bytes, modifiedAt)
+        }
+        return nil
     }
 
     /// The index could not be made to count files that are already on disk.
@@ -870,7 +901,8 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         listedDiskEntriesLocked() ?? [:]
     }
 
-    /// nil when the directory is there but cannot be listed.
+    /// nil when the directory is there but cannot be listed, or one of its
+    /// entries cannot be examined.
     private func listedDiskEntriesLocked() -> [String: DiskEntry]? {
         let urls: [URL]
         do {
@@ -887,11 +919,24 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         var entries: [String: DiskEntry] = [:]
         for url in urls {
             guard let hash = entryHash(for: url) else { continue }
-            let values = try? url.resourceValues(forKeys: [
-                .contentModificationDateKey, .fileSizeKey,
-            ])
-            let bytes = values?.fileSize ?? 0
-            let modified = values?.contentModificationDate ?? .distantPast
+            // An entry that vanished since the listing is not an entry. One
+            // that cannot be examined is there with unknown bytes, and a
+            // walk that reported it as zero bytes would under-count it: the
+            // walk as a whole has then failed.
+            let bytes: Int
+            let modified: Date
+            switch DiskCache.pathState(at: url) {
+            case .regularFile(let size, let date):
+                bytes = Int(size)
+                modified = date
+            case .missing:
+                continue
+            case .notRegularFile:
+                bytes = 0
+                modified = .distantPast
+            case .unreadable:
+                return nil
+            }
 
             var entry = entries[hash] ?? DiskEntry()
             entry.urls.append(url)
