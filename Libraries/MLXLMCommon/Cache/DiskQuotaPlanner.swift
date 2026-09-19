@@ -72,19 +72,26 @@ struct QuotaPlan: Equatable {
 ///    and chain recency below are taken over the rows that survive this step,
 ///    so a chain whose newest snapshot was oversized keeps its best fitting
 ///    one as its resume point.
-/// 3. **Soft phase, down to `low`,** paid only with rows that are not a
-///    resume point: (a) legacy companions, oldest first; (b) non-tip rows of
+/// 3. **Soft phase,** paid only with rows that are not a resume point:
+///    (a) legacy companions, oldest first, down to `low`; (b) non-tip rows of
 ///    cold chains, coldest chain first, smallest `tokenCount` first within a
-///    chain; (c) non-tip rows of the active chain, smallest `tokenCount`
-///    first. Stops as soon as `total <= low`, or when it runs out of such rows.
+///    chain, down to `low`; (c) non-tip rows of the active chain, smallest
+///    `tokenCount` first, down to the CAP only. Each step stops as soon as
+///    its goal is met, or when it runs out of such rows.
+///
+///    Why (c) stops at the cap: the conversation in progress is about to read
+///    its own non-tip rows again. A regenerate restores from the exact-prompt
+///    row, one boundary below the tip; an edit restores from further down.
+///    Spending those on hysteresis trades a certain re-prefill now for fewer
+///    evicting passes later. Cold chains' superseded rows have no such reader.
 /// 4. **Hard phase, only while `total > cap`:** (d) cold chains' tips, coldest
 ///    chain first; (e) stable roots, oldest first; (f) the active chain's tip,
 ///    last. Stops as soon as `total <= cap`.
 ///
 /// Why tips never pay for hysteresis: a tip is a conversation's resume point,
 /// and losing it costs a full cold prefill of that conversation. The low
-/// watermark only buys fewer evicting passes; that is worth superseded
-/// snapshots and nothing more. And why the stable root yields before the
+/// watermark only buys fewer evicting passes; that is worth legacy companions
+/// and cold conversations' superseded snapshots, and nothing more. And why the stable root yields before the
 /// active tip: for the conversation in progress the tip is a superset prefix
 /// of the stable root, so the root saves nothing the tip does not.
 ///
@@ -99,9 +106,13 @@ struct QuotaPlan: Equatable {
 ///    is total and ends on `id`.
 /// 7. A cache migrated from the old schema — every `chainId` nil, no stable
 ///    roots, no active chain — has no superseded rows to find: every row is a
-///    tip, the soft phase has nothing to take, and (d) is oldest recency
-///    first to exactly the cap. That is the old order, including its
-///    legacy-companions-first and oversized-first rules.
+///    tip, the soft phase has no KV row to take, and (d) is oldest recency
+///    first to exactly the cap. With no legacy companions that is the old
+///    order exactly, oversized-first included. With legacy companions it is
+///    the old order plus hysteresis on them alone: both policies take legacy
+///    companions first, oldest first, but the old one stopped at the cap and
+///    (a) goes on to `low`. The KV rows evicted are never more than the old
+///    policy's; the legacy companions evicted are never fewer.
 enum DiskQuotaPlanner {
     static let lowWatermarkFraction = 0.90
 
@@ -120,6 +131,7 @@ enum DiskQuotaPlanner {
     }
 
     static func plan(rows: [QuotaRow], capBytes: Int64, activeChain: String?) -> QuotaPlan {
+        assert(Set(rows.map(\.id)).count == rows.count, "QuotaRow ids must be unique")
         let totalBefore = rows.reduce(Int64(0)) { $0 + $1.bytes }
         var total = totalBefore
         var evict: [String] = []
@@ -176,11 +188,12 @@ enum DiskQuotaPlanner {
             return $0.tip.id < $1.tip.id
         }
 
-        // 3. Soft phase: down to the low watermark, never with a resume point.
+        // 3. Soft phase: never with a resume point. Legacy and cold rows pay
+        // for the low watermark; the active conversation's rows only for the cap.
         let low = Int64(Double(capBytes) * lowWatermarkFraction)
         _ = drain(fitting.filter(\.isLegacyCompanion).sorted(by: oldestFirst), to: low)
         _ = drain(cold.flatMap(\.superseded), to: low)
-        var trimmedActive = drain(active?.superseded ?? [], to: low)
+        var trimmedActive = drain(active?.superseded ?? [], to: capBytes)
 
         // 4. Hard phase: only while still over the cap.
         _ = drain(cold.map(\.tip), to: capBytes)
