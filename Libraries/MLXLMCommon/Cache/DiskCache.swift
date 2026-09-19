@@ -216,6 +216,16 @@ public final class DiskCache: @unchecked Sendable {
     /// SQLite database handle.
     private var db: OpaquePointer?
 
+    /// `PRAGMA user_version` of `cache_index.db` after this connection's
+    /// migration attempt. Below `DiskCacheIndexSchema.currentVersion` when the
+    /// migration could not run (the index then keeps working as v1); above it
+    /// when a newer build owns the schema.
+    let indexSchemaVersion: Int32
+
+    /// Whether the v2 columns and `legacy_companions` are really present on
+    /// this index. Callers that use them must check this, not the version.
+    let indexHasV2Columns: Bool
+
     /// Lock for thread-safe access to mutable state.
     private let lock = OSAllocatedUnfairLock()
 
@@ -306,7 +316,10 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Exact-byte initializer used by deterministic quota tests and callers
     /// that already resolved a user-facing GiB limit to bytes.
-    init(cacheDir: URL, maxSizeBytes: Int, modelKey: String? = nil) {
+    init(
+        cacheDir: URL, maxSizeBytes: Int, modelKey: String? = nil,
+        indexMigrationBusyTimeoutMs: Int32 = DiskCacheIndexSchema.defaultBusyTimeoutMs
+    ) {
         self.cacheDir = cacheDir
         self.maxSizeBytes = maxSizeBytes
         self.modelKey = modelKey
@@ -329,25 +342,25 @@ public final class DiskCache: @unchecked Sendable {
         let dbPath = cacheDir.appendingPathComponent("cache_index.db").path
         if sqlite3_open(dbPath, &db) != SQLITE_OK {
             db = nil
+            indexSchemaVersion = 0
+            indexHasV2Columns = false
             return
         }
 
         // Enable WAL mode for better concurrent read performance
-        executeSQL("PRAGMA journal_mode=WAL")
+        Self.executeSQL(db, "PRAGMA journal_mode=WAL")
 
         // Create the index table
-        executeSQL("""
-            CREATE TABLE IF NOT EXISTS cache_entries (
-                hash TEXT PRIMARY KEY,
-                token_count INTEGER,
-                file_size INTEGER,
-                created_at REAL DEFAULT (julianday('now'))
-            )
-            """)
-        executeSQL("""
-            CREATE INDEX IF NOT EXISTS idx_cache_entries_token_count
-            ON cache_entries(token_count DESC)
-            """)
+        for statement in DiskCacheIndexSchema.v1Statements {
+            Self.executeSQL(db, statement)
+        }
+
+        // Bring the index to the current schema. A migration that cannot run
+        // leaves a working v1 index; nothing below depends on the v2 columns.
+        indexSchemaVersion = DiskCacheIndexSchema.migrate(
+            db, busyTimeoutMs: indexMigrationBusyTimeoutMs)
+        indexHasV2Columns = DiskCacheIndexSchema.hasV2Columns(
+            db, busyTimeoutMs: indexMigrationBusyTimeoutMs)
     }
 
     deinit {
@@ -1016,6 +1029,12 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Execute a simple SQL statement with no bindings.
     private func executeSQL(_ sql: String) {
+        Self.executeSQL(db, sql)
+    }
+
+    /// Static form for `init`, which runs before every stored property is
+    /// set and so cannot call an instance method.
+    private static func executeSQL(_ db: OpaquePointer?, _ sql: String) {
         guard let db else { return }
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
