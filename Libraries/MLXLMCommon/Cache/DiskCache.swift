@@ -29,11 +29,30 @@ public struct DiskCacheStats: Sendable {
     /// of the same companion already counts them — so nothing is left on disk
     /// uncounted; at worst the boundary is simply not cached.
     public let failedIndexWrites: Int
+    /// Bytes of the logical cache boundaries counted in ``evictions``: what
+    /// quota enforcement has really removed from disk in this process.
+    public let evictedBytes: Int64
+    /// Quota passes in this process that removed at least one boundary. A
+    /// pass runs inline on every store; below the cap it is one SQL aggregate
+    /// and is not counted here.
+    public let quotaPasses: Int
+    /// Wall time of the most recent quota pass that found the cache over its
+    /// cap: reading the index rows, selecting victims and deleting them. 0
+    /// until there has been one. Every store waits for its own pass.
+    public let lastQuotaPassMs: Double
+    /// Incremented once per quota pass that produced a pressure event, so a
+    /// poller can tell a new event from the one it has already shown.
+    public let pressureEventSeq: UInt64
+    /// The most recent pressure event: the cap is too small for the
+    /// conversation in progress. Advisory; nothing was refused.
+    public let lastPressureEvent: DiskCachePressureEvent?
 
     init(
         hits: Int, misses: Int, stores: Int, storeSkips: Int,
         currentPayloadBytes: Int, currentEntryCount: Int,
-        evictions: Int, maxSizeBytes: Int, failedIndexWrites: Int = 0
+        evictions: Int, maxSizeBytes: Int, failedIndexWrites: Int = 0,
+        evictedBytes: Int64 = 0, quotaPasses: Int = 0, lastQuotaPassMs: Double = 0,
+        pressureEventSeq: UInt64 = 0, lastPressureEvent: DiskCachePressureEvent? = nil
     ) {
         self.hits = hits
         self.misses = misses
@@ -44,6 +63,23 @@ public struct DiskCacheStats: Sendable {
         self.evictions = evictions
         self.maxSizeBytes = maxSizeBytes
         self.failedIndexWrites = failedIndexWrites
+        self.evictedBytes = evictedBytes
+        self.quotaPasses = quotaPasses
+        self.lastQuotaPassMs = lastQuotaPassMs
+        self.pressureEventSeq = pressureEventSeq
+        self.lastPressureEvent = lastPressureEvent
+    }
+
+    /// The same counters over a different usage figure (the coordinator's
+    /// directory-walk total on an index without the companion columns).
+    func replacingUsage(currentPayloadBytes: Int, currentEntryCount: Int) -> DiskCacheStats {
+        DiskCacheStats(
+            hits: hits, misses: misses, stores: stores, storeSkips: storeSkips,
+            currentPayloadBytes: currentPayloadBytes, currentEntryCount: currentEntryCount,
+            evictions: evictions, maxSizeBytes: maxSizeBytes,
+            failedIndexWrites: failedIndexWrites, evictedBytes: evictedBytes,
+            quotaPasses: quotaPasses, lastQuotaPassMs: lastQuotaPassMs,
+            pressureEventSeq: pressureEventSeq, lastPressureEvent: lastPressureEvent)
     }
 }
 
@@ -59,6 +95,12 @@ struct DiskCacheQuotaEntry: Sendable {
     /// none, when an older build wrote the row, or on a v1 index.
     var companionKey: String? = nil
     var companionBytes: Int64 = 0
+    /// What the conversation-aware quota planner orders by, from a v2 index:
+    /// the prefix length, whether the row is a stable root (`kind == 1`), and
+    /// the conversation it belongs to (`chain_id`, NULL until one is assigned).
+    var tokenCount: Int = 0
+    var isStableRoot: Bool = false
+    var chainId: String? = nil
 }
 
 /// A recurrent companion the v2 index counts but cannot attach to a KV row:
@@ -332,6 +374,13 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Number of logical cache boundaries removed by quota enforcement.
     public private(set) var evictions: Int = 0
+    /// The coordinator's quota pass, as ``DiskCacheStats`` reports it. Written
+    /// by ``recordQuotaPass(evictedGroups:evictedBytes:milliseconds:event:)``.
+    private var quotaEvictedBytes: Int64 = 0
+    private var quotaPasses: Int = 0
+    private var lastQuotaPassMs: Double = 0
+    private var pressureEventSeq: UInt64 = 0
+    private var lastPressureEvent: DiskCachePressureEvent?
 
     /// Files successfully written or deserialized in this process. A matching
     /// fingerprint lets `store` avoid realizing and rewriting the same large
@@ -353,16 +402,26 @@ public final class DiskCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let usage = _payloadUsageLocked()
-        return DiskCacheStats(
+        return _statsLocked(bytes: usage.bytes, entryCount: usage.entryCount)
+    }
+
+    /// Caller MUST hold `lock`.
+    private func _statsLocked(bytes: Int, entryCount: Int) -> DiskCacheStats {
+        DiskCacheStats(
             hits: hits,
             misses: misses,
             stores: stores,
             storeSkips: storeSkips,
-            currentPayloadBytes: usage.bytes,
-            currentEntryCount: usage.entryCount,
+            currentPayloadBytes: bytes,
+            currentEntryCount: entryCount,
             evictions: evictions,
             maxSizeBytes: maxSizeBytes,
-            failedIndexWrites: failedIndexWrites)
+            failedIndexWrites: failedIndexWrites,
+            evictedBytes: quotaEvictedBytes,
+            quotaPasses: quotaPasses,
+            lastQuotaPassMs: lastQuotaPassMs,
+            pressureEventSeq: pressureEventSeq,
+            lastPressureEvent: lastPressureEvent)
     }
 
     // MARK: - Initialization
@@ -911,7 +970,11 @@ public final class DiskCache: @unchecked Sendable {
         var entries: [DiskCacheQuotaEntry] = []
         var stmt: OpaquePointer?
         let sql = indexHasV2Columns
-            ? "SELECT hash, file_size, created_at, companion_key, companion_bytes FROM cache_entries"
+            ? """
+                SELECT hash, file_size, created_at, companion_key, companion_bytes,
+                       token_count, kind, chain_id
+                FROM cache_entries
+                """
             : "SELECT hash, file_size, created_at FROM cache_entries"
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             return []
@@ -931,6 +994,9 @@ public final class DiskCache: @unchecked Sendable {
             if indexHasV2Columns {
                 entry.companionKey = sqlite3_column_text(stmt, 3).map { String(cString: $0) }
                 entry.companionBytes = max(0, sqlite3_column_int64(stmt, 4))
+                entry.tokenCount = max(0, Int(sqlite3_column_int64(stmt, 5)))
+                entry.isStableRoot = sqlite3_column_int64(stmt, 6) == 1
+                entry.chainId = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
             }
             entries.append(entry)
         }
@@ -1211,16 +1277,7 @@ public final class DiskCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let usage = _combinedUsageLocked()
-        return DiskCacheStats(
-            hits: hits,
-            misses: misses,
-            stores: stores,
-            storeSkips: storeSkips,
-            currentPayloadBytes: Int(usage.bytes),
-            currentEntryCount: usage.entryCount,
-            evictions: evictions,
-            maxSizeBytes: maxSizeBytes,
-            failedIndexWrites: failedIndexWrites)
+        return _statsLocked(bytes: Int(usage.bytes), entryCount: usage.entryCount)
     }
 
     /// Bring the companion columns and `legacy_companions` in line with what
@@ -1579,6 +1636,11 @@ public final class DiskCache: @unchecked Sendable {
         storeSkips = 0
         failedIndexWrites = 0
         evictions = 0
+        quotaEvictedBytes = 0
+        quotaPasses = 0
+        lastQuotaPassMs = 0
+        pressureEventSeq = 0
+        lastPressureEvent = nil
         validatedFiles.removeAll(keepingCapacity: true)
     }
 
@@ -1929,14 +1991,28 @@ public final class DiskCache: @unchecked Sendable {
             entryCount: max(0, Int(sqlite3_column_int64(stmt, 1))))
     }
 
-    /// Record logical evictions selected by the coordinator's linked KV +
-    /// recurrent-companion quota pass. The coordinator counts groups before it
-    /// removes either half, so one atomic pair increments this counter once.
-    func recordQuotaEvictions(_ count: Int) {
-        guard count > 0 else { return }
+    /// Record one over-cap pass of the coordinator's linked KV +
+    /// recurrent-companion quota. `evictedGroups` / `evictedBytes` count the
+    /// logical boundaries whose every file is really gone, so one atomic pair
+    /// increments `evictions` once; a pass that removed none is timed but is
+    /// not a counted pass. `pressureEventSeq` moves once per pass that
+    /// produced an event — the plan's, whether or not every delete succeeded.
+    func recordQuotaPass(
+        evictedGroups: Int, evictedBytes: Int64, milliseconds: Double,
+        event: DiskCachePressureEvent?
+    ) {
         lock.lock()
-        evictions += count
-        lock.unlock()
+        defer { lock.unlock() }
+        if evictedGroups > 0 {
+            evictions += evictedGroups
+            quotaEvictedBytes += max(0, evictedBytes)
+            quotaPasses += 1
+        }
+        lastQuotaPassMs = milliseconds
+        if let event {
+            pressureEventSeq += 1
+            lastPressureEvent = event
+        }
     }
 
     /// Refresh the existing eviction timestamp without replacing the row or

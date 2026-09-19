@@ -9,7 +9,8 @@ import Testing
 ///
 /// Gated on `VMLX_QUOTA_PROBE=1` so an ordinary suite run never pays for it.
 /// The cap is far above the fixture size, so no sample evicts anything and
-/// each one measures the scan alone.
+/// each one measures the scan alone — except the last step, which lowers the
+/// cap once and times the one evicting pass that follows (`QUOTA_PROBE_OVERCAP`).
 @Suite(.serialized)
 struct DiskQuotaScanCostProbe {
 
@@ -162,6 +163,39 @@ struct DiskQuotaScanCostProbe {
                     + "snapshotStats_min_ms=\(Self.ms(statsPoll[0])) "
                     + "snapshotStats_max_ms=\(Self.ms(statsPoll[4])) "
                     + "polled_bytes=\(polledBytes) polled_entries=\(polledEntries)")
+
+            // Over the cap: the pass that actually evicts. A second coordinator
+            // on the same root with a cap a tenth below the fixture runs ONE
+            // pass at open, and that pass has to evict about a tenth of the
+            // entries. Destructive, so it is a single sample — the line says
+            // so — and it runs after every measurement above.
+            if entries >= 1_000 {
+                let cap = fixtureBytes - fixtureBytes / 10
+                let tight = CacheCoordinator(config: CacheCoordinatorConfig(
+                    usePagedCache: false,
+                    enableDiskCache: true,
+                    diskCacheMaxGB: Float(cap) / 1_073_741_824,
+                    diskCacheDir: root,
+                    modelKey: modelKey))
+                let tightDisk = try #require(tight.diskCache)
+                let timing = tight.lastQuotaPassTimingForTesting
+                let remaining = tightDisk.quotaEntries().count
+                let stats = try #require(tight.snapshotStats().diskStats)
+                // Fail closed: a pass that evicted nothing, or everything,
+                // timed something else.
+                try #require(timing.evictedGroups == entries - remaining)
+                try #require(timing.evictedGroups >= entries * 8 / 100)
+                try #require(timing.evictedGroups <= entries * 12 / 100)
+                try #require(stats.quotaPasses == 1 && stats.evictions == timing.evictedGroups)
+                try #require(stats.currentPayloadBytes <= tightDisk.maxSizeBytes)
+                try #require(companion.quotaEntries().count == remaining)
+                try #require(timing.totalMs > 0 && stats.lastQuotaPassMs == timing.totalMs)
+                print(
+                    "QUOTA_PROBE_OVERCAP entries=\(entries) build=\(Self.buildConfiguration) "
+                        + "evicted=\(timing.evictedGroups) pass_ms=\(Self.ms(timing.totalMs)) "
+                        + "select_ms=\(Self.ms(timing.selectMs)) delete_ms=\(Self.ms(timing.deleteMs)) "
+                        + "rows_ms=\(Self.ms(timing.rowsMs)) samples=1")
+            }
 
             // Timed explicitly so the wall line accounts for fixture teardown;
             // the `defer` above remains the cleanup on every failing path.

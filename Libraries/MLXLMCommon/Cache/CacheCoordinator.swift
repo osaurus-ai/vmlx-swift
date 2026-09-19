@@ -328,8 +328,16 @@ public final class CacheCoordinator: @unchecked Sendable {
     private func importCompanionAccountingLocked(
         diskCache: DiskCache, companionStore: SSMCompanionDiskStore, reason: String
     ) -> Bool {
-        let summary = diskCache.reconcileCompanionAccounting(
-            companions: companionStore.quotaEntries())
+        // A directory that cannot be listed is not an empty one: importing
+        // "no companions" would commit, mark the root done, and leave every
+        // companion in it uncounted for good. Not committed; retried later.
+        guard let companions = companionStore.listedQuotaEntries() else {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk-index] companion import reason=\(reason) committed=false "
+                    + "companion directory could not be listed\n").utf8))
+            return false
+        }
+        let summary = diskCache.reconcileCompanionAccounting(companions: companions)
         // A skipped import is always reported; a committed one only under
         // the trace flag, and only when it changed something.
         let traced = ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
@@ -557,16 +565,9 @@ public final class CacheCoordinator: @unchecked Sendable {
             }
         }
 
-        return DiskCacheStats(
-            hits: base.hits,
-            misses: base.misses,
-            stores: base.stores,
-            storeSkips: base.storeSkips,
+        return base.replacingUsage(
             currentPayloadBytes: base.currentPayloadBytes + Int(companionBytes),
-            currentEntryCount: base.currentEntryCount + unlinkedCompanionCount,
-            evictions: base.evictions,
-            maxSizeBytes: base.maxSizeBytes,
-            failedIndexWrites: base.failedIndexWrites)
+            currentEntryCount: base.currentEntryCount + unlinkedCompanionCount)
     }
 
     /// Release paged-cache blocks returned by ``fetch(tokens:mediaSalt:)``.
@@ -1387,7 +1388,12 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// removes it immediately, on every call. The index pass does not: such a
     /// companion is counted as unlinked, so it stays on disk while the total
     /// fits and is the first thing evicted once it does not.
-    func enforceCombinedDiskQuota() {
+    ///
+    /// `activeChain` is the conversation in progress, which the index pass
+    /// protects (see ``DiskQuotaPlanner``). Nothing assigns chain ids yet, so
+    /// every production call passes nil; the parameter is how a test stands
+    /// in for the store path that will.
+    func enforceCombinedDiskQuota(activeChain: String? = nil) {
         guard config.enableDiskCache,
               diskCache != nil,
               ssmStateCache.diskStore != nil
@@ -1395,7 +1401,7 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         CombinedDiskCacheQuotaLock.shared.lock()
         defer { CombinedDiskCacheQuotaLock.shared.unlock() }
-        enforceCombinedDiskQuotaLocked()
+        enforceCombinedDiskQuotaLocked(activeChain: activeChain)
     }
 
     /// One unit of combined-quota eviction: a KV payload with its linked
@@ -1412,8 +1418,9 @@ public final class CacheCoordinator: @unchecked Sendable {
         let priority: Int
     }
 
-    /// The eviction policy, independent of where the groups came from: none
-    /// when the total fits; otherwise every group that can never fit, then
+    /// The directory-walk pass's eviction policy (an index without the v2
+    /// columns; the index pass selects with ``DiskQuotaPlanner``): none when
+    /// the total fits; otherwise every group that can never fit, then
     /// unlinked companions, then oldest recency, until the total fits.
     private static func groupsToEvict(
         from groups: [EvictionGroup], maxBytes: Int64
@@ -1449,7 +1456,7 @@ public final class CacheCoordinator: @unchecked Sendable {
 
     /// Reconcile the linked KV + recurrent quota. Caller must hold
     /// ``CombinedDiskCacheQuotaLock``.
-    private func enforceCombinedDiskQuotaLocked() {
+    private func enforceCombinedDiskQuotaLocked(activeChain: String? = nil) {
         guard config.enableDiskCache,
               let diskCache,
               let companionStore = ssmStateCache.diskStore
@@ -1460,25 +1467,66 @@ public final class CacheCoordinator: @unchecked Sendable {
         if companionBytesAreIndexed {
             retryCompanionImportIfDueLocked(diskCache: diskCache, companionStore: companionStore)
             enforceIndexedQuotaLocked(
-                diskCache: diskCache, companionStore: companionStore, maxBytes: maxBytes)
+                diskCache: diskCache, companionStore: companionStore, maxBytes: maxBytes,
+                activeChain: activeChain)
         } else {
             enforceDirectoryWalkQuotaLocked(
                 diskCache: diskCache, companionStore: companionStore, maxBytes: maxBytes)
         }
     }
 
-    /// Groups come from the index alone: no directory listing, no file stat,
-    /// no sidecar read. Below the cap this is one SQL aggregate.
-    private func enforceIndexedQuotaLocked(
-        diskCache: DiskCache, companionStore: SSMCompanionDiskStore, maxBytes: Int64
-    ) {
-        guard diskCache.usageBytes() > maxBytes else { return }
+    /// Where the last over-cap index pass spent its time. For the cost probe;
+    /// read and written only while ``CombinedDiskCacheQuotaLock`` is held.
+    struct QuotaPassTiming: Sendable, Equatable {
+        /// Reading the rows out of the index and building the planner's input.
+        var rowsMs = 0.0
+        /// ``DiskQuotaPlanner/plan(rows:capBytes:activeChain:)`` alone.
+        var selectMs = 0.0
+        /// Deleting the victims' files and then their rows.
+        var deleteMs = 0.0
+        /// The whole pass, the usage aggregate included.
+        var totalMs = 0.0
+        var evictedGroups = 0
+    }
+    private var _lastQuotaPassTiming = QuotaPassTiming()
 
-        var groups: [EvictionGroup] = diskCache.quotaEntries().map { kv in
-            EvictionGroup(
-                sortKey: "kv:\(kv.hash)",
-                kvHashes: [kv.hash],
-                companionHashes: kv.companionKey.map { [$0] } ?? [],
+    var lastQuotaPassTimingForTesting: QuotaPassTiming {
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+        return _lastQuotaPassTiming
+    }
+
+    /// Rows come from the index alone: no directory listing, no file stat, no
+    /// sidecar read. Below the cap this is one SQL aggregate — no row is read
+    /// and nothing is built for the planner.
+    ///
+    /// Over the cap the victims are chosen by ``DiskQuotaPlanner``: one row per
+    /// KV boundary (its linked companion's bytes included — they are evicted
+    /// as a unit) and one per unlinked companion. While every `chain_id` is
+    /// NULL and no row is a stable root that is the old order (oversized,
+    /// unlinked companions, oldest recency), except that unlinked companions
+    /// are taken down to the low watermark rather than to the cap.
+    private func enforceIndexedQuotaLocked(
+        diskCache: DiskCache, companionStore: SSMCompanionDiskStore, maxBytes: Int64,
+        activeChain: String?
+    ) {
+        let passStart = DispatchTime.now().uptimeNanoseconds
+        guard diskCache.usageBytes() > maxBytes else { return }
+        func msSince(_ start: UInt64) -> Double {
+            Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        }
+
+        let kvEntries = diskCache.quotaEntries()
+        let legacy = diskCache.legacyCompanions()
+        var rows: [QuotaRow] = []
+        rows.reserveCapacity(kvEntries.count + legacy.count)
+        var kvByID: [String: DiskCacheQuotaEntry] = [:]
+        kvByID.reserveCapacity(kvEntries.count)
+        for kv in kvEntries {
+            kvByID[kv.hash] = kv
+            rows.append(QuotaRow(
+                id: kv.hash,
+                tokenCount: kv.tokenCount,
                 bytes: kv.bytes + kv.companionBytes,
                 // A hit refreshes the row and its companion's files with one
                 // timestamp, so the row's recency is the group's — with one
@@ -1489,28 +1537,42 @@ public final class CacheCoordinator: @unchecked Sendable {
                 // is as recent as its row, where the walk would have kept it
                 // as old as its companion. The group is evicted later than
                 // before, never earlier.
-                createdAt: kv.createdAt,
-                priority: 1)
+                recency: kv.createdAt.timeIntervalSince1970,
+                isStableRoot: kv.isStableRoot,
+                chainId: kv.chainId,
+                isLegacyCompanion: false))
         }
-        let legacy = diskCache.legacyCompanions()
-        groups += legacy.map { companion in
-            EvictionGroup(
-                sortKey: "ssm:\(companion.key)",
-                kvHashes: [],
-                companionHashes: [companion.key],
+        // A KV hash is hex, so the prefix keeps the two id spaces apart.
+        let legacyPrefix = "legacy:"
+        for companion in legacy {
+            rows.append(QuotaRow(
+                id: legacyPrefix + companion.key,
+                tokenCount: 0,
                 bytes: companion.bytes,
-                createdAt: companion.modifiedAt,
-                priority: 0)
+                recency: companion.modifiedAt.timeIntervalSince1970,
+                isStableRoot: false,
+                chainId: nil,
+                isLegacyCompanion: true))
         }
+        let rowsMs = msSince(passStart)
 
-        let plan = Self.groupsToEvict(from: groups, maxBytes: maxBytes)
-        guard !plan.evicted.isEmpty else { return }
+        let selectStart = DispatchTime.now().uptimeNanoseconds
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: maxBytes, activeChain: activeChain)
+        let selectMs = msSince(selectStart)
+        guard !plan.evict.isEmpty else { return }
 
-        let evictKV = plan.evicted.reduce(into: Set<String>()) { $0.formUnion($1.kvHashes) }
-        let evictCompanion = plan.evicted.reduce(into: Set<String>()) {
-            $0.formUnion($1.companionHashes)
+        var evictKV = Set<String>()
+        var evictCompanion = Set<String>()
+        for id in plan.evict {
+            if let kv = kvByID[id] {
+                evictKV.insert(kv.hash)
+                if let key = kv.companionKey { evictCompanion.insert(key) }
+            } else {
+                evictCompanion.insert(String(id.dropFirst(legacyPrefix.count)))
+            }
         }
-        let legacyKeys = Set(legacy.map(\.key))
+        let legacyBytes = Dictionary(
+            legacy.map { ($0.key, $0.bytes) }, uniquingKeysWith: { first, _ in first })
 
         // Order: every FILE goes before the ROW that counts it. If the
         // process dies part-way, what is left is a row naming files that are
@@ -1526,11 +1588,13 @@ public final class CacheCoordinator: @unchecked Sendable {
         // it again. Each file is tried once per pass, and the plan is not
         // redone to make up for it, so one undeletable file costs at most its
         // own bytes over the cap and never takes the rest of the cache.
+        let deleteStart = DispatchTime.now().uptimeNanoseconds
         let companionsStillOnDisk = companionStore.removeQuotaEntries(hashes: evictCompanion)
         let removedCompanions = evictCompanion.subtracting(companionsStillOnDisk)
         let removedKV = diskCache.removeQuotaEntries(
             hashes: evictKV, removedCompanions: removedCompanions)
-        diskCache.forgetLegacyCompanions(keys: removedCompanions.intersection(legacyKeys))
+        let removedLegacy = removedCompanions.intersection(legacyBytes.keys)
+        diskCache.forgetLegacyCompanions(keys: removedLegacy)
         for key in companionsStillOnDisk {
             if let current = SSMCompanionDiskStore.publishedEntry(
                 key: key, in: companionStore.directory)
@@ -1538,17 +1602,39 @@ public final class CacheCoordinator: @unchecked Sendable {
                 diskCache.correctCompanionBytes(key: key, bytes: current.bytes)
             }
         }
+        let deleteMs = msSince(deleteStart)
+
         // A group is evicted once every file of it is gone.
-        let evictedGroups = plan.evicted.filter {
-            $0.kvHashes.isSubset(of: removedKV) && $0.companionHashes.isSubset(of: removedCompanions)
-        }.count
-        diskCache.recordQuotaEvictions(evictedGroups)
+        var evictedGroups = 0
+        var evictedBytes: Int64 = 0
+        for id in plan.evict {
+            if let kv = kvByID[id] {
+                guard removedKV.contains(kv.hash),
+                      kv.companionKey.map(removedCompanions.contains) ?? true
+                else { continue }
+                evictedGroups += 1
+                evictedBytes += kv.bytes + kv.companionBytes
+            } else {
+                let key = String(id.dropFirst(legacyPrefix.count))
+                guard removedLegacy.contains(key) else { continue }
+                evictedGroups += 1
+                evictedBytes += legacyBytes[key] ?? 0
+            }
+        }
+        let totalMs = msSince(passStart)
+        diskCache.recordQuotaPass(
+            evictedGroups: evictedGroups, evictedBytes: evictedBytes, milliseconds: totalMs,
+            event: plan.event)
+        _lastQuotaPassTiming = QuotaPassTiming(
+            rowsMs: rowsMs, selectMs: selectMs, deleteMs: deleteMs, totalMs: totalMs,
+            evictedGroups: evictedGroups)
 
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-            // Same keys as the directory-walk line. An index pass never
-            // removes an orphan on sight, so that count is always 0 here.
+            // Same leading keys as the directory-walk line; `ms` and `event`
+            // are appended. An index pass never removes an orphan on sight, so
+            // that count is always 0 here.
             FileHandle.standardError.write(Data(
-                "[vmlx][cache/disk-quota] before=\(plan.totalBefore) after=\(max(0, plan.remaining)) max=\(maxBytes) logicalEvictions=\(evictedGroups) kvEvicted=\(removedKV.count) companionEvicted=\(removedCompanions.count) legacyCompanionEvicted=\(removedCompanions.intersection(legacyKeys).count) orphanCompanionEvicted=0 deleteFailures=\(evictKV.count - removedKV.count + companionsStillOnDisk.count) source=index\n".utf8))
+                "[vmlx][cache/disk-quota] before=\(plan.totalBefore) after=\(max(0, plan.totalAfter)) max=\(maxBytes) logicalEvictions=\(evictedGroups) kvEvicted=\(removedKV.count) companionEvicted=\(removedCompanions.count) legacyCompanionEvicted=\(removedLegacy.count) orphanCompanionEvicted=0 deleteFailures=\(evictKV.count - removedKV.count + companionsStillOnDisk.count) source=index ms=\(String(format: "%.3f", totalMs)) event=\(plan.event?.kind.rawValue ?? "none")\n".utf8))
         }
     }
 
@@ -1557,6 +1643,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     private func enforceDirectoryWalkQuotaLocked(
         diskCache: DiskCache, companionStore: SSMCompanionDiskStore, maxBytes: Int64
     ) {
+        let passStart = DispatchTime.now().uptimeNanoseconds
         let kvEntries = diskCache.quotaEntries()
         let kvHashes = Set(kvEntries.map(\.hash))
         var companionEntries = companionStore.quotaEntries()
@@ -1615,10 +1702,16 @@ public final class CacheCoordinator: @unchecked Sendable {
         let removedCompanions = evictCompanion.subtracting(
             companionStore.removeQuotaEntries(hashes: evictCompanion))
         // A group is evicted once every file of it is gone.
-        let evictedGroups = plan.evicted.filter {
+        let evicted = plan.evicted.filter {
             $0.kvHashes.isSubset(of: removedKV) && $0.companionHashes.isSubset(of: removedCompanions)
-        }.count
-        diskCache.recordQuotaEvictions(evictedGroups)
+        }
+        let evictedGroups = evicted.count
+        // No chain ids on this index, so no conversation to raise an event for.
+        diskCache.recordQuotaPass(
+            evictedGroups: evictedGroups,
+            evictedBytes: evicted.reduce(Int64(0)) { $0 + $1.bytes },
+            milliseconds: Double(DispatchTime.now().uptimeNanoseconds - passStart) / 1_000_000,
+            event: nil)
 
         let legacyCompanionEvicted = companionEntries.reduce(into: 0) { count, entry in
             if entry.kvHash == nil, removedCompanions.contains(entry.hash) {

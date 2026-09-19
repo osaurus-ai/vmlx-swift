@@ -764,10 +764,22 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     /// companion quota. Legacy sidecars have no `kv_hash`; they remain valid
     /// for reads, but quota pressure retires them before indexed KV because
     /// they cannot prove which durable KV payload can still reach them.
+    ///
+    /// A directory that cannot be listed reads as empty here. That is right
+    /// for a quota walk (nothing it could delete) and wrong for an import,
+    /// which uses ``listedQuotaEntries()``.
     func quotaEntries() -> [SSMCompanionQuotaEntry] {
+        listedQuotaEntries() ?? []
+    }
+
+    /// ``quotaEntries()``, or nil when the directory exists but could not be
+    /// listed — which is not "no companions": whoever reconciles an index
+    /// against this list must not take nil for an empty directory. An absent
+    /// directory is empty, not an error.
+    func listedQuotaEntries() -> [SSMCompanionQuotaEntry]? {
         lock.lock()
         defer { lock.unlock() }
-        return diskEntriesLocked().map { hash, entry in
+        return listedDiskEntriesLocked()?.map { hash, entry in
             SSMCompanionQuotaEntry(
                 hash: hash,
                 kvHash: entry.kvHash,
@@ -855,11 +867,22 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     }
 
     private func diskEntriesLocked() -> [String: DiskEntry] {
-        guard let urls = try? FileManager.default.contentsOfDirectory(
-            at: cacheDir,
-            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
-            options: [.skipsHiddenFiles])
-        else { return [:] }
+        listedDiskEntriesLocked() ?? [:]
+    }
+
+    /// nil when the directory is there but cannot be listed.
+    private func listedDiskEntriesLocked() -> [String: DiskEntry]? {
+        let urls: [URL]
+        do {
+            urls = try FileManager.default.contentsOfDirectory(
+                at: cacheDir,
+                includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+                options: [.skipsHiddenFiles])
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return [:]
+        } catch {
+            return nil
+        }
 
         var entries: [String: DiskEntry] = [:]
         for url in urls {
