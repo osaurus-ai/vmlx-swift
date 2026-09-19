@@ -96,11 +96,37 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     private var storeSkips: Int = 0
 
     /// The KV index that counts this store's bytes against the shared quota,
-    /// when the coordinator has one with the v2 columns. Every write, and
-    /// every removal this store decides on its own, is reported to it, so
-    /// the quota never has to walk this directory to know what is in it —
-    /// whichever caller did the writing.
+    /// when the coordinator has one with the v2 columns, so that the quota
+    /// does not have to walk this directory — whichever caller did the
+    /// writing. Exactly these are reported to it, all from `store` and
+    /// `clear`, after this store's own locks are released:
+    ///
+    /// - a completed write, and the touch-only skip of a validated entry
+    ///   (`recordCompanion`; if the index cannot record it, the files are
+    ///   removed again);
+    /// - a write that threw, or that left no readable pair: whatever is on
+    ///   disk for that key afterwards (`recordCompanion` with the real
+    ///   bytes, or `forgetCompanions` when nothing is);
+    /// - this store's own eviction on a direct write (`forgetCompanions`);
+    /// - `clear()` (`forgetAllCompanions`).
+    ///
+    /// NOT reported: `removeQuotaEntries` — its caller, the coordinator's
+    /// combined quota pass, removes the rows itself; `fetch` and
+    /// `touchRecency`, which remove nothing (a pair that fails to decode
+    /// stays on disk and stays counted); and anything that deletes files
+    /// without going through this type, which is what
+    /// `CacheCoordinator.reconcileDiskAccounting()` is for.
     private var ledger: DiskCache?
+
+    /// The two steps of a write that publish a file under its final name.
+    enum WriteStage: Sendable { case moveTensorIntoPlace, writeSidecar }
+
+    /// Test seam, never set in production: called just before each publishing
+    /// step of a write, and an error thrown from it stands in for the file
+    /// system failing at that step. The sidecar failure can be provoked with
+    /// a real directory in the way; "the old tensor was removed and the
+    /// rename then failed" cannot be arranged from outside the process.
+    var writeFaultForTesting: (@Sendable (WriteStage) throws -> Void)?
 
     // MARK: - Initialization
 
@@ -204,7 +230,8 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     /// KV + recurrent state must be admitted or evicted as one group.
     ///
     /// Returns what is now on disk for this entry, or nil when nothing was
-    /// stored.
+    /// stored — including when the ledger could not record the entry, in
+    /// which case the files just written have been removed again.
     @discardableResult
     func store(
         ssmStates: [MLXArray],
@@ -223,21 +250,115 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             modelKey: modelKey,
             mediaSalt: mediaSalt)
 
-        let outcome = try writeEntry(
-            ssmStates: ssmStates, key: key, kvHash: kvHash, boundary: boundary,
-            isComplete: isComplete, enforceQuota: enforceQuota)
+        let outcome: WriteOutcome
+        do {
+            outcome = try writeEntry(
+                ssmStates: ssmStates, key: key, kvHash: kvHash, boundary: boundary,
+                isComplete: isComplete, enforceQuota: enforceQuota)
+        } catch {
+            // The write can fail after it has already changed the directory:
+            // the old tensor is removed before the new one is renamed in, and
+            // the tensor is published before the sidecar is written. The
+            // index must describe what is there now, not what was intended.
+            reportDiskTruth(key: key, kvHash: kvHash)
+            throw error
+        }
 
         // Reported after this store's locks are released: the index takes its
         // own lock, and nothing here needs the two held together.
-        if let ledger = outcome.ledger {
-            if let record = outcome.record {
-                ledger.recordCompanion(
-                    kvHash: record.kvHash, companionKey: record.key,
-                    bytes: record.bytes, modified: record.modifiedAt)
+        guard let ledger = outcome.ledger else { return outcome.record }
+        var record = outcome.record
+        if let written = record {
+            if let rc = ledger.recordCompanionFailureCode(
+                kvHash: written.kvHash, companionKey: written.key,
+                bytes: written.bytes, modified: written.modifiedAt)
+            {
+                removeUnrecordedEntry(key: key, rc: rc)
+                record = nil
             }
-            ledger.forgetCompanions(keys: outcome.evictedKeys)
+        } else {
+            // No throw, but no readable pair either.
+            reportDiskTruth(key: key, kvHash: kvHash)
         }
-        return outcome.record
+
+        var evicted = outcome.evictedKeys
+        if enforceQuota, ledger.indexHasV2Columns {
+            evicted.formUnion(evictOverCap(countedBy: ledger))
+        }
+        ledger.forgetCompanions(keys: evicted)
+        return record
+    }
+
+    /// After a write that did not produce a record: drop this process's
+    /// validation of the key and tell the ledger what the two final-named
+    /// files actually hold now.
+    private func reportDiskTruth(key: String, kvHash: String) {
+        lock.lock()
+        validatedEntries.removeValue(forKey: key)
+        let ledger = self.ledger
+        var bytes: Int64 = 0
+        var modified: Date?
+        for url in [safetensorsURL(for: key), sidecarURL(for: key)] {
+            guard let values = try? url.resourceValues(forKeys: [
+                .isRegularFileKey, .fileSizeKey, .contentModificationDateKey,
+            ]), values.isRegularFile == true
+            else { continue }
+            bytes += Int64(values.fileSize ?? 0)
+            if let date = values.contentModificationDate {
+                modified = modified.map { min($0, date) } ?? date
+            }
+        }
+        lock.unlock()
+
+        guard let ledger else { return }
+        guard bytes > 0 else {
+            ledger.forgetCompanions(keys: [key])
+            return
+        }
+        if let rc = ledger.recordCompanionFailureCode(
+            kvHash: kvHash, companionKey: key, bytes: bytes, modified: modified ?? Date())
+        {
+            removeUnrecordedEntry(key: key, rc: rc)
+        }
+    }
+
+    /// The index could not be made to count files that are already on disk.
+    /// Files in neither table would never be evicted, so they are taken back;
+    /// the boundary is a miss, which is the safe outcome. If another thread
+    /// rewrote the same key in the meantime its files go too and its record
+    /// stays: an over-count until that group is evicted or re-stored.
+    private func removeUnrecordedEntry(key: String, rc: Int32) {
+        MLXDiskCacheIOLock.shared.lock()
+        lock.lock()
+        try? FileManager.default.removeItem(at: safetensorsURL(for: key))
+        try? FileManager.default.removeItem(at: sidecarURL(for: key))
+        validatedEntries.removeValue(forKey: key)
+        lock.unlock()
+        MLXDiskCacheIOLock.shared.unlock()
+        FileHandle.standardError.write(Data(
+            "[vmlx][cache/ssm-store] index record failed rc=\(rc) key=\(key.prefix(12)) — companion removed\n"
+                .utf8))
+    }
+
+    /// This store's own cap on a direct write, decided from the ledger: one
+    /// aggregate below the cap, and no listing of the directory above it.
+    /// Returns the keys whose files it removed; the caller reports them.
+    private func evictOverCap(countedBy ledger: DiskCache) -> Set<String> {
+        guard maxBytes > 0 else { return [] }
+        var total = ledger.companionUsageBytes()
+        guard total > Int64(maxBytes) else { return [] }
+
+        var evicted = Set<String>()
+        for companion in ledger.companionsOldestFirst() {
+            evicted.insert(companion.key)
+            total -= companion.bytes
+            if total <= Int64(maxBytes) { break }
+        }
+        // Files first, rows after (by the caller): dying in between leaves
+        // rows naming files that are gone — an over-count the next import
+        // clears — never files the index has stopped counting.
+        removeQuotaEntries(hashes: evicted)
+        return evicted
     }
 
     private struct WriteOutcome {
@@ -335,6 +456,7 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             try save(arrays: arrays, metadata: ["format": "mlx"], url: partialURL)
             Stream.gpu.synchronize()
             try? FileManager.default.removeItem(at: safetensorsURL)
+            try writeFaultForTesting?(.moveTensorIntoPlace)
             try FileManager.default.moveItem(at: partialURL, to: safetensorsURL)
         } catch {
             try? FileManager.default.removeItem(at: partialURL)
@@ -351,6 +473,7 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         ]
         let sidecarData = try JSONSerialization.data(
             withJSONObject: sidecar, options: [.sortedKeys])
+        try writeFaultForTesting?(.writeSidecar)
         try sidecarData.write(to: sidecarURL, options: [.atomic])
 
         if let writtenSafetensors = fileFingerprint(at: safetensorsURL),
@@ -372,7 +495,9 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             validatedEntries.removeValue(forKey: key)
         }
 
-        if enforceQuota {
+        // With a v2 ledger the cap is applied by `store`, from the index,
+        // once this entry has been recorded in it.
+        if enforceQuota, !(ledger?.indexHasV2Columns ?? false) {
             outcome.evictedKeys = evictIfNeededLocked()
         }
         return outcome
@@ -569,6 +694,14 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         ledger?.forgetAllCompanions()
     }
 
+    /// Forget which pairs this process has validated; see
+    /// ``DiskCache/forgetValidatedFiles()``.
+    func forgetValidatedEntries() {
+        lock.lock()
+        validatedEntries.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+
     private func removeEveryEntry() -> DiskCache? {
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
@@ -603,7 +736,8 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         }
     }
 
-    /// Remove recurrent payloads selected by the combined quota pass.
+    /// Remove recurrent payloads selected by a quota pass. Files only: the
+    /// caller owns the index rows and removes them afterwards.
     func removeQuotaEntries(hashes: Set<String>) {
         guard !hashes.isEmpty else { return }
         MLXDiskCacheIOLock.shared.lock()
@@ -708,8 +842,9 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         return entries
     }
 
-    /// Standalone quota for callers that use this store without the
-    /// coordinator's combined pass. Returns the keys it removed.
+    /// Standalone quota by directory walk, for a store with no ledger or a
+    /// ledger without the v2 columns. With a v2 ledger `evictOverCap` applies
+    /// the same cap from the index instead. Returns the keys it removed.
     @discardableResult
     private func evictIfNeededLocked() -> Set<String> {
         guard maxBytes > 0 else { return [] }

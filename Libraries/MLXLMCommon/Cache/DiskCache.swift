@@ -22,6 +22,28 @@ public struct DiskCacheStats: Sendable {
     /// A linked KV + recurrent-companion pair increments this once.
     public let evictions: Int
     public let maxSizeBytes: Int
+    /// Writes to the index that failed in this process after the files they
+    /// describe were already on disk: a KV insert that lost to another
+    /// connection's write lock, or a companion the index could not record.
+    /// In both cases the files were removed again, so nothing is left on disk
+    /// uncounted; the boundary is simply not cached.
+    public let failedIndexWrites: Int
+
+    init(
+        hits: Int, misses: Int, stores: Int, storeSkips: Int,
+        currentPayloadBytes: Int, currentEntryCount: Int,
+        evictions: Int, maxSizeBytes: Int, failedIndexWrites: Int = 0
+    ) {
+        self.hits = hits
+        self.misses = misses
+        self.stores = stores
+        self.storeSkips = storeSkips
+        self.currentPayloadBytes = currentPayloadBytes
+        self.currentEntryCount = currentEntryCount
+        self.evictions = evictions
+        self.maxSizeBytes = maxSizeBytes
+        self.failedIndexWrites = failedIndexWrites
+    }
 }
 
 /// One indexed KV payload used by the coordinator's shared disk-quota pass.
@@ -46,7 +68,11 @@ struct DiskCacheLegacyCompanion: Sendable, Equatable {
     let modifiedAt: Date
 }
 
-/// What the one-time import changed. All zero on a second run.
+/// What one COMMITTED import changed: all zero when the index already agreed
+/// with the directory. An import that could not take the write lock or could
+/// not commit changed nothing either, but is not this value —
+/// ``DiskCache/reconcileCompanionAccounting(companions:)`` returns nil for it,
+/// so "nothing to do" and "did not run" cannot be mistaken for each other.
 struct DiskCacheCompanionImportSummary: Sendable, Equatable {
     var rowsDeletedForMissingPayload = 0
     var linksWritten = 0
@@ -243,7 +269,10 @@ public final class DiskCache: @unchecked Sendable {
     /// `PRAGMA user_version` of `cache_index.db` after this connection's
     /// migration attempt. Below `DiskCacheIndexSchema.currentVersion` when the
     /// migration could not run (the index then keeps working as v1); above it
-    /// when a newer build owns the schema.
+    /// when a newer build owns the schema. It is also 0 when the version could
+    /// not be read at all — the database did not open, or `user_version` was
+    /// unreadable under the migration's lock — so 0 means "treat as v1", not
+    /// "the file says 0". Nothing branches on it; see `indexHasV2Columns`.
     let indexSchemaVersion: Int32
 
     /// Whether the v2 columns and `legacy_companions` are really present on
@@ -269,6 +298,9 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Number of store operations that reused an already validated file.
     public private(set) var storeSkips: Int = 0
+    /// Index writes that failed after their files were on disk (see
+    /// ``DiskCacheStats/failedIndexWrites``). The files were removed again.
+    public private(set) var failedIndexWrites: Int = 0
     /// Stores refused because the payload carried NaN/Inf (never persisted).
     public private(set) var refusedNonFiniteStores: Int = 0
     /// Fetches that found a NaN/Inf record on disk (removed, reported as a miss).
@@ -322,7 +354,8 @@ public final class DiskCache: @unchecked Sendable {
             currentPayloadBytes: usage.bytes,
             currentEntryCount: usage.entryCount,
             evictions: evictions,
-            maxSizeBytes: maxSizeBytes)
+            maxSizeBytes: maxSizeBytes,
+            failedIndexWrites: failedIndexWrites)
     }
 
     // MARK: - Initialization
@@ -581,7 +614,7 @@ public final class DiskCache: @unchecked Sendable {
                 // could ever see or evict it. Take it back rather than leak it.
                 try? FileManager.default.removeItem(at: finalURL)
                 validatedFiles.removeValue(forKey: hash)
-                storeSkips += 1
+                failedIndexWrites += 1
                 FileHandle.standardError.write(Data(
                     ("[vmlx][cache/disk-store] index insert failed rc=\(insertResult) "
                         + "hash=\(hash.prefix(12)) — payload removed\n").utf8))
@@ -885,25 +918,10 @@ public final class DiskCache: @unchecked Sendable {
     // aggregates instead of a directory walk. Every method below is a no-op
     // (or reports "nothing") on an index without the v2 columns.
 
-    /// Attach a companion to its KV row, replacing whatever the row carried.
-    /// Returns false when no row has that hash.
-    @discardableResult
-    func linkCompanion(kvHash: String, companionKey: String, bytes: Int64) -> Bool {
-        guard indexHasV2Columns else { return false }
-        lock.lock()
-        defer { lock.unlock() }
-        return _linkCompanionLocked(kvHash: kvHash, companionKey: companionKey, bytes: bytes)
-    }
-
-    /// Count a companion that has no KV row to hang from.
-    func upsertLegacyCompanion(key: String, bytes: Int64, modified: Date) {
-        guard indexHasV2Columns else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        _upsertLegacyCompanionLocked(key: key, bytes: bytes, modified: modified)
-    }
-
-    func removeLegacyCompanions(keys: Set<String>) {
+    /// Stop counting unlinked companions whose files the combined quota pass
+    /// has removed. (`forgetCompanions` is the general form: it also clears
+    /// a link.)
+    func forgetLegacyCompanions(keys: Set<String>) {
         guard indexHasV2Columns, !keys.isEmpty else { return }
         lock.lock()
         defer { lock.unlock() }
@@ -928,14 +946,39 @@ public final class DiskCache: @unchecked Sendable {
     }
 
     /// A companion store finished writing (or re-validated) one entry. Link it
-    /// to its KV row; when the row is absent, count it as unlinked. Writing
-    /// the same entry again replaces its bytes. No statement writes when the
-    /// index already says exactly this.
-    func recordCompanion(kvHash: String, companionKey: String, bytes: Int64, modified: Date) {
-        guard indexHasV2Columns else { return }
+    /// to its KV row; when the row is absent — or another connection deletes
+    /// it between this method's SELECT and its UPDATE — count it as unlinked.
+    /// Writing the same entry again replaces its bytes. No statement writes
+    /// when the index already says exactly this.
+    ///
+    /// Returns false when the index could not be made to count the files
+    /// (in practice: another connection held the write lock past the busy
+    /// timeout). The caller must then remove them: files in neither table are
+    /// never evicted.
+    @discardableResult
+    func recordCompanion(kvHash: String, companionKey: String, bytes: Int64, modified: Date) -> Bool {
+        recordCompanionFailureCode(
+            kvHash: kvHash, companionKey: companionKey, bytes: bytes, modified: modified) == nil
+    }
+
+    /// ``recordCompanion(kvHash:companionKey:bytes:modified:)``, reporting the
+    /// SQLite result code of the statement that failed; nil on success.
+    func recordCompanionFailureCode(
+        kvHash: String, companionKey: String, bytes: Int64, modified: Date
+    ) -> Int32? {
+        guard indexHasV2Columns else { return nil }
         lock.lock()
         defer { lock.unlock() }
+        let rc = _recordCompanionLocked(
+            kvHash: kvHash, companionKey: companionKey, bytes: bytes, modified: modified)
+        guard rc != SQLITE_DONE else { return nil }
+        failedIndexWrites += 1
+        return rc
+    }
 
+    private func _recordCompanionLocked(
+        kvHash: String, companionKey: String, bytes: Int64, modified: Date
+    ) -> Int32 {
         var rowExists = false
         var alreadyLinked = false
         _queryLocked(
@@ -949,25 +992,137 @@ public final class DiskCache: @unchecked Sendable {
             }
         }
 
-        guard rowExists else {
-            _upsertLegacyCompanionLocked(key: companionKey, bytes: bytes, modified: modified)
-            return
+        if rowExists {
+            var linked = alreadyLinked
+            if !linked {
+                let link = _linkCompanionLocked(
+                    kvHash: kvHash, companionKey: companionKey, bytes: bytes)
+                guard link.rc == SQLITE_DONE else { return link.rc }
+                linked = link.changed
+            }
+            if linked {
+                // It may have been counted as unlinked before its row existed.
+                // If this DELETE fails the companion is counted twice until
+                // the next import: an over-count, so not a failed record.
+                var wasLegacy = false
+                _queryLocked(
+                    "SELECT 1 FROM legacy_companions WHERE key = ?", [.text(companionKey)]
+                ) { _ in wasLegacy = true }
+                if wasLegacy {
+                    _runLocked("DELETE FROM legacy_companions WHERE key = ?", [.text(companionKey)])
+                }
+                return SQLITE_DONE
+            }
+            // The UPDATE changed no row: the row went away after the SELECT.
         }
-        if !alreadyLinked {
-            _linkCompanionLocked(kvHash: kvHash, companionKey: companionKey, bytes: bytes)
-        }
-        // It may have been counted as unlinked before its row existed.
-        var wasLegacy = false
-        _queryLocked("SELECT 1 FROM legacy_companions WHERE key = ?", [.text(companionKey)]) { _ in
-            wasLegacy = true
-        }
-        if wasLegacy {
-            _runLocked("DELETE FROM legacy_companions WHERE key = ?", [.text(companionKey)])
-        }
+        return _upsertLegacyCompanionLocked(key: companionKey, bytes: bytes, modified: modified)
     }
 
-    /// Companion files were removed outside the combined quota pass (the
-    /// companion store's own eviction). Stop counting them.
+    /// Whether any companion is counted as unlinked. One statement on a table
+    /// that is normally empty; lets a caller skip hashing a companion key it
+    /// would only use to look in that table.
+    func hasLegacyCompanions() -> Bool {
+        guard indexHasV2Columns else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        var found = false
+        _queryLocked("SELECT 1 FROM legacy_companions LIMIT 1") { _ in found = true }
+        return found
+    }
+
+    /// A companion that was recorded before its KV row existed is counted as
+    /// unlinked, and unlinked companions are evicted first. When the row has
+    /// arrived, move the companion onto it: one primary-key SELECT when there
+    /// is nothing to adopt; otherwise the link and the removal of the
+    /// unlinked entry in one transaction, with the bytes read inside it.
+    /// Returns whether a companion was adopted. On any failure the companion
+    /// simply stays unlinked, still counted.
+    @discardableResult
+    func adoptLegacyCompanion(kvHash: String, companionKey: String) -> Bool {
+        guard indexHasV2Columns, let db else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+
+        var isLegacy = false
+        _queryLocked("SELECT 1 FROM legacy_companions WHERE key = ?", [.text(companionKey)]) { _ in
+            isLegacy = true
+        }
+        guard isLegacy else { return false }
+
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return false }
+        let linkRC = _runLocked(
+            """
+            UPDATE cache_entries
+            SET companion_key = ?1,
+                companion_bytes = (SELECT bytes FROM legacy_companions WHERE key = ?1)
+            WHERE hash = ?2 AND EXISTS (SELECT 1 FROM legacy_companions WHERE key = ?1)
+            """,
+            [.text(companionKey), .text(kvHash)])
+        if linkRC == SQLITE_DONE, sqlite3_changes(db) > 0,
+           _runLocked("DELETE FROM legacy_companions WHERE key = ?", [.text(companionKey)])
+               == SQLITE_DONE,
+           sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK
+        {
+            return true
+        }
+        sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+        return false
+    }
+
+    /// Companion bytes alone, linked and unlinked: what the companion store's
+    /// own cap is compared with when it is written to directly.
+    func companionUsageBytes() -> Int64 {
+        guard indexHasV2Columns else { return 0 }
+        lock.lock()
+        defer { lock.unlock() }
+        var bytes: Int64 = 0
+        _queryLocked(
+            """
+            SELECT (SELECT COALESCE(SUM(companion_bytes), 0) FROM cache_entries)
+                 + (SELECT COALESCE(SUM(bytes), 0) FROM legacy_companions)
+            """
+        ) { stmt in bytes = max(0, sqlite3_column_int64(stmt, 0)) }
+        return bytes
+    }
+
+    /// Every counted companion, least recent first. A linked companion has
+    /// its row's recency, an unlinked one its own; insertion order breaks
+    /// ties (`julianday('now')` has millisecond resolution).
+    func companionsOldestFirst() -> [DiskCacheLegacyCompanion] {
+        guard indexHasV2Columns else { return [] }
+        lock.lock()
+        defer { lock.unlock() }
+        var result: [DiskCacheLegacyCompanion] = []
+        _queryLocked(
+            """
+            SELECT companion_key, companion_bytes,
+                   (created_at - 2440587.5) * 86400.0 AS recency, rowid AS seq
+            FROM cache_entries WHERE companion_key IS NOT NULL
+            UNION ALL
+            SELECT key, bytes, modified, rowid FROM legacy_companions
+            ORDER BY recency ASC, seq ASC
+            """
+        ) { stmt in
+            guard let cKey = sqlite3_column_text(stmt, 0) else { return }
+            result.append(DiskCacheLegacyCompanion(
+                key: String(cString: cKey),
+                bytes: max(0, sqlite3_column_int64(stmt, 1)),
+                modifiedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2))))
+        }
+        return result
+    }
+
+    /// Forget which payloads this process has validated. After something
+    /// outside this package deleted files, the fingerprints describe files
+    /// that may be gone or replaced; the next store or fetch validates again.
+    func forgetValidatedFiles() {
+        lock.lock()
+        validatedFiles.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+
+    /// Companion files are gone (the companion store's own eviction, or a
+    /// failed write that left nothing). Stop counting them, linked or not.
     func forgetCompanions(keys: Set<String>) {
         guard indexHasV2Columns, !keys.isEmpty else { return }
         lock.lock()
@@ -1005,7 +1160,8 @@ public final class DiskCache: @unchecked Sendable {
             currentPayloadBytes: Int(usage.bytes),
             currentEntryCount: usage.entryCount,
             evictions: evictions,
-            maxSizeBytes: maxSizeBytes)
+            maxSizeBytes: maxSizeBytes,
+            failedIndexWrites: failedIndexWrites)
     }
 
     /// Bring the companion columns and `legacy_companions` in line with what
@@ -1014,13 +1170,17 @@ public final class DiskCache: @unchecked Sendable {
     /// and what repairs an index an older build wrote to since (its
     /// three-column INSERT OR REPLACE resets the companion columns).
     ///
-    /// Idempotent: a second run over the same directory changes nothing.
+    /// Idempotent: a second committed run over the same directory returns an
+    /// all-zero summary. Returns nil when nothing was committed — no v2
+    /// index, the write lock could not be taken within the busy timeout, or
+    /// the COMMIT failed — and the caller must then treat the import as not
+    /// done and try again later.
     @discardableResult
     func reconcileCompanionAccounting(
         companions: [SSMCompanionQuotaEntry]
-    ) -> DiskCacheCompanionImportSummary {
+    ) -> DiskCacheCompanionImportSummary? {
         var summary = DiskCacheCompanionImportSummary()
-        guard indexHasV2Columns, let db else { return summary }
+        guard indexHasV2Columns, let db else { return nil }
         lock.lock()
         defer { lock.unlock() }
 
@@ -1028,7 +1188,7 @@ public final class DiskCache: @unchecked Sendable {
             FileHandle.standardError.write(Data(
                 ("[vmlx][cache/disk-index] companion import skipped: "
                     + "\(String(cString: sqlite3_errmsg(db)))\n").utf8))
-            return summary
+            return nil
         }
 
         struct Row {
@@ -1108,7 +1268,7 @@ public final class DiskCache: @unchecked Sendable {
                 ("[vmlx][cache/disk-index] companion import could not commit: "
                     + "\(String(cString: sqlite3_errmsg(db)))\n").utf8))
             sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
-            return DiskCacheCompanionImportSummary()
+            return nil
         }
         return summary
     }
@@ -1158,8 +1318,9 @@ public final class DiskCache: @unchecked Sendable {
 
         for hash in hashes {
             try? FileManager.default.removeItem(at: safetensorsURL(for: hash))
-            // The combined quota pass removes the linked companion's files in
-            // the same step, so nothing is left to keep counting.
+            // The combined quota pass has already removed the linked
+            // companion's files (files before rows), so nothing is left to
+            // keep counting.
             _deleteEntryLocked(hash: hash, keepCompanionCounted: false)
             validatedFiles.removeValue(forKey: hash)
         }
@@ -1200,6 +1361,7 @@ public final class DiskCache: @unchecked Sendable {
         misses = 0
         stores = 0
         storeSkips = 0
+        failedIndexWrites = 0
         evictions = 0
         validatedFiles.removeAll(keepingCapacity: true)
     }
@@ -1451,16 +1613,22 @@ public final class DiskCache: @unchecked Sendable {
         FROM cache_entries
         """
 
+    /// `rc` is the statement's result; `changed` is whether a row with that
+    /// hash was there to update. `SQLITE_DONE` with `changed == false` means
+    /// the row does not exist (any more).
     @discardableResult
-    private func _linkCompanionLocked(kvHash: String, companionKey: String, bytes: Int64) -> Bool {
-        guard let db else { return false }
+    private func _linkCompanionLocked(
+        kvHash: String, companionKey: String, bytes: Int64
+    ) -> (rc: Int32, changed: Bool) {
+        guard let db else { return (SQLITE_MISUSE, false) }
         let rc = _runLocked(
             "UPDATE cache_entries SET companion_key = ?, companion_bytes = ? WHERE hash = ?",
             [.text(companionKey), .int(max(0, bytes)), .text(kvHash)])
-        return rc == SQLITE_DONE && sqlite3_changes(db) > 0
+        return (rc, rc == SQLITE_DONE && sqlite3_changes(db) > 0)
     }
 
-    private func _upsertLegacyCompanionLocked(key: String, bytes: Int64, modified: Date) {
+    @discardableResult
+    private func _upsertLegacyCompanionLocked(key: String, bytes: Int64, modified: Date) -> Int32 {
         _runLocked(
             "INSERT OR REPLACE INTO legacy_companions (key, bytes, modified) VALUES (?, ?, ?)",
             [.text(key), .int(max(0, bytes)), .real(modified.timeIntervalSince1970)])
