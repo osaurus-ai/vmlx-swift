@@ -51,6 +51,15 @@ struct SSMCompanionQuotaEntry: Sendable {
     let modifiedAt: Date
 }
 
+/// What one `store` left on disk: the entry's key, the KV payload it belongs
+/// to, and the bytes of its tensor file + sidecar.
+struct SSMCompanionStoreRecord: Sendable, Equatable {
+    let key: String
+    let kvHash: String
+    let bytes: Int64
+    let modifiedAt: Date
+}
+
 /// Disk-backed extension to the in-memory `SSMStateCache`. See header
 /// comment for storage format + concurrency model.
 public final class SSMCompanionDiskStore: @unchecked Sendable {
@@ -86,6 +95,13 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     /// validation. Exposed as a locked snapshot for tests and telemetry.
     private var storeSkips: Int = 0
 
+    /// The KV index that counts this store's bytes against the shared quota,
+    /// when the coordinator has one with the v2 columns. Every write, and
+    /// every removal this store decides on its own, is reported to it, so
+    /// the quota never has to walk this directory to know what is in it —
+    /// whichever caller did the writing.
+    private var ledger: DiskCache?
+
     // MARK: - Initialization
 
     public init(cacheDir: URL, modelKey: String? = nil, maxBytes: Int = 0) throws {
@@ -94,6 +110,23 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         self.maxBytes = maxBytes
         try FileManager.default.createDirectory(
             at: cacheDir, withIntermediateDirectories: true)
+        Self.sweepUnpublishedFiles(in: cacheDir)
+    }
+
+    /// Tensor files are written under a `.partial-` name and renamed into
+    /// place, so anything still carrying that name at open is a dead write.
+    static func sweepUnpublishedFiles(in cacheDir: URL) {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path)
+        else { return }
+        for name in names where name.hasPrefix("ssm-") && DiskCache.isUnpublishedName(name) {
+            try? FileManager.default.removeItem(at: cacheDir.appendingPathComponent(name))
+        }
+    }
+
+    func attachLedger(_ ledger: DiskCache?) {
+        lock.lock()
+        self.ledger = ledger
+        lock.unlock()
     }
 
     // MARK: - Public API
@@ -169,6 +202,10 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
 
     /// Coordinator-only transactional store. See ``DiskCache/store``: linked
     /// KV + recurrent state must be admitted or evicted as one group.
+    ///
+    /// Returns what is now on disk for this entry, or nil when nothing was
+    /// stored.
+    @discardableResult
     func store(
         ssmStates: [MLXArray],
         tokens: [Int],
@@ -176,22 +213,55 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         mediaSalt: String? = nil,
         isComplete: Bool = true,
         enforceQuota: Bool
-    ) throws {
-        guard !ssmStates.isEmpty, boundary > 0, boundary <= tokens.count else { return }
+    ) throws -> SSMCompanionStoreRecord? {
+        guard !ssmStates.isEmpty, boundary > 0, boundary <= tokens.count else { return nil }
         let key = Self.keyFor(
             tokens: tokens, boundary: boundary,
             mediaSalt: mediaSalt, modelKey: modelKey)
-        let safetensorsURL = self.safetensorsURL(for: key)
-        let sidecarURL = self.sidecarURL(for: key)
         let kvHash = DiskCache.hashTokens(
             Array(tokens.prefix(boundary)),
             modelKey: modelKey,
             mediaSalt: mediaSalt)
 
+        let outcome = try writeEntry(
+            ssmStates: ssmStates, key: key, kvHash: kvHash, boundary: boundary,
+            isComplete: isComplete, enforceQuota: enforceQuota)
+
+        // Reported after this store's locks are released: the index takes its
+        // own lock, and nothing here needs the two held together.
+        if let ledger = outcome.ledger {
+            if let record = outcome.record {
+                ledger.recordCompanion(
+                    kvHash: record.kvHash, companionKey: record.key,
+                    bytes: record.bytes, modified: record.modifiedAt)
+            }
+            ledger.forgetCompanions(keys: outcome.evictedKeys)
+        }
+        return outcome.record
+    }
+
+    private struct WriteOutcome {
+        var record: SSMCompanionStoreRecord?
+        var evictedKeys: Set<String> = []
+        var ledger: DiskCache?
+    }
+
+    private func writeEntry(
+        ssmStates: [MLXArray],
+        key: String,
+        kvHash: String,
+        boundary: Int,
+        isComplete: Bool,
+        enforceQuota: Bool
+    ) throws -> WriteOutcome {
+        let safetensorsURL = self.safetensorsURL(for: key)
+        let sidecarURL = self.sidecarURL(for: key)
+
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
         defer { lock.unlock() }
+        var outcome = WriteOutcome(ledger: ledger)
 
         // A normal warm hybrid request fetches a companion and publishes the
         // same prompt boundary again after generation. Avoid synchronizing the
@@ -209,10 +279,11 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
            currentSafetensors == validated.safetensors,
            currentSidecar == validated.sidecar
         {
+            let touchedAt = Date()
             if let touched = touchEntryFilesLocked(
                 safetensorsURL: safetensorsURL,
                 sidecarURL: sidecarURL,
-                at: Date())
+                at: touchedAt)
             {
                 validatedEntries[key] = ValidatedEntry(
                     safetensors: touched.safetensors,
@@ -226,7 +297,11 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
                     FileHandle.standardError.write(Data(
                         "[vmlx][cache/ssm-store] SKIP validated key=\(key) boundary=\(boundary) states=\(ssmStates.count)\n".utf8))
                 }
-                return
+                outcome.record = SSMCompanionStoreRecord(
+                    key: key, kvHash: kvHash,
+                    bytes: Int64(touched.safetensors.size + touched.sidecar.size),
+                    modifiedAt: touchedAt)
+                return outcome
             }
             validatedEntries.removeValue(forKey: key)
         }
@@ -250,8 +325,21 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         // Sync write — same rationale as DiskCache.swift:122-130.
         // Async dispatch races with SIGTERM on short-lived sessions,
         // leaving zero-byte files. Costs ~ms on already-realized arrays.
-        try save(arrays: arrays, metadata: ["format": "mlx"], url: safetensorsURL)
-        Stream.gpu.synchronize()
+        //
+        // Atomic publication, as in `DiskCache.store`: a process that dies
+        // mid-write must not leave a short tensor file under the final name,
+        // where the next fetch would map it.
+        let partialURL = DiskCache.temporaryURL(for: safetensorsURL)
+        try? FileManager.default.removeItem(at: partialURL)
+        do {
+            try save(arrays: arrays, metadata: ["format": "mlx"], url: partialURL)
+            Stream.gpu.synchronize()
+            try? FileManager.default.removeItem(at: safetensorsURL)
+            try FileManager.default.moveItem(at: partialURL, to: safetensorsURL)
+        } catch {
+            try? FileManager.default.removeItem(at: partialURL)
+            throw error
+        }
 
         // JSON sidecar for is_complete flag + num_states.
         let sidecar: [String: Any] = [
@@ -275,13 +363,19 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
                 numStates: ssmStates.count,
                 boundary: boundary,
                 kvHash: kvHash)
+            outcome.record = SSMCompanionStoreRecord(
+                key: key, kvHash: kvHash,
+                bytes: Int64(writtenSafetensors.size + writtenSidecar.size),
+                modifiedAt: min(
+                    writtenSafetensors.modificationDate, writtenSidecar.modificationDate))
         } else {
             validatedEntries.removeValue(forKey: key)
         }
 
         if enforceQuota {
-            evictIfNeededLocked()
+            outcome.evictedKeys = evictIfNeededLocked()
         }
+        return outcome
     }
 
     /// Look up SSM layer states for a given token prefix + boundary.
@@ -471,13 +565,18 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     /// unload so subsequent loads don't see stale state. No-op if the
     /// directory is empty.
     public func clear() {
+        let ledger = removeEveryEntry()
+        ledger?.forgetAllCompanions()
+    }
+
+    private func removeEveryEntry() -> DiskCache? {
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
         defer { lock.unlock() }
 
         guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: cacheDir, includingPropertiesForKeys: nil) else { return }
+            at: cacheDir, includingPropertiesForKeys: nil) else { return nil }
         for url in entries {
             let name = url.lastPathComponent
             if name.hasPrefix("ssm-") {
@@ -485,6 +584,7 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             }
         }
         validatedEntries.removeAll(keepingCapacity: true)
+        return ledger
     }
 
     /// Snapshot recurrent payloads for the coordinator's combined KV +
@@ -608,26 +708,35 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         return entries
     }
 
-    private func evictIfNeededLocked() {
-        guard maxBytes > 0 else { return }
+    /// Standalone quota for callers that use this store without the
+    /// coordinator's combined pass. Returns the keys it removed.
+    @discardableResult
+    private func evictIfNeededLocked() -> Set<String> {
+        guard maxBytes > 0 else { return [] }
         let entries = diskEntriesLocked()
         var totalBytes = entries.values.reduce(0) { $0 + $1.bytes }
 
-        guard totalBytes > maxBytes else { return }
+        guard totalBytes > maxBytes else { return [] }
 
+        var evicted = Set<String>()
         for (hash, entry) in entries.sorted(by: { $0.value.modified < $1.value.modified }) {
             for url in entry.urls {
                 try? FileManager.default.removeItem(at: url)
             }
             validatedEntries.removeValue(forKey: hash)
+            evicted.insert(hash)
             totalBytes -= entry.bytes
             if totalBytes <= maxBytes { break }
         }
+        return evicted
     }
 
     private func entryHash(for url: URL) -> String? {
         let name = url.lastPathComponent
+        // An unpublished tensor file is not an entry: it is not counted, and
+        // its name must not be mistaken for a key.
         guard name.hasPrefix("ssm-"),
+              !DiskCache.isUnpublishedName(name),
               (name.hasSuffix(".safetensors") || name.hasSuffix(".json")),
               let dot = name.lastIndex(of: ".")
         else { return nil }

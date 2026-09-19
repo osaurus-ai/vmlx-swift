@@ -144,6 +144,25 @@ struct DiskQuotaScanCostProbe {
                     + "companion_quotaEntries_min_ms=\(Self.ms(companionPart[0])) "
                     + "companion_quotaEntries_max_ms=\(Self.ms(companionPart[4]))")
 
+            // What the host's idle stats poll pays. Fail closed on the value it
+            // returns: a fast poll that lost the companion bytes is not a result.
+            var polledBytes = -1
+            var polledEntries = -1
+            let statsPoll = Self.sortedSteadyMillis {
+                let stats = coordinator.snapshotStats().diskStats
+                polledBytes = stats?.currentPayloadBytes ?? -1
+                polledEntries = stats?.currentEntryCount ?? -1
+            }
+            try #require(Int64(polledBytes) == fixtureBytes)
+            try #require(polledEntries == entries)
+
+            print(
+                "QUOTA_PROBE_STATS entries=\(entries) build=\(Self.buildConfiguration) "
+                    + "snapshotStats_median_ms=\(Self.ms(statsPoll[2])) "
+                    + "snapshotStats_min_ms=\(Self.ms(statsPoll[0])) "
+                    + "snapshotStats_max_ms=\(Self.ms(statsPoll[4])) "
+                    + "polled_bytes=\(polledBytes) polled_entries=\(polledEntries)")
+
             // Timed explicitly so the wall line accounts for fixture teardown;
             // the `defer` above remains the cleanup on every failing path.
             let cleanupStart = DispatchTime.now().uptimeNanoseconds
