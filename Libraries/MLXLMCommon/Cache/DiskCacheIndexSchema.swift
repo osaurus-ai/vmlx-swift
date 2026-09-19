@@ -62,9 +62,14 @@ enum DiskCacheIndexSchema {
     /// connections race: runs inside BEGIN IMMEDIATE and re-reads user_version
     /// after the write lock is held. Returns the version now in force.
     ///
-    /// Never throws and never deletes. On any failure the transaction is
-    /// rolled back and the version actually on disk is returned, which leaves
-    /// a working v1 index. A `user_version` above `currentVersion` belongs to
+    /// Never throws and never deletes. On any failure the transaction, if one
+    /// was opened, is rolled back, which leaves a working v1 index, and the
+    /// return value is `user_version` as read afterwards. When that read
+    /// fails too, the version seen under the lock is returned, or 0 when
+    /// there is none: the lock was never taken, or `user_version` could not
+    /// be read under it (that exit returns 0 without reading again). A
+    /// returned 0 therefore means "use this index as v1", not necessarily
+    /// "the file says 0". A `user_version` above `currentVersion` belongs to
     /// a newer build and is left exactly as found.
     @discardableResult
     static func migrate(
@@ -93,7 +98,9 @@ enum DiskCacheIndexSchema {
             return 0
         }
         if version >= currentVersion {
-            exec(db, "COMMIT")
+            // Nothing was written. ROLLBACK cannot fail; a COMMIT that failed
+            // would leave this connection holding the write lock.
+            exec(db, "ROLLBACK")
             return version
         }
 
@@ -122,10 +129,12 @@ enum DiskCacheIndexSchema {
     /// Independent of `user_version`, so it stays truthful for an index that a
     /// newer build has taken further.
     ///
-    /// Waits like `migrate` does. On a database that is not in WAL mode yet
-    /// (a fresh directory several connections are opening at once) a plain
-    /// read can come back SQLITE_BUSY, and a probe that could not read must
-    /// not be reported as "the columns are absent".
+    /// Waits like `migrate` does, so that contention is not mistaken for
+    /// absence: on a database that is not in WAL mode yet (a fresh directory
+    /// several connections are opening at once) a plain read can come back
+    /// SQLITE_BUSY. An index that still cannot be read once the timeout has
+    /// run out reports `false`, the conservative answer: the caller then
+    /// uses the v1 statements only.
     static func hasV2Columns(
         _ db: OpaquePointer?, busyTimeoutMs: Int32 = defaultBusyTimeoutMs
     ) -> Bool {
