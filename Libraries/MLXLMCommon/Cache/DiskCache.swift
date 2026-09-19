@@ -25,8 +25,9 @@ public struct DiskCacheStats: Sendable {
     /// Writes to the index that failed in this process after the files they
     /// describe were already on disk: a KV insert that lost to another
     /// connection's write lock, or a companion the index could not record.
-    /// In both cases the files were removed again, so nothing is left on disk
-    /// uncounted; the boundary is simply not cached.
+    /// In both cases the files were removed again — unless an earlier record
+    /// of the same companion already counts them — so nothing is left on disk
+    /// uncounted; at worst the boundary is simply not cached.
     public let failedIndexWrites: Int
 
     init(
@@ -71,7 +72,7 @@ struct DiskCacheLegacyCompanion: Sendable, Equatable {
 /// What one COMMITTED import changed: all zero when the index already agreed
 /// with the directory. An import that could not take the write lock or could
 /// not commit changed nothing either, but is not this value —
-/// ``DiskCache/reconcileCompanionAccounting(companions:)`` returns nil for it,
+/// ``DiskCache/reconcileCompanionAccounting(companions:unindexedPayloadGuardAge:now:)`` returns nil for it,
 /// so "nothing to do" and "did not run" cannot be mistaken for each other.
 struct DiskCacheCompanionImportSummary: Sendable, Equatable {
     var rowsDeletedForMissingPayload = 0
@@ -79,6 +80,7 @@ struct DiskCacheCompanionImportSummary: Sendable, Equatable {
     var linksCleared = 0
     var legacyUpserted = 0
     var legacyDeleted = 0
+    var unindexedPayloadsRemoved = 0
 
     var changedAnything: Bool { self != DiskCacheCompanionImportSummary() }
 }
@@ -284,6 +286,11 @@ public final class DiskCache: @unchecked Sendable {
     /// connection fails after its payload is already published.
     static let defaultIndexBusyTimeoutMs: Int32 = 1000
 
+    /// A published payload with no index row is removed by the import only
+    /// once it is at least this old. A younger one may be another
+    /// connection's store between its publish and its insert.
+    static let defaultUnindexedPayloadGuardAge: TimeInterval = 600
+
     /// Lock for thread-safe access to mutable state.
     private let lock = OSAllocatedUnfairLock()
 
@@ -299,7 +306,7 @@ public final class DiskCache: @unchecked Sendable {
     /// Number of store operations that reused an already validated file.
     public private(set) var storeSkips: Int = 0
     /// Index writes that failed after their files were on disk (see
-    /// ``DiskCacheStats/failedIndexWrites``). The files were removed again.
+    /// ``DiskCacheStats/failedIndexWrites``).
     public private(set) var failedIndexWrites: Int = 0
     /// Stores refused because the payload carried NaN/Inf (never persisted).
     public private(set) var refusedNonFiniteStores: Int = 0
@@ -707,6 +714,24 @@ public final class DiskCache: @unchecked Sendable {
             return nil
         }
 
+        // A payload the index does not name is counted by nothing and evicted
+        // by nothing (a crash between publish and insert, or an external purge
+        // that deleted the row and could not delete the file), so it is not
+        // served either. It is NOT removed here: the insert may be in flight
+        // on another connection. The import removes it once it is old enough
+        // that no insert can still be pending. Without a database there is no
+        // index to be missing from, and the file alone decides as it always has.
+        if db != nil, _entryMetadataLocked(hash: hash) == nil {
+            validatedFiles.removeValue(forKey: hash)
+            misses += 1
+            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][cache/disk-fetch] noRow count=\(tokens.count) "
+                        + "hash=\(hash.prefix(12)) — payload present, not indexed\n").utf8))
+            }
+            return nil
+        }
+
         do {
             // Fail closed on a short file BEFORE the lazy map: the reader's
             // short-read error never reaches the caller, so a truncated row
@@ -750,13 +775,15 @@ public final class DiskCache: @unchecked Sendable {
             FileHandle.standardError.write(Data(
                 "[vmlx][cache/disk] fetch REFUSED entry at \(url.lastPathComponent) count=\(tokens.count): \(error) — removing\n"
                 .utf8))
-            try? FileManager.default.removeItem(at: url)
             // Drop the SQLite row too. Removing only the file orphans the
             // `cache_entries` row, whose `file_size` then permanently inflates
             // the `SUM(file_size)` eviction quota (unbounded on-disk growth and
             // premature eviction of live entries). The fetch path already holds
-            // `lock`, so delete in-place.
-            _deleteEntryLocked(hash: hash)
+            // `lock`, so delete in-place — but only once the file really is
+            // gone: a row is what keeps an undeletable file counted.
+            if Self.removeCacheFile(at: url) {
+                _deleteEntryLocked(hash: hash)
+            }
             return nil
         }
     }
@@ -948,21 +975,17 @@ public final class DiskCache: @unchecked Sendable {
     /// A companion store finished writing (or re-validated) one entry. Link it
     /// to its KV row; when the row is absent — or another connection deletes
     /// it between this method's SELECT and its UPDATE — count it as unlinked.
-    /// Writing the same entry again replaces its bytes. No statement writes
-    /// when the index already says exactly this.
+    /// Writing the same entry again replaces its bytes. A row already linked
+    /// to this key with these bytes is left alone, with no statement written;
+    /// an unlinked companion is always written again, because that write is
+    /// also what refreshes its recency.
     ///
-    /// Returns false when the index could not be made to count the files
-    /// (in practice: another connection held the write lock past the busy
-    /// timeout). The caller must then remove them: files in neither table are
-    /// never evicted.
-    @discardableResult
-    func recordCompanion(kvHash: String, companionKey: String, bytes: Int64, modified: Date) -> Bool {
-        recordCompanionFailureCode(
-            kvHash: kvHash, companionKey: companionKey, bytes: bytes, modified: modified) == nil
-    }
-
-    /// ``recordCompanion(kvHash:companionKey:bytes:modified:)``, reporting the
-    /// SQLite result code of the statement that failed; nil on success.
+    /// Returns nil on success, otherwise the SQLite result code of the
+    /// statement that failed (in practice: another connection held the write
+    /// lock past the busy timeout). The index then does not count these files
+    /// as they are now, and the caller must not leave them on disk unless
+    /// ``countedCompanionBytes(key:)`` shows an earlier record still covers
+    /// them: files in neither table are never evicted.
     func recordCompanionFailureCode(
         kvHash: String, companionKey: String, bytes: Int64, modified: Date
     ) -> Int32? {
@@ -1018,9 +1041,11 @@ public final class DiskCache: @unchecked Sendable {
         return _upsertLegacyCompanionLocked(key: companionKey, bytes: bytes, modified: modified)
     }
 
-    /// Whether any companion is counted as unlinked. One statement on a table
-    /// that is normally empty; lets a caller skip hashing a companion key it
-    /// would only use to look in that table.
+    /// Whether any companion is counted as unlinked. One statement; lets a
+    /// caller skip hashing a companion key it would only use to look in that
+    /// table. The table is often empty but not reliably so: an unlinked
+    /// companion stays in it, on disk and counted, for as long as the total
+    /// fits under the cap.
     func hasLegacyCompanions() -> Bool {
         guard indexHasV2Columns else { return false }
         lock.lock()
@@ -1112,6 +1137,40 @@ public final class DiskCache: @unchecked Sendable {
         return result
     }
 
+    /// The bytes the index counts for this companion, linked or unlinked;
+    /// nil when it names no such companion. A read, so it answers while
+    /// another connection holds the write lock.
+    func countedCompanionBytes(key: String) -> Int64? {
+        guard indexHasV2Columns else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        var counted: Int64?
+        _queryLocked(
+            """
+            SELECT companion_bytes FROM cache_entries WHERE companion_key = ?1
+            UNION ALL
+            SELECT bytes FROM legacy_companions WHERE key = ?1
+            """,
+            [.text(key)]
+        ) { stmt in counted = max(counted ?? 0, sqlite3_column_int64(stmt, 0)) }
+        return counted
+    }
+
+    /// Part of a companion could not be deleted: count what is left of it,
+    /// wherever the index names it. If this write fails the record keeps its
+    /// old, larger figure — an over-count.
+    func correctCompanionBytes(key: String, bytes: Int64) {
+        guard indexHasV2Columns else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        _runLocked(
+            "UPDATE cache_entries SET companion_bytes = ? WHERE companion_key = ?",
+            [.int(max(0, bytes)), .text(key)])
+        _runLocked(
+            "UPDATE legacy_companions SET bytes = ? WHERE key = ?",
+            [.int(max(0, bytes)), .text(key)])
+    }
+
     /// Forget which payloads this process has validated. After something
     /// outside this package deleted files, the fingerprints describe files
     /// that may be gone or replaced; the next store or fetch validates again.
@@ -1170,6 +1229,22 @@ public final class DiskCache: @unchecked Sendable {
     /// and what repairs an index an older build wrote to since (its
     /// three-column INSERT OR REPLACE resets the companion columns).
     ///
+    /// `companions` was listed BEFORE this method takes the index write lock,
+    /// so it can be out of date by the time the transaction starts: a
+    /// companion written and recorded in between is in the index and not in
+    /// the list. Wherever the two disagree about a companion the index names,
+    /// its two files are looked at again inside the transaction, and what is
+    /// on disk then decides — a record is only dropped when its files are
+    /// gone, and its bytes are corrected when they differ.
+    ///
+    /// It also removes payloads the index does not name, once they are older
+    /// than `unindexedPayloadGuardAge` (as of `now`). Such a file cannot be
+    /// adopted instead: a row needs the token count its writer hashed, and
+    /// neither the content hash nor the payload carries it. `fetch` never
+    /// serves it, so removing it loses nothing. A younger one is left alone:
+    /// it may be another connection's store, between publishing the file and
+    /// inserting the row.
+    ///
     /// Idempotent: a second committed run over the same directory returns an
     /// all-zero summary. Returns nil when nothing was committed — no v2
     /// index, the write lock could not be taken within the busy timeout, or
@@ -1177,7 +1252,9 @@ public final class DiskCache: @unchecked Sendable {
     /// done and try again later.
     @discardableResult
     func reconcileCompanionAccounting(
-        companions: [SSMCompanionQuotaEntry]
+        companions: [SSMCompanionQuotaEntry],
+        unindexedPayloadGuardAge: TimeInterval = DiskCache.defaultUnindexedPayloadGuardAge,
+        now: Date = Date()
     ) -> DiskCacheCompanionImportSummary? {
         var summary = DiskCacheCompanionImportSummary()
         guard indexHasV2Columns, let db else { return nil }
@@ -1197,13 +1274,60 @@ public final class DiskCache: @unchecked Sendable {
             let companionBytes: Int64
         }
         var rows: [Row] = []
-        _queryLocked("SELECT hash, companion_key, companion_bytes FROM cache_entries") { stmt in
+        let rowsWereRead = _queryLocked(
+            "SELECT hash, companion_key, companion_bytes FROM cache_entries"
+        ) { stmt in
             guard let cHash = sqlite3_column_text(stmt, 0) else { return }
             rows.append(Row(
                 hash: String(cString: cHash),
                 companionKey: sqlite3_column_text(stmt, 1).map { String(cString: $0) },
                 companionBytes: sqlite3_column_int64(stmt, 2)))
         }
+        // Everything below treats "not in `rows`" as "not indexed", and the
+        // payload sweep deletes on it. A read that failed part-way must not
+        // be mistaken for a short index.
+        guard rowsWereRead else {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk-index] companion import abandoned, rows unreadable: "
+                    + "\(String(cString: sqlite3_errmsg(db)))\n").utf8))
+            sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            return nil
+        }
+
+        removeUnindexedPayloadsLocked(
+            indexed: Set(rows.map(\.hash)), olderThan: unindexedPayloadGuardAge, now: now,
+            summary: &summary)
+
+        // Close the gap between the caller's walk and this transaction (see
+        // the doc comment). In the steady state the walk and the index agree
+        // and nothing is looked at twice.
+        let recordedLegacy = _legacyCompanionsLocked()
+        var onDisk = Dictionary(
+            companions.map { ($0.hash, $0) }, uniquingKeysWith: { first, _ in first })
+        struct Named {
+            let key: String
+            let kvHash: String?
+            let bytes: Int64
+        }
+        var named: [Named] = rows.compactMap { row in
+            row.companionKey.map { Named(key: $0, kvHash: row.hash, bytes: row.companionBytes) }
+        }
+        named += recordedLegacy.map { Named(key: $0.key, kvHash: nil, bytes: $0.bytes) }
+        let companionDirectory = self.companionDirectory
+        for record in named {
+            let walked = onDisk[record.key]
+            if let walked, walked.bytes == record.bytes { continue }
+            if let current = SSMCompanionDiskStore.publishedEntry(
+                key: record.key, in: companionDirectory)
+            {
+                onDisk[record.key] = SSMCompanionQuotaEntry(
+                    hash: record.key, kvHash: walked?.kvHash ?? record.kvHash,
+                    bytes: current.bytes, modifiedAt: current.modifiedAt)
+            } else {
+                onDisk[record.key] = nil
+            }
+        }
+        let reconciled = Array(onDisk.values)
 
         var liveRows: [Row] = []
         for row in rows {
@@ -1222,7 +1346,7 @@ public final class DiskCache: @unchecked Sendable {
         let liveHashes = Set(liveRows.map(\.hash))
         var linkByHash: [String: SSMCompanionQuotaEntry] = [:]
         var unlinked: [SSMCompanionQuotaEntry] = []
-        for companion in companions.sorted(by: { $0.hash < $1.hash }) {
+        for companion in reconciled.sorted(by: { $0.hash < $1.hash }) {
             if let kvHash = companion.kvHash, liveHashes.contains(kvHash),
                linkByHash[kvHash] == nil
             {
@@ -1249,7 +1373,7 @@ public final class DiskCache: @unchecked Sendable {
         }
 
         let recorded = Dictionary(
-            _legacyCompanionsLocked().map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
+            recordedLegacy.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
         let unlinkedKeys = Set(unlinked.map(\.hash))
         for key in recorded.keys where !unlinkedKeys.contains(key) {
             _runLocked("DELETE FROM legacy_companions WHERE key = ?", [.text(key)])
@@ -1271,6 +1395,51 @@ public final class DiskCache: @unchecked Sendable {
             return nil
         }
         return summary
+    }
+
+    /// Where the coordinator keeps this root's recurrent companions.
+    static let companionDirectoryName = "ssm_companion"
+
+    var companionDirectory: URL {
+        cacheDir.appendingPathComponent(Self.companionDirectoryName)
+    }
+
+    /// The payload half of ``reconcileCompanionAccounting``. Caller holds
+    /// `lock` and the index write lock, so no row can appear between reading
+    /// `indexed` and the last removal here. The process-wide IO lock is not
+    /// taken (it orders before `lock`): no fetch can be mapping one of these
+    /// files, because `fetch` refuses a payload without a row. What remains
+    /// is a store re-publishing the very same hash between the age check and
+    /// the removal; its insert then names a missing file — an over-count the
+    /// next fetch of that hash clears.
+    private func removeUnindexedPayloadsLocked(
+        indexed: Set<String>, olderThan guardAge: TimeInterval, now: Date,
+        summary: inout DiskCacheCompanionImportSummary
+    ) {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path)
+        else { return }
+        let suffix = ".safetensors"
+        for name in names where name.hasSuffix(suffix) && !Self.isUnpublishedName(name) {
+            let hash = String(name.dropLast(suffix.count))
+            guard !indexed.contains(hash) else { continue }
+            let url = cacheDir.appendingPathComponent(name)
+            // Stat now, not at listing time: the guard is about this instant.
+            guard let modified = _fileFingerprint(url: url)?.modificationDate else { continue }
+            let age = now.timeIntervalSince(modified)
+            guard age >= guardAge else { continue }
+            validatedFiles.removeValue(forKey: hash)
+            do {
+                try FileManager.default.removeItem(at: url)
+                summary.unindexedPayloadsRemoved += 1
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][cache/disk-index] removed unindexed payload \(name) "
+                        + "ageSeconds=\(Int(age))\n").utf8))
+            } catch {
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][cache/disk-index] could not remove unindexed payload \(name): "
+                        + "\(error.localizedDescription)\n").utf8))
+            }
+        }
     }
 
     /// Refresh one indexed payload's eviction recency without decoding or
@@ -1309,20 +1478,67 @@ public final class DiskCache: @unchecked Sendable {
     /// The process-wide IO lock prevents another cache instance from loading
     /// a file while it is removed; the SQLite row is deleted atomically with
     /// respect to this instance's fetch/candidate queries.
-    func removeQuotaEntries(hashes: Set<String>) {
-        guard !hashes.isEmpty else { return }
+    ///
+    /// `removedCompanions` are the companion keys whose files the pass has
+    /// already removed (files before rows). Returns the hashes that are gone.
+    ///
+    /// A row is only dropped once its payload is: a payload that could not be
+    /// deleted keeps its row, so it stays counted and is tried again by the
+    /// next pass (once per pass — nothing here loops). Either way the row's
+    /// companion is counted exactly while its files exist: a removed one
+    /// leaves the accounting with the row or is unlinked from a row that
+    /// stays, and one that was not removed outlives its row as an unlinked
+    /// companion.
+    @discardableResult
+    func removeQuotaEntries(
+        hashes: Set<String>, removedCompanions: Set<String> = []
+    ) -> Set<String> {
+        guard !hashes.isEmpty else { return [] }
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
         defer { lock.unlock() }
 
+        var removed = Set<String>()
         for hash in hashes {
-            try? FileManager.default.removeItem(at: safetensorsURL(for: hash))
-            // The combined quota pass has already removed the linked
-            // companion's files (files before rows), so nothing is left to
-            // keep counting.
-            _deleteEntryLocked(hash: hash, keepCompanionCounted: false)
+            let payloadGone = Self.removeCacheFile(at: safetensorsURL(for: hash))
             validatedFiles.removeValue(forKey: hash)
+
+            var companionRemoved = false
+            if indexHasV2Columns {
+                _queryLocked(
+                    "SELECT companion_key FROM cache_entries WHERE hash = ?", [.text(hash)]
+                ) { stmt in
+                    if let cKey = sqlite3_column_text(stmt, 0) {
+                        companionRemoved = removedCompanions.contains(String(cString: cKey))
+                    }
+                }
+            }
+            if payloadGone {
+                _deleteEntryLocked(hash: hash, keepCompanionCounted: !companionRemoved)
+                removed.insert(hash)
+            } else if companionRemoved {
+                _runLocked(
+                    "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0 WHERE hash = ?",
+                    [.text(hash)])
+            }
+        }
+        return removed
+    }
+
+    /// Remove one cache file. Returns whether it is gone afterwards (a file
+    /// that was never there is gone). A file that is still there is always
+    /// reported: its row is what keeps it counted, and the caller keeps it.
+    static func removeCacheFile(at url: URL) -> Bool {
+        do {
+            try FileManager.default.removeItem(at: url)
+            return true
+        } catch {
+            guard FileManager.default.fileExists(atPath: url.path) else { return true }
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk-quota] delete failed path=\(url.path) "
+                    + "error=\(error.localizedDescription) — row kept\n").utf8))
+            return false
         }
     }
 
@@ -1590,13 +1806,21 @@ public final class DiskCache: @unchecked Sendable {
         return rc
     }
 
-    /// Visit every result row. Caller MUST hold `lock`.
+    /// Visit every result row. Returns whether the statement ran to its end;
+    /// false means `row` may have seen only some of the rows, or none.
+    /// Caller MUST hold `lock`.
+    @discardableResult
     private func _queryLocked(
         _ sql: String, _ values: [SQLValue] = [], _ row: (OpaquePointer) -> Void
-    ) {
-        guard let stmt = _prepareLocked(sql, values) else { return }
+    ) -> Bool {
+        guard let stmt = _prepareLocked(sql, values) else { return false }
         defer { sqlite3_finalize(stmt) }
-        while sqlite3_step(stmt) == SQLITE_ROW { row(stmt) }
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            row(stmt)
+            rc = sqlite3_step(stmt)
+        }
+        return rc == SQLITE_DONE
     }
 
     private static func date(julianDay: Double) -> Date {
@@ -1798,13 +2022,13 @@ public final class DiskCache: @unchecked Sendable {
         }
         sqlite3_finalize(stmt)
 
-        // Delete evicted entries and their files
+        // Delete evicted entries and their files. A payload that could not
+        // be deleted keeps its row (see `removeQuotaEntries`).
         for entry in toEvict {
-            let url = safetensorsURL(for: entry.hash)
-            try? FileManager.default.removeItem(at: url)
             validatedFiles.removeValue(forKey: entry.hash)
+            guard Self.removeCacheFile(at: safetensorsURL(for: entry.hash)) else { continue }
             _deleteEntryLocked(hash: entry.hash)
+            evictions += 1
         }
-        evictions += toEvict.count
     }
 }

@@ -41,18 +41,40 @@ struct DiskCacheCompanionAccountingTests {
         (0..<states).map { _ in MLXArray.ones([elements], dtype: .float32) }
     }
 
+    /// A clock a test moves by hand, so "a minute later" costs nothing.
+    private final class TestClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = Date()
+
+        var now: Date {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+
+        func advance(_ seconds: TimeInterval) {
+            lock.lock()
+            value += seconds
+            lock.unlock()
+        }
+    }
+
     private static func coordinator(
         root: URL, capBytes: Int64 = 1 << 30, modelKey: String, hybrid: Bool = true,
-        busyTimeoutMs: Int32 = DiskCache.defaultIndexBusyTimeoutMs
+        busyTimeoutMs: Int32 = DiskCache.defaultIndexBusyTimeoutMs,
+        clock: TestClock? = nil
     ) -> CacheCoordinator {
-        let coordinator = CacheCoordinator(
-            config: CacheCoordinatorConfig(
-                usePagedCache: false,
-                enableDiskCache: true,
-                diskCacheMaxGB: Float(capBytes) / 1_073_741_824,
-                diskCacheDir: root,
-                modelKey: modelKey),
-            diskIndexBusyTimeoutMs: busyTimeoutMs)
+        let config = CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: Float(capBytes) / 1_073_741_824,
+            diskCacheDir: root,
+            modelKey: modelKey)
+        let coordinator = clock.map { clock in
+            CacheCoordinator(
+                config: config, diskIndexBusyTimeoutMs: busyTimeoutMs,
+                importRetryInterval: 60, now: { clock.now })
+        } ?? CacheCoordinator(config: config, diskIndexBusyTimeoutMs: busyTimeoutMs)
         if hybrid {
             coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true)
         }
@@ -1716,6 +1738,670 @@ struct DiskCacheCompanionAccountingTests {
 
             try FileManager.default.setAttributes(
                 [.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    // MARK: - Review follow-ups
+
+    /// An upgraded directory (companions on disk, none counted) whose first
+    /// coordinator could not import it: the index write lock was held past
+    /// the busy timeout. Returns that coordinator and the rows a committed
+    /// import must reproduce. The lock has been released on return.
+    private static func coordinatorWhoseImportWasBlocked(
+        root: URL, modelKey: String, seeds: (Int, Int), clock: TestClock
+    ) throws -> (coordinator: CacheCoordinator, populated: [IndexedRow]) {
+        let populated: [IndexedRow]
+        do {
+            let writer = coordinator(root: root, modelKey: modelKey)
+            for boundary in [tokens(301, seed: seeds.0), tokens(1_003, seed: seeds.1)] {
+                writer.storePersistentBoundary(
+                    tokens: boundary, diskArrays: kv(), ssmStates: recurrent())
+            }
+            populated = try indexedRows(root)
+            try #require(populated.count == 2)
+            try #require(populated.allSatisfy { $0.companionKey != nil && $0.companionBytes > 0 })
+        }
+        try RawDB(root: root).require(
+            "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0")
+        CacheCoordinator.resetImportedRootsForTesting()
+
+        let blocker = try RawDB(root: root)
+        try blocker.require("BEGIN IMMEDIATE")
+        let blocked = coordinator(root: root, modelKey: modelKey, busyTimeoutMs: 50, clock: clock)
+        try #require(blocked.diskCache?.indexHasV2Columns == true)
+        try #require(
+            try indexedRows(root).allSatisfy { $0.companionKey == nil },
+            "INVALID: the import was not blocked")
+        try blocker.require("COMMIT")
+        return (blocked, populated)
+    }
+
+    /// S1. One model, loaded for hours: no second coordinator ever opens the
+    /// root, so the coordinator whose import was skipped has to retry it.
+    @Test func failedImportIsRetriedFromTheQuotaPassOfTheSameCoordinator() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("import-retry")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-import-retry"
+            let clock = TestClock()
+            let (coordinator, populated) = try Self.coordinatorWhoseImportWasBlocked(
+                root: root, modelKey: modelKey, seeds: (121, 122), clock: clock)
+            let disk = try #require(coordinator.diskCache)
+            let populatedHashes = Set(populated.map(\.hash))
+
+            clock.advance(61)
+            coordinator.storePersistentBoundary(
+                tokens: Self.tokens(517, seed: 123), diskArrays: Self.kv(),
+                ssmStates: Self.recurrent())
+
+            #expect(try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+
+            // Having committed, the pass does not import again.
+            let hashList = populatedHashes.map { "'\($0)'" }.joined(separator: ",")
+            try RawDB(root: root).require(
+                "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0 WHERE hash IN (\(hashList))")
+            clock.advance(61)
+            coordinator.storePersistentBoundary(
+                tokens: Self.tokens(307, seed: 124), diskArrays: Self.kv(), ssmStates: nil)
+            #expect(
+                try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) }
+                    .allSatisfy { $0.companionKey == nil })
+        }
+    }
+
+    /// S1. A permanently locked index must cost one walk and one busy wait
+    /// per interval, not per store. The companion directory cannot be listed
+    /// here, so a retry inside the interval would see no companions, commit
+    /// an empty import and mark the root done — and the retry that IS due,
+    /// once the directory is readable again, would then never run.
+    @Test func failedImportIsNotRetriedBeforeTheIntervalHasPassed() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("import-retry-paced")
+            let dir = Self.companionDir(root)
+            defer {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o755], ofItemAtPath: dir.path)
+                try? FileManager.default.removeItem(at: root)
+            }
+            let modelKey = "accounting-import-retry-paced"
+            let clock = TestClock()
+            let (coordinator, populated) = try Self.coordinatorWhoseImportWasBlocked(
+                root: root, modelKey: modelKey, seeds: (125, 126), clock: clock)
+            let disk = try #require(coordinator.diskCache)
+            let populatedHashes = Set(populated.map(\.hash))
+
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o000], ofItemAtPath: dir.path)
+            try Self.requireUnlistable(dir)
+            clock.advance(59)
+            coordinator.storePersistentBoundary(
+                tokens: Self.tokens(1_291, seed: 127), diskArrays: Self.kv(), ssmStates: nil)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            #expect(
+                try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) }
+                    .allSatisfy { $0.companionKey == nil })
+
+            clock.advance(2)
+            coordinator.storePersistentBoundary(
+                tokens: Self.tokens(307, seed: 128), diskArrays: Self.kv(), ssmStates: nil)
+            #expect(try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    /// (g) An on-demand reconcile that could not commit leaves the index as
+    /// the purge left it. The root must stop counting as imported, so the
+    /// quota pass retries on the same schedule as a skipped import at open.
+    @Test func uncommittedOnDemandReconcileIsRetriedFromTheQuotaPass() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("reconcile-retry")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-reconcile-retry"
+            let clock = TestClock()
+            CacheCoordinator.resetImportedRootsForTesting()
+            let coordinator = Self.coordinator(
+                root: root, modelKey: modelKey, busyTimeoutMs: 50, clock: clock)
+            let disk = try #require(coordinator.diskCache)
+            for tokens in [Self.tokens(301, seed: 129), Self.tokens(1_003, seed: 130)] {
+                coordinator.storePersistentBoundary(
+                    tokens: tokens, diskArrays: Self.kv(), ssmStates: Self.recurrent())
+            }
+            let populated = try Self.indexedRows(root)
+            try #require(populated.count == 2)
+            try #require(populated.allSatisfy { $0.companionKey != nil && $0.companionBytes > 0 })
+            let populatedHashes = Set(populated.map(\.hash))
+
+            // Something outside the package rewrote the rows.
+            try RawDB(root: root).require(
+                "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0")
+            let blocker = try RawDB(root: root)
+            try blocker.require("BEGIN IMMEDIATE")
+            try #require(
+                !coordinator.reconcileDiskAccounting(), "INVALID: the reconcile was not blocked")
+            try blocker.require("COMMIT")
+
+            clock.advance(61)
+            coordinator.storePersistentBoundary(
+                tokens: Self.tokens(307, seed: 134), diskArrays: Self.kv(), ssmStates: nil)
+            #expect(try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    /// S2. The import walks the companion directory before it takes the
+    /// index write lock. A companion written and recorded in between (a
+    /// second process on the root, or a direct writer racing an on-demand
+    /// reconcile) is in the index and not in the walk.
+    @Test func companionRecordedBetweenTheWalkAndTheTransactionIsKept() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("walk-gap")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-walk-gap"
+            let coordinator = Self.coordinator(root: root, modelKey: modelKey)
+            let disk = try #require(coordinator.diskCache)
+            let companion = try #require(coordinator.ssmStateCache.diskStore)
+            let before = Self.tokens(301, seed: 141)
+            let linkedInGap = Self.tokens(517, seed: 142)
+            let looseInGap = Self.tokens(1_003, seed: 143)
+            let staleBytesInGap = Self.tokens(1_291, seed: 144)
+            let goneInGap = Self.tokens(307, seed: 145)
+
+            coordinator.storePersistentBoundary(
+                tokens: before, diskArrays: Self.kv(), ssmStates: Self.recurrent())
+            let walked = companion.quotaEntries()
+            try #require(walked.map(\.hash) == [Self.ssmKey(before, modelKey)])
+
+            // The gap.
+            for tokens in [linkedInGap, staleBytesInGap, goneInGap] {
+                coordinator.storePersistentBoundary(
+                    tokens: tokens, diskArrays: Self.kv(), ssmStates: Self.recurrent())
+            }
+            coordinator.storePersistentBoundary(
+                tokens: looseInGap, diskArrays: nil, ssmStates: Self.recurrent())
+            try RawDB(root: root).require(
+                "UPDATE cache_entries SET companion_bytes = 7 WHERE hash = '\(Self.kvHash(staleBytesInGap, modelKey))'")
+            // The control: a record whose files really are gone is still dropped.
+            for url in Self.companionURLs(root, Self.ssmKey(goneInGap, modelKey)) {
+                try FileManager.default.removeItem(at: url)
+            }
+            let looseKey = Self.ssmKey(looseInGap, modelKey)
+            try #require(try Self.legacyRows(root) == [looseKey: Self.companionBytes(root, looseKey)])
+
+            let summary = try #require(disk.reconcileCompanionAccounting(companions: walked))
+            #expect(summary.linksCleared == 1)
+            #expect(summary.legacyDeleted == 0)
+
+            let rows = try Self.indexedRows(root)
+            for tokens in [before, linkedInGap, staleBytesInGap] {
+                let row = try #require(rows.first { $0.hash == Self.kvHash(tokens, modelKey) })
+                let key = Self.ssmKey(tokens, modelKey)
+                #expect(row.companionKey == key)
+                #expect(row.companionBytes == Self.companionBytes(root, key))
+                #expect(row.companionBytes > 7)
+            }
+            let gone = try #require(rows.first { $0.hash == Self.kvHash(goneInGap, modelKey) })
+            #expect(gone.companionKey == nil)
+            #expect(gone.companionBytes == 0)
+            #expect(try Self.legacyRows(root) == [looseKey: Self.companionBytes(root, looseKey)])
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    // MARK: Undeletable files
+
+    private static func setImmutable(_ url: URL, _ immutable: Bool) throws {
+        try FileManager.default.setAttributes([.immutable: immutable], ofItemAtPath: url.path)
+    }
+
+    private static func clearImmutableFlags(under root: URL) {
+        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)
+        else { return }
+        for case let url as URL in enumerator {
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: url.path)
+        }
+    }
+
+    /// The immutable flag is what makes these deletes fail. On a file system
+    /// without it the tests below would prove nothing.
+    private static func requireImmutableBlocksDeletion(
+        in root: URL, sourceLocation: SourceLocation = #_sourceLocation
+    ) throws {
+        let sacrificial = root.appendingPathComponent("immutable-check")
+        try Data([1]).write(to: sacrificial)
+        try setImmutable(sacrificial, true)
+        let removed = (try? FileManager.default.removeItem(at: sacrificial)) != nil
+        try? setImmutable(sacrificial, false)
+        try? FileManager.default.removeItem(at: sacrificial)
+        try #require(
+            !removed, "INVALID: an immutable file could be deleted (filesystem)",
+            sourceLocation: sourceLocation)
+    }
+
+    /// Three linked groups, oldest first, each touched to a fixed recency.
+    private static func storeGroups(
+        _ groups: [[Int]], through coordinator: CacheCoordinator
+    ) throws {
+        let disk = try #require(coordinator.diskCache)
+        let companion = try #require(coordinator.ssmStateCache.diskStore)
+        for (index, tokens) in groups.enumerated() {
+            coordinator.storePersistentBoundary(
+                tokens: tokens, diskArrays: kv(), ssmStates: recurrent())
+            let at = Date(timeIntervalSince1970: 10_000 * Double(index + 1))
+            try #require(disk.touchRecency(tokens: tokens, at: at))
+            try #require(companion.touchRecency(tokens: tokens, boundary: tokens.count, at: at))
+        }
+    }
+
+    /// Q18.2. A payload the quota pass cannot delete keeps its row: it is
+    /// still on disk, so it is still counted, and it is tried again on the
+    /// next pass — once per pass, and without taking the rest of the cache
+    /// with it.
+    @Test func undeletablePayloadKeepsItsRowUntilItCanBeDeleted() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("undeletable-kv")
+            defer {
+                Self.clearImmutableFlags(under: root)
+                try? FileManager.default.removeItem(at: root)
+            }
+            let modelKey = "accounting-undeletable-kv"
+            let groups = [Self.tokens(301, seed: 151), Self.tokens(517, seed: 152), Self.tokens(1_003, seed: 153)]
+            let writer = Self.coordinator(root: root, modelKey: modelKey)
+            try Self.storeGroups(groups, through: writer)
+            func groupBytes(_ tokens: [Int]) -> Int64 {
+                Self.fileBytes(Self.payloadURL(root, Self.kvHash(tokens, modelKey)))
+                    + Self.companionBytes(root, Self.ssmKey(tokens, modelKey))
+            }
+            let newestBytes = groupBytes(groups[2])
+            let stuckPayload = Self.payloadURL(root, Self.kvHash(groups[0], modelKey))
+            let stuckBytes = Self.fileBytes(stuckPayload)
+            try #require(stuckBytes > 0)
+
+            try Self.requireImmutableBlocksDeletion(in: root)
+            try Self.setImmutable(stuckPayload, true)
+
+            // Room for one group and a quarter: the two oldest must go. Opening
+            // a coordinator with that cap runs the pass.
+            let cap = newestBytes + newestBytes / 4
+            try #require(cap < 1 << 24, "cap must survive the Float GiB round trip exactly")
+            let small = Self.coordinator(root: root, capBytes: cap, modelKey: modelKey)
+            let disk = try #require(small.diskCache)
+            try #require(Int64(disk.maxSizeBytes) == cap)
+
+            func expectStuckRowAndNewestGroup(_ sourceLocation: SourceLocation = #_sourceLocation) throws {
+                let rows = try Self.indexedRows(root)
+                #expect(
+                    rows.map(\.hash).sorted()
+                        == [Self.kvHash(groups[0], modelKey), Self.kvHash(groups[2], modelKey)].sorted(),
+                    sourceLocation: sourceLocation)
+                let stuck = rows.first { $0.hash == Self.kvHash(groups[0], modelKey) }
+                #expect(stuck?.fileSize == stuckBytes, sourceLocation: sourceLocation)
+                // Its companion was deletable and went: no longer counted.
+                #expect(stuck?.companionKey == nil, sourceLocation: sourceLocation)
+                #expect(stuck?.companionBytes == 0, sourceLocation: sourceLocation)
+                #expect(
+                    rows.first { $0.hash == Self.kvHash(groups[2], modelKey) }?.companionKey
+                        == Self.ssmKey(groups[2], modelKey),
+                    sourceLocation: sourceLocation)
+                #expect(FileManager.default.fileExists(atPath: stuckPayload.path), sourceLocation: sourceLocation)
+                #expect(groupBytes(groups[2]) == newestBytes, sourceLocation: sourceLocation)
+                #expect(disk.usageBytes() == stuckBytes + newestBytes, sourceLocation: sourceLocation)
+                try Self.expectUsageMatchesDisk(disk, root: root, sourceLocation: sourceLocation)
+            }
+
+            try expectStuckRowAndNewestGroup()
+            #expect(Self.companionBytes(root, Self.ssmKey(groups[0], modelKey)) == 0)
+            #expect(groupBytes(groups[1]) == 0)
+            #expect(disk.snapshotStats().evictions == 1)
+
+            // Still over the cap, still undeletable: the pass tries the stuck
+            // payload again and leaves the newest group alone.
+            try #require(disk.usageBytes() > cap, "INVALID: nothing left for a second pass to do")
+            small.enforceCombinedDiskQuota()
+            try expectStuckRowAndNewestGroup()
+            #expect(disk.snapshotStats().evictions == 1)
+
+            try Self.setImmutable(stuckPayload, false)
+            small.enforceCombinedDiskQuota()
+            #expect(!FileManager.default.fileExists(atPath: stuckPayload.path))
+            #expect(try Self.indexedRows(root).map(\.hash) == [Self.kvHash(groups[2], modelKey)])
+            #expect(disk.usageBytes() == newestBytes)
+            #expect(disk.snapshotStats().evictions == 2)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    /// Q18.2, the companion half: the row goes with its payload, and the
+    /// companion file that could not be deleted stays counted, unlinked, with
+    /// the bytes that are really left.
+    @Test func undeletableCompanionStaysCountedAfterItsRowIsEvicted() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("undeletable-companion")
+            defer {
+                Self.clearImmutableFlags(under: root)
+                try? FileManager.default.removeItem(at: root)
+            }
+            let modelKey = "accounting-undeletable-companion"
+            let groups = [Self.tokens(301, seed: 154), Self.tokens(1_003, seed: 155)]
+            let writer = Self.coordinator(root: root, modelKey: modelKey)
+            try Self.storeGroups(groups, through: writer)
+            let stuckKey = Self.ssmKey(groups[0], modelKey)
+            let stuckTensor = Self.companionURLs(root, stuckKey)[0]
+            let stuckBytes = Self.fileBytes(stuckTensor)
+            try #require(stuckBytes > 0)
+            let newestBytes = Self.fileBytes(Self.payloadURL(root, Self.kvHash(groups[1], modelKey)))
+                + Self.companionBytes(root, Self.ssmKey(groups[1], modelKey))
+
+            try Self.requireImmutableBlocksDeletion(in: root)
+            try Self.setImmutable(stuckTensor, true)
+
+            let cap = newestBytes + newestBytes / 4
+            try #require(cap < 1 << 24, "cap must survive the Float GiB round trip exactly")
+            let small = Self.coordinator(root: root, capBytes: cap, modelKey: modelKey)
+            let disk = try #require(small.diskCache)
+
+            for _ in 0..<2 {  // the pass at open, then one more with the flag still set
+                #expect(try Self.indexedRows(root).map(\.hash) == [Self.kvHash(groups[1], modelKey)])
+                #expect(!FileManager.default.fileExists(
+                    atPath: Self.payloadURL(root, Self.kvHash(groups[0], modelKey)).path))
+                #expect(try Self.legacyRows(root) == [stuckKey: stuckBytes])
+                #expect(disk.usageBytes() == stuckBytes + newestBytes)
+                #expect(disk.snapshotStats().evictions == 0)
+                try Self.expectUsageMatchesDisk(disk, root: root)
+                try #require(disk.usageBytes() > cap, "INVALID: nothing left for a second pass to do")
+                small.enforceCombinedDiskQuota()
+            }
+
+            try Self.setImmutable(stuckTensor, false)
+            small.enforceCombinedDiskQuota()
+            #expect(Self.companionBytes(root, stuckKey) == 0)
+            #expect(try Self.legacyRows(root).isEmpty)
+            #expect(disk.usageBytes() == newestBytes)
+            #expect(disk.snapshotStats().evictions == 1)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    /// Q18.2, the companion store's own cap on a direct write.
+    @Test func directCompanionEvictionKeepsTheRecordOfAnUndeletableCompanion() throws {
+        try MLXMetalTestLock.withLock {
+            let sizingRoot = Self.makeRoot("undeletable-direct-sizing")
+            let root = Self.makeRoot("undeletable-direct")
+            defer {
+                Self.clearImmutableFlags(under: root)
+                try? FileManager.default.removeItem(at: sizingRoot)
+                try? FileManager.default.removeItem(at: root)
+            }
+            let modelKey = "accounting-undeletable-direct"
+            let boundaries = [
+                Self.tokens(301, seed: 156), Self.tokens(517, seed: 157),
+                Self.tokens(1_003, seed: 158), Self.tokens(1_291, seed: 159),
+            ]
+            let oneCompanion: Int64
+            do {
+                let sizing = Self.coordinator(root: sizingRoot, modelKey: modelKey)
+                sizing.storePersistentBoundary(
+                    tokens: boundaries[0], diskArrays: Self.kv(16), ssmStates: Self.recurrent())
+                oneCompanion = Self.companionBytes(sizingRoot, Self.ssmKey(boundaries[0], modelKey))
+                try #require(oneCompanion > 0)
+            }
+
+            // Room for two companions and a half; the KV payloads are tiny.
+            let coordinator = Self.coordinator(
+                root: root, capBytes: oneCompanion * 5 / 2, modelKey: modelKey)
+            let disk = try #require(coordinator.diskCache)
+            for tokens in boundaries {
+                disk.store(tokens: tokens, arrays: Self.kv(16), enforceQuota: false)
+            }
+            for tokens in boundaries.prefix(2) {
+                coordinator.ssmStateCache.store(
+                    ssmStates: Self.recurrent(), tokens: tokens, boundary: tokens.count)
+            }
+            let stuckKey = Self.ssmKey(boundaries[0], modelKey)
+            let stuckTensor = Self.companionURLs(root, stuckKey)[0]
+            let stuckBytes = Self.fileBytes(stuckTensor)
+            try Self.requireImmutableBlocksDeletion(in: root)
+            try Self.setImmutable(stuckTensor, true)
+
+            // Third companion: over the cap, the oldest is chosen, and its
+            // tensor cannot be deleted.
+            coordinator.ssmStateCache.store(
+                ssmStates: Self.recurrent(), tokens: boundaries[2], boundary: boundaries[2].count)
+            var rows = try Self.indexedRows(root)
+            let stuckRow = try #require(rows.first { $0.hash == Self.kvHash(boundaries[0], modelKey) })
+            #expect(stuckRow.companionKey == stuckKey)
+            #expect(stuckRow.companionBytes == stuckBytes)
+            #expect(rows.filter { $0.companionKey != nil }.count == 3)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+
+            try Self.setImmutable(stuckTensor, false)
+            coordinator.ssmStateCache.store(
+                ssmStates: Self.recurrent(), tokens: boundaries[3], boundary: boundaries[3].count)
+            rows = try Self.indexedRows(root)
+            #expect(Self.companionBytes(root, stuckKey) == 0)
+            #expect(rows.first { $0.hash == Self.kvHash(boundaries[0], modelKey) }?.companionKey == nil)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    // MARK: Payloads without a row
+
+    /// Q18.1. A payload with no row is counted by nothing and evicted by
+    /// nothing, so it must not be served either. `fetch` leaves the file
+    /// alone: the insert may be in flight on another connection.
+    @Test func payloadWithoutARowIsNotServed() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("rowless-fetch")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-rowless-fetch"
+            let disk = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
+            try #require(disk.indexHasV2Columns)
+            let tokens = Self.tokens(1_003, seed: 161)
+            let hash = Self.kvHash(tokens, modelKey)
+            let payload = Self.payloadURL(root, hash)
+            disk.store(tokens: tokens, arrays: Self.kv(), enforceQuota: false)
+            try #require(disk.fetch(tokens: tokens) != nil, "INVALID: the entry was never restorable")
+            let bytes = Self.fileBytes(payload)
+
+            try RawDB(root: root).require("DELETE FROM cache_entries")
+            let missesBefore = disk.snapshotStats().misses
+            #expect(disk.fetch(tokens: tokens) == nil)
+            #expect(disk.snapshotStats().misses == missesBefore + 1)
+            #expect(Self.fileBytes(payload) == bytes)
+
+            // The row arrives (the other connection's insert): served again.
+            try RawDB(root: root).require(
+                "INSERT INTO cache_entries (hash, token_count, file_size) VALUES ('\(hash)', \(tokens.count), \(bytes))")
+            #expect(disk.fetch(tokens: tokens) != nil)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    /// Q18.1. The import removes a payload with no row once it is older than
+    /// the guard age, and only then: a younger one may be another process's
+    /// store between its publish and its insert.
+    @Test func oldUnindexedPayloadIsRemovedAndAYoungOneIsLeftAlone() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("rowless-sweep")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-rowless-sweep"
+            let coordinator = Self.coordinator(root: root, modelKey: modelKey)
+            let disk = try #require(coordinator.diskCache)
+            let companion = try #require(coordinator.ssmStateCache.diskStore)
+            let indexed = Self.tokens(301, seed: 162)
+            let old = Self.tokens(517, seed: 163)
+            let nineMinutes = Self.tokens(1_003, seed: 164)
+            let young = Self.tokens(1_291, seed: 165)
+
+            coordinator.storePersistentBoundary(
+                tokens: indexed, diskArrays: Self.kv(), ssmStates: Self.recurrent())
+            for tokens in [old, nineMinutes, young] {
+                coordinator.storePersistentBoundary(
+                    tokens: tokens, diskArrays: Self.kv(), ssmStates: nil)
+            }
+            func payload(_ tokens: [Int]) -> URL { Self.payloadURL(root, Self.kvHash(tokens, modelKey)) }
+            // Takes a name, not the tokens, so a failure does not print them.
+            let payloads = ["indexed": indexed, "old": old, "nineMinutes": nineMinutes, "young": young]
+            func exists(_ name: String) -> Bool {
+                // Force-unwrapped: a mistyped name must not read as "absent".
+                FileManager.default.fileExists(atPath: payload(payloads[name]!).path)
+            }
+            func age(_ tokens: [Int], minutes: Double) throws {
+                try FileManager.default.setAttributes(
+                    [.modificationDate: Date().addingTimeInterval(-minutes * 60)],
+                    ofItemAtPath: payload(tokens).path)
+            }
+            let rowless = [old, nineMinutes, young].map { "'\(Self.kvHash($0, modelKey))'" }
+            try RawDB(root: root).require(
+                "DELETE FROM cache_entries WHERE hash IN (\(rowless.joined(separator: ",")))")
+            // The control: as old as the one that goes, but it has a row.
+            try age(indexed, minutes: 11)
+            try age(old, minutes: 11)
+            try age(nineMinutes, minutes: 9)
+
+            // The production path and the production guard age (10 minutes).
+            #expect(coordinator.reconcileDiskAccounting())
+            #expect(!exists("old"))
+            #expect(exists("nineMinutes"))
+            #expect(exists("young"))
+            #expect(exists("indexed"))
+            #expect(try Self.indexedRows(root).map(\.hash) == [Self.kvHash(indexed, modelKey)])
+            try Self.expectUsageMatchesDisk(disk, root: root, checkCompleteness: false)
+
+            // The guard age is a parameter: five minutes reaches the second.
+            let summary = try #require(
+                disk.reconcileCompanionAccounting(
+                    companions: companion.quotaEntries(), unindexedPayloadGuardAge: 300))
+            #expect(summary.unindexedPayloadsRemoved == 1)
+            #expect(!exists("nineMinutes"))
+            #expect(exists("young"))
+
+            // Nothing is left to remove: the young one stays, run after run.
+            let again = try #require(
+                disk.reconcileCompanionAccounting(companions: companion.quotaEntries()))
+            #expect(!again.changedAnything)
+            #expect(exists("young"))
+
+            try age(young, minutes: 11)
+            #expect(coordinator.reconcileDiskAccounting())
+            #expect(!exists("young"))
+            #expect(exists("indexed"))
+            #expect(disk.fetch(tokens: indexed) != nil)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    /// Q18.1. The sweep deletes what the index does not name, so it must
+    /// know that it read the index. An index that cannot be read is not an
+    /// empty index.
+    @Test func unreadableIndexNeverTriggersThePayloadSweep() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("rowless-unreadable")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-rowless-unreadable"
+            let disk = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
+            try #require(disk.indexHasV2Columns)
+            let tokens = Self.tokens(1_003, seed: 166)
+            let payload = Self.payloadURL(root, Self.kvHash(tokens, modelKey))
+            disk.store(tokens: tokens, arrays: Self.kv(), enforceQuota: false)
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date().addingTimeInterval(-11 * 60)], ofItemAtPath: payload.path)
+
+            let raw = try RawDB(root: root)
+            try raw.require("ALTER TABLE cache_entries RENAME TO cache_entries_moved")
+            let unreadable = disk.reconcileCompanionAccounting(companions: [])
+            try raw.require("ALTER TABLE cache_entries_moved RENAME TO cache_entries")
+            #expect(unreadable == nil)
+            #expect(FileManager.default.fileExists(atPath: payload.path))
+
+            let readable = try #require(disk.reconcileCompanionAccounting(companions: []))
+            #expect(!readable.changedAnything)
+            #expect(disk.fetch(tokens: tokens) != nil)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    // MARK: A failed record of an entry that is already counted
+
+    /// (c) Re-storing a validated companion only touches its files and
+    /// re-records it. When that write loses to another connection's lock the
+    /// index still counts the pair, so deleting it would throw away a valid,
+    /// counted entry.
+    @Test func busyIndexDoesNotDeleteAnAlreadyCountedCompanion() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("counted-busy")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-counted-busy"
+            let coordinator = Self.coordinator(root: root, modelKey: modelKey, busyTimeoutMs: 50)
+            let disk = try #require(coordinator.diskCache)
+            let companion = try #require(coordinator.ssmStateCache.diskStore)
+            let tokens = Self.tokens(517, seed: 171)  // no KV row: counted as unlinked
+            let key = Self.ssmKey(tokens, modelKey)
+
+            try companion.store(
+                ssmStates: Self.recurrent(), tokens: tokens, boundary: tokens.count,
+                enforceQuota: false)
+            let bytes = Self.companionBytes(root, key)
+            try #require(try Self.legacyRows(root) == [key: bytes])
+
+            let blocker = try RawDB(root: root)
+            try blocker.require("BEGIN IMMEDIATE")
+            let skipsBefore = companion.snapshotStoreSkips()
+            let record = try companion.store(
+                ssmStates: Self.recurrent(), tokens: tokens, boundary: tokens.count,
+                enforceQuota: false)
+            try blocker.require("COMMIT")
+            try #require(
+                companion.snapshotStoreSkips() == skipsBefore + 1,
+                "INVALID: the second store was not the touch-only path")
+            try #require(
+                disk.snapshotStats().failedIndexWrites == 1,
+                "INVALID: the index write was not refused")
+
+            #expect(Self.companionBytes(root, key) == bytes)
+            #expect(record?.bytes == bytes)
+            #expect(try Self.legacyRows(root) == [key: bytes])
+            let restorable = companion.fetch(tokens: tokens, boundary: tokens.count) != nil
+            #expect(restorable)
+            try Self.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
+    /// (c), the other side: the index names the key, but with fewer bytes
+    /// than the rewrite left on disk. Keeping those files would under-count,
+    /// so they still go; the stale record over-counts until it is reconciled.
+    @Test func busyIndexStillRemovesARewriteLargerThanItsRecord() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("counted-busy-larger")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "accounting-counted-busy-larger"
+            let coordinator = Self.coordinator(root: root, modelKey: modelKey, busyTimeoutMs: 50)
+            let disk = try #require(coordinator.diskCache)
+            let companion = try #require(coordinator.ssmStateCache.diskStore)
+            let tokens = Self.tokens(1_003, seed: 172)
+            let key = Self.ssmKey(tokens, modelKey)
+            coordinator.storePersistentBoundary(
+                tokens: tokens, diskArrays: Self.kv(), ssmStates: Self.recurrent())
+            let recorded = Self.companionBytes(root, key)
+            try #require(try Self.indexedRows(root).first?.companionBytes == recorded)
+
+            let blocker = try RawDB(root: root)
+            try blocker.require("BEGIN IMMEDIATE")
+            let record = try companion.store(
+                ssmStates: Self.recurrent(states: 2), tokens: tokens, boundary: tokens.count,
+                enforceQuota: false)
+            try blocker.require("COMMIT")
+            try #require(
+                disk.snapshotStats().failedIndexWrites == 1,
+                "INVALID: the index write was not refused")
+
+            #expect(record == nil)
+            #expect(Self.companionBytes(root, key) == 0)
+            // Over-counted, never under-counted.
+            #expect(disk.usageBytes() == Self.fileBytes(Self.payloadURL(root, Self.kvHash(tokens, modelKey))) + recorded)
+            #expect(coordinator.reconcileDiskAccounting())
             try Self.expectUsageMatchesDisk(disk, root: root)
         }
     }
