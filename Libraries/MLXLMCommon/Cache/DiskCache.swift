@@ -554,6 +554,9 @@ public final class DiskCache: @unchecked Sendable {
             db, busyTimeoutMs: indexMigrationBusyTimeoutMs)
         indexHasV2Columns = DiskCacheIndexSchema.hasV2Columns(
             db, busyTimeoutMs: indexMigrationBusyTimeoutMs)
+        DiskCacheIndexSchema.ensureV2Indexes(
+            db, version: indexSchemaVersion, hasV2Columns: indexHasV2Columns,
+            busyTimeoutMs: indexMigrationBusyTimeoutMs)
 
         // The schema helpers put the connection back to "no wait" when they
         // finish. Every statement from here on waits a bounded time instead.
@@ -1168,31 +1171,86 @@ public final class DiskCache: @unchecked Sendable {
     /// candidate is for the same model/media/token prefix. Returning lengths
     /// from the SQLite index lets higher layers find cross-session growing-chat
     /// prefix hits without walking every possible token count.
+    ///
+    /// On an index with the v2 columns only the lengths of rows this model
+    /// could have written are returned: rows that carry this cache's
+    /// `modelKey`, and rows that carry none. Every other model's row hashes
+    /// to a different key by construction, so probing its length can only
+    /// miss — and in a shared root those probes were most of what a fetch did
+    /// (each one a prefix copy, a SHA-256 of the prefix and an index lookup
+    /// under the process-wide IO lock).
+    ///
+    /// The filter errs towards returning a length. A row with a NULL
+    /// `model_key` was written by an older build (its three-column
+    /// `INSERT OR REPLACE` also resets the key of a row this build wrote), or
+    /// by a cache with no model key, and stays a candidate for everyone. The
+    /// key compared is the very string ``_insertEntryLocked`` binds, bound
+    /// the same way — except that a cache with NO model key also asks for
+    /// the empty one: ``hashTokens(_:modelKey:mediaSalt:)`` gives nil and ""
+    /// the same hashes, so those two share their entries, while the column
+    /// holds NULL for one and '' for the other. Under a newer build's schema
+    /// the column may mean something else, so nothing is filtered there.
+    /// Rows of this model from other conversations or other media salts are
+    /// NOT removed: neither is a column.
     public func candidateTokenCounts(maxTokens: Int, limit: Int = 128) -> [Int] {
-        guard let db, maxTokens > 0, limit > 0 else { return [] }
+        guard db != nil, maxTokens > 0, limit > 0 else { return [] }
         lock.lock()
         defer { lock.unlock() }
 
         var counts: [Int] = []
-        let sql = """
-            SELECT DISTINCT token_count
-            FROM cache_entries
-            WHERE token_count > 0 AND token_count <= ?
-            ORDER BY token_count DESC
-            LIMIT ?
-            """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            return []
-        }
-        sqlite3_bind_int64(stmt, 1, Int64(maxTokens))
-        sqlite3_bind_int(stmt, 2, Int32(limit))
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        let read: (OpaquePointer) -> Void = { stmt in
             counts.append(Int(sqlite3_column_int64(stmt, 0)))
         }
-        sqlite3_finalize(stmt)
+        if indexHasV2Columns, !indexIsFromANewerBuild,
+            _queryLocked(
+                Self.modelCandidateTokenCountsSQL,
+                [.int(Int64(maxTokens)), .int(Int64(limit)), .text(modelKey ?? "")],
+                read)
+        {
+            return counts
+        }
+        // No model column to filter on — or the filtered statement did not
+        // run to its end, and a length too many costs a probe where a length
+        // too few costs the hit.
+        counts.removeAll(keepingCapacity: true)
+        _queryLocked(
+            Self.candidateTokenCountsSQL, [.int(Int64(maxTokens)), .int(Int64(limit))], read)
         return counts
     }
+
+    static let candidateTokenCountsSQL = """
+        SELECT DISTINCT token_count
+        FROM cache_entries
+        WHERE token_count > 0 AND token_count <= ?
+        ORDER BY token_count DESC
+        LIMIT ?
+        """
+
+    /// ``candidateTokenCountsSQL`` restricted to `model_key = ?3 OR model_key
+    /// IS NULL`, written as two arms so that each is one bounded range scan
+    /// of `idx_cache_entries_model_tokens`, newest length first, that stops
+    /// at the LIMIT. The one-statement `OR` form reads and sorts EVERY row of
+    /// the model below `maxTokens` for every page (the LIMIT cannot be pushed
+    /// under the DISTINCT), which makes paging through a large cache
+    /// quadratic; and once the index has been ANALYZEd the planner answers it
+    /// from the token-count index instead, reading every other model's rows
+    /// again. The top `limit` of the union is within the union of each arm's
+    /// top `limit`.
+    static let modelCandidateTokenCountsSQL = """
+        SELECT token_count FROM (
+            SELECT * FROM (
+                SELECT DISTINCT token_count FROM cache_entries
+                WHERE model_key = ?3 AND token_count > 0 AND token_count <= ?1
+                ORDER BY token_count DESC LIMIT ?2)
+            UNION
+            SELECT * FROM (
+                SELECT DISTINCT token_count FROM cache_entries
+                WHERE model_key IS NULL AND token_count > 0 AND token_count <= ?1
+                ORDER BY token_count DESC LIMIT ?2)
+        )
+        ORDER BY token_count DESC
+        LIMIT ?2
+        """
 
     /// Snapshot indexed KV payloads for the coordinator's combined KV +
     /// recurrent-companion quota. Database/WAL bookkeeping is intentionally

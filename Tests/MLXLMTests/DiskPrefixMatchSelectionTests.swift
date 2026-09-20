@@ -198,9 +198,13 @@ struct DiskPrefixMatchSelectionTests {
     /// probe that finds no payload under its hash is one `DiskCache.fetch`
     /// miss, and the accepted candidate is not a miss.
     ///
-    /// The candidate lengths come from the index without regard to which
-    /// model wrote the row, so another model's rows are hashed and probed,
-    /// one by one, before the only row that can match.
+    /// Another model's rows hash to other keys by construction, so their
+    /// lengths are not candidates: the fetch probes `[N, N-1]` and then the
+    /// one row that can match. Without the filter this was one probe per
+    /// foreign length (329 here).
+    ///
+    /// Rows of the SAME model that cannot match — other conversations, other
+    /// media salts — are still probed: neither is a column of the index.
     @Test func foreignModelRowsCostProbesButNeverHit() throws {
         try MLXMetalTestLock.withLock {
             let root = Self.makeRoot("foreign")
@@ -234,10 +238,146 @@ struct DiskPrefixMatchSelectionTests {
             #expect(after.hits - before.hits == 1)
 
             let probes = after.misses - before.misses
-            // [N, N-1], then every foreign length: none is a multiple of the
-            // page size, so this also shows that paging goes past page one.
-            #expect(probes == foreignLengths.count + 2)
-            #expect(probes > 128)
+            #expect(probes <= 3)
+            // Not because nothing was probed: [N, N-1] always are.
+            #expect(probes == 2)
+
+            // The foreign rows are all still there, and still theirs.
+            let theirHit = try #require(Self.diskMatch(theirs.fetch(tokens: prompt)))
+            #expect(theirHit.matched == foreignLengths.last)
+        }
+    }
+
+    /// The same-model control for the test above: the filter removes only
+    /// what another model wrote.
+    @Test func sameModelRowsFromOtherConversationsAreStillProbed() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("same-model")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let coordinator = Self.coordinator(root: root, modelKey: "A")
+            let disk = try #require(coordinator.diskCache)
+            let prompt = Self.chain(301)
+            let other = Self.chain(301, seed: 9)
+            disk.store(
+                tokens: Array(prompt.prefix(37)), arrays: Self.payload(), enforceQuota: false)
+            let decoys = stride(from: 41, through: 299, by: 2).map { $0 }
+            try #require(decoys.count > 128)
+            for length in decoys {
+                disk.store(
+                    tokens: Array(other.prefix(length)), arrays: Self.payload(3),
+                    enforceQuota: false)
+            }
+
+            let before = try Self.diskStats(coordinator)
+            let hit = try #require(Self.diskMatch(coordinator.fetch(tokens: prompt)))
+            let after = try Self.diskStats(coordinator)
+            #expect(hit.matched == 37)
+            // [301, 300], then every decoy length (299 is one of them).
+            #expect(after.misses - before.misses == decoys.count + 2)
+        }
+    }
+
+    /// The string `store` writes into `model_key` and the string the
+    /// candidate filter binds must be the same bytes, or the filter hides
+    /// this model's own rows. Across a close and a reopen, for keys that a
+    /// careless comparison would mangle, and with every key in ONE root.
+    @Test func modelKeyWrittenByStoreIsTheOneTheFilterBinds() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("key-round-trip")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let prompt = Self.chain(149)
+            let keys: [(key: String?, length: Int)] = [
+                ("A", 37), ("a", 41), ("org/Modèle 4-bit 'q' \"x\" %_\\ ", 43), ("", 47),
+                (nil, 53),
+            ]
+            for entry in keys {
+                let writer = CacheCoordinator(
+                    config: CacheCoordinatorConfig(
+                        usePagedCache: false, enableDiskCache: true, diskCacheMaxGB: 1,
+                        diskCacheDir: root, modelKey: entry.key))
+                writer.storePersistentBoundary(
+                    tokens: Array(prompt.prefix(entry.length)), diskArrays: Self.payload(),
+                    ssmStates: nil)
+            }
+
+            // What is in the column, byte for byte.
+            let raw = try Support.RawDB(root: root)
+            let stored = try raw.rows(
+                "SELECT token_count, typeof(model_key), hex(model_key) FROM cache_entries ORDER BY token_count"
+            )
+            try #require(stored.count == keys.count)
+            for (row, entry) in zip(stored, keys) {
+                #expect(row[0] == "\(entry.length)")
+                if let key = entry.key {
+                    #expect(row[1] == "text")
+                    #expect(row[2] == key.utf8.map { String(format: "%02X", $0) }.joined())
+                } else {
+                    #expect(row[1] == "null")
+                }
+            }
+
+            // Every key finds its own row after a reopen, plus the unkeyed
+            // one, and nobody else's. No key and the empty key are ONE
+            // namespace — they hash alike — so each of the two must be
+            // offered the other's row as well, and is served the longer.
+            for entry in keys {
+                let reader = CacheCoordinator(
+                    config: CacheCoordinatorConfig(
+                        usePagedCache: false, enableDiskCache: true, diskCacheMaxGB: 1,
+                        diskCacheDir: root, modelKey: entry.key))
+                let disk = try #require(reader.diskCache)
+                try #require(disk.indexHasV2Columns)
+                let unkeyed = (entry.key ?? "").isEmpty
+                let expected: Set<Int> = unkeyed ? [47, 53] : [entry.length, 53]
+                #expect(
+                    Set(disk.candidateTokenCounts(maxTokens: prompt.count)) == expected,
+                    "model key \(entry.key ?? "nil")")
+                let hit = try #require(
+                    Self.diskMatch(reader.fetch(tokens: prompt)),
+                    "model key \(entry.key ?? "nil") lost its own row")
+                #expect(hit.matched == (unkeyed ? 53 : entry.length))
+            }
+
+            // The shorter of the two shared rows is reachable from both too.
+            let shorter = Array(prompt.prefix(48))
+            for key in [String?.none, ""] {
+                let reader = CacheCoordinator(
+                    config: CacheCoordinatorConfig(
+                        usePagedCache: false, enableDiskCache: true, diskCacheMaxGB: 1,
+                        diskCacheDir: root, modelKey: key))
+                let hit = try #require(Self.diskMatch(reader.fetch(tokens: shorter)))
+                #expect(hit.matched == 47)
+            }
+        }
+    }
+
+    /// Without the model column there is nothing to filter on, and under a
+    /// newer build's schema the column may not mean what it means here: both
+    /// keep offering every length.
+    @Test func candidatesAreNotFilteredWithoutTheModelColumnOrUnderANewerSchema() throws {
+        try MLXMetalTestLock.withLock {
+            for newerWithColumns in [false, true] {
+                let root = Self.makeRoot("unfiltered-\(newerWithColumns)")
+                defer { try? FileManager.default.removeItem(at: root) }
+                if newerWithColumns {
+                    do {
+                        _ = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: "A")
+                    }
+                    try Support.RawDB(root: root).require("PRAGMA user_version = 99")
+                } else {
+                    try Support.makeV1OnlyIndex(in: root)
+                }
+                let ours = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: "A")
+                let theirs = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: "B")
+                try #require(ours.indexIsFromANewerBuild)
+                try #require(ours.indexHasV2Columns == newerWithColumns)
+                let prompt = Self.chain(149)
+                ours.store(tokens: Array(prompt.prefix(37)), arrays: Self.payload())
+                theirs.store(tokens: Array(prompt.prefix(101)), arrays: Self.payload())
+
+                #expect(ours.candidateTokenCounts(maxTokens: 149) == [101, 37])
+                #expect(ours.fetch(tokens: Array(prompt.prefix(37))) != nil)
+            }
         }
     }
 

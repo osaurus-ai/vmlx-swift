@@ -122,6 +122,20 @@ import Testing
             return out
         }
 
+        /// The `detail` column of an `EXPLAIN QUERY PLAN`.
+        func planDetails(_ sql: String) throws -> [String] {
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw RawDBError.statement(sql, -1, String(cString: sqlite3_errmsg(handle)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            var out: [String] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                out.append(sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "<null>")
+            }
+            return out
+        }
+
         func rows() throws -> [Row] {
             let sql = """
                 SELECT hash, token_count, file_size, created_at
@@ -241,6 +255,7 @@ import Testing
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_cache_entries_chain'"
             )
                 == 1, sourceLocation: sourceLocation)
+        #expect(try raw.int(modelTokensIndexCount) == 1, sourceLocation: sourceLocation)
         #expect(try raw.rows() == seedRows, sourceLocation: sourceLocation)
         #expect(
             try raw.int(
@@ -252,6 +267,9 @@ import Testing
     }
 
     private static let v1ColumnNames = ["hash", "token_count", "file_size", "created_at"]
+
+    private static let modelTokensIndexCount =
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_cache_entries_model_tokens'"
 
     /// What a migration that failed inside its transaction has to leave
     /// behind: nothing, and no lock.
@@ -298,6 +316,8 @@ import Testing
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_cache_entries_chain'"
             )
                 == 0, "\(label)", sourceLocation: sourceLocation)
+        #expect(
+            try other.int(modelTokensIndexCount) == 0, "\(label)", sourceLocation: sourceLocation)
         #expect(try other.rows() == seedRows, "\(label)", sourceLocation: sourceLocation)
     }
 
@@ -395,7 +415,80 @@ import Testing
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_companions'"
             )
                 == 1)
+        #expect(try raw.int(Self.modelTokensIndexCount) == 1)
         #expect(try raw.int("SELECT COUNT(*) FROM cache_entries") == 0)
+    }
+
+    /// An index that reached v2 before `idx_cache_entries_model_tokens`
+    /// existed is not migrated again, so the open adds it; one a newer build
+    /// has claimed is left exactly as found.
+    @Test func modelTokensIndexIsAddedToAV2IndexThatLacksItAndNotToANewerOne() throws {
+        let dir = try Self.makeTempDir("late-index")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try Self.buildV1Index(in: dir)
+        do {
+            _ = DiskCache(cacheDir: dir, maxSizeBytes: 1 << 30, modelKey: "m")
+        }
+        let raw = try RawDB(Self.dbPath(dir))
+        try #require(try raw.int(Self.modelTokensIndexCount) == 1)
+        try raw.require("DROP INDEX idx_cache_entries_model_tokens")
+        try #require(try raw.int("PRAGMA user_version") == 2)
+        try #require(try raw.int(Self.modelTokensIndexCount) == 0)
+
+        do {
+            let cache = DiskCache(cacheDir: dir, maxSizeBytes: 1 << 30, modelKey: "m")
+            #expect(cache.indexSchemaVersion == 2)
+        }
+        #expect(try raw.int(Self.modelTokensIndexCount) == 1)
+        try Self.expectMigratedSeedIndex(dir)
+
+        try raw.require("DROP INDEX idx_cache_entries_model_tokens")
+        try raw.require("PRAGMA user_version = 3")
+        do {
+            let cache = DiskCache(cacheDir: dir, maxSizeBytes: 1 << 30, modelKey: "m")
+            #expect(cache.indexSchemaVersion == 3)
+            #expect(cache.indexHasV2Columns)
+            // Unfiltered there, so still answered — from the v1 index.
+            #expect(cache.candidateTokenCounts(maxTokens: 5_003) == [4_099, 333, 17])
+        }
+        #expect(try raw.int(Self.modelTokensIndexCount) == 0)
+    }
+
+    /// The candidate query must be answered from the model/tokens index
+    /// alone: two bounded searches of it, and no walk of the table.
+    @Test func modelCandidateQueryIsTwoCoveringIndexSearches() throws {
+        let dir = try Self.makeTempDir("query-plan")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try Self.buildV1Index(in: dir)
+        do {
+            _ = DiskCache(cacheDir: dir, maxSizeBytes: 1 << 30, modelKey: "m")
+        }
+        let raw = try RawDB(Self.dbPath(dir))
+        func plan() throws -> [String] {
+            try raw.planDetails("EXPLAIN QUERY PLAN " + DiskCache.modelCandidateTokenCountsSQL)
+        }
+        for analyzed in [false, true] {
+            if analyzed {
+                // Statistics change what the planner prefers; with them the
+                // one-statement OR form goes back to the token-count index.
+                for index in 0 ..< 301 {
+                    try raw.require(
+                        "INSERT INTO cache_entries (hash, token_count, file_size, model_key) "
+                            + "VALUES ('plan-\(index)', \(5 + index), 11, 'other')")
+                }
+                try raw.require("ANALYZE")
+            }
+            let details = try plan()
+            try #require(!details.isEmpty, "INVALID: no query plan was read")
+            let tableLines = details.filter { $0.contains("cache_entries") }
+            #expect(tableLines.count == 2, "analyzed=\(analyzed): \(details)")
+            for line in tableLines {
+                #expect(
+                    line.hasPrefix(
+                        "SEARCH cache_entries USING COVERING INDEX idx_cache_entries_model_tokens"),
+                    "analyzed=\(analyzed): \(line)")
+            }
+        }
     }
 
     @Test func migrationIsIdempotent() throws {
@@ -546,6 +639,7 @@ import Testing
         // Fail closed: everything below is vacuous against a v1 index.
         try #require(try raw.int("PRAGMA user_version") == 2)
         try #require(try raw.columnNames().contains("companion_bytes"))
+        try #require(try raw.int(Self.modelTokensIndexCount) == 1)
 
         // Old writer.
         try raw.run(Self.baselineInsert, [.text("oldwriter"), .int(77), .int(7_007)])
@@ -581,6 +675,15 @@ import Testing
         // Old delete-by-hash.
         try raw.run(Self.baselineDelete, [.text("aaaa")])
         #expect(sqlite3_changes(raw.handle) == 1)
+
+        // What the old statements wrote is what this build's filtered
+        // candidate query reads back: their rows carry no model key, and the
+        // model/tokens index followed every one of those writes.
+        do {
+            let cache = DiskCache(cacheDir: dir, maxSizeBytes: 1 << 30, modelKey: "m")
+            #expect(cache.candidateTokenCounts(maxTokens: 5_003) == [4_099, 333, 77])
+        }
+        #expect(try raw.strings("PRAGMA integrity_check") == ["ok"])
 
         // osaurus purge tool.
         #expect(
