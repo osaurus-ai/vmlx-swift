@@ -93,6 +93,31 @@ struct DiskRestoreRejectionEngineTests {
         try #require(coordinator.snapshotStats().diskStats)
     }
 
+    /// A two-layer entry for the 11-token boundary whose layers hold
+    /// `payloadTokens` tokens, written straight through `DiskCache.store`
+    /// under the key the engines look up. With 11 it is the entry an engine
+    /// would have written; with 9 it restores — nine tokens, into both
+    /// layers — and its offsets then disagree with the boundary it was
+    /// served for: the second structural refusal.
+    private static func plantLongEntry(
+        payloadTokens: Int, in coordinator: CacheCoordinator
+    ) throws {
+        let long = Array(prompt.prefix(11))
+        let cache: [any KVCache] = (0 ..< 2).map { _ in KVCacheSimple() }
+        for layer in cache {
+            let keys = MLXArray.ones([1, 1, payloadTokens, 4])
+            _ = layer.update(keys: keys, values: keys * 2)
+        }
+        MLX.eval(cache)
+        try #require(cache.allSatisfy { $0.offset == payloadTokens })
+        let disk = try #require(coordinator.diskCache)
+        disk.store(
+            tokens: long, arrays: TQDiskSerializer.serialize(cache: cache),
+            mediaSalt: computeCacheSalt(for: input(long), parameters: parameters),
+            enforceQuota: false)
+        try #require(disk.candidateTokenCounts(maxTokens: 11).first == 11)
+    }
+
     // MARK: - TokenIterator
 
     /// One turn of the solo path. Returns what it restored before prefill.
@@ -157,6 +182,40 @@ struct DiskRestoreRejectionEngineTests {
             #expect(
                 try Self.soloTurn(prompt, layers: 2, coordinator: coordinator, store: false) == 11)
             #expect(try Self.stats(coordinator).rejectedDiskRestores == 1)
+        }
+    }
+
+    /// The other refusal: the payload fits the cache, restores more than
+    /// nothing, and the offsets it leaves disagree with the boundary. The
+    /// control differs in the payload's token count alone, and restores.
+    @Test func tokenIteratorReportsRestoredOffsetsThatMissTheBoundary() throws {
+        try MLXMetalTestLock.withLock {
+            for payloadTokens in [11, 9] {
+                let (coordinator, root) = Self.makeCoordinator("solo-offsets-\(payloadTokens)")
+                defer { try? FileManager.default.removeItem(at: root) }
+                let prompt = Self.prompt
+                _ = try Self.soloTurn(
+                    Array(prompt.prefix(5)), layers: 2, coordinator: coordinator, store: true)
+                try Self.plantLongEntry(payloadTokens: payloadTokens, in: coordinator)
+                let planted = try Self.stats(coordinator)
+                try #require(planted.rejectedDiskRestores == 0)
+
+                let first = try Self.soloTurn(
+                    prompt, layers: 2, coordinator: coordinator, store: false)
+                let found = try Self.stats(coordinator)
+                if payloadTokens == 11 {
+                    try #require(first == 11, "INVALID: the control entry does not restore")
+                    try #require(found.rejectedDiskRestores == 0)
+                    continue
+                }
+                #expect(first == nil, "a restore that was refused was reported as one")
+                #expect(found.rejectedDiskRestores == 1)
+                #expect(found.hits == planted.hits, "the refused hit was counted")
+                #expect(
+                    try Self.soloTurn(prompt, layers: 2, coordinator: coordinator, store: false)
+                        == 5)
+                #expect(try Self.stats(coordinator).rejectedDiskRestores == 1)
+            }
         }
     }
 
@@ -266,5 +325,44 @@ struct DiskRestoreRejectionEngineTests {
 
         await oneLayer.shutdown()
         await twoLayers.shutdown()
+    }
+
+    /// The offsets refusal through the scheduler; the control differs in the
+    /// payload's token count alone. (The engine announces a cache restore as
+    /// soon as the payload is in, before it checks the offsets, so what the
+    /// refusing turn reports as restored is not asserted here.)
+    @Test func batchEngineReportsRestoredOffsetsThatMissTheBoundary() async throws {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
+        for payloadTokens in [11, 9] {
+            let (coordinator, root) = Self.makeCoordinator("batch-offsets-\(payloadTokens)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let disk = try #require(coordinator.diskCache)
+            let twoLayers = Self.engine(layers: 2, coordinator: coordinator)
+
+            _ = await Self.batchTurn(Array(Self.prompt.prefix(5)), engine: twoLayers)
+            try await Self.waitForBoundary(5, in: disk)
+            try Self.plantLongEntry(payloadTokens: payloadTokens, in: coordinator)
+            let planted = try Self.stats(coordinator)
+            try #require(planted.rejectedDiskRestores == 0)
+
+            let first = await Self.batchTurn(
+                Self.divergingPrompt(tail: 1, count: 23), engine: twoLayers)
+            try await Self.waitForBoundary(23, in: disk)
+            let found = try Self.stats(coordinator)
+            if payloadTokens == 11 {
+                try #require(first == 11, "INVALID: the control entry does not restore")
+                try #require(found.rejectedDiskRestores == 0)
+            } else {
+                #expect(found.rejectedDiskRestores == 1)
+                #expect(found.hits == planted.hits, "the refused hit was counted")
+                #expect(
+                    await Self.batchTurn(
+                        Self.divergingPrompt(tail: 2, count: 29), engine: twoLayers) == 5)
+                #expect(try Self.stats(coordinator).rejectedDiskRestores == 1)
+            }
+            await twoLayers.shutdown()
+        }
     }
 }

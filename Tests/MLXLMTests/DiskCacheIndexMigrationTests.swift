@@ -554,13 +554,15 @@ import Testing
             }
             let details = try plan()
             try #require(!details.isEmpty, "INVALID: no query plan was read")
+            // What matters, in whatever words this SQLite puts it: both
+            // arms SEARCH the model/tokens index, and nothing SCANs the table.
             let tableLines = details.filter { $0.contains("cache_entries") }
             #expect(tableLines.count == 2, "analyzed=\(analyzed): \(details)")
             for line in tableLines {
                 #expect(
-                    line.hasPrefix(
-                        "SEARCH cache_entries USING COVERING INDEX idx_cache_entries_model_tokens"),
+                    line.contains("SEARCH") && line.contains("idx_cache_entries_model_tokens"),
                     "analyzed=\(analyzed): \(line)")
+                #expect(!line.contains("SCAN"), "analyzed=\(analyzed): \(line)")
             }
         }
     }

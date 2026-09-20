@@ -95,6 +95,16 @@ struct DiskPrefixMatchSelectionTests {
             size: try #require((attributes[.size] as? NSNumber)?.uint64Value))
     }
 
+    /// A source file of the package, found from where THIS file is
+    /// (`Tests/MLXLMTests/`), not from the working directory of the run.
+    private static func packageSource(_ path: String, from file: String = #filePath) throws
+        -> String
+    {
+        let root = URL(fileURLWithPath: file)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        return try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
+    }
+
     // MARK: - 1. Longest stored prefix
 
     @Test func longestStoredPrefixWins() throws {
@@ -277,6 +287,112 @@ struct DiskPrefixMatchSelectionTests {
             #expect(hit.matched == 37)
             // [301, 300], then every decoy length (299 is one of them).
             #expect(after.misses - before.misses == decoys.count + 2)
+        }
+    }
+
+    /// The candidate lengths are read in pages of 128, and each page is the
+    /// top of TWO index arms — this model's rows and the rows with no key —
+    /// merged. 301 lengths that alternate between the two arms, with 400 of
+    /// another model's lengths in between, and the one entry that matches
+    /// below all of them: every one of ours is offered, in order, in three
+    /// pages; none of theirs is; and the fetch gets to the bottom.
+    @Test func pagingMergesTheKeyedAndUnkeyedArmsBelowAnotherModelsRows() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("paging")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let coordinator = Self.coordinator(root: root, modelKey: "A")
+            let disk = try #require(coordinator.diskCache)
+            try #require(disk.indexHasV2Columns)
+            let prompt = Self.chain(1_009)
+            disk.store(
+                tokens: Array(prompt.prefix(37)), arrays: Self.payload(), enforceQuota: false)
+
+            // Rows that name no payload: a probe of one is a plain miss.
+            var ours: [Int] = []
+            var theirs: [Int] = []
+            var statements: [String] = []
+            var length = 41
+            var slot = 0
+            while ours.count < 301 || theirs.count < 400 {
+                defer { length += 1 }
+                guard length % 64 != 0 else { continue }
+                defer { slot += 1 }
+                let isOurs = [0, 2, 4].contains(slot % 7)
+                if isOurs, ours.count < 301 {
+                    let key = ours.count % 2 == 0 ? "'A'" : "NULL"
+                    ours.append(length)
+                    statements.append("('\(String(format: "%032x", length))', \(length), 11, \(key))")
+                } else if !isOurs, theirs.count < 400 {
+                    theirs.append(length)
+                    statements.append("('\(String(format: "%032x", length))', \(length), 11, 'B')")
+                }
+            }
+            try #require(length < prompt.count - 1, "INVALID: a decoy is not below the prompt")
+            let raw = try Support.RawDB(root: root)
+            try raw.require(
+                "INSERT INTO cache_entries (hash, token_count, file_size, model_key) VALUES "
+                    + statements.joined(separator: ", "))
+            try #require(try Self.indexedTokenCounts(root).count == 1 + 301 + 400)
+            try #require(
+                try raw.rows(
+                    "SELECT COUNT(*) FROM cache_entries WHERE model_key IS NULL") == [["150"]])
+
+            // The pages, read the way the coordinator reads them.
+            var pages: [[Int]] = []
+            var maximum = prompt.count
+            while maximum > 0 {
+                let page = disk.candidateTokenCounts(maxTokens: maximum, limit: 128)
+                guard let smallest = page.last else { break }
+                pages.append(page)
+                guard page.count == 128 else { break }
+                maximum = smallest - 1
+            }
+            #expect(pages.map(\.count) == [128, 128, 46])
+            #expect(Array(pages.joined()) == (ours + [37]).sorted(by: >))
+
+            let before = try Self.diskStats(coordinator)
+            let hit = try #require(Self.diskMatch(coordinator.fetch(tokens: prompt)))
+            let after = try Self.diskStats(coordinator)
+            #expect(hit.matched == 37)
+            // [N, N-1] and each of our 301 lengths; none of their 400.
+            #expect(after.misses - before.misses == 2 + 301)
+        }
+    }
+
+    /// When the filtered statement cannot run, the unfiltered one answers: a
+    /// length too many costs a probe, a length too few costs the hit. Here
+    /// the column it filters on is dropped under an open cache, which still
+    /// believes in it. Before that, the same cache is the control: filtered,
+    /// the other model's length is not offered.
+    @Test func aFilteredCandidateQueryThatFailsFallsBackToTheUnfilteredOne() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("filter-fails")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let ours = Self.coordinator(root: root, modelKey: "A")
+            let theirs = Self.coordinator(root: root, modelKey: "B")
+            let prompt = Self.chain(149)
+            ours.storePersistentBoundary(
+                tokens: Array(prompt.prefix(37)), diskArrays: Self.payload(), ssmStates: nil)
+            theirs.storePersistentBoundary(
+                tokens: Array(prompt.prefix(101)), diskArrays: Self.payload(), ssmStates: nil)
+            let disk = try #require(ours.diskCache)
+            try #require(disk.indexHasV2Columns)
+            try #require(disk.candidateTokenCounts(maxTokens: 149) == [37], "INVALID: not filtered")
+
+            let raw = try Support.RawDB(root: root)
+            try raw.require("DROP INDEX idx_cache_entries_model_tokens")
+            try raw.require("ALTER TABLE cache_entries DROP COLUMN model_key")
+            try #require(
+                (try? raw.rows(
+                    DiskCache.modelCandidateTokenCountsSQL
+                        .replacingOccurrences(of: "?1", with: "149")
+                        .replacingOccurrences(of: "?2", with: "128")
+                        .replacingOccurrences(of: "?3", with: "'A'"))) == nil,
+                "INVALID: the filtered statement still runs")
+
+            #expect(disk.candidateTokenCounts(maxTokens: 149) == [101, 37])
+            let hit = try #require(Self.diskMatch(ours.fetch(tokens: prompt)))
+            #expect(hit.matched == 37)
         }
     }
 
@@ -989,7 +1105,7 @@ struct DiskPrefixMatchSelectionTests {
         ]
         for consumer in consumers {
             let path = consumer.path
-            let source = try String(contentsOfFile: path, encoding: .utf8)
+            let source = try Self.packageSource(path)
             let calls = source.components(separatedBy: "coordinator.reportDiskRestoreRejected(")
             try #require(
                 calls.count - 1 == consumer.reasons.count, "\(path): \(calls.count - 1) reports")
@@ -1006,9 +1122,8 @@ struct DiskPrefixMatchSelectionTests {
                 source.range(of: "coordinator.reportDiskRestoreRejected(", options: .backwards))
             #expect(lastReport.upperBound < contextual.lowerBound, "\(path)")
         }
-        let diffusion = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Diffusion/BlockDiffusionTokenIterator.swift",
-            encoding: .utf8)
+        let diffusion = try Self.packageSource(
+            "Libraries/MLXLMCommon/Diffusion/BlockDiffusionTokenIterator.swift")
         #expect(
             diffusion.contains("if detail == .disk, !cacheContainsPathDependentState(self.cache) {"))
     }
