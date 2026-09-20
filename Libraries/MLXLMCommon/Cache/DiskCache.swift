@@ -906,6 +906,28 @@ public final class DiskCache: @unchecked Sendable {
             return nil
         }
 
+        // Only a regular file is a payload. The name is ours, but the root is
+        // a user setting: `open` on a FIFO of that name never returns, and
+        // this thread holds the process-wide IO lock. Whatever else holds
+        // the name is not this cache's file — a miss, and it and the row
+        // stay (the same answer the sweep, the import and a store give).
+        switch Self.pathState(at: url) {
+        case .regularFile:
+            break
+        case .notRegularFile:
+            return _unreadablePayloadMissLocked(
+                hash: hash, url: url, tokenCount: tokens.count, reason: "not a regular file")
+        case .unreadable(let code):
+            return _unreadablePayloadMissLocked(
+                hash: hash, url: url, tokenCount: tokens.count,
+                reason: String(cString: strerror(code)))
+        case .missing:
+            // Gone since `fileExists`: the next fetch settles the row.
+            validatedFiles.removeValue(forKey: hash)
+            misses += 1
+            return nil
+        }
+
         do {
             // Fail closed on a short file BEFORE the lazy map: the reader's
             // short-read error never reaches the caller, so a truncated row
@@ -981,6 +1003,15 @@ public final class DiskCache: @unchecked Sendable {
         }
     }
 
+    /// What the vendored MLX safetensors loader's message contains when it
+    /// could not OPEN the file (`[load_safetensors] Failed to open …`). The
+    /// loader has no error codes, so this text is the only thing that tells
+    /// "could not look" from "looked, and it is corrupt" — and the second
+    /// deletes. `theLoaderStillSaysItCouldNotOpenAFile` runs the real loader
+    /// against an unreadable payload, so a reworded message fails a test
+    /// instead of deleting caches on a transient EACCES.
+    static let loaderCouldNotOpenMarker = "Failed to open"
+
     /// Whether a failed fetch has shown the payload itself to be unusable.
     /// The two integrity errors are this cache's own findings. Anything else
     /// came from the loader: it counts only when the loader got as far as
@@ -991,7 +1022,7 @@ public final class DiskCache: @unchecked Sendable {
         case DiskCacheIntegrityError.incompleteFile, DiskCacheIntegrityError.nonFinitePayload:
             return true
         default:
-            if "\(error)".contains("Failed to open") { return false }
+            if "\(error)".contains(loaderCouldNotOpenMarker) { return false }
             if case .unreadable = inspectSafetensors(url: url) { return false }
             return true
         }
@@ -1135,32 +1166,37 @@ public final class DiskCache: @unchecked Sendable {
         // What is returned here is what a quota pass may delete, by a path
         // built from it. A row whose hash is not a payload hash, or a link
         // whose key is not a companion key, names no file: it is not offered
-        // — and, once the statement is finished, dropped, so that its bytes
-        // stop counting towards a cap they could otherwise hold over for good.
-        var invalidHashes: [String] = []
-        var invalidCompanionKeys: [String] = []
-        defer {
-            invalidHashes.forEach(_dropRowWithInvalidHashLocked)
-            invalidCompanionKeys.forEach(_forgetInvalidCompanionKeyLocked)
-        }
+        // — and, once the statement is finished, retired BY ROWID, so that
+        // its bytes stop counting towards a cap they could otherwise hold
+        // over for good. Under a newer build's index it is not offered and
+        // not retired either (``_retireInvalidRecordsLocked(_:reconciling:)``).
+        var invalid = InvalidRecords()
+        defer { _retireInvalidRecordsLocked(invalid) }
+        let rowsAreOpaque = indexIsFromANewerBuild
         var stmt: OpaquePointer?
         let sql = indexHasV2Columns
             ? """
                 SELECT hash, file_size, created_at, companion_key, companion_bytes,
-                       token_count, kind, chain_id
+                       token_count, kind, chain_id, rowid
                 FROM cache_entries
                 """
-            : "SELECT hash, file_size, created_at FROM cache_entries"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            : "SELECT hash, file_size, created_at, rowid FROM cache_entries"
+        let rowidColumn: Int32 = indexHasV2Columns ? 8 : 3
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+            sqlite3_finalize(stmt)
             return []
         }
         defer { sqlite3_finalize(stmt) }
 
         while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let cHash = sqlite3_column_text(stmt, 0) else { continue }
-            let hash = String(cString: cHash)
-            guard Self.isLowercaseHex(cString: cHash, count: Self.hashLength) else {
-                invalidHashes.append(hash)
+            let hash: String
+            switch Self.indexValue(stmt, column: 0, hexDigits: Self.hashLength) {
+            case .valid(let value):
+                hash = value
+            case .unreadable:
+                continue
+            case .null, .invalid:
+                invalid.entries.append(sqlite3_column_int64(stmt, rowidColumn))
                 continue
             }
             let bytes = max(0, sqlite3_column_int64(stmt, 1))
@@ -1171,14 +1207,23 @@ public final class DiskCache: @unchecked Sendable {
             // A row an older build wrote has NULL / 0 here: it is simply a
             // KV-only group.
             if indexHasV2Columns {
-                if let cKey = sqlite3_column_text(stmt, 3) {
-                    let key = String(cString: cKey)
-                    if Self.isLowercaseHex(cString: cKey, count: SSMCompanionDiskStore.keyLength) {
-                        entry.companionKey = key
-                        entry.companionBytes = max(0, sqlite3_column_int64(stmt, 4))
-                    } else {
-                        invalidCompanionKeys.append(key)
-                    }
+                switch Self.indexValue(
+                    stmt, column: 3, hexDigits: SSMCompanionDiskStore.keyLength)
+                {
+                case .valid(let key):
+                    entry.companionKey = key
+                    entry.companionBytes = max(0, sqlite3_column_int64(stmt, 4))
+                case .unreadable:
+                    continue
+                case .null where sqlite3_column_int64(stmt, 4) == 0:
+                    break
+                case .null, .invalid:
+                    // A link that names nothing (or bytes with no key at
+                    // all). Cleared, and the row is offered as KV-only —
+                    // unless a newer build wrote it: evicting the row would
+                    // hand that key on, so the whole row is left alone.
+                    invalid.links.append(sqlite3_column_int64(stmt, rowidColumn))
+                    if rowsAreOpaque { continue }
                 }
                 entry.tokenCount = max(0, Int(sqlite3_column_int64(stmt, 5)))
                 entry.isStableRoot = sqlite3_column_int64(stmt, 6) == 1
@@ -1371,23 +1416,33 @@ public final class DiskCache: @unchecked Sendable {
         defer { lock.unlock() }
         var result: [DiskCacheLegacyCompanion] = []
         // As in `quotaEntries()`: what is returned may be deleted by a path
-        // built from its key, so a key that is not one names nothing here.
-        var invalidKeys: [String] = []
-        defer { invalidKeys.forEach(_forgetInvalidCompanionKeyLocked) }
+        // built from its key, so a key that is not one names nothing here,
+        // and its record is retired by rowid.
+        var invalid = InvalidRecords()
+        defer { _retireInvalidRecordsLocked(invalid) }
         _queryLocked(
             """
             SELECT companion_key, companion_bytes,
-                   (created_at - 2440587.5) * 86400.0 AS recency, rowid AS seq
-            FROM cache_entries WHERE companion_key IS NOT NULL
+                   (created_at - 2440587.5) * 86400.0 AS recency, rowid AS seq, 0 AS unlinked
+            FROM cache_entries WHERE companion_key IS NOT NULL OR companion_bytes != 0
             UNION ALL
-            SELECT key, bytes, modified, rowid FROM legacy_companions
+            SELECT key, bytes, modified, rowid, 1 FROM legacy_companions
             ORDER BY recency ASC, seq ASC
             """
         ) { stmt in
-            guard let cKey = sqlite3_column_text(stmt, 0) else { return }
-            let key = String(cString: cKey)
-            guard SSMCompanionDiskStore.isEntryKey(key) else {
-                invalidKeys.append(key)
+            let key: String
+            switch Self.indexValue(stmt, column: 0, hexDigits: SSMCompanionDiskStore.keyLength) {
+            case .valid(let value):
+                key = value
+            case .unreadable:
+                return
+            case .null, .invalid:
+                let rowid = sqlite3_column_int64(stmt, 3)
+                if sqlite3_column_int64(stmt, 4) == 1 {
+                    invalid.legacy.append(rowid)
+                } else {
+                    invalid.links.append(rowid)
+                }
                 return
             }
             result.append(DiskCacheLegacyCompanion(
@@ -1469,33 +1524,213 @@ public final class DiskCache: @unchecked Sendable {
     // ``safetensorsURL(for:)`` / ``SSMCompanionDiskStore/entryURLs(key:in:)``,
     // which answer nil for anything this cache does not itself compute. Such
     // a value names no file: none is stat'ed, none is deleted, and the record
-    // that carries it is dropped so that it stops counting.
+    // that carries it is retired — by rowid, the one handle that works for
+    // every value — so that it stops counting. Under an index a newer build
+    // has claimed the record is opaque instead: counted, and left alone.
 
-    /// Caller holds `lock`. Not inside a statement that is still stepping
-    /// over `cache_entries`.
-    private func _dropRowWithInvalidHashLocked(_ hash: String) {
-        Self.reportInvalidIndexValue(hash, kind: .hash)
-        validatedFiles.removeValue(forKey: hash)
-        // Its companion, if it names a real one, stays counted as unlinked.
-        var companionKey: String?
-        if indexHasV2Columns {
-            _queryLocked(
-                "SELECT companion_key FROM cache_entries WHERE hash = ?", [.text(hash)]
-            ) { stmt in
-                companionKey = sqlite3_column_text(stmt, 0).map { String(cString: $0) }
-            }
-        }
-        let companionIsReal = companionKey.map(SSMCompanionDiskStore.isEntryKey) ?? false
-        if let companionKey, !companionIsReal {
-            Self.reportInvalidIndexValue(companionKey, kind: .companionKey)
-        }
-        _deleteEntryLocked(hash: hash, keepCompanionCounted: companionIsReal)
+    /// One index column that is about to be used as a name, judged on its
+    /// storage class and its BYTES — never through `String(cString:)`, which
+    /// stops at the first NUL and repairs invalid UTF-8. `<32 hex>\0junk`, a
+    /// BLOB of 32 hex bytes and a TEXT with a broken sequence all READ as
+    /// something they are not, and a statement that binds the String back
+    /// matches no row for any of them.
+    enum IndexValue: Equatable {
+        /// TEXT of exactly the expected number of lowercase hex digits.
+        case valid(String)
+        case null
+        /// Anything else. `shown` is a bounded rendering, for the log only.
+        case invalid(shown: String)
+        /// SQLite could not produce the column (out of memory). Says nothing
+        /// about the row, which is neither offered nor retired.
+        case unreadable
     }
 
-    /// Caller holds `lock`. Not inside a statement that is still stepping.
-    private func _forgetInvalidCompanionKeyLocked(_ key: String) {
-        Self.reportInvalidIndexValue(key, kind: .companionKey)
-        _forgetCompanionLocked(key: key)
+    static func indexValue(_ stmt: OpaquePointer, column: Int32, hexDigits: Int) -> IndexValue {
+        // The type first: it is undefined once a conversion has happened.
+        switch sqlite3_column_type(stmt, column) {
+        case SQLITE_NULL:
+            return .null
+        case SQLITE_TEXT:
+            guard let text = sqlite3_column_text(stmt, column) else { return .unreadable }
+            let bytes = Int(sqlite3_column_bytes(stmt, column))
+            // `bytes` counts every byte, embedded NULs included, so the
+            // C-string test below sees the whole value or is not run.
+            if bytes == hexDigits, isLowercaseHex(cString: text, count: hexDigits) {
+                return .valid(String(cString: text))
+            }
+            return .invalid(
+                shown: boundedRendering(
+                    of: UnsafeRawBufferPointer(start: text, count: bytes), asText: true))
+        case SQLITE_BLOB:
+            let blob = sqlite3_column_blob(stmt, column)
+            let bytes = Int(sqlite3_column_bytes(stmt, column))
+            return .invalid(
+                shown: boundedRendering(
+                    of: UnsafeRawBufferPointer(start: blob, count: blob == nil ? 0 : bytes),
+                    asText: false))
+        case SQLITE_INTEGER:
+            return .invalid(shown: "INTEGER \(sqlite3_column_int64(stmt, column))")
+        default:
+            return .invalid(shown: "REAL \(sqlite3_column_double(stmt, column))")
+        }
+    }
+
+    /// How many bytes of a hostile value a log line shows.
+    static let reportedValueByteLimit = 96
+
+    /// At most ``reportedValueByteLimit`` BYTES of the value, escaped.
+    /// Counting Characters bounds nothing: one grapheme can carry thousands
+    /// of combining marks.
+    static func boundedRendering(of bytes: UnsafeRawBufferPointer, asText: Bool) -> String {
+        let shownBytes = bytes.prefix(reportedValueByteLimit)
+        let body = asText
+            ? String(decoding: shownBytes, as: UTF8.self).debugDescription
+            : "x'" + shownBytes.map { String(format: "%02x", $0) }.joined() + "'"
+        return bytes.count > shownBytes.count ? "\(body)… (\(bytes.count) bytes)" : body
+    }
+
+    static func boundedRendering(of value: String) -> String {
+        var copy = value
+        return copy.withUTF8 { boundedRendering(of: UnsafeRawBufferPointer($0), asText: true) }
+    }
+
+    /// Records one read of the index found to name nothing, by `rowid`.
+    private struct InvalidRecords {
+        /// `cache_entries` rows whose `hash` is not a payload hash.
+        var entries: [Int64] = []
+        /// `cache_entries` rows whose hash is fine and whose companion link
+        /// is not: a key that is not a companion key, or bytes with no key.
+        var links: [Int64] = []
+        /// `legacy_companions` rows whose `key` is not a companion key.
+        var legacy: [Int64] = []
+
+        var isEmpty: Bool { entries.isEmpty && links.isEmpty && legacy.isEmpty }
+    }
+
+    /// Drop the rows, clear the links and forget the unlinked records that
+    /// name nothing — each BY ROWID, which is the only handle that works for
+    /// every value (see ``IndexValue``). Returns how many of each went.
+    ///
+    /// One transaction, all or nothing: a row's drop and the hand-over of
+    /// its companion (if that names a real one, it stays counted as
+    /// unlinked) cannot come apart. The rowids were read before the write
+    /// lock was taken, so each record is read again under it and retired
+    /// only if it still names nothing; a rowid another connection has
+    /// reused for a real row is left alone.
+    ///
+    /// Under an index a NEWER build has claimed nothing is retired: a value
+    /// this build cannot read may be how that build spells its names, and a
+    /// row dropped here is a payload it would later sweep as unindexed. The
+    /// callers do not offer such a record either, so it is counted and
+    /// otherwise left exactly as it is.
+    ///
+    /// `reconciling` is the import, which already holds the write lock in
+    /// its own transaction, and which settles every companion from what is
+    /// on disk — so nothing is handed over here.
+    ///
+    /// Caller holds `lock`, and no statement is still stepping.
+    @discardableResult
+    private func _retireInvalidRecordsLocked(
+        _ found: InvalidRecords, reconciling: Bool = false
+    ) -> (entries: Int, links: Int, legacy: Int) {
+        guard let db, !found.isEmpty, !indexIsFromANewerBuild else { return (0, 0, 0) }
+        if !reconciling {
+            guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
+                return (0, 0, 0)
+            }
+        }
+        var retired = (entries: 0, links: 0, legacy: 0)
+        var reports: [(shown: String, kind: InvalidIndexValueKind)] = []
+        var ok = true
+        func run(_ sql: String, _ rowid: Int64) {
+            ok = ok && _runLocked(sql, [.int(rowid)]) == SQLITE_DONE
+        }
+
+        for rowid in found.entries where ok {
+            var hash = IndexValue.unreadable
+            var key = IndexValue.null
+            ok = _queryLocked(
+                indexHasV2Columns
+                    ? "SELECT hash, companion_key FROM cache_entries WHERE rowid = ?"
+                    : "SELECT hash FROM cache_entries WHERE rowid = ?",
+                [.int(rowid)]
+            ) { stmt in
+                hash = Self.indexValue(stmt, column: 0, hexDigits: Self.hashLength)
+                if self.indexHasV2Columns {
+                    key = Self.indexValue(
+                        stmt, column: 1, hexDigits: SSMCompanionDiskStore.keyLength)
+                }
+            }
+            let shown: String
+            switch hash {
+            case .null: shown = "NULL"
+            case .invalid(let rendering): shown = rendering
+            case .valid, .unreadable: continue
+            }
+            reports.append((shown, .hash))
+            switch key {
+            case .valid where !reconciling:
+                run(Self.moveLinkedCompanionsToLegacySQL + " WHERE rowid = ?", rowid)
+            case .invalid(let rendering):
+                reports.append((rendering, .companionKey))
+            default:
+                break
+            }
+            run("DELETE FROM cache_entries WHERE rowid = ?", rowid)
+            retired.entries += 1
+        }
+        for rowid in found.links where ok && indexHasV2Columns {
+            var shown: String?
+            ok = _queryLocked(
+                "SELECT hash, companion_key, companion_bytes FROM cache_entries WHERE rowid = ?",
+                [.int(rowid)]
+            ) { stmt in
+                guard case .valid = Self.indexValue(stmt, column: 0, hexDigits: Self.hashLength)
+                else { return }
+                switch Self.indexValue(
+                    stmt, column: 1, hexDigits: SSMCompanionDiskStore.keyLength)
+                {
+                case .invalid(let rendering): shown = rendering
+                case .null where sqlite3_column_int64(stmt, 2) != 0: shown = "NULL"
+                default: break
+                }
+            }
+            guard let shown else { continue }
+            reports.append((shown, .companionKey))
+            run(
+                "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0 WHERE rowid = ?",
+                rowid)
+            retired.links += 1
+        }
+        for rowid in found.legacy where ok && indexHasV2Columns {
+            var shown: String?
+            ok = _queryLocked("SELECT key FROM legacy_companions WHERE rowid = ?", [.int(rowid)]) {
+                stmt in
+                switch Self.indexValue(
+                    stmt, column: 0, hexDigits: SSMCompanionDiskStore.keyLength)
+                {
+                case .invalid(let rendering): shown = rendering
+                case .null: shown = "NULL"
+                default: break
+                }
+            }
+            guard let shown else { continue }
+            reports.append((shown, .companionKey))
+            run("DELETE FROM legacy_companions WHERE rowid = ?", rowid)
+            retired.legacy += 1
+        }
+
+        if !reconciling {
+            guard ok, sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+                sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+                return (0, 0, 0)
+            }
+        }
+        // Reported once it is true.
+        for report in reports {
+            Self.reportInvalidIndexValue(shown: report.shown, kind: report.kind)
+        }
+        return retired
     }
 
     enum InvalidIndexValueKind: String {
@@ -1505,15 +1740,19 @@ public final class DiskCache: @unchecked Sendable {
 
     /// One line per distinct value per process, and only for the first
     /// ``rateLimitedReportLimit`` distinct values: a damaged index with a
-    /// million bad rows is not a million lines.
-    static func reportInvalidIndexValue(_ value: String, kind: InvalidIndexValueKind) {
-        guard isFirstReport("\(kind.rawValue)\u{0}\(value)", in: reportedInvalidIndexValues)
+    /// million bad rows is not a million lines. `shown` is already bounded
+    /// and escaped (``boundedRendering(of:asText:)``): the value is hostile
+    /// by definition.
+    static func reportInvalidIndexValue(shown: String, kind: InvalidIndexValueKind) {
+        guard isFirstReport("\(kind.rawValue)\u{0}\(shown)", in: reportedInvalidIndexValues)
         else { return }
-        // The value is hostile by definition: bounded, and escaped.
-        let shown = String(value.prefix(96)).debugDescription
         FileHandle.standardError.write(Data(
             ("[vmlx][cache/disk-index] \(kind.rawValue) \(shown) — it names no file of this "
                 + "cache; no file was looked at or removed\n").utf8))
+    }
+
+    static func reportInvalidIndexValue(_ value: String, kind: InvalidIndexValueKind) {
+        reportInvalidIndexValue(shown: boundedRendering(of: value), kind: kind)
     }
 
     static let rateLimitedReportLimit = 8
@@ -1624,34 +1863,55 @@ public final class DiskCache: @unchecked Sendable {
         }
 
         struct Row {
+            let rowid: Int64
             let hash: String
-            let companionKey: String?
+            /// nil when the row has none — or a link that names nothing (a
+            /// key that is not a companion key, or bytes with no key at
+            /// all), which `invalidCompanionKey` then renders.
+            var companionKey: String? = nil
             let companionBytes: Int64
+            var invalidCompanionKey: String? = nil
         }
         var rows: [Row] = []
+        // Rows whose hash is not a payload hash — TEXT of exactly 32 hex
+        // BYTES (``IndexValue``): NULL, a BLOB, an embedded NUL. They name no
+        // file, so none is looked at; they go by rowid below, or, under a
+        // newer build's index, stay exactly as they are.
+        var invalid = InvalidRecords()
+        // Real companions those rows link to. Under the current schema they
+        // are looked at like any other the index names; under a newer one
+        // they are the opaque row's, and are not counted a second time.
+        var companionsOfInvalidRows: [(key: String, bytes: Int64)] = []
         var sawUnreadableColumn = false
         let rowsWereRead = _queryLocked(
-            "SELECT hash, companion_key, companion_bytes FROM cache_entries"
+            "SELECT hash, companion_key, companion_bytes, rowid FROM cache_entries"
         ) { stmt in
-            // `sqlite3_column_text` returns NULL for SQL NULL and for an
-            // allocation failure; only the type, read first, tells them
-            // apart. A failed read of a hash would make its payload look
-            // unindexed. A row whose hash IS NULL (the column is a TEXT
-            // primary key, which SQLite lets be NULL) names no file: it can
-            // neither hide a payload from the sweep nor expose one to it.
-            let hashIsNull = sqlite3_column_type(stmt, 0) == SQLITE_NULL
-            let keyIsNull = sqlite3_column_type(stmt, 1) == SQLITE_NULL
-            let cHash = sqlite3_column_text(stmt, 0)
-            let cKey = sqlite3_column_text(stmt, 1)
-            if (cHash == nil && !hashIsNull) || (cKey == nil && !keyIsNull) {
+            // `.unreadable` is an allocation failure, not a value. A failed
+            // read of a hash would make its payload look unindexed.
+            let hash = Self.indexValue(stmt, column: 0, hexDigits: Self.hashLength)
+            let key = Self.indexValue(
+                stmt, column: 1, hexDigits: SSMCompanionDiskStore.keyLength)
+            if hash == .unreadable || key == .unreadable {
                 sawUnreadableColumn = true
                 return
             }
-            guard let cHash else { return }
-            rows.append(Row(
-                hash: String(cString: cHash),
-                companionKey: cKey.map { String(cString: $0) },
-                companionBytes: sqlite3_column_int64(stmt, 2)))
+            let rowid = sqlite3_column_int64(stmt, 3)
+            let companionBytes = sqlite3_column_int64(stmt, 2)
+            guard case .valid(let validHash) = hash else {
+                invalid.entries.append(rowid)
+                if case .valid(let validKey) = key {
+                    companionsOfInvalidRows.append((validKey, companionBytes))
+                }
+                return
+            }
+            var row = Row(rowid: rowid, hash: validHash, companionBytes: companionBytes)
+            switch key {
+            case .valid(let validKey): row.companionKey = validKey
+            case .invalid(let shown): row.invalidCompanionKey = shown
+            case .null where companionBytes != 0: row.invalidCompanionKey = "NULL"
+            case .null, .unreadable: break
+            }
+            rows.append(row)
         }
         // Everything below treats "not in `rows`" as "not indexed", and the
         // payload sweep deletes on it. A read that failed part-way must not
@@ -1664,7 +1924,8 @@ public final class DiskCache: @unchecked Sendable {
         // reason there is no sweep this time.
         var payloadNames: [String] = []
         var sweepSkipped: String?
-        if indexSchemaVersion > DiskCacheIndexSchema.currentVersion {
+        let rowsAreOpaque = indexIsFromANewerBuild
+        if rowsAreOpaque {
             sweepSkipped =
                 "index schema version \(indexSchemaVersion) is newer than this build's "
                 + "\(DiskCacheIndexSchema.currentVersion); its payloads may be named another way"
@@ -1686,14 +1947,9 @@ public final class DiskCache: @unchecked Sendable {
         // for the sweep of the next import.
         var liveRows: [Row] = []
         var rowsWithoutPayload: [Row] = []
-        // A hash that is not a payload hash names no file: nothing is looked
-        // at for it, and the row goes (see `_dropRowWithInvalidHashLocked`).
-        var rowsWithInvalidHash: [Row] = []
         for row in rows {
-            guard let url = safetensorsURL(for: row.hash) else {
-                rowsWithInvalidHash.append(row)
-                continue
-            }
+            // Every hash in `rows` is a payload hash; this cannot fail.
+            guard let url = safetensorsURL(for: row.hash) else { continue }
             switch Self.pathState(at: url) {
             case .missing:
                 rowsWithoutPayload.append(row)
@@ -1711,6 +1967,7 @@ public final class DiskCache: @unchecked Sendable {
         // and nothing is looked at twice.
         let legacyRead = _readLegacyCompanionsLocked()
         let recordedLegacy = legacyRead.valid
+        invalid.legacy = legacyRead.invalidRowids
         var onDisk = Dictionary(
             companions.map { ($0.hash, $0) }, uniquingKeysWith: { first, _ in first })
         struct Named {
@@ -1722,15 +1979,14 @@ public final class DiskCache: @unchecked Sendable {
             row.companionKey.map { Named(key: $0, kvHash: row.hash, bytes: row.companionBytes) }
         }
         named += recordedLegacy.map { Named(key: $0.key, kvHash: nil, bytes: $0.bytes) }
+        if !rowsAreOpaque {
+            named += companionsOfInvalidRows.map { Named(key: $0.key, kvHash: nil, bytes: $0.bytes) }
+        }
         let companionDirectory = walkedDirectory ?? self.companionDirectory
+        // Every key in `named` is a companion key: one that is not was never
+        // read into a String, is never looked for on disk, and what follows
+        // clears the link that carries it.
         for record in named {
-            // The same for a key: it is never looked for on disk, and what
-            // follows clears the link that carries it.
-            guard SSMCompanionDiskStore.isEntryKey(record.key) else {
-                Self.reportInvalidIndexValue(record.key, kind: .companionKey)
-                onDisk[record.key] = nil
-                continue
-            }
             let walked = onDisk[record.key]
             if let walked, walked.bytes == record.bytes { continue }
             switch SSMCompanionDiskStore.publishedEntryState(
@@ -1761,30 +2017,34 @@ public final class DiskCache: @unchecked Sendable {
         }
 
         for row in rowsWithoutPayload {
-            _runLocked("DELETE FROM cache_entries WHERE hash = ?", [.text(row.hash)])
+            _runLocked("DELETE FROM cache_entries WHERE rowid = ?", [.int(row.rowid)])
             validatedFiles.removeValue(forKey: row.hash)
             summary.rowsDeletedForMissingPayload += 1
         }
-        // Its companion, if real, is on disk and in `reconciled` with no
-        // live row to join, so it is counted as unlinked below.
-        for row in rowsWithInvalidHash {
-            Self.reportInvalidIndexValue(row.hash, kind: .hash)
-            _runLocked("DELETE FROM cache_entries WHERE hash = ?", [.text(row.hash)])
-            validatedFiles.removeValue(forKey: row.hash)
-            summary.rowsDroppedForInvalidHash += 1
-        }
-        for key in legacyRead.invalidKeys {
-            _forgetInvalidCompanionKeyLocked(key)
-            summary.legacyDroppedForInvalidKey += 1
-        }
+        // By rowid, inside this transaction; nothing under a newer build's
+        // index. A dropped row's companion, if real, is on disk and in
+        // `reconciled` with no live row to join, so it is counted as
+        // unlinked below.
+        let retired = _retireInvalidRecordsLocked(invalid, reconciling: true)
+        summary.rowsDroppedForInvalidHash += retired.entries
+        summary.legacyDroppedForInvalidKey += retired.legacy
 
         // One companion per row. Keys are content-addressed over the same
         // tokens as the row hash, so a second claimant cannot arise from this
         // build; if one exists anyway it is counted as unlinked.
-        let liveHashes = Set(liveRows.map(\.hash))
+        //
+        // Under a newer build's index a link this build cannot read stays as
+        // it is: its row takes no other companion, and a companion an opaque
+        // row links to is that row's — not an unlinked one to count again
+        // and evict from under it.
+        let opaqueLinkHashes = rowsAreOpaque
+            ? Set(liveRows.filter { $0.invalidCompanionKey != nil }.map(\.hash)) : []
+        let opaquelyLinkedKeys = rowsAreOpaque ? Set(companionsOfInvalidRows.map(\.key)) : []
+        let liveHashes = Set(liveRows.map(\.hash)).subtracting(opaqueLinkHashes)
         var linkByHash: [String: SSMCompanionQuotaEntry] = [:]
         var unlinked: [SSMCompanionQuotaEntry] = []
-        for companion in reconciled.sorted(by: { $0.hash < $1.hash }) {
+        for companion in reconciled.sorted(by: { $0.hash < $1.hash })
+        where !opaquelyLinkedKeys.contains(companion.hash) {
             if let kvHash = companion.kvHash, liveHashes.contains(kvHash),
                linkByHash[kvHash] == nil
             {
@@ -1794,7 +2054,10 @@ public final class DiskCache: @unchecked Sendable {
             }
         }
 
-        for row in liveRows {
+        for row in liveRows where !opaqueLinkHashes.contains(row.hash) {
+            if let shown = row.invalidCompanionKey {
+                Self.reportInvalidIndexValue(shown: shown, kind: .companionKey)
+            }
             if let companion = linkByHash[row.hash] {
                 let bytes = max(0, companion.bytes)
                 if row.companionKey != companion.hash || row.companionBytes != bytes {
@@ -1802,10 +2065,10 @@ public final class DiskCache: @unchecked Sendable {
                         kvHash: row.hash, companionKey: companion.hash, bytes: bytes)
                     summary.linksWritten += 1
                 }
-            } else if row.companionKey != nil || row.companionBytes != 0 {
+            } else if row.companionKey != nil || row.invalidCompanionKey != nil {
                 _runLocked(
-                    "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0 WHERE hash = ?",
-                    [.text(row.hash)])
+                    "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0 WHERE rowid = ?",
+                    [.int(row.rowid)])
                 summary.linksCleared += 1
             }
         }
@@ -1954,11 +2217,13 @@ public final class DiskCache: @unchecked Sendable {
 
         var removed = Set<String>()
         for hash in hashes {
-            // Not a payload hash: no path, no file, and the row is dropped
-            // rather than "evicted" — it is not in the returned set, so its
-            // claimed bytes are not reported as reclaimed.
+            // Not a payload hash: no path, no file, and nothing "evicted"
+            // — it is not in the returned set, so no bytes are reported as
+            // reclaimed for it. `quotaEntries()` never offers such a value
+            // (it retires the row that carries it, by rowid); this is the
+            // second layer, and a String cannot address that row anyway.
             guard let url = safetensorsURL(for: hash) else {
-                _dropRowWithInvalidHashLocked(hash)
+                Self.reportInvalidIndexValue(hash, kind: .hash)
                 continue
             }
             let payloadGone = Self.removeCacheFile(at: url)
@@ -1969,8 +2234,10 @@ public final class DiskCache: @unchecked Sendable {
                 _queryLocked(
                     "SELECT companion_key FROM cache_entries WHERE hash = ?", [.text(hash)]
                 ) { stmt in
-                    if let cKey = sqlite3_column_text(stmt, 0) {
-                        companionRemoved = removedCompanions.contains(String(cString: cKey))
+                    if case .valid(let key) = Self.indexValue(
+                        stmt, column: 0, hexDigits: SSMCompanionDiskStore.keyLength)
+                    {
+                        companionRemoved = removedCompanions.contains(key)
                     }
                 }
             }
@@ -2078,14 +2345,13 @@ public final class DiskCache: @unchecked Sendable {
         // files the index has stopped counting.
         var doomed = Set<String>()
         _ = _queryLocked("SELECT hash FROM cache_entries") { stmt in
-            guard let text = sqlite3_column_text(stmt, 0) else { return }
-            // A row's hash is data; only one that is a payload hash
-            // becomes a path. Every row is deleted below either way.
-            let hash = String(cString: text)
-            if Self.isPayloadHash(hash) {
-                doomed.insert(hash + Self.payloadSuffix)
-            } else {
-                Self.reportInvalidIndexValue(hash, kind: .hash)
+            // A row's hash is data; only one that is a payload hash, byte
+            // for byte, becomes a name. Every row is deleted below either way.
+            switch Self.indexValue(stmt, column: 0, hexDigits: Self.hashLength) {
+            case .valid(let hash): doomed.insert(hash + Self.payloadSuffix)
+            case .invalid(let shown): Self.reportInvalidIndexValue(shown: shown, kind: .hash)
+            case .null: Self.reportInvalidIndexValue(shown: "NULL", kind: .hash)
+            case .unreadable: break
             }
         }
         var skipped: String?
@@ -2196,9 +2462,12 @@ public final class DiskCache: @unchecked Sendable {
     }
 
     /// The payload path for `hash`, or nil when `hash` is not a payload
-    /// hash. This is the ONLY place a hash becomes a path, and it is why a
-    /// hash read from the index can be handed to it: `../../x`, an empty
-    /// string or `model-00001-of-00008` gets no path at all.
+    /// hash. Every path that `fetch`, a store, a quota pass or the import
+    /// builds from a hash comes from here, which is why a hash read from the
+    /// index can be handed to it: `../../x`, an empty string or
+    /// `model-00001-of-00008` gets no path at all. (`clear()` spells the
+    /// name itself, to put it in one set with the names it lists — behind
+    /// the same test, ``IndexValue/valid(_:)``.)
     private func safetensorsURL(for hash: String) -> URL? {
         guard Self.isPayloadHash(hash) else { return nil }
         return cacheDir.appendingPathComponent(hash + Self.payloadSuffix)
@@ -2333,15 +2602,14 @@ public final class DiskCache: @unchecked Sendable {
 
     static func pathState(at url: URL) -> PathState {
         var info = stat()
-        let rc = url.withUnsafeFileSystemRepresentation { path -> Int32 in
-            guard let path else {
-                errno = EINVAL
-                return -1
-            }
-            return lstat(path, &info)
+        // `errno` is read inside the closure, next to the call that set it:
+        // by the time the closure has returned, the path buffer has been
+        // released, and that may have overwritten it.
+        let code = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return EINVAL }
+            return lstat(path, &info) == 0 ? 0 : errno
         }
-        guard rc == 0 else {
-            let code = errno
+        guard code == 0 else {
             return code == ENOENT ? .missing : .unreadable(errno: code)
         }
         guard (info.st_mode & S_IFMT) == S_IFREG else { return .notRegularFile }
@@ -2361,14 +2629,10 @@ public final class DiskCache: @unchecked Sendable {
     /// fails on a directory instead of descending into it. Returns 0, or
     /// the errno.
     static func unlinkFile(at url: URL) -> Int32 {
-        let rc = url.withUnsafeFileSystemRepresentation { path -> Int32 in
-            guard let path else {
-                errno = EINVAL
-                return -1
-            }
-            return unlink(path)
+        url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return EINVAL }
+            return unlink(path) == 0 ? 0 : errno
         }
-        return rc == 0 ? 0 : errno
     }
 
     /// `rename(2)`: atomic, replaces a regular file, replaces a symlink
@@ -2377,16 +2641,12 @@ public final class DiskCache: @unchecked Sendable {
     /// refuses an existing destination, and `replaceItemAt` is not this
     /// call.) Returns 0, or the errno.
     static func renameFile(from source: URL, to destination: URL) -> Int32 {
-        let rc = source.withUnsafeFileSystemRepresentation { from -> Int32 in
+        source.withUnsafeFileSystemRepresentation { from -> Int32 in
             destination.withUnsafeFileSystemRepresentation { to -> Int32 in
-                guard let from, let to else {
-                    errno = EINVAL
-                    return -1
-                }
-                return rename(from, to)
+                guard let from, let to else { return EINVAL }
+                return rename(from, to) == 0 ? 0 : errno
             }
         }
-        return rc == 0 ? 0 : errno
     }
 
     /// What became of one path that carries one of this cache's names.
@@ -2443,19 +2703,29 @@ public final class DiskCache: @unchecked Sendable {
 
     /// POSIX calls rather than `FileHandle`, so that the reason a read failed
     /// is an errno and "could not read" stays apart from "read, and wrong".
+    ///
+    /// Only a regular file is read. `O_NONBLOCK` is there for what is not
+    /// one: without it, `open` on a FIFO waits for a writer that never comes
+    /// (it changes nothing for a regular file).
     private static func readHeader(url: URL) -> HeaderRead {
-        let fd = url.withUnsafeFileSystemRepresentation { path -> Int32 in
-            guard let path else {
-                errno = EINVAL
-                return -1
-            }
-            return open(path, O_RDONLY | O_CLOEXEC)
+        let opened = url.withUnsafeFileSystemRepresentation { path -> (fd: Int32, errno: Int32) in
+            guard let path else { return (-1, EINVAL) }
+            let fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+            return (fd, fd < 0 ? errno : 0)
         }
-        guard fd >= 0 else { return .unreadable(errno: errno) }
+        guard opened.fd >= 0 else { return .unreadable(errno: opened.errno) }
+        let fd = opened.fd
         defer { close(fd) }
 
         var info = stat()
         guard fstat(fd, &info) == 0 else { return .unreadable(errno: errno) }
+        guard (info.st_mode & S_IFMT) == S_IFREG else {
+            #if canImport(Darwin)
+            return .unreadable(errno: EFTYPE)
+            #else
+            return .unreadable(errno: EINVAL)
+            #endif
+        }
 
         // nil: the read failed, and `readFailure` says why. Fewer bytes than
         // asked for: end of file.
@@ -2464,12 +2734,13 @@ public final class DiskCache: @unchecked Sendable {
             var data = Data(count: count)
             var filled = 0
             while filled < count {
-                let got = data.withUnsafeMutableBytes { buffer in
-                    read(fd, buffer.baseAddress! + filled, count - filled)
+                let (got, code) = data.withUnsafeMutableBytes { buffer -> (Int, Int32) in
+                    let got = read(fd, buffer.baseAddress! + filled, count - filled)
+                    return (got, got < 0 ? errno : 0)
                 }
                 if got < 0 {
-                    if errno == EINTR { continue }
-                    readFailure = errno
+                    if code == EINTR { continue }
+                    readFailure = code
                     return nil
                 }
                 if got == 0 { break }
@@ -2481,7 +2752,13 @@ public final class DiskCache: @unchecked Sendable {
         guard let lengthData = readBytes(8) else { return .unreadable(errno: readFailure) }
         guard lengthData.count == 8 else { return .malformed }
         let declared = lengthData.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
-        guard declared > 0, declared < 256 * 1024 * 1024 else { return .malformed }
+        // Against the file's own size BEFORE anything is allocated for it: a
+        // length field is eight hostile bytes, and the buffer below is
+        // zero-filled. A header that does not fit in its file is malformed.
+        let available = Int64(info.st_size) - 8
+        guard declared > 0, declared < 256 * 1024 * 1024, available > 0,
+            declared <= UInt64(available)
+        else { return .malformed }
         let headerLength = Int(declared)
         guard let headerData = readBytes(headerLength) else {
             return .unreadable(errno: readFailure)
@@ -2493,17 +2770,33 @@ public final class DiskCache: @unchecked Sendable {
     }
 
     /// One past the last tensor byte the header declares, relative to the
-    /// start of the file; nil when an entry is not a tensor description.
-    private static func declaredPayloadEnd(headerLength: Int, tensors: [String: Any]) -> Int? {
+    /// start of the file; nil when an entry is not a tensor description —
+    /// which includes offsets that are not whole numbers, are negative, run
+    /// backwards, or do not fit in an `Int` once the header is added. The
+    /// header is a file's contents, and the file is whatever sits in a
+    /// directory the user chose: `[0, 9223372036854775807]` made the sum
+    /// below TRAP, in a sweep that runs at every open.
+    static func declaredPayloadEnd(headerLength: Int, tensors: [String: Any]) -> Int? {
+        func offset(_ value: Any) -> Int? {
+            guard let number = value as? NSNumber else { return nil }
+            // Exactly an Int64: 15.5, 1e300 and 2^64-1 all have an
+            // `int64Value`, and none of them round-trips.
+            let whole = number.int64Value
+            guard NSNumber(value: whole) == number, whole >= 0 else { return nil }
+            return Int(exactly: whole)
+        }
+        guard headerLength >= 0 else { return nil }
         var end = 0
         for (key, value) in tensors where key != "__metadata__" {
             guard let tensor = value as? [String: Any],
                 let offsets = tensor["data_offsets"] as? [Any], offsets.count == 2,
-                let last = (offsets[1] as? NSNumber)?.intValue
+                let first = offset(offsets[0]), let last = offset(offsets[1]), last >= first
             else { return nil }
             end = max(end, last)
         }
-        return 8 + headerLength + end
+        let (prefix, prefixOverflow) = headerLength.addingReportingOverflow(8)
+        let (total, totalOverflow) = prefix.addingReportingOverflow(end)
+        return prefixOverflow || totalOverflow ? nil : total
     }
 
     /// The byte offset one past the last tensor payload the file's own
@@ -2789,22 +3082,26 @@ public final class DiskCache: @unchecked Sendable {
 
     private func _legacyCompanionsLocked() -> [DiskCacheLegacyCompanion] {
         // See `quotaEntries()`: a key that is not a companion key names
-        // nothing, is not offered to anyone, and is forgotten.
+        // nothing, is not offered to anyone, and is forgotten by rowid.
         let read = _readLegacyCompanionsLocked()
-        read.invalidKeys.forEach(_forgetInvalidCompanionKeyLocked)
+        _retireInvalidRecordsLocked(InvalidRecords(legacy: read.invalidRowids))
         return read.valid
     }
 
     private func _readLegacyCompanionsLocked()
-        -> (valid: [DiskCacheLegacyCompanion], invalidKeys: [String])
+        -> (valid: [DiskCacheLegacyCompanion], invalidRowids: [Int64])
     {
         var result: [DiskCacheLegacyCompanion] = []
-        var invalidKeys: [String] = []
-        _queryLocked("SELECT key, bytes, modified FROM legacy_companions") { stmt in
-            guard let cKey = sqlite3_column_text(stmt, 0) else { return }
-            let key = String(cString: cKey)
-            guard SSMCompanionDiskStore.isEntryKey(key) else {
-                invalidKeys.append(key)
+        var invalidRowids: [Int64] = []
+        _queryLocked("SELECT key, bytes, modified, rowid FROM legacy_companions") { stmt in
+            let key: String
+            switch Self.indexValue(stmt, column: 0, hexDigits: SSMCompanionDiskStore.keyLength) {
+            case .valid(let value):
+                key = value
+            case .unreadable:
+                return
+            case .null, .invalid:
+                invalidRowids.append(sqlite3_column_int64(stmt, 3))
                 return
             }
             result.append(DiskCacheLegacyCompanion(
@@ -2812,7 +3109,7 @@ public final class DiskCache: @unchecked Sendable {
                 bytes: max(0, sqlite3_column_int64(stmt, 1)),
                 modifiedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2))))
         }
-        return (result, invalidKeys)
+        return (result, invalidRowids)
     }
 
     /// Whole-root usage: two aggregates, no row materialization.
@@ -2847,9 +3144,9 @@ public final class DiskCache: @unchecked Sendable {
             nil) == SQLITE_OK
         else { return nil }
         defer { sqlite3_finalize(stmt) }
-        _ = hash.withCString { cStr in
-            sqlite3_bind_text(stmt, 1, cStr, -1, nil)
-        }
+        // TRANSIENT: the statement is stepped after this String's buffer
+        // may be gone (a nil destructor is SQLITE_STATIC).
+        sqlite3_bind_text(stmt, 1, hash, -1, Self.sqliteTransient)
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         return (
             tokenCount: Int(sqlite3_column_int64(stmt, 0)),
@@ -2917,9 +3214,7 @@ public final class DiskCache: @unchecked Sendable {
         defer { sqlite3_finalize(stmt) }
         let julianDay = date.timeIntervalSince1970 / 86_400 + 2_440_587.5
         sqlite3_bind_double(stmt, 1, julianDay)
-        _ = hash.withCString { cStr in
-            sqlite3_bind_text(stmt, 2, cStr, -1, nil)
-        }
+        sqlite3_bind_text(stmt, 2, hash, -1, Self.sqliteTransient)
         guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
         return sqlite3_changes(db) > 0
     }
@@ -2952,41 +3247,67 @@ public final class DiskCache: @unchecked Sendable {
     ///
     /// Below the cap this is one SQL aggregate. Over it, every row is read:
     /// a row whose hash is not a payload hash names no file, so it is
-    /// dropped — not evicted — before anything real pays for the bytes it
-    /// claims.
+    /// retired by rowid — not evicted — and nothing real pays for the bytes
+    /// it claims, whether or not the retirement could be written. Under a
+    /// newer build's index such a row is opaque instead: its bytes count,
+    /// it is never a victim, and only rows this build understands go.
     private func _evictIfNeededLocked() {
         guard let db else { return }
 
-        func indexedBytes() -> Int64 {
-            var total: Int64 = 0
-            _queryLocked("SELECT COALESCE(SUM(file_size), 0) FROM cache_entries") { stmt in
-                total = sqlite3_column_int64(stmt, 0)
-            }
-            return total
+        var indexedBytes: Int64 = 0
+        _queryLocked("SELECT COALESCE(SUM(file_size), 0) FROM cache_entries") { stmt in
+            indexedBytes = sqlite3_column_int64(stmt, 0)
         }
-        guard indexedBytes() > Int64(maxSizeBytes) else { return }
+        guard indexedBytes > Int64(maxSizeBytes) else { return }
 
+        let rowsAreOpaque = indexIsFromANewerBuild
         var oldestFirst: [(hash: String, url: URL, fileSize: Int64)] = []
-        var invalidHashes: [String] = []
+        var invalid = InvalidRecords()
+        var understoodBytes: Int64 = 0
+        var opaqueBytes: Int64 = 0
         var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT hash, file_size FROM cache_entries ORDER BY created_at ASC", -1, &stmt, nil) == SQLITE_OK {
+        let sql = indexHasV2Columns
+            ? "SELECT hash, file_size, rowid, companion_key FROM cache_entries ORDER BY created_at ASC"
+            : "SELECT hash, file_size, rowid FROM cache_entries ORDER BY created_at ASC"
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt {
             while sqlite3_step(stmt) == SQLITE_ROW {
-                guard let cStr = sqlite3_column_text(stmt, 0) else { continue }
-                let hash = String(cString: cStr)
-                if let url = safetensorsURL(for: hash) {
-                    oldestFirst.append((hash, url, sqlite3_column_int64(stmt, 1)))
+                let fileSize = sqlite3_column_int64(stmt, 1)
+                var victim: (hash: String, url: URL)?
+                switch Self.indexValue(stmt, column: 0, hexDigits: Self.hashLength) {
+                case .valid(let hash):
+                    // Dropping a row hands its companion key on; one a newer
+                    // build wrote in a shape this build cannot read stays
+                    // where it is, with its row.
+                    var linkIsOpaque = false
+                    if rowsAreOpaque, indexHasV2Columns,
+                       case .invalid = Self.indexValue(
+                           stmt, column: 3, hexDigits: SSMCompanionDiskStore.keyLength)
+                    {
+                        linkIsOpaque = true
+                    }
+                    if !linkIsOpaque, let url = safetensorsURL(for: hash) {
+                        victim = (hash, url)
+                    }
+                case .null, .invalid:
+                    invalid.entries.append(sqlite3_column_int64(stmt, 2))
+                case .unreadable:
+                    break
+                }
+                if let victim {
+                    oldestFirst.append((victim.hash, victim.url, fileSize))
+                    understoodBytes += fileSize
                 } else {
-                    invalidHashes.append(hash)
+                    opaqueBytes += max(0, fileSize)
                 }
             }
         }
         sqlite3_finalize(stmt)
-        invalidHashes.forEach(_dropRowWithInvalidHashLocked)
+        _retireInvalidRecordsLocked(invalid)
 
         // Delete evicted entries and their files. A payload that could not
         // be deleted keeps its row (see `removeQuotaEntries`); it is tried
         // once per pass and its bytes are not made up for by evicting more.
-        var remaining = indexedBytes()
+        var remaining = understoodBytes + (rowsAreOpaque ? opaqueBytes : 0)
         for entry in oldestFirst {
             guard remaining > Int64(maxSizeBytes) else { break }
             remaining -= entry.fileSize

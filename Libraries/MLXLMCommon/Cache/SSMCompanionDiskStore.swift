@@ -137,23 +137,30 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
 
     // MARK: - Initialization
 
-    /// `sweepUnpublishedAtOpen` is false when the index of the root this
-    /// directory belongs to has been claimed by a newer build
-    /// (``DiskCache/indexIsFromANewerBuild``): nothing is then removed from
-    /// a listing at open, here or in the root.
+    /// `sweepUnpublishedAtOpen` is false, and `rootIndexIsFromANewerBuild`
+    /// true, when the index of the root this directory belongs to has been
+    /// claimed by a newer build (``DiskCache/indexIsFromANewerBuild``):
+    /// nothing is then removed from a LISTING of this directory — not at
+    /// open, and not by ``clear()`` — here or in the root. The fact is
+    /// passed in because a store does not always have a ledger to ask.
     public init(
         cacheDir: URL, modelKey: String? = nil, maxBytes: Int = 0,
-        sweepUnpublishedAtOpen: Bool = true
+        sweepUnpublishedAtOpen: Bool = true,
+        rootIndexIsFromANewerBuild: Bool = false
     ) throws {
         self.cacheDir = cacheDir
         self.modelKey = modelKey
         self.maxBytes = maxBytes
+        self.rootIndexIsFromANewerBuild = rootIndexIsFromANewerBuild
         try FileManager.default.createDirectory(
             at: cacheDir, withIntermediateDirectories: true)
-        if sweepUnpublishedAtOpen {
+        if sweepUnpublishedAtOpen, !rootIndexIsFromANewerBuild {
             Self.sweepUnpublishedFiles(in: cacheDir)
         }
     }
+
+    /// See ``init(cacheDir:modelKey:maxBytes:sweepUnpublishedAtOpen:rootIndexIsFromANewerBuild:)``.
+    let rootIndexIsFromANewerBuild: Bool
 
     /// Tensor files are written under a `.partial-` name and renamed into
     /// place, so one that still carries that name at open is a dead write —
@@ -506,11 +513,17 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         guard maxBytes > 0 else { return [] }
         guard ledger.companionUsageBytes() > Int64(maxBytes) else { return [] }
 
-        // Reading the list drops every record whose key is not an entry key
-        // (it names no file), so the total is read again after it: bytes
-        // that name nothing must not be paid for by a real companion.
+        // Reading the list retires every record whose key is not an entry
+        // key (it names no file). The total is what the list offers, so
+        // bytes that name nothing are never paid for by a real companion,
+        // whether or not the retirement could be written — except under a
+        // newer build's index, where such a record is opaque: counted, and
+        // never offered.
         let oldestFirst = ledger.companionsOldestFirst()
-        var total = ledger.companionUsageBytes()
+        var total = oldestFirst.reduce(Int64(0)) { $0 + $1.bytes }
+        if ledger.indexIsFromANewerBuild {
+            total = max(total, ledger.companionUsageBytes())
+        }
         var evicted = Set<String>()
         for companion in oldestFirst {
             guard total > Int64(maxBytes) else { break }
@@ -896,9 +909,29 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     /// Remove all entries for a given model key. Called on model
     /// unload so subsequent loads don't see stale state. No-op if the
     /// directory is empty.
+    ///
+    /// Under an index a newer build has claimed, nothing is removed from a
+    /// LISTING of the directory, as in the root (``DiskCache/clear()``):
+    /// only the companions the index names, by the path built from each
+    /// key, and only those are forgotten. A key this build cannot read
+    /// names nothing here and stays where it is.
     public func clear() {
-        let ledger = removeEveryEntry()
-        ledger?.forgetAllCompanions()
+        guard rootIndexIsFromANewerBuild else {
+            let ledger = removeEveryEntry()
+            ledger?.forgetAllCompanions()
+            return
+        }
+        lock.lock()
+        let ledger = self.ledger
+        validatedEntries.removeAll(keepingCapacity: true)
+        lock.unlock()
+        let named = Set(ledger?.companionsOldestFirst().map(\.key) ?? [])
+        let stillOnDisk = removeQuotaEntries(hashes: named)
+        ledger?.forgetCompanions(keys: named.subtracting(stillOnDisk))
+        FileHandle.standardError.write(Data(
+            ("[vmlx][cache/ssm-store] clear skipped: the root's index is from a newer build — "
+                + "nothing is removed from a listing of \(cacheDir.lastPathComponent), only the "
+                + "\(named.count) companion(s) the index names\n").utf8))
     }
 
     /// Forget which pairs this process has validated; see

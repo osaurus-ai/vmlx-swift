@@ -241,7 +241,8 @@ public final class CacheCoordinator: @unchecked Sendable {
                 cacheDir: ssmDir,
                 modelKey: config.modelKey,
                 maxBytes: ssmMaxBytes,
-                sweepUnpublishedAtOpen: !(self.diskCache?.indexIsFromANewerBuild ?? false))
+                sweepUnpublishedAtOpen: !(self.diskCache?.indexIsFromANewerBuild ?? false),
+                rootIndexIsFromANewerBuild: self.diskCache?.indexIsFromANewerBuild ?? false)
         }
 
         importCompanionAccountingOncePerRoot()
@@ -1574,8 +1575,19 @@ public final class CacheCoordinator: @unchecked Sendable {
         }
         let rowsMs = msSince(passStart)
 
+        // The planner sees the rows this build understands. Under a newer
+        // build's index the others are opaque — counted, never offered — so
+        // what they hold comes off the cap the understood rows share. (Under
+        // the current schema a record that names nothing has just been
+        // retired; if that could not be written, nothing real pays for it.)
+        var planCap = maxBytes
+        if diskCache.indexIsFromANewerBuild {
+            let understood = rows.reduce(Int64(0)) { $0 + $1.bytes }
+            planCap = max(0, maxBytes - max(0, diskCache.usageBytes() - understood))
+        }
+
         let selectStart = DispatchTime.now().uptimeNanoseconds
-        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: maxBytes, activeChain: activeChain)
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: planCap, activeChain: activeChain)
         let selectMs = msSince(selectStart)
         guard !plan.evict.isEmpty else { return }
 
@@ -1666,7 +1678,18 @@ public final class CacheCoordinator: @unchecked Sendable {
         let kvHashes = Set(kvEntries.map(\.hash))
         var companionEntries = companionStore.quotaEntries()
 
-        let orphaned = companionEntries.filter {
+        // Under a newer build's index a row this build cannot read is not
+        // in `kvEntries`, so "no such row" proves nothing about a companion:
+        // none is removed on sight, and the opaque rows' payload bytes come
+        // off the cap the understood groups share.
+        let rowsAreOpaque = diskCache.indexIsFromANewerBuild
+        let opaqueBytes = rowsAreOpaque
+            ? max(
+                0,
+                Int64(diskCache.snapshotStats().currentPayloadBytes)
+                    - kvEntries.reduce(Int64(0)) { $0 + $1.bytes })
+            : 0
+        let orphaned = rowsAreOpaque ? [] : companionEntries.filter {
             guard let kvHash = $0.kvHash else { return false }
             return !kvHashes.contains(kvHash)
         }
@@ -1708,7 +1731,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 priority: companion.kvHash == nil ? 0 : 1))
         }
 
-        let plan = Self.groupsToEvict(from: groups, maxBytes: maxBytes)
+        let plan = Self.groupsToEvict(from: groups, maxBytes: max(0, maxBytes - opaqueBytes))
         guard !plan.evicted.isEmpty else { return }
 
         let evictKV = plan.evicted.reduce(into: Set<String>()) { $0.formUnion($1.kvHashes) }

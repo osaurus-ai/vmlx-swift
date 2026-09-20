@@ -252,7 +252,34 @@ extension DiskCacheCompanionAccountingTests {
                 #expect(Self.invalidHashLines(log).count == hostile.hashes.count, "\(log)")
                 #expect(
                     disk.snapshotStats().evictions == 0, "a dropped hostile row is not an eviction")
+                try Self.expectThePassStillEvicts(
+                    coordinator: coordinator, disk: disk, oldest: controls[0])
             }
+        }
+
+        /// The positive control of the quota-pass tests: the pass that left
+        /// every victim alone is one that CAN delete. Real entries that do
+        /// not fit are evicted, oldest first, and counted.
+        private static func expectThePassStillEvicts(
+            coordinator: CacheCoordinator, disk: DiskCache, oldest: [Int],
+            sourceLocation: SourceLocation = #_sourceLocation
+        ) throws {
+            let before = disk.snapshotStats().evictions
+            // Three of these do not fit under the cap together.
+            for seed in 0 ..< 3 {
+                Thread.sleep(forTimeInterval: 0.02)
+                coordinator.storePersistentBoundary(
+                    tokens: Self.tokens(1_291 + seed, seed: 9_990 + seed),
+                    diskArrays: Self.kv(100_003), ssmStates: nil)
+            }
+            #expect(
+                disk.snapshotStats().evictions > before,
+                "INVALID: the quota pass evicted nothing when real entries did not fit",
+                sourceLocation: sourceLocation)
+            #expect(
+                disk.fetch(tokens: oldest) == nil, "INVALID: the oldest real entry was not evicted",
+                sourceLocation: sourceLocation)
+            #expect(disk.usageBytes() <= cap, sourceLocation: sourceLocation)
         }
 
         /// `DiskCache`'s own quota on a direct store: `_evictIfNeededLocked`.
@@ -547,6 +574,8 @@ extension DiskCacheCompanionAccountingTests {
                     modelKey: modelKey,
                     after: "the coordinator's index quota pass (\(placement.rawValue))")
                 #expect(Self.invalidKeyLines(log).count == hostile.keys.count, "\(log)")
+                try Self.expectThePassStillEvicts(
+                    coordinator: coordinator, disk: disk, oldest: controls[0])
             }
         }
 
