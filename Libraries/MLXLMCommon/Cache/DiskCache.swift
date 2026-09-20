@@ -8,6 +8,12 @@ import os
 
 /// Thread-safe snapshot of ``DiskCache`` counters.
 public struct DiskCacheStats: Sendable {
+    /// Disk entries served to an engine. One that the engine then reported
+    /// as not restorable is taken out again (``rejectedDiskRestores``). One
+    /// that it abandoned for a reason of the REQUEST's — a media placeholder
+    /// left in the suffix, a missing seed state for an exact hit — is still
+    /// counted here although the turn prefilled the whole prompt: the entry
+    /// was fine, and nothing is reported for it.
     public let hits: Int
     public let misses: Int
     public let stores: Int
@@ -68,7 +74,8 @@ public struct DiskCacheStats: Sendable {
     /// the running model's cache and reported back
     /// (``CacheCoordinator/reportDiskRestoreRejected(tokens:boundary:mediaSalt:reason:)``).
     /// Each one was first counted in ``hits`` and has been taken out of it
-    /// again, so ``hits`` counts restores that were used.
+    /// again. ``hits`` still includes hits that were abandoned for reasons
+    /// of the request's, which are not rejections.
     public let rejectedDiskRestores: Int
     /// Rejections counted in ``rejectedDiskRestores`` whose payload this
     /// process had itself written after an earlier rejection of the same

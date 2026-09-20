@@ -965,14 +965,25 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// process ends; nothing is deleted and recency is left as it is:
     ///
     /// - `fetch` passes over the entry, so the longest entry that does
-    ///   restore wins;
-    /// - the entry counts as neither validated nor durable, so the store at
-    ///   the end of the turn writes the boundary again, and that store lifts
-    ///   the mark (as does a payload another process has replaced);
+    ///   restore wins — from the NEXT fetch on: nothing is fetched again in
+    ///   the turn that found out, which prefills the whole prompt;
+    /// - the entry counts as neither validated nor durable, so a store of
+    ///   that boundary writes it again, and that store lifts the mark (as
+    ///   does a payload another process has replaced). Whether such a store
+    ///   comes depends on the turn: only a boundary in this turn's store set
+    ///   is written — the prompt itself (an exact re-send), a stable prefix,
+    ///   a ladder rung. A refused boundary from earlier in the history is in
+    ///   no later turn's set, and just stays passed over until the process
+    ///   ends;
+    /// - that rewrite happens once per entry per process. If what was
+    ///   written is refused as well, the entry stays passed over and counts
+    ///   as durable, so it is not written again
+    ///   (``DiskCacheStats/rejectedRewritesSuppressed``);
     /// - the hit is taken back out of ``DiskCacheStats/hits`` and counted in
     ///   ``DiskCacheStats/rejectedDiskRestores``.
     ///
-    /// A report for an entry that is not there changes nothing.
+    /// A report for an entry that is not there, or whose payload is no
+    /// longer the one `fetch` served, changes nothing.
     ///
     /// - Parameters:
     ///   - tokens: The token sequence that was fetched.
