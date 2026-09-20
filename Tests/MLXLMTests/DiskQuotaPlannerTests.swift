@@ -1319,7 +1319,6 @@ extension DiskQuotaPlannerTests {
         #expect(plan.evict == ["absurd"], "the normal row fits and must survive")
         #expect(plan.totalBefore == .max)
         #expect(plan.totalAfter == 4096, "what is left is counted exactly")
-        #expect(plan.evictedBytes == plan.totalBefore - plan.totalAfter)
     }
 
     @Test func severalSaturatedRowsNeverTrapInEitherDirection() {
@@ -1354,6 +1353,10 @@ extension DiskQuotaPlannerTests {
         #expect(plan.totalBefore == 6_001)
         #expect(!plan.evict.isEmpty, "the negative row hid 6 001 bytes over a 5 000 cap")
         #expect(plan.totalAfter <= 5_000 && plan.totalAfter >= 0)
-        #expect(plan.evictedBytes == plan.totalBefore - plan.totalAfter)
+        // Summed here, from the rows: the negative one is 0 bytes.
+        let bytes = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, max(0, $0.bytes)) })
+        let evicted = plan.evict.reduce(Int64(0)) { $0 + (bytes[$1] ?? 0) }
+        #expect(evicted > 0 && plan.evictedBytes == evicted)
+        #expect(plan.totalAfter == 6_001 - evicted)
     }
 }

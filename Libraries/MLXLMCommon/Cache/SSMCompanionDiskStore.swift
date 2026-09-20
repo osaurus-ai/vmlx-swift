@@ -523,19 +523,33 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         // Opaque bytes that reach the cap evict every companion this build
         // writes, straight after its write. That stands; it is said once.
         let oldestFirst = ledger.companionsOldestFirst()
-        var total = IndexedBytes.total(oldestFirst.lazy.map(\.bytes))
+        var opaqueBytes: Int64 = 0
         if ledger.indexIsFromANewerBuild {
-            let counted = ledger.companionUsageBytes()
+            opaqueBytes = IndexedBytes.difference(
+                ledger.companionUsageBytes(), IndexedBytes.total(oldestFirst.lazy.map(\.bytes)))
             ledger.reportOpaqueBytes(
-                IndexedBytes.difference(counted, total), capBytes: Int64(maxBytes),
-                of: "companion cap")
-            total = max(total, counted)
+                opaqueBytes, capBytes: Int64(maxBytes), of: "companion cap")
         }
+        // A record that claims more than the whole cap can never fit, and
+        // goes FIRST, as in the other two passes (`DiskCache`'s own and the
+        // coordinator's): read oldest first, one absurd count on the NEWEST
+        // record kept the total over the cap while every real companion was
+        // taken ahead of it. What is left is then counted, not subtracted
+        // from a total that may have saturated.
+        let offeredCap = IndexedBytes.difference(Int64(maxBytes), opaqueBytes)
         var evicted = Set<String>()
+        var remaining: Int64 = 0
         for companion in oldestFirst {
-            guard total > Int64(maxBytes) else { break }
+            if companion.bytes > offeredCap {
+                evicted.insert(companion.key)
+            } else {
+                remaining = IndexedBytes.sum(remaining, companion.bytes)
+            }
+        }
+        for companion in oldestFirst where companion.bytes <= offeredCap {
+            guard remaining > offeredCap else { break }
             evicted.insert(companion.key)
-            total = IndexedBytes.difference(total, companion.bytes)
+            remaining = IndexedBytes.difference(remaining, companion.bytes)
         }
         // Files first, rows after (by the caller): dying in between leaves
         // rows naming files that are gone — an over-count the next import

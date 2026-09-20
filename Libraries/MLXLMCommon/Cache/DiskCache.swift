@@ -31,7 +31,9 @@ public struct DiskCacheStats: Sendable {
     ///
     /// Also counted: a retirement of records that name nothing which could
     /// not be written. Those records stay counted until one can; no file is
-    /// involved, and nothing real is evicted to make up for them.
+    /// involved, and nothing real is evicted to make up for them. And a row
+    /// that was to be dropped and stayed, because its companion could not be
+    /// handed to the unlinked list: it goes the next time that can be written.
     public let failedIndexWrites: Int
     /// Bytes of the logical cache boundaries counted in ``evictions``: what
     /// quota enforcement has really removed from disk in this process.
@@ -1459,6 +1461,10 @@ public final class DiskCache: @unchecked Sendable {
         defer { sqlite3_finalize(stmt) }
 
         while sqlite3_step(stmt) == SQLITE_ROW {
+            // Read before anything can skip the row: a negative count on a
+            // row that is not offered hides other rows' bytes all the same,
+            // and reading it is what switches the aggregate over.
+            let bytes = _indexedBytesLocked(stmt, 1)
             let hash: String
             switch Self.indexValue(stmt, column: 0, hexDigits: Self.hashLength) {
             case .valid(let value):
@@ -1469,7 +1475,6 @@ public final class DiskCache: @unchecked Sendable {
                 invalid.entries.append(sqlite3_column_int64(stmt, rowidColumn))
                 continue
             }
-            let bytes = _indexedBytesLocked(stmt, 1)
             var entry = DiskCacheQuotaEntry(
                 hash: hash,
                 bytes: bytes,
@@ -1917,7 +1922,12 @@ public final class DiskCache: @unchecked Sendable {
     ) -> (entries: Int, links: Int, legacy: Int) {
         guard let db, !found.isEmpty, !indexIsFromANewerBuild else { return (0, 0, 0) }
         if !reconciling {
-            if let retireNotBefore, now() < retireNotBefore { return (0, 0, 0) }
+            // A wait longer than the interval is not one this cache set: the
+            // wall clock has gone backwards since, and the back-off is over.
+            if let retireNotBefore {
+                let wait = retireNotBefore.timeIntervalSince(now())
+                if wait > 0, wait <= retireRetryInterval { return (0, 0, 0) }
+            }
             retireAttemptsForTesting += 1
             guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
                 _retirementFailedLocked(String(cString: sqlite3_errmsg(db)), backingOff: true)
@@ -2040,7 +2050,12 @@ public final class DiskCache: @unchecked Sendable {
     /// A retirement changed nothing (or, in the import, less than it meant
     /// to). Counted every time; said once per root and reason per process —
     /// a failure that lasts would otherwise be a line per store.
+    ///
+    /// `reason` is SQLite's message, which a trigger in the index can word:
+    /// it is shown — and remembered — bounded and escaped, like every other
+    /// value that comes out of the index.
     private func _retirementFailedLocked(_ reason: String, backingOff: Bool) {
+        let reason = Self.boundedRendering(of: reason)
         failedIndexWrites += 1
         if backingOff { retireNotBefore = now().addingTimeInterval(retireRetryInterval) }
         guard Self.isFirstReport("\(cacheDir.path)\u{0}\(reason)", in: Self.reportedRetireFailures)
@@ -3417,10 +3432,11 @@ public final class DiskCache: @unchecked Sendable {
     // So: a count is read through ``_indexedBytesLocked(_:_:)`` and summed
     // through ``IndexedBytes``, and a usage aggregate is ``_usageSQLLocked(_:)``.
 
-    /// One byte count from the index: `sqlite3_column_int64` saturates a REAL
-    /// (and answers 0 for NULL, and for TEXT or a BLOB that is not a
-    /// number); a negative count is 0 bytes — and from then on this cache
-    /// sums with the clamping aggregate. Caller holds `lock`.
+    /// One byte count from the index: `sqlite3_column_int64` saturates a REAL,
+    /// answers 0 for NULL, and reads TEXT or a BLOB as the integer it starts
+    /// with (`'-9000000000abc'` is -9 000 000 000; no digits, 0). A negative
+    /// count is 0 bytes — and from then on this cache sums with the clamping
+    /// aggregate. Caller holds `lock`.
     private func _indexedBytesLocked(_ stmt: OpaquePointer, _ column: Int32) -> Int64 {
         let raw = sqlite3_column_int64(stmt, column)
         if raw < 0 { indexNeedsClampedUsage = true }
@@ -3443,12 +3459,18 @@ public final class DiskCache: @unchecked Sendable {
     /// runs is therefore clamped from the next such read, or the next
     /// launch, and hides other rows' bytes until then.
     ///
-    /// In the clamping form `MAX(x, 0)` makes a negative count 0 and leaves
-    /// NULL, TEXT and BLOB to `TOTAL`, which counts them as 0 as well; the
-    /// columns are summed apart, so a NULL in one cannot swallow the other.
+    /// The clamping form is `MAX(CAST(x AS INTEGER), 0)`. The cast is what
+    /// makes it agree with the row reads: a count can be TEXT or a BLOB
+    /// (`'-9000000000abc'` is no number, so the INTEGER column keeps it),
+    /// `MAX` of a TEXT and an INTEGER is the TEXT, whatever it says, and
+    /// `TOTAL` then reads that as -9 000 000 000. Cast first, it is the same
+    /// integer `sqlite3_column_int64` reads — a REAL saturates here too —
+    /// and a negative one is 0. NULL stays NULL through both, which `TOTAL`
+    /// skips; the columns are summed apart, so a NULL in one cannot swallow
+    /// the other.
     private func _usageSQLLocked(_ columns: String...) -> String {
         indexNeedsClampedUsage
-            ? columns.map { "TOTAL(MAX(\($0), 0))" }.joined(separator: " + ")
+            ? columns.map { "TOTAL(MAX(CAST(\($0) AS INTEGER), 0))" }.joined(separator: " + ")
             : "TOTAL(\(columns.joined(separator: " + ")))"
     }
 
@@ -3461,22 +3483,29 @@ public final class DiskCache: @unchecked Sendable {
     }
 
     /// Whether the index holds a byte count the plain aggregate would get
-    /// wrong: a negative one, or a NULL (`x + NULL` is NULL, and takes the
-    /// row's other count with it). One scan, at open; a read, so it answers
-    /// while another connection holds the write lock.
+    /// wrong: a negative one, a NULL (`x + NULL` is NULL, and takes the
+    /// row's other count with it), or one that is not stored as an INTEGER
+    /// (TEXT and BLOB compare greater than every number, so `x < 0` alone
+    /// never finds `'-9000000000abc'`). One scan, at open; a read, so it
+    /// answers while another connection holds the write lock. A check that
+    /// could not be run has found nothing out, and answers true: the
+    /// clamping form is right for every index, only slower.
     private func _indexHoldsCountsToClampLocked() -> Bool {
+        func suspect(_ column: String) -> String {
+            "CAST(\(column) AS INTEGER) < 0 OR \(column) IS NULL "
+                + "OR typeof(\(column)) NOT IN ('integer')"
+        }
         var found = false
-        _queryLocked(
+        let answered = _queryLocked(
             indexHasV2Columns
                 ? """
                     SELECT EXISTS(SELECT 1 FROM cache_entries
-                                  WHERE file_size < 0 OR file_size IS NULL
-                                     OR companion_bytes < 0 OR companion_bytes IS NULL)
-                        OR EXISTS(SELECT 1 FROM legacy_companions WHERE bytes < 0 OR bytes IS NULL)
+                                  WHERE \(suspect("file_size")) OR \(suspect("companion_bytes")))
+                        OR EXISTS(SELECT 1 FROM legacy_companions WHERE \(suspect("bytes")))
                     """
-                : "SELECT EXISTS(SELECT 1 FROM cache_entries WHERE file_size < 0)"
+                : "SELECT EXISTS(SELECT 1 FROM cache_entries WHERE \(suspect("file_size")))"
         ) { stmt in found = sqlite3_column_int64(stmt, 0) != 0 }
-        return found
+        return found || !answered
     }
 
     // MARK: - Companion accounting helpers (caller holds `lock`)
@@ -3672,13 +3701,22 @@ public final class DiskCache: @unchecked Sendable {
     /// standalone eviction) the row's companion is handed to the unlinked
     /// list. Its bytes stay counted and the combined quota retires it first,
     /// instead of the files silently leaving the accounting.
+    ///
+    /// A hand-over that could not be written leaves the row where it is, for
+    /// the next caller to try again: the row is all that still counts the
+    /// companion's bytes, and the index may over-count the disk but never
+    /// under-counts it.
     private func _deleteEntryLocked(hash: String, keepCompanionCounted: Bool = true) {
         guard db != nil else { return }
         if indexHasV2Columns, keepCompanionCounted {
-            _runLocked(
+            let rc = _runLocked(
                 Self.moveLinkedCompanionsToLegacySQL
                     + " WHERE hash = ? AND companion_key IS NOT NULL",
                 [.text(hash)])
+            guard rc == SQLITE_DONE else {
+                failedIndexWrites += 1
+                return
+            }
         }
         _runLocked("DELETE FROM cache_entries WHERE hash = ?", [.text(hash)])
     }

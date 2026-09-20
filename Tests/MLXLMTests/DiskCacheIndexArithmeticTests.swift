@@ -550,14 +550,81 @@ extension DiskCacheCompanionAccountingTests {
             }
         }
 
+        /// A count can be TEXT or a BLOB: `'-9000000000abc'` is not a number,
+        /// so the INTEGER column keeps it as it is. Read as a number it is
+        /// -9 000 000 000 — by `+`, by `TOTAL`, by `sqlite3_column_int64` —
+        /// while `MAX('-9000000000abc', 0)` compares a TEXT with an INTEGER
+        /// and answers the TEXT. Both aggregates were nine gigabytes short,
+        /// for good. Found at open, and found by a row read while running.
+        @Test(arguments: [false, true])
+        func aNegativeCountStoredAsTextOrBlobIsZeroBytesAndHidesNothing(
+            plantedWhileRunning: Bool
+        ) throws {
+            try MLXMetalTestLock.withLock {
+                let root = Self.makeRoot("text-blob-\(plantedWhileRunning)")
+                defer { try? FileManager.default.removeItem(at: root) }
+                let modelKey = "index-arith-text-blob-\(plantedWhileRunning)"
+                let entries = [
+                    Self.tokens(301, seed: 9_061), Self.tokens(517, seed: 9_062),
+                    Self.tokens(1_003, seed: 9_063), Self.tokens(1_291, seed: 9_064),
+                    Self.tokens(2_003, seed: 9_065),
+                ]
+                let elements = [1_009, 2_003, 3_001, 4_099, 5_003]
+                let hashes = entries.map { DiskCache.hashTokens($0, modelKey: modelKey) }
+                let writer = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
+                for (tokens, count) in zip(entries, elements) {
+                    writer.store(tokens: tokens, arrays: Self.kv(count))
+                }
+                let sizes = hashes.map { Support.fileBytes(Support.payloadURL(root, $0)) }
+                try #require(sizes.allSatisfy { $0 > 0 }, "INVALID: a payload is missing")
+                try #require(writer.usageBytes() == sizes.reduce(0, +), "INVALID fixture")
+                let real = sizes[0] + sizes[2] + sizes[4]
+                try #require(real > 0)
+
+                let raw = try RawDB(root: root)
+                try raw.require(
+                    "UPDATE cache_entries SET file_size = '-9000000000abc' WHERE hash = '\(hashes[1])'")
+                try raw.require(
+                    """
+                    UPDATE cache_entries SET file_size = CAST('-9000000000' AS BLOB)
+                    WHERE hash = '\(hashes[3])'
+                    """)
+                try Self.requireStored(
+                    raw, column: "file_size", as: "text", where: "hash = '\(hashes[1])'")
+                try Self.requireStored(
+                    raw, column: "file_size", as: "blob", where: "hash = '\(hashes[3])'")
+
+                let disk: DiskCache
+                if plantedWhileRunning {
+                    disk = writer
+                    // Any read of the rows sees the counts for what they are.
+                    #expect(
+                        disk.quotaEntries(retiringInvalidRecords: false).map(\.bytes).sorted()
+                            == [0, 0, sizes[0], sizes[2], sizes[4]])
+                } else {
+                    disk = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
+                }
+                #expect(disk.usageBytes() == real)
+                #expect(disk.snapshotStats().currentPayloadBytes == Int(real))
+                #expect(disk.snapshotStats().currentEntryCount == 5, "nothing was dropped")
+            }
+        }
+
         /// The clamp is not free (a third of the aggregate, on every store
         /// and every stats poll), so the plain aggregate is used until a
         /// count that needs clamping has been SEEN. At open that is one scan
         /// (the tests above); while running it is a total that comes back
         /// negative, or any read of the rows.
+        ///
+        /// Until then there is a window, and it is accepted: a negative count
+        /// another writer plants while this process runs, too small to turn
+        /// the total negative, takes that much off the usage until the next
+        /// read of the rows (an over-cap pass, a stats poll of the
+        /// coordinator) or the next launch. The first assertion of each arm
+        /// states what usage reads inside the window.
         @Test func aNegativeCountPlantedWhileRunningIsClampedOnceItIsSeen() throws {
             try MLXMetalTestLock.withLock {
-                for (label, planted) in [("huge", "-5000000000"), ("small", "-1009")] {
+                for (label, planted) in [("huge", -5_000_000_000), ("small", -1_009)] {
                     let root = Self.makeRoot("negative-live-\(label)")
                     defer { try? FileManager.default.removeItem(at: root) }
                     let modelKey = "index-arith-negative-live-\(label)"
@@ -574,14 +641,44 @@ extension DiskCacheCompanionAccountingTests {
                         "UPDATE cache_entries SET file_size = \(planted) WHERE hash = '\(hashes[1])'"
                     )
 
-                    if label == "huge" {
-                        // The plain total is negative: that alone is seen.
-                        #expect(disk.usageBytes() == 2 * size, "\(label)")
-                    }
+                    // Before any row is read. A total that comes back
+                    // negative is seen by that alone; a small one is not,
+                    // and is short by what was planted.
+                    #expect(
+                        disk.usageBytes() == (label == "huge" ? 2 * size : 2 * size - 1_009),
+                        "\(label): inside the window")
                     #expect(disk.quotaEntries().map(\.bytes).sorted() == [0, size, size])
                     #expect(disk.usageBytes() == 2 * size, "\(label): still hiding other rows")
                     #expect(disk.snapshotStats().currentPayloadBytes == Int(2 * size), "\(label)")
                 }
+            }
+        }
+
+        /// The same on a row that is not even offered: a hash that is not a
+        /// payload hash, read by a poll that may not retire it. Its negative
+        /// count is seen all the same, and stops hiding the real rows' bytes.
+        @Test func aNegativeCountOnARowThatNamesNothingIsSeenToo() throws {
+            try MLXMetalTestLock.withLock {
+                let root = Self.makeRoot("negative-live-unnamed")
+                defer { try? FileManager.default.removeItem(at: root) }
+                let modelKey = "index-arith-negative-live-unnamed"
+                let disk = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
+                let entries = [Self.tokens(301, seed: 9_058), Self.tokens(517, seed: 9_059)]
+                for tokens in entries { disk.store(tokens: tokens, arrays: Self.kv(1_009)) }
+                let real = disk.usageBytes()
+                try #require(real > 2 * 1_009, "INVALID fixture")
+                try RawDB(root: root).require(
+                    """
+                    INSERT INTO cache_entries (hash, token_count, file_size, created_at)
+                    VALUES ('not-a-hash', 307, -1009, 2440587.5)
+                    """)
+                try #require(disk.usageBytes() == real - 1_009, "INVALID: not inside the window")
+
+                let offered = disk.quotaEntries(retiringInvalidRecords: false)
+                try #require(offered.count == 2, "INVALID: the unnamed row was offered")
+                try #require(try Self.hostileRowCount(root) == 1, "INVALID: the row was retired")
+                #expect(disk.usageBytes() == real)
+                #expect(disk.snapshotStats().currentPayloadBytes == Int(real))
             }
         }
 
@@ -883,6 +980,203 @@ extension DiskCacheCompanionAccountingTests {
                 #expect(disk.fetch(tokens: linked) != nil)
                 #expect(disk.fetch(tokens: plain) != nil)
                 try Support.expectUsageMatchesDisk(disk, root: root)
+            }
+        }
+
+        // MARK: - O5: what the second review found
+
+        /// The companion store's own cap read its records oldest first. One
+        /// unlinked record that claims `Int64.max` bytes — the NEWEST one —
+        /// kept the total saturated while every real companion was evicted
+        /// ahead of it. A record that can never fit goes first, as in both
+        /// other passes, and what is left is counted again.
+        @Test func anAbsurdCompanionRecordGoesFirstAndCostsNoRealCompanion() throws {
+            try MLXMetalTestLock.withLock {
+                let root = Self.makeRoot("absurd-companion")
+                defer { try? FileManager.default.removeItem(at: root) }
+                let modelKey = "index-arith-absurd-companion"
+                let ledger = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
+                try #require(ledger.indexHasV2Columns)
+                let directory = Support.companionDir(root)
+                let entries = (0 ..< 10).map { Self.tokens(301, seed: 9_071 + $0) }
+                let keys = entries.map {
+                    SSMCompanionDiskStore.keyFor(tokens: $0, boundary: $0.count, modelKey: modelKey)
+                }
+
+                let sizing = try SSMCompanionDiskStore(
+                    cacheDir: directory, modelKey: modelKey, maxBytes: 0)
+                sizing.attachLedger(ledger)
+                try sizing.store(
+                    ssmStates: Self.recurrent(4_099), tokens: entries[0], boundary: 301)
+                let one = Support.companionBytes(root, keys[0])
+                try #require(one > 4 * 4_099, "INVALID: no companion")
+
+                // Room for the ten, and not for an eleventh.
+                let store = try SSMCompanionDiskStore(
+                    cacheDir: directory, modelKey: modelKey, maxBytes: Int(10 * one + one / 2))
+                store.attachLedger(ledger)
+                for tokens in entries.dropFirst() {
+                    try store.store(
+                        ssmStates: Self.recurrent(4_099), tokens: tokens, boundary: 301)
+                }
+                let real = keys.map { Support.companionBytes(root, $0) }
+                try #require(real.allSatisfy { $0 > 0 }, "INVALID: the cap already evicted")
+                try #require(ledger.companionUsageBytes() == real.reduce(0, +), "INVALID fixture")
+
+                let absurd = SSMCompanionDiskStore.keyFor(
+                    tokens: Self.tokens(307, seed: 9_099), boundary: 307, modelKey: modelKey)
+                try RawDB(root: root).require(
+                    """
+                    INSERT INTO legacy_companions (key, bytes, modified)
+                    VALUES ('\(absurd)', 9223372036854775807, \(Date().timeIntervalSince1970 + 3_600))
+                    """)
+                try #require(ledger.companionUsageBytes() == .max, "INVALID: not over the cap")
+
+                // A direct write is what applies this cap; re-storing the
+                // newest companion adds no bytes.
+                try store.store(
+                    ssmStates: Self.recurrent(4_099), tokens: entries[9], boundary: 301)
+
+                #expect(keys.map { Support.companionBytes(root, $0) } == real)
+                #expect(try Self.legacyRecords(root).map(\.key).sorted() == keys.sorted())
+                #expect(ledger.companionUsageBytes() == real.reduce(0, +))
+            }
+        }
+
+        /// Dropping a row hands its companion to the unlinked list first, so
+        /// the companion's bytes stay counted. When that hand-over cannot be
+        /// written the row stays: the index may over-count what is on disk,
+        /// and never under-counts it.
+        @Test func aRowWhoseCompanionCannotBeHandedOverIsNotDropped() throws {
+            try MLXMetalTestLock.withLock {
+                let root = Self.makeRoot("handover-fails")
+                defer { try? FileManager.default.removeItem(at: root) }
+                let modelKey = "index-arith-handover-fails"
+                let coordinator = Self.coordinator(root: root, modelKey: modelKey)
+                let disk = try #require(coordinator.diskCache)
+                let tokens = Self.tokens(301, seed: 9_081)
+                coordinator.storePersistentBoundary(
+                    tokens: tokens, diskArrays: Self.kv(1_009), ssmStates: Self.recurrent(4_099))
+                let hash = DiskCache.hashTokens(tokens, modelKey: modelKey)
+                let key = SSMCompanionDiskStore.keyFor(
+                    tokens: tokens, boundary: tokens.count, modelKey: modelKey)
+                let companionBytes = Support.companionBytes(root, key)
+                try #require(companionBytes > 0, "INVALID: no companion")
+                let raw = try RawDB(root: root)
+                try #require(
+                    try raw.rows("SELECT companion_key FROM cache_entries WHERE hash = '\(hash)'")
+                        == [[key]], "INVALID: the row carries no link")
+
+                // The payload goes; the fetch that finds it missing drops
+                // the row — handing the companion over first.
+                try FileManager.default.removeItem(at: Support.payloadURL(root, hash))
+                try raw.require(
+                    """
+                    CREATE TRIGGER refuse_handover BEFORE INSERT ON legacy_companions
+                    BEGIN SELECT RAISE(ABORT, 'refused by a trigger'); END
+                    """)
+                try #require(disk.fetch(tokens: tokens) == nil)
+                #expect(
+                    try raw.rows("SELECT companion_key FROM cache_entries WHERE hash = '\(hash)'")
+                        == [[key]], "the row went and took the companion's bytes with it")
+                #expect(try Self.legacyRecords(root).isEmpty)
+                #expect(disk.companionUsageBytes() == companionBytes)
+
+                // Control: once the hand-over can be written, the same fetch
+                // drops the row and the companion stays counted.
+                try raw.require("DROP TRIGGER refuse_handover")
+                try #require(disk.fetch(tokens: tokens) == nil)
+                #expect(try raw.rows("SELECT 1 FROM cache_entries WHERE hash = '\(hash)'").isEmpty)
+                #expect(try Self.legacyRecords(root).map(\.key) == [key])
+                #expect(disk.companionUsageBytes() == companionBytes)
+            }
+        }
+
+        /// The back-off is a wall-clock time. A clock that is set BACKWARDS
+        /// must not stretch it: a wait longer than the interval is not one
+        /// this cache asked for.
+        @Test func aClockSetBackwardsDoesNotStretchTheRetireBackOff() throws {
+            try MLXMetalTestLock.withLock {
+                let root = Self.makeRoot("retire-clock")
+                defer { try? FileManager.default.removeItem(at: root) }
+                let modelKey = "index-arith-retire-clock"
+                let clock = TestClock()
+                let coordinator = Self.coordinator(
+                    root: root, modelKey: modelKey, busyTimeoutMs: 50, clock: clock)
+                let disk = try #require(coordinator.diskCache)
+                coordinator.storePersistentBoundary(
+                    tokens: Self.tokens(301, seed: 9_085), diskArrays: Self.kv(1_009),
+                    ssmStates: nil)
+                try RawDB(root: root).require(
+                    """
+                    INSERT INTO cache_entries (hash, token_count, file_size, created_at)
+                    VALUES (NULL, 307, \(2 * Self.cap), 2440587.5)
+                    """)
+                try #require(disk.usageBytes() > Self.cap, "INVALID: not over the cap")
+
+                let blocker = try RawDB(root: root)
+                try blocker.require("BEGIN IMMEDIATE")
+                DiskCache.resetRateLimitedReportsForTesting()
+                _ = try Support.capturingStandardError { coordinator.enforceCombinedDiskQuota() }
+                try blocker.require("ROLLBACK")
+                try #require(disk.retireAttemptsForTesting == 1, "INVALID: no failed attempt")
+                try #require(try Self.hostileRowCount(root) == 1)
+
+                // Control: inside the interval nothing is tried.
+                clock.advance(by: 11)
+                coordinator.enforceCombinedDiskQuota()
+                try #require(disk.retireAttemptsForTesting == 1, "INVALID: no back-off to stretch")
+
+                // A day backwards: the back-off now ends a day and 49 s away.
+                clock.advance(by: -86_411)
+                coordinator.enforceCombinedDiskQuota()
+                #expect(disk.retireAttemptsForTesting == 2)
+                #expect(try Self.hostileRowCount(root) == 0)
+                #expect(disk.usageBytes() < Self.cap)
+            }
+        }
+
+        /// Why a retirement failed is SQLite's message, and a trigger in the
+        /// index writes that message: it is data, and is shown bounded and
+        /// escaped like every other value from the index.
+        @Test func theReasonARetirementFailedIsShownBoundedAndEscaped() throws {
+            try MLXMetalTestLock.withLock {
+                let root = Self.makeRoot("retire-reason")
+                defer { try? FileManager.default.removeItem(at: root) }
+                let modelKey = "index-arith-retire-reason"
+                let coordinator = Self.coordinator(root: root, modelKey: modelKey)
+                let disk = try #require(coordinator.diskCache)
+                coordinator.storePersistentBoundary(
+                    tokens: Self.tokens(301, seed: 9_087), diskArrays: Self.kv(1_009),
+                    ssmStates: nil)
+                let raw = try RawDB(root: root)
+                try raw.require(
+                    """
+                    INSERT INTO cache_entries (hash, token_count, file_size, created_at)
+                    VALUES (NULL, 307, \(2 * Self.cap), 2440587.5)
+                    """)
+                let forged = "[vmlx][cache/forged] a line of its own"
+                let message = "kept\n\(forged) " + String(repeating: "A", count: 301)
+                try raw.require(
+                    """
+                    CREATE TRIGGER keep_null_hash BEFORE DELETE ON cache_entries
+                    WHEN OLD.hash IS NULL
+                    BEGIN SELECT RAISE(ABORT, '\(message)'); END
+                    """)
+                try #require(disk.usageBytes() > Self.cap, "INVALID: not over the cap")
+
+                DiskCache.resetRateLimitedReportsForTesting()
+                let (_, log) = try Support.capturingStandardError {
+                    coordinator.enforceCombinedDiskQuota()
+                }
+                try #require(try Self.hostileRowCount(root) == 1, "INVALID: the trigger did not hold")
+                let lines = Self.retireFailureLines(log)
+                try #require(lines.count == 1, "INVALID: no retire failure was logged: \(log)")
+                let line = String(lines[0])
+                #expect(line.contains("kept\\n"), "the newline was not escaped: \(line)")
+                #expect(!log.split(separator: "\n").contains { $0.hasPrefix(forged) }, "\(log)")
+                #expect(line.contains("… (\(message.utf8.count) bytes)"), "\(line)")
+                #expect(!line.contains(String(repeating: "A", count: 97)), "\(line)")
             }
         }
 
