@@ -428,65 +428,310 @@ struct DiskPrefixMatchSelectionTests {
     /// the runtime cache has two, so the restore is refused (0 tokens) and the
     /// engine prefills everything — while a shorter, restorable entry exists.
     ///
-    /// Pinned as it is today: nothing tells the coordinator. The next fetch
-    /// serves the same entry and counts another hit, the entry counts as
-    /// durable, and a store of the same boundary with the same layout is
-    /// skipped, so nothing replaces it. (A store whose layout differs is
-    /// written even today; `hasDurableDiskEntry` does not look at the layout.)
-    @Test func acceptedThenRejectedEntryShadowsShorterOne() throws {
+    /// Until the engine says so, nothing changes: the entry is served again
+    /// and counted again (that half is the control). Once it has reported the
+    /// rejection, the shorter entry wins, the refused hit is taken back, and
+    /// the next store of the boundary replaces the payload and lifts the mark.
+    @Test func rejectedRestoreLetsTheShorterEntryWin() throws {
         try MLXMetalTestLock.withLock {
             let root = Self.makeRoot("shadow")
             defer { try? FileManager.default.removeItem(at: root) }
             let modelKey = "prefix-shadow"
             let coordinator = Self.coordinator(root: root, modelKey: modelKey)
-            let prompt = Self.chain(37)
+            let fixture = try Self.storeShadowingFixture(coordinator)
+            let prompt = fixture.prompt
             let longTokens = Array(prompt.prefix(11))
-            let shortTokens = Array(prompt.prefix(5))
-
-            let oneLayer = Self.attentionCache(layers: 1, tokens: 11, fill: 1)
-            let twoLayers = Self.attentionCache(layers: 2, tokens: 5, fill: 3)
-            coordinator.storeAfterGeneration(
-                promptTokens: longTokens, perLayerData: [], ssmStates: nil, cache: oneLayer)
-            coordinator.storeAfterGeneration(
-                promptTokens: shortTokens, perLayerData: [], ssmStates: nil, cache: twoLayers)
-            try #require(try Self.indexedTokenCounts(root) == [5, 11])
-
-            // Control: the short entry restores into a two-layer cache, so
-            // the refusal below is the long entry's and not the fixture's.
-            let disk = try #require(coordinator.diskCache)
-            var control: [any KVCache] = [KVCacheSimple(), KVCacheSimple()]
-            let shortArrays = try #require(
-                disk.fetch(tokens: shortTokens, touchRecency: false, countHit: false))
-            try #require(
-                restoreFromDiskArrays(shortArrays, into: &control, requirePromptBoundary: true) == 5
-            )
 
             let before = try Self.diskStats(coordinator)
             let first = try #require(Self.diskMatch(coordinator.fetch(tokens: prompt)))
             #expect(first.matched == 11)
             var runtime: [any KVCache] = [KVCacheSimple(), KVCacheSimple()]
             try #require(!first.arrays.isEmpty)
-            #expect(
+            try #require(
                 restoreFromDiskArrays(first.arrays, into: &runtime, requirePromptBoundary: true)
                     == 0)
-            #expect(runtime.allSatisfy { $0.offset == 0 })
 
-            // TODAY: served again, counted again.
-            let second = try #require(Self.diskMatch(coordinator.fetch(tokens: prompt)))
-            #expect(second.matched == 11)
+            // Control — nothing reported yet: served again, counted again.
+            let unreported = try #require(Self.diskMatch(coordinator.fetch(tokens: prompt)))
+            #expect(unreported.matched == 11)
             #expect(try Self.diskStats(coordinator).hits - before.hits == 2)
-
-            // TODAY: durable, and the same boundary is not rewritten.
             #expect(coordinator.hasDurableDiskEntry(tokens: longTokens))
+
+            // The engine reports both refused restores.
+            for _ in 0 ..< 2 {
+                coordinator.reportDiskRestoreRejected(
+                    tokens: prompt, boundary: 11, mediaSalt: nil, reason: "test")
+            }
+            let reported = try Self.diskStats(coordinator)
+            // One payload, one mark: the second report changes nothing.
+            #expect(reported.rejectedDiskRestores - before.rejectedDiskRestores == 1)
+            #expect(reported.hits - before.hits == 1)
+            #expect(!coordinator.hasDurableDiskEntry(tokens: longTokens))
+            #expect(!coordinator.hasValidatedDiskEntry(tokens: longTokens))
+            #expect(coordinator.hasDurableDiskEntry(tokens: Array(prompt.prefix(5))))
+
+            let second = try #require(Self.diskMatch(coordinator.fetch(tokens: prompt)))
+            #expect(second.matched == 5)
+            #expect(second.remaining == Array(prompt.dropFirst(5)))
+            var restoredShort: [any KVCache] = [KVCacheSimple(), KVCacheSimple()]
+            #expect(
+                restoreFromDiskArrays(
+                    second.arrays, into: &restoredShort, requirePromptBoundary: true) == 5)
+            let afterShort = try Self.diskStats(coordinator)
+            #expect(afterShort.hits - reported.hits == 1)
+            // Nothing was deleted, and the skipped probe is not a miss.
+            #expect(try Self.indexedTokenCounts(root) == [5, 11])
+            #expect(afterShort.misses - reported.misses == 2, "[N, N-1] only")
+
+            // The turn ends: the engine stores the boundary with the cache it
+            // really has. The payload is replaced and the mark is lifted.
             let longURL = Support.payloadURL(
                 root, DiskCache.hashTokens(longTokens, modelKey: modelKey))
             let identityBefore = try Self.identity(longURL)
-            let skipsBefore = try Self.diskStats(coordinator).storeSkips
+            coordinator.storeAfterGeneration(
+                promptTokens: longTokens, perLayerData: [], ssmStates: nil,
+                cache: Self.attentionCache(layers: 2, tokens: 11, fill: 5))
+            #expect(try Self.identity(longURL) != identityBefore)
+            #expect(coordinator.hasDurableDiskEntry(tokens: longTokens))
+
+            let third = try #require(Self.diskMatch(coordinator.fetch(tokens: prompt)))
+            #expect(third.matched == 11)
+            var restoredLong: [any KVCache] = [KVCacheSimple(), KVCacheSimple()]
+            #expect(
+                restoreFromDiskArrays(
+                    third.arrays, into: &restoredLong, requirePromptBoundary: true) == 11)
+            #expect(restoredLong.allSatisfy { $0.offset == 11 })
+        }
+    }
+
+    /// One layer at 11 tokens, two layers at 5, both prefixes of one prompt;
+    /// and proof that the short one restores into a two-layer cache, so a
+    /// refusal of the long one is the long one's.
+    private static func storeShadowingFixture(
+        _ coordinator: CacheCoordinator
+    ) throws -> (prompt: [Int], oneLayer: [any KVCache]) {
+        let prompt = Self.chain(37)
+        let oneLayer = Self.attentionCache(layers: 1, tokens: 11, fill: 1)
+        coordinator.storeAfterGeneration(
+            promptTokens: Array(prompt.prefix(11)), perLayerData: [], ssmStates: nil,
+            cache: oneLayer)
+        coordinator.storeAfterGeneration(
+            promptTokens: Array(prompt.prefix(5)), perLayerData: [], ssmStates: nil,
+            cache: Self.attentionCache(layers: 2, tokens: 5, fill: 3))
+        let disk = try #require(coordinator.diskCache)
+        try #require(disk.candidateTokenCounts(maxTokens: prompt.count) == [11, 5])
+
+        var control: [any KVCache] = [KVCacheSimple(), KVCacheSimple()]
+        let shortArrays = try #require(
+            disk.fetch(tokens: Array(prompt.prefix(5)), touchRecency: false, countHit: false))
+        try #require(
+            restoreFromDiskArrays(shortArrays, into: &control, requirePromptBoundary: true) == 5)
+        return (prompt, oneLayer)
+    }
+
+    /// A store of a boundary whose payload this process has validated, with
+    /// the same layout, is skipped — that is what keeps a warm turn from
+    /// rewriting hundreds of megabytes. For a payload whose restore was
+    /// refused the same store must write. The un-rejected entry, stored the
+    /// same way in the same test, is the control: it is still skipped.
+    @Test func rejectedEntryIsRewrittenEvenWhenTheLayoutMatches() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("rewrite")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "prefix-rewrite"
+            let coordinator = Self.coordinator(root: root, modelKey: modelKey)
+            let fixture = try Self.storeShadowingFixture(coordinator)
+            let prompt = fixture.prompt
+            let longTokens = Array(prompt.prefix(11))
+            let shortTokens = Array(prompt.prefix(5))
+            let longURL = Support.payloadURL(
+                root, DiskCache.hashTokens(longTokens, modelKey: modelKey))
+            let shortURL = Support.payloadURL(
+                root, DiskCache.hashTokens(shortTokens, modelKey: modelKey))
+
+            let hit = try #require(Self.diskMatch(coordinator.fetch(tokens: prompt)))
+            try #require(hit.matched == 11)
+            coordinator.reportDiskRestoreRejected(
+                tokens: prompt, boundary: 11, mediaSalt: nil, reason: "test")
+
+            // A direct read validates the file again for this process; the
+            // mark has to hold on its own.
+            let disk = try #require(coordinator.diskCache)
+            try #require(
+                disk.fetch(tokens: longTokens, touchRecency: false, countHit: false) != nil)
+            #expect(!disk.hasValidatedEntry(tokens: longTokens))
+            #expect(!coordinator.hasDurableDiskEntry(tokens: longTokens))
+
+            let longBefore = try Self.identity(longURL)
+            let shortBefore = try Self.identity(shortURL)
+            let statsBefore = try Self.diskStats(coordinator)
+
+            coordinator.storeAfterGeneration(
+                promptTokens: shortTokens, perLayerData: [], ssmStates: nil,
+                cache: Self.attentionCache(layers: 2, tokens: 5, fill: 3))
+            let afterControl = try Self.diskStats(coordinator)
+            #expect(afterControl.storeSkips - statsBefore.storeSkips == 1)
+            #expect(try Self.identity(shortURL) == shortBefore)
+
             coordinator.storeAfterGeneration(
                 promptTokens: longTokens, perLayerData: [], ssmStates: nil,
                 cache: Self.attentionCache(layers: 1, tokens: 11, fill: 1))
-            #expect(try Self.diskStats(coordinator).storeSkips - skipsBefore == 1)
-            #expect(try Self.identity(longURL) == identityBefore)
+            let afterRewrite = try Self.diskStats(coordinator)
+            #expect(afterRewrite.storeSkips == afterControl.storeSkips)
+            #expect(try Self.identity(longURL) != longBefore)
+
+            // The mark is lifted, so the same store is skipped from now on.
+            coordinator.storeAfterGeneration(
+                promptTokens: longTokens, perLayerData: [], ssmStates: nil,
+                cache: Self.attentionCache(layers: 1, tokens: 11, fill: 1))
+            #expect(try Self.diskStats(coordinator).storeSkips - afterRewrite.storeSkips == 1)
+        }
+    }
+
+    @Test func rejectionReportedForAnEntryThatIsNotThereChangesNothing() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("no-entry")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let coordinator = Self.coordinator(root: root, modelKey: "prefix-no-entry")
+            let prompt = Self.chain(37)
+            coordinator.storePersistentBoundary(
+                tokens: Array(prompt.prefix(11)), diskArrays: Self.payload(), ssmStates: nil)
+            let hit = try #require(Self.diskMatch(coordinator.fetch(tokens: prompt)))
+            try #require(hit.matched == 11)
+            let before = try Self.diskStats(coordinator)
+            try #require(before.hits == 1)
+
+            // No row at 13; no such boundary at all at 0, -1 and 38; another
+            // salt is another entry.
+            for boundary in [13, 0, -1, 38] {
+                coordinator.reportDiskRestoreRejected(
+                    tokens: prompt, boundary: boundary, mediaSalt: nil, reason: "test")
+            }
+            coordinator.reportDiskRestoreRejected(
+                tokens: prompt, boundary: 11, mediaSalt: "other-media", reason: "test")
+
+            let after = try Self.diskStats(coordinator)
+            #expect(after.hits == before.hits)
+            #expect(after.rejectedDiskRestores == 0)
+            #expect(coordinator.hasDurableDiskEntry(tokens: Array(prompt.prefix(11))))
+            let again = try #require(Self.diskMatch(coordinator.fetch(tokens: prompt)))
+            #expect(again.matched == 11)
+            #expect(try Self.indexedTokenCounts(root) == [11])
+        }
+    }
+
+    /// The hit count never goes below zero: a rejection can be reported for
+    /// an entry this coordinator never counted a hit for.
+    @Test func rejectionNeverTakesTheHitCountBelowZero() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("floor")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let coordinator = Self.coordinator(root: root, modelKey: "prefix-floor")
+            let prompt = Self.chain(37)
+            coordinator.storePersistentBoundary(
+                tokens: Array(prompt.prefix(11)), diskArrays: Self.payload(), ssmStates: nil)
+            try #require(try Self.diskStats(coordinator).hits == 0)
+
+            coordinator.reportDiskRestoreRejected(
+                tokens: prompt, boundary: 11, mediaSalt: nil, reason: "test")
+            let after = try Self.diskStats(coordinator)
+            #expect(after.hits == 0)
+            #expect(after.rejectedDiskRestores == 1)
+            guard case .miss = coordinator.fetch(tokens: prompt) else {
+                Issue.record("the rejected entry was served")
+                return
+            }
+        }
+    }
+
+    /// A mark belongs to the coordinator that was told. Another model on the
+    /// same root has other entries; another coordinator for the SAME model (a
+    /// reload) starts without marks and is refused once more before it knows.
+    @Test func rejectedMarksStayWithTheCoordinatorThatWasTold() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("per-coordinator")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let told = Self.coordinator(root: root, modelKey: "A")
+            let other = Self.coordinator(root: root, modelKey: "B")
+            let prompt = try Self.storeShadowingFixture(told).prompt
+            _ = try Self.storeShadowingFixture(other)
+
+            try #require(Self.diskMatch(told.fetch(tokens: prompt))?.matched == 11)
+            told.reportDiskRestoreRejected(
+                tokens: prompt, boundary: 11, mediaSalt: nil, reason: "test")
+            #expect(Self.diskMatch(told.fetch(tokens: prompt))?.matched == 5)
+
+            #expect(Self.diskMatch(other.fetch(tokens: prompt))?.matched == 11)
+            #expect(try Self.diskStats(other).rejectedDiskRestores == 0)
+            #expect(other.hasDurableDiskEntry(tokens: Array(prompt.prefix(11))))
+
+            let reloaded = Self.coordinator(root: root, modelKey: "A")
+            #expect(Self.diskMatch(reloaded.fetch(tokens: prompt))?.matched == 11)
+            #expect(try Self.diskStats(reloaded).rejectedDiskRestores == 0)
+            // The one that was told still knows.
+            #expect(Self.diskMatch(told.fetch(tokens: prompt))?.matched == 5)
+        }
+    }
+
+    /// A mark is for the payload that was refused. When another writer — a
+    /// second process, or a reloaded model — has replaced that file, the
+    /// entry is a candidate again without this coordinator storing anything.
+    @Test func aPayloadReplacedBySomebodyElseLiftsTheMark() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("replaced")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let told = Self.coordinator(root: root, modelKey: "A")
+            let prompt = try Self.storeShadowingFixture(told).prompt
+            try #require(Self.diskMatch(told.fetch(tokens: prompt))?.matched == 11)
+            told.reportDiskRestoreRejected(
+                tokens: prompt, boundary: 11, mediaSalt: nil, reason: "test")
+            try #require(Self.diskMatch(told.fetch(tokens: prompt))?.matched == 5)
+
+            let elsewhere = Self.coordinator(root: root, modelKey: "A")
+            elsewhere.storeAfterGeneration(
+                promptTokens: Array(prompt.prefix(11)), perLayerData: [], ssmStates: nil,
+                cache: Self.attentionCache(layers: 2, tokens: 11, fill: 5))
+
+            let hit = try #require(Self.diskMatch(told.fetch(tokens: prompt)))
+            #expect(hit.matched == 11)
+            var runtime: [any KVCache] = [KVCacheSimple(), KVCacheSimple()]
+            #expect(
+                restoreFromDiskArrays(hit.arrays, into: &runtime, requirePromptBoundary: true)
+                    == 11)
+            #expect(told.hasDurableDiskEntry(tokens: Array(prompt.prefix(11))))
+        }
+    }
+
+    /// Both engines report a structural rejection of a disk hit, and only
+    /// that: the two reports sit on the two refusals (`restoreFromDiskArrays`
+    /// restored nothing; the restored offsets disagree with the boundary),
+    /// each behind `detail == .disk`, and before the contextual roll-backs
+    /// (media placeholders in the suffix, a missing seed state), which say
+    /// nothing about the entry.
+    @Test func bothEnginesReportStructuralRejectionsOfDiskHitsOnly() throws {
+        for path in [
+            "Libraries/MLXLMCommon/Evaluate.swift",
+            "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+        ] {
+            let source = try String(contentsOfFile: path, encoding: .utf8)
+            let calls = source.components(separatedBy: "coordinator.reportDiskRestoreRejected(")
+            try #require(calls.count - 1 == 2, "\(path): \(calls.count - 1) reports")
+            for before in calls.dropLast() {
+                #expect(
+                    before.suffix(120).contains("detail == .disk"),
+                    "\(path): a report that is not behind `detail == .disk`")
+            }
+            let reasons = [
+                "payload does not fit the runtime cache",
+                "restored offsets do not match the boundary",
+            ]
+            for reason in reasons {
+                #expect(source.components(separatedBy: reason).count - 1 == 1, "\(path)")
+            }
+            let contextual = try #require(source.range(of: "let unsafePartial ="))
+            let lastReport = try #require(
+                source.range(of: "coordinator.reportDiskRestoreRejected(", options: .backwards))
+            #expect(lastReport.upperBound < contextual.lowerBound, "\(path)")
         }
     }
 

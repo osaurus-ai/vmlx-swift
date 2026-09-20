@@ -2147,6 +2147,11 @@ public actor BatchEngine {
                             Self.logger.info(
                                 "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(diskRestored) tokens from disk, prefilling \(remaining.count) remaining"
                             )
+                        } else if detail == .disk {
+                            coordinator.reportDiskRestoreRejected(
+                                tokens: tokenIds, boundary: matchedTokens,
+                                mediaSalt: slot.mediaSalt,
+                                reason: "payload does not fit the runtime cache")
                         }
                     }
 
@@ -2158,6 +2163,12 @@ public actor BatchEngine {
                             slot.cache, matchedTokens: matchedTokens,
                             restoredTokens: restoredTokenCount, detail: detail.rawValue)
                     {
+                        if detail == .disk {
+                            coordinator.reportDiskRestoreRejected(
+                                tokens: tokenIds, boundary: matchedTokens,
+                                mediaSalt: slot.mediaSalt,
+                                reason: "restored offsets do not match the boundary")
+                        }
                         restored = false
                         retainedDiskRestore = false
                         slot.cache = context.model.newCache(parameters: slot.parameters)

@@ -816,13 +816,13 @@ public final class CacheCoordinator: @unchecked Sendable {
                 let prefix = boundary == tokens.count ? tokens : Array(tokens.prefix(boundary))
                 // A deserializable KV payload is only a candidate until
                 // architecture-specific companion state is validated below.
-                // Do not make rejected hybrid candidates hot.
-                guard let arrays = diskCache.fetch(
-                    tokens: prefix,
-                    mediaSalt: mediaSalt,
-                    touchRecency: false,
-                    countHit: false
-                ) else {
+                // Do not make rejected hybrid candidates hot: no recency
+                // touch and no hit until one is accepted.
+                let arrays: [String: MLXArray]
+                switch diskCache.fetchCandidate(tokens: prefix, mediaSalt: mediaSalt) {
+                case .arrays(let found):
+                    arrays = found
+                case .miss:
                     // A miss here means the content-addressed key over this
                     // prefix found no row; a rejection below means the row
                     // existed but its companion state was refused. Only the
@@ -830,6 +830,12 @@ public final class CacheCoordinator: @unchecked Sendable {
                     // tell those apart — and a silent companion veto has
                     // already cost a whole family (LFM2.5) its cache once.
                     ftrace("probe boundary=\(boundary) noRow")
+                    return nil
+                case .restoreRejectedEarlier:
+                    // See `reportDiskRestoreRejected`: serving it again would
+                    // end in the same full prefill, with a shorter entry that
+                    // does restore still waiting behind it.
+                    ftrace("probe boundary=\(boundary) skipped: restore was rejected earlier")
                     return nil
                 }
                 let ssmStates = resolveSSMStates(
@@ -934,6 +940,61 @@ public final class CacheCoordinator: @unchecked Sendable {
         // All tiers missed
         ftrace("MISS all tiers")
         return .miss
+    }
+
+    /// Tell the coordinator that a disk hit it served could not be restored.
+    ///
+    /// `fetch` accepts a disk candidate as soon as its payload deserializes
+    /// and its companion state is present: that is the moment the hit is
+    /// counted and the entry's recency refreshed. Whether the payload FITS
+    /// the running model's cache is only known to the engine, afterwards —
+    /// `restoreFromDiskArrays` restores 0 tokens for a payload whose layers
+    /// do not match the cache, and `validateRestoredCacheBoundary` refuses
+    /// offsets that disagree with the boundary. The engine then prefills the
+    /// whole prompt. Left untold, the coordinator serves the same entry on
+    /// every later turn, ahead of every shorter entry that would restore,
+    /// and — the fetch having validated the file — treats the boundary as
+    /// durable, so nothing ever writes it again.
+    ///
+    /// Call this for a STRUCTURAL rejection of a `.disk` hit only: the entry
+    /// cannot be used by this model as it runs now. Do not call it when the
+    /// entry was fine and the request could not use it (a missing seed state
+    /// for an exact hit, media placeholders left in the suffix).
+    ///
+    /// Everything it does is in memory, for this coordinator, until the
+    /// process ends; nothing is deleted and recency is left as it is:
+    ///
+    /// - `fetch` passes over the entry, so the longest entry that does
+    ///   restore wins;
+    /// - the entry counts as neither validated nor durable, so the store at
+    ///   the end of the turn writes the boundary again, and that store lifts
+    ///   the mark (as does a payload another process has replaced);
+    /// - the hit is taken back out of ``DiskCacheStats/hits`` and counted in
+    ///   ``DiskCacheStats/rejectedDiskRestores``.
+    ///
+    /// A report for an entry that is not there changes nothing.
+    ///
+    /// - Parameters:
+    ///   - tokens: The token sequence that was fetched.
+    ///   - boundary: `matchedTokens` of the hit: the entry is keyed by
+    ///     `tokens.prefix(boundary)`.
+    ///   - mediaSalt: The media salt of the fetch.
+    ///   - reason: What the engine found; traced, not interpreted.
+    public func reportDiskRestoreRejected(
+        tokens: [Int],
+        boundary: Int,
+        mediaSalt: String?,
+        reason: String
+    ) {
+        guard let diskCache, boundary > 0, boundary <= tokens.count else { return }
+        let prefix = boundary == tokens.count ? tokens : Array(tokens.prefix(boundary))
+        let marked = diskCache.markRestoreRejected(tokens: prefix, mediaSalt: mediaSalt)
+        if marked || ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            // Said once per payload: it explains a full prefill after a hit.
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/restore] disk restore rejected boundary=\(boundary) "
+                    + "tokens=\(tokens.count) marked=\(marked) reason=\(reason)\n").utf8))
+        }
     }
 
     /// True only after the current process has deserialized or written the

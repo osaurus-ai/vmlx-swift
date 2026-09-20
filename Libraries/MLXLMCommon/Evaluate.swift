@@ -1989,6 +1989,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                         Self.logger.info(
                             "Cache \(detail.rawValue) hit: restored \(diskRestored) tokens from disk, prefilling \(remainingTokens.count) remaining"
                         )
+                    } else if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: cacheLookupTokenIds, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "payload does not fit the runtime cache")
                     }
                 }
 
@@ -2000,6 +2005,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                         self.cache, matchedTokens: matchedTokens,
                         restoredTokens: restoredTokenCount, detail: detail.rawValue)
                 {
+                    if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: cacheLookupTokenIds, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "restored offsets do not match the boundary")
+                    }
                     restored = false
                     retainedDiskRestore = false
                     self.cache = self.model.newCache(parameters: effectiveParameters)

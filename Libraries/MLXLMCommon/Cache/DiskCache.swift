@@ -62,6 +62,12 @@ public struct DiskCacheStats: Sendable {
     /// understands share: once they reach it, every store is evicted again
     /// by the pass that follows it.
     public let opaqueBytes: Int64
+    /// Disk hits in this process that the engine then could not restore into
+    /// the running model's cache and reported back
+    /// (``CacheCoordinator/reportDiskRestoreRejected(tokens:boundary:mediaSalt:reason:)``).
+    /// Each one was first counted in ``hits`` and has been taken out of it
+    /// again, so ``hits`` counts restores that were used.
+    public let rejectedDiskRestores: Int
 
     init(
         hits: Int, misses: Int, stores: Int, storeSkips: Int,
@@ -69,7 +75,8 @@ public struct DiskCacheStats: Sendable {
         evictions: Int, maxSizeBytes: Int, failedIndexWrites: Int = 0,
         evictedBytes: Int64 = 0, quotaPasses: Int = 0, lastQuotaPassMs: Double = 0,
         pressureEventSeq: UInt64 = 0, lastPressureEvent: DiskCachePressureEvent? = nil,
-        unreadablePayloadFetches: Int = 0, opaqueBytes: Int64 = 0
+        unreadablePayloadFetches: Int = 0, opaqueBytes: Int64 = 0,
+        rejectedDiskRestores: Int = 0
     ) {
         self.hits = hits
         self.misses = misses
@@ -87,6 +94,7 @@ public struct DiskCacheStats: Sendable {
         self.lastPressureEvent = lastPressureEvent
         self.unreadablePayloadFetches = unreadablePayloadFetches
         self.opaqueBytes = opaqueBytes
+        self.rejectedDiskRestores = rejectedDiskRestores
     }
 
     /// The same counters over a different usage figure (the coordinator's
@@ -99,7 +107,8 @@ public struct DiskCacheStats: Sendable {
             failedIndexWrites: failedIndexWrites, evictedBytes: evictedBytes,
             quotaPasses: quotaPasses, lastQuotaPassMs: lastQuotaPassMs,
             pressureEventSeq: pressureEventSeq, lastPressureEvent: lastPressureEvent,
-            unreadablePayloadFetches: unreadablePayloadFetches, opaqueBytes: opaqueBytes)
+            unreadablePayloadFetches: unreadablePayloadFetches, opaqueBytes: opaqueBytes,
+            rejectedDiskRestores: rejectedDiskRestores)
     }
 }
 
@@ -402,6 +411,8 @@ public final class DiskCache: @unchecked Sendable {
     public private(set) var refusedOccupiedStores: Int = 0
     /// See ``DiskCacheStats/unreadablePayloadFetches``.
     public private(set) var unreadablePayloadFetches: Int = 0
+    /// See ``DiskCacheStats/rejectedDiskRestores``.
+    public private(set) var rejectedDiskRestores: Int = 0
 
     /// Test seams, never set in production. `temporaryURLForTesting` names
     /// the unpublished file of the next store (the real name carries a random
@@ -457,6 +468,18 @@ public final class DiskCache: @unchecked Sendable {
     /// an inherited file before it can take the fast path.
     private var validatedFiles: [String: ValidatedRecord] = [:]
 
+    /// Entries an engine could not restore into the running model's cache
+    /// (``markRestoreRejected(tokens:mediaSalt:)``), with the fingerprint of
+    /// the payload that was refused. While that very file is under the name,
+    /// the entry is not offered to the coordinator again — so a shorter entry
+    /// can win — and does not count as validated or durable, so the next
+    /// store of the boundary writes it again; that store clears the mark. A
+    /// payload somebody else has replaced since is a different file, and the
+    /// mark goes the first time that is seen. In memory only, per instance:
+    /// nothing is deleted, and a new process finds out again at the cost of
+    /// one refused restore.
+    private var rejectedRestores: [String: ValidatedFileFingerprint] = [:]
+
     /// Trace-only identity of the most recent boundary written by this cache
     /// instance. Growing agent loops can store N tokens and immediately probe N
     /// tokens under a different hash on the next turn; counts alone hide where
@@ -492,7 +515,8 @@ public final class DiskCache: @unchecked Sendable {
             pressureEventSeq: pressureEventSeq,
             lastPressureEvent: lastPressureEvent,
             unreadablePayloadFetches: unreadablePayloadFetches,
-            opaqueBytes: lastOpaqueBytes)
+            opaqueBytes: lastOpaqueBytes,
+            rejectedDiskRestores: rejectedDiskRestores)
     }
 
     // MARK: - Initialization
@@ -701,6 +725,7 @@ public final class DiskCache: @unchecked Sendable {
         if let validated = validatedFiles[hash],
            let current = _fileFingerprint(url: url),
            current == validated.file,
+           rejectedRestores[hash] != current,
            validated.hasRecurrentGeometry,
            Self.payloadLayout(arrays) == validated.layout,
            let indexed = _entryMetadataLocked(hash: hash),
@@ -826,6 +851,8 @@ public final class DiskCache: @unchecked Sendable {
             } else {
                 validatedFiles.removeValue(forKey: hash)
             }
+            // What was refused has just been replaced.
+            rejectedRestores.removeValue(forKey: hash)
             if enforceQuota {
                 _evictIfNeededLocked()
             }
@@ -886,7 +913,73 @@ public final class DiskCache: @unchecked Sendable {
         defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
         defer { lock.unlock() }
+        return _fetchLocked(
+            hash: hash, url: url, tokens: tokens, mediaSalt: mediaSalt,
+            touchRecency: touchRecency, countHit: countHit)
+    }
 
+    /// What ``fetchCandidate(tokens:mediaSalt:)`` found.
+    enum CandidateFetch {
+        case arrays([String: MLXArray])
+        case miss
+        /// The entry is there, and an engine has already refused to restore
+        /// this very payload. Nothing was read; not counted as a miss.
+        case restoreRejectedEarlier
+    }
+
+    /// The coordinator's candidate read: ``fetch(tokens:mediaSalt:touchRecency:countHit:)``
+    /// with no recency touch and no hit counted — the coordinator does both
+    /// for the candidate it accepts — that also passes over an entry whose
+    /// restore was refused (``markRestoreRejected(tokens:mediaSalt:)``).
+    func fetchCandidate(tokens: [Int], mediaSalt: String?) -> CandidateFetch {
+        guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return .miss }
+
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let refused = rejectedRestores[hash] {
+            if _fileFingerprint(url: url) == refused { return .restoreRejectedEarlier }
+            // Another writer has replaced the payload, or it is gone.
+            rejectedRestores.removeValue(forKey: hash)
+        }
+        return _fetchLocked(
+            hash: hash, url: url, tokens: tokens, mediaSalt: mediaSalt,
+            touchRecency: false, countHit: false
+        ).map(CandidateFetch.arrays) ?? .miss
+    }
+
+    /// An engine fetched this entry through the coordinator and could not
+    /// restore it into the running model's cache. See ``rejectedRestores``
+    /// for what follows from that. Returns false, and changes nothing, when
+    /// there is no such entry (no row, or no payload under the name) or when
+    /// this payload is already marked — a rejection reported twice takes one
+    /// hit back, not two.
+    ///
+    /// Takes `lock` only, like the other predicates: it reads one row and
+    /// stats one file.
+    @discardableResult
+    func markRestoreRejected(tokens: [Int], mediaSalt: String?) -> Bool {
+        guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let current = _fileFingerprint(url: url),
+              _entryMetadataLocked(hash: hash) != nil,
+              rejectedRestores[hash] != current
+        else { return false }
+        rejectedRestores[hash] = current
+        validatedFiles.removeValue(forKey: hash)
+        hits = max(0, hits - 1)
+        rejectedDiskRestores += 1
+        return true
+    }
+
+    /// Caller holds ``MLXDiskCacheIOLock`` and `lock`.
+    private func _fetchLocked(
+        hash: String, url: URL, tokens: [Int], mediaSalt: String?,
+        touchRecency: Bool, countHit: Bool
+    ) -> [String: MLXArray]? {
         guard FileManager.default.fileExists(atPath: url.path) else {
             validatedFiles.removeValue(forKey: hash)
             misses += 1
@@ -1113,6 +1206,7 @@ public final class DiskCache: @unchecked Sendable {
         guard let validated = validatedFiles[hash],
               let current = _fileFingerprint(url: url),
               current == validated.file,
+              rejectedRestores[hash] != current,
               validated.hasRecurrentGeometry,
               !requireNativeRecurrent || validated.recurrentGeometry == .native,
               current.size > 0,
@@ -1147,7 +1241,10 @@ public final class DiskCache: @unchecked Sendable {
         guard let current = _fileFingerprint(url: url), current.size > 0,
               let indexed = _entryMetadataLocked(hash: hash),
               indexed.tokenCount == tokens.count,
-              indexed.fileSize == current.size
+              indexed.fileSize == current.size,
+              // Complete and self-consistent, and of no use to the model
+              // that is running: it has to be produced again to be replaced.
+              rejectedRestores[hash] != current
         else {
             return false
         }
