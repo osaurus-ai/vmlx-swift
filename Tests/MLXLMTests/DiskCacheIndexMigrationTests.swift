@@ -1,8 +1,9 @@
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import SQLite3
 import Testing
+
+@testable import MLXLMCommon
 
 /// Schema versioning of `cache_index.db`.
 ///
@@ -232,11 +233,13 @@ import Testing
         }
         #expect(
             try raw.int(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_companions'")
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_companions'"
+            )
                 == 1, sourceLocation: sourceLocation)
         #expect(
             try raw.int(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_cache_entries_chain'")
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_cache_entries_chain'"
+            )
                 == 1, sourceLocation: sourceLocation)
         #expect(try raw.rows() == seedRows, sourceLocation: sourceLocation)
         #expect(
@@ -287,11 +290,13 @@ import Testing
             sourceLocation: sourceLocation)
         #expect(
             try other.int(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_companions'")
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_companions'"
+            )
                 == 0, "\(label)", sourceLocation: sourceLocation)
         #expect(
             try other.int(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_cache_entries_chain'")
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_cache_entries_chain'"
+            )
                 == 0, "\(label)", sourceLocation: sourceLocation)
         #expect(try other.rows() == seedRows, "\(label)", sourceLocation: sourceLocation)
     }
@@ -348,7 +353,8 @@ import Testing
         sourceLocation: SourceLocation = #_sourceLocation
     ) {
         print(
-            "MIGRATION_RACE rounds=\(rounds) overlapped=\(overlapped) workers=\(workers) index=\(index)")
+            "MIGRATION_RACE rounds=\(rounds) overlapped=\(overlapped) workers=\(workers) index=\(index)"
+        )
         if overlapped == 0 {
             Issue.record(
                 "INVALID: no round had overlapping opens — this run proves nothing about the race",
@@ -386,7 +392,8 @@ import Testing
         }
         #expect(
             try raw.int(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_companions'")
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_companions'"
+            )
                 == 1)
         #expect(try raw.int("SELECT COUNT(*) FROM cache_entries") == 0)
     }
@@ -706,7 +713,8 @@ import Testing
                 try #require(try migrator.columnNames() == Self.v1ColumnNames)
                 try #require(
                     try migrator.int(
-                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='idx_cache_entries_chain'")
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='idx_cache_entries_chain'"
+                    )
                         == 1)
                 let log = StatementLog(fault: .none)
                 migrator.install(log)

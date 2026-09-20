@@ -25,7 +25,7 @@ struct DiskQuotaScanCostProbe {
     /// ascending and converted to milliseconds.
     private static func sortedSteadyMillis(_ body: () -> Void) -> [Double] {
         var samples: [UInt64] = []
-        for _ in 0..<6 {
+        for _ in 0 ..< 6 {
             samples.append(sampleNanos(body))
         }
         return samples.dropFirst().sorted().map { Double($0) / 1_000_000 }
@@ -58,12 +58,13 @@ struct DiskQuotaScanCostProbe {
             defer { try? FileManager.default.removeItem(at: root) }
 
             let modelKey = "quota-scan-probe-model"
-            let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
-                usePagedCache: false,
-                enableDiskCache: true,
-                diskCacheMaxGB: 64,
-                diskCacheDir: root,
-                modelKey: modelKey))
+            let coordinator = CacheCoordinator(
+                config: CacheCoordinatorConfig(
+                    usePagedCache: false,
+                    enableDiskCache: true,
+                    diskCacheMaxGB: 64,
+                    diskCacheDir: root,
+                    modelKey: modelKey))
             coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true)
             let disk = try #require(coordinator.diskCache)
             let companion = try #require(coordinator.ssmStateCache.diskStore)
@@ -76,7 +77,7 @@ struct DiskQuotaScanCostProbe {
             let kv = ["data": MLXArray.ones([16], dtype: .float32)]
             let recurrent = [MLXArray.ones([16], dtype: .float32)]
             let populateStart = DispatchTime.now().uptimeNanoseconds
-            for index in 0..<entries {
+            for index in 0 ..< entries {
                 let tokens = [1_000_000 + index, 1, 2, 3]
                 disk.store(tokens: tokens, arrays: kv, enforceQuota: false)
                 try companion.store(
@@ -98,12 +99,14 @@ struct DiskQuotaScanCostProbe {
             #expect(kvHashes.count == entries)
             // Hard requirements: an unlinked or empty fixture measures a
             // different scan, so it must never reach a QUOTA_PROBE line.
-            try #require(companionBefore.allSatisfy { entry in
-                entry.kvHash.map(kvHashes.contains) ?? false
-            })
+            try #require(
+                companionBefore.allSatisfy { entry in
+                    entry.kvHash.map(kvHashes.contains) ?? false
+                })
             try #require(kvBefore.allSatisfy { $0.bytes > 0 })
             try #require(companionBefore.allSatisfy { $0.bytes > 0 })
-            let fixtureBytes = kvBefore.reduce(Int64(0)) { $0 + $1.bytes }
+            let fixtureBytes =
+                kvBefore.reduce(Int64(0)) { $0 + $1.bytes }
                 + companionBefore.reduce(Int64(0)) { $0 + $1.bytes }
             #expect(fixtureBytes < Int64(disk.maxSizeBytes) / 100)
             try #require(kvBefore.count == entries && companionBefore.count == entries)
@@ -171,12 +174,13 @@ struct DiskQuotaScanCostProbe {
             // so — and it runs after every measurement above.
             if entries >= 1_000 {
                 let cap = fixtureBytes - fixtureBytes / 10
-                let tight = CacheCoordinator(config: CacheCoordinatorConfig(
-                    usePagedCache: false,
-                    enableDiskCache: true,
-                    diskCacheMaxGB: Float(cap) / 1_073_741_824,
-                    diskCacheDir: root,
-                    modelKey: modelKey))
+                let tight = CacheCoordinator(
+                    config: CacheCoordinatorConfig(
+                        usePagedCache: false,
+                        enableDiskCache: true,
+                        diskCacheMaxGB: Float(cap) / 1_073_741_824,
+                        diskCacheDir: root,
+                        modelKey: modelKey))
                 let tightDisk = try #require(tight.diskCache)
                 let timing = tight.lastQuotaPassTimingForTesting
                 let remaining = tightDisk.quotaEntries().count

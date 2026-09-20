@@ -1,8 +1,9 @@
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import SQLite3
 import Testing
+
+@testable import MLXLMCommon
 
 /// Recurrent companion payloads are files outside `cache_index.db`. With a v2
 /// index their bytes are accounted in it, so the combined quota and the stats
@@ -30,7 +31,7 @@ struct DiskCacheCompanionAccountingTests {
     }
 
     private static func tokens(_ count: Int, seed: Int) -> [Int] {
-        (0..<count).map { seed * 100_000 + $0 }
+        (0 ..< count).map { seed * 100_000 + $0 }
     }
 
     private static func kv(_ elements: Int = 1_024) -> [String: MLXArray] {
@@ -38,7 +39,7 @@ struct DiskCacheCompanionAccountingTests {
     }
 
     private static func recurrent(_ elements: Int = 1_024, states: Int = 1) -> [MLXArray] {
-        (0..<states).map { _ in MLXArray.ones([elements], dtype: .float32) }
+        (0 ..< states).map { _ in MLXArray.ones([elements], dtype: .float32) }
     }
 
     /// A clock a test moves by hand, so "a minute later" costs nothing.
@@ -70,11 +71,12 @@ struct DiskCacheCompanionAccountingTests {
             diskCacheMaxGB: Float(capBytes) / 1_073_741_824,
             diskCacheDir: root,
             modelKey: modelKey)
-        let coordinator = clock.map { clock in
-            CacheCoordinator(
-                config: config, diskIndexBusyTimeoutMs: busyTimeoutMs,
-                importRetryInterval: 60, now: { clock.now })
-        } ?? CacheCoordinator(config: config, diskIndexBusyTimeoutMs: busyTimeoutMs)
+        let coordinator =
+            clock.map { clock in
+                CacheCoordinator(
+                    config: config, diskIndexBusyTimeoutMs: busyTimeoutMs,
+                    importRetryInterval: 60, now: { clock.now })
+            } ?? CacheCoordinator(config: config, diskIndexBusyTimeoutMs: busyTimeoutMs)
         if hybrid {
             coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true)
         }
@@ -89,12 +91,22 @@ struct DiskCacheCompanionAccountingTests {
     private typealias IndexedRow = Support.IndexedRow
 
     private static func companionDir(_ root: URL) -> URL { Support.companionDir(root) }
-    private static func payloadURL(_ root: URL, _ hash: String) -> URL { Support.payloadURL(root, hash) }
-    private static func companionURLs(_ root: URL, _ key: String) -> [URL] { Support.companionURLs(root, key) }
+    private static func payloadURL(_ root: URL, _ hash: String) -> URL {
+        Support.payloadURL(root, hash)
+    }
+    private static func companionURLs(_ root: URL, _ key: String) -> [URL] {
+        Support.companionURLs(root, key)
+    }
     private static func fileBytes(_ url: URL) -> Int64 { Support.fileBytes(url) }
-    private static func companionBytes(_ root: URL, _ key: String) -> Int64 { Support.companionBytes(root, key) }
-    private static func indexedRows(_ root: URL) throws -> [IndexedRow] { try Support.indexedRows(root) }
-    private static func legacyRows(_ root: URL) throws -> [String: Int64] { try Support.legacyRows(root) }
+    private static func companionBytes(_ root: URL, _ key: String) -> Int64 {
+        Support.companionBytes(root, key)
+    }
+    private static func indexedRows(_ root: URL) throws -> [IndexedRow] {
+        try Support.indexedRows(root)
+    }
+    private static func legacyRows(_ root: URL) throws -> [String: Int64] {
+        try Support.legacyRows(root)
+    }
     private static func onDiskBytesOfIndexedFiles(_ root: URL) throws -> Int64 {
         try Support.onDiskBytesOfIndexedFiles(root)
     }
@@ -130,7 +142,9 @@ struct DiskCacheCompanionAccountingTests {
         SSMCompanionDiskStore.keyFor(tokens: tokens, boundary: tokens.count, modelKey: modelKey)
     }
 
-    private static func makeV1OnlyIndex(in root: URL) throws { try Support.makeV1OnlyIndex(in: root) }
+    private static func makeV1OnlyIndex(in root: URL) throws {
+        try Support.makeV1OnlyIndex(in: root)
+    }
 
     // MARK: - 1
 
@@ -143,7 +157,9 @@ struct DiskCacheCompanionAccountingTests {
             let disk = try #require(coordinator.diskCache)
             try #require(disk.indexHasV2Columns)
 
-            let boundaries = [Self.tokens(301, seed: 1), Self.tokens(517, seed: 2), Self.tokens(1_003, seed: 3)]
+            let boundaries = [
+                Self.tokens(301, seed: 1), Self.tokens(517, seed: 2), Self.tokens(1_003, seed: 3),
+            ]
             for tokens in boundaries {
                 coordinator.storePersistentBoundary(
                     tokens: tokens, diskArrays: Self.kv(), ssmStates: Self.recurrent())
@@ -277,7 +293,8 @@ struct DiskCacheCompanionAccountingTests {
                 tokens: withRow, diskArrays: nil, ssmStates: Self.recurrent())
             let linked = try #require(try Self.indexedRows(root).first)
             #expect(linked.companionKey == Self.ssmKey(withRow, modelKey))
-            #expect(linked.companionBytes == Self.companionBytes(root, Self.ssmKey(withRow, modelKey)))
+            #expect(
+                linked.companionBytes == Self.companionBytes(root, Self.ssmKey(withRow, modelKey)))
             #expect(try Self.legacyRows(root).isEmpty)
             try Self.expectUsageMatchesDisk(disk, root: root)
 
@@ -310,7 +327,9 @@ struct DiskCacheCompanionAccountingTests {
             let root = Self.makeRoot("import")
             defer { try? FileManager.default.removeItem(at: root) }
             let modelKey = "accounting-import"
-            let boundaries = [Self.tokens(301, seed: 8), Self.tokens(517, seed: 9), Self.tokens(1_291, seed: 10)]
+            let boundaries = [
+                Self.tokens(301, seed: 8), Self.tokens(517, seed: 9), Self.tokens(1_291, seed: 10),
+            ]
 
             let populated: [IndexedRow]
             do {
@@ -321,7 +340,8 @@ struct DiskCacheCompanionAccountingTests {
                 }
                 populated = try Self.indexedRows(root)
                 try #require(populated.count == 3)
-                try #require(populated.allSatisfy { $0.companionKey != nil && $0.companionBytes > 0 })
+                try #require(
+                    populated.allSatisfy { $0.companionKey != nil && $0.companionBytes > 0 })
             }
 
             // An older build's three-column INSERT OR REPLACE leaves exactly
@@ -329,9 +349,10 @@ struct DiskCacheCompanionAccountingTests {
             func wipeCompanionColumns() throws {
                 try RawDB(root: root).require(
                     "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0")
-                try #require(try Self.indexedRows(root).allSatisfy {
-                    $0.companionKey == nil && $0.companionBytes == 0
-                })
+                try #require(
+                    try Self.indexedRows(root).allSatisfy {
+                        $0.companionKey == nil && $0.companionBytes == 0
+                    })
             }
             try wipeCompanionColumns()
 
@@ -381,7 +402,8 @@ struct DiskCacheCompanionAccountingTests {
                 }
                 try #require(try Self.indexedRows(root).count == 2)
             }
-            try FileManager.default.removeItem(at: Self.payloadURL(root, Self.kvHash(lost, modelKey)))
+            try FileManager.default.removeItem(
+                at: Self.payloadURL(root, Self.kvHash(lost, modelKey)))
 
             CacheCoordinator.resetImportedRootsForTesting()
             let reopened = Self.coordinator(root: root, modelKey: modelKey)
@@ -424,7 +446,8 @@ struct DiskCacheCompanionAccountingTests {
             let disk = try #require(reopened.diskCache)
 
             let rows = try Self.indexedRows(root)
-            let strippedRow = try #require(rows.first { $0.hash == Self.kvHash(stripped, modelKey) })
+            let strippedRow = try #require(
+                rows.first { $0.hash == Self.kvHash(stripped, modelKey) })
             #expect(strippedRow.companionKey == nil)
             #expect(strippedRow.companionBytes == 0)
             let intactRow = try #require(rows.first { $0.hash == Self.kvHash(intact, modelKey) })
@@ -455,15 +478,18 @@ struct DiskCacheCompanionAccountingTests {
             try Self.expectUsageMatchesDisk(disk, root: root)
 
             func fileSize(_ tokens: [Int]) throws -> Int64 {
-                try #require(try Self.indexedRows(root).first {
-                    $0.hash == Self.kvHash(tokens, modelKey)
-                }).fileSize
+                try #require(
+                    try Self.indexedRows(root).first {
+                        $0.hash == Self.kvHash(tokens, modelKey)
+                    }
+                ).fileSize
             }
 
             // A row with no companion: usage drops by exactly its bytes.
             let denseBytes = try fileSize(dense)
             var before = disk.usageBytes()
-            try FileManager.default.removeItem(at: Self.payloadURL(root, Self.kvHash(dense, modelKey)))
+            try FileManager.default.removeItem(
+                at: Self.payloadURL(root, Self.kvHash(dense, modelKey)))
             #expect(disk.fetch(tokens: dense) == nil)
             #expect(try Self.indexedRows(root).count == 2)
             #expect(disk.usageBytes() == before - denseBytes)
@@ -473,7 +499,8 @@ struct DiskCacheCompanionAccountingTests {
             // are still on disk and stay counted, now unlinked.
             let hybridBytes = try fileSize(hybrid)
             before = disk.usageBytes()
-            try FileManager.default.removeItem(at: Self.payloadURL(root, Self.kvHash(hybrid, modelKey)))
+            try FileManager.default.removeItem(
+                at: Self.payloadURL(root, Self.kvHash(hybrid, modelKey)))
             #expect(disk.fetch(tokens: hybrid) == nil)
             #expect(try Self.indexedRows(root).map(\.hash) == [Self.kvHash(kept, modelKey)])
             #expect(disk.usageBytes() == before - hybridBytes)
@@ -560,7 +587,7 @@ struct DiskCacheCompanionAccountingTests {
             // drives them, without a quota pass per entry.
             let kv = Self.kv(16)
             let recurrent = Self.recurrent(16)
-            for index in 0..<entries {
+            for index in 0 ..< entries {
                 let tokens = [2_000_000 + index, 1, 2, 3, 5]
                 disk.store(tokens: tokens, arrays: kv, enforceQuota: false)
                 try companion.store(
@@ -581,7 +608,7 @@ struct DiskCacheCompanionAccountingTests {
             try Self.requireUnlistable(dir)
 
             var samples: [UInt64] = []
-            for _ in 0..<100 {
+            for _ in 0 ..< 100 {
                 let start = DispatchTime.now().uptimeNanoseconds
                 let stats = coordinator.snapshotStats().diskStats
                 samples.append(DispatchTime.now().uptimeNanoseconds - start)
@@ -629,7 +656,9 @@ struct DiskCacheCompanionAccountingTests {
             }
             let before = disk.usageBytes()
             try Self.expectUsageMatchesDisk(disk, root: root)
-            let companionTotal = try Self.indexedRows(root).reduce(Int64(0)) { $0 + $1.companionBytes }
+            let companionTotal = try Self.indexedRows(root).reduce(Int64(0)) {
+                $0 + $1.companionBytes
+            }
             try #require(companionTotal > 0)
 
             try FileManager.default.setAttributes(
@@ -718,7 +747,8 @@ struct DiskCacheCompanionAccountingTests {
                         enforceQuota: false)
                     let sidecarURL = Self.companionURLs(root, Self.ssmKey(legacy, modelKey))[1]
                     var sidecar = try #require(
-                        JSONSerialization.jsonObject(with: Data(contentsOf: sidecarURL)) as? [String: Any])
+                        JSONSerialization.jsonObject(with: Data(contentsOf: sidecarURL))
+                            as? [String: Any])
                     sidecar.removeValue(forKey: "kv_hash")
                     sidecar.removeValue(forKey: "boundary")
                     try JSONSerialization.data(withJSONObject: sidecar, options: [.sortedKeys])
@@ -757,19 +787,25 @@ struct DiskCacheCompanionAccountingTests {
                 try #require(Int64(disk.maxSizeBytes) == cap)
 
                 let survivingKV = Set(
-                    try RawDB(root: root).rows("SELECT hash FROM cache_entries").compactMap { $0[0] })
+                    try RawDB(root: root).rows("SELECT hash FROM cache_entries").compactMap {
+                        $0[0]
+                    })
                 for hash in survivingKV {
-                    #expect(FileManager.default.fileExists(atPath: Self.payloadURL(root, hash).path))
+                    #expect(
+                        FileManager.default.fileExists(atPath: Self.payloadURL(root, hash).path))
                 }
                 let payloadsOnDisk = try FileManager.default.contentsOfDirectory(atPath: root.path)
                     .filter { $0.hasSuffix(".safetensors") }
                 #expect(Set(payloadsOnDisk) == Set(survivingKV.map { "\($0).safetensors" }))
                 let companionNames = try FileManager.default
                     .contentsOfDirectory(atPath: Self.companionDir(root).path)
-                let survivingCompanions = Set(companionNames.compactMap { name -> String? in
-                    guard name.hasPrefix("ssm-"), name.hasSuffix(".safetensors") else { return nil }
-                    return String(name.dropFirst(4).dropLast(".safetensors".count))
-                })
+                let survivingCompanions = Set(
+                    companionNames.compactMap { name -> String? in
+                        guard name.hasPrefix("ssm-"), name.hasSuffix(".safetensors") else {
+                            return nil
+                        }
+                        return String(name.dropFirst(4).dropLast(".safetensors".count))
+                    })
                 #expect(companionNames.count == survivingCompanions.count * 2)
                 // A v1 index names no companion, so neither half of the
                 // invariant applies to that run; the file-for-file comparison
@@ -805,7 +841,10 @@ struct DiskCacheCompanionAccountingTests {
             defer { try? FileManager.default.removeItem(at: root) }
             try Self.makeV1OnlyIndex(in: root)
             let modelKey = "accounting-v1-fallback"
-            let boundaries = [Self.tokens(301, seed: 41), Self.tokens(517, seed: 42), Self.tokens(1_003, seed: 43)]
+            let boundaries = [
+                Self.tokens(301, seed: 41), Self.tokens(517, seed: 42),
+                Self.tokens(1_003, seed: 43),
+            ]
 
             func directoryBytes() throws -> Int64 {
                 var total: Int64 = 0
@@ -831,11 +870,14 @@ struct DiskCacheCompanionAccountingTests {
                 for (index, tokens) in boundaries.enumerated() {
                     coordinator.storePersistentBoundary(
                         tokens: tokens, diskArrays: Self.kv(), ssmStates: Self.recurrent())
-                    #expect(disk.touchRecency(
-                        tokens: tokens, at: Date(timeIntervalSince1970: 10_000 * Double(index + 1))))
-                    #expect(try #require(coordinator.ssmStateCache.diskStore).touchRecency(
-                        tokens: tokens, boundary: tokens.count,
-                        at: Date(timeIntervalSince1970: 10_000 * Double(index + 1))))
+                    #expect(
+                        disk.touchRecency(
+                            tokens: tokens,
+                            at: Date(timeIntervalSince1970: 10_000 * Double(index + 1))))
+                    #expect(
+                        try #require(coordinator.ssmStateCache.diskStore).touchRecency(
+                            tokens: tokens, boundary: tokens.count,
+                            at: Date(timeIntervalSince1970: 10_000 * Double(index + 1))))
                     groupBytes.append(
                         Self.fileBytes(Self.payloadURL(root, Self.kvHash(tokens, modelKey)))
                             + Self.companionBytes(root, Self.ssmKey(tokens, modelKey)))
@@ -848,7 +890,9 @@ struct DiskCacheCompanionAccountingTests {
                 #expect(stats.currentEntryCount == 3)
                 // The index was not touched beyond the three v1 columns.
                 let columns = try RawDB(root: root)
-                    .rows("SELECT name FROM pragma_table_info('cache_entries')").compactMap { $0[0] }
+                    .rows("SELECT name FROM pragma_table_info('cache_entries')").compactMap {
+                        $0[0]
+                    }
                 #expect(columns == ["hash", "token_count", "file_size", "created_at"])
             }
 
@@ -860,8 +904,9 @@ struct DiskCacheCompanionAccountingTests {
             #expect(stats.currentEntryCount == 2)
             #expect(stats.currentPayloadBytes == Int(groupBytes[1] + groupBytes[2]))
             #expect(stats.currentPayloadBytes == Int(try directoryBytes()))
-            #expect(!FileManager.default.fileExists(
-                atPath: Self.payloadURL(root, Self.kvHash(boundaries[0], modelKey)).path))
+            #expect(
+                !FileManager.default.fileExists(
+                    atPath: Self.payloadURL(root, Self.kvHash(boundaries[0], modelKey)).path))
             #expect(Self.companionBytes(root, Self.ssmKey(boundaries[0], modelKey)) == 0)
             #expect(try RawDB(root: root).rows("PRAGMA user_version").first?.first == "99")
             // No index invariant here: a v1 index has no companion columns to
@@ -883,7 +928,10 @@ struct DiskCacheCompanionAccountingTests {
                 try? FileManager.default.removeItem(at: root)
             }
             let modelKey = "accounting-standalone-evict"
-            let boundaries = [Self.tokens(301, seed: 61), Self.tokens(517, seed: 62), Self.tokens(1_003, seed: 63)]
+            let boundaries = [
+                Self.tokens(301, seed: 61), Self.tokens(517, seed: 62),
+                Self.tokens(1_003, seed: 63),
+            ]
 
             let oneCompanion: Int64
             do {
@@ -906,7 +954,10 @@ struct DiskCacheCompanionAccountingTests {
                 for url in Self.companionURLs(root, Self.ssmKey(tokens, modelKey))
                 where FileManager.default.fileExists(atPath: url.path) {
                     try FileManager.default.setAttributes(
-                        [.modificationDate: Date(timeIntervalSince1970: 10_000 * Double(index + 1))],
+                        [
+                            .modificationDate: Date(
+                                timeIntervalSince1970: 10_000 * Double(index + 1))
+                        ],
                         ofItemAtPath: url.path)
                 }
             }
@@ -927,7 +978,8 @@ struct DiskCacheCompanionAccountingTests {
             #expect(try Self.legacyRows(root).isEmpty)
             #expect(disk.usageBytes() == 0)
             #expect(coordinator.snapshotStats().diskStats?.currentPayloadBytes == 0)
-            let left = try FileManager.default.contentsOfDirectory(atPath: Self.companionDir(root).path)
+            let left = try FileManager.default.contentsOfDirectory(
+                atPath: Self.companionDir(root).path)
             #expect(left.isEmpty)
             try Self.expectIndexNamesEveryPublishedFile(root)
         }
@@ -1045,7 +1097,8 @@ struct DiskCacheCompanionAccountingTests {
                 }
                 populated = try Self.indexedRows(root)
                 try #require(populated.count == 2)
-                try #require(populated.allSatisfy { $0.companionKey != nil && $0.companionBytes > 0 })
+                try #require(
+                    populated.allSatisfy { $0.companionKey != nil && $0.companionBytes > 0 })
             }
 
             // An upgraded directory: the companions are on disk, none counted.
@@ -1173,7 +1226,8 @@ struct DiskCacheCompanionAccountingTests {
                     enforceQuota: false)
                 #expect(record?.bytes == Self.companionBytes(root, Self.ssmKey(tokens, modelKey)))
             }
-            #expect(try Self.indexedRows(root).first?.companionKey == Self.ssmKey(withRow, modelKey))
+            #expect(
+                try Self.indexedRows(root).first?.companionKey == Self.ssmKey(withRow, modelKey))
             #expect(try Self.legacyRows(root).keys.sorted() == [Self.ssmKey(withoutRow, modelKey)])
             #expect(disk.snapshotStats().failedIndexWrites == 2)
             try Self.expectUsageMatchesDisk(disk, root: root)
@@ -1199,7 +1253,8 @@ struct DiskCacheCompanionAccountingTests {
             let sidecarURL = Self.companionURLs(root, key)[1]
 
             disk.store(tokens: tokens, arrays: Self.kv(), enforceQuota: false)
-            try FileManager.default.createDirectory(at: sidecarURL, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: sidecarURL, withIntermediateDirectories: true)
             try Data("in the way".utf8).write(to: sidecarURL.appendingPathComponent("occupant"))
 
             #expect(throws: (any Error).self) {
@@ -1289,7 +1344,8 @@ struct DiskCacheCompanionAccountingTests {
             let stillValidated = companion.hasValidatedCompleteEntry(
                 tokens: tokens, boundary: tokens.count)
             #expect(!stillValidated)
-            let names = try FileManager.default.contentsOfDirectory(atPath: Self.companionDir(root).path)
+            let names = try FileManager.default.contentsOfDirectory(
+                atPath: Self.companionDir(root).path)
             #expect(
                 names.sorted() == ["ssm-\(key).json", "ssm-\(key).safetensors"],
                 "an unpublished file was left behind")
@@ -1341,13 +1397,15 @@ struct DiskCacheCompanionAccountingTests {
 
                 // Removing the early companion ALONE would relieve this cap,
                 // which is what a legacy-first pass does.
-                cap = try Self.onDiskBytesOfIndexedFiles(root) - Self.companionBytes(root, earlyKey) / 2
+                cap =
+                    try Self.onDiskBytesOfIndexedFiles(root) - Self.companionBytes(root, earlyKey)
+                    / 2
                 try #require(cap < 1 << 24, "cap must survive the Float GiB round trip exactly")
 
                 // What R4 costs a store that has nothing to adopt: one
                 // primary-key SELECT on an empty table, plus the key hash.
                 var samples: [UInt64] = []
-                for index in 0..<1_000 {
+                for index in 0 ..< 1_000 {
                     let start = DispatchTime.now().uptimeNanoseconds
                     _ = disk.adoptLegacyCompanion(kvHash: row.hash, companionKey: "absent-\(index)")
                     samples.append(DispatchTime.now().uptimeNanoseconds - start)
@@ -1355,9 +1413,10 @@ struct DiskCacheCompanionAccountingTests {
                 samples.sort()
                 let long = Self.tokens(32_003, seed: 83)
                 var hashSamples: [UInt64] = []
-                for _ in 0..<21 {
+                for _ in 0 ..< 21 {
                     let start = DispatchTime.now().uptimeNanoseconds
-                    _ = SSMCompanionDiskStore.keyFor(tokens: long, boundary: long.count, modelKey: modelKey)
+                    _ = SSMCompanionDiskStore.keyFor(
+                        tokens: long, boundary: long.count, modelKey: modelKey)
                     hashSamples.append(DispatchTime.now().uptimeNanoseconds - start)
                 }
                 hashSamples.sort()
@@ -1365,7 +1424,8 @@ struct DiskCacheCompanionAccountingTests {
                     "COMPANION_ACCOUNTING adoptLegacyCompanion_empty "
                         + "median_ms=\(String(format: "%.4f", Double(samples[500]) / 1_000_000)) "
                         + "max_ms=\(String(format: "%.4f", Double(samples[999]) / 1_000_000)) samples=1000 "
-                        + "keyFor_32003_tokens_median_ms=\(String(format: "%.3f", Double(hashSamples[10]) / 1_000_000))")
+                        + "keyFor_32003_tokens_median_ms=\(String(format: "%.3f", Double(hashSamples[10]) / 1_000_000))"
+                )
             }
 
             // Same process, so no import runs that could re-link anything.
@@ -1376,10 +1436,12 @@ struct DiskCacheCompanionAccountingTests {
             #expect(
                 Self.companionBytes(root, earlyKey) > 0,
                 "the just-written companion was evicted ahead of an older group")
-            #expect(FileManager.default.fileExists(
-                atPath: Self.payloadURL(root, Self.kvHash(early, modelKey)).path))
-            #expect(!FileManager.default.fileExists(
-                atPath: Self.payloadURL(root, Self.kvHash(older, modelKey)).path))
+            #expect(
+                FileManager.default.fileExists(
+                    atPath: Self.payloadURL(root, Self.kvHash(early, modelKey)).path))
+            #expect(
+                !FileManager.default.fileExists(
+                    atPath: Self.payloadURL(root, Self.kvHash(older, modelKey)).path))
             #expect(Self.companionBytes(root, Self.ssmKey(older, modelKey)) == 0)
             try Self.expectUsageMatchesDisk(disk, root: root)
         }
@@ -1415,7 +1477,8 @@ struct DiskCacheCompanionAccountingTests {
             // The purge tool: raw SQL and file deletion, none of this package.
             do {
                 let raw = try RawDB(root: root)
-                let hashes = Set(try raw.rows("SELECT hash FROM cache_entries").compactMap { $0[0] })
+                let hashes = Set(
+                    try raw.rows("SELECT hash FROM cache_entries").compactMap { $0[0] })
                 try #require(hashes.count == 2)
                 for hash in hashes {
                     try FileManager.default.removeItem(at: Self.payloadURL(root, hash))
@@ -1424,13 +1487,15 @@ struct DiskCacheCompanionAccountingTests {
                 for name in try FileManager.default.contentsOfDirectory(atPath: dir.path)
                 where name.hasPrefix("ssm-") && name.hasSuffix(".json") {
                     let sidecarURL = dir.appendingPathComponent(name)
-                    guard let sidecar = try JSONSerialization.jsonObject(
-                        with: Data(contentsOf: sidecarURL)) as? [String: Any],
+                    guard
+                        let sidecar = try JSONSerialization.jsonObject(
+                            with: Data(contentsOf: sidecarURL)) as? [String: Any],
                         let kvHash = sidecar["kv_hash"] as? String, hashes.contains(kvHash)
                     else { continue }
                     try FileManager.default.removeItem(at: sidecarURL)
                     try FileManager.default.removeItem(
-                        at: sidecarURL.deletingPathExtension().appendingPathExtension("safetensors"))
+                        at: sidecarURL.deletingPathExtension().appendingPathExtension("safetensors")
+                    )
                 }
                 try raw.require("DELETE FROM cache_entries")
             }
@@ -1441,7 +1506,8 @@ struct DiskCacheCompanionAccountingTests {
             let looseBytes = Self.companionBytes(root, looseKey)
             try #require(looseBytes > 0, "INVALID: the purge was not supposed to reach this one")
             try #require(
-                disk.usageBytes() > looseBytes, "INVALID: the purge left nothing stale to reconcile")
+                disk.usageBytes() > looseBytes, "INVALID: the purge left nothing stale to reconcile"
+            )
 
             #expect(coordinator.reconcileDiskAccounting())
             #expect(disk.usageBytes() == looseBytes)
@@ -1457,7 +1523,8 @@ struct DiskCacheCompanionAccountingTests {
                 tokens: linked[0], diskArrays: Self.kv(), ssmStates: Self.recurrent())
             #expect(disk.fetch(tokens: linked[0]) != nil)
             #expect(companion.fetch(tokens: linked[0], boundary: linked[0].count) != nil)
-            #expect(try Self.indexedRows(root).first?.companionKey == Self.ssmKey(linked[0], modelKey))
+            #expect(
+                try Self.indexedRows(root).first?.companionKey == Self.ssmKey(linked[0], modelKey))
             try Self.expectUsageMatchesDisk(disk, root: root, atLeast: looseBytes + 1)
         }
     }
@@ -1482,9 +1549,11 @@ struct DiskCacheCompanionAccountingTests {
                     tokens: tokens, diskArrays: Self.kv(), ssmStates: Self.recurrent())
                 let at = Date(timeIntervalSince1970: 10_000 * Double(index + 1))
                 try #require(diskB.touchRecency(tokens: tokens, at: at))
-                try #require(companionB.touchRecency(tokens: tokens, boundary: tokens.count, at: at))
+                try #require(
+                    companionB.touchRecency(tokens: tokens, boundary: tokens.count, at: at))
             }
-            let b1Bytes = Self.fileBytes(Self.payloadURL(root, Self.kvHash(b1, keyB)))
+            let b1Bytes =
+                Self.fileBytes(Self.payloadURL(root, Self.kvHash(b1, keyB)))
                 + Self.companionBytes(root, Self.ssmKey(b1, keyB))
             let cap = diskB.usageBytes() + b1Bytes / 2
             try #require(cap < 1 << 24, "cap must survive the Float GiB round trip exactly")
@@ -1499,11 +1568,13 @@ struct DiskCacheCompanionAccountingTests {
 
             // A's pass retired B's oldest group: files and row.
             #expect(diskA.snapshotStats().evictions == 1)
-            #expect(!FileManager.default.fileExists(
-                atPath: Self.payloadURL(root, Self.kvHash(b1, keyB)).path))
+            #expect(
+                !FileManager.default.fileExists(
+                    atPath: Self.payloadURL(root, Self.kvHash(b1, keyB)).path))
             #expect(Self.companionBytes(root, Self.ssmKey(b1, keyB)) == 0)
-            #expect(try Self.indexedRows(root).map(\.hash).sorted()
-                == [Self.kvHash(b2, keyB), Self.kvHash(a1, keyA)].sorted())
+            #expect(
+                try Self.indexedRows(root).map(\.hash).sorted()
+                    == [Self.kvHash(b2, keyB), Self.kvHash(a1, keyA)].sorted())
             try Self.expectUsageMatchesDisk(diskA, root: root)
             try Self.expectUsageMatchesDisk(diskB, root: root)
 
@@ -1546,7 +1617,10 @@ struct DiskCacheCompanionAccountingTests {
                 try? FileManager.default.removeItem(at: root)
             }
             let modelKey = "accounting-no-walk"
-            let boundaries = [Self.tokens(301, seed: 111), Self.tokens(517, seed: 112), Self.tokens(1_003, seed: 113)]
+            let boundaries = [
+                Self.tokens(301, seed: 111), Self.tokens(517, seed: 112),
+                Self.tokens(1_003, seed: 113),
+            ]
 
             let oneCompanion: Int64
             do {
@@ -1588,7 +1662,8 @@ struct DiskCacheCompanionAccountingTests {
             #expect(Self.companionBytes(root, Self.ssmKey(boundaries[0], modelKey)) == 0)
             let rows = try Self.indexedRows(root)
             #expect(rows.count == 3)
-            #expect(rows.first { $0.hash == Self.kvHash(boundaries[0], modelKey) }?.companionKey == nil)
+            #expect(
+                rows.first { $0.hash == Self.kvHash(boundaries[0], modelKey) }?.companionKey == nil)
             #expect(rows.filter { $0.companionKey != nil }.count == 2)
 
             try FileManager.default.setAttributes(
@@ -1650,13 +1725,16 @@ struct DiskCacheCompanionAccountingTests {
                 tokens: Self.tokens(517, seed: 123), diskArrays: Self.kv(),
                 ssmStates: Self.recurrent())
 
-            #expect(try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated)
+            #expect(
+                try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated
+            )
             try Self.expectUsageMatchesDisk(disk, root: root)
 
             // Having committed, the pass does not import again.
             let hashList = populatedHashes.map { "'\($0)'" }.joined(separator: ",")
             try RawDB(root: root).require(
-                "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0 WHERE hash IN (\(hashList))")
+                "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0 WHERE hash IN (\(hashList))"
+            )
             clock.advance(61)
             coordinator.storePersistentBoundary(
                 tokens: Self.tokens(307, seed: 124), diskArrays: Self.kv(), ssmStates: nil)
@@ -1716,7 +1794,9 @@ struct DiskCacheCompanionAccountingTests {
             clock.advance(2)
             coordinator.storePersistentBoundary(
                 tokens: Self.tokens(307, seed: 128), diskArrays: Self.kv(), ssmStates: nil)
-            #expect(try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated)
+            #expect(
+                try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated
+            )
             try Self.expectUsageMatchesDisk(disk, root: root)
         }
     }
@@ -1755,7 +1835,9 @@ struct DiskCacheCompanionAccountingTests {
             clock.advance(61)
             coordinator.storePersistentBoundary(
                 tokens: Self.tokens(307, seed: 134), diskArrays: Self.kv(), ssmStates: nil)
-            #expect(try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated)
+            #expect(
+                try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated
+            )
             try Self.expectUsageMatchesDisk(disk, root: root)
         }
     }
@@ -1791,13 +1873,15 @@ struct DiskCacheCompanionAccountingTests {
             coordinator.storePersistentBoundary(
                 tokens: looseInGap, diskArrays: nil, ssmStates: Self.recurrent())
             try RawDB(root: root).require(
-                "UPDATE cache_entries SET companion_bytes = 7 WHERE hash = '\(Self.kvHash(staleBytesInGap, modelKey))'")
+                "UPDATE cache_entries SET companion_bytes = 7 WHERE hash = '\(Self.kvHash(staleBytesInGap, modelKey))'"
+            )
             // The control: a record whose files really are gone is still dropped.
             for url in Self.companionURLs(root, Self.ssmKey(goneInGap, modelKey)) {
                 try FileManager.default.removeItem(at: url)
             }
             let looseKey = Self.ssmKey(looseInGap, modelKey)
-            try #require(try Self.legacyRows(root) == [looseKey: Self.companionBytes(root, looseKey)])
+            try #require(
+                try Self.legacyRows(root) == [looseKey: Self.companionBytes(root, looseKey)])
 
             let summary = try #require(disk.reconcileCompanionAccounting(companions: walked))
             #expect(summary.linksCleared == 1)
@@ -1826,7 +1910,9 @@ struct DiskCacheCompanionAccountingTests {
     }
 
     private static func clearImmutableFlags(under root: URL) {
-        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)
+        guard
+            let enumerator = FileManager.default.enumerator(
+                at: root, includingPropertiesForKeys: nil)
         else { return }
         for case let url as URL in enumerator {
             try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: url.path)
@@ -1876,7 +1962,10 @@ struct DiskCacheCompanionAccountingTests {
                 try? FileManager.default.removeItem(at: root)
             }
             let modelKey = "accounting-undeletable-kv"
-            let groups = [Self.tokens(301, seed: 151), Self.tokens(517, seed: 152), Self.tokens(1_003, seed: 153)]
+            let groups = [
+                Self.tokens(301, seed: 151), Self.tokens(517, seed: 152),
+                Self.tokens(1_003, seed: 153),
+            ]
             let writer = Self.coordinator(root: root, modelKey: modelKey)
             try Self.storeGroups(groups, through: writer)
             func groupBytes(_ tokens: [Int]) -> Int64 {
@@ -1899,11 +1988,14 @@ struct DiskCacheCompanionAccountingTests {
             let disk = try #require(small.diskCache)
             try #require(Int64(disk.maxSizeBytes) == cap)
 
-            func expectStuckRowAndNewestGroup(_ sourceLocation: SourceLocation = #_sourceLocation) throws {
+            func expectStuckRowAndNewestGroup(_ sourceLocation: SourceLocation = #_sourceLocation)
+                throws
+            {
                 let rows = try Self.indexedRows(root)
                 #expect(
                     rows.map(\.hash).sorted()
-                        == [Self.kvHash(groups[0], modelKey), Self.kvHash(groups[2], modelKey)].sorted(),
+                        == [Self.kvHash(groups[0], modelKey), Self.kvHash(groups[2], modelKey)]
+                        .sorted(),
                     sourceLocation: sourceLocation)
                 let stuck = rows.first { $0.hash == Self.kvHash(groups[0], modelKey) }
                 #expect(stuck?.fileSize == stuckBytes, sourceLocation: sourceLocation)
@@ -1914,9 +2006,12 @@ struct DiskCacheCompanionAccountingTests {
                     rows.first { $0.hash == Self.kvHash(groups[2], modelKey) }?.companionKey
                         == Self.ssmKey(groups[2], modelKey),
                     sourceLocation: sourceLocation)
-                #expect(FileManager.default.fileExists(atPath: stuckPayload.path), sourceLocation: sourceLocation)
+                #expect(
+                    FileManager.default.fileExists(atPath: stuckPayload.path),
+                    sourceLocation: sourceLocation)
                 #expect(groupBytes(groups[2]) == newestBytes, sourceLocation: sourceLocation)
-                #expect(disk.usageBytes() == stuckBytes + newestBytes, sourceLocation: sourceLocation)
+                #expect(
+                    disk.usageBytes() == stuckBytes + newestBytes, sourceLocation: sourceLocation)
                 try Self.expectUsageMatchesDisk(disk, root: root, sourceLocation: sourceLocation)
             }
 
@@ -1960,7 +2055,8 @@ struct DiskCacheCompanionAccountingTests {
             let stuckTensor = Self.companionURLs(root, stuckKey)[0]
             let stuckBytes = Self.fileBytes(stuckTensor)
             try #require(stuckBytes > 0)
-            let newestBytes = Self.fileBytes(Self.payloadURL(root, Self.kvHash(groups[1], modelKey)))
+            let newestBytes =
+                Self.fileBytes(Self.payloadURL(root, Self.kvHash(groups[1], modelKey)))
                 + Self.companionBytes(root, Self.ssmKey(groups[1], modelKey))
 
             try Self.requireImmutableBlocksDeletion(in: root)
@@ -1971,15 +2067,18 @@ struct DiskCacheCompanionAccountingTests {
             let small = Self.coordinator(root: root, capBytes: cap, modelKey: modelKey)
             let disk = try #require(small.diskCache)
 
-            for _ in 0..<2 {  // the pass at open, then one more with the flag still set
-                #expect(try Self.indexedRows(root).map(\.hash) == [Self.kvHash(groups[1], modelKey)])
-                #expect(!FileManager.default.fileExists(
-                    atPath: Self.payloadURL(root, Self.kvHash(groups[0], modelKey)).path))
+            for _ in 0 ..< 2 {  // the pass at open, then one more with the flag still set
+                #expect(
+                    try Self.indexedRows(root).map(\.hash) == [Self.kvHash(groups[1], modelKey)])
+                #expect(
+                    !FileManager.default.fileExists(
+                        atPath: Self.payloadURL(root, Self.kvHash(groups[0], modelKey)).path))
                 #expect(try Self.legacyRows(root) == [stuckKey: stuckBytes])
                 #expect(disk.usageBytes() == stuckBytes + newestBytes)
                 #expect(disk.snapshotStats().evictions == 0)
                 try Self.expectUsageMatchesDisk(disk, root: root)
-                try #require(disk.usageBytes() > cap, "INVALID: nothing left for a second pass to do")
+                try #require(
+                    disk.usageBytes() > cap, "INVALID: nothing left for a second pass to do")
                 small.enforceCombinedDiskQuota()
             }
 
@@ -2039,7 +2138,8 @@ struct DiskCacheCompanionAccountingTests {
             coordinator.ssmStateCache.store(
                 ssmStates: Self.recurrent(), tokens: boundaries[2], boundary: boundaries[2].count)
             var rows = try Self.indexedRows(root)
-            let stuckRow = try #require(rows.first { $0.hash == Self.kvHash(boundaries[0], modelKey) })
+            let stuckRow = try #require(
+                rows.first { $0.hash == Self.kvHash(boundaries[0], modelKey) })
             #expect(stuckRow.companionKey == stuckKey)
             #expect(stuckRow.companionBytes == stuckBytes)
             #expect(rows.filter { $0.companionKey != nil }.count == 3)
@@ -2050,7 +2150,8 @@ struct DiskCacheCompanionAccountingTests {
                 ssmStates: Self.recurrent(), tokens: boundaries[3], boundary: boundaries[3].count)
             rows = try Self.indexedRows(root)
             #expect(Self.companionBytes(root, stuckKey) == 0)
-            #expect(rows.first { $0.hash == Self.kvHash(boundaries[0], modelKey) }?.companionKey == nil)
+            #expect(
+                rows.first { $0.hash == Self.kvHash(boundaries[0], modelKey) }?.companionKey == nil)
             try Self.expectUsageMatchesDisk(disk, root: root)
         }
     }
@@ -2071,7 +2172,8 @@ struct DiskCacheCompanionAccountingTests {
             let hash = Self.kvHash(tokens, modelKey)
             let payload = Self.payloadURL(root, hash)
             disk.store(tokens: tokens, arrays: Self.kv(), enforceQuota: false)
-            try #require(disk.fetch(tokens: tokens) != nil, "INVALID: the entry was never restorable")
+            try #require(
+                disk.fetch(tokens: tokens) != nil, "INVALID: the entry was never restorable")
             let bytes = Self.fileBytes(payload)
 
             try RawDB(root: root).require("DELETE FROM cache_entries")
@@ -2082,7 +2184,8 @@ struct DiskCacheCompanionAccountingTests {
 
             // The row arrives (the other connection's insert): served again.
             try RawDB(root: root).require(
-                "INSERT INTO cache_entries (hash, token_count, file_size) VALUES ('\(hash)', \(tokens.count), \(bytes))")
+                "INSERT INTO cache_entries (hash, token_count, file_size) VALUES ('\(hash)', \(tokens.count), \(bytes))"
+            )
             #expect(disk.fetch(tokens: tokens) != nil)
             try Self.expectUsageMatchesDisk(disk, root: root)
         }
@@ -2110,9 +2213,13 @@ struct DiskCacheCompanionAccountingTests {
                 coordinator.storePersistentBoundary(
                     tokens: tokens, diskArrays: Self.kv(), ssmStates: nil)
             }
-            func payload(_ tokens: [Int]) -> URL { Self.payloadURL(root, Self.kvHash(tokens, modelKey)) }
+            func payload(_ tokens: [Int]) -> URL {
+                Self.payloadURL(root, Self.kvHash(tokens, modelKey))
+            }
             // Takes a name, not the tokens, so a failure does not print them.
-            let payloads = ["indexed": indexed, "old": old, "nineMinutes": nineMinutes, "young": young]
+            let payloads = [
+                "indexed": indexed, "old": old, "nineMinutes": nineMinutes, "young": young,
+            ]
             func exists(_ name: String) -> Bool {
                 // Force-unwrapped: a mistyped name must not read as "absent".
                 FileManager.default.fileExists(atPath: payload(payloads[name]!).path)
@@ -2176,7 +2283,8 @@ struct DiskCacheCompanionAccountingTests {
             let payload = Self.payloadURL(root, Self.kvHash(tokens, modelKey))
             disk.store(tokens: tokens, arrays: Self.kv(), enforceQuota: false)
             try FileManager.default.setAttributes(
-                [.modificationDate: Date().addingTimeInterval(-11 * 60)], ofItemAtPath: payload.path)
+                [.modificationDate: Date().addingTimeInterval(-11 * 60)], ofItemAtPath: payload.path
+            )
 
             let raw = try RawDB(root: root)
             try raw.require("ALTER TABLE cache_entries RENAME TO cache_entries_moved")
@@ -2269,7 +2377,9 @@ struct DiskCacheCompanionAccountingTests {
             #expect(record == nil)
             #expect(Self.companionBytes(root, key) == 0)
             // Over-counted, never under-counted.
-            #expect(disk.usageBytes() == Self.fileBytes(Self.payloadURL(root, Self.kvHash(tokens, modelKey))) + recorded)
+            #expect(
+                disk.usageBytes() == Self.fileBytes(
+                    Self.payloadURL(root, Self.kvHash(tokens, modelKey))) + recorded)
             #expect(coordinator.reconcileDiskAccounting())
             try Self.expectUsageMatchesDisk(disk, root: root)
         }
@@ -2355,16 +2465,19 @@ struct DiskCacheCompanionAccountingTests {
                 "model-00001-of-00002.safetensors": Data(repeating: 0x22, count: 70_001),
                 "ABCDEF0123456789ABCDEF0123456789.safetensors": Data(repeating: 0x33, count: 1_031),
                 "0123456789abcdef0123456789abcde.safetensors": Data(repeating: 0x44, count: 1_033),
-                "0123456789abcdef0123456789abcdef0.safetensors": Data(repeating: 0x55, count: 1_039),
+                "0123456789abcdef0123456789abcdef0.safetensors": Data(
+                    repeating: 0x55, count: 1_039),
             ]
             for (name, data) in foreignFiles {
                 try #require(name.hasSuffix(".safetensors"))
                 try data.write(to: root.appendingPathComponent(name))
             }
-            let directory = root.appendingPathComponent("0123456789abcdef0123456789abcdef.safetensors")
+            let directory = root.appendingPathComponent(
+                "0123456789abcdef0123456789abcdef.safetensors")
             let inner = directory.appendingPathComponent("inner.bin")
             let innerData = Data(repeating: 0x66, count: 2_053)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
             try innerData.write(to: inner)
 
             try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
@@ -2386,7 +2499,8 @@ struct DiskCacheCompanionAccountingTests {
                 Set(try FileManager.default.contentsOfDirectory(atPath: root.path))
             }
             let before = try listing()
-            try #require(before.contains(controlName), "INVALID: the control payload is not on disk")
+            try #require(
+                before.contains(controlName), "INVALID: the control payload is not on disk")
 
             // The production path and the production guard age.
             #expect(coordinator.reconcileDiskAccounting())
@@ -2403,9 +2517,11 @@ struct DiskCacheCompanionAccountingTests {
                 (try? Data(contentsOf: inner)) == innerData,
                 "a DIRECTORY named like a payload was removed with its contents")
             #expect(
-                (try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)) == target.path,
+                (try? FileManager.default.destinationOfSymbolicLink(atPath: link.path))
+                    == target.path,
                 "a symlink named like a payload was removed")
-            #expect((try? Data(contentsOf: target)) == targetData, "the symlink's target was touched")
+            #expect(
+                (try? Data(contentsOf: target)) == targetData, "the symlink's target was touched")
             #expect(disk.fetch(tokens: indexed) != nil)
             try Self.expectUsageMatchesDisk(disk, root: root, checkCompleteness: false)
         }
@@ -2439,7 +2555,9 @@ struct DiskCacheCompanionAccountingTests {
                     coordinator.reconcileDiskAccounting()
                 }
                 #expect(committed, "a skipped sweep is not a failed import")
-                #expect((try? Data(contentsOf: payload)) == bytes, "\(marker): the sweep ran in a model bundle root")
+                #expect(
+                    (try? Data(contentsOf: payload)) == bytes,
+                    "\(marker): the sweep ran in a model bundle root")
                 let skipLines = log.split(separator: "\n").filter {
                     $0.hasPrefix("[vmlx][cache/disk-index] payload sweep skipped: ")
                 }
@@ -2482,7 +2600,9 @@ struct DiskCacheCompanionAccountingTests {
             }
             #expect(summary != nil, "the rest of the import still commits")
             #expect(summary?.unindexedPayloadsRemoved == 0)
-            #expect((try? Data(contentsOf: payload)) == bytes, "swept under a schema this build does not know")
+            #expect(
+                (try? Data(contentsOf: payload)) == bytes,
+                "swept under a schema this build does not know")
             #expect(log.contains("[vmlx][cache/disk-index] payload sweep skipped: "))
 
             // The control: the same file under the current schema goes.
@@ -2548,7 +2668,8 @@ struct DiskCacheCompanionAccountingTests {
             var innerFiles: [URL] = []
             for name in ["0123456789abcdef0123456789abcdef.safetensors", "weights.safetensors"] {
                 let directory = root.appendingPathComponent(name)
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(
+                    at: directory, withIntermediateDirectories: true)
                 innerFiles.append(directory.appendingPathComponent("inner.bin"))
                 try junk.write(to: innerFiles.last!)
             }
@@ -2564,19 +2685,26 @@ struct DiskCacheCompanionAccountingTests {
             for file in innerFiles {
                 #expect(
                     (try? Data(contentsOf: file)) == junk,
-                    "the open sweep removed the directory \(file.deletingLastPathComponent().lastPathComponent)")
+                    "the open sweep removed the directory \(file.deletingLastPathComponent().lastPathComponent)"
+                )
             }
-            #expect((try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)) == target.path)
+            #expect(
+                (try? FileManager.default.destinationOfSymbolicLink(atPath: link.path))
+                    == target.path)
             #expect((try? Data(contentsOf: target)) == junk)
-            #expect(!FileManager.default.fileExists(atPath: ours.path), "INVALID: the open sweep did not run")
+            #expect(
+                !FileManager.default.fileExists(atPath: ours.path),
+                "INVALID: the open sweep did not run")
 
             let shard = bundle.appendingPathComponent("model-00001-of-00002.safetensors")
-            let oursInBundle = bundle.appendingPathComponent("00112233445566778899aabbccddeeff.safetensors")
+            let oursInBundle = bundle.appendingPathComponent(
+                "00112233445566778899aabbccddeeff.safetensors")
             try junk.write(to: shard)
             try junk.write(to: oursInBundle)
             try Data("{}".utf8).write(to: bundle.appendingPathComponent("config.json"))
             _ = DiskCache(cacheDir: bundle, maxSizeBytes: 1 << 30, modelKey: "open-sweep")
-            #expect((try? Data(contentsOf: shard)) == junk, "the open sweep ran in a model bundle root")
+            #expect(
+                (try? Data(contentsOf: shard)) == junk, "the open sweep ran in a model bundle root")
             #expect((try? Data(contentsOf: oursInBundle)) == junk)
         }
     }
@@ -2656,7 +2784,9 @@ struct DiskCacheCompanionAccountingTests {
             #expect(direct == nil, "an import that could not look at a companion committed")
             #expect(directLog.contains("companion import abandoned"))
             #expect(!viaCoordinator)
-            #expect(try Self.indexedRows(root) == populated, "a link was cleared for a companion that is on disk")
+            #expect(
+                try Self.indexedRows(root) == populated,
+                "a link was cleared for a companion that is on disk")
             #expect(try Self.legacyRows(root).isEmpty)
             for url in companionFiles {
                 #expect(Self.fileBytes(url) > 0, "\(url.lastPathComponent) is gone")
@@ -2669,7 +2799,9 @@ struct DiskCacheCompanionAccountingTests {
             clock.advance(61)
             coordinator.storePersistentBoundary(
                 tokens: Self.tokens(307, seed: 193), diskArrays: Self.kv(), ssmStates: nil)
-            #expect(try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated)
+            #expect(
+                try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated
+            )
             try Self.expectUsageMatchesDisk(disk, root: root)
         }
     }
@@ -2713,7 +2845,9 @@ struct DiskCacheCompanionAccountingTests {
             let misses = disk.snapshotStats().misses
             #expect(disk.fetch(tokens: Self.tokens(517, seed: 198)) == nil)
             try #require(disk.snapshotStats().misses == misses + 1)
-            #expect(try Self.indexedRows(root) == populated, "fetch deleted the row of a payload that is on disk")
+            #expect(
+                try Self.indexedRows(root) == populated,
+                "fetch deleted the row of a payload that is on disk")
 
             let (committed, log) = try Self.capturingStandardError {
                 coordinator.reconcileDiskAccounting()
@@ -2721,7 +2855,9 @@ struct DiskCacheCompanionAccountingTests {
             restorePermissions()
             #expect(!committed, "an import that could not look at a payload committed")
             #expect(log.contains("companion import abandoned"))
-            #expect(try Self.indexedRows(root) == populated, "a row was deleted for a payload that is on disk")
+            #expect(
+                try Self.indexedRows(root) == populated,
+                "a row was deleted for a payload that is on disk")
 
             // The retry that is due commits, and sweeps nothing: the rows
             // were kept, so the old payloads are still indexed.
@@ -2730,9 +2866,13 @@ struct DiskCacheCompanionAccountingTests {
             clock.advance(61)
             coordinator.storePersistentBoundary(
                 tokens: Self.tokens(307, seed: 200), diskArrays: Self.kv(), ssmStates: nil)
-            #expect(try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated)
+            #expect(
+                try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated
+            )
             for url in payloads {
-                #expect(Self.fileBytes(url) > 0, "\(url.lastPathComponent) was swept after losing its row")
+                #expect(
+                    Self.fileBytes(url) > 0,
+                    "\(url.lastPathComponent) was swept after losing its row")
             }
             try Self.expectUsageMatchesDisk(disk, root: root)
         }
@@ -2774,12 +2914,15 @@ struct DiskCacheCompanionAccountingTests {
 
             // Search but no read permission: every file can be examined,
             // the directory cannot be listed.
-            try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: root.path)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o300], ofItemAtPath: root.path)
             try Self.requireUnlistable(root)
-            try #require(Self.lstatErrno(rowlessPayload) == 0, "INVALID: this is a stat failure too")
+            try #require(
+                Self.lstatErrno(rowlessPayload) == 0, "INVALID: this is a stat failure too")
             let committed = coordinator.reconcileDiskAccounting()
             restorePermissions()
-            #expect(!committed, "an import whose payload sweep could not list the root counted as done")
+            #expect(
+                !committed, "an import whose payload sweep could not list the root counted as done")
             #expect(try Self.indexedRows(root) == populated)
             #expect(Self.fileBytes(rowlessPayload) > 0)
 
@@ -2792,7 +2935,9 @@ struct DiskCacheCompanionAccountingTests {
                 !FileManager.default.fileExists(atPath: rowlessPayload.path),
                 "the import was never retried")
             let populatedHashes = Set(populated.map(\.hash))
-            #expect(try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated)
+            #expect(
+                try Self.indexedRows(root).filter { populatedHashes.contains($0.hash) } == populated
+            )
             try Self.expectUsageMatchesDisk(disk, root: root)
         }
     }
@@ -2824,7 +2969,9 @@ struct DiskCacheCompanionAccountingTests {
         }
         #expect(results == [false, false, false, false])
         let lines = log.split(separator: "\n").map(String.init)
-        #expect(!lines.contains { $0.hasPrefix("[vmlx][cache/disk-quota]") && !$0.contains(" before=") })
+        #expect(
+            !lines.contains { $0.hasPrefix("[vmlx][cache/disk-quota]") && !$0.contains(" before=") }
+        )
         for url in stuck {
             let mine = lines.filter { $0.contains("path=\(url.path) ") }
             #expect(mine.count == 1, "\(url.lastPathComponent): \(mine)")
@@ -2868,7 +3015,8 @@ struct DiskCacheCompanionAccountingTests {
 
         mutating func addDirectory(_ name: String, in dir: URL) throws {
             let directory = dir.appendingPathComponent(name)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
             let file = directory.appendingPathComponent("inner.bin")
             let data = Data(repeating: 0x66, count: 2_053)
             try data.write(to: file)
@@ -2903,7 +3051,8 @@ struct DiskCacheCompanionAccountingTests {
             }
             for (link, target) in links {
                 #expect(
-                    (try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)) == target.path,
+                    (try? FileManager.default.destinationOfSymbolicLink(atPath: link.path))
+                        == target.path,
                     "the symlink \(link.lastPathComponent) was removed by \(what)",
                     sourceLocation: sourceLocation)
                 #expect(
@@ -2924,7 +3073,7 @@ struct DiskCacheCompanionAccountingTests {
         let hash = DiskCache.hashTokens(Self.tokens(307, seed: 300), modelKey: "names")
         let final = URL(fileURLWithPath: "/nonexistent/\(hash).safetensors")
         #expect(DiskCache.isPublishedPayloadName(final.lastPathComponent))
-        for _ in 0..<8 {
+        for _ in 0 ..< 8 {
             let partial = DiskCache.temporaryURL(for: final).lastPathComponent
             #expect(DiskCache.isUnpublishedPayloadName(partial), "\(partial)")
             #expect(!DiskCache.isPublishedPayloadName(partial))
@@ -3014,10 +3163,12 @@ struct DiskCacheCompanionAccountingTests {
                 "0123456789abcdef0123456789abcde.safetensors", Data(repeating: 0x44, count: 1_033),
                 in: root)
             try foreign.addFile(
-                "0123456789abcdef0123456789abcdef0.safetensors", Data(repeating: 0x55, count: 1_039),
+                "0123456789abcdef0123456789abcdef0.safetensors",
+                Data(repeating: 0x55, count: 1_039),
                 in: root)
             try foreign.addFile(
-                "random.partial-abcdefgh.safetensors", Data(repeating: 0x56, count: 1_049), in: root)
+                "random.partial-abcdefgh.safetensors", Data(repeating: 0x56, count: 1_049), in: root
+            )
             try foreign.addFile(
                 "0123456789abcdef0123456789abcdef.partial-xyz.safetensors",
                 Data(repeating: 0x57, count: 1_051), in: root)
@@ -3032,7 +3183,8 @@ struct DiskCacheCompanionAccountingTests {
 
             let before = try Self.listing(root)
             try #require(before.isSuperset(of: genuine), "INVALID: a genuine file is not on disk")
-            try #require(before.isSuperset(of: foreign.names), "INVALID: a foreign entry is not on disk")
+            try #require(
+                before.isSuperset(of: foreign.names), "INVALID: a foreign entry is not on disk")
 
             coordinator.clear()
 
@@ -3081,7 +3233,8 @@ struct DiskCacheCompanionAccountingTests {
                 var foreign = ForeignEntries()
                 try foreign.addFile(marker, Data("{}".utf8), in: root)
                 try foreign.addFile(
-                    "model-00001-of-00002.safetensors", Data(repeating: 0x22, count: 70_001), in: root)
+                    "model-00001-of-00002.safetensors", Data(repeating: 0x22, count: 70_001),
+                    in: root)
                 try foreign.addFile(
                     "model-00002-of-00002.safetensors", Self.truncatedSafetensors(), in: root)
                 // A shard that happens to carry a name this cache would use.
@@ -3145,7 +3298,8 @@ struct DiskCacheCompanionAccountingTests {
                 "INVALID: the foreign shard is not incomplete")
 
             // The controls: the same bytes under names that ARE this cache's.
-            let oursTruncated = root.appendingPathComponent("00112233445566778899aabbccddeeff.safetensors")
+            let oursTruncated = root.appendingPathComponent(
+                "00112233445566778899aabbccddeeff.safetensors")
             try truncated.write(to: oursTruncated)
             let oursPartial = DiskCache.temporaryURL(
                 for: root.appendingPathComponent("8899aabbccddeeff0011223344556677.safetensors"))
@@ -3179,7 +3333,7 @@ struct DiskCacheCompanionAccountingTests {
             let tokens = Self.tokens(517, seed: 321)
             let key = Self.ssmKey(tokens, modelKey)
             let dir = Self.companionDir(root)
-            let otherKeys = (322...325).map { Self.ssmKey(Self.tokens(307, seed: $0), modelKey) }
+            let otherKeys = (322 ... 325).map { Self.ssmKey(Self.tokens(307, seed: $0), modelKey) }
 
             var foreign = ForeignEntries()
             let oursPartial: URL
@@ -3192,20 +3346,26 @@ struct DiskCacheCompanionAccountingTests {
                     "INVALID: the genuine companion pair is not on disk")
 
                 try foreign.addFile("ssm-notes.txt", Data("mine".utf8), in: dir)
-                try foreign.addFile("ssm-notes.safetensors", Data(repeating: 0x41, count: 4_099), in: dir)
+                try foreign.addFile(
+                    "ssm-notes.safetensors", Data(repeating: 0x41, count: 4_099), in: dir)
                 try foreign.addFile("ssm-notes.json", Data("{}".utf8), in: dir)
                 try foreign.addFile(
-                    "ssm-notes.partial-1A2B3C4D.safetensors", Data(repeating: 0x42, count: 1_031), in: dir)
+                    "ssm-notes.partial-1A2B3C4D.safetensors", Data(repeating: 0x42, count: 1_031),
+                    in: dir)
                 try foreign.addFile(
-                    "ssm-\(otherKeys[0]).partial-xyz.safetensors", Data(repeating: 0x43, count: 1_033),
+                    "ssm-\(otherKeys[0]).partial-xyz.safetensors",
+                    Data(repeating: 0x43, count: 1_033),
                     in: dir)
                 try foreign.addDirectory("ssm-\(otherKeys[0]).safetensors", in: dir)
                 try foreign.addDirectory("ssm-\(otherKeys[1]).json", in: dir)
-                try foreign.addDirectory("ssm-\(otherKeys[1]).partial-1A2B3C4D.safetensors", in: dir)
-                try foreign.addLink("ssm-\(otherKeys[2]).safetensors", in: dir, toNewFileIn: outside)
+                try foreign.addDirectory(
+                    "ssm-\(otherKeys[1]).partial-1A2B3C4D.safetensors", in: dir)
+                try foreign.addLink(
+                    "ssm-\(otherKeys[2]).safetensors", in: dir, toNewFileIn: outside)
                 try foreign.addLink("ssm-\(otherKeys[2]).json", in: dir, toNewFileIn: outside)
                 try foreign.addLink(
-                    "ssm-\(otherKeys[3]).partial-1A2B3C4D.safetensors", in: dir, toNewFileIn: outside)
+                    "ssm-\(otherKeys[3]).partial-1A2B3C4D.safetensors", in: dir,
+                    toNewFileIn: outside)
 
                 oursPartial = DiskCache.temporaryURL(for: Self.companionURLs(root, key)[0])
                 try Data(repeating: 0xEE, count: 40_003).write(to: oursPartial)
@@ -3259,7 +3419,8 @@ struct DiskCacheCompanionAccountingTests {
             #expect(disk.fetch(tokens: tokens) == nil)
             #expect(
                 log.split(separator: "\n").filter {
-                    $0.hasPrefix("[vmlx][cache/disk-store] REFUSED ") && $0.contains(hash.prefix(12))
+                    $0.hasPrefix("[vmlx][cache/disk-store] REFUSED ")
+                        && $0.contains(hash.prefix(12))
                 }.count == 1, "\(log)")
             #expect(
                 try Self.listing(root).allSatisfy { !$0.contains(".partial-") },
@@ -3316,8 +3477,9 @@ struct DiskCacheCompanionAccountingTests {
         let ours = root.appendingPathComponent("00112233445566778899aabbccddeeff.safetensors")
         try Data([1, 2, 3]).write(to: ours)
 
-        #expect(!DiskCache.removeCacheFile(
-            at: root.appendingPathComponent("0123456789abcdef0123456789abcdef.safetensors")))
+        #expect(
+            !DiskCache.removeCacheFile(
+                at: root.appendingPathComponent("0123456789abcdef0123456789abcdef.safetensors")))
         foreign.expectIntact(in: root, after: "removeCacheFile")
         #expect(DiskCache.removeCacheFile(at: ours))
         #expect(!FileManager.default.fileExists(atPath: ours.path))

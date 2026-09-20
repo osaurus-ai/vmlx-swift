@@ -157,7 +157,8 @@ enum DiskCacheIndexSchema {
     private static func withBusyTimeout<T>(
         _ db: OpaquePointer, _ timeoutMs: Int32, _ body: () -> T
     ) -> T {
-        let previous = scalarInt(db, "PRAGMA busy_timeout").map(Int32.init(truncatingIfNeeded:)) ?? 0
+        let previous =
+            scalarInt(db, "PRAGMA busy_timeout").map(Int32.init(truncatingIfNeeded:)) ?? 0
         guard previous <= 0 else { return body() }
         sqlite3_busy_timeout(db, timeoutMs)
         defer { sqlite3_busy_timeout(db, 0) }

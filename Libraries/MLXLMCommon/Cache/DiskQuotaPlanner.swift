@@ -159,7 +159,8 @@ enum DiskQuotaPlanner {
         guard total > capBytes else { return finish() }
 
         let activeKey = activeChain.map(ChainKey.named)
-        let activeTipBefore = rows
+        let activeTipBefore =
+            rows
             .filter { isChainRow($0) && chainKey($0) == activeKey }
             .max(by: tipOrder)
 

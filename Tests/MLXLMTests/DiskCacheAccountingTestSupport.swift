@@ -1,7 +1,8 @@
 import Foundation
-@testable import MLXLMCommon
 import SQLite3
 import Testing
+
+@testable import MLXLMCommon
 
 /// What the disk-cache accounting suites share: where the files of a cache
 /// root live, a raw connection to its index, and the accounting invariant
@@ -66,9 +67,10 @@ enum DiskCacheAccountingTestSupport {
             defer { sqlite3_finalize(stmt) }
             var out: [[String?]] = []
             while sqlite3_step(stmt) == SQLITE_ROW {
-                out.append((0..<sqlite3_column_count(stmt)).map { column in
-                    sqlite3_column_text(stmt, column).map { String(cString: $0) }
-                })
+                out.append(
+                    (0 ..< sqlite3_column_count(stmt)).map { column in
+                        sqlite3_column_text(stmt, column).map { String(cString: $0) }
+                    })
             }
             return out
         }
@@ -88,7 +90,9 @@ enum DiskCacheAccountingTestSupport {
 
     static func indexedRows(_ root: URL) throws -> [IndexedRow] {
         try RawDB(root: root)
-            .rows("SELECT hash, file_size, companion_key, companion_bytes FROM cache_entries ORDER BY hash")
+            .rows(
+                "SELECT hash, file_size, companion_key, companion_bytes FROM cache_entries ORDER BY hash"
+            )
             .map { row in
                 IndexedRow(
                     hash: row[0] ?? "", fileSize: Int64(row[1] ?? "") ?? -1,
@@ -175,10 +179,10 @@ enum DiskCacheAccountingTestSupport {
             && !foreign.contains(name)
         {
             guard name.hasSuffix(".safetensors") || name.hasSuffix(".json"),
-                  fileBytes(dir.appendingPathComponent(name)) > 0,
-                  let dot = name.lastIndex(of: ".")
+                fileBytes(dir.appendingPathComponent(name)) > 0,
+                let dot = name.lastIndex(of: ".")
             else { continue }
-            let key = String(name[name.index(name.startIndex, offsetBy: 4)..<dot])
+            let key = String(name[name.index(name.startIndex, offsetBy: 4) ..< dot])
             #expect(
                 namedCompanions.contains(key),
                 "companion \(name) is on disk but the index does not name it",
@@ -229,7 +233,8 @@ enum DiskCacheAccountingTestSupport {
         var times = [
             timeval(tv_sec: Int(when), tv_usec: 0), timeval(tv_sec: Int(when), tv_usec: 0),
         ]
-        try #require(lutimes(url.path, &times) == 0, "INVALID: lutimes failed for \(url.lastPathComponent)")
+        try #require(
+            lutimes(url.path, &times) == 0, "INVALID: lutimes failed for \(url.lastPathComponent)")
     }
 
     /// A v1 index a newer build has claimed: this build leaves it alone, so
@@ -248,7 +253,8 @@ enum DiskCacheAccountingTestSupport {
             )
             """)
         try raw.require(
-            "CREATE INDEX IF NOT EXISTS idx_cache_entries_token_count ON cache_entries(token_count DESC)")
+            "CREATE INDEX IF NOT EXISTS idx_cache_entries_token_count ON cache_entries(token_count DESC)"
+        )
         try raw.require("PRAGMA user_version = 99")
     }
 }

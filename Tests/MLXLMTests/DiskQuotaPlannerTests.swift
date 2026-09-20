@@ -79,8 +79,10 @@ struct DiskQuotaPlannerTests {
     @Test func emptyInput() {
         for cap: Int64 in [0, 1, 4099] {
             let plan = DiskQuotaPlanner.plan(rows: [], capBytes: cap, activeChain: "chat")
-            #expect(plan == QuotaPlan(
-                evict: [], evictedBytes: 0, totalBefore: 0, totalAfter: 0, event: nil))
+            #expect(
+                plan
+                    == QuotaPlan(
+                        evict: [], evictedBytes: 0, totalBefore: 0, totalAfter: 0, event: nil))
         }
     }
 
@@ -256,14 +258,17 @@ struct DiskQuotaPlannerTests {
         #expect(plan.evict == ["act:9286", "act:9675", "act:10778", "act:11167", "act:11749"])
         #expect(plan.totalAfter == 30_402)
         #expect(plan.totalAfter > 28_404)  // over low, and that is fine
-        #expect(plan.event == DiskCachePressureEvent(
-            kind: .activeChainTrimmed, chainId: "act", tipBytes: 13_827, capBytes: 31_561))
+        #expect(
+            plan.event
+                == DiskCachePressureEvent(
+                    kind: .activeChainTrimmed, chainId: "act", tipBytes: 13_827, capBytes: 31_561))
 
         // The control: the very same rows as a COLD chain do pay for low.
         let cold = DiskQuotaPlanner.plan(rows: rows, capBytes: 31_561, activeChain: "other")
-        #expect(cold.evict == [
-            "act:9286", "act:9675", "act:10778", "act:11167", "act:11749", "act:prompt",
-        ])
+        #expect(
+            cold.evict == [
+                "act:9286", "act:9675", "act:10778", "act:11167", "act:11749", "act:prompt",
+            ])
         #expect(cold.totalAfter == 16_964)
         #expect(cold.event == nil)
     }
@@ -379,8 +384,10 @@ struct DiskQuotaPlannerTests {
         let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 12000, activeChain: "act")
         #expect(plan.evict == ["act:12089", "root"])
         #expect(plan.totalAfter == 10597)
-        #expect(plan.event == DiskCachePressureEvent(
-            kind: .activeTipDropped, chainId: "act", tipBytes: 12089, capBytes: 12000))
+        #expect(
+            plan.event
+                == DiskCachePressureEvent(
+                    kind: .activeTipDropped, chainId: "act", tipBytes: 12089, capBytes: 12000))
 
         // The same rows seen from another conversation. The chain is cold now:
         // its oversized tip is nobody's event, and its fitting tip is a cold
@@ -418,16 +425,20 @@ struct DiskQuotaPlannerTests {
         let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 4400, activeChain: "act")
         #expect(plan.evict == ["act:101", "act:211", "act:307"])
         #expect(plan.totalAfter == 4099)
-        #expect(plan.event == DiskCachePressureEvent(
-            kind: .activeChainTrimmed, chainId: "act", tipBytes: 4099, capBytes: 4400))
+        #expect(
+            plan.event
+                == DiskCachePressureEvent(
+                    kind: .activeChainTrimmed, chainId: "act", tipBytes: 4099, capBytes: 4400))
 
         // cap 4500 -> low 4050: the active chain stops at the cap (4406), one
         // row earlier than the watermark would have it. Still one event.
         let lighter = DiskQuotaPlanner.plan(rows: rows, capBytes: 4500, activeChain: "act")
         #expect(lighter.evict == ["act:101", "act:211"])
         #expect(lighter.totalAfter == 4406)
-        #expect(lighter.event == DiskCachePressureEvent(
-            kind: .activeChainTrimmed, chainId: "act", tipBytes: 4099, capBytes: 4500))
+        #expect(
+            lighter.event
+                == DiskCachePressureEvent(
+                    kind: .activeChainTrimmed, chainId: "act", tipBytes: 4099, capBytes: 4500))
     }
 
     @Test func tipDroppedTakesPrecedenceOverTrimmed() {
@@ -529,8 +540,10 @@ struct DiskQuotaPlannerTests {
         // cap 1000: 4453 -> (root, oversized) 1316 -> (act:409) 907.
         let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 1000, activeChain: "act")
         #expect(plan.evict == ["root", "act:409"])
-        #expect(plan.event == DiskCachePressureEvent(
-            kind: .activeChainTrimmed, chainId: "act", tipBytes: 907, capBytes: 1000))
+        #expect(
+            plan.event
+                == DiskCachePressureEvent(
+                    kind: .activeChainTrimmed, chainId: "act", tipBytes: 907, capBytes: 1000))
 
         // cap 4100: nothing is oversized. 4453 -> (act:409) 4044: the root, as a
         // stable root, is not touched; as the chain's tip it would not be
@@ -579,8 +592,10 @@ struct DiskQuotaPlannerTests {
         #expect(plan.evict == ["act:409", "act:907", "c701", "root", "legacy:L"])
         #expect(plan.totalBefore == 5491)
         #expect(plan.totalAfter == 0)
-        #expect(plan.event == DiskCachePressureEvent(
-            kind: .activeTipDropped, chainId: "act", tipBytes: 907, capBytes: 0))
+        #expect(
+            plan.event
+                == DiskCachePressureEvent(
+                    kind: .activeTipDropped, chainId: "act", tipBytes: 907, capBytes: 0))
     }
 
     @Test func zeroByteRowsCostNothingAndSaveNothing() {
@@ -597,11 +612,12 @@ struct DiskQuotaPlannerTests {
         // In an ordered phase it is taken in its turn like any other row: it is
         // a superseded row, the total is over the goal, it goes — for 0 bytes.
         // cap 1500 -> low 1350: 1608 -> (z0) 1608 -> (y211) 1397 -> (y223) 1174.
-        let more = rows + [
-            row("y211", tokens: 211, recency: 3, chain: "Y"),
-            row("y223", tokens: 223, recency: 4, chain: "Y"),
-            row("y490", tokens: 490, bytes: 267, recency: 5, chain: "Y"),
-        ]
+        let more =
+            rows + [
+                row("y211", tokens: 211, recency: 3, chain: "Y"),
+                row("y223", tokens: 223, recency: 4, chain: "Y"),
+                row("y490", tokens: 490, bytes: 267, recency: 5, chain: "Y"),
+            ]
         #expect(total(more) == 1608)
         let plan = DiskQuotaPlanner.plan(rows: more, capBytes: 1500, activeChain: nil)
         #expect(plan.evict == ["z0", "y211", "y223"])
@@ -632,27 +648,31 @@ struct DiskQuotaPlannerTests {
     @Test func migratedCacheMatchesOldestFirstOrder() {
         var rng = SeededRNG(seed: 0x5EED_0007)
         let cases = 500
-        var compared = 0, evicting = 0, withOversized = 0, tieAtTheStoppingPoint = 0
-        for _ in 0..<cases {
-            let n = Int.random(in: 1...40, using: &rng)
-            var ids = (0..<n).map { String(format: "h%04d", $0) }
+        var compared = 0
+        var evicting = 0
+        var withOversized = 0
+        var tieAtTheStoppingPoint = 0
+        for _ in 0 ..< cases {
+            let n = Int.random(in: 1 ... 40, using: &rng)
+            var ids = (0 ..< n).map { String(format: "h%04d", $0) }
             ids.shuffle(using: &rng)
             var rows = ids.map { id in
                 row(
-                    id, tokens: Int.random(in: 1...50_000, using: &rng),
-                    bytes: Int64.random(in: 333...1291, using: &rng),
+                    id, tokens: Int.random(in: 1 ... 50_000, using: &rng),
+                    bytes: Int64.random(in: 333 ... 1291, using: &rng),
                     // A narrow recency range on purpose: ties happen, and some
                     // straddle the stopping point, where only the shared id
                     // tie-break keeps the two answers equal.
-                    recency: Double(Int.random(in: 0..<(n * 3), using: &rng)))
+                    recency: Double(Int.random(in: 0 ..< (n * 3), using: &rng)))
             }
-            if Int.random(in: 0..<5, using: &rng) == 0 {
-                rows.append(row(
-                    "hbig", tokens: 7, bytes: Int64.random(in: 3001...9001, using: &rng),
-                    recency: Double(n * 3 + 1)))
+            if Int.random(in: 0 ..< 5, using: &rng) == 0 {
+                rows.append(
+                    row(
+                        "hbig", tokens: 7, bytes: Int64.random(in: 3001 ... 9001, using: &rng),
+                        recency: Double(n * 3 + 1)))
             }
             let sum = total(rows)
-            let cap = Int64(Double(sum) * Double.random(in: 0.05...1.15, using: &rng))
+            let cap = Int64(Double(sum) * Double.random(in: 0.05 ... 1.15, using: &rng))
 
             let classic = todaysEviction(rows, cap: cap)
             let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: cap, activeChain: nil)
@@ -662,7 +682,9 @@ struct DiskQuotaPlannerTests {
             let gone = Set(classic.map(\.id))
             if classic.contains(where: { e in
                 e.bytes <= cap && rows.contains { !gone.contains($0.id) && $0.recency == e.recency }
-            }) { tieAtTheStoppingPoint += 1 }
+            }) {
+                tieAtTheStoppingPoint += 1
+            }
             #expect(Set(plan.evict) == gone)
             #expect(plan.totalBefore == sum)
             #expect(plan.totalAfter == sum - total(classic))
@@ -716,35 +738,38 @@ struct DiskQuotaPlannerTests {
     private static func mixedCorpus(
         _ rng: inout SeededRNG, tieHeavy: Bool = false
     ) -> (rows: [QuotaRow], active: String?) {
-        let n = Int.random(in: 1...48, using: &rng)
-        var ids = (0..<n).map { String(format: "r%04d", $0) }
+        let n = Int.random(in: 1 ... 48, using: &rng)
+        var ids = (0 ..< n).map { String(format: "r%04d", $0) }
         ids.shuffle(using: &rng)
         let rows = ids.map { id -> QuotaRow in
-            let kind = Int.random(in: 0..<20, using: &rng)
-            let chainPick = Int.random(in: 0..<7, using: &rng)
+            let kind = Int.random(in: 0 ..< 20, using: &rng)
+            let chainPick = Int.random(in: 0 ..< 7, using: &rng)
             return QuotaRow(
                 id: kind < 2 ? "legacy:\(id)" : id,
-                tokenCount: kind < 2 ? 0 : Int.random(in: 1...(tieHeavy ? 3 : 12), using: &rng) * 997,
-                bytes: Int64.random(in: 333...1291, using: &rng)
-                    * (Int.random(in: 0..<25, using: &rng) == 0 ? 9 : 1),
-                recency: Double(Int.random(in: 0..<(tieHeavy ? 3 : n * 2), using: &rng)),
+                tokenCount: kind < 2
+                    ? 0 : Int.random(in: 1 ... (tieHeavy ? 3 : 12), using: &rng) * 997,
+                bytes: Int64.random(in: 333 ... 1291, using: &rng)
+                    * (Int.random(in: 0 ..< 25, using: &rng) == 0 ? 9 : 1),
+                recency: Double(Int.random(in: 0 ..< (tieHeavy ? 3 : n * 2), using: &rng)),
                 isStableRoot: kind == 2,
                 chainId: chainPick < 5 ? "c\(chainPick)" : nil,
                 isLegacyCompanion: kind < 2)
         }
-        let activePick = Int.random(in: 0..<7, using: &rng)
+        let activePick = Int.random(in: 0 ..< 7, using: &rng)
         return (rows, activePick < 6 ? "c\(activePick)" : nil)  // c5 never has rows
     }
 
     @Test func planIsIndependentOfInputOrder() {
         var rng = SeededRNG(seed: 0x5EED_0006)
-        var nonTrivial = 0, corpora = 0
+        var nonTrivial = 0
+        var corpora = 0
         // One ordinary corpus, then tie-heavy ones: a stable sort with a
         // missing tie-break reproduces INPUT order, and only ties can show it.
         for tieHeavy in [false, true, true, true] {
             var corpus: (rows: [QuotaRow], active: String?)
-            repeat { corpus = Self.mixedCorpus(&rng, tieHeavy: tieHeavy) }
-            while corpus.rows.count < 40 || corpus.active == nil
+            repeat {
+                corpus = Self.mixedCorpus(&rng, tieHeavy: tieHeavy)
+            } while corpus.rows.count < 40 || corpus.active == nil
             corpora += 1
             let sum = total(corpus.rows)
             for fraction in [0.97, 0.71, 0.43, 0.13] {
@@ -752,7 +777,7 @@ struct DiskQuotaPlannerTests {
                 let baseline = DiskQuotaPlanner.plan(
                     rows: corpus.rows, capBytes: cap, activeChain: corpus.active)
                 if baseline.evict.count >= 2 { nonTrivial += 1 }
-                for _ in 0..<200 {
+                for _ in 0 ..< 200 {
                     let shuffled = corpus.rows.shuffled(using: &rng)
                     let again = DiskQuotaPlanner.plan(
                         rows: shuffled, capBytes: cap, activeChain: corpus.active)
@@ -769,11 +794,13 @@ struct DiskQuotaPlannerTests {
     /// other row is gone, a tip that fits the cap fits it alone. Hold it to that.
     @Test func activeTipThatFitsIsNeverEvicted() {
         var rng = SeededRNG(seed: 0x5EED_0004)
-        var evictingWithActiveTip = 0, downToTheTipAlone = 0
-        for _ in 0..<500 {
+        var evictingWithActiveTip = 0
+        var downToTheTipAlone = 0
+        for _ in 0 ..< 500 {
             let (rows, active) = Self.mixedCorpus(&rng)
             guard let active else { continue }
-            let tip = rows
+            let tip =
+                rows
                 .filter { !$0.isStableRoot && !$0.isLegacyCompanion && $0.chainId == active }
                 .max {
                     ($0.tokenCount, $0.recency, $0.id) < ($1.tokenCount, $1.recency, $1.id)
@@ -781,7 +808,7 @@ struct DiskQuotaPlannerTests {
             guard let tip else { continue }
             // Caps from "barely fits the tip" upward: the hardest pressure that
             // still leaves the tip a legal survivor.
-            let cap = tip.bytes + Int64.random(in: 0...1291, using: &rng)
+            let cap = tip.bytes + Int64.random(in: 0 ... 1291, using: &rng)
             guard total(rows) > cap else { continue }
             let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: cap, activeChain: active)
             evictingWithActiveTip += 1
@@ -796,18 +823,20 @@ struct DiskQuotaPlannerTests {
 
     @Test func accountingIsExact() {
         var rng = SeededRNG(seed: 0x5EED_0008)
-        var evicting = 0, withEvent = 0
-        for _ in 0..<500 {
+        var evicting = 0
+        var withEvent = 0
+        for _ in 0 ..< 500 {
             let (rows, active) = Self.mixedCorpus(&rng)
             let sum = total(rows)
-            let cap = Int64(Double(sum) * Double.random(in: 0.05...1.15, using: &rng))
+            let cap = Int64(Double(sum) * Double.random(in: 0.05 ... 1.15, using: &rng))
             let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: cap, activeChain: active)
 
             let byId = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
             #expect(plan.totalBefore == sum)
             #expect(Set(plan.evict).count == plan.evict.count)
             #expect(plan.evict.allSatisfy { byId[$0] != nil })
-            #expect(plan.evictedBytes == plan.evict.reduce(Int64(0)) { $0 + (byId[$1]?.bytes ?? 0) })
+            #expect(
+                plan.evictedBytes == plan.evict.reduce(Int64(0)) { $0 + (byId[$1]?.bytes ?? 0) })
             #expect(plan.totalAfter == plan.totalBefore - plan.evictedBytes)
             if sum <= cap {
                 #expect(plan.evict.isEmpty)
@@ -848,7 +877,10 @@ struct DiskQuotaPlannerTests {
         case plannerPerStore
     }
 
-    private struct ReplayMessage { let id: String; let tokens: Int }
+    private struct ReplayMessage {
+        let id: String
+        let tokens: Int
+    }
 
     private final class ReplayConversation {
         let name: String
@@ -872,7 +904,12 @@ struct DiskQuotaPlannerTests {
         }
     }
 
-    private struct ReplayTurn { let conversation: String; let tag: String; let prompt: Int; let hit: Int }
+    private struct ReplayTurn {
+        let conversation: String
+        let tag: String
+        let prompt: Int
+        let hit: Int
+    }
 
     private struct ReplayResult {
         var turns: [ReplayTurn] = []
@@ -911,7 +948,10 @@ struct DiskQuotaPlannerTests {
         var chainSeq = 0
         var result = ReplayResult()
 
-        init(cap: Int64, policy: ReplayPolicy) { self.cap = cap; self.policy = policy }
+        init(cap: Int64, policy: ReplayPolicy) {
+            self.cap = cap
+            self.policy = policy
+        }
 
         /// Cumulative (key, tokens) for every message end; index 0 = system only.
         static func prefixRows(_ messages: [ReplayMessage]) -> [(key: [String], tokens: Int)] {
@@ -938,13 +978,19 @@ struct DiskQuotaPlannerTests {
                 if rungs.count >= maxRungs { break }
                 let i = ends.count - 1 - d
                 if i <= 0 { break }
-                if last - ends[i].tokens >= minGap { rungs.append(ends[i]); last = ends[i].tokens }
+                if last - ends[i].tokens >= minGap {
+                    rungs.append(ends[i])
+                    last = ends[i].tokens
+                }
             }
             return (rungs, top, prompt)
         }
 
         var total: Int64 { rows.reduce(0) { $0 + Int64($1.tokens) } }
-        func tick() -> Int { clock += 1; return clock }
+        func tick() -> Int {
+            clock += 1
+            return clock
+        }
 
         /// The longest stored prefix of `key`. Touches it, and the root.
         func fetch(_ key: [String]) -> (tokens: Int, chain: String?) {
@@ -962,8 +1008,9 @@ struct DiskQuotaPlannerTests {
 
         func store(_ key: [String], tokens: Int, chain: String?) {
             guard !rows.contains(where: { $0.key == key }) else { return }
-            rows.append(Row(
-                key: key, tokens: tokens, recency: tick(), chain: key.isEmpty ? nil : chain))
+            rows.append(
+                Row(
+                    key: key, tokens: tokens, recency: tick(), chain: key.isEmpty ? nil : chain))
             if policy == .today { evictTodaysWay() }
             result.peak = max(result.peak, Double(total) / Double(cap))
             if policy == .plannerPerStore, !key.isEmpty, let chain { plannerPass(active: chain) }
@@ -1013,7 +1060,8 @@ struct DiskQuotaPlannerTests {
             _ conversation: ReplayConversation, tag: String = "", ans: Int = ReplayCache.ans,
             userMessage: ReplayMessage? = nil
         ) {
-            let user = userMessage
+            let user =
+                userMessage
                 ?? ReplayMessage(id: conversation.newId("u"), tokens: ReplayCache.user)
             let messages = conversation.messages + [user]
             let b = Self.boundaries(messages)
@@ -1039,8 +1087,10 @@ struct DiskQuotaPlannerTests {
             endTurn(active: chain)
             if total > cap { result.turnsEndedOverCap += 1 }
             conversation.messages = messages + [answer]
-            result.turns.append(ReplayTurn(
-                conversation: conversation.name, tag: tag, prompt: b.prompt.tokens, hit: hit.tokens))
+            result.turns.append(
+                ReplayTurn(
+                    conversation: conversation.name, tag: tag, prompt: b.prompt.tokens,
+                    hit: hit.tokens))
             result.trace.append(
                 "  #\(result.turns.count - 1) \(conversation.name) \(tag) chain=\(chain)"
                     + " prompt=\(b.prompt.tokens) hit=\(hit.tokens) total=\(total)"
@@ -1078,20 +1128,20 @@ struct DiskQuotaPlannerTests {
             typealias C = ReplayConversation
             switch self {
             case .baseline:
-                let chats = (0..<3).map { C("c\($0)") }
-                for chat in chats { for _ in 1...12 { cache.turn(chat) } }
+                let chats = (0 ..< 3).map { C("c\($0)") }
+                for chat in chats { for _ in 1 ... 12 { cache.turn(chat) } }
                 cache.turn(chats[0], tag: "resume")
             case .interleaved:
-                let chats = (0..<3).map { C("c\($0)") }
-                for _ in 1...12 { for chat in chats { cache.turn(chat) } }
+                let chats = (0 ..< 3).map { C("c\($0)") }
+                for _ in 1 ... 12 { for chat in chats { cache.turn(chat) } }
                 cache.turn(chats[0], tag: "resume")
             case .manyShort:
-                let chats = (0..<24).map { C("m\($0)") }
-                for chat in chats { for _ in 1...2 { cache.turn(chat) } }
+                let chats = (0 ..< 24).map { C("m\($0)") }
+                for chat in chats { for _ in 1 ... 2 { cache.turn(chat) } }
                 for chat in chats[..<6] + chats[18...] { cache.turn(chat, tag: "resume") }
             case .regenerate:
                 var chat = C("a")
-                for _ in 1...12 {
+                for _ in 1 ... 12 {
                     let history = chat.messages.count
                     cache.turn(chat, tag: "first")
                     let again = chat.fork(keep: history, suffix: "r")
@@ -1119,7 +1169,7 @@ struct DiskQuotaPlannerTests {
         // different (easier) workload.
         func boundarySet(turn: Int) -> (set: [Int], prompt: Int) {
             var messages: [ReplayMessage] = []
-            for t in 1..<turn {
+            for t in 1 ..< turn {
                 messages += [
                     ReplayMessage(id: "u\(t)", tokens: ReplayCache.user),
                     ReplayMessage(id: "a\(t)", tokens: ReplayCache.ans),
@@ -1127,7 +1177,8 @@ struct DiskQuotaPlannerTests {
             }
             messages.append(ReplayMessage(id: "u\(turn)", tokens: ReplayCache.user))
             let b = ReplayCache.boundaries(messages)
-            let set = Set((b.rungs + [b.top, b.prompt]).map(\.tokens) + [b.prompt.tokens + ReplayCache.ans])
+            let set = Set(
+                (b.rungs + [b.top, b.prompt]).map(\.tokens) + [b.prompt.tokens + ReplayCache.ans])
             return (set.sorted(), b.prompt.tokens)
         }
         #expect(boundarySet(turn: 1).set == [3137, 4240, 4629])
@@ -1185,7 +1236,8 @@ struct DiskQuotaPlannerTests {
         func pair(_ r: ReplayResult) -> String { "\(f(r.meanReuse))/\(f(r.tokenWeightedReuse))" }
         var lines = 0
         for shape in ReplayShape.allCases {
-            let caps: [Double] = shape == .regenerate
+            let caps: [Double] =
+                shape == .regenerate
                 ? [0.8, 1.2, 1.5, 2.0, 2.5, 5, 10] : [0.8, 1.5, 2.5, 5, 10]
             for capTips in caps {
                 let cell = "shape=\(shape.rawValue) cap=\(capTips)"
@@ -1206,7 +1258,8 @@ struct DiskQuotaPlannerTests {
                 // its cap. 0 == 0 and "never evicts" must not pass.
                 var valid = true
                 for arm in [today, perStore, endOfTurn, todayEOT] {
-                    let ok = arm.turns.count == shape.expectedTurns
+                    let ok =
+                        arm.turns.count == shape.expectedTurns
                         && arm.turns.contains { $0.hit > 0 } && arm.passes > 0
                         && arm.turnsEndedOverCap == 0 && arm.passesThatLeftTheCacheOverCap == 0
                     #expect(ok, "INVALID \(cell)")
