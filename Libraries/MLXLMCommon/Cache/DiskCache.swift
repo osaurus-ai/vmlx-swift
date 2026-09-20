@@ -617,9 +617,17 @@ public final class DiskCache: @unchecked Sendable {
             db, busyTimeoutMs: indexMigrationBusyTimeoutMs)
         indexHasV2Columns = DiskCacheIndexSchema.hasV2Columns(
             db, busyTimeoutMs: indexMigrationBusyTimeoutMs)
-        DiskCacheIndexSchema.ensureV2Indexes(
+        if let failure = DiskCacheIndexSchema.ensureV2Indexes(
             db, version: indexSchemaVersion, hasV2Columns: indexHasV2Columns,
-            busyTimeoutMs: indexMigrationBusyTimeoutMs)
+            busyTimeoutMs: indexMigrationBusyTimeoutMs),
+            Self.isFirstReport(cacheDir.path, in: Self.reportedIndexCreationFailures)
+        {
+            // Every open tries again, so every open would say so again.
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk-index] \(DiskCacheIndexSchema.modelTokensIndexStatement) "
+                    + "failed: \(Self.boundedRendering(of: failure)); carrying on without it\n")
+                    .utf8))
+        }
 
         // The schema helpers put the connection back to "no wait" when they
         // finish. Every statement from here on waits a bounded time instead.
@@ -2125,6 +2133,9 @@ public final class DiskCache: @unchecked Sendable {
     private static let reportedRetireFailures = OSAllocatedUnfairLock(initialState: Set<String>())
     /// Roots whose opaque bytes ``reportOpaqueBytes(_:capBytes:of:)`` has said.
     private static let reportedOpaqueRoots = OSAllocatedUnfairLock(initialState: Set<String>())
+    /// Roots whose model/tokens index could not be created at open.
+    private static let reportedIndexCreationFailures = OSAllocatedUnfairLock(
+        initialState: Set<String>())
 
     private static func isFirstReport(
         _ value: String, in reported: OSAllocatedUnfairLock<Set<String>>
@@ -2664,6 +2675,7 @@ public final class DiskCache: @unchecked Sendable {
         reportedDeleteFailures.withLock { $0.removeAll() }
         reportedRetireFailures.withLock { $0.removeAll() }
         reportedOpaqueRoots.withLock { $0.removeAll() }
+        reportedIndexCreationFailures.withLock { $0.removeAll() }
     }
 
     /// Paths ``removeCacheFile(at:)`` has already reported in this process.

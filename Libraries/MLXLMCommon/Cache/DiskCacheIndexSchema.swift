@@ -52,13 +52,18 @@ enum DiskCacheIndexSchema {
         "ALTER TABLE cache_entries ADD COLUMN companion_bytes INTEGER NOT NULL DEFAULT 0",
         "CREATE INDEX IF NOT EXISTS idx_cache_entries_chain ON cache_entries(chain_id)",
         "CREATE TABLE IF NOT EXISTS legacy_companions (key TEXT PRIMARY KEY, bytes INTEGER NOT NULL, modified REAL NOT NULL)",
-        modelTokensIndexStatement,
     ]
 
     /// What `DiskCache.candidateTokenCounts` reads: one model's lengths,
     /// longest first, without touching another model's rows or the table.
     /// Additive like everything else here — an older build neither sees nor
     /// minds an index, and SQLite keeps it current under that build's writes.
+    ///
+    /// Not one of the migration's statements: nothing depends on it, and a
+    /// statement that fails there rolls the columns back with it. Every open
+    /// creates it when it is missing (``ensureV2Indexes(_:version:hasV2Columns:busyTimeoutMs:)``),
+    /// for a fresh index, a migrated one and one that was current before
+    /// this index existed alike.
     static let modelTokensIndexName = "idx_cache_entries_model_tokens"
     static let modelTokensIndexStatement =
         "CREATE INDEX IF NOT EXISTS \(modelTokensIndexName) ON cache_entries(model_key, token_count)"
@@ -167,21 +172,22 @@ enum DiskCacheIndexSchema {
     ///
     /// A read when there is nothing to add. A failure is not an error for
     /// the cache: the statements that would use the index work without it,
-    /// slower, and the next open tries again.
+    /// slower, and the next open tries again. It is returned — SQLite's
+    /// message — for the caller to say, as often as it sees fit; nil when
+    /// the index is there or was not this build's to add.
+    @discardableResult
     static func ensureV2Indexes(
         _ db: OpaquePointer?, version: Int32, hasV2Columns: Bool,
         busyTimeoutMs: Int32 = defaultBusyTimeoutMs
-    ) {
-        guard let db, version == currentVersion, hasV2Columns else { return }
-        withBusyTimeout(db, busyTimeoutMs) {
+    ) -> String? {
+        guard let db, version == currentVersion, hasV2Columns else { return nil }
+        return withBusyTimeout(db, busyTimeoutMs) {
             let present = scalarInt(
                 db,
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='\(modelTokensIndexName)'"
             )
-            guard present == 0 else { return }
-            if !exec(db, modelTokensIndexStatement) {
-                warn("\(modelTokensIndexStatement) failed: \(lastError(db)); carrying on without it")
-            }
+            guard present == 0 else { return nil }
+            return exec(db, modelTokensIndexStatement) ? nil : lastError(db)
         }
     }
 

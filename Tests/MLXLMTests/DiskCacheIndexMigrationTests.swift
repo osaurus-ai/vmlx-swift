@@ -454,6 +454,80 @@ import Testing
         #expect(try raw.int(Self.modelTokensIndexCount) == 0)
     }
 
+    /// The model/tokens index makes one query faster and nothing depends on
+    /// it, so creating it is not part of the migration: a `CREATE INDEX` that
+    /// fails — here a table holds the index's name, which `IF NOT EXISTS`
+    /// does not excuse — must not roll five columns and a table back with
+    /// it. The open after the migration is what creates the index; when that
+    /// fails it is said once, and the cache works without it.
+    @Test func aFailedIndexCreationDoesNotCostTheMigration() throws {
+        let dir = try Self.makeTempDir("index-fails")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try Self.buildV1Index(in: dir)
+        let raw = try RawDB(Self.dbPath(dir))
+        try #require(try raw.int("PRAGMA user_version") < 2, "INVALID: not a v1 index")
+        try raw.require("CREATE TABLE idx_cache_entries_model_tokens (squatter)")
+        try #require(
+            raw.exec(DiskCacheIndexSchema.modelTokensIndexStatement) != SQLITE_OK,
+            "INVALID: the index statement does not fail on this fixture")
+
+        let tokens = (0 ..< 37).map { 7_100_000 + $0 }
+        DiskCache.resetRateLimitedReportsForTesting()
+        let (_, log) = try DiskCacheAccountingTestSupport.capturingStandardError {
+            for _ in 0 ..< 3 {
+                try MLXMetalTestLock.withLock {
+                    let cache = DiskCache(cacheDir: dir, maxSizeBytes: 1 << 30, modelKey: "m")
+                    #expect(cache.indexSchemaVersion == 2)
+                    #expect(cache.indexHasV2Columns)
+                    cache.store(
+                        tokens: tokens, arrays: ["data": MLXArray.ones([13], dtype: .float32)])
+                    #expect(cache.fetch(tokens: tokens) != nil)
+                    // The filtered query, answered without its index.
+                    #expect(cache.candidateTokenCounts(maxTokens: 5_003) == [4_099, 333, 37, 17])
+                }
+            }
+        }
+        #expect(try raw.int("PRAGMA user_version") == 2)
+        let columns = try raw.columnNames()
+        for name in Self.v2ColumnNames {
+            #expect(columns.filter { $0 == name }.count == 1, "column \(name) in \(columns)")
+        }
+        #expect(try raw.int(Self.modelTokensIndexCount) == 0)
+        let said = log.split(separator: "\n").filter {
+            $0.contains("idx_cache_entries_model_tokens") && $0.contains("failed")
+        }
+        #expect(said.count == 1, "said once per root, not per open: \(log)")
+
+        // Control: with the name free again, the next open adds the index.
+        try raw.require("DROP TABLE idx_cache_entries_model_tokens")
+        do {
+            _ = DiskCache(cacheDir: dir, maxSizeBytes: 1 << 30, modelKey: "m")
+        }
+        #expect(try raw.int(Self.modelTokensIndexCount) == 1)
+    }
+
+    /// The migration's own statements create no index a later open can
+    /// create: a failure there is a rollback.
+    @Test func theMigrationItselfDoesNotCreateTheModelTokensIndex() throws {
+        #expect(
+            !DiskCacheIndexSchema.v2Statements.contains {
+                $0.contains(DiskCacheIndexSchema.modelTokensIndexName)
+            })
+        // Migrated by the schema alone, the index is not there yet …
+        let dir = try Self.makeTempDir("index-after")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try Self.buildV1Index(in: dir)
+        let raw = try RawDB(Self.dbPath(dir))
+        try #require(DiskCacheIndexSchema.migrate(raw.handle) == 2)
+        #expect(try raw.int(Self.modelTokensIndexCount) == 0)
+        // … and an open adds it, on a migrated index as on a fresh one.
+        do {
+            _ = DiskCache(cacheDir: dir, maxSizeBytes: 1 << 30, modelKey: "m")
+        }
+        #expect(try raw.int(Self.modelTokensIndexCount) == 1)
+        try Self.expectMigratedSeedIndex(dir)
+    }
+
     /// The candidate query must be answered from the model/tokens index
     /// alone: two bounded searches of it, and no walk of the table.
     @Test func modelCandidateQueryIsTwoCoveringIndexSearches() throws {
