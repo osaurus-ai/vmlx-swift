@@ -626,7 +626,24 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(ssm.contains("MLXDiskCacheIOLock.shared.lock()"))
         #expect(ssm.contains("Stream.gpu.synchronize()"))
         #expect(ssm.contains("loadArraysAndMetadata(url: safetensorsURL)"))
-        #expect(ssm.contains("try save(arrays: arrays, metadata: [\"format\": \"mlx\"], url: safetensorsURL)"))
+        // The companion tensor is written under an unpublished name and then
+        // renamed into place. The contract is unchanged: the MLX safetensors
+        // write happens while `MLXDiskCacheIOLock` is held — and so does the
+        // rename that publishes it, so no reader in another cache instance
+        // can map the final name between the two.
+        let writeEntry = try #require(ssm.range(of: "private func writeEntry("))
+        let write = String(ssm[writeEntry.lowerBound...])
+        let ioLock = try #require(write.range(
+            of: "MLXDiskCacheIOLock.shared.lock()\n        defer { MLXDiskCacheIOLock.shared.unlock() }"))
+        let save = try #require(write.range(
+            of: "try save(arrays: arrays, metadata: [\"format\": \"mlx\"], url: partialURL)"))
+        let publish = try #require(write.range(of: "try Self.publish(partialURL, as: safetensorsURL)"))
+        let endOfWriteEntry = try #require(write.range(of: "\n    public func fetch("))
+        #expect(ioLock.upperBound < save.lowerBound)
+        #expect(save.upperBound < publish.lowerBound)
+        #expect(publish.upperBound < endOfWriteEntry.lowerBound)
+        #expect(ssm.contains("let code = DiskCache.renameFile(from: partialURL, to: finalURL)"))
+        #expect(!ssm.contains("try save(arrays: arrays, metadata: [\"format\": \"mlx\"], url: safetensorsURL)"))
     }
 
     @Test("load-time stack materialization serializes with cache IO")

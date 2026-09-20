@@ -1129,6 +1129,10 @@ import Testing
         // A dead temp file and a header-only "row" (declares 4 floats, has no payload).
         let deadTemp = tempDir.appendingPathComponent("deadbeefdeadbeefdeadbeefdeadbeef.partial-1a2b3c4d.safetensors")
         try Data("junk".utf8).write(to: deadTemp)
+        // Old enough that no store can still be writing it: a young partial
+        // may be another connection's store in flight, and is left alone.
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-11 * 60)], ofItemAtPath: deadTemp.path)
         let header = #"{"kv_0_keys":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#
         var incomplete = Data()
         var length = UInt64(header.utf8.count).littleEndian

@@ -125,31 +125,55 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     /// Test seam, never set in production: called just before each publishing
     /// step of a write, and an error thrown from it stands in for the file
     /// system failing at that step. The sidecar failure can be provoked with
-    /// a real directory in the way; "the old tensor was removed and the
-    /// rename then failed" cannot be arranged from outside the process.
+    /// a real directory in the way; a rename that fails for any other reason
+    /// than a directory under the final name cannot be arranged from outside
+    /// the process.
     var writeFaultForTesting: (@Sendable (WriteStage) throws -> Void)?
+
+    /// Test seam, never set in production: names the unpublished tensor file
+    /// of the next write. The real name carries a random tag, so nothing can
+    /// be planted under it in advance.
+    var temporaryURLForTesting: (@Sendable (URL) -> URL)?
 
     // MARK: - Initialization
 
-    public init(cacheDir: URL, modelKey: String? = nil, maxBytes: Int = 0) throws {
+    /// `sweepUnpublishedAtOpen` is false when the index of the root this
+    /// directory belongs to has been claimed by a newer build
+    /// (``DiskCache/indexIsFromANewerBuild``): nothing is then removed from
+    /// a listing at open, here or in the root.
+    public init(
+        cacheDir: URL, modelKey: String? = nil, maxBytes: Int = 0,
+        sweepUnpublishedAtOpen: Bool = true
+    ) throws {
         self.cacheDir = cacheDir
         self.modelKey = modelKey
         self.maxBytes = maxBytes
         try FileManager.default.createDirectory(
             at: cacheDir, withIntermediateDirectories: true)
-        Self.sweepUnpublishedFiles(in: cacheDir)
+        if sweepUnpublishedAtOpen {
+            Self.sweepUnpublishedFiles(in: cacheDir)
+        }
     }
 
     /// Tensor files are written under a `.partial-` name and renamed into
     /// place, so one that still carries that name at open is a dead write —
-    /// if the name is exactly this store's (``isUnpublishedTensorName(_:)``)
-    /// and a regular file holds it. Anything else that starts with `ssm-` is
-    /// not this store's to remove.
-    static func sweepUnpublishedFiles(in cacheDir: URL) {
+    /// if the name is exactly this store's (``isUnpublishedTensorName(_:)``),
+    /// a regular file holds it, and it is old enough that no write can still
+    /// be producing it (``DiskCache/isDeadWrite(at:olderThan:now:)``: another
+    /// coordinator on the same root may be in the middle of a store).
+    /// Anything else that starts with `ssm-` is not this store's to remove.
+    static func sweepUnpublishedFiles(
+        in cacheDir: URL,
+        unpublishedGuardAge: TimeInterval = DiskCache.defaultUnpublishedGuardAge,
+        now: Date = Date()
+    ) {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path)
         else { return }
         for name in names where isUnpublishedTensorName(name) {
-            _ = DiskCache.removeRegularFile(at: cacheDir.appendingPathComponent(name))
+            let url = cacheDir.appendingPathComponent(name)
+            guard DiskCache.isDeadWrite(at: url, olderThan: unpublishedGuardAge, now: now)
+            else { continue }
+            _ = DiskCache.removeRegularFile(at: url)
         }
     }
 
@@ -159,6 +183,39 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     /// store in this repository; a shorter `ssm-<32 hex>` name is not one
     /// this code has written.
     static let keyLength = 64
+
+    /// Whether `text` could be a key this store computed.
+    static func isEntryKey(_ text: String) -> Bool {
+        DiskCache.isLowercaseHex(text, count: keyLength)
+    }
+
+    /// The two files of the entry `key` in `cacheDir`, or nil when `key` is
+    /// not an entry key. This is the ONLY place a key becomes a path, and it
+    /// is why a key read from the index (`cache_entries.companion_key`,
+    /// `legacy_companions.key`) can be handed to it: `notes` would address
+    /// `ssm-notes.safetensors`, which is somebody's file, and `x/../../y`
+    /// leaves the directory. Such a key names nothing.
+    static func entryURLs(key: String, in cacheDir: URL) -> (tensor: URL, sidecar: URL)? {
+        guard isEntryKey(key) else { return nil }
+        return (
+            cacheDir.appendingPathComponent("\(namePrefix)\(key)\(DiskCache.payloadSuffix)"),
+            cacheDir.appendingPathComponent("\(namePrefix)\(key).json")
+        )
+    }
+
+    /// The key of a token prefix and its two files.
+    /// ``keyFor(tokens:boundary:mediaSalt:modelKey:)`` is an entry key by
+    /// construction, which DEBUG builds assert; a build in which that
+    /// stopped being true would miss, not build a path from the value.
+    private func entry(
+        tokens: [Int], boundary: Int, mediaSalt: String?
+    ) -> (key: String, safetensorsURL: URL, sidecarURL: URL)? {
+        let key = Self.keyFor(
+            tokens: tokens, boundary: boundary, mediaSalt: mediaSalt, modelKey: modelKey)
+        let urls = Self.entryURLs(key: key, in: cacheDir)
+        assert(urls != nil, "keyFor produced \(key), which is not an entry key")
+        return urls.map { (key, $0.tensor, $0.sidecar) }
+    }
 
     /// The key in `ssm-<key>.safetensors` / `ssm-<key>.json`, or nil when
     /// `name` is not exactly one of those two with a real key. This is the
@@ -208,16 +265,14 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         boundary: Int,
         mediaSalt: String? = nil
     ) -> Bool {
-        guard boundary > 0, boundary <= tokens.count else { return false }
-        let key = Self.keyFor(
-            tokens: tokens, boundary: boundary,
-            mediaSalt: mediaSalt, modelKey: modelKey)
+        guard boundary > 0, boundary <= tokens.count,
+              let (key, safetensorsURL, sidecarURL) = entry(
+                  tokens: tokens, boundary: boundary, mediaSalt: mediaSalt)
+        else { return false }
         let expectedKVHash = DiskCache.hashTokens(
             Array(tokens.prefix(boundary)),
             modelKey: modelKey,
             mediaSalt: mediaSalt)
-        let safetensorsURL = self.safetensorsURL(for: key)
-        let sidecarURL = self.sidecarURL(for: key)
 
         lock.lock()
         defer { lock.unlock() }
@@ -277,10 +332,10 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         isComplete: Bool = true,
         enforceQuota: Bool
     ) throws -> SSMCompanionStoreRecord? {
-        guard !ssmStates.isEmpty, boundary > 0, boundary <= tokens.count else { return nil }
-        let key = Self.keyFor(
-            tokens: tokens, boundary: boundary,
-            mediaSalt: mediaSalt, modelKey: modelKey)
+        guard !ssmStates.isEmpty, boundary > 0, boundary <= tokens.count,
+              let (key, safetensorsURL, sidecarURL) = entry(
+                  tokens: tokens, boundary: boundary, mediaSalt: mediaSalt)
+        else { return nil }
         let kvHash = DiskCache.hashTokens(
             Array(tokens.prefix(boundary)),
             modelKey: modelKey,
@@ -289,12 +344,13 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         let outcome: WriteOutcome
         do {
             outcome = try writeEntry(
-                ssmStates: ssmStates, key: key, kvHash: kvHash, boundary: boundary,
+                ssmStates: ssmStates, key: key, safetensorsURL: safetensorsURL,
+                sidecarURL: sidecarURL, kvHash: kvHash, boundary: boundary,
                 isComplete: isComplete, enforceQuota: enforceQuota)
         } catch {
             // The write can fail after it has already changed the directory:
-            // the old tensor is removed before the new one is renamed in, and
-            // the tensor is published before the sidecar is written. The
+            // the tensor is published before the sidecar is written. (A
+            // rename that fails changes nothing: the old pair stays.) The
             // index must describe what is there now, not what was intended.
             reportDiskTruth(key: key, kvHash: kvHash)
             throw error
@@ -371,11 +427,16 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     }
 
     /// Stats only, no lock: also used by the index while it holds its own.
+    ///
+    /// A `key` that is not an entry key names no file and is `absent`
+    /// without anything being looked at: the caller then forgets the record
+    /// that carries it.
     static func publishedEntryState(key: String, in cacheDir: URL) -> PublishedEntryState {
+        guard let urls = entryURLs(key: key, in: cacheDir) else { return .absent }
         var bytes: Int64 = 0
         var modified: Date?
-        for name in ["ssm-\(key).safetensors", "ssm-\(key).json"] {
-            switch DiskCache.pathState(at: cacheDir.appendingPathComponent(name)) {
+        for url in [urls.tensor, urls.sidecar] {
+            switch DiskCache.pathState(at: url) {
             case .regularFile(let size, let date):
                 bytes += size
                 modified = modified.map { min($0, date) } ?? date
@@ -425,8 +486,10 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         }
         MLXDiskCacheIOLock.shared.lock()
         lock.lock()
-        _ = DiskCache.removeRegularFile(at: safetensorsURL(for: key))
-        _ = DiskCache.removeRegularFile(at: sidecarURL(for: key))
+        if let urls = Self.entryURLs(key: key, in: cacheDir) {
+            _ = DiskCache.removeRegularFile(at: urls.tensor)
+            _ = DiskCache.removeRegularFile(at: urls.sidecar)
+        }
         validatedEntries.removeValue(forKey: key)
         lock.unlock()
         MLXDiskCacheIOLock.shared.unlock()
@@ -441,14 +504,18 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     /// Returns the keys whose files it removed; the caller reports them.
     private func evictOverCap(countedBy ledger: DiskCache) -> Set<String> {
         guard maxBytes > 0 else { return [] }
-        var total = ledger.companionUsageBytes()
-        guard total > Int64(maxBytes) else { return [] }
+        guard ledger.companionUsageBytes() > Int64(maxBytes) else { return [] }
 
+        // Reading the list drops every record whose key is not an entry key
+        // (it names no file), so the total is read again after it: bytes
+        // that name nothing must not be paid for by a real companion.
+        let oldestFirst = ledger.companionsOldestFirst()
+        var total = ledger.companionUsageBytes()
         var evicted = Set<String>()
-        for companion in ledger.companionsOldestFirst() {
+        for companion in oldestFirst {
+            guard total > Int64(maxBytes) else { break }
             evicted.insert(companion.key)
             total -= companion.bytes
-            if total <= Int64(maxBytes) { break }
         }
         // Files first, rows after (by the caller): dying in between leaves
         // rows naming files that are gone — an over-count the next import
@@ -478,6 +545,15 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         }
     }
 
+    private static func publish(_ partialURL: URL, as finalURL: URL) throws {
+        let code = DiskCache.renameFile(from: partialURL, to: finalURL)
+        guard code != 0 else { return }
+        if code == EISDIR || code == ENOTDIR {
+            throw OccupiedNameError(name: finalURL.lastPathComponent)
+        }
+        throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+    }
+
     private struct WriteOutcome {
         var record: SSMCompanionStoreRecord?
         var evictedKeys: Set<String> = []
@@ -487,14 +563,13 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     private func writeEntry(
         ssmStates: [MLXArray],
         key: String,
+        safetensorsURL: URL,
+        sidecarURL: URL,
         kvHash: String,
         boundary: Int,
         isComplete: Bool,
         enforceQuota: Bool
     ) throws -> WriteOutcome {
-        let safetensorsURL = self.safetensorsURL(for: key)
-        let sidecarURL = self.sidecarURL(for: key)
-
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
@@ -570,18 +645,29 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         // Atomic publication, as in `DiskCache.store`: a process that dies
         // mid-write must not leave a short tensor file under the final name,
         // where the next fetch would map it.
-        let partialURL = DiskCache.temporaryURL(for: safetensorsURL)
-        _ = DiskCache.removeRegularFile(at: partialURL)
+        let partialURL = temporaryURLForTesting?(safetensorsURL)
+            ?? DiskCache.temporaryURL(for: safetensorsURL)
+        // A leftover of ours under that name goes. Anything else there is
+        // not written through: `save` would follow a link.
+        switch DiskCache.removeRegularFile(at: partialURL) {
+        case .removed, .missing:
+            break
+        case .notRegularFile, .failed:
+            throw OccupiedNameError(name: partialURL.lastPathComponent)
+        }
         do {
             try save(arrays: arrays, metadata: ["format": "mlx"], url: partialURL)
             Stream.gpu.synchronize()
-            // Make room for the rename only by unlinking an older regular
-            // file of the same key; `removeItem` would have descended into a
-            // directory that carries the name.
+            // Published with one `rename(2)`, still inside the IO lock: it
+            // replaces an older regular file of the same key atomically, so
+            // a rename that fails leaves the old valid tensor where it was.
+            // A directory or a link under the final name is not an older
+            // copy of the entry and refuses the write; a directory that
+            // takes the name after that look fails the rename (EISDIR)
+            // instead of being descended into.
             try Self.requireReplaceable(safetensorsURL)
-            _ = DiskCache.removeRegularFile(at: safetensorsURL)
             try writeFaultForTesting?(.moveTensorIntoPlace)
-            try FileManager.default.moveItem(at: partialURL, to: safetensorsURL)
+            try Self.publish(partialURL, as: safetensorsURL)
         } catch {
             _ = DiskCache.removeRegularFile(at: partialURL)
             throw error
@@ -648,12 +734,10 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         touchRecency: Bool = true,
         requireComplete: Bool = false
     ) -> SSMStateCache.FetchResult? {
-        guard boundary > 0, boundary <= tokens.count else { return nil }
-        let key = Self.keyFor(
-            tokens: tokens, boundary: boundary,
-            mediaSalt: mediaSalt, modelKey: modelKey)
-        let safetensorsURL = self.safetensorsURL(for: key)
-        let sidecarURL = self.sidecarURL(for: key)
+        guard boundary > 0, boundary <= tokens.count,
+              let (key, safetensorsURL, sidecarURL) = entry(
+                  tokens: tokens, boundary: boundary, mediaSalt: mediaSalt)
+        else { return nil }
 
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
@@ -761,14 +845,10 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         mediaSalt: String? = nil,
         at date: Date
     ) -> Bool {
-        guard boundary > 0, boundary <= tokens.count else { return false }
-        let key = Self.keyFor(
-            tokens: tokens,
-            boundary: boundary,
-            mediaSalt: mediaSalt,
-            modelKey: modelKey)
-        let safetensorsURL = self.safetensorsURL(for: key)
-        let sidecarURL = self.sidecarURL(for: key)
+        guard boundary > 0, boundary <= tokens.count,
+              let (key, safetensorsURL, sidecarURL) = entry(
+                  tokens: tokens, boundary: boundary, mediaSalt: mediaSalt)
+        else { return false }
 
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
@@ -891,23 +971,22 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
 
         var stillOnDisk = Set<String>()
         for hash in hashes {
-            let tensorGone = DiskCache.removeCacheFile(at: safetensorsURL(for: hash))
-            let sidecarGone = DiskCache.removeCacheFile(at: sidecarURL(for: hash))
             validatedEntries.removeValue(forKey: hash)
+            // Not an entry key: it names no file, so there is nothing to
+            // remove and nothing left on disk — the caller forgets the
+            // record, which is all there ever was of it.
+            guard let urls = Self.entryURLs(key: hash, in: cacheDir) else {
+                DiskCache.reportInvalidIndexValue(hash, kind: .companionKey)
+                continue
+            }
+            let tensorGone = DiskCache.removeCacheFile(at: urls.tensor)
+            let sidecarGone = DiskCache.removeCacheFile(at: urls.sidecar)
             if !tensorGone || !sidecarGone { stillOnDisk.insert(hash) }
         }
         return stillOnDisk
     }
 
     // MARK: - Helpers
-
-    private func safetensorsURL(for hash: String) -> URL {
-        cacheDir.appendingPathComponent("ssm-\(hash).safetensors")
-    }
-
-    private func sidecarURL(for hash: String) -> URL {
-        cacheDir.appendingPathComponent("ssm-\(hash).json")
-    }
 
     private func fileFingerprint(at url: URL) -> FileFingerprint? {
         guard let values = try? url.resourceValues(forKeys: [
@@ -928,8 +1007,11 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         sidecarURL: URL,
         at date: Date
     ) -> (safetensors: FileFingerprint, sidecar: FileFingerprint)? {
-        guard FileManager.default.fileExists(atPath: safetensorsURL.path),
-              FileManager.default.fileExists(atPath: sidecarURL.path)
+        // `setAttributes` follows a link: only a regular file under each of
+        // the two names (by `lstat`) is an entry to re-date. A link there
+        // points at somebody else's file.
+        guard case .regularFile = DiskCache.pathState(at: safetensorsURL),
+              case .regularFile = DiskCache.pathState(at: sidecarURL)
         else { return nil }
         do {
             try FileManager.default.setAttributes(

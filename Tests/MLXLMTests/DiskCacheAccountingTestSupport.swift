@@ -123,15 +123,23 @@ enum DiskCacheAccountingTestSupport {
     /// The invariant. `atLeast` keeps it from passing on an empty fixture.
     /// `checkCompleteness: false` is for the one test that drops a file the
     /// index must NOT know about.
+    ///
+    /// `foreign` are the names (in the root or in the companion directory) of
+    /// files the TEST planted as somebody else's: the completeness walk is
+    /// deliberately loose about names — anything that ends in `.safetensors`
+    /// is taken for a payload — so a planted victim has to be named, exactly,
+    /// to be left out of it.
     static func expectUsageMatchesDisk(
         _ disk: DiskCache, root: URL, atLeast: Int64 = 1, checkCompleteness: Bool = true,
+        foreign: Set<String> = [],
         sourceLocation: SourceLocation = #_sourceLocation
     ) throws {
         let onDisk = try onDiskBytesOfIndexedFiles(root)
         #expect(onDisk >= atLeast, "fixture is empty", sourceLocation: sourceLocation)
         #expect(disk.usageBytes() == onDisk, sourceLocation: sourceLocation)
         if checkCompleteness {
-            try expectIndexNamesEveryPublishedFile(root, sourceLocation: sourceLocation)
+            try expectIndexNamesEveryPublishedFile(
+                root, foreign: foreign, sourceLocation: sourceLocation)
         }
     }
 
@@ -141,7 +149,8 @@ enum DiskCacheAccountingTestSupport {
     /// (`.partial-`) names are not entries. Throws when a directory cannot be
     /// listed, so an unreadable directory is never a silent pass.
     static func expectIndexNamesEveryPublishedFile(
-        _ root: URL, sourceLocation: SourceLocation = #_sourceLocation
+        _ root: URL, foreign: Set<String> = [],
+        sourceLocation: SourceLocation = #_sourceLocation
     ) throws {
         let rows = try indexedRows(root)
         let rowHashes = Set(rows.map(\.hash))
@@ -149,7 +158,9 @@ enum DiskCacheAccountingTestSupport {
             .union(try legacyRows(root).keys)
 
         for name in try FileManager.default.contentsOfDirectory(atPath: root.path)
-        where name.hasSuffix(".safetensors") && !DiskCache.isUnpublishedName(name) {
+        where name.hasSuffix(".safetensors") && !DiskCache.isUnpublishedName(name)
+            && !foreign.contains(name)
+        {
             guard fileBytes(root.appendingPathComponent(name)) > 0 else { continue }
             let hash = String(name.dropLast(".safetensors".count))
             #expect(
@@ -160,7 +171,9 @@ enum DiskCacheAccountingTestSupport {
         let dir = companionDir(root)
         guard FileManager.default.fileExists(atPath: dir.path) else { return }
         for name in try FileManager.default.contentsOfDirectory(atPath: dir.path)
-        where name.hasPrefix("ssm-") && !DiskCache.isUnpublishedName(name) {
+        where name.hasPrefix("ssm-") && !DiskCache.isUnpublishedName(name)
+            && !foreign.contains(name)
+        {
             guard name.hasSuffix(".safetensors") || name.hasSuffix(".json"),
                   fileBytes(dir.appendingPathComponent(name)) > 0,
                   let dot = name.lastIndex(of: ".")
@@ -182,6 +195,41 @@ enum DiskCacheAccountingTestSupport {
             (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) == nil,
             "INVALID: chmod 000 had no effect (root / filesystem)",
             sourceLocation: sourceLocation)
+    }
+
+    /// Run `body` with standard error redirected to a file, and return what
+    /// it wrote. The callers are serialized and hold `MLXMetalTestLock`.
+    static func capturingStandardError<T>(_ body: () throws -> T) throws -> (T, String) {
+        let sink = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-stderr-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: sink) }
+        fflush(stderr)
+        let saved = dup(2)
+        try #require(saved >= 0, "INVALID: could not save standard error")
+        let fd = open(sink.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+        try #require(fd >= 0, "INVALID: could not open the capture file")
+        dup2(fd, 2)
+        close(fd)
+        defer {
+            fflush(stderr)
+            dup2(saved, 2)
+            close(saved)
+        }
+        let value = try body()
+        fflush(stderr)
+        let text = (try? String(contentsOf: sink, encoding: .utf8)) ?? ""
+        // Still visible in the test log.
+        FileHandle(fileDescriptor: saved).write(Data(text.utf8))
+        return (value, text)
+    }
+
+    /// Set a path's own modification date — a symlink's, not its target's.
+    static func age(_ url: URL, by seconds: TimeInterval) throws {
+        let when = Date().addingTimeInterval(-seconds).timeIntervalSince1970
+        var times = [
+            timeval(tv_sec: Int(when), tv_usec: 0), timeval(tv_sec: Int(when), tv_usec: 0),
+        ]
+        try #require(lutimes(url.path, &times) == 0, "INVALID: lutimes failed for \(url.lastPathComponent)")
     }
 
     /// A v1 index a newer build has claimed: this build leaves it alone, so

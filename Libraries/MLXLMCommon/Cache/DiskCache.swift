@@ -46,13 +46,19 @@ public struct DiskCacheStats: Sendable {
     /// The most recent pressure event: the cap is too small for the
     /// conversation in progress. Advisory; nothing was refused.
     public let lastPressureEvent: DiskCachePressureEvent?
+    /// Fetches in this process that found an indexed payload they could not
+    /// READ (EACCES, EMFILE, EIO, a loader that could not open it). That says
+    /// nothing about the payload being corrupt: it is reported as a miss and
+    /// the file and its row are left exactly as they are.
+    public let unreadablePayloadFetches: Int
 
     init(
         hits: Int, misses: Int, stores: Int, storeSkips: Int,
         currentPayloadBytes: Int, currentEntryCount: Int,
         evictions: Int, maxSizeBytes: Int, failedIndexWrites: Int = 0,
         evictedBytes: Int64 = 0, quotaPasses: Int = 0, lastQuotaPassMs: Double = 0,
-        pressureEventSeq: UInt64 = 0, lastPressureEvent: DiskCachePressureEvent? = nil
+        pressureEventSeq: UInt64 = 0, lastPressureEvent: DiskCachePressureEvent? = nil,
+        unreadablePayloadFetches: Int = 0
     ) {
         self.hits = hits
         self.misses = misses
@@ -68,6 +74,7 @@ public struct DiskCacheStats: Sendable {
         self.lastQuotaPassMs = lastQuotaPassMs
         self.pressureEventSeq = pressureEventSeq
         self.lastPressureEvent = lastPressureEvent
+        self.unreadablePayloadFetches = unreadablePayloadFetches
     }
 
     /// The same counters over a different usage figure (the coordinator's
@@ -79,7 +86,8 @@ public struct DiskCacheStats: Sendable {
             evictions: evictions, maxSizeBytes: maxSizeBytes,
             failedIndexWrites: failedIndexWrites, evictedBytes: evictedBytes,
             quotaPasses: quotaPasses, lastQuotaPassMs: lastQuotaPassMs,
-            pressureEventSeq: pressureEventSeq, lastPressureEvent: lastPressureEvent)
+            pressureEventSeq: pressureEventSeq, lastPressureEvent: lastPressureEvent,
+            unreadablePayloadFetches: unreadablePayloadFetches)
     }
 }
 
@@ -118,10 +126,16 @@ struct DiskCacheLegacyCompanion: Sendable, Equatable {
 /// so "nothing to do" and "did not run" cannot be mistaken for each other.
 struct DiskCacheCompanionImportSummary: Sendable, Equatable {
     var rowsDeletedForMissingPayload = 0
+    /// Rows whose `hash` is not a payload hash: they name no file, so none
+    /// was looked at, and they are simply dropped.
+    var rowsDroppedForInvalidHash = 0
     var linksWritten = 0
     var linksCleared = 0
     var legacyUpserted = 0
     var legacyDeleted = 0
+    /// Unlinked records whose `key` is not a companion key: forgotten
+    /// without looking at any file.
+    var legacyDroppedForInvalidKey = 0
     var unindexedPayloadsRemoved = 0
 
     var changedAnything: Bool { self != DiskCacheCompanionImportSummary() }
@@ -181,6 +195,10 @@ enum DiskCacheIntegrityError: Error {
     /// token 0 forever (osaurus#2652: 14 such rows, written once by a broken
     /// build, kept serving "!" on every later build until removed).
     case nonFinitePayload(String)
+    /// The unpublished name a store was about to write under is held by
+    /// something that is not a regular file (a link, a directory) or could
+    /// not be examined. `save` would follow a link; nothing is written.
+    case occupiedTemporaryName(String)
 }
 
 public final class DiskCache: @unchecked Sendable {
@@ -316,7 +334,9 @@ public final class DiskCache: @unchecked Sendable {
     /// when a newer build owns the schema. It is also 0 when the version could
     /// not be read at all — the database did not open, or `user_version` was
     /// unreadable under the migration's lock — so 0 means "treat as v1", not
-    /// "the file says 0". Nothing branches on it; see `indexHasV2Columns`.
+    /// "the file says 0". Which statements are used never branches on it
+    /// (see `indexHasV2Columns`); only ``indexIsFromANewerBuild`` does, to
+    /// keep every listing-driven removal away from a newer build's root.
     let indexSchemaVersion: Int32
 
     /// Whether the v2 columns and `legacy_companions` are really present on
@@ -358,6 +378,18 @@ public final class DiskCache: @unchecked Sendable {
     /// that is not a regular file (a directory, a link). It is not an older
     /// copy of the payload, so it is not replaced; nothing is published.
     public private(set) var refusedOccupiedStores: Int = 0
+    /// See ``DiskCacheStats/unreadablePayloadFetches``.
+    public private(set) var unreadablePayloadFetches: Int = 0
+
+    /// Test seams, never set in production. `temporaryURLForTesting` names
+    /// the unpublished file of the next store (the real name carries a random
+    /// tag, so nothing can be planted under it in advance). An error thrown
+    /// from `publishFaultForTesting` stands in for the publishing rename
+    /// failing, and one from `loadFaultForTesting` for the safetensors loader
+    /// failing on a payload that passed the header inspection.
+    var temporaryURLForTesting: (@Sendable (URL) -> URL)?
+    var publishFaultForTesting: (@Sendable () throws -> Void)?
+    var loadFaultForTesting: (@Sendable (URL) throws -> Void)?
 
     /// The names of the float tensors in `arrays` that carry a non-finite
     /// value (at most `limit`), in key order. Integer and boolean tensors are
@@ -425,7 +457,8 @@ public final class DiskCache: @unchecked Sendable {
             quotaPasses: quotaPasses,
             lastQuotaPassMs: lastQuotaPassMs,
             pressureEventSeq: pressureEventSeq,
-            lastPressureEvent: lastPressureEvent)
+            lastPressureEvent: lastPressureEvent,
+            unreadablePayloadFetches: unreadablePayloadFetches)
     }
 
     // MARK: - Initialization
@@ -459,24 +492,13 @@ public final class DiskCache: @unchecked Sendable {
 
         // Create cache directory if needed
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
-        // Storage integrity at open: an interrupted store (crash, force-quit,
-        // disk full) used to leave a partial `<hash>.safetensors` under its
-        // FINAL name. `fetch` only checked existence, `loadArraysAndMetadata`
-        // maps lazily, and the MLX reader's short-read exception is dropped
-        // on the stream (`Load::eval_cpu` waits on the future without
-        // `get()`), so the row restored as zero-filled KV / recurrent state
-        // at a valid offset — silently. Stores now publish atomically
-        // (temp → rename), so at open anything still named `*.tmp` is a dead
-        // write, and any final-named file whose size is short of the
-        // payload its own header declares is removed together with its row.
-        Self.sweepUnpublishedAndIncompleteFiles(in: cacheDir)
-
         // Open SQLite database
         let dbPath = cacheDir.appendingPathComponent("cache_index.db").path
         if sqlite3_open(dbPath, &db) != SQLITE_OK {
             db = nil
             indexSchemaVersion = 0
             indexHasV2Columns = false
+            Self.sweepUnpublishedAndIncompleteFiles(in: cacheDir)
             return
         }
 
@@ -498,6 +520,36 @@ public final class DiskCache: @unchecked Sendable {
         // The schema helpers put the connection back to "no wait" when they
         // finish. Every statement from here on waits a bounded time instead.
         sqlite3_busy_timeout(db, max(0, indexBusyTimeoutMs))
+
+        // Storage integrity at open: an interrupted store (crash, force-quit,
+        // disk full) used to leave a partial `<hash>.safetensors` under its
+        // FINAL name. `fetch` only checked existence, `loadArraysAndMetadata`
+        // maps lazily, and the MLX reader's short-read exception is dropped
+        // on the stream (`Load::eval_cpu` waits on the future without
+        // `get()`), so the row restored as zero-filled KV / recurrent state
+        // at a valid offset — silently. Stores now publish atomically
+        // (temp → rename), so at open a `.partial-` file that is old enough
+        // is a dead write, and a final-named file that was read and found
+        // short of the payload its own header declares is removed.
+        //
+        // After the index is open, not before: under a schema a newer build
+        // has claimed, this build does not know what the files in the root
+        // mean, and removes none of them from a listing — here, in the
+        // import's sweep and in `clear()` alike.
+        if indexIsFromANewerBuild {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk] integrity sweep skipped: index schema version "
+                    + "\(indexSchemaVersion) is newer than this build's "
+                    + "\(DiskCacheIndexSchema.currentVersion)\n").utf8))
+        } else {
+            Self.sweepUnpublishedAndIncompleteFiles(in: cacheDir)
+        }
+    }
+
+    /// Whether a newer build has claimed this root's index. Nothing is then
+    /// removed from a listing of the root or of its companion directory.
+    var indexIsFromANewerBuild: Bool {
+        indexSchemaVersion > DiskCacheIndexSchema.currentVersion
     }
 
     deinit {
@@ -534,8 +586,7 @@ public final class DiskCache: @unchecked Sendable {
         mediaSalt: String? = nil,
         enforceQuota: Bool
     ) {
-        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
-        let url = safetensorsURL(for: hash)
+        guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return }
         let tokenCount = tokens.count
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             FileHandle.standardError.write(Data(
@@ -649,26 +700,43 @@ public final class DiskCache: @unchecked Sendable {
             // file under the final name (it sees a miss, or a `.tmp` swept
             // at the next open).
             let finalURL = url
-            let url = Self.temporaryURL(for: finalURL)
-            _ = Self.removeRegularFile(at: url)
+            let url = temporaryURLForTesting?(finalURL) ?? Self.temporaryURL(for: finalURL)
+            // A leftover of ours under that name goes. Anything else there
+            // is not written through: `save` would follow a link.
+            switch Self.removeRegularFile(at: url) {
+            case .removed, .missing:
+                break
+            case .notRegularFile, .failed:
+                throw DiskCacheIntegrityError.occupiedTemporaryName(url.lastPathComponent)
+            }
             try save(arrays: arrays, metadata: ["format": "mlx"], url: url)
             Stream.gpu.synchronize()
             guard Self.isCompleteSafetensors(url: url) else {
                 _ = Self.removeRegularFile(at: url)
                 throw DiskCacheIntegrityError.incompleteWrite(finalURL.lastPathComponent)
             }
-            // Make room for the rename — only ever by unlinking an older
-            // regular file of the same hash. Anything else under that name
-            // is not an older copy of this payload, and `removeItem` would
-            // have descended into a directory.
-            if case .notRegularFile = Self.removeRegularFile(at: finalURL) {
+            // Publish with one `rename(2)`. It replaces an older regular file
+            // of the same hash atomically, so there is no moment at which
+            // the old valid payload is gone and the new one not yet there,
+            // and a rename that fails has cost nothing. Anything else under
+            // the final name is not an older copy of this payload: a
+            // directory or a link found there refuses the store, and a
+            // directory that takes the name after that look makes the
+            // rename itself fail (EISDIR) instead of being descended into.
+            if _refuseOccupiedStoreLocked(finalURL: finalURL, hash: hash, tokenCount: tokenCount) {
                 _ = Self.removeRegularFile(at: url)
-                _ = _refuseOccupiedStoreLocked(
-                    finalURL: finalURL, hash: hash, tokenCount: tokenCount)
                 return
             }
             do {
-                try FileManager.default.moveItem(at: url, to: finalURL)
+                try publishFaultForTesting?()
+                let code = Self.renameFile(from: url, to: finalURL)
+                if code == EISDIR || code == ENOTDIR {
+                    _ = Self.removeRegularFile(at: url)
+                    _recordRefusedOccupiedStoreLocked(
+                        finalURL: finalURL, hash: hash, tokenCount: tokenCount)
+                    return
+                }
+                guard code == 0 else { throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO) }
             } catch {
                 _ = Self.removeRegularFile(at: url)
                 throw error
@@ -737,13 +805,17 @@ public final class DiskCache: @unchecked Sendable {
     /// Returns whether the store was refused. Caller holds `lock`.
     private func _refuseOccupiedStoreLocked(finalURL: URL, hash: String, tokenCount: Int) -> Bool {
         guard case .notRegularFile = Self.pathState(at: finalURL) else { return false }
+        _recordRefusedOccupiedStoreLocked(finalURL: finalURL, hash: hash, tokenCount: tokenCount)
+        return true
+    }
+
+    private func _recordRefusedOccupiedStoreLocked(finalURL: URL, hash: String, tokenCount: Int) {
         refusedOccupiedStores += 1
         validatedFiles.removeValue(forKey: hash)
         FileHandle.standardError.write(Data(
             ("[vmlx][cache/disk-store] REFUSED occupied path count=\(tokenCount) "
                 + "hash=\(hash.prefix(12)) — \(finalURL.lastPathComponent) is not a regular file "
                 + "and is left alone; nothing published\n").utf8))
-        return true
     }
 
     /// Fetch cached arrays for the given token sequence.
@@ -765,8 +837,7 @@ public final class DiskCache: @unchecked Sendable {
         touchRecency: Bool = true,
         countHit: Bool = true
     ) -> [String: MLXArray]? {
-        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
-        let url = safetensorsURL(for: hash)
+        guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return nil }
 
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
@@ -839,9 +910,17 @@ public final class DiskCache: @unchecked Sendable {
             // Fail closed on a short file BEFORE the lazy map: the reader's
             // short-read error never reaches the caller, so a truncated row
             // would otherwise restore as zeros at a valid offset.
-            guard Self.isCompleteSafetensors(url: url) else {
+            switch Self.inspectSafetensors(url: url) {
+            case .complete:
+                break
+            case .shortOrMalformed:
                 throw DiskCacheIntegrityError.incompleteFile(url.lastPathComponent)
+            case .unreadable(let code):
+                return _unreadablePayloadMissLocked(
+                    hash: hash, url: url, tokenCount: tokens.count,
+                    reason: String(cString: strerror(code)))
             }
+            try loadFaultForTesting?(url)
             let (arrays, _) = try loadArraysAndMetadata(url: url)
             // A record written before the store-side check (or by a build that
             // computed NaN) must never be restored: it is removed on first touch
@@ -865,6 +944,17 @@ public final class DiskCache: @unchecked Sendable {
             }
             return arrays
         } catch {
+            // Only what has been positively identified as unusable is
+            // removed: a file short of its declared bytes, a non-finite
+            // payload, or a decode error on a file that opens and whose
+            // header parses. A loader that could not OPEN the file, or a
+            // file that can no longer be inspected, may be a transient
+            // condition (EMFILE, EIO, EACCES), and deleting a valid payload
+            // for it would be reading "could not look" as "corrupt".
+            if !Self.isPositiveCorruption(error, url: url) {
+                return _unreadablePayloadMissLocked(
+                    hash: hash, url: url, tokenCount: tokens.count, reason: "\(error)")
+            }
             misses += 1
             validatedFiles.removeValue(forKey: hash)
             // A failed deserialize is almost always a corrupt safetensors
@@ -891,6 +981,38 @@ public final class DiskCache: @unchecked Sendable {
         }
     }
 
+    /// Whether a failed fetch has shown the payload itself to be unusable.
+    /// The two integrity errors are this cache's own findings. Anything else
+    /// came from the loader: it counts only when the loader got as far as
+    /// the file's contents — it did not fail to open it — and the file can
+    /// still be opened and inspected now.
+    private static func isPositiveCorruption(_ error: Error, url: URL) -> Bool {
+        switch error {
+        case DiskCacheIntegrityError.incompleteFile, DiskCacheIntegrityError.nonFinitePayload:
+            return true
+        default:
+            if "\(error)".contains("Failed to open") { return false }
+            if case .unreadable = inspectSafetensors(url: url) { return false }
+            return true
+        }
+    }
+
+    /// A payload that could not be read is a miss and nothing else: the file
+    /// and its row stay exactly as they are. Caller holds `lock`.
+    private func _unreadablePayloadMissLocked(
+        hash: String, url: URL, tokenCount: Int, reason: String
+    ) -> [String: MLXArray]? {
+        misses += 1
+        unreadablePayloadFetches += 1
+        validatedFiles.removeValue(forKey: hash)
+        if Self.isFirstReport(url.path, in: Self.reportedUnreadablePayloads) {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk] fetch could not read \(url.lastPathComponent) "
+                    + "count=\(tokenCount): \(reason) — a miss; file and row left alone\n").utf8))
+        }
+        return nil
+    }
+
     /// Record a deserialized candidate that CacheCoordinator accepted after
     /// validating any architecture-specific companion state.
     func recordAcceptedHit() {
@@ -910,8 +1032,7 @@ public final class DiskCache: @unchecked Sendable {
     public func hasValidatedEntry(
         tokens: [Int], mediaSalt: String? = nil, requireNativeRecurrent: Bool = false
     ) -> Bool {
-        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
-        let url = safetensorsURL(for: hash)
+        guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return false }
         lock.lock()
         defer { lock.unlock() }
 
@@ -946,8 +1067,7 @@ public final class DiskCache: @unchecked Sendable {
     public func hasDurableEntry(
         tokens: [Int], mediaSalt: String? = nil, requireNativeRecurrent: Bool = false
     ) -> Bool {
-        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
-        let url = safetensorsURL(for: hash)
+        guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return false }
         lock.lock()
         defer { lock.unlock() }
         guard let current = _fileFingerprint(url: url), current.size > 0,
@@ -1012,6 +1132,17 @@ public final class DiskCache: @unchecked Sendable {
         defer { lock.unlock() }
 
         var entries: [DiskCacheQuotaEntry] = []
+        // What is returned here is what a quota pass may delete, by a path
+        // built from it. A row whose hash is not a payload hash, or a link
+        // whose key is not a companion key, names no file: it is not offered
+        // — and, once the statement is finished, dropped, so that its bytes
+        // stop counting towards a cap they could otherwise hold over for good.
+        var invalidHashes: [String] = []
+        var invalidCompanionKeys: [String] = []
+        defer {
+            invalidHashes.forEach(_dropRowWithInvalidHashLocked)
+            invalidCompanionKeys.forEach(_forgetInvalidCompanionKeyLocked)
+        }
         var stmt: OpaquePointer?
         let sql = indexHasV2Columns
             ? """
@@ -1028,6 +1159,10 @@ public final class DiskCache: @unchecked Sendable {
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let cHash = sqlite3_column_text(stmt, 0) else { continue }
             let hash = String(cString: cHash)
+            guard Self.isLowercaseHex(cString: cHash, count: Self.hashLength) else {
+                invalidHashes.append(hash)
+                continue
+            }
             let bytes = max(0, sqlite3_column_int64(stmt, 1))
             var entry = DiskCacheQuotaEntry(
                 hash: hash,
@@ -1036,8 +1171,15 @@ public final class DiskCache: @unchecked Sendable {
             // A row an older build wrote has NULL / 0 here: it is simply a
             // KV-only group.
             if indexHasV2Columns {
-                entry.companionKey = sqlite3_column_text(stmt, 3).map { String(cString: $0) }
-                entry.companionBytes = max(0, sqlite3_column_int64(stmt, 4))
+                if let cKey = sqlite3_column_text(stmt, 3) {
+                    let key = String(cString: cKey)
+                    if Self.isLowercaseHex(cString: cKey, count: SSMCompanionDiskStore.keyLength) {
+                        entry.companionKey = key
+                        entry.companionBytes = max(0, sqlite3_column_int64(stmt, 4))
+                    } else {
+                        invalidCompanionKeys.append(key)
+                    }
+                }
                 entry.tokenCount = max(0, Int(sqlite3_column_int64(stmt, 5)))
                 entry.isStableRoot = sqlite3_column_int64(stmt, 6) == 1
                 entry.chainId = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
@@ -1228,6 +1370,10 @@ public final class DiskCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         var result: [DiskCacheLegacyCompanion] = []
+        // As in `quotaEntries()`: what is returned may be deleted by a path
+        // built from its key, so a key that is not one names nothing here.
+        var invalidKeys: [String] = []
+        defer { invalidKeys.forEach(_forgetInvalidCompanionKeyLocked) }
         _queryLocked(
             """
             SELECT companion_key, companion_bytes,
@@ -1239,8 +1385,13 @@ public final class DiskCache: @unchecked Sendable {
             """
         ) { stmt in
             guard let cKey = sqlite3_column_text(stmt, 0) else { return }
+            let key = String(cString: cKey)
+            guard SSMCompanionDiskStore.isEntryKey(key) else {
+                invalidKeys.append(key)
+                return
+            }
             result.append(DiskCacheLegacyCompanion(
-                key: String(cString: cKey),
+                key: key,
                 bytes: max(0, sqlite3_column_int64(stmt, 1)),
                 modifiedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2))))
         }
@@ -1296,11 +1447,85 @@ public final class DiskCache: @unchecked Sendable {
         guard indexHasV2Columns, !keys.isEmpty else { return }
         lock.lock()
         defer { lock.unlock() }
-        for key in keys {
-            _runLocked(
-                "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0 WHERE companion_key = ?",
-                [.text(key)])
-            _runLocked("DELETE FROM legacy_companions WHERE key = ?", [.text(key)])
+        keys.forEach(_forgetCompanionLocked)
+    }
+
+    /// Stop counting one companion, linked or not. Caller holds `lock`.
+    private func _forgetCompanionLocked(key: String) {
+        _runLocked(
+            "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0 WHERE companion_key = ?",
+            [.text(key)])
+        _runLocked("DELETE FROM legacy_companions WHERE key = ?", [.text(key)])
+    }
+
+    // MARK: - Index values are data, never path components
+    //
+    // `cache_index.db` is a plain SQLite file: an older build, another tool
+    // or corruption can put anything in it, and the root it sits in is a
+    // user setting that may be a model folder. A `hash` of
+    // `../../models/foo/model` would address a file outside the root, and
+    // `model-00001-of-00008` a shard inside it with no traversal at all. So
+    // a value read from the index becomes a path only through
+    // ``safetensorsURL(for:)`` / ``SSMCompanionDiskStore/entryURLs(key:in:)``,
+    // which answer nil for anything this cache does not itself compute. Such
+    // a value names no file: none is stat'ed, none is deleted, and the record
+    // that carries it is dropped so that it stops counting.
+
+    /// Caller holds `lock`. Not inside a statement that is still stepping
+    /// over `cache_entries`.
+    private func _dropRowWithInvalidHashLocked(_ hash: String) {
+        Self.reportInvalidIndexValue(hash, kind: .hash)
+        validatedFiles.removeValue(forKey: hash)
+        // Its companion, if it names a real one, stays counted as unlinked.
+        var companionKey: String?
+        if indexHasV2Columns {
+            _queryLocked(
+                "SELECT companion_key FROM cache_entries WHERE hash = ?", [.text(hash)]
+            ) { stmt in
+                companionKey = sqlite3_column_text(stmt, 0).map { String(cString: $0) }
+            }
+        }
+        let companionIsReal = companionKey.map(SSMCompanionDiskStore.isEntryKey) ?? false
+        if let companionKey, !companionIsReal {
+            Self.reportInvalidIndexValue(companionKey, kind: .companionKey)
+        }
+        _deleteEntryLocked(hash: hash, keepCompanionCounted: companionIsReal)
+    }
+
+    /// Caller holds `lock`. Not inside a statement that is still stepping.
+    private func _forgetInvalidCompanionKeyLocked(_ key: String) {
+        Self.reportInvalidIndexValue(key, kind: .companionKey)
+        _forgetCompanionLocked(key: key)
+    }
+
+    enum InvalidIndexValueKind: String {
+        case hash = "dropped row with an invalid hash"
+        case companionKey = "forgot companion with an invalid key"
+    }
+
+    /// One line per distinct value per process, and only for the first
+    /// ``rateLimitedReportLimit`` distinct values: a damaged index with a
+    /// million bad rows is not a million lines.
+    static func reportInvalidIndexValue(_ value: String, kind: InvalidIndexValueKind) {
+        guard isFirstReport("\(kind.rawValue)\u{0}\(value)", in: reportedInvalidIndexValues)
+        else { return }
+        // The value is hostile by definition: bounded, and escaped.
+        let shown = String(value.prefix(96)).debugDescription
+        FileHandle.standardError.write(Data(
+            ("[vmlx][cache/disk-index] \(kind.rawValue) \(shown) — it names no file of this "
+                + "cache; no file was looked at or removed\n").utf8))
+    }
+
+    static let rateLimitedReportLimit = 8
+    private static let reportedInvalidIndexValues = OSAllocatedUnfairLock(initialState: Set<String>())
+    private static let reportedUnreadablePayloads = OSAllocatedUnfairLock(initialState: Set<String>())
+
+    private static func isFirstReport(
+        _ value: String, in reported: OSAllocatedUnfairLock<Set<String>>
+    ) -> Bool {
+        reported.withLock { seen in
+            guard seen.count < rateLimitedReportLimit else { return false }
+            return seen.insert(value).inserted
         }
     }
 
@@ -1461,8 +1686,14 @@ public final class DiskCache: @unchecked Sendable {
         // for the sweep of the next import.
         var liveRows: [Row] = []
         var rowsWithoutPayload: [Row] = []
+        // A hash that is not a payload hash names no file: nothing is looked
+        // at for it, and the row goes (see `_dropRowWithInvalidHashLocked`).
+        var rowsWithInvalidHash: [Row] = []
         for row in rows {
-            let url = safetensorsURL(for: row.hash)
+            guard let url = safetensorsURL(for: row.hash) else {
+                rowsWithInvalidHash.append(row)
+                continue
+            }
             switch Self.pathState(at: url) {
             case .missing:
                 rowsWithoutPayload.append(row)
@@ -1478,7 +1709,8 @@ public final class DiskCache: @unchecked Sendable {
         // Close the gap between the caller's walk and this transaction (see
         // the doc comment). In the steady state the walk and the index agree
         // and nothing is looked at twice.
-        let recordedLegacy = _legacyCompanionsLocked()
+        let legacyRead = _readLegacyCompanionsLocked()
+        let recordedLegacy = legacyRead.valid
         var onDisk = Dictionary(
             companions.map { ($0.hash, $0) }, uniquingKeysWith: { first, _ in first })
         struct Named {
@@ -1492,6 +1724,13 @@ public final class DiskCache: @unchecked Sendable {
         named += recordedLegacy.map { Named(key: $0.key, kvHash: nil, bytes: $0.bytes) }
         let companionDirectory = walkedDirectory ?? self.companionDirectory
         for record in named {
+            // The same for a key: it is never looked for on disk, and what
+            // follows clears the link that carries it.
+            guard SSMCompanionDiskStore.isEntryKey(record.key) else {
+                Self.reportInvalidIndexValue(record.key, kind: .companionKey)
+                onDisk[record.key] = nil
+                continue
+            }
             let walked = onDisk[record.key]
             if let walked, walked.bytes == record.bytes { continue }
             switch SSMCompanionDiskStore.publishedEntryState(
@@ -1525,6 +1764,18 @@ public final class DiskCache: @unchecked Sendable {
             _runLocked("DELETE FROM cache_entries WHERE hash = ?", [.text(row.hash)])
             validatedFiles.removeValue(forKey: row.hash)
             summary.rowsDeletedForMissingPayload += 1
+        }
+        // Its companion, if real, is on disk and in `reconciled` with no
+        // live row to join, so it is counted as unlinked below.
+        for row in rowsWithInvalidHash {
+            Self.reportInvalidIndexValue(row.hash, kind: .hash)
+            _runLocked("DELETE FROM cache_entries WHERE hash = ?", [.text(row.hash)])
+            validatedFiles.removeValue(forKey: row.hash)
+            summary.rowsDroppedForInvalidHash += 1
+        }
+        for key in legacyRead.invalidKeys {
+            _forgetInvalidCompanionKeyLocked(key)
+            summary.legacyDroppedForInvalidKey += 1
         }
 
         // One companion per row. Keys are content-addressed over the same
@@ -1659,9 +1910,7 @@ public final class DiskCache: @unchecked Sendable {
         mediaSalt: String? = nil,
         at date: Date
     ) -> Bool {
-        let hash = DiskCache.hashTokens(
-            tokens, modelKey: modelKey, mediaSalt: mediaSalt)
-        let url = safetensorsURL(for: hash)
+        guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return false }
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
@@ -1705,7 +1954,14 @@ public final class DiskCache: @unchecked Sendable {
 
         var removed = Set<String>()
         for hash in hashes {
-            let payloadGone = Self.removeCacheFile(at: safetensorsURL(for: hash))
+            // Not a payload hash: no path, no file, and the row is dropped
+            // rather than "evicted" — it is not in the returned set, so its
+            // claimed bytes are not reported as reclaimed.
+            guard let url = safetensorsURL(for: hash) else {
+                _dropRowWithInvalidHashLocked(hash)
+                continue
+            }
+            let payloadGone = Self.removeCacheFile(at: url)
             validatedFiles.removeValue(forKey: hash)
 
             var companionRemoved = false
@@ -1766,6 +2022,14 @@ public final class DiskCache: @unchecked Sendable {
         return false
     }
 
+    /// Forget what the once-per-process log lines have already reported, so
+    /// a test can see a line that an earlier test in the same process caused.
+    static func resetRateLimitedReportsForTesting() {
+        reportedInvalidIndexValues.withLock { $0.removeAll() }
+        reportedUnreadablePayloads.withLock { $0.removeAll() }
+        reportedDeleteFailures.withLock { $0.removeAll() }
+    }
+
     /// Paths ``removeCacheFile(at:)`` has already reported in this process.
     private static let reportedDeleteFailures = OSAllocatedUnfairLock(initialState: Set<String>())
 
@@ -1782,7 +2046,9 @@ public final class DiskCache: @unchecked Sendable {
     /// - the entry must be a regular file by `lstat` — never a directory,
     ///   never a symlink — and goes by `unlink`.
     ///
-    /// In a root that looks like a model bundle (``modelBundleMarkers``)
+    /// In a root that looks like a model bundle (``modelBundleMarkers``),
+    /// or whose index a newer build has claimed
+    /// (``indexIsFromANewerBuild``),
     /// nothing is removed from a LISTING of it, as in every other sweep: a
     /// payload without a row and a dead partial stay, and one
     /// `[vmlx][cache/disk-index] clear skipped:` line says so. The payloads
@@ -1792,6 +2058,9 @@ public final class DiskCache: @unchecked Sendable {
     /// files in the same root. Keeping them would leak them for good —
     /// their rows are dropped here, and the unindexed-payload sweep skips a
     /// bundle root too. The same applies when the root cannot be listed.
+    /// A row's hash becomes a path only when it is a payload hash
+    /// (``safetensorsURL(for:)``'s rule); any other row names no file and is
+    /// simply deleted with the rest.
     ///
     /// The index is emptied and the counters reset in every case, so the
     /// cache references nothing afterwards. A payload of ours that could not
@@ -1810,23 +2079,33 @@ public final class DiskCache: @unchecked Sendable {
         var doomed = Set<String>()
         _ = _queryLocked("SELECT hash FROM cache_entries") { stmt in
             guard let text = sqlite3_column_text(stmt, 0) else { return }
-            // A row's hash is data; only one that spells a payload name
-            // becomes a path.
-            let name = String(cString: text) + Self.payloadSuffix
-            if Self.isPublishedPayloadName(name) { doomed.insert(name) }
+            // A row's hash is data; only one that is a payload hash
+            // becomes a path. Every row is deleted below either way.
+            let hash = String(cString: text)
+            if Self.isPayloadHash(hash) {
+                doomed.insert(hash + Self.payloadSuffix)
+            } else {
+                Self.reportInvalidIndexValue(hash, kind: .hash)
+            }
         }
         var skipped: String?
-        do {
-            let names = try FileManager.default.contentsOfDirectory(atPath: cacheDir.path)
-            if let marker = Self.modelBundleMarker(in: names) {
-                skipped = "cache root holds \(marker), so it looks like a model bundle"
-            } else {
-                doomed.formUnion(names.filter {
-                    Self.isPublishedPayloadName($0) || Self.isUnpublishedPayloadName($0)
-                })
+        if indexIsFromANewerBuild {
+            skipped =
+                "index schema version \(indexSchemaVersion) is newer than this build's "
+                + "\(DiskCacheIndexSchema.currentVersion)"
+        } else {
+            do {
+                let names = try FileManager.default.contentsOfDirectory(atPath: cacheDir.path)
+                if let marker = Self.modelBundleMarker(in: names) {
+                    skipped = "cache root holds \(marker), so it looks like a model bundle"
+                } else {
+                    doomed.formUnion(names.filter {
+                        Self.isPublishedPayloadName($0) || Self.isUnpublishedPayloadName($0)
+                    })
+                }
+            } catch {
+                skipped = "cache root could not be listed: \(error.localizedDescription)"
             }
-        } catch {
-            skipped = "cache root could not be listed: \(error.localizedDescription)"
         }
         if let skipped {
             FileHandle.standardError.write(Data(
@@ -1858,6 +2137,7 @@ public final class DiskCache: @unchecked Sendable {
         stores = 0
         storeSkips = 0
         failedIndexWrites = 0
+        unreadablePayloadFetches = 0
         evictions = 0
         quotaEvictedBytes = 0
         quotaPasses = 0
@@ -1906,9 +2186,33 @@ public final class DiskCache: @unchecked Sendable {
 
     // MARK: - Private Helpers
 
-    /// Build the file URL for a given hash.
-    private func safetensorsURL(for hash: String) -> URL {
-        cacheDir.appendingPathComponent("\(hash).safetensors")
+    /// ``hashTokens(_:modelKey:mediaSalt:)`` returns exactly this many
+    /// lowercase hex digits.
+    static let hashLength = 32
+
+    /// Whether `text` could be a hash this cache computed.
+    static func isPayloadHash(_ text: String) -> Bool {
+        isLowercaseHex(text, count: hashLength)
+    }
+
+    /// The payload path for `hash`, or nil when `hash` is not a payload
+    /// hash. This is the ONLY place a hash becomes a path, and it is why a
+    /// hash read from the index can be handed to it: `../../x`, an empty
+    /// string or `model-00001-of-00008` gets no path at all.
+    private func safetensorsURL(for hash: String) -> URL? {
+        guard Self.isPayloadHash(hash) else { return nil }
+        return cacheDir.appendingPathComponent(hash + Self.payloadSuffix)
+    }
+
+    /// The hash of a token prefix and the path of its payload.
+    /// ``hashTokens(_:modelKey:mediaSalt:)`` produces a payload hash by
+    /// construction, which DEBUG builds assert; a build in which that
+    /// stopped being true would miss, not build a path from the value.
+    private func entryKey(tokens: [Int], mediaSalt: String?) -> (hash: String, url: URL)? {
+        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
+        let url = safetensorsURL(for: hash)
+        assert(url != nil, "hashTokens produced \(hash), which is not a payload hash")
+        return url.map { (hash, $0) }
     }
 
     /// Sibling temp name used while a row is being written. MLX's `save`
@@ -1936,15 +2240,35 @@ public final class DiskCache: @unchecked Sendable {
     static let partialTagLength = 8
 
     private static func isLowerHexDigit(_ byte: UInt8) -> Bool {
-        (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte)
-            || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains(byte)
+        (byte >= 0x30 && byte <= 0x39) || (byte >= 0x61 && byte <= 0x66)
     }
 
     /// `count` lowercase hex digits and nothing else: a content hash as
     /// ``hashTokens(_:modelKey:mediaSalt:)`` (32) and the companion store's
     /// key (64) spell it.
     static func isLowercaseHex<S: StringProtocol>(_ text: S, count: Int) -> Bool {
-        text.utf8.count == count && text.utf8.allSatisfy(isLowerHexDigit)
+        guard text.utf8.count == count else { return false }
+        return text.withCString { isLowercaseHex(cString: $0, count: count) }
+    }
+
+    private static let lowercaseHexDigits: StaticString = "0123456789abcdef"
+
+    /// The same test on a NUL-terminated value, such as a column as SQLite
+    /// hands it out. `strspn`, not a Swift loop: every row of an over-cap
+    /// quota pass goes through this, and an unoptimized build runs a
+    /// byte-by-byte Swift loop some fifty times slower than libc does.
+    static func isLowercaseHex(cString: UnsafePointer<CChar>, count: Int) -> Bool {
+        let accept = UnsafeRawPointer(lowercaseHexDigits.utf8Start)
+            .assumingMemoryBound(to: CChar.self)
+        // `count` leading hex digits, none of them the terminator, so the
+        // byte at `count` is still inside the string.
+        return strspn(cString, accept) == count && cString[count] == 0
+    }
+
+    /// `sqlite3_column_text` is `unsigned char *`.
+    static func isLowercaseHex(cString: UnsafePointer<UInt8>, count: Int) -> Bool {
+        isLowercaseHex(
+            cString: UnsafeRawPointer(cString).assumingMemoryBound(to: CChar.self), count: count)
     }
 
     /// Splits `<stem>.partial-<tag>.safetensors` — the shape
@@ -2047,6 +2371,24 @@ public final class DiskCache: @unchecked Sendable {
         return rc == 0 ? 0 : errno
     }
 
+    /// `rename(2)`: atomic, replaces a regular file, replaces a symlink
+    /// ITSELF rather than its target, and fails with EISDIR / ENOTDIR on a
+    /// directory instead of descending into it. (`FileManager.moveItem`
+    /// refuses an existing destination, and `replaceItemAt` is not this
+    /// call.) Returns 0, or the errno.
+    static func renameFile(from source: URL, to destination: URL) -> Int32 {
+        let rc = source.withUnsafeFileSystemRepresentation { from -> Int32 in
+            destination.withUnsafeFileSystemRepresentation { to -> Int32 in
+                guard let from, let to else {
+                    errno = EINVAL
+                    return -1
+                }
+                return rename(from, to)
+            }
+        }
+        return rc == 0 ? 0 : errno
+    }
+
     /// What became of one path that carries one of this cache's names.
     enum OwnFileRemoval: Equatable {
         case removed
@@ -2079,46 +2421,149 @@ public final class DiskCache: @unchecked Sendable {
         }
     }
 
-    /// The byte offset one past the last tensor payload the file's own
-    /// safetensors header declares (8-byte little-endian header length, JSON
-    /// header, `data_offsets: [begin, end]` per tensor relative to the end
-    /// of the header), or nil when the header itself cannot be read.
-    static func declaredPayloadEnd(url: URL) -> Int? {
-        guard let header = tensorHeader(url: url) else { return nil }
+    /// What reading a file's safetensors header established.
+    enum PayloadInspection: Equatable {
+        /// The header parsed and the file holds every byte it declares.
+        case complete
+        /// The file was opened and read, and it is positively not a whole
+        /// safetensors file: too short for its header, a header that is not
+        /// the JSON it should be, or fewer bytes than the header declares.
+        case shortOrMalformed
+        /// The file could not be opened or read (EACCES, EMFILE, EIO, …).
+        /// That says nothing about its contents, and is never a reason to
+        /// delete it.
+        case unreadable(errno: Int32)
+    }
+
+    private enum HeaderRead {
+        case header(length: Int, tensors: [String: Any], fileSize: Int)
+        case malformed
+        case unreadable(errno: Int32)
+    }
+
+    /// POSIX calls rather than `FileHandle`, so that the reason a read failed
+    /// is an errno and "could not read" stays apart from "read, and wrong".
+    private static func readHeader(url: URL) -> HeaderRead {
+        let fd = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else {
+                errno = EINVAL
+                return -1
+            }
+            return open(path, O_RDONLY | O_CLOEXEC)
+        }
+        guard fd >= 0 else { return .unreadable(errno: errno) }
+        defer { close(fd) }
+
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { return .unreadable(errno: errno) }
+
+        // nil: the read failed, and `readFailure` says why. Fewer bytes than
+        // asked for: end of file.
+        var readFailure: Int32 = 0
+        func readBytes(_ count: Int) -> Data? {
+            var data = Data(count: count)
+            var filled = 0
+            while filled < count {
+                let got = data.withUnsafeMutableBytes { buffer in
+                    read(fd, buffer.baseAddress! + filled, count - filled)
+                }
+                if got < 0 {
+                    if errno == EINTR { continue }
+                    readFailure = errno
+                    return nil
+                }
+                if got == 0 { break }
+                filled += got
+            }
+            return data.prefix(filled)
+        }
+
+        guard let lengthData = readBytes(8) else { return .unreadable(errno: readFailure) }
+        guard lengthData.count == 8 else { return .malformed }
+        let declared = lengthData.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
+        guard declared > 0, declared < 256 * 1024 * 1024 else { return .malformed }
+        let headerLength = Int(declared)
+        guard let headerData = readBytes(headerLength) else {
+            return .unreadable(errno: readFailure)
+        }
+        guard headerData.count == headerLength,
+            let tensors = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any]
+        else { return .malformed }
+        return .header(length: headerLength, tensors: tensors, fileSize: Int(info.st_size))
+    }
+
+    /// One past the last tensor byte the header declares, relative to the
+    /// start of the file; nil when an entry is not a tensor description.
+    private static func declaredPayloadEnd(headerLength: Int, tensors: [String: Any]) -> Int? {
         var end = 0
-        for (key, value) in header.tensors where key != "__metadata__" {
+        for (key, value) in tensors where key != "__metadata__" {
             guard let tensor = value as? [String: Any],
                 let offsets = tensor["data_offsets"] as? [Any], offsets.count == 2,
                 let last = (offsets[1] as? NSNumber)?.intValue
             else { return nil }
             end = max(end, last)
         }
-        return 8 + header.length + end
+        return 8 + headerLength + end
+    }
+
+    /// The byte offset one past the last tensor payload the file's own
+    /// safetensors header declares (8-byte little-endian header length, JSON
+    /// header, `data_offsets: [begin, end]` per tensor relative to the end
+    /// of the header), or nil when the header itself cannot be read.
+    static func declaredPayloadEnd(url: URL) -> Int? {
+        guard case .header(let length, let tensors, _) = readHeader(url: url) else { return nil }
+        return declaredPayloadEnd(headerLength: length, tensors: tensors)
     }
 
     private static func tensorHeader(url: URL) -> (length: Int, tensors: [String: Any])? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8 else { return nil }
-        let headerLength = lengthData.withUnsafeBytes { Int($0.load(as: UInt64.self).littleEndian) }
-        guard headerLength > 0, headerLength < 256 * 1024 * 1024 else { return nil }
-        guard let headerData = try? handle.read(upToCount: headerLength), headerData.count == headerLength,
-            let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any]
-        else { return nil }
-        return (headerLength, header)
+        guard case .header(let length, let tensors, _) = readHeader(url: url) else { return nil }
+        return (length, tensors)
+    }
+
+    /// Header-only inspection; see ``PayloadInspection``. Only
+    /// `.shortOrMalformed` permits a caller to delete the file.
+    static func inspectSafetensors(url: URL) -> PayloadInspection {
+        switch readHeader(url: url) {
+        case .unreadable(let code):
+            return .unreadable(errno: code)
+        case .malformed:
+            return .shortOrMalformed
+        case .header(let length, let tensors, let fileSize):
+            guard let declared = declaredPayloadEnd(headerLength: length, tensors: tensors),
+                fileSize >= declared
+            else { return .shortOrMalformed }
+            return .complete
+        }
     }
 
     /// True when the file on disk holds every byte its header declares.
+    /// False says only "not shown to be complete" — it may not have been
+    /// readable at all. Anything that deletes asks
+    /// ``inspectSafetensors(url:)`` instead.
     static func isCompleteSafetensors(url: URL) -> Bool {
-        guard let declared = declaredPayloadEnd(url: url),
-            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-            let size = (attributes[.size] as? NSNumber)?.intValue
-        else { return false }
-        return size >= declared
+        inspectSafetensors(url: url) == .complete
     }
 
-    /// Remove dead temp files and incomplete final-named rows (with their
-    /// index rows) from `cacheDir`. Header-only reads: cheap even for a
+    /// How old a `.partial-` file must be before a sweep at open takes it
+    /// for a dead write. A second coordinator can open a root while another
+    /// model's store into it is still running — a large boundary takes
+    /// seconds to write — and its partial is then a store in flight, not a
+    /// dead write. Same figure, and same reasoning, as
+    /// ``defaultUnindexedPayloadGuardAge``.
+    static let defaultUnpublishedGuardAge: TimeInterval = 600
+
+    /// Whether a sweep at open may take the `.partial-` file at `url` for a
+    /// dead write: a regular file (by `lstat`) whose modification date is
+    /// not in the future and is at least `guardAge` back.
+    static func isDeadWrite(at url: URL, olderThan guardAge: TimeInterval, now: Date) -> Bool {
+        guard case .regularFile(_, let modified) = pathState(at: url), modified <= now
+        else { return false }
+        return now.timeIntervalSince(modified) >= guardAge
+    }
+
+    /// Remove dead temp files and incomplete final-named rows from
+    /// `cacheDir` (a row that names one is dropped by the next fetch of it,
+    /// or by the import). Header-only reads: cheap even for a
     /// multi-hundred-GB cache.
     ///
     /// The root may hold files that are not this cache's. A dead write must
@@ -2131,7 +2576,17 @@ public final class DiskCache: @unchecked Sendable {
     /// read as a safetensors file and used to go recursively, and never a
     /// symlink), removal is by `unlink`, and a root that looks like a model
     /// bundle is left alone entirely.
-    static func sweepUnpublishedAndIncompleteFiles(in cacheDir: URL) {
+    ///
+    /// A `.partial-` file goes only once it is old enough to be dead
+    /// (``isDeadWrite(at:olderThan:now:)``). A final-named file goes only
+    /// when it was READ and found short of its own header
+    /// (``PayloadInspection/shortOrMalformed``); one that could not be read
+    /// has not been shown to be anything, and stays.
+    static func sweepUnpublishedAndIncompleteFiles(
+        in cacheDir: URL,
+        unpublishedGuardAge: TimeInterval = DiskCache.defaultUnpublishedGuardAge,
+        now: Date = Date()
+    ) {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path) else { return }
         if let marker = modelBundleMarker(in: names) {
             FileHandle.standardError.write(Data(
@@ -2140,14 +2595,23 @@ public final class DiskCache: @unchecked Sendable {
             return
         }
         var removed = 0
+        var unreadable = 0
         for name in names {
-            let isDeadWrite = isUnpublishedPayloadName(name)
-            guard isDeadWrite || isPublishedPayloadName(name) else { continue }
+            let isUnpublished = isUnpublishedPayloadName(name)
+            guard isUnpublished || isPublishedPayloadName(name) else { continue }
             let url = cacheDir.appendingPathComponent(name)
-            guard case .regularFile = pathState(at: url) else { continue }
-            if isDeadWrite {
+            if isUnpublished {
+                guard isDeadWrite(at: url, olderThan: unpublishedGuardAge, now: now) else { continue }
                 if unlinkFile(at: url) == 0 { removed += 1 }
-            } else if !isCompleteSafetensors(url: url) {
+                continue
+            }
+            guard case .regularFile = pathState(at: url) else { continue }
+            switch inspectSafetensors(url: url) {
+            case .complete:
+                continue
+            case .unreadable:
+                unreadable += 1
+            case .shortOrMalformed:
                 guard unlinkFile(at: url) == 0 else { continue }
                 removed += 1
                 FileHandle.standardError.write(Data(
@@ -2156,6 +2620,11 @@ public final class DiskCache: @unchecked Sendable {
         }
         if removed > 0 {
             FileHandle.standardError.write(Data("[vmlx][cache/disk] integrity sweep removed \(removed) file(s)\n".utf8))
+        }
+        if unreadable > 0 {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk] integrity sweep could not read \(unreadable) payload(s); "
+                    + "left alone\n").utf8))
         }
     }
 
@@ -2319,15 +2788,31 @@ public final class DiskCache: @unchecked Sendable {
     }
 
     private func _legacyCompanionsLocked() -> [DiskCacheLegacyCompanion] {
+        // See `quotaEntries()`: a key that is not a companion key names
+        // nothing, is not offered to anyone, and is forgotten.
+        let read = _readLegacyCompanionsLocked()
+        read.invalidKeys.forEach(_forgetInvalidCompanionKeyLocked)
+        return read.valid
+    }
+
+    private func _readLegacyCompanionsLocked()
+        -> (valid: [DiskCacheLegacyCompanion], invalidKeys: [String])
+    {
         var result: [DiskCacheLegacyCompanion] = []
+        var invalidKeys: [String] = []
         _queryLocked("SELECT key, bytes, modified FROM legacy_companions") { stmt in
             guard let cKey = sqlite3_column_text(stmt, 0) else { return }
+            let key = String(cString: cKey)
+            guard SSMCompanionDiskStore.isEntryKey(key) else {
+                invalidKeys.append(key)
+                return
+            }
             result.append(DiskCacheLegacyCompanion(
-                key: String(cString: cKey),
+                key: key,
                 bytes: max(0, sqlite3_column_int64(stmt, 1)),
                 modifiedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2))))
         }
-        return result
+        return (result, invalidKeys)
     }
 
     /// Whole-root usage: two aggregates, no row materialization.
@@ -2464,43 +2949,49 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Evict oldest entries until total cache size is under `maxSizeBytes`.
     /// Caller MUST hold `lock`.
+    ///
+    /// Below the cap this is one SQL aggregate. Over it, every row is read:
+    /// a row whose hash is not a payload hash names no file, so it is
+    /// dropped — not evicted — before anything real pays for the bytes it
+    /// claims.
     private func _evictIfNeededLocked() {
         guard let db else { return }
 
-        // Query total size
-        var totalSize: Int64 = 0
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT COALESCE(SUM(file_size), 0) FROM cache_entries", -1, &stmt, nil) == SQLITE_OK {
-            if sqlite3_step(stmt) == SQLITE_ROW {
-                totalSize = sqlite3_column_int64(stmt, 0)
+        func indexedBytes() -> Int64 {
+            var total: Int64 = 0
+            _queryLocked("SELECT COALESCE(SUM(file_size), 0) FROM cache_entries") { stmt in
+                total = sqlite3_column_int64(stmt, 0)
             }
+            return total
         }
-        sqlite3_finalize(stmt)
+        guard indexedBytes() > Int64(maxSizeBytes) else { return }
 
-        guard totalSize > Int64(maxSizeBytes) else { return }
-
-        // Fetch oldest entries (by creation time) to evict
-        var toEvict: [(hash: String, fileSize: Int64)] = []
-        var accumulated: Int64 = 0
-        let excess = totalSize - Int64(maxSizeBytes)
-
+        var oldestFirst: [(hash: String, url: URL, fileSize: Int64)] = []
+        var invalidHashes: [String] = []
+        var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, "SELECT hash, file_size FROM cache_entries ORDER BY created_at ASC", -1, &stmt, nil) == SQLITE_OK {
-            while sqlite3_step(stmt) == SQLITE_ROW, accumulated < excess {
-                if let cStr = sqlite3_column_text(stmt, 0) {
-                    let hash = String(cString: cStr)
-                    let size = sqlite3_column_int64(stmt, 1)
-                    toEvict.append((hash: hash, fileSize: size))
-                    accumulated += size
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let cStr = sqlite3_column_text(stmt, 0) else { continue }
+                let hash = String(cString: cStr)
+                if let url = safetensorsURL(for: hash) {
+                    oldestFirst.append((hash, url, sqlite3_column_int64(stmt, 1)))
+                } else {
+                    invalidHashes.append(hash)
                 }
             }
         }
         sqlite3_finalize(stmt)
+        invalidHashes.forEach(_dropRowWithInvalidHashLocked)
 
         // Delete evicted entries and their files. A payload that could not
-        // be deleted keeps its row (see `removeQuotaEntries`).
-        for entry in toEvict {
+        // be deleted keeps its row (see `removeQuotaEntries`); it is tried
+        // once per pass and its bytes are not made up for by evicting more.
+        var remaining = indexedBytes()
+        for entry in oldestFirst {
+            guard remaining > Int64(maxSizeBytes) else { break }
+            remaining -= entry.fileSize
             validatedFiles.removeValue(forKey: entry.hash)
-            guard Self.removeCacheFile(at: safetensorsURL(for: entry.hash)) else { continue }
+            guard Self.removeCacheFile(at: entry.url) else { continue }
             _deleteEntryLocked(hash: entry.hash)
             evictions += 1
         }

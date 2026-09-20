@@ -240,7 +240,8 @@ public final class CacheCoordinator: @unchecked Sendable {
             self.ssmStateCache.diskStore = try? SSMCompanionDiskStore(
                 cacheDir: ssmDir,
                 modelKey: config.modelKey,
-                maxBytes: ssmMaxBytes)
+                maxBytes: ssmMaxBytes,
+                sweepUnpublishedAtOpen: !(self.diskCache?.indexIsFromANewerBuild ?? false))
         }
 
         importCompanionAccountingOncePerRoot()
@@ -354,6 +355,8 @@ public final class CacheCoordinator: @unchecked Sendable {
                     + "linksWritten=\(counts.linksWritten) linksCleared=\(counts.linksCleared) "
                     + "legacyUpserted=\(counts.legacyUpserted) "
                     + "legacyDeleted=\(counts.legacyDeleted) "
+                    + "rowsDroppedForInvalidHash=\(counts.rowsDroppedForInvalidHash) "
+                    + "legacyDroppedForInvalidKey=\(counts.legacyDroppedForInvalidKey) "
                     + "unindexedPayloadsRemoved=\(counts.unindexedPayloadsRemoved)\n").utf8))
         }
         return summary != nil

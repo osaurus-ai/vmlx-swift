@@ -525,7 +525,9 @@ struct DiskCacheCompanionAccountingTests {
                 try Self.expectUsageMatchesDisk(disk, root: root)
             }
 
-            // The next open sweeps it; the published entry is untouched.
+            // The next open sweeps it — once it is old enough that no write
+            // can still be producing it; the published entry is untouched.
+            try Self.age(partial, by: Self.elevenMinutes)
             CacheCoordinator.resetImportedRootsForTesting()
             let reopened = Self.coordinator(root: root, modelKey: modelKey)
             #expect(!FileManager.default.fileExists(atPath: partial.path))
@@ -1230,11 +1232,14 @@ struct DiskCacheCompanionAccountingTests {
         }
     }
 
-    /// R3, the over-count direction: a rewrite removes the old tensor and the
-    /// rename of the new one then fails. That interleaving cannot be arranged
-    /// from outside the process, so this uses the store's internal
-    /// `writeFaultForTesting` seam.
-    @Test func moveFailureStopsCountingTheRemovedTensor() throws {
+    /// R3, the over-count direction: the rename that publishes a rewritten
+    /// tensor fails. The write used to unlink the old tensor first, so the
+    /// failure left a sidecar alone and a record that over-counted it; the
+    /// publish is now one `rename(2)` over the old tensor, and a failure
+    /// leaves the old pair, and its count, exactly as they were. A failing
+    /// rename cannot be arranged from outside the process, so this uses the
+    /// store's internal `writeFaultForTesting` seam.
+    @Test func moveFailureKeepsTheOldTensorAndItsCount() throws {
         try MLXMetalTestLock.withLock {
             let root = Self.makeRoot("move-failure")
             defer { try? FileManager.default.removeItem(at: root) }
@@ -1251,6 +1256,7 @@ struct DiskCacheCompanionAccountingTests {
                 tokens: tokens, diskArrays: Self.kv(), ssmStates: Self.recurrent(64, states: 1))
             let before = try #require(try Self.indexedRows(root).first { $0.hash == hash })
             try #require(before.companionBytes == Self.companionBytes(root, key))
+            let oldPair = try Self.companionURLs(root, key).map { try Data(contentsOf: $0) }
 
             companion.writeFaultForTesting = { stage in
                 if stage == .moveTensorIntoPlace { throw InjectedFault() }
@@ -1269,22 +1275,25 @@ struct DiskCacheCompanionAccountingTests {
             }
             companion.writeFaultForTesting = nil
 
-            try #require(
-                Self.fileBytes(Self.companionURLs(root, key)[0]) == 0,
-                "INVALID: the old tensor survived the failed rewrite")
-            let sidecarBytes = Self.fileBytes(Self.companionURLs(root, key)[1])
-            try #require(sidecarBytes > 0)
+            // Publishing is one rename over the old tensor, so a rename that
+            // does not happen has cost nothing: the old pair is still there,
+            // byte for byte, and still counted for what it is.
+            let pairNow = Self.companionURLs(root, key).map { try? Data(contentsOf: $0) }
+            #expect(pairNow == oldPair, "the old valid pair did not survive the failed rewrite")
 
             let after = try #require(try Self.indexedRows(root).first { $0.hash == hash })
             #expect(after.companionKey == key)
-            #expect(after.companionBytes == sidecarBytes, "the removed tensor is still counted")
+            #expect(after.companionBytes == before.companionBytes)
             #expect(try Self.legacyRows(root).isEmpty)
             #expect(Self.companionBytes(root, Self.ssmKey(fresh, modelKey)) == 0)
             let stillValidated = companion.hasValidatedCompleteEntry(
                 tokens: tokens, boundary: tokens.count)
             #expect(!stillValidated)
             let names = try FileManager.default.contentsOfDirectory(atPath: Self.companionDir(root).path)
-            #expect(names == ["ssm-\(key).json"], "an unpublished file was left behind")
+            #expect(
+                names.sorted() == ["ssm-\(key).json", "ssm-\(key).safetensors"],
+                "an unpublished file was left behind")
+            #expect(companion.fetch(tokens: tokens, boundary: tokens.count)?.states.count == 1)
             try Self.expectUsageMatchesDisk(disk, root: root)
         }
     }
@@ -2272,38 +2281,13 @@ struct DiskCacheCompanionAccountingTests {
     /// serialized and these tests hold `MLXMetalTestLock`, so nothing else in
     /// the process is expected to write meanwhile.
     private static func capturingStandardError<T>(_ body: () throws -> T) throws -> (T, String) {
-        let sink = FileManager.default.temporaryDirectory
-            .appendingPathComponent("vmlx-stderr-\(UUID().uuidString).log")
-        defer { try? FileManager.default.removeItem(at: sink) }
-        fflush(stderr)
-        let saved = dup(2)
-        try #require(saved >= 0, "INVALID: could not save standard error")
-        let fd = open(sink.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
-        try #require(fd >= 0, "INVALID: could not open the capture file")
-        dup2(fd, 2)
-        close(fd)
-        defer {
-            fflush(stderr)
-            dup2(saved, 2)
-            close(saved)
-        }
-        let value = try body()
-        fflush(stderr)
-        let text = (try? String(contentsOf: sink, encoding: .utf8)) ?? ""
-        // Still visible in the test log.
-        FileHandle(fileDescriptor: saved).write(Data(text.utf8))
-        return (value, text)
+        try Support.capturingStandardError(body)
     }
 
     private static let elevenMinutes: TimeInterval = 11 * 60
 
-    /// Set a path's own modification date — a symlink's, not its target's.
     private static func age(_ url: URL, by seconds: TimeInterval) throws {
-        let when = Date().addingTimeInterval(-seconds).timeIntervalSince1970
-        var times = [
-            timeval(tv_sec: Int(when), tv_usec: 0), timeval(tv_sec: Int(when), tv_usec: 0),
-        ]
-        try #require(lutimes(url.path, &times) == 0, "INVALID: lutimes failed for \(url.lastPathComponent)")
+        try Support.age(url, by: seconds)
     }
 
     /// An ACL entry that makes every stat of `url` fail with EACCES while the
@@ -3166,6 +3150,7 @@ struct DiskCacheCompanionAccountingTests {
             let oursPartial = DiskCache.temporaryURL(
                 for: root.appendingPathComponent("8899aabbccddeeff0011223344556677.safetensors"))
             try Data(repeating: 0xEE, count: 40_003).write(to: oursPartial)
+            try Self.age(oursPartial, by: Self.elevenMinutes)
 
             _ = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: "open-sweep-names")
 
@@ -3224,6 +3209,7 @@ struct DiskCacheCompanionAccountingTests {
 
                 oursPartial = DiskCache.temporaryURL(for: Self.companionURLs(root, key)[0])
                 try Data(repeating: 0xEE, count: 40_003).write(to: oursPartial)
+                try Self.age(oursPartial, by: Self.elevenMinutes)
             }
 
             // The sweep at open.
