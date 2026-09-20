@@ -79,17 +79,20 @@ struct DiskPrefixMatchSelectionTests {
     }
 
     /// What identifies one published payload file: a rewrite publishes with
-    /// `rename`, so the name then carries a different inode.
+    /// `rename` while the older file still holds its inode, so the name then
+    /// carries a different one.
     private struct FileIdentity: Equatable {
         let inode: UInt64
         let modified: Date
+        let size: UInt64
     }
 
     private static func identity(_ url: URL) throws -> FileIdentity {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         return FileIdentity(
             inode: try #require((attributes[.systemFileNumber] as? NSNumber)?.uint64Value),
-            modified: try #require(attributes[.modificationDate] as? Date))
+            modified: try #require(attributes[.modificationDate] as? Date),
+            size: try #require((attributes[.size] as? NSNumber)?.uint64Value))
     }
 
     // MARK: - 1. Longest stored prefix
@@ -699,6 +702,127 @@ struct DiskPrefixMatchSelectionTests {
                 restoreFromDiskArrays(hit.arrays, into: &runtime, requirePromptBoundary: true)
                     == 11)
             #expect(told.hasDurableDiskEntry(tokens: Array(prompt.prefix(11))))
+        }
+    }
+
+    /// When what this process stores for a boundary does not restore either
+    /// — a serializer that does not round-trip, a caller-supplied cache of
+    /// another topology — every turn would fetch, be refused, write the whole
+    /// boundary again and lift the mark with it. One rewrite per entry per
+    /// process is the bound: the second rejection keeps the entry passed over
+    /// and leaves it durable, so the store is skipped and the shorter entry
+    /// keeps winning.
+    @Test func anEntryRejectedAgainAfterItsRewriteIsNotWrittenASecondTime() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("rewrite-once")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "prefix-rewrite-once"
+            let coordinator = Self.coordinator(root: root, modelKey: modelKey)
+            let prompt = try Self.storeShadowingFixture(coordinator).prompt
+            let longTokens = Array(prompt.prefix(11))
+            let longURL = Support.payloadURL(
+                root, DiskCache.hashTokens(longTokens, modelKey: modelKey))
+            // The store this process keeps making: one layer, as before.
+            func storeLong() {
+                coordinator.storeAfterGeneration(
+                    promptTokens: longTokens, perLayerData: [], ssmStates: nil,
+                    cache: Self.attentionCache(layers: 1, tokens: 11, fill: 1))
+            }
+
+            try #require(Self.diskMatch(coordinator.fetch(tokens: prompt))?.matched == 11)
+            coordinator.reportDiskRestoreRejected(
+                tokens: prompt, boundary: 11, mediaSalt: nil, reason: "test")
+            try #require(Self.diskMatch(coordinator.fetch(tokens: prompt))?.matched == 5)
+
+            // First rejection: the boundary is written again, once.
+            let original = try Self.identity(longURL)
+            try #require(original.size > 0)
+            storeLong()
+            let rewritten = try Self.identity(longURL)
+            #expect(rewritten.inode != original.inode)
+            #expect(rewritten != original)
+            let served = try #require(Self.diskMatch(coordinator.fetch(tokens: prompt)))
+            #expect(served.matched == 11, "the rewrite lifts the first mark")
+            let beforeSecond = try Self.diskStats(coordinator)
+            try #require(beforeSecond.rejectedDiskRestores == 1)
+            try #require(beforeSecond.rejectedRewritesSuppressed == 0)
+
+            // Second rejection, of the payload this process wrote itself.
+            coordinator.reportDiskRestoreRejected(
+                tokens: prompt, boundary: 11, mediaSalt: nil, reason: "test")
+            let afterSecond = try Self.diskStats(coordinator)
+            #expect(afterSecond.rejectedDiskRestores == 2)
+            #expect(afterSecond.rejectedRewritesSuppressed == 1)
+            #expect(afterSecond.hits == beforeSecond.hits - 1)
+            #expect(coordinator.hasDurableDiskEntry(tokens: longTokens))
+            #expect(coordinator.hasValidatedDiskEntry(tokens: longTokens))
+
+            for turn in 0 ..< 3 {
+                storeLong()
+                #expect(try Self.identity(longURL) == rewritten, "turn \(turn): written again")
+                #expect(
+                    try Self.diskStats(coordinator).storeSkips - afterSecond.storeSkips
+                        == turn + 1)
+                #expect(Self.diskMatch(coordinator.fetch(tokens: prompt))?.matched == 5)
+            }
+            #expect(try Self.diskStats(coordinator).rejectedDiskRestores == 2)
+            #expect(try Self.indexedTokenCounts(root) == [5, 11])
+        }
+    }
+
+    /// The bound must not outlive the payload it is about. Once another
+    /// writer has replaced the file, the entry is served again, and this
+    /// process has not rewritten THAT payload: a rejection of it is a first
+    /// rejection, and earns its one rewrite.
+    @Test func aPayloadReplacedBySomebodyElseAlsoForgetsTheRewrite() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("rewrite-forgotten")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let modelKey = "prefix-rewrite-forgotten"
+            let told = Self.coordinator(root: root, modelKey: modelKey)
+            let prompt = try Self.storeShadowingFixture(told).prompt
+            let longTokens = Array(prompt.prefix(11))
+            let longURL = Support.payloadURL(
+                root, DiskCache.hashTokens(longTokens, modelKey: modelKey))
+            func reject() {
+                told.reportDiskRestoreRejected(
+                    tokens: prompt, boundary: 11, mediaSalt: nil, reason: "test")
+            }
+            func storeLong(layers: Int, through coordinator: CacheCoordinator) {
+                coordinator.storeAfterGeneration(
+                    promptTokens: longTokens, perLayerData: [], ssmStates: nil,
+                    cache: Self.attentionCache(layers: layers, tokens: 11, fill: 1))
+            }
+
+            try #require(Self.diskMatch(told.fetch(tokens: prompt))?.matched == 11)
+            reject()
+            storeLong(layers: 1, through: told)
+            try #require(Self.diskMatch(told.fetch(tokens: prompt))?.matched == 11)
+            reject()
+            try #require(try Self.diskStats(told).rejectedRewritesSuppressed == 1)
+            try #require(Self.diskMatch(told.fetch(tokens: prompt))?.matched == 5)
+            try #require(told.hasDurableDiskEntry(tokens: longTokens))
+
+            // Somebody else publishes a payload that does restore.
+            let elsewhere = Self.coordinator(root: root, modelKey: modelKey)
+            storeLong(layers: 2, through: elsewhere)
+            let hit = try #require(Self.diskMatch(told.fetch(tokens: prompt)))
+            #expect(hit.matched == 11)
+            var runtime: [any KVCache] = [KVCacheSimple(), KVCacheSimple()]
+            #expect(
+                restoreFromDiskArrays(hit.arrays, into: &runtime, requirePromptBoundary: true)
+                    == 11)
+
+            // A rejection of the new payload is a first rejection again.
+            reject()
+            let stats = try Self.diskStats(told)
+            #expect(stats.rejectedDiskRestores == 3)
+            #expect(stats.rejectedRewritesSuppressed == 1)
+            #expect(!told.hasDurableDiskEntry(tokens: longTokens))
+            let replaced = try Self.identity(longURL)
+            storeLong(layers: 2, through: told)
+            #expect(try Self.identity(longURL).inode != replaced.inode)
+            #expect(Self.diskMatch(told.fetch(tokens: prompt))?.matched == 11)
         }
     }
 

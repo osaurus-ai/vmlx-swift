@@ -68,6 +68,13 @@ public struct DiskCacheStats: Sendable {
     /// Each one was first counted in ``hits`` and has been taken out of it
     /// again, so ``hits`` counts restores that were used.
     public let rejectedDiskRestores: Int
+    /// Rejections counted in ``rejectedDiskRestores`` whose payload this
+    /// process had itself written after an earlier rejection of the same
+    /// entry: what it stores for that boundary does not restore either. The
+    /// entry stays passed over by fetch and is NOT written a second time — a
+    /// boundary payload can be hundreds of megabytes, and a store → restore
+    /// round trip that fails once fails every turn.
+    public let rejectedRewritesSuppressed: Int
 
     init(
         hits: Int, misses: Int, stores: Int, storeSkips: Int,
@@ -76,7 +83,7 @@ public struct DiskCacheStats: Sendable {
         evictedBytes: Int64 = 0, quotaPasses: Int = 0, lastQuotaPassMs: Double = 0,
         pressureEventSeq: UInt64 = 0, lastPressureEvent: DiskCachePressureEvent? = nil,
         unreadablePayloadFetches: Int = 0, opaqueBytes: Int64 = 0,
-        rejectedDiskRestores: Int = 0
+        rejectedDiskRestores: Int = 0, rejectedRewritesSuppressed: Int = 0
     ) {
         self.hits = hits
         self.misses = misses
@@ -95,6 +102,7 @@ public struct DiskCacheStats: Sendable {
         self.unreadablePayloadFetches = unreadablePayloadFetches
         self.opaqueBytes = opaqueBytes
         self.rejectedDiskRestores = rejectedDiskRestores
+        self.rejectedRewritesSuppressed = rejectedRewritesSuppressed
     }
 
     /// The same counters over a different usage figure (the coordinator's
@@ -108,7 +116,8 @@ public struct DiskCacheStats: Sendable {
             quotaPasses: quotaPasses, lastQuotaPassMs: lastQuotaPassMs,
             pressureEventSeq: pressureEventSeq, lastPressureEvent: lastPressureEvent,
             unreadablePayloadFetches: unreadablePayloadFetches, opaqueBytes: opaqueBytes,
-            rejectedDiskRestores: rejectedDiskRestores)
+            rejectedDiskRestores: rejectedDiskRestores,
+            rejectedRewritesSuppressed: rejectedRewritesSuppressed)
     }
 }
 
@@ -413,6 +422,8 @@ public final class DiskCache: @unchecked Sendable {
     public private(set) var unreadablePayloadFetches: Int = 0
     /// See ``DiskCacheStats/rejectedDiskRestores``.
     public private(set) var rejectedDiskRestores: Int = 0
+    /// See ``DiskCacheStats/rejectedRewritesSuppressed``.
+    public private(set) var rejectedRewritesSuppressed: Int = 0
 
     /// Test seams, never set in production. `temporaryURLForTesting` names
     /// the unpublished file of the next store (the real name carries a random
@@ -480,6 +491,19 @@ public final class DiskCache: @unchecked Sendable {
     /// one refused restore.
     private var rejectedRestores: [String: ValidatedFileFingerprint] = [:]
 
+    /// Entries this cache has already written again after a rejection. When
+    /// the payload it wrote is rejected too, the store → restore round trip
+    /// itself is what fails (a serializer that does not round-trip, a
+    /// caller-supplied cache of another topology), and it fails the same way
+    /// every turn: fetch, refuse, write a boundary of hundreds of megabytes,
+    /// lift the mark, again. So the second mark still makes fetch pass over
+    /// the entry and no longer makes it non-durable
+    /// (``_awaitsRewriteAfterRejectionLocked(hash:current:)``): at most one
+    /// rewrite per entry per process. No store follows to lift that mark. It
+    /// goes, with this memory, when the payload under the name is not the one
+    /// that was refused — somebody else has replaced it — or with the process.
+    private var rewrittenAfterRejection: Set<String> = []
+
     /// Trace-only identity of the most recent boundary written by this cache
     /// instance. Growing agent loops can store N tokens and immediately probe N
     /// tokens under a different hash on the next turn; counts alone hide where
@@ -516,7 +540,8 @@ public final class DiskCache: @unchecked Sendable {
             lastPressureEvent: lastPressureEvent,
             unreadablePayloadFetches: unreadablePayloadFetches,
             opaqueBytes: lastOpaqueBytes,
-            rejectedDiskRestores: rejectedDiskRestores)
+            rejectedDiskRestores: rejectedDiskRestores,
+            rejectedRewritesSuppressed: rejectedRewritesSuppressed)
     }
 
     // MARK: - Initialization
@@ -725,7 +750,7 @@ public final class DiskCache: @unchecked Sendable {
         if let validated = validatedFiles[hash],
            let current = _fileFingerprint(url: url),
            current == validated.file,
-           rejectedRestores[hash] != current,
+           !_awaitsRewriteAfterRejectionLocked(hash: hash, current: current),
            validated.hasRecurrentGeometry,
            Self.payloadLayout(arrays) == validated.layout,
            let indexed = _entryMetadataLocked(hash: hash),
@@ -851,8 +876,11 @@ public final class DiskCache: @unchecked Sendable {
             } else {
                 validatedFiles.removeValue(forKey: hash)
             }
-            // What was refused has just been replaced.
-            rejectedRestores.removeValue(forKey: hash)
+            // What was refused has just been replaced — the one time this
+            // process does that for the entry.
+            if rejectedRestores.removeValue(forKey: hash) != nil {
+                rewrittenAfterRejection.insert(hash)
+            }
             if enforceQuota {
                 _evictIfNeededLocked()
             }
@@ -941,8 +969,10 @@ public final class DiskCache: @unchecked Sendable {
 
         if let refused = rejectedRestores[hash] {
             if _fileFingerprint(url: url) == refused { return .restoreRejectedEarlier }
-            // Another writer has replaced the payload, or it is gone.
+            // Another writer has replaced the payload, or it is gone: what
+            // this process knew about the entry was about the other file.
             rejectedRestores.removeValue(forKey: hash)
+            rewrittenAfterRejection.remove(hash)
         }
         return _fetchLocked(
             hash: hash, url: url, tokens: tokens, mediaSalt: mediaSalt,
@@ -955,7 +985,8 @@ public final class DiskCache: @unchecked Sendable {
     /// for what follows from that. Returns false, and changes nothing, when
     /// there is no such entry (no row, or no payload under the name) or when
     /// this payload is already marked — a rejection reported twice takes one
-    /// hit back, not two.
+    /// hit back, not two. A payload this cache wrote after an earlier
+    /// rejection is marked for fetch only; see ``rewrittenAfterRejection``.
     ///
     /// Takes `lock` only, like the other predicates: it reads one row and
     /// stats one file.
@@ -969,10 +1000,25 @@ public final class DiskCache: @unchecked Sendable {
               rejectedRestores[hash] != current
         else { return false }
         rejectedRestores[hash] = current
-        validatedFiles.removeValue(forKey: hash)
+        if rewrittenAfterRejection.contains(hash) {
+            rejectedRewritesSuppressed += 1
+        } else {
+            validatedFiles.removeValue(forKey: hash)
+        }
         hits = max(0, hits - 1)
         rejectedDiskRestores += 1
         return true
+    }
+
+    /// Whether the payload under the name is one an engine refused and this
+    /// cache has yet to write again: such an entry is neither validated nor
+    /// durable, which is what makes the next store of the boundary a real
+    /// write. False once that write has happened, whatever is refused after
+    /// it; see ``rewrittenAfterRejection``. Caller holds `lock`.
+    private func _awaitsRewriteAfterRejectionLocked(
+        hash: String, current: ValidatedFileFingerprint
+    ) -> Bool {
+        rejectedRestores[hash] == current && !rewrittenAfterRejection.contains(hash)
     }
 
     /// Caller holds ``MLXDiskCacheIOLock`` and `lock`.
@@ -1206,7 +1252,7 @@ public final class DiskCache: @unchecked Sendable {
         guard let validated = validatedFiles[hash],
               let current = _fileFingerprint(url: url),
               current == validated.file,
-              rejectedRestores[hash] != current,
+              !_awaitsRewriteAfterRejectionLocked(hash: hash, current: current),
               validated.hasRecurrentGeometry,
               !requireNativeRecurrent || validated.recurrentGeometry == .native,
               current.size > 0,
@@ -1244,7 +1290,7 @@ public final class DiskCache: @unchecked Sendable {
               indexed.fileSize == current.size,
               // Complete and self-consistent, and of no use to the model
               // that is running: it has to be produced again to be replaced.
-              rejectedRestores[hash] != current
+              !_awaitsRewriteAfterRejectionLocked(hash: hash, current: current)
         else {
             return false
         }
@@ -2696,6 +2742,8 @@ public final class DiskCache: @unchecked Sendable {
         lastOpaqueBytes = 0
         retireNotBefore = nil
         validatedFiles.removeAll(keepingCapacity: true)
+        rejectedRestores.removeAll()
+        rewrittenAfterRejection.removeAll()
     }
 
     // MARK: - Hashing
