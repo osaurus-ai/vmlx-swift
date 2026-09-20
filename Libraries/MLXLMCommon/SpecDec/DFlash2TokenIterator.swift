@@ -429,7 +429,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 mediaSalt: mediaSalt,
                 preferredDiskBoundaries: input.cacheStablePrefixTokenCounts)
             if case .hit(
-                let matchedTokens, let remainingTokens, _, let blocks, let ssmStates,
+                let matchedTokens, let remainingTokens, let detail, let blocks, let ssmStates,
                 let diskArrays) = result
             {
                 var restored = false
@@ -445,6 +445,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                         restored = true
                     }
                 }
+                // The target's cache is the one TokenIterator builds for this
+                // key (`newCache` over the same salted parameters; the
+                // drafter's cache is separate), so an entry that does not
+                // fit it fits neither, and is reported the same way.
                 if let diskArrays, !restored {
                     if restoreFromDiskArrays(
                                 diskArrays, into: &self.cache, requirePromptBoundary: true) > 0 {
@@ -453,6 +457,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                         }
                         MLX.eval(self.cache)
                         restored = true
+                    } else if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: tokensToPrefill, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "payload does not fit the runtime cache")
                     }
                 }
                 if restored, Self.traceEnabled {

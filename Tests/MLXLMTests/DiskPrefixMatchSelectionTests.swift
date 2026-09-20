@@ -951,37 +951,66 @@ struct DiskPrefixMatchSelectionTests {
         }
     }
 
-    /// Both engines report a structural rejection of a disk hit, and only
-    /// that: the two reports sit on the two refusals (`restoreFromDiskArrays`
+    /// Every consumer of a disk hit reports a structural rejection of it,
+    /// and only that: the reports sit on the refusals (`restoreFromDiskArrays`
     /// restored nothing; the restored offsets disagree with the boundary),
     /// each behind `detail == .disk`, and before the contextual roll-backs
     /// (media placeholders in the suffix, a missing seed state), which say
     /// nothing about the entry.
-    @Test func bothEnginesReportStructuralRejectionsOfDiskHitsOnly() throws {
-        for path in [
-            "Libraries/MLXLMCommon/Evaluate.swift",
-            "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
-        ] {
+    ///
+    /// The speculative and diffusion iterators build the cache they restore
+    /// into exactly as `TokenIterator` does — the model's `newCache` over the
+    /// parameters the salt was computed from; a head's or drafter's cache is
+    /// a separate array — so a payload that does not fit theirs fits neither.
+    /// DFlash 2 has no offset check to report from. The diffusion iterator
+    /// applies no recurrent companion state, so its offset refusal is
+    /// reported only for a cache without such layers.
+    @Test func everyRestoreConsumerReportsStructuralRejectionsOfDiskHitsOnly() throws {
+        let fits = "payload does not fit the runtime cache"
+        let offsets = "restored offsets do not match the boundary"
+        let consumers: [(path: String, reasons: [String], contextual: String)] = [
+            ("Libraries/MLXLMCommon/Evaluate.swift", [fits, offsets], "let unsafePartial ="),
+            (
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift", [fits, offsets],
+                "let unsafePartial ="
+            ),
+            (
+                "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift", [fits, offsets],
+                "let unsafePartial ="
+            ),
+            (
+                "Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift", [fits],
+                "input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)"
+            ),
+            (
+                "Libraries/MLXLMCommon/Diffusion/BlockDiffusionTokenIterator.swift",
+                [fits, offsets], "// ---- Encoder prefill"
+            ),
+        ]
+        for consumer in consumers {
+            let path = consumer.path
             let source = try String(contentsOfFile: path, encoding: .utf8)
             let calls = source.components(separatedBy: "coordinator.reportDiskRestoreRejected(")
-            try #require(calls.count - 1 == 2, "\(path): \(calls.count - 1) reports")
+            try #require(
+                calls.count - 1 == consumer.reasons.count, "\(path): \(calls.count - 1) reports")
             for before in calls.dropLast() {
                 #expect(
                     before.suffix(120).contains("detail == .disk"),
                     "\(path): a report that is not behind `detail == .disk`")
             }
-            let reasons = [
-                "payload does not fit the runtime cache",
-                "restored offsets do not match the boundary",
-            ]
-            for reason in reasons {
+            for reason in consumer.reasons {
                 #expect(source.components(separatedBy: reason).count - 1 == 1, "\(path)")
             }
-            let contextual = try #require(source.range(of: "let unsafePartial ="))
+            let contextual = try #require(source.range(of: consumer.contextual), "\(path)")
             let lastReport = try #require(
                 source.range(of: "coordinator.reportDiskRestoreRejected(", options: .backwards))
             #expect(lastReport.upperBound < contextual.lowerBound, "\(path)")
         }
+        let diffusion = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Diffusion/BlockDiffusionTokenIterator.swift",
+            encoding: .utf8)
+        #expect(
+            diffusion.contains("if detail == .disk, !cacheContainsPathDependentState(self.cache) {"))
     }
 
     // MARK: - 7. A hybrid veto comes after the payload is loaded

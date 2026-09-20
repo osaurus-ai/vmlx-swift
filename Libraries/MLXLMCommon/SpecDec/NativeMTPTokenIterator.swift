@@ -682,7 +682,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
             switch result {
             case .hit(
-                let matchedTokens, let remainingTokens, _, let blocks,
+                let matchedTokens, let remainingTokens, let detail, let blocks,
                 let ssmStates, let diskArrays):
                 var restored = false
                 var retainedDiskRestore = false
@@ -702,6 +702,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     }
                 }
 
+                // The base cache is the one TokenIterator builds for this key
+                // (`newCache` over the same salted parameters; the head's
+                // cache is separate), so an entry that does not fit it fits
+                // neither, and is reported the same way.
                 if let diskArrays, !restored {
                     let diskRestored = restoreFromDiskArrays(
                                 diskArrays, into: &self.cache, requirePromptBoundary: true)
@@ -719,6 +723,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         }
                         MLX.eval(self.cache)
                         restored = true
+                    } else if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: cacheLookupTokenIds, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "payload does not fit the runtime cache")
                     }
                 }
 
@@ -730,6 +739,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         self.cache, matchedTokens: matchedTokens,
                         restoredTokens: restoredTokenCount, detail: "native-mtp")
                 {
+                    if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: cacheLookupTokenIds, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "restored offsets do not match the boundary")
+                    }
                     restored = false
                     retainedDiskRestore = false
                     self.cache = model.newCache(parameters: effectiveParameters)
