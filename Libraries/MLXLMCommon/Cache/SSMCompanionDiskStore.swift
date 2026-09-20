@@ -519,16 +519,23 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         // whether or not the retirement could be written — except under a
         // newer build's index, where such a record is opaque: counted, and
         // never offered.
+        //
+        // Opaque bytes that reach the cap evict every companion this build
+        // writes, straight after its write. That stands; it is said once.
         let oldestFirst = ledger.companionsOldestFirst()
-        var total = oldestFirst.reduce(Int64(0)) { $0 + $1.bytes }
+        var total = IndexedBytes.total(oldestFirst.lazy.map(\.bytes))
         if ledger.indexIsFromANewerBuild {
-            total = max(total, ledger.companionUsageBytes())
+            let counted = ledger.companionUsageBytes()
+            ledger.reportOpaqueBytes(
+                IndexedBytes.difference(counted, total), capBytes: Int64(maxBytes),
+                of: "companion cap")
+            total = max(total, counted)
         }
         var evicted = Set<String>()
         for companion in oldestFirst {
             guard total > Int64(maxBytes) else { break }
             evicted.insert(companion.key)
-            total -= companion.bytes
+            total = IndexedBytes.difference(total, companion.bytes)
         }
         // Files first, rows after (by the caller): dying in between leaves
         // rows naming files that are gone — an over-count the next import

@@ -183,6 +183,34 @@ extension DiskCacheCompanionAccountingTests {
 
         // MARK: - O1
 
+        private final class Detached<T>: @unchecked Sendable {
+            let done = DispatchSemaphore(value: 0)
+            var value: T?
+        }
+
+        /// `body` on a detached thread, given ten seconds: a call that blocks
+        /// on a FIFO FAILS its test instead of hanging the suite. nil when it
+        /// did not come back in time — after opening `fifo` for writing, which
+        /// lets a blocked `open` return (and release whatever lock it holds)
+        /// so that the rest of the suite can run.
+        private static func withTimeout<T>(
+            _ what: String, fifo: URL, _ body: @escaping @Sendable () -> T
+        ) -> T? {
+            let outcome = Detached<T>()
+            Thread.detachNewThread {
+                outcome.value = body()
+                outcome.done.signal()
+            }
+            if outcome.done.wait(timeout: .now() + 10) == .success {
+                return outcome.value
+            }
+            Issue.record("\(what) blocked on a FIFO")
+            let writer = open(fifo.path, O_WRONLY | O_NONBLOCK)
+            if writer >= 0 { close(writer) }
+            _ = outcome.done.wait(timeout: .now() + 10)
+            return nil
+        }
+
         /// `open(O_RDONLY)` on a FIFO blocks until somebody opens it for
         /// writing. `fetch` holds the process-wide IO lock, so that was every
         /// disk cache in the process, for good.
@@ -199,26 +227,8 @@ extension DiskCacheCompanionAccountingTests {
                 try FileManager.default.removeItem(at: url)
                 try #require(mkfifo(url.path, 0o644) == 0, "INVALID: mkfifo failed")
 
-                final class Outcome: @unchecked Sendable {
-                    let done = DispatchSemaphore(value: 0)
-                    var wasMiss = false
-                }
                 func fetchWithTimeout(_ what: String) -> Bool? {
-                    let outcome = Outcome()
-                    Thread.detachNewThread {
-                        outcome.wasMiss = disk.fetch(tokens: tokens) == nil
-                        outcome.done.signal()
-                    }
-                    if outcome.done.wait(timeout: .now() + 10) == .success {
-                        return outcome.wasMiss
-                    }
-                    Issue.record("\(what) blocked on a FIFO while holding the IO lock")
-                    // Let the blocked `open` return so the lock is released
-                    // and the rest of the suite can run.
-                    let writer = open(url.path, O_WRONLY | O_NONBLOCK)
-                    if writer >= 0 { close(writer) }
-                    _ = outcome.done.wait(timeout: .now() + 10)
-                    return nil
+                    Self.withTimeout(what, fifo: url) { disk.fetch(tokens: tokens) == nil }
                 }
 
                 DiskCache.resetRateLimitedReportsForTesting()
@@ -241,6 +251,44 @@ extension DiskCacheCompanionAccountingTests {
                 #expect(!disk.hasDurableEntry(tokens: tokens))
                 #expect(!disk.touchRecency(tokens: tokens, at: Date()))
             }
+        }
+
+        /// Every FIFO path above returns BEFORE it reaches the header reader
+        /// (`fetch` and the sweep at their `lstat`, `hasDurableEntry` at the
+        /// size), so without this test `O_NONBLOCK` and the regular-file
+        /// check in the reader could both be deleted with the suite green.
+        /// They are what stands between a FIFO and a caller that has no
+        /// `lstat` of its own — or one that loses the race with a rename.
+        @Test func theHeaderReaderItselfNeverBlocksOnAFIFO() throws {
+            let root = Self.makeRoot("fifo-reader")
+            defer { try? FileManager.default.removeItem(at: root) }
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let url = root.appendingPathComponent("00112233445566778899aabbccddeeff.safetensors")
+            try #require(mkfifo(url.path, 0o644) == 0, "INVALID: mkfifo failed")
+            var info = stat()
+            try #require(
+                lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFIFO,
+                "INVALID: not a FIFO")
+
+            let result = Self.withTimeout("inspectSafetensors", fifo: url) {
+                DiskCache.inspectSafetensors(url: url)
+            }
+            let inspection = try #require(result, "the header reader blocked on a FIFO")
+            guard case .unreadable(let code) = inspection else {
+                // `.shortOrMalformed` is what permits a caller to DELETE.
+                Issue.record("a FIFO was read, and judged \(inspection)")
+                return
+            }
+            print("FIFO_INSPECTION errno=\(code) (\(String(cString: strerror(code))))")
+            #expect(code != 0)
+            #expect(
+                Self.withTimeout("declaredPayloadEnd", fifo: url) {
+                    DiskCache.declaredPayloadEnd(url: url) == nil
+                } == true)
+            #expect(
+                Self.withTimeout("isCompleteSafetensors", fifo: url) {
+                    !DiskCache.isCompleteSafetensors(url: url)
+                } == true)
         }
 
         // MARK: - O2

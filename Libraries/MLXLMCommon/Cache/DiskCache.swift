@@ -28,6 +28,10 @@ public struct DiskCacheStats: Sendable {
     /// In both cases the files were removed again — unless an earlier record
     /// of the same companion already counts them — so nothing is left on disk
     /// uncounted; at worst the boundary is simply not cached.
+    ///
+    /// Also counted: a retirement of records that name nothing which could
+    /// not be written. Those records stay counted until one can; no file is
+    /// involved, and nothing real is evicted to make up for them.
     public let failedIndexWrites: Int
     /// Bytes of the logical cache boundaries counted in ``evictions``: what
     /// quota enforcement has really removed from disk in this process.
@@ -51,6 +55,13 @@ public struct DiskCacheStats: Sendable {
     /// nothing about the payload being corrupt: it is reported as a miss and
     /// the file and its row are left exactly as they are.
     public let unreadablePayloadFetches: Int
+    /// Bytes held by records of an index a NEWER build has claimed that this
+    /// build counts but can neither read nor evict, as the most recent
+    /// over-cap quota pass found them; 0 until there has been one, and always
+    /// 0 under the current schema. They come off the cap the rows this build
+    /// understands share: once they reach it, every store is evicted again
+    /// by the pass that follows it.
+    public let opaqueBytes: Int64
 
     init(
         hits: Int, misses: Int, stores: Int, storeSkips: Int,
@@ -58,7 +69,7 @@ public struct DiskCacheStats: Sendable {
         evictions: Int, maxSizeBytes: Int, failedIndexWrites: Int = 0,
         evictedBytes: Int64 = 0, quotaPasses: Int = 0, lastQuotaPassMs: Double = 0,
         pressureEventSeq: UInt64 = 0, lastPressureEvent: DiskCachePressureEvent? = nil,
-        unreadablePayloadFetches: Int = 0
+        unreadablePayloadFetches: Int = 0, opaqueBytes: Int64 = 0
     ) {
         self.hits = hits
         self.misses = misses
@@ -75,6 +86,7 @@ public struct DiskCacheStats: Sendable {
         self.pressureEventSeq = pressureEventSeq
         self.lastPressureEvent = lastPressureEvent
         self.unreadablePayloadFetches = unreadablePayloadFetches
+        self.opaqueBytes = opaqueBytes
     }
 
     /// The same counters over a different usage figure (the coordinator's
@@ -87,7 +99,7 @@ public struct DiskCacheStats: Sendable {
             failedIndexWrites: failedIndexWrites, evictedBytes: evictedBytes,
             quotaPasses: quotaPasses, lastQuotaPassMs: lastQuotaPassMs,
             pressureEventSeq: pressureEventSeq, lastPressureEvent: lastPressureEvent,
-            unreadablePayloadFetches: unreadablePayloadFetches)
+            unreadablePayloadFetches: unreadablePayloadFetches, opaqueBytes: opaqueBytes)
     }
 }
 
@@ -353,6 +365,16 @@ public final class DiskCache: @unchecked Sendable {
     /// connection's store between its publish and its insert.
     static let defaultUnindexedPayloadGuardAge: TimeInterval = 600
 
+    /// After a retirement of records that name nothing could not be written,
+    /// how long this cache leaves them alone before it tries again. Until
+    /// then they stay counted and are still never offered to a quota pass,
+    /// so nothing real pays for them; what the wait saves is a write
+    /// transaction (and its busy timeout) on every over-cap store.
+    static let defaultRetireRetryInterval: TimeInterval = 60
+    private let retireRetryInterval: TimeInterval
+    /// The clock that paces that retry; a test passes its own.
+    private let now: @Sendable () -> Date
+
     /// Lock for thread-safe access to mutable state.
     private let lock = OSAllocatedUnfairLock()
 
@@ -390,6 +412,10 @@ public final class DiskCache: @unchecked Sendable {
     var temporaryURLForTesting: (@Sendable (URL) -> URL)?
     var publishFaultForTesting: (@Sendable () throws -> Void)?
     var loadFaultForTesting: (@Sendable (URL) throws -> Void)?
+    /// Write transactions this cache has opened to retire records that name
+    /// nothing. Only a test reads it: a stats poll must open none, and a
+    /// retirement that failed must not be tried again by every store.
+    private(set) var retireAttemptsForTesting = 0
 
     /// The names of the float tensors in `arrays` that carry a non-finite
     /// value (at most `limit`), in key order. Integer and boolean tensors are
@@ -417,6 +443,13 @@ public final class DiskCache: @unchecked Sendable {
     private var lastQuotaPassMs: Double = 0
     private var pressureEventSeq: UInt64 = 0
     private var lastPressureEvent: DiskCachePressureEvent?
+    /// See ``DiskCacheStats/opaqueBytes``.
+    private var lastOpaqueBytes: Int64 = 0
+    /// Set when a retirement could not be written: none is tried before it.
+    private var retireNotBefore: Date?
+    /// Whether usage is summed with the clamping aggregate; see
+    /// ``_usageSQLLocked(_:)``. Never goes back to false.
+    private var indexNeedsClampedUsage = false
 
     /// Files successfully written or deserialized in this process. A matching
     /// fingerprint lets `store` avoid realizing and rewriting the same large
@@ -458,7 +491,8 @@ public final class DiskCache: @unchecked Sendable {
             lastQuotaPassMs: lastQuotaPassMs,
             pressureEventSeq: pressureEventSeq,
             lastPressureEvent: lastPressureEvent,
-            unreadablePayloadFetches: unreadablePayloadFetches)
+            unreadablePayloadFetches: unreadablePayloadFetches,
+            opaqueBytes: lastOpaqueBytes)
     }
 
     // MARK: - Initialization
@@ -484,11 +518,15 @@ public final class DiskCache: @unchecked Sendable {
     init(
         cacheDir: URL, maxSizeBytes: Int, modelKey: String? = nil,
         indexMigrationBusyTimeoutMs: Int32 = DiskCacheIndexSchema.defaultBusyTimeoutMs,
-        indexBusyTimeoutMs: Int32 = DiskCache.defaultIndexBusyTimeoutMs
+        indexBusyTimeoutMs: Int32 = DiskCache.defaultIndexBusyTimeoutMs,
+        retireRetryInterval: TimeInterval = DiskCache.defaultRetireRetryInterval,
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.cacheDir = cacheDir
         self.maxSizeBytes = maxSizeBytes
         self.modelKey = modelKey
+        self.retireRetryInterval = retireRetryInterval
+        self.now = now
 
         // Create cache directory if needed
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
@@ -520,6 +558,8 @@ public final class DiskCache: @unchecked Sendable {
         // The schema helpers put the connection back to "no wait" when they
         // finish. Every statement from here on waits a bounded time instead.
         sqlite3_busy_timeout(db, max(0, indexBusyTimeoutMs))
+
+        indexNeedsClampedUsage = _indexHoldsCountsToClampLocked()
 
         // Storage integrity at open: an interrupted store (crash, force-quit,
         // disk full) used to leave a partial `<hash>.safetensors` under its
@@ -1157,7 +1197,11 @@ public final class DiskCache: @unchecked Sendable {
     /// Snapshot indexed KV payloads for the coordinator's combined KV +
     /// recurrent-companion quota. Database/WAL bookkeeping is intentionally
     /// excluded, matching this cache's existing `SUM(file_size)` contract.
-    func quotaEntries() -> [DiskCacheQuotaEntry] {
+    ///
+    /// `retiringInvalidRecords: false` is for a reader that must not write —
+    /// the stats poll: what names nothing is left out all the same, and is
+    /// retired by the next quota pass instead.
+    func quotaEntries(retiringInvalidRecords: Bool = true) -> [DiskCacheQuotaEntry] {
         guard let db else { return [] }
         lock.lock()
         defer { lock.unlock() }
@@ -1171,7 +1215,7 @@ public final class DiskCache: @unchecked Sendable {
         // over for good. Under a newer build's index it is not offered and
         // not retired either (``_retireInvalidRecordsLocked(_:reconciling:)``).
         var invalid = InvalidRecords()
-        defer { _retireInvalidRecordsLocked(invalid) }
+        defer { if retiringInvalidRecords { _retireInvalidRecordsLocked(invalid) } }
         let rowsAreOpaque = indexIsFromANewerBuild
         var stmt: OpaquePointer?
         let sql = indexHasV2Columns
@@ -1199,7 +1243,7 @@ public final class DiskCache: @unchecked Sendable {
                 invalid.entries.append(sqlite3_column_int64(stmt, rowidColumn))
                 continue
             }
-            let bytes = max(0, sqlite3_column_int64(stmt, 1))
+            let bytes = _indexedBytesLocked(stmt, 1)
             var entry = DiskCacheQuotaEntry(
                 hash: hash,
                 bytes: bytes,
@@ -1212,7 +1256,7 @@ public final class DiskCache: @unchecked Sendable {
                 {
                 case .valid(let key):
                     entry.companionKey = key
-                    entry.companionBytes = max(0, sqlite3_column_int64(stmt, 4))
+                    entry.companionBytes = _indexedBytesLocked(stmt, 4)
                 case .unreadable:
                     continue
                 case .null where sqlite3_column_int64(stmt, 4) == 0:
@@ -1397,14 +1441,16 @@ public final class DiskCache: @unchecked Sendable {
         guard indexHasV2Columns else { return 0 }
         lock.lock()
         defer { lock.unlock() }
-        var bytes: Int64 = 0
-        _queryLocked(
-            """
-            SELECT (SELECT COALESCE(SUM(companion_bytes), 0) FROM cache_entries)
-                 + (SELECT COALESCE(SUM(bytes), 0) FROM legacy_companions)
-            """
-        ) { stmt in bytes = max(0, sqlite3_column_int64(stmt, 0)) }
-        return bytes
+        return _countingAgainIfClampingBecameNecessary {
+            var bytes: Int64 = 0
+            _queryLocked(
+                """
+                SELECT (SELECT \(_usageSQLLocked("companion_bytes")) FROM cache_entries)
+                     + (SELECT \(_usageSQLLocked("bytes")) FROM legacy_companions)
+                """
+            ) { stmt in bytes = _indexedBytesLocked(stmt, 0) }
+            return bytes
+        }
     }
 
     /// Every counted companion, least recent first. A linked companion has
@@ -1447,7 +1493,7 @@ public final class DiskCache: @unchecked Sendable {
             }
             result.append(DiskCacheLegacyCompanion(
                 key: key,
-                bytes: max(0, sqlite3_column_int64(stmt, 1)),
+                bytes: _indexedBytesLocked(stmt, 1),
                 modifiedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2))))
         }
         return result
@@ -1624,9 +1670,19 @@ public final class DiskCache: @unchecked Sendable {
     /// callers do not offer such a record either, so it is counted and
     /// otherwise left exactly as it is.
     ///
+    /// A retirement that cannot be written — the write lock refused, a
+    /// statement or the COMMIT failing — changes nothing, and is never
+    /// silent: ``_retirementFailedLocked(_:backingOff:)`` counts it, says why
+    /// once, and keeps the next ``retireRetryInterval`` free of attempts, so
+    /// that a failure that lasts does not cost every over-cap store a write
+    /// transaction and its busy timeout. The records stay counted meanwhile,
+    /// and are still offered to no quota pass.
+    ///
     /// `reconciling` is the import, which already holds the write lock in
     /// its own transaction, and which settles every companion from what is
-    /// on disk — so nothing is handed over here.
+    /// on disk — so nothing is handed over here. Its transaction is not this
+    /// method's to roll back: a record whose statement fails is skipped, the
+    /// others still go, and only what really went is counted and reported.
     ///
     /// Caller holds `lock`, and no statement is still stepping.
     @discardableResult
@@ -1635,21 +1691,31 @@ public final class DiskCache: @unchecked Sendable {
     ) -> (entries: Int, links: Int, legacy: Int) {
         guard let db, !found.isEmpty, !indexIsFromANewerBuild else { return (0, 0, 0) }
         if !reconciling {
+            if let retireNotBefore, now() < retireNotBefore { return (0, 0, 0) }
+            retireAttemptsForTesting += 1
             guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
+                _retirementFailedLocked(String(cString: sqlite3_errmsg(db)), backingOff: true)
                 return (0, 0, 0)
             }
         }
         var retired = (entries: 0, links: 0, legacy: 0)
         var reports: [(shown: String, kind: InvalidIndexValueKind)] = []
-        var ok = true
-        func run(_ sql: String, _ rowid: Int64) {
-            ok = ok && _runLocked(sql, [.int(rowid)]) == SQLITE_DONE
+        // The first failure, in SQLite's words. It ends a retirement of this
+        // method's own; the import goes on to the next record.
+        var failure: String?
+        var stopped: Bool { failure != nil && !reconciling }
+        func succeeded(_ ok: Bool) -> Bool {
+            if !ok, failure == nil { failure = String(cString: sqlite3_errmsg(db)) }
+            return ok
+        }
+        func run(_ sql: String, _ rowid: Int64) -> Bool {
+            succeeded(_runLocked(sql, [.int(rowid)]) == SQLITE_DONE)
         }
 
-        for rowid in found.entries where ok {
+        for rowid in found.entries where !stopped {
             var hash = IndexValue.unreadable
             var key = IndexValue.null
-            ok = _queryLocked(
+            let wasRead = _queryLocked(
                 indexHasV2Columns
                     ? "SELECT hash, companion_key FROM cache_entries WHERE rowid = ?"
                     : "SELECT hash FROM cache_entries WHERE rowid = ?",
@@ -1661,27 +1727,29 @@ public final class DiskCache: @unchecked Sendable {
                         stmt, column: 1, hexDigits: SSMCompanionDiskStore.keyLength)
                 }
             }
-            let shown: String
+            guard succeeded(wasRead) else { continue }
+            var rowReports: [(shown: String, kind: InvalidIndexValueKind)]
             switch hash {
-            case .null: shown = "NULL"
-            case .invalid(let rendering): shown = rendering
+            case .null: rowReports = [("NULL", .hash)]
+            case .invalid(let rendering): rowReports = [(rendering, .hash)]
             case .valid, .unreadable: continue
             }
-            reports.append((shown, .hash))
             switch key {
             case .valid where !reconciling:
-                run(Self.moveLinkedCompanionsToLegacySQL + " WHERE rowid = ?", rowid)
+                guard run(Self.moveLinkedCompanionsToLegacySQL + " WHERE rowid = ?", rowid)
+                else { continue }
             case .invalid(let rendering):
-                reports.append((rendering, .companionKey))
+                rowReports.append((rendering, .companionKey))
             default:
                 break
             }
-            run("DELETE FROM cache_entries WHERE rowid = ?", rowid)
+            guard run("DELETE FROM cache_entries WHERE rowid = ?", rowid) else { continue }
+            reports += rowReports
             retired.entries += 1
         }
-        for rowid in found.links where ok && indexHasV2Columns {
+        for rowid in found.links where !stopped && indexHasV2Columns {
             var shown: String?
-            ok = _queryLocked(
+            let wasRead = _queryLocked(
                 "SELECT hash, companion_key, companion_bytes FROM cache_entries WHERE rowid = ?",
                 [.int(rowid)]
             ) { stmt in
@@ -1695,17 +1763,20 @@ public final class DiskCache: @unchecked Sendable {
                 default: break
                 }
             }
-            guard let shown else { continue }
+            guard succeeded(wasRead), let shown else { continue }
+            guard
+                run(
+                    "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0 WHERE rowid = ?",
+                    rowid)
+            else { continue }
             reports.append((shown, .companionKey))
-            run(
-                "UPDATE cache_entries SET companion_key = NULL, companion_bytes = 0 WHERE rowid = ?",
-                rowid)
             retired.links += 1
         }
-        for rowid in found.legacy where ok && indexHasV2Columns {
+        for rowid in found.legacy where !stopped && indexHasV2Columns {
             var shown: String?
-            ok = _queryLocked("SELECT key FROM legacy_companions WHERE rowid = ?", [.int(rowid)]) {
-                stmt in
+            let wasRead = _queryLocked(
+                "SELECT key FROM legacy_companions WHERE rowid = ?", [.int(rowid)]
+            ) { stmt in
                 switch Self.indexValue(
                     stmt, column: 0, hexDigits: SSMCompanionDiskStore.keyLength)
                 {
@@ -1714,23 +1785,75 @@ public final class DiskCache: @unchecked Sendable {
                 default: break
                 }
             }
-            guard let shown else { continue }
+            guard succeeded(wasRead), let shown else { continue }
+            guard run("DELETE FROM legacy_companions WHERE rowid = ?", rowid) else { continue }
             reports.append((shown, .companionKey))
-            run("DELETE FROM legacy_companions WHERE rowid = ?", rowid)
             retired.legacy += 1
         }
 
         if !reconciling {
-            guard ok, sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+            if failure == nil {
+                _ = succeeded(sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK)
+            }
+            if let failure {
                 sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+                _retirementFailedLocked(failure, backingOff: true)
                 return (0, 0, 0)
             }
+            retireNotBefore = nil
+        } else if let failure {
+            _retirementFailedLocked(failure, backingOff: false)
         }
         // Reported once it is true.
         for report in reports {
             Self.reportInvalidIndexValue(shown: report.shown, kind: report.kind)
         }
         return retired
+    }
+
+    /// A retirement changed nothing (or, in the import, less than it meant
+    /// to). Counted every time; said once per root and reason per process —
+    /// a failure that lasts would otherwise be a line per store.
+    private func _retirementFailedLocked(_ reason: String, backingOff: Bool) {
+        failedIndexWrites += 1
+        if backingOff { retireNotBefore = now().addingTimeInterval(retireRetryInterval) }
+        guard Self.isFirstReport("\(cacheDir.path)\u{0}\(reason)", in: Self.reportedRetireFailures)
+        else { return }
+        FileHandle.standardError.write(Data(
+            ("[vmlx][cache/disk-index] could not retire records that name nothing: \(reason) — "
+                + "they stay counted, no quota pass is offered them, and nothing real is "
+                + "evicted for them\n").utf8))
+    }
+
+    /// The bytes a newer build's records hold that this build can neither
+    /// read nor evict, as an over-cap pass found them (0 when it found
+    /// none). Kept for ``DiskCacheStats/opaqueBytes``, and said once per
+    /// root per process: they come off the cap this build's own rows share,
+    /// and once they reach it every store is evicted again straight away —
+    /// which nothing else would ever explain.
+    func noteOpaqueBytes(_ bytes: Int64, capBytes: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        _noteOpaqueBytesLocked(bytes, capBytes: capBytes)
+    }
+
+    private func _noteOpaqueBytesLocked(_ bytes: Int64, capBytes: Int64) {
+        lastOpaqueBytes = IndexedBytes.clamped(bytes)
+        reportOpaqueBytes(bytes, capBytes: capBytes, of: "cap")
+    }
+
+    /// The line alone: for the companion store, whose own cap is not the
+    /// figure the stats report. Takes no lock.
+    func reportOpaqueBytes(_ bytes: Int64, capBytes: Int64, of what: String) {
+        guard bytes > 0,
+            Self.reportedOpaqueRoots.withLock({ $0.insert(cacheDir.path).inserted })
+        else { return }
+        FileHandle.standardError.write(Data(
+            ("[vmlx][cache/disk-index] rows of a newer build hold \(bytes) bytes that this build "
+                + "counts but cannot evict, leaving \(IndexedBytes.difference(capBytes, bytes)) of "
+                + "the \(capBytes)-byte \(what) for its own (index schema version "
+                + "\(indexSchemaVersion), this build's \(DiskCacheIndexSchema.currentVersion))\n")
+                .utf8))
     }
 
     enum InvalidIndexValueKind: String {
@@ -1758,6 +1881,9 @@ public final class DiskCache: @unchecked Sendable {
     static let rateLimitedReportLimit = 8
     private static let reportedInvalidIndexValues = OSAllocatedUnfairLock(initialState: Set<String>())
     private static let reportedUnreadablePayloads = OSAllocatedUnfairLock(initialState: Set<String>())
+    private static let reportedRetireFailures = OSAllocatedUnfairLock(initialState: Set<String>())
+    /// Roots whose opaque bytes ``reportOpaqueBytes(_:capBytes:of:)`` has said.
+    private static let reportedOpaqueRoots = OSAllocatedUnfairLock(initialState: Set<String>())
 
     private static func isFirstReport(
         _ value: String, in reported: OSAllocatedUnfairLock<Set<String>>
@@ -1785,7 +1911,7 @@ public final class DiskCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let usage = _combinedUsageLocked()
-        return _statsLocked(bytes: Int(usage.bytes), entryCount: usage.entryCount)
+        return _statsLocked(bytes: IndexedBytes.asInt(usage.bytes), entryCount: usage.entryCount)
     }
 
     /// Bring the companion columns and `legacy_companions` in line with what
@@ -2295,6 +2421,8 @@ public final class DiskCache: @unchecked Sendable {
         reportedInvalidIndexValues.withLock { $0.removeAll() }
         reportedUnreadablePayloads.withLock { $0.removeAll() }
         reportedDeleteFailures.withLock { $0.removeAll() }
+        reportedRetireFailures.withLock { $0.removeAll() }
+        reportedOpaqueRoots.withLock { $0.removeAll() }
     }
 
     /// Paths ``removeCacheFile(at:)`` has already reported in this process.
@@ -2410,6 +2538,8 @@ public final class DiskCache: @unchecked Sendable {
         lastQuotaPassMs = 0
         pressureEventSeq = 0
         lastPressureEvent = nil
+        lastOpaqueBytes = 0
+        retireNotBefore = nil
         validatedFiles.removeAll(keepingCapacity: true)
     }
 
@@ -3049,13 +3179,91 @@ public final class DiskCache: @unchecked Sendable {
         Date(timeIntervalSince1970: (julianDay - 2_440_587.5) * 86_400)
     }
 
+    // MARK: - Byte counts are data too
+    //
+    // A `file_size` is whatever is in the index. `1e19` stays REAL in the
+    // INTEGER column; `2^63 - 1` and one more row made `SUM(file_size)` an
+    // integer overflow — the statement FAILED, usage read as 0, and the cache
+    // neither evicted nor retired; a negative size hid every other row.
+    // So: a count is read through ``_indexedBytesLocked(_:_:)`` and summed
+    // through ``IndexedBytes``, and a usage aggregate is ``_usageSQLLocked(_:)``.
+
+    /// One byte count from the index: `sqlite3_column_int64` saturates a REAL
+    /// (and answers 0 for NULL, and for TEXT or a BLOB that is not a
+    /// number); a negative count is 0 bytes — and from then on this cache
+    /// sums with the clamping aggregate. Caller holds `lock`.
+    private func _indexedBytesLocked(_ stmt: OpaquePointer, _ column: Int32) -> Int64 {
+        let raw = sqlite3_column_int64(stmt, column)
+        if raw < 0 { indexNeedsClampedUsage = true }
+        return IndexedBytes.clamped(raw)
+    }
+
+    /// The usage aggregate over `columns`, which agrees with
+    /// ``_indexedBytesLocked(_:_:)`` row by row. `TOTAL` sums in floating
+    /// point, so it cannot overflow (it is exact below 2^53 bytes), and read
+    /// back as an integer it saturates at `Int64.max`.
+    ///
+    /// Two forms, because this runs on every store and every stats poll. A
+    /// clamp per row — `MAX(x, 0)`, a CASE, any spelling of it — costs a
+    /// third of the whole statement (measured: 0.149 ms → 0.200 ms at 5 003
+    /// rows), and buys nothing on an index that holds no negative or NULL
+    /// count, which is every index this build writes. So the plain form is
+    /// used until such a count has been SEEN: by the one check at open
+    /// (``_indexHoldsCountsToClampLocked()``), or by any later read of the
+    /// rows. A negative count that another writer plants while this process
+    /// runs is therefore clamped from the next such read, or the next
+    /// launch, and hides other rows' bytes until then.
+    ///
+    /// In the clamping form `MAX(x, 0)` makes a negative count 0 and leaves
+    /// NULL, TEXT and BLOB to `TOTAL`, which counts them as 0 as well; the
+    /// columns are summed apart, so a NULL in one cannot swallow the other.
+    private func _usageSQLLocked(_ columns: String...) -> String {
+        indexNeedsClampedUsage
+            ? columns.map { "TOTAL(MAX(\($0), 0))" }.joined(separator: " + ")
+            : "TOTAL(\(columns.joined(separator: " + ")))"
+    }
+
+    /// A plain aggregate that comes back NEGATIVE has just shown that the
+    /// index needs the clamping one: count again, once, with that.
+    private func _countingAgainIfClampingBecameNecessary<T>(_ count: () -> T) -> T {
+        let wasClamping = indexNeedsClampedUsage
+        let result = count()
+        return !wasClamping && indexNeedsClampedUsage ? count() : result
+    }
+
+    /// Whether the index holds a byte count the plain aggregate would get
+    /// wrong: a negative one, or a NULL (`x + NULL` is NULL, and takes the
+    /// row's other count with it). One scan, at open; a read, so it answers
+    /// while another connection holds the write lock.
+    private func _indexHoldsCountsToClampLocked() -> Bool {
+        var found = false
+        _queryLocked(
+            indexHasV2Columns
+                ? """
+                    SELECT EXISTS(SELECT 1 FROM cache_entries
+                                  WHERE file_size < 0 OR file_size IS NULL
+                                     OR companion_bytes < 0 OR companion_bytes IS NULL)
+                        OR EXISTS(SELECT 1 FROM legacy_companions WHERE bytes < 0 OR bytes IS NULL)
+                    """
+                : "SELECT EXISTS(SELECT 1 FROM cache_entries WHERE file_size < 0)"
+        ) { stmt in found = sqlite3_column_int64(stmt, 0) != 0 }
+        return found
+    }
+
     // MARK: - Companion accounting helpers (caller holds `lock`)
 
     /// `INSERT … SELECT` that turns a row's companion link into an unlinked
     /// entry, keeping the row's recency. Callers append the WHERE clause.
+    ///
+    /// Both target columns are NOT NULL and the v1 DDL lets `created_at` be
+    /// NULL (`OR REPLACE` does not rescue a NOT NULL column that has no
+    /// default): a row without a recency is handed over as of now, and one
+    /// without a byte count as 0 bytes. Without that the statement fails —
+    /// and takes a whole retirement down with it, on every pass.
     private static let moveLinkedCompanionsToLegacySQL = """
         INSERT OR REPLACE INTO legacy_companions (key, bytes, modified)
-        SELECT companion_key, companion_bytes, (created_at - 2440587.5) * 86400.0
+        SELECT companion_key, COALESCE(companion_bytes, 0),
+               (COALESCE(created_at, julianday('now')) - 2440587.5) * 86400.0
         FROM cache_entries
         """
 
@@ -3106,7 +3314,7 @@ public final class DiskCache: @unchecked Sendable {
             }
             result.append(DiskCacheLegacyCompanion(
                 key: key,
-                bytes: max(0, sqlite3_column_int64(stmt, 1)),
+                bytes: _indexedBytesLocked(stmt, 1),
                 modifiedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2))))
         }
         return (result, invalidRowids)
@@ -3118,19 +3326,26 @@ public final class DiskCache: @unchecked Sendable {
             let usage = _payloadUsageLocked()
             return (Int64(usage.bytes), usage.entryCount)
         }
-        var bytes: Int64 = 0
-        var count = 0
-        _queryLocked(
-            "SELECT COALESCE(SUM(file_size + companion_bytes), 0), COUNT(*) FROM cache_entries"
-        ) { stmt in
-            bytes += max(0, sqlite3_column_int64(stmt, 0))
-            count += Int(sqlite3_column_int64(stmt, 1))
+        return _countingAgainIfClampingBecameNecessary {
+            var bytes: Int64 = 0
+            var count = 0
+            _queryLocked(
+                """
+                SELECT \(_usageSQLLocked("file_size", "companion_bytes")), COUNT(*)
+                FROM cache_entries
+                """
+            ) { stmt in
+                bytes = IndexedBytes.sum(bytes, _indexedBytesLocked(stmt, 0))
+                count += Int(sqlite3_column_int64(stmt, 1))
+            }
+            _queryLocked(
+                "SELECT \(_usageSQLLocked("bytes")), COUNT(*) FROM legacy_companions"
+            ) { stmt in
+                bytes = IndexedBytes.sum(bytes, _indexedBytesLocked(stmt, 0))
+                count += Int(sqlite3_column_int64(stmt, 1))
+            }
+            return (bytes, count)
         }
-        _queryLocked("SELECT COALESCE(SUM(bytes), 0), COUNT(*) FROM legacy_companions") { stmt in
-            bytes += max(0, sqlite3_column_int64(stmt, 0))
-            count += Int(sqlite3_column_int64(stmt, 1))
-        }
-        return (bytes, count)
     }
 
     private func _entryMetadataLocked(hash: String) -> (tokenCount: Int, fileSize: Int)? {
@@ -3155,20 +3370,17 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Current indexed payload usage. Caller MUST hold `lock`.
     private func _payloadUsageLocked() -> (bytes: Int, entryCount: Int) {
-        guard let db else { return (0, 0) }
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(
-            db,
-            "SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM cache_entries",
-            -1,
-            &stmt,
-            nil) == SQLITE_OK
-        else { return (0, 0) }
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return (0, 0) }
-        return (
-            bytes: max(0, Int(sqlite3_column_int64(stmt, 0))),
-            entryCount: max(0, Int(sqlite3_column_int64(stmt, 1))))
+        guard db != nil else { return (0, 0) }
+        return _countingAgainIfClampingBecameNecessary {
+            var usage = (bytes: 0, entryCount: 0)
+            _queryLocked("SELECT \(_usageSQLLocked("file_size")), COUNT(*) FROM cache_entries") {
+                stmt in
+                usage = (
+                    IndexedBytes.asInt(_indexedBytesLocked(stmt, 0)),
+                    max(0, Int(sqlite3_column_int64(stmt, 1))))
+            }
+            return usage
+        }
     }
 
     /// Record one over-cap pass of the coordinator's linked KV +
@@ -3185,7 +3397,7 @@ public final class DiskCache: @unchecked Sendable {
         defer { lock.unlock() }
         if evictedGroups > 0 {
             evictions += evictedGroups
-            quotaEvictedBytes += max(0, evictedBytes)
+            quotaEvictedBytes = IndexedBytes.sum(quotaEvictedBytes, evictedBytes)
             quotaPasses += 1
         }
         lastQuotaPassMs = milliseconds
@@ -3242,7 +3454,8 @@ public final class DiskCache: @unchecked Sendable {
         _runLocked("DELETE FROM cache_entries WHERE hash = ?", [.text(hash)])
     }
 
-    /// Evict oldest entries until total cache size is under `maxSizeBytes`.
+    /// Evict entries until the total cache size is under `maxSizeBytes`:
+    /// first every row that could never fit on its own, then oldest first.
     /// Caller MUST hold `lock`.
     ///
     /// Below the cap this is one SQL aggregate. Over it, every row is read:
@@ -3250,40 +3463,60 @@ public final class DiskCache: @unchecked Sendable {
     /// retired by rowid — not evicted — and nothing real pays for the bytes
     /// it claims, whether or not the retirement could be written. Under a
     /// newer build's index such a row is opaque instead: its bytes count,
-    /// it is never a victim, and only rows this build understands go.
+    /// it is never a victim, and only rows this build understands go — and
+    /// so is a row whose hash is fine and whose companion link this build
+    /// cannot read, exactly as ``quotaEntries(retiringInvalidRecords:)``
+    /// has it: evicting the row would hand that link on.
+    ///
+    /// A `file_size` is data (``IndexedBytes``). A row that claims more than
+    /// the cap — `1e19` reads back as `Int64.max` — is an ordinary victim,
+    /// and goes FIRST, as in the coordinator's pass: taking older rows that
+    /// do fit to make room for one that never will would empty the cache and
+    /// still end with that row's eviction. What is left is then counted, not
+    /// subtracted from a total that may have saturated.
     private func _evictIfNeededLocked() {
         guard let db else { return }
+        let capBytes = Int64(maxSizeBytes)
 
-        var indexedBytes: Int64 = 0
-        _queryLocked("SELECT COALESCE(SUM(file_size), 0) FROM cache_entries") { stmt in
-            indexedBytes = sqlite3_column_int64(stmt, 0)
+        let indexedBytes = _countingAgainIfClampingBecameNecessary { () -> Int64 in
+            var bytes: Int64 = 0
+            _queryLocked("SELECT \(_usageSQLLocked("file_size")) FROM cache_entries") { stmt in
+                bytes = _indexedBytesLocked(stmt, 0)
+            }
+            return bytes
         }
-        guard indexedBytes > Int64(maxSizeBytes) else { return }
+        guard indexedBytes > capBytes else { return }
 
         let rowsAreOpaque = indexIsFromANewerBuild
         var oldestFirst: [(hash: String, url: URL, fileSize: Int64)] = []
         var invalid = InvalidRecords()
-        var understoodBytes: Int64 = 0
-        var opaqueBytes: Int64 = 0
+        var unofferedBytes: Int64 = 0
         var stmt: OpaquePointer?
         let sql = indexHasV2Columns
-            ? "SELECT hash, file_size, rowid, companion_key FROM cache_entries ORDER BY created_at ASC"
+            ? """
+                SELECT hash, file_size, rowid, companion_key, companion_bytes
+                FROM cache_entries ORDER BY created_at ASC
+                """
             : "SELECT hash, file_size, rowid FROM cache_entries ORDER BY created_at ASC"
         if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt {
             while sqlite3_step(stmt) == SQLITE_ROW {
-                let fileSize = sqlite3_column_int64(stmt, 1)
+                let fileSize = _indexedBytesLocked(stmt, 1)
                 var victim: (hash: String, url: URL)?
                 switch Self.indexValue(stmt, column: 0, hexDigits: Self.hashLength) {
                 case .valid(let hash):
                     // Dropping a row hands its companion key on; one a newer
-                    // build wrote in a shape this build cannot read stays
-                    // where it is, with its row.
+                    // build wrote in a shape this build cannot read — or
+                    // bytes with no key at all — stays where it is, with
+                    // its row.
                     var linkIsOpaque = false
-                    if rowsAreOpaque, indexHasV2Columns,
-                       case .invalid = Self.indexValue(
-                           stmt, column: 3, hexDigits: SSMCompanionDiskStore.keyLength)
-                    {
-                        linkIsOpaque = true
+                    if rowsAreOpaque, indexHasV2Columns {
+                        switch Self.indexValue(
+                            stmt, column: 3, hexDigits: SSMCompanionDiskStore.keyLength)
+                        {
+                        case .invalid, .unreadable: linkIsOpaque = true
+                        case .null: linkIsOpaque = sqlite3_column_int64(stmt, 4) != 0
+                        case .valid: break
+                        }
                     }
                     if !linkIsOpaque, let url = safetensorsURL(for: hash) {
                         victim = (hash, url)
@@ -3295,26 +3528,42 @@ public final class DiskCache: @unchecked Sendable {
                 }
                 if let victim {
                     oldestFirst.append((victim.hash, victim.url, fileSize))
-                    understoodBytes += fileSize
                 } else {
-                    opaqueBytes += max(0, fileSize)
+                    unofferedBytes = IndexedBytes.sum(unofferedBytes, fileSize)
                 }
             }
         }
         sqlite3_finalize(stmt)
         _retireInvalidRecordsLocked(invalid)
 
+        // What the offered rows share. Under the current schema a record
+        // that is not offered names nothing and costs them nothing; under a
+        // newer build's it is opaque, and its bytes come off the cap.
+        let opaqueBytes = rowsAreOpaque ? unofferedBytes : 0
+        if rowsAreOpaque { _noteOpaqueBytesLocked(opaqueBytes, capBytes: capBytes) }
+        let offeredCap = IndexedBytes.difference(capBytes, opaqueBytes)
+
         // Delete evicted entries and their files. A payload that could not
         // be deleted keeps its row (see `removeQuotaEntries`); it is tried
         // once per pass and its bytes are not made up for by evicting more.
-        var remaining = understoodBytes + (rowsAreOpaque ? opaqueBytes : 0)
-        for entry in oldestFirst {
-            guard remaining > Int64(maxSizeBytes) else { break }
-            remaining -= entry.fileSize
+        func evict(_ entry: (hash: String, url: URL, fileSize: Int64)) {
             validatedFiles.removeValue(forKey: entry.hash)
-            guard Self.removeCacheFile(at: entry.url) else { continue }
+            guard Self.removeCacheFile(at: entry.url) else { return }
             _deleteEntryLocked(hash: entry.hash)
             evictions += 1
+        }
+        var remaining: Int64 = 0
+        for entry in oldestFirst {
+            if entry.fileSize > offeredCap {
+                evict(entry)
+            } else {
+                remaining = IndexedBytes.sum(remaining, entry.fileSize)
+            }
+        }
+        for entry in oldestFirst where entry.fileSize <= offeredCap {
+            guard remaining > offeredCap else { break }
+            remaining = IndexedBytes.difference(remaining, entry.fileSize)
+            evict(entry)
         }
     }
 }

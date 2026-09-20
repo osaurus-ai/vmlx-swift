@@ -458,12 +458,13 @@ extension DiskCacheCompanionAccountingTests {
                 let root = Self.makeRoot("busy")
                 defer { try? FileManager.default.removeItem(at: root) }
                 let modelKey = "index-rowid-busy"
+                let clock = IndexArithmetic.TestClock()
                 let coordinator = CacheCoordinator(
                     config: CacheCoordinatorConfig(
                         usePagedCache: false, enableDiskCache: true,
                         diskCacheMaxGB: Float(Self.cap) / 1_073_741_824, diskCacheDir: root,
                         modelKey: modelKey),
-                    diskIndexBusyTimeoutMs: 50)
+                    diskIndexBusyTimeoutMs: 50, now: { clock.now })
                 coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true)
                 let disk = try #require(coordinator.diskCache)
                 let controls = [Self.tokens(301, seed: 8_041), Self.tokens(517, seed: 8_042)]
@@ -492,6 +493,9 @@ extension DiskCacheCompanionAccountingTests {
                 }
                 try blocker.require("ROLLBACK")
 
+                // A failed retirement is not tried again straight away (see
+                // `IndexArithmetic`); this pass is the first one that is due.
+                clock.advance(by: DiskCache.defaultRetireRetryInterval + 1)
                 coordinator.enforceCombinedDiskQuota()
                 try Self.expectOnlyHostileRecordsGone(
                     disk: disk, root: root, real: real, controls: controls,

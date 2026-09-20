@@ -1,5 +1,35 @@
 import Foundation
 
+/// Arithmetic on byte counts that came out of `cache_index.db`.
+///
+/// The index is data. `file_size = 1e19` stays REAL in its INTEGER column and
+/// reads back as `Int64.max`, and a negative size is as easy to write: a
+/// plain `+` over the first TRAPS, and the second hides the bytes of every
+/// other row. So a count is clamped to `0...` where it is read, and every
+/// sum of counts saturates at `Int64.max` instead of overflowing. A saturated
+/// total is a lower bound, never a wrapped number, and a row that claims more
+/// than any volume holds is an ordinary row: oversized, so it goes first.
+enum IndexedBytes {
+    static func clamped(_ value: Int64) -> Int64 { max(0, value) }
+
+    static func sum(_ a: Int64, _ b: Int64) -> Int64 {
+        let (total, overflow) = clamped(a).addingReportingOverflow(clamped(b))
+        return overflow ? .max : total
+    }
+
+    static func total<Counts: Sequence>(_ counts: Counts) -> Int64 where Counts.Element == Int64 {
+        counts.reduce(0, sum)
+    }
+
+    /// `a - b`, not below 0. Both are counts, so this cannot overflow.
+    static func difference(_ a: Int64, _ b: Int64) -> Int64 {
+        max(0, clamped(a) - clamped(b))
+    }
+
+    /// For ``DiskCacheStats``, whose usage figure is an `Int`.
+    static func asInt(_ value: Int64) -> Int { Int(clamping: clamped(value)) }
+}
+
 /// One evictable unit as the planner sees it. Pure data.
 ///
 /// `id` must be unique within one `plan` call (it is the KV hash, a primary
@@ -9,7 +39,8 @@ struct QuotaRow: Equatable, Sendable {
     let id: String
     /// Prefix length of the snapshot. 0 for legacy companions.
     let tokenCount: Int
-    /// `file_size + companion_bytes`, or the legacy companion's bytes.
+    /// `file_size + companion_bytes`, or the legacy companion's bytes. A
+    /// negative count is 0 bytes, and every sum saturates (``IndexedBytes``).
     let bytes: Int64
     /// Larger = more recently used.
     let recency: Double
@@ -132,7 +163,7 @@ enum DiskQuotaPlanner {
 
     static func plan(rows: [QuotaRow], capBytes: Int64, activeChain: String?) -> QuotaPlan {
         assert(Set(rows.map(\.id)).count == rows.count, "QuotaRow ids must be unique")
-        let totalBefore = rows.reduce(Int64(0)) { $0 + $1.bytes }
+        let totalBefore = IndexedBytes.total(rows.lazy.map(\.bytes))
         var total = totalBefore
         var evict: [String] = []
         var event: DiskCachePressureEvent?
@@ -149,7 +180,7 @@ enum DiskQuotaPlanner {
             for row in candidates {
                 if total <= goal { break }
                 evict.append(row.id)
-                total -= row.bytes
+                total = IndexedBytes.difference(total, row.bytes)
                 took = true
             }
             return took
@@ -172,6 +203,11 @@ enum DiskQuotaPlanner {
                 tipBytes: tip.bytes, capBytes: capBytes)
         }
         _ = drain(oversized, to: .min)
+        if totalBefore == .max {
+            // A total that saturated on the way up is a lower bound, and what
+            // was taken off it says nothing about what is left: count that.
+            total = IndexedBytes.total(rows.lazy.filter { $0.bytes <= capBytes }.map(\.bytes))
+        }
         guard total > capBytes else { return finish() }
 
         let fitting = rows.filter { $0.bytes <= capBytes }

@@ -188,12 +188,14 @@ public final class CacheCoordinator: @unchecked Sendable {
     static let defaultImportRetryInterval: TimeInterval = 60
 
     /// `diskIndexBusyTimeoutMs` is how long the disk index waits for another
-    /// connection's write lock. Production always uses the default; a test
-    /// that holds the lock on purpose passes a short one. `importRetryInterval`
+    /// connection's write lock, and `diskIndexMigrationBusyTimeoutMs` how
+    /// long its migration does. Production always uses the defaults; a test
+    /// that holds the lock on purpose passes short ones. `importRetryInterval`
     /// and `now` pace the retry of an import that did not commit; a test
     /// passes its own clock instead of sleeping.
     init(
         config: CacheCoordinatorConfig, diskIndexBusyTimeoutMs: Int32,
+        diskIndexMigrationBusyTimeoutMs: Int32 = DiskCacheIndexSchema.defaultBusyTimeoutMs,
         importRetryInterval: TimeInterval = CacheCoordinator.defaultImportRetryInterval,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
@@ -219,7 +221,9 @@ public final class CacheCoordinator: @unchecked Sendable {
                 cacheDir: dir,
                 maxSizeBytes: Int(config.diskCacheMaxGB * 1_073_741_824),
                 modelKey: config.modelKey,
-                indexBusyTimeoutMs: diskIndexBusyTimeoutMs)
+                indexMigrationBusyTimeoutMs: diskIndexMigrationBusyTimeoutMs,
+                indexBusyTimeoutMs: diskIndexBusyTimeoutMs,
+                now: now)
         } else {
             self.diskCache = nil
         }
@@ -573,11 +577,12 @@ public final class CacheCoordinator: @unchecked Sendable {
         let base = diskCache.snapshotStats()
         guard let companionStore = ssmStateCache.diskStore else { return base }
 
-        let kvHashes = Set(diskCache.quotaEntries().map(\.hash))
+        // A poll is a read: it retires nothing, so with a record that names
+        // nothing in the index it opens no write transaction — every few
+        // seconds, per window, under the lock every store needs.
+        let kvHashes = Set(diskCache.quotaEntries(retiringInvalidRecords: false).map(\.hash))
         let companionEntries = companionStore.quotaEntries()
-        let companionBytes = companionEntries.reduce(Int64(0)) {
-            $0 + max(0, $1.bytes)
-        }
+        let companionBytes = IndexedBytes.total(companionEntries.lazy.map(\.bytes))
         let unlinkedCompanionCount = companionEntries.reduce(into: 0) { count, entry in
             if entry.kvHash.map({ !kvHashes.contains($0) }) ?? true {
                 count += 1
@@ -585,7 +590,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         }
 
         return base.replacingUsage(
-            currentPayloadBytes: base.currentPayloadBytes + Int(companionBytes),
+            currentPayloadBytes: IndexedBytes.asInt(
+                IndexedBytes.sum(Int64(base.currentPayloadBytes), companionBytes)),
             currentEntryCount: base.currentEntryCount + unlinkedCompanionCount)
     }
 
@@ -1444,7 +1450,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     private static func groupsToEvict(
         from groups: [EvictionGroup], maxBytes: Int64
     ) -> (evicted: [EvictionGroup], totalBefore: Int64, remaining: Int64) {
-        let totalBefore = groups.reduce(Int64(0)) { $0 + $1.bytes }
+        let totalBefore = IndexedBytes.total(groups.lazy.map(\.bytes))
         guard totalBefore > maxBytes else { return ([], totalBefore, totalBefore) }
 
         var remaining = totalBefore
@@ -1458,7 +1464,13 @@ public final class CacheCoordinator: @unchecked Sendable {
         let oversized = groups.filter { $0.bytes > maxBytes }
         for group in oversized {
             evicted.append(group)
-            remaining -= group.bytes
+            remaining = IndexedBytes.difference(remaining, group.bytes)
+        }
+        if totalBefore == .max {
+            // Saturated on the way up (a `file_size` from the index can be
+            // anything): what is left is counted, not subtracted.
+            remaining = IndexedBytes.total(
+                groups.lazy.filter { $0.bytes <= maxBytes }.map(\.bytes))
         }
         let oversizedKeys = Set(oversized.map(\.sortKey))
 
@@ -1468,7 +1480,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             return $0.createdAt < $1.createdAt
         }) where remaining > maxBytes && !oversizedKeys.contains(group.sortKey) {
             evicted.append(group)
-            remaining -= group.bytes
+            remaining = IndexedBytes.difference(remaining, group.bytes)
         }
         return (evicted, totalBefore, remaining)
     }
@@ -1546,7 +1558,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             rows.append(QuotaRow(
                 id: kv.hash,
                 tokenCount: kv.tokenCount,
-                bytes: kv.bytes + kv.companionBytes,
+                bytes: IndexedBytes.sum(kv.bytes, kv.companionBytes),
                 // A hit refreshes the row and its companion's files with one
                 // timestamp, so the row's recency is the group's — with one
                 // exception. The directory walk uses min(row, companion file
@@ -1580,10 +1592,17 @@ public final class CacheCoordinator: @unchecked Sendable {
         // what they hold comes off the cap the understood rows share. (Under
         // the current schema a record that names nothing has just been
         // retired; if that could not be written, nothing real pays for it.)
+        //
+        // Once the opaque bytes reach the cap, `planCap` is 0: every row is
+        // oversized, and each store is evicted by the pass that follows it.
+        // That is the decision, and it stands; it is said once per root and
+        // reported in ``DiskCacheStats/opaqueBytes``.
         var planCap = maxBytes
         if diskCache.indexIsFromANewerBuild {
-            let understood = rows.reduce(Int64(0)) { $0 + $1.bytes }
-            planCap = max(0, maxBytes - max(0, diskCache.usageBytes() - understood))
+            let understood = IndexedBytes.total(rows.lazy.map(\.bytes))
+            let opaque = IndexedBytes.difference(diskCache.usageBytes(), understood)
+            planCap = IndexedBytes.difference(maxBytes, opaque)
+            diskCache.noteOpaqueBytes(opaque, capBytes: maxBytes)
         }
 
         let selectStart = DispatchTime.now().uptimeNanoseconds
@@ -1643,12 +1662,13 @@ public final class CacheCoordinator: @unchecked Sendable {
                       kv.companionKey.map(removedCompanions.contains) ?? true
                 else { continue }
                 evictedGroups += 1
-                evictedBytes += kv.bytes + kv.companionBytes
+                evictedBytes = IndexedBytes.sum(
+                    evictedBytes, IndexedBytes.sum(kv.bytes, kv.companionBytes))
             } else {
                 let key = String(id.dropFirst(legacyPrefix.count))
                 guard removedLegacy.contains(key) else { continue }
                 evictedGroups += 1
-                evictedBytes += legacyBytes[key] ?? 0
+                evictedBytes = IndexedBytes.sum(evictedBytes, legacyBytes[key] ?? 0)
             }
         }
         let totalMs = msSince(passStart)
@@ -1684,11 +1704,11 @@ public final class CacheCoordinator: @unchecked Sendable {
         // off the cap the understood groups share.
         let rowsAreOpaque = diskCache.indexIsFromANewerBuild
         let opaqueBytes = rowsAreOpaque
-            ? max(
-                0,
-                Int64(diskCache.snapshotStats().currentPayloadBytes)
-                    - kvEntries.reduce(Int64(0)) { $0 + $1.bytes })
+            ? IndexedBytes.difference(
+                Int64(diskCache.snapshotStats().currentPayloadBytes),
+                IndexedBytes.total(kvEntries.lazy.map(\.bytes)))
             : 0
+        if rowsAreOpaque { diskCache.noteOpaqueBytes(opaqueBytes, capBytes: maxBytes) }
         let orphaned = rowsAreOpaque ? [] : companionEntries.filter {
             guard let kvHash = $0.kvHash else { return false }
             return !kvHashes.contains(kvHash)
@@ -1712,7 +1732,8 @@ public final class CacheCoordinator: @unchecked Sendable {
                 sortKey: "kv:\(kv.hash)",
                 kvHashes: [kv.hash],
                 companionHashes: Set(companions.map(\.hash)),
-                bytes: kv.bytes + companions.reduce(0) { $0 + $1.bytes },
+                bytes: IndexedBytes.sum(
+                    kv.bytes, IndexedBytes.total(companions.lazy.map(\.bytes))),
                 createdAt: companions.reduce(kv.createdAt) {
                     min($0, $1.modifiedAt)
                 },
@@ -1731,7 +1752,8 @@ public final class CacheCoordinator: @unchecked Sendable {
                 priority: companion.kvHash == nil ? 0 : 1))
         }
 
-        let plan = Self.groupsToEvict(from: groups, maxBytes: max(0, maxBytes - opaqueBytes))
+        let plan = Self.groupsToEvict(
+            from: groups, maxBytes: IndexedBytes.difference(maxBytes, opaqueBytes))
         guard !plan.evicted.isEmpty else { return }
 
         let evictKV = plan.evicted.reduce(into: Set<String>()) { $0.formUnion($1.kvHashes) }
@@ -1750,7 +1772,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         // No chain ids on this index, so no conversation to raise an event for.
         diskCache.recordQuotaPass(
             evictedGroups: evictedGroups,
-            evictedBytes: evicted.reduce(Int64(0)) { $0 + $1.bytes },
+            evictedBytes: IndexedBytes.total(evicted.lazy.map(\.bytes)),
             milliseconds: Double(DispatchTime.now().uptimeNanoseconds - passStart) / 1_000_000,
             event: nil)
 

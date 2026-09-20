@@ -1301,3 +1301,59 @@ struct DiskQuotaPlannerTests {
         #expect(lines == 3 * 5 + 7)
     }
 }
+
+// MARK: - Byte counts are data
+
+/// The rows come from `cache_index.db`, and a `file_size` there is whatever
+/// an older build, another tool or corruption left: `1e19` reads back as
+/// `Int64.max`, and a plain `+` over two such rows TRAPS. Each test is on its
+/// own so that a regression takes down one named test.
+extension DiskQuotaPlannerTests {
+
+    @Test func aSaturatedRowIsOversizedAndNeverTraps() {
+        let rows = [
+            row("absurd", tokens: 307, bytes: .max, recency: 99, chain: "A"),
+            row("normal", tokens: 517, bytes: 4096, recency: 1, chain: "B"),
+        ]
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 1 << 20, activeChain: nil)
+        #expect(plan.evict == ["absurd"], "the normal row fits and must survive")
+        #expect(plan.totalBefore == .max)
+        #expect(plan.totalAfter == 4096, "what is left is counted exactly")
+        #expect(plan.evictedBytes == plan.totalBefore - plan.totalAfter)
+    }
+
+    @Test func severalSaturatedRowsNeverTrapInEitherDirection() {
+        // Three of them: the sum overflows going up, and a total that was
+        // clamped on the way up would go below `Int64.min` on the way down.
+        let rows = [
+            row("absurd1", tokens: 307, bytes: .max, recency: 3),
+            row("absurd2", tokens: 311, bytes: .max, recency: 2),
+            row("absurd3", tokens: 313, bytes: .max - 1, recency: 1),
+            row("n1", tokens: 517, bytes: 700_001, recency: 10, chain: "N"),
+            row("n2", tokens: 1_003, bytes: 700_003, recency: 11, chain: "N"),
+            legacy("L", bytes: .max, recency: 0),
+        ]
+        let cap: Int64 = 1 << 20
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: cap, activeChain: "N")
+        // Oversized first, oldest first; then the pass goes on from what is
+        // REALLY left (1 400 004 > cap), and the active chain's non-tip pays.
+        #expect(plan.evict == ["legacy:L", "absurd3", "absurd2", "absurd1", "n1"])
+        #expect(plan.totalAfter == 700_003)
+        #expect(plan.totalAfter <= cap)
+        #expect(plan.event?.kind == .activeChainTrimmed)
+    }
+
+    @Test func aNegativeByteCountIsZeroBytes() {
+        // A negative row must not hide the bytes of the others.
+        let rows = [
+            row("negative", tokens: 307, bytes: -5_000_000_000, recency: 1),
+            row("a", tokens: 517, bytes: 3_000, recency: 2),
+            row("b", tokens: 1_003, bytes: 3_001, recency: 3),
+        ]
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 5_000, activeChain: nil)
+        #expect(plan.totalBefore == 6_001)
+        #expect(!plan.evict.isEmpty, "the negative row hid 6 001 bytes over a 5 000 cap")
+        #expect(plan.totalAfter <= 5_000 && plan.totalAfter >= 0)
+        #expect(plan.evictedBytes == plan.totalBefore - plan.totalAfter)
+    }
+}
