@@ -623,16 +623,24 @@ struct DiskPrefixMatchSelectionTests {
         }
     }
 
-    /// The hit count never goes below zero: a rejection can be reported for
-    /// an entry this coordinator never counted a hit for.
+    /// The hit count never goes below zero: a payload can be served without
+    /// a hit having been counted for it (a candidate the coordinator then
+    /// vetoes, a counter that was reset).
     @Test func rejectionNeverTakesTheHitCountBelowZero() throws {
         try MLXMetalTestLock.withLock {
             let root = Self.makeRoot("floor")
             defer { try? FileManager.default.removeItem(at: root) }
             let coordinator = Self.coordinator(root: root, modelKey: "prefix-floor")
             let prompt = Self.chain(37)
+            let stored = Array(prompt.prefix(11))
             coordinator.storePersistentBoundary(
-                tokens: Array(prompt.prefix(11)), diskArrays: Self.payload(), ssmStates: nil)
+                tokens: stored, diskArrays: Self.payload(), ssmStates: nil)
+            // Served, and no hit counted: the coordinator does the counting.
+            let disk = try #require(coordinator.diskCache)
+            guard case .arrays = disk.fetchCandidate(tokens: stored, mediaSalt: nil) else {
+                Issue.record("the stored entry was not served")
+                return
+            }
             try #require(try Self.diskStats(coordinator).hits == 0)
 
             coordinator.reportDiskRestoreRejected(
@@ -643,6 +651,123 @@ struct DiskPrefixMatchSelectionTests {
             guard case .miss = coordinator.fetch(tokens: prompt) else {
                 Issue.record("the rejected entry was served")
                 return
+            }
+        }
+    }
+
+    /// A rejection is about the payload the fetch handed out. Reported for
+    /// an entry this cache never served, it says nothing about the file that
+    /// is there: nothing is marked and nothing is counted.
+    @Test func aRejectionOfAnEntryThatWasNeverServedChangesNothing() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("never-served")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let coordinator = Self.coordinator(root: root, modelKey: "prefix-never-served")
+            let prompt = Self.chain(37)
+            coordinator.storePersistentBoundary(
+                tokens: Array(prompt.prefix(11)), diskArrays: Self.payload(), ssmStates: nil)
+            try #require(try Self.indexedTokenCounts(root) == [11])
+
+            coordinator.reportDiskRestoreRejected(
+                tokens: prompt, boundary: 11, mediaSalt: nil, reason: "test")
+            #expect(try Self.diskStats(coordinator).rejectedDiskRestores == 0)
+            #expect(coordinator.hasDurableDiskEntry(tokens: Array(prompt.prefix(11))))
+            #expect(Self.diskMatch(coordinator.fetch(tokens: prompt))?.matched == 11)
+        }
+    }
+
+    /// Between the fetch and the engine's report another writer replaces the
+    /// payload. What was refused is gone; what is under the name now has
+    /// been refused by nobody, and marking it would hide a good entry (and
+    /// have this process write it again). The same sequence without the
+    /// replacement is the control: there the report marks.
+    @Test func aRejectionMarksOnlyThePayloadThatWasServed() throws {
+        try MLXMetalTestLock.withLock {
+            for replaced in [false, true] {
+                let root = Self.makeRoot("served-\(replaced)")
+                defer { try? FileManager.default.removeItem(at: root) }
+                let modelKey = "prefix-served"
+                let told = Self.coordinator(root: root, modelKey: modelKey)
+                let prompt = try Self.storeShadowingFixture(told).prompt
+                let longTokens = Array(prompt.prefix(11))
+                let longURL = Support.payloadURL(
+                    root, DiskCache.hashTokens(longTokens, modelKey: modelKey))
+
+                try #require(Self.diskMatch(told.fetch(tokens: prompt))?.matched == 11)
+                let before = try Self.diskStats(told)
+                try #require(before.hits == 1)
+                if replaced {
+                    let servedFile = try Self.identity(longURL)
+                    let elsewhere = try #require(
+                        Self.coordinator(root: root, modelKey: modelKey).diskCache)
+                    elsewhere.store(
+                        tokens: longTokens,
+                        arrays: TQDiskSerializer.serialize(
+                            cache: Self.attentionCache(layers: 2, tokens: 11, fill: 5)),
+                        enforceQuota: false)
+                    let now = try Self.identity(longURL)
+                    try #require(now.inode != servedFile.inode)
+                    try #require(now.size != servedFile.size, "the fingerprint cannot tell them apart")
+                }
+
+                told.reportDiskRestoreRejected(
+                    tokens: prompt, boundary: 11, mediaSalt: nil, reason: "test")
+                let after = try Self.diskStats(told)
+                #expect(after.rejectedDiskRestores == (replaced ? 0 : 1), "replaced=\(replaced)")
+                #expect(after.hits == (replaced ? 1 : 0), "replaced=\(replaced)")
+                #expect(told.hasDurableDiskEntry(tokens: longTokens) == replaced)
+                let next = try #require(Self.diskMatch(told.fetch(tokens: prompt)))
+                #expect(next.matched == (replaced ? 11 : 5), "replaced=\(replaced)")
+            }
+        }
+    }
+
+    /// The served payloads are remembered for the most recent 64 entries
+    /// only. A report that arrives after 64 other entries have been served
+    /// finds nothing to compare with and is dropped — the entry is simply
+    /// served once more. One fewer in between, and the report still marks.
+    @Test func servedPayloadsAreRememberedForABoundedNumberOfEntries() throws {
+        try MLXMetalTestLock.withLock {
+            for others in [63, 64] {
+                let root = Self.makeRoot("served-bound-\(others)")
+                defer { try? FileManager.default.removeItem(at: root) }
+                let coordinator = Self.coordinator(root: root, modelKey: "prefix-served-bound")
+                let disk = try #require(coordinator.diskCache)
+                let prompt = Self.chain(37)
+                let stored = Array(prompt.prefix(11))
+                disk.store(tokens: stored, arrays: Self.payload(), enforceQuota: false)
+                for other in 0 ..< others {
+                    disk.store(
+                        tokens: Self.chain(5, seed: 11 + other), arrays: Self.payload(),
+                        enforceQuota: false)
+                }
+                try #require(try Self.indexedTokenCounts(root).count == others + 1)
+
+                try #require(Self.diskMatch(coordinator.fetch(tokens: prompt))?.matched == 11)
+                var servedOthers = 0
+                for other in 0 ..< others {
+                    if case .arrays = disk.fetchCandidate(
+                        tokens: Self.chain(5, seed: 11 + other), mediaSalt: nil)
+                    {
+                        servedOthers += 1
+                    }
+                }
+                try #require(servedOthers == others)
+
+                coordinator.reportDiskRestoreRejected(
+                    tokens: prompt, boundary: 11, mediaSalt: nil, reason: "test")
+                let marked = others < 64
+                #expect(
+                    try Self.diskStats(coordinator).rejectedDiskRestores == (marked ? 1 : 0),
+                    "others=\(others)")
+                if marked {
+                    guard case .miss = coordinator.fetch(tokens: prompt) else {
+                        Issue.record("others=\(others): the rejected entry was served")
+                        continue
+                    }
+                } else {
+                    #expect(Self.diskMatch(coordinator.fetch(tokens: prompt))?.matched == 11)
+                }
             }
         }
     }

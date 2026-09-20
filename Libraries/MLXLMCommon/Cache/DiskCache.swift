@@ -504,6 +504,18 @@ public final class DiskCache: @unchecked Sendable {
     /// that was refused — somebody else has replaced it — or with the process.
     private var rewrittenAfterRejection: Set<String> = []
 
+    /// The payloads ``fetchCandidate(tokens:mediaSalt:)`` has handed out,
+    /// oldest first. A rejection is about the file that was served, and the
+    /// engine reports it some time after the fetch: a payload that another
+    /// writer has put under the name in between was refused by nobody
+    /// (``markRestoreRejected(tokens:mediaSalt:)``). Bounded: only the most
+    /// recent ``servedCandidateLimit`` entries are kept, least recently
+    /// served dropped first. A report that comes later than that finds
+    /// nothing to compare with and is dropped — the entry is served, and
+    /// refused, once more.
+    private var servedCandidates: [(hash: String, file: ValidatedFileFingerprint)] = []
+    static let servedCandidateLimit = 64
+
     /// Trace-only identity of the most recent boundary written by this cache
     /// instance. Growing agent loops can store N tokens and immediately probe N
     /// tokens under a different hash on the next turn; counts alone hide where
@@ -974,19 +986,31 @@ public final class DiskCache: @unchecked Sendable {
             rejectedRestores.removeValue(forKey: hash)
             rewrittenAfterRejection.remove(hash)
         }
-        return _fetchLocked(
+        let before = _fileFingerprint(url: url)
+        let arrays = _fetchLocked(
             hash: hash, url: url, tokens: tokens, mediaSalt: mediaSalt,
-            touchRecency: false, countHit: false
-        ).map(CandidateFetch.arrays) ?? .miss
+            touchRecency: false, countHit: false)
+        // Remember what was served only when the file was the same one on
+        // both sides of the read (`_fetchLocked` fingerprints what it loaded).
+        servedCandidates.removeAll { $0.hash == hash }
+        if arrays != nil, let before, validatedFiles[hash]?.file == before {
+            servedCandidates.append((hash, before))
+            if servedCandidates.count > Self.servedCandidateLimit {
+                servedCandidates.removeFirst(servedCandidates.count - Self.servedCandidateLimit)
+            }
+        }
+        return arrays.map(CandidateFetch.arrays) ?? .miss
     }
 
     /// An engine fetched this entry through the coordinator and could not
     /// restore it into the running model's cache. See ``rejectedRestores``
     /// for what follows from that. Returns false, and changes nothing, when
-    /// there is no such entry (no row, or no payload under the name) or when
-    /// this payload is already marked — a rejection reported twice takes one
-    /// hit back, not two. A payload this cache wrote after an earlier
-    /// rejection is marked for fetch only; see ``rewrittenAfterRejection``.
+    /// there is no such entry (no row, or no payload under the name), when
+    /// the payload under the name is not the one the candidate fetch served
+    /// (see ``servedCandidates``), or when this payload is already marked — a
+    /// rejection reported twice takes one hit back, not two. A payload this
+    /// cache wrote after an earlier rejection is marked for fetch only; see
+    /// ``rewrittenAfterRejection``.
     ///
     /// Takes `lock` only, like the other predicates: it reads one row and
     /// stats one file.
@@ -996,6 +1020,7 @@ public final class DiskCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let current = _fileFingerprint(url: url),
+              servedCandidates.last(where: { $0.hash == hash })?.file == current,
               _entryMetadataLocked(hash: hash) != nil,
               rejectedRestores[hash] != current
         else { return false }
@@ -2744,6 +2769,7 @@ public final class DiskCache: @unchecked Sendable {
         validatedFiles.removeAll(keepingCapacity: true)
         rejectedRestores.removeAll()
         rewrittenAfterRejection.removeAll()
+        servedCandidates.removeAll()
     }
 
     // MARK: - Hashing
