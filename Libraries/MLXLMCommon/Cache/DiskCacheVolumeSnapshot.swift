@@ -34,9 +34,19 @@ public struct DiskCacheVolumeSnapshot: Equatable, Sendable {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
             attributes[.type] as? FileAttributeType == .typeRegular
         else { return nil }
+        // A closed WAL index may have no -shm file. SQLite's read-only
+        // connection then cannot establish its snapshot on macOS. Allow it
+        // to create coordination files, but never create a missing database
+        // or execute a data write. A genuinely read-only volume still uses
+        // the first path when its existing WAL state is readable.
+        return measureIndex(path: path, flags: SQLITE_OPEN_READONLY)
+            ?? measureIndex(path: path, flags: SQLITE_OPEN_READWRITE)
+    }
+
+    private static func measureIndex(path: String, flags: Int32) -> Int64? {
         var db: OpaquePointer?
         guard
-            sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil)
+            sqlite3_open_v2(path, &db, flags | SQLITE_OPEN_FULLMUTEX, nil)
                 == SQLITE_OK
         else {
             if let db { sqlite3_close(db) }
@@ -44,6 +54,9 @@ public struct DiskCacheVolumeSnapshot: Equatable, Sendable {
         }
         defer { sqlite3_close(db) }
         sqlite3_busy_timeout(db, 100)
+        guard sqlite3_exec(db, "PRAGMA query_only=ON", nil, nil, nil) == SQLITE_OK else {
+            return nil
+        }
 
         func read(_ sql: String) -> Int64? {
             var statement: OpaquePointer?

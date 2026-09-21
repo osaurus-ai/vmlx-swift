@@ -495,7 +495,9 @@ public final class DiskCache: @unchecked Sendable {
     private var lastPressureEventTick: UInt64 = 0
     private var pressureEventSeq: UInt64 = 0
     private var lastPressureEvent: DiskCachePressureEvent?
-    private var capacityPressureByChain: [String: DiskCachePressureRecord] = [:]
+    private var capacityPressureByChain: [String: DiskCachePressureRecord] {
+        DiskCachePressureHistory.records(directory: cacheDir, modelKey: modelKey, maxSizeBytes: maxSizeBytes)
+    }
     /// See ``DiskCacheStats/opaqueBytes``.
     private var lastOpaqueBytes: Int64 = 0
     /// Set when a retirement could not be written: none is tried before it.
@@ -567,9 +569,6 @@ public final class DiskCache: @unchecked Sendable {
     /// Caller MUST hold `lock`.
     private func _statsLocked(bytes: Int, entryCount: Int) -> DiskCacheStats {
         let maxSizeBytes = sharedLimit.bytes
-        capacityPressureByChain = capacityPressureByChain.filter {
-            $0.value.event.tipBytes > Int64(maxSizeBytes)
-        }
         if let event = lastPressureEvent,
             event.kind == .activeTipDropped && event.tipBytes <= Int64(maxSizeBytes)
         {
@@ -2844,7 +2843,7 @@ public final class DiskCache: @unchecked Sendable {
         lastPressureEventTick = 0
         pressureEventSeq = 0
         lastPressureEvent = nil
-        capacityPressureByChain.removeAll()
+        DiskCachePressureHistory.clear(directory: cacheDir)
         lastOpaqueBytes = 0
         retireNotBefore = nil
         validatedFiles.removeAll(keepingCapacity: true)
@@ -3739,11 +3738,9 @@ public final class DiskCache: @unchecked Sendable {
             pressureEventSeq += 1
             lastPressureEvent = event
             lastPressureEventTick = lastQuotaPassTick
-            if event.kind == .activeTipDropped, let chain = event.chainId {
-                capacityPressureByChain[chain] = DiskCachePressureRecord(
-                    event: event, sequence: pressureEventSeq, tick: lastPressureEventTick,
-                    tipTokenCount: tipTokenCount)
-            }
+            DiskCachePressureHistory.record(
+                directory: cacheDir, modelKey: modelKey, event: event,
+                tick: lastPressureEventTick, tipTokenCount: tipTokenCount)
         }
     }
 
@@ -3765,7 +3762,8 @@ public final class DiskCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard capacityPressureByChain[chainId]?.sequence == pending.sequence else { return }
-        capacityPressureByChain.removeValue(forKey: chainId)
+        DiskCachePressureHistory.resolve(
+            directory: cacheDir, modelKey: modelKey, chain: chainId, sequence: pending.sequence)
         if lastPressureEvent?.chainId == chainId, lastPressureEvent?.kind == .activeTipDropped {
             lastPressureEvent = nil
         }

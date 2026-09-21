@@ -122,6 +122,32 @@ import Testing
         #expect(DiskCacheVolumeSnapshot.read(directory: root).ownBytes == 1523)
     }
 
+    @Test func closedWALIndexCanBeMeasuredWithoutAResidentCache() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = root.appendingPathComponent("cache_index.db").path
+        var db: OpaquePointer?
+        #expect(sqlite3_open(path, &db) == SQLITE_OK)
+        let connection = try #require(db)
+        #expect(sqlite3_exec(connection, """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE cache_entries (file_size INTEGER, companion_bytes INTEGER);
+            INSERT INTO cache_entries VALUES (101, 203);
+            """, nil, nil, nil) == SQLITE_OK)
+        #expect(sqlite3_wal_checkpoint_v2(connection, nil, SQLITE_CHECKPOINT_TRUNCATE, nil, nil) == SQLITE_OK)
+        #expect(sqlite3_close(connection) == SQLITE_OK)
+        // macOS may keep coordination files after close. This fixture models
+        // the checkpointed, closed index with no live connection or sidecars.
+        for suffix in ["-wal", "-shm"] {
+            if FileManager.default.fileExists(atPath: path + suffix) {
+                try FileManager.default.removeItem(atPath: path + suffix)
+            }
+        }
+        #expect(!FileManager.default.fileExists(atPath: path + "-shm"))
+        #expect(DiskCacheVolumeSnapshot.read(directory: root).ownBytes == 304)
+    }
+
     @Test func invalidExistingIndexIsUnknownInsteadOfZero() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

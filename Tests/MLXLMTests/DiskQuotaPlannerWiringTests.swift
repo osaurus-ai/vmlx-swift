@@ -57,6 +57,43 @@ struct DiskQuotaPlannerWiringTests {
         }
     }
 
+    @Test func capacityLossSurvivesCoordinatorDestructionAndResolvesAfterReload() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("pressure-unload")
+            defer {
+                DiskCachePressureHistory.clear(directory: root)
+                try? FileManager.default.removeItem(at: root)
+            }
+            weak var released: CacheCoordinator?
+            try autoreleasepool {
+                let original = try Self.coordinator(root: root, capBytes: 20_000, modelKey: "model-a")
+                released = original
+                original.storePersistentBoundary(
+                    tokens: Self.tokens(300, seed: 911), diskArrays: Self.kv(65_537),
+                    ssmStates: Self.recurrent(), chainId: "unseen-chat")
+                original.releaseVolatile()
+            }
+            #expect(released == nil, "history must not retain the coordinator or any tensors")
+            let pending = DiskCachePressureHistory.records(
+                directory: root, modelKey: "model-a", maxSizeBytes: 20_000)
+            let loss = try #require(pending["unseen-chat"])
+            #expect(DiskCachePressureHistory.records(
+                directory: root, modelKey: "model-b", maxSizeBytes: 20_000).isEmpty)
+            let reloaded = try Self.coordinator(root: root, capBytes: 20_000, modelKey: "model-a")
+            let disk = try #require(reloaded.diskCache)
+            #expect(disk.snapshotStats().capacityPressureByChain["unseen-chat"] == loss)
+            reloaded.storePersistentBoundary(
+                tokens: Self.tokens(20, seed: 912), diskArrays: Self.kv(),
+                ssmStates: Self.recurrent(), chainId: "unseen-chat", isStableRoot: true)
+            #expect(disk.snapshotStats().capacityPressureByChain["unseen-chat"] == loss)
+            reloaded.storePersistentBoundary(
+                tokens: Self.tokens(301, seed: 913), diskArrays: Self.kv(),
+                ssmStates: Self.recurrent(), chainId: "unseen-chat")
+            #expect(disk.snapshotStats().capacityPressureByChain.isEmpty)
+            try Support.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
     @Test func liveCapChangesReachEveryModelAndTheCompanionStore() throws {
         try MLXMetalTestLock.withLock {
             let modelA = "live-cap-a", modelB = "live-cap-b"
