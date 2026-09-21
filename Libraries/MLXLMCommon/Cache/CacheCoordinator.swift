@@ -703,11 +703,15 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///   - tokens: The full token sequence to look up.
     ///   - mediaSalt: Optional VLM media fingerprint; `nil` for text-only.
     /// - Returns: A ``CacheFetchResult`` describing the outcome.
+    /// `chainId` is the conversation asking (see
+    /// ``GenerateParameters/cacheChainId``): a disk hit on an unowned history
+    /// row hands that row to it. The id never affects which entry is chosen.
     public func fetch(
         tokens: [Int],
         mediaSalt: String? = nil,
         skipExactDiskBoundary: Bool = false,
-        preferredDiskBoundaries: [Int] = []
+        preferredDiskBoundaries: [Int] = [],
+        chainId: String? = nil
     ) -> CacheFetchResult {
         func ftrace(_ msg: String) {
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
@@ -842,12 +846,14 @@ public final class CacheCoordinator: @unchecked Sendable {
                     forTokens: prefix,
                     boundary: boundary,
                     diskArrays: arrays,
-                    mediaSalt: mediaSalt)
+                    mediaSalt: mediaSalt,
+                    chainId: chainId)
                 if hasRequiredHybridSSM(ssmStates, diskArrays: arrays) {
                     touchSuccessfulDiskRestore(
                         matchedTokens: prefix,
                         matchedBoundary: boundary,
-                        mediaSalt: mediaSalt)
+                        mediaSalt: mediaSalt,
+                        chainId: chainId)
                     ftrace("HIT disk boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))")
                     return .hit(
                         matchedTokens: boundary,
@@ -1067,7 +1073,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         forTokens tokens: [Int],
         boundary: Int,
         diskArrays: [String: MLXArray],
-        mediaSalt: String? = nil
+        mediaSalt: String? = nil,
+        chainId: String? = nil
     ) -> [MLXArray]? {
         guard isHybrid else { return nil }
         if let l1 = fetchCompleteSSMStates(
@@ -1081,11 +1088,17 @@ public final class CacheCoordinator: @unchecked Sendable {
         guard let folded = TQDiskSerializer.ssmStates(from: diskArrays) else {
             return nil
         }
+        // A read is not the moment to spend the reader's own boundaries. This
+        // write-back runs a quota pass like any store, and without the reading
+        // conversation named it would spend the COLDEST chain's superseded
+        // rows — which is the chat being read precisely when the user has just
+        // returned to an older one.
         storePersistentBoundary(
             tokens: tokens,
             diskArrays: nil,
             ssmStates: folded,
-            mediaSalt: mediaSalt)
+            mediaSalt: mediaSalt,
+            chainId: chainId)
         return folded
     }
 
@@ -1122,7 +1135,8 @@ public final class CacheCoordinator: @unchecked Sendable {
     private func touchSuccessfulDiskRestore(
         matchedTokens: [Int],
         matchedBoundary: Int,
-        mediaSalt: String?
+        mediaSalt: String?,
+        chainId: String? = nil
     ) {
         guard let diskCache else { return }
         let recency = Date()
@@ -1133,6 +1147,9 @@ public final class CacheCoordinator: @unchecked Sendable {
             tokens: matchedTokens,
             mediaSalt: mediaSalt,
             at: recency)
+        if let chainId {
+            diskCache.assignChain(tokens: matchedTokens, mediaSalt: mediaSalt, chainId: chainId)
+        }
         diskCache.recordAcceptedHit()
         if isHybrid {
             _ = ssmStateCache.diskStore?.touchRecency(
@@ -1218,12 +1235,17 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///     and any layer is a TurboQuant cache in compressed phase, the disk tier
     ///     stores the compressed representation. Pass `nil` (default) to use the
     ///     standard float16 disk path.
+    /// `chainId` / `isStableRoot` are the row's owner and kind for the quota
+    /// planner (see ``GenerateParameters/cacheChainId``); they never enter
+    /// the content key.
     public func storeAfterGeneration(
         promptTokens: [Int],
         perLayerData: [(keys: MLXArray, values: MLXArray)?],
         ssmStates: [MLXArray]?,
         cache: [any KVCache]? = nil,
-        mediaSalt: String? = nil
+        mediaSalt: String? = nil,
+        chainId: String? = nil,
+        isStableRoot: Bool = false
     ) {
         let totalTokens = promptTokens.count
         let blockSize = config.pagedBlockSize
@@ -1388,7 +1410,9 @@ public final class CacheCoordinator: @unchecked Sendable {
             tokens: promptTokens,
             diskArrays: diskArrays,
             ssmStates: persistSeparateRecurrentPayload ? ssmStates : nil,
-            mediaSalt: mediaSalt)
+            mediaSalt: mediaSalt,
+            chainId: chainId,
+            isStableRoot: isStableRoot)
     }
 
     /// Persist one reusable prompt boundary as a linked transaction.
@@ -1403,7 +1427,9 @@ public final class CacheCoordinator: @unchecked Sendable {
         tokens: [Int],
         diskArrays: [String: MLXArray]?,
         ssmStates: [MLXArray]?,
-        mediaSalt: String? = nil
+        mediaSalt: String? = nil,
+        chainId: String? = nil,
+        isStableRoot: Bool = false
     ) {
         let usesCombinedQuota = config.enableDiskCache
             && diskCache != nil
@@ -1423,7 +1449,9 @@ public final class CacheCoordinator: @unchecked Sendable {
                 tokens: tokens,
                 arrays: diskArrays,
                 mediaSalt: mediaSalt,
-                enforceQuota: !usesCombinedQuota)
+                enforceQuota: !usesCombinedQuota,
+                chainId: chainId,
+                isStableRoot: isStableRoot)
             if !storesCompanion {
                 adoptEarlyCompanion(tokens: tokens, mediaSalt: mediaSalt)
             }
@@ -1443,10 +1471,12 @@ public final class CacheCoordinator: @unchecked Sendable {
                 enforceDiskQuota: !usesCombinedQuota)
         }
 
+        // The storing conversation is the one in progress: the pass that its
+        // own store triggers must not take its rows while cold ones remain.
         if usesCombinedQuota {
-            enforceCombinedDiskQuotaLocked()
+            enforceCombinedDiskQuotaLocked(activeChain: chainId)
         } else {
-            enforceCombinedDiskQuota()
+            enforceCombinedDiskQuota(activeChain: chainId)
         }
     }
 
@@ -1756,7 +1786,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             // are appended. An index pass never removes an orphan on sight, so
             // that count is always 0 here.
             FileHandle.standardError.write(Data(
-                "[vmlx][cache/disk-quota] before=\(plan.totalBefore) after=\(max(0, plan.totalAfter)) max=\(maxBytes) logicalEvictions=\(evictedGroups) kvEvicted=\(removedKV.count) companionEvicted=\(removedCompanions.count) legacyCompanionEvicted=\(removedLegacy.count) orphanCompanionEvicted=0 deleteFailures=\(evictKV.count - removedKV.count + companionsStillOnDisk.count) source=index ms=\(String(format: "%.3f", totalMs)) event=\(plan.event?.kind.rawValue ?? "none")\n".utf8))
+                "[vmlx][cache/disk-quota] before=\(plan.totalBefore) after=\(max(0, plan.totalAfter)) max=\(maxBytes) logicalEvictions=\(evictedGroups) kvEvicted=\(removedKV.count) companionEvicted=\(removedCompanions.count) legacyCompanionEvicted=\(removedLegacy.count) orphanCompanionEvicted=0 deleteFailures=\(evictKV.count - removedKV.count + companionsStillOnDisk.count) source=index ms=\(String(format: "%.3f", totalMs)) event=\(plan.event?.kind.rawValue ?? "none") chain=\(activeChain ?? "none")\n".utf8))
         }
     }
 

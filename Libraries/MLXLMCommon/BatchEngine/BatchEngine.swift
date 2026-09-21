@@ -2036,7 +2036,8 @@ public actor BatchEngine {
                     mediaSalt: slot.mediaSalt,
                     skipExactDiskBoundary: requiresDiskBackedRestore,
                     preferredDiskBoundaries: slot.originalInput
-                        .cacheStablePrefixTokenCounts)
+                        .cacheStablePrefixTokenCounts,
+                    chainId: slot.parameters.cacheChainId)
                 if case .hit(
                     let matchedTokens, let remaining, let detail, let blocks,
                     let ssmStates, let diskArrays) = result
@@ -2449,7 +2450,8 @@ public actor BatchEngine {
             perLayerData: [],
             ssmStates: nil,
             cache: diskStoreCache,
-            mediaSalt: slot.mediaSalt)
+            mediaSalt: slot.mediaSalt,
+            chainId: slot.parameters.cacheChainId)
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             FileHandle.standardError.write(Data(
                 "[vmlx][cache/store] label=disk-backed-safe-prompt-boundary-prefill count=\(tokens.count)\n".utf8))
@@ -3457,7 +3459,9 @@ public actor BatchEngine {
                     perLayerData: perLayerData,
                     ssmStates: ssmStates,
                     cache: diskStoreCache,
-                    mediaSalt: slot.mediaSalt
+                    mediaSalt: slot.mediaSalt,
+                    chainId: slot.parameters.cacheChainId,
+                    isStableRoot: label.hasPrefix("stable-system-tool")
                 )
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                     FileHandle.standardError.write(Data(

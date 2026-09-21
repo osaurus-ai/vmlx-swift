@@ -162,7 +162,8 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             switch coordinator.fetch(
                 tokens: promptTokenIds,
                 mediaSalt: mediaSalt,
-                preferredDiskBoundaries: input.cacheStablePrefixTokenCounts
+                preferredDiskBoundaries: input.cacheStablePrefixTokenCounts,
+                chainId: parameters.cacheChainId
             ) {
             case .hit(
                 let matchedTokens, let remainingTokens, let detail, let blocks, _,

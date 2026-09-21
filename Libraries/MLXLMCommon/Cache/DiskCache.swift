@@ -701,11 +701,19 @@ public final class DiskCache: @unchecked Sendable {
     /// KV and recurrent companion payloads under one combined quota lock, so
     /// it defers this cache's standalone quota pass until the linked group is
     /// complete. Direct callers retain the historical per-cache quota above.
+    /// `chainId` names the conversation storing the row and `isStableRoot`
+    /// marks a system/tool prefix shared by many conversations; both are index
+    /// metadata for the quota planner only (a v1 index ignores them) and never
+    /// touch the content key. Re-storing a row updates its owner to the
+    /// storing conversation, keeps the previous owner when none is given, and
+    /// never demotes a stable root.
     func store(
         tokens: [Int],
         arrays: [String: MLXArray],
         mediaSalt: String? = nil,
-        enforceQuota: Bool
+        enforceQuota: Bool,
+        chainId: String? = nil,
+        isStableRoot: Bool = false
     ) {
         guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return }
         let tokenCount = tokens.count
@@ -789,6 +797,7 @@ public final class DiskCache: @unchecked Sendable {
         {
             storeSkips += 1
             _touchEntryLocked(hash: hash)
+            _claimOwnershipLocked(hash: hash, chainId: chainId, isStableRoot: isStableRoot)
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                 FileHandle.standardError.write(Data(
                     "[vmlx][cache/disk-store] SKIP validated hash=\(hash) count=\(tokenCount) bytes=\(current.size)\n".utf8))
@@ -886,7 +895,8 @@ public final class DiskCache: @unchecked Sendable {
             }
 
             let insertResult = _insertEntryLocked(
-                hash: hash, tokenCount: tokenCount, fileSize: fileSize)
+                hash: hash, tokenCount: tokenCount, fileSize: fileSize,
+                chainId: chainId, isStableRoot: isStableRoot)
             guard insertResult == SQLITE_DONE else {
                 // The payload is published but has no row, so no quota pass
                 // could ever see or evict it. Take it back rather than leak it.
@@ -3352,22 +3362,31 @@ public final class DiskCache: @unchecked Sendable {
     /// old row first, which would reset `companion_key` / `companion_bytes`
     /// to their defaults while the companion files are still on disk.
     @discardableResult
-    private func _insertEntryLocked(hash: String, tokenCount: Int, fileSize: Int) -> Int32 {
+    private func _insertEntryLocked(
+        hash: String, tokenCount: Int, fileSize: Int,
+        chainId: String? = nil, isStableRoot: Bool = false
+    ) -> Int32 {
         guard db != nil else { return SQLITE_DONE }
         if indexHasV2Columns {
+            // `kind` only ever rises (a root stays a root); `chain_id` follows
+            // the latest owner but is never cleared by an ownerless re-store.
             return _runLocked(
                 """
-                INSERT INTO cache_entries (hash, token_count, file_size, model_key)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO cache_entries (hash, token_count, file_size, model_key, kind, chain_id)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(hash) DO UPDATE SET
                     token_count = excluded.token_count,
                     file_size = excluded.file_size,
                     created_at = julianday('now'),
-                    model_key = excluded.model_key
+                    model_key = excluded.model_key,
+                    kind = MAX(kind, excluded.kind),
+                    chain_id = COALESCE(excluded.chain_id, chain_id)
                 """,
                 [
                     .text(hash), .int(Int64(tokenCount)), .int(Int64(fileSize)),
                     modelKey.map(SQLValue.text) ?? .null,
+                    .int(isStableRoot ? 1 : 0),
+                    chainId.map(SQLValue.text) ?? .null,
                 ])
         }
         return _runLocked(
@@ -3686,6 +3705,41 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Refresh the existing eviction timestamp without replacing the row or
     /// rewriting the payload. Caller MUST hold `lock`.
+    /// A skipped store is still this conversation storing this boundary: the
+    /// row's owner follows it exactly as a rewrite would have made it, and a
+    /// root stays a root. Caller holds `lock`. No-op on a v1 index.
+    private func _claimOwnershipLocked(hash: String, chainId: String?, isStableRoot: Bool) {
+        guard indexHasV2Columns, !indexIsFromANewerBuild,
+            chainId != nil || isStableRoot
+        else { return }
+        _ = _runLocked(
+            """
+            UPDATE cache_entries SET chain_id = COALESCE(?, chain_id), kind = MAX(kind, ?)
+            WHERE hash = ?
+            """,
+            [chainId.map(SQLValue.text) ?? .null, .int(isStableRoot ? 1 : 0), .text(hash)])
+    }
+
+    /// Give an unowned history row (no `chain_id`, not a stable root) to the
+    /// conversation that just restored from it, so rows written before owners
+    /// existed — or by a request without one — come under the planner's
+    /// protection the first time a chat resumes through them. Rows that
+    /// already have an owner keep it: a read is not a claim. No-op on a v1
+    /// index.
+    func assignChain(tokens: [Int], mediaSalt: String?, chainId: String) {
+        guard indexHasV2Columns, !indexIsFromANewerBuild,
+            let (hash, _) = entryKey(tokens: tokens, mediaSalt: mediaSalt)
+        else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        _ = _runLocked(
+            """
+            UPDATE cache_entries SET chain_id = ?
+            WHERE hash = ? AND chain_id IS NULL AND kind = 0
+            """,
+            [.text(chainId), .text(hash)])
+    }
+
     @discardableResult
     private func _touchEntryLocked(
         hash: String,

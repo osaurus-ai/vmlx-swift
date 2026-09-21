@@ -295,6 +295,15 @@ public struct GenerateParameters: Sendable {
     /// See `Libraries/MLXLMCommon/BatchEngine/STOP-SEQUENCES-CONTRACT.md`.
     public var extraStopStrings: [String] = []
 
+    /// The conversation this request belongs to, as the host names it (a chat
+    /// session id). Rides with every disk-cache row the request stores, so the
+    /// quota pass can tell the chat in progress from cold ones and evict cold
+    /// conversations' superseded snapshots first. It is not part of any cache
+    /// key: two chats sharing a prefix still share the entry. `nil` (the
+    /// default, and every non-chat caller) leaves rows unowned; the eviction
+    /// order is then exactly what it was before this field existed.
+    public var cacheChainId: String? = nil
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -1899,7 +1908,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                     mediaSalt: mediaSalt,
                     skipExactDiskBoundary: requiresDiskBackedRestore,
                     preferredDiskBoundaries: originalInput
-                        .cacheStablePrefixTokenCounts)
+                        .cacheStablePrefixTokenCounts,
+                    chainId: parameters.cacheChainId)
                 switch result {
                 case .hit(
                     let matchedTokens, let remainingTokens, let detail, let blocks,
@@ -2933,7 +2943,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             tokens: [Int],
             cache cacheToStore: [KVCache],
             kvBits diskKVBits: Int?,
-            kvMode diskKVMode: KVQuantizationMode
+            kvMode diskKVMode: KVQuantizationMode,
+            isStableBoundary: Bool = false
         ) {
             guard !tokens.isEmpty else { return }
             // Saving the cache duplicates it several times over (snapshot, host
@@ -3010,7 +3021,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                 perLayerData: perLayerData,
                 ssmStates: ssmCapture,
                 cache: diskStoreCache,
-                mediaSalt: mediaSalt
+                mediaSalt: mediaSalt,
+                chainId: cacheInitParameters?.cacheChainId,
+                isStableRoot: isStableBoundary
             )
         }
 
@@ -3222,7 +3235,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                             kvBits: nil,
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: boundarySnapshot,
-                                requested: kvMode))
+                                requested: kvMode),
+                            isStableBoundary: isStableBoundary)
                     }
                 }
         }

@@ -427,7 +427,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             let result = coordinator.fetch(
                 tokens: tokensToPrefill,
                 mediaSalt: mediaSalt,
-                preferredDiskBoundaries: input.cacheStablePrefixTokenCounts)
+                preferredDiskBoundaries: input.cacheStablePrefixTokenCounts,
+                chainId: parameters.cacheChainId)
             if case .hit(
                 let matchedTokens, let remainingTokens, let detail, let blocks, let ssmStates,
                 let diskArrays) = result

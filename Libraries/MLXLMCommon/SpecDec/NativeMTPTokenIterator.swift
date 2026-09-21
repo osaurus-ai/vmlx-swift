@@ -677,7 +677,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 result = coordinator.fetch(
                     tokens: cacheLookupTokenIds,
                     mediaSalt: mediaSalt,
-                    preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts
+                    preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts,
+                    chainId: parameters.cacheChainId
                 )
             }
             switch result {
@@ -1013,7 +1014,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 cachePrefixTokenCounts + [sharedPromptStripBoundary].compactMap { $0 }
             ))
 
-            func store(tokens: [Int], snapshot: [KVCache], label: String) {
+            func store(
+                tokens: [Int], snapshot: [KVCache], label: String, isStableRoot: Bool = false
+            ) {
                 guard !tokens.isEmpty else { return }
                 // Post-generation tail breakdown (VMLX_CACHE_FETCH_TRACE=1): live
                 // 2026-09-04 the whole 9.5–15 s "hang at the last letters" was
@@ -1095,7 +1098,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     perLayerData: perLayerData,
                     ssmStates: ssmCapture,
                     cache: diskStoreCache,
-                    mediaSalt: mediaSalt)
+                    mediaSalt: mediaSalt,
+                    chainId: cacheInitParameters.cacheChainId,
+                    isStableRoot: isStableRoot)
             }
 
             if shouldPersistExactWarmupPrompt, !usesCanonicalHybridBoundary {
@@ -1138,7 +1143,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         store(
                             tokens: boundaryTokens,
                             snapshot: boundarySnapshot,
-                            label: "history-boundary")
+                            label: "history-boundary",
+                            isStableRoot: isStableBoundary)
                     }
                 }
 
