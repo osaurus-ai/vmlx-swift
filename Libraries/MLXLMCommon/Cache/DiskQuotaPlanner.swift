@@ -53,6 +53,12 @@ struct QuotaRow: Equatable, Sendable {
     /// row marked here is the one worth keeping. Rows from before the mark
     /// existed are `false`, and a chain with no marked row orders as before.
     var isResumeBoundary: Bool = false
+    /// `kind == 3`: the post-answer row. Whether the next prompt matches it
+    /// depends on each answer's tokenization, so even once a model has been
+    /// seen to resume from one (`isResumeBoundary` is then also true) it is
+    /// only a likely resume point: the history boundary of the same turn is
+    /// the one that always matches, and the plan keeps that one beside it.
+    var isPostAnswer: Bool = false
     /// The conversation. `nil` = a row written before chains existed: it is
     /// its own single-row chain.
     let chainId: String?
@@ -192,6 +198,15 @@ enum DiskQuotaPlanner {
         /// The resume point: the newest resume boundary, or, when none is
         /// marked, the largest row.
         let tip: QuotaRow
+        /// When the tip is a post-answer row, the newest history boundary
+        /// beneath it: the row the next prompt falls back to when the answer
+        /// re-tokenizes differently from how it was generated. Kept beside
+        /// the tip and, in the active chain, given up only after it — a
+        /// post-answer row that then fails to match would otherwise leave the
+        /// conversation with nothing but the stable root (seen live: a 10.5k-
+        /// token re-prefill on MiniCPM). `nil` when the tip is not post-answer
+        /// or no history boundary exists.
+        let fallback: QuotaRow?
         /// Rows the chain can spend before its resume boundaries: the
         /// exact-prompt / post-answer rows of a chain that has marked
         /// boundaries. Smallest first. Empty when nothing is marked.
@@ -254,10 +269,15 @@ enum DiskQuotaPlanner {
         let chains = Dictionary(grouping: fitting.filter(isChainRow), by: chainKey)
             .mapValues { members -> Chain in
                 let tip = members.max(by: tipOrder)!
-                let rest = members.filter { $0.id != tip.id }
+                let fallback =
+                    tip.isPostAnswer
+                    ? members.filter { $0.isResumeBoundary && !$0.isPostAnswer }.max(by: tipOrder)
+                    : nil
+                let rest = members.filter { $0.id != tip.id && $0.id != fallback?.id }
                 let marked = members.contains(where: \.isResumeBoundary)
                 return Chain(
                     tip: tip,
+                    fallback: fallback,
                     disposable: marked
                         ? rest.filter { !$0.isResumeBoundary }.sorted(by: shortestFirst) : [],
                     superseded: (marked ? rest.filter(\.isResumeBoundary) : rest)
@@ -275,7 +295,7 @@ enum DiskQuotaPlanner {
         let low = Int64(Double(capBytes) * lowWatermarkFraction)
         _ = drain(fitting.filter(\.isLegacyCompanion).sorted(by: oldestFirst), to: low)
         _ = drain(cold.flatMap(\.disposable), to: low)
-        _ = drain(cold.flatMap(\.superseded), to: low)
+        _ = drain(cold.flatMap { $0.superseded + ($0.fallback.map { [$0] } ?? []) }, to: low)
         // Rows the next turn never reads are not pressure; older resume
         // boundaries (an edit's or a regenerate's restore points) are.
         _ = drain(active?.disposable ?? [], to: capBytes)
@@ -286,7 +306,11 @@ enum DiskQuotaPlanner {
         _ = drain(
             fitting.filter { $0.isStableRoot && !$0.isLegacyCompanion }.sorted(by: oldestFirst),
             to: capBytes)
-        if let active, drain([active.tip], to: capBytes) { trimmedActive = true }
+        // The active chain's post-answer tip goes before its history boundary:
+        // the boundary is the row that is certain to match the next prompt.
+        if let active, drain([active.tip] + (active.fallback.map { [$0] } ?? []), to: capBytes) {
+            trimmedActive = true
+        }
 
         // 5. The pressure event.
         if trimmedActive, event == nil, let tip = activeTipBefore {

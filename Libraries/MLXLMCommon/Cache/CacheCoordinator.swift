@@ -1734,6 +1734,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 // model has been seen to resume from one.
                 isResumeBoundary: kv.isResumeBoundary
                     || (kv.isPostAnswer && diskCache.postAnswerRowsResume),
+                isPostAnswer: kv.isPostAnswer,
                 chainId: kv.chainId,
                 isLegacyCompanion: false))
         }
