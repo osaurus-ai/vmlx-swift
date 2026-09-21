@@ -186,10 +186,23 @@ enum DiskCacheIndexSchema {
                 db,
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='\(modelTokensIndexName)'"
             )
-            guard present == 0 else { return nil }
-            return exec(db, modelTokensIndexStatement) ? nil : lastError(db)
+            if present == 0, !exec(db, modelTokensIndexStatement) { return lastError(db) }
+            let meta = scalarInt(
+                db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='\(metaTableName)'")
+            if meta == 0, !exec(db, metaTableStatement) { return lastError(db) }
+            return nil
         }
     }
+
+    /// What the cache has learned about this root, one row per key: today
+    /// `resume_from_post_answer:<model key>` = "1" once a model has been seen
+    /// to resume a conversation from a post-answer row. Additive; an older
+    /// build neither reads nor minds it.
+    static let metaTableName = "cache_meta"
+    static let metaTableStatement =
+        "CREATE TABLE IF NOT EXISTS \(metaTableName) (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+
 
     /// Runs `body` with a busy timeout when the connection has none, so it
     /// waits for another connection's lock instead of failing on it. The

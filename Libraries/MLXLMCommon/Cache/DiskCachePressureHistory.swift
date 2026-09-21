@@ -12,14 +12,27 @@ public enum DiskCachePressureHistory {
     private static let storage = OSAllocatedUnfairLock(
         initialState: [Key: [String: DiskCachePressureRecord]]())
 
+    /// The canonical form of a root. It walks symlinks, so a cache resolves
+    /// it once at open and passes the result to the `rootKey:` overloads
+    /// instead of paying for it on every poll and store.
+    static func rootKey(for directory: URL) -> String {
+        directory.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
     private static func key(directory: URL, modelKey: String?) -> Key {
-        Key(root: directory.standardizedFileURL.resolvingSymlinksInPath().path, model: modelKey)
+        Key(root: rootKey(for: directory), model: modelKey)
     }
 
     public static func records(
         directory: URL, modelKey: String?, maxSizeBytes: Int
     ) -> [String: DiskCachePressureRecord] {
-        let key = key(directory: directory, modelKey: modelKey)
+        records(rootKey: rootKey(for: directory), modelKey: modelKey, maxSizeBytes: maxSizeBytes)
+    }
+
+    static func records(
+        rootKey: String, modelKey: String?, maxSizeBytes: Int
+    ) -> [String: DiskCachePressureRecord] {
+        let key = Key(root: rootKey, model: modelKey)
         return storage.withLock { entries in
             let retained = (entries[key] ?? [:]).filter {
                 $0.value.event.tipBytes > Int64(maxSizeBytes)
@@ -30,11 +43,11 @@ public enum DiskCachePressureHistory {
     }
 
     static func record(
-        directory: URL, modelKey: String?, event: DiskCachePressureEvent,
+        rootKey: String, modelKey: String?, event: DiskCachePressureEvent,
         tick: UInt64, tipTokenCount: Int
     ) {
         guard event.kind == .activeTipDropped, let chain = event.chainId else { return }
-        let key = key(directory: directory, modelKey: modelKey)
+        let key = Key(root: rootKey, model: modelKey)
         storage.withLock { entries in
             // Uptime remains ordered across coordinator destruction/recreation.
             entries[key, default: [:]][chain] = DiskCachePressureRecord(
@@ -42,8 +55,8 @@ public enum DiskCachePressureHistory {
         }
     }
 
-    static func resolve(directory: URL, modelKey: String?, chain: String, sequence: UInt64) {
-        let key = key(directory: directory, modelKey: modelKey)
+    static func resolve(rootKey: String, modelKey: String?, chain: String, sequence: UInt64) {
+        let key = Key(root: rootKey, model: modelKey)
         storage.withLock { entries in
             guard entries[key]?[chain]?.sequence == sequence else { return }
             entries[key]?.removeValue(forKey: chain)

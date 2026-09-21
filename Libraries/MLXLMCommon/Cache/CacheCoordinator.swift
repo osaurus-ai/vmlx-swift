@@ -735,7 +735,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         func ftrace(_ msg: String) {
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                 FileHandle.standardError.write(Data(
-                    "[vmlx][cache/fetch] \(msg) tokens=\(tokens.count) skipExactDisk=\(skipExactDiskBoundary)\n".utf8))
+                    ("[vmlx][cache/fetch] \(msg) tokens=\(tokens.count) skipExactDisk=\(skipExactDiskBoundary) "
+                        + "salt=\(mediaSalt.map { String($0.prefix(12)) } ?? "none")\n").utf8))
             }
         }
         func hasRequiredHybridSSM(
@@ -1265,7 +1266,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         mediaSalt: String? = nil,
         chainId: String? = nil,
         isStableRoot: Bool = false,
-        isResumeBoundary: Bool = false
+        isResumeBoundary: Bool = false,
+        isPostAnswer: Bool = false
     ) {
         let totalTokens = promptTokens.count
         let blockSize = config.pagedBlockSize
@@ -1433,7 +1435,8 @@ public final class CacheCoordinator: @unchecked Sendable {
             mediaSalt: mediaSalt,
             chainId: chainId,
             isStableRoot: isStableRoot,
-            isResumeBoundary: isResumeBoundary)
+            isResumeBoundary: isResumeBoundary,
+            isPostAnswer: isPostAnswer)
     }
 
     /// Persist one reusable prompt boundary as a linked transaction.
@@ -1451,7 +1454,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         mediaSalt: String? = nil,
         chainId: String? = nil,
         isStableRoot: Bool = false,
-        isResumeBoundary: Bool = false
+        isResumeBoundary: Bool = false,
+        isPostAnswer: Bool = false
     ) {
         let usesCombinedQuota = config.enableDiskCache
             && diskCache != nil
@@ -1474,7 +1478,8 @@ public final class CacheCoordinator: @unchecked Sendable {
                 enforceQuota: !usesCombinedQuota,
                 chainId: chainId,
                 isStableRoot: isStableRoot,
-                isResumeBoundary: isResumeBoundary)
+                isResumeBoundary: isResumeBoundary,
+                isPostAnswer: isPostAnswer)
             if !storesCompanion {
                 adoptEarlyCompanion(tokens: tokens, mediaSalt: mediaSalt)
             }
@@ -1696,7 +1701,10 @@ public final class CacheCoordinator: @unchecked Sendable {
                 // before, never earlier.
                 recency: kv.createdAt.timeIntervalSince1970,
                 isStableRoot: kv.isStableRoot,
-                isResumeBoundary: kv.isResumeBoundary,
+                // A post-answer row counts as a resume boundary once this
+                // model has been seen to resume from one.
+                isResumeBoundary: kv.isResumeBoundary
+                    || (kv.isPostAnswer && diskCache.postAnswerRowsResume),
                 chainId: kv.chainId,
                 isLegacyCompanion: false))
         }
@@ -1806,8 +1814,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         diskCache.recordQuotaPass(
             evictedGroups: evictedGroups, evictedBytes: evictedBytes, milliseconds: totalMs,
             event: confirmedEvent,
-            tipTokenCount: rows.lazy.filter { $0.chainId == activeChain && !$0.isStableRoot }
-                .map(\.tokenCount).max() ?? 0)
+            tipTokenCount: DiskQuotaPlanner.resumePoint(
+                of: rows.filter { $0.chainId == activeChain })?.tokenCount ?? 0)
         _lastQuotaPassTiming = QuotaPassTiming(
             rowsMs: rowsMs, selectMs: selectMs, deleteMs: deleteMs, totalMs: totalMs,
             evictedGroups: evictedGroups)

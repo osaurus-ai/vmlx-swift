@@ -87,4 +87,25 @@ struct DiskQuotaResumeBoundaryTests {
         let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 200, activeChain: "A")
         #expect(plan.evict == ["a1", "a2"])
     }
+
+    /// The row the plan protects and the row the confirmed event is judged by
+    /// must be the same one. A chain's resume point is its newest resume
+    /// boundary even when a larger unmarked row exists; if the larger row's
+    /// delete is the one that failed, no progress was lost, and if the resume
+    /// point's delete succeeded, it was — whatever happened to the larger row.
+    @Test
+    func theConfirmedEventJudgesTheResumePointNotTheLargestRow() throws {
+        let rows = [
+            row("history", tokens: 4_164, bytes: 4_164, recency: 3, resume: true),
+            row("post", tokens: 4_191, bytes: 4_191, recency: 5),
+        ]
+        #expect(DiskQuotaPlanner.resumePoint(of: rows)?.id == "history")
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 4_000, activeChain: "A")
+        try #require(plan.event?.kind == .activeTipDropped)
+        #expect(plan.event?.tipBytes == 4_164, "the dropped tip is the resume point")
+        #expect(
+            plan.confirmedEvent(rows: rows, lostRows: ["post"]) == nil,
+            "the larger row going is not the resume point going")
+        #expect(plan.confirmedEvent(rows: rows, lostRows: ["history"])?.kind == .activeTipDropped)
+    }
 }

@@ -1101,7 +1101,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     mediaSalt: mediaSalt,
                     chainId: cacheInitParameters.cacheChainId,
                     isStableRoot: isStableRoot,
-                    isResumeBoundary: label == "history-boundary" || label == "gen-suffix-stripped")
+                    isResumeBoundary: label == "history-boundary" || label == "gen-suffix-stripped",
+                    isPostAnswer: label == "post-answer")
             }
 
             if shouldPersistExactWarmupPrompt, !usesCanonicalHybridBoundary {

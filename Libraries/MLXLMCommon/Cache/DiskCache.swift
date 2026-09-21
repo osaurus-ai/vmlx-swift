@@ -162,6 +162,10 @@ struct DiskCacheQuotaEntry: Sendable {
     /// `kind == 2`: a history boundary, the row the conversation's next
     /// prompt starts with (see ``QuotaRow/isResumeBoundary``).
     var isResumeBoundary: Bool = false
+    /// `kind == 3`: the prompt-plus-answer snapshot written after a turn.
+    /// Whether it is a resume point depends on the model's template; see
+    /// ``DiskCache/postAnswerRowsResume``.
+    var isPostAnswer: Bool = false
     var chainId: String? = nil
 }
 
@@ -456,6 +460,18 @@ public final class DiskCache: @unchecked Sendable {
     /// See ``DiskCacheStats/rejectedRewritesSuppressed``.
     public private(set) var rejectedRewritesSuppressed: Int = 0
 
+    /// Learned, per model, from the first disk hit that landed on a
+    /// post-answer row: this model's template re-renders the assistant turn
+    /// exactly, so the row a conversation's next prompt starts with is the
+    /// prompt-plus-answer snapshot, not the history boundary. Until then
+    /// post-answer rows are spent before history boundaries; after, they are
+    /// the resume point. Kept in the index (`cache_meta`), so it survives
+    /// reopening. Never learned on a v1 index.
+    public private(set) var postAnswerRowsResume: Bool = false
+    /// The pressure history's key for this root, resolved once: it is read on
+    /// every stats poll and every store.
+    private let pressureRoot: String
+
     /// Test seams, never set in production. `temporaryURLForTesting` names
     /// the unpublished file of the next store (the real name carries a random
     /// tag, so nothing can be planted under it in advance). An error thrown
@@ -499,7 +515,8 @@ public final class DiskCache: @unchecked Sendable {
     private var pressureEventSeq: UInt64 = 0
     private var lastPressureEvent: DiskCachePressureEvent?
     private var capacityPressureByChain: [String: DiskCachePressureRecord] {
-        DiskCachePressureHistory.records(directory: cacheDir, modelKey: modelKey, maxSizeBytes: maxSizeBytes)
+        DiskCachePressureHistory.records(
+            rootKey: pressureRoot, modelKey: modelKey, maxSizeBytes: maxSizeBytes)
     }
     /// See ``DiskCacheStats/opaqueBytes``.
     private var lastOpaqueBytes: Int64 = 0
@@ -629,6 +646,7 @@ public final class DiskCache: @unchecked Sendable {
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.cacheDir = cacheDir
+        self.pressureRoot = DiskCachePressureHistory.rootKey(for: cacheDir)
         self.sharedLimit = SharedDiskCacheLimit.forRoot(cacheDir, initialBytes: maxSizeBytes)
         self.modelKey = modelKey
         self.retireRetryInterval = retireRetryInterval
@@ -671,6 +689,10 @@ public final class DiskCache: @unchecked Sendable {
                     + "failed: \(Self.boundedRendering(of: failure)); carrying on without it\n")
                     .utf8))
         }
+        // The lesson this root has already learned about this model.
+        lock.lock()
+        postAnswerRowsResume = _loadPostAnswerLessonLocked()
+        lock.unlock()
 
         // The schema helpers put the connection back to "no wait" when they
         // finish. Every statement from here on waits a bounded time instead.
@@ -750,14 +772,18 @@ public final class DiskCache: @unchecked Sendable {
         enforceQuota: Bool,
         chainId: String? = nil,
         isStableRoot: Bool = false,
-        isResumeBoundary: Bool = false
+        isResumeBoundary: Bool = false,
+        isPostAnswer: Bool = false
     ) {
         guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return }
         let tokenCount = tokens.count
+        let rowKind = Self.rowKind(
+            stableRoot: isStableRoot, resumeBoundary: isResumeBoundary, postAnswer: isPostAnswer)
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             FileHandle.standardError.write(Data(
                 ("[vmlx][cache/disk-store] count=\(tokenCount) hash=\(hash.prefix(12)) "
                     + "modelKey=\(modelKey ?? "nil") salt=\(mediaSalt.map { String($0.prefix(12)) } ?? "nil") "
+                    + "kind=\(rowKind) "
                     + "keys=\(arrays.keys.sorted().prefix(6))\n").utf8))
         }
 
@@ -836,7 +862,7 @@ public final class DiskCache: @unchecked Sendable {
             _touchEntryLocked(hash: hash)
             _claimOwnershipLocked(
                 hash: hash, chainId: chainId,
-                kind: Self.rowKind(stableRoot: isStableRoot, resumeBoundary: isResumeBoundary))
+                kind: rowKind)
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                 FileHandle.standardError.write(Data(
                     "[vmlx][cache/disk-store] SKIP validated hash=\(hash) count=\(tokenCount) bytes=\(current.size)\n".utf8))
@@ -936,7 +962,7 @@ public final class DiskCache: @unchecked Sendable {
             let insertResult = _insertEntryLocked(
                 hash: hash, tokenCount: tokenCount, fileSize: fileSize,
                 chainId: chainId,
-                kind: Self.rowKind(stableRoot: isStableRoot, resumeBoundary: isResumeBoundary))
+                kind: rowKind)
             guard insertResult == SQLITE_DONE else {
                 // The payload is published but has no row, so no quota pass
                 // could ever see or evict it. Take it back rather than leak it.
@@ -1569,6 +1595,7 @@ public final class DiskCache: @unchecked Sendable {
                 let kind = sqlite3_column_int64(stmt, 6)
                 entry.isStableRoot = kind == 1
                 entry.isResumeBoundary = kind == 2
+                entry.isPostAnswer = kind == 3
                 entry.chainId = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
             }
             entries.append(entry)
@@ -3750,7 +3777,7 @@ public final class DiskCache: @unchecked Sendable {
             lastPressureEvent = event
             lastPressureEventTick = lastQuotaPassTick
             DiskCachePressureHistory.record(
-                directory: cacheDir, modelKey: modelKey, event: event,
+                rootKey: pressureRoot, modelKey: modelKey, event: event,
                 tick: lastPressureEventTick, tipTokenCount: tipTokenCount)
         }
     }
@@ -3774,7 +3801,7 @@ public final class DiskCache: @unchecked Sendable {
         defer { lock.unlock() }
         guard capacityPressureByChain[chainId]?.sequence == pending.sequence else { return }
         DiskCachePressureHistory.resolve(
-            directory: cacheDir, modelKey: modelKey, chain: chainId, sequence: pending.sequence)
+            rootKey: pressureRoot, modelKey: modelKey, chain: chainId, sequence: pending.sequence)
         if lastPressureEvent?.chainId == chainId, lastPressureEvent?.kind == .activeTipDropped {
             lastPressureEvent = nil
         }
@@ -3805,12 +3832,42 @@ public final class DiskCache: @unchecked Sendable {
     /// 2 = a history boundary — the row a conversation's next prompt starts
     /// with. Merging two kinds keeps the stronger: root over boundary over
     /// ordinary. (1 beats 2, so a plain MAX would be wrong.)
-    static func rowKind(stableRoot: Bool, resumeBoundary: Bool) -> Int64 {
-        stableRoot ? 1 : (resumeBoundary ? 2 : 0)
+    static func rowKind(stableRoot: Bool, resumeBoundary: Bool, postAnswer: Bool = false) -> Int64 {
+        stableRoot ? 1 : (resumeBoundary ? 2 : (postAnswer ? 3 : 0))
     }
 
+    /// Precedence when two kinds meet: root (1) over resume boundary (2) over
+    /// post-answer (3) over ordinary (0). A plain MAX would rank 3 above 2.
     static func kindMergeSQL(_ a: String, _ b: String) -> String {
-        "CASE WHEN \(a) = 1 OR \(b) = 1 THEN 1 WHEN \(a) = 2 OR \(b) = 2 THEN 2 ELSE 0 END"
+        "CASE WHEN \(a) = 1 OR \(b) = 1 THEN 1 WHEN \(a) = 2 OR \(b) = 2 THEN 2 "
+            + "WHEN \(a) = 3 OR \(b) = 3 THEN 3 ELSE 0 END"
+    }
+
+    static let postAnswerResumeMetaPrefix = "resume_from_post_answer:"
+
+    /// Caller holds `lock`. Reads the lesson for this model from `cache_meta`;
+    /// absent table or row means nothing learned.
+    private func _loadPostAnswerLessonLocked() -> Bool {
+        guard indexHasV2Columns, !indexIsFromANewerBuild else { return false }
+        var learned = false
+        _ = _queryLocked(
+            "SELECT value FROM \(DiskCacheIndexSchema.metaTableName) WHERE key = ?",
+            [.text(Self.postAnswerResumeMetaPrefix + (modelKey ?? ""))]
+        ) { stmt in
+            if let text = sqlite3_column_text(stmt, 0) { learned = String(cString: text) == "1" }
+        }
+        return learned
+    }
+
+    /// Caller holds `lock`. A hit landed on a post-answer row: remember it for
+    /// this model, in memory and in the index.
+    private func _learnPostAnswerResumesLocked() {
+        guard !postAnswerRowsResume else { return }
+        postAnswerRowsResume = true
+        _ = _runLocked(
+            "INSERT OR REPLACE INTO \(DiskCacheIndexSchema.metaTableName) (key, value) "
+                + "VALUES (?, '1')",
+            [.text(Self.postAnswerResumeMetaPrefix + (modelKey ?? ""))])
     }
 
     /// A row a fetch just resumed from is, by that fact, a resume point: mark
@@ -3829,6 +3886,19 @@ public final class DiskCache: @unchecked Sendable {
         else { return }
         lock.lock()
         defer { lock.unlock() }
+        // What kind of row was resumed from decides what this model's template
+        // does: a hit on a post-answer row is the lesson that such rows are
+        // where its conversations resume.
+        var hitKind: Int64 = 0
+        _ = _queryLocked("SELECT kind FROM cache_entries WHERE hash = ?", [.text(hash)]) { stmt in
+            hitKind = sqlite3_column_int64(stmt, 0)
+        }
+        if hitKind == 3 { _learnPostAnswerResumesLocked() }
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/chain] hit count=\(tokens.count) kind=\(hitKind) "
+                    + "postAnswerRowsResume=\(postAnswerRowsResume)\n").utf8))
+        }
         _ = _runLocked(
             """
             UPDATE cache_entries

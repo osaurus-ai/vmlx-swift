@@ -354,4 +354,81 @@ struct DiskCacheChainAssignmentTests {
         _ = c.fetch(tokens: stable + tokens(3, seed: 102), chainId: "B")
         #expect(try rows(root).first { $0.tokens == 11 }?.kind == 1)
     }
+
+    /// A post-answer row is `kind = 3`: spent before the history boundary until
+    /// the cache has SEEN one resume a conversation. That first hit teaches the
+    /// cache, per model, that this template starts its next prompt from the
+    /// post-answer row; from then on such rows are the resume point and the
+    /// history boundary is the one spent first. The lesson is kept in the index
+    /// so it survives reopening.
+    @Test
+    func aPostAnswerRowBecomesTheResumePointOnceOneIsSeenToResume() throws {
+        let root = makeRoot("learn")
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Roomy while learning.
+        let c = try coordinator(root: root)
+        let disk = try #require(c.diskCache)
+        let history = tokens(29, seed: 110)
+        let post = tokens(37, seed: 110)
+        c.storePersistentBoundary(
+            tokens: history, diskArrays: kv(), ssmStates: nil, chainId: "A", isResumeBoundary: true)
+        c.storePersistentBoundary(
+            tokens: post, diskArrays: kv(), ssmStates: nil, chainId: "A", isPostAnswer: true)
+        #expect(try rows(root).first { $0.tokens == 37 }?.kind == 3)
+        #expect(!disk.postAnswerRowsResume, "nothing learned yet")
+
+        // Under pressure, before the lesson: the unmarked rows go first —
+        // smallest first — and the history boundary is what survives.
+        let tight = try coordinator(root: root, capBytes: 5_000)
+        tight.storePersistentBoundary(
+            tokens: tokens(31, seed: 110), diskArrays: kv(), ssmStates: nil, chainId: "A")
+        var kept = try rows(root).map(\.tokens).sorted()
+        try #require(kept.count == 1, "the cap holds one row: \(kept)")
+        #expect(kept == [29], "history kept, post-answer and exact prompt spent: \(kept)")
+
+        // The lesson: a hit that lands on a post-answer row.
+        let c2 = try coordinator(root: root)
+        let post2 = tokens(41, seed: 111)
+        c2.storePersistentBoundary(
+            tokens: post2, diskArrays: kv(), ssmStates: nil, chainId: "B", isPostAnswer: true)
+        guard
+            case .hit(let matched, _, _, _, _, _) = c2.fetch(
+                tokens: post2 + tokens(5, seed: 112), chainId: "B")
+        else {
+            Issue.record("expected a hit")
+            return
+        }
+        #expect(matched == 41)
+        #expect(try #require(c2.diskCache).postAnswerRowsResume, "learned from the hit")
+        #expect(
+            try rows(root).first { $0.tokens == 41 }?.kind == 2, "the hit row itself is promoted")
+
+        // Now a NEW post-answer row is the resume point over the history boundary.
+        let c3 = try coordinator(root: root, capBytes: 9_000)
+        #expect(try #require(c3.diskCache).postAnswerRowsResume, "the lesson survived reopening")
+        let history3 = tokens(43, seed: 113)
+        let post3 = tokens(47, seed: 113)
+        c3.storePersistentBoundary(
+            tokens: history3, diskArrays: kv(), ssmStates: nil, chainId: "C", isResumeBoundary: true
+        )
+        c3.storePersistentBoundary(
+            tokens: post3, diskArrays: kv(), ssmStates: nil, chainId: "C", isPostAnswer: true)
+        kept = try rows(root).filter { $0.chain == "C" }.map(\.tokens).sorted()
+        try #require(!kept.isEmpty)
+        #expect(kept.contains(47), "the post-answer row is now the resume point: \(kept)")
+    }
+
+    @Test
+    func aV1IndexNeverLearnsAndNeverFails() throws {
+        let root = makeRoot("learn-v1")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Support.makeV1OnlyIndex(in: root)
+        let disk = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: "m")
+        try #require(!disk.indexHasV2Columns)
+        disk.store(
+            tokens: tokens(37, seed: 120), arrays: kv(), enforceQuota: false, chainId: "A",
+            isPostAnswer: true)
+        #expect(!disk.postAnswerRowsResume)
+        #expect(try Support.RawDB(root: root).rows("SELECT hash FROM cache_entries").count == 1)
+    }
 }

@@ -2945,7 +2945,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             kvBits diskKVBits: Int?,
             kvMode diskKVMode: KVQuantizationMode,
             isStableBoundary: Bool = false,
-            isResumeBoundary: Bool = false
+            isResumeBoundary: Bool = false,
+            isPostAnswer: Bool = false
         ) {
             guard !tokens.isEmpty else { return }
             // Saving the cache duplicates it several times over (snapshot, host
@@ -3025,7 +3026,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                 mediaSalt: mediaSalt,
                 chainId: cacheInitParameters?.cacheChainId,
                 isStableRoot: isStableBoundary,
-                isResumeBoundary: isResumeBoundary
+                isResumeBoundary: isResumeBoundary,
+                isPostAnswer: isPostAnswer
             )
         }
 
@@ -3274,7 +3276,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             pendingDrainedTokenId: y.tokens.size == 1
                 ? y.tokens.item(Int.self) : nil)
         guard let generatedBoundaryTokens else { return }
-        store(tokens: generatedBoundaryTokens, cache: cache, kvBits: kvBits, kvMode: kvMode)
+        // Whether the next prompt starts from this row depends on the
+        // template; the cache learns that from the first hit on one.
+        store(
+            tokens: generatedBoundaryTokens, cache: cache, kvBits: kvBits, kvMode: kvMode,
+            isPostAnswer: true)
     }
 
     /// Align the post-answer boundary key with what the cache actually

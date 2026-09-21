@@ -104,11 +104,7 @@ struct QuotaPlan: Equatable {
             !$0.isStableRoot && !$0.isLegacyCompanion && $0.chainId == event.chainId
         }
         if event.kind == .activeTipDropped {
-            let tip = active.max {
-                if $0.tokenCount != $1.tokenCount { return $0.tokenCount < $1.tokenCount }
-                if $0.recency != $1.recency { return $0.recency < $1.recency }
-                return $0.id < $1.id
-            }
+            let tip = DiskQuotaPlanner.resumePoint(of: active)
             return tip.map { lostRows.contains($0.id) } == true ? event : nil
         }
         return active.contains { lostRows.contains($0.id) } ? event : nil
@@ -307,6 +303,15 @@ enum DiskQuotaPlanner {
 
     private static func chainKey(_ row: QuotaRow) -> ChainKey {
         row.chainId.map(ChainKey.named) ?? .solo(row.id)
+    }
+
+    /// The row a conversation resumes from: its newest resume boundary, or
+    /// its largest row when nothing is marked. One definition, used by the
+    /// plan, by the confirmed event and by the coordinator's pressure record,
+    /// so what is protected, what is judged lost and what must be retained to
+    /// resolve the loss are always the same row.
+    static func resumePoint(of rows: [QuotaRow]) -> QuotaRow? {
+        rows.filter(isChainRow).max(by: tipOrder)
     }
 
     /// `max(by:)` order for a chain's tip: a resume boundary over any other

@@ -3464,7 +3464,8 @@ public actor BatchEngine {
                     isStableRoot: label.hasPrefix("stable-system-tool"),
                     // The rows a later prompt of this chat starts with; the
                     // exact prompt and the post-answer snapshot are not.
-                    isResumeBoundary: label == "history-boundary" || label == "gen-suffix-stripped"
+                    isResumeBoundary: label == "history-boundary" || label == "gen-suffix-stripped",
+                    isPostAnswer: label == "post-answer"
                 )
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                     FileHandle.standardError.write(Data(
