@@ -12,7 +12,8 @@ import Testing
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let liveLimit = SharedDiskCacheLimit.forRoot(root, initialBytes: 42 * Int(gb))
-        try Data("not a sqlite database".utf8).write(to: root.appendingPathComponent("cache_index.db"))
+        try Data("not a sqlite database".utf8).write(
+            to: root.appendingPathComponent("cache_index.db"))
         let resolved = DiskCacheCapPolicy.resolve(percent: nil, legacyGB: nil, directory: root)
         #expect(resolved.rule == .unknownVolume)
         #expect(resolved.capBytes == Int64(liveLimit.bytes))
@@ -130,12 +131,17 @@ import Testing
         var db: OpaquePointer?
         #expect(sqlite3_open(path, &db) == SQLITE_OK)
         let connection = try #require(db)
-        #expect(sqlite3_exec(connection, """
-            PRAGMA journal_mode=WAL;
-            CREATE TABLE cache_entries (file_size INTEGER, companion_bytes INTEGER);
-            INSERT INTO cache_entries VALUES (101, 203);
-            """, nil, nil, nil) == SQLITE_OK)
-        #expect(sqlite3_wal_checkpoint_v2(connection, nil, SQLITE_CHECKPOINT_TRUNCATE, nil, nil) == SQLITE_OK)
+        #expect(
+            sqlite3_exec(
+                connection,
+                """
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE cache_entries (file_size INTEGER, companion_bytes INTEGER);
+                INSERT INTO cache_entries VALUES (101, 203);
+                """, nil, nil, nil) == SQLITE_OK)
+        #expect(
+            sqlite3_wal_checkpoint_v2(connection, nil, SQLITE_CHECKPOINT_TRUNCATE, nil, nil)
+                == SQLITE_OK)
         #expect(sqlite3_close(connection) == SQLITE_OK)
         // macOS may keep coordination files after close. This fixture models
         // the checkpointed, closed index with no live connection or sidecars.
@@ -146,6 +152,63 @@ import Testing
         }
         #expect(!FileManager.default.fileExists(atPath: path + "-shm"))
         #expect(DiskCacheVolumeSnapshot.read(directory: root).ownBytes == 304)
+    }
+
+    /// Measuring is a read. An index whose process died with frames still in
+    /// the WAL and no `-shm` must be counted in full, and the measurement must
+    /// leave the database bytes and the WAL exactly as it found them — a
+    /// checkpoint on close is a write from a settings/stats path. The fixture
+    /// copies a live database and its WAL mid-session, which is what a crash
+    /// leaves behind.
+    @Test func measuringAnUncheckpointedWALIndexWritesNothing() throws {
+        let live = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: live, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: live)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let livePath = live.appendingPathComponent("cache_index.db").path
+        var db: OpaquePointer?
+        #expect(sqlite3_open(livePath, &db) == SQLITE_OK)
+        let connection = try #require(db)
+        #expect(
+            sqlite3_exec(
+                connection,
+                """
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE cache_entries (file_size INTEGER, companion_bytes INTEGER);
+                INSERT INTO cache_entries VALUES (101, 203);
+                """, nil, nil, nil) == SQLITE_OK)
+        #expect(
+            sqlite3_wal_checkpoint_v2(connection, nil, SQLITE_CHECKPOINT_TRUNCATE, nil, nil)
+                == SQLITE_OK)
+        #expect(
+            sqlite3_exec(connection, "INSERT INTO cache_entries VALUES (1000, 0);", nil, nil, nil)
+                == SQLITE_OK)
+        // Copy the main file and the WAL while the writer is still open: the
+        // 1000-byte row exists only in the WAL at this point.
+        let path = root.appendingPathComponent("cache_index.db").path
+        try FileManager.default.copyItem(atPath: livePath, toPath: path)
+        try FileManager.default.copyItem(atPath: livePath + "-wal", toPath: path + "-wal")
+        #expect(sqlite3_close(connection) == SQLITE_OK)
+        let dbBefore = try Data(contentsOf: URL(fileURLWithPath: path))
+        let walBefore = try Data(contentsOf: URL(fileURLWithPath: path + "-wal"))
+        try #require(!walBefore.isEmpty, "the fixture needs frames in the WAL")
+        try #require(!FileManager.default.fileExists(atPath: path + "-shm"))
+
+        #expect(
+            DiskCacheVolumeSnapshot.read(directory: root).ownBytes == 1304,
+            "every WAL frame counted")
+
+        #expect(
+            try Data(contentsOf: URL(fileURLWithPath: path)) == dbBefore,
+            "the database file was not written")
+        #expect(
+            FileManager.default.fileExists(atPath: path + "-wal"),
+            "the WAL was not checkpointed away")
+        #expect(try Data(contentsOf: URL(fileURLWithPath: path + "-wal")) == walBefore)
     }
 
     @Test func invalidExistingIndexIsUnknownInsteadOfZero() throws {
@@ -196,8 +259,12 @@ import Testing
 
     @Test func failedDeletionDoesNotReportLostProgress() {
         let rows = [
-            QuotaRow(id: "old", tokenCount: 10, bytes: 151, recency: 1, isStableRoot: false, chainId: "chat", isLegacyCompanion: false),
-            QuotaRow(id: "tip", tokenCount: 20, bytes: 151, recency: 2, isStableRoot: false, chainId: "chat", isLegacyCompanion: false),
+            QuotaRow(
+                id: "old", tokenCount: 10, bytes: 151, recency: 1, isStableRoot: false,
+                chainId: "chat", isLegacyCompanion: false),
+            QuotaRow(
+                id: "tip", tokenCount: 20, bytes: 151, recency: 2, isStableRoot: false,
+                chainId: "chat", isLegacyCompanion: false),
         ]
         let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 100, activeChain: "chat")
         #expect(plan.event?.kind == .activeTipDropped)

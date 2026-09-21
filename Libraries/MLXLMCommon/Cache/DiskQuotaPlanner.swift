@@ -145,10 +145,14 @@ struct QuotaPlan: Equatable {
 ///    its goal is met, or when it runs out of such rows.
 ///
 ///    Why (c) stops at the cap: the conversation in progress is about to read
-///    its own non-tip rows again. A regenerate restores from the exact-prompt
-///    row, one boundary below the tip; an edit restores from further down.
-///    Spending those on hysteresis trades a certain re-prefill now for fewer
+///    its own resume boundaries again — an edit restores from an older one,
+///    and a regenerate lands on the newest (it is the prompt minus the
+///    assistant header, so the exact-prompt row buys only those few tokens).
+///    Spending them on hysteresis trades a certain re-prefill now for fewer
 ///    evicting passes later. Cold chains' superseded rows have no such reader.
+///    A marked chain's unmarked rows (exact prompt, post-answer) are spent
+///    before any of that and are not pressure; a row that a hit lands on is
+///    marked from then on, so each template keeps the row it really reuses.
 /// 4. **Hard phase, only while `total > cap`:** (d) cold chains' tips, coldest
 ///    chain first; (e) stable roots, oldest first; (f) the active chain's tip,
 ///    last. Stops as soon as `total <= cap`.

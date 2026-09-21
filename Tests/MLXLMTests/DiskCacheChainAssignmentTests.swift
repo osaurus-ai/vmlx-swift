@@ -302,8 +302,10 @@ struct DiskCacheChainAssignmentTests {
         defer { try? FileManager.default.removeItem(at: root) }
         // Each row ≈ 4.1 KB; the cap holds three of the four.
         let c = try coordinator(root: root, capBytes: 13_000)
-        let rootT = tokens(11, seed: 90), history = tokens(29, seed: 90)
-        let exact = tokens(31, seed: 90), post = tokens(37, seed: 90)
+        let rootT = tokens(11, seed: 90)
+        let history = tokens(29, seed: 90)
+        let exact = tokens(31, seed: 90)
+        let post = tokens(37, seed: 90)
         c.storePersistentBoundary(
             tokens: rootT, diskArrays: kv(), ssmStates: nil, chainId: "A", isStableRoot: true)
         c.storePersistentBoundary(
@@ -314,5 +316,42 @@ struct DiskCacheChainAssignmentTests {
         try #require(kept.count == 3, "one row had to go: \(kept)")
         #expect(kept.contains(29), "the history boundary survived: \(kept)")
         #expect(!kept.contains(31), "the exact-prompt row went first: \(kept)")
+    }
+
+    /// A row a fetch actually resumed from is, by that fact, a resume point:
+    /// mark it `kind = 2` whoever owns it. On templates that re-render the
+    /// assistant turn the history boundary is already marked; on templates
+    /// that do not (Gemma 4) the post-answer row is the one that hits, and
+    /// this is how it earns the same protection after one turn. A root stays
+    /// a root, and ownership still moves only onto unowned rows.
+    @Test
+    func theRowAHitLandedOnBecomesAResumePoint() throws {
+        let root = makeRoot("promote")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = try coordinator(root: root)
+        let stable = tokens(11, seed: 100)
+        let post = tokens(37, seed: 100)
+        c.storePersistentBoundary(
+            tokens: stable, diskArrays: kv(), ssmStates: nil, chainId: "A", isStableRoot: true)
+        c.storePersistentBoundary(tokens: post, diskArrays: kv(), ssmStates: nil, chainId: "A")
+        try #require(try rows(root).first { $0.tokens == 37 }?.kind == 0)
+
+        // Another chat sharing the prefix hits the post-answer row.
+        guard
+            case .hit(let matched, _, _, _, _, _) = c.fetch(
+                tokens: post + tokens(5, seed: 101), chainId: "B")
+        else {
+            Issue.record("expected a hit")
+            return
+        }
+        #expect(matched == 37)
+        let after = try rows(root)
+        #expect(after.first { $0.tokens == 37 }?.kind == 2, "promoted by the hit")
+        #expect(
+            after.first { $0.tokens == 37 }?.chain == "A", "ownership did not move to the reader")
+
+        // A hit on the root leaves it a root.
+        _ = c.fetch(tokens: stable + tokens(3, seed: 102), chainId: "B")
+        #expect(try rows(root).first { $0.tokens == 11 }?.kind == 1)
     }
 }

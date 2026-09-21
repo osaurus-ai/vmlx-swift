@@ -3813,12 +3813,16 @@ public final class DiskCache: @unchecked Sendable {
         "CASE WHEN \(a) = 1 OR \(b) = 1 THEN 1 WHEN \(a) = 2 OR \(b) = 2 THEN 2 ELSE 0 END"
     }
 
-    /// Give an unowned history row (no `chain_id`, not a stable root) to the
-    /// conversation that just restored from it, so rows written before owners
-    /// existed — or by a request without one — come under the planner's
-    /// protection the first time a chat resumes through them. Rows that
-    /// already have an owner keep it: a read is not a claim. No-op on a v1
-    /// index.
+    /// A row a fetch just resumed from is, by that fact, a resume point: mark
+    /// it `kind = 2` whoever owns it. The engines mark history boundaries at
+    /// store time, but which row a template's next prompt really starts with
+    /// is only known once it hits — on templates that re-render the assistant
+    /// turn it is the history boundary, on those that do not (Gemma 4) it is
+    /// the post-answer row — so the hit is the truth and this is how the
+    /// second kind earns the same protection after one turn. A root stays a
+    /// root. Ownership moves only onto an unowned row (written before owners
+    /// existed, or by a request without one); a read is not a claim on
+    /// another conversation's row. No-op on a v1 index.
     func assignChain(tokens: [Int], mediaSalt: String?, chainId: String) {
         guard indexHasV2Columns, !indexIsFromANewerBuild,
             let (hash, _) = entryKey(tokens: tokens, mediaSalt: mediaSalt)
@@ -3827,8 +3831,10 @@ public final class DiskCache: @unchecked Sendable {
         defer { lock.unlock() }
         _ = _runLocked(
             """
-            UPDATE cache_entries SET chain_id = ?
-            WHERE hash = ? AND chain_id IS NULL AND kind <> 1
+            UPDATE cache_entries
+            SET chain_id = CASE WHEN chain_id IS NULL THEN ?1 ELSE chain_id END,
+                kind = CASE WHEN kind = 1 THEN 1 ELSE 2 END
+            WHERE hash = ?2
             """,
             [.text(chainId), .text(hash)])
     }
