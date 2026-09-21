@@ -21,6 +21,52 @@ struct DiskQuotaPlannerWiringTests {
 
     private typealias Support = DiskCacheAccountingTestSupport
 
+    @Test func liveCapChangesReachEveryModelAndTheCompanionStore() throws {
+        try MLXMetalTestLock.withLock {
+            let modelA = "live-cap-a", modelB = "live-cap-b"
+            let a = Self.tokens(197, seed: 71), b = Self.tokens(239, seed: 72)
+            let fixture = Boundary(label: "a", tokens: a, recency: 10, chain: "a")
+            let size = try #require(Self.measure(modelKey: modelA, [fixture])["a"])
+            let small = size + size / 2
+            let root = Self.makeRoot("live-cap")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let first = try Self.coordinator(root: root, capBytes: small, modelKey: modelA)
+            let second = try Self.coordinator(root: root, capBytes: small, modelKey: modelB)
+            let firstDisk = try #require(first.diskCache)
+            let secondDisk = try #require(second.diskCache)
+
+            first.storePersistentBoundary(tokens: a, diskArrays: Self.kv(), ssmStates: Self.recurrent(), chainId: "a")
+            second.storePersistentBoundary(tokens: b, diskArrays: Self.kv(), ssmStates: Self.recurrent(), chainId: "b")
+            #expect(try Support.indexedRows(root).count == 1, "control: the small cap cannot hold both groups")
+            let oldEvictions = secondDisk.snapshotStats().evictions
+
+            first.updateDiskCap(bytes: Int(size * 5))
+            #expect(secondDisk.maxSizeBytes == Int(size * 5))
+            #expect(abs(Double(second.config.diskCacheMaxGB) * 1_073_741_824 - Double(size * 5)) < 1)
+            first.storePersistentBoundary(tokens: a, diskArrays: Self.kv(), ssmStates: Self.recurrent(), chainId: "a")
+            let c = Self.tokens(281, seed: 73)
+            second.storePersistentBoundary(tokens: c, diskArrays: Self.kv(), ssmStates: Self.recurrent(), chainId: "b")
+            #expect(try Support.indexedRows(root).count == 3)
+            #expect(secondDisk.snapshotStats().evictions == oldEvictions)
+
+            // A direct recurrent write also consults the raised shared limit.
+            let companion = try #require(second.ssmStateCache.diskStore)
+            let d = Self.tokens(317, seed: 74)
+            _ = try companion.store(ssmStates: Self.recurrent(4096), tokens: d, boundary: d.count)
+            try Support.expectUsageMatchesDisk(firstDisk, root: root)
+            #expect(try Support.indexedRows(root).count == 3)
+
+            second.updateDiskCap(bytes: Int(small))
+            #expect(firstDisk.maxSizeBytes == Int(small))
+            // No reload and no synchronous purge: the next store enforces it.
+            #expect(firstDisk.usageBytes() > small)
+            first.storePersistentBoundary(tokens: a, diskArrays: Self.kv(), ssmStates: Self.recurrent(), chainId: "a")
+            #expect(firstDisk.usageBytes() <= small)
+            #expect(try Support.indexedRows(root).count > 0)
+            try Support.expectUsageMatchesDisk(firstDisk, root: root)
+        }
+    }
+
     // MARK: - Fixtures
 
     private static func makeRoot(_ label: String) -> URL {

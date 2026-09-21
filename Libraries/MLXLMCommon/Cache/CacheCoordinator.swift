@@ -94,8 +94,26 @@ public final class CacheCoordinator: @unchecked Sendable {
 
     // MARK: - Properties
 
-    /// The configuration used to create this coordinator.
-    public let config: CacheCoordinatorConfig
+    private let initialConfig: CacheCoordinatorConfig
+
+    /// Creation settings with the current shared disk quota. A live size
+    /// change must be visible to callers reporting the active runtime policy.
+    public var config: CacheCoordinatorConfig {
+        var current = initialConfig
+        if let diskCache {
+            current.diskCacheMaxGB = Float(Double(diskCache.maxSizeBytes) / 1_073_741_824)
+        }
+        return current
+    }
+
+    /// Applies to every resident coordinator on this root without unloading
+    /// models. Raises take effect immediately; decreases are enforced on the
+    /// next serialized store, so a settings edit never deletes synchronously.
+    public func updateDiskCap(bytes: Int) {
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+        diskCache?.updateMaxSizeBytes(bytes)
+    }
 
     /// The in-memory paged KV cache, or `nil` if disabled.
     public let pagedCache: PagedCacheManager?
@@ -199,7 +217,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         importRetryInterval: TimeInterval = CacheCoordinator.defaultImportRetryInterval,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
-        self.config = config
+        self.initialConfig = config
         self.importRetryInterval = importRetryInterval
         self.now = now
 
@@ -219,7 +237,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                     .appendingPathComponent("vmlx_disk_cache")
             self.diskCache = DiskCache(
                 cacheDir: dir,
-                maxSizeBytes: Int(config.diskCacheMaxGB * 1_073_741_824),
+                maxSizeBytes: DiskCacheCapPolicy.byteLimit(gigabytes: config.diskCacheMaxGB),
                 modelKey: config.modelKey,
                 indexMigrationBusyTimeoutMs: diskIndexMigrationBusyTimeoutMs,
                 indexBusyTimeoutMs: diskIndexBusyTimeoutMs,
@@ -240,13 +258,14 @@ public final class CacheCoordinator: @unchecked Sendable {
             let ssmDir = baseDir.appendingPathComponent(DiskCache.companionDirectoryName)
             let ssmMaxBytes = max(
                 1,
-                Int(config.diskCacheMaxGB * 1_073_741_824))
+                DiskCacheCapPolicy.byteLimit(gigabytes: config.diskCacheMaxGB))
             self.ssmStateCache.diskStore = try? SSMCompanionDiskStore(
                 cacheDir: ssmDir,
                 modelKey: config.modelKey,
                 maxBytes: ssmMaxBytes,
                 sweepUnpublishedAtOpen: !(self.diskCache?.indexIsFromANewerBuild ?? false),
-                rootIndexIsFromANewerBuild: self.diskCache?.indexIsFromANewerBuild ?? false)
+                rootIndexIsFromANewerBuild: self.diskCache?.indexIsFromANewerBuild ?? false,
+                sharedQuotaRoot: baseDir)
         }
 
         importCompanionAccountingOncePerRoot()
@@ -1595,7 +1614,7 @@ public final class CacheCoordinator: @unchecked Sendable {
               let companionStore = ssmStateCache.diskStore
         else { return }
 
-        let maxBytes = Int64(max(1, Int(config.diskCacheMaxGB * 1_073_741_824)))
+        let maxBytes = Int64(max(1, diskCache.maxSizeBytes))
 
         if companionBytesAreIndexed {
             retryCompanionImportIfDueLocked(diskCache: diskCache, companionStore: companionStore)
@@ -1774,9 +1793,13 @@ public final class CacheCoordinator: @unchecked Sendable {
             }
         }
         let totalMs = msSince(passStart)
+        let lostRows = removedKV.union(kvEntries.compactMap { kv in
+            kv.companionKey.map(removedCompanions.contains) == true ? kv.hash : nil
+        })
+        let confirmedEvent = plan.confirmedEvent(rows: rows, lostRows: lostRows)
         diskCache.recordQuotaPass(
             evictedGroups: evictedGroups, evictedBytes: evictedBytes, milliseconds: totalMs,
-            event: plan.event)
+            event: confirmedEvent)
         _lastQuotaPassTiming = QuotaPassTiming(
             rowsMs: rowsMs, selectMs: selectMs, deleteMs: deleteMs, totalMs: totalMs,
             evictedGroups: evictedGroups)
@@ -1786,7 +1809,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             // are appended. An index pass never removes an orphan on sight, so
             // that count is always 0 here.
             FileHandle.standardError.write(Data(
-                "[vmlx][cache/disk-quota] before=\(plan.totalBefore) after=\(max(0, plan.totalAfter)) max=\(maxBytes) logicalEvictions=\(evictedGroups) kvEvicted=\(removedKV.count) companionEvicted=\(removedCompanions.count) legacyCompanionEvicted=\(removedLegacy.count) orphanCompanionEvicted=0 deleteFailures=\(evictKV.count - removedKV.count + companionsStillOnDisk.count) source=index ms=\(String(format: "%.3f", totalMs)) event=\(plan.event?.kind.rawValue ?? "none") chain=\(activeChain ?? "none")\n".utf8))
+                "[vmlx][cache/disk-quota] before=\(plan.totalBefore) after=\(max(0, plan.totalAfter)) max=\(maxBytes) logicalEvictions=\(evictedGroups) kvEvicted=\(removedKV.count) companionEvicted=\(removedCompanions.count) legacyCompanionEvicted=\(removedLegacy.count) orphanCompanionEvicted=0 deleteFailures=\(evictKV.count - removedKV.count + companionsStillOnDisk.count) source=index ms=\(String(format: "%.3f", totalMs)) event=\(confirmedEvent?.kind.rawValue ?? "none") chain=\(activeChain ?? "none")\n".utf8))
         }
     }
 

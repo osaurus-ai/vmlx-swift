@@ -12,10 +12,9 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     /// Bumped whenever a persisted default changes in a way that existing
     /// installs must follow. `migrateToCurrentSchema()` performs the one-shot.
     ///
-    /// 2: disk-cache size default moved from a flat 10 GB to auto (10% of the
-    ///    cache volume). Installs that had already written the literal 10.0
-    ///    must move to auto, otherwise only fresh installs benefit.
-    public static let contractVersion = 3
+    /// 4: Automatic uses 30% of available space (free + owned payloads).
+    ///    Explicit settings, including historical 10% values, are preserved.
+    public static let contractVersion = 4
 
     public var network: VMLXServerNetworkSettings
     public var concurrency: VMLXServerConcurrencySettings
@@ -66,59 +65,12 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         self.performance = performance
     }
 
-    /// Apply one-shot migrations for persisted defaults that have changed.
-    ///
-    /// Call immediately after decoding a stored settings file, before handing
-    /// the value to the runtime. Idempotent: it stamps `schemaVersion`, so a
-    /// second call is a no-op.
-    ///
-    /// v2 — disk-cache size. The default used to be a flat 10 GB, which could
-    /// not hold one full-context conversation of a 27B (256 KiB/token at bf16
-    /// over a 222k window is ~54 GB) and is shared across every model in the
-    /// cache root. Auto (10% of the volume) only fills in for an UNSET value,
-    /// so without this migration every install that had already persisted the
-    /// literal 10.0 would keep 10 GB forever after updating and only fresh
-    /// installs would benefit.
-    ///
-    /// Deliberately version-gated rather than "rewrite any 10.0 we find": once
-    /// a user has been migrated, a later deliberate choice of 10 GB is theirs
-    /// and must survive. Same shape as the MTP-Off defect, where the fix was a
-    /// schema version rather than deleting the migration.
+    /// Preserve explicit disk percentages and legacy sizes, including 10%.
+    /// An unset value follows Automatic; changing that policy never rewrites a
+    /// user's saved choice. Earlier migrations could not distinguish a chosen
+    /// 10% from the old default, so do not infer intent from the number alone.
     public mutating func migrateToCurrentSchema() {
-        let stored = schemaVersion ?? 1
-        if stored < 2 {
-            // Only the exact legacy default moves; any other explicit size the
-            // user chose is left alone.
-            if let size = cache.blockDisk.maxSizeGB, size == 10.0 {
-                cache.blockDisk.maxSizeGB = nil
-            }
-            if let legacy = cache.legacyDisk.maxSizeGB, legacy == 10.0 {
-                cache.legacyDisk.maxSizeGB = nil
-            }
-        }
-        if stored < 3 {
-            // ONE-TIME: every updating install lands on 10% of its own disk.
-            //
-            // This is a deliberate reset, not a unit conversion. The setting
-            // is a share of the disk now, and the whole point is that every
-            // machine ends up correctly sized for itself — so an install
-            // carrying a stale number from the flat-10-GB era, or any other
-            // hand-set figure, is moved onto the share rather than kept.
-            //
-            // For essentially everyone this RAISES the cap: the old default
-            // was a flat 10 GB, which is 10% of a 100 GB disk and a rounding
-            // error on a 4 TB one. A 27B stores ~256 KiB per token, so a
-            // 222k-token conversation needs ~54 GB and the old cap could not
-            // hold even one of them.
-            //
-            // Version-gated, so it happens exactly once. A size the user
-            // chooses AFTER updating is theirs and survives every later
-            // launch — same shape as the v2 migration and the MTP-Off fix.
-            cache.blockDisk.maxSizePercent = Self.autoDiskCacheFraction * 100.0
-            cache.blockDisk.maxSizeGB = nil
-            cache.legacyDisk.maxSizeGB = nil
-        }
-        schemaVersion = Self.contractVersion
+        schemaVersion = max(schemaVersion ?? 1, Self.contractVersion)
     }
 
     public func validationIssues(
@@ -278,12 +230,19 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 field: "cache.pagedKV.maxBlocks",
                 message: "Paged KV max blocks must be positive."))
         }
-        if let maxSize = cache.blockDisk.maxSizeGB, maxSize <= 0 {
+        if let percent = cache.blockDisk.maxSizePercent,
+            !percent.isFinite || percent <= 0 || percent > 100
+        {
+            issues.append(.error(
+                field: "cache.blockDisk.maxSizePercent",
+                message: "Disk cache percentage must be greater than 0 and at most 100. Leave it blank for Automatic."))
+        }
+        if let maxSize = cache.blockDisk.maxSizeGB, !maxSize.isFinite || maxSize <= 0 {
             issues.append(.error(
                 field: "cache.blockDisk.maxSizeGB",
                 message: "Block disk L2 cache size must be positive."))
         }
-        if let maxSize = cache.legacyDisk.maxSizeGB, maxSize <= 0 {
+        if let maxSize = cache.legacyDisk.maxSizeGB, !maxSize.isFinite || maxSize <= 0 {
             issues.append(.error(
                 field: "cache.legacyDisk.maxSizeGB",
                 message: "Legacy disk cache size must be positive."))
@@ -1013,37 +972,14 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             longPromptMultiplier: cache.longPromptMultiplier)
     }
 
-    /// Fraction of the cache volume's total capacity used when the user has not
-    /// set an explicit disk-cache size. Matches the "auto" convention other MLX
-    /// servers use, and is deliberately a share of the DISK rather than a flat
-    /// constant: KV cost scales with the model, so a fixed number is wrong for
-    /// every machine at once.
-    public static let autoDiskCacheFraction: Double = 0.10
+    /// Automatic uses a share of free space plus this cache's own payloads.
+    public static let autoDiskCacheFraction = DiskCacheCapPolicy.automaticFraction
 
-    /// Floor for the auto size. Equal to the historical flat default, so
-    /// resolving "auto" can only ever raise the cap, never lower it — no user
-    /// loses cache they had before, and a volume whose capacity cannot be read
-    /// falls back to exactly the old behaviour.
+    /// Fallback only when volume measurements are unavailable, not a floor
+    /// that forces a 10 GB cache onto a nearly full disk.
     public static let autoDiskCacheFloorGB: Double = 10.0
 
-    /// Resolve the effective disk-cache cap in GB for a nil (unset) setting.
-    ///
-    /// A flat 10 GB could not hold ONE full-context conversation of a 27B: at
-    /// 64 layers / 4 KV heads / head_dim 256 the KV cost is 256 KiB per token at
-    /// bf16, so a 222k window needs ~54 GB, and the cap is shared across every
-    /// model in the cache root. Past ~18% of one window each store had to evict
-    /// earlier boundaries of the SAME conversation, so reuse collapsed exactly
-    /// as context grew — the reported symptom.
-    ///
-    /// This ADVISES a larger cap; it never refuses or blocks. If the volume's
-    /// capacity cannot be read it returns the floor rather than guessing small.
-    /// Total capacity of the volume holding `directory`, in GB, or nil when it
-    /// cannot be read.
-    ///
-    /// Separated from the cap arithmetic so the UI can show a user what their
-    /// percentage actually resolves to ("10% of 3.7 TB ≈ 372 GB") using the
-    /// same number the runtime enforces, rather than a second estimate that
-    /// can disagree with it.
+    /// Total volume capacity used to explain an explicit percentage.
     public static func cacheVolumeCapacityGB(for directory: URL?) -> Double? {
         guard let directory else { return nil }
         // Walk up to the nearest existing ancestor: the cache dir itself may not
@@ -1062,56 +998,17 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         return Double(capacity) / 1_073_741_824.0
     }
 
-    /// Resolve the effective cap from the user's settings.
-    ///
-    /// Order is percent, then the legacy GB value, then the default share. The
-    /// percent is what the UI edits; the GB value only survives so an install
-    /// that already had an explicit number keeps exactly that number until it
-    /// is migrated.
-    ///
-    /// Like `autoDiskCacheMaxGB`, this ADVISES upward and never downward: a
-    /// volume whose capacity cannot be read falls back to the floor rather
-    /// than guessing small, and nothing here refuses or blocks.
+    /// Effective cap shared by runtime, settings and diagnostics. Explicit
+    /// percentages keep their total-volume units and existing host ceiling;
+    /// both that ceiling and Automatic add owned payload bytes back to free.
     public static func resolveDiskCacheMaxGB(
-        percent: Double?,
-        legacyGB: Double?,
-        directory: URL?
+        percent: Double?, legacyGB: Double?, directory: URL?
     ) -> Double {
-        if let percent, percent > 0 {
-            guard let capacity = cacheVolumeCapacityGB(for: directory) else {
-                return autoDiskCacheFloorGB
-            }
-            // NO FLOOR on an explicit share.
-            //
-            // The floor exists so that resolving AUTO can only ever raise the
-            // cap — nobody loses cache they had before by not choosing. Applying
-            // it to a number the user typed inverts that: someone who sets 1% on
-            // a 500 GB disk means 5 GB, and clamping them up to 10 GB is an
-            // invented limit overriding an explicit choice. Their machine,
-            // their call.
-            return capacity * percent / 100.0
-        }
-        if let legacyGB, legacyGB > 0 { return legacyGB }
-        return autoDiskCacheMaxGB(for: directory)
+        DiskCacheCapPolicy.resolve(percent: percent, legacyGB: legacyGB, directory: directory).capGB
     }
 
     public static func autoDiskCacheMaxGB(for directory: URL?) -> Double {
-        guard let directory else { return autoDiskCacheFloorGB }
-        // Walk up to the nearest existing ancestor: the cache dir itself may not
-        // exist yet on first run, and `resourceValues` needs a real path.
-        var probe = directory
-        while !FileManager.default.fileExists(atPath: probe.path) {
-            let parent = probe.deletingLastPathComponent()
-            guard parent.path != probe.path else { return autoDiskCacheFloorGB }
-            probe = parent
-        }
-        guard
-            let capacity = try? probe.resourceValues(
-                forKeys: [.volumeTotalCapacityKey]
-            ).volumeTotalCapacity
-        else { return autoDiskCacheFloorGB }
-        let gb = Double(capacity) / 1_073_741_824.0 * autoDiskCacheFraction
-        return Swift.max(autoDiskCacheFloorGB, gb)
+        resolveDiskCacheMaxGB(percent: nil, legacyGB: nil, directory: directory)
     }
 
     private static func resolvedDirectory(_ path: String?) -> URL? {
@@ -1262,6 +1159,20 @@ public struct VMLXServerCacheSettings: Codable, Sendable, Equatable {
         self.legacyDisk = legacyDisk
         self.blockDisk = blockDisk
         self.enableSSMReDerive = enableSSMReDerive
+    }
+
+    /// Disk-size changes update the shared quota in place. All other cache
+    /// controls still change the model's captured runtime configuration.
+    public func requiresModelReload(comparedTo other: Self) -> Bool {
+        var lhs = self
+        var rhs = other
+        lhs.blockDisk.maxSizePercent = nil
+        rhs.blockDisk.maxSizePercent = nil
+        lhs.blockDisk.maxSizeGB = nil
+        rhs.blockDisk.maxSizeGB = nil
+        lhs.legacyDisk.maxSizeGB = nil
+        rhs.legacyDisk.maxSizeGB = nil
+        return lhs != rhs
     }
 
     public var defaultKVMode: KVQuantizationMode {

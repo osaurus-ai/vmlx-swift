@@ -79,6 +79,24 @@ struct QuotaPlan: Equatable {
     /// Always `totalBefore - evictedBytes`.
     let totalAfter: Int64
     let event: DiskCachePressureEvent?
+
+    /// A selected victim is not proof of lost progress: its file deletion can fail.
+    /// `lostRows` includes a KV payload or required companion actually removed.
+    func confirmedEvent(rows: [QuotaRow], lostRows: Set<String>) -> DiskCachePressureEvent? {
+        guard let event else { return nil }
+        let active = rows.filter {
+            !$0.isStableRoot && !$0.isLegacyCompanion && $0.chainId == event.chainId
+        }
+        if event.kind == .activeTipDropped {
+            let tip = active.max {
+                if $0.tokenCount != $1.tokenCount { return $0.tokenCount < $1.tokenCount }
+                if $0.recency != $1.recency { return $0.recency < $1.recency }
+                return $0.id < $1.id
+            }
+            return tip.map { lostRows.contains($0.id) } == true ? event : nil
+        }
+        return active.contains { lostRows.contains($0.id) } ? event : nil
+    }
 }
 
 /// The disk prefix cache's eviction policy as a pure function: rows + cap +

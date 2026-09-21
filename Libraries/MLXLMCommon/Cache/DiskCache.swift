@@ -52,6 +52,10 @@ public struct DiskCacheStats: Sendable {
     /// cap: reading the index rows, selecting victims and deleting them. 0
     /// until there has been one. Every store waits for its own pass.
     public let lastQuotaPassMs: Double
+    /// Process-monotonic timestamps let a host select the newest reading
+    /// across models. A per-model sequence or the largest duration cannot.
+    public let lastQuotaPassTick: UInt64
+    public let lastPressureEventTick: UInt64
     /// Incremented once per quota pass that produced a pressure event, so a
     /// poller can tell a new event from the one it has already shown.
     public let pressureEventSeq: UInt64
@@ -91,6 +95,7 @@ public struct DiskCacheStats: Sendable {
         evictions: Int, maxSizeBytes: Int, failedIndexWrites: Int = 0,
         evictedBytes: Int64 = 0, quotaPasses: Int = 0, lastQuotaPassMs: Double = 0,
         pressureEventSeq: UInt64 = 0, lastPressureEvent: DiskCachePressureEvent? = nil,
+        lastQuotaPassTick: UInt64 = 0, lastPressureEventTick: UInt64 = 0,
         unreadablePayloadFetches: Int = 0, opaqueBytes: Int64 = 0,
         rejectedDiskRestores: Int = 0, rejectedRewritesSuppressed: Int = 0
     ) {
@@ -108,6 +113,8 @@ public struct DiskCacheStats: Sendable {
         self.lastQuotaPassMs = lastQuotaPassMs
         self.pressureEventSeq = pressureEventSeq
         self.lastPressureEvent = lastPressureEvent
+        self.lastQuotaPassTick = lastQuotaPassTick
+        self.lastPressureEventTick = lastPressureEventTick
         self.unreadablePayloadFetches = unreadablePayloadFetches
         self.opaqueBytes = opaqueBytes
         self.rejectedDiskRestores = rejectedDiskRestores
@@ -124,6 +131,7 @@ public struct DiskCacheStats: Sendable {
             failedIndexWrites: failedIndexWrites, evictedBytes: evictedBytes,
             quotaPasses: quotaPasses, lastQuotaPassMs: lastQuotaPassMs,
             pressureEventSeq: pressureEventSeq, lastPressureEvent: lastPressureEvent,
+            lastQuotaPassTick: lastQuotaPassTick, lastPressureEventTick: lastPressureEventTick,
             unreadablePayloadFetches: unreadablePayloadFetches, opaqueBytes: opaqueBytes,
             rejectedDiskRestores: rejectedDiskRestores,
             rejectedRewritesSuppressed: rejectedRewritesSuppressed)
@@ -358,8 +366,15 @@ public final class DiskCache: @unchecked Sendable {
     /// Root directory for cache files and the SQLite index.
     public let cacheDir: URL
 
-    /// Maximum total cache size in bytes.
-    public let maxSizeBytes: Int
+    /// The live root-wide quota, shared by all models using this index.
+    public var maxSizeBytes: Int { sharedLimit.bytes }
+    private let sharedLimit: SharedDiskCacheLimit
+
+    /// Changes only the quota; cached payloads and in-memory model state are
+    /// retained. The next quota pass enforces a lowered cap.
+    public func updateMaxSizeBytes(_ bytes: Int) {
+        sharedLimit.update(bytes: bytes)
+    }
 
     /// Model key for cache isolation (prevents cross-model hash collisions).
     public let modelKey: String?
@@ -472,6 +487,8 @@ public final class DiskCache: @unchecked Sendable {
     private var quotaEvictedBytes: Int64 = 0
     private var quotaPasses: Int = 0
     private var lastQuotaPassMs: Double = 0
+    private var lastQuotaPassTick: UInt64 = 0
+    private var lastPressureEventTick: UInt64 = 0
     private var pressureEventSeq: UInt64 = 0
     private var lastPressureEvent: DiskCachePressureEvent?
     /// See ``DiskCacheStats/opaqueBytes``.
@@ -544,7 +561,11 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Caller MUST hold `lock`.
     private func _statsLocked(bytes: Int, entryCount: Int) -> DiskCacheStats {
-        DiskCacheStats(
+        let maxSizeBytes = sharedLimit.bytes
+        let currentPressure = lastPressureEvent.flatMap { event in
+            event.kind == .activeTipDropped && event.tipBytes <= Int64(maxSizeBytes) ? nil : event
+        }
+        return DiskCacheStats(
             hits: hits,
             misses: misses,
             stores: stores,
@@ -558,7 +579,9 @@ public final class DiskCache: @unchecked Sendable {
             quotaPasses: quotaPasses,
             lastQuotaPassMs: lastQuotaPassMs,
             pressureEventSeq: pressureEventSeq,
-            lastPressureEvent: lastPressureEvent,
+            lastPressureEvent: currentPressure,
+            lastQuotaPassTick: lastQuotaPassTick,
+            lastPressureEventTick: lastPressureEventTick,
             unreadablePayloadFetches: unreadablePayloadFetches,
             opaqueBytes: lastOpaqueBytes,
             rejectedDiskRestores: rejectedDiskRestores,
@@ -579,7 +602,7 @@ public final class DiskCache: @unchecked Sendable {
     ) {
         self.init(
             cacheDir: cacheDir,
-            maxSizeBytes: Int(maxSizeGB * 1_073_741_824),
+            maxSizeBytes: DiskCacheCapPolicy.byteLimit(gigabytes: maxSizeGB),
             modelKey: modelKey)
     }
 
@@ -593,7 +616,7 @@ public final class DiskCache: @unchecked Sendable {
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.cacheDir = cacheDir
-        self.maxSizeBytes = maxSizeBytes
+        self.sharedLimit = SharedDiskCacheLimit.forRoot(cacheDir, initialBytes: maxSizeBytes)
         self.modelKey = modelKey
         self.retireRetryInterval = retireRetryInterval
         self.now = now
@@ -2806,6 +2829,8 @@ public final class DiskCache: @unchecked Sendable {
         quotaEvictedBytes = 0
         quotaPasses = 0
         lastQuotaPassMs = 0
+        lastQuotaPassTick = 0
+        lastPressureEventTick = 0
         pressureEventSeq = 0
         lastPressureEvent = nil
         lastOpaqueBytes = 0
@@ -3684,7 +3709,7 @@ public final class DiskCache: @unchecked Sendable {
     /// logical boundaries whose every file is really gone, so one atomic pair
     /// increments `evictions` once; a pass that removed none is timed but is
     /// not a counted pass. `pressureEventSeq` moves once per pass that
-    /// produced an event — the plan's, whether or not every delete succeeded.
+    /// actually lost an active boundary, after deletion results are checked.
     func recordQuotaPass(
         evictedGroups: Int, evictedBytes: Int64, milliseconds: Double,
         event: DiskCachePressureEvent?
@@ -3697,9 +3722,11 @@ public final class DiskCache: @unchecked Sendable {
             quotaPasses += 1
         }
         lastQuotaPassMs = milliseconds
+        lastQuotaPassTick = DispatchTime.now().uptimeNanoseconds
         if let event {
             pressureEventSeq += 1
             lastPressureEvent = event
+            lastPressureEventTick = lastQuotaPassTick
         }
     }
 

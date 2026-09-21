@@ -84,7 +84,9 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     private let cacheDir: URL
     private let modelKey: String?
     /// Maximum total disk bytes before oldest-entry eviction. 0 = unlimited.
-    private let maxBytes: Int
+    private let initialMaxBytes: Int
+    private let sharedLimit: SharedDiskCacheLimit?
+    private var maxBytes: Int { sharedLimit?.bytes ?? initialMaxBytes }
 
     /// Companion pairs successfully written or deserialized by this process.
     /// The process-local validation requirement prevents an inherited corrupt
@@ -146,11 +148,15 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     public init(
         cacheDir: URL, modelKey: String? = nil, maxBytes: Int = 0,
         sweepUnpublishedAtOpen: Bool = true,
-        rootIndexIsFromANewerBuild: Bool = false
+        rootIndexIsFromANewerBuild: Bool = false,
+        sharedQuotaRoot: URL? = nil
     ) throws {
         self.cacheDir = cacheDir
         self.modelKey = modelKey
-        self.maxBytes = maxBytes
+        self.initialMaxBytes = maxBytes
+        self.sharedLimit = sharedQuotaRoot.map {
+            SharedDiskCacheLimit.forRoot($0, initialBytes: maxBytes)
+        }
         self.rootIndexIsFromANewerBuild = rootIndexIsFromANewerBuild
         try FileManager.default.createDirectory(
             at: cacheDir, withIntermediateDirectories: true)

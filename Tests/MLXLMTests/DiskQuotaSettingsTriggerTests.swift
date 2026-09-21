@@ -105,75 +105,35 @@ struct DiskQuotaSettingsTriggerTests {
 
     // MARK: - 10. The resolver
 
-    /// `resolveDiskCacheMaxGB(percent:legacyGB:directory:)`, as it answers
-    /// today. It reads the volume capacity itself, so a capacity cannot be
-    /// fed to it: "known" is the volume the temporary directory is on, and
-    /// "unknown" is no directory.
-    ///
-    /// What is worth knowing before relying on it:
-    ///
-    /// - A percent has no floor; unset has a 10 GB floor. On an 80 GB volume
-    ///   10 % is 8 GB, LESS than the 10 GB that not choosing gives. (Here: a
-    ///   0.01 % share resolves below the floor that unset resolves to.)
-    /// - A percent of 0 or less is treated as unset, not as "no cache".
-    /// - With the capacity unknown, a percent gives a flat 10 GB: 1 % and
-    ///   100 % resolve to the same number.
-    /// - A GB value is ignored as soon as a percent is set.
-    /// - A percent above 100 is taken literally: 1000 % is ten volumes.
-    @Test func resolveDiskCacheMaxGBTable() throws {
-        let dir = Self.makeRoot("resolver")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let capacity = try #require(VMLXServerRuntimeSettings.cacheVolumeCapacityGB(for: dir))
-        try #require(capacity > 0)
-        let floor = VMLXServerRuntimeSettings.autoDiskCacheFloorGB
-        try #require(floor == 10)
-        let auto = Swift.max(floor, capacity * 0.10)
-
+    /// The shared arithmetic is deterministic; the public resolver's file IO
+    /// path is checked separately with an explicit cap on an unknown volume.
+    @Test func resolveDiskCacheMaxGBTable() {
+        let gb: Int64 = 1_073_741_824
         struct Row {
             let percent: Double?
             let legacyGB: Double?
-            let known: Double
-            let unknown: Double
+            let capGB: Double
         }
-        let table: [Row] = [
-            Row(percent: nil, legacyGB: nil, known: auto, unknown: floor),
-            Row(percent: nil, legacyGB: 50, known: 50, unknown: 50),
-            Row(percent: 10, legacyGB: nil, known: capacity * 0.10, unknown: floor),
-            Row(percent: 10, legacyGB: 50, known: capacity * 0.10, unknown: floor),
-            Row(percent: 0.01, legacyGB: nil, known: capacity * 0.0001, unknown: floor),
-            Row(percent: 0.01, legacyGB: 50, known: capacity * 0.0001, unknown: floor),
-            Row(percent: 0, legacyGB: nil, known: auto, unknown: floor),
-            Row(percent: 0, legacyGB: 50, known: 50, unknown: 50),
-            Row(percent: -5, legacyGB: nil, known: auto, unknown: floor),
-            Row(percent: -5, legacyGB: 50, known: 50, unknown: 50),
-            Row(percent: 100, legacyGB: nil, known: capacity, unknown: floor),
-            Row(percent: 100, legacyGB: 50, known: capacity, unknown: floor),
-            Row(percent: 1000, legacyGB: nil, known: capacity * 10, unknown: floor),
-            Row(percent: 1000, legacyGB: 50, known: capacity * 10, unknown: floor),
+        let table = [
+            Row(percent: nil, legacyGB: nil, capGB: 30),
+            Row(percent: nil, legacyGB: 50, capGB: 25),
+            Row(percent: 10, legacyGB: nil, capGB: 25),
+            Row(percent: 10, legacyGB: 50, capGB: 25),
+            Row(percent: 0.01, legacyGB: nil, capGB: 0.1),
+            Row(percent: 0.01, legacyGB: 50, capGB: 0.1),
+            Row(percent: 0, legacyGB: nil, capGB: 30),
+            Row(percent: -5, legacyGB: 50, capGB: 25),
+            Row(percent: 100, legacyGB: nil, capGB: 25),
+            Row(percent: 1000, legacyGB: nil, capGB: 30),
         ]
         for row in table {
-            let known = VMLXServerRuntimeSettings.resolveDiskCacheMaxGB(
-                percent: row.percent, legacyGB: row.legacyGB, directory: dir)
-            let unknown = VMLXServerRuntimeSettings.resolveDiskCacheMaxGB(
-                percent: row.percent, legacyGB: row.legacyGB, directory: nil)
-            let label =
-                "percent=\(row.percent.map { "\($0)" } ?? "nil") "
-                + "legacyGB=\(row.legacyGB.map { "\($0)" } ?? "nil")"
-            #expect(abs(known - row.known) < 1e-9, "\(label) capacity known: \(known)")
-            #expect(unknown == row.unknown, "\(label) capacity unknown: \(unknown)")
+            let result = DiskCacheCapPolicy.resolve(
+                percent: row.percent, legacyGB: row.legacyGB,
+                totalBytes: 1000 * gb, freeBytes: 80 * gb, ownBytes: 20 * gb)
+            #expect(abs(result.capGB - row.capGB) < 1e-8)
         }
-
-        // The floor is for not choosing; a share that was chosen can land
-        // below it. Needs a volume above 1 GB to show, which every volume
-        // this suite runs on is.
-        try #require(capacity * 0.0001 < floor)
-        let tiny = VMLXServerRuntimeSettings.resolveDiskCacheMaxGB(
-            percent: 0.01, legacyGB: nil, directory: dir)
-        let unset = VMLXServerRuntimeSettings.resolveDiskCacheMaxGB(
-            percent: nil, legacyGB: nil, directory: dir)
-        #expect(tiny < floor)
-        #expect(unset >= floor)
+        #expect(VMLXServerRuntimeSettings.resolveDiskCacheMaxGB(
+            percent: 1, legacyGB: 50, directory: nil) == 10)
     }
 
     // MARK: - 11. The companion store's own cap
