@@ -159,6 +159,9 @@ struct DiskCacheQuotaEntry: Sendable {
     /// the conversation it belongs to (`chain_id`, NULL until one is assigned).
     var tokenCount: Int = 0
     var isStableRoot: Bool = false
+    /// `kind == 2`: a history boundary, the row the conversation's next
+    /// prompt starts with (see ``QuotaRow/isResumeBoundary``).
+    var isResumeBoundary: Bool = false
     var chainId: String? = nil
 }
 
@@ -746,7 +749,8 @@ public final class DiskCache: @unchecked Sendable {
         mediaSalt: String? = nil,
         enforceQuota: Bool,
         chainId: String? = nil,
-        isStableRoot: Bool = false
+        isStableRoot: Bool = false,
+        isResumeBoundary: Bool = false
     ) {
         guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return }
         let tokenCount = tokens.count
@@ -830,7 +834,9 @@ public final class DiskCache: @unchecked Sendable {
         {
             storeSkips += 1
             _touchEntryLocked(hash: hash)
-            _claimOwnershipLocked(hash: hash, chainId: chainId, isStableRoot: isStableRoot)
+            _claimOwnershipLocked(
+                hash: hash, chainId: chainId,
+                kind: Self.rowKind(stableRoot: isStableRoot, resumeBoundary: isResumeBoundary))
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                 FileHandle.standardError.write(Data(
                     "[vmlx][cache/disk-store] SKIP validated hash=\(hash) count=\(tokenCount) bytes=\(current.size)\n".utf8))
@@ -929,7 +935,8 @@ public final class DiskCache: @unchecked Sendable {
 
             let insertResult = _insertEntryLocked(
                 hash: hash, tokenCount: tokenCount, fileSize: fileSize,
-                chainId: chainId, isStableRoot: isStableRoot)
+                chainId: chainId,
+                kind: Self.rowKind(stableRoot: isStableRoot, resumeBoundary: isResumeBoundary))
             guard insertResult == SQLITE_DONE else {
                 // The payload is published but has no row, so no quota pass
                 // could ever see or evict it. Take it back rather than leak it.
@@ -1559,7 +1566,9 @@ public final class DiskCache: @unchecked Sendable {
                     if rowsAreOpaque { continue }
                 }
                 entry.tokenCount = max(0, Int(sqlite3_column_int64(stmt, 5)))
-                entry.isStableRoot = sqlite3_column_int64(stmt, 6) == 1
+                let kind = sqlite3_column_int64(stmt, 6)
+                entry.isStableRoot = kind == 1
+                entry.isResumeBoundary = kind == 2
                 entry.chainId = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
             }
             entries.append(entry)
@@ -3400,12 +3409,14 @@ public final class DiskCache: @unchecked Sendable {
     @discardableResult
     private func _insertEntryLocked(
         hash: String, tokenCount: Int, fileSize: Int,
-        chainId: String? = nil, isStableRoot: Bool = false
+        chainId: String? = nil, kind: Int64 = 0
     ) -> Int32 {
         guard db != nil else { return SQLITE_DONE }
         if indexHasV2Columns {
-            // `kind` only ever rises (a root stays a root); `chain_id` follows
-            // the latest owner but is never cleared by an ownerless re-store.
+            // A row's kind never weakens: a root (1) stays a root, a resume
+            // boundary (2) is not demoted by a plain re-store; `chain_id`
+            // follows the latest owner but is never cleared by an ownerless
+            // re-store.
             return _runLocked(
                 """
                 INSERT INTO cache_entries (hash, token_count, file_size, model_key, kind, chain_id)
@@ -3415,13 +3426,13 @@ public final class DiskCache: @unchecked Sendable {
                     file_size = excluded.file_size,
                     created_at = julianday('now'),
                     model_key = excluded.model_key,
-                    kind = MAX(kind, excluded.kind),
+                    kind = \(Self.kindMergeSQL("kind", "excluded.kind")),
                     chain_id = COALESCE(excluded.chain_id, chain_id)
                 """,
                 [
                     .text(hash), .int(Int64(tokenCount)), .int(Int64(fileSize)),
                     modelKey.map(SQLValue.text) ?? .null,
-                    .int(isStableRoot ? 1 : 0),
+                    .int(kind),
                     chainId.map(SQLValue.text) ?? .null,
                 ])
         }
@@ -3774,16 +3785,32 @@ public final class DiskCache: @unchecked Sendable {
     /// A skipped store is still this conversation storing this boundary: the
     /// row's owner follows it exactly as a rewrite would have made it, and a
     /// root stays a root. Caller holds `lock`. No-op on a v1 index.
-    private func _claimOwnershipLocked(hash: String, chainId: String?, isStableRoot: Bool) {
+    private func _claimOwnershipLocked(hash: String, chainId: String?, kind: Int64) {
         guard indexHasV2Columns, !indexIsFromANewerBuild,
-            chainId != nil || isStableRoot
+            chainId != nil || kind != 0
         else { return }
+        // Numbered parameters: the kind appears twice inside the CASE, and a
+        // positional `?` there would shift the hash into the wrong slot.
         _ = _runLocked(
             """
-            UPDATE cache_entries SET chain_id = COALESCE(?, chain_id), kind = MAX(kind, ?)
-            WHERE hash = ?
+            UPDATE cache_entries
+            SET chain_id = COALESCE(?1, chain_id), kind = \(Self.kindMergeSQL("kind", "?2"))
+            WHERE hash = ?3
             """,
-            [chainId.map(SQLValue.text) ?? .null, .int(isStableRoot ? 1 : 0), .text(hash)])
+            [chainId.map(SQLValue.text) ?? .null, .int(kind), .text(hash)])
+    }
+
+    /// The `kind` column: 0 = an ordinary snapshot (exact prompt, post-answer,
+    /// seed), 1 = a stable system/tool root shared by many conversations,
+    /// 2 = a history boundary — the row a conversation's next prompt starts
+    /// with. Merging two kinds keeps the stronger: root over boundary over
+    /// ordinary. (1 beats 2, so a plain MAX would be wrong.)
+    static func rowKind(stableRoot: Bool, resumeBoundary: Bool) -> Int64 {
+        stableRoot ? 1 : (resumeBoundary ? 2 : 0)
+    }
+
+    static func kindMergeSQL(_ a: String, _ b: String) -> String {
+        "CASE WHEN \(a) = 1 OR \(b) = 1 THEN 1 WHEN \(a) = 2 OR \(b) = 2 THEN 2 ELSE 0 END"
     }
 
     /// Give an unowned history row (no `chain_id`, not a stable root) to the
@@ -3801,7 +3828,7 @@ public final class DiskCache: @unchecked Sendable {
         _ = _runLocked(
             """
             UPDATE cache_entries SET chain_id = ?
-            WHERE hash = ? AND chain_id IS NULL AND kind = 0
+            WHERE hash = ? AND chain_id IS NULL AND kind <> 1
             """,
             [.text(chainId), .text(hash)])
     }

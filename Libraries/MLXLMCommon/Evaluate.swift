@@ -2944,7 +2944,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             cache cacheToStore: [KVCache],
             kvBits diskKVBits: Int?,
             kvMode diskKVMode: KVQuantizationMode,
-            isStableBoundary: Bool = false
+            isStableBoundary: Bool = false,
+            isResumeBoundary: Bool = false
         ) {
             guard !tokens.isEmpty else { return }
             // Saving the cache duplicates it several times over (snapshot, host
@@ -3023,7 +3024,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                 cache: diskStoreCache,
                 mediaSalt: mediaSalt,
                 chainId: cacheInitParameters?.cacheChainId,
-                isStableRoot: isStableBoundary
+                isStableRoot: isStableBoundary,
+                isResumeBoundary: isResumeBoundary
             )
         }
 
@@ -3137,13 +3139,17 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // `stripAt` routinely coincides with a `cachePrefixTokenCounts`
                     // entry.
                     if let strippedSnapshot = hybridStripSnapshot {
+                        // The stripped boundary is where a hybrid model's
+                        // next turn resumes (measured: every warm turn of
+                        // LFM2.5 landed here), so it is the row to keep.
                         store(
                             tokens: Array(promptTokenIds.prefix(stripAt)),
                             cache: strippedSnapshot,
                             kvBits: nil,
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: strippedSnapshot,
-                                requested: kvMode))
+                                requested: kvMode),
+                            isResumeBoundary: true)
                     } else {
                         Self.logger.debug(
                             "TokenIterator: no stripped-boundary snapshot to store at \(stripAt, privacy: .public); prefill did not cross the boundary"
@@ -3236,7 +3242,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: boundarySnapshot,
                                 requested: kvMode),
-                            isStableBoundary: isStableBoundary)
+                            isStableBoundary: isStableBoundary,
+                            // A message boundary that is not the shared root
+                            // is what the next prompt of this chat (or an
+                            // edited one) starts with.
+                            isResumeBoundary: !isStableBoundary)
                     }
                 }
         }

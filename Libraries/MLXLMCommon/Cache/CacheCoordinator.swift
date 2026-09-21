@@ -1264,7 +1264,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         cache: [any KVCache]? = nil,
         mediaSalt: String? = nil,
         chainId: String? = nil,
-        isStableRoot: Bool = false
+        isStableRoot: Bool = false,
+        isResumeBoundary: Bool = false
     ) {
         let totalTokens = promptTokens.count
         let blockSize = config.pagedBlockSize
@@ -1431,7 +1432,8 @@ public final class CacheCoordinator: @unchecked Sendable {
             ssmStates: persistSeparateRecurrentPayload ? ssmStates : nil,
             mediaSalt: mediaSalt,
             chainId: chainId,
-            isStableRoot: isStableRoot)
+            isStableRoot: isStableRoot,
+            isResumeBoundary: isResumeBoundary)
     }
 
     /// Persist one reusable prompt boundary as a linked transaction.
@@ -1448,7 +1450,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         ssmStates: [MLXArray]?,
         mediaSalt: String? = nil,
         chainId: String? = nil,
-        isStableRoot: Bool = false
+        isStableRoot: Bool = false,
+        isResumeBoundary: Bool = false
     ) {
         let usesCombinedQuota = config.enableDiskCache
             && diskCache != nil
@@ -1470,7 +1473,8 @@ public final class CacheCoordinator: @unchecked Sendable {
                 mediaSalt: mediaSalt,
                 enforceQuota: !usesCombinedQuota,
                 chainId: chainId,
-                isStableRoot: isStableRoot)
+                isStableRoot: isStableRoot,
+                isResumeBoundary: isResumeBoundary)
             if !storesCompanion {
                 adoptEarlyCompanion(tokens: tokens, mediaSalt: mediaSalt)
             }
@@ -1692,6 +1696,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 // before, never earlier.
                 recency: kv.createdAt.timeIntervalSince1970,
                 isStableRoot: kv.isStableRoot,
+                isResumeBoundary: kv.isResumeBoundary,
                 chainId: kv.chainId,
                 isLegacyCompanion: false))
         }

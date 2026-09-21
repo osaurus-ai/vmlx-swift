@@ -46,6 +46,13 @@ struct QuotaRow: Equatable, Sendable {
     let recency: Double
     /// `kind == 1`: system prompt + tools, shared across conversations.
     let isStableRoot: Bool
+    /// `kind == 2`: a history boundary — the prompt cut just before a user
+    /// message, which is what the conversation's NEXT prompt starts with.
+    /// The exact-prompt and post-answer rows of the same turn are larger but,
+    /// on templates that re-render the assistant turn, never match again; a
+    /// row marked here is the one worth keeping. Rows from before the mark
+    /// existed are `false`, and a chain with no marked row orders as before.
+    var isResumeBoundary: Bool = false
     /// The conversation. `nil` = a row written before chains existed: it is
     /// its own single-row chain.
     let chainId: String?
@@ -182,8 +189,14 @@ enum DiskQuotaPlanner {
     }
 
     private struct Chain {
+        /// The resume point: the newest resume boundary, or, when none is
+        /// marked, the largest row.
         let tip: QuotaRow
-        /// Smallest `tokenCount` first.
+        /// Rows the chain can spend before its resume boundaries: the
+        /// exact-prompt / post-answer rows of a chain that has marked
+        /// boundaries. Smallest first. Empty when nothing is marked.
+        let disposable: [QuotaRow]
+        /// Every other non-tip row, smallest `tokenCount` first.
         let superseded: [QuotaRow]
         let recency: Double
     }
@@ -241,9 +254,14 @@ enum DiskQuotaPlanner {
         let chains = Dictionary(grouping: fitting.filter(isChainRow), by: chainKey)
             .mapValues { members -> Chain in
                 let tip = members.max(by: tipOrder)!
+                let rest = members.filter { $0.id != tip.id }
+                let marked = members.contains(where: \.isResumeBoundary)
                 return Chain(
                     tip: tip,
-                    superseded: members.filter { $0.id != tip.id }.sorted(by: shortestFirst),
+                    disposable: marked
+                        ? rest.filter { !$0.isResumeBoundary }.sorted(by: shortestFirst) : [],
+                    superseded: (marked ? rest.filter(\.isResumeBoundary) : rest)
+                        .sorted(by: shortestFirst),
                     recency: members.reduce(-Double.infinity) { max($0, $1.recency) })
             }
         let active = activeKey.flatMap { chains[$0] }
@@ -256,7 +274,11 @@ enum DiskQuotaPlanner {
         // for the low watermark; the active conversation's rows only for the cap.
         let low = Int64(Double(capBytes) * lowWatermarkFraction)
         _ = drain(fitting.filter(\.isLegacyCompanion).sorted(by: oldestFirst), to: low)
+        _ = drain(cold.flatMap(\.disposable), to: low)
         _ = drain(cold.flatMap(\.superseded), to: low)
+        // Rows the next turn never reads are not pressure; older resume
+        // boundaries (an edit's or a regenerate's restore points) are.
+        _ = drain(active?.disposable ?? [], to: capBytes)
         var trimmedActive = drain(active?.superseded ?? [], to: capBytes)
 
         // 4. Hard phase: only while still over the cap.
@@ -283,8 +305,10 @@ enum DiskQuotaPlanner {
         row.chainId.map(ChainKey.named) ?? .solo(row.id)
     }
 
-    /// `max(by:)` order for a chain's tip: tokens, then recency, then id.
+    /// `max(by:)` order for a chain's tip: a resume boundary over any other
+    /// row, then tokens, then recency, then id.
     private static func tipOrder(_ a: QuotaRow, _ b: QuotaRow) -> Bool {
+        if a.isResumeBoundary != b.isResumeBoundary { return !a.isResumeBoundary }
         if a.tokenCount != b.tokenCount { return a.tokenCount < b.tokenCount }
         if a.recency != b.recency { return a.recency < b.recency }
         return a.id < b.id

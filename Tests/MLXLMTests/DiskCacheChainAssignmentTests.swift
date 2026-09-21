@@ -255,4 +255,64 @@ struct DiskCacheChainAssignmentTests {
             #expect(othersKept == [37], "the other chat's superseded rows go first; \(state)")
         }
     }
+
+    /// The index records which rows are the chat's resume points: a history
+    /// boundary is `kind = 2`, a shared root stays `1` whatever a later store
+    /// says, and a plain re-store never demotes a boundary.
+    @Test
+    func aHistoryBoundaryIsRecordedAndNeverDemoted() throws {
+        let root = makeRoot("kind2")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = try coordinator(root: root)
+        let history = tokens(37, seed: 80)
+        let stable = tokens(11, seed: 80)
+        c.storePersistentBoundary(
+            tokens: history, diskArrays: kv(), ssmStates: nil, chainId: "A", isResumeBoundary: true)
+        c.storePersistentBoundary(
+            tokens: stable, diskArrays: kv(), ssmStates: nil, chainId: "A", isStableRoot: true)
+        var after = try rows(root)
+        try #require(after.count == 2)
+        #expect(after.first { $0.tokens == 37 }?.kind == 2)
+        #expect(after.first { $0.tokens == 11 }?.kind == 1)
+
+        // A later store of the same rows as something weaker changes nothing;
+        // a root asked to be a boundary stays a root.
+        c.storePersistentBoundary(tokens: history, diskArrays: kv(), ssmStates: nil, chainId: "A")
+        c.storePersistentBoundary(
+            tokens: stable, diskArrays: kv(), ssmStates: nil, chainId: "A", isResumeBoundary: true)
+        after = try rows(root)
+        #expect(after.first { $0.tokens == 37 }?.kind == 2, "not demoted by a plain re-store")
+        #expect(after.first { $0.tokens == 11 }?.kind == 1, "a root outranks a boundary")
+
+        // An ordinary row later stored as a boundary is promoted.
+        let plain = tokens(23, seed: 80)
+        c.storePersistentBoundary(tokens: plain, diskArrays: kv(), ssmStates: nil, chainId: "A")
+        #expect(try rows(root).first { $0.tokens == 23 }?.kind == 0)
+        c.storePersistentBoundary(
+            tokens: plain, diskArrays: kv(), ssmStates: nil, chainId: "A", isResumeBoundary: true)
+        #expect(try rows(root).first { $0.tokens == 23 }?.kind == 2)
+    }
+
+    /// The live defect (L-010) at the index level: with the boundary marked,
+    /// the pass triggered by the chat's own stores keeps it and spends the
+    /// exact-prompt and post-answer rows instead.
+    @Test
+    func thePassKeepsTheHistoryBoundaryOverLargerUselessRows() throws {
+        let root = makeRoot("l010")
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Each row ≈ 4.1 KB; the cap holds three of the four.
+        let c = try coordinator(root: root, capBytes: 13_000)
+        let rootT = tokens(11, seed: 90), history = tokens(29, seed: 90)
+        let exact = tokens(31, seed: 90), post = tokens(37, seed: 90)
+        c.storePersistentBoundary(
+            tokens: rootT, diskArrays: kv(), ssmStates: nil, chainId: "A", isStableRoot: true)
+        c.storePersistentBoundary(
+            tokens: history, diskArrays: kv(), ssmStates: nil, chainId: "A", isResumeBoundary: true)
+        c.storePersistentBoundary(tokens: exact, diskArrays: kv(), ssmStates: nil, chainId: "A")
+        c.storePersistentBoundary(tokens: post, diskArrays: kv(), ssmStates: nil, chainId: "A")
+        let kept = try rows(root).map(\.tokens).sorted()
+        try #require(kept.count == 3, "one row had to go: \(kept)")
+        #expect(kept.contains(29), "the history boundary survived: \(kept)")
+        #expect(!kept.contains(31), "the exact-prompt row went first: \(kept)")
+    }
 }
