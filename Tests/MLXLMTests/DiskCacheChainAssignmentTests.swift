@@ -431,4 +431,45 @@ struct DiskCacheChainAssignmentTests {
         #expect(!disk.postAnswerRowsResume)
         #expect(try Support.RawDB(root: root).rows("SELECT hash FROM cache_entries").count == 1)
     }
+
+    @Test(
+        "a snapshot larger than the whole cap is not written at all, and the chat's loss is still recorded"
+    )
+    func aSnapshotLargerThanTheCapIsNeverWritten() throws {
+        let root = makeRoot("oversized")
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Cap 5 000 bytes; a 1 031-float payload is 4 124 bytes and fits, a
+        // 2 003-float payload is 8 012 bytes and can never be kept.
+        let c = try coordinator(root: root, capBytes: 5_000)
+        let disk = try #require(c.diskCache)
+        c.storePersistentBoundary(
+            tokens: tokens(11, seed: 130), diskArrays: kv(1_031), ssmStates: nil, chainId: "A",
+            isResumeBoundary: true)
+        let before = try FileManager.default.contentsOfDirectory(atPath: root.path)
+            .filter { $0.hasSuffix(".safetensors") }
+        #expect(before.count == 1)
+        c.storePersistentBoundary(
+            tokens: tokens(23, seed: 130), diskArrays: kv(2_003), ssmStates: nil, chainId: "A",
+            isPostAnswer: true)
+        // Nothing was written — not even transiently deleted: the fitting row
+        // is untouched, the payload count did not move, and no eviction was
+        // counted. The event is the one the pass would have confirmed.
+        let after = try FileManager.default.contentsOfDirectory(atPath: root.path)
+            .filter { $0.hasSuffix(".safetensors") }
+        #expect(after == before)
+        #expect(try rows(root).map(\.tokens) == [11])
+        let stats = disk.snapshotStats()
+        #expect(stats.evictions == 0)
+        #expect(stats.lastPressureEvent?.kind == .activeTipDropped)
+        #expect(stats.lastPressureEvent?.chainId == "A")
+        #expect(stats.lastPressureEvent?.tipBytes == 8_012)
+        #expect(stats.lastPressureEvent?.capBytes == 5_000)
+        #expect(stats.capacityPressureByChain["A"]?.tipTokenCount == 23)
+        // A later retained boundary at least as long resolves it, as after a pass.
+        let c2 = try coordinator(root: root, capBytes: 5_000)
+        c2.storePersistentBoundary(
+            tokens: tokens(29, seed: 131), diskArrays: kv(1_031), ssmStates: nil, chainId: "A",
+            isResumeBoundary: true)
+        #expect(try #require(c2.diskCache).snapshotStats().capacityPressureByChain["A"] == nil)
+    }
 }

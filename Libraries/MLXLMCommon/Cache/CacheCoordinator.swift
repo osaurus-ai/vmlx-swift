@@ -1470,6 +1470,35 @@ public final class CacheCoordinator: @unchecked Sendable {
         }
 
         let storesCompanion = isHybrid && !(ssmStates?.isEmpty ?? true)
+        // A snapshot larger than the whole cap can never be kept: the pass
+        // that follows its own store removes it first (oversized rows go
+        // before anything else). Writing it anyway costs a full payload write
+        // and delete on every turn — on a small SSD that is exactly the churn
+        // the quota exists to stop (seen live: 1.5–2 GB written and deleted
+        // per turn once a 0.6B chat's snapshot outgrew a 1.2 GB cap). Skip
+        // the write and report what the pass would have confirmed, so the
+        // chat's pressure record and the stats stay truthful.
+        if usesCombinedQuota, let diskCache, let diskArrays, !diskArrays.isEmpty {
+            let cap = Int64(max(1, diskCache.maxSizeBytes))
+            let kvBytes = diskArrays.values.reduce(Int64(0)) { $0 + Int64($1.nbytes) }
+            let companionBytes = (storesCompanion ? ssmStates : nil)?
+                .reduce(Int64(0)) { $0 + Int64($1.nbytes) } ?? 0
+            let payload = IndexedBytes.sum(kvBytes, companionBytes)
+            if payload > cap {
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    FileHandle.standardError.write(Data(
+                        ("[vmlx][cache/disk-store] SKIP oversized count=\(tokens.count) "
+                            + "bytes=\(payload) cap=\(cap) chain=\(chainId ?? "nil")\n").utf8))
+                }
+                diskCache.recordQuotaPass(
+                    evictedGroups: 0, evictedBytes: 0, milliseconds: 0,
+                    event: DiskCachePressureEvent(
+                        kind: .activeTipDropped, chainId: chainId, tipBytes: payload,
+                        capBytes: cap),
+                    tipTokenCount: tokens.count)
+                return
+            }
+        }
         if let diskArrays, !diskArrays.isEmpty {
             diskCache?.store(
                 tokens: tokens,
