@@ -87,6 +87,7 @@ extension DiskCacheCapPolicy {
         return resolve(
             percent: percent, legacyGB: legacyGB,
             totalBytes: volume.totalBytes, freeBytes: volume.freeBytes, ownBytes: volume.ownBytes,
-            previousCapBytes: previousCapBytes)
+            previousCapBytes: previousCapBytes
+                ?? directory.flatMap { SharedDiskCacheLimit.currentBytes(for: $0).map(Int64.init) })
     }
 }

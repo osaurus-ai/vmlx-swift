@@ -7,6 +7,19 @@ import Testing
 @Suite struct DiskCacheCapPolicyTests {
     private let gb: Int64 = 1_073_741_824
 
+    @Test func unreadableIndexPreservesAnotherModelsLiveRootCap() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let liveLimit = SharedDiskCacheLimit.forRoot(root, initialBytes: 42 * Int(gb))
+        try Data("not a sqlite database".utf8).write(to: root.appendingPathComponent("cache_index.db"))
+        let resolved = DiskCacheCapPolicy.resolve(percent: nil, legacyGB: nil, directory: root)
+        #expect(resolved.rule == .unknownVolume)
+        #expect(resolved.capBytes == Int64(liveLimit.bytes))
+        let second = SharedDiskCacheLimit.forRoot(root, initialBytes: Int(resolved.capBytes))
+        #expect(second.bytes == 42 * Int(gb))
+    }
+
     @Test(arguments: [Double?.none, 10.0, 0.005])
     func cacheGrowthDoesNotRatchetTheCap(percent: Double?) {
         let empty = DiskCacheCapPolicy.resolve(

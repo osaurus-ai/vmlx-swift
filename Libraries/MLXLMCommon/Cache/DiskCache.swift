@@ -62,6 +62,7 @@ public struct DiskCacheStats: Sendable {
     /// The most recent pressure event: the cap is too small for the
     /// conversation in progress. Advisory; nothing was refused.
     public let lastPressureEvent: DiskCachePressureEvent?
+    public let capacityPressureByChain: [String: DiskCachePressureRecord]
     /// Fetches in this process that found an indexed payload they could not
     /// READ (EACCES, EMFILE, EIO, a loader that could not open it). That says
     /// nothing about the payload being corrupt: it is reported as a miss and
@@ -97,7 +98,8 @@ public struct DiskCacheStats: Sendable {
         pressureEventSeq: UInt64 = 0, lastPressureEvent: DiskCachePressureEvent? = nil,
         lastQuotaPassTick: UInt64 = 0, lastPressureEventTick: UInt64 = 0,
         unreadablePayloadFetches: Int = 0, opaqueBytes: Int64 = 0,
-        rejectedDiskRestores: Int = 0, rejectedRewritesSuppressed: Int = 0
+        rejectedDiskRestores: Int = 0, rejectedRewritesSuppressed: Int = 0,
+        capacityPressureByChain: [String: DiskCachePressureRecord] = [:]
     ) {
         self.hits = hits
         self.misses = misses
@@ -113,6 +115,7 @@ public struct DiskCacheStats: Sendable {
         self.lastQuotaPassMs = lastQuotaPassMs
         self.pressureEventSeq = pressureEventSeq
         self.lastPressureEvent = lastPressureEvent
+        self.capacityPressureByChain = capacityPressureByChain
         self.lastQuotaPassTick = lastQuotaPassTick
         self.lastPressureEventTick = lastPressureEventTick
         self.unreadablePayloadFetches = unreadablePayloadFetches
@@ -134,7 +137,8 @@ public struct DiskCacheStats: Sendable {
             lastQuotaPassTick: lastQuotaPassTick, lastPressureEventTick: lastPressureEventTick,
             unreadablePayloadFetches: unreadablePayloadFetches, opaqueBytes: opaqueBytes,
             rejectedDiskRestores: rejectedDiskRestores,
-            rejectedRewritesSuppressed: rejectedRewritesSuppressed)
+            rejectedRewritesSuppressed: rejectedRewritesSuppressed,
+            capacityPressureByChain: capacityPressureByChain)
     }
 }
 
@@ -491,6 +495,7 @@ public final class DiskCache: @unchecked Sendable {
     private var lastPressureEventTick: UInt64 = 0
     private var pressureEventSeq: UInt64 = 0
     private var lastPressureEvent: DiskCachePressureEvent?
+    private var capacityPressureByChain: [String: DiskCachePressureRecord] = [:]
     /// See ``DiskCacheStats/opaqueBytes``.
     private var lastOpaqueBytes: Int64 = 0
     /// Set when a retirement could not be written: none is tried before it.
@@ -562,8 +567,13 @@ public final class DiskCache: @unchecked Sendable {
     /// Caller MUST hold `lock`.
     private func _statsLocked(bytes: Int, entryCount: Int) -> DiskCacheStats {
         let maxSizeBytes = sharedLimit.bytes
-        let currentPressure = lastPressureEvent.flatMap { event in
-            event.kind == .activeTipDropped && event.tipBytes <= Int64(maxSizeBytes) ? nil : event
+        capacityPressureByChain = capacityPressureByChain.filter {
+            $0.value.event.tipBytes > Int64(maxSizeBytes)
+        }
+        if let event = lastPressureEvent,
+            event.kind == .activeTipDropped && event.tipBytes <= Int64(maxSizeBytes)
+        {
+            lastPressureEvent = nil
         }
         return DiskCacheStats(
             hits: hits,
@@ -579,13 +589,14 @@ public final class DiskCache: @unchecked Sendable {
             quotaPasses: quotaPasses,
             lastQuotaPassMs: lastQuotaPassMs,
             pressureEventSeq: pressureEventSeq,
-            lastPressureEvent: currentPressure,
+            lastPressureEvent: lastPressureEvent,
             lastQuotaPassTick: lastQuotaPassTick,
             lastPressureEventTick: lastPressureEventTick,
             unreadablePayloadFetches: unreadablePayloadFetches,
             opaqueBytes: lastOpaqueBytes,
             rejectedDiskRestores: rejectedDiskRestores,
-            rejectedRewritesSuppressed: rejectedRewritesSuppressed)
+            rejectedRewritesSuppressed: rejectedRewritesSuppressed,
+            capacityPressureByChain: capacityPressureByChain)
     }
 
     // MARK: - Initialization
@@ -2833,6 +2844,7 @@ public final class DiskCache: @unchecked Sendable {
         lastPressureEventTick = 0
         pressureEventSeq = 0
         lastPressureEvent = nil
+        capacityPressureByChain.removeAll()
         lastOpaqueBytes = 0
         retireNotBefore = nil
         validatedFiles.removeAll(keepingCapacity: true)
@@ -3712,7 +3724,7 @@ public final class DiskCache: @unchecked Sendable {
     /// actually lost an active boundary, after deletion results are checked.
     func recordQuotaPass(
         evictedGroups: Int, evictedBytes: Int64, milliseconds: Double,
-        event: DiskCachePressureEvent?
+        event: DiskCachePressureEvent?, tipTokenCount: Int = 0
     ) {
         lock.lock()
         defer { lock.unlock() }
@@ -3727,6 +3739,35 @@ public final class DiskCache: @unchecked Sendable {
             pressureEventSeq += 1
             lastPressureEvent = event
             lastPressureEventTick = lastQuotaPassTick
+            if event.kind == .activeTipDropped, let chain = event.chainId {
+                capacityPressureByChain[chain] = DiskCachePressureRecord(
+                    event: event, sequence: pressureEventSeq, tick: lastPressureEventTick,
+                    tipTokenCount: tipTokenCount)
+            }
+        }
+    }
+
+    /// Only a retained boundary at least as long as the lost tip resolves the
+    /// loss. A smaller stable root written during the next prefill does not.
+    func reconcileCapacityPressure(chainId: String?, requiresCompanion: Bool) {
+        guard let chainId else { return }
+        lock.lock()
+        let pending = capacityPressureByChain[chainId]
+        lock.unlock()
+        guard let pending else { return }
+        let retained = quotaEntries(retiringInvalidRecords: false).contains {
+            $0.chainId == chainId && !$0.isStableRoot
+                && $0.tokenCount >= pending.tipTokenCount
+                && IndexedBytes.sum($0.bytes, $0.companionBytes) <= Int64(maxSizeBytes)
+                && (!requiresCompanion || $0.companionKey != nil)
+        }
+        guard retained else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard capacityPressureByChain[chainId]?.sequence == pending.sequence else { return }
+        capacityPressureByChain.removeValue(forKey: chainId)
+        if lastPressureEvent?.chainId == chainId, lastPressureEvent?.kind == .activeTipDropped {
+            lastPressureEvent = nil
         }
     }
 

@@ -31,6 +31,11 @@ final class SharedDiskCacheLimit: @unchecked Sendable {
         }
     }
 
+    static func currentBytes(for root: URL) -> Int? {
+        let key = root.standardizedFileURL.resolvingSymlinksInPath().path
+        return roots.withLock { $0[key]?.value?.bytes }
+    }
+
     var bytes: Int { storage.withLock { $0 } }
 
     func update(bytes: Int) {

@@ -1497,6 +1497,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         } else {
             enforceCombinedDiskQuota(activeChain: chainId)
         }
+        diskCache?.reconcileCapacityPressure(chainId: chainId, requiresCompanion: isHybrid)
     }
 
     /// The direct companion writers (`maybeReDeriveSSMState`, and
@@ -1799,7 +1800,9 @@ public final class CacheCoordinator: @unchecked Sendable {
         let confirmedEvent = plan.confirmedEvent(rows: rows, lostRows: lostRows)
         diskCache.recordQuotaPass(
             evictedGroups: evictedGroups, evictedBytes: evictedBytes, milliseconds: totalMs,
-            event: confirmedEvent)
+            event: confirmedEvent,
+            tipTokenCount: rows.lazy.filter { $0.chainId == activeChain && !$0.isStableRoot }
+                .map(\.tokenCount).max() ?? 0)
         _lastQuotaPassTiming = QuotaPassTiming(
             rowsMs: rowsMs, selectMs: selectMs, deleteMs: deleteMs, totalMs: totalMs,
             evictedGroups: evictedGroups)

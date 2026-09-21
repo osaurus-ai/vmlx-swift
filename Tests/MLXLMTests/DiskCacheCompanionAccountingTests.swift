@@ -1558,10 +1558,11 @@ struct DiskCacheCompanionAccountingTests {
             let cap = diskB.usageBytes() + b1Bytes / 2
             try #require(cap < 1 << 24, "cap must survive the Float GiB round trip exactly")
 
-            // Model A has the smaller cap; its own store pushes the root over.
+            // Loading model A updates the root's shared cap; its store pushes it over.
             let modelA = Self.coordinator(root: root, capBytes: cap, modelKey: keyA)
             let diskA = try #require(modelA.diskCache)
             try #require(Int64(diskA.maxSizeBytes) == cap)
+            #expect(diskB.maxSizeBytes == diskA.maxSizeBytes)
             #expect(diskA.snapshotStats().evictions == 0)
             modelA.storePersistentBoundary(
                 tokens: a1, diskArrays: Self.kv(), ssmStates: Self.recurrent())
@@ -1588,14 +1589,18 @@ struct DiskCacheCompanionAccountingTests {
             #expect(!stillValidated)
             try Self.expectUsageMatchesDisk(diskB, root: root)
 
-            // B stores it again (B's own cap is large, so nothing is evicted).
+            // B stores it again under the SAME root cap. It retires the next
+            // oldest group, rather than silently restoring its old larger cap.
             modelB.storePersistentBoundary(
                 tokens: b1, diskArrays: Self.kv(), ssmStates: Self.recurrent())
             let restored = try #require(
                 try Self.indexedRows(root).first { $0.hash == Self.kvHash(b1, keyB) })
             #expect(restored.companionKey == Self.ssmKey(b1, keyB))
             #expect(diskB.fetch(tokens: b1) != nil)
-            #expect(try Self.indexedRows(root).count == 3)
+            #expect(try Self.indexedRows(root).count == 2)
+            #expect(diskB.fetch(tokens: b2) == nil)
+            #expect(diskB.snapshotStats().evictions == 1)
+            #expect(diskA.usageBytes() <= cap)
             #expect(diskA.usageBytes() == diskB.usageBytes())
             try Self.expectUsageMatchesDisk(diskA, root: root)
             try Self.expectUsageMatchesDisk(diskB, root: root)

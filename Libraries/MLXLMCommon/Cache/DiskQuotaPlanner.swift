@@ -71,6 +71,15 @@ public struct DiskCachePressureEvent: Sendable, Equatable {
     public let capBytes: Int64
 }
 
+/// An unresolved capacity loss, retained by chat so another chat's quota pass
+/// cannot overwrite it before the host gets a chance to poll.
+public struct DiskCachePressureRecord: Sendable, Equatable {
+    public let event: DiskCachePressureEvent
+    public let sequence: UInt64
+    public let tick: UInt64
+    public let tipTokenCount: Int
+}
+
 struct QuotaPlan: Equatable {
     /// Row ids, in eviction order. No id appears twice.
     let evict: [String]

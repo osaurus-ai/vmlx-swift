@@ -21,6 +21,42 @@ struct DiskQuotaPlannerWiringTests {
 
     private typealias Support = DiskCacheAccountingTestSupport
 
+    @Test func capacityLossSurvivesInterleavedChatsUntilTheirProgressFits() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("pressure-interleave")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let coordinator = try Self.coordinator(root: root, capBytes: 20_000, modelKey: "pressure")
+            let disk = try #require(coordinator.diskCache)
+            for (chain, seed) in [("a", 901), ("b", 902)] {
+                coordinator.storePersistentBoundary(
+                    tokens: Self.tokens(300, seed: seed), diskArrays: Self.kv(65_537),
+                    ssmStates: Self.recurrent(), chainId: chain)
+            }
+            // Both stores completed before the first host poll.
+            let delayed = disk.snapshotStats()
+            #expect(Set(delayed.capacityPressureByChain.keys) == ["a", "b"])
+            #expect(delayed.lastPressureEvent?.chainId == "b")
+            let a = try #require(delayed.capacityPressureByChain["a"])
+            #expect(a.sequence < delayed.capacityPressureByChain["b"]!.sequence)
+            #expect(a.tipTokenCount == 300)
+
+            coordinator.storePersistentBoundary(
+                tokens: Self.tokens(20, seed: 903), diskArrays: Self.kv(),
+                ssmStates: Self.recurrent(), chainId: "a", isStableRoot: true)
+            #expect(disk.snapshotStats().capacityPressureByChain["a"] == a)
+            coordinator.storePersistentBoundary(
+                tokens: Self.tokens(301, seed: 904), diskArrays: Self.kv(),
+                ssmStates: Self.recurrent(), chainId: "a")
+            #expect(disk.snapshotStats().capacityPressureByChain["a"] == nil)
+            #expect(disk.snapshotStats().capacityPressureByChain["b"] != nil)
+            coordinator.updateDiskCap(bytes: 1_000_000)
+            #expect(disk.snapshotStats().capacityPressureByChain.isEmpty)
+            coordinator.updateDiskCap(bytes: 20_000)
+            #expect(disk.snapshotStats().capacityPressureByChain.isEmpty, "old events must not resurrect")
+            try Support.expectUsageMatchesDisk(disk, root: root)
+        }
+    }
+
     @Test func liveCapChangesReachEveryModelAndTheCompanionStore() throws {
         try MLXMetalTestLock.withLock {
             let modelA = "live-cap-a", modelB = "live-cap-b"
