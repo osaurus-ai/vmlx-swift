@@ -290,3 +290,61 @@ The strict invocation must set `TEST_RUNNER_MLX_ENABLE_TF32=0`, since a bare she
 This confirmed defect is not yet established as the cause of the full-model
 post-tool failures. The correction is newer than the R9 app; refreshed app and
 full eval proof are still required before merge.
+
+### Resident packed banks and controlled decode comparison
+
+The current candidate keeps the original packed expert banks in owned MLX memory
+and passes router indices directly to native GPU gather-quantized matmul. Gate,
+up and down projections retain their individual affine/MXFP4 modes, group sizes,
+scales and biases. No quantization conversion or system memory-limit change is
+part of this correction. Explicit mapped/host-routing diagnostics remain opt-in.
+The model contract is shared with load-policy inspection so hosts account for a
+full resident load. Caller allocator budgets remain unchanged.
+
+Two loader defects were caught before promotion: Foundation read buffers needed
+per-tensor autorelease pools, and integer indexing built deferred gather copies
+instead of zero-copy expert views. Range slicing fixes the diagnostic views;
+the production resident path consumes full banks without per-expert slicing.
+
+Matched 128-step replay rounds on the local M5 Max 128 GiB measured:
+
+| Path | Round 1 steps/s | Round 2 steps/s | Median latency, ms | p95, ms | Maximum, ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Native, unwired A2 | 39.93 | 38.02 | 25.07 / 26.03 | 26.04 / 28.69 | 26.38 / 29.31 |
+| Native, wired B1 | 40.55 | 39.35 | 24.72 / 25.23 | 25.57 / 26.98 | 26.39 / 28.17 |
+| Compiled MoE diagnostic C1 | 40.26 | 39.60 | 24.94 / 25.04 | 26.42 / 26.84 | 29.59 / 28.59 |
+
+All these rounds had zero pageins and 0–20 KiB process read I/O per round.
+There is one explicit sampled-token host read per step, no CPU routing read.
+Graph building takes approximately 1.6–1.8 ms median; evaluation/wait takes
+approximately 23–24 ms, including CPU encoding, scheduling and GPU work.
+Process CPU time is approximately 18–20 ms per step. The original Swift receipt
+fields named `cpu_*_ns` contain Mach ticks; the comparison receipt corrects them
+using the independently calibrated 125/3 ns-per-tick host timebase.
+
+The 904 ms historical first-decode stall did not recur in the boundary probes;
+its original cause remains undetermined. An independent Python 0.32.2 reference
+on the same bundle/input trace measured 38.90 steps/s in its warm round. Its
+cold round included a 1.17 s outlier and substantial prefill reads. These rows
+are controlled teacher-forced throughput diagnostics, not natural-answer proof.
+The separate natural capture finished 596 tokens at 39.98 tokens/s.
+
+Receipts: `controlled-comparison-r1.json`, `controlled-workload-r1.json`,
+`cpu-counter-unit-calibration.json`, `controlled-python-reference-p1.json`, and
+matching process-memory/summary files. Earlier `resident-gpu-compiled-r7` was
+actually eager because the global compile diagnostic flag was absent; C1 sets
+both flags. No production compile-policy gate was relaxed.
+
+The approximately 45 tokens/s target is still open. The app must be rebuilt and
+re-proven against this candidate; old R9/R10 mmap performance is not the current
+engine ceiling. Full app/eval/merge gates remain outstanding.
+
+The resident admission/catalog/runtime matrix passes 17/17, and the VLM wrapper
+plus LoadConfiguration matrix passes 47/47 with TF32 disabled for numerical
+qualification. The wrapper explicitly forwards its text model's owned-weight
+requirement. Receipts: `local-resident-admission-build-r1.log` and
+`local-resident-vlm-build-r1.log`. App R11 is building from the recorded source
+inputs; no R11 runtime result is claimed here. The controlled replay used a
+synchronous model/sample/item loop; production TokenIterator overlaps the next
+GPU submission with the previous token's host read, so actual app throughput
+still needs its own measurement.

@@ -57,6 +57,8 @@ struct MiMoV26AuxiliaryLoaderTests {
         let weights = Dictionary(uniqueKeysWithValues: original.parameters().flattened())
         try MLX.save(arrays: weights, url: directory.appendingPathComponent("model.safetensors"))
         let model = try MiMoV26(JSONDecoder().decode(MiMoV26Configuration.self, from: data))
+        #expect(model.requiresResidentSafetensorsWeights == model.languageModel.requiresResidentSafetensorsWeights)
+        #expect(model.requiresResidentSafetensorsWeights)
         try model.configure(modelDirectory: directory)
         let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
         try loadWeights(modelDirectory: directory, model: model,

@@ -51,6 +51,7 @@ final class MiMoV26: Module, VLMModel, KVCacheDimensionProvider, SafetensorsLoad
     var preservesCheckpointParameterDTypes: Bool { true }
     var supportsWholeForwardCompilation: Bool { languageModel.supportsWholeForwardCompilation }
     var requiresExactTensorMmapBuffers: Bool { true }
+    var requiresResidentSafetensorsWeights: Bool { languageModel.requiresResidentSafetensorsWeights }
 
     init(_ configuration: MiMoV26Configuration, requesting: Set<ModelRuntimeRequestModality>? = nil) throws {
         var supported: Set<ModelRuntimeRequestModality> = [.text]

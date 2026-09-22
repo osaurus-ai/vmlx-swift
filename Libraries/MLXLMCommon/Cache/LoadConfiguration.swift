@@ -267,6 +267,8 @@ public enum DeepseekV4ActivationQAT {
 /// pulled once at load entry so the resolver doesn't re-walk the
 /// directory or re-parse `config.json`.
 public struct LoadBundleFacts: Sendable, Equatable {
+    /// Converted MiMo V2.6 packed banks are owned GPU inputs by default.
+    public private(set) var isMiMoV26MixedQuantized: Bool = false
     /// Top-level or nested `model_type` from config metadata, when available.
     public var modelType: String?
 
@@ -381,11 +383,13 @@ public struct LoadBundleFacts: Sendable, Equatable {
         var jangFormat: String?
         var declaredComputeDType: String?
         var routedExpertLayout: String?
+        var isMiMoV26MixedQuantized = false
         let configURL = url.appendingPathComponent("config.json")
         if let data = try? Data(contentsOf: configURL),
             let json = try? JSONSerialization.jsonObject(with: data)
                 as? [String: Any]
         {
+            isMiMoV26MixedQuantized = MiMoV26BundleContract.matches(data)
             let routedKeys = [
                 "num_local_experts",
                 "num_experts",
@@ -524,6 +528,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
             numRoutedExperts: numRoutedExperts,
             topK: topK)
         facts.hasPrestackedAffineRoutedExperts = hasPrestackedAffineRoutedExperts
+        facts.isMiMoV26MixedQuantized = isMiMoV26MixedQuantized
         return facts
     }
 
@@ -651,6 +656,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
     public var requiresResidentSafetensors: Bool {
         (isPlainDeepseekV4AffineJANG && !hasPrestackedAffineRoutedExperts)
             || isGlm5NextAffineJANG
+            || isMiMoV26MixedQuantized
     }
 
     public func resolveMmapSafetensors(requested: Bool) -> Bool {

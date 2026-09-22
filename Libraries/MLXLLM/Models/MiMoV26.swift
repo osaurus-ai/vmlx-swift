@@ -7,18 +7,7 @@ import MLXLMCommon
 import MLXNN
 
 /// The converted V2.6 contract, identified by representation rather than a repository name.
-public enum MiMoV26Contract {
-    public static func matches(_ data: Data) -> Bool {
-        guard let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            config["model_type"] as? String == "mimo_v2",
-            config["attention_projection_layout"] as? String == "fused_qkv",
-            let quantization = config["quantization"] as? [String: Any]
-        else { return false }
-        let modes = Set(([quantization] + quantization.values.compactMap { $0 as? [String: Any] })
-            .compactMap { $0["mode"] as? String })
-        return modes.contains("affine") && modes.contains("mxfp4")
-    }
-}
+public typealias MiMoV26Contract = MiMoV26BundleContract
 
 enum MiMoV26Error: Error {
     case invalidConfiguration(String)
@@ -101,6 +90,7 @@ final class MiMoV26Router: Module {
 final class MiMoV26MoE: Module, UnaryLayer {
     let gate: MiMoV26Router
     @ModuleInfo(key: "switch_mlp") var experts: Module & SwitchGLULayer
+    private var compiledResidentDecode: (@Sendable ([MLXArray]) -> [MLXArray])?
 
     init(_ config: MiMoV2FlashConfiguration) {
         gate = MiMoV26Router(config)
@@ -110,9 +100,27 @@ final class MiMoV26MoE: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let compiledResidentDecode, !CompiledDecodeTrace.isActive, x.dim(-2) == 1 {
+            return compiledResidentDecode([x])[0]
+        }
         let (indices, scores) = gate(x)
         let values = experts(x, indices).asType(.float32)
         return (values * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(x.dtype)
+    }
+
+    /// Cache-free MoE region only: attention and rotating KV remain eager.
+    /// Capture child modules, never self, so unloading releases the full bank.
+    func configureCompiledResidentDecode() {
+        guard HardwareInfo.isCompiledDecodeSupported,
+            RuntimeEnvironment.value("VMLX_MIMO_COMPILE_MOE") == "1",
+            (experts as? MixedQuantizedSwitchGLU)?.usesResidentGPURouting == true else { return }
+        let router = gate, projections = experts
+        compiledResidentDecode = vmlxTrustedCompile(inputs: [router]) { args in
+            let x = args[0]
+            let (indices, scores) = router(x)
+            let values = projections(x, indices).asType(.float32)
+            return [(values * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(x.dtype)]
+        }
     }
 }
 
@@ -155,17 +163,19 @@ public final class MiMoV26TextModel: Module, LLMModel, KVCacheDimensionProvider,
 {
     public var preservesCheckpointParameterDTypes: Bool { true }
     // Auxiliary towers share shards with the text backbone. Keep them out of
-    // the text load before creating buffers, and map the selected tensor spans
-    // rather than exposing each entire multi-gigabyte shard to Metal.
+    // the text load before allocating. The mapped diagnostic uses exact spans.
     public var requiresExactTensorMmapBuffers: Bool { true }
+    // Owned weights are the normal path. The explicit mapped override exists
+    // for controlled residency comparisons, never as an automatic low-RAM fallback.
+    private let expertStorage: MixedQuantizedExpertCatalog.Storage =
+        RuntimeEnvironment.value("VMLX_MIMO_EXPERT_STORAGE") == "mapped" ? .mapped : .resident
+    public var requiresResidentSafetensorsWeights: Bool { expertStorage == .resident }
     private var exactExpertRegions = false
-    // Host-routed exact expert regions require eager orchestration. The native
-    // fallback also retains eager rotating-cache semantics until whole-forward
+    // Retain eager rotating-cache semantics until whole-forward
     // compiled window masks are qualified across ring wraps.
     public var supportsWholeForwardCompilation: Bool { false }
 
-    /// Indexed converted bundles use exact, read-only expert slices. Mapping
-    /// failures are load errors, before the model is admitted for generation.
+    /// Load indexed packed expert banks before admitting the model for generation.
     public func configure(modelDirectory: URL) throws {
         let index = modelDirectory.appendingPathComponent("model.safetensors.index.json")
         guard FileManager.default.fileExists(atPath: index.path) else { return }
@@ -179,12 +189,14 @@ public final class MiMoV26TextModel: Module, LLMModel, KVCacheDimensionProvider,
         // leaves the existing parameter graph intact.
         let replacements = try routed.map { index in
             (index, try MixedQuantizedSwitchGLU(catalog: catalog, layer: index,
-                                               inputDimensions: configuration.hiddenSize))
+                                               inputDimensions: configuration.hiddenSize,
+                                               storage: expertStorage))
         }
         for (index, replacement) in replacements {
             let moe = model.layers[index].mlp as! MiMoV26MoE
             try moe.update(modules: .unflattened([("switch_mlp", replacement as Module)]),
                            verify: .noUnusedKeys)
+            moe.configureCompiledResidentDecode()
         }
         exactExpertRegions = true
     }

@@ -9,6 +9,10 @@ import MLX
 /// Every projection/companion is resolved independently: companions can live
 /// in different shards. Mapping a slice never exposes a whole bank to Metal.
 public final class MixedQuantizedExpertCatalog: Sendable {
+    public enum Storage: Sendable {
+        case mapped
+        case resident
+    }
     public struct InvalidBundle: LocalizedError, Sendable {
         public let reason: String
         public var errorDescription: String? { reason }
@@ -173,6 +177,51 @@ public final class MixedQuantizedExpertCatalog: Sendable {
         }
         self.expertCount = expertCount
         self.layers = built
+    }
+
+    /// Resident mode loads each native packed bank once, then makes zero-copy
+    /// expert views. No dequantized or permanent prestacked overlay is created.
+    public func loadExperts(layer: Int, storage: Storage) throws -> [Expert] {
+        if storage == .mapped {
+            return try (0..<expertCount).map { index in
+                try Task.checkCancellation()
+                return try loadExpert(layer: layer, index: index)
+            }
+        }
+        let bank = try loadResidentLayer(layer: layer)
+        func slice(_ projection: Projection, _ index: Int) -> Projection {
+            // Swift's single integer subscript creates an array-index gather,
+            // which copies each selected expert when first evaluated. An
+            // explicit range slice preserves the shared resident bank instead.
+            func view(_ array: MLXArray) -> MLXArray {
+                array[index..<(index + 1)].squeezed(axis: 0)
+            }
+            return Projection(weight: view(projection.weight), scales: view(projection.scales),
+                biases: projection.biases.map(view), bits: projection.bits,
+                groupSize: projection.groupSize, mode: projection.mode)
+        }
+        return (0..<expertCount).map { index in
+            Expert(gate: slice(bank.gate, index), up: slice(bank.up, index), down: slice(bank.down, index))
+        }
+    }
+
+    /// Native packed banks for GPU-side routing. Every projection retains its
+    /// own quantization mode and group size, including mixed MXFP4/affine gates.
+    public func loadResidentLayer(layer: Int) throws -> Expert {
+        guard let layer = layers[layer] else {
+            throw InvalidBundle(reason: "Invalid expert layer")
+        }
+        func read(_ region: Region) throws -> MLXArray {
+            try ResidentSafetensorsReader.loadRegion(url: region.url,
+                offset: region.offset, length: Int(region.length),
+                shape: region.shape, dtype: region.dtype)
+        }
+        func load(_ spec: Spec) throws -> Projection {
+            try Projection(weight: read(spec.weight), scales: read(spec.scales),
+                biases: spec.biases.map(read), bits: spec.bits, groupSize: spec.groupSize,
+                mode: spec.biases == nil ? .mxfp4 : .affine)
+        }
+        return try Expert(gate: load(layer.gate), up: load(layer.up), down: load(layer.down))
     }
 
     public func loadExpert(layer: Int, index: Int) throws -> Expert {

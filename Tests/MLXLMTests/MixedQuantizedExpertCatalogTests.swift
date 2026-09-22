@@ -10,6 +10,27 @@ import Testing
 
 @Suite("Mixed expert region loading", .serialized)
 struct MixedQuantizedExpertCatalogTests {
+    @Test("Host load policy recognizes the same resident contract as the model factory")
+    func residentAdmissionContract() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var config: [String: Any] = ["model_type": "mimo_v2",
+            "attention_projection_layout": "fused_qkv", "n_routed_experts": 256,
+            "quantization": ["mode": "affine", "gate": ["mode": "mxfp4"]]]
+        let url = directory.appendingPathComponent("config.json")
+        try JSONSerialization.data(withJSONObject: config).write(to: url)
+        let facts = LoadBundleFacts.inspect(bundleURL: directory)
+        #expect(facts.isMiMoV26MixedQuantized)
+        #expect(!facts.resolveMmapSafetensors(requested: true))
+        // Residency must not silently raise the caller's allocator limits.
+        #expect(facts.resolveMLXMemoryLimit(requested: .default) == .default)
+        #expect(facts.resolveMLXAllocatorCacheLimit(requested: .default) == .default)
+        config["attention_projection_layout"] = "separate"
+        try JSONSerialization.data(withJSONObject: config).write(to: url)
+        #expect(!LoadBundleFacts.inspect(bundleURL: directory).requiresResidentSafetensors)
+    }
+
     private func saveAligned(_ arrays: [String: MLXArray], to url: URL) throws {
         try MLX.save(arrays: arrays, url: url)
         let data = try Data(contentsOf: url)
@@ -86,6 +107,48 @@ struct MixedQuantizedExpertCatalogTests {
         #expect(throws: MixedQuantizedExpertCatalog.InvalidBundle.self) { try catalog.loadExpert(layer: 0, index: 0) }
     }
 
+    @Test func residentBanksPreservePackedBitsAndSurviveSourceRemoval() throws {
+        let (url, weights) = try bundle()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let source = try catalog(url)
+        let resident = try source.loadExperts(layer: 1, storage: .resident)
+        // Adjacent expert views must address adjacent spans of the same bank.
+        // Single integer indexing instead produces separately allocated gathers.
+        let first = resident[0].gate.weight.asData(access: .noCopy)
+        let second = resident[1].gate.weight.asData(access: .noCopy)
+        first.data.withUnsafeBytes { a in
+            second.data.withUnsafeBytes { b in
+                #expect(Int(bitPattern: b.baseAddress!) - Int(bitPattern: a.baseAddress!) == first.data.count)
+            }
+        }
+        let mappedModule = try MixedQuantizedSwitchGLU(catalog: source, layer: 1,
+            inputDimensions: 64, storage: .mapped)
+        let residentModule = try MixedQuantizedSwitchGLU(catalog: source, layer: 1,
+            inputDimensions: 64, storage: .resident)
+        let input = MLXArray.ones([1, 1, 64], dtype: .bfloat16)
+        let routes = MLXArray([Int32(3), 0]).reshaped(1, 1, 2)
+        let expected = mappedModule(input, routes)
+        MLX.eval(expected)
+        try FileManager.default.removeItem(at: url)
+        for (index, expert) in resident.enumerated() {
+            for (name, projection) in [("gate_proj", expert.gate), ("up_proj", expert.up), ("down_proj", expert.down)] {
+                let stem = "model.layers.1.mlp.switch_mlp.\(name)"
+                let weight = try #require(weights[stem + ".weight"])
+                let scales = try #require(weights[stem + ".scales"])
+                #expect(projection.weight.dtype == weight.dtype)
+                #expect(arrayEqual(projection.weight, weight[index]).item(Bool.self))
+                #expect(projection.scales.dtype == scales.dtype)
+                #expect(arrayEqual(projection.scales, scales[index]).item(Bool.self))
+                if let bias = weights[stem + ".biases"] {
+                    #expect(arrayEqual(try #require(projection.biases), bias[index]).item(Bool.self))
+                } else {
+                    #expect(projection.biases == nil)
+                }
+            }
+        }
+        #expect(arrayEqual(expected, residentModule(input, routes)).item(Bool.self))
+    }
+
     @Test func rejectsMissingCompanionAndTraversal() throws {
         let (url, _) = try bundle()
         defer { try? FileManager.default.removeItem(at: url) }
@@ -123,7 +186,8 @@ struct MixedQuantizedExpertCatalogTests {
         }
     }
 
-    @Test func eightRegionMetalKernelMatchesNativeProjections() throws {
+    @Test(arguments: [MixedQuantizedExpertCatalog.Storage.mapped, .resident])
+    func eightRegionMetalKernelMatchesNativeProjections(storage: MixedQuantizedExpertCatalog.Storage) throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -152,7 +216,8 @@ struct MixedQuantizedExpertCatalogTests {
                 .write(to: directory.appendingPathComponent("model.safetensors.index.json"))
             let catalog = try MixedQuantizedExpertCatalog(directory: directory, layerIndices: [1],
                 expertCount: 8, inputDimensions: 512, hiddenDimensions: 512)
-            let module = try MixedQuantizedSwitchGLU(catalog: catalog, layer: 1, inputDimensions: 512)
+            let module = try MixedQuantizedSwitchGLU(catalog: catalog, layer: 1,
+                inputDimensions: 512, storage: storage)
             #expect(module.parameters().flattened().isEmpty)
             let reference = order.map { index in
                 func project(_ x: MLXArray, _ name: String) -> MLXArray {

@@ -4,25 +4,40 @@
 import MLX
 import MLXNN
 
-/// Native expert projections backed by exact file regions. All mappings are
-/// created during loading, so failures propagate through the throwing loader.
-/// These are read-only mappings, not copied banks: macOS can reclaim cold pages.
+/// Native mixed-quantized projections. Resident banks keep routing on the GPU;
+/// explicit mapped diagnostics retain exact file regions and host routing.
 public final class MixedQuantizedSwitchGLU: Module, SwitchGLULayer {
     private let experts: [MixedQuantizedExpertCatalog.Expert]
+    private let resident: MixedQuantizedExpertCatalog.Expert?
+    public var usesResidentGPURouting: Bool { resident != nil }
     private let kernels = MixedQuantizedExpertKernel()
     private let inputDimensions: Int
 
-    public init(catalog: MixedQuantizedExpertCatalog, layer: Int, inputDimensions: Int) throws {
-        let mapped = try (0..<catalog.expertCount).map {
-            try Task.checkCancellation()
-            return try catalog.loadExpert(layer: layer, index: $0)
+    public init(catalog: MixedQuantizedExpertCatalog, layer: Int, inputDimensions: Int,
+                storage: MixedQuantizedExpertCatalog.Storage = .mapped) throws {
+        if storage == .resident && RuntimeEnvironment.value("VMLX_MIMO_RESIDENT_ROUTING") != "host" {
+            self.resident = try catalog.loadResidentLayer(layer: layer)
+            self.experts = []
+        } else {
+            self.resident = nil
+            self.experts = try catalog.loadExperts(layer: layer, storage: storage)
         }
-        self.experts = mapped
         self.inputDimensions = inputDimensions
         super.init()
     }
 
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        if let resident {
+            func project(_ input: MLXArray, _ projection: MixedQuantizedExpertCatalog.Projection) -> MLXArray {
+                gatherQuantizedMM(input, projection.weight, scales: projection.scales,
+                    biases: projection.biases, rhsIndices: indices,
+                    groupSize: projection.groupSize, bits: projection.bits,
+                    mode: projection.mode, sortedIndices: false)
+            }
+            let input = expandedDimensions(x, axes: [-2, -3])
+            let activated = silu(project(input, resident.gate)) * project(input, resident.up)
+            return project(activated, resident.down).squeezed(axis: -2)
+        }
         let routes = indices.asArray(Int32.self)
         let k = indices.dim(-1)
         // Router indices come from argPartition over the configured expert

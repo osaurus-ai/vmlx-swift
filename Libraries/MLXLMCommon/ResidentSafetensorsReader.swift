@@ -55,6 +55,39 @@ enum ResidentSafetensorsReader {
         "F16": .float16, "BF16": .bfloat16, "F32": .float32, "F64": .float64,
     ]
 
+    /// Read an already validated tensor span into owned MLX storage. This keeps
+    /// native packed weights intact and avoids retaining a second mapped copy.
+    static func loadRegion(url: URL, offset: UInt64, length: Int,
+                           shape: [Int], dtype: DType) throws -> MLXArray {
+        func read() throws -> MLXArray {
+            try Task.checkCancellation()
+            guard url.isFileURL else { throw InvalidFile(detail: "not a file URL") }
+            let file = try FileHandle(forReadingFrom: url)
+            defer { try? file.close() }
+            #if canImport(Darwin)
+            guard fcntl(file.fileDescriptor, F_NOCACHE, 1) == 0 else {
+                throw InvalidFile(detail: "uncached I/O unavailable (errno \(errno))")
+            }
+            #endif
+            let fileSize = try file.seekToEnd()
+            guard fileSize <= UInt64(Int.max), offset <= fileSize, length > 0,
+                UInt64(length) <= fileSize - offset else {
+                throw InvalidFile(detail: "tensor region outside file")
+            }
+            try file.seek(toOffset: offset)
+            let data = try readExactly(file, count: length, fileSize: Int(fileSize))
+            let array = MLXArray(data, shape, dtype: dtype)
+            MLX.eval(array)
+            return array
+        }
+        #if canImport(Darwin)
+        // Drain Foundation buffers per tensor, not after the full async load.
+        return try autoreleasepool(invoking: read)
+        #else
+        return try read()
+        #endif
+    }
+
     static func load(url: URL, excludingKeys: Set<String>) throws -> ([String: MLXArray], [String: String]) {
         #if canImport(Darwin)
         try Task.checkCancellation()
@@ -171,7 +204,19 @@ enum ResidentSafetensorsReader {
         try file.seek(toOffset: UInt64(end))
         return result
         #else
-        throw InvalidFile(detail: "uncached owned reader requires Darwin")
+        let offset = try file.offset()
+        guard offset <= UInt64(fileSize), count >= 0, count <= fileSize - Int(offset) else {
+            throw InvalidFile(detail: "read range out of bounds")
+        }
+        var result = Data()
+        result.reserveCapacity(count)
+        while result.count < count {
+            try Task.checkCancellation()
+            guard let chunk = try file.read(upToCount: min(count - result.count, 4 * 1024 * 1024)),
+                !chunk.isEmpty else { throw InvalidFile(detail: "short owned read") }
+            result.append(chunk)
+        }
+        return result
         #endif
     }
 }
