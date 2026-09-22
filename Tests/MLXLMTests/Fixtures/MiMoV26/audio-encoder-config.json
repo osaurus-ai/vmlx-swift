@@ -1,0 +1,18 @@
+{
+  "audio_channels": 3,
+  "group_size": 4,
+  "input_local_dim": 16,
+  "input_local_layers": 2,
+  "input_local_attn_heads": 4,
+  "input_local_head_dim": 4,
+  "input_local_intermediate_size": 32,
+  "input_full_attention": true,
+  "out_hidden_size": 16,
+  "rope_theta": 640000,
+  "partial_rotary_factor": 1.0,
+  "projection_layers": 2,
+  "add_post_norm": true,
+  "audio_segment_size": 6000,
+  "speech_vocab_size": "16",
+  "speech_zeroemb_idx": "15"
+}

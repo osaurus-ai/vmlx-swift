@@ -1,0 +1,10 @@
+{
+  "source_model": "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+  "source_revision": "5711b268169967567844e1e560e8a3966da959b1",
+  "converted_config_sha256": "73d96f049747d0aea808919ae31f8b2403b242d61e72bd2f3819bc656849dd1d",
+  "fields": [
+    "vision_config",
+    "processor_config"
+  ],
+  "note": "Exact processor and vision settings from the requested converted bundle; no weights."
+}

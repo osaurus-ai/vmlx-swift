@@ -50,8 +50,8 @@ import MLX
 ///
 /// Shape + dtype are hashed before bytes so different-shaped tensors with
 /// identical bytes never collide. Ordering is deterministic: image before
-/// video. The `frames: [THW]?` field is ignored because it is recoverable
-/// from the pixel tensor shape.
+/// video. Frame grids are also hashed: flattened patches can have identical
+/// shapes and bytes but different temporal boundaries or rotary positions.
 ///
 /// Thread-safety: safe to call concurrently; CryptoKit's SHA256 is
 /// value-typed and the underlying MLXArray reads are via `asData` which
@@ -67,10 +67,12 @@ public func computeMediaSalt(for input: LMInput) -> String? {
     if let image = input.image {
         hasher.update(data: Data("image:".utf8))
         hashMLXArray(image.pixels, into: &hasher)
+        hashFrameGrids(image.frames, into: &hasher)
     }
     if let video = input.video {
         hasher.update(data: Data("video:".utf8))
         hashMLXArray(video.pixels, into: &hasher)
+        hashFrameGrids(video.frames, into: &hasher)
     }
     if let audio = input.audio {
         // Same shape+dtype+bytes treatment as image/video. Hash the
@@ -82,10 +84,34 @@ public func computeMediaSalt(for input: LMInput) -> String? {
         var sr = Int64(audio.sampleRate)
         withUnsafeBytes(of: &sr) { hasher.update(bufferPointer: $0) }
         hashMLXArray(audio.waveform, into: &hasher)
+        if let counts = audio.clipSampleCounts {
+            // The same PCM split into different clips can produce different
+            // encoder positions, segment edges, and padded code groups.
+            hasher.update(data: Data("clips:".utf8))
+            var count = Int64(counts.count)
+            withUnsafeBytes(of: &count) { hasher.update(bufferPointer: $0) }
+            for samples in counts {
+                var length = Int64(samples)
+                withUnsafeBytes(of: &length) { hasher.update(bufferPointer: $0) }
+            }
+        }
     }
 
     let digest = hasher.finalize()
     return digest.map { String(format: "%02x", $0) }.joined()
+}
+
+private func hashFrameGrids(_ frames: [THW]?, into hasher: inout SHA256) {
+    guard let frames else { return }
+    hasher.update(data: Data("grids:".utf8))
+    var count = Int64(frames.count).littleEndian
+    withUnsafeBytes(of: &count) { hasher.update(bufferPointer: $0) }
+    for frame in frames {
+        for dimension in [frame.t, frame.h, frame.w] {
+            var value = Int64(dimension).littleEndian
+            withUnsafeBytes(of: &value) { hasher.update(bufferPointer: $0) }
+        }
+    }
 }
 
 /// Feeds an MLXArray's shape, dtype, and raw contiguous bytes into an

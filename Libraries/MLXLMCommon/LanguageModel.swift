@@ -213,13 +213,20 @@ public struct LMInput {
         /// re-encode cost on every turn.
         public let preEncodedEmbedding: MLXArray?
 
+        /// Lengths of independently encoded clips packed into `waveform`.
+        /// Nil represents one clip. Keeping boundaries is necessary for audio
+        /// tokenizers that reset positions and pad code groups per clip.
+        public let clipSampleCounts: [Int]?
+
         public init(
             waveform: MLXArray, sampleRate: Int = 16_000,
-            preEncodedEmbedding: MLXArray? = nil
+            preEncodedEmbedding: MLXArray? = nil,
+            clipSampleCounts: [Int]? = nil
         ) {
             self.waveform = waveform
             self.sampleRate = sampleRate
             self.preEncodedEmbedding = preEncodedEmbedding
+            self.clipSampleCounts = clipSampleCounts
         }
     }
 
@@ -451,6 +458,16 @@ public protocol VisionLanguageModelProtocol: LanguageModel {}
 /// - the ``TokenIterator`` accumulates this information into a ``GenerateResult``
 public protocol LanguageModel: Module {
 
+    /// Whether the checkpoint's floating-point parameter dtypes are part of
+    /// this runtime's numerical contract. Such models own their activation
+    /// casts and must not receive the loader's blanket BF16 materialization.
+    var preservesCheckpointParameterDTypes: Bool { get }
+
+    /// Whether the entire forward can be traced by the generic MLX compiler.
+    /// Host routing or file-backed row selection may require eager scheduling
+    /// even when individual device kernels support compilation.
+    var supportsWholeForwardCompilation: Bool { get }
+
     /// Maximum number of sequences this architecture can decode in one
     /// model forward. `nil` means the architecture supports the batch
     /// engine's configured width. Models with path-dependent cache state that
@@ -510,6 +527,9 @@ public protocol LanguageModel: Module {
 }
 
 extension LanguageModel {
+    public var preservesCheckpointParameterDTypes: Bool { false }
+    public var supportsWholeForwardCompilation: Bool { true }
+
     /// Most standard-attention and wrapped recurrent-cache architectures use
     /// the batch engine's configured width.
     public var maximumSupportedDecodeBatchSize: Int? { nil }

@@ -1,0 +1,27 @@
+{
+  "d_model": 16,
+  "encoder_layers": 3,
+  "encoder_attention_heads": 4,
+  "encoder_ffn_dim": 32,
+  "encoder_skip_layer_id": 2,
+  "encoder_causal": true,
+  "encoder_attn_window_size": [
+    2,
+    0
+  ],
+  "hybrid_attention": true,
+  "swa_per_block": 2,
+  "kernel_size": 3,
+  "stride_size": 2,
+  "avg_pooler": 2,
+  "rope_theta": 10000,
+  "n_mels": 4,
+  "num_quantizers": 3,
+  "codebook_size": [
+    8,
+    8,
+    8
+  ],
+  "ln_type": "LayerNorm",
+  "activation_function": "gelu"
+}

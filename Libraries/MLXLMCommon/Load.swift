@@ -1299,6 +1299,7 @@ public func loadWeights(
     // mmap; recasting it is not the stock Qwen/JANG dtype policy.
     let materialiseBFloat16 =
         hadamardContract == nil
+        && !model.preservesCheckpointParameterDTypes
         && !preserveJANGAffineMmapDtypes
         && (!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16
             || autoJANGTQMmapBFloat16)
@@ -1328,6 +1329,7 @@ public func loadWeights(
         FileHandle.standardError.write(Data(
             ("[Load] dtype-materialisation bf16=\(materialiseBFloat16) mmap=\(mmapSafetensorsActive) "
                 + "jangtqNative=\(isJANGTQNative) preserveJANGAffine=\(preserveJANGAffineMmapDtypes) "
+                + "preserveCheckpointDTypes=\(model.preservesCheckpointParameterDTypes) "
                 + "autoJANGTQBF16=\(autoJANGTQMmapBFloat16) allowJANGTQBF16=\(allowJANGTQMmapBFloat16) "
                 + "params[\(summary)]\n").utf8))
     }

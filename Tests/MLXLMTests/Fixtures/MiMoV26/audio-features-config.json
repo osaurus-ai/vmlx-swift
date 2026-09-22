@@ -1,0 +1,9 @@
+{
+  "sampling_rate": 24000,
+  "nfft": 960,
+  "hop_length": 240,
+  "window_size": 960,
+  "n_mels": 128,
+  "fmin": 0,
+  "fmax": null
+}

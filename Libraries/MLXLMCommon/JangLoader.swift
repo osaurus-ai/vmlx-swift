@@ -2868,7 +2868,18 @@ public struct JangLoader: Sendable {
                     bitWidthsUsed: bitWidthsUsed)
             }
 
-            let mode = weights[basePath + ".biases"] == nil ? defaultMode : .affine
+            // Packed dimensions establish bits/group size, not the number format.
+            // A mixed bundle may use native MXFP4 for one expert projection and
+            // affine for its neighbors. Preserve a geometrically valid explicit
+            // format; an affine bias companion still takes precedence.
+            let declaredMode: QuantizationMode? = {
+                guard let declared = explicitForLayer,
+                    declared.bits == bits, declared.groupSize == inferredGroupSize
+                else { return nil }
+                return declared.mode
+            }()
+            let mode = weights[basePath + ".biases"] == nil
+                ? (declaredMode ?? defaultMode) : .affine
             let declaredMatches =
                 declaredForLayer?.bits == bits
                 && declaredForLayer?.groupSize == inferredGroupSize

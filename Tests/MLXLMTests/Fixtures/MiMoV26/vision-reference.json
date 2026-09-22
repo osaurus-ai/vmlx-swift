@@ -1,0 +1,28 @@
+{
+  "reference_sha256": "f8599fff4769bc958840576c71d3aa2094fc208c4ba1d5fb92f4b7d7059daf3c",
+  "grid": [
+    [
+      1,
+      4,
+      6
+    ],
+    [
+      2,
+      2,
+      4
+    ]
+  ],
+  "patch_grid": [
+    1,
+    4,
+    6
+  ],
+  "mlx_version": "0.32.2",
+  "generator_sha256": "5afe652d2603e6c89030b0cbb0d87436a2790cce79691a8d582784cf8c3f8989",
+  "output_shape": [
+    10,
+    16
+  ],
+  "original_generator_sha256": "601ea3d246c71c02160655e509a03f00bb9c0e527c8a0554231be05680d77c59",
+  "numpy_version": "2.4.5"
+}

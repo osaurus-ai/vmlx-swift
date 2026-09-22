@@ -248,6 +248,31 @@ final class SaveTests: XCTestCase {
         }
     }
 
+    public func testExactTensorBuffersWithNoExcludedKeys() throws {
+        try withMLXMetallibForTests {
+            let url = temporaryPath.appending(path: "exact-no-exclusions.safetensors")
+            let firstKey = "layers.0.mlp.switch_mlp.gate_proj.tq_packed"
+            let secondKey = "layers.0.mlp.switch_mlp.up_proj.tq_packed"
+            try writeSparseFloat32Safetensors(
+                at: url, firstKey: firstKey, firstValues: [1, 2, 3, 4],
+                secondKey: secondKey, secondValues: [5, 6, 7, 8], gapBytes: 1 << 20)
+            try withEnvironment("MLX_SAFETENSORS_MMAP", value: "1") {
+                try withEnvironment("MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS", value: "0") {
+                    let before = mlx_safetensors_mmap_tracked_buffer_bytes()
+                    let (arrays, _) = try MLX.loadArraysAndMetadata(
+                        url: url, excludingKeys: [], exactTensorBuffers: true)
+                    let tracked = mlx_safetensors_mmap_tracked_buffer_bytes() - before
+                    XCTAssertGreaterThan(tracked, 0)
+                    XCTAssertLessThan(tracked, 1 << 18,
+                        "an empty exclusion list must still honor exact tensor mappings")
+                    let first = try XCTUnwrap(arrays[firstKey])
+                    let second = try XCTUnwrap(arrays[secondKey])
+                    XCTAssertEqual(MLX.sum(first + second, stream: .gpu).item(Float.self), 36)
+                }
+            }
+        }
+    }
+
     public func testMmapSafetensorsForceInvalidateCanRefaultGPUComputation() throws {
         try withMLXMetallibForTests {
             let safetensorsPath = temporaryPath.appending(

@@ -108,7 +108,13 @@ public enum LLMTypeRegistry {
             "granitemoehybrid": create(
                 GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),
             "mimo": create(MiMoConfiguration.self, MiMoModel.init),
-            "mimo_v2": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
+            "mimo_v2": { data, _ in
+                let config = try JSONDecoder.json5().decode(MiMoV2FlashConfiguration.self, from: data)
+                if MiMoV26Contract.matches(data) {
+                    return try MiMoV26TextModel(config)
+                }
+                return MiMoV2FlashModel(config)
+            },
             "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
             "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
             "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),
@@ -1827,6 +1833,10 @@ public final class LLMModelFactory: ModelFactory {
             } else {
                 throw error
             }
+        }
+
+        if let mimo = model as? MiMoV26TextModel {
+            try mimo.configure(modelDirectory: modelDirectory)
         }
 
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")

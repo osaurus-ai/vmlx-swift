@@ -48,21 +48,15 @@ struct MiMoV2FlashRuntimeTests {
     }
 
     @Test("mimo_v2 source config decodes and registry dispatches native model")
-    func registryRecognizesMimoV2SourceModelType() throws {
+    func registryRecognizesMimoV2SourceModelType() async throws {
         let config = try JSONDecoder.json5().decode(
             MiMoV2FlashConfiguration.self,
             from: Self.configJSON())
         #expect(config.modelType == "mimo_v2")
 
-        let registryPath = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Libraries/MLXLLM/LLMModelFactory.swift")
-        let source = try String(contentsOf: registryPath, encoding: .utf8)
-        #expect(
-            source.contains(
-                #""mimo_v2": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init)"#))
+        let model = try await LLMTypeRegistry.shared.createModel(
+            configuration: Self.configJSON(), modelType: "mimo_v2")
+        #expect(model is MiMoV2FlashModel)
     }
 
     @Test("mimo_v2 autodetects think XML reasoning and XML function tools")

@@ -365,6 +365,7 @@ public actor BatchEngine {
     /// decode coherently on the uncompiled path but diverge on the compiled
     /// trace until each path has dedicated parity proof.
     private var compiledDecodeDeniedForModel: Bool {
+        guard context.model.supportsWholeForwardCompilation else { return true }
         if context.configuration.toolCallFormat == .hunyuan {
             return true
         }

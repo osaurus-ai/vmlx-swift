@@ -11,7 +11,7 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-private func attentionWithCacheUpdateAndSinks(
+func attentionWithCacheUpdateAndSinks(
     queries: MLXArray,
     keys: MLXArray,
     values: MLXArray,

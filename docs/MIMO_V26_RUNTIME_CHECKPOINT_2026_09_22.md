@@ -1,0 +1,192 @@
+# MiMo V2.6 converted runtime checkpoint
+
+Status: partial; not merge-ready. No release or tag is authorized.
+
+The target is the fused-QKV, mixed affine/MXFP4 representation of
+MiMo-V2.6-Flash-RL-JANG_2L. Dispatch uses the representation in `config.json`,
+not a model repository name. The older MiMo implementation remains separate.
+
+## Implemented and tested
+
+- Text backbone preserves checkpoint dtypes, fused QKV, partial rotary
+  positions, asymmetric key/value dimensions, attention sinks, and FP32
+  router/weighted-expert accumulation. Native cache is nine full KV layers
+  plus 39 rotating layers, with no TurboQuant layers.
+- Generic loading excludes auxiliary media and MTP tensors before mapping.
+  Selected text weights use exact tensor mappings. Mixed quantization keeps
+  each module's explicit, shape-valid mode.
+- Vision and input-audio component math has deterministic reference fixtures.
+  These components are not yet connected to a production multimodal factory.
+- The local mmap-enabled component run passed 68 tests in seven suites.
+  The separate 97-test loader matrix has 30 existing issues; an unchanged
+  baseline reproduces the same normalized issues. That matrix is not green.
+
+## Local app evidence
+
+All current execution is on the user's selected M5 Max Mac with 128 GiB RAM.
+The private Osaurus build uses an isolated profile and this Swift worktree.
+
+Osaurus's tool-capability rejection was caused by treating an unrecognized
+descriptive XML format string as an explicit unsupported format, while
+ignoring the bundle's `tool_parser` and `dialect`. The companion Osaurus
+change distinguishes unknown metadata from explicit unsupported capability.
+Its 15 policy tests and 16 diagnostics tests pass. Actual app requests now
+pass that gate and reach model loading and prefill. Successful tool execution
+has not yet been shown.
+
+The original Strict/mmap app row produced no response before cancellation,
+read about 923 GiB, and peaked at 1.58 GiB process physical footprint. That is
+a failed performance row, not a successful low-memory result. Exact tensor
+mappings reduce mapped allocation by about 3 GB, but another cold run still
+read 300 GiB without producing a visible response before cancellation.
+
+A controlled diagnostic changed only the existing app's custom physical
+memory fraction from 0.60 to 0.80, retaining Strict mode, the same prompt,
+native sampling, and cache topology. This places the measured mapped MLX
+allocation below the allocator limit. It also failed: 1,119 GiB read and no
+visible response before cancellation; peak physical footprint was 2.52 GiB.
+
+Further investigation found that `loadArraysAndMetadata` ignored the exact
+mapping option when its exclusion set was empty. This affected 21 of the
+target's 24 shards, so the previous loader log overstated mapping coverage.
+A new regression reproduced a 1,048,836-byte whole-shard mapping where the
+test requires less than 262,144 bytes. The corrected option handling passes
+that regression and all 12 save/load tests. The rebuilt R5 app was measured and still failed throughput, as detailed below.
+
+The pinned Metal allocator initializes explicit wired residency to zero
+(`backend/metal/allocator.h`, `resident.h`). Swift comments describing a
+75-percent default are stale. The current residency policy declines to wire
+this bundle because it exceeds the physical-memory reserve policy. Neither
+the residency policy nor the kernel working-set limit has been changed.
+
+Detailed private receipts, binary/source identities, process memory samples,
+and runtime API snapshots are in
+`~/vmlx-private-evidence/mimo26-swift-2026-09-22/STATUS.md`.
+Private paths must not enter the final package dependency pin.
+
+## Remaining gates
+
+- Coherent visible text, native reasoning on/off, real tool continuation,
+  multi-turn output, emitted token rates, and acceptable read pressure.
+- Production multimodal factory/processor, ordered image/video/audio
+  expansion, lazy auxiliary loading, and real media app requests.
+- Correct media and geometry cache identity; cold/warm/restart restoration
+  with actual BF16 KV and all topology-dependent state.
+- Saved/relaunched settings, API kwargs, applicable agent-loop evaluations,
+  and measured optimizations without prompt or sampler coercion.
+- Complete dev-app/CLI rebuild, Swift PR and merge, then Osaurus dependency
+  pin to that real merged commit and companion PR/merge. No release.
+
+## Local integration update
+
+The fresh VLM factory now wraps the fused text runtime and loads native vision/audio towers lazily. The processor reads the authoritative nested settings, expands media tokens before cache lookup, retains per-clip audio and visual geometry, and carries ordered content through Osaurus. Tiny checkpoint, media preprocessing, mixed quantization, and scatter tests execute on the local M5 Max. This remains partial until full-bundle multimodal app turns and cache restore are proven.
+
+Default-policy component results:77SwiftTesting tests with9attributed TF32 chunk-comparison issues and12/12SaveTests. The pinned backend defaults multi-rowF32GEMM toTF32 onM5; GEMV staysF32. The same text matrix passes7/7withMLX_ENABLE_TF32=0; a separate media-prefill test passes all6chunk sizes under that strict policy. No application precision policy or sampling default was changed. The F32vision fixture currently records default-M5TF32 results, so strict-F32/other-device fixture qualification remains open. Strict-F32 real-bundle audio proof now matches both WAV clips exactly through mel preprocessing and all RVQ codes; default-TF32 code parity and full media app proof remain open.
+
+The local R5 app no longer rejects tool capability metadata. A short text-only API request naturally stopped with the correct answer4, but first text took123.621seconds and throughput was0.0317tokens/s. Long tool prompts produced no response and were canceled. Exact-tensor mappings and a larger prefill chunk did not eliminate pathological weight rereads. These are failed performance rows, not usable low-RAM or completed tool/UI proof. Osaurus policy and ordered-content mapping suites pass28/28; the latest media integration still needs a fresh Releaseapp and full live/eval gates before merge. No release/tag action is authorized.
+
+
+Actual local auxiliary loading now passes with the real bundle: vision produces
+8x4096 BF16 embeddings; the two recorded speech clips produce 46x20 and 42x20
+codes, then 12x4096 and 11x4096 BF16 embeddings. The independent Python reference
+matches both mel arrays and every code exactly under strict F32. One audio
+embedding is exact; the other differs by at most 0.00048828125. Vision rotary
+CPU/Metal trig differs at approximately 1e-7; providing identical rotary values
+makes all 28 blocks and final embeddings bit-exact. These are bounded component
+diagnostics, not full multimodal generation proof.
+
+A private exact-expert mapping diagnostic produced bit-identical outputs for
+all 141 routed projections versus whole-bank gather, preserving MXFP4 and affine
+packing and companion dtypes. The first whole-bank traversal read 80.5 GiB;
+its later warm traversal took 0.136 seconds. Exact mappings expose about 2.82 GiB
+for the selected experts, with warm traversals around 0.1 seconds. Cache warmth
+and diagnostic dispatch differ, so these numbers are not end-to-end token rates
+or a qualified production speedup. A bounded full text-generation diagnostic
+is the next gate before integrating any alternative mapping path.
+
+
+## Latest bounded local diagnostics
+
+The audio tokenizer now scopes precise encoder/RVQ math to the CPU. With the
+normal TF32 backend setting, both real clips match strict Swift codes and
+embeddings exactly. This does not change global GPU precision. Full audio app
+requests and optimized frontend timing remain unproven.
+
+A private optimized exact-region forward completed three coherent natural-stop
+turns at 12.89, 14.97, and 13.25 tokens/s with 128 retained expert mappings per
+layer. Sampled physical footprint peaked at 635 MB. A separate 32 GiB process
+residency experiment did not reliably improve throughput and restored the
+previous process limit. These are private diagnostic results, not shipped code,
+Osaurus UI proof, or completion of the approximately 45 tokens/s target.
+
+A compiled attention/router experiment failed its cache-wrap parity check;
+it remains disabled pending strict correctness proof. Production mapping/kernel
+integration, full app/tool/media/cache proof, evaluation gates, and both merges
+remain outstanding. No release or tag is authorized.
+
+
+## Production exact-region checkpoint
+
+Indexed MiMo loads now validate and map exact expert slices during the throwing
+load phase, exclude routed banks from generic loading, and use package-owned
+native affine/MXFP4 Metal kernels for eight-expert decode. Seven focused tests
+pass, including bit-exact kernel and tiny full-model/cache-wrap comparisons and
+mapping-error propagation. The host-routed path declines generic whole-forward
+compilation; no sampler or prompt behavior changes.
+
+The actual local production factory and forward completed three coherent,
+natural-stop turns. Load took2.061seconds. Single-token answers4and7 took1.992
+and0.928seconds total; these do not establish a sustained decode rate. The
+longer answer measured9.205tokens/s with peak sampled physical footprint712MB.
+This is below the approximately45tokens/s target.
+
+The canonical R6 Osaurus app/CLI build completed on this Mac. In the isolated
+dev app, two consecutive `osaurus_help` calls executed with valid arguments,
+grounded visible answers, preserved history, and natural stops. Final-answer
+rates were 13.4 and 14.0 tokens/s; complete tool loops took 82.078 and 50.516
+seconds. Native thinking was then enabled through the picker: a probability
+question produced a separate closed reasoning panel and the correct visible
+answer at 14.5 tokens/s. Two-tool physical-footprint sampling peaked at 7.8 GB;
+the interval read approximately 184 GB from disk, so read pressure remains a
+performance concern. Receipts: `local-app-r6-source-identity.json`,
+`local-app-r6-tool-conversation.json`, `local-app-r6-ui-actions.jsonl`, and
+`local-app-r6-two-tools-memory-summary.json` under the private evidence root.
+
+During the follow-up, disk L2 reported a hit, with 9 ordinary KV layers and
+39 rotating layers, disk-backed restore, paged RAM off, and zero TurboQuant
+layers. The configured 30-second idle policy unloads the model and resets
+per-model counters. This is text/tool cache evidence only.
+
+The first real image attachment failed before generation. Unified runtime logs
+and a new TokenIterator regression trace this to stable-boundary capture placing
+media on a text prefix that ends before its placeholders. The split now keeps
+media with the half containing the complete placeholder span; boundaries inside
+that span remain unsplit. The fix and a related absolute-boundary offset
+correction now pass eight focused text/media tests, four existing hybrid
+stable-capture tests, and the disk-restore progress regression. The R7 app
+contains the fix: the same image retry correctly identified the red circle,
+then a second image was correctly identified as a blue square and contrasted
+with the first. A third turn without a new attachment correctly recalled which
+image had corners. All three ended naturally with separate closed reasoning
+and unlocked input. Observed rates were 8.5, 5.3, and 8.6 tokens/s; first-token
+times were 80.01, 55.45, and 7.49 seconds. Builds were concurrent during the
+latter turns; these are operational measurements, not isolated benchmarks.
+
+The follow-up cache receipt reports one disk L2 hit, 37 misses, and five stores,
+with the same 9 KV plus 39 rotating layers, paged RAM off, and zero TurboQuant
+layers. Receipts: `local-app-r7-source-identity.json`,
+`local-app-r7-multimodal-history-conversation.json`, and
+`local-app-r7-media-followup-admin-cache-stats.json`.
+
+The tiny audio tokenizer reference was regenerated on CPU F32 to match the
+production tokenizer's scoped device. All weights, input mels, and RVQ codes
+remain bit-exact; only the two reference feature arrays changed. The same
+four audio tests now pass under both strict F32 and default TF32 backend
+settings, including device restoration after success and failure.
+
+Osaurus native audio/video attachment capability evidence now uses the
+representation, native processor configuration, and installed component
+weights. The 52-test Osaurus metadata/policy/mapping matrix passes; the actual
+bundle probe reports image, audio, and video support from 1,477 root tensors.
+The fresh app rebuild is still pending. Audio/video app turns, restart cache reuse, affected full evaluations,
+performance, and both merges remain incomplete. No release or tag is authorized.

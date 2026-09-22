@@ -1,0 +1,14 @@
+{
+  "reference_sha256": "e306e75627b0c3809f2a2d4ffd464f414285c3312754d723f4e873d8d369764e",
+  "generator_sha256": "8a7187ebd3c148486e91ab317297727c504e2bed1bff6c7d935131a011d1efae",
+  "input_rate": 22050,
+  "input_samples": 2205,
+  "resampled_samples": 2400,
+  "mel_shape": [
+    11,
+    128
+  ],
+  "original_generator_sha256": "2b9a9c52b5f98002149849cc4f726c185b84dc9220ab615925722c9d0b21cca0",
+  "mlx_version": "0.32.2",
+  "numpy_version": "2.4.5"
+}

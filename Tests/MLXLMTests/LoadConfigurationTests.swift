@@ -239,8 +239,10 @@ struct LoadConfigurationTests {
 
     @Test("JANGTQ load keeps tq tensors raw and protects mmap residency")
     func jangtqLoadDoesNotSkipWholeModelBFloat16Conversion() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Load.swift",
+            contentsOf: repository.appendingPathComponent("Libraries/MLXLMCommon/Load.swift"),
             encoding: .utf8)
 
         #expect(source.contains("let mmapSafetensorsActive = envFlag(\"MLX_SAFETENSORS_MMAP\")"))

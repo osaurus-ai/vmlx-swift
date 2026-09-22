@@ -1,0 +1,12 @@
+{
+  "reference_sha256": "e306e75627b0c3809f2a2d4ffd464f414285c3312754d723f4e873d8d369764e",
+  "generator_sha256": "7d1ecaea6d59d16c756667a11035457a45ce1f8caaf288fff6dc14b0982bf60c",
+  "dtype": "bfloat16",
+  "output_shape": [
+    2,
+    16
+  ],
+  "original_generator_sha256": "60d2060950bc9a6ce1c4dfc978d84880b2e4e61a45cccd33bc3f0af33240f0c6",
+  "mlx_version": "0.32.2",
+  "numpy_version": "2.4.5"
+}

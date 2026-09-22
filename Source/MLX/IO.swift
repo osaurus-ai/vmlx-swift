@@ -187,7 +187,9 @@ public func loadArraysAndMetadata(
     exactTensorBuffers: Bool = false,
     stream: StreamOrDevice = .cpu
 ) throws -> ([String: MLXArray], [String: String]) {
-    guard !excludingKeys.isEmpty else {
+    // Exact mappings are a storage choice independent of exclusions. Text-only
+    // shards can require them even when every tensor in that shard is retained.
+    guard !excludingKeys.isEmpty || exactTensorBuffers else {
         return try loadArraysAndMetadata(url: url, stream: stream)
     }
     precondition(url.isFileURL)

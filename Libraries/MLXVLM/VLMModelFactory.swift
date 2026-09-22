@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 
 public enum VLMError: LocalizedError, Equatable {
@@ -119,6 +120,12 @@ public enum VLMTypeRegistry {
     public static let shared: ModelTypeRegistry = .init(creators: _creators)
 
     nonisolated(unsafe) private static let _creators: [String: ModelCreator] = [
+        "mimo_v2": { data, requesting in
+            guard MiMoV26Contract.matches(data) else {
+                throw ModelFactoryError.unsupportedModelType("mimo_v2 without the V2.6 fused mixed-quant contract")
+            }
+            return try MiMoV26(JSONDecoder.json5().decode(MiMoV26Configuration.self, from: data), requesting: requesting)
+        },
         "paligemma": create(PaliGemmaConfiguration.self, PaliGemma.init),
         // Block-diffusion Gemma: the MLXLLM engine with the Gemma4 vision
         // tower installed. Generation runs via BlockDiffusionTokenIterator;
@@ -246,6 +253,9 @@ public enum VLMProcessorTypeRegistry {
 
     /// Shared instance with default processor types.
     public static let shared: ProcessorTypeRegistry = .init(creators: [
+        "MiMoV26Processor": { data, tokenizer in
+            try MiMoV26Processor(JSONDecoder.json5().decode(MiMoV26ProcessorConfiguration.self, from: data), tokenizer: tokenizer)
+        },
         "MuseGlimmerProcessor": create(
             MuseGlimmerProcessorConfiguration.self, MuseGlimmerProcessor.init),
         "Glm5NextProcessor": create(
@@ -646,6 +656,9 @@ public final class VLMModelFactory: ModelFactory {
         if let configurable = model as? Qwen4ExpModelDirectoryConfigurable {
             try configurable.configure(modelDirectory: modelDirectory)
         }
+        if let mimo = model as? MiMoV26 {
+            try mimo.configure(modelDirectory: modelDirectory)
+        }
 
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let generationConfig =
@@ -839,6 +852,12 @@ private struct ProcessorConfigError: Error {
 private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
     Data, BaseProcessorConfiguration
 ) {
+    // Converted MiMo carries the authoritative settings in config.json.
+    // Its legacy Qwen preprocessor sidecar describes a different pixel path.
+    if let data = try? Data(contentsOf: modelDirectory.appendingPathComponent("config.json")),
+        MiMoV26Contract.matches(data) {
+        return (data, BaseProcessorConfiguration(processorClass: "MiMoV26Processor"))
+    }
     let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
     let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
     let audioPreprocessorConfigURL = modelDirectory.appending(

@@ -1,6 +1,14 @@
 // Copyright © 2025 Apple Inc.
 
 public enum Chat {
+    /// Ordered content references into a message's per-modality payload arrays.
+    /// Each media marker consumes the next payload of its kind.
+    public enum ContentPart: Sendable, Equatable {
+        case text(String)
+        case image
+        case video
+        case audio
+    }
     public struct Message {
         /// The role of the message sender.
         public var role: Role
@@ -28,6 +36,10 @@ public enum Chat {
         /// path populates this field; downstream
         /// ``UserInput.init(chat:)`` copies it into ``UserInput/audios``.
         public var audios: [UserInput.Audio]
+
+        /// Original rich-content order, when supplied by the host. Processors
+        /// that need native media placeholders can retain text/media interleaving.
+        public var contentParts: [ContentPart]?
 
         /// Structured tool calls issued by this message (assistant role
         /// only). `nil` on messages that did not issue tool calls.
@@ -66,7 +78,8 @@ public enum Chat {
             audios: [UserInput.Audio] = [],
             reasoningContent: String? = nil,
             toolCalls: [ToolCall]? = nil,
-            toolCallId: String? = nil
+            toolCallId: String? = nil,
+            contentParts: [ContentPart]? = nil
         ) {
             self.role = role
             self.content = content
@@ -74,6 +87,7 @@ public enum Chat {
             self.images = images
             self.videos = videos
             self.audios = audios
+            self.contentParts = contentParts
             self.toolCalls = toolCalls
             self.toolCallId = toolCallId
         }

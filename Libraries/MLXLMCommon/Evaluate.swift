@@ -1530,6 +1530,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     private static let logger = Logger(subsystem: "vmlx", category: "TokenIterator")
 
     private static func compiledDecodeDenied(for model: any LanguageModel) -> Bool {
+        guard model.supportsWholeForwardCompilation else { return true }
         let typeName = String(describing: type(of: model)).lowercased()
         // DSV4 owns a composite SWA + CSA/HSA cache. Its stateless gate and
         // SwiGLU micrographs are already compiled inside the model, while the
@@ -2398,6 +2399,22 @@ public struct TokenIterator: TokenIteratorProtocol {
         let split = boundary - (promptTokenIds.count - size)
         guard split >= 0, split < size else { return nil }
 
+        // Keep a media payload with the complete placeholder span it belongs
+        // to. Stable system/history boundaries can precede that span; putting
+        // the payload on the text-only head loses it from the actual media
+        // prefill. A split inside the span cannot partition opaque tower inputs.
+        var mediaInHead = false
+        var mediaInTail = false
+        if input.hasMediaContent {
+            guard let mediaTokenIds = input.mediaTokenIds, !mediaTokenIds.isEmpty else { return nil }
+            let ids = input.text.tokenIds ?? input.text.tokens.reshaped(-1).asArray(Int.self)
+            guard ids.count == size else { return nil }
+            let media = Set(mediaTokenIds)
+            mediaInHead = ids[..<split].contains(where: media.contains)
+            mediaInTail = ids[split...].contains(where: media.contains)
+            guard mediaInHead != mediaInTail else { return nil }
+        }
+
         // The mask, when present, is per-token (`Qwen3VLProcessor` hands the
         // hybrids an all-ones `[1, T]`), so it slices exactly like the tokens.
         // Anything not token-aligned — a materialized `[1, 1, T, T]` attention
@@ -2420,9 +2437,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                     tokens: flat[..<split][.newAxis, 0...],
                     mask: flatMask.map { slice($0[..<split]) },
                     tokenIds: headTokenIds),
-                image: input.image,
-                video: input.video,
-                audio: input.audio,
+                image: mediaInHead ? input.image : nil,
+                video: mediaInHead ? input.video : nil,
+                audio: mediaInHead ? input.audio : nil,
                 mediaTokenIds: input.mediaTokenIds,
                 cacheScopeSalt: input.cacheScopeSalt,
                 cachePromptIntent: input.cachePromptIntent,
@@ -2433,6 +2450,10 @@ public struct TokenIterator: TokenIteratorProtocol {
                 tokens: flat[split...][.newAxis, 0...],
                 mask: flatMask.map { slice($0[split...]) },
                 tokenIds: tailTokenIds),
+            image: mediaInTail ? input.image : nil,
+            video: mediaInTail ? input.video : nil,
+            audio: mediaInTail ? input.audio : nil,
+            mediaTokenIds: input.mediaTokenIds,
             cacheScopeSalt: input.cacheScopeSalt,
             cachePromptIntent: input.cachePromptIntent,
             toolSchemas: input.toolSchemas)
@@ -2571,7 +2592,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         var remaining = input
         for boundary in wanted {
             guard boundary > consumed,
-                let split = boundarySplit(of: remaining, at: boundary - consumed),
+                let split = boundarySplit(of: remaining, at: boundary),
                 let head = split.head
             else { continue }
             let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
