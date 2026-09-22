@@ -155,6 +155,69 @@ struct MiMoV26RuntimeTests {
         Self.expectChunkParity(actual, whole[0, -1])
     }
 
+    @Test("Warm iterator captures use absolute prompt boundaries")
+    func warmIteratorBoundaryIdentity() throws {
+        MLXRandom.seed(26)
+        let model = try Self.model()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false, enableDiskCache: true, diskCacheDir: directory,
+            modelKey: "mimo-tiny-warm-boundary"))
+        let parameters = GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 16)
+        func input(_ tokens: [Int], boundaries: [Int]) -> LMInput {
+            LMInput(tokens: MLXArray(tokens.map(Int32.init)).reshaped(1, tokens.count),
+                    tokenIds: tokens, cachePrefixTokenCounts: boundaries,
+                    cacheStablePrefixTokenCounts: [37])
+        }
+        let seedTokens = Array(0..<60)
+        let seedInput = input(seedTokens, boundaries: [37, 52])
+        var seed = try TokenIterator(input: seedInput, model: model, parameters: parameters,
+                                     cacheCoordinator: coordinator)
+        seed.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+        let probeTokens = Array(seedTokens.prefix(37)) + Array(70..<100)
+        let probeInput = input(probeTokens, boundaries: [37, 59])
+        let hit = coordinator.fetch(tokens: probeTokens,
+                                    mediaSalt: computeCacheSalt(for: probeInput, parameters: parameters),
+                                    skipExactDiskBoundary: true, preferredDiskBoundaries: [37])
+        guard case .hit(let matched, _, let detail, _, _, _) = hit else {
+            Issue.record("Missing prerequisite disk prefix hit")
+            return
+        }
+        #expect(matched == 36)
+        #expect(detail == .disk)
+        var warm = try TokenIterator(input: probeInput, model: model, parameters: parameters,
+                                     cacheCoordinator: coordinator)
+        #expect(!warm.stableBoundarySnapshots.isEmpty)
+        for (boundary, snapshot) in warm.stableBoundarySnapshots {
+            #expect(snapshot.allSatisfy { $0.offset == boundary },
+                    "snapshot key \(boundary) has offsets \(snapshot.map(\.offset))")
+        }
+        #expect(warm.cache.allSatisfy { $0.offset == probeTokens.count })
+        warm.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+        // A later turn must be able to reuse the boundary just captured by a
+        // warm turn, with the same continuation as an uncached full prefill.
+        let thirdTokens = Array(probeTokens.prefix(59)) + Array(100..<112)
+        let thirdInput = input(thirdTokens, boundaries: [37, 59, 63])
+        let thirdHit = coordinator.fetch(tokens: thirdTokens,
+                                         mediaSalt: computeCacheSalt(for: thirdInput, parameters: parameters),
+                                         skipExactDiskBoundary: true, preferredDiskBoundaries: [59])
+        guard case .hit(let thirdMatched, _, .disk, _, _, _) = thirdHit else {
+            Issue.record("Warm turn did not publish a reusable disk boundary")
+            return
+        }
+        #expect(thirdMatched == 59)
+        let third = try TokenIterator(input: thirdInput, model: model, parameters: parameters,
+                                      cacheCoordinator: coordinator)
+        let cold = model.newCache(parameters: parameters)
+        eval(model(MLXArray(thirdTokens).reshaped(1, thirdTokens.count), cache: cold), cold)
+        let continuation = MLXArray([Int32(112)]).reshaped(1, 1)
+        let restoredLogits = model(continuation, cache: third.cache)
+        let freshLogits = model(continuation, cache: cold)
+        eval(restoredLogits, freshLogits)
+        Self.expectChunkParity(restoredLogits, freshLogits)
+    }
+
     @Test("Disk snapshots preserve asymmetric KV and wrapped sliding state", arguments: [5, 9, 17])
     func diskCacheRoundTrip(prefix: Int) throws {
         MLXRandom.seed(26)

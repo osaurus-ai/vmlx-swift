@@ -2483,6 +2483,9 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        // A warm input contains only the suffix after the restored prefix.
+        // Snapshot keys and processor boundaries refer to the whole prompt.
+        let inputStart = promptTokenIds.count - input.text.tokens.size
         // Prefill to a reusable structural boundary first, copy the exact cache
         // state, then consume the tail. Both halves run through the model's real
         // prepare/forward path in order; this avoids a second full prefill after
@@ -2513,11 +2516,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             // The head we just prefilled ends exactly at a boundary the store
             // loop will ask for later. Keep it so that loop can use it instead
             // of replaying the prefix through the model.
-            var capturedHeadCount = 0
+            var capturedBoundary = inputStart
             if let head = capture.head {
-                capturedHeadCount = head.text.tokenIds?.count ?? head.text.tokens.size
-                if capturedHeadCount > 0 {
-                    stableBoundarySnapshots[capturedHeadCount] = snapshot
+                capturedBoundary += head.text.tokenIds?.count ?? head.text.tokens.size
+                if capturedBoundary > inputStart {
+                    stableBoundarySnapshots[capturedBoundary] = snapshot
                 }
             }
             // Keep going through the stable boundaries that sit AFTER this
@@ -2529,7 +2532,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             if try prepareCapturingStableBoundaries(
                 input: capture.tail,
                 windowSize: windowSize,
-                alreadyConsumed: capturedHeadCount,
+                alreadyConsumed: capturedBoundary,
                 promptTokensForProcessor: input.text.tokens)
             {
                 return
@@ -2540,7 +2543,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             return
         }
         if try prepareCapturingStableBoundaries(
-            input: input, windowSize: windowSize, alreadyConsumed: 0,
+            input: input, windowSize: windowSize, alreadyConsumed: inputStart,
             promptTokensForProcessor: input.text.tokens)
         {
             return

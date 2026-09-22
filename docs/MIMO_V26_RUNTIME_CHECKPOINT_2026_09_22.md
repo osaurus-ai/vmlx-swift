@@ -256,3 +256,37 @@ Additional receipts: `local-media-video-timing-r1.log`,
 `vision-dual-precision-comparison.json`, `local-media-strict-r26.log`,
 `local-media-default-r27.log`, `local-cache-roundtrip-r1.log`,
 `evals-r8-baseline-interruption.json`, and `evals-r8-memory-only-ab/AgentLoop.json`.
+
+### R9 video retry and warm-cache boundary correction
+
+The rebuilt local app now describes the actual video correctly: red circle to
+blue square, on white, with the transition at one second. A second turn correctly
+identifies the final blue square on white. Both stop naturally with thinking off.
+The rows generated 116 tokens at 4.8 tokens/s (90.95 s TTFT plus 2 s load), then
+17 tokens at 5.8 tokens/s (34.05 s TTFT). Compiler activity was concurrent; these
+are operational observations, not an isolated performance comparison. Peak app
+physical footprint was 7,830,115,632 bytes, with 369,837,142,016 bytes of read I/O
+over the sampled run. The approximately 45 tokens/s target remains unmet.
+The cache receipt records one L2 hit, 14 misses, five stores, nine full-KV and
+39 rotating layers, paged RAM off, and TurboQuant layer count zero.
+
+R9 app SHA256 is
+`421d0d5fec5afe9a5e7e70367f12bdc79ae2949889ebe854a4ad97991b4c3eac`,
+built from runtime `2cefe12fc3a68bdb91b3f56f4836ad2f14d57c38` and the recorded
+Osaurus worktree. Receipts: `local-app-r9-source-identity.json`,
+`local-app-r9-video-multiturn-conversation.json`,
+`local-app-r9-video-followup-cache.json`, and `local-app-r9-memory-summary.json`.
+
+A subsequent real TokenIterator reproduction found a warm-prefill bookkeeping
+defect: a snapshot at absolute token 59 was labeled token 23 after restoring 36
+tokens. Capture keys and stable-boundary traversal now include that restored
+prefix. The regression failed before the correction and passes afterward,
+including a third-turn disk restore whose continuation agrees with fresh prefill.
+The strict matrix passes 19 tests in three suites with zero issues; the default
+matrix passes 13 tests with four previously attributed TF32 chunk differences.
+The strict invocation must set `TEST_RUNNER_MLX_ENABLE_TF32=0`, since a bare shell
+`MLX_ENABLE_TF32` is not forwarded by Xcode. Receipts: `local-warm-boundary-r1.log`,
+`local-warm-boundary-r3.log`, and `local-warm-boundary-r4-strict.log`.
+This confirmed defect is not yet established as the cause of the full-model
+post-tool failures. The correction is newer than the R9 app; refreshed app and
+full eval proof are still required before merge.
