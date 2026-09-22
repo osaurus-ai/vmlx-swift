@@ -20,14 +20,20 @@ tower.load_weights(list(weights.items()),strict=True)
 grid=np.array([[1,4,6],[2,2,4]])
 pixels=mx.array((np.arange(40*24,dtype=np.float32)%53-26).reshape(40,24)*.04)
 out=tower(pixels,grid);mx.eval(out)
+# Preserve the default-GPU reference and independently evaluate the same
+# reference implementation under CPU F32. M5 default GPU GEMM may use TF32;
+# strict-F32 and non-TF32 devices must not compare against that rounded golden.
+with mx.stream(mx.cpu):
+    out_f32=tower(pixels,grid)
+    mx.eval(out_f32)
 cos,sin=v.rotary_cos_sin(grid,4,2)
 raw=(np.arange(3*5*7,dtype=np.float32)%251).reshape(1,3,5,7)
 resized=v.resize_bilinear(raw,8,12)
 normalized=(resized-v.PIXEL_MEAN[None,:,None,None])/v.PIXEL_STD[None,:,None,None]
 patches,patch_grid=v.flatten_patches(np.repeat(normalized,2,axis=0),2,2,2)
 arrays={'weight.'+k:a for k,a in weights.items()}
-arrays.update(pixels=pixels,expected=out,cosine=mx.array(cos),sine=mx.array(sin),columns=mx.array(v.window_index_col(grid)),raw=mx.array(raw),resized=mx.array(resized),patches=mx.array(patches))
+arrays.update(pixels=pixels,expected=out,expected_f32=out_f32,cosine=mx.array(cos),sine=mx.array(sin),columns=mx.array(v.window_index_col(grid)),raw=mx.array(raw),resized=mx.array(resized),patches=mx.array(patches))
 mx.save_safetensors(str(root/'vision-reference.safetensors'),arrays)
 (root/'vision-config.json').write_text(json.dumps(cfg,indent=2)+'\n')
-(root/'vision-reference.json').write_text(json.dumps(dict(reference_sha256=hashlib.sha256((source).read_bytes()).hexdigest(),grid=grid.tolist(),patch_grid=list(patch_grid),mlx_version=mx.__version__,generator_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),output_shape=list(out.shape)),indent=2)+'\n')
+(root/'vision-reference.json').write_text(json.dumps(dict(reference_sha256=hashlib.sha256((source).read_bytes()).hexdigest(),grid=grid.tolist(),patch_grid=list(patch_grid),mlx_version=mx.__version__,generator_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),output_shape=list(out.shape),reference_math=dict(expected="default_gpu",expected_f32="cpu_f32"),gpu_device=mx.metal.device_info()),indent=2)+'\n')
 print((root/'vision-reference.json').read_text())

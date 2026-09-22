@@ -3,6 +3,7 @@
 
 import CoreImage
 import CoreMedia
+import AVFoundation
 import Foundation
 import MLX
 import MLXLMCommon
@@ -41,6 +42,80 @@ private struct MiMoMediaTestTokenizer: Tokenizer {
 
 @Suite("MiMo V2.6 native media prompt preparation", .serialized)
 struct MiMoV26ProcessorTests {
+    @Test("Video sampling uses decoded presentation times rather than nominal FPS")
+    func encodedVideoFrameTiming() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 64, AVVideoHeightKey: 64,
+        ])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input,
+            sourcePixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+                kCVPixelBufferWidthKey as String: 64, kCVPixelBufferHeightKey as String: 64])
+        writer.add(input)
+        #expect(writer.startWriting())
+        writer.startSession(atSourceTime: .zero)
+        let seconds = [0.0, 0.2, 0.8, 1.5]
+        for time in seconds {
+            let deadline = Date().addingTimeInterval(10)
+            while !input.isReadyForMoreMediaData && Date() < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            try #require(input.isReadyForMoreMediaData)
+            var buffer: CVPixelBuffer?
+            #expect(CVPixelBufferPoolCreatePixelBuffer(nil, try #require(adaptor.pixelBufferPool), &buffer) == kCVReturnSuccess)
+            let pixelBuffer = try #require(buffer)
+            CVPixelBufferLockBaseAddress(pixelBuffer, [])
+            let base = try #require(CVPixelBufferGetBaseAddress(pixelBuffer))
+            memset(base, 255, CVPixelBufferGetDataSize(pixelBuffer))
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+            #expect(adaptor.append(pixelBuffer, withPresentationTime: CMTime(seconds: time, preferredTimescale: 600)))
+        }
+        writer.endSession(atSourceTime: CMTime(seconds: 2, preferredTimescale: 600))
+        input.markAsFinished()
+        await writer.finishWriting()
+        try #require(writer.status == .completed)
+        let asset = AVURLAsset(url: url)
+        let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
+        let times = try MiMoV26Processor.videoPresentationTimes(asset: asset, track: track)
+        #expect(times.count == seconds.count)
+        for (actual, expected) in zip(times, seconds) {
+            #expect(abs(actual.seconds - expected) < 0.002)
+        }
+        let result = try await processor().prepare(input: UserInput(chat: [
+            Chat.Message(role: .user, content: "describe", videos: [.url(url)]),
+        ]))
+        let grid = try #require(result.video?.frames?.first)
+        #expect(grid.t == 2) // All four decoded frames, two per temporal patch.
+        #expect(result.text.tokenIds?.filter { $0 == 151656 }.count == grid.product / 4)
+    }
+
+    @Test("Encoded sRGB pixels are normalized once for images and video")
+    func encodedSRGBPixels() async throws {
+        let bytes = Data(Array(repeating: [UInt8(64), 128, 192, 255], count: 64 * 64).flatMap { $0 })
+        let provider = try #require(CGDataProvider(data: bytes as CFData))
+        let cg = try #require(CGImage(width: 64, height: 64, bitsPerComponent: 8, bitsPerPixel: 32,
+            bytesPerRow: 64 * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue), provider: provider,
+            decode: nil, shouldInterpolate: false, intent: .defaultIntent))
+        let image = CIImage(cgImage: cg)
+        let frames = [0.0, 1.0].map {
+            UserInput.VideoFrame(frame: image, timeStamp: CMTime(seconds: $0, preferredTimescale: 600))
+        }
+        let message = Chat.Message(role: .user, content: "describe", images: [.ciImage(image)],
+            videos: [.frames(frames)])
+        let result = try await processor().prepare(input: UserInput(chat: [message]))
+        for pixels in [try #require(result.image?.pixels), try #require(result.video?.pixels)] {
+            // Packed columns are C,T,P,P. Uniform sRGB bytes must preserve their
+            // numerical values before the vendor's mean/std normalization.
+            let channels = pixels.reshaped(-1, 3, 2 * 16 * 16).mean(axes: [0, 2])
+            let expected = MLXArray([(Float(64) - 123.675) / 58.395,
+                (Float(128) - 116.28) / 57.12, (Float(192) - 103.53) / 57.375])
+            #expect(allClose(channels, expected, rtol: 0, atol: 0.01).item(Bool.self))
+        }
+    }
+
     private func processor() throws -> MiMoV26Processor {
         let file = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .appendingPathComponent("Fixtures/MiMoV26/processor-config.json")

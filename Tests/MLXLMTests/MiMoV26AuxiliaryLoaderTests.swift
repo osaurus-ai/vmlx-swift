@@ -101,7 +101,7 @@ struct MiMoV26AuxiliaryLoaderTests {
             .write(to: directory.appendingPathComponent("model.safetensors.index.json"))
         let loaded = try MiMoV26AuxiliaryLoader.vision(in: directory, configuration: config)
         let output = try loaded(#require(values["pixels"]), grid: [THW(1, 4, 6), THW(2, 2, 4)])
-        #expect(allClose(output, try #require(values["expected"]), rtol: 2e-4, atol: 2e-5).item(Bool.self))
+        #expect(try MiMoV26VisionTests.matchesReference(output, tensors: values))
 
         var object = try #require(JSONSerialization.jsonObject(with: MiMoV26RuntimeTests.configuration()) as? [String: Any])
         object["hidden_size"] = 16
@@ -118,9 +118,10 @@ struct MiMoV26AuxiliaryLoaderTests {
             image: .init(pixels: try #require(values["pixels"])[..<24], frames: [THW(1, 4, 6)]),
             video: .init(pixels: try #require(values["pixels"])[24...], frames: [THW(2, 2, 4)]))
         let embeddings = try wrapped.inputEmbeddings(input)[0]
-        let expected = try #require(values["expected"])
-        #expect(allClose(embeddings[MLXArray([4, 5, 6, 7, 8, 9])], expected[..<6], rtol: 2e-4, atol: 2e-5).item(Bool.self))
-        #expect(allClose(embeddings[MLXArray([1, 2, 11, 12])], expected[6...], rtol: 2e-4, atol: 2e-5).item(Bool.self))
+        #expect(try MiMoV26VisionTests.matchesReference(embeddings[MLXArray([4, 5, 6, 7, 8, 9])],
+            tensors: values, selecting: { $0[..<6] }))
+        #expect(try MiMoV26VisionTests.matchesReference(embeddings[MLXArray([1, 2, 11, 12])],
+            tensors: values, selecting: { $0[6...] }))
         #expect(arrayEqual(embeddings[MLXArray([0, 3, 10])], wrapped.languageModel.embed(MLXArray([1, 2, 3]))).item(Bool.self))
         let fullCache = wrapped.newCache(parameters: nil), splitCache = wrapped.newCache(parameters: nil)
         let full = wrapped.languageModel(embeddings: embeddings[.newAxis], cache: fullCache)

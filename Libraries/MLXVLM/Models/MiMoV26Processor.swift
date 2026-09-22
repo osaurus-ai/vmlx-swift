@@ -88,7 +88,10 @@ struct MiMoV26Processor: UserInputProcessor {
     }
 
     private func pixels(_ image: CIImage, processing: UserInput.Processing?) throws -> MLXArray {
-        let image = MediaProcessing.apply(image, processing: processing).toSRGB()
+        // Rendering into an explicit sRGB color space performs the conversion.
+        // An additional tone-curve filter would encode it twice and change the
+        // vendor's numerical RGB input (including midtones in video frames).
+        let image = MediaProcessing.apply(image, processing: processing)
         guard !image.extent.isEmpty, !image.extent.isInfinite else { throw VLMError.processing("Invalid MiMo image extent") }
         // CI's floating rendering is 0...1; native MiMo pixel math starts at 0...255.
         return image.asMLXArray(colorSpace: CGColorSpace(name: CGColorSpace.sRGB)) * 255
@@ -129,11 +132,15 @@ struct MiMoV26Processor: UserInputProcessor {
             return try await videoFrames(.avAsset(AVURLAsset(url: url)))
         case .avAsset(let asset):
             guard let track = try await asset.loadTracks(withMediaType: .video).first else { throw VLMError.noVideoTrackFound }
-            let fps = Double(try await track.load(.nominalFrameRate))
             let seconds = try await asset.load(.duration).seconds
-            guard seconds.isFinite, seconds > 0, fps.isFinite, fps > 0,
-                seconds * fps < Double(Int.max) else { throw VLMError.videoNotDecodable }
-            let indices = try sampleIndices(total: Int((seconds * fps).rounded()), fps: fps)
+            guard seconds.isFinite, seconds > 0 else { throw VLMError.videoNotDecodable }
+            // nominalFrameRate * duration is not a sample count, particularly
+            // with edit lists or variable frame durations. Scan presentation
+            // times without retaining decoded frames, then decode only the
+            // selected frames into the model payload. Compressed sample buffers
+            // can include preroll/non-display packets, so use decoded samples.
+            let times = try Self.videoPresentationTimes(asset: asset, track: track)
+            let indices = try sampleIndices(total: times.count, fps: Double(times.count) / seconds)
             let generator = AVAssetImageGenerator(asset: asset)
             generator.appliesPreferredTrackTransform = true
             generator.requestedTimeToleranceBefore = .zero
@@ -141,12 +148,38 @@ struct MiMoV26Processor: UserInputProcessor {
             var frames: [UserInput.VideoFrame] = []
             for index in indices {
                 try Task.checkCancellation()
-                let time = CMTime(seconds: Double(index) / fps, preferredTimescale: 60_000)
+                let time = times[index]
                 let (image, _) = try await generator.image(at: time)
                 frames.append(.init(frame: CIImage(cgImage: image), timeStamp: time))
             }
             return frames
         }
+    }
+
+    static func videoPresentationTimes(asset: AVAsset, track: AVAssetTrack) throws -> [CMTime] {
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track,
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { throw VLMError.videoNotDecodable }
+        reader.add(output)
+        guard reader.startReading() else { throw reader.error ?? VLMError.videoNotDecodable }
+        defer { reader.cancelReading() }
+        var times: [CMTime] = []
+        while let sample = output.copyNextSampleBuffer() {
+            try Task.checkCancellation()
+            let time = CMSampleBufferGetPresentationTimeStamp(sample)
+            guard time.isNumeric, time.seconds >= 0 else { throw VLMError.videoNotDecodable }
+            times.append(time)
+        }
+        try Task.checkCancellation()
+        guard reader.status == .completed else { throw reader.error ?? VLMError.videoNotDecodable }
+        times.sort { CMTimeCompare($0, $1) < 0 }
+        guard times.count >= 2,
+            zip(times, times.dropFirst()).allSatisfy({ CMTimeCompare($0, $1) < 0 }) else {
+            throw VLMError.videoNotDecodable
+        }
+        return times
     }
 
     private func video(_ video: UserInput.Video, processing: UserInput.Processing?) async throws -> Visual {

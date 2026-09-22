@@ -87,7 +87,7 @@ The local R5 app no longer rejects tool capability metadata. A short text-only A
 
 
 Actual local auxiliary loading now passes with the real bundle: vision produces
-8x4096 BF16 embeddings; the two recorded speech clips produce 46x20 and 42x20
+8x4096 BF16 embeddings; the two locally synthesized speech clips produce 46x20 and 42x20
 codes, then 12x4096 and 11x4096 BF16 embeddings. The independent Python reference
 matches both mel arrays and every code exactly under strict F32. One audio
 embedding is exact; the other differs by at most 0.00048828125. Vision rotary
@@ -190,3 +190,69 @@ weights. The 52-test Osaurus metadata/policy/mapping matrix passes; the actual
 bundle probe reports image, audio, and video support from 1,477 root tensors.
 The fresh app rebuild is still pending. Audio/video app turns, restart cache reuse, affected full evaluations,
 performance, and both merges remain incomplete. No release or tag is authorized.
+
+
+### R8 local app and media accuracy checkpoint
+
+The fresh R8 app completed three audio turns with Thinking off, using neutral
+attachment names. It transcribed the first clip as “The access code is blue
+seven,” identified the second as “green nine,” compared the changed color and
+number, and recalled the first clip on a follow-up without a new attachment.
+All three ended naturally with empty reasoning fields and unlocked input.
+Observed rates were 6.9, 10.2, and 12.0 tokens/s. These WAV fixtures were
+synthesized locally with macOS speech, not human recordings.
+
+Video accuracy failed. The attached four-frame fixture contains a red circle
+followed by a blue square on white. The model invented additional shapes,
+split/merge events, and a black background; its follow-up repeated the wrong
+background and shape count. Both turns stopped naturally, at 10.3 and 11.5
+tokens/s, but neither is an accuracy pass. Decoded frames were inspected using
+both FFmpeg and AVFoundation. The processor's nominal-FPS frame-count estimate
+selects only two frames from this four-frame asset. Independent sRGB pixel
+checks also reproduced a double tone-curve conversion in image and video
+preparation; a regression fails both modalities before the correction.
+Correction and refreshed live proof are in progress.
+
+Model-free ToolEnvelope and ToolResultGrounding suites passed 10/10 and 15/15.
+The full local AgentLoop, AgentLoopFrontier, ReasoningChannel, and CacheProof
+run is in progress. No external judge key is configured; fallback self-judge
+rubrics require manual review and are not independent scores. This local run
+does not establish a frontier-provider model result.
+
+R8 app SHA256:
+`58d63d073a87516f979d24ee9f64af79671af62f7c9fa5f4e994d28d1ed96c3c`.
+Runtime source for that app: `3a927fee1aacc8b6ea41fcac02543c124ca77b82`.
+Receipts are `local-app-r8-source-identity.json`,
+`local-app-r8-audio-multiturn-conversation.json`,
+`local-app-r8-video-multiturn-conversation.json`,
+`local-media-colors-r1.log`, and `evals-r8-deterministic-r2/` in the private
+evidence directory. The current processor correction is newer than this app.
+Performance remains below the approximately 45 tokens/s target. Both merges
+remain incomplete; no release or tag is authorized.
+
+
+The color and timestamp corrections now pass five processor tests, including
+an encoded sRGB fixture and an H.264 file generated with variable presentation
+times. R9 app proof remains pending. The vision fixture now retains all 62
+original tensors unchanged and adds a CPU-F32 golden from the independent
+reference. The strict matrix passes 23/23 with zero issues. The default matrix
+runs 23 tests with the same nine documented TF32 chunk differences; no comparison
+tolerance or production precision setting changed. A separate parameterized
+MiMo disk round-trip test passes all three wrapped-window cases with bit-exact
+BF16 state and continuation logits.
+
+The older R8 full-eval baseline was interrupted after eight completed cases:
+five passed and three failed. The failures include incorrect file content and
+garbled post-tool replies. All three had disk L2 hits, but that association is
+not a diagnosis. A focused memory-only comparison errored on all three cases:
+the first generated one tool call, then a reload was refused; the remaining
+cases failed admission. The harness had omitted the app's saved server-runtime
+profile, including its mmap-loading and prefill policy. The comparison is
+inconclusive. The Osaurus eval bootstrap correction now preserves that profile
+while redirecting writable KV directories into isolated storage; its tests and
+refreshed matched-profile runs are pending. Full eval gates remain incomplete.
+
+Additional receipts: `local-media-video-timing-r1.log`,
+`vision-dual-precision-comparison.json`, `local-media-strict-r26.log`,
+`local-media-default-r27.log`, `local-cache-roundtrip-r1.log`,
+`evals-r8-baseline-interruption.json`, and `evals-r8-memory-only-ab/AgentLoop.json`.

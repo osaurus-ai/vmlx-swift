@@ -18,11 +18,21 @@
     6
   ],
   "mlx_version": "0.32.2",
-  "generator_sha256": "5afe652d2603e6c89030b0cbb0d87436a2790cce79691a8d582784cf8c3f8989",
+  "generator_sha256": "17f3dc68d1b317226b40d64a43094f5eb5837b3dde4834b55fd45cc44ee65dbc",
   "output_shape": [
     10,
     16
   ],
-  "original_generator_sha256": "601ea3d246c71c02160655e509a03f00bb9c0e527c8a0554231be05680d77c59",
-  "numpy_version": "2.4.5"
+  "reference_math": {
+    "expected": "default_gpu",
+    "expected_f32": "cpu_f32"
+  },
+  "gpu_device": {
+    "device_name": "Apple M5 Max",
+    "max_recommended_working_set_size": 115448725504,
+    "memory_size": 137438953472,
+    "architecture": "applegpu_g17s",
+    "max_buffer_length": 86586540032,
+    "resource_limit": 499000
+  }
 }

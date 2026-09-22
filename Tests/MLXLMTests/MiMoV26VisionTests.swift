@@ -17,6 +17,19 @@ struct MiMoV26VisionTests {
         try MLX.loadArrays(url: Self.fixtures.appendingPathComponent("vision-reference.safetensors"))
     }
 
+    /// Both goldens come from the independent reference tower with identical
+    /// weights and inputs. Default GPU math can use TF32 on supported devices;
+    /// an explicitly strict process must match CPU F32, never the TF32 golden.
+    /// The complete output must match one policy at the original tolerance.
+    static func matchesReference(_ actual: MLXArray, tensors: [String: MLXArray],
+        selecting: (MLXArray) -> MLXArray = { $0 }) throws -> Bool {
+        let keys = ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0"
+            ? ["expected_f32"] : ["expected_f32", "expected"]
+        return try keys.contains { key in
+            allClose(actual, selecting(try #require(tensors[key])), rtol: 2e-4, atol: 2e-5).item(Bool.self)
+        }
+    }
+
     @Test("Flattened patches with different geometry cannot reuse media cache state")
     func cacheGeometry() {
         let pixels = MLXArray((0..<96).map { Float($0) }).reshaped(8, 12)
@@ -49,10 +62,9 @@ struct MiMoV26VisionTests {
         try tower.update(parameters: ModuleParameters.unflattened(weights), verify: .all)
         let grid = [THW(1, 4, 6), THW(2, 2, 4)]
         let result = try tower(#require(tensors["pixels"]), grid: grid)
-        let expected = try #require(tensors["expected"])
         eval(result)
         #expect(result.shape == [10, 16])
-        #expect(allClose(result, expected, rtol: 2e-4, atol: 2e-5).item(Bool.self))
+        #expect(try Self.matchesReference(result, tensors: tensors))
         // A separate item/temporal frame must never attend to earlier frames.
         let isolated = try tower(#require(tensors["pixels"])[24...], grid: [THW(2, 2, 4)])
         #expect(allClose(result[6...], isolated, rtol: 2e-4, atol: 2e-5).item(Bool.self))

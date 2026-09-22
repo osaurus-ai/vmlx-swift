@@ -155,6 +155,42 @@ struct MiMoV26RuntimeTests {
         Self.expectChunkParity(actual, whole[0, -1])
     }
 
+    @Test("Disk snapshots preserve asymmetric KV and wrapped sliding state", arguments: [5, 9, 17])
+    func diskCacheRoundTrip(prefix: Int) throws {
+        MLXRandom.seed(26)
+        let model = try Self.model()
+        model.update(parameters: ModuleParameters.unflattened(
+            model.parameters().flattened().map { ($0.0, $0.1.asType(.bfloat16)) }))
+        let live = model.newCache(parameters: nil)
+        eval(model(MLXArray(Array(0..<prefix)).reshaped(1, prefix), cache: live), live)
+        // Exercise the ring after decode has wrapped, not only concat-prefill.
+        for token in prefix..<(prefix + 3) {
+            eval(model(MLXArray([token]).reshaped(1, 1), cache: live), live)
+        }
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".safetensors")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let arrays = TQDiskSerializer.serialize(cache: live, preserveStandardKVStorageDType: true)
+        try MLX.save(arrays: arrays, url: file)
+        var restored = model.newCache(parameters: nil)
+        #expect(restoreFromDiskArrays(try MLX.loadArrays(url: file), into: &restored,
+            requirePromptBoundary: true) == prefix + 3)
+        eval(restored)
+        for (original, copy) in zip(live, restored) {
+            #expect(original.metaState == copy.metaState)
+            for (a, b) in zip(original.state, copy.state) {
+                #expect(a.dtype == b.dtype && arrayEqual(a, b).item(Bool.self))
+            }
+        }
+        for tail in [[prefix + 3, prefix + 4, prefix + 5], [prefix + 6]] {
+            let tokens = MLXArray(tail).reshaped(1, tail.count)
+            let expected = model(tokens, cache: live)
+            let actual = model(tokens, cache: restored)
+            eval(expected, actual, live, restored)
+            #expect(arrayEqual(actual, expected).item(Bool.self))
+            #expect(live.map(\.offset) == restored.map(\.offset))
+        }
+    }
+
     @Test("Real safetensors load preserves mixed expert formats and FP32 router parameters")
     func mixedCheckpointRoundTrip() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
