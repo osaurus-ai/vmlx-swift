@@ -92,6 +92,41 @@ private func makeCacheDir() -> URL {
     }
 }
 
+/// LRU, not FIFO: a hit refreshes a row's recency, so an old row that was just
+/// read outlives a newer row nobody has touched.
+@Test func aHitRefreshesRecencySoTheUntouchedRowGoesFirst() throws {
+    try MLXMetalTestLock.withLock {
+        let dir = makeCacheDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let cache = DiskCache(cacheDir: dir, maxSizeBytes: 250_000, modelKey: "lru-hit")
+
+        store(cache, tokens: [1, 1, 1], approximateBytes: 100_000)  // oldest
+        Thread.sleep(forTimeInterval: 1.1)
+        store(cache, tokens: [2, 2, 2], approximateBytes: 100_000)  // newer, never read
+        Thread.sleep(forTimeInterval: 1.1)
+        #expect(cache.fetch(tokens: [1, 1, 1]) != nil, "the old row is read (touched)")
+        Thread.sleep(forTimeInterval: 1.1)
+        store(cache, tokens: [3, 3, 3], approximateBytes: 100_000)  // forces one eviction
+
+        #expect(cache.hasDurableEntry(tokens: [1, 1, 1]), "the row that was just read must survive")
+        #expect(!cache.hasDurableEntry(tokens: [2, 2, 2]), "the untouched row is the LRU victim")
+        #expect(cache.hasDurableEntry(tokens: [3, 3, 3]))
+
+        // Control: with touchRecency off, the same read must NOT protect the row.
+        let dir2 = makeCacheDir()
+        defer { try? FileManager.default.removeItem(at: dir2) }
+        let cache2 = DiskCache(cacheDir: dir2, maxSizeBytes: 250_000, modelKey: "lru-hit")
+        store(cache2, tokens: [1, 1, 1], approximateBytes: 100_000)
+        Thread.sleep(forTimeInterval: 1.1)
+        store(cache2, tokens: [2, 2, 2], approximateBytes: 100_000)
+        Thread.sleep(forTimeInterval: 1.1)
+        #expect(cache2.fetch(tokens: [1, 1, 1], touchRecency: false) != nil)
+        store(cache2, tokens: [3, 3, 3], approximateBytes: 100_000)
+        #expect(
+            !cache2.hasDurableEntry(tokens: [1, 1, 1]), "an untouched read leaves the old row oldest")
+    }
+}
+
 @Test func loweringTheCapIsEnforcedOnTheNextStore() throws {
     try MLXMetalTestLock.withLock {
         let dir = makeCacheDir()
