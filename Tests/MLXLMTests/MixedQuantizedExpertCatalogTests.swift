@@ -3,7 +3,7 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXNN
 @testable import MLXLLM
 import Testing
@@ -186,8 +186,8 @@ struct MixedQuantizedExpertCatalogTests {
         }
     }
 
-    @Test(arguments: [MixedQuantizedExpertCatalog.Storage.mapped, .resident])
-    func eightRegionMetalKernelMatchesNativeProjections(storage: MixedQuantizedExpertCatalog.Storage) throws {
+    @Test(arguments: [MixedQuantizedExpertCatalog.Storage.mapped, .resident], [64, 128])
+    func eightRegionMetalKernelMatchesNativeProjections(storage: MixedQuantizedExpertCatalog.Storage, upGroup: Int) throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -199,7 +199,7 @@ struct MixedQuantizedExpertCatalogTests {
             for name in ["gate_proj", "up_proj", "down_proj"] {
                 let mx = name == "gate_proj" && mxGate
                 let mode: QuantizationMode = mx ? .mxfp4 : .affine
-                let group = mx ? 32 : name == "down_proj" ? 128 : 64
+                let group = mx ? 32 : name == "down_proj" ? 128 : name == "up_proj" ? upGroup : 64
                 let count: Int = 8 * 512 * 512
                 let values: [Float] = (0..<count).map { (index: Int) -> Float in
                     Float(index % 41 - 20) / Float(83)
@@ -218,6 +218,29 @@ struct MixedQuantizedExpertCatalogTests {
                 expertCount: 8, inputDimensions: 512, hiddenDimensions: 512)
             let module = try MixedQuantizedSwitchGLU(catalog: catalog, layer: 1,
                 inputDimensions: 512, storage: storage)
+            if storage == .resident {
+                let bank = try catalog.loadResidentLayer(layer: 1)
+                let duplicateRoutes: [Int32] = [7, 0, 7, 1, 4, 2, 0, 3]
+                let pair = try #require(MixedQuantizedExpertKernel().pairedGateUp(input,
+                    indices: MLXArray(duplicateRoutes).reshaped(1, 1, 8),
+                    gate: bank.gate, up: bank.up))
+                for (i, name) in ["gate_proj", "up_proj"].enumerated() {
+                    let mx = name == "gate_proj" && mxGate
+                    let stem = "model.layers.1.mlp.switch_mlp.\(name)"
+                    let expected = stacked(duplicateRoutes.map { index in
+                        quantizedMM(input, weights[stem + ".weight"]![Int(index)],
+                            scales: weights[stem + ".scales"]![Int(index)],
+                            biases: weights[stem + ".biases"].map { $0[Int(index)] },
+                            groupSize: mx ? 32 : name == "up_proj" ? upGroup : 64, bits: mx ? 4 : 2,
+                            mode: mx ? .mxfp4 : .affine)
+                    }).reshaped(1, 1, 8, 1, 512)
+                    #expect(arrayEqual(expected, pair[i]).item(Bool.self))
+                }
+                let fused = try #require(MixedQuantizedExpertKernel().fusedGateUp(input,
+                    indices: MLXArray(duplicateRoutes).reshaped(1, 1, 8),
+                    gate: bank.gate, up: bank.up))
+                #expect(arrayEqual(silu(pair[0]) * pair[1], fused).item(Bool.self))
+            }
             #expect(module.parameters().flattened().isEmpty)
             let reference = order.map { index in
                 func project(_ x: MLXArray, _ name: String) -> MLXArray {
@@ -226,7 +249,7 @@ struct MixedQuantizedExpertCatalogTests {
                     return quantizedMM(x, weights[stem + ".weight"]![Int(index)],
                         scales: weights[stem + ".scales"]![Int(index)],
                         biases: weights[stem + ".biases"].map { $0[Int(index)] },
-                        groupSize: mx ? 32 : name == "down_proj" ? 128 : 64,
+                        groupSize: mx ? 32 : name == "down_proj" ? 128 : name == "up_proj" ? upGroup : 64,
                         bits: mx ? 4 : 2, mode: mx ? .mxfp4 : .affine)
                 }
                 return project(MLXNN.silu(project(input, "gate_proj")) * project(input, "up_proj"), "down_proj")
@@ -236,6 +259,120 @@ struct MixedQuantizedExpertCatalogTests {
             #expect(arrayEqual(expected, result).item(Bool.self))
             eval(result)
         }
+    }
+
+    @Test(arguments: [false, true], [64, 128])
+    func fusedGateUpMatchesNativeAtProductionShape(mxGate: Bool, upGroup: Int) throws {
+        let width = 4096, hidden = 2048
+        func projection(mx: Bool, group: Int, phase: Float) -> MixedQuantizedExpertCatalog.Projection {
+            let positions = MLXArray(0..<(2 * hidden * width)).asType(.float32)
+            let source = (sin(positions * Float(0.173) + phase) * Float(0.03))
+                .reshaped(2, hidden, width).asType(.bfloat16)
+            let mode: QuantizationMode = mx ? .mxfp4 : .affine
+            let q = quantized(source, groupSize: group, bits: mx ? 4 : 2, mode: mode)
+            eval(q.wq, q.scales)
+            return .init(weight: q.wq, scales: q.scales, biases: q.biases,
+                bits: mx ? 4 : 2, groupSize: group, mode: mode)
+        }
+        let gate = projection(mx: mxGate, group: mxGate ? 32 : 64, phase: 0)
+        let up = projection(mx: false, group: upGroup, phase: 1.71)
+        let indices = MLXArray([Int32(1), 0, 1, 1, 0, 0, 1, 0]).reshaped(1, 1, 8)
+        let kernel = MixedQuantizedExpertKernel()
+        for magnitude: Float in [0, 1, 16] {
+            // Deliberately strided input, duplicate routes, and nonlinear/saturated SiLU ranges.
+            let input = (sin(MLXArray(0..<(2 * width)).asType(.float32) * Float(0.071)) * magnitude)
+                .asType(.bfloat16)[.stride(by: 2)].reshaped(1, 1, width)
+            func native(_ p: MixedQuantizedExpertCatalog.Projection) -> MLXArray {
+                gatherQuantizedMM(expandedDimensions(input, axes: [-2, -3]), p.weight,
+                    scales: p.scales, biases: p.biases, rhsIndices: indices,
+                    groupSize: p.groupSize, bits: p.bits, mode: p.mode)
+            }
+            let expected = silu(native(gate)) * native(up)
+            let result = try #require(kernel.fusedGateUp(input, indices: indices, gate: gate, up: up))
+            #expect(arrayEqual(expected, result).item(Bool.self),
+                "magnitude=\(magnitude) maxAbs=\(abs(expected.asType(.float32) - result.asType(.float32)).max().item(Float.self))")
+        }
+    }
+
+    @Test func fusedDownReduceMatchesNativeAtProductionShape() throws {
+        let width = 2048, output = 4096, experts = 8
+        let kernel = MixedQuantizedExpertKernel()
+        let positions = MLXArray(0..<(experts * output * width)).asType(.float32)
+        let weights = (sin(positions * Float(0.173)) * Float(0.03))
+            .reshaped(experts, output, width).asType(.bfloat16)
+        let packed = quantized(weights, groupSize: 64, bits: 2, mode: .affine)
+        let bias = try #require(packed.biases)
+        eval(packed.wq, packed.scales, bias)
+        let scores = MLXArray([Float(0.1), 0.2, 0.05, 0.12, 0.08, 0.15, 0.19, 0.11])
+            .reshaped(1, 1, 8)
+        for routes: [Int32] in [[0, 1, 2, 3, 4, 5, 6, 7], [7, 2, 7, 0, 3, 2, 1, 7]] {
+            let indices = MLXArray(routes).reshaped(1, 1, 8)
+            for magnitude: Float in [0, 1, 16] {
+                let x = (sin(MLXArray(0..<(16 * width)).asType(.float32) * Float(0.071)) * magnitude)
+                    .asType(.bfloat16)[.stride(by: 2)].reshaped(1, 1, 8, 1, width)
+                let down = gatherQuantizedMM(x, packed.wq, scales: packed.scales, biases: bias,
+                    rhsIndices: indices, groupSize: 64, bits: 2, mode: .affine)
+                let expected = (down.squeezed(axis: -2).asType(.float32)
+                    * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(.bfloat16)
+                let projection = MixedQuantizedExpertCatalog.Projection(weight: packed.wq,
+                    scales: packed.scales, biases: bias, bits: 2, groupSize: 64, mode: .affine)
+                let actual = try #require(kernel.fusedDownReduce(x, indices: indices,
+                    scores: scores, down: projection))
+                #expect(arrayEqual(expected, actual).item(Bool.self),
+                    "routes=\(routes) magnitude=\(magnitude) maxAbs=\(abs(expected.asType(.float32) - actual.asType(.float32)).max().item(Float.self))")
+            }
+        }
+    }
+
+    @Test func weightedResidentDecodeAndFallbackContracts() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var weights: [String: MLXArray] = [:]
+        for name in ["gate_proj", "up_proj", "down_proj"] {
+            let mx = name == "gate_proj"
+            let phase: Float = mx ? 0 : name == "up_proj" ? 1.3 : 2.7
+            let values = sin(MLXArray(0..<(8 * 512 * 512)).asType(.float32) * Float(0.031) + phase)
+            let source = (values * Float(0.01)).reshaped(8, 512, 512).asType(.bfloat16)
+            let q = quantized(source, groupSize: mx ? 32 : 64, bits: mx ? 4 : 2,
+                mode: mx ? .mxfp4 : .affine)
+            let stem = "model.layers.1.mlp.switch_mlp.\(name)"
+            weights[stem + ".weight"] = q.wq
+            weights[stem + ".scales"] = q.scales
+            weights[stem + ".biases"] = q.biases
+        }
+        try saveAligned(weights, to: directory.appendingPathComponent("model.safetensors"))
+        try JSONSerialization.data(withJSONObject: ["weight_map": weights.mapValues { _ in "model.safetensors" }])
+            .write(to: directory.appendingPathComponent("model.safetensors.index.json"))
+        let catalog = try MixedQuantizedExpertCatalog(directory: directory, layerIndices: [1],
+            expertCount: 8, inputDimensions: 512, hiddenDimensions: 512)
+        let module = try MixedQuantizedSwitchGLU(catalog: catalog, layer: 1,
+            inputDimensions: 512, storage: .resident)
+        let x = sin(MLXArray(0..<512).asType(.float32)).asType(.bfloat16).reshaped(1, 1, 512)
+        let routes = MLXArray([Int32(7), 1, 0, 7, 3, 1, 4, 2]).reshaped(1, 1, 8)
+        let scores = MLXArray([Float(0.1), 0.2, 0.05, 0.12, 0.08, 0.15, 0.19, 0.11]).reshaped(1, 1, 8)
+        let result = module.fusedWeightedOutput(x, routes, scores: scores)
+        if RuntimeEnvironment.value("VMLX_MIMO_FUSED_DOWN_REDUCE") == "1" {
+            let actual = try #require(result)
+            let expected = (module(x, routes).asType(.float32) * scores[.ellipsis, .newAxis])
+                .sum(axis: -2).asType(.bfloat16)
+            #expect(arrayEqual(actual, expected).item(Bool.self))
+        } else {
+            #expect(result == nil)
+        }
+        let batch = broadcast(x, to: [1, 2, 512])
+        #expect(module.fusedWeightedOutput(batch, routes, scores: scores) == nil)
+        #expect(module.fusedWeightedOutput(x, routes, scores: scores.asType(.bfloat16)) == nil)
+        let mapped = try MixedQuantizedSwitchGLU(catalog: catalog, layer: 1,
+            inputDimensions: 512, storage: .mapped)
+        #expect(mapped.fusedWeightedOutput(x, routes, scores: scores) == nil)
+        let bank = try catalog.loadResidentLayer(layer: 1)
+        let kernel = MixedQuantizedExpertKernel()
+        let activated = MLXArray.zeros([1, 1, 8, 1, 512], dtype: .bfloat16)
+        #expect(kernel.fusedDownReduce(activated.asType(.float32), indices: routes,
+            scores: scores, down: bank.down) == nil)
+        #expect(kernel.fusedDownReduce(activated, indices: routes.asType(.float32),
+            scores: scores, down: bank.down) == nil)
     }
 
     @Test func indexedModelLoadAndRingCacheParity() throws {
@@ -267,7 +404,9 @@ struct MixedQuantizedExpertCatalogTests {
         try loadWeights(modelDirectory: directory, model: loaded,
                         perLayerQuantization: base.perLayerQuantization)
         let reference = original.newCache(parameters: nil), actual = loaded.newCache(parameters: nil)
-        for tokens in [[1, 2, 3], [4], [5], [6], [7], [8], [9]] {
+        // The long warm chunk crosses the grouped-expert threshold and wraps
+        // the rotating cache; following tokens verify restored route ordering.
+        for tokens in [[1, 2, 3], Array(10..<50), [4], [5], [6], [7], [8], [9]] {
             let input = MLXArray(tokens).reshaped(1, -1)
             let expected = original(input, cache: reference), result = loaded(input, cache: actual)
             #expect(arrayEqual(expected, result).item(Bool.self),

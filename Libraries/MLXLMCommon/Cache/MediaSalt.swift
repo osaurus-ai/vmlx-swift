@@ -254,7 +254,11 @@ private func cachePolicySalt(for parameters: GenerateParameters) -> String {
     let kvBits = parameters.kvBits.map(String.init) ?? "none"
     let maxKV = parameters.maxKVSize.map(String.init) ?? "none"
     return [
-        "cache-policy-v4",
+        // v4 post-answer rows could be keyed with the unforwarded lookahead
+        // instead of the consumed stop token. Isolate all derived snapshots,
+        // including rows subsequently promoted to resume boundaries.
+        "cache-policy-v5",
+        "postAnswer=forwarded-token-v1",
         "promptBoundaryDisk=raw-kv|zaya-typed-tq-min44-v1",
         "kvMode=\(cachePolicyDescription(parameters.kvMode))",
         "kvBits=\(kvBits)",

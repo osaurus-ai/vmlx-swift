@@ -104,6 +104,10 @@ final class MiMoV26MoE: Module, UnaryLayer {
             return compiledResidentDecode([x])[0]
         }
         let (indices, scores) = gate(x)
+        if let mixed = experts as? MixedQuantizedSwitchGLU,
+            let result = mixed.fusedWeightedOutput(x, indices, scores: scores) {
+            return result
+        }
         let values = experts(x, indices).asType(.float32)
         return (values * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(x.dtype)
     }

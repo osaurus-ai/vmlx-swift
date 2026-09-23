@@ -1579,6 +1579,9 @@ public struct TokenIterator: TokenIteratorProtocol {
     var state: LMOutput.State?
 
     var y: LMInput.Text
+    // `y` advances to the next prediction before next() returns. Retain the
+    // token actually forwarded into KV using the existing return-value sync.
+    private var lastForwardedTokenId: Int?
     var cache: [KVCache]
     var processor: LogitProcessor?
     let sampler: LogitSampler
@@ -2925,9 +2928,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             Memory.clearCache()
         }
 
-        return MLXPressGenerationProfile.time("decode.token_item_sync") {
+        let forwardedToken = MLXPressGenerationProfile.time("decode.token_item_sync") {
             previousY.tokens.item(Int.self)
         }
+        lastForwardedTokenId = forwardedToken
+        return forwardedToken
     }
 
     public mutating func storeCacheAfterGeneration(
@@ -3292,13 +3297,13 @@ public struct TokenIterator: TokenIteratorProtocol {
         // boundary-offset guard (correctly) refuses the store, silently
         // costing the post-answer boundary every turn (observed live:
         // "REFUSED offset/key mismatch tokens=3627 offsets=[3628]").
-        // Extend the key by the pending drained token instead.
+        // Extend the key by the forwarded stop token. `y` already holds the
+        // next prediction, which has never been forwarded and cannot label KV.
         let generatedBoundaryTokens = Self.generatedBoundaryTokensAligned(
             promptTokenIds: promptTokenIds,
             generatedTokenIds: generatedTokenIds,
             cacheOffsets: cache.map(\.offset),
-            pendingDrainedTokenId: y.tokens.size == 1
-                ? y.tokens.item(Int.self) : nil)
+            pendingDrainedTokenId: lastForwardedTokenId)
         guard let generatedBoundaryTokens else { return }
         // Whether the next prompt starts from this row depends on the
         // template; the cache learns that from the first hit on one.

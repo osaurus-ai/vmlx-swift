@@ -348,3 +348,213 @@ inputs; no R11 runtime result is claimed here. The controlled replay used a
 synchronous model/sample/item loop; production TokenIterator overlaps the next
 GPU submission with the previous token's host read, so actual app throughput
 still needs its own measurement.
+
+### Resident app R12 and command batching diagnostic
+
+The Release dev app now runs the resident path on this Mac. Its first two
+natural-stop text answers measured **43.1 tokens/s over 482 tokens** and
+**39.0 tokens/s over 421 tokens** using final engine-backed UI counters. The
+temporary streaming estimate of 56.7 tokens/s was superseded by 43.1 and is
+not acceptance evidence. Both answers preserve the conversation without loops
+or protocol leakage; their rainbow explanations contain factual imprecision,
+so this is not a perfect factual-quality result.
+
+The unchanged strict 80% profile admitted 109,071,847,320 estimated bytes against
+109,951,162,777 budget bytes, after replacing the generic 25% weight multiplier
+with validated MiMo payload and KV accounting in the companion Osaurus tree.
+Actual peak physical footprint was **111,369,596,384 bytes**, above that admission
+estimate and nominal budget. The load budget is not a hard physical-footprint
+guarantee. Full media peak qualification remains open. Cache telemetry reports
+nine full and 39 rotating layers, paged RAM off, TurboQuant layers zero, one
+disk-L2 hit and seven stores across the text conversation.
+
+App SHA256: `e7cc53f960845586bc586d14f3e6b475497860b3926443a3e5afaf0e2ef342d2`.
+Receipts: `local-app-r12-build-inputs.json`,
+`local-app-r12-rainbow-ui-observations.json`,
+`local-app-r12-rainbow-conversation.json`, `local-app-r12-rainbow-cache.json`,
+and `local-app-r12-memory-summary.json`; actual CUA controls and screenshots
+were exercised and inspected.
+
+A subsequent same-binary 128-step A/B/A comparison of native command-buffer
+batching versus `MLX_MAX_MB_PER_BUFFER=8192` measured 39.6–41.0 steps/s for the
+default and 40.1–41.2 for the override. CPU median fell from 18–19 ms to about
+13 ms per step, but wall-clock improvement was small. The override is not
+promoted. This changes command batching, not a system memory ceiling.
+Receipts: `controlled-command-buffer-r1-identity.json`,
+`controlled-command-buffer-r1-results.json` and matching raw replay files.
+
+The paired gate/up dispatch passed strict native parity, but its A/B/A speed
+bracket was unstable: native 41.76/41.82, paired 40.29/42.69, closing native
+31.34/33.32 steps/s. It is not promoted on this evidence.
+
+### Grouped prefill, TensorOps and fused activation investigation
+
+With identical 3,595 prompt tokens, native unsorted A/B/A baselines measured
+96.7–98.9 tokens/s. Grouped routing (`VMLX_MIMO_SORT_PREFILL=1`) measured
+408.3/474.1 tokens/s. It uses the existing gatherSort/scatterUnsort helpers and
+native sorted-index gathered quantized GEMM without changing packed weights.
+Strict cache/model parity passed 17/17. Grouped prefill is now enabled by default, with an explicit zero-valued
+opt-out for diagnostics; updated app proof is building. Receipts: `grouped-prefill-r1-identity.json`,
+`grouped-prefill-r1-results.json`, `local-grouped-prefill-tests-r1.log`.
+
+The local stack sample actually entered `gather_qmm_rhs_nax` (frames at lines
+326/333 of `prefill-sorted-profile-c1-stacks.txt`). This verifies existing
+MLX NAX/TensorOps dispatch on this M5, rather than inferring it solely from a
+source predicate. The sampled run is diagnostic, not a clean speed benchmark.
+First-decode stalls remain; unprofiled sorted rounds took 0.63–1.05 seconds
+with zero disk reads/pageins and predominantly system CPU time. The aggregate
+sample contains substantial Metal command submission, but does not isolate
+those stalls or establish the cause of the historical 904 ms event.
+
+Apple's [TensorOps session](https://developer.apple.com/videos/play/wwdc2026/330/)
+places native FP4/FP8/2-bit tensor types and E8M0 scale planes in macOS 27.
+This host runs 26.4. Existing NAX gathered GEMM is available here; the new native
+quantized APIs must not be described as available or benchmarked here.
+
+The CoreML device probe sees ANE/GPU/CPU, but `AccelerationRuntime` has no
+validated MiMo CoreML island. This is capability evidence only, not inference
+or speed proof (`coreml-capability-r1/identity.json`, `result.txt`). Apple's
+[linear quantization guide](https://apple.github.io/coremltools/docs-guides/source/opt-quantization-overview.html)
+documents 4/8-bit weights; it does not establish a direct replacement for this
+bundle's mixed 2-bit affine/MXFP4 execution. No CoreML conversion is promoted.
+
+A new opt-in `VMLX_MIMO_FUSED_GATE_UP=1` combines both packed dot products,
+BF16 projection rounding, SiLU and multiplication in one kernel/output.
+Strict parity passes 18/18, including the production 4096-to-2048 shape,
+both gate formats, both up groups, duplicate routes, strided input, and
+zero/normal/wide activations (`local-fused-gate-up-tests-r2.log`). Full-model
+A/B/A measured native 42.17/42.07, fused 40.53/42.66, then native 41.84/41.83
+steps/s. The fused cold round includes a 194.87 ms first-step stall; the warm
+improvement is about 1.6%, with CPU median about 14.2 ms versus 17 ms.
+It remains opt-in and is not proof of 45 tokens/s. Receipts:
+`fused-gate-up-r1-identity.json`, `fused-gate-up-r1-results.json`. Sustained 45 tokens/s,
+refreshed full media/eval gates, and merges remain open.
+
+
+### R13 actual app with grouped prefill and fused gate/up
+
+The fresh Release app SHA256
+`2efb2022852d2e7dd9822cb59065fa3467fc4768613e3836eea6b486d97a1f2d`
+ran grouped prefill at its new default and fused gate/up by explicit opt-in.
+Final settled UI counters measured **45.3 tokens/s for 548 tokens**, followed
+by **33.8 tokens/s for 422 tokens**. This is not sustained 45 across turns.
+Both outputs stopped naturally without loops or protocol leakage. The first
+answer contains a secondary-color-order contradiction and incorrectly calls
+the reflection total; the follow-up fixes the color order but retains other
+scientific imprecision. These are not clean factual-quality passes.
+
+First TTFT was 1.52 seconds plus 38.8 seconds model load, with disk restore
+at boundary 3234 and only 106 remaining prompt tokens. The follow-up had
+TTFT 8.07 seconds without reloading, restoring boundary 3340 and prefilling
+663 remaining tokens. Do not attribute the first short TTFT solely to the
+sorting optimization. Peak physical footprint was 109,489,154,856 bytes.
+Cache topology remains nine full/39 rotating, TurboQuant layers zero, paged
+RAM off, two disk-L2 hits and six stores.
+
+Receipts: `local-app-r13-build-inputs.json`, `local-app-r13-process.json`,
+`local-app-r13-rainbow-ui-observations.json`,
+`local-app-r13-rainbow-conversation.json`, `local-app-r13-rainbow-cache.json`,
+`local-app-r13-memory-summary.json`, plus inspected actual CUA screenshots.
+The current strict focused matrix passes 18 kernel/cache tests and 61
+media/loading tests; full current app/eval qualification remains open.
+
+After saving Keep Model Loaded in the actual Settings UI and restarting the
+same binary, two further turns measured 45.2 tokens/s (449 tokens) and
+44.8 tokens/s (532 tokens). The model stayed resident through 88.825 seconds
+of idle time; the next turn had 1.74 seconds TTFT without another load.
+Both stopped naturally, but factual inaccuracies remain. Receipts:
+`local-app-r13-keep-ui-observations.json`,
+`local-app-r13-keep-conversation.json`,
+`local-app-r13-keep-after-idle-cache.json`.
+The second run peaked at 109,236,890,792 bytes physical footprint. A
+9.059-second interior decode window of the 44.8 tokens/s turn had zero
+process disk reads (19 samples, excluding the first/last second):
+`local-app-r13-keep-decode-read-window.json`. This is a bounded app window,
+not a claim that loading or cache restore performs no reads.
+
+### Post-answer boundary correctness
+
+The R13 live trace showed a saved key ending in token 436 where the next
+chat template contained stop token 151645. The iterator had forwarded the
+stop into KV, then replaced `y` with the next prediction; the store mistakenly
+used that unforwarded prediction to label the snapshot. A real iterator/disk
+regression reproduced both a missed correct boundary and a false hit on the
+lookahead key (`post-answer-boundary-red-r2.log`).
+
+The fix retains the token read already required by `next()` and uses it when
+the cache is exactly one token beyond the visible answer. It adds no extra
+per-token scalar synchronization. Cache policy v5 isolates old mislabeled
+rows, including snapshots promoted to resume boundaries. Length-stop and
+legacy-row isolation regressions are included. All four iterator/cache tests
+pass, as do the mixed-expert parity suite and the 61 media/loading tests
+(`post-answer-boundary-green-r1.log`, `post-answer-media-regression-r1.log`).
+R14 app proof failed during a host restart; this is not a measured TTFT improvement
+and does not explain the variation in decode throughput.
+
+A private down-projection/weighting/reduction fusion experiment also passed
+exact native parity at the production 2048-to-4096 shape, including distinct
+and duplicate routes and zero/normal/wide BF16 inputs
+(`down-reduce-parity-r1.log`). The actual-bank
+128-route A/B/A microbenchmark passed exact parity and measured median
+0.413 / 0.229 / 0.403 ms for native / fused / native, with p95
+0.553 / 0.344 / 0.598 ms (`down-reduce-actual-micro-r1.json`). These are
+synchronized single-layer timings, not full-model token throughput.
+
+The candidate is now wired through `MixedQuantizedSwitchGLU` and
+`MiMoV26MoE` behind default-off `VMLX_MIMO_FUSED_DOWN_REDUCE=1`. It preserves
+BF16 projection rounding, FP32 route weighting/reduction, and GPU-resident
+indices. Unsupported shapes/formats, mapped weights and prefill fall back to
+the ordinary path. The integrated 11-test suite passed for fused gate/up,
+native gate/up, paired gate/up, and all-default dispatch, with strict TF32
+disabled (`down-reduce-integrated-*-r1.log`). Production-shape parity includes
+strided inputs, duplicate routes, and zero/normal/wide activations. No
+full-model throughput claim or default promotion follows from these tests.
+
+A second actual-bank microbenchmark exercised the integrated helper, rather
+than the private prototype: all 128 route traces matched native output
+exactly. Native / fused / native median times were 0.363 / 0.205 / 0.368 ms,
+with p95 0.416 / 0.255 / 0.440 ms
+(`down-reduce-actual-micro-r2.json`, corresponding identity and summary).
+Only one resident layer was loaded; full-model throughput remains unmeasured.
+
+### R14 host watchdog restart — live proof failed
+
+The R14 app cold-prefill run did not complete. The Mac restarted at
+18:24:48 local time; the panic reports no watchdogd check-ins for 93 seconds.
+The last runtime trace was a 3,332-token cold prefill under cache policy v5,
+with all cache tiers missing. There is no completed answer or token/s result.
+The post-answer fix remains unit-tested, not verified in the updated app.
+
+Peak sampled app physical footprint was 110,792,845,640 bytes, below the
+112 GiB process guard. That guard did not protect whole-host liveness.
+The panic reported compressor and swap limits OK; these records do not
+establish a specific OOM or GPU-kernel cause. Large-model retries are held
+while the saved incident is investigated. Evidence:
+`r14-watchdog-restart/incident.json`, `local-app-r14-runtime.log`,
+`local-app-r14-memory.jsonl`, `LOCAL-RESIDENT-RUN-HOLD.json`.
+No release, merge-readiness or complete-runtime claim follows from R14.
+
+The full retired panic snapshot additionally reports 881 free 16 KiB pages
+(about 14 MiB) and 42.91 GiB of compressor memory, despite a normal pressure
+flag. `r14-watchdog-restart/full-panic-memory-receipt.json` preserves the
+source identity and snapshot. This is evidence of inadequate headroom, not
+a proven causal stack for the watchdog.
+
+Private run supervision now checks whole-host reclaimable capacity before
+launch and throughout the run, with an 8 GiB diagnostic reserve. It aborts
+its own child on pressure, excessive compressor/swap growth, stale or missing
+telemetry, or a missed deadline. Ten bounded tests pass, including a real
+tiny child with live samples, refusal before spawn, and terminating only the
+owned child while another remains alive. A tenth regression also verifies
+that a failed receipt write cannot prevent abort (`host-guard-tests-r2.log`,
+`host-guard-tiny-child-r2.jsonl`). No model was loaded in these tests.
+The old large-model launchers remain held. These safeguards reduce risk;
+they cannot guarantee that a kernel or driver will never stall.
+
+Osaurus materialized-load admission also removes the extra 10% reclaim
+credit, accounts for working state and concurrent loads, and shares the
+existing handoff OS headroom policy. Its updated 31-test focused suite passes,
+including refusal telemetry (`resident-host-admission-tests-r3.log`). The fresh
+R15 Release dev app built successfully with source manifest verification
+(`local-app-r15-build-outputs.json`), but has not been launched. Actual-app
+proof remains required; R14 predates these changes.

@@ -12,6 +12,11 @@ public final class MixedQuantizedSwitchGLU: Module, SwitchGLULayer {
     public var usesResidentGPURouting: Bool { resident != nil }
     private let kernels = MixedQuantizedExpertKernel()
     private let inputDimensions: Int
+    private let pairedGateUp = RuntimeEnvironment.value("VMLX_MIMO_PAIRED_GATE_UP") == "1"
+    private let fusedGateUp = RuntimeEnvironment.value("VMLX_MIMO_FUSED_GATE_UP") == "1"
+    private let fusedDownReduce = RuntimeEnvironment.value("VMLX_MIMO_FUSED_DOWN_REDUCE") == "1"
+    // Match native SwitchGLU's grouped GEMM prefill; retain an explicit A/B opt-out.
+    private let sortPrefill = RuntimeEnvironment.value("VMLX_MIMO_SORT_PREFILL") != "0"
 
     public init(catalog: MixedQuantizedExpertCatalog, layer: Int, inputDimensions: Int,
                 storage: MixedQuantizedExpertCatalog.Storage = .mapped) throws {
@@ -26,17 +31,62 @@ public final class MixedQuantizedSwitchGLU: Module, SwitchGLULayer {
         super.init()
     }
 
+    /// Optional single-token weighted path; all other shapes use the ordinary
+    /// expert outputs and caller reduction. No route indices cross to the CPU.
+    public func fusedWeightedOutput(_ x: MLXArray, _ indices: MLXArray,
+                                    scores: MLXArray) -> MLXArray? {
+        guard fusedDownReduce, let resident, x.size == inputDimensions,
+            x.dtype == .bfloat16, indices.size == 8,
+            scores.shape == indices.shape, scores.dtype == .float32,
+            resident.down.bits == 2, resident.down.groupSize == 64,
+            resident.down.mode == .affine else { return nil }
+        let activated: MLXArray
+        if fusedGateUp, let fused = kernels.fusedGateUp(x, indices: indices,
+            gate: resident.gate, up: resident.up) {
+            activated = fused
+        } else {
+            let input = expandedDimensions(x, axes: [-2, -3])
+            func project(_ p: MixedQuantizedExpertCatalog.Projection) -> MLXArray {
+                gatherQuantizedMM(input, p.weight, scales: p.scales, biases: p.biases,
+                    rhsIndices: indices, groupSize: p.groupSize, bits: p.bits, mode: p.mode)
+            }
+            let pair = pairedGateUp ? kernels.pairedGateUp(x, indices: indices,
+                gate: resident.gate, up: resident.up) : nil
+            activated = silu(pair?[0] ?? project(resident.gate)) * (pair?[1] ?? project(resident.up))
+        }
+        return kernels.fusedDownReduce(activated, indices: indices, scores: scores, down: resident.down)
+    }
+
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         if let resident {
+            let doSort = sortPrefill && indices.size >= 64
+            var input = expandedDimensions(x, axes: [-2, -3])
+            var routes = indices
+            var inverseOrder = MLXArray()
+            if doSort {
+                (input, routes, inverseOrder) = gatherSort(x: input, indices: indices)
+            }
             func project(_ input: MLXArray, _ projection: MixedQuantizedExpertCatalog.Projection) -> MLXArray {
                 gatherQuantizedMM(input, projection.weight, scales: projection.scales,
-                    biases: projection.biases, rhsIndices: indices,
+                    biases: projection.biases, rhsIndices: routes,
                     groupSize: projection.groupSize, bits: projection.bits,
-                    mode: projection.mode, sortedIndices: false)
+                    mode: projection.mode, sortedIndices: doSort)
             }
-            let input = expandedDimensions(x, axes: [-2, -3])
-            let activated = silu(project(input, resident.gate)) * project(input, resident.up)
-            return project(activated, resident.down).squeezed(axis: -2)
+            let activated: MLXArray
+            if fusedGateUp, let fused = kernels.fusedGateUp(x, indices: indices,
+                gate: resident.gate, up: resident.up) {
+                activated = fused
+            } else {
+                let pair = pairedGateUp ? kernels.pairedGateUp(x, indices: indices,
+                    gate: resident.gate, up: resident.up) : nil
+                activated = silu(pair?[0] ?? project(input, resident.gate))
+                    * (pair?[1] ?? project(input, resident.up))
+            }
+            var output = project(activated, resident.down)
+            if doSort {
+                output = scatterUnsort(x: output, invOrder: inverseOrder, shape: indices.shape)
+            }
+            return output.squeezed(axis: -2)
         }
         let routes = indices.asArray(Int32.self)
         let k = indices.dim(-1)
