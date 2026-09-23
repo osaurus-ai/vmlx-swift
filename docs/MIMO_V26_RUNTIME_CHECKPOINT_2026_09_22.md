@@ -558,3 +558,283 @@ including refusal telemetry (`resident-host-admission-tests-r3.log`). The fresh
 R15 Release dev app built successfully with source manifest verification
 (`local-app-r15-build-outputs.json`), but has not been launched. Actual-app
 proof remains required; R14 predates these changes.
+
+### R16 guarded local app and eval results — partial
+
+After reclaiming desktop memory, unchanged whole-host admission passed and
+the R16 dev app loaded this bundle on this Mac. With gate/up fusion explicitly enabled, down fusion off, and prefill chunks
+of 512, three API-driven turns through the actual app completed naturally at 49.3515, 48.9995 and 48.4999 tokens/s
+(393, 518 and 1,314 generated tokens). TTFT was 62.03 seconds including cold
+load, then 1.55 and 1.80 seconds. All had visible answers and separate
+reasoning. Turn two contained an incorrect binary-search walkthrough; an
+explicit third-turn correction produced the correct trace. This is qualified
+multiturn evidence, not perfect answer quality or native chat-UI proof.
+
+Cache policy v5 accepted post-answer disk restores at boundaries 468 and
+1,073. Interior decode windows had zero sampled process disk reads (12, 17
+and 50 samples). During these requests the app peaked at 105,109,072,272
+bytes physical footprint, with minimum host reclaimable memory
+14,865,039,360 bytes and zero swap. A later idle interval tripped the guard's
+compressor-growth limit and terminated only the owned app. The request-window
+summary does not cover that later interval. No claim of guaranteed host
+liveness follows from the successful turns. The failed-sample logging gap was
+then fixed; eleven bounded guard tests pass. Receipts:
+`local-app-r16-three-turn-summary.json`, `local-app-r16-api-*-result.json`,
+`local-app-r16-host-memory.jsonl`, `host-guard-tests-r3-completion.json`.
+
+At Swift 24bb1e683f4378decb22d999de42d89728229519 and the recorded R16
+companion source manifest, AgentLoop completed **43/56 passed, 9 failed,
+4 skipped**. Failed and skipped rows include model instruction/arithmetic
+errors, an observed same-batch read/write race, isolated-profile prerequisites,
+and truthful child-model memory refusals. AgentLoopFrontier across two
+non-overlapping runs completed **30 scored cases: 25 passed and 5 failed**;
+two additional cases were interrupted and ten were not run. ReasoningChannel
+and CacheProof were not started. Raw automated grades are retained alongside
+manual rubric reviews and checker-coverage caveats. The image-to-spreadsheet
+row used OCR fallback and is not native MiMo vision evidence.
+
+Both eval processes were deliberately stopped after pathological tool output.
+One response generated 16,384 tokens at 38.234281 tokens/s and stopped at
+length; the app nevertheless returned executable tool calls, growing the next
+request from 9 to 938 chat messages and to 93,127 prompt tokens. Exact tool
+call count was not captured. A second run was stopped during another repeated
+tool stream. The runtime batches' completed scores do not qualify these
+interrupted cases. Evidence: `evals-r16-full/AgentLoop.json`, both Frontier
+partial reports, `evals-r16-failure-attribution-progress.json`,
+`evals-r16-manual-rubric-review.json`, `evals-r16-interrupted-case.json`, and
+`local-evals-r16-remaining-owned-stop.json`.
+
+The companion app now has regression-first work to reject length-truncated
+tool responses before dispatch while retaining the upstream cache drain.
+It also recognizes the bundle's explicit `chat.thinking` default, previously
+ignored on agent requests that synthesized enable_thinking=false. Those
+changes require fresh app/eval proof; the cause of repetitive generation
+remains unresolved. R16 scores must not be reused as their qualification.
+No new fusion default, quantization, sampler, or system memory-limit change
+was made. Full current UI/media/cache/eval gates and CI remain outstanding;
+this PR stays draft and must not be released or tagged.
+
+R17 preparation also refreshed bundle identity: the initial pre-publication
+metadata receipt is stale. All 52 files in the current SHA256-MANIFEST.json
+(110,927,079,438 bytes including all weight shards and sidecars) passed full
+SHA-256 and size checks. Publication manifest SHA-256:
+`d4ce2f3eb49e5ff40676f0eb5c4b3bd5d85840169e1a579f067591b664666b03`.
+Generation-config and tokenizer/template bytes still match the initial receipt;
+config/index hashes differ only by a trailing newline, while JANG metadata and
+the manifest naming also changed. No bundle file was edited. Receipts:
+`r17-bundle-contract-refresh.json`, `r17-publication-file-hashes.jsonl`.
+
+### R17 current companion proof — still partial
+
+R17 Release app and eval CLI built from verified source manifests. App SHA256
+`87156890aa9a2254660488eff5d7950efd68a08229c385585fa7c3fa197a148d`;
+eval CLI `eb3ba037a1194f4792be37f20c15c1c345cb64f831d2f9f7237608e5299b0f78`.
+Native kernels, sorted prefill default, no quantization/sampler changes.
+
+R17b actual API tool/default/off/default reasoning sequence passed five short
+turns at 48.14–48.83 tokens/s. Real image/audio, changed image/audio and video
+turns answered correctly at 48.18/47.64/46.75 tokens/s. Fourth media recall
+FAILED after a disk restore at 2,522 tokens: 1,024 generated tokens, length stop,
+empty visible answer. Replaying the identical request with prefix/disk restore
+disabled succeeded naturally (337 tokens, 47.00 tokens/s). Settings were restored
+exactly. This comparison does not yet establish cache corruption; direct saved
+state comparison is pending. Raw `local-app-r17b-media-*` and
+`local-app-r17b-recall-no-cache.*` receipts retain both outcomes.
+
+Two actual native UI turns settled at 46.4/46.2 tokens/s (297/255 tokens), with
+visible answers, closed reasoning and unlocked input. A hold/checkout factual
+error prompted a correction; quality was not perfect. Receipt
+`local-app-r17b-ui-observations.json` and exported persisted conversation
+`local-app-r17b-ui-library-two-turns.json`. Earlier API first-delta timestamps
+include role-only events and must not be described as content TTFT.
+
+The R17b owned app exited normally with no guard trip: peak physical footprint
+111,264,790,288 bytes, minimum reclaimable memory 15,010,168,832 bytes, unchanged
+compressor 1,005,142,016 bytes, zero swap and normal pressure throughout. A prior
+R17 load was stopped by the compressor-growth guard. Bundle-scoped read-only
+file-cache invalidation recovered physical free memory before R17b; neither
+system memory limits nor the guard were weakened. Runtime outcomes do not
+guarantee immunity to a driver/host stall. `local-app-r17b-completion-summary.json`.
+
+Optional optimization work is frozen. Remaining merge gates are the cache
+recall diagnosis, full current ReasoningChannel/CacheProof/AgentLoop/Frontier
+matrix, remaining applicable native UI media/settings/cancellation proof, and
+exact-head CI. PR493 remains draft. The app must consume the actual merged Swift
+SHA and be verified before its own merge. No release or tag is authorized.
+
+R17 saved-state diagnosis now reproduces actual app snapshots bit-for-bit:
+316 forced tokens from the 2,206-token prompt reproduce all 96 tensors at
+2,522 tokens. Restored-vs-live continuation logits also match exactly. Matching
+the app's 25+3-token split at the generation-prefix boundary reproduces all
+96 tensors of its 2,550-token recall snapshot. Monolithic28 and27+1 shapes
+differ numerically; that difference is not evidence of serialization corruption.
+No production cache patch is justified by this reproduction. The original
+recall quality failure remains recorded, and this is not a general cold/warm
+quality guarantee. No generated output or generation-throughput claim belongs
+to these forced-token diagnostics. Receipts: `r17-cache-parity-result.json`,
+`r17-cache-parity-splits-result.json`, both `cache-parity*-r17-process.json` and
+`cache-parity*-r17-memory-summary.json`. Full R17 eval matrix is now running.
+
+
+### R17 complete baseline and R18 allocator budget fix in progress
+ReasoningChannel 13/13; CacheProof 11/14 (three footprint/budget failures);
+AgentLoop 43/56 passed, 9 failed, 4 skipped. Frontier first case passed; baseline
+was deliberately stopped after AgentLoop to diagnose the measured memory issue.
+This is not a full Frontier qualification. Owned CLI PID 42779 terminated via
+SIGTERM with verified parent/command; no host guard trip. Exact receipt:
+`local-evals-r17-deliberate-stop.json`, reports in `evals-r17-full/`.
+
+Actual unchanged R17c app reproduced buffer retention on the original five-turn
+cache fixture: MLX active bytes stayed exactly 103,087,517,652 while freed-buffer
+cache grew 109,392,115 to 2,062,262,535 bytes. Sampled footprint increased
+104,928,684,192 to 106,399,165,032 bytes. Decode 48.09-48.95 tokens/s, but first
+three turns hit 192-token caps (third empty visible); last two stopped naturally.
+This is allocator attribution, not full coherency proof. App exited normally;
+peak footprint 106,449,463,984 bytes; no guard trip. Evidence:
+`r17c-allocator-attribution.json`, `local-app-r17c-allocator-*`,
+`local-app-r17c-memory-summary.json`.
+
+R18 candidate bounds the process-wide MLX reusable-buffer pool by the remaining
+admitted budget after all resident working-set estimates. It keeps explicit
+user maxima and ordinary small-model dynamic pools, applies the bound to native
+MTP/DSV4 windows and child-admission accounting, and does not alter compute memory
+limits, weights, KV, quantization, prompts or sampling. Candidate unit tests and
+fresh app/full eval proof are pending. Not merge-ready. Optional optimization is
+frozen; no release/tag.
+
+
+### R19 integration before full qualification
+Both upstream main branches advanced while R18 was building. Read-only drift
+receipts `swift-main-drift-r18.json` and `osaurus-main-drift-r18.json` identify
+all changes. The owned R18 xcodebuild was interrupted with verified PID/parent
+before any model run; `r18-build-deliberate-stop.json`. R18 is not a built or
+live-qualified candidate.
+
+App branch fast-forwarded to 93513e8d6c499cdb25931fe1e7205676c5856854;
+all 18 task files reapplied cleanly from retained stash and binary patch.
+Swift feature branch merged main's CacheCoordinator logging/type-check fix,
+head 5a7c0f868f9f5e4d0d320481700d5505e4a94b0b, pushed to existing draft PR493.
+Integration receipts `osaurus-r18-main-integration.json` and
+`swift-r18-main-integration.json` retain source identity and stash references.
+No user work was discarded. Current source manifest:
+`post-fixes-r19-source-manifest.json` (1,802 Swift / 3,403 app files).
+Focused regressions and Release app/CLI builds restart on this integrated
+source, then current full eval/UI proof. All R17/R18 results are historical,
+not current integrated-head qualification. No release/tag.
+
+
+### R19 live candidate: memory improvement and actual UI proof
+Integrated-source focused tests: 94/94. Release app and eval build commands
+both succeeded and hashes match current source manifest. App SHA256
+434d3057aa9467a36ccd227f06c0565551f3df786268cea38786f00133501180;
+CLI 5faa5fbd884ce7b77528cecd6630d68cc8d440e4c4c4c9111ca508a2c588886a.
+The original wrapper attempted a duplicate eval-log create after the independently
+successful parallel eval build; exclusive creation refused before spawning any
+second build. This orchestration error is retained separately from the two
+successful command receipts in `r19-build-completion-reconciliation.json`.
+
+Original five-turn app fixture: physical growth 947.13 MiB, down from R17c
+1402.36 MiB and below 1024 MiB gate. Active MLX bytes remain constant; reusable
+pool settles near resolved 879,315,457-byte allowance. Decode 47.67-48.80 tok/s.
+First three turns hit original 192-token cap; last two stop naturally. This
+is memory/speed evidence, not a whole-conversation coherence pass.
+`r19-allocator-attribution.json`, `local-app-r19-allocator-*`.
+
+Current native-default/off/default nested-tool API sequence passed. Image/audio,
+changed image/audio and video recognition passed at 48.25/47.46/47.23 tok/s.
+Fourth media-history recall FAILED semantically: natural stop 752 tokens at
+44.8294 tok/s, correct shape order but invented spoken phrases. Expected blue
+seven / green nine; emitted Red circle / Blue square. No sampler/prompt/cache
+change hides it. `local-app-r19-media-semantic-review.json` explicitly scores
+3/4 while the execution script returncode is 0. Do not generalize media support
+to perfect recall. R19 app exited 0, no guard trip, peak 109,702,378,800 bytes,
+below admitted 109,951,162,777-byte budget.
+
+Actual UI Memory Safety override: typed/saved 512 MiB, navigated away and back,
+observed persisted field and effective Memory.cacheLimit=536,870,912. Cancelled
+an actual model load with visible Stop at ~83 GB footprint; footprint fell
+below 2 GiB within 0.509 s, models/activity empty and input unlocked. No tokens
+were generated before cancellation. Resumed in the same chat, two natural-stop
+answers 225/294 tokens at 46.3/46.5 tok/s with native reasoning. Cleared override
+via UI, saved, quit/relaunched and verified the complete runtime settings equal
+the original. The original computed cache allowance returned to 879,315,457.
+`local-app-r19-ui-observations.json`, load-cancel receipts and images,
+`local-app-r19b-settings-after-relaunch.json`.
+
+Actual Attach Files UI selected a.png then b.png. Two natural-stop image answers
+correctly identify red circle, then blue square and comparison, at 47.4/47.0
+ tok/s. Actual Prefix Cache off/save/reload: correct image-history recall at
+46.7 tok/s and all cache counters zero. Re-enable/save/reload: correct white
+background recall at 47.1 tok/s with one L2 hit. All four turns have visible
+answers, closed reasoning, no protocol leak/loop, Stop gone and input unlocked.
+Original settings restored exactly. `local-app-r19b-ui-observations.json`,
+`local-app-r19b-ui-image-conversation.json`, prefix-off/on cache receipts and
+inspected screenshots. R19b app exited 0, no guard trip, peak108,049,674,200B.
+This qualifies current image/settings/load-cancel UI, not every audio/video UI
+flow; current audio/video runtime API results and recall failure remain separate.
+
+Full R19 matrix now running under unchanged host guard, owned CLI PID85005,
+source identity `local-evals-r19-process.json`; ReasoningChannel 13/13 completed.
+Order: ReasoningChannel, CacheProof, AgentLoopFrontier, AgentLoop. Four Linux CI
+jobs green on head5a7c0f86; macOS/CUDA queued, advisory lint red. Required full
+matrix/failed-case attribution and final pin/CI/merge remain outstanding.
+Optional optimization frozen; no release/tag.
+
+
+### R19 cache regression result and remaining provider dependency
+ReasoningChannel completed 13/13 and CacheProof completed 14/14 on the frozen
+R19 app/Swift source manifest. All three previous footprint gates now pass.
+The current local AgentLoopFrontier run is still active; raw rows remain in
+evals-r19-full/AgentLoopFrontier.json.partial.jsonl. No full-matrix claim.
+
+The suite name AgentLoopFrontier does not make a MiMo run a remote comparison.
+OsaurusEvals README also requires a real remote-model report for model-facing
+default changes. No supported provider key is set in this process, and five
+conventional .env locations are absent. The existing configured remote provider
+deepseek-v4.1-flash has authType none, but two read-only /v1/models probes failed
+to connect. No credential values were printed or extracted. The app has no
+configured Codex OAuth provider and the eval bootstrap supports API-key presets.
+See r19-remote-comparison-prerequisites.json. Manual grading replaces missing
+judge credentials only; it cannot manufacture remote-run evidence. A request
+for an existing credential source or restored endpoint is pending while local
+proof continues. No gates bypassed, no release/tag.
+
+
+### R19 completed local Frontier
+AgentLoopFrontier completed all 42/42 cases with raw passes on frozen R19
+source. ReasoningChannel13/13 and CacheProof14/14 are also complete. AgentLoop
+is next in the same guarded process. `evals-r19-frontier-completion.json` pins
+the final report hash; `evals-r19-manual-rubric-review.json` covers all five
+Frontier rubric rows. Live-data reporting shape is correct, but independent
+verification of every claimed successful fetch is partial because the existing
+harness saves full transcripts only for failures. Raw self-judge scores remain
+unchanged. Image-to-spreadsheet is file/OCR proof, not native vision.
+This is local MiMo evidence only. Required remote comparison and exact-head CI
+remain external dependencies; no merge-readiness or release claim.
+
+
+### R19 local matrix complete; Swift merge authorization
+Local frozen-source matrix finished: ReasoningChannel 13/13, CacheProof 14/14,
+AgentLoopFrontier 42/42; AgentLoop 41/56 passed, 11 failed, 4 skipped.
+`evals-r19-completion.json` pins all reports and counts;
+`evals-r19-agent-failure-attribution.json` covers every non-pass. Eleven completed
+manual-rubric rows were reviewed without replacing raw self-judge scores;
+passed-case provenance limitations remain explicit. CLI exited 1 for failed
+cases, with no host-guard trip; peak footprint 108,061,878,816 bytes.
+
+Failures include excess calls (PPTX/PDF/XLSX/single-file delivery), a malformed
+search argument, plain-prose instead of structured clarification, fixture
+capability/rejection-policy mismatches, an unreached cancellation checkpoint,
+missing configured workers, and same-model child budgets that do not fit.
+XLSX readback reported not_found despite listing/output assertions; its reader
+root cause is unproven and is not attributed to MiMo math. Raw failures remain.
+The media-history semantic recall failure also remains; no universal coherence
+or all-agent-workloads claim.
+
+Eric explicitly directed merging vmlx-swift without CI on 2026-09-23; CI remains
+required for the Osaurus companion. Queued macOS/CUDA engine jobs no longer
+block the engine merge under that instruction. This documentation-only update
+does not change tested runtime source. Companion remote comparison, remaining
+app UI proof, final merged dependency pin and app CI remain separate work.
+No release/tag. First queued follow-up after MiMo is required concise agent
+descriptions, tracked in Osaurus docs/NEXT_AFTER_MIMO_AGENT_DESCRIPTIONS.md.
