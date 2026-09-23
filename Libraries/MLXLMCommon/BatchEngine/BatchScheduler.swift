@@ -107,13 +107,18 @@ struct BatchSlot {
     /// the previous conversation prefix instead of missing every turn.
     var generatedTokenIds: [Int] = []
 
-    /// True when this request can emit structured tool calls.
+    /// True when this request can emit structured tool calls (tool schemas
+    /// were offered).
     ///
     /// BatchEngine parses tool calls outside the actor that stores cache
     /// entries, so finishSlot cannot observe the final `.toolCall` event
-    /// directly. Treat tool-enabled requests conservatively: store prompt and
-    /// history boundaries, but not generated/post-answer boundaries that could
-    /// make a warm required-tool replay resume after the tool envelope.
+    /// directly. It therefore replays the bridge's parser pipeline over the
+    /// generated text (`BatchEngine.generatedTextEmitsToolCall`) and stores
+    /// the generated/post-answer boundary only when no tool call was emitted,
+    /// the same rule the solo `TokenIterator` path applies through
+    /// `!handler.emittedToolCall`. A plain-text answer to a tool-enabled
+    /// request keeps its boundary; a turn that produced a tool call does not,
+    /// so a warm required-tool replay can never resume after the envelope.
     let disablesGeneratedCacheBoundary: Bool
 
     /// Number of prompt tokens (for completion info).

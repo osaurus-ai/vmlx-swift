@@ -3280,6 +3280,50 @@ public actor BatchEngine {
 
     // MARK: - Completion
 
+    /// Whether a finished generation emitted a structured tool call.
+    ///
+    /// `finishSlot` runs on the actor while the stream bridge parses tool
+    /// calls on its own executor, so the bridge's `.toolCall` events cannot be
+    /// observed here in time. Replay the bridge's pipeline over the generated
+    /// text instead: the same `ReasoningParser`, then the same
+    /// `ToolCallProcessor` with the request's tool schemas. Inline and bare
+    /// fallbacks (Gemma-4 `call:`, LFM2 inline JSON, Mistral arrays) are then
+    /// honoured exactly as the consumer saw them, and a call-shaped mention
+    /// inside reasoning counts only for formats that parse that channel.
+    static func generatedTextEmitsToolCall(
+        text: String,
+        format: ToolCallFormat,
+        tools: [ToolSpec]?,
+        reasoningParser: ReasoningParser?
+    ) -> Bool {
+        guard !text.isEmpty else { return false }
+        let processor = ToolCallProcessor(format: format, tools: tools)
+        var emitted = false
+        func note(_ events: [Generation]) {
+            for event in events {
+                if case .toolCall = event { emitted = true }
+            }
+        }
+        if var parser = reasoningParser {
+            for segment in parser.feed(text) + parser.flush() {
+                switch segment {
+                case .content(let c):
+                    note(routeGenerationText(c, channel: .content, through: processor))
+                case .reasoning(let r):
+                    note(routeGenerationText(r, channel: .reasoning, through: processor))
+                }
+            }
+            note(
+                flushGenerationText(
+                    channel: parser.isInsideReasoning ? .reasoning : .content,
+                    through: processor))
+        } else {
+            note(routeGenerationText(text, channel: .content, through: processor))
+            note(flushGenerationText(channel: .content, through: processor))
+        }
+        return emitted
+    }
+
     /// Finish a slot by yielding completion info and closing its stream.
     ///
     /// When a cache coordinator is present and the slot completed normally
@@ -3750,10 +3794,27 @@ public actor BatchEngine {
             // Store the growing-chat boundary only when the cache offset proves
             // it covers prompt + generated tokens exactly enough to resume.
             let generatedBoundaryTokens = promptTokens + slot.generatedTokenIds
+            // Tool-enabled requests used to skip this boundary whenever tools
+            // were merely OFFERED, which cost the post-answer checkpoint on
+            // every turn of an agent loop even when the model answered in
+            // plain text; the solo path only skips it when a tool call was
+            // EMITTED. Decide from the generated text so the two engines
+            // agree.
+            let emittedToolCall =
+                slot.disablesGeneratedCacheBoundary
+                && Self.generatedTextEmitsToolCall(
+                    text: context.tokenizer.decode(tokenIds: slot.generatedTokenIds),
+                    format: context.configuration.toolCallFormat ?? .json,
+                    tools: slot.originalInput.toolSchemas,
+                    reasoningParser: ReasoningParser.forPrompt(
+                        stampName: context.configuration.reasoningParserName,
+                        promptTail: _decodePromptTail(
+                            input: slot.originalInput, tokenizer: context.tokenizer,
+                            tokens: 64)))
             if !usesCanonicalHybridBoundary,
                !isReusablePrefixWarmup,
                reason == .stop,
-               !slot.disablesGeneratedCacheBoundary,
+               !emittedToolCall,
                !containsUnprovenZayaTurboQuantDiskState(slot.cache),
                !slot.generatedTokenIds.isEmpty,
                cacheCovers(generatedBoundaryTokens.count, cache: slot.cache)

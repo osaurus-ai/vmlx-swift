@@ -888,6 +888,7 @@ let package = Package(
                 "NativeMTPActivationErrorTextTests.swift",
                 "HybridWarmupMemoScopeTests.swift",
                 "BatchEngineGrowingChatCacheSourceTests.swift",
+                "BatchEngineToolCallEnvelopeTests.swift",
                 "ProcessorPatchSizeShapeTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
                 "NativeDiskDurabilityTests.swift",
