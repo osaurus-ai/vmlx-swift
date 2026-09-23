@@ -1889,7 +1889,7 @@ public final class LLMModelFactory: ModelFactory {
             // — older bundles use it, and the new schema inherits it
             // as a fallback. Finally `model_type` infer.
             let chatStamped = ToolCallFormat.fromCapabilityName(
-                jangConfig?.chat?.toolCalling?.parser)
+                jangConfig?.chat?.toolCalling?.parser, modelType: baseConfig.modelType)
             let templateAwareJang =
                 ParserResolution.toolCall(
                     capabilities: jangConfig?.capabilities,

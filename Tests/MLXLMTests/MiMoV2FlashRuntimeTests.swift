@@ -63,7 +63,7 @@ struct MiMoV2FlashRuntimeTests {
     func parserAutodetectMatchesMiMoTemplate() {
         #expect(reasoningStampFromModelType("mimo_v2") == "think_xml")
         #expect(ReasoningParser.fromCapabilityName(reasoningStampFromModelType("mimo_v2")) != nil)
-        #expect(ToolCallFormat.infer(from: "mimo_v2") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "mimo_v2") == .mimo)
         #expect(ToolCallFormat.fromCapabilityName("xml_function") == .xmlFunction)
     }
 

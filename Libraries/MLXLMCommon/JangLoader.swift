@@ -533,7 +533,7 @@ public enum ParserResolution {
             return (.minicpm5, .chatTemplate)
         }
         if let cap = capabilities,
-            let stamped = ToolCallFormat.fromCapabilityName(cap.toolParser)
+            let stamped = ToolCallFormat.fromCapabilityName(cap.toolParser, modelType: modelType)
         {
             if let templateFormat = templateDeclaredToolCallFormat(chatTemplate),
                 shouldPreferTemplateToolCallFormat(

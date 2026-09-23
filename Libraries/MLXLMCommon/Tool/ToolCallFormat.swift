@@ -166,6 +166,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`
     case xmlFunction = "xml_function"
 
+    /// MiMo XML transport preserves literal parameter string bytes.
+    case mimo
+
     /// StepFun Step 3.5 / 3.7 XML-function format plus the observed
     /// schema-gated bare `name({"arg": ...})` live fallback.
     case step
@@ -249,6 +252,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return LFM2ToolCallParser()
         case .xmlFunction:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        case .mimo:
+            return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>",
+                                     preservesLiteralStringValues: true)
         case .step:
             return StepToolCallParser()
         case .nemotron:
@@ -419,7 +425,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             || normalized.hasPrefix("mimo_v2_")
             || compact.hasPrefix("mimov2")
         {
-            return .xmlFunction
+            return .mimo
         }
 
         // Nemotron family (nemotron_h, etc.)
@@ -547,7 +553,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     ///
     /// Returns `nil` when the name is unknown or empty — callers should
     /// fall back to `infer(from: model_type)`.
-    public static func fromCapabilityName(_ name: String?) -> ToolCallFormat? {
+    public static func fromCapabilityName(_ name: String?, modelType: String? = nil) -> ToolCallFormat? {
         guard let name, !name.isEmpty else { return nil }
         let n = name.lowercased()
         let normalized = normalizedAlias(n)
@@ -560,6 +566,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         if let direct = ToolCallFormat(rawValue: n)
             ?? ToolCallFormat(rawValue: normalized)
         {
+            // Older MiMo bundles stamp the shared XML envelope name. Resolve
+            // its string dialect from the declared architecture, not its filename.
+            if direct == .xmlFunction, let modelType, infer(from: modelType) == .mimo {
+                return .mimo
+            }
             return direct
         }
 
@@ -629,7 +640,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             || normalized.hasPrefix("mimo_v2_")
             || compact.hasPrefix("mimov2")
         {
-            return .xmlFunction
+            return .mimo
         }
 
         if compact.hasPrefix("nemotron") {
@@ -651,7 +662,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // Qwen 3.5 / 3.6 family — XML-style <tool_call>…</tool_call>
         // (vLLM ecosystem names `qwen3_coder` / `qwen3_coder_xml` aliased here).
         case "qwen", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
-            "qwen3_coder", "qwen3_coder_xml", "mimo", "mimo_v2", "mimo_v2_flash":
+            "qwen3_coder", "qwen3_coder_xml":
             return .xmlFunction
         // StepFun Step 3.5 / 3.7 parser aliases. JANG
         // Step 3.7 VLM bundles stamp `tool_parser = "step3p5"` because the

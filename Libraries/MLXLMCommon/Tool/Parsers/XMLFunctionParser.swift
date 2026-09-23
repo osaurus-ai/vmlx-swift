@@ -9,17 +9,21 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
     public let endTag: String?
     public let decodesHTMLLineBreaks: Bool
     public let unwrapJSONQuotedStringParameters: Bool
+    /// MiMo transports strings without framing newlines or JSON escapes.
+    public let preservesLiteralStringValues: Bool
 
     public init(
         startTag: String,
         endTag: String,
         decodesHTMLLineBreaks: Bool = false,
-        unwrapJSONQuotedStringParameters: Bool = false
+        unwrapJSONQuotedStringParameters: Bool = false,
+        preservesLiteralStringValues: Bool = false
     ) {
         self.startTag = startTag
         self.endTag = endTag
         self.decodesHTMLLineBreaks = decodesHTMLLineBreaks
         self.unwrapJSONQuotedStringParameters = unwrapJSONQuotedStringParameters
+        self.preservesLiteralStringValues = preservesLiteralStringValues
     }
 
     /// The XML-function transport's closers are protocol control markers even
@@ -176,8 +180,8 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
 
             var paramValue = String(paramSection[nameEnd.upperBound ..< valueEnd])
 
-            // Trim leading/trailing newlines (matching Python behavior)
-            paramValue = trimBoundaryNewlines(paramValue)
+            // Qwen framing includes boundary newlines; MiMo string bytes are literal.
+            if !preservesLiteralStringValues { paramValue = trimBoundaryNewlines(paramValue) }
 
             if decodesHTMLLineBreaks,
                isStringType(funcName: funcName, argName: paramName, tools: tools) {
@@ -190,7 +194,7 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             }
 
             // Convert value based on schema type
-            arguments[paramName] = convertParameterValue(
+            arguments[paramName] = convertTransportValue(
                 paramValue, paramName: paramName, funcName: funcName, tools: tools)
 
             searchRange = (nextSearchStart ?? paramEnd.upperBound) ..< paramSection.endIndex
@@ -255,7 +259,7 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             else { continue }
 
             var value = String(content[valueOpen.upperBound ..< valueClose.lowerBound])
-            value = trimBoundaryNewlines(value)
+            if !preservesLiteralStringValues { value = trimBoundaryNewlines(value) }
             if decodesHTMLLineBreaks,
                 isStringType(funcName: funcName, argName: key, tools: tools) {
                 value = decodeHTMLLineBreaks(value)
@@ -265,7 +269,7 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
                 let unwrapped = decodeQuotedStringParameter(value) {
                 value = trimBoundaryNewlines(unwrapped)
             }
-            arguments[key] = convertParameterValue(
+            arguments[key] = convertTransportValue(
                 value, paramName: key, funcName: funcName, tools: tools)
             search = valueClose.upperBound ..< content.endIndex
         }
@@ -363,6 +367,20 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             "_field": field,
             "_expected": expected,
         ]
+    }
+
+    private func convertTransportValue(
+        _ value: String, paramName: String, funcName: String, tools: [[String: any Sendable]]?
+    ) -> any Sendable {
+        if preservesLiteralStringValues {
+            let type = getParameterType(funcName: funcName, paramName: paramName, tools: tools)?.lowercased()
+            if type == nil || ["string", "str", "text", "varchar", "char", "enum"].contains(type ?? "") {
+                return value
+            }
+            return convertParameterValue(
+                trimBoundaryNewlines(value), paramName: paramName, funcName: funcName, tools: tools)
+        }
+        return convertParameterValue(value, paramName: paramName, funcName: funcName, tools: tools)
     }
 
     private func trimBoundaryNewlines(_ value: String) -> String {

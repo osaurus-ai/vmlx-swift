@@ -695,7 +695,7 @@ public final class VLMModelFactory: ModelFactory {
             // Same priority ladder as LLMModelFactory — DSV4 VLM
             // bundles will stamp `chat.tool_calling.parser = "dsml"`.
             let chatStamped = ToolCallFormat.fromCapabilityName(
-                jangConfig?.chat?.toolCalling?.parser)
+                jangConfig?.chat?.toolCalling?.parser, modelType: baseConfig.modelType)
             let templateAwareJang = ParserResolution.toolCall(
                 capabilities: jangConfig?.capabilities,
                 modelType: baseConfig.modelType,
