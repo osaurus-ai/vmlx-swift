@@ -277,16 +277,98 @@ struct MixedQuantizedExpertCatalogTests {
 
     @Test(arguments: [3, 5, 6])
     func nativeAffineWidthsKeepPackingAndRouting(bits: Int) throws {
+        // Preserve the installed bundle's three-bit gate / two-bit up/down case.
+        try nativeQuantRouting(specs: [
+            "gate_proj": (bits, 128, .affine),
+            "up_proj": (2, 128, .affine), "down_proj": (2, 128, .affine),
+        ], dtype: .bfloat16)
+    }
+
+    @Test(arguments: 0..<36)
+    func nativeAffineProjectionMatrix(caseIndex: Int) throws {
+        let widths = [2, 3, 4, 5, 6, 8]
+        let group = [32, 64, 128][caseIndex / 6 % 3]
+        let dtype: DType = caseIndex < 18 ? .bfloat16 : .float16
+        // Each role sees all six widths, three group sizes, and both scale
+        // dtypes. Rotate widths to exercise mixed, not only uniform, banks.
+        var specs: [String: (bits: Int, group: Int, mode: QuantizationMode)] = [:]
+        for (offset, name) in ["gate_proj", "up_proj", "down_proj"].enumerated() {
+            specs[name] = (widths[(caseIndex + offset) % widths.count], group, .affine)
+        }
+        try nativeQuantRouting(specs: specs, dtype: dtype)
+    }
+
+    @Test(arguments: 1..<8, [DType.bfloat16, .float16])
+    func nativeMXFP4ProjectionMatrix(mask: Int, dtype: DType) throws {
+        // Every nonempty combination of MXFP4 gate/up/down, including all
+        // MXFP4. Remaining roles use odd-bit affine companions.
+        var specs: [String: (bits: Int, group: Int, mode: QuantizationMode)] = [:]
+        for (offset, name) in ["gate_proj", "up_proj", "down_proj"].enumerated() {
+            specs[name] = mask & (1 << offset) != 0
+                ? (4, 32, .mxfp4) : ([3, 5, 6][offset], 128, .affine)
+        }
+        try nativeQuantRouting(specs: specs, dtype: dtype)
+    }
+
+    @Test(arguments: 1..<8, [DType.bfloat16, .float16])
+    func nativeMXFP8ProjectionMatrix(mask: Int, dtype: DType) throws {
+        var specs: [String: (bits: Int, group: Int, mode: QuantizationMode)] = [:]
+        for (offset, name) in ["gate_proj", "up_proj", "down_proj"].enumerated() {
+            specs[name] = mask & (1 << offset) != 0
+                ? (8, 32, .mxfp8)
+                : offset == 1 ? (4, 32, .mxfp4) : (3, 128, .affine)
+        }
+        try nativeQuantRouting(specs: specs, dtype: dtype)
+    }
+
+    @Test(arguments: 0..<4)
+    func rejectsInvalidMXFP8Companions(caseIndex: Int) throws {
+        let (url, original) = try bundle()
+        defer { try? FileManager.default.removeItem(at: url) }
+        var weights = original
+        let stem = "model.layers.1.mlp.switch_mlp.gate_proj"
+        let bits = caseIndex == 3 ? 6 : 8
+        let group = caseIndex == 0 ? 64 : 32
+        let dtype: DType = caseIndex == 1 ? .float16 : .uint8
+        weights[stem + ".weight"] = MLXArray.zeros([4, 32, 2 * bits], dtype: .uint32)
+        weights[stem + ".scales"] = MLXArray.ones([4, 32, 64 / group], dtype: dtype)
+        weights[stem + ".biases"] = caseIndex == 2
+            ? MLXArray.zeros([4, 32, 64 / group], dtype: .uint8) : nil
+        try saveAligned(weights, to: url.appendingPathComponent("model.safetensors"))
+        try JSONSerialization.data(withJSONObject: ["weight_map": weights.mapValues { _ in "model.safetensors" }])
+            .write(to: url.appendingPathComponent("model.safetensors.index.json"))
+        #expect(throws: MixedQuantizedExpertCatalog.InvalidBundle.self) { try catalog(url) }
+    }
+
+    @Test(arguments: ["affine", "mxfp4", "mxfp8"])
+    func quantizationDoesNotSelectLegacyArchitecture(mode: String) async throws {
+        var object = try #require(JSONSerialization.jsonObject(
+            with: MiMoV26RuntimeTests.configuration(moe: true)) as? [String: Any])
+        object["quantization"] = ["mode": mode, "bits": mode == "mxfp4" ? 4 : 8,
+                                   "group_size": mode == "affine" ? 64 : 32]
+        let data = try JSONSerialization.data(withJSONObject: object)
+        #expect(MiMoV26Contract.matches(data))
+        let model = try await LLMTypeRegistry.shared.createModel(configuration: data, modelType: "mimo_v2")
+        #expect(model is MiMoV26TextModel)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try data.write(to: directory.appendingPathComponent("config.json"))
+        #expect(LoadBundleFacts.inspect(bundleURL: directory).requiresResidentSafetensors)
+    }
+
+    private func nativeQuantRouting(
+        specs: [String: (bits: Int, group: Int, mode: QuantizationMode)], dtype: DType
+    ) throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         var weights: [String: MLXArray] = [:]
         for (projection, phase) in [("gate_proj", Float(0.3)), ("up_proj", 1.1), ("down_proj", 2.7)] {
-            // The updated MiMo bundle mixes three-bit gates with two-bit up/down.
-            let width = projection == "gate_proj" ? bits : 2
+            let spec = specs[projection]!
             let values = sin(MLXArray(0..<(8 * 512 * 512)).asType(.float32) * Float(0.031) + phase)
-            let packed = quantized((values * Float(0.02)).reshaped(8, 512, 512).asType(.bfloat16),
-                groupSize: 128, bits: width, mode: .affine)
+            let packed = quantized((values * Float(0.02)).reshaped(8, 512, 512).asType(dtype),
+                groupSize: spec.group, bits: spec.bits, mode: spec.mode)
             let stem = "model.layers.1.mlp.switch_mlp.\(projection)"
             weights[stem + ".weight"] = packed.wq
             weights[stem + ".scales"] = packed.scales
@@ -298,17 +380,31 @@ struct MixedQuantizedExpertCatalogTests {
         let source = try MixedQuantizedExpertCatalog(directory: directory, layerIndices: [1],
             expertCount: 8, inputDimensions: 512, hiddenDimensions: 512)
         let bank = try source.loadResidentLayer(layer: 1)
-        #expect(bank.gate.bits == bits && bank.gate.groupSize == 128)
-        #expect(bank.up.bits == 2 && bank.down.bits == 2)
-        #expect(arrayEqual(bank.gate.weight, weights["model.layers.1.mlp.switch_mlp.gate_proj.weight"]!).item(Bool.self))
+        for (name, projection) in [("gate_proj", bank.gate), ("up_proj", bank.up), ("down_proj", bank.down)] {
+            let stem = "model.layers.1.mlp.switch_mlp.\(name)"
+            let spec = specs[name]!
+            #expect(projection.bits == spec.bits && projection.groupSize == spec.group)
+            #expect(projection.mode == spec.mode)
+            for (actual, expected) in [(projection.weight, weights[stem + ".weight"]!),
+                                       (projection.scales, weights[stem + ".scales"]!)] {
+                #expect(actual.dtype == expected.dtype)
+                #expect(arrayEqual(actual, expected).item(Bool.self))
+            }
+            if let bias = weights[stem + ".biases"] {
+                #expect(projection.biases?.dtype == dtype)
+                #expect(arrayEqual(try #require(projection.biases), bias).item(Bool.self))
+            } else {
+                #expect(projection.biases == nil)
+            }
+        }
         let reference = SwitchGLU(inputDims: 512, hiddenDims: 512, numExperts: 8,
             allowFusedGateUpCache: false)
         let projections: [(String, Module)] = ["gate_proj", "up_proj", "down_proj"].map { name in
             let stem = "model.layers.1.mlp.switch_mlp.\(name)"
             return (name, QuantizedSwitchLinear(inputDims: 512, outputDims: 512, numExperts: 8,
                 weight: weights[stem + ".weight"]!, scales: weights[stem + ".scales"]!,
-                biases: weights[stem + ".biases"], groupSize: 128,
-                bits: name == "gate_proj" ? bits : 2))
+                biases: weights[stem + ".biases"], groupSize: specs[name]!.group,
+                bits: specs[name]!.bits, mode: specs[name]!.mode))
         }
         try reference.update(modules: ModuleChildren.unflattened(projections), verify: .all)
         func expertOutput(_ input: MLXArray, _ expert: Int) -> MLXArray {
@@ -316,8 +412,8 @@ struct MixedQuantizedExpertCatalogTests {
                 let stem = "model.layers.1.mlp.switch_mlp.\(name)"
                 return quantizedMM(value, weights[stem + ".weight"]![expert],
                     scales: weights[stem + ".scales"]![expert],
-                    biases: weights[stem + ".biases"]![expert], groupSize: 128,
-                    bits: name == "gate_proj" ? bits : 2, mode: .affine)
+                    biases: weights[stem + ".biases"].map { $0[expert] }, groupSize: specs[name]!.group,
+                    bits: specs[name]!.bits, mode: specs[name]!.mode)
             }
             return project(silu(project(input, "gate_proj")) * project(input, "up_proj"), "down_proj")
         }
@@ -326,7 +422,7 @@ struct MixedQuantizedExpertCatalogTests {
                 inputDimensions: 512, storage: storage)
             for tokens in [1, 8] {
                 let x = (sin(MLXArray(0..<(tokens * 512)).asType(.float32) * Float(0.017)) * Float(0.1))
-                    .asType(.bfloat16).reshaped(1, tokens, 512)
+                    .asType(dtype).reshaped(1, tokens, 512)
                 let order: [Int32] = (0..<(tokens * 8)).map { Int32(($0 * 3 + $0 / 8) % 8) }
                 let routes = MLXArray(order).reshaped(1, tokens, 8)
                 let expected: MLXArray
@@ -348,8 +444,8 @@ struct MixedQuantizedExpertCatalogTests {
                 }
                 let actual = module(x, routes)
                 #expect(arrayEqual(expected, actual).item(Bool.self),
-                    "bits=\(bits) storage=\(storage) tokens=\(tokens) maxAbs=\(abs(expected.asType(.float32) - actual.asType(.float32)).max().item(Float.self))")
-                if tokens == 1 {
+                    "specs=\(specs) dtype=\(dtype) storage=\(storage) tokens=\(tokens) maxAbs=\(abs(expected.asType(.float32) - actual.asType(.float32)).max().item(Float.self))")
+                if tokens == 1 && [3, 5, 6].contains(specs["gate_proj"]!.bits) {
                     // Existing specialized kernels must decline odd-bit gates.
                     let kernel = MixedQuantizedExpertKernel()
                     #expect(kernel.fusedGateUp(x, indices: routes, gate: bank.gate, up: bank.up) == nil)
@@ -473,11 +569,19 @@ struct MixedQuantizedExpertCatalogTests {
             scores: scores, down: bank.down) == nil)
     }
 
-    @Test func indexedModelLoadAndRingCacheParity() throws {
+    @Test(arguments: [QuantizationMode.affine, .mxfp4, .mxfp8])
+    func indexedModelLoadAndRingCacheParity(gateMode: QuantizationMode) throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let data = try MiMoV26RuntimeTests.configuration(moe: true)
+        let gateBits = gateMode == .affine ? 3 : gateMode == .mxfp4 ? 4 : 8
+        var object = try #require(JSONSerialization.jsonObject(
+            with: MiMoV26RuntimeTests.configuration(moe: true)) as? [String: Any])
+        var quantization = try #require(object["quantization"] as? [String: Any])
+        quantization["model.layers.1.mlp.switch_mlp.gate_proj"] =
+            ["bits": gateBits, "group_size": 32, "mode": gateMode.rawValue]
+        object["quantization"] = quantization
+        let data = try JSONSerialization.data(withJSONObject: object)
         try data.write(to: directory.appendingPathComponent("config.json"))
         let original = try MiMoV26RuntimeTests.model(moe: true)
         try original.update(parameters: ModuleParameters.unflattened(original.parameters().flattened().map {
@@ -485,7 +589,7 @@ struct MixedQuantizedExpertCatalogTests {
         }), verify: .all)
         MLXNN.quantize(model: original, filter: { path, module in
             guard module is Quantizable else { return nil }
-            if path.hasSuffix("switch_mlp.gate_proj") { return (32, 4, .mxfp4) }
+            if path.hasSuffix("switch_mlp.gate_proj") { return (32, gateBits, gateMode) }
             if path.hasSuffix("switch_mlp.up_proj") { return (64, 2, .affine) }
             if path.hasSuffix("self_attn.o_proj") { return (32, 8, .affine) }
             return (64, 8, .affine)

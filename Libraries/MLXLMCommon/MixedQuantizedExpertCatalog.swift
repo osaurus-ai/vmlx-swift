@@ -5,7 +5,7 @@ import Cmlx
 import Foundation
 import MLX
 
-/// Validated, immutable descriptors for native affine/MXFP4 expert slices.
+/// Validated, immutable descriptors for native affine/MXFP4/MXFP8 expert slices.
 /// Every projection/companion is resolved independently: companions can live
 /// in different shards. Mapping a slice never exposes a whole bank to Metal.
 public final class MixedQuantizedExpertCatalog: Sendable {
@@ -63,6 +63,9 @@ public final class MixedQuantizedExpertCatalog: Sendable {
         let biases: Region?
         let bits: Int
         let groupSize: Int
+        var mode: QuantizationMode {
+            biases != nil ? .affine : bits == 8 ? .mxfp8 : .mxfp4
+        }
     }
 
     private struct Layer: Sendable {
@@ -165,8 +168,8 @@ public final class MixedQuantizedExpertCatalog: Sendable {
                     throw invalid("Invalid native affine expert companions: \(stem)")
                 }
             } else {
-                guard bits == 4, group == 32, scales.dtype == .uint8 else {
-                    throw invalid("Invalid native MXFP4 expert companions: \(stem)")
+                guard [4, 8].contains(bits), group == 32, scales.dtype == .uint8 else {
+                    throw invalid("Invalid native MX expert companions: \(stem) (bits=\(bits), group=\(group), scales=\(scales.dtype))")
                 }
             }
             return Spec(weight: weight, scales: scales, biases: biases, bits: bits, groupSize: group)
@@ -208,7 +211,7 @@ public final class MixedQuantizedExpertCatalog: Sendable {
     }
 
     /// Native packed banks for GPU-side routing. Every projection retains its
-    /// own quantization mode and group size, including mixed MXFP4/affine gates.
+    /// own quantization mode and group size, including mixed MX/affine roles.
     public func loadResidentLayer(layer: Int) throws -> Expert {
         guard let layer = layers[layer] else {
             throw InvalidBundle(reason: "Invalid expert layer")
@@ -221,7 +224,7 @@ public final class MixedQuantizedExpertCatalog: Sendable {
         func load(_ spec: Spec) throws -> Projection {
             try Projection(weight: read(spec.weight), scales: read(spec.scales),
                 biases: spec.biases.map(read), bits: spec.bits, groupSize: spec.groupSize,
-                mode: spec.biases == nil ? .mxfp4 : .affine)
+                mode: spec.mode)
         }
         return try Expert(gate: load(layer.gate), up: load(layer.up), down: load(layer.down))
     }
@@ -255,7 +258,7 @@ public final class MixedQuantizedExpertCatalog: Sendable {
         func load(_ spec: Spec) throws -> Projection {
             try Projection(weight: map(spec.weight), scales: map(spec.scales),
                 biases: spec.biases.map(map), bits: spec.bits, groupSize: spec.groupSize,
-                mode: spec.biases == nil ? .mxfp4 : .affine)
+                mode: spec.mode)
         }
         return try Expert(gate: load(spec.gate), up: load(spec.up), down: load(spec.down))
     }

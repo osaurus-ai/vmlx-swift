@@ -8,8 +8,9 @@ public enum MiMoV26BundleContract {
             config["attention_projection_layout"] as? String == "fused_qkv",
             let quantization = config["quantization"] as? [String: Any]
         else { return false }
-        let modes = Set(([quantization] + quantization.values.compactMap { $0 as? [String: Any] })
-            .compactMap { $0["mode"] as? String })
-        return modes.contains("affine") && modes.contains("mxfp4")
+        // Fused QKV is an architecture contract, not a particular quant mix.
+        // The loaders validate individual formats and companion tensors. A
+        // uniform affine or MX bundle must not fall into the legacy model.
+        return !quantization.isEmpty
     }
 }
