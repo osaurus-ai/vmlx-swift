@@ -186,6 +186,20 @@ struct MixedQuantizedExpertCatalogTests {
         }
     }
 
+    @Test(arguments: [1, 7, 9])
+    func rejectsUnsupportedAffineWidths(bits: Int) throws {
+        let (url, original) = try bundle()
+        defer { try? FileManager.default.removeItem(at: url) }
+        var weights = original
+        // Valid payload geometry must not admit a width native MLX rejects.
+        weights["model.layers.1.mlp.switch_mlp.up_proj.weight"] =
+            MLXArray.zeros([4, 32, 2 * bits], dtype: .uint32)
+        try saveAligned(weights, to: url.appendingPathComponent("model.safetensors"))
+        try JSONSerialization.data(withJSONObject: ["weight_map": weights.mapValues { _ in "model.safetensors" }])
+            .write(to: url.appendingPathComponent("model.safetensors.index.json"))
+        #expect(throws: MixedQuantizedExpertCatalog.InvalidBundle.self) { try catalog(url) }
+    }
+
     @Test(arguments: [MixedQuantizedExpertCatalog.Storage.mapped, .resident], [64, 128])
     func eightRegionMetalKernelMatchesNativeProjections(storage: MixedQuantizedExpertCatalog.Storage, upGroup: Int) throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -258,6 +272,90 @@ struct MixedQuantizedExpertCatalogTests {
             let result = module(input, MLXArray(order).reshaped(1, 1, 8))
             #expect(arrayEqual(expected, result).item(Bool.self))
             eval(result)
+        }
+    }
+
+    @Test(arguments: [3, 5, 6])
+    func nativeAffineWidthsKeepPackingAndRouting(bits: Int) throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var weights: [String: MLXArray] = [:]
+        for (projection, phase) in [("gate_proj", Float(0.3)), ("up_proj", 1.1), ("down_proj", 2.7)] {
+            // The updated MiMo bundle mixes three-bit gates with two-bit up/down.
+            let width = projection == "gate_proj" ? bits : 2
+            let values = sin(MLXArray(0..<(8 * 512 * 512)).asType(.float32) * Float(0.031) + phase)
+            let packed = quantized((values * Float(0.02)).reshaped(8, 512, 512).asType(.bfloat16),
+                groupSize: 128, bits: width, mode: .affine)
+            let stem = "model.layers.1.mlp.switch_mlp.\(projection)"
+            weights[stem + ".weight"] = packed.wq
+            weights[stem + ".scales"] = packed.scales
+            weights[stem + ".biases"] = packed.biases
+        }
+        try saveAligned(weights, to: directory.appendingPathComponent("model.safetensors"))
+        try JSONSerialization.data(withJSONObject: ["weight_map": weights.mapValues { _ in "model.safetensors" }])
+            .write(to: directory.appendingPathComponent("model.safetensors.index.json"))
+        let source = try MixedQuantizedExpertCatalog(directory: directory, layerIndices: [1],
+            expertCount: 8, inputDimensions: 512, hiddenDimensions: 512)
+        let bank = try source.loadResidentLayer(layer: 1)
+        #expect(bank.gate.bits == bits && bank.gate.groupSize == 128)
+        #expect(bank.up.bits == 2 && bank.down.bits == 2)
+        #expect(arrayEqual(bank.gate.weight, weights["model.layers.1.mlp.switch_mlp.gate_proj.weight"]!).item(Bool.self))
+        let reference = SwitchGLU(inputDims: 512, hiddenDims: 512, numExperts: 8,
+            allowFusedGateUpCache: false)
+        let projections: [(String, Module)] = ["gate_proj", "up_proj", "down_proj"].map { name in
+            let stem = "model.layers.1.mlp.switch_mlp.\(name)"
+            return (name, QuantizedSwitchLinear(inputDims: 512, outputDims: 512, numExperts: 8,
+                weight: weights[stem + ".weight"]!, scales: weights[stem + ".scales"]!,
+                biases: weights[stem + ".biases"], groupSize: 128,
+                bits: name == "gate_proj" ? bits : 2))
+        }
+        try reference.update(modules: ModuleChildren.unflattened(projections), verify: .all)
+        func expertOutput(_ input: MLXArray, _ expert: Int) -> MLXArray {
+            func project(_ value: MLXArray, _ name: String) -> MLXArray {
+                let stem = "model.layers.1.mlp.switch_mlp.\(name)"
+                return quantizedMM(value, weights[stem + ".weight"]![expert],
+                    scales: weights[stem + ".scales"]![expert],
+                    biases: weights[stem + ".biases"]![expert], groupSize: 128,
+                    bits: name == "gate_proj" ? bits : 2, mode: .affine)
+            }
+            return project(silu(project(input, "gate_proj")) * project(input, "up_proj"), "down_proj")
+        }
+        for storage in [MixedQuantizedExpertCatalog.Storage.mapped, .resident] {
+            let module = try MixedQuantizedSwitchGLU(catalog: source, layer: 1,
+                inputDimensions: 512, storage: storage)
+            for tokens in [1, 8] {
+                let x = (sin(MLXArray(0..<(tokens * 512)).asType(.float32) * Float(0.017)) * Float(0.1))
+                    .asType(.bfloat16).reshaped(1, tokens, 512)
+                let order: [Int32] = (0..<(tokens * 8)).map { Int32(($0 * 3 + $0 / 8) % 8) }
+                let routes = MLXArray(order).reshaped(1, tokens, 8)
+                let expected: MLXArray
+                if tokens == 1 {
+                    expected = stacked(order.map { expertOutput(x[0], Int($0)) })
+                        .reshaped(1, tokens, 8, 512)
+                } else if storage == .resident {
+                    // Compare prefill to the native batched SwitchGLU, not
+                    // separate QMV calls with a different reduction order.
+                    expected = reference(x, routes)
+                } else {
+                    // Every expert receives each token once in this route
+                    // fixture. Compute native QMM independently by expert,
+                    // then select each result in the requested router order.
+                    let byExpert = (0..<8).map { expertOutput(x[0], $0) }
+                    expected = stacked(order.enumerated().map { position, expert in
+                        byExpert[Int(expert)][position / 8]
+                    }).reshaped(1, tokens, 8, 512)
+                }
+                let actual = module(x, routes)
+                #expect(arrayEqual(expected, actual).item(Bool.self),
+                    "bits=\(bits) storage=\(storage) tokens=\(tokens) maxAbs=\(abs(expected.asType(.float32) - actual.asType(.float32)).max().item(Float.self))")
+                if tokens == 1 {
+                    // Existing specialized kernels must decline odd-bit gates.
+                    let kernel = MixedQuantizedExpertKernel()
+                    #expect(kernel.fusedGateUp(x, indices: routes, gate: bank.gate, up: bank.up) == nil)
+                    #expect(kernel.pairedGateUp(x, indices: routes, gate: bank.gate, up: bank.up) == nil)
+                }
+            }
         }
     }
 

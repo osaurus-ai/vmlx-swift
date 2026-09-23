@@ -157,7 +157,9 @@ public final class MixedQuantizedExpertCatalog: Sendable {
             }
             let bits = weight.shape[2] * 32 / input, group = input / scales.shape[2]
             if let biases {
-                guard [2, 4, 8].contains(bits), [32, 64, 128].contains(group),
+                // Match native MLX affine packing, including non-power-of-two
+                // widths. Specialized fused kernels retain their own guards.
+                guard [2, 3, 4, 5, 6, 8].contains(bits), [32, 64, 128].contains(group),
                     [.float16, .bfloat16].contains(scales.dtype),
                     biases.dtype == scales.dtype, biases.shape == scales.shape else {
                     throw invalid("Invalid native affine expert companions: \(stem)")
