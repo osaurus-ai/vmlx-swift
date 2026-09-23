@@ -372,16 +372,24 @@ public final class CacheCoordinator: @unchecked Sendable {
         let traced = ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
         if summary == nil || (traced && summary?.changedAnything == true) {
             let counts = summary ?? DiskCacheCompanionImportSummary()
-            FileHandle.standardError.write(Data(
-                ("[vmlx][cache/disk-index] companion import reason=\(reason) "
-                    + "committed=\(summary != nil) "
-                    + "rowsDeletedForMissingPayload=\(counts.rowsDeletedForMissingPayload) "
-                    + "linksWritten=\(counts.linksWritten) linksCleared=\(counts.linksCleared) "
-                    + "legacyUpserted=\(counts.legacyUpserted) "
-                    + "legacyDeleted=\(counts.legacyDeleted) "
-                    + "rowsDroppedForInvalidHash=\(counts.rowsDroppedForInvalidHash) "
-                    + "legacyDroppedForInvalidKey=\(counts.legacyDroppedForInvalidKey) "
-                    + "unindexedPayloadsRemoved=\(counts.unindexedPayloadsRemoved)\n").utf8))
+            // One array joined once, not a chain of `+`: ten concatenated
+            // interpolations is an expression some toolchains refuse to
+            // type-check ("unable to type-check this expression in
+            // reasonable time"), which broke the build for part of the team.
+            let fields = [
+                "reason=\(reason)",
+                "committed=\(summary != nil)",
+                "rowsDeletedForMissingPayload=\(counts.rowsDeletedForMissingPayload)",
+                "linksWritten=\(counts.linksWritten)",
+                "linksCleared=\(counts.linksCleared)",
+                "legacyUpserted=\(counts.legacyUpserted)",
+                "legacyDeleted=\(counts.legacyDeleted)",
+                "rowsDroppedForInvalidHash=\(counts.rowsDroppedForInvalidHash)",
+                "legacyDroppedForInvalidKey=\(counts.legacyDroppedForInvalidKey)",
+                "unindexedPayloadsRemoved=\(counts.unindexedPayloadsRemoved)",
+            ]
+            let line = "[vmlx][cache/disk-index] companion import " + fields.joined(separator: " ") + "\n"
+            FileHandle.standardError.write(Data(line.utf8))
         }
         return summary != nil
     }
