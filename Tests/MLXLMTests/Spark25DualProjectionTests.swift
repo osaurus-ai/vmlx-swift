@@ -10,6 +10,7 @@ struct Spark25DualProjectionTests {
         return QuantizedLinear(weight: (MLXRandom.normal([10240,2560])*0.02).asType(.bfloat16), bias:nil,groupSize:64,bits:6)
     }
     @Test func nativeQ6ExactAndStrided() {
+        #if canImport(Metal)
         let g=layer(seed:7),u=layer(seed:19)
         eval(g.parameters(),u.parameters())
         for seed:UInt64 in [7,19,31] {
@@ -22,6 +23,7 @@ struct Spark25DualProjectionTests {
                 if let actual { eval(expected,actual);#expect((expected .== actual).all().item(Bool.self)) }
             }
         }
+        #endif
     }
     @Test func fallbackContracts() {
         let g=layer(seed:11),u=layer(seed:13)
