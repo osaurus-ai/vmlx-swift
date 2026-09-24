@@ -252,13 +252,18 @@ struct Bench {
         //   BENCH_PERF_PERSISTENT_ALLOCATOR_CACHE_BYTES — post-load MLX
         //     freed-buffer reuse limit for allocator-policy A/B measurements.
         if (env["BENCH_PERF"] ?? "0") == "1" {
-            try await runPerfBench(
-                modelPath: modelPath, maxNew: maxNew,
-                variant: env["BENCH_PERF_VARIANT"] ?? "auto",
-                warmup: Int(env["BENCH_PERF_WARMUP"] ?? "1") ?? 1,
-                runs: Int(env["BENCH_PERF_RUNS"] ?? "3") ?? 3,
-                useTokenIterator:
-                    (env["BENCH_PERF_PATH"] ?? "batch") == "iter")
+            do {
+                try await runPerfBench(
+                    modelPath: modelPath, maxNew: maxNew,
+                    variant: env["BENCH_PERF_VARIANT"] ?? "auto",
+                    warmup: Int(env["BENCH_PERF_WARMUP"] ?? "1") ?? 1,
+                    runs: Int(env["BENCH_PERF_RUNS"] ?? "3") ?? 3,
+                    useTokenIterator:
+                        (env["BENCH_PERF_PATH"] ?? "batch") == "iter")
+            } catch {
+                print("[BENCH_PERF] error: \(String(reflecting: error))")
+                exit(benchFailureExitCode(for: error))
+            }
             return
         }
 
