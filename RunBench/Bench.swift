@@ -8539,6 +8539,28 @@ func runPerfBench(
             var rssMiB = 0.0
             var footprintMiB = 0.0
 
+            // Progress units are token counts for this text-only benchmark.
+            // Keep them separate from logical prompt throughput: restored
+            // tokens must not be advertised as freshly computed prefill work.
+            var prefillStart: PrefillProgress?
+            var tokenDeliveryIntervals: [TimeInterval] = []
+            var lastTokenDelivery: TimeInterval?
+
+            mutating func recordPrefill(_ progress: PrefillProgress) {
+                if prefillStart == nil, progress.stage == .prefill,
+                    progress.detail == "running"
+                {
+                    prefillStart = progress
+                }
+            }
+
+            mutating func recordTokenDelivery(at time: TimeInterval) {
+                if let lastTokenDelivery {
+                    tokenDeliveryIntervals.append(max(0, time - lastTokenDelivery))
+                }
+                lastTokenDelivery = time
+            }
+
             var tokps: Double {
                 genSec > 0 ? Double(genTokens) / genSec : 0
             }
@@ -8722,9 +8744,8 @@ func runPerfBench(
                         result.toolCalls += 1
                     case .toolCallProgress:
                         break
-                    case .prefillProgress:
-
-                        break
+                    case .prefillProgress(let progress):
+                        result.recordPrefill(progress)
                     case .info(let info):
                         result.genTokens = info.generationTokenCount
                         result.promptSec = info.promptTime
@@ -8740,13 +8761,13 @@ func runPerfBench(
                 for await ev in stream {
                     switch ev {
                     case .token(let token):
+                        result.recordTokenDelivery(at: CFAbsoluteTimeGetCurrent())
                         if result.ttftSec == 0 {
                             result.ttftSec = CFAbsoluteTimeGetCurrent() - start
                         }
                         rawTokens.append(token)
-                    case .prefillProgress:
-
-                        break
+                    case .prefillProgress(let progress):
+                        result.recordPrefill(progress)
                     case .info(let info):
                         result.genTokens = info.generationTokenCount
                         result.promptSec = info.promptTime
@@ -8778,9 +8799,8 @@ func runPerfBench(
                         result.toolCalls += 1
                     case .toolCallProgress:
                         break
-                    case .prefillProgress:
-
-                        break
+                    case .prefillProgress(let progress):
+                        result.recordPrefill(progress)
                     case .info(let info):
                         result.genTokens = info.generationTokenCount
                         result.promptSec = info.promptTime
@@ -8814,7 +8834,7 @@ func runPerfBench(
                 let leaks = markerLeaks(in: result.text).joined(separator: ",")
                 let loop = lagunaLoopHeuristic(visible)
                 print(String(format:
-                    "  PERF_RUN label=%@ samplingSource=%@ seed=%@ ttft_ms=%.0f prompt_ms=%.0f prompt_tps=%.0f first_decode_ms=%.0f genTokens=%d genSec=%.3f tokps=%.1f tail_tokps_est=%.1f rss_mib=%.0f footprint_mib=%.0f temp=%.2f topP=%.2f topK=%d minP=%.2f rep=%@ stop=%@ unclosedReasoning=%@ textChars=%d reasoningChars=%d toolCalls=%d loop=%@ leaks=%@",
+                    "  PERF_RUN label=%@ samplingSource=%@ seed=%@ ttft_ms=%.0f prompt_ms=%.0f logical_prompt_tps=%.0f first_decode_ms=%.0f genTokens=%d genSec=%.3f tokps=%.1f tail_tokps_est=%.1f rss_mib=%.0f footprint_mib=%.0f temp=%.2f topP=%.2f topK=%d minP=%.2f rep=%@ stop=%@ unclosedReasoning=%@ textChars=%d reasoningChars=%d toolCalls=%d loop=%@ leaks=%@",
                     label, samplingSource, perfSeedLabel,
                     result.ttftSec * 1000,
                     result.promptSec * 1000,
@@ -8831,6 +8851,27 @@ func runPerfBench(
                     result.text.count, result.reasoning.count,
                     result.toolCalls, loop ? "YES" : "NO",
                     leaks.isEmpty ? "none" : leaks))
+                if let progress = result.prefillStart {
+                    let restored = min(progress.completedUnitCount, progress.totalUnitCount)
+                    let remaining = progress.totalUnitCount - restored
+                    print(
+                        "  PERF_PREFILL label=\(label) logical_tokens=\(promptTokens.count) reported_restored_units=\(restored) reported_remaining_units=\(remaining) source=first_running_progress"
+                    )
+                } else {
+                    print("  PERF_PREFILL label=\(label) reported_restored_units=unknown reported_remaining_units=unknown")
+                }
+                // Raw submit emits exactly one event per token. Parsed chunk
+                // timing is not token timing; never synthesize its percentiles.
+                let intervals = result.tokenDeliveryIntervals.sorted()
+                if !intervals.isEmpty {
+                    let median = intervals.count.isMultiple(of: 2)
+                        ? (intervals[intervals.count / 2 - 1] + intervals[intervals.count / 2]) / 2
+                        : intervals[intervals.count / 2]
+                    let p95 = intervals[max(0, Int(ceil(Double(intervals.count) * 0.95)) - 1)]
+                    print(String(format:
+                        "  PERF_TOKEN_DELIVERY label=%@ intervals=%d median_ms=%.3f p95_ms=%.3f max_ms=%.3f scope=host_delivery_not_gpu_kernel raw_protocol_output=YES",
+                        label, intervals.count, median * 1000, p95 * 1000, intervals.last! * 1000))
+                }
                 if !result.reasoning.isEmpty {
                     print("    REASONING_PREVIEW \"\(compactPreview(result.reasoning))\"")
                 }
