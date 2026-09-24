@@ -8396,6 +8396,8 @@ func runOrnithReportedReplay(modelPath: String, maxNew: Int) async throws {
 /// reports the runtime's initial prefill units separately. Raw `submit` mode
 /// additionally reports host token-delivery latency (not GPU kernel timing).
 /// `BENCH_PERF_CACHE_CHAIN_ID` opts into conversation-aware quota ownership.
+/// Omit `BENCH_PERF_ENABLE_THINKING` to preserve the bundle's template default;
+/// explicit `0` / `1` select off / on. Invalid values fail before model loading.
 func runPerfBench(
     modelPath: String,
     maxNew: Int,
@@ -8406,6 +8408,24 @@ func runPerfBench(
 ) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     let env = ProcessInfo.processInfo.environment
+    let thinkingContext: [String: any Sendable]?
+    let thinkingLabel: String
+    switch env["BENCH_PERF_ENABLE_THINKING"] {
+    case nil:
+        thinkingContext = nil
+        thinkingLabel = "omitted"
+    case "0":
+        thinkingContext = ["enable_thinking": false]
+        thinkingLabel = "false"
+    case "1":
+        thinkingContext = ["enable_thinking": true]
+        thinkingLabel = "true"
+    default:
+        throw NSError(
+            domain: "BENCH_PERF", code: 1,
+            userInfo: [NSLocalizedDescriptionKey:
+                "BENCH_PERF_ENABLE_THINKING must be 0, 1, or unset"])
+    }
     let modelName = modelDir.lastPathComponent
     let useJangPressLoad = env["BENCH_PERF_JANGPRESS"] == "1"
     let useMmap = env["BENCH_PERF_MMAP"] != "0"
@@ -8494,17 +8514,11 @@ func runPerfBench(
             ["role": "user", "content": promptText]
         ]
 
-        let promptTokens: [Int]
-        let enableThinking = (env["BENCH_PERF_ENABLE_THINKING"] ?? "0") == "1"
-        do {
-            promptTokens = try context.tokenizer.applyChatTemplate(
-                messages: messages,
-                tools: nil,
-                additionalContext: ["enable_thinking": enableThinking])
-        } catch {
-            promptTokens = try context.tokenizer.applyChatTemplate(messages: messages)
-        }
-        print("PERF_TEMPLATE enable_thinking=\(enableThinking)")
+        // A template error must fail the benchmark, not silently drop a
+        // requested override and measure a different generation contract.
+        let promptTokens = try context.tokenizer.applyChatTemplate(
+            messages: messages, tools: nil, additionalContext: thinkingContext)
+        print("PERF_TEMPLATE enable_thinking=\(thinkingLabel)")
         let promptIds = MLXArray(promptTokens.map { Int32($0) })
             .reshaped(1, promptTokens.count)
 
