@@ -8371,7 +8371,10 @@ func runOrnithReportedReplay(modelPath: String, maxNew: Int) async throws {
 /// to seed sampling from the bundle's generation_config.json, with explicit
 /// BENCH_PERF_TEMP/TOP_P/TOP_K/MIN_P/REPETITION_PENALTY env overrides still
 /// taking final precedence. Set BENCH_PERF_SEED to make stochastic rows
-/// reproducible.
+/// reproducible. `logical_prompt_tps` includes cache reuse; `PERF_PREFILL`
+/// reports the runtime's initial prefill units separately. Raw `submit` mode
+/// additionally reports host token-delivery latency (not GPU kernel timing).
+/// `BENCH_PERF_CACHE_CHAIN_ID` opts into conversation-aware quota ownership.
 func runPerfBench(
     modelPath: String,
     maxNew: Int,
@@ -8385,7 +8388,7 @@ func runPerfBench(
     let modelName = modelDir.lastPathComponent
     let useJangPressLoad = env["BENCH_PERF_JANGPRESS"] == "1"
     let useMmap = env["BENCH_PERF_MMAP"] != "0"
-        let pathLabel = useTokenIterator ? "iter" : "batch"
+        let pathLabel = useTokenIterator ? "iter" : (env["BENCH_PERF_PATH"] ?? "batch")
         var perfLine = ""
 
         do {
@@ -8718,6 +8721,7 @@ func runPerfBench(
             default:
                 break
             }
+            params.cacheChainId = env["BENCH_PERF_CACHE_CHAIN_ID"]
             var result = PerfTurnResult()
             let start = CFAbsoluteTimeGetCurrent()
             let whichPath = env["BENCH_PERF_PATH"] ?? "batch"
@@ -8887,7 +8891,7 @@ func runPerfBench(
                     "hits=\($0.cacheHits),misses=\($0.cacheMisses),allocated=\($0.allocatedBlocks),free=\($0.freeBlocks),evictions=\($0.evictions)"
                 } ?? "disabled"
                 let disk = snapshot.diskStats.map {
-                    "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),maxBytes=\($0.maxSizeBytes)"
+                    "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),maxBytes=\($0.maxSizeBytes),bytes=\($0.currentPayloadBytes),evictions=\($0.evictions),evictedBytes=\($0.evictedBytes),quotaPasses=\($0.quotaPasses),lastQuotaPassMs=\($0.lastQuotaPassMs)"
                 } ?? "disabled"
                 let ssm = snapshot.ssmStats
                 print(
