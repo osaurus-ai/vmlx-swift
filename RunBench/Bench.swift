@@ -2916,6 +2916,22 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     let modelName = modelDir.lastPathComponent
     let env = ProcessInfo.processInfo.environment
+    // Benchmark-only override: validate before loading weights or creating the
+    // cache root. The default remains the historical 4 GiB regression quota.
+    let diskMaxGB: Float
+    if let raw = env["BENCH_GROWING_DISK_MAX_GB"] {
+        guard let value = Float(raw), value.isFinite, value > 0,
+            Double(value) * 1_073_741_824 >= 1,
+            Double(value) * 1_073_741_824 < Double(Int.max)
+        else {
+            throw NSError(domain: "BENCH_GROWING_CHAT_CACHE", code: 13,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "BENCH_GROWING_DISK_MAX_GB must be a positive finite, representable GiB quota"])
+        }
+        diskMaxGB = value
+    } else {
+        diskMaxGB = 4
+    }
     let cacheDir = URL(fileURLWithPath:
         env["BENCH_GROWING_CACHE_DIR"] ??
         "/tmp/vmlx-growing-chat-cache-\(modelName)-\(UUID().uuidString)")
@@ -2929,6 +2945,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
 
     print("\n=== BENCH_GROWING_CHAT_CACHE — \(modelName) ===")
     print("Cache dir: \(cacheDir.path)")
+    print("Requested disk quota: \(diskMaxGB) GiB")
     let nativeMTPDepth = env["BENCH_GROWING_NATIVE_MTP_DEPTH"].flatMap(Int.init)
     let useMmap = env["BENCH_GROWING_MMAP"] == "1"
     let loadStart = CFAbsoluteTimeGetCurrent()
@@ -2969,7 +2986,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         enableDiskCache: enableDiskCache,
         pagedBlockSize: 64,
         maxCacheBlocks: 512,
-        diskCacheMaxGB: 4.0,
+        diskCacheMaxGB: diskMaxGB,
         diskCacheDir: cacheDir,
         ssmMaxEntries: 64,
         modelKey: modelName))
