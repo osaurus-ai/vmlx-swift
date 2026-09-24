@@ -3145,6 +3145,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         let promptSize = input.text.tokens.size
         let t0 = CFAbsoluteTimeGetCurrent()
         var firstTokenWall: Double?
+        var completionInfoWall: Double?
         var out: [Int] = []
         var info: GenerateCompletionInfo?
 
@@ -3166,6 +3167,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
                     break
                 case .info(let i):
                     info = i
+                    completionInfoWall = CFAbsoluteTimeGetCurrent() - t0
                 }
             }
             await task.value
@@ -3183,6 +3185,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
                     break
                 case .info(let i):
                     info = i
+                    completionInfoWall = CFAbsoluteTimeGetCurrent() - t0
                 }
             }
         }
@@ -3200,6 +3203,15 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             wall,
             tokps,
             String(text.prefix(120)).replacingOccurrences(of: "\n", with: "\\n")))
+        if env["BENCH_GROWING_FULL_TEXT"] == "1" {
+            print("GROWING_FULL_TEXT label=\(label) text=\(text.debugDescription)")
+            if let completionInfoWall {
+                print(String(format:
+                    "GROWING_STREAM_TAIL label=%@ completion_info_ms=%.3f stream_end_ms=%.3f tail_ms=%.3f",
+                    label, completionInfoWall * 1000, wall * 1000,
+                    max(0, wall - completionInfoWall) * 1000))
+            }
+        }
         return (out, info, wall)
     }
 
