@@ -491,13 +491,24 @@ public final class DiskCache: @unchecked Sendable {
     /// skipped. Used on both sides of the disk boundary: a record is neither
     /// written nor restored when it is not entirely finite.
     static func nonFiniteTensorNames(in arrays: [String: MLXArray], limit: Int = 4) -> [String] {
+        let keys = arrays.keys.sorted().filter {
+            guard let array = arrays[$0] else { return false }
+            return array.dtype.isFloatingPoint && array.size > 0
+        }
         var names: [String] = []
-        for key in arrays.keys.sorted() {
-            guard let array = arrays[key], array.dtype.isFloatingPoint, array.size > 0 else { continue }
-            let nonFinite = (1 - MLX.isFinite(array).asType(.int32)).sum().item(Int32.self)
-            if nonFinite > 0 {
-                names.append("\(key)(\(nonFinite))")
-                if names.count >= limit { break }
+        // Reading one scalar per tensor serializes GPU work with the CPU for
+        // every layer. Reduce a bounded group together, then copy its small
+        // count vector once. Keep batches bounded so validation does not
+        // construct full-cache-sized temporary masks on long-context restores.
+        let batchSize = 8
+        for start in stride(from: 0, to: keys.count, by: batchSize) {
+            let batch = keys[start ..< min(start + batchSize, keys.count)]
+            let counts = MLX.stacked(batch.map { key in
+                (1 - MLX.isFinite(arrays[key]!).asType(.int32)).sum()
+            }).asArray(Int32.self)
+            for (key, count) in zip(batch, counts) where count > 0 {
+                names.append("\(key)(\(count))")
+                if names.count >= limit { return names }
             }
         }
         return names

@@ -1190,3 +1190,54 @@ import Testing
         #expect(DiskCache.nonFiniteTensorNames(in: ["ids": MLXArray([Int32(1), 2])]).isEmpty)
     }
 }
+
+@Test func diskCacheBatchedFiniteValidationPreservesNamesCountsAndLimits() async throws {
+    try await MLXMetalTestLock.withLock {
+        var arrays: [String: MLXArray] = [:]
+        for index in 0 ..< 25 {
+            let key = String(format: "layer_%02d", index)
+            let dtype: DType = [.float16, .bfloat16, .float32][index % 3]
+            arrays[key] = MLXArray([Float(1), 2, 3, 4]).asType(dtype)
+        }
+        arrays["integer"] = MLXArray([Int32.min, Int32.max])
+        arrays["empty"] = MLXArray([Float]())
+        #expect(DiskCache.nonFiniteTensorNames(in: arrays).isEmpty)
+        // Defects on both sides of batch boundaries and in the final batch.
+        for index in [0, 7, 8, 16, 24] {
+            let key = String(format: "layer_%02d", index)
+            let dtype = arrays[key]!.dtype
+            arrays[key] = MLXArray([Float.nan, .infinity, -.infinity, 4]).asType(dtype)
+        }
+        let expected = [0, 7, 8, 16, 24].map { String(format: "layer_%02d(3)", $0) }
+        #expect(DiskCache.nonFiniteTensorNames(in: arrays) == Array(expected.prefix(4)))
+        #expect(DiskCache.nonFiniteTensorNames(in: arrays, limit: 1) == Array(expected.prefix(1)))
+        #expect(DiskCache.nonFiniteTensorNames(in: arrays, limit: 9) == expected)
+        #expect(DiskCache.nonFiniteTensorNames(in: [:]).isEmpty)
+    }
+}
+
+@Test func diskCacheFiniteValidationTimingDiagnostic() async throws {
+    guard ProcessInfo.processInfo.environment["VMLX_BENCH_FINITE_VALIDATION"] == "1" else { return }
+    try await MLXMetalTestLock.withLock {
+        let arrays = Dictionary(uniqueKeysWithValues: (0 ..< 72).map {
+            (String(format: "kv_%02d", $0), MLXArray.ones([1, 4, 1024, 256]).asType(.bfloat16))
+        })
+        eval(Array(arrays.values))
+        func legacy() -> [String] {
+            var names: [String] = []
+            for key in arrays.keys.sorted() {
+                let count = (1 - MLX.isFinite(arrays[key]!).asType(.int32)).sum().item(Int32.self)
+                if count > 0 { names.append("\(key)(\(count))"); if names.count >= 4 { break } }
+            }
+            return names
+        }
+        for round in 0 ..< 7 {
+            for batched in (round.isMultiple(of: 2) ? [false, true] : [true, false]) {
+                let start = Date()
+                let result = batched ? DiskCache.nonFiniteTensorNames(in: arrays) : legacy()
+                #expect(result.isEmpty)
+                print("FINITE_VALIDATION round=\(round) batched=\(batched) ms=\(Date().timeIntervalSince(start) * 1000)")
+            }
+        }
+    }
+}
