@@ -41,7 +41,7 @@ enum Spark25Activation {
     private static let referenceOverride =
         ProcessInfo.processInfo.environment["VMLX_SPARK_GELU_REFERENCE"] == "1"
 
-    private static var usesMetalStream: Bool {
+    static var usesMetalStream: Bool {
         let stream = StreamOrDevice.default
         if stream == .gpu { return true }
         var device = mlx_device_new()
@@ -70,7 +70,10 @@ enum Spark25Activation {
             """,
         // Same polynomial and expm1 implementation as the pinned MLX Metal
         // erf.h/expm1f.h. Keep their coefficients, rounding and licenses intact.
-        header: """
+        header: geluMetalHeader
+    )
+
+    static let geluMetalHeader = """
             // Copyright © 2023 Apple Inc.
 
 
@@ -197,5 +200,4 @@ enum Spark25Activation {
               return r;
             }
             """
-    )
 }

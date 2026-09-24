@@ -177,6 +177,9 @@ final class Spark25MLP: Module, UnaryLayer {
         _down.wrappedValue = Linear(c.intermediateSize, c.hiddenSize, bias: c.mlpBias)
     }
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let activation = Spark25DualProjection.apply(x, gate: gate, up: up) {
+            return down(activation)
+        }
         // Preserve the original graph construction and temporary lifetimes
         // outside the measured prefill regime.
         guard Spark25Activation.isLargePrefillShape(x) else {
