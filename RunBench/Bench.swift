@@ -8428,8 +8428,10 @@ func runPerfBench(
     default:
         throw NSError(
             domain: "BENCH_PERF", code: 1,
-            userInfo: [NSLocalizedDescriptionKey:
-                "BENCH_PERF_ENABLE_THINKING must be 0, 1, or unset"])
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "BENCH_PERF_ENABLE_THINKING must be 0, 1, or unset"
+            ])
     }
     let modelName = modelDir.lastPathComponent
     let useJangPressLoad = env["BENCH_PERF_JANGPRESS"] == "1"
