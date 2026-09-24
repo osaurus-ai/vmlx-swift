@@ -3042,6 +3042,10 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     if let nativeMTPDepth {
         params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
     }
+    params.cacheChainId = env["BENCH_GROWING_CACHE_CHAIN_ID"]
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .flatMap { $0.isEmpty ? nil : $0 }
+    print("Cache chain: \(params.cacheChainId ?? "unowned")")
     let growingKVMode: String
     switch (env["BENCH_GROWING_KV_MODE"] ?? "none").lowercased() {
     case "tq", "tq44", "turboquant":
@@ -3260,7 +3264,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             "hits=\($0.cacheHits),misses=\($0.cacheMisses),allocated=\($0.allocatedBlocks),free=\($0.freeBlocks),evictions=\($0.evictions)"
         } ?? "disabled"
         let disk = snapshot.diskStats.map {
-            "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),maxBytes=\($0.maxSizeBytes)"
+            "hits=\($0.hits),misses=\($0.misses),stores=\($0.stores),skips=\($0.storeSkips),evictions=\($0.evictions),bytes=\($0.currentPayloadBytes),maxBytes=\($0.maxSizeBytes)"
         } ?? "disabled"
         let ssm = snapshot.ssmStats
         print(
