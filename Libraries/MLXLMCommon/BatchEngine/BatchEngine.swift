@@ -2434,7 +2434,8 @@ public actor BatchEngine {
         _ snapshot: [KVCache],
         for slot: BatchSlot
     ) {
-        guard let coordinator = cacheCoordinator,
+        guard slot.originalInput.cachePromptIntent != .auxiliary,
+            let coordinator = cacheCoordinator,
             slot.cachePromptTokenIds.count > 1,
             CacheStoreBudget.canStore(snapshot)
         else { return }
@@ -2493,7 +2494,8 @@ public actor BatchEngine {
                 // the ordinary prepare path. A later exact replay restores the
                 // N-1 disk entry and performs only this one-token prefill.
                 let shouldCaptureDiskSeed =
-                    cacheCoordinator?.canPersistBoundaries == true
+                    slot.originalInput.cachePromptIntent != .auxiliary
+                    && cacheCoordinator?.canPersistBoundaries == true
                     && slot.diskSeedSnapshot == nil
                     && cacheRequiresPrefillCapturedDiskSeed(slot.cache)
                     && !slot.originalInput.hasMediaContent
