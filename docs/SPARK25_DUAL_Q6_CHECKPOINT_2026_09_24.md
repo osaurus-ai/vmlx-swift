@@ -20,3 +20,11 @@ An improved component probe uses324unchanged tensors/2,300,313,600bytes across a
 CacheABBA completed8native turns; all full outputs and685retained checkpoint tensors per comparison exact. Snapshot/finalization tails4.745–5.549s remain separate from decode. Paged cache off, same rotating/full topology as baseline; no new cache topology or low-RAM-family claim. `cache-parity-review.json`, `cache-abba-timing-review.json`.
 
 Do not promote or pin this candidate yet: stable useful whole-model timing and dev-app UI qualification remain missing. No PR, no release/tag. All owned jobs finished. Next isolate cache finalization phases in a separate lane, retaining this candidate and its failed/noisy performance rows rather than presenting component timings as user-visible gains.
+
+## Serialized R38 recheck and current-engine integration
+
+On the original qualified R33 binary, native short ABBA (1027tokens/turn) now measures reference97.6/94.6tok/s versus fused101.5/98.5: mean decode latency3.88%lower, throughput4.04%higher. Original long workload ABBA (7032tokens/turn) measures reference90.9/89.9 versus fused93.2/93.1: latency2.91%lower, throughput3.00%higher. n=2 per arm; all full outputs exact, native stop, no length cap or template/sampler changes. Raw submit protocol is not a parsed UI stream. Host-delivery percentiles are recorded; GPU synchronization counts remain unmeasured. Earlier regressions and drift are retained; no causal explanation for them is claimed.
+
+The native long answer remains identical to baseline, including factual imprecision in its hash-table explanation. These are runtime/output-equivalence checks, not a claim of factual correctness for every generated statement.
+
+Evidence: private raptor-dual-q6-recheck-r38/{short-abba-review,long-abba-review}.json and full-model raw logs. Integration branch is based on merged cache enginea2a45e86 with the same kernel source cherry-picked. Combined exact-head build, native/cache proof and app UI/CI still pending; not merge-ready. Other model families retain explicit fallbacks; no generic/all-chip performance claim.
