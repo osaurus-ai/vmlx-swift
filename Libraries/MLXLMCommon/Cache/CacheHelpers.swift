@@ -795,6 +795,11 @@ public func restoreFromDiskArrays(
     // prefill the full prompt, which would otherwise advance restored SSM
     // state twice. Stage every format, including unsupported custom layers.
     let version = TQDiskSerializer.formatVersion(of: arrays)
+    // A damaged v2 marker must not downgrade a typed hybrid snapshot to
+    // legacy attention-only restoration and silently discard its recurrence.
+    if version < 2, arrays.keys.contains(where: { $0.hasPrefix("__layer_kind_") }) {
+        return 0
+    }
     if requirePromptBoundary {
         var staged = cache.map { $0.copy() }
         let restored = version >= 2
@@ -1096,17 +1101,10 @@ private func restoreFromV2Arrays(
             return 0
 
         case .cacheList(let subLayers):
-            // CacheList composite (BaichuanM1, FalconH1, MiMoV2Flash
-            // hybrid stacks). Dispatch each sub-LayerData via the
-            // existing per-type helpers using the FULL CacheList
-            // (`cache[i]`) as `into:` — restore* helpers already
-            // introspect CacheList sub-caches by type and find the
-            // matching sub-slot.
-            //
-            // Sub-layer ORDER on disk does NOT have to match the
-            // runtime CacheList's internal order — type matching does
-            // the dispatch. This is the same convention SSM state
-            // restoration in extractSSMStates uses.
+            // Child records are indexed, including duplicate cache types.
+            // Whole-list type lookup would repeatedly overwrite the first
+            // matching child and falsely report the remaining child as warm.
+            guard let list = cache[i] as? CacheList else { return 0 }
             for (subIndex, subData) in subLayers.enumerated() {
                 switch subData {
                 case .standard(let kv):
@@ -1117,32 +1115,27 @@ private func restoreFromV2Arrays(
                         values = values.asType(.bfloat16)
                     }
                     guard keys.shape.count >= 3, values.shape.count >= 3 else {
-                        continue
+                        return 0
                     }
                     if totalTokens == 0 {
                         totalTokens = keys.dim(2)
                     }
-                    restoreKVLayer(keys: keys, values: values, into: cache[i])
+                    restoreKVLayer(keys: keys, values: values, into: list[subIndex])
 
                 case .mamba(let comp):
-                    guard let list = cache[i] as? CacheList, subIndex < list.count,
-                          restoreMambaLayer(comp, into: list[subIndex])
+                    guard restoreMambaLayer(comp, into: list[subIndex])
                     else { return 0 }
 
                 case .rotating(let comp):
-                    restoreRotatingLayer(comp, into: cache[i])
+                    restoreRotatingLayer(comp, into: list[subIndex])
                     if totalTokens == 0 {
                         totalTokens = comp.offset
                     }
 
                 case .tq, .qkv, .deepseekV4, .zayaCCA, .zayaCCATQ, .cacheList,
                      .qsaKV, .modelState, .requiredMiss, .skip:
-                    // .skip is a per-sub no-op (sub-cache had no
-                    // persistable state). The other cases (incl. .qsaKV —
-                    // no model nests a QSAKVCache inside a CacheList) are
-                    // not currently emitted as sub-cache kinds — see
-                    // TQDiskSerializer.deserializeCacheListLayer.
-                    continue
+                    // Unsupported children invalidate the entire snapshot.
+                    return 0
                 }
             }
 
@@ -1164,6 +1157,12 @@ private func restoreFromLegacyArrays(
     _ arrays: [String: MLXArray],
     into cache: [any KVCache]
 ) -> Int {
+    // Legacy formats carry no recurrent/composite companion state. Count
+    // equality among attention layers alone cannot establish a complete hit.
+    guard cache.allSatisfy({
+        !($0 is QSAKVCache)
+            && ($0 is KVCacheSimple || $0 is QuantizedKVCache || $0 is TurboQuantKVCache)
+    }) else { return 0 }
     var kvByLayer: [Int: (keys: MLXArray, values: MLXArray)] = [:]
 
     if TQDiskSerializer.isTQNative(arrays) {
@@ -1660,6 +1659,25 @@ private func canRestoreMambaRecords(
     switch data {
     case .requiredMiss:
         return false
+    case .standard(let component):
+        return (layer is KVCacheSimple || layer is TurboQuantKVCache)
+            && !(layer is QSAKVCache)
+            && component.keys.ndim >= 3 && component.values.ndim >= 3
+            && component.keys.dim(2) == component.values.dim(2)
+    case .rotating(let component):
+        // Pool wrappers need additional native companion state and cannot
+        // be restored from a rotating-only composite record.
+        guard !(layer is HybridPoolCache) else { return false }
+        let target = (layer as? RotatingKVCache)
+            ?? (layer as? RotatingKVCacheWrapper)?.rotating
+        guard let target,
+              component.keys.ndim >= 3, component.values.ndim >= 3,
+              component.keys.dim(2) == component.values.dim(2)
+        else { return false }
+        return component.keep == target.keep && component.maxSize == target.maxCacheSize
+            && component.keep >= 0 && component.keep < component.maxSize
+            && component.step > 0 && component.offset >= 0
+            && component.idx >= 0 && component.idx <= component.keys.dim(2)
     case .mamba(let component):
         guard let target = layer as? MambaCache else { return false }
         if let count = component.persistentSlotCount {
@@ -1676,7 +1694,7 @@ private func canRestoreMambaRecords(
             canRestoreMambaRecords($0.element, into: list[$0.offset])
         }
     default:
-        return true
+        return false
     }
 }
 

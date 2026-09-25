@@ -575,8 +575,8 @@ public enum TQDiskSerializer {
     /// `RotatingKVCacheWrapper` (unwrapped to inner rotating),
     /// `KVCacheSimple`, `TurboQuantKVCache` (fill phase only — compressed
     /// TQ inside CacheList is unusual; recorded as `.skip`). Other sub-cache
-    /// types are recorded as `.skip` for that sub-slot only — restore
-    /// re-prefills just that slot.
+    /// types are recorded as `.skip`; restore then misses the complete
+    /// record because a prefix cannot be warm with an uncomputed child.
     private static func serializeCacheListLayer(
         _ list: CacheList,
         index i: Int,
@@ -1253,7 +1253,7 @@ public enum TQDiskSerializer {
             case .cacheList:
                 let subs = deserializeCacheListLayer(index: i, from: arrays)
                 if subs.isEmpty {
-                    out.append(IndexedLayerData(index: i, data: .skip))
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
                 } else {
                     out.append(IndexedLayerData(index: i, data: .cacheList(subs)))
                 }
@@ -1526,7 +1526,7 @@ public enum TQDiskSerializer {
     /// Returns the per-sub `LayerData` array in original order so the
     /// restore path can dispatch each into the correct sub-cache slot.
     /// Returns an empty array if the count metadata is missing or 0 —
-    /// the caller treats empty as `.skip`.
+    /// the caller treats empty as `.requiredMiss`.
     private static func deserializeCacheListLayer(
         index i: Int,
         from arrays: [String: MLXArray]
@@ -1537,7 +1537,9 @@ public enum TQDiskSerializer {
             return []
         }
         let count = Int(countValue)
-        guard count > 0 else { return [] }
+        // Every child needs at least its own kind tag. Bound allocation and
+        // traversal by the payload, including corrupted count metadata.
+        guard count > 0, count <= arrays.count else { return [] }
 
         var subs: [LayerData] = []
         subs.reserveCapacity(count)
@@ -1547,7 +1549,7 @@ public enum TQDiskSerializer {
                   let kindRaw = readMetaInt32(kindArr),
                   let kind = LayerKind(rawValue: kindRaw)
             else {
-                subs.append(.skip)
+                subs.append(.requiredMiss)
                 continue
             }
             switch kind {
@@ -1557,7 +1559,7 @@ public enum TQDiskSerializer {
                 {
                     subs.append(.standard(KVLayerComponents(keys: k, values: v)))
                 } else {
-                    subs.append(.skip)
+                    subs.append(.requiredMiss)
                 }
             case .mamba:
                 let component = deserializeMambaState(prefix: "mamba_\(i)_sub_\(j)", from: arrays)
@@ -1566,7 +1568,7 @@ public enum TQDiskSerializer {
                 if let k = arrays["rot_\(i)_sub_\(j)_keys"],
                    let v = arrays["rot_\(i)_sub_\(j)_values"],
                    let metaArr = arrays["__rot_\(i)_sub_\(j)_meta__"],
-                   !metaArr.shape.isEmpty, metaArr.shape[0] == 5
+                   metaArr.shape == [5], metaArr.dtype == .int32
                 {
                     let m = metaArr.asArray(Int32.self)
                     if m.count == 5 {
@@ -1581,20 +1583,20 @@ public enum TQDiskSerializer {
                                     offset: Int(m[3]),
                                     idx: Int(m[4]))))
                     } else {
-                        subs.append(.skip)
+                        subs.append(.requiredMiss)
                     }
                 } else {
-                    subs.append(.skip)
+                    subs.append(.requiredMiss)
                 }
             case .skip, .unknown:
-                subs.append(.skip)
+                subs.append(.requiredMiss)
             case .tq, .qkv, .deepseekV4, .cacheList, .zayaCCA, .zayaCCATQ, .qsaKV, .modelState:
                 // Not currently emitted as sub-cache types — see
                 // serializeCacheListLayer (no model nests a QSAKVCache
                 // inside a CacheList). If a future bundle ships these
-                // we'll need to extend serialize too. Skip for now so
-                // old readers don't crash on a tag they can't round-trip.
-                subs.append(.skip)
+                // the complete record must miss until this reader can restore
+                // every child. An empty sibling must never count as a hit.
+                subs.append(.requiredMiss)
             }
         }
         return subs

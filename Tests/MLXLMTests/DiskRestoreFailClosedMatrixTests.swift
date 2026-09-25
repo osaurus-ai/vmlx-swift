@@ -21,7 +21,8 @@
 //   Ornith 1.5 / Qwen 3.5-3.6       MambaCache + RotatingKVCache   (hybrid SSM)
 //   DeepSeek-V4                     DeepseekV4Cache + RotatingKVCache
 //   Nanbeige / LagunaM1             KVCacheSimple      (no newCache override)
-//   LFM2 / Jamba / FalconH1         MambaCache
+//   LFM2 / Jamba / GraniteHybrid    MambaCache + KVCacheSimple
+//   FalconH1                       CacheList(MambaCache, KVCacheSimple)
 //   Gemma-4 / Mistral / GPTOSS      RotatingKVCache
 //
 // Every case runs BOTH directions. The positive control is not optional: a
@@ -89,8 +90,35 @@ struct DiskRestoreFailClosedMatrixTests {
             families: "Nanbeige, LagunaM1 (default cache, no newCache override)",
             make: { [KVCacheSimple(), KVCacheSimple(), KVCacheSimple()] }),
         Topology(
+            name: "hybrid-plain-kv",
+            families: "LFM2, LFM2MoE, Jamba, GraniteMoeHybrid mixed configurations",
+            make: { [MambaCache(), KVCacheSimple(), MambaCache()] }),
+        Topology(
+            name: "composite-hybrid",
+            families: "FalconH1",
+            make: {
+                [CacheList(MambaCache(), KVCacheSimple()),
+                 CacheList(MambaCache(), KVCacheSimple())]
+            }),
+        Topology(
+            name: "composite-duplicate-kv",
+            families: "synthetic duplicate-type CacheList contract",
+            make: { [CacheList(KVCacheSimple(), KVCacheSimple())] }),
+        Topology(
+            name: "composite-tq-fill",
+            families: "synthetic full-precision TQ composite contract",
+            make: { [CacheList(MambaCache(), TurboQuantKVCache())] }),
+        Topology(
+            name: "composite-rotating",
+            families: "synthetic rotating CacheList contract",
+            make: {
+                [CacheList(MambaCache(), RotatingKVCache(maxSize: 16, keep: 0)),
+                 CacheList(RotatingKVCache(maxSize: 16, keep: 0),
+                           RotatingKVCache(maxSize: 16, keep: 0))]
+            }),
+        Topology(
             name: "pure-ssm",
-            families: "LFM2, LFM2MoE, Jamba, FalconH1, GraniteMoeHybrid",
+            families: "synthetic all-recurrent configuration",
             make: { [MambaCache(), MambaCache(), MambaCache()] }),
         ]
     }
@@ -112,11 +140,11 @@ struct DiskRestoreFailClosedMatrixTests {
     /// make every assertion below vacuously true.
     private static func advance(_ caches: [any KVCache], steps: Int, headDim: Int = 8) {
         for s in 0..<steps {
-            for c in caches {
+            for c in leaves(caches) {
                 if let mamba = c as? MambaCache {
                     mamba[0] = MLXArray.ones([1, 4, headDim]) * Float(s + 1)
                     mamba[1] = MLXArray.ones([1, 4, headDim]) * Float(s + 2)
-                    mamba.offset = s + 1
+                    mamba.offset = 2 * (s + 1)
                 } else {
                     let k = MLXArray.ones([1, 1, 2, headDim]) * Float(s + 1)
                     let v = MLXArray.ones([1, 1, 2, headDim]) * Float(s + 2)
@@ -125,6 +153,21 @@ struct DiskRestoreFailClosedMatrixTests {
             }
         }
         MLX.eval(caches)
+    }
+
+    /// Composite layers must validate every child, not only the wrapper's
+    /// inherited offset (which does not represent the contained states).
+    private static func leaves(_ caches: [any KVCache]) -> [any KVCache] {
+        caches.flatMap { cache -> [any KVCache] in
+            if let list = cache as? CacheList {
+                return leaves((0 ..< list.count).map { list[$0] })
+            }
+            return [cache]
+        }
+    }
+
+    private static func offsets(_ caches: [any KVCache]) -> [Int] {
+        leaves(caches).map(\.offset)
     }
 
     /// The invariant, stated once.
@@ -166,7 +209,7 @@ struct DiskRestoreFailClosedMatrixTests {
                 let tokens = [1, 2, 3, 4, 5]
                 let original = topo.make()
                 Self.advance(original, steps: 3)
-                let expected = original.map(\.offset)
+                let expected = Self.offsets(original)
                 #expect(
                     expected.allSatisfy { $0 > 0 },
                     "\(topo.name): setup failed to advance — the whole suite would be vacuous")
@@ -190,10 +233,9 @@ struct DiskRestoreFailClosedMatrixTests {
                     // layers that carry a sequence dimension, and its `.mamba`
                     // branch says so outright: "no sequence dim to measure ...
                     // the attention side already provides that number." That
-                    // holds for hybrids and is FALSE for a model whose every
-                    // layer is recurrent, so LFM2 / Jamba / FalconH1 /
-                    // GraniteMoeHybrid can never report a hit and re-prefill
-                    // every turn.
+                    // holds for hybrids and is FALSE for an all-recurrent
+                    // topology. This synthetic row is not proof that the named
+                    // shipped mixed-attention families always miss.
                     //
                     // This is a PERFORMANCE defect, not a correctness one — it
                     // misses, which is the safe direction — so it is out of
@@ -213,7 +255,7 @@ struct DiskRestoreFailClosedMatrixTests {
                 }
 
                 #expect(restored > 0, "\(topo.name) [\(topo.families)]: intact payload missed")
-                for (i, (before, after)) in zip(expected, target.map(\.offset)).enumerated() {
+                for (i, (before, after)) in zip(expected, Self.offsets(target)).enumerated() {
                     #expect(
                         after == before,
                         "\(topo.name): layer \(i) offset \(before) -> \(after)")
@@ -244,7 +286,7 @@ struct DiskRestoreFailClosedMatrixTests {
                     let restored = restoreFromDiskArrays(arrays, into: &target)
                     Self.assertFailedClosed(
                         restoredTokens: restored,
-                        offsets: target.map(\.offset),
+                        offsets: Self.offsets(target),
                         topology: "\(topo.name) [\(topo.families)]",
                         damage: "dropping the kind tag for layer \(victim)")
                 }
@@ -279,10 +321,84 @@ struct DiskRestoreFailClosedMatrixTests {
                     let restored = restoreFromDiskArrays(arrays, into: &target)
                     Self.assertFailedClosed(
                         restoredTokens: restored,
-                        offsets: target.map(\.offset),
+                        offsets: Self.offsets(target),
                         topology: "\(topo.name) [\(topo.families)]",
                         damage: "dropping data tensor '\(key)'")
                 }
+            }
+        }
+    }
+
+    @Test("invalid composite metadata misses before mutating any child")
+    func invalidCompositeMetadataIsAtomic() throws {
+        try MLXMetalTestLock.withLock {
+            let topo = try #require(Self.topologies.first { $0.name == "composite-hybrid" })
+            let original = topo.make()
+            Self.advance(original, steps: 2)
+            let intact = TQDiskSerializer.serialize(cache: original)
+            // Small invalid values exercise the same bounds as a corrupt huge
+            // count without ever requesting an unbounded baseline allocation.
+            let mutations: [(String, Int32)] = [
+                ("__cache_list_1_count__", 0),
+                ("__cache_list_1_count__", -1),
+                ("__cache_list_1_count__", Int32(intact.count + 1)),
+                ("__cache_list_1_sub_1_kind__", -1),
+                (TQDiskSerializer.formatVersionKey, 0),
+            ]
+            var malformedShape = intact
+            malformedShape["kv_1_sub_1_keys"] = MLXArray.ones([2, 8])
+            var malformedTarget = topo.make()
+            #expect(restoreFromDiskArrays(malformedShape, into: &malformedTarget) == 0)
+            #expect(Self.offsets(malformedTarget).allSatisfy { $0 == 0 })
+            for (key, value) in mutations {
+                var arrays = intact
+                arrays[key] = MLXArray([value])
+                var target = topo.make()
+                #expect(restoreFromDiskArrays(arrays, into: &target) == 0, "\(key)=\(value)")
+                #expect(Self.offsets(target).allSatisfy { $0 == 0 }, "\(key)=\(value)")
+            }
+        }
+    }
+
+    @Test("composite rotating snapshots retain wrapped-window offsets")
+    func rotatingCompositeWindowRoundTrip() throws {
+        try MLXMetalTestLock.withLock {
+            let topo = try #require(Self.topologies.first { $0.name == "composite-rotating" })
+            let original = topo.make()
+            Self.advance(original, steps: 12)
+            let arrays = TQDiskSerializer.serialize(cache: original)
+            var target = topo.make()
+            #expect(restoreFromDiskArrays(arrays, into: &target) == 24)
+            #expect(Self.offsets(target) == Self.offsets(original))
+            for field in [0, 1, 4] {
+                var damaged = arrays
+                let key = "__rot_1_sub_1_meta__"
+                var meta = try #require(arrays[key]).asArray(Int32.self)
+                meta[field] = 999
+                damaged[key] = MLXArray(meta)
+                var fresh = topo.make()
+                #expect(restoreFromDiskArrays(damaged, into: &fresh) == 0)
+                #expect(Self.offsets(fresh).allSatisfy { $0 == 0 })
+            }
+        }
+    }
+
+    @Test("legacy attention snapshots cannot restore hybrid companion state")
+    func legacyHybridMissKeepsPlainKVCompatibility() throws {
+        try MLXMetalTestLock.withLock {
+            let keys = MLXArray.ones([1, 1, 4, 8])
+            let arrays = ["b0_l0_keys": keys, "b0_l0_values": keys * 2]
+            var plain: [any KVCache] = [KVCacheSimple()]
+            #expect(restoreFromDiskArrays(arrays, into: &plain) == 4)
+            #expect(Self.offsets(plain) == [4])
+            var hybrid: [any KVCache] = [MambaCache(), KVCacheSimple()]
+            #expect(restoreFromDiskArrays(arrays, into: &hybrid) == 0)
+            #expect(Self.offsets(hybrid) == [0, 0])
+            for requireBoundary in [false, true] {
+                var sparse: [any KVCache] = [QSAKVCache()]
+                #expect(restoreFromDiskArrays(
+                    arrays, into: &sparse, requirePromptBoundary: requireBoundary) == 0)
+                #expect(Self.offsets(sparse) == [0])
             }
         }
     }
@@ -309,7 +425,7 @@ struct DiskRestoreFailClosedMatrixTests {
                     let restored = restoreFromDiskArrays(arrays, into: &target)
                     Self.assertFailedClosed(
                         restoredTokens: restored,
-                        offsets: target.map(\.offset),
+                        offsets: Self.offsets(target),
                         topology: "\(topo.name) [\(topo.families)]",
                         damage: "truncating to the first \(keep) of \(ordered.count) keys")
                 }
@@ -328,7 +444,7 @@ struct DiskRestoreFailClosedMatrixTests {
                 let restored = restoreFromDiskArrays([:], into: &target)
                 #expect(restored == 0, "\(topo.name): empty payload reported \(restored) tokens")
                 #expect(
-                    target.map(\.offset).allSatisfy { $0 == 0 },
+                    Self.offsets(target).allSatisfy { $0 == 0 },
                     "\(topo.name): empty payload advanced a layer")
             }
         }
