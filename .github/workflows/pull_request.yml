@@ -202,3 +202,55 @@ jobs:
       - name: Linux CUDA CMake Swift Build - No Release
         run: |
           bash .github/scripts/build-linux-cuda-cmake.sh
+
+  linux_swiftpm:
+    name: Linux SwiftPM (${{ matrix.arch }})
+    # Advisory while it is new: builds the Linux profile of Package.swift (the LM libraries and
+    # their dependencies) and runs VMLXLinuxTests. GitHub-hosted runners only: the self-hosted pools
+    # queue for a day. python3 is for scripts/check-metal-only.sh.
+    continue-on-error: true
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: ubuntu-24.04
+            arch: x86_64
+          - host: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.host }}
+    container:
+      image: swift:6.3-bookworm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install the Linux packages
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libopenblas-dev liblapack-dev liblapacke-dev gfortran g++ libsqlite3-dev python3
+
+      - name: METAL-ONLY check (advisory)
+        if: ${{ !cancelled() && hashFiles('scripts/check-metal-only.sh') != '' }}
+        continue-on-error: true
+        run: bash scripts/check-metal-only.sh
+
+      - name: Build the Linux profile
+        run: swift build
+
+      - name: VMLXLinuxTests
+        run: |
+          set -o pipefail
+          swift test --filter VMLXLinuxTests 2>&1 | tee vmlx-linux-tests.log
+          grep -Eq 'Test run with [1-9][0-9]* tests? .*passed' vmlx-linux-tests.log
+
+      # Last, and with !cancelled(), so a broken checker never hides the build and test results.
+      - name: METAL-ONLY checker test
+        if: ${{ !cancelled() && hashFiles('scripts/check-metal-only-test.sh') != '' }}
+        run: bash scripts/check-metal-only-test.sh
