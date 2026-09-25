@@ -1277,6 +1277,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         isResumeBoundary: Bool = false,
         isPostAnswer: Bool = false
     ) {
+        var trace = CacheFinalizationTrace("coordinator-store", tokens: promptTokens.count)
+        defer { trace.mark("return") }
         let totalTokens = promptTokens.count
         let blockSize = config.pagedBlockSize
         let traceCacheStore =
@@ -1363,6 +1365,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             FileHandle.standardError.write(Data(message.utf8))
         }
 
+        trace.mark("geometry-and-paged-companion")
         // Store in paged cache (skip when the model is paged-incompatible —
         // see `isPagedIncompatible` above). Recurrent-only/state-only caches
         // must not publish token hashes without any restorable KV payload;
@@ -1381,6 +1384,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             publishedPagedPayload = true
         }
 
+        trace.mark("paged-store")
         // Build the disk payload before entering the linked-store transaction.
         //
         // SLIDING-1: when the raw cache is available, use the v2
@@ -1436,6 +1440,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             }
         }
 
+        trace.mark("disk-serialization")
         storePersistentBoundary(
             tokens: promptTokens,
             diskArrays: diskArrays,

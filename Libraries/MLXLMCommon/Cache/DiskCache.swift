@@ -775,6 +775,8 @@ public final class DiskCache: @unchecked Sendable {
         isResumeBoundary: Bool = false,
         isPostAnswer: Bool = false
     ) {
+        var trace = CacheFinalizationTrace("disk-store", tokens: tokens.count)
+        defer { trace.mark("return") }
         guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return }
         let tokenCount = tokens.count
         let rowKind = Self.rowKind(
@@ -817,7 +819,9 @@ public final class DiskCache: @unchecked Sendable {
         // `defer { unlock() }` to cover every exit path.
         // A payload with NaN/Inf is not a cache entry, it is the failure the
         // cache would replay: refuse before touching the disk or the index.
+        trace.mark("before-validation")
         let nonFinite = Self.nonFiniteTensorNames(in: arrays)
+        trace.mark("validation")
         if !nonFinite.isEmpty {
             lock.lock()
             refusedNonFiniteStores += 1
@@ -832,6 +836,7 @@ public final class DiskCache: @unchecked Sendable {
         defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
         defer { lock.unlock() }
+        trace.mark("locks-acquired")
         stores += 1
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             traceLastStoredTokens = tokens
@@ -873,6 +878,7 @@ public final class DiskCache: @unchecked Sendable {
         if _refuseOccupiedStoreLocked(finalURL: url, hash: hash, tokenCount: tokenCount) {
             return
         }
+        trace.mark("reuse-and-path-check")
         // Pre-realize arrays under the lock so Metal work completes
         // before the writer hits the C++ save path AND no other thread
         // can interleave MLX ops on the same device during this window.
@@ -889,6 +895,7 @@ public final class DiskCache: @unchecked Sendable {
         MLX.eval(Array(arrays.values))
         Stream.gpu.synchronize()
         let tEval = Date()
+        trace.mark("materialize")
         do {
             // Atomic publication: the row becomes visible under its content
             // hash only after every byte is on disk. A reader that races the
@@ -950,6 +957,7 @@ public final class DiskCache: @unchecked Sendable {
                         + "save=\(tSave.timeIntervalSince(tEval))s\n").utf8))
             }
 
+            trace.mark("write-and-publish")
             let fileSize: Int
             if let attrs = try? FileManager.default.attributesOfItem(atPath: finalURL.path),
                 let size = attrs[.size] as? Int
@@ -974,6 +982,7 @@ public final class DiskCache: @unchecked Sendable {
                         + "hash=\(hash.prefix(12)) — payload removed\n").utf8))
                 return
             }
+            trace.mark("index-insert")
             if let fingerprint = _fileFingerprint(url: finalURL), fingerprint.size > 0 {
                 validatedFiles[hash] = ValidatedRecord(
                     file: fingerprint, layout: Self.payloadLayout(arrays),
@@ -986,6 +995,7 @@ public final class DiskCache: @unchecked Sendable {
             if rejectedRestores.removeValue(forKey: hash) != nil {
                 rewrittenAfterRejection.insert(hash)
             }
+            trace.mark("validated-metadata")
             if enforceQuota {
                 _evictIfNeededLocked()
             }

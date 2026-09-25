@@ -3383,6 +3383,8 @@ public actor BatchEngine {
                     coordinator.requiresRecurrentSSMCompanion)
 
             func storeCacheEntry(tokens: [Int], snapshot: [KVCache], label: String) {
+                var trace = CacheFinalizationTrace("batch-entry-" + label, tokens: tokens.count)
+                defer { trace.mark("return") }
                 guard !tokens.isEmpty else { return }
                 // Serialising the cache materialises it again (host `Data` for the
                 // disk write, plus the disk-store cache) while the snapshot and the

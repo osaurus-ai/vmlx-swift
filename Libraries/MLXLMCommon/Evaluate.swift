@@ -2977,6 +2977,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             isResumeBoundary: Bool = false,
             isPostAnswer: Bool = false
         ) {
+            var trace = CacheFinalizationTrace("solo-entry", tokens: tokens.count)
+            defer { trace.mark("return") }
             guard !tokens.isEmpty else { return }
             // Saving the cache duplicates it several times over (snapshot, host
             // `Data` for the disk write, disk-store cache) at the point where
