@@ -40,11 +40,15 @@ public enum MetalLiveBufferGuard {
     /// Mirrors mlx's Metal `device_info()`: reads `iogpu.rsrc_limit` and
     /// falls back to 499000 when the sysctl reports nothing.
     public static func resourceLimit() -> Int? {
+        #if canImport(Darwin)
         var value: Int = 0
         var length = MemoryLayout<Int>.size
         sysctlbyname("iogpu.rsrc_limit", &value, &length, nil, 0)
         if value <= 0 { value = 499_000 }
         return value
+        #else
+        return nil
+        #endif
     }
 
     /// Safe generated-token cap from the Metal live-buffer ceiling.

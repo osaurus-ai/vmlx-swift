@@ -77,6 +77,7 @@ public enum HardwareInfo {
     ///
     /// Queried via `sysctl hw.machine` at runtime.
     private static var machineIdentifier: String {
+        #if canImport(Darwin)
         var size: Int = 0
         sysctlbyname("hw.machine", nil, &size, nil, 0)
         guard size > 0 else { return "" }
@@ -85,5 +86,8 @@ public enum HardwareInfo {
         let count = machine.firstIndex(of: 0) ?? machine.count
         let bytes = machine.prefix(count).map { UInt8(bitPattern: $0) }
         return String(bytes: bytes, encoding: .utf8) ?? ""
+        #else
+        return ""
+        #endif
     }
 }

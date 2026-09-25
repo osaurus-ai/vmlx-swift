@@ -8,7 +8,9 @@
 // Python reference: mlx_vlm/models/gemma4/language.py
 
 import Foundation
-import OSLog
+#if canImport(os)
+    import OSLog
+#endif
 
 private let gemma4WeightsLogger = Logger(subsystem: "vmlx", category: "Gemma4Weights")
 import MLX

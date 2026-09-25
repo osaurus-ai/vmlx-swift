@@ -47,7 +47,11 @@
 //   No RAM doubling.
 
 import Foundation
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 public enum JangPressShardError: Error, CustomStringConvertible {
     case openFailed(URL, errno: Int32)
@@ -119,6 +123,7 @@ public final class JangPressShard: @unchecked Sendable {
         guard fdLocal >= 0 else { throw JangPressShardError.openFailed(path, errno: errno) }
         self.fd = fdLocal
 
+        #if canImport(Darwin)
         if noCacheIO {
             guard fcntl(fdLocal, F_NOCACHE, 1) == 0 else {
                 let savedErrno = errno
@@ -127,6 +132,10 @@ public final class JangPressShard: @unchecked Sendable {
             }
         }
         self.noCacheIOEnabled = noCacheIO
+        #else
+        // F_NOCACHE is Darwin-only: on Linux the shard's reads go through the page cache.
+        self.noCacheIOEnabled = false
+        #endif
 
         var st = stat()
         guard fstat(fdLocal, &st) == 0 else {

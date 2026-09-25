@@ -620,11 +620,11 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(disk.contains("public enum MLXCacheIOLock"))
         #expect(disk.contains("withSerializedMLXCacheIO"))
         #expect(disk.contains("MLXDiskCacheIOLock.shared.lock()"))
-        #expect(disk.contains("Stream.gpu.synchronize()"))
+        #expect(disk.contains("synchronizeComputeStream()"))
         #expect(disk.contains("try loadArraysAndMetadata(url: url)"))
         #expect(disk.contains("try save(arrays: arrays, metadata: [\"format\": \"mlx\"], url: url)"))
         #expect(ssm.contains("MLXDiskCacheIOLock.shared.lock()"))
-        #expect(ssm.contains("Stream.gpu.synchronize()"))
+        #expect(ssm.contains("synchronizeComputeStream()"))
         #expect(ssm.contains("loadArraysAndMetadata(url: safetensorsURL)"))
         // The companion tensor is written under an unpublished name and then
         // renamed into place. The contract is unchanged: the MLX safetensors
@@ -656,7 +656,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
 
         #expect(helperSource.contains("MLXCacheIOLock.withSerializedMLXCacheIO"))
         #expect(helperSource.contains("MLX.eval(result)"))
-        #expect(helperSource.contains("Stream.gpu.synchronize()"))
+        #expect(helperSource.contains("synchronizeComputeStream()"))
         #expect(helperSource.contains("MLX.Memory.clearCache()"))
     }
 
@@ -675,7 +675,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
 
         #expect(storeSource.contains("MLXCacheIOLock.withSerializedMLXCacheIO"))
         #expect(storeSource.contains("MLX.eval(materialized)"))
-        #expect(storeSource.contains("Stream.gpu.synchronize()"))
+        #expect(storeSource.contains("synchronizeComputeStream()"))
         #expect(storeSource.contains("let disk: SSMCompanionDiskStore?"))
         #expect(promptTailSource.contains("input.text.tokenIds"))
         #expect(!promptTailSource.contains("tailArray.asArray"))

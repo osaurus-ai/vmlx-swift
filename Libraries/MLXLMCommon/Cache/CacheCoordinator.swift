@@ -2,7 +2,9 @@
 
 import Foundation
 @preconcurrency import MLX
-import os
+#if canImport(os)
+    import os
+#endif
 
 /// Serializes process-wide combined disk-quota reconciliation. Individual KV
 /// and companion stores already own their IO locks; this lock only protects

@@ -1,10 +1,16 @@
 // Copyright © 2025 Apple Inc. All rights reserved.
 
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 import MLX
 import SQLite3
-import os
+#if canImport(os)
+    import os
+#endif
 
 /// Thread-safe snapshot of ``DiskCache`` counters.
 public struct DiskCacheStats: Sendable {
@@ -228,10 +234,10 @@ public enum MLXCacheIOLock {
     public static func withSerializedMLXCacheIO<T>(_ body: () throws -> T) rethrows -> T {
         MLXDiskCacheIOLock.shared.lock()
         defer {
-            Stream.gpu.synchronize()
+            synchronizeComputeStream()
             MLXDiskCacheIOLock.shared.unlock()
         }
-        Stream.gpu.synchronize()
+        synchronizeComputeStream()
         return try body()
     }
 }
@@ -960,9 +966,9 @@ public final class DiskCache: @unchecked Sendable {
         let phaseTrace =
             ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
         let tStart = Date()
-        Stream.gpu.synchronize()
+        synchronizeComputeStream()
         MLX.eval(Array(arrays.values))
-        Stream.gpu.synchronize()
+        synchronizeComputeStream()
         let tEval = Date()
         trace.mark("materialize")
         do {
@@ -982,7 +988,7 @@ public final class DiskCache: @unchecked Sendable {
                 throw DiskCacheIntegrityError.occupiedTemporaryName(url.lastPathComponent)
             }
             try save(arrays: arrays, metadata: ["format": "mlx"], url: url)
-            Stream.gpu.synchronize()
+            synchronizeComputeStream()
             guard Self.isCompleteSafetensors(url: url) else {
                 _ = Self.removeRegularFile(at: url)
                 throw DiskCacheIntegrityError.incompleteWrite(finalURL.lastPathComponent)

@@ -36,10 +36,16 @@
 // falls through on memory miss, using the same model key and media salt
 // isolation as the KV tiers.
 
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 import MLX
-import os
+#if canImport(os)
+    import os
+#endif
 
 /// One recurrent companion payload used by the coordinator's shared quota.
 /// New sidecars carry the hash of their matching KV payload so eviction can
@@ -666,9 +672,9 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         // DiskCache.swift:148-157. GPU work must complete before the
         // safetensors writer can read the storage. MLX's tensor
         // realization (NOT script eval — this is `mlx.core.eval`).
-        Stream.gpu.synchronize()
+        synchronizeComputeStream()
         MLX.eval(ssmStates)
-        Stream.gpu.synchronize()
+        synchronizeComputeStream()
 
         // Materialize key→array dict expected by `save(arrays:metadata:url:)`.
         // Ordering preserved by `state_<idx>` keys; `extractSSMStates`
@@ -697,7 +703,7 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         }
         do {
             try save(arrays: arrays, metadata: ["format": "mlx"], url: partialURL)
-            Stream.gpu.synchronize()
+            synchronizeComputeStream()
             // Published with one `rename(2)`, still inside the IO lock: it
             // replaces an older regular file of the same key atomically, so
             // a rename that fails leaves the old valid tensor where it was.
