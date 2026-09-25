@@ -882,6 +882,10 @@ public final class DiskCache: @unchecked Sendable {
         // `defer { unlock() }` to cover every exit path.
         // A payload with NaN/Inf is not a cache entry, it is the failure the
         // cache would replay: refuse before touching the disk or the index.
+        // Validation also evaluates MLX reductions. It belongs to the same
+        // process-wide critical section as materialization and safetensors IO.
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
         trace.mark("before-validation")
         let nonFinite = Self.nonFiniteTensorNames(in: arrays)
         trace.mark("validation")
@@ -895,8 +899,6 @@ public final class DiskCache: @unchecked Sendable {
             return
         }
 
-        MLXDiskCacheIOLock.shared.lock()
-        defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
         defer { lock.unlock() }
         trace.mark("locks-acquired")
