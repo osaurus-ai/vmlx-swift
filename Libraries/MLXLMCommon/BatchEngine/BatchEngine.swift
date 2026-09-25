@@ -2467,6 +2467,12 @@ public actor BatchEngine {
     ) {
         var slot = initialSlot ?? activeSlots[slotIndex]
 
+        // Alignment after preparation does not prove that a warm restore used
+        // the same partition as cold prefill. Only a genuinely cold start can
+        // mint durable canonical checkpoint provenance here.
+        let canonicalPrefillStart = slot.cache.allSatisfy { $0.offset == 0 }
+            && inputForPrepare.text.tokens.size == slot.cachePromptTokenIds.count
+
         let totalPromptUnits = max(0, slot.promptTokenCount)
         let remainingPromptUnits = max(0, inputForPrepare.text.tokens.size)
         slot.continuation.yield(.prefillProgress(PrefillProgress(
@@ -2667,7 +2673,9 @@ public actor BatchEngine {
             {
                 slot.prefillReplaySeed = BatchPrefillReplaySeed(
                     tokens: Array(slot.cachePromptTokenIds.prefix(consumed)),
-                    cache: makePromptBoundaryCacheSnapshot(from: slot.cache))
+                    cache: makePromptBoundaryCacheSnapshot(from: slot.cache),
+                    canonicalChunkSize: canonicalPrefillStart && consumed % chunkSize == 0
+                        ? chunkSize : nil)
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                     FileHandle.standardError.write(Data(
                         "[vmlx][cache/prefill-replay-seed] captured=\(consumed) prompt=\(slot.cachePromptTokenIds.count)\n".utf8))
@@ -3625,11 +3633,52 @@ public actor BatchEngine {
                     let rebuildStart = traceRebuild ? DispatchTime.now().uptimeNanoseconds : 0
                     let chunkSize = max(1, slot.prefillStepSize)
                     let expectedSeedCount = ((tokens.count - 1) / chunkSize) * chunkSize
-                    let reusableSeed = boundaryReplaySeed.flatMap { seed in
+                    let contract = CanonicalPrefillCheckpoint(chunkSize: chunkSize)!
+                    func canContinue(_ seed: BatchPrefillReplaySeed.State) -> Bool {
                         canReuseBoundaryReplay
-                            && seed.tokens.count == expectedSeedCount
-                            && tokens.starts(with: seed.tokens)
-                            && CacheStoreBudget.canStore(seed.cache) ? seed : nil
+                            && contract.canContinue(seedTokens: seed.tokens, targetTokens: tokens,
+                                                    storedChunkSize: seed.canonicalChunkSize)
+                            && CacheStoreBudget.canStore(seed.cache)
+                    }
+                    if let seed = boundaryReplaySeed, !canContinue(seed) {
+                        boundaryReplaySeed = nil
+                    }
+                    // A disk checkpoint has a separate namespace and recorded
+                    // canonical schedule. Never infer this from an arbitrary
+                    // warm chat boundary merely having a divisible offset.
+                    if canReuseBoundaryReplay,
+                       boundaryReplaySeed == nil,
+                       let persisted = coordinator.diskCache?.fetchCanonicalCheckpoint(
+                            targetTokens: tokens, contract: contract, requestSalt: slot.mediaSalt)
+                    {
+                        let validDType = persisted.arrays[TQDiskSerializer.preserveStandardKVStorageDTypeKey]
+                            .map { $0.size == 1 && $0.dtype == .int32 && $0.item(Int32.self) == 1 } ?? false
+                        var restored = context.model.newCache(parameters: slot.parameters)
+                        if validDType,
+                           restoreFromDiskArrays(persisted.arrays, into: &restored, requirePromptBoundary: true)
+                            == persisted.tokens.count,
+                           restored.count == storageTopologySnapshot.count,
+                           restored.allSatisfy({
+                               ($0 is KVCacheSimple || $0 is RotatingKVCache)
+                                   && $0.offset == persisted.tokens.count
+                           }), CacheStoreBudget.canStore(restored)
+                        {
+                            boundaryReplaySeed = (persisted.tokens, restored, chunkSize)
+                            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                                FileHandle.standardError.write(Data(
+                                    "[vmlx][cache/canonical-checkpoint] restored=\(persisted.tokens.count) target=\(tokens.count) chunk=\(chunkSize)\n".utf8))
+                            }
+                        } else {
+                            // Let the next canonical rebuild replace this
+                            // payload instead of preserving it via store dedup.
+                            coordinator.diskCache?.markRestoreRejected(
+                                tokens: persisted.tokens,
+                                mediaSalt: contract.storageSalt(requestSalt: slot.mediaSalt),
+                                countedHit: false)
+                        }
+                    }
+                    let reusableSeed = boundaryReplaySeed.flatMap { seed in
+                        canContinue(seed) ? seed : nil
                     }
                     if reusableSeed == nil { boundaryReplaySeed = nil }
                     let reusedCount = reusableSeed?.tokens.count ?? 0
@@ -3659,7 +3708,7 @@ public actor BatchEngine {
                         // Require an unchanged token suffix and exact offsets,
                         // not merely a cache-shaped object from custom prepare.
                         let consumed = tokens.count - remaining.tokens.size
-                        if reusableSeed == nil,
+                        if reusableSeed == nil || reusableSeed?.canonicalChunkSize == chunkSize,
                            canReuseBoundaryReplay,
                            consumed > 0, consumed == expectedSeedCount,
                            remaining.mask == nil,
@@ -3674,7 +3723,7 @@ public actor BatchEngine {
                         {
                             boundaryReplaySeed = (
                                 Array(tokens.prefix(consumed)),
-                                makePromptBoundaryCacheSnapshot(from: cache))
+                                makePromptBoundaryCacheSnapshot(from: cache), chunkSize)
                         }
                         // Match the main prefill path's batch-first shape.
                         // ZAYA CCA reads B/T from activation rank and traps
@@ -3869,6 +3918,12 @@ public actor BatchEngine {
                 Self.logger.debug(
                     "Skipped post-answer cache entry for slot \(slot.id.description, privacy: .public): reason=\(String(describing: reason), privacy: .public) generated=\(slot.generatedTokenIds.count) cacheOffset=\((slot.cache.map(\.offset).max() ?? 0), privacy: .public)"
                 )
+            }
+            if canReuseBoundaryReplay, reason == .stop,
+               let seed = boundaryReplaySeed, let chunkSize = seed.canonicalChunkSize {
+                coordinator.storeCanonicalCheckpoint(
+                    tokens: seed.tokens, cache: seed.cache, chunkSize: chunkSize,
+                    requestSalt: slot.mediaSalt, chainId: slot.parameters.cacheChainId)
             }
             } else {
                 Self.logger.debug(

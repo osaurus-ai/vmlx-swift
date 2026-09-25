@@ -59,6 +59,10 @@ struct QuotaRow: Equatable, Sendable {
     /// only a likely resume point: the history boundary of the same turn is
     /// the one that always matches, and the plan keeps that one beside it.
     var isPostAnswer: Bool = false
+    /// A separately namespaced full-chunk prefill checkpoint. It accelerates
+    /// boundary reconstruction but must never displace the actual chat resume
+    /// point. Older canonical checkpoints are disposable.
+    var isCanonicalCheckpoint: Bool = false
     /// The conversation. `nil` = a row written before chains existed: it is
     /// its own single-row chain.
     let chainId: String?
@@ -207,6 +211,9 @@ enum DiskQuotaPlanner {
         /// token re-prefill on MiniCPM). `nil` when the tip is not post-answer
         /// or no history boundary exists.
         let fallback: QuotaRow?
+        /// At most one current checkpoint survives the soft phase. The hard
+        /// cap can spend it before any actual conversation tip.
+        let checkpoint: QuotaRow?
         /// Rows the chain can spend before its resume boundaries: the
         /// exact-prompt / post-answer rows of a chain that has marked
         /// boundaries. Smallest first. Empty when nothing is marked.
@@ -247,7 +254,7 @@ enum DiskQuotaPlanner {
         let activeKey = activeChain.map(ChainKey.named)
         let activeTipBefore =
             rows
-            .filter { isChainRow($0) && chainKey($0) == activeKey }
+            .filter { isChainRow($0) && !$0.isCanonicalCheckpoint && chainKey($0) == activeKey }
             .max(by: tipOrder)
 
         // 2. Rows that can never fit.
@@ -273,14 +280,23 @@ enum DiskQuotaPlanner {
                     tip.isPostAnswer
                     ? members.filter { $0.isResumeBoundary && !$0.isPostAnswer }.max(by: tipOrder)
                     : nil
-                let rest = members.filter { $0.id != tip.id && $0.id != fallback?.id }
+                let checkpoint = tip.isCanonicalCheckpoint ? nil : members.filter {
+                    $0.isCanonicalCheckpoint && $0.id != tip.id
+                }.max(by: oldestFirst)
+                let rest = members.filter {
+                    $0.id != tip.id && $0.id != fallback?.id && $0.id != checkpoint?.id
+                }
                 let marked = members.contains(where: \.isResumeBoundary)
                 return Chain(
                     tip: tip,
                     fallback: fallback,
-                    disposable: marked
-                        ? rest.filter { !$0.isResumeBoundary }.sorted(by: shortestFirst) : [],
-                    superseded: (marked ? rest.filter(\.isResumeBoundary) : rest)
+                    checkpoint: checkpoint,
+                    disposable: rest.filter {
+                        $0.isCanonicalCheckpoint || (marked && !$0.isResumeBoundary)
+                    }.sorted(by: shortestFirst),
+                    superseded: rest.filter {
+                        !$0.isCanonicalCheckpoint && (!marked || $0.isResumeBoundary)
+                    }
                         .sorted(by: shortestFirst),
                     recency: members.reduce(-Double.infinity) { max($0, $1.recency) })
             }
@@ -299,16 +315,30 @@ enum DiskQuotaPlanner {
         // Rows the next turn never reads are not pressure; older resume
         // boundaries (an edit's or a regenerate's restore points) are.
         _ = drain(active?.disposable ?? [], to: capBytes)
+        // Another chat's optional replay checkpoint must yield before an
+        // active edit/regenerate boundary. A chain containing only a
+        // checkpoint has no real resume tip to protect.
+        _ = drain(cold.flatMap {
+            $0.tip.isCanonicalCheckpoint ? [$0.tip] : ($0.checkpoint.map { [$0] } ?? [])
+        }, to: capBytes)
         var trimmedActive = drain(active?.superseded ?? [], to: capBytes)
 
         // 4. Hard phase: only while still over the cap.
-        _ = drain(cold.map(\.tip), to: capBytes)
+        // Checkpoints accelerate replay; chat resume rows avoid losing the
+        // conversation's reusable state altogether. Spend checkpoints first,
+        // cold chains before the chain currently generating.
+        if let active {
+            _ = drain(active.tip.isCanonicalCheckpoint ? [active.tip]
+                      : (active.checkpoint.map { [$0] } ?? []), to: capBytes)
+        }
+        _ = drain(cold.map(\.tip).filter { !$0.isCanonicalCheckpoint }, to: capBytes)
         _ = drain(
             fitting.filter { $0.isStableRoot && !$0.isLegacyCompanion }.sorted(by: oldestFirst),
             to: capBytes)
         // The active chain's post-answer tip goes before its history boundary:
         // the boundary is the row that is certain to match the next prompt.
-        if let active, drain([active.tip] + (active.fallback.map { [$0] } ?? []), to: capBytes) {
+        if let active, !active.tip.isCanonicalCheckpoint,
+           drain([active.tip] + (active.fallback.map { [$0] } ?? []), to: capBytes) {
             trimmedActive = true
         }
 
@@ -335,12 +365,13 @@ enum DiskQuotaPlanner {
     /// so what is protected, what is judged lost and what must be retained to
     /// resolve the loss are always the same row.
     static func resumePoint(of rows: [QuotaRow]) -> QuotaRow? {
-        rows.filter(isChainRow).max(by: tipOrder)
+        rows.filter { isChainRow($0) && !$0.isCanonicalCheckpoint }.max(by: tipOrder)
     }
 
     /// `max(by:)` order for a chain's tip: a resume boundary over any other
     /// row, then tokens, then recency, then id.
     private static func tipOrder(_ a: QuotaRow, _ b: QuotaRow) -> Bool {
+        if a.isCanonicalCheckpoint != b.isCanonicalCheckpoint { return a.isCanonicalCheckpoint }
         if a.isResumeBoundary != b.isResumeBoundary { return !a.isResumeBoundary }
         if a.tokenCount != b.tokenCount { return a.tokenCount < b.tokenCount }
         if a.recency != b.recency { return a.recency < b.recency }

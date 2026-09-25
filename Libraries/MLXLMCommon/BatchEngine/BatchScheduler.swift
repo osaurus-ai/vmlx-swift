@@ -23,10 +23,10 @@ enum SlotPhase {
 /// discarding the state clears every alias, so a replaced replay seed cannot
 /// remain retained by the scheduler's older copy of the slot.
 final class BatchPrefillReplaySeed {
-    typealias State = (tokens: [Int], cache: [KVCache])
+    typealias State = (tokens: [Int], cache: [KVCache], canonicalChunkSize: Int?)
     private var state: State?
-    init(tokens: [Int], cache: [KVCache]) {
-        state = (tokens, cache)
+    init(tokens: [Int], cache: [KVCache], canonicalChunkSize: Int? = nil) {
+        state = (tokens, cache, canonicalChunkSize)
     }
     func takeSnapshot() -> State? {
         defer { state = nil }

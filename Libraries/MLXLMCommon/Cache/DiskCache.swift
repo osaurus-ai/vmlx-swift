@@ -166,6 +166,7 @@ struct DiskCacheQuotaEntry: Sendable {
     /// Whether it is a resume point depends on the model's template; see
     /// ``DiskCache/postAnswerRowsResume``.
     var isPostAnswer: Bool = false
+    var isCanonicalCheckpoint: Bool = false
     var chainId: String? = nil
 }
 
@@ -407,6 +408,7 @@ public final class DiskCache: @unchecked Sendable {
     /// Whether the v2 columns and `legacy_companions` are really present on
     /// this index. Callers that use them must check this, not the version.
     let indexHasV2Columns: Bool
+    let indexHasReplayChunkColumn: Bool
 
     /// How long an ordinary index statement waits for another connection's
     /// write lock. Without a wait, an insert that loses to another model's
@@ -660,6 +662,7 @@ public final class DiskCache: @unchecked Sendable {
             db = nil
             indexSchemaVersion = 0
             indexHasV2Columns = false
+            indexHasReplayChunkColumn = false
             Self.sweepUnpublishedAndIncompleteFiles(in: cacheDir)
             return
         }
@@ -689,6 +692,8 @@ public final class DiskCache: @unchecked Sendable {
                     + "failed: \(Self.boundedRendering(of: failure)); carrying on without it\n")
                     .utf8))
         }
+        indexHasReplayChunkColumn = DiskCacheIndexSchema.ensureReplayChunkColumn(
+            db, busyTimeoutMs: indexMigrationBusyTimeoutMs)
         // The lesson this root has already learned about this model.
         lock.lock()
         postAnswerRowsResume = _loadPostAnswerLessonLocked()
@@ -739,6 +744,57 @@ public final class DiskCache: @unchecked Sendable {
 
     // MARK: - Public API
 
+    /// Canonical checkpoints never share a payload key with ordinary chat
+    /// boundaries. The producer is responsible for canonical provenance and
+    /// dtype-preserving serialization; divisibility alone is insufficient.
+    func storeCanonicalCheckpoint(
+        tokens: [Int], arrays: [String: MLXArray],
+        contract: CanonicalPrefillCheckpoint, requestSalt: String?,
+        chainId: String, enforceQuota: Bool
+    ) {
+        guard indexHasReplayChunkColumn else { return }
+        store(tokens: tokens, arrays: arrays,
+              mediaSalt: contract.storageSalt(requestSalt: requestSalt),
+              enforceQuota: enforceQuota, chainId: chainId,
+              replayChunkSize: contract.chunkSize)
+    }
+
+    /// Indexed candidates only. No directory scan or one-probe-per-token
+    /// search on the generation path. Other chats' lengths can be candidates,
+    /// but exact token/model/request identity must pass the normal fetch.
+    func fetchCanonicalCheckpoint(
+        targetTokens: [Int], contract: CanonicalPrefillCheckpoint,
+        requestSalt: String?
+    ) -> (tokens: [Int], arrays: [String: MLXArray])? {
+        guard indexHasReplayChunkColumn, targetTokens.count > 1 else { return nil }
+        lock.lock()
+        var counts: [Int] = []
+        let queried = _queryLocked(
+            """
+            SELECT DISTINCT token_count FROM cache_entries
+            WHERE (model_key = ? OR (model_key IS NULL AND ? = ''))
+                AND kind = 0 AND typeof(replay_chunk_size) = 'integer'
+                AND replay_chunk_size = ? AND typeof(token_count) = 'integer'
+                AND token_count > 0 AND token_count < ?
+                AND token_count % replay_chunk_size = 0
+            ORDER BY token_count DESC LIMIT 128
+            """,
+            [.text(modelKey ?? ""), .text(modelKey ?? ""),
+             .int(Int64(contract.chunkSize)), .int(Int64(targetTokens.count))]
+        ) { counts.append(Int(sqlite3_column_int64($0, 0))) }
+        lock.unlock()
+        guard queried else { return nil }
+        for count in counts {
+            let prefix = Array(targetTokens.prefix(count))
+            if case .arrays(let arrays) = fetchCandidate(
+                tokens: prefix, mediaSalt: contract.storageSalt(requestSalt: requestSalt))
+            {
+                return (prefix, arrays)
+            }
+        }
+        return nil
+    }
+
     /// Store token arrays to disk as a safetensors file.
     ///
     /// Arrays are evaluated on the calling thread, then the file write and
@@ -773,8 +829,15 @@ public final class DiskCache: @unchecked Sendable {
         chainId: String? = nil,
         isStableRoot: Bool = false,
         isResumeBoundary: Bool = false,
-        isPostAnswer: Bool = false
+        isPostAnswer: Bool = false,
+        replayChunkSize: Int? = nil
     ) {
+        if let replayChunkSize {
+            guard indexHasReplayChunkColumn, replayChunkSize > 0,
+                !tokens.isEmpty, tokens.count % replayChunkSize == 0,
+                !isStableRoot, !isResumeBoundary, !isPostAnswer
+            else { return }
+        }
         var trace = CacheFinalizationTrace("disk-store", tokens: tokens.count)
         defer { trace.mark("return") }
         guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return }
@@ -868,6 +931,10 @@ public final class DiskCache: @unchecked Sendable {
             _claimOwnershipLocked(
                 hash: hash, chainId: chainId,
                 kind: rowKind)
+            if let replayChunkSize {
+                _runLocked("UPDATE cache_entries SET replay_chunk_size = ? WHERE hash = ? AND kind = 0",
+                           [.int(Int64(replayChunkSize)), .text(hash)])
+            }
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                 FileHandle.standardError.write(Data(
                     "[vmlx][cache/disk-store] SKIP validated hash=\(hash) count=\(tokenCount) bytes=\(current.size)\n".utf8))
@@ -970,7 +1037,7 @@ public final class DiskCache: @unchecked Sendable {
             let insertResult = _insertEntryLocked(
                 hash: hash, tokenCount: tokenCount, fileSize: fileSize,
                 chainId: chainId,
-                kind: rowKind)
+                kind: rowKind, replayChunkSize: replayChunkSize)
             guard insertResult == SQLITE_DONE else {
                 // The payload is published but has no row, so no quota pass
                 // could ever see or evict it. Take it back rather than leak it.
@@ -1118,7 +1185,7 @@ public final class DiskCache: @unchecked Sendable {
     /// Takes `lock` only, like the other predicates: it reads one row and
     /// stats one file.
     @discardableResult
-    func markRestoreRejected(tokens: [Int], mediaSalt: String?) -> Bool {
+    func markRestoreRejected(tokens: [Int], mediaSalt: String?, countedHit: Bool = true) -> Bool {
         guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return false }
         lock.lock()
         defer { lock.unlock() }
@@ -1133,7 +1200,7 @@ public final class DiskCache: @unchecked Sendable {
         } else {
             validatedFiles.removeValue(forKey: hash)
         }
-        hits = max(0, hits - 1)
+        if countedHit { hits = max(0, hits - 1) }
         rejectedDiskRestores += 1
         return true
     }
@@ -1550,7 +1617,7 @@ public final class DiskCache: @unchecked Sendable {
         let sql = indexHasV2Columns
             ? """
                 SELECT hash, file_size, created_at, companion_key, companion_bytes,
-                       token_count, kind, chain_id, rowid
+                       token_count, kind, chain_id, rowid, \(indexHasReplayChunkColumn ? "replay_chunk_size" : "NULL")
                 FROM cache_entries
                 """
             : "SELECT hash, file_size, created_at, rowid FROM cache_entries"
@@ -1607,6 +1674,11 @@ public final class DiskCache: @unchecked Sendable {
                 entry.isResumeBoundary = kind == 2
                 entry.isPostAnswer = kind == 3
                 entry.chainId = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
+                if kind == 0, sqlite3_column_type(stmt, 9) == SQLITE_INTEGER {
+                    let step = sqlite3_column_int64(stmt, 9)
+                    entry.isCanonicalCheckpoint = step > 0 && entry.tokenCount > 0
+                        && Int64(entry.tokenCount) % step == 0
+                }
             }
             entries.append(entry)
         }
@@ -3446,7 +3518,7 @@ public final class DiskCache: @unchecked Sendable {
     @discardableResult
     private func _insertEntryLocked(
         hash: String, tokenCount: Int, fileSize: Int,
-        chainId: String? = nil, kind: Int64 = 0
+        chainId: String? = nil, kind: Int64 = 0, replayChunkSize: Int? = nil
     ) -> Int32 {
         guard db != nil else { return SQLITE_DONE }
         if indexHasV2Columns {
@@ -3454,24 +3526,30 @@ public final class DiskCache: @unchecked Sendable {
             // boundary (2) is not demoted by a plain re-store; `chain_id`
             // follows the latest owner but is never cleared by an ownerless
             // re-store.
+            let replayColumn = indexHasReplayChunkColumn ? ", replay_chunk_size" : ""
+            let replayValue = indexHasReplayChunkColumn ? ", ?" : ""
+            let replayUpdate = indexHasReplayChunkColumn
+                ? ", replay_chunk_size = excluded.replay_chunk_size" : ""
+            var values: [SQLValue] = [
+                .text(hash), .int(Int64(tokenCount)), .int(Int64(fileSize)),
+                modelKey.map(SQLValue.text) ?? .null, .int(kind),
+                chainId.map(SQLValue.text) ?? .null,
+            ]
+            if indexHasReplayChunkColumn {
+                values.append(replayChunkSize.map { .int(Int64($0)) } ?? .null)
+            }
             return _runLocked(
                 """
-                INSERT INTO cache_entries (hash, token_count, file_size, model_key, kind, chain_id)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO cache_entries (hash, token_count, file_size, model_key, kind, chain_id\(replayColumn))
+                VALUES (?, ?, ?, ?, ?, ?\(replayValue))
                 ON CONFLICT(hash) DO UPDATE SET
                     token_count = excluded.token_count,
                     file_size = excluded.file_size,
                     created_at = julianday('now'),
                     model_key = excluded.model_key,
                     kind = \(Self.kindMergeSQL("kind", "excluded.kind")),
-                    chain_id = COALESCE(excluded.chain_id, chain_id)
-                """,
-                [
-                    .text(hash), .int(Int64(tokenCount)), .int(Int64(fileSize)),
-                    modelKey.map(SQLValue.text) ?? .null,
-                    .int(kind),
-                    chainId.map(SQLValue.text) ?? .null,
-                ])
+                    chain_id = COALESCE(excluded.chain_id, chain_id)\(replayUpdate)
+                """, values)
         }
         return _runLocked(
             """
@@ -3801,7 +3879,7 @@ public final class DiskCache: @unchecked Sendable {
         lock.unlock()
         guard let pending else { return }
         let retained = quotaEntries(retiringInvalidRecords: false).contains {
-            $0.chainId == chainId && !$0.isStableRoot
+            $0.chainId == chainId && !$0.isStableRoot && !$0.isCanonicalCheckpoint
                 && $0.tokenCount >= pending.tipTokenCount
                 && IndexedBytes.sum($0.bytes, $0.companionBytes) <= Int64(maxSizeBytes)
                 && (!requiresCompanion || $0.companionKey != nil)

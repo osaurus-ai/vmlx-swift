@@ -511,6 +511,38 @@ public final class CacheCoordinator: @unchecked Sendable {
         lock.withLock { _requiresSeparateRecurrentPayload }
     }
 
+    /// Persist a sealed canonical prefill chunk only after normal resume rows
+    /// have been written. This optional acceleration must fit beside the
+    /// active resume point; do not write a large row merely to evict it again.
+    func storeCanonicalCheckpoint(
+        tokens: [Int], cache: [KVCache], chunkSize: Int,
+        requestSalt: String?, chainId: String?
+    ) {
+        guard config.enableDiskCache, let diskCache,
+            diskCache.indexHasReplayChunkColumn, ssmStateCache.diskStore != nil,
+            let chainId, !chainId.isEmpty,
+            let contract = CanonicalPrefillCheckpoint(chunkSize: chunkSize),
+            !tokens.isEmpty, tokens.count % chunkSize == 0,
+            !cache.isEmpty,
+            cache.allSatisfy({ ($0 is KVCacheSimple || $0 is RotatingKVCache) && $0.offset == tokens.count }),
+            CacheStoreBudget.canStore(cache)
+        else { return }
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+        let arrays = TQDiskSerializer.serialize(cache: cache, preserveStandardKVStorageDType: true)
+        let bytes = IndexedBytes.total(arrays.values.map { Int64($0.nbytes) })
+        let cap = Int64(max(1, diskCache.maxSizeBytes))
+        // A conservative header allowance avoids writing right at the cap.
+        let resumeBytes = diskCache.quotaEntries(retiringInvalidRecords: false)
+            .filter { $0.chainId == chainId && !$0.isCanonicalCheckpoint }
+            .map { IndexedBytes.sum($0.bytes, $0.companionBytes) }.max() ?? 0
+        guard IndexedBytes.sum(IndexedBytes.sum(bytes, resumeBytes), 131_072) <= cap else { return }
+        diskCache.storeCanonicalCheckpoint(
+            tokens: tokens, arrays: arrays, contract: contract,
+            requestSalt: requestSalt, chainId: chainId, enforceQuota: false)
+        enforceCombinedDiskQuotaLocked(activeChain: chainId)
+    }
+
     /// Whether a prompt-boundary store has any tier to land in. With both tiers
     /// disabled every store is discarded, so callers must not pay to produce a
     /// boundary snapshot — the hybrid stripped boundary in particular costs a
@@ -1748,6 +1780,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 isResumeBoundary: kv.isResumeBoundary
                     || (kv.isPostAnswer && diskCache.postAnswerRowsResume),
                 isPostAnswer: kv.isPostAnswer,
+                isCanonicalCheckpoint: kv.isCanonicalCheckpoint,
                 chainId: kv.chainId,
                 isLegacyCompanion: false))
         }

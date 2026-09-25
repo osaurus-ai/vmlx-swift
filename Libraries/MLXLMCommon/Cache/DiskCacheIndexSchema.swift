@@ -203,6 +203,39 @@ enum DiskCacheIndexSchema {
     static let metaTableStatement =
         "CREATE TABLE IF NOT EXISTS \(metaTableName) (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
 
+    /// Optional v2 capability, not a new entry kind or schema version. Older
+    /// readers may evict these ordinary rows and can still write their usual
+    /// columns. NULL means that no canonical prefill schedule is asserted.
+    /// Payload keys must separately namespace the chunk size: this metadata
+    /// must never relabel an ordinary same-token snapshot as canonical.
+    static let replayChunkColumn = "replay_chunk_size"
+
+    /// Install the optional column atomically and report whether it is usable.
+    /// Recheck version and columns under the write lock; a future writer may
+    /// migrate between the caller's version read and acquiring this lock.
+    /// Failure disables checkpoint persistence, never ordinary cache access.
+    static func ensureReplayChunkColumn(
+        _ db: OpaquePointer?, busyTimeoutMs: Int32 = defaultBusyTimeoutMs
+    ) -> Bool {
+        guard let db else { return false }
+        return withBusyTimeout(db, busyTimeoutMs) {
+            guard userVersion(db) == currentVersion,
+                v2ColumnNames.allSatisfy({ columnExists(db, $0) })
+            else { return false }
+            if columnExists(db, replayChunkColumn) { return true }
+            guard exec(db, "BEGIN IMMEDIATE") else { return false }
+            defer { exec(db, "ROLLBACK") }
+            guard userVersion(db) == currentVersion,
+                v2ColumnNames.allSatisfy({ columnExists(db, $0) })
+            else { return false }
+            if !columnExists(db, replayChunkColumn) {
+                guard exec(db, "ALTER TABLE cache_entries ADD COLUMN \(replayChunkColumn) INTEGER")
+                else { return false }
+            }
+            return exec(db, "COMMIT")
+        }
+    }
+
 
     /// Runs `body` with a busy timeout when the connection has none, so it
     /// waits for another connection's lock instead of failing on it. The
