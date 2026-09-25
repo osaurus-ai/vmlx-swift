@@ -204,17 +204,15 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// (e.g. compact tool JSON), which a naive per-round rescan tokenizes in
     /// seconds.
     ///
-    /// Merges happen in rank-rounds: within a round every non-overlapping
-    /// occurrence of the current min-rank pair is merged (left to right)
-    /// before any pair created by those merges is admitted, as in the original
-    /// per-round rescan, which the differential test pins. Hugging Face
-    /// tokenizers admits a new pair at once instead, so the two differ where a
-    /// merged pair outranks its own components, as in SentencePiece whitespace
-    /// runs (rank(\t\t,\t) < rank(\t,\t)): on Gemma's table, 32 tabs give
-    /// 16 + 16 here and 31 + 1 there. Because the heap is keyed
-    /// `(rank, leftIndex)`, same-rank occurrences pop in left-to-right order
-    /// for free. Stale heap entries (a node consumed by an earlier merge, or
-    /// whose pair rank no longer matches the candidate) are skipped on pop.
+    /// Merges happen in Hugging Face tokenizers' order (`Word::merge_all`):
+    /// the adjacent pair with the lowest rank merges first, the leftmost of
+    /// equals, and the pairs a merge forms with its neighbours join the heap
+    /// at once. A pair that outranks the one that formed it therefore merges
+    /// before that one's other occurrences, as in SentencePiece whitespace
+    /// runs (rank(\t\t,\t) < rank(\t,\t)). Because the heap is keyed
+    /// `(rank, leftIndex)`, equal ranks pop in left-to-right order for free.
+    /// Stale heap entries (a node consumed by an earlier merge, or whose pair
+    /// no longer carries the entry's rank) are skipped on pop.
     ///
     /// Returns the pieces in order, and `[]` for an empty token. They stay an
     /// array, as in upstream swift-transformers #355, because joining them on
@@ -284,43 +282,24 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
 
         for i in 0..<n where next[i] >= 0 { push(i) }
 
-        // Adjacencies created during a round, pushed only once the round ends so
-        // a new lower-rank pair cannot preempt the round's remaining merges.
-        var pending: [Int] = []
-        while let head = pop() {
-            let roundRank = head.rank
-            var cand: (rank: Int, left: Int)? = head
-            pending.removeAll(keepingCapacity: true)
-            repeat {
-                let l = cand!.left
-                if alive[l] {
-                    let r = next[l]
-                    // Skip stale entries: the live pair at this node must still
-                    // carry the round's rank.
-                    if r >= 0, alive[r],
-                        let curRank = bpeRanks[BytePair(parts[l], parts[r])], curRank == roundRank
-                    {
-                        // Merge r into l; r leaves the list.
-                        parts[l] = parts[l] + parts[r]
-                        alive[r] = false
-                        let rn = next[r]
-                        next[l] = rn
-                        if rn >= 0 { prev[rn] = l }
+        while let top = pop() {
+            let l = top.left
+            let r = next[l]
+            // Skip stale entries: the node was consumed by an earlier merge, or
+            // the live pair at it no longer carries this entry's rank.
+            guard alive[l], r >= 0, alive[r], bpeRanks[BytePair(parts[l], parts[r])] == top.rank
+            else { continue }
 
-                        // Defer adjacencies created by this merge to the next round.
-                        pending.append(prev[l])
-                        pending.append(l)
-                    }
-                }
-                // Drain remaining same-rank occurrences (they sit at the heap top).
-                if let top = heap.first, top.rank == roundRank {
-                    cand = pop()
-                } else {
-                    cand = nil
-                }
-            } while cand != nil
+            // Merge r into l; r leaves the list.
+            parts[l] = parts[l] + parts[r]
+            alive[r] = false
+            let rn = next[r]
+            next[l] = rn
+            if rn >= 0 { prev[rn] = l }
 
-            for left in pending { push(left) }
+            // Admit the pairs this merge formed with its neighbours at once.
+            push(prev[l])
+            push(l)
         }
 
         // Walk the surviving list from the head (node 0 is never consumed —
