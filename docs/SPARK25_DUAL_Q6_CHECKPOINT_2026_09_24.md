@@ -37,3 +37,5 @@ Integrated growing-cache ABBA passes8native turns and full raw output/685retaine
 Private `raptor-dual-q6-recheck-r38/integrated-review.json` contains receipts/traces; all guards passed. Metal System Trace10s capture failed to finish saving before60s; its partial document could not export. Instrumented rates are excluded; no GPU synchronization-count claim.
 
 Engine CI is waived by user instruction, not claimed green. Osaurus still needs its separate exact pin/build/UI/hosted CI before merge. No release or tag.
+
+Final runtime8db8c655 removes only trailing whitespace from30blank Metal-header lines. Exact rebuild passed112.45s with no source mutation and produces the byte-identical RunBench SHA f70930277f06a75ba104ae9fec8e970b3008652a98d0ff07398429c50eac4745. Integrated runtime/cache proof therefore targets the same executable; `git diff --check` passes. `raptor-dual-q6-recheck-r38/final-binary-equivalence.json`.
