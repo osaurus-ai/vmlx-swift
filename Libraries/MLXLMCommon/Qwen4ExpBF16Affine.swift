@@ -126,6 +126,9 @@ public enum Qwen4ExpBF16Affine {
         }
         """
 
+    // METAL-ONLY: case 2. Metal kernel; `quantizedMM` computes the same
+    // with MLX ops, but `supports` in `dense` does not pick it for the
+    // shapes this kernel handles, so this path needs a Metal device.
     private static let denseKernel = MLXFast.metalKernel(
         name: "qwen4_exp_bf16_f16_affine_qmv_fast",
         inputNames: ["x", "w", "scales", "biases"],
@@ -144,6 +147,9 @@ public enum Qwen4ExpBF16Affine {
         header: qmvHeader,
         ensureRowContiguous: false)
 
+    // METAL-ONLY: case 2. Metal kernel, off unless `Qwen4ExpBF16QuantizedSwitchLinear`
+    // is installed, which `loadWeights` does only when it enables
+    // `qwen4ExpNativeBF16Affine`; the default path computes the same with MLX ops.
     private static let gatheredKernel = MLXFast.metalKernel(
         name: "qwen4_exp_bf16_f16_affine_gather_qmv_fast",
         inputNames: ["x", "w", "scales", "biases", "indices"],
@@ -171,6 +177,9 @@ public enum Qwen4ExpBF16Affine {
         ensureRowContiguous: false)
 
 
+    // METAL-ONLY: case 2. Metal kernel, off unless `Qwen4ExpBF16QuantizedEmbedding`
+    // is installed, which `loadWeights` does only when it enables
+    // `qwen4ExpNativeBF16Affine`; the default path computes the same with MLX ops.
     private static let embeddingKernel = MLXFast.metalKernel(
         name: "qwen4_exp_bf16_affine_embedding",
         inputNames: ["indices", "w", "scales", "biases"],

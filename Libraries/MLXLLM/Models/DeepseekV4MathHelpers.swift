@@ -108,6 +108,9 @@ func deepseekV4CachedRegion(
 
 public enum DeepseekV4Math {
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback, off unless
+    // `VMLX_DSV4_OFFICIAL_ACTIVATION_QAT=1` or `LoadConfiguration.deepseekV4ActivationQAT`:
+    // with it on, this path needs a Metal device.
     private static let e4m3KVActivationRoundTripKernel = MLXFast.metalKernel(
         name: "deepseek_v4_e4m3_kv_activation_roundtrip",
         inputNames: ["x"],
@@ -187,6 +190,9 @@ public enum DeepseekV4Math {
             }
         """)
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback, off unless
+    // `VMLX_DSV4_OFFICIAL_ACTIVATION_QAT=1` or `LoadConfiguration.deepseekV4ActivationQAT`:
+    // with it on, this path needs a Metal device.
     private static let indexerActivationRoundTripKernel = MLXFast.metalKernel(
         name: "deepseek_v4_indexer_hadamard128_e2m1_roundtrip",
         inputNames: ["x"],
@@ -340,6 +346,10 @@ public enum DeepseekV4Math {
                 && residual.dim(-2) == hcMult
                 && comb.dim(-2) == hcMult
                 && blockOut.size > 0
+        // METAL-ONLY: case 1. "GPU" here means Metal. A CUDA or Vulkan build also
+        // reports .gpu, passes this test and then fails on the Metal kernel below;
+        // on those builds the test must ask for Metal, as the `#if canImport(Metal)`
+        // guards around the same test in `Qwen4ExpQSA.swift` do.
         if Device.defaultDevice().deviceType == .gpu && isSingleTokenDecode {
             let x = contiguous(blockOut)
             let residual = contiguous(residual)
@@ -545,6 +555,10 @@ public enum DeepseekV4Math {
     // nodes per call (roughly 3,400 nodes per token across 43 layers). The
     // reference DSV4 MLX runtime uses one Metal dispatch instead. Keep the
     // same fp32 arithmetic and exact normalization order here.
+    //
+    // METAL-ONLY: case 2. Metal kernel, taken when the device test in `hcPost` passes. On
+    // a CPU device `hcPost` uses the `hcExpandResidual` path, which computes the same with
+    // MLX ops; a CUDA or Vulkan build also passes the test (see the case-1 note there).
     private static let hcPostDecodeKernel = MLXFast.metalKernel(
         name: "deepseek_v4_hc_post_decode",
         inputNames: ["x", "residual", "post", "comb"],
@@ -574,6 +588,9 @@ public enum DeepseekV4Math {
             y[gid] = static_cast<outT>(direct + residual_mix);
         """)
 
+    // METAL-ONLY: case 2. Metal kernel, taken when the device test in `hcSplitSinkhorn` passes.
+    // On a CPU device `hcSplitSinkhorn` uses `hcSplitSinkhornOps`, which computes the same with
+    // MLX ops; a CUDA or Vulkan build also passes the test (see the case-1 note there).
     private static let hcSplitSinkhornKernel = MLXFast.metalKernel(
         name: "deepseek_v4_hc_split_sinkhorn",
         inputNames: ["mixes", "scale", "base", "eps"],
@@ -739,6 +756,10 @@ public enum DeepseekV4Math {
         iters: Int = 20,
         eps: Float = 1e-6
     ) -> (pre: MLXArray, post: MLXArray, comb: MLXArray) {
+        // METAL-ONLY: case 1. "GPU" here means Metal. A CUDA or Vulkan build also
+        // reports .gpu, passes this test and then fails on the Metal kernel below;
+        // on those builds the test must ask for Metal, as the `#if canImport(Metal)`
+        // guards around the same test in `Qwen4ExpQSA.swift` do.
         if Device.defaultDevice().deviceType == .gpu {
             let leadShape = Array(mixes.shape.dropLast())
             let rows = mixes.size / ((2 + hcMult) * hcMult)
@@ -1576,6 +1597,10 @@ public enum DeepseekV4Math {
     // depends only on the token), so the staging barriers stay convergent.
     // Dynamic dims arrive via an int32 params buffer so pool-shape math
     // never enters the compiled source: one compile total.
+    //
+    // METAL-ONLY: case 2. Metal kernel; the dense-mask branch of `DeepseekV4Attention` computes the
+    // same with MLX ops, but `heads16PrefillAttention` (on unless `VMLX_DSV4_HEADS16_PREFILL=0`)
+    // does not pick it for the shapes this kernel handles, so this path needs a Metal device.
     private static let heads16PrefillKernel = MLXFast.metalKernel(
         name: "vmlx_dsv4_heads16_prefill",
         inputNames: ["q", "kv", "pool", "topk", "sinks", "fscale", "params"],

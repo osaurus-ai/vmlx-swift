@@ -755,6 +755,9 @@ private func makeVLMGatedDeltaKernel(
     var inputNames = ["q", "k", "v", "g", "b", "state_in", "T"]
     if hasMask { inputNames.append("mask") }
     let suffix = (hasMask ? "_mask" : "") + (roundStateEachStep ? "_strict" : "_fast")
+    // METAL-ONLY: case 2. Metal kernel; `gatedDeltaOps` computes the same with
+    // MLX ops, but the head-dimension test in `gatedDeltaUpdate` does not pick
+    // it for the shapes this kernel handles, so this path needs a Metal device.
     return MLXFast.metalKernel(
         name: "vlm_gated_delta_step\(suffix)",
         inputNames: inputNames,

@@ -53,6 +53,7 @@ private func makeBitLinearKernel() -> MLXFast.MLXFastKernel {
         }
         """
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     return MLXFast.metalKernel(
         name: "bitlinear_matmul",
         inputNames: ["x", "packed_weights", "weight_scale"],

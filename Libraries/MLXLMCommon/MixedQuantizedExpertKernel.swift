@@ -30,6 +30,10 @@ final class MixedQuantizedExpertKernel {
                     IN_DIM,OUT_DIM,uint3(0,threadgroup_position_in_grid.y,0),
                     simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
                 """
+            // METAL-ONLY: case 2. Metal kernel, off unless `VMLX_MIMO_EXPERT_STORAGE=mapped`
+            // or `VMLX_MIMO_RESIDENT_ROUTING=host`, as MiMoV26 builds it; the default path
+            // computes the same with MLX ops. `MixedQuantizedSwitchGLU.init`'s own default
+            // storage, `.mapped`, takes this path.
             return MLXFast.metalKernel(name:fpMode ? "mimo_region_mxfp4_e8" : "mimo_region_affine_e8",
                 inputNames:names,outputNames:["out"],source:source,
                 header:header.replacingOccurrences(of:"const constant int&",with:"const int"),ensureRowContiguous:false)
@@ -62,6 +66,8 @@ final class MixedQuantizedExpertKernel {
                 """
             var header = "namespace aff {\n" + MixedQuantizedExpertKernelSource.affine + "\n}\n"
             if mxGate { header += "namespace mx {\n" + MixedQuantizedExpertKernelSource.mxfp4 + "\n}\n" }
+            // METAL-ONLY: case 2. Metal kernel, off unless `VMLX_MIMO_PAIRED_GATE_UP=1`;
+            // the default path computes the same with MLX ops.
             return MLXFast.metalKernel(name: mxGate ? "mimo_resident_gate_up_mxfp4" : "mimo_resident_gate_up_affine",
                 inputNames: names, outputNames: ["gate", "up"], source: source,
                 header: header.replacingOccurrences(of: "const constant int&", with: "const int"),
@@ -114,6 +120,8 @@ final class MixedQuantizedExpertKernel {
                 """
             var header = "namespace aff {\n" + MixedQuantizedExpertKernelSource.affine + "\n}\n"
             if mxGate { header += "namespace mx {\n" + MixedQuantizedExpertKernelSource.mxfp4 + "\n}\n" }
+            // METAL-ONLY: case 2. Metal kernel, off unless `VMLX_MIMO_FUSED_GATE_UP=1`;
+            // the default path computes the same with MLX ops.
             return MLXFast.metalKernel(name: mxGate ? "mimo_fused_swiglu_mxfp4" : "mimo_fused_swiglu_affine",
                 inputNames: names, outputNames: ["out"], source: source,
                 header: header.replacingOccurrences(of: "const constant int&", with: "const int"),
@@ -164,6 +172,8 @@ final class MixedQuantizedExpertKernel {
             """
         let header = ("namespace aff {\n" + MixedQuantizedExpertKernelSource.affine + "\n}")
             .replacingOccurrences(of: "const constant int&", with: "const int")
+        // METAL-ONLY: case 2. Metal kernel, off unless `VMLX_MIMO_FUSED_DOWN_REDUCE=1`;
+        // the default path computes the same with MLX ops.
         return MLXFast.metalKernel(name: "mimo_down_weight_reduce_affine2",
             inputNames: ["x", "indices", "weight", "scales", "biases", "scores"],
             outputNames: ["out"], source: source, header: header, ensureRowContiguous: false)

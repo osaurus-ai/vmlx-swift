@@ -59,6 +59,9 @@ private func makeSSMKernel() -> MLXFast.MLXFastKernel? {
             }
         """
 
+    // METAL-ONLY: case 2. Metal kernel; `ssmAttn` computes the same with MLX
+    // ops, but the single-token test in `ssmUpdate` does not pick it for the
+    // shapes this kernel handles, so this path needs a Metal device.
     return MLXFast.metalKernel(
         name: "ssm_kernel",
         inputNames: ["X", "A_log", "B", "C", "D", "dt", "state_in"],
