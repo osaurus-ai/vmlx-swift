@@ -38,7 +38,7 @@ private final class BoundaryRecordingModel: Module, LanguageModel, @unchecked Se
 
 @Suite("Rotating boundary replay", .serialized)
 struct RotatingBoundaryReplayTests {
-    @Test(arguments: [39, 35, 34, 67, 15])
+    @Test(arguments: [39, 35, 34, 67, 15, 17, 33, 65])
     func persistedBoundariesMatchIndependentPrefill(length: Int) async throws {
         try await verify(length: length, masked: false)
     }
@@ -68,13 +68,23 @@ struct RotatingBoundaryReplayTests {
             owner = BatchPrefillReplaySeed(tokens: [1], cache: [cache])
         }
         let schedulerAlias = owner!
-        var transferred = owner.take()
+        var transferred = owner!.takeSnapshot()
         #expect(transferred?.tokens == [1])
-        #expect(schedulerAlias.take() == nil)
+        #expect(schedulerAlias.takeSnapshot() == nil)
         #expect(retainedCache != nil)
         transferred = nil
         #expect(retainedCache == nil)
         schedulerAlias.discard()
+
+        do {
+            let cache = KVCacheSimple()
+            retainedCache = cache
+            owner = BatchPrefillReplaySeed(tokens: [2], cache: [cache])
+        }
+        let cancelledAlias = owner!
+        owner!.discard()
+        #expect(retainedCache == nil)
+        #expect(cancelledAlias.takeSnapshot() == nil)
     }
 
     private func verify(length: Int, masked: Bool, stableBoundaries: [Int]? = nil) async throws {

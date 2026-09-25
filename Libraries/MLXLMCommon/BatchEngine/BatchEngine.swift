@@ -3518,7 +3518,7 @@ public actor BatchEngine {
             // Adjacent rotating boundaries share the same completed prefill
             // chunks. Retain one sealed seed for this finalization only; each
             // consumer gets its own evaluated copy before advancing the tail.
-            var boundaryReplaySeed = slot.prefillReplaySeed?.take()
+            var boundaryReplaySeed = slot.prefillReplaySeed?.takeSnapshot()
             slot.prefillReplaySeed = nil
             liveSlot.prefillReplaySeed = nil
             let canReuseBoundaryReplay =

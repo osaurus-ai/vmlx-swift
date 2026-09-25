@@ -19,11 +19,6 @@ enum SlotPhase {
 
 // MARK: - Active Slot
 
-/// An active generation slot managed by ``BatchEngine``.
-///
-/// Each slot represents one in-flight request. It owns its KV cache, sampler,
-/// processor, and token history. Slots transition from `.prefill` → `.decode`
-/// and eventually become finished when they hit a stop token or max token limit.
 /// Actor-confined ownership shared by BatchSlot value copies. Taking or
 /// discarding the state clears every alias, so a replaced replay seed cannot
 /// remain retained by the scheduler's older copy of the slot.
@@ -33,13 +28,18 @@ final class BatchPrefillReplaySeed {
     init(tokens: [Int], cache: [KVCache]) {
         state = (tokens, cache)
     }
-    func take() -> State? {
+    func takeSnapshot() -> State? {
         defer { state = nil }
         return state
     }
     func discard() { state = nil }
 }
 
+/// An active generation slot managed by ``BatchEngine``.
+///
+/// Each slot represents one in-flight request. It owns its KV cache, sampler,
+/// processor, and token history. Slots transition from `.prefill` → `.decode`
+/// and eventually become finished when they hit a stop token or max token limit.
 struct BatchSlot {
     /// Unique identifier matching the original request.
     let id: BatchRequestID
