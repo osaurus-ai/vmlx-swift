@@ -2665,9 +2665,9 @@ public actor BatchEngine {
                    == slot.cachePromptTokenIds.suffix(remainingText.tokens.size).map(Int32.init),
                CacheStoreBudget.canStore(slot.cache)
             {
-                slot.prefillReplaySeed = (
-                    Array(slot.cachePromptTokenIds.prefix(consumed)),
-                    makePromptBoundaryCacheSnapshot(from: slot.cache))
+                slot.prefillReplaySeed = BatchPrefillReplaySeed(
+                    tokens: Array(slot.cachePromptTokenIds.prefix(consumed)),
+                    cache: makePromptBoundaryCacheSnapshot(from: slot.cache))
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                     FileHandle.standardError.write(Data(
                         "[vmlx][cache/prefill-replay-seed] captured=\(consumed) prompt=\(slot.cachePromptTokenIds.count)\n".utf8))
@@ -3329,6 +3329,7 @@ public actor BatchEngine {
             // scheduler's next completed-slot cleanup pass.
             liveSlot.promptCacheSnapshot = nil
             liveSlot.diskSeedSnapshot = nil
+            liveSlot.prefillReplaySeed?.discard()
             liveSlot.prefillReplaySeed = nil
         }
         let now = Date()
@@ -3517,7 +3518,7 @@ public actor BatchEngine {
             // Adjacent rotating boundaries share the same completed prefill
             // chunks. Retain one sealed seed for this finalization only; each
             // consumer gets its own evaluated copy before advancing the tail.
-            var boundaryReplaySeed = slot.prefillReplaySeed
+            var boundaryReplaySeed = slot.prefillReplaySeed?.take()
             slot.prefillReplaySeed = nil
             liveSlot.prefillReplaySeed = nil
             let canReuseBoundaryReplay =

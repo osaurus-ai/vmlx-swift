@@ -58,6 +58,25 @@ struct RotatingBoundaryReplayTests {
         try await verify(length: 99, masked: false, stableBoundaries: [35, 36, 37, 38, 39])
     }
 
+    @Test
+    func replaySeedReleasesAcrossSlotAliases() {
+        var owner: BatchPrefillReplaySeed!
+        weak var retainedCache: KVCacheSimple?
+        do {
+            let cache = KVCacheSimple()
+            retainedCache = cache
+            owner = BatchPrefillReplaySeed(tokens: [1], cache: [cache])
+        }
+        let schedulerAlias = owner!
+        var transferred = owner.take()
+        #expect(transferred?.tokens == [1])
+        #expect(schedulerAlias.take() == nil)
+        #expect(retainedCache != nil)
+        transferred = nil
+        #expect(retainedCache == nil)
+        schedulerAlias.discard()
+    }
+
     private func verify(length: Int, masked: Bool, stableBoundaries: [Int]? = nil) async throws {
         try await MLXMetalTestLock.withLock {
             let root = FileManager.default.temporaryDirectory

@@ -24,6 +24,22 @@ enum SlotPhase {
 /// Each slot represents one in-flight request. It owns its KV cache, sampler,
 /// processor, and token history. Slots transition from `.prefill` → `.decode`
 /// and eventually become finished when they hit a stop token or max token limit.
+/// Actor-confined ownership shared by BatchSlot value copies. Taking or
+/// discarding the state clears every alias, so a replaced replay seed cannot
+/// remain retained by the scheduler's older copy of the slot.
+final class BatchPrefillReplaySeed {
+    typealias State = (tokens: [Int], cache: [KVCache])
+    private var state: State?
+    init(tokens: [Int], cache: [KVCache]) {
+        state = (tokens, cache)
+    }
+    func take() -> State? {
+        defer { state = nil }
+        return state
+    }
+    func discard() { state = nil }
+}
+
 struct BatchSlot {
     /// Unique identifier matching the original request.
     let id: BatchRequestID
@@ -70,7 +86,7 @@ struct BatchSlot {
 
     /// Sealed, already-computed chunk boundary for this request's rotating
     /// finalization replay. Bounded to one snapshot and cleared at completion.
-    var prefillReplaySeed: (tokens: [Int], cache: [KVCache])?
+    var prefillReplaySeed: BatchPrefillReplaySeed?
 
     /// Token IDs that describe the cache snapshot at the prompt boundary.
     ///
