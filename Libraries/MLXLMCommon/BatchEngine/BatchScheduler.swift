@@ -68,6 +68,10 @@ struct BatchSlot {
     /// that cannot be losslessly trimmed after their rotating window wraps.
     var diskSeedSnapshot: [KVCache]?
 
+    /// Sealed, already-computed chunk boundary for this request's rotating
+    /// finalization replay. Bounded to one snapshot and cleared at completion.
+    var prefillReplaySeed: (tokens: [Int], cache: [KVCache])?
+
     /// Token IDs that describe the cache snapshot at the prompt boundary.
     ///
     /// Usually this is the same as `originalInput.text.tokens`. Some models
@@ -208,6 +212,7 @@ extension BatchSlot {
         self.cache = cache
         self.promptCacheSnapshot = nil
         self.diskSeedSnapshot = nil
+        self.prefillReplaySeed = nil
         self.cachePromptTokenIds = request.input.text.tokens.reshaped(-1).asArray(Int.self)
         self.cachePromptUsesPostPrepareKey = false
         self.originalInput = request.input

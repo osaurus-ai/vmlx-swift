@@ -2641,6 +2641,38 @@ public actor BatchEngine {
         let firstToken: MLXArray
         switch prepareResult {
         case .tokens(let remainingText):
+            // prepare() has already forwarded complete chunks. Preserve that
+            // exact boundary rather than repeating those chunks after decode.
+            // Do not split/reorder prefill, and reject custom token/mask/media
+            // paths or an unaligned restored prefix.
+            let consumed = slot.cachePromptTokenIds.count - remainingText.tokens.size
+            let chunkSize = max(1, slot.prefillStepSize)
+            let seedBoundary = max(0, slot.cachePromptTokenIds.count - 1)
+            let expectedChunk = max(0, (seedBoundary - 1) / chunkSize) * chunkSize
+            if slot.originalInput.cachePromptIntent != .auxiliary,
+               slot.originalInput.cachePromptIntent != .reusablePrefixWarmup,
+               cacheCoordinator?.canPersistBoundaries == true,
+               !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot),
+               !slot.originalInput.hasMediaContent,
+               !slot.originalInput.requiresPostPrepareCacheKey,
+               slot.originalInput.text.mask == nil, remainingText.mask == nil,
+               consumed > 0, consumed == expectedChunk || consumed == seedBoundary,
+               slot.cache.contains(where: { $0 is RotatingKVCache }),
+               slot.cache.allSatisfy({
+                   ($0 is RotatingKVCache || $0 is KVCacheSimple) && $0.offset == consumed
+               }),
+               remainingText.tokens.reshaped(-1).asArray(Int32.self)
+                   == slot.cachePromptTokenIds.suffix(remainingText.tokens.size).map(Int32.init),
+               CacheStoreBudget.canStore(slot.cache)
+            {
+                slot.prefillReplaySeed = (
+                    Array(slot.cachePromptTokenIds.prefix(consumed)),
+                    makePromptBoundaryCacheSnapshot(from: slot.cache))
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    FileHandle.standardError.write(Data(
+                        "[vmlx][cache/prefill-replay-seed] captured=\(consumed) prompt=\(slot.cachePromptTokenIds.count)\n".utf8))
+                }
+            }
             // Seed the processor with the full prompt tokens.
             let promptTokens = slot.originalInput.text.tokens
             slot.processor?.prompt(promptTokens)
@@ -3289,7 +3321,7 @@ public actor BatchEngine {
     /// (not cancelled), stores prompt and safe post-answer boundaries for
     /// future cache reuse.
     private func finishSlot(_ liveSlot: inout BatchSlot, reason: GenerateStopReason) {
-        let slot = liveSlot
+        var slot = liveSlot
         slot.nanTrace?.finish(totalSteps: slot.generatedTokenCount)
         defer {
             // Cache stores are synchronous. Drop the sole retained prompt/seed
@@ -3297,6 +3329,7 @@ public actor BatchEngine {
             // scheduler's next completed-slot cleanup pass.
             liveSlot.promptCacheSnapshot = nil
             liveSlot.diskSeedSnapshot = nil
+            liveSlot.prefillReplaySeed = nil
         }
         let now = Date()
         let prefillTime = (slot.decodeStartTime ?? now).timeIntervalSince(slot.prefillStartTime)
@@ -3484,7 +3517,9 @@ public actor BatchEngine {
             // Adjacent rotating boundaries share the same completed prefill
             // chunks. Retain one sealed seed for this finalization only; each
             // consumer gets its own evaluated copy before advancing the tail.
-            var boundaryReplaySeed: (tokens: [Int], cache: [KVCache])?
+            var boundaryReplaySeed = slot.prefillReplaySeed
+            slot.prefillReplaySeed = nil
+            liveSlot.prefillReplaySeed = nil
             let canReuseBoundaryReplay =
                 !slot.originalInput.hasMediaContent
                 && !slot.originalInput.requiresPostPrepareCacheKey
@@ -3503,6 +3538,11 @@ public actor BatchEngine {
                 }
                 if tokens.count == storageSnapshotTokenCount {
                     return storageTopologySnapshot.map { $0.copy() }
+                }
+                if canReuseBoundaryReplay, let seed = boundaryReplaySeed,
+                   seed.tokens == tokens, CacheStoreBudget.canStore(seed.cache)
+                {
+                    return makePromptBoundaryCacheSnapshot(from: seed.cache)
                 }
                 let trimCount = storageSnapshotTokenCount - tokens.count
                 let trimmed = storageTopologySnapshot.map { $0.copy() }

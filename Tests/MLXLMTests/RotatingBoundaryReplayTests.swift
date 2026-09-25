@@ -7,7 +7,7 @@ import Testing
 /// An exact token recorder: both cache layers contain the token IDs, making
 /// a stale or mutated prefix observable after disk restore and continuation.
 private final class BoundaryRecordingModel: Module, LanguageModel, @unchecked Sendable {
-    var vocabularySize: Int { 64 }
+    var vocabularySize: Int { 128 }
     private(set) var forwardedCount = 0
 
     func newCache(parameters: GenerateParameters?) -> [KVCache] {
@@ -38,7 +38,7 @@ private final class BoundaryRecordingModel: Module, LanguageModel, @unchecked Se
 
 @Suite("Rotating boundary replay", .serialized)
 struct RotatingBoundaryReplayTests {
-    @Test(arguments: [39, 35, 15])
+    @Test(arguments: [39, 35, 34, 67, 15])
     func persistedBoundariesMatchIndependentPrefill(length: Int) async throws {
         try await verify(length: length, masked: false)
     }
@@ -48,7 +48,17 @@ struct RotatingBoundaryReplayTests {
         try await verify(length: 39, masked: true)
     }
 
-    private func verify(length: Int, masked: Bool) async throws {
+    @Test
+    func distantStablePrefixKeepsHistorySeed() async throws {
+        try await verify(length: 99, masked: false, stableBoundaries: [35])
+    }
+
+    @Test
+    func severalStablePrefixesDoNotIncreaseReplayWork() async throws {
+        try await verify(length: 99, masked: false, stableBoundaries: [35, 36, 37, 38, 39])
+    }
+
+    private func verify(length: Int, masked: Bool, stableBoundaries: [Int]? = nil) async throws {
         try await MLXMetalTestLock.withLock {
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent("rotating-replay-test-\(UUID().uuidString)")
@@ -57,9 +67,9 @@ struct RotatingBoundaryReplayTests {
             var configuration = ModelConfiguration(id: "rotating-replay-test")
             // Synthetic fixture only: finish after prefill so recorded work is
             // exactly the prompt plus boundary reconstruction, never sampling.
-            configuration.eosTokenIds = Set(0..<64)
+            configuration.eosTokenIds = Set(0..<128)
             let processor = TestInputProcessor(
-                tokenizer: TestTokenizer(vocabularySize: 64),
+                tokenizer: TestTokenizer(vocabularySize: 128),
                 configuration: configuration,
                 messageGenerator: DefaultMessageGenerator())
             nonisolated(unsafe) let context = ModelContext(
@@ -72,12 +82,13 @@ struct RotatingBoundaryReplayTests {
             let engine = BatchEngine(context: context, maxBatchSize: 1, cacheCoordinator: coordinator)
             let ids = Array(1...length)
             let boundary = length - 3
+            let stable = stableBoundaries ?? [boundary]
             let input = LMInput(
                 text: LMInput.Text(
                     tokens: MLXArray(ids.map(Int32.init)),
                     mask: masked ? MLXArray.ones([length], dtype: .bool) : nil),
-                cachePrefixTokenCounts: [boundary],
-                cacheStablePrefixTokenCounts: [boundary])
+                cachePrefixTokenCounts: Array(Set(stable + [boundary])).sorted(),
+                cacheStablePrefixTokenCounts: stable)
             let parameters = GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 16)
             let salt = computeCacheSalt(for: input, parameters: parameters)
             let (_, stream) = await engine.submit(input: input, parameters: parameters)
@@ -87,13 +98,27 @@ struct RotatingBoundaryReplayTests {
             }
             await engine.shutdown()
             #expect(stop == .stop)
-            // At 39, all three wrapped boundaries share the completed 32-token
-            // chunk prefix. At 35 the earlier boundary crosses that chunk edge.
-            if length == 39 { #expect(model.forwardedCount == (masked ? 148 : 84)) }
-            if length == 35 { #expect(model.forwardedCount == 116) }
+            // The first replay reuses the chunk already computed by prefill.
+            // Shorter subsequent prefixes keep their own original replay policy;
+            // retaining a long seed across them previously increased work.
+            if length == 39 { #expect(model.forwardedCount == (masked ? 148 : 52)) }
+            if length == 35 { #expect(model.forwardedCount == 84) }
+            // Later shorter boundaries must still replace the initial seed.
+            if length == 34 { #expect(model.forwardedCount == 80) }
+            if length == 67 { #expect(model.forwardedCount == 148) }
             if length == 15 { #expect(model.forwardedCount == 15) }
+            // A distant system/tool prefix must not regress the replay order.
+            // Only the initial 96-token replay is avoided (327->231 or345->249).
+            if length == 99 {
+                if stable.count == 1 {
+                    #expect(model.forwardedCount == 231)
+                } else {
+                    // Baseline345 minus the already-computed96-token chunk.
+                    #expect(model.forwardedCount == 249)
+                }
+            }
 
-            for count in [length - 1, boundary - 1, boundary] {
+            for count in [length - 1] + stable.map({ $0 - 1 }) + [boundary] {
                 let prefix = Array(ids.prefix(count))
                 let arrays = try #require(coordinator.diskCache?.fetch(tokens: prefix, mediaSalt: salt))
                 var restored = model.newCache(parameters: parameters)
