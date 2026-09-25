@@ -30,7 +30,11 @@
 // (~a few milliseconds for a typical 448x448 image), negligible vs vision
 // tower forward (~100 ms).
 
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 import MLX
 

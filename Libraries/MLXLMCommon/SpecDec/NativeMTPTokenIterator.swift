@@ -2032,7 +2032,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let logits = verifier.logits
         let hidden = verifier.hiddenStates
         let scheduled = DispatchSemaphore(value: 0)
+        let box = SendableBox((logits, hidden))
         Self.prefetchQueue.async {
+            let (logits, hidden) = box.consume()
             asyncEval(logits, hidden)
             scheduled.signal()
         }

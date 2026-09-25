@@ -327,7 +327,7 @@ public class BertModel: Module, EmbeddingModel {
     /// like `attention.output.dense` to `attention.out_proj`.
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights.reduce(into: [:]) { result, item in
-            let key = item.key
+            let renamed = item.key
                 .replacingOccurrences(of: ".layer.", with: ".layers.")
                 .replacingOccurrences(of: ".self.key.", with: ".key_proj.")
                 .replacingOccurrences(of: ".self.query.", with: ".query_proj.")
@@ -338,6 +338,9 @@ public class BertModel: Module, EmbeddingModel {
                 .replacingOccurrences(of: ".intermediate.dense.", with: ".linear1.")
                 .replacingOccurrences(of: ".output.dense.", with: ".linear2.")
                 .replacingOccurrences(of: ".LayerNorm.", with: ".norm.")
+            // Two statements: Swift 6.3's type checker on Linux cannot finish the whole chain.
+            let key =
+                renamed
                 .replacingOccurrences(of: "pooler.dense.", with: "pooler.")
                 .replacingOccurrences(
                     of: "cls.predictions.transform.dense.", with: "lm_head.dense."

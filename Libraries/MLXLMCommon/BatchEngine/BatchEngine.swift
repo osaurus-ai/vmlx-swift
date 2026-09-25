@@ -4,7 +4,9 @@
 import Foundation
 import MLX
 import MLXNN
-import os
+#if canImport(os)
+    import os
+#endif
 
 /// Errors thrown by mutable ``BatchEngine`` configuration APIs.
 public enum BatchEngineConfigurationError: Error, LocalizedError, Sendable {

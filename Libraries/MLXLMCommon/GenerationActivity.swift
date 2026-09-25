@@ -1,7 +1,9 @@
 // Copyright © 2026 Apple Inc.
 
 import Foundation
-import os
+#if canImport(os)
+    import os
+#endif
 
 /// One finite generation's process-activity lifetime, not a model-residency lease.
 ///

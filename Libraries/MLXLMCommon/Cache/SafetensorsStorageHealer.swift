@@ -660,7 +660,7 @@ enum SafetensorsStorageHealer {
         }
         private static func systemPread(
             _ fd: Int32, _ pointer: UnsafeMutableRawPointer, _ count: Int, _ offset: Int64
-        ) -> Int { Glibc.pread(fd, pointer, count, offset) }
+        ) -> Int { Glibc.pread(fd, pointer, count, off_t(offset)) }
         private static func systemFsync(_ fd: Int32) -> Int32 { Glibc.fsync(fd) }
         private static func systemRename(_ source: String, _ destination: String) -> Int32 {
             Glibc.rename(source, destination)

@@ -48,11 +48,17 @@
 //  the private wiki.)
 //
 
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 import MLX
 import MLXNN
-import os.log
+#if canImport(os)
+    import os.log
+#endif
 
 private let stampLog = Logger(subsystem: "com.vmlx", category: "ProposalHeadStamp")
 

@@ -3,7 +3,9 @@
 
 import Foundation
 import MLX
-import os
+#if canImport(os)
+    import os
+#endif
 
 // MARK: - BatchQuantize
 
