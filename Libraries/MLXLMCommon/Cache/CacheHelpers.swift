@@ -1159,10 +1159,12 @@ private func restoreFromLegacyArrays(
 ) -> Int {
     // Legacy formats carry no recurrent/composite companion state. Count
     // equality among attention layers alone cannot establish a complete hit.
-    guard cache.allSatisfy({
-        !($0 is QSAKVCache)
-            && ($0 is KVCacheSimple || $0 is QuantizedKVCache || $0 is TurboQuantKVCache)
-    }) else { return 0 }
+    guard
+        cache.allSatisfy({
+            !($0 is QSAKVCache)
+                && ($0 is KVCacheSimple || $0 is QuantizedKVCache || $0 is TurboQuantKVCache)
+        })
+    else { return 0 }
     var kvByLayer: [Int: (keys: MLXArray, values: MLXArray)] = [:]
 
     if TQDiskSerializer.isTQNative(arrays) {
@@ -1668,11 +1670,12 @@ private func canRestoreMambaRecords(
         // Pool wrappers need additional native companion state and cannot
         // be restored from a rotating-only composite record.
         guard !(layer is HybridPoolCache) else { return false }
-        let target = (layer as? RotatingKVCache)
+        let target =
+            (layer as? RotatingKVCache)
             ?? (layer as? RotatingKVCacheWrapper)?.rotating
         guard let target,
-              component.keys.ndim >= 3, component.values.ndim >= 3,
-              component.keys.dim(2) == component.values.dim(2)
+            component.keys.ndim >= 3, component.values.ndim >= 3,
+            component.keys.dim(2) == component.values.dim(2)
         else { return false }
         return component.keep == target.keep && component.maxSize == target.maxCacheSize
             && component.keep >= 0 && component.keep < component.maxSize

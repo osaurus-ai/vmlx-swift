@@ -89,37 +89,42 @@ struct DiskRestoreFailClosedMatrixTests {
             name: "plain-kv",
             families: "Nanbeige, LagunaM1 (default cache, no newCache override)",
             make: { [KVCacheSimple(), KVCacheSimple(), KVCacheSimple()] }),
-        Topology(
-            name: "hybrid-plain-kv",
-            families: "LFM2, LFM2MoE, Jamba, GraniteMoeHybrid mixed configurations",
-            make: { [MambaCache(), KVCacheSimple(), MambaCache()] }),
-        Topology(
-            name: "composite-hybrid",
-            families: "FalconH1",
-            make: {
-                [CacheList(MambaCache(), KVCacheSimple()),
-                 CacheList(MambaCache(), KVCacheSimple())]
-            }),
-        Topology(
-            name: "composite-duplicate-kv",
-            families: "synthetic duplicate-type CacheList contract",
-            make: { [CacheList(KVCacheSimple(), KVCacheSimple())] }),
-        Topology(
-            name: "composite-tq-fill",
-            families: "synthetic full-precision TQ composite contract",
-            make: { [CacheList(MambaCache(), TurboQuantKVCache())] }),
-        Topology(
-            name: "composite-rotating",
-            families: "synthetic rotating CacheList contract",
-            make: {
-                [CacheList(MambaCache(), RotatingKVCache(maxSize: 16, keep: 0)),
-                 CacheList(RotatingKVCache(maxSize: 16, keep: 0),
-                           RotatingKVCache(maxSize: 16, keep: 0))]
-            }),
-        Topology(
+            Topology(
+                name: "hybrid-plain-kv",
+                families: "LFM2, LFM2MoE, Jamba, GraniteMoeHybrid mixed configurations",
+                make: { [MambaCache(), KVCacheSimple(), MambaCache()] }),
+            Topology(
+                name: "composite-hybrid",
+                families: "FalconH1",
+                make: {
+                    [
+                        CacheList(MambaCache(), KVCacheSimple()),
+                        CacheList(MambaCache(), KVCacheSimple()),
+                    ]
+                }),
+            Topology(
+                name: "composite-duplicate-kv",
+                families: "synthetic duplicate-type CacheList contract",
+                make: { [CacheList(KVCacheSimple(), KVCacheSimple())] }),
+            Topology(
+                name: "composite-tq-fill",
+                families: "synthetic full-precision TQ composite contract",
+                make: { [CacheList(MambaCache(), TurboQuantKVCache())] }),
+            Topology(
+                name: "composite-rotating",
+                families: "synthetic rotating CacheList contract",
+                make: {
+                    [
+                        CacheList(MambaCache(), RotatingKVCache(maxSize: 16, keep: 0)),
+                        CacheList(
+                            RotatingKVCache(maxSize: 16, keep: 0),
+                            RotatingKVCache(maxSize: 16, keep: 0)),
+                    ]
+                }),
+            Topology(
             name: "pure-ssm",
-            families: "synthetic all-recurrent configuration",
-            make: { [MambaCache(), MambaCache(), MambaCache()] }),
+                families: "synthetic all-recurrent configuration",
+                make: { [MambaCache(), MambaCache(), MambaCache()] }),
         ]
     }
 
@@ -396,8 +401,9 @@ struct DiskRestoreFailClosedMatrixTests {
             #expect(Self.offsets(hybrid) == [0, 0])
             for requireBoundary in [false, true] {
                 var sparse: [any KVCache] = [QSAKVCache()]
-                #expect(restoreFromDiskArrays(
-                    arrays, into: &sparse, requirePromptBoundary: requireBoundary) == 0)
+                #expect(
+                    restoreFromDiskArrays(
+                        arrays, into: &sparse, requirePromptBoundary: requireBoundary) == 0)
                 #expect(Self.offsets(sparse) == [0])
             }
         }

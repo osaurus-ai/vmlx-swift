@@ -1568,7 +1568,7 @@ public enum TQDiskSerializer {
                 if let k = arrays["rot_\(i)_sub_\(j)_keys"],
                    let v = arrays["rot_\(i)_sub_\(j)_values"],
                    let metaArr = arrays["__rot_\(i)_sub_\(j)_meta__"],
-                   metaArr.shape == [5], metaArr.dtype == .int32
+                    metaArr.shape == [5], metaArr.dtype == .int32
                 {
                     let m = metaArr.asArray(Int32.self)
                     if m.count == 5 {

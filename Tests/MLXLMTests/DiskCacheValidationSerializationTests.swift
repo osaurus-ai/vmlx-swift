@@ -28,8 +28,9 @@ struct DiskCacheValidationSerializationTests {
             let beforeRelease = finished.wait(timeout: .now() + 0.25)
             MLXDiskCacheIOLock.shared.unlock()
             #expect(didStart == .success)
-            #expect(beforeRelease == .timedOut,
-                    "Even rejected payload validation must wait for global MLX IO ownership")
+            #expect(
+                beforeRelease == .timedOut,
+                "Even rejected payload validation must wait for global MLX IO ownership")
             if beforeRelease == .timedOut {
                 #expect(finished.wait(timeout: .now() + 5) == .success)
             }
