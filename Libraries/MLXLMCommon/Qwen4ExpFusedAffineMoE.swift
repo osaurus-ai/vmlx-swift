@@ -84,6 +84,9 @@ public enum Qwen4ExpFusedAffineMoE {
         return raw != "0" && raw.lowercased() != "false"
     }()
 
+    // METAL-ONLY: case 2. Metal kernel; the generic `SwitchGLU` path computes the same with
+    // MLX ops, but `SwitchGLU.qwen4ExpReduced` (on unless `VMLX_QWEN4_EXP_FUSED_AFFINE_MOE=0`)
+    // does not pick it for the shapes this kernel handles, so this path needs a Metal device.
     private static let pairKernel = MLXFast.metalKernel(
         name: "vmlx_qwen4_q4g64_pair_swiglu",
         inputNames: ["x", "gw", "gs", "gb", "uw", "us", "ub", "inds", "lim"],
@@ -193,6 +196,9 @@ public enum Qwen4ExpFusedAffineMoE {
         // remains the same allocation-free contract.
         ensureRowContiguous: true)
 
+    // METAL-ONLY: case 2. Metal kernel; the generic `SwitchGLU` path computes the same with
+    // MLX ops, but `SwitchGLU.qwen4ExpReduced` (on unless `VMLX_QWEN4_EXP_FUSED_AFFINE_MOE=0`)
+    // does not pick it for the shapes this kernel handles, so this path needs a Metal device.
     private static let downKernel = MLXFast.metalKernel(
         name: "vmlx_qwen4_q4g64_weighted_down10",
         inputNames: ["act", "dw", "ds", "db", "inds", "scores"],

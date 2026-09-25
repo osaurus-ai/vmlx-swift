@@ -428,6 +428,9 @@ private func makeBailingGLAKernel() -> MLXFast.MLXFastKernel? {
             }
         """
 
+    // METAL-ONLY: case 2. Metal kernel; `recurrentGLAReference` computes the same
+    // with MLX ops, but the head-dimension guard in `recurrentGLAKernel` does not
+    // pick it for the shapes this kernel handles, so this path needs a Metal device.
     return MLXFast.metalKernel(
         name: "bailing_recurrent_gla",
         inputNames: ["q", "k", "v", "g", "state_in", "T"],

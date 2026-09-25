@@ -275,6 +275,10 @@ private func makeNemotronHMambaDepthwiseDecodeConvKernel() -> MLXFast.MLXFastKer
             }
         """
 
+    // METAL-ONLY: case 2. Metal kernel; the `conv1d` path of `applyConv`
+    // computes the same with MLX ops, but `nemotronHMambaDepthwiseDecodeConv`
+    // (on unless `VMLX_DISABLE_NEMOTRON_MAMBA_CONV_FASTPATH=1`) does not pick
+    // it for the shapes this kernel handles, so this path needs a Metal device.
     return MLXFast.metalKernel(
         name: "nemotron_h_mamba_depthwise_decode_conv",
         inputNames: ["input", "state", "weight", "bias"],
