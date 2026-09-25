@@ -8,6 +8,43 @@ import XCTest
 
 final class GenerationConfigDefaultsTests: XCTestCase {
 
+    func testOutputTokenAliasesValidateAndRoundTrip() throws {
+        let rows: [(String, Int?)] = [
+            (#"{"max_tokens":1048576}"#, 1048576),
+            (#"{"max_tokens":12,"max_new_tokens":24}"#, 24),
+            (#"{"max_tokens":12,"max_new_tokens":null}"#, 12),
+            (#"{"max_tokens":12,"max_new_tokens":0}"#, 12),
+            (#"{"max_tokens":12,"max_new_tokens":-4}"#, 12),
+            (#"{"max_tokens":12,"max_new_tokens":true}"#, 12),
+            (#"{"max_tokens":12,"max_new_tokens":1.5}"#, 12),
+            (#"{"max_tokens":12,"max_new_tokens":"24"}"#, 12),
+            (#"{"max_tokens":1.0}"#, 1),
+            (#"{"max_tokens":0}"#, nil),
+            (#"{"max_tokens":-1}"#, nil),
+            (#"{"max_tokens":true}"#, nil),
+            (#"{"max_tokens":1.5}"#, nil),
+            (#"{"max_tokens":"12"}"#, nil),
+            (#"{"max_tokens":9223372036854775808}"#, nil),
+            (#"{"max_length":42}"#, nil),
+            (#"{}"#, nil),
+        ]
+        for (json, expected) in rows {
+            let data = Data(json.utf8)
+            let config = try JSONDecoder().decode(GenerationConfigFile.self, from: data)
+            XCTAssertEqual(config.maxNewTokens, expected, json)
+            let dictionary = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(GenerationConfigFile.outputTokenLimit(from: dictionary), expected, json)
+            let encoded = try JSONEncoder().encode(config)
+            XCTAssertEqual(try JSONDecoder().decode(GenerationConfigFile.self, from: encoded), config)
+            let encodedObject = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+            XCTAssertNil(encodedObject["max_tokens"], "Encode only canonical max_new_tokens")
+        }
+        let config = try JSONDecoder().decode(GenerationConfigFile.self,
+            from: Data(#"{"max_tokens":true,"temperature":0.7,"top_k":32}"#.utf8))
+        XCTAssertEqual(config.temperature, 0.7)
+        XCTAssertEqual(config.topK, 32)
+    }
+
     func testDecodesSamplingDefaults() throws {
         let json = """
         {

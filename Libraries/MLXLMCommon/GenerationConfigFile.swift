@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 import Foundation
+import CoreFoundation
 
 /// Declarative defaults passed to a tokenizer chat template when a request
 /// does not provide an explicit value. Hugging Face bundles currently use
@@ -110,6 +111,53 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         self.confidenceThreshold = confidenceThreshold
         self.padTokenId = padTokenId
         self.samplerConfig = samplerConfig
+    }
+
+    /// Both spellings describe newly generated tokens, never total context length.
+    /// Ignore invalid caps without discarding the bundle's other defaults.
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let aliases = try decoder.container(keyedBy: OutputLimitKeys.self)
+        maxNewTokens = Self.positiveInteger(try? values.decode(Int.self, forKey: .maxNewTokens))
+            ?? Self.positiveInteger(try? aliases.decode(Int.self, forKey: .maxTokens))
+        eosTokenIds = try values.decodeIfPresent(IntOrIntArray.self, forKey: .eosTokenIds)
+        temperature = try values.decodeIfPresent(Float.self, forKey: .temperature)
+        topP = try values.decodeIfPresent(Float.self, forKey: .topP)
+        topK = try values.decodeIfPresent(Int.self, forKey: .topK)
+        minP = try values.decodeIfPresent(Float.self, forKey: .minP)
+        repetitionPenalty = try values.decodeIfPresent(Float.self, forKey: .repetitionPenalty)
+        presencePenalty = try values.decodeIfPresent(Float.self, forKey: .presencePenalty)
+        frequencyPenalty = try values.decodeIfPresent(Float.self, forKey: .frequencyPenalty)
+        doSample = try values.decodeIfPresent(Bool.self, forKey: .doSample)
+        suppressTokens = try values.decodeIfPresent([Int].self, forKey: .suppressTokens)
+        defaultChatTemplateKwargs = try values.decodeIfPresent(ChatTemplateKwargsDefaults.self, forKey: .defaultChatTemplateKwargs)
+        maxDenoisingSteps = try values.decodeIfPresent(Int.self, forKey: .maxDenoisingSteps)
+        tMin = try values.decodeIfPresent(Float.self, forKey: .tMin)
+        tMax = try values.decodeIfPresent(Float.self, forKey: .tMax)
+        stabilityThreshold = try values.decodeIfPresent(Int.self, forKey: .stabilityThreshold)
+        confidenceThreshold = try values.decodeIfPresent(Float.self, forKey: .confidenceThreshold)
+        padTokenId = try values.decodeIfPresent(Int.self, forKey: .padTokenId)
+        samplerConfig = try values.decodeIfPresent(SamplerConfig.self, forKey: .samplerConfig)
+    }
+
+    private enum OutputLimitKeys: String, CodingKey {
+        case maxTokens = "max_tokens"
+    }
+
+    /// JSONSerialization companion for JANG's sampling-defaults dictionary.
+    static func outputTokenLimit(from values: [String: Any]) -> Int? {
+        func positiveInteger(_ value: Any?) -> Int? {
+            guard let number = value as? NSNumber,
+                CFGetTypeID(number) != CFBooleanGetTypeID(),
+                number.intValue > 0, number.decimalValue == Decimal(number.intValue)
+            else { return nil }
+            return number.intValue
+        }
+        return positiveInteger(values["max_new_tokens"]) ?? positiveInteger(values["max_tokens"])
+    }
+
+    private static func positiveInteger(_ value: Int?) -> Int? {
+        value.flatMap { $0 > 0 ? $0 : nil }
     }
 
     enum CodingKeys: String, CodingKey {

@@ -1990,7 +1990,7 @@ public struct JangLoader: Sendable {
                     minP: floatValue(sDict["min_p"]),
                     repetitionPenalty: floatValue(sDict["repetition_penalty"]),
                     presencePenalty: floatValue(sDict["presence_penalty"]),
-                    maxNewTokens: (sDict["max_tokens"] as? Int) ?? (sDict["max_new_tokens"] as? Int)
+                    maxNewTokens: GenerationConfigFile.outputTokenLimit(from: sDict)
                 )
             } else { sampling = nil }
 

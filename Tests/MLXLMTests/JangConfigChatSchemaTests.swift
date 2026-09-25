@@ -15,6 +15,21 @@ import Testing
 @Suite("JangLoader — DSV4 chat schema")
 struct JangConfigChatSchemaTests {
 
+    @Test("JANG token aliases follow generation-config precedence and validation")
+    func outputTokenAliases() throws {
+        for (sampling, expected) in [
+            (["max_tokens": 99] as [String: Any], 99),
+            (["max_tokens": 99, "max_new_tokens": 42], 42),
+            (["max_tokens": 99, "max_new_tokens": true], 99),
+            (["max_tokens": 99, "max_new_tokens": 1.5], 99),
+        ] {
+            let config = try JangLoader.parseConfig(from: [
+                "format": "jang", "chat": ["sampling_defaults": sampling]
+            ])
+            #expect(config.chat?.samplingDefaults?.maxNewTokens == expected)
+        }
+    }
+
     @Test("parseConfig reads chat.reasoning / tool_calling / sampling_defaults")
     func parsesFullChatBlock() throws {
         let json: [String: Any] = [
