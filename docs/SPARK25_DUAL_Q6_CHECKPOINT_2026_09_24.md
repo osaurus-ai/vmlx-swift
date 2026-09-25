@@ -28,3 +28,12 @@ On the original qualified R33 binary, native short ABBA (1027tokens/turn) now me
 The native long answer remains identical to baseline, including factual imprecision in its hash-table explanation. These are runtime/output-equivalence checks, not a claim of factual correctness for every generated statement.
 
 Evidence: private raptor-dual-q6-recheck-r38/{short-abba-review,long-abba-review}.json and full-model raw logs. Integration branch is based on merged cache enginea2a45e86 with the same kernel source cherry-picked. Combined exact-head build, native/cache proof and app UI/CI still pending; not merge-ready. Other model families retain explicit fallbacks; no generic/all-chip performance claim.
+
+## Integrated engine qualification
+Runtime6d5ae291 built successfully in386.46s with no source mutation, binaryf70930277f06a75ba104ae9fec8e970b3008652a98d0ff07398429c50eac4745. Kernel/dispatch/test files are byte-identical to the12focused test inputs. Integrated native1027-token ABBA candidate103.4/102.9 versusreference99.9/91.5, all outputs exact; the reference drift makes the larger apparent gap unreliable, so retain the earlier conservative~3%long-workload result.
+
+Integrated growing-cache ABBA passes8native turns and full raw output/685retained tensors per comparison under2.2GiB quota. Native-equivalent thinking=true matches the bundle's Jinja defaulttrue. A separate parsed batched2 check uses omitted template overrides and passes2turns plus new-process SSD restore:89.79/101.72/101.82tok/s, accepted1183tokens/36layers on restart. Captured1024checkpoint is reused for1155boundary; cold/warm fallback behavior retained. Physical peaks3.93GB for growing rows and1.71GB for batched proof; no low-RAM-family claim.
+
+Private `raptor-dual-q6-recheck-r38/integrated-review.json` contains receipts/traces; all guards passed. Metal System Trace10s capture failed to finish saving before60s; its partial document could not export. Instrumented rates are excluded; no GPU synchronization-count claim.
+
+Engine CI is waived by user instruction, not claimed green. Osaurus still needs its separate exact pin/build/UI/hosted CI before merge. No release or tag.
