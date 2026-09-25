@@ -24,7 +24,7 @@ struct JangConfigChatSchemaTests {
             (["max_tokens": 99, "max_new_tokens": 1.5], 99),
         ] {
             let config = try JangLoader.parseConfig(from: [
-                "format": "jang", "chat": ["sampling_defaults": sampling]
+                "format": "jang", "chat": ["sampling_defaults": sampling],
             ])
             #expect(config.chat?.samplingDefaults?.maxNewTokens == expected)
         }

@@ -10,7 +10,7 @@ final class GenerationConfigDefaultsTests: XCTestCase {
 
     func testOutputTokenAliasesValidateAndRoundTrip() throws {
         let rows: [(String, Int?)] = [
-            (#"{"max_tokens":1048576}"#, 1048576),
+            (#"{"max_tokens":1048576}"#, 1_048_576),
             (#"{"max_tokens":12,"max_new_tokens":24}"#, 24),
             (#"{"max_tokens":12,"max_new_tokens":null}"#, 12),
             (#"{"max_tokens":12,"max_new_tokens":0}"#, 12),
@@ -32,14 +32,18 @@ final class GenerationConfigDefaultsTests: XCTestCase {
             let data = Data(json.utf8)
             let config = try JSONDecoder().decode(GenerationConfigFile.self, from: data)
             XCTAssertEqual(config.maxNewTokens, expected, json)
-            let dictionary = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let dictionary = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: data) as? [String: Any])
             XCTAssertEqual(GenerationConfigFile.outputTokenLimit(from: dictionary), expected, json)
             let encoded = try JSONEncoder().encode(config)
-            XCTAssertEqual(try JSONDecoder().decode(GenerationConfigFile.self, from: encoded), config)
-            let encodedObject = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+            XCTAssertEqual(
+                try JSONDecoder().decode(GenerationConfigFile.self, from: encoded), config)
+            let encodedObject = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: encoded) as? [String: Any])
             XCTAssertNil(encodedObject["max_tokens"], "Encode only canonical max_new_tokens")
         }
-        let config = try JSONDecoder().decode(GenerationConfigFile.self,
+        let config = try JSONDecoder().decode(
+            GenerationConfigFile.self,
             from: Data(#"{"max_tokens":true,"temperature":0.7,"top_k":32}"#.utf8))
         XCTAssertEqual(config.temperature, 0.7)
         XCTAssertEqual(config.topK, 32)

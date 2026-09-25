@@ -1,7 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
-import Foundation
 import CoreFoundation
+import Foundation
 
 /// Declarative defaults passed to a tokenizer chat template when a request
 /// does not provide an explicit value. Hugging Face bundles currently use
@@ -118,7 +118,8 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         let aliases = try decoder.container(keyedBy: OutputLimitKeys.self)
-        maxNewTokens = Self.positiveInteger(try? values.decode(Int.self, forKey: .maxNewTokens))
+        maxNewTokens =
+            Self.positiveInteger(try? values.decode(Int.self, forKey: .maxNewTokens))
             ?? Self.positiveInteger(try? aliases.decode(Int.self, forKey: .maxTokens))
         eosTokenIds = try values.decodeIfPresent(IntOrIntArray.self, forKey: .eosTokenIds)
         temperature = try values.decodeIfPresent(Float.self, forKey: .temperature)
@@ -130,7 +131,8 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         frequencyPenalty = try values.decodeIfPresent(Float.self, forKey: .frequencyPenalty)
         doSample = try values.decodeIfPresent(Bool.self, forKey: .doSample)
         suppressTokens = try values.decodeIfPresent([Int].self, forKey: .suppressTokens)
-        defaultChatTemplateKwargs = try values.decodeIfPresent(ChatTemplateKwargsDefaults.self, forKey: .defaultChatTemplateKwargs)
+        defaultChatTemplateKwargs = try values.decodeIfPresent(
+            ChatTemplateKwargsDefaults.self, forKey: .defaultChatTemplateKwargs)
         maxDenoisingSteps = try values.decodeIfPresent(Int.self, forKey: .maxDenoisingSteps)
         tMin = try values.decodeIfPresent(Float.self, forKey: .tMin)
         tMax = try values.decodeIfPresent(Float.self, forKey: .tMax)
