@@ -1032,3 +1032,78 @@ if Context.environment["MLX_SWIFT_BUILD_DOC"] == "1"
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.3.0")
     )
 }
+
+// MARK: - VMLXLinuxTests
+
+// Tests for the Linux port. Declared on every platform, and before the Linux profile below, which
+// must find it among the targets.
+package.targets.append(
+    .testTarget(
+        name: "VMLXLinuxTests",
+        dependencies: ["MLX", "MLXNN", "MLXLMCommon", "MLXEmbedders"],
+        path: "Tests/VMLXLinuxTests"
+    )
+)
+
+// MARK: - Linux profile
+
+#if os(Linux)
+    // On Linux, only the libraries named in `roots` and their dependencies exist, as targets and
+    // as products; most other targets import Apple-only frameworks. Walking the dependencies,
+    // instead of listing the targets, keeps a new dependency of a kept target in the build, where
+    // CI shows whether it compiles on Linux. A consumer that references another product must do so
+    // under `#if os(...)` in its own manifest, not under a `.when(platforms:)` condition, which
+    // SwiftPM checks after resolving products; or build with `VMLX_LINUX_PROFILE=0`, which keeps
+    // every target.
+    do {
+        // Always: MLXLMCommon cannot compile on Linux without these. Declared before the walk, so
+        // that it reaches them.
+        package.targets.append(
+            .systemLibrary(
+                name: "CSQLite3Linux", path: "LinuxSupport/CSQLite3",
+                providers: [.apt(["libsqlite3-dev"]), .yum(["sqlite-devel"])])
+        )
+        guard let common = package.targets.first(where: { $0.name == "MLXLMCommon" }) else {
+            fatalError("Linux profile: no target named MLXLMCommon")
+        }
+        common.dependencies += [
+            "CSQLite3Linux",
+            .product(name: "Crypto", package: "swift-crypto"),
+        ]
+    }
+    if Context.environment["VMLX_LINUX_PROFILE"] != "0" {
+        let roots = [
+            "MLXEmbedders", "MLXLLM", "MLXHuggingFace", "VMLXTokenizers", "MLXFFT", "MLXLinalg",
+            "CSQLite3Linux", "VMLXLinuxTests",
+        ]
+        let targetsByName = Dictionary(
+            package.targets.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+        for root in roots where targetsByName[root] == nil {
+            // An upstream rename must not quietly remove a library from Linux.
+            fatalError("Linux profile: no target named \(root)")
+        }
+        var kept = Set<String>()
+        var pending = roots
+        while let name = pending.popLast() {
+            guard let target = targetsByName[name], kept.insert(name).inserted else { continue }
+            for dependency in target.dependencies {
+                switch dependency {
+                case .targetItem(let name, _), .byNameItem(let name, _):
+                    pending.append(name)
+                case .productItem:
+                    continue
+                @unknown default:
+                    continue
+                }
+            }
+        }
+        package.targets.removeAll { !kept.contains($0.name) }
+        package.products.removeAll { product in
+            switch product {
+            case let library as Product.Library: !library.targets.allSatisfy(kept.contains)
+            case let executable as Product.Executable: !executable.targets.allSatisfy(kept.contains)
+            default: true
+            }
+        }
+    }
+#endif

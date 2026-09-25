@@ -1,6 +1,8 @@
 // Copyright © 2025 Apple Inc.
 
-import CoreGraphics
+#if canImport(CoreGraphics)
+    import CoreGraphics
+#endif
 import Foundation
 import MLX
 

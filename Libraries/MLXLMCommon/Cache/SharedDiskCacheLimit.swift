@@ -1,5 +1,7 @@
 import Foundation
-import os
+#if canImport(os)
+    import os
+#endif
 
 /// All coordinators writing one index must enforce the same live quota.
 /// Weak registry entries let a root start with a freshly measured policy once

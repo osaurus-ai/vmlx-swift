@@ -1,7 +1,11 @@
 // Copyright © 2024 Apple Inc.
 
-@preconcurrency import AVFoundation
-import CoreImage
+#if canImport(AVFoundation)
+    @preconcurrency import AVFoundation
+#endif
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 
@@ -39,6 +43,7 @@ public struct UserInput {
         }
     }
 
+    #if canImport(CoreImage) && canImport(AVFoundation)
     public struct VideoFrame {
         public let frame: CIImage
         public let timeStamp: CMTime
@@ -48,14 +53,20 @@ public struct UserInput {
             self.timeStamp = timeStamp
         }
     }
+    #endif
 
     /// Representation of a video resource.
     public enum Video {
+        #if canImport(AVFoundation)
         case avAsset(AVAsset)
+        #endif
         case url(URL)
+        #if canImport(CoreImage) && canImport(AVFoundation)
         /// Useful for decoded frames held in memory
         case frames([VideoFrame])
+        #endif
 
+        #if canImport(CoreImage) && canImport(AVFoundation)
         @available(
             *, deprecated,
             message: "Use MediaProcessing.asProcessedSequence() with the Video directly"
@@ -72,14 +83,18 @@ public struct UserInput {
                 )
             }
         }
+        #endif
     }
 
     /// Representation of an image resource.
     public enum Image {
+        #if canImport(CoreImage)
         case ciImage(CIImage)
+        #endif
         case url(URL)
         case array(MLXArray)
 
+        #if canImport(CoreImage)
         public func asCIImage() throws -> CIImage {
             switch self {
             case .ciImage(let image):
@@ -135,6 +150,7 @@ public struct UserInput {
                     format: .RGBA8, colorSpace: cs)
             }
         }
+        #endif
     }
 
     /// Representation of an audio resource (mono PCM, model handles

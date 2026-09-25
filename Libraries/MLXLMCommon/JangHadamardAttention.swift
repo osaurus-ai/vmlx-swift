@@ -1,7 +1,9 @@
 import Foundation
 import MLX
 import MLXNN
-import os
+#if canImport(os)
+    import os
+#endif
 
 /// Bonsai2 keeps its checkpoint weights and Hadamard/normalization arithmetic
 /// unchanged. Only the attention boundary uses half-precision Q/K/V. Recurrent

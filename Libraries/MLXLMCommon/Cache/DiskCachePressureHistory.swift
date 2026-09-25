@@ -1,5 +1,7 @@
 import Foundation
-import os
+#if canImport(os)
+    import os
+#endif
 
 /// Process-lifetime capacity-loss metadata. It owns no model, tensors, cache
 /// coordinator or SQLite connection, so idle unload cannot erase a notice

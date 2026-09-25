@@ -1,9 +1,15 @@
 // Copyright © 2024 Apple Inc.
 
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 import MLX
-import os
+#if canImport(os)
+    import os
+#endif
 
 /// Thread-safe snapshot of ``SSMStateCache`` counters.
 public struct SSMStateCacheStats: Sendable {
@@ -154,7 +160,7 @@ public final class SSMStateCache: @unchecked Sendable {
             if !materialized.isEmpty {
                 MLX.eval(materialized)
             }
-            Stream.gpu.synchronize()
+            synchronizeComputeStream()
             return materialized
         }
 
