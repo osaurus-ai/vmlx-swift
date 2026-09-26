@@ -585,6 +585,7 @@ let package = Package(
         .target(
             name: "MLXDistributedTP",
             dependencies: [
+                "Cmlx",
                 "MLXDistributedCore",
                 "MLXDistributedJACCL",
                 "CmlxDistributedShim",
