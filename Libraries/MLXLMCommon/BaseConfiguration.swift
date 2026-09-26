@@ -30,6 +30,10 @@ public struct BaseConfiguration: Codable, Sendable {
 
         public var asTuple: (Int, Int, QuantizationMode) { (groupSize, bits, mode) }
 
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.groupSize == rhs.groupSize && lhs.bits == rhs.bits && lhs.mode == rhs.mode
+        }
+
         enum CodingKeys: String, CodingKey {
             case groupSize = "group_size"
             case bits = "bits"
@@ -396,6 +400,12 @@ public struct BaseConfiguration: Codable, Sendable {
         quantizationContainer?.perLayerQuantization
     }
 
+    private enum QuantizationAliasKeys: String, CodingKey {
+        case method = "quant_method"
+        case bits
+        case groupSize = "group_size"
+    }
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case quantizationContainer = "quantization"
@@ -415,8 +425,27 @@ public struct BaseConfiguration: Codable, Sendable {
         // with different plans rather than silently preferring one.
         let legacy = try container.decodeIfPresent(
             QuantizationContainer.self, forKey: .quantizationContainer)
-        let alias = try container.decodeIfPresent(
-            QuantizationContainer.self, forKey: .quantizationConfigAlias)
+        let alias: QuantizationContainer?
+        if container.contains(.quantizationConfigAlias),
+            try !container.decodeNil(forKey: .quantizationConfigAlias)
+        {
+            // Converted bundles may retain the source ModelOpt/FP8 metadata.
+            // Only an MLX-shaped plan is an alias; do not interpret a different
+            // backend's metadata as affine quantization.
+            let metadata = try container.nestedContainer(
+                keyedBy: QuantizationAliasKeys.self, forKey: .quantizationConfigAlias)
+            let method = try metadata.decodeIfPresent(String.self, forKey: .method)
+            if let method, method.lowercased() != "mlx",
+                !metadata.contains(.bits), !metadata.contains(.groupSize)
+            {
+                alias = nil
+            } else {
+                alias = try container.decode(
+                    QuantizationContainer.self, forKey: .quantizationConfigAlias)
+            }
+        } else {
+            alias = nil
+        }
         switch (legacy, alias) {
         case (nil, nil):
             self.quantizationContainer = nil

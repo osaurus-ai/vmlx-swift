@@ -349,4 +349,29 @@ public class BaseConfigurationTests: XCTestCase {
             .init(groupSize: 64, bits: 4))
     }
 
+    func testEquivalentDualKeysWithImplicitAndExplicitAffineMode() throws {
+        let json = #"{"model_type":"test","quantization":{"group_size":64,"bits":4},"quantization_config":{"group_size":64,"bits":4,"mode":"affine"}}"#
+        let config = try JSONDecoder().decode(BaseConfiguration.self, from: Data(json.utf8))
+        XCTAssertEqual(config.perLayerQuantization?.quantization(layer: "x")?.mode, .affine)
+    }
+
+    func testConvertedBundleRetainsForeignQuantizationMetadata() throws {
+        let json = #"{"model_type":"step3p5","quantization":{"bits":2,"group_size":128},"quantization_config":{"quant_method":"modelopt","config_groups":{},"quant_algo":"FP8"}}"#
+        let config = try JSONDecoder().decode(BaseConfiguration.self, from: Data(json.utf8))
+        XCTAssertEqual(config.perLayerQuantization?.quantization(layer: "x")?.bits, 2)
+    }
+
+    func testForeignMetadataIsNotAnMLXQuantizationPlan() throws {
+        let json = #"{"model_type":"test","quantization_config":{"quant_method":"fp8","weight_block_size":[128,128]}}"#
+        let config = try JSONDecoder().decode(BaseConfiguration.self, from: Data(json.utf8))
+        XCTAssertNil(config.perLayerQuantization)
+    }
+
+    func testMalformedMLXAliasStillThrows() throws {
+        for alias in [#"{"quant_method":"mlx"}"#, #"{"bits":4}"#, #"{"group_size":64}"#] {
+            let json = "{\"model_type\":\"test\",\"quantization_config\":\(alias)}"
+            XCTAssertThrowsError(try JSONDecoder().decode(BaseConfiguration.self, from: Data(json.utf8)))
+        }
+    }
+
 }
