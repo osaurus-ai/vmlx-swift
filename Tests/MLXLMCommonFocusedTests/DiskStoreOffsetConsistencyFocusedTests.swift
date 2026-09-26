@@ -126,6 +126,63 @@ struct DiskStoreOffsetConsistencyFocusedTests {
         #expect(matched == 12)
     }
 
+    @Test("composite snapshots store by leaf boundaries and restore from disk")
+    func compositeSnapshotStoresAndRestores() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let coordinator = makeCoordinator(diskDir: dir)
+        let tokens = Array(0..<12)
+        let recurrent = MambaCache()
+        recurrent[0] = MLXArray.ones([1, 2, 4])
+        recurrent[1] = MLXArray.ones([1, 4, 4])
+        recurrent.offset = tokens.count
+        let attention = KVCacheSimple()
+        _ = attention.update(keys: MLXArray.ones([1, 1, 12, 4]), values: MLXArray.ones([1, 1, 12, 4]))
+        MLX.eval(attention)
+        let nested = CacheList(recurrent, attention)
+        #expect(nested.offset == 0)
+        coordinator.storeAfterGeneration(
+            promptTokens: tokens, perLayerData: [], ssmStates: nil, cache: [nested])
+        guard case .hit(let matched, _, _, _, _, let arrays) =
+            coordinator.fetch(tokens: tokens + [12, 13]), let arrays
+        else {
+            Issue.record("valid composite was not stored and fetched through the coordinator")
+            return
+        }
+        var restored: [any KVCache] = [CacheList(MambaCache(), KVCacheSimple())]
+        let count = restoreFromDiskArrays(arrays, into: &restored, requirePromptBoundary: true)
+        #expect(matched == tokens.count)
+        #expect(count == tokens.count, "Stored payload: \(arrays.keys.sorted().map { "\($0):\(arrays[$0]!.dtype)" })")
+        #expect(validateRestoredCacheBoundary(restored, matchedTokens: matched, restoredTokens: count))
+    }
+
+    @Test("unsupported deeper composite serialization does not claim a restored boundary")
+    func unsupportedNestedSerializationFailsClosed() {
+        let original = CacheList(CacheList(rotatingCache(fedTokens: 12)))
+        let arrays = TQDiskSerializer.serialize(cache: [original])
+        var target: [any KVCache] = [CacheList(CacheList(RotatingKVCache(maxSize: 8, keep: 0)))]
+        #expect(restoreFromDiskArrays(arrays, into: &target, requirePromptBoundary: true) == 0)
+        #expect(cacheBoundaryLeafOffsets(target) == [0])
+    }
+
+    @Test("composite store rejects a mismatched child or empty subtree")
+    func invalidCompositeStoreIsRefused() throws {
+        for empty in [false, true] {
+            let dir = try tempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let coordinator = makeCoordinator(diskDir: dir)
+            let good = rotatingCache(fedTokens: 12)
+            let bad: any KVCache = empty ? CacheList([]) : rotatingCache(fedTokens: 13)
+            coordinator.storeAfterGeneration(
+                promptTokens: Array(0..<12), perLayerData: [], ssmStates: nil,
+                cache: [CacheList(good, CacheList(bad))])
+            guard case .miss = coordinator.fetch(tokens: Array(0..<14)) else {
+                Issue.record("invalid composite reached disk (empty=\(empty))")
+                continue
+            }
+        }
+    }
+
     // MARK: - Post-answer boundary key alignment (consumed stop token)
 
     /// The async decode pipeline forwards the consumed stop token while

@@ -136,6 +136,18 @@ func makeDiskStoreCache(
         kvMode: parameters.kvMode)
 }
 
+/// Token boundaries belong to leaves, not CacheList's unused inherited offset.
+/// An empty composite contributes an invalid boundary rather than disappearing.
+func cacheBoundaryLeafOffsets(_ cache: [any KVCache]) -> [Int] {
+    cache.flatMap { layer -> [Int] in
+        if let list = layer as? CacheList {
+            guard list.count > 0 else { return [0] }
+            return cacheBoundaryLeafOffsets((0..<list.count).map { list[$0] })
+        }
+        return [layer.offset]
+    }
+}
+
 /// Fail-closed validation of a coordinator cache restore.
 ///
 /// A hit restores two independently derived lengths: attention layers take
@@ -159,17 +171,7 @@ public func validateRestoredCacheBoundary(
     restoredTokens: Int,
     detail: String = ""
 ) -> Bool {
-    // CacheList's inherited offset does not advance with its children.
-    // Validate every leaf instead, keeping an empty composite invalid even
-    // when a sibling has a valid boundary.
-    func boundaryOffsets(_ layer: any KVCache) -> [Int] {
-        if let list = layer as? CacheList {
-            guard list.count > 0 else { return [0] }
-            return (0..<list.count).flatMap { boundaryOffsets(list[$0]) }
-        }
-        return [layer.offset]
-    }
-    let offsets = cache.flatMap { boundaryOffsets($0) }
+    let offsets = cacheBoundaryLeafOffsets(cache)
     let consistent =
         matchedTokens > 0
         && restoredTokens == matchedTokens
