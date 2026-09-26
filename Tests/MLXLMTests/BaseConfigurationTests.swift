@@ -153,4 +153,225 @@ public class BaseConfigurationTests: XCTestCase {
             "Only real per-layer dictionary overrides and false skips should enter the override map.")
     }
 
+    func testQuantizationConfigAlias() throws {
+        // Hugging Face configs spell the plan `quantization_config` instead of
+        // the historical `quantization` key; the alias must decode to the same
+        // plan. From https://github.com/osaurus-ai/vmlx-swift/issues/515
+        let json =
+            """
+            {
+                "model_type": "qwen3_5",
+                "quantization_config": {
+                    "group_size": 64,
+                    "bits": 4
+                }
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            BaseConfiguration.self, from: json.data(using: .utf8)!)
+
+        XCTAssertEqual(
+            config.perLayerQuantization?.quantization(layer: "x"),
+            .init(groupSize: 64, bits: 4))
+    }
+
+    func testQuantizationConfigAliasWithPerLayerOverrides() throws {
+        let json =
+            """
+            {
+                "model_type": "Test",
+                "quantization_config": {
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.embed_tokens": {
+                        "group_size": 32,
+                        "bits": 4
+                    },
+                    "model.layers.0.self_attn.q_norm": false
+                }
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            BaseConfiguration.self, from: json.data(using: .utf8)!)
+
+        XCTAssertEqual(
+            config.perLayerQuantization?.quantization(layer: "x"),
+            .init(groupSize: 64, bits: 4))
+        XCTAssertEqual(
+            config.perLayerQuantization?.quantization(layer: "model.embed_tokens"),
+            .init(groupSize: 32, bits: 4))
+        XCTAssertNil(
+            config.perLayerQuantization?.quantization(layer: "model.layers.0.self_attn.q_norm"))
+    }
+
+    func testEquivalentDualQuantizationKeys() throws {
+        let json =
+            """
+            {
+                "model_type": "Test",
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 4
+                },
+                "quantization_config": {
+                    "group_size": 64,
+                    "bits": 4
+                }
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            BaseConfiguration.self, from: json.data(using: .utf8)!)
+
+        XCTAssertEqual(
+            config.perLayerQuantization?.quantization(layer: "x"),
+            .init(groupSize: 64, bits: 4))
+    }
+
+    func testEquivalentDualQuantizationKeysWithPerLayerOverrides() throws {
+        let json =
+            """
+            {
+                "model_type": "Test",
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.embed_tokens": {
+                        "group_size": 32,
+                        "bits": 4
+                    }
+                },
+                "quantization_config": {
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.embed_tokens": {
+                        "group_size": 32,
+                        "bits": 4
+                    }
+                }
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            BaseConfiguration.self, from: json.data(using: .utf8)!)
+
+        XCTAssertEqual(
+            config.perLayerQuantization?.quantization(layer: "model.embed_tokens"),
+            .init(groupSize: 32, bits: 4))
+    }
+
+    func testConflictingDualQuantizationKeys() throws {
+        let json =
+            """
+            {
+                "model_type": "Test",
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 4
+                },
+                "quantization_config": {
+                    "group_size": 64,
+                    "bits": 8
+                }
+            }
+            """
+
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(BaseConfiguration.self, from: json.data(using: .utf8)!)
+        ) { error in
+            guard case DecodingError.dataCorrupted(let context) = error else {
+                return XCTFail("Expected dataCorrupted DecodingError, got \(error)")
+            }
+            XCTAssertTrue(
+                context.debugDescription.contains("quantization_config"),
+                "Error should name the conflicting alias key: \(context.debugDescription)")
+        }
+    }
+
+    func testConflictingDualQuantizationKeysWithPerLayerOverrides() throws {
+        let json =
+            """
+            {
+                "model_type": "Test",
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 4
+                },
+                "quantization_config": {
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.embed_tokens": {
+                        "group_size": 32,
+                        "bits": 4
+                    }
+                }
+            }
+            """
+
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(BaseConfiguration.self, from: json.data(using: .utf8)!)
+        ) { error in
+            guard case DecodingError.dataCorrupted(let context) = error else {
+                return XCTFail("Expected dataCorrupted DecodingError, got \(error)")
+            }
+            XCTAssertTrue(
+                context.debugDescription.contains("quantization_config"),
+                "Error should explain the conflicting plans: \(context.debugDescription)")
+        }
+    }
+
+    func testQuantizationEncodingUsesHistoricalKey() throws {
+        // Encoding must keep writing `quantization` (never `quantization_config`)
+        // so existing consumers and caches see the same wire format.
+        let json =
+            """
+            {
+                "model_type": "Test",
+                "quantization_config": {
+                    "group_size": 64,
+                    "bits": 4
+                }
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            BaseConfiguration.self, from: json.data(using: .utf8)!)
+        let encoded = try JSONEncoder().encode(config)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+
+        XCTAssertNotNil(object["quantization"])
+        XCTAssertNil(object["quantization_config"])
+        XCTAssertEqual(
+            config.perLayerQuantization?.quantization(layer: "x"),
+            .init(groupSize: 64, bits: 4))
+    }
+
+    func testEquivalentDualKeysWithImplicitAndExplicitAffineMode() throws {
+        let json = #"{"model_type":"test","quantization":{"group_size":64,"bits":4},"quantization_config":{"group_size":64,"bits":4,"mode":"affine"}}"#
+        let config = try JSONDecoder().decode(BaseConfiguration.self, from: Data(json.utf8))
+        XCTAssertEqual(config.perLayerQuantization?.quantization(layer: "x")?.mode, .affine)
+    }
+
+    func testConvertedBundleRetainsForeignQuantizationMetadata() throws {
+        let json = #"{"model_type":"step3p5","quantization":{"bits":2,"group_size":128},"quantization_config":{"quant_method":"modelopt","config_groups":{},"quant_algo":"FP8"}}"#
+        let config = try JSONDecoder().decode(BaseConfiguration.self, from: Data(json.utf8))
+        XCTAssertEqual(config.perLayerQuantization?.quantization(layer: "x")?.bits, 2)
+    }
+
+    func testForeignMetadataIsNotAnMLXQuantizationPlan() throws {
+        let json = #"{"model_type":"test","quantization_config":{"quant_method":"fp8","weight_block_size":[128,128]}}"#
+        let config = try JSONDecoder().decode(BaseConfiguration.self, from: Data(json.utf8))
+        XCTAssertNil(config.perLayerQuantization)
+    }
+
+    func testMalformedMLXAliasStillThrows() throws {
+        for alias in [#"{"quant_method":"mlx"}"#, #"{"bits":4}"#, #"{"group_size":64}"#] {
+            let json = "{\"model_type\":\"test\",\"quantization_config\":\(alias)}"
+            XCTAssertThrowsError(try JSONDecoder().decode(BaseConfiguration.self, from: Data(json.utf8)))
+        }
+    }
+
 }

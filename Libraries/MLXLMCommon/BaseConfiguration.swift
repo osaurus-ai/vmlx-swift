@@ -30,6 +30,10 @@ public struct BaseConfiguration: Codable, Sendable {
 
         public var asTuple: (Int, Int, QuantizationMode) { (groupSize, bits, mode) }
 
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.groupSize == rhs.groupSize && lhs.bits == rhs.bits && lhs.mode == rhs.mode
+        }
+
         enum CodingKeys: String, CodingKey {
             case groupSize = "group_size"
             case bits = "bits"
@@ -65,13 +69,13 @@ public struct BaseConfiguration: Codable, Sendable {
     }
 
     /// handling instructions for ``PerLayerQuantization``
-    public enum QuantizationOption: Sendable {
+    public enum QuantizationOption: Sendable, Equatable {
         case skip
         case quantize(Quantization)
     }
 
     /// Per-layer ``Quantization`` values with optional default.
-    public struct PerLayerQuantization: Sendable {
+    public struct PerLayerQuantization: Sendable, Equatable {
         public var quantization: Quantization? = nil
         public var perLayerQuantization: [String: QuantizationOption]
 
@@ -225,7 +229,7 @@ public struct BaseConfiguration: Codable, Sendable {
     /// ```
     ///
     /// This mixed type structure requires manual decoding.
-    public struct QuantizationContainer: Codable, Sendable {
+    public struct QuantizationContainer: Codable, Sendable, Equatable {
         public var quantization: Quantization
         public var perLayerQuantization: PerLayerQuantization
 
@@ -396,9 +400,78 @@ public struct BaseConfiguration: Codable, Sendable {
         quantizationContainer?.perLayerQuantization
     }
 
+    private enum QuantizationAliasKeys: String, CodingKey {
+        case method = "quant_method"
+        case bits
+        case groupSize = "group_size"
+    }
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case quantizationContainer = "quantization"
+        case quantizationConfigAlias = "quantization_config"
         case eosTokenIds = "eos_token_id"
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        self.modelType = try container.decode(String.self, forKey: .modelType)
+        self.eosTokenIds = try container.decodeIfPresent(IntOrIntArray.self, forKey: .eosTokenIds)
+
+        // Hugging Face configs may spell the quantization plan
+        // `quantization_config` instead of the historical `quantization`
+        // key. Accept both spellings, but fail closed when both are present
+        // with different plans rather than silently preferring one.
+        let legacy = try container.decodeIfPresent(
+            QuantizationContainer.self, forKey: .quantizationContainer)
+        let alias: QuantizationContainer?
+        if container.contains(.quantizationConfigAlias),
+            try !container.decodeNil(forKey: .quantizationConfigAlias)
+        {
+            // Converted bundles may retain the source ModelOpt/FP8 metadata.
+            // Only an MLX-shaped plan is an alias; do not interpret a different
+            // backend's metadata as affine quantization.
+            let metadata = try container.nestedContainer(
+                keyedBy: QuantizationAliasKeys.self, forKey: .quantizationConfigAlias)
+            let method = try metadata.decodeIfPresent(String.self, forKey: .method)
+            if let method, method.lowercased() != "mlx",
+                !metadata.contains(.bits), !metadata.contains(.groupSize)
+            {
+                alias = nil
+            } else {
+                alias = try container.decode(
+                    QuantizationContainer.self, forKey: .quantizationConfigAlias)
+            }
+        } else {
+            alias = nil
+        }
+        switch (legacy, alias) {
+        case (nil, nil):
+            self.quantizationContainer = nil
+        case (let value?, nil), (nil, let value?):
+            self.quantizationContainer = value
+        case (let legacyValue?, let aliasValue?):
+            guard legacyValue == aliasValue else {
+                let message =
+                    "Both \"quantization\" and \"quantization_config\" are present but "
+                    + "describe different quantization plans; remove one key or make the plans identical."
+                throw DecodingError.dataCorruptedError(
+                    forKey: .quantizationConfigAlias,
+                    in: container,
+                    debugDescription: message)
+            }
+            self.quantizationContainer = legacyValue
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        // Encode with the historical `quantization` key so existing consumers
+        // and caches keep seeing the same wire format; the quantization_config
+        // alias is decode-only.
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(modelType, forKey: .modelType)
+        try container.encodeIfPresent(quantizationContainer, forKey: .quantizationContainer)
+        try container.encodeIfPresent(eosTokenIds, forKey: .eosTokenIds)
     }
 }
