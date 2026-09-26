@@ -270,7 +270,10 @@ let cmlx = Target.target(
         "mlx/mlx/distributed/mpi/mpi.cpp",
         "mlx/mlx/distributed/ring/ring.cpp",
         "mlx/mlx/distributed/nccl/nccl.cpp",
+        // SDK-gated wrappers under distributed/ select the real JACCL
+        // backend on supported macOS SDKs and the upstream stub elsewhere.
         "mlx/mlx/distributed/jaccl/jaccl.cpp",
+        "mlx/mlx/distributed/jaccl/no_jaccl.cpp",
         "mlx/mlx/distributed/jaccl/lib",
     ],
     cSettings: [
@@ -281,6 +284,7 @@ let cmlx = Target.target(
         .headerSearchPath("mlx"),
         .headerSearchPath("mlx-c"),
         .headerSearchPath("json/single_include/nlohmann"),
+        .headerSearchPath("mlx/mlx/distributed/jaccl/lib"),
         .headerSearchPath("fmt/include"),
         .define("MLX_VERSION", to: "\"0.32.2\""),
     ],
