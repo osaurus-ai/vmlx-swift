@@ -76,10 +76,10 @@ public struct TQCodebook: Sendable {
     /// - Returns: Unnormalized density value.
     static func betaPDF(_ x: Float, d: Int) -> Float {
         let df = Double(d)
-        let logConst = lgamma(df / 2.0) - 0.5 * Darwin.log(Double.pi) - lgamma((df - 1.0) / 2.0)
+        let logConst = lgamma(df / 2.0) - 0.5 * log(Double.pi) - lgamma((df - 1.0) / 2.0)
         let xd = Double(x)
         let safe = Swift.max(1.0 - xd * xd, 1e-30)
-        return Float(Darwin.exp(logConst + (df - 3.0) / 2.0 * Darwin.log(safe)))
+        return Float(exp(logConst + (df - 3.0) / 2.0 * log(safe)))
     }
 
     // MARK: - Trapezoidal Integration

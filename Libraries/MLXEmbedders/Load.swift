@@ -190,6 +190,7 @@ func loadSynchronous(modelDirectory: URL, modelName: String) throws -> Embedding
     }
 
     weights = model.sanitize(weights: weights)
+    weights = CPUPrecisionPolicy.applyOnLoad(weights)
 
     if let perLayerQuantization = baseConfig.perLayerQuantization {
         quantize(model: model) { path, module in

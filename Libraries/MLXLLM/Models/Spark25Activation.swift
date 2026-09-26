@@ -55,6 +55,8 @@ enum Spark25Activation {
     // not put CustomTransforms/StopGradient nodes on ordinary inference:
     // their stream dependencies serialize otherwise asynchronous decode.
 
+    // METAL-ONLY: case 2. Metal kernel, called only under `canImport(Metal)` and when
+    // `usesMetalStream` holds; otherwise `geluMultiply` computes `gelu(gate) * up` with MLX ops.
     private static let kernel = MLXFast.metalKernel(
         name: "spark25_exact_bf16_gelu_multiply",
         inputNames: ["g", "u"], outputNames: ["out"],

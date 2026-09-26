@@ -219,6 +219,14 @@ public final class BailingV3KDAAttention: Module {
     let headDim: Int
     let projectionSize: Int
     let convKernelSize: Int
+    /// Whether this layer may use the fused decode-step convolution.
+    ///
+    /// Held per LAYER and captured at construction, not re-read from the process-wide flag on every
+    /// call: a flag that can change between two calls on the same cache is a race in waiting, and
+    /// one already cost a session's debugging on the MLA representation switch. Settable for the
+    /// same reason the reference keeps it as an instance attribute — it lets one layer be measured
+    /// both ways without building a second one, which would have different random weights.
+    public var fusedConv: Bool = KDAConvRuntime.enabled
     let safeGate: Bool
     let lowerBound: Float
 
@@ -331,15 +339,37 @@ public final class BailingV3KDAAttention: Module {
             convState = MLXArray.zeros(
                 [B, convKernelSize - 1, 3 * proj], dtype: dtype)
         }
-        let convInput = concatenated([convState, mixed], axis: 1)
-        if let cache {
-            cache[0] = convInput[0..., (1 - convKernelSize)..., 0...]
-        }
+        var q: MLXArray
+        var k: MLXArray
+        let v: MLXArray
 
-        var q = silu(qConv(convInput[0..., 0..., 0 ..< proj]))
-        var k = silu(kConv(convInput[0..., 0..., proj ..< (2 * proj)]))
-        let v = silu(vConv(convInput[0..., 0..., (2 * proj) ..< (3 * proj)]))
-            .reshaped(B, T, numHeads, headDim)
+        // A decode step's input stage is three tiny convolutions, three activations and a state
+        // shift — almost pure dispatch and allocation overhead, repeated in 34 of GLM-5.3's 45
+        // layers. `glm5KDAConvDecode` does all of it in one kernel, and returns nil for any shape,
+        // dtype or geometry it does not handle exactly, so the stock path below stays the
+        // definition of correct rather than becoming a rarely-taken fallback.
+        //
+        // `mixed` is already masked at this point, so a padding mask needs no special handling here.
+        if let fused = glm5KDAConvDecode(
+            token: mixed, state: convState,
+            qWeight: qConv.weight, kWeight: kConv.weight, vWeight: vConv.weight,
+            proj: proj, kernelSize: convKernelSize, enabled: fusedConv)
+        {
+            if let cache { cache[0] = fused.next }
+            q = fused.out[0..., 0..., 0 ..< proj]
+            k = fused.out[0..., 0..., proj ..< (2 * proj)]
+            v = fused.out[0..., 0..., (2 * proj) ..< (3 * proj)]
+                .reshaped(B, T, numHeads, headDim)
+        } else {
+            let convInput = concatenated([convState, mixed], axis: 1)
+            if let cache {
+                cache[0] = convInput[0..., (1 - convKernelSize)..., 0...]
+            }
+            q = silu(qConv(convInput[0..., 0..., 0 ..< proj]))
+            k = silu(kConv(convInput[0..., 0..., proj ..< (2 * proj)]))
+            v = silu(vConv(convInput[0..., 0..., (2 * proj) ..< (3 * proj)]))
+                .reshaped(B, T, numHeads, headDim)
+        }
 
         q = q.reshaped(B, T, numHeads, headDim)
         k = k.reshaped(B, T, numHeads, headDim)

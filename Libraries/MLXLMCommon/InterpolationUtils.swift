@@ -136,6 +136,7 @@ private func makeBicubicInterpolationKernel() -> MLXFast.MLXFastKernel {
         output[output_offset] = result;
         """
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     return MLXFast.metalKernel(
         name: "bicubic_interpolation_antialias",
         inputNames: ["input", "dims", "params"],
@@ -183,6 +184,7 @@ private func makeNearestInterpolationKernel() -> MLXFast.MLXFastKernel {
         output[output_offset] = input[input_offset];
         """
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     return MLXFast.metalKernel(
         name: "nearest_interpolation",
         inputNames: ["input", "dims"],

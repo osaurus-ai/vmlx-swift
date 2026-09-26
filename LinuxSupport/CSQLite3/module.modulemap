@@ -1,0 +1,11 @@
+// Copyright © 2026 Osaurus AI. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+// Linux only: the system libsqlite3, under the module name Apple platforms provide, so that
+// `import SQLite3` compiles unchanged.
+// The module name `SQLite3` is global: no other `module SQLite3` may be in the same Linux build.
+module SQLite3 [system] {
+    header "shim.h"
+    link "sqlite3"
+    export *
+}

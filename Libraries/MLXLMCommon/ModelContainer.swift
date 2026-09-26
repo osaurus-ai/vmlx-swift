@@ -3,7 +3,9 @@
 import Foundation
 import MLX
 import MLXNN
-import os
+#if canImport(os)
+    import os
+#endif
 
 /// Source-backed cache topology reported by a loaded model.
 ///

@@ -954,6 +954,7 @@ private let kGatherTQSlots8ScoredSource = """
 /// `MLXFast.metalKernel(...)` and cached for the lifetime of the process.
 public enum JANGTQKernelLibrary {
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     public static let hadamardMultiblock: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "jangtq_hadamard_multiblock",
         inputNames: ["x", "signs", "meta"],
@@ -961,6 +962,7 @@ public enum JANGTQKernelLibrary {
         source: kHadamardMultiblockSource
     )
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     public static let hadamardShuffleLE1024: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "jangtq_hadamard_shuffle_le1024",
         inputNames: ["x", "signs", "meta"],
@@ -968,6 +970,7 @@ public enum JANGTQKernelLibrary {
         source: kHadamardShuffleLE1024Source
     )
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     public static let fusedGateUpSwiGLU: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "jangtq_fused_gate_up_swiglu",
         inputNames: [
@@ -979,6 +982,7 @@ public enum JANGTQKernelLibrary {
         source: kFusedSwiGLUSource
     )
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     public static let fusedGateUpSwiGLUOffsets: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "jangtq_fused_gate_up_swiglu_offsets",
         inputNames: [
@@ -991,6 +995,7 @@ public enum JANGTQKernelLibrary {
         source: kFusedSwiGLUOffsetsSource
     )
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     public static let gatherTQ: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "jangtq_gather_tq_matmul",
         inputNames: ["x_rot", "packed", "norms", "codebook", "rhs_indices", "meta"],
@@ -998,6 +1003,7 @@ public enum JANGTQKernelLibrary {
         source: kGatherTQSource
     )
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     public static let gatherTQOffsets: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "jangtq_gather_tq_offsets_matmul",
         inputNames: [
@@ -1008,6 +1014,7 @@ public enum JANGTQKernelLibrary {
         source: kGatherTQOffsetsSource
     )
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     public static let gatherTQOffsetsScored: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "jangtq_gather_tq_offsets_scored_matmul",
         inputNames: [
@@ -1018,6 +1025,7 @@ public enum JANGTQKernelLibrary {
         source: kGatherTQOffsetsScoredSource
     )
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     public static let gatherTQScored: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "jangtq_gather_tq_scored_matmul",
         inputNames: [
@@ -1028,6 +1036,7 @@ public enum JANGTQKernelLibrary {
         source: kGatherTQScoredSource
     )
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     public static let fusedGateUpSwiGLUSlots8: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "jangtq_fused_gate_up_swiglu_slots8",
         inputNames: [
@@ -1044,6 +1053,7 @@ public enum JANGTQKernelLibrary {
         source: kFusedSwiGLUSlots8Source
     )
 
+    // METAL-ONLY: case 2. Metal kernel with no fallback: this path needs a Metal device.
     public static let gatherTQSlots8Scored: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "jangtq_gather_tq_slots8_scored_matmul",
         inputNames: [

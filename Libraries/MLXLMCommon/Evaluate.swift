@@ -3,7 +3,9 @@
 import Foundation
 import MLX
 import MLXNN
-import os
+#if canImport(os)
+    import os
+#endif
 
 /// A `LogitSampler` is responsible for sampling `logits` produced by
 /// a ``LanguageModel`` to produce a token.

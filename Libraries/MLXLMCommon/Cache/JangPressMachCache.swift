@@ -7,11 +7,17 @@
 // experts after compute; this file provides that primitive without creating
 // permanent on-disk stacked tensors.
 
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
 import Cmlx
 import MLX
-import os
+#if canImport(os)
+    import os
+#endif
 
 private let jangPressMachNoopDestructor: @convention(c) (UnsafeMutableRawPointer?) -> Void = { _ in }
 private let jangPressMachColdState =
@@ -140,7 +146,9 @@ public final class JangPressMachCache: @unchecked Sendable {
     private var tiles: [TileKey: JangPressTile] = [:]
     private var hotPinned: Set<TileKey> = []
     private var volatileTiles: Set<TileKey> = []
+    #if canImport(Darwin)
     private var pressureSource: DispatchSourceMemoryPressure?
+    #endif
     private var stats = JangPressMachStats(
         totalTiles: 0,
         totalBytesAllocated: 0,
@@ -162,7 +170,9 @@ public final class JangPressMachCache: @unchecked Sendable {
     }
 
     deinit {
+        #if canImport(Darwin)
         pressureSource?.cancel()
+        #endif
         lock.lock()
         let regions = tiles.values.map { ($0.region, $0.allocatedSize) }
         tiles.removeAll()
@@ -535,7 +545,7 @@ public final class JangPressMachCache: @unchecked Sendable {
                 &state)
             guard kr == KERN_SUCCESS else { return false }
             volatileTiles.remove(key)
-            _ = Darwin.madvise(tile.baseAddress, tile.allocatedSize, MADV_PAGEOUT)
+            _ = madvise(tile.baseAddress, tile.allocatedSize, MADV_PAGEOUT)
             return true
         }
     }
@@ -569,6 +579,7 @@ public final class JangPressMachCache: @unchecked Sendable {
     }
 
     private func installPressureMonitor() {
+        #if canImport(Darwin)
         let queue = DispatchQueue(label: "ai.jangq.vmlx.mlxpress-mach-pressure", qos: .utility)
         let source = DispatchSource.makeMemoryPressureSource(
             eventMask: [.normal, .warning, .critical],
@@ -587,5 +598,6 @@ public final class JangPressMachCache: @unchecked Sendable {
         }
         source.activate()
         pressureSource = source
+        #endif
     }
 }
