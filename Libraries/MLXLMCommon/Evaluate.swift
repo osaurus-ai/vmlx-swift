@@ -3306,7 +3306,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         let generatedBoundaryTokens = Self.generatedBoundaryTokensAligned(
             promptTokenIds: promptTokenIds,
             generatedTokenIds: generatedTokenIds,
-            cacheOffsets: cache.map(\.offset),
+            cacheOffsets: cacheBoundaryLeafOffsets(cache),
             pendingDrainedTokenId: lastForwardedTokenId)
         guard let generatedBoundaryTokens else { return }
         // Whether the next prompt starts from this row depends on the

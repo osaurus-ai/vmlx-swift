@@ -525,6 +525,7 @@ class FalconH1Mixer: Module {
         )
         if let cache = cache {
             cache[1] = state
+            cache.offset += inputStates.dim(1)
         }
 
         if let norm = norm {

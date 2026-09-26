@@ -1337,8 +1337,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         // Refuse the whole store instead: a skipped entry costs one prefill,
         // a poisoned entry costs correctness for every later turn.
         if let cache {
-            let offsets = Set(cache.map(\.offset))
-            if offsets.contains(where: { $0 != totalTokens }) {
+            let offsets = Set(cacheBoundaryLeafOffsets(cache))
+            if totalTokens <= 0 || offsets.isEmpty || offsets.contains(where: { $0 != totalTokens }) {
                 if traceCacheStore {
                     FileHandle.standardError.write(Data(
                         ("[vmlx][cache/store] REFUSED offset/key mismatch"

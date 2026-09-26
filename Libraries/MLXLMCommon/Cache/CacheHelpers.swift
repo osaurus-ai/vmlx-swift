@@ -136,6 +136,18 @@ func makeDiskStoreCache(
         kvMode: parameters.kvMode)
 }
 
+/// Token boundaries belong to leaves, not CacheList's unused inherited offset.
+/// An empty composite contributes an invalid boundary rather than disappearing.
+func cacheBoundaryLeafOffsets(_ cache: [any KVCache]) -> [Int] {
+    cache.flatMap { layer -> [Int] in
+        if let list = layer as? CacheList {
+            guard list.count > 0 else { return [0] }
+            return cacheBoundaryLeafOffsets((0..<list.count).map { list[$0] })
+        }
+        return [layer.offset]
+    }
+}
+
 /// Fail-closed validation of a coordinator cache restore.
 ///
 /// A hit restores two independently derived lengths: attention layers take
@@ -159,10 +171,11 @@ public func validateRestoredCacheBoundary(
     restoredTokens: Int,
     detail: String = ""
 ) -> Bool {
-    let offsets = cache.map(\.offset)
+    let offsets = cacheBoundaryLeafOffsets(cache)
     let consistent =
         matchedTokens > 0
         && restoredTokens == matchedTokens
+        && !offsets.isEmpty
         && offsets.allSatisfy { $0 == matchedTokens }
     if !consistent {
         let unique = Array(Set(offsets)).sorted()
@@ -212,7 +225,11 @@ public func cacheRequiresDiskBackedCoordinatorRestore(_ cache: [any KVCache]) ->
         return true
     }
     return cache.contains { layer in
-        layer is DiskCacheStateProviding ||
+        if let list = layer as? CacheList {
+            return cacheRequiresDiskBackedCoordinatorRestore(
+                (0..<list.count).map { list[$0] })
+        }
+        return layer is DiskCacheStateProviding ||
             layer is HybridPoolCache ||
             layer is RotatingKVCache ||
             layer is RotatingKVCacheWrapper ||
@@ -784,7 +801,8 @@ public func restoreSSMStates(
 ///   - arrays: The disk cache dictionary loaded via `DiskCache.fetch()`.
 ///   - cache: The model's per-layer KV cache array to restore into.
 /// - Returns: The total number of tokens restored, measured from the first
-///   attention layer's key tensor sequence dim, or `0` if nothing matched.
+///   attention layer's key tensor sequence dim or a typed recurrent offset,
+///   or `0` if nothing matched.
 @discardableResult
 public func restoreFromDiskArrays(
     _ arrays: [String: MLXArray], into cache: inout [any KVCache],
@@ -1003,10 +1021,11 @@ private func restoreFromV2Arrays(
             if totalTokens == 0 { totalTokens = header.offset }
 
         case .mamba(let comp):
-            // Mamba state arrays are cumulative — no sequence dim to
-            // measure, so they don't contribute to `totalTokens`. The
-            // attention side already provides that number.
+            // All-recurrent models have no attention tensor from which to
+            // recover a sequence length. The typed snapshot records the
+            // logical recurrent boundary explicitly.
             guard restoreMambaLayer(comp, into: cache[i]) else { return 0 }
+            if totalTokens == 0 { totalTokens = comp.offset }
 
         case .tq(let comp):
             // Restore the compressed prefix into the existing
@@ -1125,6 +1144,7 @@ private func restoreFromV2Arrays(
                 case .mamba(let comp):
                     guard restoreMambaLayer(comp, into: list[subIndex])
                     else { return 0 }
+                    if totalTokens == 0 { totalTokens = comp.offset }
 
                 case .rotating(let comp):
                     restoreRotatingLayer(comp, into: list[subIndex])

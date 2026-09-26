@@ -211,7 +211,7 @@ struct DiskRestoreFailClosedMatrixTests {
                 let dir = Self.tempDir()
                 defer { try? FileManager.default.removeItem(at: dir) }
 
-                let tokens = [1, 2, 3, 4, 5]
+                let tokens = [1, 2, 3, 4, 5, 6]
                 let original = topo.make()
                 Self.advance(original, steps: 3)
                 let expected = Self.offsets(original)
@@ -231,35 +231,10 @@ struct DiskRestoreFailClosedMatrixTests {
                 var target = topo.make()
                 let restored = restoreFromDiskArrays(arrays, into: &target)
 
-                if topo.name == "pure-ssm" {
-                    // KNOWN GAP, deliberately pinned rather than hidden.
-                    //
-                    // `restoreFromV2Arrays` seeds `totalTokens` only from
-                    // layers that carry a sequence dimension, and its `.mamba`
-                    // branch says so outright: "no sequence dim to measure ...
-                    // the attention side already provides that number." That
-                    // holds for hybrids and is FALSE for an all-recurrent
-                    // topology. This synthetic row is not proof that the named
-                    // shipped mixed-attention families always miss.
-                    //
-                    // This is a PERFORMANCE defect, not a correctness one — it
-                    // misses, which is the safe direction — so it is out of
-                    // scope for the fail-closed work and tracked separately.
-                    // The `.tq` and `.qkv` branches already show the fix shape
-                    // (`if totalTokens == 0 { totalTokens = comp.offset }`),
-                    // but enabling reuse for a family that has never had it
-                    // needs its own proof that the newly-allowed path is
-                    // correct, not a drive-by change here.
-                    #expect(
-                        restored == 0,
-                        """
-                        pure-SSM now restores (\(restored) tokens) — the known gap \
-                        has been closed. Remove this branch and assert full restore.
-                        """)
-                    continue
-                }
-
-                #expect(restored > 0, "\(topo.name) [\(topo.families)]: intact payload missed")
+                #expect(restored == tokens.count, "\(topo.name): intact payload boundary differed")
+                #expect(validateRestoredCacheBoundary(
+                    target, matchedTokens: tokens.count, restoredTokens: restored,
+                    detail: topo.name))
                 for (i, (before, after)) in zip(expected, Self.offsets(target)).enumerated() {
                     #expect(
                         after == before,
@@ -270,6 +245,44 @@ struct DiskRestoreFailClosedMatrixTests {
     }
 
     // MARK: - Damage: a dropped layer-kind tag
+
+    @Test("tiny Falcon-H1 advances both composite children and restores continuation")
+    func falconCompositeContinuation() throws {
+        try MLXMetalTestLock.withLock {
+            // Production model code with tiny initialized weights. This is
+            // cache-state/logit parity, not a pretrained-family quality row.
+            let config = try JSONDecoder().decode(FalconH1Configuration.self, from: Data(#"""
+                {"hidden_size":16,"num_hidden_layers":2,"vocab_size":32,
+                 "num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,
+                 "intermediate_size":32,"mamba_d_ssm":32,"mamba_d_head":8,
+                 "mamba_n_heads":4,"mamba_d_state":4,"mamba_n_groups":1,
+                 "mamba_chunk_size":8,"mamba_d_conv":4}
+                """#.utf8))
+            let model = FalconH1Model(config)
+            let original = model.newCache(parameters: nil)
+            let prefix = model(MLXArray([Int32(1), 2, 3, 4, 5, 6]).reshaped(1, 6), cache: original)
+            MLX.eval(prefix, original)
+            try #require(Self.offsets(original).allSatisfy { $0 == 6 })
+            let payload = TQDiskSerializer.serialize(
+                cache: original, preserveStandardKVStorageDType: true)
+            let path = FileManager.default.temporaryDirectory
+                .appendingPathComponent("falcon-cache-\(UUID().uuidString).safetensors")
+            defer { try? FileManager.default.removeItem(at: path) }
+            try MLX.save(arrays: payload, url: path)
+            let diskPayload = try MLX.loadArrays(url: path)
+            MLX.eval(diskPayload)
+            var restored = model.newCache(parameters: nil)
+            let count = restoreFromDiskArrays(diskPayload, into: &restored, requirePromptBoundary: true)
+            try #require(validateRestoredCacheBoundary(
+                restored, matchedTokens: 6, restoredTokens: count))
+            let next = MLXArray([Int32(7)]).reshaped(1, 1)
+            let warm = model(next, cache: original)
+            let resumed = model(next, cache: restored)
+            MLX.eval(warm, resumed)
+            #expect(MLX.allClose(warm, resumed, rtol: 1e-5, atol: 1e-6).item(Bool.self))
+            #expect(Self.offsets(restored).allSatisfy { $0 == 7 })
+        }
+    }
 
     /// A truncated or partially-written payload loses trailing keys. Every
     /// layer is tagged, so dropping one tag is the minimal realistic damage.
