@@ -106,6 +106,95 @@ struct HybridRestoreBoundaryInvariantTests {
 
     // MARK: - 1. Pure helper contract
 
+    @Test("composite boundaries validate each child rather than the wrapper")
+    func compositeBoundariesValidateLeaves() {
+        FocusedMLXTestSupport.withLock {
+            let recurrent = makeMamba(offset: 37)
+            let attention = makeKV(offset: 37)
+            let composite = CacheList(recurrent, attention)
+            #expect(composite.offset == 0)
+            #expect(validateRestoredCacheBoundary(
+                [composite], matchedTokens: 37, restoredTokens: 37))
+            recurrent.offset = 36
+            #expect(!validateRestoredCacheBoundary(
+                [composite], matchedTokens: 37, restoredTokens: 37))
+            recurrent.offset = 37
+            #expect(!validateRestoredCacheBoundary(
+                [composite], matchedTokens: 37, restoredTokens: 36))
+        }
+    }
+
+    @Test("nested and empty composites cannot hide a missing boundary")
+    func nestedCompositeBoundariesFailClosed() {
+        FocusedMLXTestSupport.withLock {
+            let inner = CacheList(makeMamba(offset: 37), makeKV(offset: 37))
+            let nested = CacheList(makeKV(offset: 37), inner)
+            #expect(validateRestoredCacheBoundary(
+                [nested], matchedTokens: 37, restoredTokens: 37))
+            #expect(!validateRestoredCacheBoundary(
+                [], matchedTokens: 37, restoredTokens: 37))
+            #expect(!validateRestoredCacheBoundary(
+                [CacheList(makeKV(offset: 37), CacheList())],
+                matchedTokens: 37, restoredTokens: 37))
+            #expect(!validateRestoredCacheBoundary(
+                [CacheList(makeKV(offset: 37), CacheList(makeKV(offset: 0)))],
+                matchedTokens: 37, restoredTokens: 37))
+        }
+    }
+
+    @Test("composite rotating layers require typed disk restore")
+    func compositeTypedRestoreRouting() {
+        #expect(cacheRequiresDiskBackedCoordinatorRestore([
+            CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 32))
+        ]))
+        #expect(cacheRequiresDiskBackedCoordinatorRestore([
+            CacheList(KVCacheSimple(), CacheList(RotatingKVCache(maxSize: 32)))
+        ]))
+        #expect(!cacheRequiresDiskBackedCoordinatorRestore([
+            CacheList(KVCacheSimple(), KVCacheSimple())
+        ]))
+    }
+
+    @Test("serialized composite state passes the production restore boundary gate")
+    func serializedCompositeBoundary() {
+        FocusedMLXTestSupport.withLock {
+            let original: [any KVCache] = [CacheList(makeMamba(offset: 37), makeKV(offset: 37))]
+            let payload = TQDiskSerializer.serialize(cache: original)
+            var restored: [any KVCache] = [CacheList(MambaCache(), KVCacheSimple())]
+            let count = restoreFromDiskArrays(payload, into: &restored, requirePromptBoundary: true)
+            #expect(count == 37)
+            #expect(validateRestoredCacheBoundary(
+                restored, matchedTokens: 37, restoredTokens: count))
+            #expect(!validateRestoredCacheBoundary(
+                restored, matchedTokens: 38, restoredTokens: count))
+        }
+    }
+
+    @Test("all-recurrent snapshots recover their explicit logical boundary")
+    func serializedRecurrentBoundary() {
+        FocusedMLXTestSupport.withLock {
+            let original: [any KVCache] = [makeMamba(offset: 37), makeMamba(offset: 37)]
+            let payload = TQDiskSerializer.serialize(cache: original)
+            var restored: [any KVCache] = [MambaCache(), MambaCache()]
+            let count = restoreFromDiskArrays(payload, into: &restored, requirePromptBoundary: true)
+            #expect(count == 37)
+            #expect(validateRestoredCacheBoundary(
+                restored, matchedTokens: 37, restoredTokens: count))
+            for (source, target) in zip(original, restored) {
+                #expect(source.state.count == target.state.count)
+                for (a, b) in zip(source.state, target.state) {
+                    #expect(MLX.arrayEqual(a, b).item(Bool.self))
+                }
+            }
+            var damaged = payload
+            damaged.removeValue(forKey: "__layer_kind_1__")
+            var fresh: [any KVCache] = [MambaCache(), MambaCache()]
+            #expect(restoreFromDiskArrays(
+                damaged, into: &fresh, requirePromptBoundary: true) == 0)
+            #expect(fresh.allSatisfy { $0.offset == 0 && $0.state.isEmpty })
+        }
+    }
+
     @Test("all layers at 37 with restoredTokens 37 is a valid restore")
     func consistentRestoreIsValid() {
         FocusedMLXTestSupport.withLock {
