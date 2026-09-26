@@ -4,17 +4,16 @@ import MLX  // brings Cmlx into the link, even though we don't use MLX symbols d
 import Darwin
 #endif
 
-/// Thin Swift binding around MLX's JACCL distributed backend (RDMA over
-/// Thunderbolt 5 / TB4 on Apple Silicon, macOS 26.3+). Phase 4 ships a
-/// single capability probe (`isAvailable`) so callers can detect whether
-/// the upstream C++ + librdma + verbs SDK headers are wired correctly on
-/// the host. Real `Group` lifecycle + collectives land in Phase 5.
+/// Capability probes for MLX's JACCL distributed backend.
+/// The backend is compiled when the macOS SDK provides the verbs headers;
+/// other platforms use the upstream unavailable stub. Group lifecycle and
+/// collectives are exposed separately by MLXDistributedTP. A successful
+/// capability probe does not establish a working RDMA device or peer.
 public enum JACCL {
 
-    /// Returns true when the JACCL backend can initialise on this host
-    /// — i.e. `librdma.dylib` loads, the verbs ABI matches, and at least
-    /// one IBV port is queryable. Note: returning `true` does NOT imply
-    /// a peer is currently reachable; only that the local stack is sound.
+    /// Returns true when the compiled JACCL backend can load librdma and
+    /// resolve its required verbs symbols. This does not enumerate devices,
+    /// query ports, initialize a group, or prove a peer/collective is ready.
     public static func isAvailable() -> Bool {
         // CmlxDistributedShim exposes `bool vmlx_distributed_is_available(const char* bk)`.
         // Pass "jaccl" to get the JACCL-specific gate (rather than "any").
