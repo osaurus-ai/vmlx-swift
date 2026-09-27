@@ -607,13 +607,28 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             throw DFlash2RuntimeError.drafterTargetMismatch(
                 "drafter vocab_size \(config.vocabSize) != model vocabulary \(targetVocab)")
         }
-        self.contextHidden = prefill.hidden
+        // A prompt-cache hit restored the prefix without producing its
+        // hidden states; splice back the rows prefill computed for it on an
+        // earlier request, or the drafter drafts from the suffix alone.
+        var seeded = prefill.hidden
+        if restoredCount > 0,
+            let prior = drafter.contextStore.rows(
+                endingAt: restoredCount, of: self.promptTokenIds, salt: self.mediaSalt)
+        {
+            seeded = concatenated([prior.asType(seeded.dtype), seeded], axis: 1)
+            if let limit = hiddenLimit, seeded.dim(1) > limit {
+                seeded = seeded[0..., (seeded.dim(1) - limit)..., 0...]
+            }
+        }
+        drafter.contextStore.store(
+            tokens: self.promptTokenIds, salt: self.mediaSalt, rows: seeded)
+        self.contextHidden = seeded
         self.contextHiddenConsumed = false
-        self.stats.seededContextRows = prefill.hidden.dim(1)
+        self.stats.seededContextRows = seeded.dim(1)
 
         // The drafter's cache starts counting where the retained hidden
         // window starts, so its RoPE positions line up with the target's.
-        let hiddenOffset = self.cache.first.map { $0.offset - prefill.hidden.dim(1) } ?? 0
+        let hiddenOffset = self.cache.first.map { $0.offset - seeded.dim(1) } ?? 0
         for c in self.draftCache {
             c.offsetForDFlash2 = Swift.max(0, hiddenOffset)
         }

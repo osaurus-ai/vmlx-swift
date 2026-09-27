@@ -310,4 +310,72 @@ final class Spark25DFlash2LiveTests: XCTestCase {
             print("[raptor-live] wrote \(url.path)")
         }
     }
+
+    /// A prompt-cache hit restores the target's prefix without re-running it.
+    /// The drafter's context must still cover that prefix, or it drafts from
+    /// the new suffix alone. Same request cold and after a hit on a shorter
+    /// prompt it extends (partial hit) and on itself (full hit).
+    func testDrafterKeepsContextAcrossPromptCacheHits() async throws {
+        guard let bundle = Self.bundle else {
+            throw XCTSkip("Set VMLX_SPARK25_DFLASH_BUNDLE to a Spark2.5 bundle with dflash/")
+        }
+        let context = try await MLXLMCommon.loadModel(
+            from: bundle, using: #huggingFaceTokenizerLoader())
+        nonisolated(unsafe) let ctx = context
+        let drafter = try DFlash2DrafterResolver.shared.drafter(
+            at: bundle.appendingPathComponent("dflash"))
+        let system = (1 ... 40).map {
+            "Rule \($0): when asked about item \($0 % 9), answer with its code, K-\($0 * 7)."
+        }.joined(separator: " ")
+        func prepare(_ turns: [Chat.Message]) async throws -> LMInput {
+            try await ctx.processor.prepare(input: UserInput(chat: turns))
+        }
+        let first = try await prepare([
+            .system(system), .user("Write a Python function that reverses a linked list."),
+        ])
+        let second = try await prepare([
+            .system(system), .user("Write a Python function that reverses a linked list."),
+            .assistant(
+                "def reverse(head):\n    prev = None\n    while head:\n        head.next, prev, head = prev, head, head.next\n    return prev"
+            ),
+            .user("Now write the recursive version and explain its stack depth."),
+        ])
+        var p = GenerateParameters(maxTokens: 384, temperature: 0)
+        p.prefillStepSize = 1024
+        func coordinator() -> CacheCoordinator {
+            CacheCoordinator(
+                config: CacheCoordinatorConfig(
+                    usePagedCache: true, enableDiskCache: false,
+                    modelKey: "spark25-dflash-hit-\(UUID().uuidString)"))
+        }
+        func run(_ input: LMInput, _ coord: CacheCoordinator?) throws -> DFlash2GenerationStats {
+            var it = try DFlash2TokenIterator(
+                input: input, target: ctx.model as! any DFlash2Target, drafter: drafter,
+                blockSize: nil, parameters: p, cacheCoordinator: coord)
+            var ids: [Int] = []
+            while ids.count < 384, let t = it.next() { ids.append(t) }
+            it.storeCacheAfterGeneration(generatedTokenIds: ids, includeGeneratedBoundary: true)
+            return it.dflash2Stats!
+        }
+        let cold = try run(second, nil)
+        let warmCoord = coordinator()
+        _ = try run(first, warmCoord)
+        let partial = try run(second, warmCoord)
+        let full = try run(second, warmCoord)
+        let promptRows = second.text.tokens.size
+        for (name, s) in [("cold", cold), ("partial-hit", partial), ("full-hit", full)] {
+            print(
+                String(
+                    format:
+                        "[dflash-hit] %-11@ prompt=%d seededContextRows=%d tokPerVerify=%.2f accepted/drafted=%d/%d",
+                    name as NSString, promptRows, s.seededContextRows, s.acceptanceLength,
+                    s.acceptedTokens, s.draftedTokens))
+        }
+        XCTAssertGreaterThan(
+            partial.acceptanceLength, cold.acceptanceLength * 0.9,
+            "a partial prompt-cache hit must not starve the drafter of context")
+        XCTAssertGreaterThan(
+            full.acceptanceLength, cold.acceptanceLength * 0.9,
+            "a full prompt-cache hit must not starve the drafter of context")
+    }
 }

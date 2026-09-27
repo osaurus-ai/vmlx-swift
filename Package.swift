@@ -932,6 +932,7 @@ let package = Package(
                 "DFlash2StageProbeTests.swift",
                 "DFlash2DrafterSelectionTests.swift",
                 "DFlash2ThroughputGovernorTests.swift",
+                "DFlash2ContextStoreTests.swift",
                 "CompilableKVCacheSnapshotTests.swift",
                 "DFlash2DispatchReachabilityTests.swift",
                 "MixedGroupSizeQuantizationFocusedTests.swift",

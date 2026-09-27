@@ -672,6 +672,10 @@ final class DFlash2CandidateSelector: Module {
 
 /// DFlash 2 block-diffusion drafter.
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
+    /// Context rows of recent prompts, for prompt-cache hits
+    /// (`DFlash2ContextStore`).
+    let contextStore = DFlash2ContextStore()
+
 
     public let config: DFlash2Configuration
 
