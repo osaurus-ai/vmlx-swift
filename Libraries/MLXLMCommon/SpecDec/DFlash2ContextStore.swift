@@ -44,6 +44,12 @@ final class DFlash2ContextStore: @unchecked Sendable {
         if entries.count > Self.capacity { entries.removeLast(entries.count - Self.capacity) }
     }
 
+    func removeAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        entries.removeAll()
+    }
+
     /// Rows for the last positions of `prompt[0 ..< restored]`, from a stored
     /// prompt sharing that prefix, or `nil` when none covers it.
     func rows(endingAt restored: Int, of prompt: [Int], salt: String?) -> MLXArray? {

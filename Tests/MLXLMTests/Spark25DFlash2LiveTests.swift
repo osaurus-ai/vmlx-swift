@@ -362,13 +362,21 @@ final class Spark25DFlash2LiveTests: XCTestCase {
         _ = try run(first, warmCoord)
         let partial = try run(second, warmCoord)
         let full = try run(second, warmCoord)
+        // A prefix restored with nothing kept for it (the disk tier after a
+        // relaunch): the rows are recomputed.
+        drafter.contextStore.removeAll()
+        let recomputed = try run(second, warmCoord)
         let promptRows = second.text.tokens.size
-        for (name, s) in [("cold", cold), ("partial-hit", partial), ("full-hit", full)] {
+        for (name, s) in [
+            ("cold", cold), ("partial-hit", partial), ("full-hit", full),
+            ("recomputed", recomputed),
+        ] {
             print(
                 String(
                     format:
-                        "[dflash-hit] %-11@ prompt=%d seededContextRows=%d tokPerVerify=%.2f accepted/drafted=%d/%d",
-                    name as NSString, promptRows, s.seededContextRows, s.acceptanceLength,
+                        "[dflash-hit] %-11@ prompt=%d seededContextRows=%d recomputed=%d tokPerVerify=%.2f accepted/drafted=%d/%d",
+                    name as NSString, promptRows, s.seededContextRows, s.recomputedContextRows,
+                    s.acceptanceLength,
                     s.acceptedTokens, s.draftedTokens))
         }
         XCTAssertGreaterThan(
@@ -377,5 +385,9 @@ final class Spark25DFlash2LiveTests: XCTestCase {
         XCTAssertGreaterThan(
             full.acceptanceLength, cold.acceptanceLength * 0.9,
             "a full prompt-cache hit must not starve the drafter of context")
+        XCTAssertGreaterThan(recomputed.recomputedContextRows, 0)
+        XCTAssertGreaterThan(
+            recomputed.acceptanceLength, cold.acceptanceLength * 0.85,
+            "rows recomputed for an unkept prefix must restore most of the context")
     }
 }

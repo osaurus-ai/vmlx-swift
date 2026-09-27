@@ -74,6 +74,8 @@ public struct DFlash2GenerationStats: Sendable, Equatable {
     public var acceptedTokens: Int = 0
     public var emittedTokens: Int = 0
     public var seededContextRows: Int = 0
+    /// Context rows recomputed for a restored prefix nothing was kept for.
+    public var recomputedContextRows: Int = 0
     public var autoregressiveFallbackTokens: Int = 0
     public var draftSeconds: Double = 0
     public var verifySeconds: Double = 0
@@ -289,6 +291,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// on Spark2.5 4B JANG_6M (M5 Max): projections cost 4.6 ms for 1-5 rows,
     /// 9.2 ms at 6, 13.4 ms at 8.
     static let singlePassVerifyRows = 5
+
+    /// Context rows rebuilt for a drafter without a sliding window.
+    static let recomputedContextRows = 2047
 
     /// The block width a request runs at. A pinned width always wins. For a
     /// target whose every layer rolls back by trimming (no recurrent state)
@@ -611,13 +616,31 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // hidden states; splice back the rows prefill computed for it on an
         // earlier request, or the drafter drafts from the suffix alone.
         var seeded = prefill.hidden
-        if restoredCount > 0,
-            let prior = drafter.contextStore.rows(
+        let contextWindow = hiddenLimit ?? Self.recomputedContextRows
+        let missingRows = Swift.min(restoredCount, contextWindow - seeded.dim(1))
+        if missingRows > 0 {
+            if let prior = drafter.contextStore.rows(
                 endingAt: restoredCount, of: self.promptTokenIds, salt: self.mediaSalt)
-        {
-            seeded = concatenated([prior.asType(seeded.dtype), seeded], axis: 1)
-            if let limit = hiddenLimit, seeded.dim(1) > limit {
-                seeded = seeded[0..., (seeded.dim(1) - limit)..., 0...]
+            {
+                seeded = concatenated([prior.asType(seeded.dtype), seeded], axis: 1)
+            } else {
+                // Nothing kept for this prefix (it came from the disk tier,
+                // e.g. after a relaunch). Recompute the rows the drafter's
+                // window still needs over a scratch cache: exact for the
+                // sliding layers past their window, approximate for the
+                // full-attention layers, which lose the context before the
+                // span. Acceptance only — the target's cache is untouched.
+                var scratch = target.newCache(parameters: effectiveParameters)
+                let span = Array(self.promptTokenIds[(restoredCount - missingRows) ..< restoredCount])
+                let recomputed = try Self.prefill(
+                    tokens: span, target: target, cache: &scratch,
+                    captureLayerIDs: self.captureLayerIDs, orderedLayerIDs: self.orderedLayerIDs,
+                    hiddenLimit: hiddenLimit, stepSize: effectiveParameters.prefillStepSize)
+                seeded = concatenated([recomputed.hidden.asType(seeded.dtype), seeded], axis: 1)
+                self.stats.recomputedContextRows = recomputed.hidden.dim(1)
+            }
+            if seeded.dim(1) > contextWindow {
+                seeded = seeded[0..., (seeded.dim(1) - contextWindow)..., 0...]
             }
         }
         drafter.contextStore.store(
