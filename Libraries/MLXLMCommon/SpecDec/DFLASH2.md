@@ -213,6 +213,32 @@ Raising the kernel's row cap to 8 lowers the 8-row projections to
 at 12 rows). Wide blocks need a genuinely multi-row small-M kernel, not
 a different cap.
 
+### Drafting has to pay on the turn at hand
+
+Acceptance is a property of the content. In the app, with the bundle's own
+sampler (T=1, top_p 0.95), reasoning on and 4-7k-token agent prompts, the
+Spark2.5 drafter accepts 1.3-2.2 tokens per verify, while a cycle costs
+~2.2 plain steps — drafting ran at 84-98 tok/s against 102-111 plain.
+
+`DFlash2ThroughputGovernor` measures drafting windows (12 cycles) against
+plain decoding on the same turn and sets drafting aside — for 64 tokens,
+doubling to 512 while it keeps losing — after one window below 85% of
+plain or two in a row below 97%. Both paths emit the target's tokens.
+Governor on vs off (`VMLX_DFLASH2_GOVERNOR=0`), 1024 tokens, alternating
+processes, two rounds:
+
+| arm | off | on |
+|---|---|---|
+| greedy b5 | 1.24x | 1.22-1.23x |
+| sampled b5 | 1.09-1.11x | 1.05x |
+| sampled b8 (losing) | 0.78-0.80x | 0.88-0.89x |
+
+The floor is ~0.9x plain: plain steps inside this iterator also record the
+drafter's context and run ~7-9% slower than the plain decoder (measured
+per pause as `throughputPausedSeconds`). `GenerateCompletionInfo.dflash2Stats`
+reports width, cycles, drafted/accepted tokens and pauses for every
+drafted turn.
+
 ### On losslessness under quantization
 
 Byte-equality with the plain iterator holds on bf16 and was also
