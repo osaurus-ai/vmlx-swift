@@ -66,6 +66,8 @@ public enum DFlash2RuntimeError: Error, LocalizedError {
 /// Per-generation counters, mirrored into the generation info so a host
 /// can show acceptance without a debug build.
 public struct DFlash2GenerationStats: Sendable, Equatable {
+    public init() {}
+
     public var blockSize: Int = 0
     public var verifyCalls: Int = 0
     public var draftedTokens: Int = 0
@@ -76,11 +78,19 @@ public struct DFlash2GenerationStats: Sendable, Equatable {
     public var draftSeconds: Double = 0
     public var verifySeconds: Double = 0
     public var commitSeconds: Double = 0
+    /// Times drafting was set aside because it decoded slower than plain
+    /// on this turn, and the tokens decoded plainly for that reason.
+    public var throughputPauses: Int = 0
+    public var throughputPausedTokens: Int = 0
+    public var throughputPausedSeconds: Double = 0
 
     /// Mean number of tokens committed per target forward. 1.0 means the
-    /// drafter contributed nothing; the ceiling is `blockSize`.
+    /// drafter contributed nothing; the ceiling is `blockSize`. Tokens
+    /// decoded plainly (fallback or a throughput pause) are not verify
+    /// output and are left out.
     public var acceptanceLength: Double {
-        verifyCalls > 0 ? Double(emittedTokens) / Double(verifyCalls) : 0
+        verifyCalls > 0
+            ? Double(emittedTokens - autoregressiveFallbackTokens) / Double(verifyCalls) : 0
     }
 }
 
@@ -136,6 +146,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// prefill this is the tail of the prompt; afterwards it is exactly
     /// the tokens committed by the previous cycle.
     private var contextHidden: MLXArray
+    /// Whether the last draft already consumed `contextHidden`.
+    private var contextHiddenConsumed = false
+    /// Token sampled by the last plain step, not yet emitted or cached.
+    private var plainLookahead: MLXArray?
+    private var governor = DFlash2ThroughputGovernor()
 
     private var pendingTokens: [Int] = []
     private var pendingIndex = 0
@@ -240,6 +255,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private var adaptiveSeconds: [Int: Double] = [:]
     private var adaptiveCyclesAtSize = 0
     private var adaptiveSettled = false
+
+    /// `VMLX_DFLASH2_GOVERNOR=0` drafts every cycle regardless of measured
+    /// throughput — the control arm for measuring the governor itself.
+    private static let governorEnabled =
+        ProcessInfo.processInfo.environment["VMLX_DFLASH2_GOVERNOR"] != "0"
 
     private static let traceEnabled =
         ProcessInfo.processInfo.environment["VMLX_DFLASH2_TRACE"] == "1"
@@ -588,6 +608,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 "drafter vocab_size \(config.vocabSize) != model vocabulary \(targetVocab)")
         }
         self.contextHidden = prefill.hidden
+        self.contextHiddenConsumed = false
         self.stats.seededContextRows = prefill.hidden.dim(1)
 
         // The drafter's cache starts counting where the retained hidden
@@ -789,11 +810,24 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let budget = maxTokens.map { $0 - tokenCount } ?? Int.max
         guard budget > 0 else { return false }
 
+        // Drafting only while it measurably beats plain decoding on this
+        // turn (`DFlash2ThroughputGovernor`). Both paths emit the target's
+        // own tokens, so this is purely a speed decision.
+        if !drafterDisabled, Self.governorEnabled,
+            !governor.shouldDraft(now: Date.timeIntervalSinceReferenceDate)
+        {
+            let stepped = runAutoregressiveStep()
+            if stepped { recordGovernorStep() }
+            return stepped
+        }
+
         // A prefetched verify is already on the GPU — consume it, provided
         // it still fits the remaining budget.
         if let prefetched = inFlight, prefetched.blockSize <= budget + 1 {
             inFlight = nil
-            return completeVerify(prefetched)
+            let completed = completeVerify(prefetched)
+            if completed { recordGovernorStep() }
+            return completed
         }
         // Anything else in flight was speculated against a budget or block
         // size we can no longer use; roll its rows back before proceeding.
@@ -806,6 +840,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         if bs <= 1 || drafterDisabled {
             return runAutoregressiveStep()
         }
+        // Leaving plain decoding: the sampled-ahead token goes out first,
+        // so the verify block starts from an emitted, uncached anchor.
+        if flushPlainLookahead() { return true }
         guard let flight = issueVerify(bs: bs) else {
             // The drafter forward produced a degenerate result — an MLX
             // error inside its layer stack degraded to a scalar husk
@@ -823,7 +860,16 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     + "continuing autoregressively.\n").utf8))
             return runAutoregressiveStep()
         }
-        return completeVerify(flight)
+        let completed = completeVerify(flight)
+        if completed { recordGovernorStep() }
+        return completed
+    }
+
+    private mutating func recordGovernorStep() {
+        governor.record(tokens: pendingTokens.count, now: Date.timeIntervalSinceReferenceDate)
+        stats.throughputPauses = governor.pauses
+        stats.throughputPausedTokens = governor.pausedTokens
+        stats.throughputPausedSeconds = governor.pausedSeconds
     }
 
     /// Build one cycle's draft + verify graphs and DISPATCH them, without
@@ -875,6 +921,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // credits collapsing to one host sync per cycle for a large share
         // of its speedup — this loop previously paid three.
         asyncEval(proposal.tokens)
+        contextHiddenConsumed = true
         stats.draftSeconds += Date.timeIntervalSinceReferenceDate - draftStart
 
         // The sliding clip inside drafter attention can advance the cache
@@ -1086,6 +1133,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
 
         contextHidden = newHidden[0..., ..<committedInputs, 0...]
+        contextHiddenConsumed = false
 
         var emitted = draftIDs.prefix(accepted).map { $0 }
         emitted.append(acceptance.bonus)
@@ -1293,28 +1341,63 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 .utf8))
     }
 
-    /// Single-token target step. Used when the remaining budget cannot
-    /// fill a block and as the safety valve when acceptance cannot run.
+    /// Single-token target step: the tail of the budget, the safety valve
+    /// when drafting cannot run, and the throughput governor's plain
+    /// stretches.
+    ///
+    /// Pipelined like `TokenIterator`: each call queues the forward that
+    /// writes the emitted token's cache row and samples the next token, then
+    /// reads the emitted token — which a previous forward produced — so the
+    /// host read overlaps the GPU instead of draining it every token. The
+    /// sampled-ahead token is not in the cache until the next call consumes
+    /// it; ``flushPlainLookahead()`` emits it before drafting resumes.
     private mutating func runAutoregressiveStep() -> Bool {
         // A plain step reads and advances the same cache an in-flight
         // verify has already speculatively extended.
         abandonInFlightVerify()
         guard !cacheHoldsUnverifiedRows else { return false }
-        let input = MLXArray([Int32(lastToken)]).reshaped(1, 1)
+        let emitted =
+            plainLookahead
+            ?? dispatchPlainForward(MLXArray([Int32(lastToken)]).reshaped(1, 1))
+        plainLookahead = dispatchPlainForward(emitted.reshaped(1, 1))
+        emitPlainToken(emitted.reshaped(-1)[0].item(Int.self))
+        return true
+    }
+
+    /// Queue one target forward over `input`, recording its hidden row for
+    /// the drafter, and return the lazily sampled next token.
+    private mutating func dispatchPlainForward(_ input: MLXArray) -> MLXArray {
         let (logits, captured) = target.callAsFunction(
             input, cache: cache, captureLayerIDs: captureLayerIDs,
             recordPrefixCommitStates: false)
         let hidden = extractContextFeature(captured: captured, targetLayerIDs: orderedLayerIDs)
         let sampled = sampler.sample(logits: logits[0..., -1, 0...])
-        MLX.eval(sampled, hidden)
-        let token = sampled.reshaped(-1)[0].item(Int.self)
-        contextHidden = hidden
+        asyncEval(sampled, hidden)
+        // The drafter must see every committed token's hidden row, in
+        // order: consecutive plain steps accumulate until the next draft
+        // consumes them, or its context and positions fall behind.
+        contextHidden =
+            contextHiddenConsumed ? hidden : concatenated([contextHidden, hidden], axis: 1)
+        contextHiddenConsumed = false
+        return sampled
+    }
+
+    /// Emit the sampled-ahead token so `lastToken` is again the emitted
+    /// token whose row is not yet in the cache — the anchor a verify block
+    /// starts from. False when there is nothing to flush.
+    private mutating func flushPlainLookahead() -> Bool {
+        guard let lookahead = plainLookahead else { return false }
+        plainLookahead = nil
+        emitPlainToken(lookahead.reshaped(-1)[0].item(Int.self))
+        return true
+    }
+
+    private mutating func emitPlainToken(_ token: Int) {
         lastToken = token
         pendingTokens = [token]
         pendingIndex = 0
         stats.emittedTokens += 1
         stats.autoregressiveFallbackTokens += 1
-        return true
     }
 
     /// Roll the target cache back to the accepted prefix.
@@ -1355,7 +1438,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
 
     // MARK: - Stats + cache store
 
-    var dflash2Stats: DFlash2GenerationStats { stats }
+    var dflash2Stats: DFlash2GenerationStats? { stats }
 
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],

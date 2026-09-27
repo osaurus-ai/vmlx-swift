@@ -143,7 +143,8 @@ final class Spark25DFlash2LiveTests: XCTestCase {
         ]
 
         var report: [String: Any] = [:]
-        for (name, text) in prompts {
+        let skipAudit = ProcessInfo.processInfo.environment["VMLX_SPARK25_DFLASH_SKIP_AUDIT"] == "1"
+        for (name, text) in prompts where !skipAudit {
             let input = try await prepare(text)
             let promptTokens = input.text.tokens.reshaped(-1).asArray(Int.self)
             func mark(_ s: String) {
@@ -197,6 +198,35 @@ final class Spark25DFlash2LiveTests: XCTestCase {
             report[name] = ["prompt_tokens": promptTokens.count, "arms": arms]
         }
 
+        // The host sees which path ran: `.info` carries DFlash 2 stats for a
+        // DFlash request through the public generate API, and none for plain.
+        for (label, strategy) in [
+            (
+                "dflash",
+                DraftStrategy.dflash2(
+                    drafterPath: URL(fileURLWithPath: selection.path), blockSize: nil)
+            ),
+            ("plain", nil),
+        ] as [(String, DraftStrategy?)] {
+            var parameters = GenerateParameters(maxTokens: 48, temperature: 0)
+            parameters.draftStrategy = strategy
+            var info: GenerateCompletionInfo?
+            for await item in try MLXLMCommon.generate(
+                input: try await prepare(prompts[0].1), parameters: parameters, context: ctx)
+            {
+                if case .info(let i) = item { info = i }
+            }
+            let stats = try XCTUnwrap(info).dflash2Stats
+            print(
+                "[raptor-live] completion info \(label): dflash2Stats=\(String(describing: stats))")
+            if strategy == nil {
+                XCTAssertNil(stats)
+            } else {
+                XCTAssertEqual(stats?.blockSize, 5)
+                XCTAssertGreaterThan(stats?.verifyCalls ?? 0, 0)
+            }
+        }
+
         // Throughput: one warm-up, then ≥3 probes per arm, interleaved,
         // median reported. Greedy and the bundle's own sampler.
         let probes = Int(ProcessInfo.processInfo.environment["VMLX_SPARK25_DFLASH_PROBES"] ?? "3")!
@@ -204,20 +234,26 @@ final class Spark25DFlash2LiveTests: XCTestCase {
         var sampled = GenerateParameters(
             generationConfig: ctx.configuration.generationDefaults,
             fallback: GenerateParameters(maxTokens: 256))
-        sampled.maxTokens = 256
+        let speedTokens = Int(
+            ProcessInfo.processInfo.environment["VMLX_SPARK25_DFLASH_SPEED_TOKENS"] ?? "256")!
+        sampled.maxTokens = speedTokens
         sampled.prefillStepSize = 1024
         var greedy256 = greedy
-        greedy256.maxTokens = 256
+        greedy256.maxTokens = speedTokens
         let arms: [(String, GenerateParameters, Int?)] = [
             ("greedy-plain", greedy256, -1), ("greedy-b8", greedy256, 8),
             ("greedy-b6", greedy256, 6), ("greedy-b5", greedy256, 5), ("greedy-b4", greedy256, 4),
             ("sampled-plain", sampled, -1), ("sampled-b8", sampled, 8), ("sampled-b5", sampled, 5),
             ("sampled-b4", sampled, 4),
         ]
+        let armFilter = ProcessInfo.processInfo.environment["VMLX_SPARK25_DFLASH_ARMS"].map {
+            Set($0.split(separator: ",").map(String.init))
+        }
+        let selectedArms = arms.filter { armFilter?.contains($0.0) ?? true }
         var rates: [String: [Double]] = [:]
         var acceptance: [String: [Double]] = [:]
         for probe in 0 ... probes {
-            for (name, parameters, block) in arms {
+            for (name, parameters, block) in selectedArms {
                 Memory.clearCache()
                 let run =
                     try block == -1
@@ -229,12 +265,14 @@ final class Spark25DFlash2LiveTests: XCTestCase {
                 print(
                     String(
                         format:
-                            "[raptor-speed] probe %d %-13@ %4d tok %6.2f tok/s accLen %.2f  per-cycle ms draft %.2f verify %.2f commit %.2f  cycles %d ar %d",
+                            "[raptor-speed] probe %d %-13@ %4d tok %6.2f tok/s accLen %.2f  per-cycle ms draft %.2f verify %.2f commit %.2f  cycles %d ar %d  paused %d tok @ %.1f tok/s",
                         probe, name as NSString, run.tokens.count, rate, st?.acceptanceLength ?? 1,
                         (st?.draftSeconds ?? 0) / cycles * 1000,
                         (st?.verifySeconds ?? 0) / cycles * 1000,
                         (st?.commitSeconds ?? 0) / cycles * 1000, st?.verifyCalls ?? 0,
-                        st?.autoregressiveFallbackTokens ?? 0))
+                        st?.autoregressiveFallbackTokens ?? 0, st?.throughputPausedTokens ?? 0,
+                        Double(st?.throughputPausedTokens ?? 0)
+                            / Swift.max(st?.throughputPausedSeconds ?? 0, 1e-6)))
                 guard probe > 0 else { continue }  // discard the warm-up probe
                 rates[name, default: []].append(rate)
                 acceptance[name, default: []].append(run.stats?.acceptanceLength ?? 1)
@@ -245,7 +283,7 @@ final class Spark25DFlash2LiveTests: XCTestCase {
             return s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2
         }
         var speed: [String: Any] = [:]
-        for (name, _, _) in arms {
+        for (name, _, _) in selectedArms {
             let m = median(rates[name] ?? [0])
             let base = median(
                 rates[name.hasPrefix("greedy") ? "greedy-plain" : "sampled-plain"] ?? [1])

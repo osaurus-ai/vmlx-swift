@@ -105,4 +105,73 @@ final class Spark25VerifyCostProbe: XCTestCase {
             "[verify-cost] shapes qkv \(layers[0].attention.qkv.weight.shape) mlp.gate \(layers[0].mlp.gate.weight.shape) down \(layers[0].mlp.down.weight.shape) types \(type(of: layers[0].mlp.gate))"
         )
     }
+
+    /// What a plain step inside the DFlash iterator costs relative to a
+    /// plain decode step, split into its parts. Pipelined like TokenIterator.
+    func testPlainStepCostWithCapture() async throws {
+        guard let path = ProcessInfo.processInfo.environment["VMLX_SPARK25_DFLASH_BUNDLE"] else {
+            throw XCTSkip("Set VMLX_SPARK25_DFLASH_BUNDLE")
+        }
+        let context = try await MLXLMCommon.loadModel(
+            from: URL(fileURLWithPath: path), using: #huggingFaceTokenizerLoader())
+        nonisolated(unsafe) let ctx = context
+        let model = try XCTUnwrap(ctx.model as? Spark25Model)
+        let taps: [Int] = [1, 9, 17, 25, 33]
+        let steps = 384
+
+        enum Variant: String, CaseIterable {
+            case plain, capture, captureLazyConcat, captureEvalConcat, plainSampled, captureSampled
+        }
+        let topP = GenerateParameters(temperature: 1.0, topP: 0.95).sampler()
+        func run(_ v: Variant) -> Double {
+            let cache = model.newCache()
+            let prompt = MLXArray((0 ..< 700).map { Int32(1000 + $0 % 5000) }).reshaped(1, -1)
+            eval(model(prompt, cache: cache))
+            var context = MLXArray.zeros([1, 0, 12800], dtype: .bfloat16)
+            var next = MLXArray([Int32(42)])
+            let start = Date.timeIntervalSinceReferenceDate
+            for _ in 0 ..< steps {
+                let input = next.reshaped(1, 1)
+                let sampled: MLXArray
+                switch v {
+                case .plain:
+                    sampled = argMax(model(input, cache: cache)[0..., -1, 0...], axis: -1)
+                    asyncEval(sampled)
+                case .plainSampled:
+                    sampled = topP.sample(logits: model(input, cache: cache)[0..., -1, 0...])
+                    asyncEval(sampled)
+                case .captureSampled:
+                    let (logits, captured) = model(input, cache: cache, captureLayerIDs: Set(taps))
+                    let hidden = extractContextFeature(captured: captured, targetLayerIDs: taps)
+                    sampled = topP.sample(logits: logits[0..., -1, 0...])
+                    asyncEval(sampled, hidden)
+                    context = concatenated([context, hidden], axis: 1)
+                default:
+                    let (logits, captured) = model(input, cache: cache, captureLayerIDs: Set(taps))
+                    let hidden = extractContextFeature(captured: captured, targetLayerIDs: taps)
+                    sampled = argMax(logits[0..., -1, 0...], axis: -1)
+                    asyncEval(sampled, hidden)
+                    if v == .captureLazyConcat {
+                        context = concatenated([context, hidden], axis: 1)
+                    } else if v == .captureEvalConcat {
+                        context = concatenated([context, hidden], axis: 1)
+                        asyncEval(context)
+                    }
+                }
+                _ = next.reshaped(-1)[0].item(Int32.self)
+                next = sampled
+            }
+            _ = next.reshaped(-1)[0].item(Int32.self)
+            eval(context)
+            return Double(steps) / (Date.timeIntervalSinceReferenceDate - start)
+        }
+        for round in 0 ... 2 {
+            var line = "[plain-step] round \(round)"
+            for v in Variant.allCases {
+                Memory.clearCache()
+                line += String(format: " %@=%.1f", v.rawValue, run(v))
+            }
+            print(line)
+        }
+    }
 }

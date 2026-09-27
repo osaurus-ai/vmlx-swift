@@ -107,7 +107,7 @@ final class DFlash2AcceptanceMatrixTests: XCTestCase {
                     let start = Date()
                     while produced < maxTokens, iterator.next() != nil { produced += 1 }
                     let secs = Date().timeIntervalSince(start)
-                    let s = iterator.dflash2Stats
+                    let s = iterator.dflash2Stats!
                     let accRate = s.draftedTokens > 0
                         ? Double(s.acceptedTokens) / Double(s.draftedTokens) * 100 : 0
                     print(String(
