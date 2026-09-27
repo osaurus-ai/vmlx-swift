@@ -107,7 +107,9 @@ for threads in $CONFIGURATIONS; do
   echo "== MLX_CPU_THREADS=$threads: exit $rc, $(grep -E 'Test run with' "$log" | tail -1)"
   if [ "$rc" != 0 ] || ! grep -Eq 'Test run with [1-9][0-9]* tests? .*passed' "$log"; then
     status=1
-    grep -E '✘|failed|error|STALLED' "$log" | head -20 || true
+    # Each recorded issue with the values swift-testing prints under it (↳), and any stall or crash.
+    awk '/recorded an issue/ {show = 1; print; next} show && /^↳/ {print; next} {show = 0}
+      /STALLED|[Ff]atal error|error:/ {print}' "$log" | head -40 || true
     # The executable exits 69 when the filter matches no test, where `swift test` exits 0.
     if [ "$rc" = 69 ]; then echo "no test matches --filter '$FILTER'"; fi
   fi
