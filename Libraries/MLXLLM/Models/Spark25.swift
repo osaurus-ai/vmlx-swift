@@ -223,6 +223,17 @@ final class Spark25ModelInner: Module {
         norm = RMSNorm(dimensions: c.hiddenSize, eps: c.rmsNormEps)
     }
     func callAsFunction(_ tokens: MLXArray, cache: [KVCache]?) -> MLXArray {
+        callAsFunctionCapturing(tokens, cache: cache, captureLayerIDs: []).0
+    }
+
+    /// Forward with per-block hidden-state capture for DFlash drafters.
+    /// Captured rows are block outputs (post-residual) in the embedding
+    /// dtype — the bf16 hidden states the drafter was trained on — while
+    /// the residual stream itself stays fp32. An empty set is the plain
+    /// forward.
+    func callAsFunctionCapturing(
+        _ tokens: MLXArray, cache: [KVCache]?, captureLayerIDs: Set<Int>
+    ) -> (MLXArray, [Int: MLXArray]) {
         let embedded = embedding(tokens)
         var h = embedded.asType(.float32)
         // Compute masks before updating any layer's cache. Each type owns a
@@ -232,14 +243,20 @@ final class Spark25ModelInner: Module {
         let full = createAttentionMask(h: h, cache: fullIndex.flatMap { cache?[$0] })
         let sliding = createAttentionMask(
             h: h, cache: slidingIndex.flatMap { cache?[$0] }, windowSize: config.slidingWindow)
+        var captured: [Int: MLXArray] = [:]
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: config.layerTypes[i] == .full ? full : sliding, cache: cache?[i])
+            if captureLayerIDs.contains(i) {
+                captured[i] = h.asType(embedded.dtype)
+            }
         }
-        return norm(h).asType(embedded.dtype)
+        return (norm(h).asType(embedded.dtype), captured)
     }
 }
 
-public final class Spark25Model: Module, LLMModel, KVCacheDimensionProvider {
+public final class Spark25Model: Module, LLMModel, KVCacheDimensionProvider,
+    HiddenStateCaptureModel, TokenEmbedderModel
+{
     public let vocabularySize: Int
     public let kvHeads: [Int]
     let model: Spark25ModelInner
@@ -257,8 +274,25 @@ public final class Spark25Model: Module, LLMModel, KVCacheDimensionProvider {
     }
     public var loraLayers: [Module] { model.layers }
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let h = model(inputs, cache: cache)
-        return lmHead?(h) ?? model.embedding.asLinear(h)
+        projectToLogits(model(inputs, cache: cache))
+    }
+
+    /// `HiddenStateCaptureModel`: the DFlash drafter reads the outputs of
+    /// `dflash_config.target_layer_ids` (0-based block indices).
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?, captureLayerIDs: Set<Int>
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        let (h, captured) = model.callAsFunctionCapturing(
+            inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+        return (projectToLogits(h), captured)
+    }
+
+    public func embed(_ tokenIds: MLXArray) -> MLXArray {
+        model.embedding(tokenIds)
+    }
+
+    public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+        lmHead?(hidden) ?? model.embedding.asLinear(hidden)
     }
     public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
         config.layerTypes.map { type in

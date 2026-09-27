@@ -506,7 +506,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     public func resolvedMTPDraftStrategy(
         configData: Data?,
         jangConfig: JangConfig?,
-        status: MTPBundleStatus?
+        status: MTPBundleStatus?,
+        modelDirectory: URL? = nil
     ) -> DraftStrategy? {
         let launch = resolvedMTPLaunch(
             configData: configData,
@@ -520,7 +521,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         // who downloads a drafter and points the runtime at it has asked
         // for speculation, and making them also flip Mode to Auto would
         // be a second switch for one decision.
-        if let selection = resolvedDFlash2Selection(configData: configData) {
+        let bundle = modelDirectory
+        if let selection = resolvedDFlash2Selection(configData: configData, modelDirectory: bundle) {
             return .dflash2(
                 drafterPath: URL(fileURLWithPath: selection.path),
                 blockSize: mtp.dflash2BlockSize)
@@ -537,19 +539,47 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     /// described by `configData`. `nil` otherwise — including when the
     /// folder has gone missing, which must degrade to ordinary decoding
     /// rather than failing the request.
-    public func resolvedDFlash2Selection(configData: Data?) -> VMLXDFlash2DrafterInfo? {
-        guard let path = mtp.dflash2DrafterPath, !path.isEmpty else { return nil }
-        guard let info = VMLXDFlash2DrafterInfo.read(at: URL(fileURLWithPath: path)) else {
-            return nil
+    ///
+    /// With `modelDirectory`, a drafter shipped in the bundle
+    /// (``VMLXDFlash2DrafterInfo/bundled(in:)``) is used when no selected
+    /// drafter fits and ``VMLXServerMTPSettings/bundledDrafter`` is not
+    /// `.off`.
+    public func resolvedDFlash2Selection(
+        configData: Data?, modelDirectory: URL? = nil
+    ) -> VMLXDFlash2DrafterInfo? {
+        if let path = mtp.dflash2DrafterPath, !path.isEmpty,
+            let info = VMLXDFlash2DrafterInfo.read(at: URL(fileURLWithPath: path)),
+            info.mismatchReason(configData: configData) == nil
+        {
+            return info
         }
-        guard info.mismatchReason(configData: configData) == nil else { return nil }
+        return resolvedBundledDFlash2(configData: configData, modelDirectory: modelDirectory)
+    }
+
+    /// The bundle's own drafter when it is enabled and fits, else `nil`.
+    public func resolvedBundledDFlash2(
+        configData: Data?, modelDirectory: URL?
+    ) -> VMLXDFlash2DrafterInfo? {
+        guard mtp.bundledDrafter != .off, let modelDirectory,
+            let info = VMLXDFlash2DrafterInfo.bundled(in: modelDirectory),
+            info.mismatchReason(configData: configData) == nil
+        else { return nil }
         return info
     }
 
     /// Why the selected drafter is not being used for this bundle, for
     /// display. `nil` when it IS being used or when none is selected.
-    public func dflash2RejectionReason(configData: Data?) -> String? {
-        guard let path = mtp.dflash2DrafterPath, !path.isEmpty else { return nil }
+    ///
+    /// With `modelDirectory` and no selected drafter, reports why the
+    /// bundle's own drafter is not drafting.
+    public func dflash2RejectionReason(configData: Data?, modelDirectory: URL? = nil) -> String? {
+        guard let path = mtp.dflash2DrafterPath, !path.isEmpty else {
+            guard let modelDirectory,
+                let bundled = VMLXDFlash2DrafterInfo.bundled(in: modelDirectory)
+            else { return nil }
+            if mtp.bundledDrafter == .off { return "The bundled DFlash 2 drafter is turned off." }
+            return bundled.mismatchReason(configData: configData)
+        }
         let url = URL(fileURLWithPath: path)
         guard let info = VMLXDFlash2DrafterInfo.read(at: url) else {
             return FileManager.default.fileExists(atPath: path)
@@ -1522,6 +1552,17 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     /// drafts seven tokens per verification step.
     public var dflash2BlockSize: Int?
 
+    /// Whether a DFlash 2 drafter shipped INSIDE the model bundle
+    /// (`<bundle>/dflash/`) drafts for that model.
+    ///
+    /// `.auto` (the default) uses it whenever it fits the bundle; `.off` is
+    /// the user turning it off. Like a selected drafter folder, this is
+    /// independent of ``mode``, which governs the native MTP head — hosts
+    /// that present one speculation switch write both. A selected
+    /// ``dflash2DrafterPath`` that fits takes precedence over the bundled
+    /// one.
+    public var bundledDrafter: VMLXBundledDrafterMode
+
     public init(
         mode: VMLXMTPServerMode = .off,
         draftTokenLimit: Int? = nil,
@@ -1529,8 +1570,10 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
         acceptedTokensOnlyEnterBaseCache: Bool = true,
         dflash2DrafterPath: String? = nil,
         dflash2BlockSize: Int? = nil,
-        explicitDepth: Int? = nil
+        explicitDepth: Int? = nil,
+        bundledDrafter: VMLXBundledDrafterMode = .auto
     ) {
+        self.bundledDrafter = bundledDrafter
         self.mode = mode
         self.draftTokenLimit = draftTokenLimit
         self.keepDraftCacheSeparate = keepDraftCacheSeparate
@@ -1563,7 +1606,15 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
         self.dflash2DrafterPath = try c.decodeIfPresent(String.self, forKey: .dflash2DrafterPath)
         self.dflash2BlockSize = try c.decodeIfPresent(Int.self, forKey: .dflash2BlockSize)
         self.explicitDepth = try c.decodeIfPresent(Int.self, forKey: .explicitDepth)
+        self.bundledDrafter =
+            try c.decodeIfPresent(VMLXBundledDrafterMode.self, forKey: .bundledDrafter) ?? .auto
     }
+}
+
+/// See ``VMLXServerMTPSettings/bundledDrafter``.
+public enum VMLXBundledDrafterMode: String, Codable, Sendable, Equatable, CaseIterable {
+    case auto
+    case off
 }
 
 public enum VMLXMTPServerMode: String, Codable, Sendable, Equatable, CaseIterable {

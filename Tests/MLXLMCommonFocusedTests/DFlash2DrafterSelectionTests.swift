@@ -253,4 +253,110 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
         }
         XCTAssertEqual(blockSize, 4)
     }
+
+    // MARK: - Drafter shipped inside the model bundle
+
+    /// A Raptor-shaped bundle: 36-layer, 2560-wide target with `dflash/`.
+    private func makeBundle(withDrafter: Bool = true, vocabularySize: Int = 131_072) throws -> (
+        dir: URL, config: Data
+    ) {
+        let bundle = root.appendingPathComponent("bundle-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        let config = try JSONSerialization.data(withJSONObject: [
+            "model_type": "spark2_5", "vocab_size": 131_072, "num_hidden_layers": 36,
+            "hidden_size": 2560,
+        ])
+        try config.write(to: bundle.appendingPathComponent("config.json"))
+        if withDrafter {
+            let drafter = try makeDrafter(
+                name: "drafter-\(UUID().uuidString)", vocabularySize: vocabularySize,
+                hiddenSize: 2560, targetLayerIDs: [1, 9, 17, 25, 33], numTargetLayers: 36)
+            try FileManager.default.moveItem(
+                at: drafter, to: bundle.appendingPathComponent("dflash"))
+        }
+        return (bundle, config)
+    }
+
+    func testBundledDrafterDraftsByDefault() throws {
+        let (dir, config) = try makeBundle()
+        let settings = VMLXServerRuntimeSettings()
+        XCTAssertEqual(settings.mtp.bundledDrafter, .auto)
+        XCTAssertEqual(settings.mtp.mode, .off, "the native-MTP mode default is unchanged")
+        let strategy = settings.resolvedMTPDraftStrategy(
+            configData: config, jangConfig: nil, status: nil, modelDirectory: dir)
+        XCTAssertEqual(
+            strategy?.dflash2DrafterPath?.resolvingSymlinksInPath().path,
+            dir.appendingPathComponent("dflash").resolvingSymlinksInPath().path)
+        XCTAssertNil(settings.dflash2RejectionReason(configData: config, modelDirectory: dir))
+    }
+
+    func testTurningTheBundledDrafterOffIsHonoured() throws {
+        let (dir, config) = try makeBundle()
+        var settings = VMLXServerRuntimeSettings()
+        settings.mtp.bundledDrafter = .off
+        for mode in VMLXMTPServerMode.allCases {
+            settings.mtp.mode = mode
+            XCTAssertNil(
+                settings.resolvedDFlash2Selection(configData: config, modelDirectory: dir),
+                "mode \(mode)")
+            XCTAssertNil(
+                settings.resolvedMTPDraftStrategy(
+                    configData: config, jangConfig: nil, status: nil, modelDirectory: dir
+                )?.dflash2DrafterPath,
+                "mode \(mode)")
+        }
+        XCTAssertEqual(
+            settings.dflash2RejectionReason(configData: config, modelDirectory: dir),
+            "The bundled DFlash 2 drafter is turned off.")
+    }
+
+    func testCallersThatDoNotPassTheBundleAreUnchanged() throws {
+        let (_, config) = try makeBundle()
+        let settings = VMLXServerRuntimeSettings()
+        XCTAssertNil(settings.resolvedDFlash2Selection(configData: config))
+        XCTAssertNil(
+            settings.resolvedMTPDraftStrategy(configData: config, jangConfig: nil, status: nil))
+    }
+
+    func testMismatchedBundledDrafterIsIgnoredWithAReason() throws {
+        let (dir, config) = try makeBundle(vocabularySize: 151_936)
+        let settings = VMLXServerRuntimeSettings()
+        XCTAssertNil(settings.resolvedDFlash2Selection(configData: config, modelDirectory: dir))
+        XCTAssertNotNil(settings.dflash2RejectionReason(configData: config, modelDirectory: dir))
+    }
+
+    func testSelectedDrafterTakesPrecedenceOverTheBundledOne() throws {
+        let (dir, config) = try makeBundle()
+        let chosen = try makeDrafter(
+            name: "chosen", vocabularySize: 131_072, hiddenSize: 2560,
+            targetLayerIDs: [2, 10, 18, 26, 34], numTargetLayers: 36)
+        var settings = VMLXServerRuntimeSettings()
+        settings.mtp.dflash2DrafterPath = chosen.path
+        XCTAssertEqual(
+            settings.resolvedDFlash2Selection(configData: config, modelDirectory: dir)?.path,
+            chosen.path)
+        // A selected folder that does not fit falls back to the bundle's.
+        settings.mtp.dflash2DrafterPath = root.appendingPathComponent("missing").path
+        XCTAssertEqual(
+            settings.resolvedDFlash2Selection(configData: config, modelDirectory: dir)?.path,
+            dir.appendingPathComponent("dflash").path)
+    }
+
+    func testBundleWithoutADrafterResolvesNothing() throws {
+        let (dir, config) = try makeBundle(withDrafter: false)
+        let settings = VMLXServerRuntimeSettings()
+        XCTAssertNil(settings.resolvedDFlash2Selection(configData: config, modelDirectory: dir))
+        XCTAssertNil(settings.dflash2RejectionReason(configData: config, modelDirectory: dir))
+    }
+
+    func testSettingsWrittenBeforeTheBundledSwitchDecodeAsAuto() throws {
+        let old = #"{"mode":"off","keepDraftCacheSeparate":true,"acceptedTokensOnlyEnterBaseCache":true}"#
+        let decoded = try JSONDecoder().decode(VMLXServerMTPSettings.self, from: Data(old.utf8))
+        XCTAssertEqual(decoded.bundledDrafter, .auto)
+        var off = decoded
+        off.bundledDrafter = .off
+        let roundTrip = try JSONDecoder().decode(
+            VMLXServerMTPSettings.self, from: JSONEncoder().encode(off))
+        XCTAssertEqual(roundTrip.bundledDrafter, .off)
+    }
 }

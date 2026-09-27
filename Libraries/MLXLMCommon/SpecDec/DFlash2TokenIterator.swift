@@ -263,6 +263,27 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// there is nothing to draft.
     static let minimumBlockSize = 2
 
+    /// Rows one verify forward can carry while each quantized weight is
+    /// still read once: the small-M `qmv_wide` kernel streams at most 5 input
+    /// rows per weight pass, so 6-10 rows read every weight twice. Measured
+    /// on Spark2.5 4B JANG_6M (M5 Max): projections cost 4.6 ms for 1-5 rows,
+    /// 9.2 ms at 6, 13.4 ms at 8.
+    static let singlePassVerifyRows = 5
+
+    /// The block width a request runs at. A pinned width always wins. For a
+    /// target whose every layer rolls back by trimming (no recurrent state)
+    /// the default is the trained width capped at ``singlePassVerifyRows``:
+    /// on Spark2.5 every width from 4 to 8 audited lossless against a
+    /// teacher-forced forward, and b5 decoded 1.37x plain where the trained
+    /// b8 decoded 0.88x. Hybrid targets keep the trained width — a narrower
+    /// one diverged from plain decode on Qwen3.8 and that has not been
+    /// re-measured.
+    static func defaultBlockSize(requested: Int?, trained: Int, cache: [KVCache]) -> Int {
+        if let requested { return requested }
+        guard cache.allSatisfy(\.rollsBackVerifiedRows) else { return trained }
+        return Swift.min(trained, singlePassVerifyRows)
+    }
+
     static func unservableReason(_ parameters: GenerateParameters) -> String? {
         // A penalty of exactly 1.0 (repetition) or 0 (presence/frequency)
         // is the identity. Bundles ship those as explicit defaults —
@@ -337,9 +358,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // at temp 0 (sharedPrefix 429/1209 vs 1209/1209 at the trained
         // width) — this runtime's packing is not width-neutral. A
         // caller-pinned size still wins; it is a measurement request.
-        let effectiveBlockSize = requestedBlockSize ?? config.blockSize
-        guard effectiveBlockSize >= Self.minimumBlockSize else {
-            throw DFlash2RuntimeError.blockSizeTooSmall(effectiveBlockSize)
+        if let requestedBlockSize, requestedBlockSize < Self.minimumBlockSize {
+            throw DFlash2RuntimeError.blockSizeTooSmall(requestedBlockSize)
         }
 
         var effectiveParameters = parameters
@@ -357,6 +377,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.orderedLayerIDs = config.targetLayerIds
         self.captureLayerIDs = Set(config.targetLayerIds)
         self.cache = cache ?? target.newCache(parameters: effectiveParameters)
+        let effectiveBlockSize = Self.defaultBlockSize(
+            requested: requestedBlockSize, trained: config.blockSize, cache: self.cache)
+        guard effectiveBlockSize >= Self.minimumBlockSize else {
+            throw DFlash2RuntimeError.blockSizeTooSmall(effectiveBlockSize)
+        }
         self.draftCache = drafter.makeCache()
         self.cacheCoordinator = cacheCoordinator
         self.sampler = effectiveParameters.sampler()
@@ -392,11 +417,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // A hybrid target whose recurrent layers cannot record their
         // per-step state has no way back from a rejected block. Refuse up
         // front rather than corrupting the cache mid-turn.
-        let hasUntrimmableState = self.cache.contains { !$0.isTrimmable }
+        let hasUntrimmableState = self.cache.contains { !$0.rollsBackVerifiedRows }
         if hasUntrimmableState, !target.supportsCapturingPrefixCommitRecording {
             throw DFlash2RuntimeError.targetLacksPrefixCommitRecording
         }
-        if hasUntrimmableState, self.cache.contains(where: { !($0 is MambaCache) && !$0.isTrimmable })
+        if hasUntrimmableState,
+            self.cache.contains(where: { !($0 is MambaCache) && !$0.rollsBackVerifiedRows })
         {
             throw DFlash2RuntimeError.targetLacksPrefixCommitRecording
         }
@@ -482,14 +508,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                         // to seed `contextHidden` with.
                         let cacheOffset = self.cache.first?.offset ?? tokensToPrefill.count
                         let trimNeeded = cacheOffset - (tokensToPrefill.count - 1)
-                        if trimNeeded < 0 {
+                        if trimNeeded < 0
+                            || !Self.trimVerifiedRows(self.cache, trimNeeded)
+                        {
+                            // A restored sliding window that cannot give the
+                            // row back exactly is re-prefilled rather than
+                            // left one row ahead of the other layers.
                             self.cache = target.newCache(parameters: effectiveParameters)
                         } else {
-                            if trimNeeded > 0 {
-                                for layer in self.cache where layer.isTrimmable {
-                                    _ = layer.trim(trimNeeded)
-                                }
-                            }
                             tokensToPrefill = [last]
                         }
                     } else {
@@ -772,6 +798,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // Anything else in flight was speculated against a budget or block
         // size we can no longer use; roll its rows back before proceeding.
         abandonInFlightVerify()
+        guard !cacheHoldsUnverifiedRows else { return false }
 
         // The block spends one position on the anchor, so a block of size
         // `bs` yields at most `bs` new tokens (bs-1 drafts + 1 bonus).
@@ -877,7 +904,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let verifyInput = concatenated(
             [MLXArray([Int32(lastToken)]).reshaped(1, 1), draftTokens], axis: 1)
 
-        let hasRecurrentState = cache.contains { !$0.isTrimmable }
+        let hasRecurrentState = cache.contains { !$0.rollsBackVerifiedRows }
         // Input-capture is the fast rollback: recurrent layers stash
         // REFERENCES to this forward's inputs and a rejection replays only
         // the accepted rows, one kernel per layer. The per-prefix recording
@@ -1010,15 +1037,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             // EVERY cycle commits from the staging slots (a full accept
             // adopts the staged final state, no replay). Attention caches
             // advanced in-graph and just rewind their offset.
-            if rejected > 0 {
-                for layer in cache where layer.isTrimmable {
-                    _ = layer.trim(rejected)
-                }
-            }
-            let committed = (target as? DFlash2StagedVerifyRollbackModel)?
-                .commitStagedVerifiedBlock(
-                    cache: cache, acceptedInputs: committedInputs,
-                    blockLength: flight.verifyRows) ?? false
+            let committed = Self.trimVerifiedRows(cache, rejected)
+                && ((target as? DFlash2StagedVerifyRollbackModel)?
+                    .commitStagedVerifiedBlock(
+                        cache: cache, acceptedInputs: committedInputs,
+                        blockLength: flight.verifyRows) ?? false)
             guard committed else {
                 stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
                 FileHandle.standardError.write(
@@ -1032,11 +1055,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         } else if rejected > 0 {
             let committed: Bool
             if usesInputCapture, let rollback = target as? DFlash2VerifyRollbackModel {
-                for layer in cache where layer.isTrimmable {
-                    _ = layer.trim(rejected)
-                }
-                committed = rollback.commitVerifiedBlock(
-                    cache: cache, acceptedInputs: committedInputs)
+                committed = Self.trimVerifiedRows(cache, rejected)
+                    && rollback.commitVerifiedBlock(
+                        cache: cache, acceptedInputs: committedInputs)
             } else {
                 committed = Self.commit(
                     cache: cache, committedInputs: committedInputs, rejected: rejected)
@@ -1111,11 +1132,21 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// offset were never touched. Must run before ANY path that persists
     /// or reuses the cache, or unverified draft positions leak into a
     /// stored prefix.
+    /// Set when a rollback could not be applied exactly (see
+    /// ``trimVerifiedRows(_:_:)``). Unreachable by construction; checked so
+    /// that it fails closed instead of decoding from a wrong history.
+    private var cacheHoldsUnverifiedRows = false
+
     private mutating func abandonInFlightVerify() {
         guard let flight = inFlight else { return }
         inFlight = nil
-        for layer in cache where layer.isTrimmable {
-            _ = layer.trim(flight.verifyRows)
+        if !Self.trimVerifiedRows(cache, flight.verifyRows) {
+            // The cache still holds unverified rows: nothing more may be
+            // decoded from it or stored as a prompt prefix.
+            cacheHoldsUnverifiedRows = true
+            FileHandle.standardError.write(Data(
+                ("[DFlash2] ABORTED: could not roll back \(flight.verifyRows) unverified "
+                    + "rows. The turn is TRUNCATED at \(stats.emittedTokens) tokens.\n").utf8))
         }
         for layer in cache { (layer as? MambaCache)?.clearVerifyStaging() }
         stagedWarmedSizes.removeAll(keepingCapacity: true)
@@ -1268,6 +1299,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // A plain step reads and advances the same cache an in-flight
         // verify has already speculatively extended.
         abandonInFlightVerify()
+        guard !cacheHoldsUnverifiedRows else { return false }
         let input = MLXArray([Int32(lastToken)]).reshaped(1, 1)
         let (logits, captured) = target.callAsFunction(
             input, cache: cache, captureLayerIDs: captureLayerIDs,
@@ -1293,7 +1325,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private static func commit(
         cache: [KVCache], committedInputs: Int, rejected: Int
     ) -> Bool {
-        for layer in cache where !layer.isTrimmable {
+        for layer in cache where !layer.rollsBackVerifiedRows {
             guard let mamba = layer as? MambaCache,
                 mamba.commitRecordedPrefix(length: committedInputs)
             else {
@@ -1301,9 +1333,17 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 return false
             }
         }
-        for layer in cache where layer.isTrimmable {
-            _ = layer.trim(rejected)
-        }
+        return trimVerifiedRows(cache, rejected)
+    }
+
+    /// Drop `n` rows from every layer that rolls back by trimming. False —
+    /// with nothing trimmed — when a sliding-window layer cannot drop them
+    /// exactly, since its history would be wrong from then on.
+    static func trimVerifiedRows(_ cache: [KVCache], _ n: Int) -> Bool {
+        guard n > 0 else { return true }
+        let layers = cache.filter(\.rollsBackVerifiedRows)
+        guard layers.allSatisfy({ $0.canRollBackVerifiedRows(n) }) else { return false }
+        for layer in layers { layer.trim(n) }
         return true
     }
 
@@ -1323,6 +1363,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     ) {
         // Never persist a cache that still carries unverified draft rows.
         abandonInFlightVerify()
+        guard !cacheHoldsUnverifiedRows else { return }
         guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else { return }
         // Auxiliary (title/suggestion/summary) prompts never store a
         // boundary — see `CachePromptIntent.auxiliary`.

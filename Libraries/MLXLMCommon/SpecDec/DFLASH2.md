@@ -158,6 +158,61 @@ mlx 0.32.1 measures ~15–30% better at the same shapes, and oMLX-style
 split-K verify-shape kernels (their lm_head 2.6–3.3×) would close the
 rest. That is the path from ~1.4–1.5× to ~2×+ on quants.
 
+### Sliding-window targets (Spark2.5)
+
+Spark2.5 runs 27 of its 36 layers on a 512-row `RotatingKVCache`.
+`isTrimmable` on that cache goes false the moment the window fills, and
+the iterator read "not trimmable" as "recurrent" — so after 512 tokens
+the sliding layers kept every rejected row while the full-attention
+layers dropped them. Nothing crashed; the target just attended to
+drafts it had rejected.
+
+A verify block is a multi-row update, and a multi-row update leaves the
+rotating buffer in temporal order: the window of history, then the new
+rows. Dropping up to that many newest rows is therefore exact, and
+`RotatingKVCache.trim` now cuts them off (`canDropNewestRowsExactly`).
+The iterator classifies layers with `rollsBackVerifiedRows` and fails
+closed — truncating the turn rather than decoding from a wrong history —
+if a rollback ever cannot be exact. `Spark25DFlash2Tests` drives the
+real model through uneven blocks past the window against a cache-free
+forward (max divergence < 1e-3 with `MLX_ENABLE_TF32=0`), and runs the
+old rollback as a control (divergence 3.9).
+
+### Bundled drafters and the default width
+
+A bundle may ship its own drafter in `<bundle>/dflash/`. Hosts pass the
+bundle directory to `resolvedMTPDraftStrategy(…, modelDirectory:)`; it
+drafts unless `mtp.bundledDrafter == .off`, and a selected drafter
+folder that fits still wins.
+
+Verify cost decides the width. The small-M quantized kernel
+(`qmv_wide`) streams at most 5 input rows per pass over the weights, so
+6-10 rows read every weight twice. On Spark2.5 4B JANG_6M the
+projections cost 4.6 ms for 1-5 rows, 9.2 ms at 6 and 13.4 ms at 8, and
+a whole verify at 8 rows cost 1.8x a decode step. With no pinned width,
+targets with no recurrent state now run at `min(trained, 5)`; hybrid
+targets keep the trained width.
+
+M5 Max 128 GB, release, 256 tokens, 5 interleaved probes after a
+warm-up, median (`Spark25DFlash2LiveTests`):
+
+| Spark2.5 4B JANG_6M | plain | b8 (trained) | b6 | b5 (default) | b4 |
+|---|---|---|---|---|---|
+| greedy tok/s | 108.7 | 95.3 (0.88x) | 125.8 (1.16x) | 148.4 (1.37x) | 144.5 (1.33x) |
+| greedy accept len | 1 | 2.72 | 2.72 | 2.61 | 2.39 |
+| sampled (bundle T=1, top_p .95) | 106.9 | 75.1 (0.70x) | — | 121.7 (1.14x) | 121.4 (1.14x) |
+
+Every width from 4 to 8 audited lossless as a property: over 640-token
+runs from a 32-token and an 832-token prompt, every emitted token was
+the argmax of one teacher-forced forward over the emitted history (0
+violations; a corrupted-history control shows 9-31). The short prompt
+was token-identical to plain decode at every width.
+
+Raising the kernel's row cap to 8 lowers the 8-row projections to
+~10.9 ms — still 2.4x one row — and a cap of 12 spills registers (47 ms
+at 12 rows). Wide blocks need a genuinely multi-row small-M kernel, not
+a different cap.
+
 ### On losslessness under quantization
 
 Byte-equality with the plain iterator holds on bf16 and was also
@@ -175,6 +230,8 @@ that every emitted token is the verify forward's own argmax.
 | `DFlash2StageProbeTests` | drafter + `probe.py` golden | every intermediate of layer 0 and each layer output |
 | `DFlash2ReferenceParityTests` | drafter + `dflash2_reference_dump.py` golden | the traced path, against BOTH reference precisions |
 | `DFlash2LosslessSmokeTests` | target + drafter | greedy output equality, single-turn and warm-prefix multiturn |
+| `Spark25DFlash2Tests` | nothing | sliding-window rollback against a cache-free forward, capture parity, width rule |
+| `Spark25DFlash2LiveTests` | a Spark2.5 bundle with `dflash/` | teacher-forced losslessness audit past the window, throughput by width |
 
 ### On the parity tolerance
 

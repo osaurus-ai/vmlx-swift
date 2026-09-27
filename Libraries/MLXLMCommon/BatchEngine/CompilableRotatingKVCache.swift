@@ -254,6 +254,11 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
     /// Return ONLY state that mutates during decode: the keys/values
     /// buffers and the two MLXArray counters. See the equivalent comment
     /// on `CompilableTurboQuantKVCache.innerState`.
+    /// The compiled ring keeps a fixed-shape buffer and its own write
+    /// index, so the slicing rollback in ``RotatingKVCache/trim(_:)`` does
+    /// not apply.
+    public override var supportsVerifiedRowRollback: Bool { false }
+
     public override func innerState() -> [MLXArray] {
         var state = [MLXArray]()
         if let k = keys { state.append(k) }
