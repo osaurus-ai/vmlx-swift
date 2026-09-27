@@ -4,3 +4,6 @@
 [submodule "submodules/mlx-c"]
 	path = Source/Cmlx/mlx-c
 	url = https://github.com/osaurus-ai/mlx-c
+[submodule "submodules/highway"]
+	path = Source/Cmlx/highway
+	url = https://github.com/google/highway

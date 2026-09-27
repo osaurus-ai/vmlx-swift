@@ -196,6 +196,10 @@ let cmlx = Target.target(
         // vendored library, include header only
         "json",
 
+        // Google Highway, a submodule. Linux x86-64 compiles its runtime sources through the
+        // wrappers in highway-runtime/, and nothing else of it compiles anywhere.
+        "highway",
+
         // vendored library
         "fmt/test",
         "fmt/doc",
