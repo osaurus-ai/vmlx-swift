@@ -1167,6 +1167,19 @@ package.targets.append(
     )
 )
 
+// MARK: - VMLXCPUKernelTests
+
+// The CPU backend's kernels against independent references (T-167 phase 2). Declared on every
+// platform, and before the Linux profile, which must find it; its sources compile only on Linux.
+// Run it through scripts/run-cpu-kernel-tests.sh, which sets what the host must execute.
+package.targets.append(
+    .testTarget(
+        name: "VMLXCPUKernelTests",
+        dependencies: ["MLX", "CmlxCPUShim"],
+        path: "Tests/VMLXCPUKernelTests"
+    )
+)
+
 // MARK: - Linux profile
 
 #if os(Linux)
@@ -1201,7 +1214,7 @@ package.targets.append(
     if Context.environment["VMLX_LINUX_PROFILE"] != "0" {
         let roots = [
             "MLXEmbedders", "MLXLLM", "MLXVLM", "MLXHuggingFace", "VMLXTokenizers", "MLXFFT",
-            "MLXLinalg", "CSQLite3Linux", "VMLXLinuxTests",
+            "MLXLinalg", "CSQLite3Linux", "VMLXLinuxTests", "VMLXCPUKernelTests",
         ]
         let targetsByName = Dictionary(
             package.targets.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
