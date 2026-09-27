@@ -650,6 +650,15 @@ let package = Package(
             ]
         ),
         .target(
+            name: "CmlxCPUShim",
+            dependencies: ["Cmlx"],
+            path: "Libraries/CmlxCPUShim",
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .headerSearchPath("../../Source/Cmlx/mlx")
+            ] + highwayDefines
+        ),
+        .target(
             name: "MLXDistributedTP",
             dependencies: [
                 "MLXDistributedCore",
