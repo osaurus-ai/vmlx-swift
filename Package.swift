@@ -66,9 +66,26 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/cpu/gemms/bnns.cpp",  // macOS Accelerate version
         "mlx-conditional",
         "mlx-c/mlx/c/metal.cpp",
+        // ml-explore/mlx#3019's per-target dispatch shims, which only MSVC builds.
+        "mlx/mlx/backend/cpu/norms_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/quantized_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/rope_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/sdpa_highway_dispatch.cpp",
     ]
 
-    let cxxSettings: [CXXSetting] = []
+    // Google Highway SIMD kernels in the CPU backend (T-167 phase 2), on x86-64 for now. In a
+    // manifest, #if arch tests the host, which is the target in a native build.
+    // VMLX_HWY_ALL_TARGETS=1 compiles every attainable target, EMU128 included, for the kernel tests.
+    #if arch(x86_64)
+        let highwayDefines: [CXXSetting] =
+            [.define("MLX_USE_HIGHWAY_KERNELS"), .define("HWY_DISABLE_PCLMUL_AES")]
+            + (Context.environment["VMLX_HWY_ALL_TARGETS"] == "1"
+                ? [.define("HWY_COMPILE_ALL_ATTAINABLE")] : [])
+    #else
+        let highwayDefines: [CXXSetting] = []
+    #endif
+
+    let cxxSettings: [CXXSetting] = [.headerSearchPath("highway")] + highwayDefines
 
     let linkerSettings: [LinkerSetting] = [
         .linkedLibrary("gfortran", .when(platforms: [.linux])),
@@ -94,6 +111,25 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         // bnns instead of simd (accelerate)
         "mlx/mlx/backend/cpu/gemms/simd_fp16.cpp",
         "mlx/mlx/backend/cpu/gemms/simd_bf16.cpp",
+
+        // The CPU backend's Highway kernels (T-167 phase 2) are Linux-only, and so is the
+        // Highway runtime.
+        "highway-runtime",
+        "mlx/mlx/backend/cpu/highway_info.cpp",
+        "mlx/mlx/backend/cpu/norms.cpp",
+        "mlx/mlx/backend/cpu/norms_highway.cpp",
+        "mlx/mlx/backend/cpu/norms_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/precision.cpp",
+        "mlx/mlx/backend/cpu/quantized_highway.cpp",
+        "mlx/mlx/backend/cpu/quantized_highway_backend.cpp",
+        "mlx/mlx/backend/cpu/quantized_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/rope.cpp",
+        "mlx/mlx/backend/cpu/rope_highway.cpp",
+        "mlx/mlx/backend/cpu/rope_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/sdpa.cpp",
+        "mlx/mlx/backend/cpu/sdpa_highway.cpp",
+        "mlx/mlx/backend/cpu/sdpa_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/threading",
     ]
 
     let cxxSettings: [CXXSetting] = [
@@ -105,6 +141,8 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         .define("SWIFTPM_BUNDLE", to: "\"mlx-swift_Cmlx\""),
         .define("METAL_PATH", to: "\"default.metallib\""),
     ]
+
+    let highwayDefines: [CXXSetting] = []
 
     let linkerSettings: [LinkerSetting] = [
         .linkedFramework("Foundation"),

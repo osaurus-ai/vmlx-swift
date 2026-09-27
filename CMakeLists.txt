@@ -38,6 +38,11 @@ FetchContent_Declare(
 FetchContent_Declare(
   mlx-c
   SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx-c")
+# ml-explore/mlx#3019's Highway kernels take Google Highway from this submodule
+# instead of fetching it at build time.
+set(MLX_HIGHWAY_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/highway"
+    CACHE PATH "Google Highway sources")
 FetchContent_MakeAvailable(mlx-c)
 
 # swift-numerics
