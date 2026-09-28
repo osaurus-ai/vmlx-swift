@@ -263,5 +263,133 @@
                     "non-contiguous activations")
             }
         }
+
+        /// x·w and |x|·|w| in Double, for row-major x of shape [rows, k] and w of shape [k, n], or
+        /// [n, k] when `transposed`.
+        static func hostProduct(
+            _ x: [Double], _ w: [Double], rows: Int, k: Int, n: Int, transposed: Bool
+        ) -> (value: [Double], magnitude: [Double]) {
+            var value = [Double](repeating: 0, count: rows * n)
+            var magnitude = value
+            for r in 0 ..< rows {
+                for c in 0 ..< n {
+                    var (sum, size) = (0.0, 0.0)
+                    for i in 0 ..< k {
+                        let product = x[r * k + i] * (transposed ? w[c * k + i] : w[i * n + c])
+                        sum += product
+                        size += abs(product)
+                    }
+                    value[r * n + c] = sum
+                    magnitude[r * n + c] = size
+                }
+            }
+            return (value, magnitude)
+        }
+
+        /// Untransposed weights, x·w with w of shape [K, N], quantized along N. #3019 keeps MLX's
+        /// scalar _qmm for them, which adds x_k·(s·q + b) along each row of w. On exact data
+        /// (`exactAffine`, its groups along N), with K = 256, every product and partial sum is
+        /// exact in float32, so the result must match float64 bit for bit.
+        @Test(arguments: [2, 4, 8])
+        func untransposedAffineOnExactDataIsExact(bits: Int) throws {
+            try KernelLock.run {
+                let (k, n, groupSize) = (256, 512, 64)
+                let wValues = Self.exactAffine(
+                    n: k, k: n, groupSize: groupSize, bits: bits, seed: UInt64(bits + 60))
+                let (wq, scales, biases) = quantized(
+                    MLXArray(wValues, [k, n]), groupSize: groupSize, bits: bits)
+                let w = hostDequantized(
+                    wq, scales: scales, biases: biases, groupSize: groupSize, bits: bits)
+                try #require(
+                    w == wValues.map(Double.init), "the constructed weights must quantize exactly")
+                for rows in [1, 5, 33] {
+                    var random = SeededRandom(seed: UInt64(rows + 60))
+                    let xValues = (0 ..< rows * k).map { _ in Float(Int(random.next() % 17) - 8) }
+                    let exact = Self.hostProduct(
+                        xValues.map(Double.init), w, rows: rows, k: k, n: n, transposed: false
+                    ).value
+                    vmlx_cpu_reset_counters()
+                    let y = quantizedMM(
+                        MLXArray(xValues, [rows, k]), wq, scales: scales, biases: biases,
+                        transpose: false, groupSize: groupSize, bits: bits)
+                    expectIdentical(y, exact, "bits \(bits) rows \(rows)")
+                    #expect(
+                        vmlx_cpu_highway_calls(VMLX_CPU_FAMILY_QMM_AFFINE_DEQUANT) == 0
+                            && vmlx_cpu_highway_calls(VMLX_CPU_FAMILY_QMM_AFFINE_INT8) == 0,
+                        "a dispatched affine kernel ran for untransposed weights")
+                }
+            }
+        }
+
+        /// mxfp4, nvfp4 and mxfp8 weights, untransposed: #3019 keeps MLX's scalar fp_qmm for them,
+        /// which adds (x_k·scale)·ŵ in float32 in K steps. That errs by at most about
+        /// (K + 2)·u·Σ|x·ŵ| (u = ε/2), which (K + 2)·ε·Σ|x·ŵ| covers twice. float32 only: fp_qmm
+        /// accumulates bf16 and fp16 in the dtype, on every build. The weights are dequantized on
+        /// the host.
+        @Test(arguments: floatingPointModes)
+        func untransposedFloatingPointModesWithinTheFloat32Bound(
+            mode: (QuantizationMode, Int, Int)
+        ) {
+            KernelLock.run {
+                let (qmode, groupSize, bits) = mode
+                let (k, n) = (256, 512)
+                let w = MLXRandom.normal([k, n], dtype: .float32, key: MLXRandom.key(61))
+                let (wq, scales, _) = quantized(w, groupSize: groupSize, bits: bits, mode: qmode)
+                let wHat = hostDequantized(
+                    wq, scales: scales, biases: nil, groupSize: groupSize, bits: bits, mode: qmode)
+                for rows in [1, 5, 33] {
+                    let x = MLXRandom.normal(
+                        [rows, k], dtype: .float32, key: MLXRandom.key(UInt64(rows + 61)))
+                    let reference = sumBound(
+                        Self.hostProduct(
+                            doubles(x), wHat, rows: rows, k: k, n: n, transposed: false),
+                        c: Double(k + 2), dtype: .float32)
+                    vmlx_cpu_reset_counters()
+                    let y = quantizedMM(
+                        x, wq, scales: scales, biases: nil, transpose: false,
+                        groupSize: groupSize, bits: bits, mode: qmode)
+                    expectWithin(y, reference, "\(qmode) rows \(rows)")
+                    if Highway.enabled {
+                        // The family's undispatched fallback, and counted as such.
+                        #expect(vmlx_cpu_fallback_calls(VMLX_CPU_FAMILY_QMM_FP) > 0)
+                        #expect(vmlx_cpu_highway_calls(VMLX_CPU_FAMILY_QMM_FP) == 0)
+                    }
+                }
+            }
+        }
+
+        /// 2-bit weights from 32 rows on. #3019 dequantizes them to float32 with its scalar
+        /// dequantizer, since the dispatched one serves 4 and 8 bits, and multiplies with SGEMM,
+        /// which it splits by rows across the pool; with N = 128 it splits the dequantization too.
+        /// On exact data (`exactAffine`), with K = 1024, the result must match float64 bit for bit.
+        @Test(arguments: [32, 64, 128])
+        func twoBitAffineFromThirtyTwoRowsIsExact(groupSize: Int) throws {
+            try KernelLock.run {
+                let (n, k, bits) = (128, 1024, 2)
+                let wValues = Self.exactAffine(
+                    n: n, k: k, groupSize: groupSize, bits: bits, seed: UInt64(groupSize + 70))
+                let (wq, scales, biases) = quantized(
+                    MLXArray(wValues, [n, k]), groupSize: groupSize, bits: bits)
+                let w = hostDequantized(
+                    wq, scales: scales, biases: biases, groupSize: groupSize, bits: bits)
+                try #require(
+                    w == wValues.map(Double.init), "the constructed weights must quantize exactly")
+                for rows in [32, 33, 64] {
+                    var random = SeededRandom(seed: UInt64(rows + 70))
+                    let xValues = (0 ..< rows * k).map { _ in Float(Int(random.next() % 17) - 8) }
+                    let exact = Self.hostProduct(
+                        xValues.map(Double.init), w, rows: rows, k: k, n: n, transposed: true
+                    ).value
+                    vmlx_cpu_reset_counters()
+                    let y = quantizedMM(
+                        MLXArray(xValues, [rows, k]), wq, scales: scales, biases: biases,
+                        transpose: true, groupSize: groupSize, bits: bits)
+                    expectIdentical(y, exact, "group \(groupSize) rows \(rows)")
+                    #expect(
+                        vmlx_cpu_highway_calls(VMLX_CPU_FAMILY_QMM_AFFINE_DEQUANT) == 0,
+                        "the dispatched dequantizer ran for 2 bits")
+                }
+            }
+        }
     }
 #endif
