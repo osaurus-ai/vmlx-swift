@@ -148,8 +148,9 @@
         }
 
         /// bf16 and fp16 activations with scales and biases in the same dtype. #3019 accumulates in
-        /// float32 and rounds the output once; the scalar code accumulates in the dtype (the chunk
-        /// header), so this runs on Highway builds only.
+        /// float32 and rounds the output once. MLX's scalar code accumulates in the dtype itself,
+        /// rounding after every operation, which the float32 bound does not admit: upstream's
+        /// behaviour. So this runs on Highway builds only.
         @Test(
             .disabled(
                 if: !Highway.enabled, "the scalar code accumulates bf16 and fp16 in the dtype"),
@@ -180,12 +181,14 @@
             }
         }
 
-        /// The int8 path (Highway builds only) runs only when switched on (spec §3.5). One row, affine
-        /// 4-bit, group 64, K 256 meets every other condition of it. Switched on, it must leave the
-        /// float32 bound, which shows that it ran, and stay within its own: rounding activations to
-        /// int8 per group moves each by at most max|x_g|/254, and #3019 multiplies that displacement by
-        /// s·q (the bias goes on the unrounded group sum), which |s|·q + |b| bounds. Spec §4 measures
-        /// int8 and reports it rather than gating it; this bound only has to hold for a correct kernel.
+        /// The int8 path (Highway builds only) runs only when switched on, by the environment's
+        /// MLX_CPU_QUANTIZED_INT8 or by vmlx_cpu_set_quantized_int8; it is off by default. One row,
+        /// affine 4-bit, group 64, K 256 meets every other condition of it. Switched on, it must
+        /// leave the float32 bound, which shows that it ran, and stay within its own: rounding
+        /// activations to int8 per group moves each by at most max|x_g|/254, and #3019 multiplies
+        /// that displacement by s·q (the bias goes on the unrounded group sum), which |s|·q + |b|
+        /// bounds. The switch trades accuracy for speed, so no accuracy target gates it; this bound
+        /// only has to hold for a correct kernel.
         @Test(
             .disabled(if: !Highway.enabled, "only builds with Highway kernels have the int8 path"))
         func int8ActivationsOnlyWhenSwitchedOn() {

@@ -11,7 +11,7 @@
         /// softmax(x)_i = exp(x_i - max)/Σ_j exp(x_j - max). Each exponential errs by at most
         /// k_exp·ε relative, plus its argument's rounding (range·ε); the sum by (n - 1)·u; the
         /// normalisation by 2u. So |p̂_i - p_i| <= (2·k_exp + n + 2 + range)·ε·p_i. k_exp is measured in
-        /// units with an absolute floor (Task 24), but MLX's exp scales an exact 2^ipart, so its error
+        /// units with an absolute floor, but MLX's exp scales an exact 2^ipart, so its error
         /// is relative throughout. MLX's exp is 0 below about -87.68, which adds at most 1e-38. For bf16
         /// and fp16 (computed in float32, `precise`), one unit of the dtype more.
         static func softmax(_ row: ArraySlice<Double>, kExp: Double, dtype: DType) -> [(

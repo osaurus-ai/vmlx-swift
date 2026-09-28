@@ -8,9 +8,10 @@
     import Testing
 
     @Suite(.serialized) struct GemmTests {
-        /// fp32 GEMMs on both sides of #3019's row split (M >= 16 and M*N*K >= 65536) and of Task 19's
-        /// column split below it, which needs at least two 64-column slices (N/64 >= 2), in all four
-        /// transpose combinations. Where the column split applies it must happen, and nowhere else.
+        /// fp32 GEMMs on both sides of #3019's row split (M >= 16 and M*N*K >= 65536) and of the
+        /// column split the CPU backend makes below it, which needs at least two 64-column slices
+        /// (N/64 >= 2), in all four transpose combinations. Where the column split applies it must
+        /// happen, and nowhere else.
         @Test(arguments: [1, 3, 8, 15, 16, 17, 64])
         func float32WithinTheBound(rows: Int) {
             KernelLock.run {

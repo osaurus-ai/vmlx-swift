@@ -73,7 +73,7 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/cpu/sdpa_highway_dispatch.cpp",
     ]
 
-    // Google Highway SIMD kernels in the CPU backend (T-167 phase 2), on x86-64 for now. In a
+    // Google Highway SIMD kernels in the CPU backend, on x86-64 for now. In a
     // manifest, #if arch tests the host, which is the target in a native build.
     // VMLX_HWY_ALL_TARGETS=1 compiles every attainable target, EMU128 included, for the kernel tests.
     #if arch(x86_64)
@@ -112,8 +112,7 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/cpu/gemms/simd_fp16.cpp",
         "mlx/mlx/backend/cpu/gemms/simd_bf16.cpp",
 
-        // The CPU backend's Highway kernels (T-167 phase 2) are Linux-only, and so is the
-        // Highway runtime.
+        // The CPU backend's Highway kernels are Linux-only, and so is the Highway runtime.
         "highway-runtime",
         "mlx/mlx/backend/cpu/highway_info.cpp",
         "mlx/mlx/backend/cpu/norms.cpp",
@@ -1169,7 +1168,7 @@ package.targets.append(
 
 // MARK: - VMLXCPUKernelTests
 
-// The CPU backend's kernels (T-167 phase 2) against references computed on the host in Double,
+// The CPU backend's kernels against references computed on the host in Double,
 // with two exceptions: the quantized matmul's bound takes MLX's float64 matmul, and the functions
 // MLX takes from libm are compared with glibc's own. Declared on every platform, and before the
 // Linux profile, which must find it; its sources compile only on Linux.

@@ -95,7 +95,7 @@ if [ -z "$EXPECT" ]; then
     # Highway 1.4.0 marks AVX10_2 broken below Clang 23 (hwy/detect_targets.h), so Swift 6.4's
     # Clang 21 attains the rest. Add AVX10_2 when the toolchain's Clang reaches 23.
     x86_64) ATTAINABLE="AVX3_SPR AVX3_ZEN4 AVX3_DL AVX3 AVX2 SSE4 SSSE3 SSE2" ;;
-    *) ATTAINABLE="" ;; # arm64 arrives with plan 2
+    *) ATTAINABLE="" ;; # no Highway kernels off x86-64 yet
   esac
   if [ -n "$ATTAINABLE" ]; then
     H="$ROOT/Source/Cmlx/highway"

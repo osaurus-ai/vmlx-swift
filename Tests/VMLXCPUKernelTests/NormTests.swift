@@ -167,7 +167,7 @@
         }
 
         /// Rows that are not contiguous (a transposed view), and float64, which #3019's kernels do not
-        /// handle: Task 17 hands it to MLX's fallback, which computes in float32, and counts that.
+        /// handle: MLX's fallback computes it in float32, and the counters count that.
         @Test func viewsAndFloat64() {
             KernelLock.run {
                 let n = 128

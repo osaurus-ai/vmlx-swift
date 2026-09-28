@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 #if os(Linux)
-    /// The largest error, in units (see `unitsError`), of each of MLX's polynomial functions on the
-    /// scalar CPU code of osaurus-ai/mlx 866e78697 (arm64, no Highway), measured by plan 1's Task 24. A
-    /// Highway build may exceed it by 2 units, and no more.
+    /// The largest error, in units (see `unitsError`), of each of MLX's polynomial functions on its
+    /// scalar CPU code, measured on arm64, which has no Highway kernels. A Highway build may exceed
+    /// it by 2 units, and no more. To measure it again, on a build without Highway kernels, run
+    /// `VMLX_ULP_BASELINE=1 swift test -c release -Xswiftc -enable-testing --filter
+    /// PolynomialAccuracyTests`: each test prints `ULP_BASELINE <name> <units>` and fails, since
+    /// it judges nothing. scripts/run-cpu-kernel-tests.sh unsets the variable.
     enum ULPBaseline {
         static let units: [String: Double] = [
             "exp": 62.385592963546515,

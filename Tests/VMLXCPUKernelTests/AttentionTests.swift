@@ -60,7 +60,7 @@
             }
         }
 
-        /// One case per kernel path, for runs under an emulator (Task 31's SDE job), where the sweep
+        /// One case per kernel path, for runs under an emulator (Intel SDE, in CI), where the sweep
         /// across every target would take hours.
         static let eachPath: [Case] = [
             Case(kvHeads: 2, queries: 1, keys: 200, headDim: 128),
@@ -226,8 +226,8 @@
             try Self.check(c)
         }
 
-        /// What #3019's kernel does not handle goes to MLX's fallback (Tasks 15 and 17) and is right
-        /// there: a value head dim unlike the query's (MLA), head dims over 256, and float64.
+        /// What #3019's kernel does not handle goes to MLX's fallback and is right there:
+        /// a value head dim unlike the query's (MLA), head dims over 256, and float64.
         @Test(arguments: [
             Case(headDim: 192, valueDim: 128), Case(headDim: 128, valueDim: 192),
             Case(queries: 1, headDim: 320), Case(headDim: 320), Case(dtype: .float64),

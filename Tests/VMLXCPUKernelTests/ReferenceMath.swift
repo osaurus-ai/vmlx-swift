@@ -83,7 +83,8 @@
         -> Double
     {
         try #require(
-            ULPBaseline.units[name], "no baseline for \(name): Task 24 measures it",
+            ULPBaseline.units[name],
+            "no baseline for \(name): measure one with VMLX_ULP_BASELINE=1 (see ULPBaseline)",
             sourceLocation: sourceLocation) + 2
     }
 

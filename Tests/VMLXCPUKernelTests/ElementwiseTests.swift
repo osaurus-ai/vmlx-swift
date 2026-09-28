@@ -461,8 +461,9 @@
             expectWithin(apply(x), expected, "\(name) \(dtype)")
         }
 
-        /// MLX's polynomials in bf16 and fp16: the float32 result's error (Task 24's baseline plus 2
-        /// units, in units of the float32 result) plus one unit of the dtype for the final rounding.
+        /// MLX's polynomials in bf16 and fp16: the float32 result's error (`polynomialUnits`, the
+        /// scalar code's measured error plus 2 units, in units of the float32 result) plus one unit
+        /// of the dtype for the final rounding.
         @Test(arguments: [DType.bfloat16, .float16])
         func polynomialsInHalfPrecision(dtype: DType) throws {
             try KernelLock.run {

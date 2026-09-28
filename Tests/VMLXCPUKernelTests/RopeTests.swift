@@ -24,8 +24,8 @@
         }
 
         /// Positions stay at or below 200, so every angle lies in the range the sin and cos baselines
-        /// were measured on (Task 24). A rotated half of 10 (dims 20) leaves a tail at 4, 8 and 16
-        /// lanes; the others are multiples of 16.
+        /// were measured on, [-300, 300] (`polynomialCases`). A rotated half of 10 (dims 20) leaves
+        /// a tail at 4, 8 and 16 lanes; the others are multiples of 16.
         static let cases: [Case] = [
             Case(),
             Case(length: 33, offsets: [37]),

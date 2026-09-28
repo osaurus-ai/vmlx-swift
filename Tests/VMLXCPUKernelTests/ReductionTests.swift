@@ -119,8 +119,9 @@
             }
         }
 
-        /// #3019's contiguous reduction accumulates bf16 and fp16 in float32 (Task 15). The scalar code
-        /// accumulates in the dtype, where these sums stop at 256 and 2048: upstream's behaviour.
+        /// The Highway build's contiguous reduction accumulates bf16 and fp16 in float32, and adds
+        /// its threads' partial sums in float32 too. The scalar code accumulates in the dtype,
+        /// where these sums stop at 256 and 2048: upstream's behaviour.
         @Test(
             .disabled(
                 if: !Highway.enabled, "the scalar code accumulates bf16 and fp16 in the dtype"),
@@ -131,8 +132,8 @@
                 #expect(doubles(MLX.sum(ones)) == [4096], "\(dtype) sum of 4096 ones")
                 #expect(doubles(MLX.mean(ones)) == [1], "\(dtype) mean of 4096 ones")
                 if dtype == .bfloat16 {
-                    // Past MIN_TOTAL_ELEMENTS, on the pool: exactly 3, which thread partials rounded to
-                    // bf16 never give, for any pool of 2 to 64 threads (Task 15).
+                    // Past MIN_TOTAL_ELEMENTS, on the pool: exactly 3. Thread partials rounded to
+                    // bf16 give another sum: 0 with a pool of 8 threads, -8192 with 9 or 12.
                     let x = concatenated([
                         MLXArray.ones([(1 << 20) + 3], dtype: dtype),
                         MLXArray([Float(-1_048_576)]).asType(dtype),

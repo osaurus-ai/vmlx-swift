@@ -19,8 +19,8 @@
         var description: String { name }
     }
 
-    // MLX's exp maps x > 88 to +inf, before float32's true limit near 88.72: a known deviation,
-    // recorded in spec §4, and outside this grid.
+    // MLX's exp maps x > 88 to +inf, before float32's true limit near 88.72: MLX's own behaviour
+    // on every path, and outside this grid.
     let polynomialCases: [PolynomialCase] = [
         PolynomialCase(
             name: "exp",
@@ -72,7 +72,8 @@
                 return
             }
             let baseline = try #require(
-                ULPBaseline.units[name], "no baseline for \(name): Task 24 measures it")
+                ULPBaseline.units[name],
+                "no baseline for \(name): measure one with VMLX_ULP_BASELINE=1 (see ULPBaseline)")
             #expect(
                 measured <= baseline + 2,
                 "\(name): \(measured) units against a baseline of \(baseline), \(worst)")
