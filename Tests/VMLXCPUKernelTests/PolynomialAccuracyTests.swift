@@ -56,10 +56,14 @@
             ProcessInfo.processInfo.environment["VMLX_ULP_BASELINE"] == "1"
         }
 
+        /// Judges `measured` against the baseline. Measuring mode only prints it, and records an issue,
+        /// so that a measuring run can never pass for a judged one.
         static func judge(_ name: String, _ measured: Double, worst: String) throws {
             if measuring {
                 print("ULP_BASELINE \(name) \(measured)")
                 print("  worst \(worst)")
+                Issue.record(
+                    "VMLX_ULP_BASELINE=1 measures \(name) (\(measured) units), and judges nothing")
                 return
             }
             let baseline = try #require(
