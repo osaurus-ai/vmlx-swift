@@ -48,14 +48,31 @@ enum SwitchGLUActivationFixture {
             let output = routed(input, indices, preDownScores: scored ? scores : nil)
             let actual = output.asArray(Float.self)
             XCTAssertEqual(output.shape, [1, tokens, 2, 64], file: file, line: line)
-            for route in 0 ..< (tokens * 2) {
-                for column in 0 ..< 64 {
-                    let value: Float = column % 2 == 0 ? -2 : 3
-                    let score: Float = route % 2 == 0 ? 0.25 : 0.75
-                    XCTAssertEqual(
-                        actual[route * 64 + column], expected(value, score), accuracy: 0.0002,
-                        "quantized=\(quantized) tokens=\(tokens) route=\(route) column=\(column)",
-                        file: file, line: line)
+            // Compute the activation independently, then let the actual down
+            // projection apply its native sorted/TF32 precision. This oracle does
+            // not reuse the production activation or change its strict tolerance.
+            let scalarRows = (0 ..< tokens * 2 * 64).map { index -> Float in
+                let route = index / 64, column = index % 64
+                let value: Float = column % 2 == 0 ? -2 : 3
+                let score: Float = route % 2 == 0 ? 0.25 : 0.75
+                return expected(value, score)
+            }
+            let activated = MLXArray(scalarRows, [tokens * 2, 1, 64])
+            let oracleOutput: MLXArray
+            if indices.size >= 64 {
+                let order = argSort(indices.flattened())
+                let down = routed.downProj(activated[order], indices.flattened()[order], sortedIndices: true)
+                oracleOutput = scatterUnsort(x: down, invOrder: argSort(order), shape: indices.shape).squeezed(axis: -2)
+            } else {
+                oracleOutput = routed.downProj(activated.reshaped([1, tokens, 2, 1, 64]), indices).squeezed(axis: -2)
+            }
+            let expectedRows = oracleOutput.asArray(Float.self)
+            for index in actual.indices {
+                XCTAssertEqual(actual[index], expectedRows[index], accuracy: 0.0002,
+                               "native down quantized=\(quantized) tokens=\(tokens) index=\(index)", file: file, line: line)
+                if tokens == 1 || ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0" {
+                    XCTAssertEqual(actual[index], scalarRows[index], accuracy: 0.0002,
+                                   "scalar quantized=\(quantized) tokens=\(tokens) index=\(index)", file: file, line: line)
                 }
             }
         }
