@@ -206,5 +206,59 @@
                 }
             }
         }
+
+        /// A float16 array's elements, read as their bits and decoded on the host, as a float64
+        /// array: no MLX conversion between the kernel's output and the comparison.
+        static func decodedHalf(_ array: MLXArray) -> MLXArray {
+            let bits = array.view(dtype: .uint16).asArray(UInt16.self)
+            return MLXArray(bits.map { Double(Float16(bitPattern: $0)) }, array.shape)
+        }
+
+        /// float16 infinities and NaN through the kernels' own float16 loads, on every target.
+        /// Without F16C (SSE4, SSSE3 and SSE2) Highway converts float16 in software, and its
+        /// conversion takes exponent 31 for a finite number (inf for 65536), which gives finite
+        /// results here. With an infinity in a row the sum of squares is infinite and RMSNorm's
+        /// scale 0: NaN at the infinity and elsewhere a zero with the sign of x·w, as in float64. A
+        /// NaN makes its row NaN, and so does either in LayerNorm, whose mean it enters. The inputs
+        /// are made from their bits, and the outputs compared bit for bit.
+        @Test func float16InfinityAndNaNThroughTheKernelLoads() {
+            KernelLock.run {
+                let n = 96  // whole vectors at 4, 8 and 16 lanes, and no scalar tail
+                let specials: [[(lane: Int, bits: UInt16)]] = [
+                    [(5, 0x7C00)], [(50, 0xFC00)], [(90, 0x7E00)], [(33, 0x7C01)],
+                    [(0, 0xFC00), (95, 0x7C00)],
+                ]
+                var random = SeededRandom(seed: 81)
+                var xBits = random.floats(specials.count * n, -3, 3).map { Float16($0).bitPattern }
+                for (row, lanes) in specials.enumerated() {
+                    for (lane, bits) in lanes { xBits[row * n + lane] = bits }
+                }
+                let wBits = random.floats(n, -1.5, 1.5).map { Float16($0).bitPattern }
+                let bBits = random.floats(n, -0.2, 0.2).map { Float16($0).bitPattern }
+                func half(_ bits: [UInt16], _ shape: [Int]) -> MLXArray {
+                    MLXArray(bits, shape).view(dtype: .float16)
+                }
+                func values(_ bits: [UInt16]) -> [Double] {
+                    bits.map { Double(Float16(bitPattern: $0)) }
+                }
+                let x = half(xBits, [specials.count, n])
+                let (w, b) = (half(wBits, [n]), half(bBits, [n]))
+                let (xs, ws, bs) = (values(xBits), values(wBits), values(bBits))
+                let rms = Self.rows(xs, width: n) { Self.rmsNorm($0, ws, dtype: .float16) }
+                let layer = Self.rows(xs, width: n) {
+                    Self.layerNorm($0, ws, bs, dtype: .float16, exactMean: false)
+                }
+                forEachTarget(VMLX_CPU_FAMILY_RMS_NORM) { target in
+                    expectIdentical(
+                        Self.decodedHalf(MLXFast.rmsNorm(x, weight: w, eps: Self.eps)),
+                        rms.map { $0.value }, "float16 rms_norm on \(target)")
+                }
+                forEachTarget(VMLX_CPU_FAMILY_LAYER_NORM) { target in
+                    expectIdentical(
+                        Self.decodedHalf(MLXFast.layerNorm(x, weight: w, bias: b, eps: Self.eps)),
+                        layer.map { $0.value }, "float16 layer_norm on \(target)")
+                }
+            }
+        }
     }
 #endif
