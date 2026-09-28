@@ -444,6 +444,21 @@
             }
         }
 
+        /// One polynomial function in bf16 or fp16 on `domain`, against `truth` and the bound of
+        /// `polynomialsInHalfPrecision`.
+        static func checkInHalfPrecision(
+            _ name: String, _ domain: ClosedRange<Double>, _ apply: (MLXArray) -> MLXArray,
+            _ truth: (Double) -> Double, dtype: DType
+        ) throws {
+            let k = try polynomialUnits(name)
+            let (x, xs) = materialize(spread(domain, seed: 76), dtype)
+            let expected = xs.map { v -> (value: Double, bound: Double) in
+                let t = truth(v)
+                return (t, k * max(Double(Float(t).ulp), 0x1p-33) + ulp(t, in: dtype))
+            }
+            expectWithin(apply(x), expected, "\(name) \(dtype)")
+        }
+
         /// MLX's polynomials in bf16 and fp16: the float32 result's error (Task 24's baseline plus 2
         /// units, in units of the float32 result) plus one unit of the dtype for the final rounding.
         @Test(arguments: [DType.bfloat16, .float16])
@@ -455,23 +470,25 @@
                         ("sin", -300 ... 300, { MLX.sin($0) }, { Foundation.sin($0) }),
                         ("cos", -300 ... 300, { MLX.cos($0) }, { Foundation.cos($0) }),
                         ("erf", -5 ... 5, { MLX.erf($0) }, { Foundation.erf($0) }),
-                        (
-                            "sigmoid", -30 ... 30, { MLX.sigmoid($0) },
-                            { 1 / (1 + Foundation.exp(-$0)) }
-                        ),
                     ]
                 for (name, domain, apply, truth) in cases {
-                    if name == "sigmoid" && !Highway.enabled {
-                        continue  // the scalar code's half-precision sigmoid: the task's preamble
-                    }
-                    let k = try polynomialUnits(name)
-                    let (x, xs) = materialize(spread(domain, seed: 76), dtype)
-                    let expected = xs.map { v -> (value: Double, bound: Double) in
-                        let t = truth(v)
-                        return (t, k * max(Double(Float(t).ulp), 0x1p-33) + ulp(t, in: dtype))
-                    }
-                    expectWithin(apply(x), expected, "\(name) \(dtype)")
+                    try Self.checkInHalfPrecision(name, domain, apply, truth, dtype: dtype)
                 }
+            }
+        }
+
+        /// sigmoid, as `polynomialsInHalfPrecision`.
+        @Test(
+            .disabled(
+                if: !Highway.enabled,
+                "the scalar code rounds exp(|x|) to the dtype, which overflows fp16 below x = -11.09"
+            ),
+            arguments: [DType.bfloat16, .float16])
+        func sigmoidInHalfPrecision(dtype: DType) throws {
+            try KernelLock.run {
+                try Self.checkInHalfPrecision(
+                    "sigmoid", -30 ... 30, { MLX.sigmoid($0) }, { 1 / (1 + Foundation.exp(-$0)) },
+                    dtype: dtype)
             }
         }
     }

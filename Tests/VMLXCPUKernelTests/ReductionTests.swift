@@ -121,10 +121,12 @@
 
         /// #3019's contiguous reduction accumulates bf16 and fp16 in float32 (Task 15). The scalar code
         /// accumulates in the dtype, where these sums stop at 256 and 2048: upstream's behaviour.
-        @Test(arguments: [DType.bfloat16, .float16])
+        @Test(
+            .disabled(
+                if: !Highway.enabled, "the scalar code accumulates bf16 and fp16 in the dtype"),
+            arguments: [DType.bfloat16, .float16])
         func halfPrecisionSumsAccumulateInFloat(dtype: DType) {
             KernelLock.run {
-                guard Highway.enabled else { return }
                 let ones = MLXArray.ones([4096], dtype: dtype)
                 #expect(doubles(MLX.sum(ones)) == [4096], "\(dtype) sum of 4096 ones")
                 #expect(doubles(MLX.mean(ones)) == [1], "\(dtype) mean of 4096 ones")

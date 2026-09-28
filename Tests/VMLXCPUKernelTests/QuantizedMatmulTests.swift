@@ -101,53 +101,63 @@
             }
         }
 
+        static let floatingPointModes = [
+            (QuantizationMode.mxfp4, 32, 4), (.nvfp4, 16, 4), (.mxfp8, 32, 8),
+        ]
+
         /// mxfp4, nvfp4 and mxfp8, whose kernels #3019 dispatches at every M, for each activation dtype
         /// they accept. Their weights carry no bias, so Σ|x·ŵ| is the magnitude of the terms. bf16 and
         /// fp16 run on Highway builds only: the scalar fp_qmm_t accumulates in the dtype.
-        @Test(
-            arguments: [(QuantizationMode.mxfp4, 32, 4), (.nvfp4, 16, 4), (.mxfp8, 32, 8)],
-            [
-                DType.float32, .bfloat16, .float16,
-            ])
-        func floatingPointModesWithinTheFloat32Bound(
-            mode: (QuantizationMode, Int, Int), dtype: DType
-        ) {
-            KernelLock.run {
-                let (qmode, groupSize, bits) = mode
-                guard dtype == .float32 || Highway.enabled else { return }
-                let k = 1024
-                let w = MLXRandom.normal([256, k], dtype: .float32, key: MLXRandom.key(9))
-                let (wq, scales, _) = quantized(w, groupSize: groupSize, bits: bits, mode: qmode)
-                let wHat = dequantized(
-                    wq, scales: scales, biases: nil, groupSize: groupSize, bits: bits, mode: qmode,
-                    dtype: .float32)
-                for rows in [1, 8, 32, 64] {
-                    let x = MLXRandom.normal(
-                        [rows, k], dtype: .float32, key: MLXRandom.key(UInt64(rows))
-                    )
-                    .asType(dtype)
-                    forEachTarget(VMLX_CPU_FAMILY_QMM_FP) { target in
-                        let y = quantizedMM(
-                            x, wq, scales: scales, biases: nil, transpose: true,
-                            groupSize: groupSize, bits: bits, mode: qmode)
-                        #expect(y.dtype == dtype)
-                        #expect(
-                            withinSumBound(y, x, wHat.transposed(), c: Double(k + 2)),
-                            "\(qmode) \(dtype) rows \(rows) on \(target)")
-                    }
+        static func checkFloatingPointMode(_ mode: (QuantizationMode, Int, Int), dtype: DType) {
+            let (qmode, groupSize, bits) = mode
+            let k = 1024
+            let w = MLXRandom.normal([256, k], dtype: .float32, key: MLXRandom.key(9))
+            let (wq, scales, _) = quantized(w, groupSize: groupSize, bits: bits, mode: qmode)
+            let wHat = dequantized(
+                wq, scales: scales, biases: nil, groupSize: groupSize, bits: bits, mode: qmode,
+                dtype: .float32)
+            for rows in [1, 8, 32, 64] {
+                let x = MLXRandom.normal(
+                    [rows, k], dtype: .float32, key: MLXRandom.key(UInt64(rows))
+                )
+                .asType(dtype)
+                forEachTarget(VMLX_CPU_FAMILY_QMM_FP) { target in
+                    let y = quantizedMM(
+                        x, wq, scales: scales, biases: nil, transpose: true,
+                        groupSize: groupSize, bits: bits, mode: qmode)
+                    #expect(y.dtype == dtype)
+                    #expect(
+                        withinSumBound(y, x, wHat.transposed(), c: Double(k + 2)),
+                        "\(qmode) \(dtype) rows \(rows) on \(target)")
                 }
             }
+        }
+
+        @Test(arguments: floatingPointModes)
+        func floatingPointModesWithinTheFloat32Bound(mode: (QuantizationMode, Int, Int)) {
+            KernelLock.run { Self.checkFloatingPointMode(mode, dtype: .float32) }
+        }
+
+        @Test(
+            .disabled(
+                if: !Highway.enabled, "the scalar fp_qmm_t accumulates bf16 and fp16 in the dtype"),
+            arguments: floatingPointModes, [DType.bfloat16, .float16])
+        func floatingPointModesWithHalfPrecisionActivations(
+            mode: (QuantizationMode, Int, Int), dtype: DType
+        ) {
+            KernelLock.run { Self.checkFloatingPointMode(mode, dtype: dtype) }
         }
 
         /// bf16 and fp16 activations with scales and biases in the same dtype. #3019 accumulates in
         /// float32 and rounds the output once; the scalar code accumulates in the dtype (the chunk
         /// header), so this runs on Highway builds only.
         @Test(
+            .disabled(
+                if: !Highway.enabled, "the scalar code accumulates bf16 and fp16 in the dtype"),
             arguments: [DType.bfloat16, .float16],
             [(4, 32), (4, 64), (4, 128), (8, 32), (8, 64), (8, 128)])
         func halfPrecisionActivations(dtype: DType, layout: (bits: Int, groupSize: Int)) {
             KernelLock.run {
-                guard Highway.enabled else { return }
                 let (bits, groupSize) = layout
                 let k = 1024
                 let w = MLXRandom.normal([128, k], dtype: .float32, key: MLXRandom.key(21)).asType(
@@ -177,9 +187,10 @@
         /// int8 per group moves each by at most max|x_g|/254, and #3019 multiplies that displacement by
         /// s·q (the bias goes on the unrounded group sum), which |s|·q + |b| bounds. Spec §4 measures
         /// int8 and reports it rather than gating it; this bound only has to hold for a correct kernel.
-        @Test func int8ActivationsOnlyWhenSwitchedOn() {
+        @Test(
+            .disabled(if: !Highway.enabled, "only builds with Highway kernels have the int8 path"))
+        func int8ActivationsOnlyWhenSwitchedOn() {
             KernelLock.run {
-                guard Highway.enabled else { return }
                 let (n, k, groupSize) = (64, 256, 64)
                 let w = MLXRandom.normal([n, k], dtype: .float32, key: MLXRandom.key(31))
                 let x = MLXRandom.normal([1, k], dtype: .float32, key: MLXRandom.key(32))
