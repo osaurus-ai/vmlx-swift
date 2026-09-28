@@ -6,24 +6,25 @@ import XCTest
 @testable import MLXLMCommon
 
 enum SwitchGLUActivationFixture {
-    static func projections(_ routed: SwitchGLU, quantized: Bool) {
+    static func projections(_ routed: SwitchGLU, quantized: Bool) throws {
         let weight = broadcast(MLXArray.eye(64), to: [2, 64, 64])
         func projection() -> SwitchLinear {
             let linear = SwitchLinear(inputDims: 64, outputDims: 64, numExperts: 2, weight: weight)
             return quantized
                 ? QuantizedSwitchLinear(linear, groupSize: 64, bits: 4, mode: .affine) : linear
         }
-        routed.gateProj = projection()
-        routed.upProj = projection()
-        routed.downProj = projection()
+        try routed.update(modules: ModuleChildren.unflattened([
+            ("gate_proj", projection() as Module), ("up_proj", projection() as Module),
+            ("down_proj", projection() as Module),
+        ]), verify: .all)
     }
 
     static func check(
         _ routed: SwitchGLU, quantized: Bool,
         scored: Bool = false, expected: (Float, Float) -> Float,
         file: StaticString = #filePath, line: UInt = #line
-    ) {
-        projections(routed, quantized: quantized)
+    ) throws {
+        try projections(routed, quantized: quantized)
         for tokens in [1, 32] {
             let values = (0 ..< (tokens * 64)).map { Float($0 % 2 == 0 ? -2 : 3) }
             let input = MLXArray(values, [1, tokens, 64])
@@ -53,34 +54,34 @@ enum SwitchGLUActivationFixture {
 }
 
 final class SwitchGLUCustomActivationTests: XCTestCase {
-    func testCustomActivationMatchingSiluAtOneIsPreserved() {
-        MLXMetalTestLock.withLock {
+    func testCustomActivationMatchingSiluAtOneIsPreserved() throws {
+        try MLXMetalTestLock.withLock {
             for quantized in [false, true] {
                 let routed = SwitchGLU(
                     inputDims: 64, hiddenDims: 64, numExperts: 2,
                     activation: { MLXNN.silu($0) + ($0 - 1) * ($0 - 1) })
-                SwitchGLUActivationFixture.check(routed, quantized: quantized) { x, _ in
+                try SwitchGLUActivationFixture.check(routed, quantized: quantized) { x, _ in
                     (SwitchGLUActivationFixture.silu(x) + (x - 1) * (x - 1)) * x
                 }
             }
         }
     }
 
-    func testCustomActivationMatchingGeluAtOneIsPreserved() {
-        MLXMetalTestLock.withLock {
+    func testCustomActivationMatchingGeluAtOneIsPreserved() throws {
+        try MLXMetalTestLock.withLock {
             for quantized in [false, true] {
                 let routed = SwitchGLU(
                     inputDims: 64, hiddenDims: 64, numExperts: 2,
                     activation: { safeGeluApproximate($0) + ($0 - 1) * ($0 - 1) })
-                SwitchGLUActivationFixture.check(routed, quantized: quantized) { x, _ in
+                try SwitchGLUActivationFixture.check(routed, quantized: quantized) { x, _ in
                     (SwitchGLUActivationFixture.gelu(x) + (x - 1) * (x - 1)) * x
                 }
             }
         }
     }
 
-    func testGlueAndScoredGluePrecedence() {
-        MLXMetalTestLock.withLock {
+    func testGlueAndScoredGluePrecedence() throws {
+        try MLXMetalTestLock.withLock {
             for quantized in [false, true] {
                 for scored in [false, true] {
                     let routed = SwitchGLU(
@@ -89,7 +90,7 @@ final class SwitchGLUCustomActivationTests: XCTestCase {
                         scoredGlue: { gate, up, scores in
                             gate - up + scores[.ellipsis, .newAxis, .newAxis] * 11
                         })
-                    SwitchGLUActivationFixture.check(routed, quantized: quantized, scored: scored) {
+                    try SwitchGLUActivationFixture.check(routed, quantized: quantized, scored: scored) {
                         x, score in
                         scored ? score * 11 : 2 * x + 7
                     }
