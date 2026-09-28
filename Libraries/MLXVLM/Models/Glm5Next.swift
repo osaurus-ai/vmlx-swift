@@ -1875,12 +1875,8 @@ public final class Glm5NextMoE: Module {
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
             numExperts: config.nRoutedExperts,
-            // `swiglu_limit` is 10.0 in this bundle, so the activation is CLAMPED. Plain silu would
-            // be wrong on the tail, silently — nothing about the shapes would object.
-            activation: { clip(silu($0), min: -config.swigluLimit!, max: config.swigluLimit!) },
-            // The SAME value that builds the eager activation above, so the fused decode kernel and
-            // the generic path cannot disagree about the clamp.
-            swigluLimit: config.swigluLimit)
+            // One typed two-input contract drives both eager and fused clamps.
+            activation: .swiGLU(limit: config.swigluLimit))
         _sharedExperts.wrappedValue = Glm5NextSharedExpert(config)
         super.init()
     }

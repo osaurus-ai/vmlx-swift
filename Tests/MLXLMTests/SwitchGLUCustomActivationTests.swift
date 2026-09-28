@@ -1,0 +1,145 @@
+import Foundation
+import MLX
+import MLXNN
+import XCTest
+
+@testable import MLXLMCommon
+
+enum SwitchGLUActivationFixture {
+    static func projections(_ routed: SwitchGLU, quantized: Bool) throws {
+        let weight = broadcast(MLXArray.eye(64), to: [2, 64, 64])
+        // An explicitly packed identity is exact: dequant(code) = code * 1 + 0.
+        // Quantizing eye() estimates group scales and slightly perturbs 1, which
+        // would make this activation-only regression measure quantization error.
+        var packedIdentity = [UInt32](repeating: 0, count: 2 * 64 * 8)
+        for expert in 0 ..< 2 {
+            for row in 0 ..< 64 {
+                packedIdentity[(expert * 64 + row) * 8 + row / 8] = UInt32(1) << (4 * (row % 8))
+            }
+        }
+        func projection() -> SwitchLinear {
+            if quantized {
+                return QuantizedSwitchLinear(
+                    inputDims: 64, outputDims: 64, numExperts: 2,
+                    weight: MLXArray(packedIdentity, [2, 64, 8]),
+                    scales: MLXArray.ones([2, 64, 1]), biases: MLXArray.zeros([2, 64, 1]),
+                    groupSize: 64, bits: 4, mode: .affine)
+            }
+            return SwitchLinear(inputDims: 64, outputDims: 64, numExperts: 2, weight: weight)
+        }
+        try routed.update(modules: ModuleChildren.unflattened([
+            ("gate_proj", projection() as Module), ("up_proj", projection() as Module),
+            ("down_proj", projection() as Module),
+        ]), verify: .all)
+    }
+
+    static func check(
+        _ routed: SwitchGLU, quantized: Bool,
+        scored: Bool = false, expected: (Float, Float) -> Float,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        try projections(routed, quantized: quantized)
+        for tokens in [1, 32] {
+            let values = (0 ..< (tokens * 64)).map { Float($0 % 2 == 0 ? -2 : 3) }
+            let input = MLXArray(values, [1, tokens, 64])
+            let indices = MLXArray((0 ..< (tokens * 2)).map { UInt32($0 % 2) }, [1, tokens, 2])
+            let scores = MLXArray(
+                (0 ..< (tokens * 2)).map { Float($0 % 2 == 0 ? 0.25 : 0.75) }, [1, tokens, 2])
+            let output = routed(input, indices, preDownScores: scored ? scores : nil)
+            let actual = output.asArray(Float.self)
+            XCTAssertEqual(output.shape, [1, tokens, 2, 64], file: file, line: line)
+            // Compute the activation independently, then let the actual down
+            // projection apply its native sorted/TF32 precision. This oracle does
+            // not reuse the production activation or change its strict tolerance.
+            let scalarRows = (0 ..< tokens * 2 * 64).map { index -> Float in
+                let route = index / 64, column = index % 64
+                let value: Float = column % 2 == 0 ? -2 : 3
+                let score: Float = route % 2 == 0 ? 0.25 : 0.75
+                return expected(value, score)
+            }
+            let activated = MLXArray(scalarRows, [tokens * 2, 1, 64])
+            let oracleOutput: MLXArray
+            if indices.size >= 64 {
+                let order = argSort(indices.flattened())
+                let down = routed.downProj(activated[order], indices.flattened()[order], sortedIndices: true)
+                oracleOutput = scatterUnsort(x: down, invOrder: argSort(order), shape: indices.shape).squeezed(axis: -2)
+            } else {
+                oracleOutput = routed.downProj(activated.reshaped([1, tokens, 2, 1, 64]), indices).squeezed(axis: -2)
+            }
+            let expectedRows = oracleOutput.asArray(Float.self)
+            for index in actual.indices {
+                XCTAssertEqual(actual[index], expectedRows[index], accuracy: 0.0002,
+                               "native down quantized=\(quantized) tokens=\(tokens) index=\(index)", file: file, line: line)
+                if tokens == 1 || ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0" {
+                    XCTAssertEqual(actual[index], scalarRows[index], accuracy: 0.0002,
+                                   "scalar quantized=\(quantized) tokens=\(tokens) index=\(index)", file: file, line: line)
+                }
+            }
+        }
+    }
+
+    static func silu(_ x: Float) -> Float { x / (1 + exp(-x)) }
+    static func gelu(_ x: Float) -> Float {
+        0.5 * x * (1 + tanh(sqrt(2 / Float.pi) * (x + 0.044715 * x * x * x)))
+    }
+}
+
+final class SwitchGLUCustomActivationTests: XCTestCase {
+    func testCustomActivationMatchingSiluAtOneIsPreserved() throws {
+        try MLXMetalTestLock.withLock {
+            for quantized in [false, true] {
+                let routed = SwitchGLU(
+                    inputDims: 64, hiddenDims: 64, numExperts: 2,
+                    activation: { MLXNN.silu($0) + ($0 - 1) * ($0 - 1) })
+                try SwitchGLUActivationFixture.check(routed, quantized: quantized) { x, _ in
+                    (SwitchGLUActivationFixture.silu(x) + (x - 1) * (x - 1)) * x
+                }
+            }
+        }
+    }
+
+    func testCustomActivationMatchingGeluAtOneIsPreserved() throws {
+        try MLXMetalTestLock.withLock {
+            for quantized in [false, true] {
+                let routed = SwitchGLU(
+                    inputDims: 64, hiddenDims: 64, numExperts: 2,
+                    activation: { safeGeluApproximate($0) + ($0 - 1) * ($0 - 1) })
+                try SwitchGLUActivationFixture.check(routed, quantized: quantized) { x, _ in
+                    (SwitchGLUActivationFixture.gelu(x) + (x - 1) * (x - 1)) * x
+                }
+            }
+        }
+    }
+
+    func testGlueAndScoredGluePrecedence() throws {
+        try MLXMetalTestLock.withLock {
+            for quantized in [false, true] {
+                for scored in [false, true] {
+                    let routed = SwitchGLU(
+                        inputDims: 64, hiddenDims: 64, numExperts: 2,
+                        activation: { $0 * 100 }, glue: { gate, up in gate + up + 7 },
+                        scoredGlue: { gate, up, scores in
+                            gate - up + scores[.ellipsis, .newAxis, .newAxis] * 11
+                        })
+                    try SwitchGLUActivationFixture.check(routed, quantized: quantized, scored: scored) {
+                        x, score in
+                        scored ? score * 11 : 2 * x + 7
+                    }
+                }
+            }
+        }
+    }
+
+    func testConstructorDoesNotExecuteCustomActivation() {
+        MLXMetalTestLock.withLock {
+            var calls = 0
+            _ = SwitchGLU(
+                inputDims: 64, hiddenDims: 64, numExperts: 2,
+                activation: { x in
+                    calls += 1
+                    return MLXNN.silu(x)
+                })
+            XCTAssertEqual(calls, 0)
+        }
+    }
+}

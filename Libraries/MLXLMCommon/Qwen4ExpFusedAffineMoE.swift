@@ -329,7 +329,8 @@ public enum Qwen4ExpFusedAffineMoE {
             && projection.biases?.dtype == metadataDType
     }
 
-    /// - Parameter swigluLimit: clamp applied to `silu(gate)` before the up-projection multiply,
+    /// - Parameter swigluLimit: upper bound on raw gate and symmetric bounds on raw up,
+    ///   applied before SiLU and multiplication,
     ///   for models that set one (GLM-5.3's `swiglu_limit` is 10.0). `nil` means unclamped, which is
     ///   what Qwen4-Exp and Ornith use and leaves their generated kernel unchanged.
     public static func makeReducer(
