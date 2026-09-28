@@ -160,12 +160,40 @@
         return all(abs(got.asType(.float64) - reference) .<= bound).item(Bool.self)
     }
 
-    /// The matmul bound: reference and magnitude from float64 matmuls of a and b.
+    /// a·b and |a|·|b| in Double, computed on the host, for a of shape [..., m, k] and b of shape
+    /// [..., k, n] with the same leading (batch) dimensions. MLX's own float64 matmul would share
+    /// the float32 path's partitioning in gemms/cblas.cpp.
+    func hostMatmul(_ a: MLXArray, _ b: MLXArray) -> (value: [Double], magnitude: [Double]) {
+        let (m, k, n) = (a.dim(-2), a.dim(-1), b.dim(-1))
+        precondition(
+            b.dim(-2) == k && Array(a.shape.dropLast(2)) == Array(b.shape.dropLast(2)),
+            "hostMatmul: \(a.shape) times \(b.shape)")
+        let (x, y) = (doubles(a), doubles(b))
+        var value = [Double](repeating: 0, count: x.count / k * n)
+        var magnitude = value
+        for batch in 0 ..< x.count / (m * k) {
+            for i in 0 ..< m {
+                let row = (batch * m + i) * n
+                for p in 0 ..< k {
+                    let xip = x[(batch * m + i) * k + p]
+                    let column = (batch * k + p) * n
+                    for j in 0 ..< n {
+                        let product = xip * y[column + j]
+                        value[row + j] += product
+                        magnitude[row + j] += abs(product)
+                    }
+                }
+            }
+        }
+        return (value, magnitude)
+    }
+
+    /// The matmul bound, with its reference and magnitude computed on the host (`hostMatmul`).
     func withinSumBound(_ got: MLXArray, _ a: MLXArray, _ b: MLXArray, c: Double) -> Bool {
-        let a64 = a.asType(.float64)
-        let b64 = b.asType(.float64)
+        let reference = hostMatmul(a, b)
         return withinBound(
-            got, reference: matmul(a64, b64), magnitude: matmul(abs(a64), abs(b64)), c: c)
+            got, reference: MLXArray(reference.value, got.shape),
+            magnitude: MLXArray(reference.magnitude, got.shape), c: c)
     }
 
     /// The same bound for an affine quantized matmul x·wᵀ. The kernels compute s·Σ x·q + b·Σ x per
