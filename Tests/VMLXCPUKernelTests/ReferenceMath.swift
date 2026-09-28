@@ -87,16 +87,13 @@
             sourceLocation: sourceLocation) + 2
     }
 
-    /// Checks every element of `got` against its float64 reference value and its bound, and names
-    /// the element furthest outside its bound.
-    func expectWithin(
-        _ got: MLXArray, _ reference: [(value: Double, bound: Double)],
-        _ label: @autoclosure () -> String, sourceLocation: SourceLocation = #_sourceLocation
-    ) {
+    /// Where `got` leaves its float64 reference: nil when every element is within its bound (equal
+    /// values, infinities and NaNs included), else the element furthest outside it. On the host.
+    func outsideBound(_ got: MLXArray, _ reference: [(value: Double, bound: Double)]) -> String? {
         let values = doubles(got)
-        #expect(
-            values.count == reference.count, "\(label()): element count",
-            sourceLocation: sourceLocation)
+        guard values.count == reference.count else {
+            return "\(values.count) elements, where float64 gives \(reference.count)"
+        }
         var worst = (index: 0, ratio: 0.0)
         for (i, (value, expected)) in zip(values, reference).enumerated() {
             if value == expected.value || (value.isNaN && expected.value.isNaN) {
@@ -106,10 +103,19 @@
             let ratio = error.isNaN || expected.bound.isNaN ? .infinity : error / expected.bound
             if ratio > worst.ratio { worst = (i, ratio) }
         }
-        #expect(
-            worst.ratio <= 1,
-            "\(label()): element \(worst.index) is \(values[worst.index]), float64 gives \(reference[worst.index].value), \(worst.ratio) times its bound",
-            sourceLocation: sourceLocation)
+        if worst.ratio <= 1 { return nil }
+        return
+            "element \(worst.index) is \(values[worst.index]), float64 gives \(reference[worst.index].value), \(worst.ratio) times its bound"
+    }
+
+    /// Checks every element of `got` against its float64 reference value and its bound, and names
+    /// the element furthest outside its bound.
+    func expectWithin(
+        _ got: MLXArray, _ reference: [(value: Double, bound: Double)],
+        _ label: @autoclosure () -> String, sourceLocation: SourceLocation = #_sourceLocation
+    ) {
+        let outside = outsideBound(got, reference)
+        #expect(outside == nil, "\(label()): \(outside ?? "")", sourceLocation: sourceLocation)
     }
 
     /// `count` Doubles over `domain`, alternately evenly spaced and seeded-random.
@@ -148,16 +154,20 @@
             sourceLocation: sourceLocation)
     }
 
-    /// Every |got - reference| is within c * eps32 * magnitude, plus one unit of got's dtype when it
-    /// is not float32; reference and magnitude are float64 arrays of the same shape as got.
-    func withinBound(_ got: MLXArray, reference: MLXArray, magnitude: MLXArray, c: Double) -> Bool {
-        var bound = magnitude * (c * eps32)
-        if got.dtype == .bfloat16 || got.dtype == .float16 {
-            let bits = got.dtype == .bfloat16 ? 8.0 : 11.0
-            let exponent = floor(log2(maximum(abs(reference), MLXArray(1e-30, dtype: .float64))))
-            bound = bound + pow(MLXArray(2.0, dtype: .float64), exponent - (bits - 1))
+    /// A sum of products computed in float32, element by element: its float64 value, and the bound
+    /// c·ε·magnitude, plus one unit of `dtype` at the value when the result is bf16 or fp16.
+    func sumBound(_ reference: (value: [Double], magnitude: [Double]), c: Double, dtype: DType)
+        -> [(value: Double, bound: Double)]
+    {
+        let bits: Double? = dtype == .bfloat16 ? 8 : dtype == .float16 ? 11 : nil
+        return zip(reference.value, reference.magnitude).map { value, magnitude in
+            var bound = magnitude * (c * eps32)
+            if let bits {
+                let exponent = Foundation.log2(Swift.max(abs(value), 1e-30)).rounded(.down)
+                bound += Foundation.exp2(exponent - (bits - 1))
+            }
+            return (value, bound)
         }
-        return all(abs(got.asType(.float64) - reference) .<= bound).item(Bool.self)
     }
 
     /// a·b and |a|·|b| in Double, computed on the host, for a of shape [..., m, k] and b of shape
@@ -188,21 +198,21 @@
         return (value, magnitude)
     }
 
-    /// The matmul bound, with its reference and magnitude computed on the host (`hostMatmul`).
-    func withinSumBound(_ got: MLXArray, _ a: MLXArray, _ b: MLXArray, c: Double) -> Bool {
-        let reference = hostMatmul(a, b)
-        return withinBound(
-            got, reference: MLXArray(reference.value, got.shape),
-            magnitude: MLXArray(reference.magnitude, got.shape), c: c)
+    /// The matmul bound of a·b, whose result has `dtype` (`sumBound`), with its reference and
+    /// magnitude computed on the host (`hostMatmul`).
+    func matmulBound(_ a: MLXArray, _ b: MLXArray, c: Double, dtype: DType)
+        -> [(value: Double, bound: Double)]
+    {
+        sumBound(hostMatmul(a, b), c: c, dtype: dtype)
     }
 
     /// The same bound for an affine quantized matmul x·wᵀ. The kernels compute s·Σ x·q + b·Σ x per
     /// group, so their rounding scales with Σ |x|·(|s|·q + |b|), which exceeds Σ |x·w| where s·q and b
     /// nearly cancel. dequantized() with |s| and |b| gives |s|·q + |b|.
-    func withinQuantizedBound(
-        _ got: MLXArray, _ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray?,
-        groupSize: Int, bits: Int, c: Double
-    ) -> Bool {
+    func quantizedBound(
+        _ x: MLXArray, _ wq: MLXArray, scales: MLXArray, biases: MLXArray?, groupSize: Int,
+        bits: Int, c: Double, dtype: DType
+    ) -> [(value: Double, bound: Double)] {
         let s32 = scales.asType(.float32)
         let b32 = biases?.asType(.float32)
         let w = dequantized(
@@ -211,8 +221,10 @@
             wq, scales: abs(s32), biases: b32.map { abs($0) }, groupSize: groupSize, bits: bits,
             dtype: .float32)
         let x64 = x.asType(.float64)
-        return withinBound(
-            got, reference: matmul(x64, w.asType(.float64).transposed()),
-            magnitude: matmul(abs(x64), wAbs.asType(.float64).transposed()), c: c)
+        return sumBound(
+            (
+                doubles(matmul(x64, w.asType(.float64).transposed())),
+                doubles(matmul(abs(x64), wAbs.asType(.float64).transposed()))
+            ), c: c, dtype: dtype)
     }
 #endif

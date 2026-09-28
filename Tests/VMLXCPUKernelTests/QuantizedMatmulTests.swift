@@ -81,15 +81,15 @@
                     for rows in [1, 8, 31, 32, 33, 64] {
                         let x = MLXRandom.normal(
                             [rows, k], dtype: .float32, key: MLXRandom.key(UInt64(rows)))
+                        let reference = quantizedBound(
+                            x, wq, scales: scales, biases: biases, groupSize: groupSize,
+                            bits: bits, c: Double(k + 2), dtype: .float32)
                         let run = {
                             let y = quantizedMM(
                                 x, wq, scales: scales, biases: biases, transpose: true,
                                 groupSize: groupSize, bits: bits)
-                            #expect(
-                                withinQuantizedBound(
-                                    y, x, wq, scales: scales, biases: biases, groupSize: groupSize,
-                                    bits: bits, c: Double(k + 2)),
-                                "bits \(bits) group \(groupSize) K \(k) rows \(rows)")
+                            expectWithin(
+                                y, reference, "bits \(bits) group \(groupSize) K \(k) rows \(rows)")
                         }
                         if rows >= 32 {
                             forEachTarget(VMLX_CPU_FAMILY_QMM_AFFINE_DEQUANT) { _ in run() }
@@ -121,14 +121,13 @@
                     [rows, k], dtype: .float32, key: MLXRandom.key(UInt64(rows))
                 )
                 .asType(dtype)
+                let reference = matmulBound(x, wHat.transposed(), c: Double(k + 2), dtype: dtype)
                 forEachTarget(VMLX_CPU_FAMILY_QMM_FP) { target in
                     let y = quantizedMM(
                         x, wq, scales: scales, biases: nil, transpose: true,
                         groupSize: groupSize, bits: bits, mode: qmode)
                     #expect(y.dtype == dtype)
-                    #expect(
-                        withinSumBound(y, x, wHat.transposed(), c: Double(k + 2)),
-                        "\(qmode) \(dtype) rows \(rows) on \(target)")
+                    expectWithin(y, reference, "\(qmode) \(dtype) rows \(rows) on \(target)")
                 }
             }
         }
@@ -171,11 +170,11 @@
                         groupSize: groupSize,
                         bits: bits)
                     #expect(y.dtype == dtype)
-                    #expect(
-                        withinQuantizedBound(
-                            y, x, wq, scales: scales, biases: biases, groupSize: groupSize,
-                            bits: bits,
-                            c: Double(k + 2)),
+                    expectWithin(
+                        y,
+                        quantizedBound(
+                            x, wq, scales: scales, biases: biases, groupSize: groupSize,
+                            bits: bits, c: Double(k + 2), dtype: dtype),
                         "\(dtype) bits \(bits) group \(groupSize) rows \(rows)")
                 }
             }
@@ -200,15 +199,13 @@
                         x, wq, scales: scales, biases: biases, transpose: true,
                         groupSize: groupSize, bits: 4)
                 }
-                let fp32Bound = { (y: MLXArray) in
-                    withinQuantizedBound(
-                        y, x, wq, scales: scales, biases: biases, groupSize: groupSize, bits: 4,
-                        c: Double(k + 2))
-                }
+                let fp32Bound = quantizedBound(
+                    x, wq, scales: scales, biases: biases, groupSize: groupSize, bits: 4,
+                    c: Double(k + 2), dtype: .float32)
 
                 vmlx_cpu_reset_counters()
                 #expect(!vmlx_cpu_quantized_int8())
-                #expect(fp32Bound(multiply()))
+                expectWithin(multiply(), fp32Bound, "int8 off")
                 #expect(vmlx_cpu_highway_calls(VMLX_CPU_FAMILY_QMM_AFFINE_INT8) == 0)
 
                 let xs = doubles(x)
@@ -240,7 +237,9 @@
                 vmlx_cpu_set_quantized_int8(true)
                 forEachTarget(VMLX_CPU_FAMILY_QMM_AFFINE_INT8) { target in
                     let y = multiply()
-                    #expect(!fp32Bound(y), "int8 on \(target): exact, so the int8 path did not run")
+                    #expect(
+                        outsideBound(y, fp32Bound) != nil,
+                        "int8 on \(target): within the float32 bound, so the int8 path did not run")
                     expectWithin(y, expected, "int8 on \(target)")
                 }
             }
@@ -256,10 +255,12 @@
                 let x = xT.transposed()
                 let y = quantizedMM(
                     x, wq, scales: scales, biases: biases, transpose: true, groupSize: 64, bits: 8)
-                #expect(
-                    withinQuantizedBound(
-                        y, x, wq, scales: scales, biases: biases, groupSize: 64, bits: 8,
-                        c: Double(k + 2)))
+                expectWithin(
+                    y,
+                    quantizedBound(
+                        x, wq, scales: scales, biases: biases, groupSize: 64, bits: 8,
+                        c: Double(k + 2), dtype: .float32),
+                    "non-contiguous activations")
             }
         }
     }

@@ -26,8 +26,8 @@
                         let b = bT ? b0.transposed() : b0
                         vmlx_cpu_reset_counters()
                         let y = matmul(a, b)
-                        #expect(
-                            withinSumBound(y, a, b, c: Double(k + 2)),
+                        expectWithin(
+                            y, matmulBound(a, b, c: Double(k + 2), dtype: .float32),
                             "rows \(rows) n \(n) aT \(aT) bT \(bT)")
                         let split =
                             Highway.enabled && vmlx_cpu_thread_count() > 1 && rows < 16
@@ -45,7 +45,7 @@
             KernelLock.run {
                 let a = MLXRandom.normal([16, 8, 64], dtype: .float32, key: MLXRandom.key(1))
                 let b = MLXRandom.normal([16, 64, 32], dtype: .float32, key: MLXRandom.key(2))
-                #expect(withinSumBound(matmul(a, b), a, b, c: 66))
+                expectWithin(matmul(a, b), matmulBound(a, b, c: 66, dtype: .float32), "batched")
             }
         }
 
@@ -72,8 +72,8 @@
                         let b = bT ? b0.transposed() : b0
                         let y = matmul(a, b)
                         #expect(y.dtype == dtype)
-                        #expect(
-                            withinSumBound(y, a, b, c: Double(k + 2)),
+                        expectWithin(
+                            y, matmulBound(a, b, c: Double(k + 2), dtype: dtype),
                             "\(dtype) \(rows)x\(n)x\(k) bT \(bT)")
                     }
                 }
