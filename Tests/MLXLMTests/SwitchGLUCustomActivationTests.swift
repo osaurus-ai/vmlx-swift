@@ -8,10 +8,24 @@ import XCTest
 enum SwitchGLUActivationFixture {
     static func projections(_ routed: SwitchGLU, quantized: Bool) throws {
         let weight = broadcast(MLXArray.eye(64), to: [2, 64, 64])
+        // An explicitly packed identity is exact: dequant(code) = code * 1 + 0.
+        // Quantizing eye() estimates group scales and slightly perturbs 1, which
+        // would make this activation-only regression measure quantization error.
+        var packedIdentity = [UInt32](repeating: 0, count: 2 * 64 * 8)
+        for expert in 0 ..< 2 {
+            for row in 0 ..< 64 {
+                packedIdentity[(expert * 64 + row) * 8 + row / 8] = UInt32(1) << (4 * (row % 8))
+            }
+        }
         func projection() -> SwitchLinear {
-            let linear = SwitchLinear(inputDims: 64, outputDims: 64, numExperts: 2, weight: weight)
-            return quantized
-                ? QuantizedSwitchLinear(linear, groupSize: 64, bits: 4, mode: .affine) : linear
+            if quantized {
+                return QuantizedSwitchLinear(
+                    inputDims: 64, outputDims: 64, numExperts: 2,
+                    weight: MLXArray(packedIdentity, [2, 64, 8]),
+                    scales: MLXArray.ones([2, 64, 1]), biases: MLXArray.zeros([2, 64, 1]),
+                    groupSize: 64, bits: 4, mode: .affine)
+            }
+            return SwitchLinear(inputDims: 64, outputDims: 64, numExperts: 2, weight: weight)
         }
         try routed.update(modules: ModuleChildren.unflattened([
             ("gate_proj", projection() as Module), ("up_proj", projection() as Module),
