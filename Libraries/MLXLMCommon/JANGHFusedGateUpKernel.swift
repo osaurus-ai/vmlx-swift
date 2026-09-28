@@ -1,11 +1,12 @@
+import Foundation
+import MLX
+import MLXFast
+
 #if canImport(CryptoKit)
     import CryptoKit
 #else
     import Crypto
 #endif
-import Foundation
-import MLX
-import MLXFast
 
 /// Decode-only experimental primitive; not installed by any model factory.
 /// Prepared inputs and hidden outputs stay F32 across H32/activation boundaries.
@@ -25,15 +26,20 @@ final class JANGHFusedGateUpKernel {
         guard let gate = contract.projections[gateModule], let up = contract.projections[upModule],
             gate.rotation == up.rotation,
             let gateBook = contract.codebooks[gate.bits], let upBook = contract.codebooks[up.bits]
-        else { throw JANGHFormatContract.ValidationError.invalid("incompatible fused JANGH projections") }
+        else {
+            throw JANGHFormatContract.ValidationError.invalid(
+                "incompatible fused JANGH projections")
+        }
         gateBits = gate.bits
         upBits = up.bits
         inputRotation = gate.rotation
         self.outputRotation = outputRotation
-        let description = "jangh-fused-gu-v1|\(gate.bits)|\(up.bits)|\(gate.rotation.rawValue)|"
+        let description =
+            "jangh-fused-gu-v1|\(gate.bits)|\(up.bits)|\(gate.rotation.rawValue)|"
             + "\(outputRotation.rawValue)|\(gateBook.alpha.bitPattern)|\(gateBook.beta.bitPattern)|"
             + "\(upBook.alpha.bitPattern)|\(upBook.beta.bitPattern)"
-        identity = SHA256.hash(data: Data(description.utf8)).map { String(format: "%02x", $0) }.joined()
+        identity = SHA256.hash(data: Data(description.utf8)).map { String(format: "%02x", $0) }
+            .joined()
         func projection(_ name: String, bits: Int, book: JANGHFormatContract.Codebook) -> String {
             let center = Float((1 << bits) - 1) / 2
             return """
@@ -111,7 +117,9 @@ final class JANGHFusedGateUpKernel {
             """
         fused = MLXFast.metalKernel(
             name: "jangh_fused_gu_" + identity,
-            inputNames: ["x", "packed_g", "scales_g", "packed_u", "scales_u", "indices", "limit_value"],
+            inputNames: [
+                "x", "packed_g", "scales_g", "packed_u", "scales_u", "indices", "limit_value",
+            ],
             outputNames: ["out"], source: source)
         h32 = MLXFast.metalKernel(
             name: "jangh_decode_h32_f32_v1", inputNames: ["x"], outputNames: ["out"],
@@ -163,7 +171,9 @@ final class JANGHFusedGateUpKernel {
             indices.dtype == .uint32, indices.size > 0,
             indices.size.isMultiple(of: input.dim(0))
         else { throw JANGHFormatContract.ValidationError.invalid("invalid fused JANGH tensors") }
-        let k = input.dim(1), n = gatePacked.dim(1), experts = gatePacked.dim(0)
+        let k = input.dim(1)
+        let n = gatePacked.dim(1)
+        let experts = gatePacked.dim(0)
         let gWidth = k.multipliedReportingOverflow(by: gateBits)
         let uWidth = k.multipliedReportingOverflow(by: upBits)
         guard !gWidth.overflow, !uWidth.overflow,
@@ -177,12 +187,16 @@ final class JANGHFusedGateUpKernel {
         let rows = rotated ? 32 : 8
         let threads = rotated ? 256 : 64
         return fused(
-            [contiguous(input), contiguous(gatePacked), contiguous(gateScales),
-             contiguous(upPacked), contiguous(upScales), contiguous(indices.flattened()),
-             MLXArray([limit ?? 0])],
-            template: [("K", k), ("N", n), ("EXPERTS", experts), ("ROWS", rows),
-                       ("WORDS_g", gWidth.partialValue / 32), ("WORDS_u", uWidth.partialValue / 32),
-                       ("XDIV", indices.size / input.dim(0)), ("ROT_OUT", rotated)],
+            [
+                contiguous(input), contiguous(gatePacked), contiguous(gateScales),
+                contiguous(upPacked), contiguous(upScales), contiguous(indices.flattened()),
+                MLXArray([limit ?? 0]),
+            ],
+            template: [
+                ("K", k), ("N", n), ("EXPERTS", experts), ("ROWS", rows),
+                ("WORDS_g", gWidth.partialValue / 32), ("WORDS_u", uWidth.partialValue / 32),
+                ("XDIV", indices.size / input.dim(0)), ("ROT_OUT", rotated),
+            ],
             grid: (threads, (n + rows - 1) / rows, indices.size), threadGroup: (threads, 1, 1),
             outputShapes: [[indices.size, n]], outputDTypes: [.float32])[0]
     }

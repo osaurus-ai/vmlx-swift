@@ -1,11 +1,12 @@
+import Foundation
+import MLX
+import MLXFast
+
 #if canImport(CryptoKit)
     import CryptoKit
 #else
     import Crypto
 #endif
-import Foundation
-import MLX
-import MLXFast
 
 /// Executable JANGH building blocks. Not registered as a model loader.
 /// QMV returns F32, matching the reference's projection accumulation boundary.
