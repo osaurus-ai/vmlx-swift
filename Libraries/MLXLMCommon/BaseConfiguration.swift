@@ -44,27 +44,28 @@ public struct BaseConfiguration: Codable, Sendable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.groupSize = try container.decode(Int.self, forKey: .groupSize)
             self.bits = try container.decode(Int.self, forKey: .bits)
-            if let rawMode = try container.decodeIfPresent(String.self, forKey: ._mode) {
-                let normalized = rawMode.lowercased()
-                if let mode = QuantizationMode(rawValue: normalized) {
-                    self._mode = mode
-                } else if normalized == "affine+mxtq" || normalized == "affine_mxtq" {
-                    // JANG VL bundles use this composite marker to say
-                    // non-routed affine weights plus MXTQ routed-expert
-                    // sidecars. BaseConfiguration only needs the ordinary
-                    // affine fallback; JangLoader consumes the MXTQ sidecar
-                    // metadata separately.
-                    self._mode = .affine
-                } else {
-                    throw DecodingError.dataCorruptedError(
-                        forKey: ._mode,
-                        in: container,
-                        debugDescription:
-                            "Cannot initialize QuantizationMode from invalid String value \(rawMode)")
-                }
-            } else {
-                self._mode = nil
+            self._mode = try Self.decodeMode(from: container)
+        }
+
+        fileprivate static func decodeMode(
+            from container: KeyedDecodingContainer<CodingKeys>
+        ) throws -> QuantizationMode? {
+            guard let rawMode = try container.decodeIfPresent(String.self, forKey: ._mode) else {
+                return nil
             }
+            let normalized = rawMode.lowercased()
+            if let mode = QuantizationMode(rawValue: normalized) {
+                return mode
+            }
+            // Composite markers describe affine weights plus separately handled MXTQ sidecars.
+            if normalized == "affine+mxtq" || normalized == "affine_mxtq" {
+                return .affine
+            }
+            throw DecodingError.dataCorruptedError(
+                forKey: ._mode,
+                in: container,
+                debugDescription:
+                    "Unsupported quantization mode '\(rawMode)'; explicit modes cannot fall back to affine.")
         }
     }
 
@@ -349,15 +350,9 @@ public struct BaseConfiguration: Codable, Sendable {
                     keyedBy: Quantization.CodingKeys.self,
                     forKey: key)
                 let bits = try nested.decode(Int.self, forKey: .bits)
-                let mode = try nested.decodeIfPresent(String.self, forKey: ._mode)
-                    .flatMap { QuantizationMode(rawValue: $0.lowercased()) }
-                    ?? quantizationModeDefaultForLayerOverride()
+                let mode = try Quantization.decodeMode(from: nested) ?? .affine
                 return Quantization(groupSize: defaultGroupSize, bits: bits, mode: mode)
             }
-        }
-
-        private static func quantizationModeDefaultForLayerOverride() -> QuantizationMode {
-            .affine
         }
 
         private static func isScalarMetadata(
