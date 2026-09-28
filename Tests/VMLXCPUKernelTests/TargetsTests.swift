@@ -29,12 +29,13 @@
             }
         }
 
-        /// What the shim reports agrees with itself.
+        /// What the shim reports agrees with itself, and the int8 switch starts off: its default,
+        /// since the runner unsets MLX_CPU_QUANTIZED_INT8.
         @Test func shimAnswersAgree() {
             KernelLock.run {
                 #expect(vmlx_cpu_thread_count() >= 1)
                 #expect(String(cString: vmlx_cpu_thread_setting_error()).isEmpty)
-                #expect(!vmlx_cpu_quantized_int8())
+                #expect(!KernelLock.initialQuantizedInt8, "the int8 switch started on")
                 if Highway.enabled {
                     #expect(Highway.compiled != 0)
                     #expect(Highway.compiled & Highway.supported != 0)

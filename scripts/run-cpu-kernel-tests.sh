@@ -37,6 +37,8 @@ while [ $# -gt 0 ]; do
     *) echo "usage: $0 [--expect '<targets>'] [--sde <chip>] [--skip-build] [--filter <filter>] [--once] [--stall <s>]" >&2; exit 2 ;;
   esac
 done
+# The tests check that the int8 switch starts off, its default.
+unset MLX_CPU_QUANTIZED_INT8
 SWIFT_FLAGS=(--package-path "$ROOT" --scratch-path "$SCRATCH" -c release -Xswiftc -enable-testing)
 export VMLX_HWY_ALL_TARGETS=1
 if [ "$BUILD" = 1 ]; then
