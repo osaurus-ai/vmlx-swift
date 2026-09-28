@@ -141,6 +141,12 @@ private func debugDumpReasoningPrompt(
             at: URL(fileURLWithPath: dir, isDirectory: true),
             withIntermediateDirectories: true)
         try body.write(to: url, atomically: true, encoding: .utf8)
+        // Decoded text can retokenize differently (especially generated
+        // history). The same explicit private dump opt-in also saves the
+        // original IDs so offline speculative replay uses the exact input.
+        try JSONEncoder().encode(tokenIds).write(
+            to: url.deletingPathExtension().appendingPathExtension("tokens.json"),
+            options: .atomic)
         let line = "[vmlx] reasoning promptDump path=\(path) model=\(modelName) file=\(url.path)\n"
         if let data = line.data(using: .utf8) {
             FileHandle.standardError.write(data)

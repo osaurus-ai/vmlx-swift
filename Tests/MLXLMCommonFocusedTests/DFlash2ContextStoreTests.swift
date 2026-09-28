@@ -36,6 +36,26 @@ final class DFlash2ContextStoreTests: XCTestCase {
         XCTAssertEqual(positions(store.rows(endingAt: 49, of: prompt, salt: nil)), Array(0 ..< 49))
     }
 
+    func testInsufficientWindowDoesNotMasqueradeAsACompleteHit() {
+        let store = DFlash2ContextStore()
+        let prompt = Array(0 ..< 100)
+        store.store(tokens: prompt, salt: nil, rows: rows(40 ..< 100))
+        XCTAssertNil(store.rows(endingAt: 70, of: prompt, salt: nil, minimumRows: 40))
+        XCTAssertEqual(
+            positions(store.rows(endingAt: 70, of: prompt, salt: nil, minimumRows: 30)),
+            Array(40 ..< 70))
+    }
+
+    func testSearchContinuesPastAnIncompleteNewerEntry() {
+        let store = DFlash2ContextStore()
+        let prompt = Array(0 ..< 100)
+        store.store(tokens: Array(prompt.prefix(70)), salt: nil, rows: rows(0 ..< 70))
+        store.store(tokens: prompt, salt: nil, rows: rows(40 ..< 100))
+        XCTAssertEqual(
+            positions(store.rows(endingAt: 70, of: prompt, salt: nil, minimumRows: 40)),
+            Array(0 ..< 70))
+    }
+
     func testDivergentTokensAndOtherMediaAreNotReused() {
         let store = DFlash2ContextStore()
         store.store(tokens: Array(0 ..< 20), salt: "image-a", rows: rows(0 ..< 20))

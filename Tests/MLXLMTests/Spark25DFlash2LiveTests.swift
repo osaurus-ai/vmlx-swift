@@ -21,6 +21,7 @@
 
 import Foundation
 import MLX
+import MLXRandom
 @preconcurrency import VMLXTokenizers
 import XCTest
 
@@ -363,6 +364,10 @@ final class Spark25DFlash2LiveTests: XCTestCase {
                 // Reverse order on alternating probes to expose thermal drift.
                 for speculative in (probe.isMultiple(of: 2) ? [false, true] : [true, false]) {
                     Memory.clearCache()
+                    if let seed = env["VMLX_SPARK25_DFLASH_SEED"].flatMap(UInt64.init) {
+                        parameters.randomSeed = seed + UInt64(probe)
+                        MLXRandom.seed(seed + UInt64(probe))
+                    }
                     let run =
                         try speculative
                         ? dflash(ctx, drafter, input, parameters, block: 5)
@@ -434,7 +439,10 @@ final class Spark25DFlash2LiveTests: XCTestCase {
                 input: input, target: ctx.model as! any DFlash2Target, drafter: drafter,
                 blockSize: nil, parameters: p, cacheCoordinator: coord)
             var ids: [Int] = []
+            let decodeStart = Date.timeIntervalSinceReferenceDate
             while ids.count < 384, let t = it.next() { ids.append(t) }
+            let decodeSeconds = Date.timeIntervalSinceReferenceDate - decodeStart
+            print("[dflash-hit-speed] tokens=\(ids.count) tok/s=\(Double(ids.count) / max(decodeSeconds, 1e-6))")
             it.storeCacheAfterGeneration(generatedTokenIds: ids, includeGeneratedBoundary: true)
             return it.dflash2Stats!
         }

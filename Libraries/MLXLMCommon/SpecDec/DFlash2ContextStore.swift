@@ -51,14 +51,19 @@ final class DFlash2ContextStore: @unchecked Sendable {
     }
 
     /// Rows for the last positions of `prompt[0 ..< restored]`, from a stored
-    /// prompt sharing that prefix, or `nil` when none covers it.
-    func rows(endingAt restored: Int, of prompt: [Int], salt: String?) -> MLXArray? {
-        guard restored > 0, restored <= prompt.count else { return nil }
+    /// prompt sharing that prefix, or `nil` when none covers at least
+    /// `minimumRows` positions ending at the requested boundary.
+    func rows(
+        endingAt restored: Int, of prompt: [Int], salt: String?, minimumRows: Int = 1
+    ) -> MLXArray? {
+        guard restored > 0, restored <= prompt.count,
+            minimumRows > 0, minimumRows <= restored
+        else { return nil }
         lock.lock()
         defer { lock.unlock() }
         for entry in entries where entry.salt == salt && entry.tokens.count >= restored {
             let rowsStart = entry.tokens.count - entry.rows.dim(1)
-            guard restored > rowsStart,
+            guard restored - rowsStart >= minimumRows,
                 entry.tokens[0 ..< restored].elementsEqual(prompt[0 ..< restored])
             else { continue }
             return entry.rows[0..., 0 ..< (restored - rowsStart), 0...]

@@ -269,6 +269,9 @@ final class GroupedDynamicCausalConv: Module {
 
     /// `_grouped_dynamic_convolve`. `base` is `(kernel_size, hidden)`,
     /// `dynamic` is `(B, L, kernel_size, groups)`.
+    private static let fusedConvolutionEnabled =
+        ProcessInfo.processInfo.environment["VMLX_DFLASH2_FUSED_CONV"] == "1"
+
     static let convTraceEnabled =
         ProcessInfo.processInfo.environment["VMLX_DFLASH2_TRACE"] == "1"
 
@@ -286,6 +289,23 @@ final class GroupedDynamicCausalConv: Module {
         // precondition took the whole host down (observed live
         // 2026-08-20).
         guard hidden.ndim == 3, dynamic.ndim >= 3 else { return hidden }
+        #if canImport(Metal)
+            if fusedConvolutionEnabled,
+                Device.defaultDevice() == .gpu,
+                dynamic.dtype == hidden.dtype,
+                [.float32, .float16, .bfloat16].contains(hidden.dtype)
+            {
+                return convolveMetal(
+                    hidden: hidden, dynamic: dynamic, base: base, groupSize: groupSize)
+            }
+        #endif
+        return convolveReference(
+            hidden: hidden, dynamic: dynamic, base: base, groupSize: groupSize)
+    }
+
+    static func convolveReference(
+        hidden: MLXArray, dynamic: MLXArray, base: MLXArray, groupSize: Int
+    ) -> MLXArray {
         let batch = hidden.dim(0)
         let length = hidden.dim(1)
         let hiddenSize = hidden.dim(2)
@@ -321,6 +341,50 @@ final class GroupedDynamicCausalConv: Module {
         }
         return output.reshaped(batch, length, hiddenSize)
     }
+
+    #if canImport(Metal)
+        /// One output element per thread; no chip-specific matrix features.
+        /// Preserve the reference's intermediate dtype rounding at each tap.
+        private static let convolutionKernel = MLXFast.metalKernel(
+            name: "dflash2_grouped_dynamic_causal_conv",
+            inputNames: ["hidden", "dynamic", "base", "meta"],
+            outputNames: ["output"],
+            source: """
+                uint i = thread_position_in_grid.x;
+                if (i >= meta[4]) return;
+                uint length = meta[0], width = meta[1], group_size = meta[2];
+                uint taps = meta[3], groups = width / group_size;
+                uint row = i / width, position = row % length;
+                uint channel = i % width, group = channel / group_size;
+                T result = T(0);
+                for (uint tap = 0; tap < taps; ++tap) {
+                    float value = position >= tap ? float(hidden[i - tap * width]) : 0.0f;
+                    T a = T(float(base[tap * width + channel]) * value);
+                    result = T(float(result) + float(a));
+                    T b = T(float(dynamic[(row * taps + tap) * groups + group]) * value);
+                    result = T(float(result) + float(b));
+                }
+                output[i] = result;
+                """)
+
+        static func convolveMetal(
+            hidden: MLXArray, dynamic: MLXArray, base: MLXArray, groupSize: Int
+        ) -> MLXArray {
+            if convTraceEnabled {
+                let line = "[DFlash2Conv] fusedMetal dtype=\(hidden.dtype) shape=\(hidden.shape)\n"
+                FileHandle.standardError.write(Data(line.utf8))
+            }
+            let meta = MLXArray([
+                UInt32(hidden.dim(1)), UInt32(hidden.dim(2)), UInt32(groupSize),
+                UInt32(base.dim(0)), UInt32(hidden.size),
+            ])
+            return convolutionKernel(
+                [hidden, dynamic, base.asType(hidden.dtype), meta],
+                template: [("T", hidden.dtype)],
+                grid: (hidden.size, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [hidden.shape], outputDTypes: [hidden.dtype])[0]
+        }
+    #endif
 }
 
 // MARK: - Attention

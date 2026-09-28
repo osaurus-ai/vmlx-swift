@@ -264,6 +264,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private static let governorEnabled =
         ProcessInfo.processInfo.environment["VMLX_DFLASH2_GOVERNOR"] != "0"
 
+    private static let deviceAcceptanceEnabled =
+        ProcessInfo.processInfo.environment["VMLX_DFLASH2_DEVICE_ACCEPTANCE"] == "1"
+
     private static let traceEnabled =
         ProcessInfo.processInfo.environment["VMLX_DFLASH2_TRACE"] == "1"
 
@@ -647,7 +650,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let missingRows = Swift.min(restoredCount, contextWindow - seeded.dim(1))
         if missingRows > 0 {
             if let prior = drafter.contextStore.rows(
-                endingAt: restoredCount, of: self.promptTokenIds, salt: self.mediaSalt)
+                endingAt: restoredCount, of: self.promptTokenIds, salt: self.mediaSalt,
+                minimumRows: missingRows)
             {
                 seeded = concatenated([prior.asType(seeded.dtype), seeded], axis: 1)
             } else {
@@ -1121,12 +1125,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let cycleVerifySeconds = flight.verifySeconds
         let budget = maxTokens.map { $0 - tokenCount } ?? Int.max
 
-        // MARK: accept — the cycle's single host sync happens on the first
-        // asArray below, after both forwards are already in flight.
+        // The experimental sampled path packs the proposal and decision into
+        // one readback. Keep the original path as a same-binary timing control.
 
-        let draftIDs = draftTokens.reshaped(-1).asArray(Int32.self).map(Int.init)
+        let draftIDs: [Int]
         let acceptance: DFlash2Sampling.Acceptance
         if isGreedy {
+            draftIDs = draftTokens.reshaped(-1).asArray(Int32.self).map(Int.init)
             let targetIDs = greedyTargetIds!.reshaped(-1).asArray(Int32.self).map(Int.init)
             acceptance = DFlash2Sampling.acceptGreedy(
                 draftTokens: draftIDs, targetTokens: targetIDs)
@@ -1137,11 +1142,25 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 // Sampled request with no q: cannot run the accept test.
                 return runAutoregressiveStep()
             }
-            acceptance = DFlash2Sampling.acceptSampled(
-                draftTokens: draftTokens,
-                targetProbabilities: targetProbs,
-                draftProbabilities: draftProbs,
-                draftIndices: proposal.candidates)
+            if Self.deviceAcceptanceEnabled {
+                let decision = DFlash2Sampling.sampledAcceptance(
+                    draftTokens: draftTokens,
+                    targetProbabilities: targetProbs,
+                    draftProbabilities: draftProbs,
+                    draftIndices: proposal.candidates)
+                let packed = concatenated([
+                    draftTokens.reshaped(-1).asType(.int32), decision,
+                ]).asArray(Int32.self)
+                draftIDs = packed.prefix(draftTokens.size).map(Int.init)
+                acceptance = DFlash2Sampling.Acceptance(
+                    accepted: Int(packed[draftTokens.size]),
+                    bonus: Int(packed[draftTokens.size + 1]))
+            } else {
+                draftIDs = draftTokens.reshaped(-1).asArray(Int32.self).map(Int.init)
+                acceptance = DFlash2Sampling.acceptSampled(
+                    draftTokens: draftTokens, targetProbabilities: targetProbs,
+                    draftProbabilities: draftProbs, draftIndices: proposal.candidates)
+            }
         }
 
         let accepted = acceptance.accepted
