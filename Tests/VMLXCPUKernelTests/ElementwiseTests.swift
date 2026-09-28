@@ -451,10 +451,12 @@
             _ truth: (Double) -> Double, dtype: DType
         ) throws {
             let k = try polynomialUnits(name)
+            // The floor the baseline was measured with: erf's is 2^-24, the others' 2^-33.
+            let unitFloor = polynomialFloor(name)
             let (x, xs) = materialize(spread(domain, seed: 76), dtype)
             let expected = xs.map { v -> (value: Double, bound: Double) in
                 let t = truth(v)
-                return (t, k * max(Double(Float(t).ulp), 0x1p-33) + ulp(t, in: dtype))
+                return (t, k * max(Double(Float(t).ulp), unitFloor) + ulp(t, in: dtype))
             }
             expectWithin(apply(x), expected, "\(name) \(dtype)")
         }

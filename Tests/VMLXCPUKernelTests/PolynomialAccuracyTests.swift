@@ -51,6 +51,11 @@
             apply: { MLX.sigmoid($0) }, reference: { 1 / (1 + Foundation.exp(-$0)) }),
     ]
 
+    /// The absolute floor of a unit (`unitsError`) that `name`'s baseline was measured with.
+    func polynomialFloor(_ name: String) -> Double {
+        polynomialCases.first { $0.name == name }?.floor ?? 0x1p-33
+    }
+
     @Suite(.serialized) struct PolynomialAccuracyTests {
         static var measuring: Bool {
             ProcessInfo.processInfo.environment["VMLX_ULP_BASELINE"] == "1"
