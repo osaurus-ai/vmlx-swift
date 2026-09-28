@@ -214,9 +214,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Whether full-size blocks run the staged verify (attention caches
     /// promoted to Compilable buffers; GDN commits from staging slots).
     private var useStagedVerify = false
-    /// The first staged cycle runs EAGERLY to allocate the staging slots;
-    /// `compile()` needs those objects to exist before the trace.
-    private var stagedVerifyWarm = false
+    /// Staging and compilation are independent: staged rollback is also
+    /// used by the eager path. Only the explicit, hardware-gated opt-in
+    /// below may build or replay a compiled trace after warm-up.
+    private var useCompiledVerify = false
     /// Compiled S = 1+block verify forwards, keyed by block size. Each is
     /// a fixed shape; the adaptive controller below moves between a small
     /// set of sizes, so at most a handful of traces are ever built. Tail
@@ -741,7 +742,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 return layer
             }
             MLX.eval(self.cache)
-            self.useStagedVerify = true
+            self.useCompiledVerify = true
         }
     }
 
@@ -1041,7 +1042,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         var greedyTargetIds: MLXArray? = nil
         let newHidden: MLXArray
         if stagedCycle {
-            if !stagedWarmedSizes.contains(bs) {
+            if !useCompiledVerify || !stagedWarmedSizes.contains(bs) {
                 // Eager warm-up under the staged mode: allocates the
                 // fixed staging slots the compile trace will track.
                 let (l, captured) = NativeMTPVerifierStatePolicy.withVerifierMode(

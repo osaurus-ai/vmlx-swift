@@ -425,3 +425,12 @@ Remaining gates include cold/partial/full/disk-restored prefix runs, growing
 multi-turn chat, cancellation rollback, effective compilation policy, default
 sampling, coherent tool use, and interleaved app speed measurements. No new
 M3/M4/M5 performance claim follows from these source changes.
+
+Staged verify and compiled verify now have separate execution flags. Previously,
+staged targets built a compiled trace after their first full-size cycle even
+when the compilation opt-in or hardware gate was off. The eager staged path
+now remains eager after warmup unless both compilation gates passed.
+`DFlash2VerifyCompilationGateTests` exercises the real iterator with a synthetic
+target beyond warmup: absent opt-in, explicit off, and hardware-policy refusal
+all retain staged execution with zero compiled traces. This is control-flow
+regression evidence, not a pretrained-model correctness or speed measurement.
