@@ -1,6 +1,7 @@
 // Copyright 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
 
+import Foundation
 import MLX
 import XCTest
 
@@ -74,5 +75,83 @@ final class DFlash2ContextStoreTests: XCTestCase {
         XCTAssertNil(store.rows(endingAt: 3, of: [1000, 1, 2], salt: nil))
         XCTAssertNotNil(
             store.rows(endingAt: 3, of: [1000 + DFlash2ContextStore.capacity, 1, 2], salt: nil))
+    }
+
+    func testAuxiliaryAndApproximateRowsDoNotEvictConversation() {
+        let store = DFlash2ContextStore()
+        let prompt = Array(0 ..< 20)
+        store.store(tokens: prompt, salt: nil, rows: rows(0 ..< 20))
+        for i in 0 ..< 12 {
+            store.store(tokens: [100 + i, 1, 2], salt: nil, rows: rows(0 ..< 3), intent: .auxiliary)
+            store.store(tokens: [200 + i, 1, 2], salt: nil, rows: rows(0 ..< 3), isExact: false)
+        }
+        XCTAssertEqual(positions(store.rows(endingAt: 20, of: prompt, salt: nil)), prompt)
+        XCTAssertNil(store.rows(endingAt: 3, of: [100, 1, 2], salt: nil))
+    }
+
+    func testDiskFeatureContractRejectsWrongLayersBoundaryWidthAndCoverage() throws {
+        let store = DFlash2ContextStore()
+        let prompt = Array(0 ..< 100)
+        store.store(tokens: prompt, salt: nil, rows: rows(40 ..< 100))
+        let payload = try XCTUnwrap(store.diskPayload(endingAt: 100, of: prompt, salt: nil, layers: [9]))
+        func read(_ boundary: Int = 100, _ end: Int = 99, _ count: Int = 59, _ layers: [Int] = [9], _ width: Int = 1) -> MLXArray? {
+            DFlash2ContextStore.diskRows(payload, cacheBoundary: boundary, endingAt: end,
+                                        minimumRows: count, layers: layers, width: width)
+        }
+        XCTAssertEqual(positions(read()), Array(40 ..< 99))
+        XCTAssertNil(read(99))
+        XCTAssertNil(read(100, 99, 60))
+        XCTAssertNil(read(100, 99, 59, [17]))
+        XCTAssertNil(read(100, 99, 59, [9], 2))
+        var malformed = payload
+        malformed["dflash2_context_meta"] = MLXArray([Int32(2), 100, 60, 1])
+        XCTAssertNil(DFlash2ContextStore.validatedDiskPayload(malformed, boundary: 100))
+    }
+
+    func testFeaturesSurviveDiskReopenInsideTheTargetEntry() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("dflash-context-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = CacheCoordinatorConfig(usePagedCache: false, enableDiskCache: true,
+                                           pagedBlockSize: 4, diskCacheMaxGB: 0.01,
+                                           diskCacheDir: root, modelKey: "dflash-context-test")
+        let prompt = Array(0 ..< 20)
+        let store = DFlash2ContextStore()
+        store.store(tokens: prompt, salt: "image-a", rows: rows(0 ..< 20))
+        let kv = KVCacheSimple()
+        _ = kv.update(keys: MLXArray.ones([1, 1, 20, 4]), values: MLXArray.ones([1, 1, 20, 4]))
+        let writer = CacheCoordinator(config: config)
+        writer.storeAfterGeneration(promptTokens: prompt, perLayerData: [], ssmStates: nil,
+                                    cache: [kv], mediaSalt: "image-a",
+                                    dflashContext: store.diskPayload(endingAt: 20, of: prompt, salt: "image-a", layers: [9]))
+        store.removeAll()
+        let reader = CacheCoordinator(config: config)
+        guard case .hit(let matched, _, let detail, _, _, let disk) = reader.fetch(tokens: prompt + [20], mediaSalt: "image-a") else {
+            return XCTFail("Expected the persisted target entry")
+        }
+        XCTAssertEqual(matched, 20)
+        XCTAssertEqual(detail, .disk)
+        let arrays = try XCTUnwrap(disk)
+        XCTAssertEqual(positions(DFlash2ContextStore.diskRows(arrays, cacheBoundary: 20,
+                         endingAt: 20, minimumRows: 20, layers: [9], width: 1)), prompt)
+        var target: [any KVCache] = [KVCacheSimple()]
+        XCTAssertEqual(restoreFromDiskArrays(arrays, into: &target), 20)
+        XCTAssertEqual(target[0].offset, 20)
+        XCTAssertFalse(reader.hasDurableDiskEntry(tokens: prompt, mediaSalt: "image-b"))
+        // Same target boundary and tensor dimensions, different tap layer:
+        // must replace the validated entry, not skip the store by layout.
+        store.store(tokens: prompt, salt: "image-a", rows: rows(0 ..< 20))
+        reader.storeAfterGeneration(promptTokens: prompt, perLayerData: [], ssmStates: nil,
+                                    cache: [kv], mediaSalt: "image-a",
+                                    dflashContext: store.diskPayload(endingAt: 20, of: prompt, salt: "image-a", layers: [17]))
+        let reopened = CacheCoordinator(config: config)
+        guard case .hit(_, _, _, _, _, let replaced) = reopened.fetch(tokens: prompt + [20], mediaSalt: "image-a") else {
+            return XCTFail("Expected replacement entry")
+        }
+        let updated = try XCTUnwrap(replaced)
+        XCTAssertNotNil(DFlash2ContextStore.diskRows(updated, cacheBoundary: 20, endingAt: 20,
+                                                    minimumRows: 20, layers: [17], width: 1))
+        XCTAssertNil(DFlash2ContextStore.diskRows(updated, cacheBoundary: 20, endingAt: 20,
+                                                 minimumRows: 20, layers: [9], width: 1))
     }
 }

@@ -35,7 +35,14 @@ final class DFlash2ContextStore: @unchecked Sendable {
     private var entries: [Entry] = []
 
     /// Remember the context rows of a prefilled prompt.
-    func store(tokens: [Int], salt: String?, rows: MLXArray) {
+    func store(
+        tokens: [Int], salt: String?, rows: MLXArray,
+        intent: LMInput.CachePromptIntent = .generation, isExact: Bool = true
+    ) {
+        // Auxiliary prompts must not evict conversational features. Features
+        // reconstructed from a truncated full-attention prefix are not exact
+        // and must not become a persistent source for subsequent requests.
+        guard intent != .auxiliary, isExact else { return }
         guard rows.ndim == 3, rows.dim(1) > 0, rows.dim(1) <= tokens.count else { return }
         lock.lock()
         defer { lock.unlock() }
@@ -69,5 +76,73 @@ final class DFlash2ContextStore: @unchecked Sendable {
             return entry.rows[0..., 0 ..< (restored - rowsStart), 0...]
         }
         return nil
+    }
+
+    /// Raw target features travel in the same file as the target KV boundary.
+    /// They precede the drafter projection, so compatibility depends on the
+    /// target's cache identity and ordered capture layers, not drafter weights.
+    private static func diskContractKey(_ layers: [Int]) -> String {
+        "dflash2_context_v1_layers_" + layers.map(String.init).joined(separator: "_")
+    }
+
+    func diskPayload(
+        endingAt boundary: Int, of prompt: [Int], salt: String?, layers: [Int]
+    ) -> [String: MLXArray]? {
+        guard let rows = rows(endingAt: boundary, of: prompt, salt: salt),
+            let end = Int32(exactly: boundary),
+            let count = Int32(exactly: rows.dim(1)),
+            let width = Int32(exactly: rows.dim(2)),
+            !layers.isEmpty, layers.allSatisfy({ Int32(exactly: $0) != nil })
+        else { return nil }
+        return [
+            "dflash2_context_meta": MLXArray([Int32(1), end, count, width]),
+            "dflash2_context_layers": MLXArray(layers.map(Int32.init)),
+            "dflash2_context_rows": rows,
+            Self.diskContractKey(layers): MLXArray(Int32(1)),
+        ]
+    }
+
+    static func validatedDiskPayload(
+        _ arrays: [String: MLXArray], boundary: Int
+    ) -> [String: MLXArray]? {
+        guard let meta = arrays["dflash2_context_meta"], meta.shape == [4],
+            meta.dtype == .int32,
+            let layers = arrays["dflash2_context_layers"], layers.ndim == 1,
+            layers.size > 0, layers.dtype == .int32,
+            let rows = arrays["dflash2_context_rows"], rows.ndim == 3,
+            rows.dim(0) == 1, rows.dim(1) > 0, rows.dim(1) <= boundary,
+            rows.dim(2) > 0, [.bfloat16, .float16, .float32].contains(rows.dtype)
+        else { return nil }
+        let fields = meta.asArray(Int32.self)
+        guard fields[0] == 1, Int(fields[1]) == boundary,
+            Int(fields[2]) == rows.dim(1), Int(fields[3]) == rows.dim(2)
+        else { return nil }
+        // The contract is part of the key set as well as tensor metadata:
+        // DiskCache's validated-store shortcut compares payload layouts.
+        // Different tap IDs with the same shape must force a replacement.
+        let contractKey = diskContractKey(layers.asArray(Int32.self).map(Int.init))
+        guard let contract = arrays[contractKey], contract.ndim == 0,
+            contract.dtype == .int32, contract.item(Int32.self) == 1
+        else { return nil }
+        return [
+            "dflash2_context_meta": meta, "dflash2_context_layers": layers,
+            "dflash2_context_rows": rows,
+            contractKey: contract,
+        ]
+    }
+
+    static func diskRows(
+        _ arrays: [String: MLXArray], cacheBoundary: Int, endingAt end: Int,
+        minimumRows: Int, layers: [Int], width: Int
+    ) -> MLXArray? {
+        guard end > 0, end <= cacheBoundary, minimumRows > 0,
+            let payload = validatedDiskPayload(arrays, boundary: cacheBoundary),
+            let rows = payload["dflash2_context_rows"], rows.dim(2) == width,
+            let savedLayers = payload["dflash2_context_layers"],
+            savedLayers.asArray(Int32.self).map(Int.init) == layers
+        else { return nil }
+        let start = cacheBoundary - rows.dim(1)
+        guard end - start >= minimumRows else { return nil }
+        return rows[0..., 0 ..< (end - start), 0...]
     }
 }

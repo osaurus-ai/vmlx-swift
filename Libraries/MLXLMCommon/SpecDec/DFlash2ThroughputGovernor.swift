@@ -42,7 +42,7 @@ struct DFlash2ThroughputGovernor: Sendable, Equatable {
     /// Verify cycles per measured drafting window.
     static let windowCycles = 12
     /// Plain tokens decoded to measure plain throughput.
-    static let calibrationTokens = 8
+    static let calibrationTokens = 16
     static let initialBackoff = 64
     static let maxBackoff = 512
     /// A window below this fraction of plain counts as losing.
@@ -68,6 +68,7 @@ struct DFlash2ThroughputGovernor: Sendable, Equatable {
     private var windowTokens = 0
     private var windowCycles = 0
     private var plainRemaining = 0
+    private var discardPlainTransition = false
     private var calibrating = false
     private var losingWindows = 0
     private var backoff = Self.initialBackoff
@@ -113,6 +114,14 @@ struct DFlash2ThroughputGovernor: Sendable, Equatable {
                 pausedSeconds += elapsed
             }
             plainRemaining -= tokens
+            if discardPlainTransition {
+                // The first AR step after verification has no pending plain
+                // forward. Keep its cost in pause telemetry, but do not use
+                // pipeline startup as the steady-state plain baseline.
+                discardPlainTransition = false
+                resetWindow(now: now)
+                return
+            }
             guard plainRemaining <= 0 else { return }
             plainRate = Double(windowTokens) / Swift.max(now - start, 1e-6)
             if calibrating {
@@ -138,6 +147,7 @@ struct DFlash2ThroughputGovernor: Sendable, Equatable {
     }
 
     private mutating func enterPlain(tokens: Int, now: Double) {
+        discardPlainTransition = mode != .plain
         mode = .plain
         plainRemaining = tokens
         resetWindow(now: now)

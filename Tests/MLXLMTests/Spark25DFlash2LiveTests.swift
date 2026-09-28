@@ -397,6 +397,69 @@ final class Spark25DFlash2LiveTests: XCTestCase {
         }
     }
 
+    func testDiskContextSurvivesAuxiliaryChurn() async throws {
+        guard let bundle = Self.bundle,
+            let replay = ProcessInfo.processInfo.environment["VMLX_SPARK25_DFLASH_REPLAY_TOKENS"]
+        else { throw XCTSkip("Provide the bundle and an app-sized token replay") }
+        let ids = try JSONDecoder().decode([Int32].self, from: Data(contentsOf: URL(fileURLWithPath: replay)))
+        XCTAssertGreaterThan(ids.count, 2048)
+        let context = try await MLXLMCommon.loadModel(from: bundle, using: #huggingFaceTokenizerLoader())
+        nonisolated(unsafe) let ctx = context
+        let drafter = try DFlash2DrafterResolver.shared.drafter(at: bundle.appendingPathComponent("dflash"))
+        let input = LMInput(tokens: MLXArray(ids))
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("dflash-live-disk-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = CacheCoordinatorConfig(usePagedCache: false, enableDiskCache: true,
+                                           diskCacheMaxGB: 2, diskCacheDir: root,
+                                           modelKey: "spark25-dflash-live-disk")
+        var parameters = GenerateParameters(generationConfig: ctx.configuration.generationDefaults,
+                                            fallback: GenerateParameters(maxTokens: 96))
+        parameters.maxTokens = 96
+        parameters.prefillStepSize = 1024
+        parameters.randomSeed = 417
+        let cacheSalt = computeCacheSalt(for: input, parameters: parameters)
+        func run(_ name: String, _ input: LMInput, _ coordinator: CacheCoordinator, count: Int) throws -> DFlash2GenerationStats {
+            MLXRandom.seed(417)
+            var p = parameters
+            p.maxTokens = count
+            let start = Date.timeIntervalSinceReferenceDate
+            var iterator = try DFlash2TokenIterator(input: input, target: ctx.model as! any DFlash2Target,
+                                                    drafter: drafter, blockSize: 5, parameters: p,
+                                                    cacheCoordinator: coordinator)
+            let decodeStart = Date.timeIntervalSinceReferenceDate
+            var tokens: [Int] = []
+            while tokens.count < count, let token = iterator.next() { tokens.append(token) }
+            let decodeSeconds = Date.timeIntervalSinceReferenceDate - decodeStart
+            iterator.storeCacheAfterGeneration(generatedTokenIds: tokens, includeGeneratedBoundary: true)
+            let stats = iterator.dflash2Stats!
+            print("[dflash-disk] name=\(name) prompt=\(input.text.tokens.size) prefill_s=\(decodeStart-start) tok/s=\(Double(tokens.count)/max(decodeSeconds,1e-6)) seeded=\(stats.seededContextRows) recomputed=\(stats.recomputedContextRows) acceptance=\(stats.acceptanceLength)")
+            return stats
+        }
+        drafter.contextStore.removeAll()
+        let writer = CacheCoordinator(config: config)
+        let cold = try run("cold", input, writer, count: 96)
+        for i in 0 ..< 6 {
+            let auxiliary = try await ctx.processor.prepare(input: UserInput(chat: [
+                .user("Give a short title for a conversation about sorting lists. Variant \(i).")
+            ]))
+            _ = try run("aux-\(i)", auxiliary.withCachePromptIntent(.auxiliary), writer, count: 32)
+        }
+        XCTAssertNotNil(drafter.contextStore.rows(endingAt: ids.count, of: ids.map(Int.init), salt: cacheSalt,
+                                                 minimumRows: cold.seededContextRows))
+        drafter.contextStore.removeAll()
+        let reader = CacheCoordinator(config: config)
+        guard case .hit(let boundary, _, let detail, _, _, let arrays) = reader.fetch(tokens: ids.map(Int.init), mediaSalt: cacheSalt) else {
+            return XCTFail("Expected disk target boundary after reopening")
+        }
+        XCTAssertEqual(detail, .disk)
+        XCTAssertEqual(boundary, ids.count)
+        XCTAssertNotNil(try XCTUnwrap(arrays)["dflash2_context_rows"])
+        let restored = try run("reopened-disk", input, reader, count: 96)
+        XCTAssertEqual(restored.seededContextRows, cold.seededContextRows)
+        XCTAssertEqual(restored.recomputedContextRows, 0)
+    }
+
     /// A prompt-cache hit restores the target's prefix without re-running it.
     /// The drafter's context must still cover that prefix, or it drafts from
     /// the new suffix alone. Same request cold and after a hit on a shorter

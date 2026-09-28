@@ -461,6 +461,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // MARK: prefix reuse
 
         var tokensToPrefill = self.promptTokenIds
+        var diskContext: (boundary: Int, arrays: [String: MLXArray])?
         if let coordinator = cacheCoordinator, !tokensToPrefill.isEmpty,
             !input.requiresPostPrepareCacheKey
         {
@@ -553,6 +554,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                                 .utf8))
                 }
                 if restored {
+                    if let diskArrays {
+                        diskContext = (matchedTokens, diskArrays)
+                    }
                     if input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens) {
                         self.cache = target.newCache(parameters: effectiveParameters)
                     } else if remainingTokens.isEmpty, let last = tokensToPrefill.last {
@@ -646,12 +650,20 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // hidden states; splice back the rows prefill computed for it on an
         // earlier request, or the drafter drafts from the suffix alone.
         var seeded = prefill.hidden
+        var contextIsExact = true
         let contextWindow = hiddenLimit ?? Self.recomputedContextRows
         let missingRows = Swift.min(restoredCount, contextWindow - seeded.dim(1))
         if missingRows > 0 {
             if let prior = drafter.contextStore.rows(
                 endingAt: restoredCount, of: self.promptTokenIds, salt: self.mediaSalt,
                 minimumRows: missingRows)
+            {
+                seeded = concatenated([prior.asType(seeded.dtype), seeded], axis: 1)
+            } else if let diskContext,
+                let prior = DFlash2ContextStore.diskRows(
+                    diskContext.arrays, cacheBoundary: diskContext.boundary,
+                    endingAt: restoredCount, minimumRows: missingRows,
+                    layers: self.orderedLayerIDs, width: seeded.dim(2))
             {
                 seeded = concatenated([prior.asType(seeded.dtype), seeded], axis: 1)
             } else {
@@ -670,13 +682,15 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     hiddenLimit: hiddenLimit, stepSize: effectiveParameters.prefillStepSize)
                 seeded = concatenated([recomputed.hidden.asType(seeded.dtype), seeded], axis: 1)
                 self.stats.recomputedContextRows = recomputed.hidden.dim(1)
+                contextIsExact = missingRows == restoredCount
             }
             if seeded.dim(1) > contextWindow {
                 seeded = seeded[0..., (seeded.dim(1) - contextWindow)..., 0...]
             }
         }
         drafter.contextStore.store(
-            tokens: self.promptTokenIds, salt: self.mediaSalt, rows: seeded)
+            tokens: self.promptTokenIds, salt: self.mediaSalt, rows: seeded,
+            intent: input.cachePromptIntent, isExact: contextIsExact)
         self.contextHidden = seeded
         self.contextHiddenConsumed = false
         self.stats.seededContextRows = seeded.dim(1)
@@ -1575,7 +1589,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 perLayerData: extractLayerData(from: snapshot),
                 ssmStates: extractSSMStates(from: snapshot),
                 cache: snapshot,
-                mediaSalt: mediaSalt)
+                mediaSalt: mediaSalt,
+                dflashContext: drafter.contextStore.diskPayload(
+                    endingAt: stripAt, of: promptTokenIds, salt: mediaSalt,
+                    layers: orderedLayerIDs))
             return
         }
 
@@ -1591,6 +1608,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             perLayerData: extractLayerData(from: snapshot),
             ssmStates: extractSSMStates(from: snapshot),
             cache: snapshot,
-            mediaSalt: mediaSalt)
+            mediaSalt: mediaSalt,
+            dflashContext: drafter.contextStore.diskPayload(
+                endingAt: promptTokenIds.count, of: promptTokenIds, salt: mediaSalt,
+                layers: orderedLayerIDs))
     }
 }

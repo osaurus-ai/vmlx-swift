@@ -99,6 +99,25 @@ final class DFlash2ThroughputGovernorTests: XCTestCase {
         XCTAssertNil(g.plainRate)
     }
 
+    func testSlowPipelineStartupDoesNotDepressPlainBaseline() {
+        var g = DFlash2ThroughputGovernor()
+        var clock = 0.0
+        for _ in 0 ..< DFlash2ThroughputGovernor.windowCycles {
+            XCTAssertTrue(g.shouldDraft(now: clock))
+            clock += 0.025
+            g.record(tokens: 2, now: clock)
+        }
+        XCTAssertFalse(g.shouldDraft(now: clock))
+        clock += 0.2 // transition cost, deliberately much slower than AR
+        g.record(tokens: 1, now: clock)
+        for _ in 1 ..< DFlash2ThroughputGovernor.calibrationTokens {
+            clock += 0.01
+            g.record(tokens: 1, now: clock)
+        }
+        XCTAssertEqual(g.plainRate ?? 0, 100, accuracy: 1e-8)
+        XCTAssertEqual(g.pauses, 1, "80 tok/s drafting must lose to 100 tok/s steady AR")
+    }
+
     func testOneMarginallyLosingWindowDoesNotPause() {
         // Drafting 5% slower than plain for exactly one window, then winning:
         // noise, not a trend — no pause.
