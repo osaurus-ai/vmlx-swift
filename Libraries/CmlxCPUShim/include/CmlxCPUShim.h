@@ -4,7 +4,8 @@
 // The C++ core's CPU backend controls, for Swift: Highway targets, the int8
 // quantized-matmul switch, the thread pool and per-family dispatch counters.
 // Builds without Highway kernels (macOS; Linux without MLX_USE_HIGHWAY_KERNELS)
-// answer as such a build: no targets, int8 off, one thread, no counts.
+// answer as such a build: no targets, one thread, no counts. Their int8 switch
+// is the core's own on Linux, where it changes nothing, and off on macOS.
 
 #ifndef VMLX_CMLX_CPU_SHIM_H
 #define VMLX_CMLX_CPU_SHIM_H
@@ -16,7 +17,8 @@
 extern "C" {
 #endif
 
-// Kernel families, in the order of mlx::core::cpu::highway_info::Family.
+// Kernel families, in the order of mlx::core::cpu::highway_info::Family, which
+// the shim checks enumerator by enumerator.
 typedef enum {
   VMLX_CPU_FAMILY_QMM_AFFINE_DEQUANT = 0,
   VMLX_CPU_FAMILY_QMM_AFFINE_INT8,
@@ -34,9 +36,11 @@ bool vmlx_cpu_highway_enabled(void);
 // supported by this CPU as dispatch sees it (after a test restriction).
 int64_t vmlx_cpu_highway_compiled_targets(void);
 int64_t vmlx_cpu_highway_supported_targets(void);
-// Restricts dispatch to `targets`, which must be supported; 0 restores the CPU's
-// own set. For tests: process-wide, never while kernels run.
-void vmlx_cpu_highway_set_targets_for_test(int64_t targets);
+// Restricts dispatch to `targets`; 0 restores the CPU's own set. Refuses a set
+// with a target this CPU does not support, which would fault: returns false,
+// and leaves dispatch unrestricted. For tests: process-wide, and never while
+// kernels run.
+bool vmlx_cpu_highway_set_targets_for_test(int64_t targets);
 // Highway's name for one target bit, such as "AVX2"; "Unknown" for a bit it
 // does not know, and "" in a build without Highway.
 const char* vmlx_cpu_highway_target_name(int64_t target);
@@ -53,7 +57,7 @@ const char* vmlx_cpu_thread_count_reason(void);
 const char* vmlx_cpu_thread_setting_error(void);
 bool vmlx_cpu_openblas_pinned(void);
 
-// Dispatch counters since the last reset.
+// Dispatch counters since the last reset; 0 for a family outside the enum.
 int64_t vmlx_cpu_executed_targets(vmlx_cpu_family family);
 uint64_t vmlx_cpu_highway_calls(vmlx_cpu_family family);
 uint64_t vmlx_cpu_fallback_calls(vmlx_cpu_family family);

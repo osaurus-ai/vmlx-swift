@@ -74,7 +74,9 @@
         defer { vmlx_cpu_highway_set_targets_for_test(0) }
         var ran: [String] = []
         for target in Highway.runnable {
-            vmlx_cpu_highway_set_targets_for_test(target)
+            #expect(
+                vmlx_cpu_highway_set_targets_for_test(target),
+                "the shim refused \(Highway.name(target))", sourceLocation: sourceLocation)
             vmlx_cpu_reset_counters()
             try body(Highway.name(target))
             let executed = vmlx_cpu_executed_targets(family)
