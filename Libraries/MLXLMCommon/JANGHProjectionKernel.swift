@@ -75,7 +75,8 @@ final class JANGHProjectionKernel {
             """
         qmv = MLXFast.metalKernel(
             name: "jangh_qmv_" + identity,
-            inputNames: ["x", "packed", "scales", "indices"], outputNames: ["out"], source: source)
+            inputNames: ["x", "packed", "scales", "indices"], outputNames: ["out"], source: source,
+            ensureRowContiguous: false)
         h32 = MLXFast.metalKernel(
             name: "jangh_h32_v1", inputNames: ["x"], outputNames: ["out"],
             source: """
@@ -124,10 +125,12 @@ final class JANGHProjectionKernel {
             packed.shape == [packed.dim(0), packed.dim(1), bitWidth.partialValue / 32],
             scales.shape == [packed.dim(0), packed.dim(1)]
         else { throw JANGHFormatContract.ValidationError.invalid("invalid JANGH packed geometry") }
+        try JANGHBankLayout.requireReadyRowContiguous(packed, role: "packed projection")
+        try JANGHBankLayout.requireReadyRowContiguous(scales, role: "projection scales")
         let x = rotation == .hadamard32 ? try hadamard32(input) : input
         return qmv(
             [
-                contiguous(x), contiguous(packed), contiguous(scales),
+                contiguous(x), packed, scales,
                 contiguous(indices.flattened()),
             ],
             template: [
