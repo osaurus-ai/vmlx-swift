@@ -217,10 +217,10 @@ jobs:
   linux_swiftpm:
     name: Linux SwiftPM (${{ matrix.arch }})
     # Advisory while it is new: builds the Linux profile of Package.swift (the LM libraries and
-    # their dependencies) and runs VMLXLinuxTests. GitHub-hosted runners only: the self-hosted pools
-    # queue for a day. python3 is for scripts/check-metal-only.sh.
+    # their dependencies), runs VMLXLinuxTests, then the CPU kernel tests. GitHub-hosted runners
+    # only: the self-hosted pools queue for a day. python3 is for scripts/check-metal-only.sh.
     continue-on-error: true
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -231,7 +231,7 @@ jobs:
             arch: aarch64
     runs-on: ${{ matrix.host }}
     container:
-      image: swift:6.3-bookworm
+      image: swift:6.4-bookworm
     defaults:
       run:
         shell: bash
@@ -261,7 +261,45 @@ jobs:
           swift test --filter VMLXLinuxTests 2>&1 | tee vmlx-linux-tests.log
           grep -Eq 'Test run with [1-9][0-9]* tests? .*passed' vmlx-linux-tests.log
 
+      - name: CPU kernel tests
+        run: |
+          set -o pipefail
+          bash scripts/run-cpu-kernel-tests.sh 2>&1 | tee cpu-kernel-tests.log
+
       # Last, and with !cancelled(), so a broken checker never hides the build and test results.
       - name: METAL-ONLY checker test
         if: ${{ !cancelled() && hashFiles('scripts/check-metal-only-test.sh') != '' }}
         run: bash scripts/check-metal-only-test.sh
+
+  linux_cpu_kernels_sde:
+    name: Linux CPU kernels under SDE (Sapphire Rapids)
+    # Advisory: emulated AVX-512 is slow, so it runs one pool configuration and the tests that
+    # dispatch per target. The native x86 leg of linux_swiftpm runs everything.
+    continue-on-error: true
+    timeout-minutes: 180
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install Intel SDE
+        uses: petarpetrovt/setup-sde@6d2773bc0ef3005fd52e0ae0bb91782321793aec # v6.0
+        with:
+          sdeVersion: 10.13.1
+
+      - name: Allow ptrace for SDE
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0
+
+      - name: Kernel tests under SDE
+        run: |
+          docker run --rm --cap-add=SYS_PTRACE -v "$PWD:/work" -v "$SDE_PATH:/sde:ro" -w /work \
+            swift:6.4-bookworm bash -c '
+              set -euo pipefail
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                libopenblas-dev liblapack-dev liblapacke-dev gfortran g++ libsqlite3-dev python3
+              export PATH=/sde:$PATH
+              bash scripts/run-cpu-kernel-tests.sh --sde spr --once --stall 5400 \
+                --filter "VMLXCPUKernelTests\\.(TargetsTests|QuantizedMatmulTests|NormTests|RopeTests)|AttentionTests/eachPath"'
