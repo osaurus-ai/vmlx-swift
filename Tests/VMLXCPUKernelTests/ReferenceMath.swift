@@ -136,7 +136,8 @@
         return (array, doubles(array))
     }
 
-    /// `got` equals `expected` element for element: NaN matches NaN, and +0 matches -0.
+    /// `got` equals `expected` element for element, bit for bit: +0 and -0 differ, and any NaN
+    /// matches any NaN. (`doubles` converts exactly, keeping the sign of a zero.)
     func expectIdentical(
         _ got: MLXArray, _ expected: [Double], _ label: @autoclosure () -> String,
         sourceLocation: SourceLocation = #_sourceLocation
@@ -146,7 +147,7 @@
             values.count == expected.count, "\(label()): element count",
             sourceLocation: sourceLocation)
         let differing = zip(values, expected).enumerated().filter { _, pair in
-            !(pair.0 == pair.1 || (pair.0.isNaN && pair.1.isNaN))
+            !(pair.0.bitPattern == pair.1.bitPattern || (pair.0.isNaN && pair.1.isNaN))
         }
         #expect(
             differing.isEmpty,
