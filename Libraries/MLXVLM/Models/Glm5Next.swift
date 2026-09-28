@@ -1875,11 +1875,11 @@ public final class Glm5NextMoE: Module {
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
             numExperts: config.nRoutedExperts,
-            // `swiglu_limit` is 10.0 in this bundle, so the activation is CLAMPED. Plain silu would
-            // be wrong on the tail, silently — nothing about the shapes would object.
-            activation: { clip(silu($0), min: -config.swigluLimit!, max: config.swigluLimit!) },
-            // The SAME value that builds the eager activation above, so the fused decode kernel and
-            // the generic path cannot disagree about the clamp.
+            // The model clamps both raw projections. A one-input activation cannot
+            // express the up clamp and can be classified as plain SiLU at small inputs.
+            glue: { gate, up in
+                Glm5NextActivation.clampedSwiGLU(gate: gate, up: up, limit: config.swigluLimit)
+            },
             swigluLimit: config.swigluLimit)
         _sharedExperts.wrappedValue = Glm5NextSharedExpert(config)
         super.init()
