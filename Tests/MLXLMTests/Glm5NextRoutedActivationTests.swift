@@ -77,20 +77,39 @@ final class Glm5NextRoutedActivationTests: XCTestCase {
                 let actual = output.asType(.float32).asArray(Float.self)
                 let gate: [Float] = [25, -25, 1, -1]
                 let up: [Float] = [1, 1, 400, -400]
+                // Independent scalar activation oracle; use the real down projection
+                // only after that boundary so sorted F32 TF32 rounding is not mistaken
+                // for an activation-contract error. No runtime precision override.
+                let hidden = routed.hiddenDims
+                var activated = [Float](repeating: 0, count: tokens * 2 * hidden)
+                for route in 0 ..< tokens * 2 {
+                    for column in 0 ..< hidden {
+                        let g = limit.map { min(gate[column % 4], $0) } ?? gate[column % 4]
+                        let u = limit.map { max(-$0, min(up[column % 4], $0)) } ?? up[column % 4]
+                        activated[route * hidden + column] = g / (1 + exp(-g)) * u
+                    }
+                }
+                let oracleRows = MLXArray(activated, [tokens * 2, 1, hidden]).asType(dtype)
+                let oracleOutput: MLXArray
+                if indices.size >= 64 {
+                    let order = argSort(indices.flattened())
+                    let down = routed.downProj(oracleRows[order], indices.flattened()[order], sortedIndices: true)
+                    oracleOutput = scatterUnsort(x: down, invOrder: argSort(order), shape: indices.shape).squeezed(axis: -2)
+                } else {
+                    oracleOutput = routed.downProj(
+                        oracleRows.reshaped([1, tokens, 2, 1, hidden]), indices).squeezed(axis: -2)
+                }
+                let expectedRows = oracleOutput.asType(.float32).asArray(Float.self)
                 for route in 0 ..< (tokens * 2) {
                     for column in 0 ..< 64 {
-                        var expected: Float = 0
-                        if column < 32 {
-                            let g = limit.map { min(gate[column % 4], $0) } ?? gate[column % 4]
-                            let u =
-                                limit.map { max(-$0, min(up[column % 4], $0)) } ?? up[column % 4]
-                            expected = g / (1 + exp(-g)) * u
+                        let scalar: Float = column < hidden ? activated[route * hidden + column] : 0
+                        let tolerance: Float = dtype == .float32 ? 0.0001 : max(0.002, abs(scalar) * 0.015)
+                        XCTAssertEqual(actual[route * 64 + column], expectedRows[route * 64 + column],
+                                       accuracy: tolerance, "native down dtype=\(dtype) tokens=\(tokens) column=\(column)")
+                        if tokens == 1 || ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0" {
+                            XCTAssertEqual(actual[route * 64 + column], scalar, accuracy: tolerance,
+                                           "scalar dtype=\(dtype) tokens=\(tokens) column=\(column)")
                         }
-                        let tolerance: Float =
-                            dtype == .float32 ? 0.0001 : max(0.002, abs(expected) * 0.015)
-                        XCTAssertEqual(
-                            actual[route * 64 + column], expected, accuracy: tolerance,
-                            "dtype=\(dtype) tokens=\(tokens) column=\(column)")
                     }
                 }
             }
