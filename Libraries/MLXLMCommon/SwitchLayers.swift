@@ -174,12 +174,15 @@ public protocol SwitchGLULayer: Module {
 /// Custom functions cannot be classified by evaluating a finite set of inputs.
 public enum SwitchGLUActivation {
     case silu
+    /// A known two-input contract: raw gate is bounded above, raw up on both sides.
+    /// nil preserves ordinary, unclamped SwiGLU. Opaque glue still takes precedence.
+    case swiGLU(limit: Float?)
     case geluApproximate
     case custom((MLXArray) -> MLXArray)
 
     fileprivate var function: (MLXArray) -> MLXArray {
         switch self {
-        case .silu: return MLXNN.silu
+        case .silu, .swiGLU: return MLXNN.silu
         case .geluApproximate: return safeGeluApproximate
         case .custom(let activation): return activation
         }
@@ -202,10 +205,10 @@ public class SwitchGLU: Module, SwitchGLULayer {
     /// the activated `gate * up` result. When non-nil, this OVERRIDES
     /// the standard `activation(gate) * up` path (and the compiled
     /// SwiGLU/GeGLU fast-paths) so DSV4 can apply
-    /// `silu(min(gate, 10)) * clip(up, -10, 10)` — symmetric clamping
-    /// of BOTH gate and up that the one-arg `activation` API can only
-    /// express on `gate`. Every other caller passes `nil` and gets the
-    /// historical bit-for-bit-identical fast paths.
+    /// `silu(min(gate, 10)) * clip(up, -10, 10)` — upper-only gate clamping
+    /// and symmetric up clamping that a one-input activation cannot express.
+    /// A typed `.swiGLU` declaration supplies this closure internally; an
+    /// explicit opaque closure takes precedence and disables fused reduction.
     let glue: ((MLXArray, MLXArray) -> MLXArray)?
     /// Optional model-specific activation that applies a per-route score
     /// before the down projection. DSV4-0731 requires this ordering because
@@ -246,17 +249,16 @@ public class SwitchGLU: Module, SwitchGLULayer {
     /// Built after checkpoint loading on the first Qwen4Exp decode call, then
     /// reused without repeating projection casts, shape walks, or dtype checks
     /// in every routed layer for every token.
-    /// The SwiGLU clamp this bank's activation applies, when it applies one.
-    ///
-    /// Kept ALONGSIDE `activation` rather than inferred from it: the closure is opaque, and the
-    /// fused kernel needs the number, not a function. Both should come from the same config field —
-    /// GLM-5.3 passes `swiglu_limit` to each. A model that clamps its eager activation but leaves
-    /// this nil would get an unclamped fast path and a clamped slow one, which is why
-    /// `Glm5NextMoE` sets them from one value.
+    /// The raw-projection clamp used by the typed SwiGLU contract. Legacy
+    /// metadata alone never authorizes fused math; its independent value must
+    /// agree with an explicitly declared two-input contract.
     public let swigluLimit: Float?
 
+    private let supportsFusedSwiGLUReduction: Bool
+
     private lazy var qwen4ExpReducer: Qwen4ExpFusedAffineMoE.Reducer? = {
-        guard let gate = gateProj as? QuantizedSwitchLinear,
+        guard supportsFusedSwiGLUReduction,
+            let gate = gateProj as? QuantizedSwitchLinear,
             let up = upProj as? QuantizedSwitchLinear,
             let down = downProj as? QuantizedSwitchLinear
         else { return nil }
@@ -276,12 +278,34 @@ public class SwitchGLU: Module, SwitchGLULayer {
         compileSeparatedDecode: Bool = false,
         swigluLimit: Float? = nil
     ) {
-        self.swigluLimit = swigluLimit
+        let typedSwiGLUGlue: ((MLXArray, MLXArray) -> MLXArray)?
+        if case .swiGLU(let limit) = activation {
+            self.swigluLimit = limit
+            typedSwiGLUGlue = { gate, up in
+                guard let limit else { return MLXNN.silu(gate) * up }
+                let gateBound = MLXArray(limit).asType(gate.dtype)
+                let upBound = MLXArray(limit).asType(up.dtype)
+                return MLXNN.silu(minimum(gate, gateBound))
+                    * clip(up, min: -upBound, max: upBound)
+            }
+            // Independently supplied legacy metadata cannot override the typed math.
+            supportsFusedSwiGLUReduction = glue == nil && scoredGlue == nil
+                && (swigluLimit == nil || swigluLimit == limit)
+                && (limit?.isFinite ?? true)
+        } else {
+            self.swigluLimit = swigluLimit
+            typedSwiGLUGlue = nil
+            if case .silu = activation {
+                supportsFusedSwiGLUReduction = glue == nil && scoredGlue == nil && swigluLimit == nil
+            } else {
+                supportsFusedSwiGLUReduction = false
+            }
+        }
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts
         self.activation = activation.function
-        self.glue = glue
+        self.glue = glue ?? typedSwiGLUGlue
         self.scoredGlue = scoredGlue
         self.allowFusedGateUpCache = allowFusedGateUpCache
         self.compileSeparatedDecode = compileSeparatedDecode
@@ -415,8 +439,9 @@ public class SwitchGLU: Module, SwitchGLULayer {
         callAsFunction(x, indices, preDownScores: nil)
     }
 
-    /// Exact-shape Qwen4Exp decode reduction. Returns `nil` unless the
-    /// q4/g64 2560→640→2560 top-10 BF16 contract and opt-in flag match.
+    /// Qualified affine decode reduction. Returns nil unless projection geometry,
+    /// backend policy, and the declared two-input SwiGLU math all match.
+    /// Opaque/custom activations and scored glue never opt in by tensor shape alone.
     public func qwen4ExpReduced(
         _ input: MLXArray, indices: MLXArray, scores: MLXArray
     ) -> MLXArray? {

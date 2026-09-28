@@ -1875,12 +1875,8 @@ public final class Glm5NextMoE: Module {
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
             numExperts: config.nRoutedExperts,
-            // The model clamps both raw projections. A one-input activation cannot
-            // express the up clamp and can be classified as plain SiLU at small inputs.
-            glue: { gate, up in
-                Glm5NextActivation.clampedSwiGLU(gate: gate, up: up, limit: config.swigluLimit)
-            },
-            swigluLimit: config.swigluLimit)
+            // One typed two-input contract drives both eager and fused clamps.
+            activation: .swiGLU(limit: config.swigluLimit))
         _sharedExperts.wrappedValue = Glm5NextSharedExpert(config)
         super.init()
     }
