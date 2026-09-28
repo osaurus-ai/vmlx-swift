@@ -827,7 +827,7 @@ private class TextRouter: Module {
 private class TextExperts: Module {
     @ModuleInfo(key: "switch_glu") var sg: SwitchGLU
     init(_ cfg: G4TextConfig) {
-        _sg.wrappedValue = SwitchGLU(inputDims: cfg.hiddenSize, hiddenDims: cfg.moeIntermediateSize, numExperts: cfg.numExperts, activation: { safeGeluApproximate($0) }, bias: false)
+        _sg.wrappedValue = SwitchGLU(inputDims: cfg.hiddenSize, hiddenDims: cfg.moeIntermediateSize, numExperts: cfg.numExperts, activation: .geluApproximate, bias: false)
         super.init()
     }
     func callAsFunction(_ x: MLXArray, idx: MLXArray, wts: MLXArray) -> MLXArray {

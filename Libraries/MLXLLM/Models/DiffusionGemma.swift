@@ -378,7 +378,7 @@ class DiffusionGemmaExperts: Module {
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
             numExperts: config.numExperts,
-            activation: { safeGeluApproximate($0) },
+            activation: .geluApproximate,
             bias: false)
         super.init()
     }

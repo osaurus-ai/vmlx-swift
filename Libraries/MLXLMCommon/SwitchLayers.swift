@@ -127,8 +127,10 @@ private enum Qwen4ExpCompiledRoutedSwitchGLU {
         }
         if !didReport {
             didReport = true
-            FileHandle.standardError.write(Data(
-                "[Qwen4Exp] compiled_routed_switch_glu=active stock_gather_qmm=true shared_weight_inputs=true dtype=bfloat16\n".utf8))
+            FileHandle.standardError.write(
+                Data(
+                    "[Qwen4Exp] compiled_routed_switch_glu=active stock_gather_qmm=true shared_weight_inputs=true dtype=bfloat16\n"
+                        .utf8))
         }
         lock.unlock()
 
@@ -166,6 +168,22 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 
 public protocol SwitchGLULayer: Module {
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray
+}
+
+/// Explicit activation contract for routed GLU fast paths.
+/// Custom functions cannot be classified by evaluating a finite set of inputs.
+public enum SwitchGLUActivation {
+    case silu
+    case geluApproximate
+    case custom((MLXArray) -> MLXArray)
+
+    fileprivate var function: (MLXArray) -> MLXArray {
+        switch self {
+        case .silu: return MLXNN.silu
+        case .geluApproximate: return safeGeluApproximate
+        case .custom(let activation): return activation
+        }
+    }
 }
 
 public class SwitchGLU: Module, SwitchGLULayer {
@@ -250,7 +268,7 @@ public class SwitchGLU: Module, SwitchGLULayer {
         inputDims: Int,
         hiddenDims: Int,
         numExperts: Int,
-        activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
+        activation: SwitchGLUActivation = .silu,
         bias: Bool = false,
         glue: ((MLXArray, MLXArray) -> MLXArray)? = nil,
         scoredGlue: ((MLXArray, MLXArray, MLXArray) -> MLXArray)? = nil,
@@ -262,21 +280,21 @@ public class SwitchGLU: Module, SwitchGLULayer {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts
-        self.activation = activation
+        self.activation = activation.function
         self.glue = glue
         self.scoredGlue = scoredGlue
         self.allowFusedGateUpCache = allowFusedGateUpCache
         self.compileSeparatedDecode = compileSeparatedDecode
-        // Detect common activation types for compiled fast path.
-        // Use safeGeluApproximate for comparison to avoid MLXNN's compiledGeluApproximate
-        // which uses the Power primitive (x ** 3) and crashes on some Metal GPUs during
-        // model load time — see comment on safeGeluApproximate above.
-        let testInput = MLXArray([Float(1.0)])
-        let testOutput = activation(testInput)
-        let siluOutput = silu(testInput)
-        let geluOutput = safeGeluApproximate(testInput)
-        self.isSiluActivation = (testOutput .== siluOutput).all().item(Bool.self)
-        self.isGeluActivation = !isSiluActivation && (testOutput .== geluOutput).all().item(Bool.self)
+        if case .silu = activation {
+            self.isSiluActivation = true
+        } else {
+            self.isSiluActivation = false
+        }
+        if case .geluApproximate = activation {
+            self.isGeluActivation = true
+        } else {
+            self.isGeluActivation = false
+        }
 
         self._gateProj.wrappedValue = SwitchLinear(
             inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
@@ -286,6 +304,27 @@ public class SwitchGLU: Module, SwitchGLULayer {
             inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
 
         super.init()
+    }
+
+    /// Source-compatible custom-activation initializer. Supplying a closure always
+    /// preserves that closure; use an explicit identity to opt into a known fast path.
+    public convenience init(
+        inputDims: Int,
+        hiddenDims: Int,
+        numExperts: Int,
+        activation: @escaping (MLXArray) -> MLXArray,
+        bias: Bool = false,
+        glue: ((MLXArray, MLXArray) -> MLXArray)? = nil,
+        scoredGlue: ((MLXArray, MLXArray, MLXArray) -> MLXArray)? = nil,
+        allowFusedGateUpCache: Bool = true,
+        compileSeparatedDecode: Bool = false,
+        swigluLimit: Float? = nil
+    ) {
+        self.init(
+            inputDims: inputDims, hiddenDims: hiddenDims, numExperts: numExperts,
+            activation: .custom(activation), bias: bias, glue: glue, scoredGlue: scoredGlue,
+            allowFusedGateUpCache: allowFusedGateUpCache,
+            compileSeparatedDecode: compileSeparatedDecode, swigluLimit: swigluLimit)
     }
 
     /// Populate the fused gate+up weight cache on first forward. Safe to
