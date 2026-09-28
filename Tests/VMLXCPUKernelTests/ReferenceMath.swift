@@ -228,4 +228,66 @@
                 doubles(matmul(abs(x64), wAbs.asType(.float64).transposed()))
             ), c: c, dtype: dtype)
     }
+
+    /// The value of an FP4 E2M1 code: a sign bit, two exponent bits (bias 1), one mantissa bit.
+    func fp4E2M1(_ code: UInt32) -> Double {
+        let exponent = Int((code >> 1) & 3)
+        let mantissa = Double(code & 1)
+        let magnitude =
+            exponent == 0
+            ? mantissa / 2
+            : (1 + mantissa / 2) * Double(sign: .plus, exponent: exponent - 1, significand: 1)
+        return code & 8 == 0 ? magnitude : -magnitude
+    }
+
+    /// The value of an FP8 E4M3 code: a sign bit, four exponent bits (bias 7), three mantissa bits.
+    /// 0x7F and 0xFF are NaN.
+    func fp8E4M3(_ code: UInt32) -> Double {
+        let exponent = Int((code >> 3) & 15)
+        let mantissa = Double(code & 7)
+        if exponent == 15 && mantissa == 7 { return .nan }
+        let magnitude =
+            exponent == 0
+            ? mantissa / 8 * 0x1p-6
+            : (1 + mantissa / 8) * Double(sign: .plus, exponent: exponent - 7, significand: 1)
+        return code & 0x80 == 0 ? magnitude : -magnitude
+    }
+
+    /// The value of an E8M0 scale code, 2^(code - 127). 255 is NaN.
+    func e8m0(_ code: UInt8) -> Double {
+        code == 255 ? .nan : Double(sign: .plus, exponent: Int(code) - 127, significand: 1)
+    }
+
+    /// A quantized matrix dequantized on the host, in Double, without MLX's dequantize. Each code
+    /// is `bits` wide, packed into 32-bit words from the lowest bits up. Affine: code · scale +
+    /// bias of its group. mxfp4 and nvfp4: the E2M1 value of the code; mxfp8: its E4M3 value;
+    /// times the group's scale, E8M0 for mxfp4 and mxfp8 and E4M3 for nvfp4. Row-major, in
+    /// `wq`'s shape with the last axis counted in elements.
+    func hostDequantized(
+        _ wq: MLXArray, scales: MLXArray, biases: MLXArray?, groupSize: Int, bits: Int,
+        mode: QuantizationMode = .affine
+    ) -> [Double] {
+        let perWord = 32 / bits
+        let mask = UInt32(1 << bits) - 1
+        var codes = [UInt32]()
+        codes.reserveCapacity(wq.size * perWord)
+        for word in wq.asArray(UInt32.self) {
+            for i in 0 ..< perWord { codes.append((word >> UInt32(i * bits)) & mask) }
+        }
+        switch mode {
+        case .affine:
+            guard let biases else { preconditionFailure("affine weights have biases") }
+            let (s, b) = (doubles(scales), doubles(biases))
+            return codes.enumerated().map { i, q in
+                s[i / groupSize] * Double(q) + b[i / groupSize]
+            }
+        case .mxfp4, .nvfp4, .mxfp8:
+            let scaleCodes = scales.asArray(UInt8.self)
+            let scale =
+                mode == .nvfp4 ? scaleCodes.map { fp8E4M3(UInt32($0)) } : scaleCodes.map(e8m0)
+            return codes.enumerated().map { i, q in
+                (bits == 4 ? fp4E2M1(q) : fp8E4M3(q)) * scale[i / groupSize]
+            }
+        }
+    }
 #endif
