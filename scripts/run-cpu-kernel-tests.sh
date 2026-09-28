@@ -10,13 +10,18 @@
 #
 # The test build (VMLX_HWY_ALL_TARGETS=1, release) compiles every attainable Highway target, EMU128
 # included. VMLX_EXPECT_HWY_TARGETS, the targets this host must execute, is --expect's value, or else
-# Highway's own detection of this CPU (scripts/hwy-supported-targets.cc) intersected with the targets
-# Highway 1.4.0 attains on this architecture, plus EMU128. It never comes from what the build contains.
+# Highway's own detection of this CPU (scripts/hwy-supported-targets.cc, compiled with $CXX, by
+# default g++) intersected with the targets Highway 1.4.0 attains on this architecture, plus EMU128.
+# It never comes from what the build contains.
 # --sde runs the probe and the tests under Intel SDE, emulating <chip> (for example spr).
 # --filter narrows the tests (default: the whole target); --once runs only the default pool, for
-# emulated runs, which are slow. A run whose log stops growing for --stall seconds (default 3600) is
-# killed with everything it started, and fails: a hung kernel must not hold a runner forever.
+# emulated runs, which are slow. A run whose log stops growing for --stall seconds (default 1200) is
+# killed with everything it started: a hung kernel must not hold a runner forever.
 # VMLX_KERNEL_TESTS_SCRATCH moves the build (default .build/hwy-all), for a mutated build beside it.
+#
+# Exits 0 when every configuration passed. Otherwise with the first failing configuration's status:
+# 124 when it stalled, 69 when no test matched the filter, and else the test executable's own (1 for
+# a failed test). Exits 2 for a usage error, a missing test executable or a missing probe compiler.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SCRATCH="${VMLX_KERNEL_TESTS_SCRATCH:-$ROOT/.build/hwy-all}"
@@ -25,8 +30,13 @@ SDE=""
 BUILD=1
 FILTER=VMLXCPUKernelTests
 CONFIGURATIONS="1 default"
-STALL=3600
+STALL=1200
+usage() {
+  echo "usage: $0 [--expect '<targets>'] [--sde <chip>] [--skip-build] [--filter <filter>] [--once] [--stall <s>]" >&2
+  exit 2
+}
 while [ $# -gt 0 ]; do
+  case "$1" in --expect | --sde | --filter | --stall) [ $# -ge 2 ] || usage ;; esac
   case "$1" in
     --expect) EXPECT=$2; shift 2 ;;
     --sde) SDE=$2; shift 2 ;;
@@ -34,11 +44,12 @@ while [ $# -gt 0 ]; do
     --filter) FILTER=$2; shift 2 ;;
     --once) CONFIGURATIONS=default; shift ;;
     --stall) STALL=$2; shift 2 ;;
-    *) echo "usage: $0 [--expect '<targets>'] [--sde <chip>] [--skip-build] [--filter <filter>] [--once] [--stall <s>]" >&2; exit 2 ;;
+    *) usage ;;
   esac
 done
-# The tests check that the int8 switch starts off, its default.
-unset MLX_CPU_QUANTIZED_INT8
+# The tests expect the int8 switch off at the start, and judge the polynomial bounds, which
+# VMLX_ULP_BASELINE=1 would only measure.
+unset MLX_CPU_QUANTIZED_INT8 VMLX_ULP_BASELINE
 SWIFT_FLAGS=(--package-path "$ROOT" --scratch-path "$SCRATCH" -c release -Xswiftc -enable-testing)
 export VMLX_HWY_ALL_TARGETS=1
 if [ "$BUILD" = 1 ]; then
@@ -46,20 +57,22 @@ if [ "$BUILD" = 1 ]; then
 fi
 # The test executable, run directly: `swift test` would start it in a process group of its own, out
 # of watched's reach. Swift Build (SwiftPM 6.4's default) links one per test target, beside its .so;
-# the native build system linked one per package.
+# the native build system linked one per package. The newest, should a stale one remain.
 BIN=$(swift build "${SWIFT_FLAGS[@]}" --show-bin-path)
-TEST_BIN=$(find "$BIN" -maxdepth 1 -type f -perm -u+x \( -name 'VMLXCPUKernelTests-test-runner' -o -name '*PackageTests.xctest' \) 2> /dev/null | head -1 || true)
+TEST_BIN=$(find "$BIN" -maxdepth 1 -type f -perm -u+x \( -name 'VMLXCPUKernelTests-test-runner' -o -name '*PackageTests.xctest' \) -printf '%T@ %p\n' 2> /dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)
 [ -n "$TEST_BIN" ] || { echo "no test executable in $BIN" >&2; exit 2; }
+echo "Tests: $TEST_BIN"
 # The emulator's command prefix, empty without --sde.
 SDE_RUN=()
 if [ -n "$SDE" ]; then SDE_RUN=(sde64 "-$SDE" --); fi
 # watched <log> <program...>: runs the program line-buffered into <log> under setsid, which makes it
 # the leader of a new process group, and kills that group if the log stops growing for $STALL
 # seconds, so that no hung child (SDE starts several) outlives the run. Returns the program's exit
-# status, 137 after a kill.
+# status, and sets STALLED to 1 after a kill.
 watched() {
   local log=$1
   shift
+  STALLED=0
   setsid stdbuf -oL -eL "$@" > "$log" 2>&1 &
   local pid=$! last=-1 idle=0 size rc=0
   while kill -0 "$pid" 2> /dev/null; do
@@ -69,6 +82,8 @@ watched() {
     if [ "$idle" -ge "$STALL" ]; then
       echo "STALLED: no output for $STALL s" >> "$log"
       kill -9 -- "-$pid" 2> /dev/null || true
+      STALLED=1
+      break
     fi
   done
   wait "$pid" || rc=$?
@@ -84,10 +99,15 @@ if [ -z "$EXPECT" ]; then
   esac
   if [ -n "$ATTAINABLE" ]; then
     H="$ROOT/Source/Cmlx/highway"
+    PROBE_CXX=${CXX:-g++}
+    command -v "$PROBE_CXX" > /dev/null || {
+      echo "no C++ compiler for the target probe: $PROBE_CXX (install g++, or set CXX)" >&2
+      exit 2
+    }
     mkdir -p "$SCRATCH"
-    g++ -std=c++17 -O1 -DHWY_DISABLE_PCLMUL_AES -I "$H" "$ROOT/scripts/hwy-supported-targets.cc" \
-      "$H/hwy/targets.cc" "$H/hwy/abort.cc" "$H/hwy/print.cc" "$H/hwy/per_target.cc" \
-      -o "$SCRATCH/hwy-supported-targets"
+    "$PROBE_CXX" -std=c++17 -O1 -DHWY_DISABLE_PCLMUL_AES -I "$H" \
+      "$ROOT/scripts/hwy-supported-targets.cc" "$H/hwy/targets.cc" "$H/hwy/abort.cc" \
+      "$H/hwy/print.cc" "$H/hwy/per_target.cc" -o "$SCRATCH/hwy-supported-targets"
     SUPPORTED=" $("${SDE_RUN[@]}" "$SCRATCH/hwy-supported-targets") "
     EXPECT=""
     for t in $ATTAINABLE; do
@@ -107,13 +127,18 @@ for threads in $CONFIGURATIONS; do
   rc=0
   watched "$log" "${SDE_RUN[@]}" "$TEST_BIN" --testing-library swift-testing --filter "$FILTER" || rc=$?
   echo "== MLX_CPU_THREADS=$threads: exit $rc, $(grep -E 'Test run with' "$log" | tail -1)"
-  if [ "$rc" != 0 ] || ! grep -Eq 'Test run with [1-9][0-9]* tests? .*passed' "$log"; then
-    status=1
-    # Each recorded issue with the values swift-testing prints under it (↳), and any stall or crash.
-    awk '/recorded an issue/ {show = 1; print; next} show && /^↳/ {print; next} {show = 0}
-      /STALLED|[Ff]atal error|error:/ {print}' "$log" | head -40 || true
+  if [ "$rc" = 0 ] && grep -Eq 'Test run with [1-9][0-9]* tests? .*passed' "$log"; then continue; fi
+  # Each recorded issue with the values swift-testing prints under it (↳), and any stall or crash.
+  awk '/recorded an issue/ {show = 1; print; next} show && /^↳/ {print; next} {show = 0}
+    /STALLED|[Ff]atal error|error:/ {print}' "$log" | head -40 || true
+  if [ "$STALLED" = 1 ]; then
+    rc=124
+  elif [ "$rc" = 69 ]; then
     # The executable exits 69 when the filter matches no test, where `swift test` exits 0.
-    if [ "$rc" = 69 ]; then echo "no test matches --filter '$FILTER'"; fi
+    echo "no test matches --filter '$FILTER'"
+  elif [ "$rc" = 0 ]; then
+    rc=1 # exit 0 without a passing summary line
   fi
+  if [ "$status" = 0 ]; then status=$rc; fi
 done
 exit "$status"
