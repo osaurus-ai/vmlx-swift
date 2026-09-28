@@ -18,7 +18,8 @@
         static let initialQuantizedInt8 = vmlx_cpu_quantized_int8()
 
         /// Also puts the process-wide state back to its defaults on the way in and out, so that a
-        /// test that fails midway cannot leave the int8 switch or a target mask to the next.
+        /// test that fails midway cannot leave the int8 switch or a target mask to the next. The
+        /// body runs on the CPU device, whatever other device a build may have.
         static func run<R>(_ body: () throws -> R) rethrows -> R {
             lock.lock()
             _ = initialQuantizedInt8
@@ -27,7 +28,7 @@
                 reset()
                 lock.unlock()
             }
-            return try body()
+            return try Device.withDefaultDevice(.cpu, body)
         }
 
         private static func reset() {

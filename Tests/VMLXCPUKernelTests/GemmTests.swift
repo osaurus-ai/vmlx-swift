@@ -45,7 +45,7 @@
             KernelLock.run {
                 let a = MLXRandom.normal([16, 8, 64], dtype: .float32, key: MLXRandom.key(1))
                 let b = MLXRandom.normal([16, 64, 32], dtype: .float32, key: MLXRandom.key(2))
-                expectWithin(matmul(a, b), matmulBound(a, b, c: 66, dtype: .float32), "batched")
+                expectWithin(matmul(a, b), matmulBound(a, b, c: 64 + 2, dtype: .float32), "batched")
             }
         }
 

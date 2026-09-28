@@ -1169,8 +1169,10 @@ package.targets.append(
 
 // MARK: - VMLXCPUKernelTests
 
-// The CPU backend's kernels against independent references (T-167 phase 2). Declared on every
-// platform, and before the Linux profile, which must find it; its sources compile only on Linux.
+// The CPU backend's kernels (T-167 phase 2) against references computed on the host in Double,
+// with two exceptions: the quantized matmul's bound takes MLX's float64 matmul, and the functions
+// MLX takes from libm are compared with glibc's own. Declared on every platform, and before the
+// Linux profile, which must find it; its sources compile only on Linux.
 // Run it through scripts/run-cpu-kernel-tests.sh, which sets what the host must execute.
 package.targets.append(
     .testTarget(

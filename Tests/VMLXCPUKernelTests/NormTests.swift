@@ -13,8 +13,9 @@
 
         /// RMSNorm of one row in float64, with each element's bound. The float32 work (a sum of n
         /// squares, a square root, a reciprocal, two products) errs by at most (n/2 + 5)·u·|y|; the
-        /// bound allows 4 times that. For bf16 and fp16 it adds the two roundings MLX's fallback
-        /// makes in the dtype: x·r, then its product with the weight.
+        /// bound, (n + 8)·ε·|y|, allows 4(n + 8)/(n + 10) times that: 3.3 at n = 1, near 4 for wide
+        /// rows. For bf16 and fp16 it adds the two roundings MLX's fallback makes in the dtype: x·r,
+        /// then its product with the weight.
         static func rmsNorm(_ x: ArraySlice<Double>, _ w: [Double], dtype: DType)
             -> [(value: Double, bound: Double)]
         {
