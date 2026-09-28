@@ -44,6 +44,7 @@ final class DeepseekV3MoEDtypeTests: XCTestCase {
           "n_routed_experts": 4,
           "num_experts_per_tok": 2,
           "norm_topk_prob": true,
+          "attention_bias": false,
           "topk_group": 1,
           "n_group": 1,
           "routed_scaling_factor": 1.0
