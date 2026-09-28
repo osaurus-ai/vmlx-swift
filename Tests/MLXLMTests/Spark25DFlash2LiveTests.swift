@@ -311,6 +311,87 @@ final class Spark25DFlash2LiveTests: XCTestCase {
         }
     }
 
+    /// Compare the same user request with and without an exported app system
+    /// prompt. An optional JSON token array replays the exact rendered app input.
+    /// Private app content stays outside the repository.
+    func testAppPromptAcceptance() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let bundle = Self.bundle,
+            let systemPath = env["VMLX_SPARK25_DFLASH_SYSTEM_PROMPT"]
+        else {
+            throw XCTSkip("Set bundle and VMLX_SPARK25_DFLASH_SYSTEM_PROMPT")
+        }
+        let system = try String(contentsOfFile: systemPath, encoding: .utf8)
+        XCTAssertFalse(system.isEmpty)
+        let context = try await MLXLMCommon.loadModel(
+            from: bundle, using: #huggingFaceTokenizerLoader())
+        nonisolated(unsafe) let ctx = context
+        let drafter = try DFlash2DrafterResolver.shared.drafter(
+            at: bundle.appendingPathComponent("dflash"))
+        let user =
+            "Write a Python function that merges two sorted lists, then explain its complexity."
+        var inputs: [(String, LMInput)] = []
+        for (name, messages) in [
+            ("short", [Chat.Message.user(user)]),
+            ("app-system", [.system(system), .user(user)]),
+        ] {
+            inputs.append((name, try await ctx.processor.prepare(input: UserInput(chat: messages))))
+        }
+        if let path = env["VMLX_SPARK25_DFLASH_REPLAY_TOKENS"] {
+            let ids = try JSONDecoder().decode(
+                [Int32].self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+            guard !ids.isEmpty, ids.allSatisfy({ $0 >= 0 && Int($0) < drafter.config.vocabSize })
+            else {
+                throw NSError(
+                    domain: "DFlashReplay", code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Replay tokens are empty or outside the vocabulary"
+                    ])
+            }
+            inputs.append(("app-replay", LMInput(tokens: MLXArray(ids))))
+        }
+        var parameters = GenerateParameters(
+            generationConfig: ctx.configuration.generationDefaults,
+            fallback: GenerateParameters(maxTokens: 256))
+        parameters.maxTokens = 256
+        parameters.prefillStepSize = 1024
+        let probes = max(3, Int(env["VMLX_SPARK25_DFLASH_PROBES"] ?? "3") ?? 3)
+        var rows: [[String: Any]] = []
+        for probe in 0 ... probes {
+            for (name, input) in inputs {
+                // Reverse order on alternating probes to expose thermal drift.
+                for speculative in (probe.isMultiple(of: 2) ? [false, true] : [true, false]) {
+                    Memory.clearCache()
+                    let run =
+                        try speculative
+                        ? dflash(ctx, drafter, input, parameters, block: 5)
+                        : plain(ctx, input, parameters)
+                    let rate = Double(run.tokens.count) / max(run.decodeSeconds, 1e-6)
+                    let row: [String: Any] = [
+                        "probe": probe, "warmup": probe == 0, "input": name,
+                        "prompt_tokens": input.text.tokens.size,
+                        "path": speculative ? "dflash" : "plain", "tokens": run.tokens,
+                        "tok_s": rate, "acceptance_length": run.stats?.acceptanceLength ?? 1,
+                        "verify_calls": run.stats?.verifyCalls ?? 0,
+                        "temperature": parameters.temperature, "top_p": parameters.topP,
+                    ]
+                    rows.append(row)
+                    print(
+                        "[app-acceptance] probe=\(probe) input=\(name) dflash=\(speculative) prompt=\(input.text.tokens.size) tok/s=\(rate) acceptance=\(run.stats?.acceptanceLength ?? 1)"
+                    )
+                }
+            }
+        }
+        if let out = env["VMLX_SPARK25_DFLASH_OUT"] {
+            let url = URL(fileURLWithPath: out).appendingPathComponent(
+                "app-acceptance-\(UUID().uuidString).json")
+            try JSONSerialization.data(
+                withJSONObject: rows, options: [.prettyPrinted, .sortedKeys]
+            ).write(to: url)
+        }
+    }
+
     /// A prompt-cache hit restores the target's prefix without re-running it.
     /// The drafter's context must still cover that prefix, or it drafts from
     /// the new suffix alone. Same request cold and after a hit on a shorter

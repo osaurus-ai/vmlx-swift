@@ -398,3 +398,30 @@ process segfaults at exit. Reproduce with `DFlash2LosslessSmokeTests`:
 tests pass either way, the process exits with signal 11 only when the
 compiled verify is on. Fixing it likely means moving the trace table
 into a reference-typed box owned by the run.
+
+### Prefix-cache and acceptance follow-up (2026-09-27, partial)
+
+DFlash2 now validates restored layer offsets and restored token count against
+the coordinator's matched boundary, using the same invariant as native MTP.
+A mismatched restore rebuilds the target cache and prefills the complete input.
+This source change still needs fresh runtime coverage before promotion.
+
+The context-store fallback after a disk restore reconstructs a recent token
+span on a scratch cache. Those hidden features are approximate when earlier
+context influences the target; a short-prompt acceptance result does not prove
+equivalence on long prompts. Native MTP separately starts restored prefixes
+with a cold head cache. Legacy DFlash/DDTree's streaming entry point does not
+accept a cache coordinator. Prefix-cache support must be assessed per strategy.
+
+`Spark25DFlash2LiveTests.testAppPromptAcceptance` accepts a private exported
+system prompt through `VMLX_SPARK25_DFLASH_SYSTEM_PROMPT` and optionally an
+exact rendered token array through `VMLX_SPARK25_DFLASH_REPLAY_TOKENS` (JSON).
+It compares the same user request with and without the system prompt, using
+bundle sampling defaults, block 5, one warmup and at least three probes.
+`VMLX_SPARK25_DFLASH_OUT` records token IDs, acceptance and rates for inspection.
+Fixed-length diagnostic output is not a completion/coherency pass.
+
+Remaining gates include cold/partial/full/disk-restored prefix runs, growing
+multi-turn chat, cancellation rollback, effective compilation policy, default
+sampling, coherent tool use, and interleaved app speed measurements. No new
+M3/M4/M5 performance claim follows from these source changes.

@@ -485,12 +485,15 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 let diskArrays) = result
             {
                 var restored = false
+                var restoredTokenCount = 0
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(
                         from: blocks, into: self.cache,
-                        preserveStandardKVStorageDType: coordinator.config.preserveStandardKVStorageDType)
+                        preserveStandardKVStorageDType: coordinator.config
+                            .preserveStandardKVStorageDType)
                     coordinator.release(blocks: blocks)
                     if restoredTokens > 0 {
+                        restoredTokenCount = restoredTokens
                         if let ssm = ssmStates {
                             restoreSSMStates(ssm, into: self.cache, boundary: matchedTokens)
                         }
@@ -502,8 +505,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 // drafter's cache is separate), so an entry that does not
                 // fit it fits neither, and is reported the same way.
                 if let diskArrays, !restored {
-                    if restoreFromDiskArrays(
-                                diskArrays, into: &self.cache, requirePromptBoundary: true) > 0 {
+                    let diskRestored = restoreFromDiskArrays(
+                        diskArrays, into: &self.cache, requirePromptBoundary: true)
+                    if diskRestored > 0 {
+                        restoredTokenCount = diskRestored
                         if let ssm = ssmStates {
                             restoreSSMStates(ssm, into: self.cache, boundary: matchedTokens)
                         }
@@ -516,12 +521,32 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                             reason: "payload does not fit the runtime cache")
                     }
                 }
+                // Use the same boundary contract as native MTP and plain
+                // decode: a hit is usable only when every companion agrees
+                // with the token boundary advertised by the coordinator.
+                if restored,
+                    !validateRestoredCacheBoundary(
+                        self.cache, matchedTokens: matchedTokens,
+                        restoredTokens: restoredTokenCount, detail: "dflash2")
+                {
+                    if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: tokensToPrefill, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "restored offsets do not match the boundary")
+                    }
+                    restored = false
+                    self.cache = target.newCache(parameters: effectiveParameters)
+                }
                 if restored, Self.traceEnabled {
                     let offsets = Set(self.cache.map(\.offset)).sorted()
-                    let kvLens = self.cache.compactMap { ($0 as? KVCacheSimple)?.state.first?.dim(2) }
-                    FileHandle.standardError.write(Data(
-                        "[DFlash2 restore] matched=\(matchedTokens) remaining=\(remainingTokens.count) offsets=\(offsets) kvLens=\(Set(kvLens).sorted())\n"
-                            .utf8))
+                    let kvLens = self.cache.compactMap {
+                        ($0 as? KVCacheSimple)?.state.first?.dim(2)
+                    }
+                    FileHandle.standardError.write(
+                        Data(
+                            "[DFlash2 restore] matched=\(matchedTokens) remaining=\(remainingTokens.count) offsets=\(offsets) kvLens=\(Set(kvLens).sorted())\n"
+                                .utf8))
                 }
                 if restored {
                     if input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens) {
@@ -582,7 +607,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             let promptCount = promptTokenIds.count
             let prefillCount = tokensToPrefill.count
             let offsets: [Int] = self.cache.prefix(3).map { $0.offset }
-            let line = "[DFlash2Init] prompt=\(promptCount) toPrefill=\(prefillCount)"
+            let line =
+                "[DFlash2Init] prompt=\(promptCount) toPrefill=\(prefillCount)"
                 + " restored=\(restoredCount) offsets=\(offsets)\n"
             FileHandle.standardError.write(Data(line.utf8))
         }
@@ -631,7 +657,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 // full-attention layers, which lose the context before the
                 // span. Acceptance only — the target's cache is untouched.
                 var scratch = target.newCache(parameters: effectiveParameters)
-                let span = Array(self.promptTokenIds[(restoredCount - missingRows) ..< restoredCount])
+                let span = Array(
+                    self.promptTokenIds[(restoredCount - missingRows) ..< restoredCount])
                 let recomputed = try Self.prefill(
                     tokens: span, target: target, cache: &scratch,
                     captureLayerIDs: self.captureLayerIDs, orderedLayerIDs: self.orderedLayerIDs,
@@ -664,7 +691,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             let firstShape = first.shape
             let firstDtype = first.dtype
             let samplerKind = String(describing: type(of: self.sampler))
-            let line = "[DFlash2Init] first=\(firstShape) dtype=\(firstDtype) sampler=\(samplerKind)\n"
+            let line =
+                "[DFlash2Init] first=\(firstShape) dtype=\(firstDtype) sampler=\(samplerKind)\n"
             FileHandle.standardError.write(Data(line.utf8))
         }
         let firstToken = first.reshaped(-1)[0].item(Int.self)
@@ -703,7 +731,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             ProcessInfo.processInfo.environment["VMLX_DFLASH2_COMPILED_VERIFY"] == "1"
         {
             let promptOffset = self.cache.map(\.offset).max() ?? self.promptTokenIds.count
-            let bufferLength = promptOffset + (self.maxTokens ?? 4096)
+            let bufferLength =
+                promptOffset + (self.maxTokens ?? 4096)
                 + effectiveBlockSize + 8
             self.cache = self.cache.map { layer in
                 if !(layer is CompilableKVCache), layer is KVCacheSimple {
@@ -810,7 +839,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         if let maxTokens, tokenCount >= maxTokens {
             if Self.traceEnabled, stats.verifyCalls > 0 {
                 let line = String(
-                    format: "[DFlash2 stats] cycles=%d accLen=%.2f draft=%.2fs verify=%.2fs commit=%.2fs arFallback=%d\n",
+                    format:
+                        "[DFlash2 stats] cycles=%d accLen=%.2f draft=%.2fs verify=%.2fs commit=%.2fs arFallback=%d\n",
                     stats.verifyCalls, stats.acceptanceLength, stats.draftSeconds,
                     stats.verifySeconds, stats.commitSeconds,
                     stats.autoregressiveFallbackTokens)
@@ -891,11 +921,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             // after a fully-rejected block once the context passed the
             // drafter's 2048-token sliding window.
             drafterDisabled = true
-            FileHandle.standardError.write(Data(
-                ("[DFlash2] drafter forward degenerated at cycle "
-                    + "\(stats.verifyCalls) (ctx=\(promptTokenIds.count + stats.emittedTokens)); "
-                    + "speculation disabled for the rest of the turn, "
-                    + "continuing autoregressively.\n").utf8))
+            FileHandle.standardError.write(
+                Data(
+                    ("[DFlash2] drafter forward degenerated at cycle "
+                        + "\(stats.verifyCalls) (ctx=\(promptTokenIds.count + stats.emittedTokens)); "
+                        + "speculation disabled for the rest of the turn, "
+                        + "continuing autoregressively.\n").utf8))
             return runAutoregressiveStep()
         }
         let completed = completeVerify(flight)
@@ -942,8 +973,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     logitsStart: 1)
             }
         } catch {
-            FileHandle.standardError.write(Data(
-                "[DFlash2] drafter forward error: \(error)\n".utf8))
+            FileHandle.standardError.write(
+                Data(
+                    "[DFlash2] drafter forward error: \(error)\n".utf8))
             return nil
         }
         // Host-side metadata check, no sync: a degraded drafter forward
@@ -997,7 +1029,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // graph flush per record — measured at 48 layers × 7 prefixes = 336
         // launches + 336 flushes per cycle on Qwen3.8, most of a verify
         // that cost 5.1× a decode step.
-        let usesInputCapture = hasRecurrentState && target is DFlash2VerifyRollbackModel
+        let usesInputCapture =
+            hasRecurrentState && target is DFlash2VerifyRollbackModel
             && ProcessInfo.processInfo.environment["VMLX_DFLASH2_INPUT_CAPTURE"] != "0"
         // Full-size blocks take the compiled staged verify; tail blocks
         // (shrunken bs near the budget) keep the eager path — compiling is
@@ -1012,8 +1045,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 // Eager warm-up under the staged mode: allocates the
                 // fixed staging slots the compile trace will track.
                 let (l, captured) = NativeMTPVerifierStatePolicy.withVerifierMode(
-                    "input_capture_staged")
-                {
+                    "input_capture_staged"
+                ) {
                     target.callAsFunction(
                         verifyInput, cache: cache, captureLayerIDs: captureLayerIDs,
                         recordPrefixCommitStates: false)
@@ -1032,7 +1065,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 newHidden = concatenated(Array(outs[1...]), axis: -1)
             }
         } else {
-            let verifierMode = usesInputCapture
+            let verifierMode =
+                usesInputCapture
                 ? "input_capture"
                 : (hasRecurrentState ? "capture_commit" : "input_capture")
             let (l, captured) = NativeMTPVerifierStatePolicy.withVerifierMode(verifierMode) {
@@ -1122,7 +1156,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             // EVERY cycle commits from the staging slots (a full accept
             // adopts the staged final state, no replay). Attention caches
             // advanced in-graph and just rewind their offset.
-            let committed = Self.trimVerifiedRows(cache, rejected)
+            let committed =
+                Self.trimVerifiedRows(cache, rejected)
                 && ((target as? DFlash2StagedVerifyRollbackModel)?
                     .commitStagedVerifiedBlock(
                         cache: cache, acceptedInputs: committedInputs,
@@ -1140,7 +1175,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         } else if rejected > 0 {
             let committed: Bool
             if usesInputCapture, let rollback = target as? DFlash2VerifyRollbackModel {
-                committed = Self.trimVerifiedRows(cache, rejected)
+                committed =
+                    Self.trimVerifiedRows(cache, rejected)
                     && rollback.commitVerifiedBlock(
                         cache: cache, acceptedInputs: committedInputs)
             } else {
@@ -1230,9 +1266,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             // The cache still holds unverified rows: nothing more may be
             // decoded from it or stored as a prompt prefix.
             cacheHoldsUnverifiedRows = true
-            FileHandle.standardError.write(Data(
-                ("[DFlash2] ABORTED: could not roll back \(flight.verifyRows) unverified "
-                    + "rows. The turn is TRUNCATED at \(stats.emittedTokens) tokens.\n").utf8))
+            FileHandle.standardError.write(
+                Data(
+                    ("[DFlash2] ABORTED: could not roll back \(flight.verifyRows) unverified "
+                        + "rows. The turn is TRUNCATED at \(stats.emittedTokens) tokens.\n").utf8))
         }
         for layer in cache { (layer as? MambaCache)?.clearVerifyStaging() }
         stagedWarmedSizes.removeAll(keepingCapacity: true)
@@ -1247,8 +1284,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             }
         }
         if Self.traceEnabled {
-            FileHandle.standardError.write(Data(
-                "[DFlash2] abandoned in-flight verify (\(flight.verifyRows) rows)\n".utf8))
+            FileHandle.standardError.write(
+                Data(
+                    "[DFlash2] abandoned in-flight verify (\(flight.verifyRows) rows)\n".utf8))
         }
     }
 
@@ -1276,8 +1314,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             }
         }
         if Self.traceEnabled {
-            FileHandle.standardError.write(Data(
-                "[DFlash2] compiled verify built (S=\(blockLength))\n".utf8))
+            FileHandle.standardError.write(
+                Data(
+                    "[DFlash2] compiled verify built (S=\(blockLength))\n".utf8))
         }
     }
 
@@ -1374,9 +1413,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let rates = Self.blockLadder
             .map { String(format: "b%d=%.1f", $0, throughput(of: $0)) }
             .joined(separator: " ")
-        FileHandle.standardError.write(Data(
-            "[DFlash2] block \(from) -> \(to)\(settled ? " (settled)" : "") tok/verify-s: \(rates)\n"
-                .utf8))
+        FileHandle.standardError.write(
+            Data(
+                "[DFlash2] block \(from) -> \(to)\(settled ? " (settled)" : "") tok/verify-s: \(rates)\n"
+                    .utf8))
     }
 
     /// Single-token target step: the tail of the budget, the safety valve

@@ -379,6 +379,7 @@ struct HybridRestoreBoundaryInvariantTests {
             "Evaluate.swift",
             "BatchEngine/BatchEngine.swift",
             "SpecDec/NativeMTPTokenIterator.swift",
+            "SpecDec/DFlash2TokenIterator.swift",
         ]
         for relative in applySites {
             let source = try String(
