@@ -38,7 +38,8 @@
                 if Highway.enabled {
                     #expect(Highway.compiled != 0)
                     #expect(Highway.compiled & Highway.supported != 0)
-                    #expect(vmlx_cpu_openblas_pinned() == (vmlx_cpu_thread_count() > 1))
+                    // vmlx links OpenBLAS on Linux, and the pool pins it at every size, 1 included.
+                    #expect(vmlx_cpu_openblas_pinned())
                 } else {
                     #expect(Highway.compiled == 0)
                     #expect(String(cString: vmlx_cpu_thread_count_reason()) == "no pool")
