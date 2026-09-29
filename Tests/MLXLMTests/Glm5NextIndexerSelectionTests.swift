@@ -254,12 +254,14 @@ struct Glm5NextIndexerSelectionTests {
                     #expect(single.valid.asArray(Bool.self) == batch.valid[0].asArray(Bool.self))
                     let first = mask.firstIndex(of: 1) ?? length
                     let expectedIndices = (0 ..< (poolCount * f.shape.K)).map { Int32(first + $0) }
-                    let expectedValid = stride(from: first, to: first + poolCount * f.shape.K, by: f.shape.K)
-                        .map { start in
-                            (start ..< (start + f.shape.K)).allSatisfy {
-                                $0 < length && mask[$0] != 0
-                            }
+                    let expectedValid = stride(
+                        from: first, to: first + poolCount * f.shape.K, by: f.shape.K
+                    )
+                    .map { start in
+                        (start ..< (start + f.shape.K)).allSatisfy {
+                            $0 < length && mask[$0] != 0
                         }
+                    }
                     #expect(single.indices.asArray(Int32.self) == expectedIndices)
                     #expect(single.valid.asArray(Bool.self) == expectedValid)
                     #expect(
