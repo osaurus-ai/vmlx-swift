@@ -159,16 +159,21 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
         // Write new tokens at idxArray position. For n=1 in a non-wrapping
         // scenario, this is a straight linear write. The trace handles
         // per-step advancement through `_updateInternal` + MLXArray math.
+        // A freshly promoted RotatingKVCache can leave idx at maxCacheSize.
+        // Normalize before writing; dynamic slice otherwise clamps to the last
+        // slot rather than rotating to the first non-pinned slot.
+        let writeIndex = MLX.`where`(
+            idxArray .>= Int32(maxCacheSize), MLXArray([Int32(keep)]), idxArray)
         keys!._updateInternal(
-            dynamicSliceUpdate(keys!, update: newKeys, start: idxArray, axes: [2]))
+            dynamicSliceUpdate(keys!, update: newKeys, start: writeIndex, axes: [2]))
         values!._updateInternal(
-            dynamicSliceUpdate(values!, update: newValues, start: idxArray, axes: [2]))
+            dynamicSliceUpdate(values!, update: newValues, start: writeIndex, axes: [2]))
 
         // Advance counters. Wrap arithmetic on idxArray:
         //   newIdx = advance < maxCacheSize ? advance : keep + (advance - keep) % (maxCacheSize - keep)
         // We use `where_` so both branches live in the MLXArray graph.
         let advance = MLXArray([Int32(nTokens)])
-        let advancedIdx = idxArray + advance
+        let advancedIdx = writeIndex + advance
         let maxSz = MLXArray([Int32(maxCacheSize)])
         let keepArr = MLXArray([Int32(keep)])
         let cycleLen = maxSz - keepArr  // number of rotating slots
@@ -243,7 +248,22 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
 
         if let windowSize {
             let windowStart = linds - Int32(windowSize - 1)
-            mask = mask & (rinds .>= windowStart)
+            if n == 1 {
+                // rinds are physical ring slots, while linds are absolute token
+                // positions. Recover each slot's token position relative to the
+                // write index for the incoming token before applying the window.
+                let writeIndex = MLX.`where`(
+                    idxArray .>= Int32(maxCacheSize), MLXArray([Int32(keep)]), idxArray)
+                let cycleLength = Int32(maxCacheSize - keep)
+                let age = (writeIndex - rinds + cycleLength) % cycleLength
+                let ringPositions = linds - age
+                let positions = MLX.`where`(
+                    (offsetArray .>= Int32(maxCacheSize)) & (rinds .>= Int32(keep)),
+                    ringPositions, rinds)
+                mask = mask & (positions .>= windowStart)
+            } else {
+                mask = mask & (rinds .>= windowStart)
+            }
         }
 
         return .array(mask)
