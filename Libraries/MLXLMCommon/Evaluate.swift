@@ -1345,6 +1345,9 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var turboQuantCompressionCount: Int { get }
     var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { get }
     var nativeMTPStats: NativeMTPGenerationStats? { get }
+    /// DFlash 2 counters for this generation; `nil` unless the DFlash 2
+    /// iterator produced the tokens.
+    var dflash2Stats: DFlash2GenerationStats? { get }
     /// CPU-only end-of-generation bookkeeping needed to BUILD the completion
     /// info (e.g. the native-MTP stats snapshot). Split from
     /// `storeCacheAfterGeneration` so the generate loop can emit `.info` —
@@ -1364,6 +1367,7 @@ extension TokenIteratorProtocol {
     public var turboQuantCompressionCount: Int { 0 }
     public var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { nil }
     public var nativeMTPStats: NativeMTPGenerationStats? { nil }
+    public var dflash2Stats: DFlash2GenerationStats? { nil }
 
     public mutating func finalizeGenerationStats(generatedTokenIds: [Int]) {}
 
@@ -4856,6 +4860,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 turboQuantCacheTransition: iterator.lastTurboQuantCacheTransition,
                 unclosedReasoning: unclosedReasoning,
                 nativeMTPStats: iterator.nativeMTPStats,
+                dflash2Stats: iterator.dflash2Stats,
                 toolCallProtocolFailure: handler.toolCallProtocolFailure
             )
             _ = continuation.yield(handler.infoEvent(info))
@@ -5004,6 +5009,11 @@ public struct GenerateCompletionInfo: Sendable {
     /// struct omits. `nil` for any generation that did not run the
     /// native-MTP iterator.
     public let nativeMTPStats: NativeMTPGenerationStats?
+    /// DFlash 2 counters (block width, verify calls, drafted and accepted
+    /// tokens, per-phase seconds) when the DFlash 2 iterator produced this
+    /// generation; `nil` otherwise. Without it a DFlash turn and a plain one
+    /// are indistinguishable to the host.
+    public let dflash2Stats: DFlash2GenerationStats?
 
     /// The number of tokens processed per second during the prompt phase.
     ///
@@ -5036,8 +5046,10 @@ public struct GenerateCompletionInfo: Sendable {
         turboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? = nil,
         unclosedReasoning: Bool = false,
         nativeMTPStats: NativeMTPGenerationStats? = nil,
+        dflash2Stats: DFlash2GenerationStats? = nil,
         toolCallProtocolFailure: ToolCallProtocolFailure? = nil
     ) {
+        self.dflash2Stats = dflash2Stats
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
         self.promptTime = promptTime

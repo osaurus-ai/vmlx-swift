@@ -85,6 +85,23 @@ public struct VMLXDFlash2DrafterInfo: Codable, Sendable, Equatable {
             weightBytes: bytes)
     }
 
+    /// The block width a request against `model` runs at, for display: the
+    /// same resolution the iterator performs (a pinned width, else the
+    /// trained width, capped for targets without recurrent state).
+    public func effectiveBlockSize(requested: Int?, model: any LanguageModel) -> Int {
+        DFlash2TokenIterator.defaultBlockSize(
+            requested: requested, trained: blockSize, cache: model.newCache(parameters: nil))
+    }
+
+    /// Folder inside a model bundle that holds its own drafter.
+    public static let bundledFolderName = "dflash"
+
+    /// The DFlash 2 drafter a model bundle ships in
+    /// ``bundledFolderName``, or `nil` when it ships none.
+    public static func bundled(in modelDirectory: URL) -> VMLXDFlash2DrafterInfo? {
+        read(at: modelDirectory.appendingPathComponent(bundledFolderName, isDirectory: true))
+    }
+
     /// Why this drafter cannot serve the bundle described by
     /// `configData`, or `nil` when it can.
     ///

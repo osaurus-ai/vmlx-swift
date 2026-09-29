@@ -1309,7 +1309,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         chainId: String? = nil,
         isStableRoot: Bool = false,
         isResumeBoundary: Bool = false,
-        isPostAnswer: Bool = false
+        isPostAnswer: Bool = false,
+        dflashContext: [String: MLXArray]? = nil
     ) {
         var trace = CacheFinalizationTrace("coordinator-store", tokens: promptTokens.count)
         defer { trace.mark("return") }
@@ -1474,6 +1475,15 @@ public final class CacheCoordinator: @unchecked Sendable {
             }
         }
 
+        // Keep raw DFlash target features in the same atomic, quota-accounted
+        // payload as their KV boundary. Never allow supplemental keys to
+        // overwrite the target cache schema.
+        if diskArrays != nil, let dflashContext,
+            let context = DFlash2ContextStore.validatedDiskPayload(
+                dflashContext, boundary: totalTokens)
+        {
+            diskArrays?.merge(context) { current, _ in current }
+        }
         trace.mark("disk-serialization")
         storePersistentBoundary(
             tokens: promptTokens,

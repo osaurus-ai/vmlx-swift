@@ -167,4 +167,59 @@ public enum DFlash2Sampling {
         let bonus = sample(probabilities: residual.expandedDimensions(axis: 0))[0].item(Int.self)
         return Acceptance(accepted: accepted, bonus: bonus)
     }
+
+    /// Device-side `[accepted, bonus]`. Keeping the rejection position as an
+    /// array lets the caller read this together with the proposed token IDs,
+    /// rather than stopping the GPU before constructing the residual graph.
+    static func sampledAcceptance(
+        draftTokens: MLXArray,
+        targetProbabilities: MLXArray,
+        draftProbabilities: MLXArray,
+        draftIndices: MLXArray
+    ) -> MLXArray {
+        let gamma = draftTokens.dim(1)
+        if gamma == 0 {
+            let bonus = sample(probabilities: targetProbabilities[0..., -1, 0...])[0]
+            return stacked([MLXArray(Int32(0)), bonus.asType(.int32)])
+        }
+        let tokenColumn = draftTokens.expandedDimensions(axis: -1)
+
+        // p(x) under the target, at the drafted tokens.
+        let p = takeAlong(
+            targetProbabilities[0..., ..<gamma, 0...], tokenColumn, axis: -1)[.ellipsis, 0]
+        // q(x) under the drafter: the candidate row's probability at
+        // whichever slot holds the drafted token.
+        let q = (draftProbabilities * (draftIndices .== tokenColumn)).sum(axis: -1)
+
+        let u = MLXRandom.uniform(low: 0, high: 1, q.shape)
+        let acceptedArray = cumprod(((u * q) .< p).asType(.int32), axis: -1).sum(axis: -1)
+        let accepted = acceptedArray[0]
+
+        // Residual correction at the rejection point. The draft's mass
+        // is subtracted only at the candidate ids it could have produced.
+        let targetRow = MLX.take(targetProbabilities[0], accepted, axis: 0)
+        // A full accept selects the target's bonus row. Clamp only the draft
+        // gather (which has no bonus row); its residual is discarded below.
+        let draftRow = minimum(accepted, MLXArray(Int32(gamma - 1)))
+        let indices = MLX.take(draftIndices[0], draftRow, axis: 0)
+        var residual = targetRow
+        let values = MLX.take(residual, indices) - MLX.take(
+            draftProbabilities[0], draftRow, axis: 0)
+        residual = putAlong(
+            residual.expandedDimensions(axis: 0),
+            indices.expandedDimensions(axis: 0),
+            values: values.expandedDimensions(axis: 0),
+            axis: -1)[0]
+        residual = maximum(residual, MLXArray(Float(0)))
+        let total = residual.sum()
+        // An all-zero residual means the draft distribution dominated the
+        // target everywhere it had mass; fall back to the target itself
+        // rather than dividing by zero.
+        residual = MLX.where(
+            total .> 0, residual / maximum(total, MLXArray(Float(1e-30))),
+            targetRow)
+        let corrected = MLX.where(accepted .== gamma, targetRow, residual)
+        let bonus = sample(probabilities: corrected.expandedDimensions(axis: 0))[0]
+        return stacked([accepted, bonus.asType(.int32)])
+    }
 }

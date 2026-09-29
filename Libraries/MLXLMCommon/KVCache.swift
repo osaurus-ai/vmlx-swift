@@ -449,6 +449,22 @@ public func createAttentionMask(
     return .causal
 }
 
+extension KVCache {
+    /// Whether speculative decoding can undo this layer's last verify block
+    /// by trimming it. True for ordinary trimmable caches and for a
+    /// sliding-window cache after its window filled; false for recurrent
+    /// state, which rolls back through its own recorded or replayed state.
+    public var rollsBackVerifiedRows: Bool {
+        isTrimmable || (self as? RotatingKVCache)?.supportsVerifiedRowRollback == true
+    }
+
+    /// Whether `n` newest rows can be trimmed exactly right now.
+    public func canRollBackVerifiedRows(_ n: Int) -> Bool {
+        if n <= 0 || isTrimmable { return true }
+        return (self as? RotatingKVCache)?.canDropNewestRowsExactly(n) == true
+    }
+}
+
 public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
     if let cache {
         return cache.makeMask(N: h.dim(1))
@@ -1047,9 +1063,41 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     @discardableResult
     public override func trim(_ n: Int) -> Int {
         let trimmed = min(offset, n)
+        if canDropNewestRowsExactly(trimmed), let keys, let values {
+            // Past the window a bare rewind leaves the dropped rows in the
+            // buffer, where the next single-token write attends to them.
+            // Cut them off instead so the buffer again holds exactly the
+            // accepted history, in order.
+            let kept = keys.dim(2) - trimmed
+            self.keys = keys[.ellipsis, ..<kept, 0...]
+            self.values = values[.ellipsis, ..<kept, 0...]
+            offset -= trimmed
+            idx = kept
+            return trimmed
+        }
         offset -= trimmed
         idx -= trimmed
         return trimmed
+    }
+
+    /// Whether this sliding-window cache can roll back the rows of its last
+    /// multi-row update. Speculative decoding verifies a drafted block with
+    /// one multi-row forward and then drops the rejected suffix.
+    ///
+    /// Before the window fills, trimming is an ordinary rewind
+    /// (``isTrimmable``). After it fills, a multi-row update still leaves the
+    /// buffer in temporal order — the full window of history followed by the
+    /// new rows — so dropping up to that many newest rows is exact. A ring
+    /// that single-token writes have rotated cannot be rolled back.
+    open var supportsVerifiedRowRollback: Bool { keep == 0 }
+
+    /// True when `n` newest rows can be dropped leaving exactly the history
+    /// the next forward needs: `min(maxCacheSize - 1, offset - n)` rows.
+    public func canDropNewestRowsExactly(_ n: Int) -> Bool {
+        guard supportsVerifiedRowRollback, n > 0, offset >= maxCacheSize,
+            let keys, idx == keys.dim(2)
+        else { return false }
+        return keys.dim(2) - n >= min(maxCacheSize - 1, offset - n)
     }
 
     /// Read the cached keys/values in temporal order without mutating
