@@ -123,7 +123,8 @@ final class JANGHPrefillKernelTests: XCTestCase {
     private func check(
         tokens: Int, bits: Int, upBits: Int?, n: Int, k: Int, dtype: DType,
         backend: JANGHPrefillKernel.Backend, rotateInput: Bool = false,
-        rotateOutput: Bool = false, experts: Int = 3, invalid: Bool = false
+        rotateOutput: Bool = false, experts: Int = 3, invalid: Bool = false,
+        routeIDs: [UInt32]? = nil
     ) throws {
         let gate = bank(bits: bits, experts: experts, n: n, k: k, seed: 7)
         let up = upBits.map { bank(bits: $0, experts: experts, n: n, k: k, seed: 19) }
@@ -136,7 +137,8 @@ final class JANGHPrefillKernelTests: XCTestCase {
         }
         values = rounded(values, dtype)
         // Sorted segments straddle both16-row steel and64-row NAX tiles.
-        var ids = (0 ..< tokens).map { UInt32(min(experts - 1, $0 / max(1, tokens / experts))) }
+        var ids = routeIDs ?? (0 ..< tokens).map { UInt32(min(experts - 1, $0 / max(1, tokens / experts))) }
+        XCTAssertEqual(ids.count, tokens)
         if invalid { ids[tokens - 1] = UInt32.max }
         let limit: Float? = up == nil ? nil : 0.7
         let actual = try kernel.projectSorted(
@@ -218,6 +220,29 @@ final class JANGHPrefillKernelTests: XCTestCase {
             }
         }
     }
+    func testExpertScheduledTilesEmptyExpertsBoundariesAndInvalidSuffix() throws {
+        try MLXMetalTestLock.withLock {
+            let patterns: [[UInt32]] = [
+                [UInt32](repeating: 64, count: 65), // 64 leading empty groups
+                [0, 31, 32, 63, 64], // lane and wave boundaries, interior empties
+                [UInt32](repeating: 1, count: 15) + [UInt32](repeating: 33, count: 17),
+                [UInt32](repeating: 2, count: 63) + [UInt32](repeating: 64, count: 65),
+                [0, 32, 64, 65, UInt32.max], // all invalid IDs share the NaN group
+                [UInt32](repeating: UInt32.max, count: 17),
+            ]
+            for backend in backends {
+                for (index, ids) in patterns.enumerated() {
+                    try check(tokens: ids.count, bits: [2, 3, 4, 6, 8, 2][index],
+                              upBits: index % 2 == 0 ? 4 : nil,
+                              n: index % 2 == 0 ? 96 : 65, k: 64,
+                              dtype: index % 2 == 0 ? .bfloat16 : .float16,
+                              backend: backend, rotateOutput: index % 2 == 0,
+                              experts: 65, routeIDs: ids)
+                }
+            }
+        }
+    }
+
     func testTinyDeviceBuffersAndInvalidExpert() throws {
         try MLXMetalTestLock.withLock {
             for backend in backends {
