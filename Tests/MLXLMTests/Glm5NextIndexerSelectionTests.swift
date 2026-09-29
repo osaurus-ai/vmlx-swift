@@ -208,4 +208,80 @@ struct Glm5NextIndexerSelectionTests {
                 "the tight-budget selection also equals causal — the fixture does not sparsify")
         }
     }
+    @Test("single-row device offsets preserve padded and invalid pool layouts exactly")
+    func singleRowDeviceOffsetsMatchValidatedBatch() throws {
+        try MLXMetalTestLock.withLock {
+            let f = Self.fixture
+            let ix = Self.makeIndexer(f)
+            let masks: [[Float]] = [
+                [1, 1, 1, 1, 1, 1],
+                [0, 1, 1, 1, 1, 1],
+                [0, 0, 1, 1, 1, 1],
+                [0, 1, 1, 0, 1, 0],
+                [0, 0, 0, 0, 0, 1],
+                [0, 0, 0, 0, 0, 0],
+            ]
+            for dtype: DType in [.float32, .float16, .bfloat16] {
+                for mask in masks {
+                    let row = concatenated(
+                        [
+                            Self.packed(f)[.ellipsis, ..<(2 * f.shape.D)],
+                            MLXArray(mask, [1, f.shape.N, 1]),
+                        ], axis: -1
+                    ).asType(dtype)
+                    // B=2 deliberately retains the original host-validated offset path.
+                    let alignedBatch = concatenated([row, row], axis: 0)
+                    let single = try ix.pooledStates(packed: row)
+                    let batch = try ix.pooledStates(packed: alignedBatch)
+                    eval(
+                        single.keys, single.indices, single.valid, batch.keys, batch.indices,
+                        batch.valid)
+                    #expect(single.keys.shape == [1, 3, f.shape.D])
+                    #expect(single.keys.dtype == dtype)
+                    #expect(single.indices.shape == [3, f.shape.K])
+                    #expect(single.indices.dtype == .int32)
+                    #expect(
+                        single.keys.asType(.float32).asArray(Float.self)
+                            == batch.keys[0].asType(.float32).asArray(Float.self))
+                    #expect(single.indices.asArray(Int32.self) == batch.indices.asArray(Int32.self))
+                    #expect(single.valid.asArray(Bool.self) == batch.valid[0].asArray(Bool.self))
+                    let first = mask.firstIndex(of: 1) ?? f.shape.N
+                    let expectedIndices = (0 ..< f.shape.N).map { Int32(first + $0) }
+                    let expectedValid = stride(from: first, to: first + f.shape.N, by: f.shape.K)
+                        .map { start in
+                            (start ..< (start + f.shape.K)).allSatisfy {
+                                $0 < f.shape.N && mask[$0] != 0
+                            }
+                        }
+                    #expect(single.indices.asArray(Int32.self) == expectedIndices)
+                    #expect(single.valid.asArray(Bool.self) == expectedValid)
+                    #expect(
+                        single.keys.asType(.float32).asArray(Float.self).allSatisfy { $0.isFinite })
+                }
+            }
+        }
+    }
+
+    @Test("batched rows with unequal first-valid offsets remain rejected")
+    func unalignedBatchStillRejected() throws {
+        try MLXMetalTestLock.withLock {
+            let f = Self.fixture
+            let ix = Self.makeIndexer(f)
+            let first = Self.packed(f)
+            for mask: [Float] in [[0, 1, 1, 1, 1, 1], [0, 0, 0, 0, 0, 0]] {
+                let second = concatenated(
+                    [
+                        first[.ellipsis, ..<(2 * f.shape.D)],
+                        MLXArray(mask, [1, f.shape.N, 1]),
+                    ], axis: -1)
+                do {
+                    _ = try ix.pooledStates(packed: concatenated([first, second], axis: 0))
+                    Issue.record("Unequal batch offsets must not share a pool layout")
+                } catch let error as Glm5NextDecoderUnavailable {
+                    #expect(error.detail.contains("different offsets"))
+                }
+            }
+        }
+    }
+
 }

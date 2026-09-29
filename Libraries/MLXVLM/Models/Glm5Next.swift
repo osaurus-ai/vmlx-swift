@@ -1225,18 +1225,26 @@ extension Glm5NextIndexer {
         // and producing one shared layout anyway would quietly mis-pool the padded rows.
         let anyValid = valid.any(axis: -1)
         let firstKey = MLX.where(anyValid, valid.asType(.int32).argMax(axis: -1), MLXArray(Int32(N)))
-        let firstValues = firstKey.asType(.int32).asArray(Int32.self)
-        guard let start = firstValues.first, firstValues.allSatisfy({ $0 == start }) else {
-            throw Glm5NextDecoderUnavailable(
-                detail:
-                    "the sequences in this batch begin at different offsets (padding); the indexer's "
-                    + "pool layout is shared across the batch and cannot express that")
+        let start: MLXArray
+        if B == 1 {
+            // A single sequence always has a shared layout. Keep its offset on the device:
+            // reading it on the host would evaluate the preceding model graph at every indexer.
+            start = firstKey[0].asType(.int32)
+        } else {
+            let firstValues = firstKey.asType(.int32).asArray(Int32.self)
+            guard let first = firstValues.first, firstValues.allSatisfy({ $0 == first }) else {
+                throw Glm5NextDecoderUnavailable(
+                    detail:
+                        "the sequences in this batch begin at different offsets (padding); the indexer's "
+                        + "pool layout is shared across the batch and cannot express that")
+            }
+            start = MLXArray(first)
         }
 
         let poolCount = (N + poolSize - 1) / poolSize
         let offsets = MLXArray(Int32(0) ..< Int32(poolCount * poolSize))
             .reshaped(poolCount, poolSize)
-        let poolIndices = offsets + MLXArray(start)
+        let poolIndices = offsets + start
         let safe = clip(poolIndices, min: MLXArray(Int32(0)), max: MLXArray(Int32(N - 1)))
         let flatSafe = safe.reshaped(-1)
 
