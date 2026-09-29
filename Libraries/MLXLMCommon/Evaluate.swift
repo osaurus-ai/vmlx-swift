@@ -2657,7 +2657,15 @@ public struct TokenIterator: TokenIteratorProtocol {
             y = tokens
 
             // evaluate the remainder of the prompt -- this primes the pump
-            let token = step(previous: y)
+            let result = try withError { error in
+                let result = forwardUncompiled(previous: y)
+                // The remainder projection is part of preparation too. Check
+                // its originating MLX error before indexing its output array.
+                try error.check()
+                try validatePreparedLogitsForSampling(result.logits)
+                return result
+            }
+            let token = sampleUncompiledResult(result)
             y = .init(tokens: token)
             MLXPressGenerationProfile.time("prompt.async_eval_submit") {
                 asyncEval(y.tokens)
@@ -2896,15 +2904,22 @@ public struct TokenIterator: TokenIteratorProtocol {
             self.compiledExternalInputModel = nil
         }
 
+        return sampleUncompiledResult(forwardUncompiled(previous: previous))
+    }
+
+    private func forwardUncompiled(previous: LMInput.Text) -> LMOutput {
         // Models expect [B, L] input. If the caller passed 1D tokens [L], add a batch
         // axis. If they passed 2D [B, L] already (some VLM bench/test paths), use as-is —
         // adding another newAxis would produce 3D and break QuantizedLinear matmul on
         // pure-LLM model paths (Llama, Mistral, Phi, etc).
         let stepInput: LMInput.Text =
             previous.tokens.ndim == 1 ? previous[text: .newAxis] : previous
-        let result = MLXPressGenerationProfile.time("decode.model_forward") {
+        return MLXPressGenerationProfile.time("decode.model_forward") {
             model(stepInput, cache: cache.isEmpty ? nil : cache, state: state)
         }
+    }
+
+    private mutating func sampleUncompiledResult(_ result: LMOutput) -> MLXArray {
         self.state = result.state
 
         if shouldQuantizeAfterStep {

@@ -268,6 +268,153 @@ final class PreparedLogitsValidationTests: XCTestCase {
         }
     }
 
+    func testSoloTokenTailFailureTransportAndCancellationDrain() async throws {
+        try await MLXMetalTestLock.withLock {
+            for cancel in [false, true] {
+                let fixture = PreparedLogitsFixture(
+                    shape: [1, 1, 4], failProjection: true, mutateCache: true)
+                fixture.returnsTokens = true
+                fixture.cancelPreparation = cancel
+                let processor = TestInputProcessor()
+                let context = ModelContext(
+                    configuration: processor.configuration, model: fixture,
+                    processor: processor, tokenizer: processor.tokenizer)
+                let engine = BatchEngine(context: context, maxBatchSize: 1)
+                let stream = await engine.generate(
+                    input: LMInput(tokens: MLXArray([Int32(1), 2])),
+                    parameters: GenerateParameters(maxTokens: 1, temperature: 0))
+                var infos: [GenerateCompletionInfo] = []
+                for await event in stream {
+                    switch event {
+                    case .info(let info): infos.append(info)
+                    case .prefillProgress: break
+                    default: XCTFail("Failed solo preparation must not emit model output")
+                    }
+                }
+                XCTAssertEqual(infos.count, 1)
+                XCTAssertEqual(infos.first?.generationTokenCount, 0)
+                XCTAssertEqual(infos.first?.stopReason, .cancelled)
+                if cancel {
+                    XCTAssertNil(infos.first?.generationFailure)
+                } else {
+                    XCTAssertEqual(infos.first?.generationFailure?.stage, .preparation)
+                    XCTAssertTrue(infos.first?.generationFailure?.cause.contains("matmul") == true)
+                }
+                let active = await engine.activeCount
+                let soloActive = await engine.isSoloFastPathActiveForTesting
+                XCTAssertEqual(active, 0, "The producer must drain before stream termination")
+                XCTAssertFalse(soloActive)
+                await engine.shutdown()
+            }
+        }
+    }
+
+    func testTokenTailMalformedShapesThrowBeforeSampling() throws {
+        try MLXMetalTestLock.withLock {
+            for shape in [[], [4], [1, 4], [1, 1, 1, 4], [0, 1, 4], [1, 0, 4], [1, 1, 0]] {
+                let fixture = PreparedLogitsFixture(shape: shape)
+                fixture.returnsTokens = true
+                XCTAssertThrowsError(
+                    try TokenIterator(
+                        input: LMInput(tokens: MLXArray([Int32(1)])), model: fixture,
+                        parameters: GenerateParameters(maxTokens: 1, temperature: 0))
+                ) { error in
+                    XCTAssertEqual(error as? PreparedLogitsValidationError, .invalidShape(shape))
+                }
+            }
+        }
+    }
+
+    func testTokenTailProjectionPreservesOriginatingErrorAndFreshRequest() throws {
+        try MLXMetalTestLock.withLock {
+            let failing = PreparedLogitsFixture(shape: [1, 1, 4], failProjection: true)
+            failing.returnsTokens = true
+            XCTAssertThrowsError(
+                try TokenIterator(
+                    input: LMInput(tokens: MLXArray([Int32(1), 2])), model: failing,
+                    parameters: GenerateParameters(maxTokens: 1, temperature: 0))
+            ) { error in
+                guard let mlxError = error as? MLXError, case .caught(let message) = mlxError else {
+                    return XCTFail("Expected originating MLX projection error, got \(error)")
+                }
+                XCTAssertTrue(message.contains("matmul"), message)
+                XCTAssertFalse(error is PreparedLogitsValidationError)
+            }
+            // Both single-token and remaining multi-token prepare paths retain
+            // the same last-position greedy result after a failed request.
+            for length in [1, 3] {
+                let valid = PreparedLogitsFixture(shape: [1, length, 4])
+                valid.returnsTokens = true
+                var iterator = try TokenIterator(
+                    input: LMInput(tokens: MLXArray(Array(repeating: Int32(1), count: length))),
+                    model: valid, parameters: GenerateParameters(maxTokens: 1, temperature: 0))
+                XCTAssertEqual(iterator.next(), 3)
+            }
+        }
+    }
+
+    func testTokenTailFailureDoesNotPublishMutatedCache() throws {
+        try MLXMetalTestLock.withLock {
+            for projectionFailure in [false, true] {
+                let directory = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("token-tail-failure-\(UUID().uuidString)")
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let coordinator = CacheCoordinator(
+                    config: CacheCoordinatorConfig(
+                        usePagedCache: false, enableDiskCache: true, diskCacheDir: directory,
+                        modelKey: "token-tail-failure"))
+                let fixture = PreparedLogitsFixture(
+                    shape: [1, 4], failProjection: projectionFailure, mutateCache: true)
+                fixture.returnsTokens = true
+                let input = LMInput(tokens: MLXArray([Int32(1)]))
+                let parameters = GenerateParameters(maxTokens: 1, temperature: 0)
+                let callerCache = KVCacheSimple()
+                XCTAssertThrowsError(
+                    try TokenIterator(
+                        input: input, model: fixture, cache: [callerCache], parameters: parameters,
+                        cacheCoordinator: coordinator))
+                // Ownership remains with the caller on failure; no implicit rollback.
+                XCTAssertEqual(callerCache.offset, 1)
+                XCTAssertEqual(coordinator.diskCache?.stores, 0)
+                let salt = computeCacheSalt(for: input, parameters: parameters)
+                guard case .miss = coordinator.fetch(tokens: [1], mediaSalt: salt) else {
+                    return XCTFail("Failed token-tail projection must not publish cache")
+                }
+            }
+        }
+    }
+
+    func testSessionInvalidatesTokenTailFailureUntilReset() async throws {
+        try await MLXMetalTestLock.withLock {
+            let fixture = PreparedLogitsFixture(shape: [1, 1, 4], mutateCache: true)
+            fixture.returnsTokens = true
+            let processor = TestInputProcessor()
+            let context = ModelContext(
+                configuration: processor.configuration, model: fixture,
+                processor: processor, tokenizer: processor.tokenizer)
+            let session = ChatSession(
+                context, generateParameters: GenerateParameters(maxTokens: 1, temperature: 0))
+            _ = try await session.respond(to: "first fact")
+            fixture.outputShape = [1, 4]
+            do {
+                _ = try await session.respond(to: "failing continuation")
+                XCTFail("Expected malformed token-tail projection")
+            } catch is PreparedLogitsValidationError {}
+            XCTAssertGreaterThan(fixture.preparedOffsets.last ?? 0, 0)
+            await session.withCache { XCTAssertNil($0) }
+            let callsAfterFailure = fixture.preparedOffsets.count
+            fixture.outputShape = [1, 1, 4]
+            do {
+                _ = try await session.respond(to: "must require history replay")
+                XCTFail("Invalid session must require explicit reset/history replay")
+            } catch ChatSessionError.cacheInvalidatedAfterPreparation {}
+            XCTAssertEqual(fixture.preparedOffsets.count, callsAfterFailure)
+            await session.clear()
+            _ = try await session.respond(to: "new conversation")
+            XCTAssertEqual(fixture.preparedOffsets.last, 0)
+        }
+    }
+
     func testMalformedPreparedShapesThrowBeforeSampling() throws {
         try MLXMetalTestLock.withLock {
             for shape in [[], [4], [1, 4], [1, 1, 1, 4], [0, 1, 4], [1, 0, 4], [1, 1, 0]] {
