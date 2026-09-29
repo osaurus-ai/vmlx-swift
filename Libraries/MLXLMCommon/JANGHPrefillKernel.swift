@@ -14,6 +14,19 @@ final class JANGHPrefillKernel {
     private var kernels: [String: MLXFast.MLXFastKernel] = [:]
     private let lock = NSLock()
     private let rotation = JANGHRowRotation()
+    private static let offsetKernel = MLXFast.metalKernel(
+        name: "jangh_prefill_sorted_offsets", inputNames: ["indices", "meta"],
+        outputNames: ["offsets"], source: """
+            const uint g = thread_position_in_grid.x;
+            if (g > uint(meta[1])) return;
+            int lo = 0, hi = meta[0];
+            while (lo < hi) {
+                const int mid = lo + (hi - lo) / 2;
+                if (indices[mid] < g) lo = mid + 1; else hi = mid;
+            }
+            offsets[g] = lo;
+            """, ensureRowContiguous: false)
+
 
     init(contract: JANGHFormatContract, module: String, upModule: String? = nil) throws {
         guard let projection = contract.projections[module],
@@ -75,12 +88,12 @@ final class JANGHPrefillKernel {
                 threadgroup \(type) Wg[64 * PAD];
                 threadgroup \(type) Wu[\(fused ? 64 : 1) * PAD];
                 tq_gather_qmm_nax<\(type), \(width), \(upBits), \(fused), \(rotate)>(
-                    x,wg,sg,wu,su,indices,y,meta[0],meta[1],meta[2],meta[3],lim[0],Wg,Wu,
+                    x,wg,sg,wu,su,offsets,y,meta[0],meta[1],meta[2],meta[3],lim[0],Wg,Wu,
                     threadgroup_position_in_grid,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
                 """
             value = MLXFast.metalKernel(
                 name: "jangh_prefill_" + key,
-                inputNames: ["x", "wg", "sg", "wu", "su", "indices", "meta", "lim"],
+                inputNames: ["x", "wg", "sg", "wu", "su", "offsets", "meta", "lim"],
                 outputNames: ["y"], source: source,
                 header: JANGHPrefillHeaders.nax + codebookHeader + JANGHPrefillSource.loader + JANGHPrefillSource.nax,
                 ensureRowContiguous: false)
@@ -89,12 +102,12 @@ final class JANGHPrefillKernel {
                 constexpr int PAD = 32 + 16 / sizeof(\(type));
                 threadgroup \(type) Xs[16 * PAD];
                 threadgroup \(type) Ws[32 * PAD];
-                tq_gather_qmm_steel<\(type), \(width)>(x,wg,sg,indices,y,meta[0],meta[1],meta[2],meta[3],Xs,Ws,
+                tq_gather_qmm_steel<\(type), \(width)>(x,wg,sg,offsets,y,meta[0],meta[1],meta[2],meta[3],Xs,Ws,
                     threadgroup_position_in_grid,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
                 """
             value = MLXFast.metalKernel(
                 name: "jangh_prefill_" + key,
-                inputNames: ["x", "wg", "sg", "indices", "meta"], outputNames: ["y"], source: source,
+                inputNames: ["x", "wg", "sg", "offsets", "meta"], outputNames: ["y"], source: source,
                 header: JANGHPrefillHeaders.steel + codebookHeader + JANGHPrefillSource.loader + JANGHPrefillSource.steel,
                 ensureRowContiguous: false)
         }
@@ -116,6 +129,7 @@ final class JANGHPrefillKernel {
         else { throw JANGHFormatContract.ValidationError.invalid("invalid JANGH prefill inputs") }
         let m = input.dim(0), k = input.dim(1), n = packed.dim(1), experts = packed.dim(0)
         guard [m, n, k, experts].allSatisfy({ $0 <= Int(Int32.max) }),
+            experts < Int(Int32.max),
             !rotateOutput || n.isMultiple(of: 32)
         else { throw JANGHFormatContract.ValidationError.invalid("invalid JANGH prefill dimensions") }
         func validate(_ weights: MLXArray, _ scale: MLXArray, bits: Int) throws {
@@ -134,18 +148,24 @@ final class JANGHPrefillKernel {
         let idx = contiguous(indices.size < 8
             ? concatenated([indices, broadcast(indices[(indices.size - 1)...], to: [8 - indices.size])]) : indices)
         let metadata = MLXArray([Int32(m), Int32(n), Int32(k), Int32(experts)])
+        // GPU lower bounds exactly match gather_mm_offsets. The extra group
+        // collects invalid sorted IDs so existing fail-closed NaNs are preserved.
+        let offsets = Self.offsetKernel(
+            [idx, MLXArray([Int32(m), Int32(experts)])],
+            grid: (experts + 1, 1, 1), threadGroup: (min(experts + 1, 256), 1, 1),
+            outputShapes: [[max(8, experts + 1)]], outputDTypes: [.int32])[0]
         func deviceArray(_ array: MLXArray) -> MLXArray {
             array.size < 8 ? concatenated([array.flattened(), MLXArray.zeros([8 - array.size], dtype: array.dtype)]) : array
         }
         if selected == .nax {
             return kernel(dtype: input.dtype, backend: .nax, fused: upPacked != nil, rotate: rotateOutput, width: bits)(
-                [x, deviceArray(packed), deviceArray(scales), deviceArray(upPacked ?? packed), deviceArray(upScales ?? scales), idx, metadata, MLXArray([limit ?? 0])],
-                grid: (((n + 63) / 64) * 128, (m + 63) / 64, 1), threadGroup: (128, 1, 1),
+                [x, deviceArray(packed), deviceArray(scales), deviceArray(upPacked ?? packed), deviceArray(upScales ?? scales), offsets, metadata, MLXArray([limit ?? 0])],
+                grid: (((n + 63) / 64) * 128, min(m, (m + 63) / 64 + experts), 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [input.dtype])[0]
         }
         func single(_ w: MLXArray, _ s: MLXArray, _ width: Int) -> MLXArray {
             return kernel(dtype: input.dtype, backend: .steel, fused: false, rotate: false, width: width)(
-                [x, deviceArray(w), deviceArray(s), idx, metadata], grid: (((n + 31) / 32) * 64, (m + 15) / 16, 1), threadGroup: (64, 1, 1),
+                [x, deviceArray(w), deviceArray(s), offsets, metadata], grid: (((n + 31) / 32) * 64, min(m, (m + 15) / 16 + experts), 1), threadGroup: (64, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [input.dtype])[0]
         }
         var gate = single(packed, scales, bits)
