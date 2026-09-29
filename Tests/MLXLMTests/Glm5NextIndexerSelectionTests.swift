@@ -220,13 +220,20 @@ struct Glm5NextIndexerSelectionTests {
                 [0, 1, 1, 0, 1, 0],
                 [0, 0, 0, 0, 0, 1],
                 [0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1],
+                [0, 1, 1, 1, 1],
+                [0, 0, 0, 0, 0],
+                [1],
+                [0],
             ]
             for dtype: DType in [.float32, .float16, .bfloat16] {
                 for mask in masks {
+                    let length = mask.count
+                    let poolCount = (length + f.shape.K - 1) / f.shape.K
                     let row = concatenated(
                         [
-                            Self.packed(f)[.ellipsis, ..<(2 * f.shape.D)],
-                            MLXArray(mask, [1, f.shape.N, 1]),
+                            Self.packed(f)[0..., ..<length, ..<(2 * f.shape.D)],
+                            MLXArray(mask, [1, length, 1]),
                         ], axis: -1
                     ).asType(dtype)
                     // B=2 deliberately retains the original host-validated offset path.
@@ -236,21 +243,21 @@ struct Glm5NextIndexerSelectionTests {
                     eval(
                         single.keys, single.indices, single.valid, batch.keys, batch.indices,
                         batch.valid)
-                    #expect(single.keys.shape == [1, 3, f.shape.D])
+                    #expect(single.keys.shape == [1, poolCount, f.shape.D])
                     #expect(single.keys.dtype == dtype)
-                    #expect(single.indices.shape == [3, f.shape.K])
+                    #expect(single.indices.shape == [poolCount, f.shape.K])
                     #expect(single.indices.dtype == .int32)
                     #expect(
                         single.keys.asType(.float32).asArray(Float.self)
                             == batch.keys[0].asType(.float32).asArray(Float.self))
                     #expect(single.indices.asArray(Int32.self) == batch.indices.asArray(Int32.self))
                     #expect(single.valid.asArray(Bool.self) == batch.valid[0].asArray(Bool.self))
-                    let first = mask.firstIndex(of: 1) ?? f.shape.N
-                    let expectedIndices = (0 ..< f.shape.N).map { Int32(first + $0) }
-                    let expectedValid = stride(from: first, to: first + f.shape.N, by: f.shape.K)
+                    let first = mask.firstIndex(of: 1) ?? length
+                    let expectedIndices = (0 ..< (poolCount * f.shape.K)).map { Int32(first + $0) }
+                    let expectedValid = stride(from: first, to: first + poolCount * f.shape.K, by: f.shape.K)
                         .map { start in
                             (start ..< (start + f.shape.K)).allSatisfy {
-                                $0 < f.shape.N && mask[$0] != 0
+                                $0 < length && mask[$0] != 0
                             }
                         }
                     #expect(single.indices.asArray(Int32.self) == expectedIndices)
