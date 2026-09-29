@@ -232,7 +232,7 @@ final class JANGHPrefillKernelTests: XCTestCase {
             ]
             for backend in backends {
                 for (index, ids) in patterns.enumerated() {
-                    try check(tokens: ids.count, bits: index % 2 == 0 ? 2 : 3,
+                    try check(tokens: ids.count, bits: [2, 3, 4, 6, 8, 2][index],
                               upBits: index % 2 == 0 ? 4 : nil,
                               n: index % 2 == 0 ? 96 : 65, k: 64,
                               dtype: index % 2 == 0 ? .bfloat16 : .float16,

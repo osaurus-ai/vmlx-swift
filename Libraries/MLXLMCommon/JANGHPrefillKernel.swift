@@ -129,7 +129,8 @@ final class JANGHPrefillKernel {
         else { throw JANGHFormatContract.ValidationError.invalid("invalid JANGH prefill inputs") }
         let m = input.dim(0), k = input.dim(1), n = packed.dim(1), experts = packed.dim(0)
         guard [m, n, k, experts].allSatisfy({ $0 <= Int(Int32.max) }),
-            experts < Int(Int32.max),
+            // Shader ceil-divisions and 32-lane group scans use signed ints.
+            m <= Int(Int32.max) - 63, experts <= Int(Int32.max) - 32,
             !rotateOutput || n.isMultiple(of: 32)
         else { throw JANGHFormatContract.ValidationError.invalid("invalid JANGH prefill dimensions") }
         func validate(_ weights: MLXArray, _ scale: MLXArray, bits: Int) throws {
