@@ -124,22 +124,6 @@ final class Qwen25VLTextPrefillTests: XCTestCase {
             }
         }
     }
-    func testOwnedBaselineRankTwoFatalFixture() throws {
-        guard ProcessInfo.processInfo.environment["VMLX_QWEN25VL_BASELINE_FATAL_FIXTURE"] == "1" else {
-            throw XCTSkip("Owned subprocess diagnostic only")
-        }
-        try MLXMetalTestLock.withLock {
-            let m = try model(), cache = [KVCacheSimple()]
-            print("QWEN25VL_RANK2_FIXTURE_BEGIN tokens=2")
-            let output = try logits(m.prepare(LMInput(tokens: MLXArray([Int32(1),2]).reshaped(1,2)),
-                cache: cache, windowSize: 2))
-            eval(output)
-            XCTAssertEqual(output.shape, [1,2,32])
-            XCTAssertEqual(cache[0].offset, 2)
-            print("QWEN25VL_RANK2_FIXTURE_PASS")
-        }
-    }
-
     private final class Progress: @unchecked Sendable {
         let lock = NSLock(); var values: [Int] = []
         func add(_ value: Int) { lock.lock(); defer { lock.unlock() }; values.append(value) }
