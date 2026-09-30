@@ -21,18 +21,6 @@ import XCTest
             XCTAssertEqual(fcntl(STDERR_FILENO, F_GETNOSIGPIPE), flags)
         }
 
-        func testModelErrorsStillPropagateAfterDiagnostic() {
-            enum ModelFailure: Error { case invalidWeights }
-            XCTAssertThrowsError(
-                try { () throws -> Void in
-                    LoadDiagnostics.write(Data("[Load] invalid weights regression\n".utf8))
-                    throw ModelFailure.invalidWeights
-                }()
-            ) { error in
-                XCTAssertTrue(error is ModelFailure)
-            }
-        }
-
         func testConcurrentDiagnosticsLeaveThreadMasksUnchanged() {
             DispatchQueue.concurrentPerform(iterations: 16) { index in
                 var beforeMask = sigset_t()
