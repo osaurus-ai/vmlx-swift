@@ -2497,20 +2497,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         // generation and does not alter sampler or template behavior.
         if let capture = prefillBoundaryCapture(of: input) {
             if let head = capture.head {
-                let preparedHead = try MLXPressGenerationProfile.time("prompt.model_prepare") {
-                    try model.prepare(head, cache: cache, windowSize: windowSize)
-                }
-                switch preparedHead {
-                case .tokens(let remaining):
-                    _ = model(
-                        remaining[text: .newAxis],
-                        cache: cache.isEmpty ? nil : cache,
-                        state: nil)
-                case .logits:
-                    break
-                }
+                try prepareBoundaryHead(head, windowSize: windowSize)
+            } else {
+                try withError { MLX.eval(cache) }
             }
-            MLX.eval(cache)
             let snapshot = makePromptBoundaryCacheSnapshot(from: cache)
             switch capture.kind {
             case .hybridStrip:
@@ -2558,6 +2548,23 @@ public struct TokenIterator: TokenIteratorProtocol {
             promptTokensForProcessor: input.text.tokens)
     }
 
+    /// Preserve the originating MLX failure before snapshotting a prefix or
+    /// continuing into its tail. Cache-boundary prefill is preparation too.
+    private mutating func prepareBoundaryHead(_ input: LMInput, windowSize: Int?) throws {
+        try withError { error in
+            let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
+                try model.prepare(input, cache: cache, windowSize: windowSize)
+            }
+            try error.check()
+            if case .tokens(let remaining) = prepared {
+                _ = model(remaining[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: nil)
+                try error.check()
+            }
+            MLX.eval(cache)
+            try error.check()
+        }
+    }
+
     /// Prefill in segments that end on each processor-declared stable boundary,
     /// keeping the cache state at every one.
     ///
@@ -2603,19 +2610,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 let split = boundarySplit(of: remaining, at: boundary),
                 let head = split.head
             else { continue }
-            let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
-                try model.prepare(head, cache: cache, windowSize: windowSize)
-            }
-            switch prepared {
-            case .tokens(let leftover):
-                _ = model(
-                    leftover[text: .newAxis],
-                    cache: cache.isEmpty ? nil : cache,
-                    state: nil)
-            case .logits:
-                break
-            }
-            MLX.eval(cache)
+            try prepareBoundaryHead(head, windowSize: windowSize)
             stableBoundarySnapshots[boundary] = makePromptBoundaryCacheSnapshot(from: cache)
             remaining = split.tail
             consumed = boundary
