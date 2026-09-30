@@ -136,6 +136,39 @@ func makeDiskStoreCache(
         kvMode: parameters.kvMode)
 }
 
+/// Materialize compiled rotating metadata once at the host storage boundary.
+/// Call while the request still owns the cache, before offset admission or copy().
+/// Never call inside a compiled forward: device counters remain the trace state.
+func synchronizeCompiledRotatingCacheMetadataForStorage(_ cache: [any KVCache]) {
+    var rotating: [CompilableRotatingKVCache] = []
+    var seen = Set<ObjectIdentifier>()
+    func visit(_ layer: any KVCache) {
+        if let compiled = layer as? CompilableRotatingKVCache {
+            if seen.insert(ObjectIdentifier(compiled)).inserted { rotating.append(compiled) }
+        } else if let list = layer as? CacheList {
+            for index in 0..<list.count { visit(list[index]) }
+        } else if let wrapper = layer as? RotatingKVCacheWrapper {
+            visit(wrapper.rotating)
+        }
+    }
+    cache.forEach(visit)
+    guard !rotating.isEmpty else { return }
+    MLX.eval(rotating.flatMap { [$0.idxArray, $0.offsetArray] })
+    // Read every counter before publishing metadata. Do not change device
+    // arrays or their wrappers, which may still belong to a reusable trace.
+    let counters = rotating.map { ($0.idxArray.item(Int.self), $0.offsetArray.item(Int.self)) }
+    for (layer, counters) in zip(rotating, counters) {
+        layer.idx = counters.0
+        layer.offset = counters.1
+    }
+}
+
+/// Composite caches carry their position in leaves, not the parent offset.
+/// The coordinator subsequently requires exact agreement for every leaf.
+func cacheCoversTokenCount(_ tokenCount: Int, cache: [any KVCache]) -> Bool {
+    (cacheBoundaryLeafOffsets(cache).max() ?? 0) >= tokenCount
+}
+
 /// Token boundaries belong to leaves, not CacheList's unused inherited offset.
 /// An empty composite contributes an invalid boundary rather than disappearing.
 func cacheBoundaryLeafOffsets(_ cache: [any KVCache]) -> [Int] {

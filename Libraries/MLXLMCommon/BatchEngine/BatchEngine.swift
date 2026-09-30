@@ -3410,6 +3410,9 @@ public actor BatchEngine {
             slot.originalInput.cachePromptIntent != .auxiliary,
             let coordinator = cacheCoordinator
         {
+            // Compiled rotating counters are device state. Publish their host
+            // metadata before admission or any fallback live-cache snapshot.
+            synchronizeCompiledRotatingCacheMetadataForStorage(slot.cache)
             let promptTokens = slot.cachePromptTokenIds
             let hasHybridPool = slot.cache.contains { $0 is HybridPoolCache }
             let promptCacheSnapshot = slot.promptCacheSnapshot
@@ -3419,10 +3422,6 @@ public actor BatchEngine {
                 let storageSnapshotTokenCount = promptCacheSnapshot == nil
                     ? max(0, promptTokens.count - 1)
                     : promptTokens.count
-
-            func cacheCovers(_ tokenCount: Int, cache: [KVCache]) -> Bool {
-                cache.map(\.offset).max() ?? 0 >= tokenCount
-            }
 
             // One predicate for all three engines. Three inline copies used to
             // drift: this one and the MTP one rejected `stripAt ==
@@ -3947,7 +3946,7 @@ public actor BatchEngine {
                !slot.disablesGeneratedCacheBoundary,
                !containsUnprovenZayaTurboQuantDiskState(slot.cache),
                !slot.generatedTokenIds.isEmpty,
-               cacheCovers(generatedBoundaryTokens.count, cache: slot.cache)
+               cacheCoversTokenCount(generatedBoundaryTokens.count, cache: slot.cache)
             {
                 storeCacheEntry(
                     tokens: generatedBoundaryTokens,

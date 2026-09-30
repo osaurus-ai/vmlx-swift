@@ -2968,6 +2968,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         // and never prefix a future request — persisting their boundaries is
         // pure write cost. They may restore; they never store.
         guard originalInput.cachePromptIntent != .auxiliary else { return }
+        if includeGeneratedBoundary {
+            synchronizeCompiledRotatingCacheMetadataForStorage(cache)
+        }
 
         var sharedPromptRederivedStates: [Int: [MLXArray]]?
         let sharedPromptAdditionalBoundaries = Array(Set(
