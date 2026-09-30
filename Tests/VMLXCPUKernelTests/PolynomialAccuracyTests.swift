@@ -61,10 +61,13 @@
             ProcessInfo.processInfo.environment["VMLX_ULP_BASELINE"] == "1"
         }
 
-        /// Judges `measured` against the baseline. Measuring mode only prints it, and records an issue,
-        /// so that a measuring run can never pass for a judged one.
+        /// Judges `measured` against the baseline. Measuring mode refuses a Highway build, prints
+        /// the value and records an issue, so that a measuring run can never pass for a judged one.
         static func judge(_ name: String, _ measured: Double, worst: String) throws {
             if measuring {
+                // The baseline is the scalar code's: a Highway build would measure its own kernels.
+                try #require(
+                    !Highway.enabled, "measure ULPBaseline without Highway (VMLX_NO_HIGHWAY=1)")
                 print("ULP_BASELINE \(name) \(measured)")
                 print("  worst \(worst)")
                 Issue.record(

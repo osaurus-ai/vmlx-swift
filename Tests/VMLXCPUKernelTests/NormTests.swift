@@ -215,7 +215,8 @@
         }
 
         /// float16 infinities and NaN through the kernels' own float16 loads, on every target.
-        /// Without F16C (SSE4, SSSE3 and SSE2) Highway converts float16 in software, and its
+        /// Where a target has no conversion instruction (SSE4, SSSE3, SSE2 and EMU128; arm64's NEON
+        /// targets convert with FCVTL) Highway converts float16 in software, and its
         /// conversion takes exponent 31 for a finite number (inf for 65536), which gives finite
         /// results here. With an infinity in a row the sum of squares is infinite and RMSNorm's
         /// scale 0: NaN at the infinity and elsewhere a zero with the sign of x·w, as in float64. A

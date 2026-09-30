@@ -2,8 +2,9 @@
 # Copyright © 2026 Osaurus AI. All rights reserved.
 # SPDX-License-Identifier: MIT
 #
-# run-cpu-kernel-tests.sh: build the Highway test build and run VMLXCPUKernelTests twice, with
-# MLX_CPU_THREADS=1 and with the default pool, as CI does. Linux only.
+# run-cpu-kernel-tests.sh (Linux only): build the kernel tests, with Highway unless
+# VMLX_NO_HIGHWAY=1, and run VMLXCPUKernelTests twice, with MLX_CPU_THREADS=1 and with the default
+# pool, as CI does.
 #
 #   scripts/run-cpu-kernel-tests.sh [--expect "<Highway targets>"] [--sde <chip>] [--skip-build]
 #                                    [--filter <swift-testing filter>] [--once] [--stall <seconds>]
@@ -19,13 +20,14 @@
 # emulated runs, which are slow. A run whose log stops growing for --stall seconds (default 1200) is
 # killed with everything it started: a hung kernel must not hold a runner forever.
 # VMLX_KERNEL_TESTS_SCRATCH moves the build (default .build/hwy-all), for a mutated build beside it.
+# VMLX_NO_HIGHWAY=1 (Package.swift) builds without Highway; the expectation is then `none`, and the
+# default scratch path `.build/no-hwy`.
 #
 # Exits 0 when every configuration passed. Otherwise with the first failing configuration's status:
 # 124 when it stalled, 69 when no test matched the filter, and else the test executable's own (1 for
 # a failed test). Exits 2 for a usage error, a missing test executable or a missing probe compiler.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-SCRATCH="${VMLX_KERNEL_TESTS_SCRATCH:-$ROOT/.build/hwy-all}"
 EXPECT=""
 SDE=""
 BUILD=1
@@ -48,6 +50,8 @@ while [ $# -gt 0 ]; do
     *) usage ;;
   esac
 done
+if [ "${VMLX_NO_HIGHWAY:-}" = 1 ]; then DEFAULT_SCRATCH=$ROOT/.build/no-hwy; else DEFAULT_SCRATCH=$ROOT/.build/hwy-all; fi
+SCRATCH="${VMLX_KERNEL_TESTS_SCRATCH:-$DEFAULT_SCRATCH}"
 # The tests expect the int8 switch off at the start, and judge the polynomial bounds, which
 # VMLX_ULP_BASELINE=1 would only measure.
 unset MLX_CPU_QUANTIZED_INT8 VMLX_ULP_BASELINE
@@ -90,7 +94,17 @@ watched() {
   wait "$pid" || rc=$?
   return "$rc"
 }
-echo "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- || true)"
+# ARM's /proc/cpuinfo names no model: take lscpu's vendor and model names there (several on
+# big.LITTLE), and the CPU features that decide Highway's NEON targets.
+if [ "$(uname -m)" = aarch64 ]; then
+  CPU=$(LC_ALL=C lscpu 2> /dev/null | awk -F': +' '/^Vendor ID:/ {v = $2} /^Model name:/ {m = m (m == "" ? "" : ", ") $2} END {print v " " m}' || true)
+  FEATURES=$(grep -m1 '^Features' /proc/cpuinfo | cut -d: -f2- | tr ' ' '\n' | grep -xE 'aes|asimdhp|asimddp|bf16' | paste -sd ' ' - || true)
+  echo "CPU: $CPU (features: $FEATURES)"
+else
+  echo "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- || true)"
+fi
+# A build without Highway (Package.swift's VMLX_NO_HIGHWAY) executes no Highway target.
+if [ -z "$EXPECT" ] && [ "${VMLX_NO_HIGHWAY:-}" = 1 ]; then EXPECT=none; fi
 if [ -z "$EXPECT" ]; then
   case "$(uname -m)" in
     # Highway 1.4.0 marks AVX10_2 broken below Clang 23 (hwy/detect_targets.h), so Swift 6.4's

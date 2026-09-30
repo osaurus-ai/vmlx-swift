@@ -3,11 +3,14 @@
 
 #if os(Linux)
     /// The largest error, in units (see `unitsError`), of each of MLX's polynomial functions on its
-    /// scalar CPU code, measured on arm64, which has no Highway kernels. A Highway build may exceed
-    /// it by 2 units, and no more. To measure it again, on a build without Highway kernels, run
-    /// `VMLX_ULP_BASELINE=1 swift test -c release -Xswiftc -enable-testing --filter
-    /// PolynomialAccuracyTests`: each test prints `ULP_BASELINE <name> <units>` and fails, since
-    /// it judges nothing. scripts/run-cpu-kernel-tests.sh unsets the variable.
+    /// scalar CPU code, measured on Linux arm64 without Highway kernels. A Highway build may exceed
+    /// it by 2 units, and no more. To measure it again, on Linux arm64, run
+    /// `VMLX_NO_HIGHWAY=1 VMLX_ULP_BASELINE=1 swift test -c release -Xswiftc -enable-testing
+    /// --scratch-path .build/no-hwy --filter PolynomialAccuracyTests`: each test prints
+    /// `ULP_BASELINE <name> <units>` and fails, since it judges nothing.
+    /// After `VMLX_NO_HIGHWAY=1 scripts/run-cpu-kernel-tests.sh` has built `.build/no-hwy`, add
+    /// `--skip-build`: without it, swift test recompiles the Swift modules for testability.
+    /// scripts/run-cpu-kernel-tests.sh unsets VMLX_ULP_BASELINE.
     enum ULPBaseline {
         static let units: [String: Double] = [
             "exp": 62.385592963546515,
