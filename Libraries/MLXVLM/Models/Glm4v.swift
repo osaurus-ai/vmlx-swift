@@ -910,6 +910,40 @@ public class Glm4v: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
+        // Text-only callers may provide [T] or [1,T]. Normalize before embedding;
+        // adding an axis to [1,T] produces [1,1,T,H] and invalid attention reshapes.
+        if input.image == nil && input.video == nil && input.audio == nil {
+            let tokens = input.text.tokens
+            guard (tokens.ndim == 1 || (tokens.ndim == 2 && tokens.dim(0) == 1)),
+                  tokens.size > 0, tokens.dtype == .int32 || tokens.dtype == .int64,
+                  input.text.mask == nil, windowSize == nil || windowSize! > 0,
+                  cache.count == config.textConfiguration.hiddenLayers
+            else {
+                throw NSError(domain: "Glm4v.prepare", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Expected nonempty unmasked single-sequence integer tokens, positive prefill step and complete cache"])
+            }
+            languageModel._positionIds = nil
+            languageModel._ropeDeltas = nil
+            let flat = tokens.reshaped(-1)
+            let step = windowSize ?? 512
+            var result: LMOutput?
+            var consumed = 0
+            while consumed < flat.size {
+                try Task.checkCancellation()
+                let end = min(consumed + step, flat.size)
+                result = try withError { error in
+                    let output = languageModel(flat[consumed ..< end].expandedDimensions(axis: 0), cache: cache)
+                    try error.check()
+                    eval(output.logits)
+                    eval(cache)
+                    try error.check()
+                    return output
+                }
+                consumed = end
+                PrefillProgressReporter.reportCompletedUnits(consumed)
+            }
+            return .logits(result!)
+        }
         let dtype = visionModel.patchEmbed.proj.weight.dtype
 
         var allPixels: MLXArray?
