@@ -114,6 +114,14 @@ final class Qwen25VLTextPrefillTests: XCTestCase {
                 XCTAssertEqual(cache[0].offset, 0); XCTAssertTrue(cache[0].state.isEmpty)
             }
             XCTAssertEqual(cache[0].offset, 0); XCTAssertTrue(cache[0].state.isEmpty)
+            _ = try m.prepare(LMInput(tokens: ids), cache: cache, windowSize: 2)
+            let retained = cache[0].state.map { $0.asArray(Float.self) }
+            for values: [Int8] in [[1,0], [1,2], [1,-1]] {
+                XCTAssertThrowsError(try m.prepare(LMInput(text: .init(tokens: ids,
+                    mask: MLXArray(values))), cache: cache, windowSize: 2))
+                XCTAssertEqual(cache[0].offset, 2)
+                XCTAssertEqual(cache[0].state.map { $0.asArray(Float.self) }, retained)
+            }
         }
     }
     func testOwnedBaselineRankTwoFatalFixture() throws {
