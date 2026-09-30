@@ -870,14 +870,14 @@ public class Qwen25VL: Module, VLMModel, KVCacheDimensionProvider {
             if let mask = input.text.mask {
                 // Qwen2.5-VL text forward has no padding-mask input. An all-true mask
                 // is equivalent to omission; reject actual padding before cache mutation.
-                guard mask.shape == tokens.shape, mask.dtype == .bool,
+                guard mask.shape == tokens.shape, (mask.dtype == .bool || mask.dtype.isInteger),
                       try withError({ error in
-                          let allTrue = mask.all().item(Bool.self)
+                          let allTrue = (mask .== MLXArray(1, dtype: mask.dtype)).all().item(Bool.self)
                           try error.check()
                           return allTrue
                       }) else {
                     throw NSError(domain: "Qwen25VL.prepare", code: 2,
-                        userInfo: [NSLocalizedDescriptionKey: "Qwen2.5-VL text preparation requires an all-true bool mask matching tokens"])
+                        userInfo: [NSLocalizedDescriptionKey: "Qwen2.5-VL text preparation requires an all-one bool or integer mask matching tokens"])
                 }
             }
             // Qwen2.5-VL text RoPE reads each cache offset directly; there is

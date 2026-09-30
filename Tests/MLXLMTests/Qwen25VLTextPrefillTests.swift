@@ -76,6 +76,23 @@ final class Qwen25VLTextPrefillTests: XCTestCase {
             XCTAssertEqual(actual.asArray(Float.self), expected.asArray(Float.self))
         }
     }
+    func testIntegerAllOneMasksMatchUnmaskedText() throws {
+        try MLXMetalTestLock.withLock {
+            let m = try model(), ids = MLXArray([Int32(1),2,3,4])
+            let referenceCache = [KVCacheSimple()]
+            let expected = try logits(m.prepare(LMInput(tokens: ids), cache: referenceCache, windowSize: 2))
+            for dtype: DType in [.int8, .uint8, .int32, .int64] {
+                let cache = [KVCacheSimple()]
+                let input = LMInput(text: .init(tokens: ids, mask: MLXArray.ones([4], dtype: dtype)))
+                let actual = try logits(m.prepare(input, cache: cache, windowSize: 2))
+                XCTAssertEqual(actual.asArray(Float.self), expected.asArray(Float.self))
+                XCTAssertEqual(cache[0].offset, 4)
+                for (a, b) in zip(cache[0].state, referenceCache[0].state) {
+                    XCTAssertEqual(a.asArray(Float.self), b.asArray(Float.self))
+                }
+            }
+        }
+    }
     func testInvalidStepEmptyTokensAndPaddingRejectBeforeMutation() throws {
         try MLXMetalTestLock.withLock {
             let m = try model(), ids = MLXArray([Int32(1),2])
@@ -90,6 +107,12 @@ final class Qwen25VLTextPrefillTests: XCTestCase {
             XCTAssertThrowsError(try m.prepare(LMInput(tokens: ids), cache: [KVCacheSimple(), KVCacheSimple()], windowSize: 2))
             let wrongMask = LMInput(text: .init(tokens: ids, mask: MLXArray.ones([1,2], dtype: .bool)))
             XCTAssertThrowsError(try m.prepare(wrongMask, cache: cache, windowSize: 2))
+            for mask in [MLXArray([Int8(1),0]), MLXArray([Int8(1),2]),
+                         MLXArray([Int8(1),-1]), MLXArray.ones([2], dtype: .float32)] {
+                XCTAssertThrowsError(try m.prepare(LMInput(text: .init(tokens: ids, mask: mask)),
+                    cache: cache, windowSize: 2))
+                XCTAssertEqual(cache[0].offset, 0); XCTAssertTrue(cache[0].state.isEmpty)
+            }
             XCTAssertEqual(cache[0].offset, 0); XCTAssertTrue(cache[0].state.isEmpty)
         }
     }
