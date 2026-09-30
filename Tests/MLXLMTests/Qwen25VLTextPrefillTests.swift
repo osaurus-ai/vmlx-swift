@@ -124,6 +124,34 @@ final class Qwen25VLTextPrefillTests: XCTestCase {
             }
         }
     }
+    func testIteratorStableBoundaryPreparationMatchesUnsplitText() throws {
+        try MLXMetalTestLock.withLock {
+            let m = try model()
+            let ids = MLXArray([Int32(1), 2, 3, 4, 5, 6, 7, 8])
+            let parameters = GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 3)
+            let plainCache = [KVCacheSimple()], splitCache = [KVCacheSimple()]
+            var plain = try TokenIterator(input: LMInput(tokens: ids), model: m,
+                cache: plainCache, parameters: parameters)
+            // The production iterator slices stable boundaries into [1,T]
+            // inputs before calling this model's prepare implementation.
+            var split = try TokenIterator(input: LMInput(tokens: ids,
+                cachePrefixTokenCounts: [4, 6], cacheStablePrefixTokenCounts: [4, 6]),
+                model: m, cache: splitCache, parameters: parameters)
+            XCTAssertEqual(plainCache[0].offset, splitCache[0].offset)
+            XCTAssertGreaterThanOrEqual(splitCache[0].offset, 8)
+            for (a, b) in zip(plainCache[0].state, splitCache[0].state) {
+                XCTAssertEqual(a.shape, b.shape)
+                XCTAssertLessThan(abs(a - b).max().item(Float.self), 0.001)
+            }
+            let started = Date()
+            let expected = plain.next(), actual = split.next()
+            XCTAssertNotNil(expected)
+            XCTAssertEqual(actual, expected)
+            XCTAssertNil(plain.next()); XCTAssertNil(split.next())
+            print("VLM_ITERATOR_FIXTURE tokens=2 tokens_per_second=\(2 / max(Date().timeIntervalSince(started), 0.000001))")
+        }
+    }
+
     private final class Progress: @unchecked Sendable {
         let lock = NSLock(); var values: [Int] = []
         func add(_ value: Int) { lock.lock(); defer { lock.unlock() }; values.append(value) }
