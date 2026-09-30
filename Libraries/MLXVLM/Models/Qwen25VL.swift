@@ -855,6 +855,53 @@ public class Qwen25VL: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
+        // Text-only callers may provide [T] or [1,T]. Normalize before embedding;
+        // adding an axis to [1,T] produces [1,1,T,H] and invalid attention reshapes.
+        if input.image == nil && input.video == nil && input.audio == nil {
+            let tokens = input.text.tokens
+            guard (tokens.ndim == 1 || (tokens.ndim == 2 && tokens.dim(0) == 1)),
+                  tokens.size > 0, tokens.dtype == .int32 || tokens.dtype == .int64,
+                  windowSize == nil || windowSize! > 0,
+                  cache.isEmpty || cache.count == config.textConfiguration.hiddenLayers
+            else {
+                throw NSError(domain: "Qwen25VL.prepare", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Expected nonempty unmasked single-sequence integer tokens, positive prefill step and complete cache"])
+            }
+            if let mask = input.text.mask {
+                // Qwen2.5-VL text forward has no padding-mask input. An all-true mask
+                // is equivalent to omission; reject actual padding before cache mutation.
+                guard mask.shape == tokens.shape, mask.dtype == .bool,
+                      try withError({ error in
+                          let allTrue = mask.all().item(Bool.self)
+                          try error.check()
+                          return allTrue
+                      }) else {
+                    throw NSError(domain: "Qwen25VL.prepare", code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "Qwen2.5-VL text preparation requires an all-true bool mask matching tokens"])
+                }
+            }
+            // Qwen2.5-VL text RoPE reads each cache offset directly; there is
+            // no persistent media position/delta state to reset.
+            let flat = tokens.reshaped(-1)
+            let step = cache.isEmpty ? flat.size : (windowSize ?? 512)
+            var result: LMOutput?
+            var consumed = 0
+            while consumed < flat.size {
+                try Task.checkCancellation()
+                let end = consumed + min(step, flat.size - consumed)
+                result = try withError { error in
+                    let output = languageModel(flat[consumed ..< end].expandedDimensions(axis: 0), cache: cache.isEmpty ? nil : cache)
+                    try error.check()
+                    eval(output.logits)
+                    eval(cache)
+                    try error.check()
+                    return output
+                }
+                consumed = end
+                PrefillProgressReporter.reportCompletedUnits(consumed)
+            }
+            return .logits(result!)
+        }
         let dtype = visionModel.patchEmbed.proj.weight.dtype
 
         // Process both images and videos together
