@@ -860,32 +860,44 @@ public class Qwen25VL: Module, VLMModel, KVCacheDimensionProvider {
         if input.image == nil && input.video == nil && input.audio == nil {
             let tokens = input.text.tokens
             guard (tokens.ndim == 1 || (tokens.ndim == 2 && tokens.dim(0) == 1)),
-                  tokens.size > 0, tokens.dtype == .int32 || tokens.dtype == .int64,
-                  windowSize == nil || windowSize! > 0,
-                  cache.isEmpty || cache.count == config.textConfiguration.hiddenLayers
+                tokens.size > 0, tokens.dtype == .int32 || tokens.dtype == .int64,
+                windowSize == nil || windowSize! > 0,
+                cache.isEmpty || cache.count == config.textConfiguration.hiddenLayers
             else {
-                throw NSError(domain: "Qwen25VL.prepare", code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "Expected nonempty unmasked single-sequence integer tokens, positive prefill step and complete cache"])
+                throw NSError(
+                    domain: "Qwen25VL.prepare", code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Expected nonempty unmasked single-sequence integer tokens, positive prefill step and complete cache"
+                    ])
             }
             if let mask = input.text.mask {
                 // Qwen2.5-VL text forward has no padding-mask input. An all-true mask
                 // is equivalent to omission; reject actual padding before cache mutation.
                 guard mask.shape == tokens.shape, (mask.dtype == .bool || mask.dtype.isInteger),
-                      try withError({ error in
-                          let allTrue = (mask .== MLXArray(1, dtype: mask.dtype)).all().item(Bool.self)
-                          try error.check()
-                          return allTrue
-                      }) else {
-                    throw NSError(domain: "Qwen25VL.prepare", code: 2,
-                        userInfo: [NSLocalizedDescriptionKey: "Qwen2.5-VL text preparation requires an all-one bool or integer mask matching tokens"])
+                    try withError({ error in
+                        let allTrue = (mask .== MLXArray(1, dtype: mask.dtype)).all().item(
+                            Bool.self)
+                        try error.check()
+                        return allTrue
+                    })
+                else {
+                    throw NSError(
+                        domain: "Qwen25VL.prepare", code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Qwen2.5-VL text preparation requires an all-one bool or integer mask matching tokens"
+                        ])
                 }
             }
             // Keep the original full-text forward shape and native position
             // handling. Chunked prefill is a separate numerical contract.
             let inputEmbeddings = self.inputEmbeddings(
                 inputIds: tokens.reshaped(-1), pixelValues: nil, frames: nil)
-            return .logits(languageModel(nil, cache: cache.isEmpty ? nil : cache,
-                inputEmbedding: inputEmbeddings))
+            return .logits(
+                languageModel(
+                    nil, cache: cache.isEmpty ? nil : cache,
+                    inputEmbedding: inputEmbeddings))
         }
         let dtype = visionModel.patchEmbed.proj.weight.dtype
 
