@@ -8,6 +8,7 @@
 #
 #   scripts/run-cpu-kernel-tests.sh [--expect "<Highway targets>"] [--sde <chip>] [--skip-build]
 #                                    [--filter <swift-testing filter>] [--once] [--stall <seconds>]
+#                                    [--sanitize thread]
 #
 # The test build (VMLX_HWY_ALL_TARGETS=1, release) compiles every attainable Highway target, EMU128
 # included. VMLX_EXPECT_HWY_TARGETS, the targets this host must execute, is --expect's value, or
@@ -17,15 +18,22 @@
 # contains.
 # --sde runs the probe and the tests under Intel SDE, emulating <chip> (for example spr).
 # --filter narrows the tests (default: the whole target); --once runs only the default pool, for
-# emulated runs, which are slow. A run whose log stops growing for --stall seconds (default 1200) is
-# killed with everything it started: a hung kernel must not hold a runner forever.
-# VMLX_KERNEL_TESTS_SCRATCH moves the build (default .build/hwy-all), for a mutated build beside it.
+# emulated and sanitized runs, which are slow. A run whose log stops growing for --stall seconds
+# (default 1200) is killed with everything it started: a hung kernel must not hold a runner forever.
+# --sanitize thread builds with SwiftPM's --sanitize=thread, the one sanitizer tried so far (another
+# name is a usage error), in the scratch path .build/hwy-all-thread (.build/no-hwy-thread with
+# VMLX_NO_HIGHWAY=1). It checks that the test executable holds ThreadSanitizer's runtime
+# (`__tsan_init`), and prints a GitHub warning annotation when it does not: an uninstrumented run
+# would pass.
+# VMLX_KERNEL_TESTS_SCRATCH moves the build (default .build/hwy-all, or as --sanitize and
+# VMLX_NO_HIGHWAY say), for a mutated build beside it.
 # VMLX_NO_HIGHWAY=1 (Package.swift) builds without Highway; the expectation is then `none`, and the
 # default scratch path `.build/no-hwy`.
 #
 # Exits 0 when every configuration passed. Otherwise with the first failing configuration's status:
-# 124 when it stalled, 69 when no test matched the filter, and else the test executable's own (1 for
-# a failed test). Exits 2 for a usage error, a missing test executable or a missing probe compiler.
+# 124 when it stalled, 69 when no test matched the filter, and else the test executable's own: 1 for
+# a failed test, 66 when ThreadSanitizer reported (its exit code). Exits 2 for a usage error, a
+# missing test executable or a missing probe compiler.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 EXPECT=""
@@ -34,12 +42,13 @@ BUILD=1
 FILTER=VMLXCPUKernelTests
 CONFIGURATIONS="1 default"
 STALL=1200
+SANITIZE=""
 usage() {
-  echo "usage: $0 [--expect '<targets>'] [--sde <chip>] [--skip-build] [--filter <filter>] [--once] [--stall <s>]" >&2
+  echo "usage: $0 [--expect '<targets>'] [--sde <chip>] [--skip-build] [--filter <filter>] [--once] [--stall <s>] [--sanitize thread]" >&2
   exit 2
 }
 while [ $# -gt 0 ]; do
-  case "$1" in --expect | --sde | --filter | --stall) [ $# -ge 2 ] || usage ;; esac
+  case "$1" in --expect | --sde | --filter | --stall | --sanitize) [ $# -ge 2 ] || usage ;; esac
   case "$1" in
     --expect) EXPECT=$2; shift 2 ;;
     --sde) SDE=$2; shift 2 ;;
@@ -47,15 +56,18 @@ while [ $# -gt 0 ]; do
     --filter) FILTER=$2; shift 2 ;;
     --once) CONFIGURATIONS=default; shift ;;
     --stall) STALL=$2; shift 2 ;;
+    --sanitize) [ "$2" = thread ] || usage; SANITIZE=$2; shift 2 ;;
     *) usage ;;
   esac
 done
 if [ "${VMLX_NO_HIGHWAY:-}" = 1 ]; then DEFAULT_SCRATCH=$ROOT/.build/no-hwy; else DEFAULT_SCRATCH=$ROOT/.build/hwy-all; fi
+if [ -n "$SANITIZE" ]; then DEFAULT_SCRATCH=$DEFAULT_SCRATCH-$SANITIZE; fi # .build/hwy-all-thread, .build/no-hwy-thread
 SCRATCH="${VMLX_KERNEL_TESTS_SCRATCH:-$DEFAULT_SCRATCH}"
 # The tests expect the int8 switch off at the start, and judge the polynomial bounds, which
 # VMLX_ULP_BASELINE=1 would only measure.
 unset MLX_CPU_QUANTIZED_INT8 VMLX_ULP_BASELINE
 SWIFT_FLAGS=(--package-path "$ROOT" --scratch-path "$SCRATCH" -c release -Xswiftc -enable-testing)
+if [ -n "$SANITIZE" ]; then SWIFT_FLAGS+=("--sanitize=$SANITIZE"); fi
 export VMLX_HWY_ALL_TARGETS=1
 if [ "$BUILD" = 1 ]; then
   swift build "${SWIFT_FLAGS[@]}" --build-tests
@@ -67,6 +79,15 @@ BIN=$(swift build "${SWIFT_FLAGS[@]}" --show-bin-path)
 TEST_BIN=$(find "$BIN" -maxdepth 1 -type f -perm -u+x \( -name 'VMLXCPUKernelTests-test-runner' -o -name '*PackageTests.xctest' \) -printf '%T@ %p\n' 2> /dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)
 [ -n "$TEST_BIN" ] || { echo "no test executable in $BIN" >&2; exit 2; }
 echo "Tests: $TEST_BIN"
+# A sanitized build is proven by its runtime's entry point, which needs no report.
+if [ "$SANITIZE" = thread ]; then
+  syms=$( { nm "$TEST_BIN"; nm -D "$TEST_BIN"; } 2> /dev/null || true)
+  if grep -qw __tsan_init <<< "$syms"; then
+    echo "ThreadSanitizer: $TEST_BIN holds __tsan_init"
+  else
+    echo "::warning::$TEST_BIN holds no __tsan_init: not built with ThreadSanitizer"
+  fi
+fi
 # The emulator's command prefix, empty without --sde.
 SDE_RUN=()
 if [ -n "$SDE" ]; then SDE_RUN=(sde64 "-$SDE" --); fi
@@ -145,9 +166,11 @@ for threads in $CONFIGURATIONS; do
   watched "$log" "${SDE_RUN[@]}" "$TEST_BIN" --testing-library swift-testing --filter "$FILTER" || rc=$?
   echo "== MLX_CPU_THREADS=$threads: exit $rc, $(grep -E 'Test run with' "$log" | tail -1)"
   if [ "$rc" = 0 ] && grep -Eq 'Test run with [1-9][0-9]* tests? .*passed' "$log"; then continue; fi
-  # Each recorded issue with the values swift-testing prints under it (↳), and any stall or crash.
+  # Each recorded issue with the values swift-testing prints under it (↳), any stall or crash, and a
+  # sanitizer's distinct summaries, startup failure and closing count.
   awk '/recorded an issue/ {show = 1; print; next} show && /^↳/ {print; next} {show = 0}
-    /STALLED|[Ff]atal error|error:/ {print}' "$log" | head -40 || true
+    /^SUMMARY: [A-Za-z]+Sanitizer/ {if (!seen[$0]++) print; next}
+    /STALLED|[Ff]atal error|error:|^FATAL: |CHECK failed|Sanitizer: reported/ {print}' "$log" | head -40 || true
   if [ "$STALLED" = 1 ]; then
     rc=124
   elif [ "$rc" = 69 ]; then

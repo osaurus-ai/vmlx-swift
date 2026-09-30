@@ -215,10 +215,11 @@ jobs:
           bash .github/scripts/build-linux-cuda-cmake.sh
 
   linux_swiftpm:
-    name: Linux SwiftPM (${{ matrix.arch }})
+    name: Linux SwiftPM (${{ matrix.arch }}, Highway ${{ matrix.highway }})
     # Advisory while it is new: builds the Linux profile of Package.swift (the LM libraries and
-    # their dependencies), runs VMLXLinuxTests, then the CPU kernel tests. GitHub-hosted runners
-    # only: the self-hosted pools queue for a day. python3 is for scripts/check-metal-only.sh.
+    # their dependencies) with Highway on x86-64 and arm64, and in a third leg without it, then
+    # runs VMLXLinuxTests and the CPU kernel tests. GitHub-hosted runners only: the self-hosted
+    # pools queue for a day. python3 is for scripts/check-metal-only.sh.
     continue-on-error: true
     timeout-minutes: 120
     strategy:
@@ -227,9 +228,18 @@ jobs:
         include:
           - host: ubuntu-24.04
             arch: x86_64
+            highway: "on"
           - host: ubuntu-24.04-arm
             arch: aarch64
+            highway: "on"
+          # Without Highway (VMLX_NO_HIGHWAY=1): MLX's scalar CPU code, as the aarch64 leg ran
+          # before it had Highway.
+          - host: ubuntu-24.04-arm
+            arch: aarch64
+            highway: "off"
     runs-on: ${{ matrix.host }}
+    env:
+      VMLX_NO_HIGHWAY: ${{ matrix.highway == 'off' && '1' || '' }}
     container:
       image: swift:6.4-bookworm
     defaults:
@@ -303,3 +313,45 @@ jobs:
               export PATH=/sde:$PATH
               bash scripts/run-cpu-kernel-tests.sh --sde spr --once --stall 5400 \
                 --filter "VMLXCPUKernelTests\\.(TargetsTests|QuantizedMatmulTests|NormTests|RopeTests)|AttentionTests/eachPath"'
+
+  linux_cpu_kernels_tsan:
+    name: Linux CPU kernels under ThreadSanitizer (aarch64)
+    # Advisory: the CPU pool and the threaded kernels under ThreadSanitizer, on arm64. TSan checks
+    # the C++ memory model, not the CPU's, so one architecture suffices. Nothing is suppressed: a
+    # report fails the step. One pool configuration, the threaded suites only.
+    continue-on-error: true
+    # 60 min: ~18 expected (4.4 min on a 12-CPU arm64 Linux VM x ~3.6 on this runner, plus setup),
+    # doubled, plus the runner's --stall window (1200 s, passed below), so that a hang ends in
+    # STALLED, not a timeout.
+    timeout-minutes: 60
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Fewer random mmap bits, for ThreadSanitizer
+        run: |
+          sudo sysctl vm.mmap_rnd_bits
+          sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Kernel tests under ThreadSanitizer
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work swift:6.4-bookworm bash -c '
+            set -euo pipefail
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              libopenblas-dev liblapack-dev liblapacke-dev gfortran g++ libsqlite3-dev python3
+            bash scripts/run-cpu-kernel-tests.sh --sanitize thread --once --stall 1200 \
+              --filter "VMLXCPUKernelTests\\.(QuantizedMatmulTests|GatherQuantizedMatmulTests|GemmTests|ReductionTests|IndexingTests)|threadedElementwise|threadedRows|threadedSoftmax"'
+
+      - name: Upload the ThreadSanitizer logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsan-kernel-tests
+          path: .build/hwy-all-thread/kernel-tests-*.log
+          include-hidden-files: true
+          overwrite: true
+          retention-days: 7
