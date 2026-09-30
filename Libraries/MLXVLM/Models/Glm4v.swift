@@ -916,23 +916,36 @@ public class Glm4v: Module, VLMModel, KVCacheDimensionProvider {
             let tokens = input.text.tokens
             guard (tokens.ndim == 1 || (tokens.ndim == 2 && tokens.dim(0) == 1)),
                   tokens.size > 0, tokens.dtype == .int32 || tokens.dtype == .int64,
-                  input.text.mask == nil, windowSize == nil || windowSize! > 0,
-                  cache.count == config.textConfiguration.hiddenLayers
+                  windowSize == nil || windowSize! > 0,
+                  cache.isEmpty || cache.count == config.textConfiguration.hiddenLayers
             else {
                 throw NSError(domain: "Glm4v.prepare", code: 1,
                     userInfo: [NSLocalizedDescriptionKey: "Expected nonempty unmasked single-sequence integer tokens, positive prefill step and complete cache"])
             }
+            if let mask = input.text.mask {
+                // GLM4V text forward has no padding-mask input. An all-true mask
+                // is equivalent to omission; reject actual padding before cache mutation.
+                guard mask.shape == tokens.shape, mask.dtype == .bool,
+                      try withError({ error in
+                          let allTrue = mask.all().item(Bool.self)
+                          try error.check()
+                          return allTrue
+                      }) else {
+                    throw NSError(domain: "Glm4v.prepare", code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "GLM4V text preparation requires an all-true bool mask matching tokens"])
+                }
+            }
             languageModel._positionIds = nil
             languageModel._ropeDeltas = nil
             let flat = tokens.reshaped(-1)
-            let step = windowSize ?? 512
+            let step = cache.isEmpty ? flat.size : (windowSize ?? 512)
             var result: LMOutput?
             var consumed = 0
             while consumed < flat.size {
                 try Task.checkCancellation()
                 let end = min(consumed + step, flat.size)
                 result = try withError { error in
-                    let output = languageModel(flat[consumed ..< end].expandedDimensions(axis: 0), cache: cache)
+                    let output = languageModel(flat[consumed ..< end].expandedDimensions(axis: 0), cache: cache.isEmpty ? nil : cache)
                     try error.check()
                     eval(output.logits)
                     eval(cache)

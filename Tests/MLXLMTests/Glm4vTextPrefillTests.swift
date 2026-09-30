@@ -25,6 +25,11 @@ final class Glm4vTextPrefillTests: XCTestCase {
             let y = try logits(m.prepare(LMInput(tokens: ids.reshaped(1,4)), cache: b, windowSize: 4))
             XCTAssertEqual(x.asArray(Float.self), y.asArray(Float.self))
             XCTAssertEqual(a[0].offset, 4); XCTAssertEqual(b[0].offset, 4)
+            XCTAssertEqual(a[0].state.count, b[0].state.count)
+            for (x, y) in zip(a[0].state, b[0].state) {
+                XCTAssertEqual(x.shape, y.shape)
+                XCTAssertEqual(x.asArray(Float.self), y.asArray(Float.self))
+            }
         }
     }
     func testMalformedRanksRefuseBeforeCacheMutation() throws {
@@ -50,8 +55,36 @@ final class Glm4vTextPrefillTests: XCTestCase {
             XCTAssertLessThan(delta, 0.001)
             XCTAssertEqual(progress.values, [8,16,24,32,33]); XCTAssertEqual(a[0].offset, 33)
             XCTAssertEqual(b[0].offset, 33)
+            XCTAssertEqual(a[0].state.count, b[0].state.count)
+            for (x,y) in zip(a[0].state,b[0].state) {
+                XCTAssertEqual(x.shape,y.shape)
+                XCTAssertLessThan(abs(x-y).max().item(Float.self), 0.001)
+            }
             let next = MLXArray([Int32(3)]).reshaped(1,1)
             XCTAssertLessThan(abs(m(next, cache: a) - m(next, cache: b)).max().item(Float.self), 0.001)
+        }
+    }
+    func testUncachedPrepareKeepsFullContextAndAllTrueMask() throws {
+        try MLXMetalTestLock.withLock {
+            let m = try model(), ids = MLXArray([Int32(1),2,3,4]).reshaped(1,4)
+            let input = LMInput(text: .init(tokens: ids, mask: MLXArray.ones([1,4], dtype: .bool)))
+            let actual = try logits(m.prepare(input, cache: [], windowSize: 1))
+            let expected = m(ids, cache: nil)
+            XCTAssertEqual(actual.shape, [1,4,32])
+            XCTAssertEqual(actual.asArray(Float.self), expected.asArray(Float.self))
+        }
+    }
+    func testInvalidStepEmptyTokensAndPaddingRejectBeforeMutation() throws {
+        try MLXMetalTestLock.withLock {
+            let m = try model(), ids = MLXArray([Int32(1),2])
+            let cache = [KVCacheSimple()]
+            for step in [0,-1] {
+                XCTAssertThrowsError(try m.prepare(LMInput(tokens: ids), cache: cache, windowSize: step))
+            }
+            XCTAssertThrowsError(try m.prepare(LMInput(tokens: MLXArray([Int32]())), cache: cache, windowSize: 2))
+            let masked = LMInput(text: .init(tokens: ids, mask: MLXArray([true,false])))
+            XCTAssertThrowsError(try m.prepare(masked, cache: cache, windowSize: 2))
+            XCTAssertEqual(cache[0].offset, 0); XCTAssertTrue(cache[0].state.isEmpty)
         }
     }
     private final class Progress: @unchecked Sendable {
