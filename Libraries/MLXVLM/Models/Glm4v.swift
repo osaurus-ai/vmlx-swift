@@ -936,27 +936,12 @@ public class Glm4v: Module, VLMModel, KVCacheDimensionProvider {
                         userInfo: [NSLocalizedDescriptionKey: "GLM4V text preparation requires an all-one bool or integer mask matching tokens"])
                 }
             }
-            languageModel._positionIds = nil
-            languageModel._ropeDeltas = nil
-            let flat = tokens.reshaped(-1)
-            let step = cache.isEmpty ? flat.size : (windowSize ?? 512)
-            var result: LMOutput?
-            var consumed = 0
-            while consumed < flat.size {
-                try Task.checkCancellation()
-                let end = min(consumed + step, flat.size)
-                result = try withError { error in
-                    let output = languageModel(flat[consumed ..< end].expandedDimensions(axis: 0), cache: cache.isEmpty ? nil : cache)
-                    try error.check()
-                    eval(output.logits)
-                    eval(cache)
-                    try error.check()
-                    return output
-                }
-                consumed = end
-                PrefillProgressReporter.reportCompletedUnits(consumed)
-            }
-            return .logits(result!)
+            // Keep the original full-text forward shape and native position
+            // handling. Chunked prefill is a separate numerical contract.
+            let inputEmbeddings = self.inputEmbeddings(
+                inputIds: tokens.reshaped(-1), pixelValues: nil, frames: nil)
+            return .logits(languageModel(nil, cache: cache.isEmpty ? nil : cache,
+                inputEmbedding: inputEmbeddings))
         }
         let dtype = visionModel.patchEmbed.proj.weight.dtype
 

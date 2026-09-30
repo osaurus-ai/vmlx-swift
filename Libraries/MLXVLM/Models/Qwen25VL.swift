@@ -880,27 +880,12 @@ public class Qwen25VL: Module, VLMModel, KVCacheDimensionProvider {
                         userInfo: [NSLocalizedDescriptionKey: "Qwen2.5-VL text preparation requires an all-one bool or integer mask matching tokens"])
                 }
             }
-            // Qwen2.5-VL text RoPE reads each cache offset directly; there is
-            // no persistent media position/delta state to reset.
-            let flat = tokens.reshaped(-1)
-            let step = cache.isEmpty ? flat.size : (windowSize ?? 512)
-            var result: LMOutput?
-            var consumed = 0
-            while consumed < flat.size {
-                try Task.checkCancellation()
-                let end = consumed + min(step, flat.size - consumed)
-                result = try withError { error in
-                    let output = languageModel(flat[consumed ..< end].expandedDimensions(axis: 0), cache: cache.isEmpty ? nil : cache)
-                    try error.check()
-                    eval(output.logits)
-                    eval(cache)
-                    try error.check()
-                    return output
-                }
-                consumed = end
-                PrefillProgressReporter.reportCompletedUnits(consumed)
-            }
-            return .logits(result!)
+            // Keep the original full-text forward shape and native position
+            // handling. Chunked prefill is a separate numerical contract.
+            let inputEmbeddings = self.inputEmbeddings(
+                inputIds: tokens.reshaped(-1), pixelValues: nil, frames: nil)
+            return .logits(languageModel(nil, cache: cache.isEmpty ? nil : cache,
+                inputEmbedding: inputEmbeddings))
         }
         let dtype = visionModel.patchEmbed.proj.weight.dtype
 

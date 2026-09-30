@@ -44,26 +44,25 @@ final class Qwen25VLTextPrefillTests: XCTestCase {
             }
         }
     }
-    func testLongTextChunkingMatchesLastLogitsAndReportsProgress() throws {
+    func testLongFlatAndBatchedTextKeepExactMultiTurnCacheParity() throws {
         try MLXMetalTestLock.withLock {
             let m = try model(), ids = MLXArray((0..<33).map { Int32($0 % 30 + 1) })
             let a = [KVCacheSimple()], b = [KVCacheSimple()]
-            let progress = Progress()
-            let chunked = try PrefillProgressReporter.withHandler({ progress.add($0) }) {
-                try logits(m.prepare(LMInput(tokens: ids), cache: a, windowSize: 8))
+            for turn in [ids, MLXArray([Int32(3), 4, 5]), MLXArray([Int32(6)])] {
+                let flat = try logits(m.prepare(LMInput(tokens: turn), cache: a, windowSize: 8))
+                let batched = try logits(m.prepare(LMInput(tokens: turn.reshaped(1, -1)),
+                    cache: b, windowSize: 8))
+                XCTAssertEqual(flat.shape, batched.shape)
+                XCTAssertEqual(flat.asArray(Float.self), batched.asArray(Float.self))
+                XCTAssertEqual(a[0].offset, b[0].offset)
+                XCTAssertEqual(a[0].state.count, b[0].state.count)
+                for (x, y) in zip(a[0].state, b[0].state) {
+                    XCTAssertEqual(x.shape, y.shape)
+                    XCTAssertEqual(x.asArray(Float.self), y.asArray(Float.self))
+                }
             }
-            let full = try logits(m.prepare(LMInput(tokens: ids), cache: b, windowSize: 64))
-            let delta = abs(chunked[0..., -1, 0...] - full[0..., -1, 0...]).max().item(Float.self)
-            XCTAssertLessThan(delta, 0.001)
-            XCTAssertEqual(progress.values, [8,16,24,32,33]); XCTAssertEqual(a[0].offset, 33)
-            XCTAssertEqual(b[0].offset, 33)
-            XCTAssertEqual(a[0].state.count, b[0].state.count)
-            for (x,y) in zip(a[0].state,b[0].state) {
-                XCTAssertEqual(x.shape,y.shape)
-                XCTAssertLessThan(abs(x-y).max().item(Float.self), 0.001)
-            }
-            let next = MLXArray([Int32(3)]).reshaped(1,1)
-            XCTAssertLessThan(abs(m(next, cache: a) - m(next, cache: b)).max().item(Float.self), 0.001)
+            XCTAssertEqual(a[0].offset, 37)
+            XCTAssertEqual(b[0].offset, 37)
         }
     }
     func testUncachedPrepareKeepsFullContextAndAllTrueMask() throws {
@@ -124,24 +123,26 @@ final class Qwen25VLTextPrefillTests: XCTestCase {
             }
         }
     }
-    func testIteratorStableBoundaryPreparationMatchesUnsplitText() throws {
+    func testIteratorStableBoundariesKeepExactFlatAndBatchParity() throws {
         try MLXMetalTestLock.withLock {
             let m = try model()
             let ids = MLXArray([Int32(1), 2, 3, 4, 5, 6, 7, 8])
             let parameters = GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 3)
             let plainCache = [KVCacheSimple()], splitCache = [KVCacheSimple()]
-            var plain = try TokenIterator(input: LMInput(tokens: ids), model: m,
+            var plain = try TokenIterator(input: LMInput(tokens: ids,
+                cachePrefixTokenCounts: [4, 6], cacheStablePrefixTokenCounts: [4, 6]), model: m,
                 cache: plainCache, parameters: parameters)
             // The production iterator slices stable boundaries into [1,T]
             // inputs before calling this model's prepare implementation.
-            var split = try TokenIterator(input: LMInput(tokens: ids,
+            var split = try TokenIterator(input: LMInput(tokens: ids.reshaped(1, -1),
                 cachePrefixTokenCounts: [4, 6], cacheStablePrefixTokenCounts: [4, 6]),
                 model: m, cache: splitCache, parameters: parameters)
             XCTAssertEqual(plainCache[0].offset, splitCache[0].offset)
             XCTAssertGreaterThanOrEqual(splitCache[0].offset, 8)
+            XCTAssertEqual(plainCache[0].state.count, splitCache[0].state.count)
             for (a, b) in zip(plainCache[0].state, splitCache[0].state) {
                 XCTAssertEqual(a.shape, b.shape)
-                XCTAssertLessThan(abs(a - b).max().item(Float.self), 0.001)
+                XCTAssertEqual(a.asArray(Float.self), b.asArray(Float.self))
             }
             let started = Date()
             let expected = plain.next(), actual = split.next()
@@ -152,8 +153,4 @@ final class Qwen25VLTextPrefillTests: XCTestCase {
         }
     }
 
-    private final class Progress: @unchecked Sendable {
-        let lock = NSLock(); var values: [Int] = []
-        func add(_ value: Int) { lock.lock(); defer { lock.unlock() }; values.append(value) }
-    }
 }
