@@ -342,14 +342,14 @@ public func loadWeights(
             // as `layers.0.experts_input` into model.update(), which correctly
             // rejects them as unhandled parameters.
             if isAuxiliaryCalibrationSafetensor(url.lastPathComponent) {
-                FileHandle.standardError.write(Data(
+                LoadDiagnostics.write(Data(
                     "[loadWeights] skipping non-inference calibration artifact \(url.lastPathComponent)\n".utf8))
                 continue
             }
             if skipDSV4Sidecar
                 && url.lastPathComponent == "jangtq_stacked.safetensors"
             {
-                FileHandle.standardError.write(Data(
+                LoadDiagnostics.write(Data(
                     "[loadWeights] VMLX_DSV4_SKIP_SIDECAR=1 — skipping jangtq_stacked.safetensors\n".utf8))
                 continue
             }
@@ -386,7 +386,7 @@ public func loadWeights(
                     + missing.sorted().joined(separator: ", ")
                     + ". The bundle layout is incomplete or superseded — "
                     + "re-download the bundle."
-                FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                LoadDiagnostics.write(Data("[loadWeights] \(message)\n".utf8))
                 throw TruncatedSafetensorsError(description: message)
             case .staleIndex(let missing, let replacement):
                 // The index describes a layout that is not in this directory
@@ -406,7 +406,7 @@ public func loadWeights(
                         let message =
                             "model.safetensors.index.json is stale (names \(missing.count) absent file(s)) "
                             + "and the replacement shard \(name) has an unreadable header — re-download the bundle."
-                        FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                        LoadDiagnostics.write(Data("[loadWeights] \(message)\n".utf8))
                         throw TruncatedSafetensorsError(description: message)
                     }
                     for key in keys {
@@ -418,10 +418,10 @@ public func loadWeights(
                         "model.safetensors.index.json is stale and the \(replacement.count)-shard replacement "
                         + "declares \(duplicates.count) duplicate tensor(s): "
                         + duplicates.sorted().prefix(5).joined(separator: ", ") + " — re-download the bundle."
-                    FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                    LoadDiagnostics.write(Data("[loadWeights] \(message)\n".utf8))
                     throw TruncatedSafetensorsError(description: message)
                 }
-                FileHandle.standardError.write(Data(
+                LoadDiagnostics.write(Data(
                     ("[loadWeights] model.safetensors.index.json is stale: none of the "
                         + "\(missing.count) file(s) it names exist in \(modelDirectory.path) "
                         + "(e.g. \(missing.sorted().first ?? "")); loading the complete "
@@ -441,7 +441,7 @@ public func loadWeights(
                 !selected.contains(where: { $0.path == url.path })
             }.count
             if droppedCount > 0 {
-                FileHandle.standardError.write(Data(
+                LoadDiagnostics.write(Data(
                     ("[loadWeights] index-manifest load: ignoring \(droppedCount) "
                         + "non-indexed safetensors file(s) in the bundle\n").utf8))
             }
@@ -484,7 +484,7 @@ public func loadWeights(
                 + "shard sets (\(summary)). Using only "
                 + "`-of-\(completeTag).safetensors`. Delete the partial "
                 + "set(s) to silence this warning.\n"
-            FileHandle.standardError.write(Data(warning.utf8))
+            LoadDiagnostics.write(Data(warning.utf8))
             allShardURLs = allShardURLs.filter {
                 $0.lastPathComponent.hasSuffix(
                     "-of-\(String(format: "%05d", completeTotal)).safetensors")
@@ -517,10 +517,10 @@ public func loadWeights(
                 + "garbage output that varies per launch. Re-download the bundle.\n"
                 + detail
             if ProcessInfo.processInfo.environment["VMLX_ALLOW_TRUNCATED_SHARDS"] == "1" {
-                FileHandle.standardError.write(Data(
+                LoadDiagnostics.write(Data(
                     "[loadWeights] WARNING (VMLX_ALLOW_TRUNCATED_SHARDS=1): \(message)\n".utf8))
             } else {
-                FileHandle.standardError.write(Data("[loadWeights] \(message)\n".utf8))
+                LoadDiagnostics.write(Data("[loadWeights] \(message)\n".utf8))
                 throw TruncatedSafetensorsError(description: message)
             }
         }
@@ -560,7 +560,7 @@ public func loadWeights(
             requiresOwnedCompute: modelKeyExcluder?.requiresResidentSafetensorsWeights == true,
             readerOverride: RuntimeEnvironment.value("VMLX_FLASH_RESIDENT_READER"))
         if uncachedResidentRead {
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[loadWeights] resident_reader=uncached_owned source_files_unchanged=true\n".utf8))
         }
         for url in allShardURLs {
@@ -652,19 +652,19 @@ public func loadWeights(
             }
         }
         if skippedPrestackedSourceTensors > 0 {
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[loadWeights] using MLXPress prestacked routed overlay; skipped \(skippedPrestackedSourceTensors) original per-expert tensor(s)\n".utf8))
         }
         if skippedStreamingSourceTensors > 0 {
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[loadWeights] using MLXPress active-expert streaming; skipped \(skippedStreamingSourceTensors) per-expert tensor(s) during weight load\n".utf8))
         }
         if skippedPreservedMTPTensors > 0 {
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[loadWeights] preserved MTP tensors are isolated from base AR load; skipped \(skippedPreservedMTPTensors) tensor(s) across \(skippedPreservedMTPShards) MTP-only shard(s)\n".utf8))
         }
         if skippedModelExcludedTensors > 0 {
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 ("[loadWeights] model-owned file-backed tensors bypassed generic MLX load; "
                     + "skipped \(skippedModelExcludedTensors) tensor(s) including "
                     + "\(skippedModelExcludedShards) auxiliary-only shard(s); "
@@ -672,12 +672,12 @@ public func loadWeights(
                     + "\(modelKeyExcluder?.requiresExactTensorMmapBuffers == true)\n").utf8))
         }
         if residentSafetensorsBytes > 0 {
-            FileHandle.standardError.write(Data(String(format:
+            LoadDiagnostics.write(Data(String(format:
                 "[loadWeights] resident compute materialization complete bytes=%.3f_GiB auxiliary_model_owned_tensors=excluded\n",
                 Double(residentSafetensorsBytes) / 1_073_741_824).utf8))
         }
         if loadPreservedMTP {
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[loadWeights] native MTP requested; preserved MTP tensors are included in model update\n".utf8))
         }
     }
@@ -707,7 +707,7 @@ public func loadWeights(
                     "affine-1 manifest weight must be a non-empty uint32 tensor: \(key)")
             }
         }
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             "[Load] JANG affine-1 validated \(contract.modulePaths.count) native 1-bit weight(s)\n".utf8))
     }
 
@@ -747,7 +747,7 @@ public func loadWeights(
             throw error
         }
     } else if declaresJANGTQNative {
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             "[loadWeights] JANGTQ runtime sidecar missing; generating deterministic signs/codebooks on demand\n".utf8))
     }
 
@@ -819,7 +819,7 @@ public func loadWeights(
         if !inferred.perLayerQuantization.isEmpty {
             let b = inferred.quantization?.bits ?? -1
             let g = inferred.quantization?.groupSize ?? -1
-            FileHandle.standardError.write(
+            LoadDiagnostics.write(
                 Data("[Load] JANG shape walk produced \(inferred.perLayerQuantization.count) per-layer quant override(s) over default (bits=\(b), gs=\(g))\n".utf8))
         }
         if ProcessInfo.processInfo.environment["VMLX_LOAD_QUANT_TRACE"] == "1" {
@@ -850,7 +850,7 @@ public func loadWeights(
                         "MISSING (weight=\(weightArr != nil) scales=\(scales != nil)) "
                         + "override=\(String(describing: override))"
                 }
-                FileHandle.standardError.write(
+                LoadDiagnostics.write(
                     Data("[Load][quant-trace] \(probe): \(desc)\n".utf8))
             }
         }
@@ -922,7 +922,7 @@ public func loadWeights(
         )
         if ProcessInfo.processInfo.environment["VMLX_LOAD_DIAG"] == "1" {
             let topQ = declaredAffineQuantization ?? inferred.quantization
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[merge-diag] top-level quantization = \(topQ.map { "(b=\($0.bits), gs=\($0.groupSize), mode=\($0.mode.rawValue))" } ?? "NIL"); merged_count=\(merged.count); inferred_count=\(inferred.perLayerQuantization.count); explicit_count=\(perLayerQuantization?.perLayerQuantization.count ?? 0); hidden_hint=\(hiddenHint.map(String.init) ?? "nil"); valid_dims=\(validInDims.sorted())\n".utf8))
         }
     } else if let perLayerQuantization {
@@ -994,7 +994,7 @@ public func loadWeights(
                 }
             }
             if corrections > 0 {
-                FileHandle.standardError.write(
+                LoadDiagnostics.write(
                     Data("[Load] config per-layer quant disagreed with safetensors shapes — patched \(corrections) layer(s) from shape walk\n".utf8))
             }
         }
@@ -1019,7 +1019,7 @@ public func loadWeights(
         if let inferred, !inferred.perLayerQuantization.isEmpty {
             let b = inferred.quantization?.bits ?? -1
             let g = inferred.quantization?.groupSize ?? -1
-            FileHandle.standardError.write(
+            LoadDiagnostics.write(
                 Data("[Load] non-JANG shape walk produced \(inferred.perLayerQuantization.count) per-layer quant override(s) over default (bits=\(b), gs=\(g))\n".utf8))
         }
         effectivePerLayerQuantization = inferred
@@ -1034,7 +1034,7 @@ public func loadWeights(
         if let inferred {
             let b = inferred.quantization?.bits ?? -1
             let g = inferred.quantization?.groupSize ?? -1
-            FileHandle.standardError.write(
+            LoadDiagnostics.write(
                 Data("[Load] config has no quant block — shape walk inferred default (bits=\(b), gs=\(g)) plus \(inferred.perLayerQuantization.count) override(s)\n".utf8))
         }
         effectivePerLayerQuantization = inferred
@@ -1184,7 +1184,7 @@ public func loadWeights(
             let linearCount = updates.count { $0.1 is Qwen4ExpBF16QuantizedLinear }
             let switchCount = updates.count { $0.1 is Qwen4ExpBF16QuantizedSwitchLinear }
             let embeddingCount = updates.count { $0.1 is Qwen4ExpBF16QuantizedEmbedding }
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 ("[Qwen4Exp] native_bf16_affine_modules linear=\(linearCount) "
                     + "switch=\(switchCount) embedding=\(embeddingCount) "
                     + "total_updates=\(updates.count)\n").utf8))
@@ -1259,7 +1259,7 @@ public func loadWeights(
             try model.update(modules: ModuleChildren.unflattened(headUpdates), verify: .none)
             MLX.eval(model)
             MLX.Memory.clearCache()
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[Load] quantized tied embedding head bits=\(headBits) gs=\(headGroupSize) paths=\(headUpdates.map(\.0))\n".utf8))
         }
     }
@@ -1314,7 +1314,7 @@ public func loadWeights(
     }
     if let hadamardContract {
         try hadamardContract.verifyLoaded(model: model)
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             ("[Load] JANG Hadamard verified=\(hadamardContract.modulePaths.count) "
                 + "block=\(hadamardContract.blockSize) compute=float32 stored_dtypes_preserved=true\n").utf8))
     }
@@ -1330,7 +1330,7 @@ public func loadWeights(
         }
         let summary = histogram.sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }.joined(separator: " ")
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             ("[Load] dtype-materialisation bf16=\(materialiseBFloat16) mmap=\(mmapSafetensorsActive) "
                 + "jangtqNative=\(isJANGTQNative) preserveJANGAffine=\(preserveJANGAffineMmapDtypes) "
                 + "preserveCheckpointDTypes=\(model.preservesCheckpointParameterDTypes) "
@@ -1352,7 +1352,7 @@ public func loadWeights(
     {
         let pinned = pinPreservedAffineEmbeddingOutputDTypes(model)
         if pinned > 0 {
-            FileHandle.standardError.write(Data(
+            LoadDiagnostics.write(Data(
                 "[Load] jang_affine_preserve embedding_output_dtype=bfloat16 modules=\(pinned)\n"
                     .utf8))
         }
@@ -1369,7 +1369,7 @@ public func loadWeights(
             count += 1
             dtypes.insert(String(describing: value.dtype))
         }
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             ("[Qwen4Exp] runtime_affine_metadata_dtype="
                 + dtypes.sorted().joined(separator: ",")
                 + " runtime_affine_metadata_count=\(count)"
@@ -1391,13 +1391,13 @@ public func loadWeights(
                 key.contains(needle) ? "\(key)=\(value.dtype)" : nil
             }.sorted().joined(separator: ",")
         }
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             ("[Qwen4Exp] runtime_parameter_dtypes bf16_count=\(bf16Count)"
                 + " f16_count=\(f16Keys.count)"
                 + " f16_keys=\(f16Keys.isEmpty ? "none" : f16Keys.prefix(8).joined(separator: ","))"
                 + " f32_count=\(f32Keys.count)"
                 + " f32_keys=\(f32Keys.isEmpty ? "none" : f32Keys.prefix(8).joined(separator: ","))\n").utf8))
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             ("[Qwen4Exp] runtime_parameter_boundaries embedding={"
                 + parameterDTypeSummary(matching: "embed_tokens")
                 + "} lm_head={" + parameterDTypeSummary(matching: "lm_head") + "}\n").utf8))
